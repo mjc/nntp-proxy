@@ -364,7 +364,7 @@ impl RequestContext {
     #[must_use]
     pub const fn cache_availability(&self) -> Option<RequestCacheAvailability> {
         match self.cache_entry {
-            Some(entry) => Some(entry.availability),
+            Some(entry) => Some(entry.availability()),
             None => None,
         }
     }
@@ -373,7 +373,7 @@ impl RequestContext {
     #[must_use]
     pub const fn cache_entry_status(&self) -> Option<StatusCode> {
         match self.cache_entry {
-            Some(entry) => Some(entry.status),
+            Some(entry) => Some(entry.status()),
             None => None,
         }
     }
@@ -382,7 +382,7 @@ impl RequestContext {
     #[must_use]
     pub const fn cache_entry_tier(&self) -> Option<RequestCacheTier> {
         match self.cache_entry {
-            Some(entry) => Some(entry.tier),
+            Some(entry) => Some(entry.tier()),
             None => None,
         }
     }
@@ -391,7 +391,7 @@ impl RequestContext {
     #[must_use]
     pub const fn cache_entry_timestamp(&self) -> Option<RequestCacheTimestampMillis> {
         match self.cache_entry {
-            Some(entry) => Some(entry.timestamp),
+            Some(entry) => Some(entry.timestamp()),
             None => None,
         }
     }
@@ -400,7 +400,7 @@ impl RequestContext {
     #[must_use]
     pub const fn cache_payload_kind(&self) -> Option<RequestCachePayloadKind> {
         match self.cache_entry {
-            Some(entry) => Some(entry.payload_kind),
+            Some(entry) => Some(entry.payload_kind()),
             None => None,
         }
     }
@@ -409,7 +409,7 @@ impl RequestContext {
     #[must_use]
     pub const fn cache_article_number(&self) -> Option<RequestCacheArticleNumber> {
         match self.cache_entry {
-            Some(entry) => entry.article_number,
+            Some(entry) => entry.article_number(),
             None => None,
         }
     }
