@@ -75,7 +75,7 @@ impl PartialOrd<usize> for CachedPayloadLen {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CachedPayload {
+pub(crate) enum CachedPayload {
     Missing,
     AvailabilityOnly,
     Article {
@@ -411,12 +411,6 @@ impl ArticleEntry {
     #[inline]
     pub const fn set_tier(&mut self, tier: ttl::CacheTier) {
         self.tier = tier;
-    }
-
-    #[inline]
-    #[must_use]
-    pub const fn payload(&self) -> &CachedPayload {
-        &self.payload
     }
 
     #[inline]
@@ -1280,7 +1274,7 @@ mod tests {
         );
 
         assert_eq!(entry.status_code(), StatusCode::new(220));
-        assert!(matches!(entry.payload(), CachedPayload::Article { .. }));
+        assert!(matches!(entry.payload, CachedPayload::Article { .. }));
     }
 
     #[test]
@@ -1290,7 +1284,7 @@ mod tests {
         );
 
         assert_eq!(entry.status_code(), StatusCode::new(220));
-        assert!(matches!(entry.payload(), CachedPayload::Article { .. }));
+        assert!(matches!(entry.payload, CachedPayload::Article { .. }));
     }
 
     #[test]
@@ -1304,7 +1298,7 @@ mod tests {
         );
 
         assert_eq!(entry.status_code(), StatusCode::new(220));
-        assert!(matches!(entry.payload(), CachedPayload::Article { .. }));
+        assert!(matches!(entry.payload, CachedPayload::Article { .. }));
     }
 
     #[test]
@@ -1328,7 +1322,7 @@ mod tests {
             ArticleEntry::from_cache_buffer_with_tier(response.into(), ttl::CacheTier::new(0));
 
         assert_eq!(entry.status_code(), StatusCode::new(220));
-        match entry.payload() {
+        match entry.payload {
             CachedPayload::Article { headers, body, .. } => {
                 assert_eq!(headers, b"Subject: Test");
                 assert_eq!(body, b"Body");
@@ -1579,7 +1573,7 @@ mod tests {
             "Backend 1 should still be available"
         );
 
-        assert!(matches!(entry.payload(), CachedPayload::Missing));
+        assert!(matches!(entry.payload, CachedPayload::Missing));
 
         // Record backend 1 also returned 430
         cache

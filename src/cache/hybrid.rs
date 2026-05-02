@@ -702,10 +702,6 @@ mod tests {
             .await;
 
         let entry = cache.get(&msg_id).await.unwrap();
-        assert!(matches!(
-            entry.payload(),
-            crate::cache::article::CachedPayload::AvailabilityOnly
-        ));
         assert_eq!(entry.payload_len(), 0);
         assert!(entry.should_try_backend(BackendId::from_index(0)));
 

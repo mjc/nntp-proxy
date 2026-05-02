@@ -900,9 +900,11 @@ fn test_hybrid_entry_serialization_roundtrip() {
     // Deserialize
     let decoded = HybridArticleEntry::decode(&mut Cursor::new(&encoded)).unwrap();
 
-    // Verify all fields match
     assert_eq!(decoded.status_code(), entry.status_code());
-    assert_eq!(decoded.payload(), entry.payload());
+    assert_eq!(
+        hybrid_response_bytes(&decoded, b"ARTICLE", "<test@example.com>"),
+        hybrid_response_bytes(&entry, b"ARTICLE", "<test@example.com>")
+    );
     assert_eq!(decoded.availability(), entry.availability());
     assert_eq!(decoded.tier().get(), entry.tier().get());
     assert!(!decoded.should_try_backend(BackendId::from_index(0)));

@@ -461,11 +461,6 @@ impl HybridArticleEntry {
     }
 
     #[must_use]
-    pub fn payload(&self) -> &CachedPayload {
-        &self.payload
-    }
-
-    #[must_use]
     pub fn payload_len(&self) -> super::article::CachedPayloadLen {
         self.payload.len()
     }
@@ -784,7 +779,7 @@ mod tests {
         .expect("valid status code");
 
         assert_eq!(entry.status_code().as_u16(), 220);
-        assert!(matches!(entry.payload(), CachedPayload::Article { .. }));
+        assert!(matches!(entry.payload, CachedPayload::Article { .. }));
     }
 
     #[test]
@@ -795,7 +790,7 @@ mod tests {
         .expect("valid status code");
 
         assert_eq!(entry.status_code().as_u16(), 220);
-        assert!(matches!(entry.payload(), CachedPayload::Article { .. }));
+        assert!(matches!(entry.payload, CachedPayload::Article { .. }));
     }
 
     #[test]
@@ -810,7 +805,7 @@ mod tests {
         .expect("valid status code");
 
         assert_eq!(entry.status_code().as_u16(), 220);
-        assert!(matches!(entry.payload(), CachedPayload::Article { .. }));
+        assert!(matches!(entry.payload, CachedPayload::Article { .. }));
     }
 
     #[test]
@@ -837,7 +832,7 @@ mod tests {
         .expect("valid status code");
 
         assert_eq!(entry.status_code().as_u16(), 220);
-        match entry.payload() {
+        match entry.payload {
             CachedPayload::Article { headers, body, .. } => {
                 assert_eq!(headers, b"Subject: Test");
                 assert_eq!(body, b"Body");
