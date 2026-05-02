@@ -394,7 +394,7 @@ impl HybridArticleCache {
                 let mut updated = existing.value().clone();
                 updated.record_backend_has(backend_id);
                 // Refresh timestamp on successful upsert to extend tier-aware TTL
-                updated.timestamp = ttl::now_millis();
+                updated.timestamp = ttl::CacheTimestampMillis::now();
                 self.cache.insert(key.clone(), updated);
                 debug!(
                     msg_id = %key,

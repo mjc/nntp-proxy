@@ -89,7 +89,7 @@ pub struct HybridArticleEntry {
     /// Unix timestamp when availability info was last updated (milliseconds since epoch)
     /// Used to expire stale availability-only entries (430 stubs, STAT responses)
     /// and for tier-aware TTL calculation
-    pub(super) timestamp: u64,
+    pub(super) timestamp: ttl::CacheTimestampMillis,
     /// Server tier (lower = higher priority)
     /// Used for tier-aware TTL: higher tier = longer TTL
     tier: ttl::CacheTier,
@@ -112,7 +112,7 @@ impl Code for HybridArticleEntry {
             ])
             .map_err(foyer::Error::io_error)?;
         writer
-            .write_all(&self.timestamp.to_le_bytes())
+            .write_all(&self.timestamp.get().to_le_bytes())
             .map_err(foyer::Error::io_error)?;
         writer
             .write_all(&[self.tier.get()])
@@ -160,7 +160,7 @@ impl Code for HybridArticleEntry {
         reader
             .read_exact(&mut timestamp_bytes)
             .map_err(foyer::Error::io_error)?;
-        let timestamp = u64::from_le_bytes(timestamp_bytes);
+        let timestamp = ttl::CacheTimestampMillis::new(u64::from_le_bytes(timestamp_bytes));
 
         // Read tier
         let mut tier_byte = [0u8; 1];
@@ -363,7 +363,7 @@ impl HybridArticleEntry {
         Some(Self {
             status_code,
             availability: ArticleAvailability::new(),
-            timestamp: ttl::now_millis(),
+            timestamp: ttl::CacheTimestampMillis::now(),
             tier: tier.into(),
             payload,
         })
@@ -395,7 +395,7 @@ impl HybridArticleEntry {
             self.payload.clone(),
             self.availability,
             self.tier.get(),
-            self.timestamp,
+            self.timestamp.get(),
         )
     }
 
@@ -515,7 +515,7 @@ impl HybridArticleEntry {
     #[inline]
     #[must_use]
     pub fn is_expired(&self, base_ttl_millis: u64) -> bool {
-        ttl::is_expired(self.timestamp, base_ttl_millis, self.tier.get())
+        ttl::is_expired(self.timestamp.get(), base_ttl_millis, self.tier.get())
     }
 
     /// Get the tier of the backend that provided this article
