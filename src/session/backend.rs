@@ -155,8 +155,6 @@ pub struct BackendFirstResponse {
     pub bytes_read: usize,
     /// Parsed status code, if present
     pub status_code: Option<StatusCode>,
-    /// Whether this is a multiline response
-    pub is_multiline: bool,
     /// Any validation warnings
     pub warnings: SmallVec<[ResponseWarning; 0]>,
 }
@@ -167,6 +165,27 @@ impl BackendFirstResponse {
     #[must_use]
     pub const fn status_code(&self) -> Option<StatusCode> {
         self.status_code
+    }
+
+    /// Derive response shape from the typed request and parsed status.
+    #[inline]
+    #[must_use]
+    pub fn response_shape(
+        &self,
+        request: &RequestContext,
+    ) -> Option<crate::protocol::ResponseShape> {
+        self.status_code
+            .map(|status| request.response_shape(status))
+    }
+
+    /// Whether the typed request/status pair expects a multiline response.
+    #[inline]
+    #[must_use]
+    pub fn is_multiline_for(&self, request: &RequestContext) -> bool {
+        matches!(
+            self.response_shape(request),
+            Some(crate::protocol::ResponseShape::Multiline)
+        )
     }
 
     /// Log validation warnings with context
@@ -255,7 +274,6 @@ pub async fn send_request_timed<C>(
 where
     C: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    use crate::protocol::ResponseShape;
     use std::time::Instant;
 
     let start = Instant::now();
@@ -276,17 +294,12 @@ where
     let recv_elapsed = recv_start.elapsed();
 
     let validated = parse_backend_status(&buffer[..total], total, min_len);
-    let is_multiline = validated
-        .status_code
-        .is_some_and(|status| matches!(request.response_shape(status), ResponseShape::Multiline));
-
     let elapsed = start.elapsed();
 
     Ok((
         BackendFirstResponse {
             bytes_read: total,
             status_code: validated.status_code,
-            is_multiline,
             warnings: validated.warnings,
         },
         elapsed.as_micros() as u64,
@@ -368,7 +381,7 @@ mod tests {
         assert!(result.is_ok(), "send_request should handle partial reads");
         let resp = result.unwrap();
         assert_eq!(resp.status_code(), Some(StatusCode::new(200)));
-        assert!(!resp.is_multiline);
+        assert!(!resp.is_multiline_for(&request));
     }
 
     #[tokio::test]
@@ -390,7 +403,7 @@ mod tests {
         let resp = result.unwrap();
         assert_eq!(resp.bytes_read, b"111 20260501173336\r\n".len());
         assert_eq!(resp.status_code(), Some(StatusCode::new(111)));
-        assert!(!resp.is_multiline);
+        assert!(!resp.is_multiline_for(&request));
         assert_eq!(&buffer[..resp.bytes_read], b"111 20260501173336\r\n");
     }
 
@@ -412,7 +425,7 @@ mod tests {
         );
         let resp = result.unwrap();
         assert_eq!(resp.status_code(), Some(StatusCode::new(211)));
-        assert!(!resp.is_multiline);
+        assert!(!resp.is_multiline_for(&request));
     }
 
     // ─── Command response tests ─────────────────────────────────────────────
@@ -423,7 +436,6 @@ mod tests {
         let response = BackendFirstResponse {
             bytes_read: 20,
             status_code: Some(StatusCode::new(430)),
-            is_multiline: false,
             warnings: SmallVec::new(),
         };
         assert_eq!(response.status_code(), Some(StatusCode::new(430)));
@@ -432,7 +444,6 @@ mod tests {
         let response = BackendFirstResponse {
             bytes_read: 30,
             status_code: Some(StatusCode::new(220)),
-            is_multiline: true,
             warnings: SmallVec::new(),
         };
         assert_ne!(response.status_code(), Some(StatusCode::new(430)));
@@ -443,7 +454,6 @@ mod tests {
         let response = BackendFirstResponse {
             bytes_read: 10,
             status_code: Some(StatusCode::new(211)),
-            is_multiline: false,
             warnings: SmallVec::new(),
         };
         assert_eq!(response.status_code().map(|c| c.as_u16()), Some(211));

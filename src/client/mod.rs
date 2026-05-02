@@ -161,7 +161,7 @@ impl NntpClient {
         // Validate response - early return on errors
         Self::validate_response(&response)?;
 
-        if response.is_multiline {
+        if response.is_multiline_for(request) {
             // Use a capture buffer as the accumulator: pooled, can grow beyond io_buffer
             // capacity without panicking, returned to pool on drop.
             let mut capture = self.buffer_pool.acquire_capture().await;

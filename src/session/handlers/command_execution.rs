@@ -158,13 +158,14 @@ impl ClientSession {
         }
 
         // Success - stream response
+        let is_multiline = cmd_response.is_multiline_for(request);
         debug!(
             client = %self.client_addr,
             backend = backend_id.as_index(),
             command_verb = %String::from_utf8_lossy(request.verb()),
             first_chunk_bytes = cmd_response.bytes_read,
             status_code = status_code.as_u16(),
-            is_multiline = cmd_response.is_multiline,
+            is_multiline,
             "Streaming backend response to client"
         );
         let mut conn = conn;
@@ -182,7 +183,7 @@ impl ClientSession {
                     request,
                     msg_id,
                     status_code,
-                    is_multiline: cmd_response.is_multiline,
+                    is_multiline,
                     first_chunk: &state.buffer[..cmd_response.bytes_read],
                 },
             )
