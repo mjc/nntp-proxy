@@ -150,7 +150,7 @@ pub fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
 
 /// Metadata for the first backend response chunk.
 #[derive(Debug)]
-pub struct BackendFirstResponse {
+pub(crate) struct BackendFirstResponse {
     /// Number of bytes read into buffer
     pub bytes_read: usize,
     /// Parsed status code, if present
@@ -253,7 +253,7 @@ where
 }
 
 /// Send a typed request and read the first response chunk.
-pub async fn send_request<C>(
+pub(crate) async fn send_request<C>(
     conn: &mut C,
     request: &RequestContext,
     buffer: &mut PooledBuffer,
@@ -266,7 +266,7 @@ where
 }
 
 /// Send a typed request with timing measurements.
-pub async fn send_request_timed<C>(
+pub(crate) async fn send_request_timed<C>(
     conn: &mut C,
     request: &RequestContext,
     buffer: &mut PooledBuffer,
