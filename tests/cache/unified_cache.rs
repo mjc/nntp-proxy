@@ -668,41 +668,6 @@ fn test_hybrid_entry_has_availability_info_after_has() {
 }
 
 #[test]
-fn test_hybrid_entry_is_availability_stale_fresh() {
-    let entry = hybrid_article();
-
-    // Entry just created should not be stale with reasonable TTL
-    assert!(!entry.is_availability_stale(3600)); // 1 hour TTL
-    assert!(!entry.is_availability_stale(60)); // 1 minute TTL
-}
-
-#[test]
-fn test_hybrid_entry_is_availability_stale_zero_ttl() {
-    let entry = hybrid_article();
-
-    // With zero TTL, everything is immediately stale (edge case)
-    // Note: implementation uses `> ttl` so zero TTL means 0 seconds old is not stale
-    assert!(!entry.is_availability_stale(0));
-}
-
-#[test]
-fn test_hybrid_entry_clear_stale_availability_not_stale() {
-    let mut entry = hybrid_article();
-    record_missing(&mut entry, &[0]);
-    record_has(&mut entry, &[1]);
-
-    assert!(entry.has_availability_info());
-    assert_hybrid_should_try(&entry, &[(0, false), (1, true)]);
-
-    // With large TTL, should NOT clear
-    entry.clear_stale_availability(3600);
-
-    // Availability should still be there
-    assert!(entry.has_availability_info());
-    assert_hybrid_should_try(&entry, &[(0, false)]);
-}
-
-#[test]
 fn test_hybrid_entry_should_try_after_record_missing() {
     let mut entry = hybrid_article();
 

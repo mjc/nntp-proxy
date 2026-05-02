@@ -568,27 +568,6 @@ impl HybridArticleEntry {
         self.availability.has_availability_info()
     }
 
-    /// Check if availability information is stale (older than `ttl_millis`)
-    ///
-    /// `HybridArticleEntry` stores timestamps for tier-aware TTL, but foyer's cache
-    /// handles eviction based on insertion time. This method is kept for compatibility
-    /// and always returns false since the cache layer manages staleness.
-    #[inline]
-    #[must_use]
-    pub const fn is_availability_stale(&self, _ttl_millis: u64) -> bool {
-        // Foyer cache handles TTL-based eviction separately
-        false
-    }
-
-    /// Clear stale availability information
-    ///
-    /// `HybridArticleEntry` now tracks timestamps via `timestamp` field for tier-aware TTL,
-    /// but foyer handles eviction separately. This method is a no-op for compatibility.
-    #[inline]
-    pub const fn clear_stale_availability(&mut self, _ttl_millis: u64) {
-        // Foyer cache handles TTL-based eviction, no need to clear here
-    }
-
     /// Check if this entry has expired based on tier-aware TTL
     ///
     /// See [`super::ttl`] for the TTL formula.
