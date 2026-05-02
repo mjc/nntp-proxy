@@ -351,18 +351,23 @@ fn encoded_payload_size(payload: &CachedPayload) -> usize {
 }
 
 impl HybridArticleEntry {
-    /// Ingest a cold backend response into a typed hybrid cache entry.
+    /// Ingest a cold wire response into a typed hybrid cache entry.
     ///
     /// Returns `None` if the status code is invalid or not cacheable. The entry
-    /// stores semantic payload sections, not the original backend response.
+    /// stores semantic payload sections, not the original response.
     #[must_use]
-    pub fn from_backend_response(buffer: impl AsRef<[u8]>) -> Option<Self> {
-        Self::from_backend_response_with_tier(buffer, ttl::CacheTier::new(0))
+    pub fn from_wire_response(buffer: impl AsRef<[u8]>) -> Option<Self> {
+        Self::from_wire_response_with_tier(buffer, ttl::CacheTier::new(0))
     }
 
-    /// Ingest a cold backend response with a specific provider tier.
     #[must_use]
-    pub fn from_backend_response_with_tier(
+    pub fn from_backend_response(buffer: impl AsRef<[u8]>) -> Option<Self> {
+        Self::from_wire_response(buffer)
+    }
+
+    /// Ingest a cold wire response with a specific provider tier.
+    #[must_use]
+    pub fn from_wire_response_with_tier(
         buffer: impl AsRef<[u8]>,
         tier: ttl::CacheTier,
     ) -> Option<Self> {
@@ -378,6 +383,14 @@ impl HybridArticleEntry {
             tier,
             payload,
         })
+    }
+
+    #[must_use]
+    pub fn from_backend_response_with_tier(
+        buffer: impl AsRef<[u8]>,
+        tier: ttl::CacheTier,
+    ) -> Option<Self> {
+        Self::from_wire_response_with_tier(buffer, tier)
     }
 
     #[must_use]
@@ -745,8 +758,8 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_entry_ingests_backend_response_by_name() {
-        let entry = HybridArticleEntry::from_backend_response(
+    fn hybrid_entry_ingests_wire_response_by_name() {
+        let entry = HybridArticleEntry::from_wire_response(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         )
         .expect("valid status code");
@@ -756,8 +769,8 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_entry_ingests_borrowed_backend_response_bytes() {
-        let entry = HybridArticleEntry::from_backend_response(
+    fn hybrid_entry_ingests_borrowed_wire_response_bytes() {
+        let entry = HybridArticleEntry::from_wire_response(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".as_slice(),
         )
         .expect("valid status code");

@@ -324,14 +324,18 @@ pub struct ArticleEntry {
 }
 
 impl ArticleEntry {
-    /// Ingest a cold backend response into a typed semantic cache entry.
+    /// Ingest a cold wire response into a typed semantic cache entry.
     ///
-    /// This is the boundary for cold backend responses. The entry
-    /// stores parsed metadata and payload sections, not the original wire
-    /// response.
+    /// This is the boundary for cold responses read from the wire. The entry
+    /// stores parsed metadata and payload sections, not the original response.
+    #[must_use]
+    pub fn from_wire_response(buffer: impl AsRef<[u8]>) -> Self {
+        Self::from_wire_response_with_tier(buffer, ttl::CacheTier::new(0))
+    }
+
     #[must_use]
     pub fn from_backend_response(buffer: impl AsRef<[u8]>) -> Self {
-        Self::from_backend_response_with_tier(buffer, ttl::CacheTier::new(0))
+        Self::from_wire_response(buffer)
     }
 
     #[must_use]
@@ -362,9 +366,9 @@ impl ArticleEntry {
         }
     }
 
-    /// Ingest a cold backend response with a specific provider tier.
+    /// Ingest a cold wire response with a specific provider tier.
     #[must_use]
-    pub fn from_backend_response_with_tier(buffer: impl AsRef<[u8]>, tier: ttl::CacheTier) -> Self {
+    pub fn from_wire_response_with_tier(buffer: impl AsRef<[u8]>, tier: ttl::CacheTier) -> Self {
         let buffer = buffer.as_ref();
         let status_code = StatusCode::parse(buffer).unwrap_or_else(|| StatusCode::new(430));
         let payload = parse_payload(status_code, buffer);
@@ -375,6 +379,11 @@ impl ArticleEntry {
             tier,
             inserted_at: ttl::CacheTimestampMillis::now(),
         }
+    }
+
+    #[must_use]
+    pub fn from_backend_response_with_tier(buffer: impl AsRef<[u8]>, tier: ttl::CacheTier) -> Self {
+        Self::from_wire_response_with_tier(buffer, tier)
     }
 
     #[must_use]
@@ -1244,8 +1253,8 @@ mod tests {
     }
 
     #[test]
-    fn article_entry_ingests_backend_response_by_name() {
-        let entry = ArticleEntry::from_backend_response(
+    fn article_entry_ingests_wire_response_by_name() {
+        let entry = ArticleEntry::from_wire_response(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         );
 
@@ -1254,8 +1263,8 @@ mod tests {
     }
 
     #[test]
-    fn article_entry_ingests_borrowed_backend_response_bytes() {
-        let entry = ArticleEntry::from_backend_response(
+    fn article_entry_ingests_borrowed_wire_response_bytes() {
+        let entry = ArticleEntry::from_wire_response(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".as_slice(),
         );
 
