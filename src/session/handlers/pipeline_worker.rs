@@ -308,8 +308,9 @@ mod tests {
         match response {
             Ok(completed) => completed
                 .context
-                .response_status()
+                .response_metadata()
                 .expect("completed queued request records response status")
+                .status()
                 .as_u16(),
             other @ Err(_) => panic!("Expected Success, got {other:?}"),
         }
@@ -737,8 +738,8 @@ mod tests {
         assert_eq!(
             first
                 .context
-                .response_status()
-                .map(|status| status.as_u16()),
+                .response_metadata()
+                .map(|response| response.status().as_u16()),
             Some(223)
         );
         assert_eq!(first.context.message_id(), Some("<a@b>"));
@@ -746,8 +747,8 @@ mod tests {
         assert_eq!(
             second
                 .context
-                .response_status()
-                .map(|status| status.as_u16()),
+                .response_metadata()
+                .map(|response| response.status().as_u16()),
             Some(430)
         );
         assert_eq!(second.context.message_id(), Some("<c@d>"));
@@ -956,7 +957,10 @@ mod tests {
                     match result {
                         Ok(completed) => {
                             prop_assert_eq!(
-                                completed.context.response_status().map(|status| status.as_u16()),
+                                completed
+                                    .context
+                                    .response_metadata()
+                                    .map(|response| response.status().as_u16()),
                                 Some(codes[idx])
                             );
                             prop_assert_eq!(completed.response.to_vec(), responses[idx].clone());
