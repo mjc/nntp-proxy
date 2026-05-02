@@ -88,6 +88,7 @@ impl QueuedContext {
     ) {
         let mut context = self.context;
         context.set_backend_id(backend_id);
+        context.set_response_status(status_code);
         let _ = self.client_return.send(Ok(CompletedPipelineRequest {
             context,
             data,
@@ -402,6 +403,10 @@ mod tests {
         let completed = rx.blocking_recv().unwrap().unwrap();
         assert_eq!(completed.context.message_id(), Some("<test@example.com>"));
         assert_eq!(completed.context.backend_id(), Some(backend_id));
+        assert_eq!(
+            completed.context.response_status(),
+            Some(completed.status_code)
+        );
         assert_eq!(completed.status_code.as_u16(), 223);
         assert!(completed.data.is_empty());
     }

@@ -60,6 +60,7 @@ pub struct RequestContext {
     args: SmallVec<[u8; 512]>,
     message_id: Option<(usize, usize)>,
     backend_id: Option<BackendId>,
+    response_status: Option<StatusCode>,
 }
 
 impl RequestContext {
@@ -83,6 +84,7 @@ impl RequestContext {
             args,
             message_id,
             backend_id: None,
+            response_status: None,
         }
     }
 
@@ -99,6 +101,7 @@ impl RequestContext {
             args,
             message_id,
             backend_id: None,
+            response_status: None,
         }
     }
 
@@ -117,6 +120,17 @@ impl RequestContext {
     #[inline]
     pub const fn set_backend_id(&mut self, backend_id: BackendId) {
         self.backend_id = Some(backend_id);
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn response_status(&self) -> Option<StatusCode> {
+        self.response_status
+    }
+
+    #[inline]
+    pub const fn set_response_status(&mut self, status: StatusCode) {
+        self.response_status = Some(status);
     }
 
     #[inline]
@@ -330,6 +344,7 @@ mod tests {
         assert_eq!(ctx.kind(), RequestKind::Article);
         assert_eq!(ctx.message_id(), Some("<a@b>"));
         assert_eq!(ctx.backend_id(), None);
+        assert_eq!(ctx.response_status(), None);
         assert!(ctx.is_pipelineable());
         assert_eq!(wire(&ctx), b"ARTICLE <a@b>\r\n");
     }
@@ -342,6 +357,17 @@ mod tests {
         ctx.set_backend_id(backend_id);
 
         assert_eq!(ctx.backend_id(), Some(backend_id));
+        assert_eq!(wire(&ctx), b"STAT <a@b>\r\n");
+    }
+
+    #[test]
+    fn request_context_records_response_status_when_known() {
+        let mut ctx = RequestContext::from_request_line("STAT <a@b>\r\n");
+        let status = StatusCode::new(223);
+
+        ctx.set_response_status(status);
+
+        assert_eq!(ctx.response_status(), Some(status));
         assert_eq!(wire(&ctx), b"STAT <a@b>\r\n");
     }
 
