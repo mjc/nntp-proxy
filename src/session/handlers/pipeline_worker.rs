@@ -15,9 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::metrics::MetricsCollector;
 use crate::pool::{BufferPool, DeadpoolConnectionProvider};
-use crate::router::backend_queue::{
-    BackendQueue, CompletedPipelineRequest, PipelineError, QueuedContext,
-};
+use crate::router::backend_queue::{BackendQueue, PipelineError, QueuedContext};
 #[cfg(test)]
 use crate::session::backend::validate_backend_response;
 use crate::types::BackendId;
@@ -189,13 +187,7 @@ async fn execute_pipeline_batch(
                 metrics
                     .record_client_to_backend_bytes_for(backend_id, req.context.wire_len() as u64);
 
-                // Send response to client (ignore error if client disconnected)
-                let _ = req.response_tx.send(Ok(CompletedPipelineRequest {
-                    context: req.context,
-                    data,
-                    status_code,
-                    backend_id,
-                }));
+                req.complete_success(data, status_code, backend_id);
             }
             Err(e) => {
                 warn!(
@@ -209,7 +201,7 @@ async fn execute_pipeline_batch(
                 );
 
                 // Fail this request
-                let _ = req.response_tx.send(Err(PipelineError::ReadFailed));
+                req.complete_error(PipelineError::ReadFailed);
 
                 // Fail remaining requests (no Vec allocation - iterate directly)
                 let error_msg = PipelineError::ConnectionLost {
@@ -217,7 +209,7 @@ async fn execute_pipeline_batch(
                     batch_len,
                 };
                 for (_, remaining_req) in batch_iter {
-                    let _ = remaining_req.response_tx.send(Err(error_msg));
+                    remaining_req.complete_error(error_msg);
                 }
 
                 // Connection broken — return false immediately
@@ -281,7 +273,7 @@ async fn read_full_response(
 #[allow(clippy::iter_with_drain)] // drain used intentionally; empty Vec returned for allocation reuse
 fn fail_batch(mut batch: Vec<QueuedContext>, error: PipelineError) -> Vec<QueuedContext> {
     for req in batch.drain(..) {
-        let _ = req.response_tx.send(Err(error));
+        req.complete_error(error);
     }
     batch
 }

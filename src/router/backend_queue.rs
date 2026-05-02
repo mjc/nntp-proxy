@@ -67,6 +67,32 @@ pub struct QueuedContext {
     pub response_tx: oneshot::Sender<PipelineResponse>,
 }
 
+impl QueuedContext {
+    /// Complete this queued context with the backend response that matched it.
+    ///
+    /// Responses are matched by each backend connection's FIFO order; consuming
+    /// the queued context here prevents sending response data without its
+    /// matching request context.
+    pub fn complete_success(
+        self,
+        data: crate::pool::ChunkedResponse,
+        status_code: crate::protocol::StatusCode,
+        backend_id: BackendId,
+    ) {
+        let _ = self.response_tx.send(Ok(CompletedPipelineRequest {
+            context: self.context,
+            data,
+            status_code,
+            backend_id,
+        }));
+    }
+
+    /// Complete this queued context with a queue/worker failure.
+    pub fn complete_error(self, error: PipelineError) {
+        let _ = self.response_tx.send(Err(error));
+    }
+}
+
 /// Errors returned when enqueuing fails
 #[derive(Debug, thiserror::Error)]
 pub enum QueueError {
@@ -348,5 +374,43 @@ mod tests {
         assert_eq!(context.verb(), b"STAT");
         assert_eq!(context.args(), b"<test@example.com>");
         assert_eq!(context.wire_len(), 25);
+    }
+
+    #[test]
+    fn test_queued_context_success_completes_matching_context() {
+        let (tx, rx) = oneshot::channel();
+        let queued = QueuedContext {
+            context: RequestContext::from_request_line("STAT <test@example.com>\r\n"),
+            response_tx: tx,
+        };
+        let backend_id = BackendId::from_index(1);
+
+        queued.complete_success(
+            crate::pool::ChunkedResponse::default(),
+            crate::protocol::StatusCode::new(223),
+            backend_id,
+        );
+
+        let completed = rx.blocking_recv().unwrap().unwrap();
+        assert_eq!(completed.context.message_id(), Some("<test@example.com>"));
+        assert_eq!(completed.status_code.as_u16(), 223);
+        assert_eq!(completed.backend_id, backend_id);
+        assert!(completed.data.is_empty());
+    }
+
+    #[test]
+    fn test_queued_context_error_completes_without_response_data() {
+        let (tx, rx) = oneshot::channel();
+        let queued = QueuedContext {
+            context: RequestContext::from_request_line("STAT <test@example.com>\r\n"),
+            response_tx: tx,
+        };
+
+        queued.complete_error(PipelineError::ReadFailed);
+
+        assert!(matches!(
+            rx.blocking_recv().unwrap(),
+            Err(PipelineError::ReadFailed)
+        ));
     }
 }
