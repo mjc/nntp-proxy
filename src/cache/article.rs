@@ -341,8 +341,8 @@ impl ArticleEntry {
     /// Get the tier of the backend that provided this article
     #[inline]
     #[must_use]
-    pub const fn tier(&self) -> u8 {
-        self.tier.get()
+    pub const fn tier(&self) -> ttl::CacheTier {
+        self.tier
     }
 
     /// Set the tier (used when updating entry)

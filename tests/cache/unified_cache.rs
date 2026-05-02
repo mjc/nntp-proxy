@@ -896,7 +896,7 @@ fn test_hybrid_entry_serialization_roundtrip() {
     assert_eq!(decoded.status_code(), entry.status_code());
     assert_eq!(decoded.payload(), entry.payload());
     assert_eq!(decoded.availability(), entry.availability());
-    assert_eq!(decoded.tier(), entry.tier());
+    assert_eq!(decoded.tier().get(), entry.tier().get());
     assert!(!decoded.should_try_backend(BackendId::from_index(0)));
     assert!(decoded.should_try_backend(BackendId::from_index(1)));
 }

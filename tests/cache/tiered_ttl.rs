@@ -186,7 +186,7 @@ fn test_is_expired_future_timestamp() {
 #[test]
 fn test_article_entry_tier_default() {
     let entry = ArticleEntry::from_response_buffer(b"220 0 <test@example.com>\r\n.\r\n".to_vec());
-    assert_eq!(entry.tier(), 0);
+    assert_eq!(entry.tier().get(), 0);
 }
 
 #[test]
@@ -195,17 +195,17 @@ fn test_article_entry_with_tier() {
         b"220 0 <test@example.com>\r\n.\r\n".to_vec(),
         CacheTier::new(3),
     );
-    assert_eq!(entry.tier(), 3);
+    assert_eq!(entry.tier().get(), 3);
 }
 
 #[test]
 fn test_article_entry_set_tier() {
     let mut entry =
         ArticleEntry::from_response_buffer(b"220 0 <test@example.com>\r\n.\r\n".to_vec());
-    assert_eq!(entry.tier(), 0);
+    assert_eq!(entry.tier().get(), 0);
 
     entry.set_tier(CacheTier::new(5));
-    assert_eq!(entry.tier(), 5);
+    assert_eq!(entry.tier().get(), 5);
 }
 
 #[test]
@@ -270,7 +270,7 @@ async fn test_cache_higher_tier_longer_ttl() {
         .get(&msg_id)
         .await
         .expect("Should be cached immediately");
-    let stored_tier = entry.tier();
+    let stored_tier = entry.tier().get();
     assert_eq!(stored_tier, 1, "Tier should be stored as 1");
     drop(entry);
 
@@ -331,7 +331,7 @@ async fn test_cache_preserves_tier_on_get() {
 
     // Get and verify tier is preserved
     let entry = cache.get(&msg_id).await.expect("Should be cached");
-    assert_eq!(entry.tier(), 3);
+    assert_eq!(entry.tier().get(), 3);
 }
 
 #[tokio::test]
@@ -354,7 +354,7 @@ async fn test_cache_upsert_updates_tier_with_larger_buffer() {
         .await;
 
     let entry = cache.get(&msg_id).await.expect("Should be cached");
-    assert_eq!(entry.tier(), 5);
+    assert_eq!(entry.tier().get(), 5);
 
     // Upsert with different tier and LARGER buffer (triggers replacement)
     cache
@@ -368,7 +368,7 @@ async fn test_cache_upsert_updates_tier_with_larger_buffer() {
 
     let entry = cache.get(&msg_id).await.expect("Should still be cached");
     // Tier should be updated because the buffer was replaced
-    assert_eq!(entry.tier(), 2);
+    assert_eq!(entry.tier().get(), 2);
 }
 
 #[tokio::test]
@@ -390,7 +390,7 @@ async fn test_cache_upsert_keeps_tier_without_replacement() {
         .await;
 
     let entry = cache.get(&msg_id).await.expect("Should be cached");
-    assert_eq!(entry.tier(), 5);
+    assert_eq!(entry.tier().get(), 5);
 
     // Upsert with same-sized buffer (doesn't trigger replacement)
     cache
@@ -399,5 +399,5 @@ async fn test_cache_upsert_keeps_tier_without_replacement() {
 
     let entry = cache.get(&msg_id).await.expect("Should still be cached");
     // Tier should NOT be updated because buffer wasn't replaced
-    assert_eq!(entry.tier(), 5);
+    assert_eq!(entry.tier().get(), 5);
 }

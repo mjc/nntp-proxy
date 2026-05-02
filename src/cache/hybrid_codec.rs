@@ -528,8 +528,8 @@ impl HybridArticleEntry {
     /// Get the tier of the backend that provided this article
     #[inline]
     #[must_use]
-    pub const fn tier(&self) -> u8 {
-        self.tier.get()
+    pub const fn tier(&self) -> ttl::CacheTier {
+        self.tier
     }
 }
 
@@ -859,12 +859,12 @@ mod tests {
             ttl::CacheTier::new(3),
         )
         .unwrap();
-        assert_eq!(entry.tier(), 3);
+        assert_eq!(entry.tier().get(), 3);
 
         let mut encoded = Vec::new();
         entry.encode(&mut encoded).unwrap();
         let decoded = HybridArticleEntry::decode(&mut encoded.as_slice()).unwrap();
-        assert_eq!(decoded.tier(), 3);
+        assert_eq!(decoded.tier().get(), 3);
     }
 
     #[test]
@@ -1082,13 +1082,13 @@ mod tests {
             ttl::CacheTier::new(5),
         )
         .unwrap();
-        assert_eq!(entry.tier(), 5);
+        assert_eq!(entry.tier().get(), 5);
     }
 
     #[test]
     fn test_with_tier_zero_default() {
         let entry = HybridArticleEntry::from_response_buffer(b"220 ok\r\n".to_vec()).unwrap();
-        assert_eq!(entry.tier(), 0);
+        assert_eq!(entry.tier().get(), 0);
     }
 
     #[test]
@@ -1120,7 +1120,7 @@ mod tests {
         let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
 
         assert_entry_eq(&original, &decoded);
-        assert_eq!(original.tier(), decoded.tier());
+        assert_eq!(original.tier().get(), decoded.tier().get());
     }
 
     #[test]
@@ -1246,7 +1246,7 @@ mod tests {
             let mut reader = std::io::Cursor::new(buffer);
             let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
 
-            assert_eq!(tier, decoded.tier(), "Tier mismatch");
+            assert_eq!(tier, decoded.tier().get(), "Tier mismatch");
         }
     }
 
