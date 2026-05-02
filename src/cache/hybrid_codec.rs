@@ -15,7 +15,7 @@ use crate::types::BackendId;
 use foyer::Code;
 use std::io::{Read, Write};
 
-use super::article::{CachedArticleNumber, CachedPayload, parse_payload};
+use super::article::{CachedArticleNumber, CachedPayload, parse_payload, parse_payload_chunks};
 use super::availability::ArticleAvailability;
 use super::ttl;
 
@@ -391,10 +391,30 @@ impl HybridArticleEntry {
                 Self::from_wire_response_with_tier(buffer.as_ref(), tier)
             }
             super::CacheBuffer::Chunked(buffer) => {
-                Self::from_wire_response_with_tier(buffer.to_vec(), tier)
+                Self::from_chunked_response_with_tier(&buffer, tier)
             }
             super::CacheBuffer::Small(buffer) => Self::from_wire_response_with_tier(buffer, tier),
         }
+    }
+
+    #[must_use]
+    fn from_chunked_response_with_tier(
+        buffer: &crate::pool::ChunkedResponse,
+        tier: ttl::CacheTier,
+    ) -> Option<Self> {
+        let mut prefix = smallvec::SmallVec::<[u8; 128]>::new();
+        buffer.copy_prefix_into(3, &mut prefix);
+        let raw_code = StatusCode::parse(&prefix)?.as_u16();
+        let status_code = CacheableStatusCode::try_from(raw_code).ok()?;
+        let payload = parse_payload_chunks(StatusCode::new(raw_code), buffer.iter_chunks());
+
+        Some(Self {
+            status_code,
+            availability: ArticleAvailability::new(),
+            timestamp: ttl::CacheTimestampMillis::now(),
+            tier,
+            payload,
+        })
     }
 
     #[must_use]
@@ -739,6 +759,39 @@ mod tests {
 
         assert_eq!(entry.status_code().as_u16(), 220);
         assert!(matches!(entry.payload(), CachedPayload::Article { .. }));
+    }
+
+    #[test]
+    fn hybrid_entry_ingests_chunked_cache_buffer_without_flattening_wire_response() {
+        let pool = crate::pool::BufferPool::new(
+            crate::types::BufferSize::try_new(1024).expect("valid buffer size"),
+            1,
+        )
+        .with_capture_pool(8, 4);
+        let mut response = crate::pool::ChunkedResponse::default();
+        response.extend_from_slice(
+            &pool,
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+        );
+        assert!(
+            response.iter_chunks().count() > 1,
+            "test response must span chunks"
+        );
+
+        let entry = HybridArticleEntry::from_cache_buffer_with_tier(
+            response.into(),
+            ttl::CacheTier::new(0),
+        )
+        .expect("valid status code");
+
+        assert_eq!(entry.status_code().as_u16(), 220);
+        match entry.payload() {
+            CachedPayload::Article { headers, body, .. } => {
+                assert_eq!(headers, b"Subject: Test");
+                assert_eq!(body, b"Body");
+            }
+            other => panic!("expected article payload, got {other:?}"),
+        }
     }
 
     #[test]

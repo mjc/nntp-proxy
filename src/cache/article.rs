@@ -414,9 +414,27 @@ impl ArticleEntry {
                 Self::from_wire_response_with_tier(buffer.as_ref(), tier)
             }
             super::CacheBuffer::Chunked(buffer) => {
-                Self::from_wire_response_with_tier(buffer.to_vec(), tier)
+                Self::from_chunked_response_with_tier(&buffer, tier)
             }
             super::CacheBuffer::Small(buffer) => Self::from_wire_response_with_tier(buffer, tier),
+        }
+    }
+
+    #[must_use]
+    fn from_chunked_response_with_tier(
+        buffer: &crate::pool::ChunkedResponse,
+        tier: ttl::CacheTier,
+    ) -> Self {
+        let mut prefix = smallvec::SmallVec::<[u8; 128]>::new();
+        buffer.copy_prefix_into(3, &mut prefix);
+        let status_code = StatusCode::parse(&prefix).unwrap_or_else(|| StatusCode::new(430));
+        let payload = parse_payload_chunks(status_code, buffer.iter_chunks());
+        Self {
+            backend_availability: ArticleAvailability::new(),
+            status_code,
+            payload,
+            tier,
+            inserted_at: ttl::CacheTimestampMillis::now(),
         }
     }
 
@@ -702,6 +720,94 @@ pub(crate) fn parse_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPay
         .filter(|_| buffer.ends_with(b"\r\n.\r\n"))
         .unwrap_or(buffer.len());
     let payload = &buffer[status_end..body_end];
+    match code {
+        220 => {
+            if let Some(split) = memchr::memmem::find(payload, b"\r\n\r\n") {
+                CachedPayload::Article {
+                    article_number,
+                    headers: payload[..split].to_vec(),
+                    body: payload[split + 4..].to_vec(),
+                }
+            } else {
+                CachedPayload::Article {
+                    article_number,
+                    headers: Vec::new(),
+                    body: payload.to_vec(),
+                }
+            }
+        }
+        221 => CachedPayload::Head {
+            article_number,
+            headers: payload.to_vec(),
+        },
+        222 => CachedPayload::Body {
+            article_number,
+            body: payload.to_vec(),
+        },
+        223 => CachedPayload::Stat { article_number },
+        _ => CachedPayload::AvailabilityOnly,
+    }
+}
+
+pub(crate) fn parse_payload_chunks<'a>(
+    status_code: StatusCode,
+    chunks: impl IntoIterator<Item = &'a [u8]>,
+) -> CachedPayload {
+    let code = status_code.as_u16();
+    if code == 430 {
+        return CachedPayload::Missing;
+    }
+
+    let mut status_line = Vec::new();
+    let mut payload_with_tail = Vec::new();
+    let mut in_status = true;
+
+    for chunk in chunks {
+        for &byte in chunk {
+            if in_status {
+                status_line.push(byte);
+                if status_line.ends_with(b"\r\n") {
+                    in_status = false;
+                }
+            } else {
+                payload_with_tail.push(byte);
+            }
+        }
+    }
+
+    if in_status {
+        return CachedPayload::AvailabilityOnly;
+    }
+
+    let article_number = parse_article_number(&status_line);
+    let Some(payload) = payload_without_multiline_terminator(code, &payload_with_tail) else {
+        return match code {
+            223 => CachedPayload::Stat { article_number },
+            _ => CachedPayload::AvailabilityOnly,
+        };
+    };
+    payload_from_semantic_bytes(code, article_number, payload)
+}
+
+fn payload_without_multiline_terminator(code: u16, payload: &[u8]) -> Option<&[u8]> {
+    if !matches!(code, 220..=222) {
+        return Some(payload);
+    }
+    if payload == b".\r\n" {
+        return Some(&[]);
+    }
+    payload.strip_suffix(b"\r\n.\r\n").or_else(|| {
+        payload
+            .strip_suffix(b".\r\n")
+            .filter(|_| payload.len() == 3)
+    })
+}
+
+fn payload_from_semantic_bytes(
+    code: u16,
+    article_number: Option<CachedArticleNumber>,
+    payload: &[u8],
+) -> CachedPayload {
     match code {
         220 => {
             if let Some(split) = memchr::memmem::find(payload, b"\r\n\r\n") {
@@ -1210,6 +1316,36 @@ mod tests {
 
         assert_eq!(entry.status_code(), StatusCode::new(220));
         assert!(matches!(entry.payload(), CachedPayload::Article { .. }));
+    }
+
+    #[test]
+    fn article_entry_ingests_chunked_cache_buffer_without_flattening_wire_response() {
+        let pool = crate::pool::BufferPool::new(
+            crate::types::BufferSize::try_new(1024).expect("valid buffer size"),
+            1,
+        )
+        .with_capture_pool(8, 4);
+        let mut response = crate::pool::ChunkedResponse::default();
+        response.extend_from_slice(
+            &pool,
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+        );
+        assert!(
+            response.iter_chunks().count() > 1,
+            "test response must span chunks"
+        );
+
+        let entry =
+            ArticleEntry::from_cache_buffer_with_tier(response.into(), ttl::CacheTier::new(0));
+
+        assert_eq!(entry.status_code(), StatusCode::new(220));
+        match entry.payload() {
+            CachedPayload::Article { headers, body, .. } => {
+                assert_eq!(headers, b"Subject: Test");
+                assert_eq!(body, b"Body");
+            }
+            other => panic!("expected article payload, got {other:?}"),
+        }
     }
 
     #[test]
