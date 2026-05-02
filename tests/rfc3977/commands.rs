@@ -10,48 +10,64 @@
 
 use nntp_proxy::command::NntpCommand;
 use nntp_proxy::protocol;
+use nntp_proxy::types::MessageId;
+
+fn msgid(value: &str) -> MessageId<'_> {
+    MessageId::from_borrowed(value).unwrap()
+}
+
+fn wire(context: &protocol::RequestContext) -> Vec<u8> {
+    let mut out = Vec::with_capacity(context.wire_len());
+    out.extend_from_slice(context.verb());
+    if !context.args().is_empty() {
+        out.push(b' ');
+        out.extend_from_slice(context.args());
+    }
+    out.extend_from_slice(b"\r\n");
+    out
+}
 
 // === Command Termination (RFC 3977 §3.1) ===
 
 #[test]
 fn test_all_commands_end_with_crlf() {
     // RFC 3977 §3.1: "Commands in NNTP MUST use the canonical CRLF"
-    let test_commands: Vec<String> = vec![
-        protocol::authinfo_user("user"),
-        protocol::authinfo_pass("pass"),
-        protocol::article_by_msgid("<msgid@example>"),
-        protocol::body_by_msgid("<msgid@example>"),
-        protocol::head_by_msgid("<msgid@example>"),
-        protocol::stat_by_msgid("<msgid@example>"),
+    let test_commands = vec![
+        protocol::authinfo_user("user").into_bytes(),
+        protocol::authinfo_pass("pass").into_bytes(),
+        wire(&protocol::article_request(&msgid("<msgid@example>"))),
+        wire(&protocol::body_request(&msgid("<msgid@example>"))),
+        wire(&protocol::head_request(&msgid("<msgid@example>"))),
+        wire(&protocol::stat_request(&msgid("<msgid@example>"))),
     ];
 
     for cmd in &test_commands {
         assert!(
-            cmd.ends_with("\r\n"),
+            cmd.ends_with(b"\r\n"),
             "Command does not end with CRLF: {cmd:?}"
         );
     }
 
     // Constants too
     assert!(protocol::QUIT.ends_with(b"\r\n"));
-    assert!(protocol::DATE.ends_with(b"\r\n"));
+    assert!(wire(&protocol::date_request()).ends_with(b"\r\n"));
 }
 
 #[test]
 fn test_commands_only_one_crlf() {
     // Commands should have exactly one CRLF - prevents command injection
     let commands = vec![
-        protocol::authinfo_user("testuser"),
-        protocol::authinfo_pass("testpass"),
-        protocol::article_by_msgid("<test@example>"),
-        protocol::body_by_msgid("<test@example>"),
-        protocol::head_by_msgid("<test@example>"),
-        protocol::stat_by_msgid("<test@example>"),
+        protocol::authinfo_user("testuser").into_bytes(),
+        protocol::authinfo_pass("testpass").into_bytes(),
+        wire(&protocol::article_request(&msgid("<test@example>"))),
+        wire(&protocol::body_request(&msgid("<test@example>"))),
+        wire(&protocol::head_request(&msgid("<test@example>"))),
+        wire(&protocol::stat_request(&msgid("<test@example>"))),
     ];
 
     for cmd in &commands {
         assert_eq!(
-            cmd.matches("\r\n").count(),
+            cmd.windows(2).filter(|window| *window == b"\r\n").count(),
             1,
             "Command has multiple CRLFs (injection risk): {cmd:?}"
         );
@@ -82,26 +98,26 @@ fn test_authinfo_pass_with_special_chars() {
 
 #[test]
 fn test_article_command_with_message_id() {
-    let cmd = protocol::article_by_msgid("<unique-id@news.example.com>");
-    assert_eq!(cmd, "ARTICLE <unique-id@news.example.com>\r\n");
+    let cmd = protocol::article_request(&msgid("<unique-id@news.example.com>"));
+    assert_eq!(wire(&cmd), b"ARTICLE <unique-id@news.example.com>\r\n");
 }
 
 #[test]
 fn test_body_command_with_message_id() {
-    let cmd = protocol::body_by_msgid("<test@example.com>");
-    assert_eq!(cmd, "BODY <test@example.com>\r\n");
+    let cmd = protocol::body_request(&msgid("<test@example.com>"));
+    assert_eq!(wire(&cmd), b"BODY <test@example.com>\r\n");
 }
 
 #[test]
 fn test_head_command_with_message_id() {
-    let cmd = protocol::head_by_msgid("<test@example.com>");
-    assert_eq!(cmd, "HEAD <test@example.com>\r\n");
+    let cmd = protocol::head_request(&msgid("<test@example.com>"));
+    assert_eq!(wire(&cmd), b"HEAD <test@example.com>\r\n");
 }
 
 #[test]
 fn test_stat_command_with_message_id() {
-    let cmd = protocol::stat_by_msgid("<test@example.com>");
-    assert_eq!(cmd, "STAT <test@example.com>\r\n");
+    let cmd = protocol::stat_request(&msgid("<test@example.com>"));
+    assert_eq!(wire(&cmd), b"STAT <test@example.com>\r\n");
 }
 
 // === Command Constants ===
@@ -113,7 +129,7 @@ fn test_quit_constant() {
 
 #[test]
 fn test_date_constant() {
-    assert_eq!(protocol::DATE, b"DATE\r\n");
+    assert_eq!(wire(&protocol::date_request()), b"DATE\r\n");
 }
 
 // === Keywords Are Uppercase ===
@@ -123,12 +139,12 @@ fn test_keywords_are_uppercase() {
     // RFC 3977 §3.1: Keywords are case-insensitive, convention is UPPERCASE
     assert!(protocol::authinfo_user("u").starts_with("AUTHINFO USER "));
     assert!(protocol::authinfo_pass("p").starts_with("AUTHINFO PASS "));
-    assert!(protocol::article_by_msgid("<m>").starts_with("ARTICLE "));
-    assert!(protocol::body_by_msgid("<m>").starts_with("BODY "));
-    assert!(protocol::head_by_msgid("<m>").starts_with("HEAD "));
-    assert!(protocol::stat_by_msgid("<m>").starts_with("STAT "));
+    assert!(wire(&protocol::article_request(&msgid("<m>"))).starts_with(b"ARTICLE "));
+    assert!(wire(&protocol::body_request(&msgid("<m>"))).starts_with(b"BODY "));
+    assert!(wire(&protocol::head_request(&msgid("<m>"))).starts_with(b"HEAD "));
+    assert!(wire(&protocol::stat_request(&msgid("<m>"))).starts_with(b"STAT "));
     assert!(protocol::QUIT.starts_with(b"QUIT"));
-    assert!(protocol::DATE.starts_with(b"DATE"));
+    assert!(wire(&protocol::date_request()).starts_with(b"DATE"));
 }
 
 // === Command Length (RFC 3977 §3.1) ===
@@ -139,8 +155,14 @@ fn test_standard_commands_under_512_octets() {
     let commands = vec![
         protocol::authinfo_user("typical_username"),
         protocol::authinfo_pass("typical_password"),
-        protocol::article_by_msgid("<typical-msgid@example.com>"),
-        protocol::body_by_msgid("<typical-msgid@example.com>"),
+        String::from_utf8(wire(&protocol::article_request(&msgid(
+            "<typical-msgid@example.com>",
+        ))))
+        .unwrap(),
+        String::from_utf8(wire(&protocol::body_request(&msgid(
+            "<typical-msgid@example.com>",
+        ))))
+        .unwrap(),
     ];
 
     for cmd in &commands {
@@ -157,10 +179,10 @@ fn test_standard_commands_under_512_octets() {
 fn test_long_message_id_command_length() {
     // Very long message-ID may exceed 512 but the library doesn't enforce
     let long_id = format!("<{}@example.com>", "x".repeat(450));
-    let cmd = protocol::article_by_msgid(&long_id);
+    let cmd = protocol::article_request(&msgid(&long_id));
     // We produce the command; server will reject if too long
-    assert!(!cmd.is_empty());
-    assert!(cmd.ends_with("\r\n"));
+    assert!(cmd.wire_len() > 0);
+    assert!(wire(&cmd).ends_with(b"\r\n"));
 }
 
 // === Command Classification (NntpCommand::parse) ===

@@ -4,8 +4,14 @@
 //! before marking a session as authenticated.
 
 use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
+use nntp_proxy::protocol::RequestContext;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+fn classify(command: &str) -> CommandAction<'static> {
+    let request = Box::leak(Box::new(RequestContext::from_request_line(command)));
+    CommandHandler::classify_request(request)
+}
 
 /// Test that `StandardHandler` requires valid credentials
 #[tokio::test]
@@ -18,7 +24,7 @@ async fn test_standard_handler_validates_credentials() {
     let authenticated = Arc::new(AtomicBool::new(false));
 
     // Step 1: AUTHINFO USER
-    let action = CommandHandler::classify("AUTHINFO USER testuser\r\n");
+    let action = classify("AUTHINFO USER testuser\r\n");
     let CommandAction::InterceptAuth(AuthAction::RequestPassword(username)) = action else {
         panic!("Expected RequestPassword action")
     };
@@ -33,7 +39,7 @@ async fn test_standard_handler_validates_credentials() {
     assert!(!auth_success);
 
     // Step 2: AUTHINFO PASS with WRONG password
-    let action = CommandHandler::classify("AUTHINFO PASS wrongpass\r\n");
+    let action = classify("AUTHINFO PASS wrongpass\r\n");
     let CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) = action else {
         panic!("Expected ValidateAndRespond action")
     };
@@ -57,7 +63,7 @@ async fn test_standard_handler_validates_credentials() {
     assert!(!authenticated.load(Ordering::Acquire));
 
     // Step 3: AUTHINFO PASS with CORRECT password
-    let action = CommandHandler::classify("AUTHINFO PASS testpass\r\n");
+    let action = classify("AUTHINFO PASS testpass\r\n");
     let CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) = action else {
         panic!("Expected ValidateAndRespond action")
     };
@@ -89,7 +95,7 @@ async fn test_pass_before_user_rejected() {
     let auth_handler = create_test_auth_handler_with("testuser", "testpass");
 
     // Try to send AUTHINFO PASS without first sending USER
-    let action = CommandHandler::classify("AUTHINFO PASS testpass\r\n");
+    let action = classify("AUTHINFO PASS testpass\r\n");
     let CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) = action else {
         panic!("Expected ValidateAndRespond action")
     };
@@ -331,7 +337,7 @@ async fn test_session_handler_respects_auth_success() {
     let authenticated = Arc::new(AtomicBool::new(false));
 
     // Step 1: AUTHINFO USER
-    let action = CommandHandler::classify("AUTHINFO USER user\r\n");
+    let action = classify("AUTHINFO USER user\r\n");
     if let CommandAction::InterceptAuth(AuthAction::RequestPassword(username)) = action {
         auth_username = Some(username.to_string());
 
@@ -357,7 +363,7 @@ async fn test_session_handler_respects_auth_success() {
     );
 
     // Step 2: AUTHINFO PASS with correct password
-    let action = CommandHandler::classify("AUTHINFO PASS pass\r\n");
+    let action = classify("AUTHINFO PASS pass\r\n");
     if let CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) = action {
         let mut output = Vec::new();
         let (_, auth_success) = auth_handler

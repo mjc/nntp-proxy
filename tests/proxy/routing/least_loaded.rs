@@ -27,22 +27,22 @@ fn test_least_loaded_basic() {
     );
 
     // First request should go to backend 0 (both empty, picks first)
-    let backend1 = selector.route_command(ClientId::new(), "LIST").unwrap();
+    let backend1 = selector.route(ClientId::new()).unwrap();
     assert_eq!(backend1.as_index(), 0);
 
     // Second request should go to backend 1 (backend 0 has 1 pending)
-    let backend2 = selector.route_command(ClientId::new(), "LIST").unwrap();
+    let backend2 = selector.route(ClientId::new()).unwrap();
     assert_eq!(backend2.as_index(), 1);
 
     // Third request should go to backend 0 again (both have 1 pending, picks first)
-    let backend3 = selector.route_command(ClientId::new(), "LIST").unwrap();
+    let backend3 = selector.route(ClientId::new()).unwrap();
     assert_eq!(backend3.as_index(), 0);
 
     // Complete a command on backend 0
     selector.complete_command(backend1);
 
     // Next request should go to backend 0 (now has 1 pending vs backend 1's 1 pending)
-    let backend4 = selector.route_command(ClientId::new(), "LIST").unwrap();
+    let backend4 = selector.route(ClientId::new()).unwrap();
     assert_eq!(backend4.as_index(), 0);
 }
 
@@ -70,7 +70,7 @@ fn test_least_loaded_unequal_capacity() {
     // Route 15 requests
     let mut counts = [0; 2];
     for _ in 0..15 {
-        let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         counts[backend.as_index()] += 1;
     }
 
@@ -108,7 +108,7 @@ fn test_least_loaded_respects_pending_counts() {
 
     // Route 10 requests - they should distribute evenly (both start at 0)
     for _ in 0..10 {
-        selector.route_command(ClientId::new(), "LIST").unwrap();
+        selector.route(ClientId::new()).unwrap();
     }
 
     // Both backends now have 5 pending each (even distribution)
@@ -132,7 +132,7 @@ fn test_least_loaded_respects_pending_counts() {
 
     // Now backend 0 has 2 pending, backend 1 has 5 pending
     // Next request should go to backend 0 (ratio 2/10 = 0.2 vs 5/10 = 0.5)
-    let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+    let backend = selector.route(ClientId::new()).unwrap();
     assert_eq!(
         backend.as_index(),
         0,
@@ -154,7 +154,7 @@ fn test_least_loaded_single_backend() {
 
     // All requests should go to the only backend
     for _ in 0..20 {
-        let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         assert_eq!(backend.as_index(), 0);
     }
 }
@@ -177,7 +177,7 @@ fn test_least_loaded_load_balancing_fairness() {
     // Route 30 requests
     let mut counts = [0; 3];
     for _ in 0..30 {
-        let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         counts[backend.as_index()] += 1;
     }
 

@@ -21,11 +21,11 @@ fn test_backend_load_tracking() {
     assert_eq!(router.backend_load(backend_id).map(|c| c.get()), Some(0));
 
     // Route a command
-    router.route_command(client_id, "LIST").unwrap();
+    router.route(client_id).unwrap();
     assert_eq!(router.backend_load(backend_id).map(|c| c.get()), Some(1));
 
     // Route another
-    router.route_command(client_id, "LIST").unwrap();
+    router.route(client_id).unwrap();
     assert_eq!(router.backend_load(backend_id).map(|c| c.get()), Some(2));
 
     // Complete one

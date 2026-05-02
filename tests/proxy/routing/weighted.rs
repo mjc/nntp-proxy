@@ -64,7 +64,7 @@ fn test_weighted_distribution_equal_weights() {
     // Issue 100 requests and count distribution
     let mut counts = [0; 2];
     for _ in 0..100 {
-        let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         counts[backend.as_index()] += 1;
     }
 
@@ -109,7 +109,7 @@ fn test_weighted_distribution_unequal_weights() {
     // Issue 900 requests (10x the total weight for good statistical sample)
     let mut counts = [0; 2];
     for _ in 0..900 {
-        let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         counts[backend.as_index()] += 1;
     }
 
@@ -163,7 +163,7 @@ fn test_weighted_distribution_three_backends() {
     // Issue 600 requests (10x total weight)
     let mut counts = [0; 3];
     for _ in 0..600 {
-        let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         counts[backend.as_index()] += 1;
     }
 
@@ -215,9 +215,7 @@ fn test_weighted_real_world_scenario() {
     let mut counts = [0; 2];
 
     for _ in 0..total_requests {
-        let backend = selector
-            .route_command(ClientId::new(), "ARTICLE <test@example.com>")
-            .unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         counts[backend.as_index()] += 1;
     }
 
@@ -266,7 +264,7 @@ fn test_weighted_extreme_imbalance() {
     // Issue 1000 requests
     let mut counts = [0; 2];
     for _ in 0..1000 {
-        let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         counts[backend.as_index()] += 1;
     }
 
@@ -308,7 +306,7 @@ fn test_weighted_consistency_across_runs() {
     for run in 0..5 {
         let mut counts = [0; 2];
         for _ in 0..1000 {
-            let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+            let backend = selector.route(ClientId::new()).unwrap();
             counts[backend.as_index()] += 1;
         }
 
@@ -343,7 +341,7 @@ fn test_zero_weight_backend_handled() {
     assert_eq!(selector.total_weight(), 0);
 
     // Should fail gracefully when routing
-    let result = selector.route_command(ClientId::new(), "LIST");
+    let result = selector.route(ClientId::new());
     assert!(result.is_err());
 }
 
@@ -370,7 +368,7 @@ fn test_mixed_zero_and_nonzero_weights() {
 
     // All requests should go to the non-zero backend
     for _ in 0..100 {
-        let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         assert_eq!(backend.as_index(), 1);
     }
 }
@@ -400,7 +398,7 @@ fn test_weighted_with_varying_pool_sizes() {
     let mut counts = vec![0; pool_sizes.len()];
 
     for _ in 0..num_requests {
-        let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         counts[backend.as_index()] += 1;
     }
 
@@ -437,7 +435,7 @@ fn test_weighted_single_backend() {
 
     // All requests should go to the only backend
     for _ in 0..100 {
-        let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         assert_eq!(backend.as_index(), 0);
     }
 }
@@ -470,7 +468,7 @@ fn test_weighted_distribution_precision() {
     let mut counts = [0; 2];
 
     for _ in 0..num_requests {
-        let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         counts[backend.as_index()] += 1;
     }
 

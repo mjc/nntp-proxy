@@ -698,9 +698,9 @@ proptest! {
         let client_id = nntp_proxy::types::ClientId::new();
 
         // Routing with zero backends should return an error
-        let result = selector.route_command(client_id, "LIST");
+        let result = selector.route(client_id);
         prop_assert!(result.is_err(),
-            "route_command with zero backends should return error");
+            "route with zero backends should return error");
     }
 
     #[test]
@@ -737,7 +737,7 @@ proptest! {
         let mut count1 = 0usize;
         for _ in 0..num_requests {
             let client_id = nntp_proxy::types::ClientId::new();
-            if let Ok(id) = selector.route_command(client_id, "LIST") {
+            if let Ok(id) = selector.route(client_id) {
                 if id == id0 { count0 += 1; }
                 if id == id1 { count1 += 1; }
                 // Complete immediately so pending counts don't accumulate
@@ -826,7 +826,7 @@ proptest! {
         let validated = validate_backend_response(data, data.len(), nntp_proxy::protocol::MIN_RESPONSE_LENGTH);
 
         // Should be multiline for 220/221/222
-        prop_assert!(validated.is_multiline,
+        prop_assert!(validated.response.is_multiline(),
             "Code {code} should be detected as multiline");
 
         // Terminator detection should find the real terminator, not a false positive

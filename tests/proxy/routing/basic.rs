@@ -48,7 +48,7 @@ fn test_add_multiple_backends() {
 fn test_no_backends_fails() {
     let router = BackendSelector::new();
     let client_id = ClientId::new();
-    let result = router.route_command(client_id, "LIST\r\n");
+    let result = router.route(client_id);
 
     assert!(result.is_err());
 }

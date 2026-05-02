@@ -13,7 +13,14 @@ use tokio::net::{TcpListener, TcpStream};
 
 use crate::test_helpers::wait_for_server;
 
+use nntp_proxy::command::{CommandAction, CommandHandler};
 use nntp_proxy::config::UserCredentials;
+use nntp_proxy::protocol::RequestContext;
+
+fn classify(command: &str) -> CommandAction<'static> {
+    let request = Box::leak(Box::new(RequestContext::from_request_line(command)));
+    CommandHandler::classify_request(request)
+}
 
 #[tokio::test]
 async fn test_auth_flow_complete_with_valid_credentials() {
@@ -297,21 +304,21 @@ async fn test_multiple_clients_with_auth() {
 #[tokio::test]
 async fn test_auth_handler_integration() {
     use crate::test_helpers::create_test_auth_handler_with;
-    use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
+    use nntp_proxy::command::{AuthAction, CommandAction};
 
     let handler = create_test_auth_handler_with("alice", "secret");
 
     // Test command classification
-    let action = CommandHandler::classify("LIST\r\n");
+    let action = classify("LIST\r\n");
     assert_eq!(action, CommandAction::ForwardStateless);
 
-    let action = CommandHandler::classify("AUTHINFO USER alice\r\n");
+    let action = classify("AUTHINFO USER alice\r\n");
     assert!(matches!(
         action,
         CommandAction::InterceptAuth(AuthAction::RequestPassword(_))
     ));
 
-    let action = CommandHandler::classify("GROUP misc.test\r\n");
+    let action = classify("GROUP misc.test\r\n");
     assert!(matches!(action, CommandAction::Reject(_)));
 
     // Test auth handler responses

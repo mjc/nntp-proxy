@@ -7,8 +7,14 @@
 
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
+use nntp_proxy::protocol::RequestContext;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
+
+fn classify(command: &str) -> CommandAction<'static> {
+    let request = Box::leak(Box::new(RequestContext::from_request_line(command)));
+    CommandHandler::classify_request(request)
+}
 
 /// Test that Reject commands (stateful commands) don't bypass authentication.
 ///
@@ -28,7 +34,7 @@ async fn test_reject_commands_dont_bypass_authentication() {
     let mut authenticated = false;
 
     // First command: GROUP (stateful, will be rejected)
-    let action = CommandHandler::classify("GROUP misc.test\r\n");
+    let action = classify("GROUP misc.test\r\n");
     match action {
         CommandAction::Reject(response) => {
             // Session sends rejection response
@@ -41,7 +47,7 @@ async fn test_reject_commands_dont_bypass_authentication() {
 
     // Second command: LIST (stateless)
     // This should ALSO require authentication, proving no bypass
-    let action = CommandHandler::classify("LIST\r\n");
+    let action = classify("LIST\r\n");
     match action {
         CommandAction::ForwardStateless => {
             // In the actual handler, this branch checks if auth is enabled

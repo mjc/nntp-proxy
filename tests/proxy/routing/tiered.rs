@@ -35,7 +35,7 @@ fn test_tier_zero_selected_first() {
 
     // Despite being added second, tier 0 should be selected first
     let backend = selector
-        .route_command_with_availability(ClientId::new(), "ARTICLE", Some(&availability))
+        .route_with_availability(ClientId::new(), Some(&availability))
         .unwrap();
     assert_eq!(
         backend.as_index(),
@@ -78,11 +78,7 @@ fn test_tier_escalation_on_430() {
 
     // Now routing should select tier 1 backend
     let backend = selector
-        .route_command_with_availability(
-            ClientId::new(),
-            "ARTICLE <test@example.com>",
-            Some(&availability),
-        )
+        .route_with_availability(ClientId::new(), Some(&availability))
         .unwrap();
     assert_eq!(
         backend.as_index(),
@@ -126,7 +122,7 @@ fn test_within_tier_load_balancing() {
     let mut counts = [0; 3];
     for _ in 0..100 {
         let backend = selector
-            .route_command_with_availability(ClientId::new(), "ARTICLE", Some(&availability))
+            .route_with_availability(ClientId::new(), Some(&availability))
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -184,11 +180,7 @@ fn test_partial_tier_exhaustion() {
 
     // Should still select from tier 0 (the remaining one)
     let backend = selector
-        .route_command_with_availability(
-            ClientId::new(),
-            "ARTICLE <test@example.com>",
-            Some(&availability),
-        )
+        .route_with_availability(ClientId::new(), Some(&availability))
         .unwrap();
     assert_eq!(
         backend.as_index(),
@@ -235,11 +227,7 @@ fn test_multiple_tiers() {
 
     // Should escalate to tier 2
     let backend = selector
-        .route_command_with_availability(
-            ClientId::new(),
-            "ARTICLE <test@example.com>",
-            Some(&availability),
-        )
+        .route_with_availability(ClientId::new(), Some(&availability))
         .unwrap();
     assert_eq!(
         backend.as_index(),
@@ -296,7 +284,7 @@ fn test_tiered_weighted_round_robin() {
     let mut counts = [0; 3];
     for _ in 0..400 {
         let backend = selector
-            .route_command_with_availability(ClientId::new(), "ARTICLE", Some(&availability))
+            .route_with_availability(ClientId::new(), Some(&availability))
             .unwrap();
         counts[backend.as_index()] += 1;
     }
