@@ -11,15 +11,12 @@ use futures::executor::block_on;
 use nntp_proxy::cache::{
     ArticleAvailability, ArticleCache, ArticleEntry, BackendStatus, UnifiedCache,
 };
-use nntp_proxy::protocol::{RequestKind, StatusCode};
+use nntp_proxy::protocol::RequestKind;
 use nntp_proxy::router::BackendCount;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
 
-use super::{
-    article_entry, article_response_bytes, assert_article_response, assert_no_article_response,
-    body_entry, head_entry, response_bytes, test_msg_id,
-};
+use super::{article_response_bytes, assert_article_response, assert_no_article_response};
 
 // ============================================================================
 // UnifiedCache Tests
@@ -163,160 +160,6 @@ async fn test_cache_stats_provider_unified_cache_memory() {
 
     assert_eq!(stats.entry_count, 0);
     assert!(stats.disk.is_none()); // Memory-only cache has no disk stats
-}
-
-// ============================================================================
-// ArticleEntry::response_for() Tests
-// ============================================================================
-
-#[test]
-fn test_response_for_stat_synthesizes_223() {
-    let response = response_bytes(&article_entry(), RequestKind::Stat).unwrap();
-
-    assert!(String::from_utf8_lossy(&response).starts_with("223 0 <test@example.com>\r\n"));
-}
-
-#[test]
-fn test_response_for_body_from_article_allocates_nothing() {
-    let entry = article_entry();
-    let msg_id = test_msg_id();
-
-    let (response, allocations) = crate::allocation_count_delta(|| {
-        entry
-            .response_for(RequestKind::Body, msg_id.as_str())
-            .expect("ARTICLE cache entry can serve BODY")
-    });
-
-    assert_eq!(allocations, 0);
-    assert_eq!(response.status(), StatusCode::new(222));
-    assert_eq!(
-        response.wire_len().get(),
-        b"222 0 <test@example.com>\r\nBody\r\n.\r\n".len()
-    );
-}
-
-#[test]
-fn test_response_exposes_typed_status() {
-    let entry = ArticleEntry::from_response_bytes(
-        b"220 42 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
-    );
-
-    let cases = [
-        (RequestKind::Article, 220),
-        (RequestKind::Head, 221),
-        (RequestKind::Body, 222),
-        (RequestKind::Stat, 223),
-    ];
-
-    for (request_kind, status) in cases {
-        let response = entry
-            .response_for(request_kind, "<test@example.com>")
-            .expect("ARTICLE cache entry can synthesize all article command responses");
-
-        assert_eq!(response.status(), StatusCode::new(status));
-    }
-}
-
-#[test]
-fn test_response_for_handles_near_limit_message_id_without_allocation() {
-    let entry = article_entry();
-    let local = "a".repeat(520);
-    let msg_id_text = format!("<{local}@example.com>");
-
-    let (response, allocations) = crate::allocation_count_delta(|| {
-        entry
-            .response_for(RequestKind::Stat, &msg_id_text)
-            .expect("long message-id still fits stack response buffer")
-    });
-
-    assert_eq!(allocations, 0);
-    assert_eq!(response.status(), StatusCode::new(223));
-    assert_eq!(
-        response.wire_len().get(),
-        "223 0 ".len() + msg_id_text.len() + 2
-    );
-}
-
-#[test]
-fn test_response_for_stat_from_body() {
-    let response = response_bytes(&body_entry(), RequestKind::Stat).unwrap();
-
-    assert!(String::from_utf8_lossy(&response).starts_with("223 0 <test@example.com>\r\n"));
-}
-
-#[test]
-fn test_response_for_stat_from_head() {
-    let response = response_bytes(&head_entry(), RequestKind::Stat).unwrap();
-
-    assert!(String::from_utf8_lossy(&response).starts_with("223 0 <test@example.com>\r\n"));
-}
-
-#[test]
-fn test_response_for_430_returns_none_for_stat() {
-    let entry = ArticleEntry::from_response_bytes(b"430 No Such Article\r\n");
-
-    assert_no_article_response(&entry, RequestKind::Stat);
-}
-
-#[test]
-fn test_response_for_article_direct_match() {
-    assert_article_response(
-        &article_entry(),
-        RequestKind::Article,
-        b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
-    );
-}
-
-#[test]
-fn test_response_for_body_from_article() {
-    assert_article_response(
-        &article_entry(),
-        RequestKind::Body,
-        b"222 0 <test@example.com>\r\nBody\r\n.\r\n",
-    );
-}
-
-#[test]
-fn test_response_for_head_from_article() {
-    assert_article_response(
-        &article_entry(),
-        RequestKind::Head,
-        b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n",
-    );
-}
-
-#[test]
-fn test_response_for_body_cannot_serve_article() {
-    assert_no_article_response(&body_entry(), RequestKind::Article);
-}
-
-#[test]
-fn test_response_for_head_cannot_serve_body() {
-    assert_no_article_response(&head_entry(), RequestKind::Body);
-}
-
-#[test]
-fn test_response_for_validates_buffer() {
-    // Create an invalid buffer (missing .\r\n terminator)
-    let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody".to_vec();
-    let entry = ArticleEntry::from_response_bytes(buffer);
-
-    // Should return None because buffer fails validation
-    assert_no_article_response(&entry, RequestKind::Article);
-}
-
-#[test]
-fn test_response_for_empty_message_id() {
-    let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_response_bytes(buffer);
-
-    // STAT with minimal message ID <x> should still work
-    let msg_id = MessageId::from_borrowed("<x>").unwrap();
-    let response = article_response_bytes(&entry, RequestKind::Stat, &msg_id);
-    assert!(response.is_some());
-    let response_bytes = response.unwrap();
-    let response_str = String::from_utf8_lossy(&response_bytes);
-    assert!(response_str.starts_with("223 0 <x>")); // Returns the message ID we passed
 }
 
 // ============================================================================

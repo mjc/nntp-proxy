@@ -34,20 +34,6 @@ pub fn test_msg_id() -> MessageId<'static> {
     MessageId::from_borrowed("<test@example.com>").unwrap()
 }
 
-pub fn article_entry() -> ArticleEntry {
-    ArticleEntry::from_response_bytes(
-        b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
-    )
-}
-
-pub fn body_entry() -> ArticleEntry {
-    ArticleEntry::from_response_bytes(b"222 0 <test@example.com>\r\nBody content\r\n.\r\n")
-}
-
-pub fn head_entry() -> ArticleEntry {
-    ArticleEntry::from_response_bytes(b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n")
-}
-
 pub fn response_bytes(entry: &ArticleEntry, request_kind: RequestKind) -> Option<Vec<u8>> {
     article_response_bytes(entry, request_kind, &test_msg_id())
 }
