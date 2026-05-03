@@ -622,10 +622,10 @@ pub(crate) fn parse_payload_chunked_response(
         return CachedPayload::Missing;
     }
 
-    let Some((status_end, status_line)) = chunked_status_line(buffer) else {
+    let Some((status_end, article_number)) = chunked_status_line_end_and_article_number(buffer)
+    else {
         return CachedPayload::AvailabilityOnly;
     };
-    let article_number = parse_article_number(&status_line);
 
     match code {
         220..=222 => {
@@ -639,19 +639,46 @@ pub(crate) fn parse_payload_chunked_response(
     }
 }
 
-fn chunked_status_line(
+fn chunked_status_line_end_and_article_number(
     buffer: &crate::pool::ChunkedResponse,
-) -> Option<(usize, smallvec::SmallVec<[u8; 128]>)> {
-    let mut status_line = smallvec::SmallVec::<[u8; 128]>::new();
+) -> Option<(usize, Option<CachedArticleNumber>)> {
     let mut position = 0;
+    let mut previous = 0;
+    let mut article_number = 0_u64;
+    let mut article_number_seen = false;
+    let mut article_number_valid = true;
+    let mut article_number_done = false;
 
     for chunk in buffer.iter_chunks() {
         for &byte in chunk {
-            status_line.push(byte);
-            position += 1;
-            if status_line.ends_with(b"\r\n") {
-                return Some((position, status_line));
+            if position >= 4 && !article_number_done {
+                match byte {
+                    b'0'..=b'9' if article_number_valid => {
+                        article_number_seen = true;
+                        article_number = article_number
+                            .checked_mul(10)
+                            .and_then(|value| value.checked_add(u64::from(byte - b'0')))
+                            .unwrap_or_else(|| {
+                                article_number_valid = false;
+                                0
+                            });
+                    }
+                    b' ' | b'\r' | b'\n' => {
+                        article_number_done = true;
+                    }
+                    _ => {
+                        article_number_valid = false;
+                    }
+                }
             }
+
+            position += 1;
+            if previous == b'\r' && byte == b'\n' {
+                let parsed = (article_number_seen && article_number_valid)
+                    .then(|| CachedArticleNumber::new(article_number));
+                return Some((position, parsed));
+            }
+            previous = byte;
         }
     }
 
@@ -1715,6 +1742,28 @@ mod tests {
             }
             other => panic!("expected article payload, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn chunked_cache_ingest_parses_article_number_without_copying_status_line() {
+        let pool = crate::pool::BufferPool::new(
+            crate::types::BufferSize::try_new(1024).expect("valid buffer size"),
+            1,
+        )
+        .with_capture_pool(8, 4);
+        let mut response = crate::pool::ChunkedResponse::default();
+        response.extend_from_slice(
+            &pool,
+            b"220 123456789 <very-long-message-id-that-spans-chunks@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+        );
+
+        let entry =
+            CachedArticle::from_ingest_response_with_tier(response.into(), ttl::CacheTier::new(0));
+
+        assert_eq!(
+            entry.article_number(),
+            Some(CachedArticleNumber::new(123_456_789))
+        );
     }
 
     #[test]
