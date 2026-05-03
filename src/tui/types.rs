@@ -28,7 +28,10 @@ impl ChartX {
 }
 
 impl From<usize> for ChartX {
+    #[allow(clippy::cast_precision_loss)]
     fn from(index: usize) -> Self {
+        // Chart indices are tiny UI positions (history length is bounded), so
+        // converting them to f64 for plotting does not affect correctness.
         Self::new(index as f64)
     }
 }

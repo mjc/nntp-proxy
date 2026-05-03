@@ -17,6 +17,19 @@ use ratatui::{
     widgets::{Axis, Block, Chart, Dataset, GraphType, List, ListItem, Paragraph, Wrap},
 };
 
+#[allow(clippy::cast_precision_loss)]
+fn counter_as_f64(value: u64) -> f64 {
+    // These chart labels and percentages are display-only aggregates; the
+    // underlying pipeline counters remain exact integers in the snapshot.
+    value as f64
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn size_as_f64(value: usize) -> f64 {
+    // Pool utilization is presented as a percentage in the UI, not used for control flow.
+    value as f64
+}
+
 // ============================================================================
 // Widget Creation Helpers (Pure Functions)
 // ============================================================================
@@ -247,7 +260,8 @@ fn create_app_summary(
 
     // Show pipeline stats if any batches have been processed
     if snapshot.pipeline_batches > 0 {
-        let avg_batch = snapshot.pipeline_commands as f64 / snapshot.pipeline_batches as f64;
+        let avg_batch =
+            counter_as_f64(snapshot.pipeline_commands) / counter_as_f64(snapshot.pipeline_batches);
         lines.push(Line::from(vec![
             "Pipeline: ".fg(styles::LABEL),
             format!(
@@ -279,7 +293,7 @@ fn create_app_summary(
                 "{}/{} ({:.0}%)",
                 in_use,
                 total,
-                (in_use * 100) as f64 / total as f64
+                size_as_f64(in_use * 100) / size_as_f64(total)
             )
             .fg(buffer_color(in_use, total)),
         ]));

@@ -17,10 +17,15 @@ const fn count_as_f64_for_rate(value: u64) -> f64 {
     value as f64
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
 fn bytes_per_second_to_u64(bytes_delta: u64, seconds: f64) -> u64 {
     // Bytes/sec is exposed as an integer metric. Truncating the fractional
     // byte/sec component matches the previous API and avoids overstating rate.
+    // Callers pass positive elapsed durations, so the computed rate is non-negative.
     (count_as_f64_for_rate(bytes_delta) / seconds) as u64
 }
 

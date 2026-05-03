@@ -36,21 +36,18 @@ impl LogBuffer {
     /// Get recent log lines (clones strings)
     #[must_use]
     pub fn recent_lines(&self, count: usize) -> Vec<String> {
-        if let Ok(lines) = self.lines.lock() {
-            lines.iter().rev().take(count).rev().cloned().collect()
-        } else {
-            Vec::new()
-        }
+        self.lines.lock().map_or_else(
+            |_| Vec::new(),
+            |lines| lines.iter().rev().take(count).rev().cloned().collect(),
+        )
     }
 
     /// Get all log lines (clones strings)
     #[must_use]
     pub fn all_lines(&self) -> Vec<String> {
-        if let Ok(lines) = self.lines.lock() {
-            lines.iter().cloned().collect()
-        } else {
-            Vec::new()
-        }
+        self.lines
+            .lock()
+            .map_or_else(|_| Vec::new(), |lines| lines.iter().cloned().collect())
     }
 
     /// Access log lines with a closure (zero-allocation, holds lock briefly)

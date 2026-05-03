@@ -83,6 +83,7 @@ impl UserStats {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // These percentage tests rely on exact zero/default results from fixed counters.
 mod tests {
     use super::*;
 

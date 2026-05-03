@@ -198,6 +198,10 @@ impl ConnectionStream {
     }
 
     /// Stash bytes that were already read from the backend but belong to the next response.
+    ///
+    /// # Errors
+    /// Returns an error if stashing `bytes` would exceed the configured leftover
+    /// capacity, which indicates likely protocol desynchronization.
     pub fn stash_leftover(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.leftover.len() + bytes.len() <= MAX_LEFTOVER_BYTES,

@@ -279,6 +279,20 @@ pub struct TuiApp {
 }
 
 impl TuiApp {
+    #[allow(clippy::cast_precision_loss)]
+    fn counter_as_f64(value: u64) -> f64 {
+        // TUI throughput and rate calculations are display-only aggregates.
+        // The exact counters remain stored as integers in the metrics snapshot.
+        value as f64
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn throughput_as_u64(rate: Throughput) -> u64 {
+        // Displayed per-user byte rates are derived from non-negative throughput
+        // samples; truncating fractional bytes/sec matches the existing UI.
+        rate.get() as u64
+    }
+
     /// Create a new TUI application
     ///
     /// **Note:** Prefer using `TuiAppBuilder` for more flexibility.
@@ -296,7 +310,7 @@ impl TuiApp {
     #[inline]
     fn calculate_rate(byte_delta: u64, time_delta_secs: f64) -> Throughput {
         if time_delta_secs > 0.0 {
-            Throughput::new((byte_delta as f64) / time_delta_secs)
+            Throughput::new(Self::counter_as_f64(byte_delta) / time_delta_secs)
         } else {
             Throughput::zero()
         }
@@ -306,7 +320,7 @@ impl TuiApp {
     #[inline]
     fn calculate_command_rate(cmd_delta: u64, time_delta_secs: f64) -> CommandsPerSecond {
         if time_delta_secs > 0.0 {
-            CommandsPerSecond::new((cmd_delta as f64) / time_delta_secs)
+            CommandsPerSecond::new(Self::counter_as_f64(cmd_delta) / time_delta_secs)
         } else {
             CommandsPerSecond::zero()
         }
@@ -331,12 +345,14 @@ impl TuiApp {
                     let sent_delta = current.bytes_sent.saturating_sub(prev.bytes_sent);
                     let recv_delta = current.bytes_received.saturating_sub(prev.bytes_received);
                     (
-                        BytesPerSecondRate::new(
-                            Self::calculate_rate(sent_delta.into(), time_delta).get() as u64,
-                        ),
-                        BytesPerSecondRate::new(
-                            Self::calculate_rate(recv_delta.into(), time_delta).get() as u64,
-                        ),
+                        BytesPerSecondRate::new(Self::throughput_as_u64(Self::calculate_rate(
+                            sent_delta.into(),
+                            time_delta,
+                        ))),
+                        BytesPerSecondRate::new(Self::throughput_as_u64(Self::calculate_rate(
+                            recv_delta.into(),
+                            time_delta,
+                        ))),
                     )
                 },
             );

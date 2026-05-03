@@ -26,9 +26,16 @@ const SPARKLINE_WIDTH: usize = 15;
 ///
 /// # Returns
 /// A string of length `SPARKLINE_WIDTH` with filled/empty blocks
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 #[must_use]
 pub fn create_sparkline(value: u64, max_value: u64) -> String {
     let filled = if max_value > 0 {
+        // Sparkline width is tiny and purely visual, so approximate float math is
+        // sufficient and keeping the cast local makes the display tradeoff explicit.
         ((value as f64 / max_value as f64) * SPARKLINE_WIDTH as f64) as usize
     } else {
         0
