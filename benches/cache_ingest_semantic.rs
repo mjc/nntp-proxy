@@ -1,4 +1,4 @@
-//! Benchmarks for typed cache ingestion from response bytes.
+//! Benchmarks for typed cache ingestion from wire responses.
 //!
 //! Run with: cargo bench --bench cache_ingest_semantic
 
@@ -44,7 +44,7 @@ mod semantic_ingest {
                         rt.block_on(async {
                             let msg_id = MessageId::from_borrowed("<bench@example.com>").unwrap();
                             cache
-                                .upsert(
+                                .upsert_wire_response(
                                     msg_id,
                                     black_box(bytes.as_slice()),
                                     BackendId::from_index(0),
@@ -72,7 +72,7 @@ mod cache_upsert {
     };
 
     #[divan::bench(sample_count = 100, sample_size = 50)]
-    fn response_bytes(bencher: Bencher) {
+    fn wire_response(bencher: Bencher) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let cache = ArticleCache::new(16 * 1024 * 1024, Duration::from_secs(300), true);
         let bytes = article_response(64 * 1024);
@@ -83,7 +83,7 @@ mod cache_upsert {
                 rt.block_on(async {
                     let msg_id = MessageId::from_borrowed("<bench@example.com>").unwrap();
                     cache
-                        .upsert(
+                        .upsert_wire_response(
                             msg_id,
                             black_box(bytes.as_slice()),
                             BackendId::from_index(0),

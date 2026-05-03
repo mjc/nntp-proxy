@@ -134,7 +134,7 @@ mod unified_cache {
         rt.block_on(async {
             let msg_id = MessageId::from_borrowed("<hit@example.com>").unwrap();
             cache
-                .upsert(
+                .upsert_wire_response(
                     msg_id.to_owned(),
                     b"220 0 <hit@example.com>\r\nSubject: test\r\n\r\nbody\r\n.\r\n".to_vec(),
                     BackendId::from_index(0),
@@ -162,7 +162,7 @@ mod unified_cache {
                 rt.block_on(async {
                     let msg_id = MessageId::from_borrowed("<bench@test.com>").unwrap();
                     cache
-                        .upsert(
+                        .upsert_wire_response(
                             msg_id.to_owned(),
                             data.clone(),
                             BackendId::from_index(0),

@@ -37,7 +37,7 @@ fn cache_entry_from_bytes(response: impl AsRef<[u8]>) -> ArticleEntry {
 
     block_on(async {
         cache
-            .upsert(
+            .upsert_wire_response(
                 msg_id.clone(),
                 response.as_ref(),
                 BackendId::from_index(0),

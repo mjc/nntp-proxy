@@ -46,7 +46,7 @@ impl MockHybridCache {
         }
     }
 
-    async fn upsert(
+    async fn upsert_wire_response(
         &self,
         message_id: MessageId<'_>,
         buffer: impl AsRef<[u8]>,
@@ -139,7 +139,7 @@ mod tests {
         MessageId::from_borrowed(value).unwrap()
     }
 
-    fn response_bytes(
+    fn wire_response(
         entry: &DiskArticleEntry,
         request_kind: RequestKind,
         message_id: &MessageId<'_>,
@@ -152,7 +152,7 @@ mod tests {
 
     fn assert_article(entry: &DiskArticleEntry, message_id: &MessageId<'_>, expected: &[u8]) {
         assert_eq!(
-            response_bytes(entry, RequestKind::Article, message_id).unwrap(),
+            wire_response(entry, RequestKind::Article, message_id).unwrap(),
             expected
         );
     }
@@ -171,7 +171,7 @@ mod tests {
     async fn upsert_keeps_existing_semantic_payload_over_longer_metadata_only_response() {
         let cache = MockHybridCache::new(1024);
         cache
-            .upsert(
+            .upsert_wire_response(
                 msg_id(),
                 b"220 1 <mock-hybrid@example>\r\nH: V\r\n\r\nBody\r\n.\r\n".as_slice(),
                 BackendId::from_index(0),
@@ -179,7 +179,7 @@ mod tests {
             .await;
 
         cache
-            .upsert(
+            .upsert_wire_response(
                 msg_id(),
                 b"220 1 <mock-hybrid@example> long status line without payload\r\n".as_slice(),
                 BackendId::from_index(1),
@@ -204,7 +204,7 @@ mod tests {
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n";
 
         cache
-            .upsert(
+            .upsert_wire_response(
                 message_id.clone(),
                 buffer.as_slice(),
                 BackendId::from_index(0),
@@ -231,7 +231,7 @@ mod tests {
         let buffer = b"220 0 <borrowed@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n";
 
         cache
-            .upsert(
+            .upsert_wire_response(
                 message_id.clone(),
                 buffer.as_slice(),
                 BackendId::from_index(0),
@@ -272,7 +272,7 @@ mod tests {
         let large_buffer =
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nLarge body content here\r\n.\r\n";
         cache
-            .upsert(
+            .upsert_wire_response(
                 message_id.clone(),
                 large_buffer.as_slice(),
                 BackendId::from_index(0),
@@ -280,7 +280,7 @@ mod tests {
             .await;
 
         cache
-            .upsert(
+            .upsert_wire_response(
                 message_id.clone(),
                 b"223 0 <test@example.com>\r\n".as_slice(),
                 BackendId::from_index(1),
@@ -320,7 +320,7 @@ mod tests {
         let message_id = msgid("<avail@example.com>");
 
         cache
-            .upsert(
+            .upsert_wire_response(
                 message_id.clone(),
                 b"220 0 <avail@example.com>\r\nBody\r\n.\r\n".as_slice(),
                 BackendId::from_index(0),
@@ -346,7 +346,7 @@ mod tests {
 
         let message_id = msgid("<test@example.com>");
         cache
-            .upsert(
+            .upsert_wire_response(
                 message_id,
                 b"220 0 <test@example.com>\r\n.\r\n".as_slice(),
                 BackendId::from_index(0),
