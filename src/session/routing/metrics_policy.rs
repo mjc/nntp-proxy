@@ -38,7 +38,9 @@ pub fn determine_metrics_action_for_request(
         MetricsAction::Error4xx
     } else if response_code >= 500 {
         MetricsAction::Error5xx
-    } else if request.expects_multiline_body(status_code) && matches!(response_code, 220..=222) {
+    } else if request.response_body_kind(status_code).is_multiline()
+        && matches!(response_code, 220..=222)
+    {
         MetricsAction::Article
     } else {
         MetricsAction::None

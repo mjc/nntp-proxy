@@ -393,7 +393,7 @@ pub(crate) async fn buffer_response_for_request(
     let response = &io_buffer[..initial_len];
     let status_code = validate_response_prefix(response, source)?;
 
-    if !request.expects_multiline_body(status_code) {
+    if !request.response_body_kind(status_code).is_multiline() {
         result_buf.extend_from_slice(pool, response);
         if let Some(pos) = memchr::memchr(b'\n', response) {
             let end = pos + 1;

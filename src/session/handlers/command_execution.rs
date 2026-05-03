@@ -172,14 +172,14 @@ impl ClientSession {
         }
 
         // Success - stream response
-        let expects_multiline_body = request.expects_multiline_body(status_code);
+        let is_multiline_body = request.response_body_kind(status_code).is_multiline();
         debug!(
             client = %self.client_addr,
             backend = backend_id.as_index(),
             command_verb = ?request.verb(),
             first_chunk_bytes = cmd_response.bytes_read,
             status_code = status_code.as_u16(),
-            expects_multiline_body,
+            is_multiline_body,
             "Streaming backend response to client"
         );
         let mut conn = conn;
@@ -343,7 +343,10 @@ impl ClientSession {
         params: ResponseStreamParams<'_>,
     ) -> Result<u64, StreamingError> {
         let code = params.status_code.as_u16();
-        let expects_multiline_body = params.request.expects_multiline_body(params.status_code);
+        let is_multiline_body = params
+            .request
+            .response_body_kind(params.status_code)
+            .is_multiline();
 
         let cache_action = determine_cache_action_for_request(
             params.request,
@@ -353,15 +356,15 @@ impl ClientSession {
         );
 
         debug!(
-            "stream_response_to_client: code={}, expects_multiline_body={}, cache_articles={}, has_msg_id={}, action={:?}",
+            "stream_response_to_client: code={}, is_multiline_body={}, cache_articles={}, has_msg_id={}, action={:?}",
             code,
-            expects_multiline_body,
+            is_multiline_body,
             self.cache_articles,
             params.msg_id.is_some(),
             cache_action
         );
 
-        match (expects_multiline_body, cache_action) {
+        match (is_multiline_body, cache_action) {
             (true, CacheAction::CaptureArticle) => {
                 let captured =
                     streaming::buffer_multiline_response(pooled_conn, params.first_chunk, ctx)

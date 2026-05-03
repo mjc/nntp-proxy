@@ -164,7 +164,7 @@ impl NntpClient {
         let status_code = response
             .status_code()
             .expect("validate_response returned Ok with parsed status");
-        if request.expects_multiline_body(status_code) {
+        if request.response_body_kind(status_code).is_multiline() {
             // Use a capture buffer as the accumulator: pooled, can grow beyond io_buffer
             // capacity without panicking, returned to pool on drop.
             let mut capture = self.buffer_pool.acquire_capture().await;

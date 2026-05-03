@@ -801,11 +801,6 @@ impl RequestContext {
             ResponseBodyKind::SingleLine
         }
     }
-
-    #[must_use]
-    pub fn expects_multiline_body(&self, status: StatusCode) -> bool {
-        self.response_body_kind(status).is_multiline()
-    }
 }
 
 fn trim_line_end(mut line: &[u8]) -> &[u8] {

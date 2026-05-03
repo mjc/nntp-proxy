@@ -360,7 +360,11 @@ mod tests {
         assert!(result.is_ok(), "send_request should handle partial reads");
         let resp = result.unwrap();
         assert_eq!(resp.status_code(), Some(StatusCode::new(200)));
-        assert!(!request.expects_multiline_body(resp.status_code().unwrap()));
+        assert!(
+            !request
+                .response_body_kind(resp.status_code().unwrap())
+                .is_multiline()
+        );
     }
 
     #[tokio::test]
@@ -382,7 +386,11 @@ mod tests {
         let resp = result.unwrap();
         assert_eq!(resp.bytes_read, b"111 20260501173336\r\n".len());
         assert_eq!(resp.status_code(), Some(StatusCode::new(111)));
-        assert!(!request.expects_multiline_body(resp.status_code().unwrap()));
+        assert!(
+            !request
+                .response_body_kind(resp.status_code().unwrap())
+                .is_multiline()
+        );
         assert_eq!(&buffer[..resp.bytes_read], b"111 20260501173336\r\n");
     }
 
@@ -404,7 +412,11 @@ mod tests {
         );
         let resp = result.unwrap();
         assert_eq!(resp.status_code(), Some(StatusCode::new(211)));
-        assert!(!request.expects_multiline_body(resp.status_code().unwrap()));
+        assert!(
+            !request
+                .response_body_kind(resp.status_code().unwrap())
+                .is_multiline()
+        );
     }
 
     // ─── Command response tests ─────────────────────────────────────────────
