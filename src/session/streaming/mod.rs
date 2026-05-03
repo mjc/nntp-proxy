@@ -16,7 +16,7 @@ use tail_buffer::TailBuffer;
 /// Callers use `must_remove_connection()` to decide pool fate — no string
 /// inspection or downcast needed.
 #[derive(Debug)]
-pub(crate) enum StreamingError {
+pub enum StreamingError {
     /// Client disconnected; backend was drained and connection is clean.
     /// → Return connection to pool.
     ClientDisconnect(std::io::Error),
@@ -100,7 +100,7 @@ impl StreamingError {
 ///
 /// Groups the session-level context that is invariant across all chunks
 /// of a streaming response, keeping function signatures concise.
-pub(crate) struct StreamContext<'a> {
+pub struct StreamContext<'a> {
     pub client_addr: crate::types::ClientAddress,
     pub backend_id: crate::types::BackendId,
     pub buffer_pool: &'a crate::pool::BufferPool,
@@ -224,7 +224,7 @@ where
 ///
 /// If `capture` is Some, the response will be captured into the Vec for caching.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn stream_multiline_response<R, W>(
+pub async fn stream_multiline_response<R, W>(
     backend_read: &mut R,
     client_write: &mut W,
     first_chunk: &[u8],

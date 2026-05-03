@@ -158,6 +158,10 @@ harness = false
 name = "end_to_end_proxy"
 harness = false
 
+[[bench]]
+name = "streaming_roundtrip"
+harness = false
+
 
 [profile.dev]
 split-debuginfo = "unpacked"  # Faster linking — don't bundle debuginfo into binary
