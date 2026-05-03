@@ -520,6 +520,23 @@ enum ChunkResult {
     Continue,
 }
 
+#[derive(Clone, Copy)]
+enum TerminatorScan {
+    Exact,
+    BoundaryOnly,
+}
+
+struct ChunkProcessOptions {
+    terminator_scan: TerminatorScan,
+}
+
+struct ChunkProcessState<'a, R> {
+    backend_read: &'a mut R,
+    total_bytes: &'a mut u64,
+    ctx: &'a StreamContext<'a>,
+    options: ChunkProcessOptions,
+}
+
 /// Process a single chunk: detect terminator, capture, write to client.
 ///
 /// Uses `TailBuffer` for stateful cross-chunk terminator detection.
@@ -533,40 +550,41 @@ async fn process_chunk<R, W>(
     tail: &mut TailBuffer,
     capture: &mut Option<&mut crate::pool::ChunkedResponse>,
     client_write: &mut W,
-    backend_read: &mut R,
-    total_bytes: &mut u64,
-    ctx: &StreamContext<'_>,
+    state: ChunkProcessState<'_, R>,
 ) -> Result<ChunkResult, StreamingError>
 where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
     // Detect terminator location: within chunk or spanning boundary
-    let status = tail.detect_terminator(data);
+    let status = match state.options.terminator_scan {
+        TerminatorScan::Exact => tail.detect_terminator(data),
+        TerminatorScan::BoundaryOnly => tail.detect_terminal_boundary(data),
+    };
     let write_len = status.write_len(data.len());
 
     // Capture data if requested (for caching)
     if let Some(cap) = capture {
-        cap.extend_from_slice(ctx.buffer_pool, &data[..write_len]);
+        cap.extend_from_slice(state.ctx.buffer_pool, &data[..write_len]);
     }
 
     // Write current chunk (or portion up to terminator) to client
     if let Err(e) = client_write.write_all(&data[..write_len]).await {
         return Err(handle_client_write_error(
             e,
-            backend_read,
+            state.backend_read,
             DrainContext {
                 write_len,
                 chunk_len: data.len(),
-                total_bytes: *total_bytes,
+                total_bytes: *state.total_bytes,
                 tail_data: &data[..write_len],
                 terminator_found: status.is_found(),
-                ctx,
+                ctx: state.ctx,
             },
         )
         .await);
     }
-    *total_bytes += write_len as u64;
+    *state.total_bytes += write_len as u64;
 
     if status.is_found() {
         return Ok(ChunkResult::Done { write_len });
@@ -605,9 +623,14 @@ where
         &mut tail,
         &mut capture,
         client_write,
-        backend_read,
-        &mut total_bytes,
-        ctx,
+        ChunkProcessState {
+            backend_read,
+            total_bytes: &mut total_bytes,
+            ctx,
+            options: ChunkProcessOptions {
+                terminator_scan: TerminatorScan::Exact,
+            },
+        },
     )
     .await?
     {
@@ -671,14 +694,27 @@ where
         }
 
         let data = &buffers[idx][..n];
+        let options = ChunkProcessOptions {
+            terminator_scan: if capture.is_none()
+                && leftover_out.is_none()
+                && n == buffers[idx].capacity()
+            {
+                TerminatorScan::BoundaryOnly
+            } else {
+                TerminatorScan::Exact
+            },
+        };
         match process_chunk(
             data,
             &mut tail,
             &mut capture,
             client_write,
-            backend_read,
-            &mut total_bytes,
-            ctx,
+            ChunkProcessState {
+                backend_read,
+                total_bytes: &mut total_bytes,
+                ctx,
+                options,
+            },
         )
         .await?
         {
