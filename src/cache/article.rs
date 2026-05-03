@@ -335,7 +335,7 @@ impl ArticleEntry {
 
     /// Parse a cold backend wire response into typed cache metadata and payload.
     #[must_use]
-    fn from_wire_response_with_tier(response: impl AsRef<[u8]>, tier: ttl::CacheTier) -> Self {
+    pub fn from_wire_response_with_tier(response: impl AsRef<[u8]>, tier: ttl::CacheTier) -> Self {
         let response = response.as_ref();
         let status_code = StatusCode::parse(response).unwrap_or_else(|| StatusCode::new(430));
         let payload = parse_payload(status_code, response);
@@ -370,7 +370,7 @@ impl ArticleEntry {
     }
 
     #[must_use]
-    fn from_chunked_response_with_tier(
+    pub fn from_chunked_response_with_tier(
         buffer: &crate::pool::ChunkedResponse,
         tier: ttl::CacheTier,
     ) -> Self {

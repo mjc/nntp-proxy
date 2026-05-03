@@ -4,7 +4,10 @@
 
 use divan::{Bencher, black_box};
 use nntp_proxy::cache::ArticleCache;
-use nntp_proxy::types::{BackendId, MessageId};
+use nntp_proxy::cache::ArticleEntry;
+use nntp_proxy::cache::ttl::CacheTier;
+use nntp_proxy::pool::{BufferPool, ChunkedResponse};
+use nntp_proxy::types::{BackendId, BufferSize, MessageId};
 use std::time::Duration;
 
 fn main() {
@@ -93,4 +96,44 @@ mod cache_upsert {
                 });
             });
     }
+}
+
+mod entry_parse {
+    use super::{
+        ArticleEntry, Bencher, BufferPool, BufferSize, CacheTier, ChunkedResponse,
+        article_response, black_box,
+    };
+
+    fn chunked_response(bytes: &[u8]) -> ChunkedResponse {
+        let pool =
+            BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(4096, 8);
+        let mut response = ChunkedResponse::default();
+        response.extend_from_slice(&pool, bytes);
+        assert!(
+            response.iter_chunks().count() > 1,
+            "benchmark requires chunked storage"
+        );
+        response
+    }
+
+    macro_rules! bench_entry_parse {
+        ($name:ident, $bytes:expr, $samples:expr) => {
+            #[divan::bench(sample_count = $samples, sample_size = 100)]
+            fn $name(bencher: Bencher) {
+                let bytes = $bytes;
+                let chunked = chunked_response(&bytes);
+                bencher
+                    .counter(divan::counter::BytesCount::new(bytes.len()))
+                    .bench(|| {
+                        black_box(ArticleEntry::from_chunked_response_with_tier(
+                            black_box(&chunked),
+                            CacheTier::new(0),
+                        ))
+                    });
+            }
+        };
+    }
+
+    bench_entry_parse!(chunked_article_64k_body, article_response(64 * 1024), 200);
+    bench_entry_parse!(chunked_article_1mb_body, article_response(1024 * 1024), 50);
 }
