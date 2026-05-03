@@ -926,8 +926,10 @@ mod tests {
 
     #[test]
     fn test_resolve_availability_file_path_default_for_availability_only() {
-        let mut cache = crate::config::Cache::default();
-        cache.cache_articles = false;
+        let cache = crate::config::Cache {
+            cache_articles: false,
+            ..Default::default()
+        };
 
         let result = resolve_availability_file_path("/etc/nntp-proxy/config.toml", Some(&cache))
             .expect("availability-only mode should resolve a path");
@@ -938,9 +940,11 @@ mod tests {
 
     #[test]
     fn test_resolve_availability_file_path_with_configured() {
-        let mut cache = crate::config::Cache::default();
-        cache.cache_articles = false;
-        cache.availability_file = Some(std::path::PathBuf::from("/custom/path/availability.idx"));
+        let cache = crate::config::Cache {
+            cache_articles: false,
+            availability_file: Some(std::path::PathBuf::from("/custom/path/availability.idx")),
+            ..Default::default()
+        };
 
         let result = resolve_availability_file_path("config.toml", Some(&cache))
             .expect("configured path should be used");
