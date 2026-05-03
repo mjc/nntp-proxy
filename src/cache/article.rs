@@ -15,16 +15,16 @@ use super::availability::ArticleAvailability;
 use super::ttl;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct CachedArticleNumber(u64);
+pub(crate) struct CachedArticleNumber(u64);
 
 impl CachedArticleNumber {
     #[must_use]
-    pub const fn new(value: u64) -> Self {
+    pub(crate) const fn new(value: u64) -> Self {
         Self(value)
     }
 
     #[must_use]
-    pub const fn get(self) -> u64 {
+    pub(crate) const fn get(self) -> u64 {
         self.0
     }
 }
@@ -257,7 +257,7 @@ impl CachedPayload {
     }
 
     #[must_use]
-    pub const fn article_number(&self) -> Option<CachedArticleNumber> {
+    pub(crate) const fn article_number(&self) -> Option<CachedArticleNumber> {
         match self {
             Self::Article { article_number, .. }
             | Self::Head { article_number, .. }
@@ -420,7 +420,7 @@ impl ArticleEntry {
 
     #[inline]
     #[must_use]
-    pub const fn article_number(&self) -> Option<CachedArticleNumber> {
+    pub(crate) const fn article_number(&self) -> Option<CachedArticleNumber> {
         self.payload.article_number()
     }
 
