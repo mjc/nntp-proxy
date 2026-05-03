@@ -361,7 +361,7 @@ impl CachedArticle {
     }
 
     #[must_use]
-    pub fn from_ingest_response_with_tier(
+    pub(crate) fn from_ingest_response_with_tier(
         buffer: impl Into<super::CacheIngestResponse>,
         tier: ttl::CacheTier,
     ) -> Self {

@@ -4,8 +4,7 @@
 
 use divan::{Bencher, black_box};
 use nntp_proxy::cache::ArticleCache;
-use nntp_proxy::cache::ttl::CacheTier;
-use nntp_proxy::cache::{CacheIngestResponse, CachedArticle};
+use nntp_proxy::cache::CacheIngestResponse;
 use nntp_proxy::pool::{BufferPool, ChunkedResponse};
 use nntp_proxy::types::{BackendId, BufferSize, MessageId};
 use std::time::Duration;
@@ -98,10 +97,10 @@ mod cache_upsert {
     }
 }
 
-mod entry_parse {
+mod chunked_ingest {
     use super::{
-        Bencher, BufferPool, BufferSize, CacheIngestResponse, CacheTier, CachedArticle,
-        ChunkedResponse, article_response, black_box,
+        ArticleCache, BackendId, Bencher, BufferPool, BufferSize, CacheIngestResponse,
+        ChunkedResponse, Duration, MessageId, article_response, black_box,
     };
 
     fn chunked_response(bytes: &[u8]) -> ChunkedResponse {
@@ -116,24 +115,33 @@ mod entry_parse {
         response
     }
 
-    macro_rules! bench_entry_parse {
+    macro_rules! bench_chunked_ingest {
         ($name:ident, $bytes:expr, $samples:expr) => {
             #[divan::bench(sample_count = $samples, sample_size = 100)]
             fn $name(bencher: Bencher) {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let cache = ArticleCache::new(16 * 1024 * 1024, Duration::from_secs(300), true);
                 let bytes = $bytes;
                 bencher
                     .counter(divan::counter::BytesCount::new(bytes.len()))
                     .with_inputs(|| chunked_response(&bytes))
                     .bench_values(|chunked| {
-                        black_box(CachedArticle::from_ingest_response_with_tier(
-                            CacheIngestResponse::Chunked(black_box(chunked)),
-                            CacheTier::new(0),
-                        ))
+                        rt.block_on(async {
+                            let msg_id = MessageId::from_borrowed("<bench@example.com>").unwrap();
+                            cache
+                                .upsert_ingest(
+                                    msg_id,
+                                    CacheIngestResponse::Chunked(black_box(chunked)),
+                                    BackendId::from_index(0),
+                                    0.into(),
+                                )
+                                .await;
+                        });
                     });
             }
         };
     }
 
-    bench_entry_parse!(chunked_article_64k_body, article_response(64 * 1024), 200);
-    bench_entry_parse!(chunked_article_1mb_body, article_response(1024 * 1024), 50);
+    bench_chunked_ingest!(chunked_article_64k_body, article_response(64 * 1024), 200);
+    bench_chunked_ingest!(chunked_article_1mb_body, article_response(1024 * 1024), 50);
 }
