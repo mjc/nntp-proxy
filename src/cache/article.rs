@@ -144,24 +144,36 @@ impl CachedArticleResponse<'_> {
     where
         W: tokio::io::AsyncWrite + Unpin,
     {
+        use std::io::IoSlice;
         use tokio::io::AsyncWriteExt as _;
 
-        writer.write_all(self.status_line()).await?;
         match self.payload {
-            CachedArticleResponsePayload::None => {}
+            CachedArticleResponsePayload::None => writer.write_all(self.status_line()).await?,
             CachedArticleResponsePayload::Article { headers, body } => {
-                writer.write_all(headers).await?;
-                writer.write_all(b"\r\n\r\n").await?;
-                writer.write_all(body).await?;
-                writer.write_all(b"\r\n.\r\n").await?;
+                let mut slices = [
+                    IoSlice::new(self.status_line()),
+                    IoSlice::new(headers),
+                    IoSlice::new(b"\r\n\r\n"),
+                    IoSlice::new(body),
+                    IoSlice::new(b"\r\n.\r\n"),
+                ];
+                write_all_vectored(writer, &mut slices).await?;
             }
             CachedArticleResponsePayload::Head { headers } => {
-                writer.write_all(headers).await?;
-                writer.write_all(b"\r\n.\r\n").await?;
+                let mut slices = [
+                    IoSlice::new(self.status_line()),
+                    IoSlice::new(headers),
+                    IoSlice::new(b"\r\n.\r\n"),
+                ];
+                write_all_vectored(writer, &mut slices).await?;
             }
             CachedArticleResponsePayload::Body { body } => {
-                writer.write_all(body).await?;
-                writer.write_all(b"\r\n.\r\n").await?;
+                let mut slices = [
+                    IoSlice::new(self.status_line()),
+                    IoSlice::new(body),
+                    IoSlice::new(b"\r\n.\r\n"),
+                ];
+                write_all_vectored(writer, &mut slices).await?;
             }
         }
         Ok(())
@@ -793,6 +805,33 @@ fn payload_for_status(
     }
 }
 
+async fn write_all_vectored<W>(
+    writer: &mut W,
+    slices: &mut [std::io::IoSlice<'_>],
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use std::future::poll_fn;
+    use std::io::{Error, ErrorKind, IoSlice};
+    use std::pin::Pin;
+
+    let mut remaining = slices;
+    while !remaining.is_empty() {
+        let written =
+            poll_fn(|cx| Pin::new(&mut *writer).poll_write_vectored(cx, remaining)).await?;
+        if written == 0 {
+            return Err(Error::new(
+                ErrorKind::WriteZero,
+                "failed to write cached article response",
+            ));
+        }
+        IoSlice::advance_slices(&mut remaining, written);
+    }
+
+    Ok(())
+}
+
 fn parse_article_number(status_line: &[u8]) -> Option<CachedArticleNumber> {
     let rest = status_line.get(4..)?;
     let end = memchr::memchr(b' ', rest).unwrap_or(rest.len());
@@ -1252,7 +1291,54 @@ mod tests {
     use super::*;
     use crate::types::MessageId;
     use futures::executor::block_on;
+    use std::io::IoSlice;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
     use std::time::Duration;
+    use tokio::io::AsyncWrite;
+
+    #[derive(Default)]
+    struct CountingWriter {
+        bytes: Vec<u8>,
+        writes: usize,
+        vectored_writes: usize,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            self.vectored_writes += 1;
+            let len = bufs.iter().map(|buf| buf.len()).sum();
+            bufs.iter()
+                .for_each(|buf| self.bytes.extend_from_slice(buf));
+            Poll::Ready(Ok(len))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     fn entry_from_wire_response(buffer: impl AsRef<[u8]>) -> ArticleEntry {
         ArticleEntry::from_wire_response_with_tier(buffer, ttl::CacheTier::new(0))
@@ -1298,6 +1384,24 @@ mod tests {
             out,
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n"
         );
+    }
+
+    #[tokio::test]
+    async fn cached_article_response_uses_vectored_write() {
+        let entry = create_test_article("<test@example.com>");
+        let response = entry
+            .response_for(RequestKind::Article, "<test@example.com>")
+            .unwrap();
+        let mut out = CountingWriter::default();
+
+        response.write_to(&mut out).await.unwrap();
+
+        assert_eq!(
+            out.bytes,
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n"
+        );
+        assert_eq!(out.writes, 0);
+        assert_eq!(out.vectored_writes, 1);
     }
 
     #[test]
