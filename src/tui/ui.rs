@@ -18,14 +18,14 @@ use ratatui::{
 };
 
 #[allow(clippy::cast_precision_loss)]
-fn counter_as_f64(value: u64) -> f64 {
+const fn counter_as_f64(value: u64) -> f64 {
     // These chart labels and percentages are display-only aggregates; the
     // underlying pipeline counters remain exact integers in the snapshot.
     value as f64
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn size_as_f64(value: usize) -> f64 {
+const fn size_as_f64(value: usize) -> f64 {
     // Pool utilization is presented as a percentage in the UI, not used for control flow.
     value as f64
 }

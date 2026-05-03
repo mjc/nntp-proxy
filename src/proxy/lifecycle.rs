@@ -677,7 +677,7 @@ mod tests {
     #[tokio::test]
     async fn test_apply_tcp_optimizations() {
         let config = create_test_config();
-        let proxy = Arc::new(NntpProxy::new(config, RoutingMode::Stateful).await.unwrap());
+        let _proxy = Arc::new(NntpProxy::new(config, RoutingMode::Stateful).await.unwrap());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

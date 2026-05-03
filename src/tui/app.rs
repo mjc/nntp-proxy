@@ -280,14 +280,14 @@ pub struct TuiApp {
 
 impl TuiApp {
     #[allow(clippy::cast_precision_loss)]
-    fn counter_as_f64(value: u64) -> f64 {
+    const fn counter_as_f64(value: u64) -> f64 {
         // TUI throughput and rate calculations are display-only aggregates.
         // The exact counters remain stored as integers in the metrics snapshot.
         value as f64
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn throughput_as_u64(rate: Throughput) -> u64 {
+    const fn throughput_as_u64(rate: Throughput) -> u64 {
         // Displayed per-user byte rates are derived from non-negative throughput
         // samples; truncating fractional bytes/sec matches the existing UI.
         rate.get() as u64
