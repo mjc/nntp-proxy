@@ -8,8 +8,10 @@
 
 use divan::{Bencher, black_box};
 use futures::executor::block_on;
-use nntp_proxy::cache::ArticleEntry;
+use nntp_proxy::cache::{ArticleCache, ArticleEntry};
 use nntp_proxy::protocol::RequestKind;
+use nntp_proxy::types::{BackendId, MessageId};
+use std::time::Duration;
 
 fn main() {
     divan::main();
@@ -26,7 +28,24 @@ It has multiple lines.\r\n\
 .\r\n";
 
 fn article_entry() -> ArticleEntry {
-    ArticleEntry::from_response_bytes(ARTICLE_RESPONSE)
+    cache_entry_from_bytes(ARTICLE_RESPONSE)
+}
+
+fn cache_entry_from_bytes(response: impl AsRef<[u8]>) -> ArticleEntry {
+    let cache = ArticleCache::new(1024 * 1024, Duration::from_secs(300), true);
+    let msg_id = MessageId::from_borrowed(MSG_ID).unwrap();
+
+    block_on(async {
+        cache
+            .upsert(
+                msg_id.clone(),
+                response.as_ref(),
+                BackendId::from_index(0),
+                0.into(),
+            )
+            .await;
+        cache.get(&msg_id).await.expect("bench entry cached")
+    })
 }
 
 fn write_cached_response(entry: &ArticleEntry, request_kind: RequestKind) -> usize {
@@ -66,11 +85,11 @@ mod article_derived_hits {
 }
 
 mod no_payload_entries {
-    use super::{ArticleEntry, Bencher, RequestKind, black_box, write_cached_response};
+    use super::{Bencher, RequestKind, black_box, cache_entry_from_bytes, write_cached_response};
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
     fn missing_entry_returns_none(bencher: Bencher) {
-        let entry = ArticleEntry::from_response_bytes(b"430 No article\r\n");
+        let entry = cache_entry_from_bytes(b"430 No article\r\n");
 
         bencher.bench(|| {
             black_box(write_cached_response(
@@ -82,7 +101,7 @@ mod no_payload_entries {
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
     fn availability_only_returns_none(bencher: Bencher) {
-        let entry = ArticleEntry::from_response_bytes(b"220 42 <bench@example.com>\r\n");
+        let entry = cache_entry_from_bytes(b"220 42 <bench@example.com>\r\n");
 
         bencher.bench(|| {
             black_box(write_cached_response(
@@ -94,16 +113,15 @@ mod no_payload_entries {
 }
 
 mod near_limit_status_line {
-    use super::{ArticleEntry, Bencher, RequestKind, black_box, block_on};
+    use super::{Bencher, RequestKind, black_box, block_on, cache_entry_from_bytes};
 
     const LONG_MSG_ID: &str = "<aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\
 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb@example.com>";
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
     fn stat_with_long_message_id(bencher: Bencher) {
-        let entry = ArticleEntry::from_response_bytes(
-            b"220 42 <x@y>\r\nSubject: Benchmark\r\n\r\nBody\r\n.\r\n",
-        );
+        let entry =
+            cache_entry_from_bytes(b"220 42 <x@y>\r\nSubject: Benchmark\r\n\r\nBody\r\n.\r\n");
 
         bencher.bench(|| {
             black_box(

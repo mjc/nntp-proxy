@@ -3,7 +3,7 @@
 //! Run with: cargo bench --bench cache_ingest_semantic
 
 use divan::{Bencher, black_box};
-use nntp_proxy::cache::{ArticleCache, ArticleEntry};
+use nntp_proxy::cache::ArticleCache;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
 
@@ -27,21 +27,31 @@ const MISSING_RESPONSE: &[u8] = b"430 No article\r\n";
 
 mod semantic_ingest {
     use super::{
-        ArticleEntry, BODY_RESPONSE, Bencher, HEAD_RESPONSE, MISSING_RESPONSE, STAT_RESPONSE,
-        article_response, black_box,
+        ArticleCache, BODY_RESPONSE, BackendId, Bencher, Duration, HEAD_RESPONSE, MISSING_RESPONSE,
+        MessageId, STAT_RESPONSE, article_response, black_box,
     };
 
     macro_rules! bench_ingest {
         ($name:ident, $bytes:expr, $samples:expr) => {
             #[divan::bench(sample_count = $samples, sample_size = 100)]
             fn $name(bencher: Bencher) {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                let cache = ArticleCache::new(16 * 1024 * 1024, Duration::from_secs(300), true);
                 let bytes = $bytes;
                 bencher
                     .counter(divan::counter::BytesCount::new(bytes.len()))
                     .bench(|| {
-                        black_box(ArticleEntry::from_response_bytes(black_box(
-                            bytes.as_slice(),
-                        )))
+                        rt.block_on(async {
+                            let msg_id = MessageId::from_borrowed("<bench@example.com>").unwrap();
+                            cache
+                                .upsert(
+                                    msg_id,
+                                    black_box(bytes.as_slice()),
+                                    BackendId::from_index(0),
+                                    0.into(),
+                                )
+                                .await;
+                        });
                     });
             }
         };
