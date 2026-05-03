@@ -176,12 +176,9 @@ fn trim_ascii(bytes: &[u8]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::RequestLine;
 
     fn classify(command: &str) -> CommandAction<'static> {
-        let request = Box::leak(Box::new(RequestContext::from_request_line(
-            RequestLine::parse(command.as_bytes()),
-        )));
+        let request = Box::leak(Box::new(RequestContext::parse(command.as_bytes())));
         CommandHandler::classify_request(request)
     }
 

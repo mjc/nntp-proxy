@@ -10,7 +10,7 @@
 
 use futures::executor::block_on;
 use nntp_proxy::protocol;
-use nntp_proxy::protocol::{RequestContext, RequestKind, RequestLine, RequestRouteClass};
+use nntp_proxy::protocol::{RequestContext, RequestKind, RequestRouteClass};
 use nntp_proxy::types::MessageId;
 
 fn msgid(value: &str) -> MessageId<'_> {
@@ -41,7 +41,7 @@ fn standard_requests() -> Vec<RequestContext> {
 }
 
 fn assert_class(line: &str, kind: RequestKind, route_class: RequestRouteClass) {
-    let request = RequestLine::parse(line.as_bytes());
+    let request = RequestContext::parse(line.as_bytes());
     assert_eq!(request.kind(), kind, "{line}");
     assert_eq!(request.route_class(), route_class, "{line}");
 }
@@ -320,6 +320,6 @@ fn test_classify_commands() {
     .into_iter()
     .for_each(|(line, kind, route_class)| assert_class(line, kind, route_class));
 
-    let _ = RequestLine::parse(b"");
-    let _ = RequestLine::parse(b"   ");
+    let _ = RequestContext::parse(b"");
+    let _ = RequestContext::parse(b"   ");
 }

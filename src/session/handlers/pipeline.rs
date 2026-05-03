@@ -6,7 +6,7 @@
 //!
 //! Single-command batches fall through to the existing sequential path with zero overhead.
 
-use crate::protocol::{RequestContext, RequestLine};
+use crate::protocol::RequestContext;
 use crate::session::ClientSession;
 use anyhow::Result;
 use tokio::io::AsyncBufReadExt;
@@ -169,16 +169,14 @@ impl ClientSession {
             Err(e) => return Err(e.into()),
         }
 
-        let request_line = RequestLine::parse(command_buf);
-        if !request_line.is_pipelineable() {
+        let request = RequestContext::parse(command_buf);
+        if !request.is_pipelineable() {
             // Single non-pipelineable command → return as trailing
-            return Ok(RequestBatch::trailing(RequestContext::from_request_line(
-                request_line,
-            )));
+            return Ok(RequestBatch::trailing(request));
         }
 
         let mut batch_contexts: smallvec::SmallVec<[RequestContext; 4]> = smallvec::SmallVec::new();
-        batch_contexts.push(RequestContext::from_request_line(request_line));
+        batch_contexts.push(request);
 
         // Read more commands from the buffer (non-blocking)
         while batch_contexts.len() < MAX_PIPELINE_DEPTH {
@@ -202,15 +200,15 @@ impl ClientSession {
                             command_buf.len(),
                         ));
                     }
-                    let request_line = RequestLine::parse(command_buf);
-                    if !request_line.is_pipelineable() {
+                    let request = RequestContext::parse(command_buf);
+                    if !request.is_pipelineable() {
                         // Non-pipelineable command ends the batch
                         return Ok(RequestBatch::contexts_with_trailing(
                             batch_contexts,
-                            RequestContext::from_request_line(request_line),
+                            request,
                         ));
                     }
-                    batch_contexts.push(RequestContext::from_request_line(request_line));
+                    batch_contexts.push(request);
                 }
             }
         }

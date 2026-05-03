@@ -243,7 +243,7 @@ pub struct RequestContext {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RequestLine<'a> {
+struct RequestLine<'a> {
     kind: RequestKind,
     verb: &'a [u8],
     args: &'a [u8],
@@ -286,12 +286,14 @@ impl<'a> RequestLine<'a> {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn message_id(&self) -> Option<&str> {
         let (start, end) = self.message_id?;
         std::str::from_utf8(&self.args[start..end]).ok()
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn message_id_value(&self) -> Option<MessageId<'a>> {
         let (start, end) = self.message_id?;
         MessageId::from_borrowed(std::str::from_utf8(&self.args[start..end]).ok()?).ok()
@@ -303,13 +305,9 @@ impl<'a> RequestLine<'a> {
     }
 
     #[must_use]
+    #[cfg(test)]
     pub fn route_class(&self) -> RequestRouteClass {
         route_class(self.kind, self.message_id.is_some())
-    }
-
-    #[must_use]
-    pub fn is_pipelineable(&self) -> bool {
-        matches!(self.route_class(), RequestRouteClass::ArticleByMessageId)
     }
 }
 
@@ -405,7 +403,7 @@ impl RequestContext {
     }
 
     #[must_use]
-    pub fn from_request_line(line: RequestLine<'_>) -> Self {
+    fn from_request_line(line: RequestLine<'_>) -> Self {
         Self::from_parts(
             line.kind(),
             SmallVec::from_slice(line.verb()),

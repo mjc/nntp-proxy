@@ -17,7 +17,7 @@ supported! {
     use iai_callgrind::{
         Callgrind, EntryPoint, LibraryBenchmarkConfig, library_benchmark, library_benchmark_group, main,
     };
-    use nntp_proxy::protocol::{RequestKind, RequestLine};
+    use nntp_proxy::protocol::{RequestContext, RequestKind};
     use std::hint::black_box;
 
     const REALISTIC_VERBS: &[&[u8]] = &[
@@ -36,7 +36,7 @@ supported! {
     ];
     #[inline(never)]
     fn classify_request_line(verb: &[u8]) -> RequestKind {
-        RequestLine::parse(verb).kind()
+        RequestContext::parse(verb).kind()
     }
 
     #[inline(never)]

@@ -12,19 +12,19 @@
 
 use nntp_proxy::cache::ArticleAvailability;
 use nntp_proxy::cache::ttl::{CacheTier, effective_ttl};
-use nntp_proxy::protocol::{RequestLine, RequestRouteClass, StatusCode};
+use nntp_proxy::protocol::{RequestContext, RequestRouteClass, StatusCode};
 use nntp_proxy::types::MessageId;
 use proptest::prelude::*;
 
 // =============================================================================
-// 1. RequestLine - Classifier robustness and consistency
+// 1. RequestContext - Classifier robustness and consistency
 // =============================================================================
 
 proptest! {
     #[test]
     fn prop_request_context_never_panics(s in ".*") {
         // Parse any already-read request line without panicking
-        let _ = RequestLine::parse(s.as_bytes());
+        let _ = RequestContext::parse(s.as_bytes());
     }
 
     #[test]
@@ -35,8 +35,8 @@ proptest! {
         let upper = format!("{cmd} {arg}");
         let lower = format!("{} {}", cmd.to_lowercase(), arg);
 
-        let upper_result = RequestLine::parse(upper.as_bytes());
-        let lower_result = RequestLine::parse(lower.as_bytes());
+        let upper_result = RequestContext::parse(upper.as_bytes());
+        let lower_result = RequestContext::parse(lower.as_bytes());
 
         // Same classification regardless of case
         prop_assert_eq!(upper_result.kind(), lower_result.kind(), "UPPER vs lower kind differs: {} vs {}", upper, lower);
@@ -46,8 +46,8 @@ proptest! {
     #[test]
     fn prop_trailing_line_ending_idempotent(s in "[A-Za-z0-9]+( [A-Za-z0-9@.<>_-]+)?") {
         let with_crlf = format!("{s}\r\n");
-        let result1 = RequestLine::parse(with_crlf.as_bytes());
-        let result2 = RequestLine::parse(s.as_bytes());
+        let result1 = RequestContext::parse(with_crlf.as_bytes());
+        let result2 = RequestContext::parse(s.as_bytes());
 
         // Request line endings do not affect classification.
         prop_assert_eq!(result1.kind(), result2.kind(), "Line ending changed kind: '{}' vs '{}'", with_crlf, s);
@@ -61,15 +61,15 @@ proptest! {
     ) {
         // With angle brackets, should be ArticleByMessageId
         let with_brackets = format!("{cmd} <{arg}>");
-        let request = RequestLine::parse(with_brackets.as_bytes());
+        let request = RequestContext::parse(with_brackets.as_bytes());
         prop_assert_eq!(request.route_class(), RequestRouteClass::ArticleByMessageId);
     }
 
     #[test]
     fn prop_request_context_deterministic(s in ".*") {
         // Same input always produces same classification
-        let result1 = RequestLine::parse(s.as_bytes());
-        let result2 = RequestLine::parse(s.as_bytes());
+        let result1 = RequestContext::parse(s.as_bytes());
+        let result2 = RequestContext::parse(s.as_bytes());
 
         prop_assert_eq!(result1.kind(), result2.kind(), "Kind not deterministic for: {}", s);
         prop_assert_eq!(result1.route_class(), result2.route_class(), "Route not deterministic for: {}", s);

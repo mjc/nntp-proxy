@@ -63,8 +63,7 @@ fn determine_cache_action(
     cache_articles: bool,
     has_message_id: bool,
 ) -> CacheAction {
-    let request =
-        RequestContext::from_request_line(crate::protocol::RequestLine::parse(command.as_bytes()));
+    let request = RequestContext::parse(command.as_bytes());
     let response_code = StatusCode::new(response_code);
     determine_cache_action_for_request(&request, response_code, cache_articles, has_message_id)
 }
@@ -103,7 +102,7 @@ mod tests {
     use super::*;
 
     fn request(command: &str) -> RequestContext {
-        RequestContext::from_request_line(crate::protocol::RequestLine::parse(command.as_bytes()))
+        RequestContext::parse(command.as_bytes())
     }
 
     // Tests for should_capture_for_cache
