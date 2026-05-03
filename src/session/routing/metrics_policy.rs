@@ -48,10 +48,9 @@ pub fn determine_metrics_action_for_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::RequestLine;
 
     fn determine_metrics_action(command: &str, response_code: u16) -> MetricsAction {
-        let request = RequestContext::from_request_line(RequestLine::parse(command.as_bytes()));
+        let request = RequestContext::parse(command.as_bytes());
         determine_metrics_action_for_request(&request, StatusCode::new(response_code))
     }
 

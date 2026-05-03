@@ -7,7 +7,7 @@
 //! Run with: cargo bench --bench request_serialization
 
 use divan::{Bencher, black_box};
-use nntp_proxy::protocol::{RequestContext, RequestLine, StatusCode};
+use nntp_proxy::protocol::{RequestContext, StatusCode};
 
 fn main() {
     divan::main();
@@ -59,7 +59,7 @@ fn write_request_slices(sink: &mut FixedSink, request: &RequestContext) -> usize
 }
 
 fn request_context(line: &[u8]) -> RequestContext {
-    RequestContext::from_request_line(RequestLine::parse(line))
+    RequestContext::parse(line)
 }
 
 mod single_request {

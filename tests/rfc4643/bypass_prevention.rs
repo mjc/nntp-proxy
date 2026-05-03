@@ -4,14 +4,12 @@
 //! before marking a session as authenticated.
 
 use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
-use nntp_proxy::protocol::{RequestContext, RequestLine};
+use nntp_proxy::protocol::RequestContext;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 fn classify(command: &str) -> CommandAction<'static> {
-    let request = Box::leak(Box::new(RequestContext::from_request_line(
-        RequestLine::parse(command.as_bytes()),
-    )));
+    let request = Box::leak(Box::new(RequestContext::parse(command.as_bytes())));
     CommandHandler::classify_request(request)
 }
 

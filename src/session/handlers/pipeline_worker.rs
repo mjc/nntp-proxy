@@ -260,9 +260,7 @@ async fn read_full_response(
     result_buf: &mut crate::pool::ChunkedResponse,
     pool: &BufferPool,
 ) -> Result<crate::protocol::StatusCode> {
-    let request = crate::protocol::RequestContext::from_request_line(
-        crate::protocol::RequestLine::parse(request_line),
-    );
+    let request = crate::protocol::RequestContext::parse(request_line);
     crate::session::streaming::read_full_response_for_request(
         &request,
         buffer,
@@ -291,7 +289,7 @@ fn fail_batch(mut batch: Vec<QueuedContext>, error: PipelineError) -> Vec<Queued
 mod tests {
     use super::*;
     use crate::pool::BufferPool;
-    use crate::protocol::{RequestContext, RequestLine};
+    use crate::protocol::RequestContext;
     use crate::router::backend_queue::PipelineResponse;
     use crate::stream::ConnectionStream;
     use proptest::prelude::*;
@@ -316,7 +314,7 @@ mod tests {
     }
 
     fn request_context(line: &[u8]) -> RequestContext {
-        RequestContext::from_request_line(RequestLine::parse(line))
+        RequestContext::parse(line)
     }
 
     fn expect_success_status(response: PipelineResponse) -> u16 {

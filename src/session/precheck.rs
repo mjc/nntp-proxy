@@ -427,7 +427,6 @@ pub fn spawn_background_precheck(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::RequestLine;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -537,9 +536,7 @@ mod tests {
             cache_articles: true,
         };
 
-        let request = RequestContext::from_request_line(RequestLine::parse(
-            b"ARTICLE <test@example.com>\r\n",
-        ));
+        let request = RequestContext::parse(b"ARTICLE <test@example.com>\r\n");
         let result = query_backend(&deps, backend_id, &request).await;
         assert_eq!(result, QueryResult::Error(backend_id));
     }

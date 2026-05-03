@@ -504,13 +504,11 @@ impl ClientSession {
 mod tests {
     use super::BackendAttemptResult;
     use super::classify_buffered_response_write_err;
-    use crate::protocol::{
-        RequestContext, RequestLine, RequestResponseMetadata, ResponseWireLen, StatusCode,
-    };
+    use crate::protocol::{RequestContext, RequestResponseMetadata, ResponseWireLen, StatusCode};
     use crate::types::BackendId;
 
     fn request_context(line: &[u8]) -> RequestContext {
-        RequestContext::from_request_line(RequestLine::parse(line))
+        RequestContext::parse(line)
     }
 
     #[test]

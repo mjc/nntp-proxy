@@ -898,7 +898,7 @@ mod tests {
     }
 
     fn request_context(line: &[u8]) -> RequestContext {
-        RequestContext::from_request_line(RequestLine::parse(line))
+        RequestContext::parse(line)
     }
 
     #[test]

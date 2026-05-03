@@ -283,7 +283,6 @@ mod tests {
     use crate::cache::UnifiedCache;
     use crate::metrics::MetricsCollector;
     use crate::pool::{BufferPool, DeadpoolConnectionProvider};
-    use crate::protocol::RequestLine;
     use crate::types::{BufferSize, ClientAddress, ServerName};
     use std::net::SocketAddr;
     use std::time::Duration;
@@ -321,7 +320,7 @@ mod tests {
     }
 
     fn request_context(line: &[u8]) -> RequestContext {
-        RequestContext::from_request_line(RequestLine::parse(line))
+        RequestContext::parse(line)
     }
 
     #[tokio::test]

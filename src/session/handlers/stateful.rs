@@ -2,7 +2,7 @@
 //!
 //! Bidirectional proxy: each client gets a dedicated backend connection.
 
-use crate::protocol::{RequestContext, RequestLine};
+use crate::protocol::RequestContext;
 use crate::session::{ClientSession, common};
 use crate::types::TransferMetrics;
 use anyhow::Result;
@@ -111,8 +111,7 @@ impl ClientSession {
                                 state.add_backend_to_client(COMMAND_TOO_LONG.len() as u64);
                                 continue;
                             }
-                            let request_line = RequestLine::parse(&line);
-                            let request = RequestContext::from_request_line(request_line);
+                            let request = RequestContext::parse(&line);
                             state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
 
                             if state.skip_auth_check {
@@ -121,7 +120,7 @@ impl ClientSession {
                                 // enabled. When auth is disabled skip_auth_check is true from
                                 // the start, and AUTHINFO should be forwarded to the backend.
                                 if self.auth_handler.is_enabled()
-                                    && request_line.kind() == crate::protocol::RequestKind::AuthInfo
+                                    && request.kind() == crate::protocol::RequestKind::AuthInfo
                                 {
                                     use crate::protocol::AUTH_ALREADY_AUTHENTICATED;
                                     client_write.write_all(AUTH_ALREADY_AUTHENTICATED).await?;

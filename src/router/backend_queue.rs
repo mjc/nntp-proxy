@@ -231,12 +231,11 @@ impl std::fmt::Debug for QueuedContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::RequestLine;
     use crate::types::BackendId;
     use std::sync::Arc;
 
     fn request_context(line: &[u8]) -> RequestContext {
-        RequestContext::from_request_line(RequestLine::parse(line))
+        RequestContext::parse(line)
     }
 
     fn queue_depth(queue: &BackendQueue) -> usize {
