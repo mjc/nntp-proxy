@@ -7,7 +7,7 @@
 #![allow(clippy::unused_async)]
 
 use super::hybrid_codec::DiskCachedArticle;
-use super::{CacheIngestBytes, HybridCacheStats};
+use super::{BackendResponseBytes, HybridCacheStats};
 use crate::types::{BackendId, MessageId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,7 +59,7 @@ impl MockHybridCache {
     async fn upsert_ingest(
         &self,
         message_id: MessageId<'_>,
-        buffer: CacheIngestBytes,
+        buffer: BackendResponseBytes,
         backend_id: BackendId,
     ) {
         let key = message_id.without_brackets().to_string();

@@ -367,7 +367,7 @@ impl HybridArticleCache {
     pub(crate) async fn upsert_ingest(
         &self,
         message_id: MessageId<'_>,
-        buffer: super::CacheIngestBytes,
+        buffer: super::BackendResponseBytes,
         backend_id: BackendId,
         tier: super::ttl::CacheTier,
     ) {

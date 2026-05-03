@@ -362,18 +362,22 @@ impl CachedArticle {
 
     #[must_use]
     pub(crate) fn from_ingest_bytes_with_tier(
-        buffer: super::CacheIngestBytes,
+        buffer: super::BackendResponseBytes,
         tier: ttl::CacheTier,
     ) -> Self {
         match buffer {
-            super::CacheIngestBytes::Boxed(buffer) => Self::from_response_with_tier(buffer, tier),
-            super::CacheIngestBytes::Pooled(buffer) => {
+            super::BackendResponseBytes::Owned(buffer) => {
+                Self::from_response_with_tier(buffer, tier)
+            }
+            super::BackendResponseBytes::Pooled(buffer) => {
                 Self::from_response_with_tier(buffer.as_ref(), tier)
             }
-            super::CacheIngestBytes::Chunked(buffer) => {
+            super::BackendResponseBytes::Chunked(buffer) => {
                 Self::from_chunked_response_with_tier(&buffer, tier)
             }
-            super::CacheIngestBytes::Small(buffer) => Self::from_response_with_tier(buffer, tier),
+            super::BackendResponseBytes::Inline(buffer) => {
+                Self::from_response_with_tier(buffer, tier)
+            }
         }
     }
 
@@ -993,7 +997,7 @@ impl ArticleCache {
     pub(crate) async fn upsert_ingest(
         &self,
         message_id: MessageId<'_>,
-        buffer: super::CacheIngestBytes,
+        buffer: super::BackendResponseBytes,
         backend_id: BackendId,
         tier: ttl::CacheTier,
     ) {
