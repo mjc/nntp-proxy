@@ -112,6 +112,7 @@ impl ClientSession {
                                 continue;
                             }
                             let request_line = RequestLine::parse(&line);
+                            let request = RequestContext::from_request_line(request_line);
                             state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
 
                             if state.skip_auth_check {
@@ -129,12 +130,10 @@ impl ClientSession {
                                         AUTH_ALREADY_AUTHENTICATED.len() as u64,
                                     );
                                 } else {
-                                    // Hot path: forward directly
-                                    backend_write.write_all(&line).await?;
-                                    state.add_client_to_backend(line.len());
+                                    request.write_wire_to(&mut backend_write).await?;
+                                    state.add_client_to_backend(request.request_wire_len().get());
                                 }
                             } else {
-                                let request = RequestContext::from_request_line(request_line);
                                 // Auth path
                                 let auth_result = common::handle_stateful_auth_check(
                                     &request,
