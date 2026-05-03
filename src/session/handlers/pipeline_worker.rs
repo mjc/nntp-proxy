@@ -848,6 +848,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pipeline_batches_keep_independent_backend_connection_fifo() {
+        async fn run_backend_batch(
+            backend_id: BackendId,
+            responses: &'static [u8],
+            commands: [&str; 2],
+        ) -> [PipelineResponse; 2] {
+            use tokio::io::AsyncReadExt;
+
+            let pool = BufferPool::for_tests();
+            let metrics = MetricsCollector::new(2);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+
+            tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                stream.write_all(responses).await.unwrap();
+                stream.shutdown().await.unwrap();
+            });
+
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut conn = ConnectionStream::plain(stream);
+            let (req1, rx1) = queued_context(commands[0]);
+            let (req2, rx2) = queued_context(commands[1]);
+            let mut result_buf = crate::pool::ChunkedResponse::default();
+
+            let (success, _batch) = execute_pipeline_batch(
+                backend_id,
+                &mut conn,
+                vec![req1, req2],
+                &metrics,
+                &pool,
+                &mut result_buf,
+            )
+            .await;
+            assert!(success);
+
+            [rx1.await.unwrap(), rx2.await.unwrap()]
+        }
+
+        let backend0 = BackendId::from_index(0);
+        let backend1 = BackendId::from_index(1);
+
+        let (batch0, batch1) = tokio::join!(
+            run_backend_batch(
+                backend0,
+                b"223 0 <b0-a@example> status\r\n430 No such article\r\n",
+                ["STAT <b0-a@example>\r\n", "STAT <b0-b@example>\r\n"],
+            ),
+            run_backend_batch(
+                backend1,
+                b"430 No such article\r\n223 0 <b1-b@example> status\r\n",
+                ["STAT <b1-a@example>\r\n", "STAT <b1-b@example>\r\n"],
+            ),
+        );
+
+        let summarize = |response: PipelineResponse| {
+            let completed = response.expect("pipeline request should complete");
+            (
+                completed.context.backend_id(),
+                completed.context.message_id().map(str::to_owned),
+                completed
+                    .context
+                    .response_metadata()
+                    .map(|metadata| metadata.status().as_u16()),
+            )
+        };
+
+        assert_eq!(
+            batch0.map(summarize),
+            [
+                (Some(backend0), Some("<b0-a@example>".to_owned()), Some(223)),
+                (Some(backend0), Some("<b0-b@example>".to_owned()), Some(430)),
+            ]
+        );
+        assert_eq!(
+            batch1.map(summarize),
+            [
+                (Some(backend1), Some("<b1-a@example>".to_owned()), Some(430)),
+                (Some(backend1), Some("<b1-b@example>".to_owned()), Some(223)),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn test_pipeline_batch_server_disconnect_mid_batch() {
         use tokio::io::AsyncReadExt;
 
