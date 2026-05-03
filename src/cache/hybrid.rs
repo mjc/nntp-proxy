@@ -353,24 +353,14 @@ impl HybridArticleCache {
     /// A cached full article (220/222 response) must not be replaced by STAT availability.
     ///
     /// The tier is stored with the entry for tier-aware TTL calculation.
-    pub async fn upsert_backend_response(
+    pub async fn upsert_ingest(
         &self,
         message_id: MessageId<'_>,
-        buffer: impl AsRef<[u8]>,
+        buffer: impl Into<super::CacheIngestResponse>,
         backend_id: BackendId,
         tier: super::ttl::CacheTier,
     ) {
-        self.upsert_ingest(message_id, buffer.as_ref().into(), backend_id, tier)
-            .await;
-    }
-
-    pub(crate) async fn upsert_ingest(
-        &self,
-        message_id: MessageId<'_>,
-        buffer: super::CacheIngestResponse,
-        backend_id: BackendId,
-        tier: super::ttl::CacheTier,
-    ) {
+        let buffer = buffer.into();
         let key = message_id.without_brackets().to_string();
         let mut entry = if self.config.cache_articles {
             let buffer_len = buffer.len();
@@ -671,7 +661,7 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<test123@example.com>").unwrap();
         let buffer = b"220 0 <test123@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         cache
-            .upsert_backend_response(msg_id, buffer.clone(), BackendId::from_index(0), 0.into())
+            .upsert_ingest(msg_id, buffer.clone(), BackendId::from_index(0), 0.into())
             .await;
 
         // Retrieve it
@@ -702,7 +692,7 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<test123@example.com>").unwrap();
         let buffer = b"220 0 <test123@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         cache
-            .upsert_backend_response(msg_id.clone(), buffer, BackendId::from_index(0), 0.into())
+            .upsert_ingest(msg_id.clone(), buffer, BackendId::from_index(0), 0.into())
             .await;
 
         let entry = cache.get(&msg_id).await.unwrap();

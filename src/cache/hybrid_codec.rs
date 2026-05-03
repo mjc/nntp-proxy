@@ -708,7 +708,7 @@ mod tests {
     // DiskCachedArticle tests
     // =========================================================================
 
-    fn disk_cached_article_from_backend_response(
+    fn disk_cached_article_from_ingest_bytes(
         buffer: impl AsRef<[u8]>,
     ) -> Option<DiskCachedArticle> {
         DiskCachedArticle::from_contiguous_ingest_with_tier(buffer, ttl::CacheTier::new(0))
@@ -718,7 +718,7 @@ mod tests {
     fn test_disk_cached_article_basic() {
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         let mut entry =
-            disk_cached_article_from_backend_response(buffer.clone()).expect("valid status code");
+            disk_cached_article_from_ingest_bytes(buffer.clone()).expect("valid status code");
 
         assert_eq!(
             render_response(&entry, RequestKind::Article, "<test@example.com>").unwrap(),
@@ -736,8 +736,8 @@ mod tests {
     }
 
     #[test]
-    fn disk_cached_article_ingests_backend_response_by_name() {
-        let entry = disk_cached_article_from_backend_response(
+    fn disk_cached_article_ingests_contiguous_ingest_by_name() {
+        let entry = disk_cached_article_from_ingest_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         )
         .expect("valid status code");
@@ -747,8 +747,8 @@ mod tests {
     }
 
     #[test]
-    fn disk_cached_article_ingests_borrowed_backend_response() {
-        let entry = disk_cached_article_from_backend_response(
+    fn disk_cached_article_ingests_borrowed_ingest() {
+        let entry = disk_cached_article_from_ingest_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".as_slice(),
         )
         .expect("valid status code");
@@ -809,7 +809,7 @@ mod tests {
     fn test_disk_cached_article_response_do_not_clone_payload() {
         let buffer = b"220 7 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         let entry =
-            disk_cached_article_from_backend_response(buffer.clone()).expect("valid status code");
+            disk_cached_article_from_ingest_bytes(buffer.clone()).expect("valid status code");
 
         let response = entry
             .cached_response_for(RequestKind::Head, "<test@example.com>")
@@ -825,7 +825,7 @@ mod tests {
 
     #[test]
     fn test_disk_cached_article_availability() {
-        let mut entry = disk_cached_article_from_backend_response(b"220 ok\r\n").expect("valid");
+        let mut entry = disk_cached_article_from_ingest_bytes(b"220 ok\r\n").expect("valid");
 
         for i in 0..8 {
             assert!(entry.should_try_backend(BackendId::from_index(i)));
@@ -849,7 +849,7 @@ mod tests {
     #[test]
     fn test_disk_cached_article_command_matching() {
         let article =
-            disk_cached_article_from_backend_response(b"220 0 <id>\r\nH: V\r\n\r\nB\r\n.\r\n")
+            disk_cached_article_from_ingest_bytes(b"220 0 <id>\r\nH: V\r\n\r\nB\r\n.\r\n")
                 .expect("valid");
         assert!(
             article
@@ -868,7 +868,7 @@ mod tests {
         );
 
         let body =
-            disk_cached_article_from_backend_response(b"222 0 <id>\r\nB\r\n.\r\n").expect("valid");
+            disk_cached_article_from_ingest_bytes(b"222 0 <id>\r\nB\r\n.\r\n").expect("valid");
         assert!(
             body.cached_response_for(RequestKind::Article, "<id>")
                 .is_none()
@@ -882,8 +882,8 @@ mod tests {
                 .is_none()
         );
 
-        let head = disk_cached_article_from_backend_response(b"221 0 <id>\r\nH: V\r\n.\r\n")
-            .expect("valid");
+        let head =
+            disk_cached_article_from_ingest_bytes(b"221 0 <id>\r\nH: V\r\n.\r\n").expect("valid");
         assert!(
             head.cached_response_for(RequestKind::Article, "<id>")
                 .is_none()
@@ -900,16 +900,16 @@ mod tests {
 
     #[test]
     fn test_disk_cached_article_rejects_invalid() {
-        assert!(disk_cached_article_from_backend_response(b"999 invalid\r\n").is_none());
-        assert!(disk_cached_article_from_backend_response(vec![]).is_none());
-        assert!(disk_cached_article_from_backend_response(b"20").is_none());
-        assert!(disk_cached_article_from_backend_response(b"abc\r\n").is_none());
+        assert!(disk_cached_article_from_ingest_bytes(b"999 invalid\r\n").is_none());
+        assert!(disk_cached_article_from_ingest_bytes(vec![]).is_none());
+        assert!(disk_cached_article_from_ingest_bytes(b"20").is_none());
+        assert!(disk_cached_article_from_ingest_bytes(b"abc\r\n").is_none());
 
-        assert!(disk_cached_article_from_backend_response(b"220 article\r\n").is_some());
-        assert!(disk_cached_article_from_backend_response(b"221 head\r\n").is_some());
-        assert!(disk_cached_article_from_backend_response(b"222 body\r\n").is_some());
-        assert!(disk_cached_article_from_backend_response(b"223 stat\r\n").is_some());
-        assert!(disk_cached_article_from_backend_response(b"430 not found\r\n").is_some());
+        assert!(disk_cached_article_from_ingest_bytes(b"220 article\r\n").is_some());
+        assert!(disk_cached_article_from_ingest_bytes(b"221 head\r\n").is_some());
+        assert!(disk_cached_article_from_ingest_bytes(b"222 body\r\n").is_some());
+        assert!(disk_cached_article_from_ingest_bytes(b"223 stat\r\n").is_some());
+        assert!(disk_cached_article_from_ingest_bytes(b"430 not found\r\n").is_some());
     }
 
     // =========================================================================
@@ -918,11 +918,11 @@ mod tests {
 
     #[test]
     fn test_entry_status_code_returns_protocol_status_code() {
-        let entry = disk_cached_article_from_backend_response(b"220 0 <id>\r\n").unwrap();
+        let entry = disk_cached_article_from_ingest_bytes(b"220 0 <id>\r\n").unwrap();
         let sc = entry.status_code();
         assert_eq!(sc.as_u16(), 220);
 
-        let entry = disk_cached_article_from_backend_response(b"430 not found\r\n").unwrap();
+        let entry = disk_cached_article_from_ingest_bytes(b"430 not found\r\n").unwrap();
         let sc = entry.status_code();
         assert_eq!(sc.as_u16(), 430);
     }
@@ -937,7 +937,7 @@ mod tests {
             (b"430 missing\r\n", 430),
         ];
         for (buf, expected) in cases {
-            let entry = disk_cached_article_from_backend_response(buf)
+            let entry = disk_cached_article_from_ingest_bytes(buf)
                 .unwrap_or_else(|| panic!("should accept code {expected}"));
             assert_eq!(entry.status_code().as_u16(), *expected);
         }
@@ -948,7 +948,7 @@ mod tests {
         for code in [200, 201, 211, 411, 480, 500, 502] {
             let buf = format!("{code} response\r\n").into_bytes();
             assert!(
-                disk_cached_article_from_backend_response(buf).is_none(),
+                disk_cached_article_from_ingest_bytes(buf).is_none(),
                 "code {code} should be rejected"
             );
         }
@@ -960,7 +960,7 @@ mod tests {
 
     #[test]
     fn test_code_encode_decode_roundtrip_article() {
-        let entry = disk_cached_article_from_backend_response(
+        let entry = disk_cached_article_from_ingest_bytes(
             b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n",
         )
         .unwrap();
@@ -982,7 +982,7 @@ mod tests {
             b"430 missing\r\n",
         ];
         for raw in buffers {
-            let entry = disk_cached_article_from_backend_response(raw).unwrap();
+            let entry = disk_cached_article_from_ingest_bytes(raw).unwrap();
             let mut encoded = Vec::new();
             entry.encode(&mut encoded).unwrap();
             let decoded = DiskCachedArticle::decode(&mut encoded.as_slice()).unwrap();
@@ -1022,7 +1022,7 @@ mod tests {
 
     #[test]
     fn test_code_encode_decode_preserves_availability() {
-        let mut entry = disk_cached_article_from_backend_response(b"220 ok\r\n").unwrap();
+        let mut entry = disk_cached_article_from_ingest_bytes(b"220 ok\r\n").unwrap();
         entry.record_backend_has(BackendId::from_index(0));
         entry.record_backend_missing(BackendId::from_index(2));
 
@@ -1037,7 +1037,7 @@ mod tests {
 
     #[test]
     fn test_code_estimated_size() {
-        let entry = disk_cached_article_from_backend_response(b"220 article\r\n").unwrap();
+        let entry = disk_cached_article_from_ingest_bytes(b"220 article\r\n").unwrap();
         let expected = 4 + 2 + 2 + 8 + 1 + 1;
         assert_eq!(entry.estimated_size(), expected);
     }
@@ -1048,7 +1048,7 @@ mod tests {
 
     #[test]
     fn test_is_complete_article_220() {
-        let entry = disk_cached_article_from_backend_response(
+        let entry = disk_cached_article_from_ingest_bytes(
             b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n",
         )
         .unwrap();
@@ -1058,7 +1058,7 @@ mod tests {
     #[test]
     fn test_is_complete_article_222() {
         let entry =
-            disk_cached_article_from_backend_response(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n")
+            disk_cached_article_from_ingest_bytes(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n")
                 .unwrap();
         assert!(entry.is_complete_article());
     }
@@ -1066,26 +1066,25 @@ mod tests {
     #[test]
     fn test_is_complete_article_false_for_head() {
         let entry =
-            disk_cached_article_from_backend_response(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n")
-                .unwrap();
+            disk_cached_article_from_ingest_bytes(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
         assert!(!entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_false_for_stat() {
-        let entry = disk_cached_article_from_backend_response(b"223 0 <t@x>\r\n").unwrap();
+        let entry = disk_cached_article_from_ingest_bytes(b"223 0 <t@x>\r\n").unwrap();
         assert!(!entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_false_for_430() {
-        let entry = disk_cached_article_from_backend_response(b"430 not found\r\n").unwrap();
+        let entry = disk_cached_article_from_ingest_bytes(b"430 not found\r\n").unwrap();
         assert!(!entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_false_for_too_small_buffer() {
-        let entry = disk_cached_article_from_backend_response(b"220 ok\r\n.\r\n").unwrap();
+        let entry = disk_cached_article_from_ingest_bytes(b"220 ok\r\n.\r\n").unwrap();
         assert!(!entry.is_complete_article());
     }
 
@@ -1095,7 +1094,7 @@ mod tests {
 
     #[test]
     fn test_cached_response_for_stat_from_220() {
-        let entry = disk_cached_article_from_backend_response(
+        let entry = disk_cached_article_from_ingest_bytes(
             b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n",
         )
         .unwrap();
@@ -1106,8 +1105,7 @@ mod tests {
     #[test]
     fn test_cached_response_for_stat_from_221() {
         let entry =
-            disk_cached_article_from_backend_response(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n")
-                .unwrap();
+            disk_cached_article_from_ingest_bytes(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
         let resp = render_response(&entry, RequestKind::Stat, "<t@x>")
             .expect("should serve STAT from head");
         assert_eq!(resp, b"223 0 <t@x>\r\n");
@@ -1116,7 +1114,7 @@ mod tests {
     #[test]
     fn test_cached_response_for_stat_from_222() {
         let entry =
-            disk_cached_article_from_backend_response(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n")
+            disk_cached_article_from_ingest_bytes(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n")
                 .unwrap();
         let resp = render_response(&entry, RequestKind::Stat, "<t@x>")
             .expect("should serve STAT from body");
@@ -1125,14 +1123,14 @@ mod tests {
 
     #[test]
     fn test_cached_response_for_stat_not_from_430() {
-        let entry = disk_cached_article_from_backend_response(b"430 not found\r\n").unwrap();
+        let entry = disk_cached_article_from_ingest_bytes(b"430 not found\r\n").unwrap();
         assert!(render_response(&entry, RequestKind::Stat, "<t@x>").is_none());
     }
 
     #[test]
     fn test_cached_response_for_article_direct() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = disk_cached_article_from_backend_response(buf.clone()).unwrap();
+        let entry = disk_cached_article_from_ingest_bytes(buf.clone()).unwrap();
         let resp =
             render_response(&entry, RequestKind::Article, "<t@x>").expect("should serve ARTICLE");
         assert_eq!(resp, buf);
@@ -1148,7 +1146,7 @@ mod tests {
     #[test]
     fn test_cached_response_for_body_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = disk_cached_article_from_backend_response(buf.clone()).unwrap();
+        let entry = disk_cached_article_from_ingest_bytes(buf.clone()).unwrap();
         let resp = render_response(&entry, RequestKind::Body, "<t@x>").expect("220 can serve BODY");
         assert_eq!(resp, b"222 0 <t@x>\r\nBody\r\n.\r\n");
     }
@@ -1156,7 +1154,7 @@ mod tests {
     #[test]
     fn test_cached_response_for_head_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = disk_cached_article_from_backend_response(buf.clone()).unwrap();
+        let entry = disk_cached_article_from_ingest_bytes(buf.clone()).unwrap();
         let resp = render_response(&entry, RequestKind::Head, "<t@x>").expect("220 can serve HEAD");
         assert_eq!(resp, b"221 0 <t@x>\r\nSubject: T\r\n.\r\n");
     }
@@ -1164,7 +1162,7 @@ mod tests {
     #[test]
     fn test_cached_response_for_body_cannot_serve_article() {
         let entry =
-            disk_cached_article_from_backend_response(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n")
+            disk_cached_article_from_ingest_bytes(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n")
                 .unwrap();
         assert!(render_response(&entry, RequestKind::Article, "<t@x>").is_none());
     }
@@ -1172,8 +1170,7 @@ mod tests {
     #[test]
     fn test_cached_response_for_head_cannot_serve_body() {
         let entry =
-            disk_cached_article_from_backend_response(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n")
-                .unwrap();
+            disk_cached_article_from_ingest_bytes(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
         assert!(render_response(&entry, RequestKind::Body, "<t@x>").is_none());
     }
 
@@ -1189,7 +1186,7 @@ mod tests {
 
     #[test]
     fn test_with_tier_zero_default() {
-        let entry = disk_cached_article_from_backend_response(b"220 ok\r\n").unwrap();
+        let entry = disk_cached_article_from_ingest_bytes(b"220 ok\r\n").unwrap();
         assert_eq!(entry.tier().get(), 0);
     }
 
@@ -1210,7 +1207,7 @@ mod tests {
 
     #[test]
     fn prop_disk_cached_article_encode_decode_roundtrip_220() {
-        let original = disk_cached_article_from_backend_response(
+        let original = disk_cached_article_from_ingest_bytes(
             b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n",
         )
         .unwrap();
@@ -1227,7 +1224,7 @@ mod tests {
 
     #[test]
     fn prop_disk_cached_article_encode_decode_roundtrip_221() {
-        let original = disk_cached_article_from_backend_response(
+        let original = disk_cached_article_from_ingest_bytes(
             b"221 headers\r\nMid: <test@example.com>\r\n\r\n.\r\n",
         )
         .unwrap();
@@ -1244,7 +1241,7 @@ mod tests {
     #[test]
     fn prop_disk_cached_article_encode_decode_roundtrip_222() {
         let original =
-            disk_cached_article_from_backend_response(b"222 body\r\n\r\nbody content\r\n.\r\n")
+            disk_cached_article_from_ingest_bytes(b"222 body\r\n\r\nbody content\r\n.\r\n")
                 .unwrap();
 
         let mut buffer = Vec::new();
@@ -1258,7 +1255,7 @@ mod tests {
 
     #[test]
     fn prop_disk_cached_article_encode_decode_roundtrip_223() {
-        let original = disk_cached_article_from_backend_response(b"223 stat\r\n.\r\n").unwrap();
+        let original = disk_cached_article_from_ingest_bytes(b"223 stat\r\n.\r\n").unwrap();
 
         let mut buffer = Vec::new();
         original.encode(&mut buffer).unwrap();
@@ -1271,7 +1268,7 @@ mod tests {
 
     #[test]
     fn prop_disk_cached_article_encode_decode_roundtrip_430() {
-        let original = disk_cached_article_from_backend_response(b"430 missing\r\n.\r\n").unwrap();
+        let original = disk_cached_article_from_ingest_bytes(b"430 missing\r\n.\r\n").unwrap();
 
         let mut buffer = Vec::new();
         original.encode(&mut buffer).unwrap();
@@ -1293,7 +1290,7 @@ mod tests {
         ];
 
         for code in &codes {
-            let entry = disk_cached_article_from_backend_response(code).unwrap();
+            let entry = disk_cached_article_from_ingest_bytes(code).unwrap();
             let estimated = entry.estimated_size();
 
             let mut buffer = Vec::new();
@@ -1351,7 +1348,7 @@ mod tests {
 
     #[test]
     fn prop_disk_cached_article_preserves_availability() {
-        let entry = disk_cached_article_from_backend_response(
+        let entry = disk_cached_article_from_ingest_bytes(
             b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n",
         )
         .unwrap();

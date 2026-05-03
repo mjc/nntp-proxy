@@ -37,7 +37,7 @@ use smallvec::SmallVec;
 /// Hot-path code should hand off one of these owned forms directly instead of
 /// flattening into a fresh `Vec<u8>` before spawning cache work.
 #[derive(Debug)]
-pub(crate) enum CacheIngestResponse {
+pub enum CacheIngestResponse {
     Owned(Box<[u8]>),
     Pooled(crate::pool::PooledBuffer),
     Chunked(crate::pool::ChunkedResponse),
@@ -126,6 +126,12 @@ impl From<&[u8]> for CacheIngestResponse {
         } else {
             Self::Owned(value.into())
         }
+    }
+}
+
+impl<const N: usize> From<&[u8; N]> for CacheIngestResponse {
+    fn from(value: &[u8; N]) -> Self {
+        Self::from(value.as_slice())
     }
 }
 
@@ -364,27 +370,14 @@ impl UnifiedCache {
         }
     }
 
-    /// Upsert (insert or update) an article in the cache
-    ///
-    /// The tier is used for tier-aware TTL calculation (higher tier = longer TTL).
-    pub async fn upsert_backend_response(
+    pub async fn upsert_ingest(
         &self,
         message_id: MessageId<'_>,
-        buffer: impl AsRef<[u8]>,
+        buffer: impl Into<CacheIngestResponse>,
         backend_id: BackendId,
         tier: ttl::CacheTier,
     ) {
-        self.upsert_ingest(message_id, buffer.as_ref().into(), backend_id, tier)
-            .await;
-    }
-
-    pub(crate) async fn upsert_ingest(
-        &self,
-        message_id: MessageId<'_>,
-        buffer: CacheIngestResponse,
-        backend_id: BackendId,
-        tier: ttl::CacheTier,
-    ) {
+        let buffer = buffer.into();
         match self {
             Self::Memory(cache) => {
                 cache

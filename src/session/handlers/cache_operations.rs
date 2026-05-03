@@ -361,7 +361,7 @@ mod tests {
         let expected = b"220 0 <hit@example>\r\nHeader: v\r\n\r\nBody\r\n.\r\n";
         session
             .cache
-            .upsert_backend_response(
+            .upsert_ingest(
                 msg_id.clone(),
                 expected.to_vec(),
                 BackendId::from_index(0),

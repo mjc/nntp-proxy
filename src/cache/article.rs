@@ -1013,24 +1013,14 @@ impl ArticleCache {
     /// The tier is stored with the entry for tier-aware TTL calculation.
     ///
     /// CRITICAL: Always re-insert to refresh TTL, and mark backend as having the article.
-    pub async fn upsert_backend_response(
+    pub async fn upsert_ingest(
         &self,
         message_id: MessageId<'_>,
-        buffer: impl AsRef<[u8]>,
+        buffer: impl Into<super::CacheIngestResponse>,
         backend_id: BackendId,
         tier: ttl::CacheTier,
     ) {
-        self.upsert_ingest(message_id, buffer.as_ref().into(), backend_id, tier)
-            .await;
-    }
-
-    pub(crate) async fn upsert_ingest(
-        &self,
-        message_id: MessageId<'_>,
-        buffer: super::CacheIngestResponse,
-        backend_id: BackendId,
-        tier: ttl::CacheTier,
-    ) {
+        let buffer = buffer.into();
         let key: Arc<str> = message_id.without_brackets().into();
         let cache_articles = self.cache_articles;
 
@@ -1348,13 +1338,13 @@ mod tests {
         }
     }
 
-    fn cached_article_from_backend_response(buffer: impl AsRef<[u8]>) -> CachedArticle {
+    fn cached_article_from_ingest_bytes(buffer: impl AsRef<[u8]>) -> CachedArticle {
         CachedArticle::from_contiguous_ingest_with_tier(buffer, ttl::CacheTier::new(0))
     }
 
     fn create_test_cached_article(msgid: &str) -> CachedArticle {
         let buffer = format!("220 0 {msgid}\r\nSubject: Test\r\n\r\nBody\r\n.\r\n").into_bytes();
-        cached_article_from_backend_response(buffer)
+        cached_article_from_ingest_bytes(buffer)
     }
 
     fn rendered(entry: &CachedArticle, request_kind: RequestKind, msgid: &str) -> Vec<u8> {
@@ -1466,7 +1456,7 @@ mod tests {
 
     #[test]
     fn body_payload_serves_body_and_stat_only() {
-        let entry = cached_article_from_backend_response(
+        let entry = cached_article_from_ingest_bytes(
             b"222 0 <test@example.com>\r\nBody content only\r\n.\r\n",
         );
 
@@ -1483,7 +1473,7 @@ mod tests {
 
     #[test]
     fn article_payload_serves_article_head_body_and_stat() {
-        let entry = cached_article_from_backend_response(
+        let entry = cached_article_from_ingest_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         );
 
@@ -1500,9 +1490,8 @@ mod tests {
 
     #[test]
     fn head_payload_serves_head_and_stat_only() {
-        let entry = cached_article_from_backend_response(
-            b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n",
-        );
+        let entry =
+            cached_article_from_ingest_bytes(b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n");
 
         assert_serves(
             &entry,
@@ -1517,11 +1506,10 @@ mod tests {
 
     #[test]
     fn body_payload_completeness_requires_semantic_body() {
-        let complete = cached_article_from_backend_response(
-            b"222 0 <test@example.com>\r\nBody content\r\n.\r\n",
-        );
+        let complete =
+            cached_article_from_ingest_bytes(b"222 0 <test@example.com>\r\nBody content\r\n.\r\n");
         let metadata_only =
-            cached_article_from_backend_response(b"222 0 <test@example.com>\r\n".as_slice());
+            cached_article_from_ingest_bytes(b"222 0 <test@example.com>\r\n".as_slice());
 
         assert!(complete.is_complete_article());
         assert!(!metadata_only.is_complete_article());
@@ -1538,7 +1526,7 @@ mod tests {
         );
 
         cache
-            .upsert_backend_response(
+            .upsert_ingest(
                 msg_id.clone(),
                 complete.as_bytes().to_vec(),
                 backend_id,
@@ -1546,7 +1534,7 @@ mod tests {
             )
             .await;
         cache
-            .upsert_backend_response(
+            .upsert_ingest(
                 msg_id.clone(),
                 b"222 0 <test@example.com>\r\n".to_vec(),
                 backend_id,
@@ -1573,7 +1561,7 @@ mod tests {
         );
 
         cache
-            .upsert_backend_response(
+            .upsert_ingest(
                 msg_id.clone(),
                 b"222 0 <test@example.com>\r\n".to_vec(),
                 backend_id,
@@ -1590,7 +1578,7 @@ mod tests {
         );
 
         cache
-            .upsert_backend_response(
+            .upsert_ingest(
                 msg_id.clone(),
                 complete.as_bytes().to_vec(),
                 backend_id,
@@ -1608,7 +1596,7 @@ mod tests {
     #[test]
     fn test_cached_article_basic() {
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = cached_article_from_backend_response(buffer.clone());
+        let entry = cached_article_from_ingest_bytes(buffer.clone());
 
         assert_eq!(entry.status_code(), StatusCode::new(220));
         assert_eq!(
@@ -1622,8 +1610,8 @@ mod tests {
     }
 
     #[test]
-    fn cached_article_ingests_backend_response_by_name() {
-        let entry = cached_article_from_backend_response(
+    fn cached_article_ingests_contiguous_ingest_by_name() {
+        let entry = cached_article_from_ingest_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         );
 
@@ -1632,8 +1620,8 @@ mod tests {
     }
 
     #[test]
-    fn cached_article_ingests_borrowed_backend_response() {
-        let entry = cached_article_from_backend_response(
+    fn cached_article_ingests_borrowed_ingest() {
+        let entry = cached_article_from_ingest_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".as_slice(),
         );
 
@@ -1643,7 +1631,7 @@ mod tests {
 
     #[test]
     fn cached_article_defaults_to_tier_zero() {
-        let entry = cached_article_from_backend_response(b"220 0 <test@example.com>\r\n.\r\n");
+        let entry = cached_article_from_ingest_bytes(b"220 0 <test@example.com>\r\n.\r\n");
 
         assert_eq!(entry.tier(), ttl::CacheTier::new(0));
     }
@@ -1664,7 +1652,7 @@ mod tests {
         impl SharedSlice for Arc<[u8]> {}
         fn assert_shared_slice<T: SharedSlice>(_: &T) {}
 
-        let entry = cached_article_from_backend_response(
+        let entry = cached_article_from_ingest_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         );
 
@@ -1679,7 +1667,7 @@ mod tests {
 
     #[test]
     fn cached_article_clone_shares_payload_sections() {
-        let entry = cached_article_from_backend_response(
+        let entry = cached_article_from_ingest_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         );
         let cloned = entry.clone();
@@ -1769,29 +1757,28 @@ mod tests {
     #[test]
     fn test_is_complete_article() {
         // Metadata-only responses should NOT be complete articles
-        let metadata_only_430 = cached_article_from_backend_response(b"430\r\n");
+        let metadata_only_430 = cached_article_from_ingest_bytes(b"430\r\n");
         assert!(!metadata_only_430.is_complete_article());
 
-        let metadata_only_220 = cached_article_from_backend_response(b"220\r\n");
+        let metadata_only_220 = cached_article_from_ingest_bytes(b"220\r\n");
         assert!(!metadata_only_220.is_complete_article());
 
-        let metadata_only_223 = cached_article_from_backend_response(b"223\r\n");
+        let metadata_only_223 = cached_article_from_ingest_bytes(b"223\r\n");
         assert!(!metadata_only_223.is_complete_article());
 
         // Full article SHOULD be complete
-        let full = cached_article_from_backend_response(
+        let full = cached_article_from_ingest_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         );
         assert!(full.is_complete_article());
 
         // Wrong status code (not 220) should NOT be complete article
-        let head_response = cached_article_from_backend_response(
-            b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n",
-        );
+        let head_response =
+            cached_article_from_ingest_bytes(b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n");
         assert!(!head_response.is_complete_article());
 
         // Missing terminator should NOT be complete
-        let no_terminator = cached_article_from_backend_response(
+        let no_terminator = cached_article_from_ingest_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n",
         );
         assert!(!no_terminator.is_complete_article());
@@ -1901,7 +1888,7 @@ mod tests {
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
 
         cache
-            .upsert_backend_response(
+            .upsert_ingest(
                 msgid.clone(),
                 buffer.clone(),
                 BackendId::from_index(0),
@@ -1928,7 +1915,7 @@ mod tests {
 
         // Insert with backend 0
         cache
-            .upsert_backend_response(
+            .upsert_ingest(
                 msgid.clone(),
                 buffer.clone(),
                 BackendId::from_index(0),
@@ -1938,7 +1925,7 @@ mod tests {
 
         // Update with backend 1 - does nothing (entry already exists)
         cache
-            .upsert_backend_response(
+            .upsert_ingest(
                 msgid.clone(),
                 buffer.clone(),
                 BackendId::from_index(1),
@@ -2090,7 +2077,7 @@ mod tests {
         let full_size = buffer.len();
 
         cache_metadata_only
-            .upsert_backend_response(msgid.clone(), buffer, BackendId::from_index(0), 0.into())
+            .upsert_ingest(msgid.clone(), buffer, BackendId::from_index(0), 0.into())
             .await;
         cache_metadata_only.sync().await;
 
@@ -2110,7 +2097,7 @@ mod tests {
         let original_payload_size = b"Subject: Test2".len() + b"Body2".len();
 
         cache_full
-            .upsert_backend_response(msgid2.clone(), buffer2, BackendId::from_index(0), 0.into())
+            .upsert_ingest(msgid2.clone(), buffer2, BackendId::from_index(0), 0.into())
             .await;
         cache_full.sync().await;
 
@@ -2181,7 +2168,7 @@ mod tests {
             "222 0 <test@example.com>\r\n{}\r\n.\r\n",
             std::str::from_utf8(&body).unwrap()
         );
-        let article = cached_article_from_backend_response(response.as_bytes());
+        let article = cached_article_from_ingest_bytes(response.as_bytes());
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
         cache.insert(msgid.clone(), article).await;
@@ -2201,7 +2188,7 @@ mod tests {
                 msgid.as_str(),
                 std::str::from_utf8(&body).unwrap()
             );
-            let article = cached_article_from_backend_response(response.as_bytes());
+            let article = cached_article_from_ingest_bytes(response.as_bytes());
             cache.insert(msgid, article).await;
             cache.sync().await;
         }
@@ -2226,7 +2213,7 @@ mod tests {
 
         // Create small metadata-only response (53 bytes)
         let metadata_only = b"223 0 <test@example.com>\r\n".to_vec();
-        let article = cached_article_from_backend_response(metadata_only);
+        let article = cached_article_from_ingest_bytes(metadata_only);
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
         cache.insert(msgid, article).await;
@@ -2242,7 +2229,7 @@ mod tests {
             let msgid_str = format!("<metadata_only{i}@example.com>");
             let msgid = MessageId::new(msgid_str).unwrap();
             let metadata_only = format!("223 0 {}\r\n", msgid.as_str());
-            let article = cached_article_from_backend_response(metadata_only.as_bytes());
+            let article = cached_article_from_ingest_bytes(metadata_only.as_bytes());
             cache.insert(msgid, article).await;
         }
 

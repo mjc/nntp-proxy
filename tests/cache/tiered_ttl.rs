@@ -53,7 +53,7 @@ fn article_bytes(message_id: &str, body: &str) -> Vec<u8> {
 
 async fn upsert_tier(cache: &ArticleCache, message_id: MessageId<'_>, tier: u8, body: &str) {
     cache
-        .upsert_backend_response(
+        .upsert_ingest(
             message_id.clone(),
             article_bytes(message_id.as_str(), body),
             BackendId::from_index(0),
@@ -328,7 +328,7 @@ async fn test_cache_upsert_updates_tier_with_larger_buffer() {
 
     // Upsert with different tier and LARGER buffer (triggers replacement)
     cache
-        .upsert_backend_response(
+        .upsert_ingest(
             msg_id.clone(),
             buffer_large,
             BackendId::from_index(1),
@@ -350,7 +350,7 @@ async fn test_cache_upsert_keeps_tier_without_replacement() {
 
     // Insert with tier 5
     cache
-        .upsert_backend_response(
+        .upsert_ingest(
             msg_id.clone(),
             buffer.clone(),
             BackendId::from_index(0),
@@ -362,7 +362,7 @@ async fn test_cache_upsert_keeps_tier_without_replacement() {
 
     // Upsert with same-sized buffer (doesn't trigger replacement)
     cache
-        .upsert_backend_response(msg_id.clone(), buffer, BackendId::from_index(1), 2.into())
+        .upsert_ingest(msg_id.clone(), buffer, BackendId::from_index(1), 2.into())
         .await;
 
     // Tier should NOT be updated because buffer wasn't replaced

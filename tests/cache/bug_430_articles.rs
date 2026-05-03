@@ -74,7 +74,7 @@ async fn test_race_condition_upsert_vs_sync_availability() -> Result<()> {
     // Now upsert runs with the actual article
     let article_data = b"220 0 <race@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
     cache
-        .upsert_backend_response(
+        .upsert_ingest(
             msg_id.clone(),
             article_data.clone(),
             BackendId::from_index(0),
@@ -105,7 +105,7 @@ async fn test_second_request_gets_article_not_430() -> Result<()> {
     // First request: upsert the article
     let article_data = b"220 0 <second@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
     cache
-        .upsert_backend_response(
+        .upsert_ingest(
             msg_id.clone(),
             article_data.clone(),
             BackendId::from_index(0),
@@ -333,7 +333,7 @@ async fn test_concurrent_upsert_and_sync() -> Result<()> {
         let article_data =
             b"220 0 <concurrent@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         cache1
-            .upsert_backend_response(msg_id1, article_data, BackendId::from_index(0), 0.into())
+            .upsert_ingest(msg_id1, article_data, BackendId::from_index(0), 0.into())
             .await;
     });
 
@@ -378,7 +378,7 @@ async fn test_metadata_only_not_served_as_article() -> Result<()> {
     // First, put a 223 metadata-only response in the cache (as if from STAT precheck)
     // We'll use upsert with a metadata-only response-like buffer to simulate this
     cache
-        .upsert_backend_response(
+        .upsert_ingest(
             msg_id.clone(),
             b"223\r\n".to_vec(),
             BackendId::from_index(0),
@@ -409,7 +409,7 @@ async fn test_precheck_metadata_only_then_article_request() -> Result<()> {
 
     // Step 1: STAT precheck creates a metadata-only response
     cache
-        .upsert_backend_response(
+        .upsert_ingest(
             msg_id.clone(),
             b"223\r\n".to_vec(),
             BackendId::from_index(0),
@@ -433,7 +433,7 @@ async fn test_precheck_metadata_only_then_article_request() -> Result<()> {
         b"220 0 <precheck-then-article@example.com>\r\nSubject: Test\r\n\r\nReal body.\r\n.\r\n"
             .to_vec();
     cache
-        .upsert_backend_response(
+        .upsert_ingest(
             msg_id.clone(),
             real_article.clone(),
             BackendId::from_index(0),
