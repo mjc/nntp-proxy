@@ -111,7 +111,16 @@ impl ClientSession {
                                 state.add_backend_to_client(COMMAND_TOO_LONG.len() as u64);
                                 continue;
                             }
-                            let request = RequestContext::parse(&line);
+                            let Some(request) = RequestContext::parse_valid_client_line(&line) else {
+                                client_write
+                                    .write_all(crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE)
+                                    .await?;
+                                client_write.flush().await?;
+                                state.add_backend_to_client(
+                                    crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE.len() as u64,
+                                );
+                                continue;
+                            };
                             state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
 
                             if state.skip_auth_check {

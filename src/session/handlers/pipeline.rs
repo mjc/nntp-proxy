@@ -25,11 +25,15 @@ pub(super) struct RequestBatch {
     trailing_context: Option<RequestContext>,
     /// True if the trailing command exceeded the 512-byte RFC 3977 limit
     trailing_oversized: bool,
+    /// True if the trailing command was rejected before context creation.
+    trailing_invalid: bool,
     /// Wire length for a trailing oversized command rejected before context creation.
     trailing_wire_len: usize,
     /// True if the first (blocking) command exceeded the 512-byte RFC 3977 limit.
     /// The batch is otherwise empty; caller must send 501 and continue.
     first_oversized: bool,
+    /// True if the first command was rejected before context creation.
+    first_invalid: bool,
 }
 
 impl RequestBatch {
@@ -38,14 +42,23 @@ impl RequestBatch {
             contexts: smallvec::SmallVec::new(),
             trailing_context: None,
             trailing_oversized: false,
+            trailing_invalid: false,
             trailing_wire_len: 0,
             first_oversized: false,
+            first_invalid: false,
         }
     }
 
     fn first_oversized() -> Self {
         Self {
             first_oversized: true,
+            ..Self::empty()
+        }
+    }
+
+    fn first_invalid() -> Self {
+        Self {
+            first_invalid: true,
             ..Self::empty()
         }
     }
@@ -65,8 +78,22 @@ impl RequestBatch {
             contexts,
             trailing_context: None,
             trailing_oversized: true,
+            trailing_invalid: false,
             trailing_wire_len,
             first_oversized: false,
+            first_invalid: false,
+        }
+    }
+
+    fn contexts_with_trailing_invalid(contexts: smallvec::SmallVec<[RequestContext; 4]>) -> Self {
+        Self {
+            contexts,
+            trailing_context: None,
+            trailing_oversized: false,
+            trailing_invalid: true,
+            trailing_wire_len: 0,
+            first_oversized: false,
+            first_invalid: false,
         }
     }
 
@@ -78,8 +105,10 @@ impl RequestBatch {
             contexts,
             trailing_context: Some(trailing_context),
             trailing_oversized: false,
+            trailing_invalid: false,
             trailing_wire_len: 0,
             first_oversized: false,
+            first_invalid: false,
         }
     }
 
@@ -92,7 +121,11 @@ impl RequestBatch {
 
     /// Whether this batch is empty (client disconnected)
     pub(super) fn is_empty(&self) -> bool {
-        self.contexts.is_empty() && self.trailing_context.is_none() && !self.trailing_oversized
+        self.contexts.is_empty()
+            && self.trailing_context.is_none()
+            && !self.trailing_oversized
+            && !self.trailing_invalid
+            && !self.first_invalid
     }
 
     /// Get a typed context by index from the pipelineable commands.
@@ -125,6 +158,11 @@ impl RequestBatch {
         self.trailing_oversized
     }
 
+    /// Whether the trailing command was syntactically invalid.
+    pub const fn is_trailing_invalid(&self) -> bool {
+        self.trailing_invalid
+    }
+
     /// Wire length for the trailing oversized command, if any.
     pub const fn trailing_wire_len(&self) -> usize {
         self.trailing_wire_len
@@ -134,6 +172,11 @@ impl RequestBatch {
     /// When true, the batch is otherwise empty — caller should send 501 and continue.
     pub const fn is_first_oversized(&self) -> bool {
         self.first_oversized
+    }
+
+    /// Whether the first command was syntactically invalid.
+    pub const fn is_first_invalid(&self) -> bool {
+        self.first_invalid
     }
 }
 
@@ -169,7 +212,9 @@ impl ClientSession {
             Err(e) => return Err(e.into()),
         }
 
-        let request = RequestContext::parse(command_buf);
+        let Some(request) = RequestContext::parse_valid_client_line(command_buf) else {
+            return Ok(RequestBatch::first_invalid());
+        };
         if !request.is_pipelineable() {
             // Single non-pipelineable command → return as trailing
             return Ok(RequestBatch::trailing(request));
@@ -200,7 +245,9 @@ impl ClientSession {
                             command_buf.len(),
                         ));
                     }
-                    let request = RequestContext::parse(command_buf);
+                    let Some(request) = RequestContext::parse_valid_client_line(command_buf) else {
+                        return Ok(RequestBatch::contexts_with_trailing_invalid(batch_contexts));
+                    };
                     if !request.is_pipelineable() {
                         // Non-pipelineable command ends the batch
                         return Ok(RequestBatch::contexts_with_trailing(
@@ -297,5 +344,46 @@ mod tests {
         assert!(batch.is_trailing_oversized());
         assert!(batch.trailing_context().is_none());
         assert!(batch.trailing_wire_len() > 512);
+    }
+
+    #[tokio::test]
+    async fn read_command_batch_rejects_empty_first_line_before_context_creation() {
+        let session = test_session();
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(b"\r\n").await.unwrap();
+        drop(client);
+
+        let mut reader = BufReader::new(server);
+        let mut command_buf = Vec::with_capacity(COMMAND);
+
+        let batch = session
+            .read_command_batch(&mut reader, &mut command_buf)
+            .await
+            .unwrap();
+
+        assert!(batch.is_first_invalid());
+        assert_eq!(batch.len(), 0);
+        assert!(batch.trailing_context().is_none());
+    }
+
+    #[tokio::test]
+    async fn read_command_batch_rejects_empty_trailing_line_before_context_creation() {
+        let session = test_session();
+        let (mut client, server) = tokio::io::duplex(4096);
+        client.write_all(b"STAT <a@b>\r\n\r\n").await.unwrap();
+        drop(client);
+
+        let mut reader = BufReader::new(server);
+        let mut command_buf = Vec::with_capacity(COMMAND);
+
+        let batch = session
+            .read_command_batch(&mut reader, &mut command_buf)
+            .await
+            .unwrap();
+
+        assert_eq!(batch.len(), 1);
+        assert_eq!(batch.context(0).kind(), RequestKind::Stat);
+        assert!(batch.is_trailing_invalid());
+        assert!(batch.trailing_context().is_none());
     }
 }

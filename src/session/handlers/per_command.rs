@@ -350,6 +350,18 @@ impl ClientSession {
                 continue;
             }
 
+            if batch.is_first_invalid() {
+                warn!(
+                    "Client {} sent invalid first command, rejecting with 501",
+                    self.client_addr
+                );
+                client_write
+                    .write_all(crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE)
+                    .await
+                    .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                continue;
+            }
+
             if batch.is_empty() {
                 debug!("Client {} disconnected", self.client_addr);
                 break;
@@ -466,6 +478,18 @@ impl ClientSession {
                 );
                 client_write
                     .write_all(crate::protocol::COMMAND_TOO_LONG)
+                    .await
+                    .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                continue;
+            }
+
+            if batch.is_trailing_invalid() {
+                warn!(
+                    "Client {} sent invalid trailing command, rejecting",
+                    self.client_addr
+                );
+                client_write
+                    .write_all(crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE)
                     .await
                     .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                 continue;

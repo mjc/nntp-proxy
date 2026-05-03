@@ -403,6 +403,12 @@ impl RequestContext {
     }
 
     #[must_use]
+    pub(crate) fn parse_valid_client_line(line: &[u8]) -> Option<Self> {
+        let line = RequestLine::parse(line);
+        (!line.verb().is_empty()).then(|| Self::from_request_line(line))
+    }
+
+    #[must_use]
     fn from_request_line(line: RequestLine<'_>) -> Self {
         Self::from_parts(
             line.kind(),
