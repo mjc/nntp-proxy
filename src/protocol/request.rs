@@ -43,6 +43,19 @@ pub enum RequestKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResponseBodyKind {
+    SingleLine,
+    Multiline,
+}
+
+impl ResponseBodyKind {
+    #[must_use]
+    pub const fn is_multiline(self) -> bool {
+        matches!(self, Self::Multiline)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestRouteClass {
     ArticleByMessageId,
     Stateless,
@@ -763,13 +776,13 @@ impl RequestContext {
     }
 
     #[must_use]
-    pub fn expects_multiline_body(&self, status: StatusCode) -> bool {
+    pub fn response_body_kind(&self, status: StatusCode) -> ResponseBodyKind {
         let code = status.as_u16();
         if status.is_error() {
-            return false;
+            return ResponseBodyKind::SingleLine;
         }
 
-        matches!(
+        if matches!(
             (self.kind, code),
             (RequestKind::Article, 220)
                 | (RequestKind::Head, 221)
@@ -782,7 +795,16 @@ impl RequestContext {
                 | (RequestKind::Hdr | RequestKind::Xhdr, 225)
                 | (RequestKind::NewNews, 230)
                 | (RequestKind::NewGroups, 231)
-        )
+        ) {
+            ResponseBodyKind::Multiline
+        } else {
+            ResponseBodyKind::SingleLine
+        }
+    }
+
+    #[must_use]
+    pub fn expects_multiline_body(&self, status: StatusCode) -> bool {
+        self.response_body_kind(status).is_multiline()
     }
 }
 
@@ -1301,10 +1323,17 @@ mod tests {
     fn request_aware_multiline_body_expectation() {
         let group = request_context(b"GROUP alt.test\r\n");
         let listgroup = request_context(b"LISTGROUP alt.test\r\n");
-        assert!(!group.expects_multiline_body(StatusCode::new(211)));
-        assert!(listgroup.expects_multiline_body(StatusCode::new(211)));
-        assert!(
-            !request_context(b"ARTICLE <x@y>\r\n").expects_multiline_body(StatusCode::new(430))
+        assert_eq!(
+            group.response_body_kind(StatusCode::new(211)),
+            ResponseBodyKind::SingleLine
+        );
+        assert_eq!(
+            listgroup.response_body_kind(StatusCode::new(211)),
+            ResponseBodyKind::Multiline
+        );
+        assert_eq!(
+            request_context(b"ARTICLE <x@y>\r\n").response_body_kind(StatusCode::new(430)),
+            ResponseBodyKind::SingleLine
         );
     }
 }
