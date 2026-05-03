@@ -63,9 +63,7 @@ impl ClientSession {
 
         // Extract availability before any early returns so we can pass it back
         let availability = cached.to_availability(router.backend_count());
-        if let Some(metadata) = cache_entry_metadata(&cached, &availability) {
-            request.record_cache_entry_metadata(metadata);
-        }
+        request.record_cache_entry_metadata(cache_entry_metadata(&cached, &availability));
 
         if !cached.has_availability_info() {
             debug!(
@@ -215,15 +213,15 @@ fn cache_availability_metadata(availability: &ArticleAvailability) -> RequestCac
 fn cache_entry_metadata(
     cached: &crate::cache::ArticleEntry,
     availability: &ArticleAvailability,
-) -> Option<RequestCacheEntryMetadata> {
-    Some(RequestCacheEntryMetadata::new(
+) -> RequestCacheEntryMetadata {
+    RequestCacheEntryMetadata::new(
         cached.status_code(),
         cache_availability_metadata(availability),
         RequestCacheTier::new(cached.tier().get()),
         RequestCacheTimestampMillis::new(cached.inserted_at().get()),
         cache_payload_kind(cached.payload_kind()),
         cache_article_number(cached.article_number()),
-    ))
+    )
 }
 
 fn cache_article_number(
