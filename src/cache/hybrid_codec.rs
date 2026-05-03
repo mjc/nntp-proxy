@@ -375,12 +375,12 @@ fn encoded_payload_size(payload: &CachedPayload) -> usize {
 }
 
 impl DiskCachedArticle {
-    /// Parse a cold backend response into typed cache metadata and payload.
+    /// Parse a contiguous ingest response into typed cache metadata and payload.
     ///
     /// Returns `None` if the status code is invalid or not cacheable. The entry
     /// stores semantic payload sections, not the original response.
     #[must_use]
-    fn from_backend_response_with_tier(
+    fn from_contiguous_ingest_with_tier(
         response: impl AsRef<[u8]>,
         tier: ttl::CacheTier,
     ) -> Option<Self> {
@@ -405,22 +405,22 @@ impl DiskCachedArticle {
     ) -> Option<Self> {
         match buffer {
             super::CacheIngestResponse::Owned(buffer) => {
-                Self::from_backend_response_with_tier(buffer, tier)
+                Self::from_contiguous_ingest_with_tier(buffer, tier)
             }
             super::CacheIngestResponse::Pooled(buffer) => {
-                Self::from_backend_response_with_tier(buffer.as_ref(), tier)
+                Self::from_contiguous_ingest_with_tier(buffer.as_ref(), tier)
             }
             super::CacheIngestResponse::Chunked(buffer) => {
-                Self::from_chunked_response_with_tier(&buffer, tier)
+                Self::from_chunked_ingest_with_tier(&buffer, tier)
             }
             super::CacheIngestResponse::Inline(buffer) => {
-                Self::from_backend_response_with_tier(buffer, tier)
+                Self::from_contiguous_ingest_with_tier(buffer, tier)
             }
         }
     }
 
     #[must_use]
-    fn from_chunked_response_with_tier(
+    fn from_chunked_ingest_with_tier(
         buffer: &crate::pool::ChunkedResponse,
         tier: ttl::CacheTier,
     ) -> Option<Self> {
@@ -711,7 +711,7 @@ mod tests {
     fn disk_cached_article_from_backend_response(
         buffer: impl AsRef<[u8]>,
     ) -> Option<DiskCachedArticle> {
-        DiskCachedArticle::from_backend_response_with_tier(buffer, ttl::CacheTier::new(0))
+        DiskCachedArticle::from_contiguous_ingest_with_tier(buffer, ttl::CacheTier::new(0))
     }
 
     #[test]
@@ -1007,7 +1007,7 @@ mod tests {
 
     #[test]
     fn test_code_encode_decode_preserves_tier() {
-        let entry = DiskCachedArticle::from_backend_response_with_tier(
+        let entry = DiskCachedArticle::from_contiguous_ingest_with_tier(
             b"220 article\r\n",
             ttl::CacheTier::new(3),
         )
@@ -1179,7 +1179,7 @@ mod tests {
 
     #[test]
     fn test_with_tier_sets_tier() {
-        let entry = DiskCachedArticle::from_backend_response_with_tier(
+        let entry = DiskCachedArticle::from_contiguous_ingest_with_tier(
             b"220 ok\r\n",
             ttl::CacheTier::new(5),
         )
@@ -1196,7 +1196,7 @@ mod tests {
     #[test]
     fn test_with_tier_rejects_invalid_code() {
         assert!(
-            DiskCachedArticle::from_backend_response_with_tier(
+            DiskCachedArticle::from_contiguous_ingest_with_tier(
                 b"999 bad\r\n",
                 ttl::CacheTier::new(0)
             )
@@ -1333,7 +1333,7 @@ mod tests {
     #[test]
     fn prop_disk_cached_article_preserves_tier() {
         for tier in [0u8, 1, 5, 10, 255] {
-            let entry = DiskCachedArticle::from_backend_response_with_tier(
+            let entry = DiskCachedArticle::from_contiguous_ingest_with_tier(
                 b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n",
                 ttl::CacheTier::new(tier),
             )

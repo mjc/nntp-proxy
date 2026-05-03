@@ -345,9 +345,9 @@ impl CachedArticle {
         }
     }
 
-    /// Parse a cold backend response into typed cache metadata and payload.
+    /// Parse a contiguous ingest response into typed cache metadata and payload.
     #[must_use]
-    pub fn from_backend_response_with_tier(
+    pub fn from_contiguous_ingest_with_tier(
         response: impl AsRef<[u8]>,
         tier: ttl::CacheTier,
     ) -> Self {
@@ -370,22 +370,22 @@ impl CachedArticle {
     ) -> Self {
         match buffer {
             super::CacheIngestResponse::Owned(buffer) => {
-                Self::from_backend_response_with_tier(buffer, tier)
+                Self::from_contiguous_ingest_with_tier(buffer, tier)
             }
             super::CacheIngestResponse::Pooled(buffer) => {
-                Self::from_backend_response_with_tier(buffer.as_ref(), tier)
+                Self::from_contiguous_ingest_with_tier(buffer.as_ref(), tier)
             }
             super::CacheIngestResponse::Chunked(buffer) => {
-                Self::from_chunked_response_with_tier(&buffer, tier)
+                Self::from_chunked_ingest_with_tier(&buffer, tier)
             }
             super::CacheIngestResponse::Inline(buffer) => {
-                Self::from_backend_response_with_tier(buffer, tier)
+                Self::from_contiguous_ingest_with_tier(buffer, tier)
             }
         }
     }
 
     #[must_use]
-    pub fn from_chunked_response_with_tier(
+    pub fn from_chunked_ingest_with_tier(
         buffer: &crate::pool::ChunkedResponse,
         tier: ttl::CacheTier,
     ) -> Self {
@@ -1349,7 +1349,7 @@ mod tests {
     }
 
     fn cached_article_from_backend_response(buffer: impl AsRef<[u8]>) -> CachedArticle {
-        CachedArticle::from_backend_response_with_tier(buffer, ttl::CacheTier::new(0))
+        CachedArticle::from_contiguous_ingest_with_tier(buffer, ttl::CacheTier::new(0))
     }
 
     fn create_test_cached_article(msgid: &str) -> CachedArticle {
@@ -1650,7 +1650,7 @@ mod tests {
 
     #[test]
     fn cached_article_can_ingest_with_tier_internally() {
-        let entry = CachedArticle::from_backend_response_with_tier(
+        let entry = CachedArticle::from_contiguous_ingest_with_tier(
             b"220 0 <test@example.com>\r\n.\r\n",
             ttl::CacheTier::new(5),
         );

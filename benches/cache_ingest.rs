@@ -1,4 +1,4 @@
-//! Benchmarks for cache ingestion from backend responses.
+//! Benchmarks for cache ingestion from typed ingest responses.
 //!
 //! Run with: cargo bench --bench cache_ingest
 
@@ -125,7 +125,7 @@ mod entry_parse {
                 bencher
                     .counter(divan::counter::BytesCount::new(bytes.len()))
                     .bench(|| {
-                        black_box(CachedArticle::from_chunked_response_with_tier(
+                        black_box(CachedArticle::from_chunked_ingest_with_tier(
                             black_box(&chunked),
                             CacheTier::new(0),
                         ))
