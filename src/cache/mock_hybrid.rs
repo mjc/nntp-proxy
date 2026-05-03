@@ -178,9 +178,43 @@ impl MockHybridCache {
 mod tests {
     use super::*;
     use crate::protocol::RequestKind;
+    use anyhow::Result;
+    use futures::executor::block_on;
 
     fn msg_id() -> MessageId<'static> {
         MessageId::from_borrowed("<mock-hybrid@example>").expect("valid message id")
+    }
+
+    fn msgid(value: &str) -> MessageId<'_> {
+        MessageId::from_borrowed(value).unwrap()
+    }
+
+    fn response_bytes(
+        entry: &HybridArticleEntry,
+        request_kind: RequestKind,
+        message_id: &MessageId<'_>,
+    ) -> Option<Vec<u8>> {
+        let response = entry.response_for(request_kind, message_id.as_str())?;
+        let mut out = Vec::with_capacity(response.wire_len().get());
+        block_on(response.write_to(&mut out)).ok()?;
+        Some(out)
+    }
+
+    fn assert_article(entry: &HybridArticleEntry, message_id: &MessageId<'_>, expected: &[u8]) {
+        assert_eq!(
+            response_bytes(entry, RequestKind::Article, message_id).unwrap(),
+            expected
+        );
+    }
+
+    fn assert_availability(entry: &HybridArticleEntry, cases: &[(usize, bool)]) {
+        cases.iter().for_each(|(backend_index, should_try)| {
+            assert_eq!(
+                entry.should_try_backend(BackendId::from_index(*backend_index)),
+                *should_try,
+                "backend {backend_index}"
+            );
+        });
     }
 
     #[tokio::test]
@@ -210,5 +244,167 @@ mod tests {
             "longer raw wire stubs must not replace semantic article payloads"
         );
         assert!(entry.should_try_backend(BackendId::from_index(1)));
+    }
+
+    #[tokio::test]
+    async fn basic_ops() -> Result<()> {
+        let cache = MockHybridCache::new(1024 * 1024);
+
+        let message_id = msgid("<test@example.com>");
+        let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n";
+
+        cache
+            .upsert(
+                message_id.clone(),
+                buffer.as_slice(),
+                BackendId::from_index(0),
+            )
+            .await;
+
+        assert_article(
+            &cache.get(&message_id).await.expect("Entry should exist"),
+            &message_id,
+            buffer,
+        );
+
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 1);
+        assert_eq!(stats.misses, 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upsert_accepts_borrowed_backend_bytes() -> Result<()> {
+        let cache = MockHybridCache::new(1024 * 1024);
+        let message_id = msgid("<borrowed@example.com>");
+        let buffer = b"220 0 <borrowed@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n";
+
+        cache
+            .upsert(
+                message_id.clone(),
+                buffer.as_slice(),
+                BackendId::from_index(0),
+            )
+            .await;
+
+        assert_article(
+            &cache.get(&message_id).await.expect("cached entry"),
+            &message_id,
+            buffer,
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cache_miss_updates_stats() -> Result<()> {
+        let cache = MockHybridCache::new(1024 * 1024);
+
+        let message_id = msgid("<nonexistent@example.com>");
+        let entry = cache.get(&message_id).await;
+
+        assert!(entry.is_none());
+
+        let stats = cache.stats();
+        assert_eq!(stats.hits, 0);
+        assert_eq!(stats.misses, 1);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn upsert_preserves_larger_buffer() -> Result<()> {
+        let cache = MockHybridCache::new(1024 * 1024);
+
+        let message_id = msgid("<test@example.com>");
+
+        let large_buffer =
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nLarge body content here\r\n.\r\n";
+        cache
+            .upsert(
+                message_id.clone(),
+                large_buffer.as_slice(),
+                BackendId::from_index(0),
+            )
+            .await;
+
+        cache
+            .upsert(
+                message_id.clone(),
+                b"223 0 <test@example.com>\r\n".as_slice(),
+                BackendId::from_index(1),
+            )
+            .await;
+
+        let entry = cache.get(&message_id).await.unwrap();
+        assert_article(&entry, &message_id, large_buffer);
+        assert_availability(&entry, &[(0, true), (1, true)]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn record_missing_creates_availability_entry() -> Result<()> {
+        let cache = MockHybridCache::new(1024 * 1024);
+
+        let message_id = msgid("<missing@example.com>");
+
+        cache
+            .record_missing(message_id.clone(), BackendId::from_index(0))
+            .await;
+
+        let entry = cache.get(&message_id).await;
+        assert!(entry.is_some());
+
+        let entry = entry.unwrap();
+        assert_availability(&entry, &[(0, false), (1, true)]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tracks_availability() -> Result<()> {
+        let cache = MockHybridCache::new(1024 * 1024);
+
+        let message_id = msgid("<avail@example.com>");
+
+        cache
+            .upsert(
+                message_id.clone(),
+                b"220 0 <avail@example.com>\r\nBody\r\n.\r\n".as_slice(),
+                BackendId::from_index(0),
+            )
+            .await;
+
+        cache
+            .record_missing(message_id.clone(), BackendId::from_index(1))
+            .await;
+        cache
+            .record_missing(message_id.clone(), BackendId::from_index(2))
+            .await;
+
+        let entry = cache.get(&message_id).await.unwrap();
+        assert_availability(&entry, &[(0, true), (1, false), (2, false), (3, true)]);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn close_succeeds() -> Result<()> {
+        let cache = MockHybridCache::new(1024 * 1024);
+
+        let message_id = msgid("<test@example.com>");
+        cache
+            .upsert(
+                message_id,
+                b"220 0 <test@example.com>\r\n.\r\n".as_slice(),
+                BackendId::from_index(0),
+            )
+            .await;
+
+        cache.close().await?;
+
+        Ok(())
     }
 }
