@@ -8,16 +8,8 @@
 //! - Response status parsing functions (pure, easily testable)
 //! - Command execution helpers - Send command, read response
 //!
-//! # Usage
-//!
-//! ```ignore
-//! use crate::session::backend::{send_request, BackendFirstResponse};
-//!
-//! let response = send_request(&mut conn, &request, &mut buffer).await?;
-//! if response.is_430() {
-//!     // Article not found
-//! }
-//! ```
+//! Backend requests and response parsing are driven by `RequestContext`; callers
+//! should not rebuild command strings after request validation.
 
 use anyhow::Result;
 use smallvec::SmallVec;

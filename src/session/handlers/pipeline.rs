@@ -17,7 +17,7 @@ const MAX_PIPELINE_DEPTH: usize = 16;
 /// A batch of requests read from the client's TCP buffer.
 ///
 /// Uses typed contexts for pipelineable requests and the trailing
-/// non-pipelineable line, avoiding parallel raw command state.
+/// non-pipelineable line, keeping one request model for the whole batch.
 pub(super) struct RequestBatch {
     /// Typed contexts for each pipelineable command.
     contexts: smallvec::SmallVec<[RequestContext; 4]>,

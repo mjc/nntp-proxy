@@ -25,7 +25,7 @@ pub enum CacheAction {
 /// - 220 = ARTICLE (full article - headers + body)
 /// - 221 = HEAD (headers only - don't cache)
 /// - 222 = BODY (body only - cache this for yEnc content)
-/// - 223 = STAT (status only)
+/// - 223 = STAT (availability, no payload)
 #[inline]
 fn should_capture_for_cache(
     request: &RequestContext,

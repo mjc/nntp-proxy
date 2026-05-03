@@ -248,7 +248,8 @@ async fn execute_pipeline_batch(
 
 /// Read a complete NNTP response (status line + multiline body if applicable).
 ///
-/// Fills `result_buf` with the full response bytes and returns the parsed status code.
+/// Fills `result_buf` with the response bytes for the supplied request context
+/// and returns the parsed status code.
 ///
 /// `result_buf` is cleared and reused for each response to avoid per-response allocations.
 #[cfg(test)]

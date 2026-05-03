@@ -70,7 +70,7 @@ impl NntpClient {
 
     /// Fetch article body (BODY command)
     ///
-    /// Returns `PooledBuffer` with the raw response.
+    /// Returns `PooledBuffer` with the backend response bytes.
     /// Parse with `Article::parse(&buffer, validate_yenc)`.
     ///
     /// # Arguments
@@ -85,7 +85,7 @@ impl NntpClient {
 
     /// Fetch article headers (HEAD command)
     ///
-    /// Returns `PooledBuffer` with the raw response.
+    /// Returns `PooledBuffer` with the backend response bytes.
     /// Parse with `Article::parse(&buffer, false)`.
     ///
     /// # Arguments
@@ -100,7 +100,7 @@ impl NntpClient {
 
     /// Fetch full article (ARTICLE command)
     ///
-    /// Returns `PooledBuffer` with the raw response.
+    /// Returns `PooledBuffer` with the backend response bytes.
     /// Parse with `Article::parse(&buffer, validate_yenc)`.
     ///
     /// # Arguments
