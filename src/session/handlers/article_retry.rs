@@ -438,24 +438,17 @@ impl ClientSession {
             request.kind(),
             request.verb()
         );
-        // Extract message-ID early for cache/availability tracking
-        let msg_id = request.message_id_value().map(|msg_id| msg_id.to_owned());
-
         debug!(
             "Client {} msg_id={:?}, cache_articles={}",
-            self.client_addr, msg_id, self.cache_articles
+            self.client_addr,
+            request.message_id(),
+            self.cache_articles
         );
 
         // Try cache first - may return early if cache hit.
         // On partial hit, the request carries availability info to avoid a redundant cache.get().
         let cached_availability = match self
-            .try_serve_from_cache(
-                msg_id.as_ref(),
-                request,
-                &router,
-                client_write,
-                backend_to_client_bytes,
-            )
+            .try_serve_from_cache(request, &router, client_write, backend_to_client_bytes)
             .await?
         {
             CacheLookupResult::Hit => return Ok(()),
@@ -467,6 +460,7 @@ impl ClientSession {
             }),
             CacheLookupResult::Miss => None,
         };
+        let msg_id = request.message_id_value().map(|msg_id| msg_id.to_owned());
 
         // H3: Hoist availability loading before pipeline/retry branch (compute once, use in both paths)
         // O1: cached_availability already contains the result of cache.get() - reuse it
@@ -478,28 +472,29 @@ impl ClientSession {
             && (request.is_stat() || request.is_head())
         {
             let deps = self.precheck_deps(&router);
-            let bytes_written =
-                if let Some(entry) = precheck::precheck(&deps, request, msg_id_ref).await {
-                    if let Some(write) =
-                        write_cached_article_response(client_write, &entry, request, msg_id_ref)
-                            .await
-                            .map_err(|e| SessionError::from(anyhow::Error::from(e)))?
-                    {
-                        write.wire_len.get()
-                    } else {
-                        client_write
-                            .write_all(crate::protocol::NO_SUCH_ARTICLE)
-                            .await
-                            .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
-                        crate::protocol::NO_SUCH_ARTICLE.len()
-                    }
+            let bytes_written = if let Some(entry) =
+                precheck::precheck(&deps, request, msg_id_ref).await
+            {
+                if let Some(write) =
+                    write_cached_article_response(client_write, &entry, request.kind(), msg_id_ref)
+                        .await
+                        .map_err(|e| SessionError::from(anyhow::Error::from(e)))?
+                {
+                    write.wire_len.get()
                 } else {
                     client_write
                         .write_all(crate::protocol::NO_SUCH_ARTICLE)
                         .await
                         .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                     crate::protocol::NO_SUCH_ARTICLE.len()
-                };
+                }
+            } else {
+                client_write
+                    .write_all(crate::protocol::NO_SUCH_ARTICLE)
+                    .await
+                    .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                crate::protocol::NO_SUCH_ARTICLE.len()
+            };
             *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written);
             return Ok(());
         }

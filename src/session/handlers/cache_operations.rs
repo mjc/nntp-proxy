@@ -8,7 +8,7 @@ use crate::cache::ttl::CacheTier;
 use crate::protocol::{
     RequestCacheArticleNumber, RequestCacheAvailability, RequestCacheEntryMetadata,
     RequestCachePayloadKind, RequestCacheStatus, RequestCacheTier, RequestCacheTimestampMillis,
-    RequestContext, RequestResponseMetadata, ResponseWireLen, StatusCode,
+    RequestContext, RequestKind, RequestResponseMetadata, ResponseWireLen, StatusCode,
 };
 use crate::router::BackendSelector;
 use crate::session::{ClientSession, precheck};
@@ -39,27 +39,27 @@ impl ClientSession {
     /// wasn't servable, or `Miss`.
     pub(super) async fn try_serve_from_cache(
         &self,
-        msg_id: Option<&crate::types::MessageId<'_>>,
         request: &mut RequestContext,
         router: &Arc<BackendSelector>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<CacheLookupResult> {
-        let Some(msg_id_ref) = msg_id else {
+        let Some(msg_id_for_lookup) = request.message_id_value() else {
             request.record_cache_status(RequestCacheStatus::Miss);
             return Ok(CacheLookupResult::Miss);
         };
 
         debug!(
             "Client {} checking cache for {}",
-            self.client_addr, msg_id_ref
+            self.client_addr, msg_id_for_lookup
         );
 
-        let Some(cached) = self.cache.get(msg_id_ref).await else {
-            debug!("Cache MISS for message-ID: {}", msg_id_ref);
+        let Some(cached) = self.cache.get(&msg_id_for_lookup).await else {
+            debug!("Cache MISS for message-ID: {}", msg_id_for_lookup);
             request.record_cache_status(RequestCacheStatus::Miss);
             return Ok(CacheLookupResult::Miss);
         };
+        drop(msg_id_for_lookup);
 
         // Extract stored availability before any early returns so we can pass it back.
         // Cache-hit metadata should preserve both checked and missing bits; retry routing
@@ -70,7 +70,7 @@ impl ClientSession {
         if !cached.has_availability_info() {
             debug!(
                 "Cache entry exists for {} but no availability info (missing=0) - running precheck",
-                msg_id_ref
+                request.message_id().unwrap_or("<invalid>")
             );
             request.record_cache_status(RequestCacheStatus::PartialHit);
             return Ok(CacheLookupResult::PartialHit);
@@ -78,7 +78,9 @@ impl ClientSession {
 
         debug!(
             "Client {} cache HIT for {} (cache_articles={})",
-            self.client_addr, msg_id_ref, self.cache_articles
+            self.client_addr,
+            request.message_id().unwrap_or("<invalid>"),
+            self.cache_articles
         );
 
         // If full article caching enabled, try to serve from cache
@@ -89,7 +91,10 @@ impl ClientSession {
                 precheck::spawn_background_precheck(
                     self.precheck_deps(router),
                     request.clone(),
-                    msg_id_ref.to_owned(),
+                    request
+                        .message_id_value()
+                        .expect("cached request still has message id")
+                        .to_owned(),
                 );
             }
             request.record_cache_status(RequestCacheStatus::PartialHit);
@@ -103,7 +108,7 @@ impl ClientSession {
             debug!(
                 "Client {} cache entry for {} has no complete payload (payload_len={}), fetching full article",
                 self.client_addr,
-                msg_id_ref,
+                request.message_id().unwrap_or("<invalid>"),
                 cached.payload_len().get()
             );
             request.record_cache_status(RequestCacheStatus::PartialHit);
@@ -112,19 +117,23 @@ impl ClientSession {
 
         // Serve from cache, avoiding buffer copies for the common path.
         // STAT is synthesized (tiny response), everything else writes directly from typed payload sections.
+        let request_kind = request.kind();
+        let msg_id_for_write = request
+            .message_id_value()
+            .expect("cached request still has message id");
         let Some(write) =
-            write_cached_article_response(client_write, &cached, request, msg_id_ref).await?
+            write_cached_article_response(client_write, &cached, request_kind, &msg_id_for_write)
+                .await?
         else {
             let status_code = cached.status_code().as_u16();
             debug!(
                 "Client {} cached response (code={}) can't serve request kind {:?}",
-                self.client_addr,
-                status_code,
-                request.kind()
+                self.client_addr, status_code, request_kind
             );
             request.record_cache_status(RequestCacheStatus::PartialHit);
             return Ok(CacheLookupResult::PartialHit);
         };
+        drop(msg_id_for_write);
         *backend_to_client_bytes = backend_to_client_bytes.add(write.wire_len.get());
 
         request.record_cache_response(write.metadata());
@@ -258,13 +267,13 @@ impl CachedResponseWrite {
 pub(super) async fn write_cached_article_response<W>(
     client_write: &mut W,
     cached: &crate::cache::ArticleEntry,
-    request: &RequestContext,
+    request_kind: RequestKind,
     msg_id: &MessageId<'_>,
 ) -> std::io::Result<Option<CachedResponseWrite>>
 where
     W: AsyncWrite + Unpin,
 {
-    let Some(response) = cached.response_for(request.kind(), msg_id.as_str()) else {
+    let Some(response) = cached.response_for(request_kind, msg_id.as_str()) else {
         return Ok(None);
     };
     let wire_len = response.wire_len();
@@ -330,19 +339,9 @@ mod tests {
         let (mut client, _server) = tcp_write_pair().await;
         let (_read, mut write) = client.split();
         let mut request = request_context(b"ARTICLE <missing@example>\r\n");
-        let msg_id = request
-            .message_id_value()
-            .map(|msg_id| msg_id.to_owned())
-            .expect("message id");
 
         let result = session
-            .try_serve_from_cache(
-                Some(&msg_id),
-                &mut request,
-                &router,
-                &mut write,
-                &mut metrics,
-            )
+            .try_serve_from_cache(&mut request, &router, &mut write, &mut metrics)
             .await
             .expect("lookup succeeds");
 
@@ -361,7 +360,7 @@ mod tests {
         let mut request = request_context(b"DATE\r\n");
 
         let result = session
-            .try_serve_from_cache(None, &mut request, &router, &mut write, &mut metrics)
+            .try_serve_from_cache(&mut request, &router, &mut write, &mut metrics)
             .await
             .expect("lookup succeeds");
 
@@ -393,13 +392,7 @@ mod tests {
         let mut request = request_context(b"ARTICLE <hit@example>\r\n");
 
         let result = session
-            .try_serve_from_cache(
-                Some(&msg_id),
-                &mut request,
-                &router,
-                &mut write,
-                &mut metrics,
-            )
+            .try_serve_from_cache(&mut request, &router, &mut write, &mut metrics)
             .await
             .expect("lookup succeeds");
 
@@ -477,13 +470,7 @@ mod tests {
         let mut request = request_context(b"ARTICLE <partial@example>\r\n");
 
         let result = session
-            .try_serve_from_cache(
-                Some(&msg_id),
-                &mut request,
-                &router,
-                &mut write,
-                &mut metrics,
-            )
+            .try_serve_from_cache(&mut request, &router, &mut write, &mut metrics)
             .await
             .expect("lookup succeeds");
 
