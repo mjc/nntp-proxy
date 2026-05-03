@@ -154,6 +154,10 @@ harness = false
 name = "tail_buffer_boundaries"
 harness = false
 
+[[bench]]
+name = "end_to_end_proxy"
+harness = false
+
 
 [profile.dev]
 split-debuginfo = "unpacked"  # Faster linking — don't bundle debuginfo into binary
