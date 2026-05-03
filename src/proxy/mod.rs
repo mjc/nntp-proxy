@@ -29,7 +29,7 @@ use crate::router;
 
 #[derive(Debug, Clone)]
 pub struct NntpProxy {
-    pub(super) servers: Arc<Vec<Server>>,
+    pub(super) servers: Arc<[Server]>,
     /// Backend selector for round-robin load balancing
     pub(super) router: Arc<router::BackendSelector>,
     /// Connection providers per server - easily swappable implementation

@@ -173,7 +173,7 @@ impl NntpProxyBuilder {
 
         let backend_strategy = self.config.proxy.backend_selection;
         let cache_config = self.config.cache;
-        let servers = Arc::new(self.config.servers);
+        let servers: Arc<[Server]> = self.config.servers.into();
 
         let router = Arc::new({
             use types::BackendId;
@@ -372,7 +372,7 @@ pub(super) struct BuildContext {
     connection_providers: Vec<DeadpoolConnectionProvider>,
     buffer_pool: BufferPool,
     metrics: MetricsCollector,
-    servers: Arc<Vec<Server>>,
+    servers: Arc<[Server]>,
     router: Arc<router::BackendSelector>,
     auth_handler: Arc<AuthHandler>,
     adaptive_precheck: bool,

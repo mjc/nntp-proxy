@@ -157,7 +157,7 @@ impl ThroughputHistory {
 pub struct TuiAppBuilder {
     metrics: MetricsCollector,
     router: Arc<BackendSelector>,
-    servers: Arc<Vec<Server>>,
+    servers: Arc<[Server]>,
     cache: Option<Arc<crate::cache::UnifiedCache>>,
     buffer_pool: Option<crate::pool::BufferPool>,
     log_buffer: Option<LogBuffer>,
@@ -170,7 +170,7 @@ impl TuiAppBuilder {
     pub const fn new(
         metrics: MetricsCollector,
         router: Arc<BackendSelector>,
-        servers: Arc<Vec<Server>>,
+        servers: Arc<[Server]>,
     ) -> Self {
         Self {
             metrics,
@@ -251,7 +251,7 @@ pub struct TuiApp {
     /// Router for getting pending command counts
     router: Arc<BackendSelector>,
     /// Server configurations for display names
-    servers: Arc<Vec<Server>>,
+    servers: Arc<[Server]>,
     /// Current metrics snapshot (Arc for zero-cost sharing)
     snapshot: Arc<MetricsSnapshot>,
     /// Historical throughput data per backend
@@ -287,7 +287,7 @@ impl TuiApp {
     pub fn new(
         metrics: MetricsCollector,
         router: Arc<BackendSelector>,
-        servers: Arc<Vec<Server>>,
+        servers: Arc<[Server]>,
     ) -> Self {
         TuiAppBuilder::new(metrics, router, servers).build()
     }
@@ -559,20 +559,19 @@ mod tests {
     use std::time::Duration;
 
     /// Helper to create test servers
-    fn create_test_servers(count: usize) -> Arc<Vec<Server>> {
-        Arc::new(
-            (0..count)
-                .map(|i| {
-                    Server::builder(
-                        format!("backend{i}.example.com"),
-                        Port::try_new(119).unwrap(),
-                    )
-                    .name(format!("Backend {i}"))
-                    .build()
-                    .unwrap()
-                })
-                .collect(),
-        )
+    fn create_test_servers(count: usize) -> Arc<[Server]> {
+        (0..count)
+            .map(|i| {
+                Server::builder(
+                    format!("backend{i}.example.com"),
+                    Port::try_new(119).unwrap(),
+                )
+                .name(format!("Backend {i}"))
+                .build()
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .into()
     }
 
     /// Helper to create test `TuiApp`
@@ -593,12 +592,13 @@ mod tests {
     fn test_previous_snapshot_uses_new_snapshot_not_old() {
         let metrics = MetricsCollector::new(1);
         let router = Arc::new(BackendSelector::new());
-        let servers = Arc::new(vec![
+        let servers: Arc<[Server]> = vec![
             Server::builder("test.example.com", Port::try_new(119).unwrap())
                 .name("Test Server".to_string())
                 .build()
                 .unwrap(),
-        ]);
+        ]
+        .into();
 
         let mut app = TuiApp::new(metrics.clone(), router, servers);
 

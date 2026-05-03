@@ -127,7 +127,7 @@ fn launch_tui(
             let mut builder = tui::TuiAppBuilder::new(
                 proxy.metrics().clone(),
                 proxy.router().clone(),
-                proxy.servers().to_vec().into(),
+                Arc::from(proxy.servers()),
             );
 
             // Add log buffer if available

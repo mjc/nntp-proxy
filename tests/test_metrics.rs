@@ -7,7 +7,6 @@ use nntp_proxy::types::{
     ArticleBytesTotal, BackendId, BackendToClientBytes, BytesPerSecondRate, BytesReceived,
     BytesSent, ClientToBackendBytes, TimingMeasurementCount, TotalConnections,
 };
-use std::sync::Arc;
 use std::time::Duration;
 
 #[test]
@@ -235,7 +234,7 @@ fn test_metrics_snapshot_with_multiple_backends() {
         client_to_backend_bytes: ClientToBackendBytes::new(1500),
         backend_to_client_bytes: BackendToClientBytes::new(15000),
         uptime: Duration::from_secs(100),
-        backend_stats: Arc::new(vec![stats1, stats2]),
+        backend_stats: vec![stats1, stats2].into(),
         ..Default::default()
     };
 
