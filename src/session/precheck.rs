@@ -119,174 +119,127 @@ async fn execute_backend_query(
         return Ok(QueryResult::Error);
     };
     let mut conn = crate::pool::ConnectionGuard::new(conn_raw, provider.clone());
-    let mut buffer = deps.buffer_pool.acquire().await;
-    let (cmd_response, timings) = send_precheck_request(&mut conn, request, &mut buffer).await?;
-    let Some(status_code) = cmd_response.status_code() else {
-        return Err(());
-    };
-    let hit = build_precheck_hit(
-        deps,
-        request,
-        status_code,
-        &mut conn,
-        &mut buffer,
-        cmd_response.bytes_read,
-    )
-    .await?;
-    let result = query_result_from_status(deps, backend_id, status_code, timings, hit);
-    let _ = conn.release();
-    Ok(result)
-}
 
-async fn send_precheck_request(
-    conn: &mut crate::pool::ConnectionGuard,
-    request: &RequestContext,
-    buffer: &mut crate::pool::PooledBuffer,
-) -> Result<(backend::BackendFirstResponse, Option<(u64, u64, u64)>), ()> {
-    if should_sample_backend_timing() {
-        backend::send_request_timed(&mut ***conn, request, buffer)
+    let mut buffer = deps.buffer_pool.acquire().await;
+
+    let response = if should_sample_backend_timing() {
+        backend::send_request_timed(&mut **conn, request, &mut buffer)
             .await
             .map(|(response, ttfb, send, recv)| (response, Some((ttfb, send, recv))))
-            .map_err(|_| ())
     } else {
-        backend::send_request(&mut ***conn, request, buffer)
+        backend::send_request(&mut **conn, request, &mut buffer)
             .await
             .map(|response| (response, None))
-            .map_err(|_| ())
-    }
-}
+    };
 
-async fn build_precheck_hit(
-    deps: &OwnedDeps,
-    request: &RequestContext,
-    status_code: StatusCode,
-    conn: &mut crate::pool::ConnectionGuard,
-    buffer: &mut crate::pool::PooledBuffer,
-    bytes_read: usize,
-) -> Result<PrecheckHit, ()> {
-    if request.expects_multiline_response(status_code) {
-        return capture_multiline_precheck(deps, conn, buffer, bytes_read)
-            .await
-            .map(|response| {
-                response.map_or_else(
-                    || PrecheckHit::Availability(status_code),
-                    |response| {
-                        PrecheckHit::Payload(crate::cache::CacheIngestResponse::Chunked(response))
-                    },
-                )
-            });
-    }
-    if deps.cache_articles {
-        return Ok(PrecheckHit::Payload(
-            crate::cache::CacheIngestResponse::from(&buffer[..bytes_read]),
-        ));
-    }
-
-    Ok(PrecheckHit::Availability(status_code))
-}
-
-async fn capture_multiline_precheck(
-    deps: &OwnedDeps,
-    conn: &mut crate::pool::ConnectionGuard,
-    buffer: &mut crate::pool::PooledBuffer,
-    bytes_read: usize,
-) -> Result<Option<crate::pool::ChunkedResponse>, ()> {
-    use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
-
-    let mut response = deps
-        .cache_articles
-        .then(crate::pool::ChunkedResponse::default);
-    if let Some(response) = &mut response {
-        response.extend_from_slice(&deps.buffer_pool, &buffer[..bytes_read]);
-    }
-
-    let mut tail = TailBuffer::default();
-    match tail.detect_terminator(&buffer[..bytes_read]) {
-        TerminatorStatus::FoundAt(pos) => {
-            if pos < bytes_read && conn.stash_leftover(&buffer[pos..bytes_read]).is_err() {
+    // Use shared backend request execution with sampled timing
+    match response {
+        Ok((cmd_response, timings)) => {
+            let Some(status_code) = cmd_response.status_code() else {
+                // Invalid response - conn drops → remove_with_cooldown
                 return Err(());
-            }
-            if let Some(response) = &mut response {
-                response.truncate(pos);
-            }
-            Ok(response)
-        }
-        TerminatorStatus::NotFound => {
-            tail.update(&buffer[..bytes_read]);
-            collect_remaining_precheck_response(deps, conn, buffer, &mut tail, &mut response)
-                .await?;
-            Ok(response)
-        }
-    }
-}
+            };
 
-async fn collect_remaining_precheck_response(
-    deps: &OwnedDeps,
-    conn: &mut crate::pool::ConnectionGuard,
-    buffer: &mut crate::pool::PooledBuffer,
-    tail: &mut crate::session::streaming::tail_buffer::TailBuffer,
-    response: &mut Option<crate::pool::ChunkedResponse>,
-) -> Result<(), ()> {
-    use crate::session::streaming::tail_buffer::TerminatorStatus;
-
-    loop {
-        match buffer.read_from(&mut ***conn).await {
-            Ok(0) | Err(_) => return Err(()),
-            Ok(n) => match tail.detect_terminator(&buffer[..n]) {
-                TerminatorStatus::FoundAt(pos) => {
-                    if pos < n && conn.stash_leftover(&buffer[pos..n]).is_err() {
-                        return Err(());
-                    }
-                    if let Some(response) = response {
-                        response.extend_from_slice(&deps.buffer_pool, &buffer[..pos]);
-                    }
-                    return Ok(());
+            let response = if request.expects_multiline_response(status_code) {
+                use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
+                let mut response = deps
+                    .cache_articles
+                    .then(crate::pool::ChunkedResponse::default);
+                if let Some(response) = &mut response {
+                    response
+                        .extend_from_slice(&deps.buffer_pool, &buffer[..cmd_response.bytes_read]);
                 }
-                TerminatorStatus::NotFound => {
-                    tail.update(&buffer[..n]);
-                    if let Some(response) = response {
-                        response.extend_from_slice(&deps.buffer_pool, &buffer[..n]);
+                let mut tail = TailBuffer::default();
+                match tail.detect_terminator(buffer.as_ref()) {
+                    TerminatorStatus::FoundAt(pos) => {
+                        // pos is after the terminator (terminator included in [..pos])
+                        if pos < cmd_response.bytes_read
+                            && conn
+                                .stash_leftover(&buffer[pos..cmd_response.bytes_read])
+                                .is_err()
+                        {
+                            return Err(());
+                        }
+                        if let Some(response) = &mut response {
+                            response.truncate(pos);
+                        }
+                    }
+                    TerminatorStatus::NotFound => {
+                        tail.update(buffer.as_ref());
+                        loop {
+                            match buffer.read_from(conn.as_mut()).await {
+                                Ok(0) | Err(_) => return Err(()),
+                                Ok(n) => match tail.detect_terminator(&buffer[..n]) {
+                                    TerminatorStatus::FoundAt(pos) => {
+                                        if pos < n && conn.stash_leftover(&buffer[pos..n]).is_err()
+                                        {
+                                            return Err(());
+                                        }
+                                        if let Some(response) = &mut response {
+                                            response.extend_from_slice(
+                                                &deps.buffer_pool,
+                                                &buffer[..pos],
+                                            );
+                                        }
+                                        break;
+                                    }
+                                    TerminatorStatus::NotFound => {
+                                        tail.update(&buffer[..n]);
+                                        if let Some(response) = &mut response {
+                                            response
+                                                .extend_from_slice(&deps.buffer_pool, &buffer[..n]);
+                                        }
+                                    }
+                                },
+                            }
+                        }
                     }
                 }
-            },
-        }
-    }
-}
+                if let Some(response) = response {
+                    PrecheckHit::Payload(crate::cache::CacheIngestResponse::Chunked(response))
+                } else {
+                    PrecheckHit::Availability(status_code)
+                }
+            } else if deps.cache_articles {
+                PrecheckHit::Payload(crate::cache::CacheIngestResponse::from(
+                    &buffer[..cmd_response.bytes_read],
+                ))
+            } else {
+                PrecheckHit::Availability(status_code)
+            };
 
-fn query_result_from_status(
-    deps: &OwnedDeps,
-    backend_id: BackendId,
-    status_code: StatusCode,
-    timings: Option<(u64, u64, u64)>,
-    hit: PrecheckHit,
-) -> QueryResult {
-    match status_code.as_u16() {
-        220..=223 => {
-            record_precheck_metrics(deps, backend_id, timings);
-            tracing::debug!(
-                backend = backend_id.as_index(),
-                "precheck recording command to metrics"
-            );
-            QueryResult::Found(backend_id, hit)
-        }
-        430 => {
-            record_precheck_metrics(deps, backend_id, timings);
-            deps.metrics.record_error_4xx(backend_id);
-            QueryResult::Missing(backend_id)
-        }
-        _ => QueryResult::Error,
-    }
-}
+            let result = match status_code.as_u16() {
+                220..=223 => {
+                    tracing::debug!(
+                        backend = backend_id.as_index(),
+                        "precheck recording command to metrics"
+                    );
+                    deps.metrics.record_command(backend_id);
+                    if let Some((ttfb, send, recv)) = timings {
+                        deps.metrics.record_ttfb_micros(backend_id, ttfb);
+                        deps.metrics.record_send_recv_micros(backend_id, send, recv);
+                    }
+                    QueryResult::Found(backend_id, response)
+                }
+                430 => {
+                    deps.metrics.record_command(backend_id);
+                    if let Some((ttfb, send, recv)) = timings {
+                        deps.metrics.record_ttfb_micros(backend_id, ttfb);
+                        deps.metrics.record_send_recv_micros(backend_id, send, recv);
+                    }
+                    deps.metrics.record_error_4xx(backend_id);
+                    QueryResult::Missing(backend_id)
+                }
+                _ => QueryResult::Error,
+            };
 
-fn record_precheck_metrics(
-    deps: &OwnedDeps,
-    backend_id: BackendId,
-    timings: Option<(u64, u64, u64)>,
-) {
-    deps.metrics.record_command(backend_id);
-    if let Some((ttfb, send, recv)) = timings {
-        deps.metrics.record_ttfb_micros(backend_id, ttfb);
-        deps.metrics.record_send_recv_micros(backend_id, send, recv);
+            let _ = conn.release(); // response received; connection healthy, return to pool
+            Ok(result)
+        }
+        Err(_) => {
+            // Connection error - conn drops → remove_with_cooldown
+            Err(())
+        }
     }
 }
 
@@ -592,7 +545,7 @@ mod tests {
 
         let deps = OwnedDeps {
             router: Arc::new(selector),
-            cache: Arc::new(UnifiedCache::memory(100, Duration::from_mins(1), true)),
+            cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
             buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 2),
             metrics: MetricsCollector::new(1),
             cache_articles: true,
@@ -605,13 +558,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_precheck_availability_hit_records_no_payload() {
-        use crate::cache::CachedPayloadKind;
+    async fn cache_precheck_availability_hit_does_not_persist_positive_entry() {
         use crate::cache::UnifiedCache;
         use crate::types::BackendId;
 
         let backend_id = BackendId::from_index(0);
-        let cache = UnifiedCache::memory(100, Duration::from_mins(1), false);
+        let cache = UnifiedCache::availability(100);
         let msg_id = MessageId::new("<test@example.com>".to_string()).unwrap();
 
         cache_precheck_hit(
@@ -623,10 +575,9 @@ mod tests {
         )
         .await;
 
-        let entry = cache.get(&msg_id).await.expect("entry cached");
-        assert_eq!(entry.status_code(), StatusCode::new(223));
-        assert_eq!(entry.payload_kind(), CachedPayloadKind::AvailabilityOnly);
-        assert_eq!(entry.payload_len().get(), 0);
-        assert!(entry.has_availability_info());
+        assert!(
+            cache.get(&msg_id).await.is_none(),
+            "availability-only index should persist negatives, not optimistic positive hits"
+        );
     }
 }

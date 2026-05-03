@@ -16,26 +16,26 @@ use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
 
 fn assert_multiplier_cases(cases: &[(u8, u64)]) {
-    for (tier, expected) in cases {
+    cases.iter().for_each(|(tier, expected)| {
         assert_eq!(
             ttl_multiplier(CacheTier::new(*tier)),
             *expected,
             "tier {tier}"
         );
-    }
+    });
 }
 
 fn assert_effective_ttl_cases(base_ttl: u64, cases: &[(u8, u64)]) {
-    for (tier, expected) in cases {
+    cases.iter().for_each(|(tier, expected)| {
         assert_eq!(
             effective_ttl_ms(base_ttl, CacheTier::new(*tier)),
             *expected,
             "tier {tier}"
         );
-    }
+    });
 }
 
-const fn effective_ttl_ms(base_ttl: u64, tier: CacheTier) -> u64 {
+fn effective_ttl_ms(base_ttl: u64, tier: CacheTier) -> u64 {
     effective_ttl(CacheTtlMillis::new(base_ttl), tier).get()
 }
 
@@ -156,9 +156,9 @@ fn test_max_ttl_tier_constant() {
 fn test_is_expired_fresh_entry() {
     let now = now_millis();
     // Just inserted with 1s TTL - should not be expired
-    for tier in [0, 1, 63] {
+    [0, 1, 63].into_iter().for_each(|tier| {
         assert!(!is_expired_ms(now, 1000, CacheTier::new(tier)));
-    }
+    });
 }
 
 #[test]
@@ -201,20 +201,18 @@ fn test_is_expired_high_tier_extension() {
     // 100s ago with 1s base TTL
     let inserted = now.saturating_sub(100_000);
 
-    for tier in 0..=6 {
-        assert!(is_expired_ms(inserted, 1000, CacheTier::new(tier)));
-    }
-    for tier in [7, 10] {
+    (0..=6).for_each(|tier| assert!(is_expired_ms(inserted, 1000, CacheTier::new(tier))));
+    [7, 10].into_iter().for_each(|tier| {
         assert!(!is_expired_ms(inserted, 1000, CacheTier::new(tier)));
-    }
+    });
 }
 
 #[test]
 fn test_is_expired_zero_ttl_always_expires() {
     let now = now_millis();
-    for tier in [0, 1, 63] {
+    [0, 1, 63].into_iter().for_each(|tier| {
         assert!(is_expired_ms(now, 0, CacheTier::new(tier)));
-    }
+    });
 }
 
 #[test]
@@ -232,7 +230,7 @@ fn test_is_expired_future_timestamp() {
 #[tokio::test]
 async fn test_cache_tier_0_expires_at_base_ttl() {
     // Use very short TTL for testing
-    let cache = ArticleCache::new(1_000_000, Duration::from_millis(50), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_millis(50));
 
     let msg_id = MessageId::from_borrowed("<tier0-test@example.com>").unwrap();
 
@@ -252,7 +250,7 @@ async fn test_cache_tier_0_expires_at_base_ttl() {
 #[tokio::test]
 async fn test_cache_higher_tier_longer_ttl() {
     // Use 200ms base TTL for more reliable timing
-    let cache = ArticleCache::new(1_000_000, Duration::from_millis(200), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_millis(200));
 
     let msg_id = MessageId::from_borrowed("<tier1-test@example.com>").unwrap();
 
@@ -285,7 +283,7 @@ async fn test_cache_higher_tier_longer_ttl() {
 #[tokio::test]
 async fn test_cache_tier_2_even_longer() {
     // Use 200ms base TTL for more reliable timing
-    let cache = ArticleCache::new(1_000_000, Duration::from_millis(200), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_millis(200));
 
     let msg_id = MessageId::from_borrowed("<tier2-test@example.com>").unwrap();
 
@@ -305,7 +303,7 @@ async fn test_cache_tier_2_even_longer() {
 
 #[tokio::test]
 async fn test_cache_preserves_tier_on_get() {
-    let cache = ArticleCache::new(1_000_000, Duration::from_mins(1), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(60));
 
     let msg_id = MessageId::from_borrowed("<tier-preserve@example.com>").unwrap();
 
@@ -318,7 +316,7 @@ async fn test_cache_preserves_tier_on_get() {
 
 #[tokio::test]
 async fn test_cache_upsert_updates_tier_with_larger_buffer() {
-    let cache = ArticleCache::new(1_000_000, Duration::from_mins(1), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(60));
 
     let msg_id = MessageId::from_borrowed("<tier-update@example.com>").unwrap();
     let buffer_large = article_bytes(msg_id.as_str(), "Larger body content here");
@@ -345,7 +343,7 @@ async fn test_cache_upsert_updates_tier_with_larger_buffer() {
 #[tokio::test]
 async fn test_cache_upsert_keeps_tier_without_replacement() {
     // Verify that tier is NOT updated when buffer isn't replaced
-    let cache = ArticleCache::new(1_000_000, Duration::from_mins(1), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(60));
 
     let msg_id = MessageId::from_borrowed("<tier-keep@example.com>").unwrap();
     let buffer = article_bytes(msg_id.as_str(), "Body");

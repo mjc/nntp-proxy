@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::auth::AuthHandler;
@@ -273,8 +273,9 @@ impl NntpProxyBuilder {
             let capacity = cache_config.max_capacity.as_u64();
             let cache_articles = cache_config.cache_articles;
 
-            // Check if disk cache is configured
-            let cache = if let Some(disk_config) = &cache_config.disk {
+            let cache = if !cache_articles {
+                Arc::new(UnifiedCache::availability(capacity))
+            } else if let Some(disk_config) = &cache_config.disk {
                 let hybrid_config = HybridCacheConfig {
                     memory_capacity: capacity,
                     disk_path: disk_config.path.clone(),
@@ -282,7 +283,6 @@ impl NntpProxyBuilder {
                     shards: disk_config.shards,
                     compression: disk_config.compression,
                     ttl: cache_config.ttl,
-                    cache_articles,
                 };
 
                 info!(
@@ -298,21 +298,14 @@ impl NntpProxyBuilder {
                         .context("Failed to initialize hybrid disk cache")?,
                 )
             } else {
-                Arc::new(UnifiedCache::memory(
-                    capacity,
-                    cache_config.ttl,
-                    cache_articles,
-                ))
+                Arc::new(UnifiedCache::memory(capacity, cache_config.ttl))
             };
 
             Self::log_cache_config(cache_config, cache_articles);
             (cache, cache_articles)
         } else {
             debug!("Cache not configured, using availability-only mode (capacity=0)");
-            (
-                Arc::new(UnifiedCache::memory(0, Duration::from_hours(1), false)),
-                true,
-            )
+            (Arc::new(UnifiedCache::availability(0)), false)
         };
 
         Ok(ctx.into_proxy(cache, cache_articles))
@@ -334,34 +327,28 @@ impl NntpProxyBuilder {
         let (ctx, cache_config) = self.build_infrastructure()?;
 
         // Create article cache (memory-only in sync version)
-        let (cache, cache_articles) = cache_config.as_ref().map_or_else(
-            || {
-                debug!("Cache not configured, using availability-only mode (capacity=0)");
-                (
-                    Arc::new(UnifiedCache::memory(0, Duration::from_hours(1), false)),
-                    true,
-                )
-            },
-            |cache_config| {
-                let capacity = cache_config.max_capacity.as_u64();
-                let cache_articles = cache_config.cache_articles;
+        let (cache, cache_articles) = if let Some(cache_config) = &cache_config {
+            let capacity = cache_config.max_capacity.as_u64();
+            let cache_articles = cache_config.cache_articles;
 
-                if cache_config.disk.is_some() {
-                    warn!(
-                        "Disk cache configured but build_sync() called - using memory-only cache. Use build() for disk cache support."
-                    );
-                }
+            if cache_config.disk.is_some() && cache_articles {
+                warn!(
+                    "Disk cache configured but build_sync() called - using memory-only cache. Use build() for disk cache support."
+                );
+            }
 
-                let cache = Arc::new(UnifiedCache::memory(
-                    capacity,
-                    cache_config.ttl,
-                    cache_articles,
-                ));
+            let cache = if cache_articles {
+                Arc::new(UnifiedCache::memory(capacity, cache_config.ttl))
+            } else {
+                Arc::new(UnifiedCache::availability(capacity))
+            };
 
-                Self::log_cache_config(cache_config, cache_articles);
-                (cache, cache_articles)
-            },
-        );
+            Self::log_cache_config(cache_config, cache_articles);
+            (cache, cache_articles)
+        } else {
+            debug!("Cache not configured, using availability-only mode (capacity=0)");
+            (Arc::new(UnifiedCache::availability(0)), false)
+        };
 
         Ok(ctx.into_proxy(cache, cache_articles))
     }
@@ -410,16 +397,16 @@ impl BuildContext {
     ///
     /// Only spawns if a Tokio runtime is available (skipped in sync test contexts).
     fn spawn_pipeline_workers(&self) {
-        use crate::session::handlers::pipeline_worker::{
-            PipelineWorkerConfig, backend_pipeline_worker,
-        };
-        use crate::types::BackendId;
-
         // Check if a Tokio runtime is available before spawning
         let Ok(_handle) = tokio::runtime::Handle::try_current() else {
             debug!("No Tokio runtime available, skipping pipeline worker spawning");
             return;
         };
+
+        use crate::session::handlers::pipeline_worker::{
+            PipelineWorkerConfig, backend_pipeline_worker,
+        };
+        use crate::types::BackendId;
 
         for (idx, server) in self.servers.iter().enumerate() {
             let backend_id = BackendId::from_index(idx);

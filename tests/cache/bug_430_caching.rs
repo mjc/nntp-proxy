@@ -19,7 +19,7 @@ use std::time::Duration;
 /// Test that 430 responses create cache entries (unit-level)
 #[tokio::test]
 async fn test_430_response_creates_cache_entry() {
-    let cache = ArticleCache::new(1000, Duration::from_mins(5), true);
+    let cache = ArticleCache::new(1000, Duration::from_secs(300));
 
     let msgid = MessageId::from_borrowed("<missing@example.com>").unwrap();
 
@@ -47,7 +47,7 @@ async fn test_430_response_creates_cache_entry() {
 /// Test that subsequent 430s update the same cache entry
 #[tokio::test]
 async fn test_multiple_430s_update_same_entry() {
-    let cache = ArticleCache::new(1000, Duration::from_mins(5), true);
+    let cache = ArticleCache::new(1000, Duration::from_secs(300));
 
     let msgid = MessageId::from_borrowed("<missing@example.com>").unwrap();
 
@@ -110,7 +110,7 @@ async fn test_cache_grows_with_430_responses() {
     // With MOKA_OVERHEAD=2000 and 2.5x multiplier for small entries:
     // Each missing entry stores no payload and weighs approx (0 + 68 + 40 + 2000) * 2.5.
     // So 100 entries need ~528KB capacity
-    let cache = ArticleCache::new(1_000_000, Duration::from_mins(5), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
 
     // Initial stats
     let stats = cache.stats();
@@ -148,7 +148,7 @@ async fn test_regression_bug_symptoms_fixed() {
     // With MOKA_OVERHEAD=2000 and 2.5x multiplier for small entries:
     // Each missing entry stores no payload and weighs approx (0 + 68 + 40 + 2000) * 2.5.
     // So 500 entries need ~2.64MB capacity
-    let cache = ArticleCache::new(5_000_000, Duration::from_mins(5), true);
+    let cache = ArticleCache::new(5_000_000, Duration::from_secs(300));
     let metrics = MetricsCollector::new(2);
 
     // Simulate SABnzbd requesting hundreds of missing articles

@@ -64,7 +64,7 @@ impl ClientSession {
         // Cache-hit metadata should preserve both checked and missing bits; retry routing
         // can derive backend attempts later when it actually needs router.backend_count().
         let availability = cached.availability();
-        request.record_cache_entry_metadata(cache_entry_metadata(&cached, availability));
+        request.record_cache_entry_metadata(cache_entry_metadata(&cached, &availability));
 
         if !cached.has_availability_info() {
             debug!(
@@ -199,15 +199,13 @@ impl ClientSession {
     }
 }
 
-const fn cache_availability_metadata(
-    availability: ArticleAvailability,
-) -> RequestCacheAvailability {
+fn cache_availability_metadata(availability: &ArticleAvailability) -> RequestCacheAvailability {
     RequestCacheAvailability::from_bits(availability.checked_bits(), availability.missing_bits())
 }
 
 fn cache_entry_metadata(
     cached: &crate::cache::CachedArticle,
-    availability: ArticleAvailability,
+    availability: &ArticleAvailability,
 ) -> RequestCacheEntryMetadata {
     RequestCacheEntryMetadata::new(
         cached.status_code(),
@@ -215,14 +213,17 @@ fn cache_entry_metadata(
         RequestCacheTier::new(cached.tier().get()),
         RequestCacheTimestampMillis::new(cached.inserted_at().get()),
         cache_payload_kind(cached.payload_kind()),
-        cached
-            .article_number()
-            .map(crate::cache::CachedArticleNumber::get)
-            .map(RequestCacheArticleNumber::new),
+        cache_article_number(cached.article_number()),
     )
 }
 
-const fn cache_payload_kind(payload: crate::cache::CachedPayloadKind) -> RequestCachePayloadKind {
+fn cache_article_number(
+    article_number: Option<crate::cache::CachedArticleNumber>,
+) -> Option<RequestCacheArticleNumber> {
+    article_number.map(|number| RequestCacheArticleNumber::new(number.get()))
+}
+
+fn cache_payload_kind(payload: crate::cache::CachedPayloadKind) -> RequestCachePayloadKind {
     match payload {
         crate::cache::CachedPayloadKind::Missing => RequestCachePayloadKind::Missing,
         crate::cache::CachedPayloadKind::AvailabilityOnly => {
@@ -291,8 +292,7 @@ mod tests {
         )
         .with_cache(Arc::new(UnifiedCache::memory(
             1024,
-            Duration::from_mins(1),
-            true,
+            Duration::from_secs(60),
         )))
         .build()
     }

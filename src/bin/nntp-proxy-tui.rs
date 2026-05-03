@@ -56,6 +56,8 @@ async fn run_proxy(
         args.common.config.as_str(),
         config.proxy.stats_file.as_ref(),
     );
+    let availability_path =
+        runtime::resolve_availability_file_path(args.common.config.as_str(), config.cache.as_ref());
     let server_names: Vec<String> = config
         .servers
         .iter()
@@ -64,6 +66,9 @@ async fn run_proxy(
     let metrics_store = runtime::load_metrics_from_disk(&stats_path, &server_names);
 
     let proxy = build_proxy(config, routing_mode, metrics_store).await?;
+    if let Some(path) = availability_path.as_ref() {
+        let _ = runtime::load_availability_from_disk(proxy.cache(), path);
+    }
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
     let (tui_shutdown_tx, tui_shutdown_rx) = mpsc::channel::<()>(1);
 
@@ -84,12 +89,14 @@ async fn run_proxy(
     runtime::spawn_stats_flusher(proxy.connection_stats());
     runtime::spawn_cache_stats_logger(&proxy);
     runtime::spawn_metrics_saver(&proxy, stats_path.clone(), server_names.clone());
+    runtime::spawn_availability_saver(&proxy, availability_path.clone());
 
     spawn_tui_shutdown_handler(
         &proxy,
         &shutdown_tx,
         tui_shutdown_tx,
         stats_path,
+        availability_path,
         server_names,
     );
 
@@ -167,6 +174,7 @@ fn spawn_tui_shutdown_handler(
     shutdown_tx: &mpsc::Sender<()>,
     tui_shutdown_tx: mpsc::Sender<()>,
     stats_path: PathBuf,
+    availability_path: Option<PathBuf>,
     server_names: Vec<String>,
 ) {
     let proxy = Arc::clone(proxy);
@@ -186,6 +194,15 @@ fn spawn_tui_shutdown_handler(
         {
             Ok(()) => info!("Metrics saved to {}", stats_path.display()),
             Err(e) => warn!("Failed to save metrics on shutdown: {}", e),
+        }
+
+        if let Some(path) = availability_path.clone() {
+            let cache = proxy.cache().clone();
+            match runtime::save_availability_to_disk_blocking(cache, path.clone()).await {
+                Ok(true) => info!("Availability index saved to {}", path.display()),
+                Ok(false) => {}
+                Err(e) => warn!("Failed to save availability index on shutdown: {}", e),
+            }
         }
 
         proxy.graceful_shutdown().await;

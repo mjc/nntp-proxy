@@ -61,13 +61,6 @@ use super::ttl;
 
 const HYBRID_CACHE_NAME: &str = "nntp-article-cache-v3";
 
-#[allow(clippy::cast_precision_loss)] // Hit rates are display metrics derived from exact integer counters.
-const fn count_as_f64(value: u64) -> f64 {
-    // Cache hit ratios are presentation metrics; exact counters remain stored
-    // separately and are not fed back into cache behavior.
-    value as f64
-}
-
 /// Check available disk space at the given path using df command
 fn check_available_space(path: &Path) -> Option<u64> {
     // Try to use statfs on Linux/Unix
@@ -99,8 +92,6 @@ pub struct HybridCacheConfig {
     pub disk_path: std::path::PathBuf,
     /// Time-to-live for cached articles (not directly used by foyer, but kept for API consistency)
     pub ttl: Duration,
-    /// Whether to cache full article bodies
-    pub cache_articles: bool,
     /// Compression codec for disk storage (lz4, zstd, or none)
     pub compression: CompressionCodec,
     /// Number of shards for concurrent access
@@ -113,8 +104,7 @@ impl Default for HybridCacheConfig {
             memory_capacity: 256 * 1024 * 1024,     // 256 MB memory
             disk_capacity: 10 * 1024 * 1024 * 1024, // 10 GB disk
             disk_path: std::path::PathBuf::from("/var/cache/nntp-proxy"),
-            ttl: Duration::from_hours(1), // 1 hour
-            cache_articles: true,
+            ttl: Duration::from_secs(3600), // 1 hour
             compression: CompressionCodec::Lz4,
             shards: 16, // Match indexer shards for consistent lock contention
         }
@@ -156,11 +146,6 @@ impl HybridArticleCache {
     /// Create a new hybrid cache with the given configuration
     ///
     /// This will create the disk cache directory if it doesn't exist.
-    ///
-    /// # Errors
-    /// Returns any filesystem, disk-space validation, or foyer initialization
-    /// error encountered while constructing the hybrid cache.
-    #[allow(clippy::too_many_lines)] // This setup wires several orthogonal cache subsystems in one constructor.
     pub async fn new(config: HybridCacheConfig) -> anyhow::Result<Self> {
         // Ensure disk cache directory exists
         std::fs::create_dir_all(&config.disk_path).map_err(|e| {
@@ -374,26 +359,11 @@ impl HybridArticleCache {
     ) {
         let buffer = buffer.into();
         let key = message_id.without_brackets().to_string();
-        let mut entry = if self.config.cache_articles {
-            let buffer_len = buffer.len();
-            let Some(entry) = DiskCachedArticle::from_ingest_response_with_tier(buffer, tier)
-            else {
-                warn!(msg_id = %key, buffer_len, "Cannot cache: invalid status code");
-                return;
-            };
-            entry
-        } else {
-            let Some(status_code) = buffer
-                .status_code()
-                .and_then(|code| CacheableStatusCode::try_from(code.as_u16()).ok())
-            else {
-                warn!(
-                    msg_id = %key,
-                    "Cannot cache: invalid status code"
-                );
-                return;
-            };
-            DiskCachedArticle::availability_only(status_code, tier)
+        let buffer_len = buffer.len();
+        let Some(mut entry) = DiskCachedArticle::from_ingest_response_with_tier(buffer, tier)
+        else {
+            warn!(msg_id = %key, buffer_len, "Cannot cache: invalid status code");
+            return;
         };
         let entry_len = entry.payload_len();
 
@@ -419,11 +389,7 @@ impl HybridArticleCache {
 
         entry.record_backend_has(backend_id);
         self.cache.insert(key.clone(), entry);
-        if self.config.cache_articles {
-            debug!(msg_id = %key, stored_bytes = entry_len.get(), tier = tier.get(), "Hybrid cache upsert");
-        } else {
-            debug!(msg_id = %key, stored_bytes = entry_len.get(), tier = tier.get(), "Hybrid cache upsert (availability only)");
-        }
+        debug!(msg_id = %key, stored_bytes = entry_len.get(), tier = tier.get(), "Hybrid cache upsert");
     }
 
     /// Record that a backend doesn't have an article (430 response)
@@ -545,9 +511,6 @@ impl HybridArticleCache {
     ///
     /// Flushes pending writes to disk before returning.
     /// This waits for all enqueued disk writes to complete.
-    ///
-    /// # Errors
-    /// Returns any foyer shutdown error while draining pending disk-cache writes.
     pub async fn close(&self) -> anyhow::Result<()> {
         self.cache
             .close()
@@ -582,7 +545,7 @@ impl HybridCacheStats {
         if total == 0 {
             0.0
         } else {
-            (count_as_f64(self.hits) / count_as_f64(total)) * 100.0
+            (self.hits as f64 / total as f64) * 100.0
         }
     }
 
@@ -592,7 +555,7 @@ impl HybridCacheStats {
         if self.hits == 0 {
             0.0
         } else {
-            (count_as_f64(self.disk_hits) / count_as_f64(self.hits)) * 100.0
+            (self.disk_hits as f64 / self.hits as f64) * 100.0
         }
     }
 }
@@ -604,17 +567,7 @@ impl HybridArticleCache {
     /// Uses `NoopIoEngineConfig` without a block engine config so foyer falls back
     /// to `NoopEngineConfig` — a trivially synchronous engine that spawns zero
     /// background tasks. Safe with any tokio runtime flavor.
-    ///
-    /// # Errors
-    /// Returns any initialization error from the underlying test-only cache path.
     pub async fn new_memory_only(memory_capacity: u64) -> anyhow::Result<Self> {
-        Self::new_memory_only_with_cache_articles(memory_capacity, true).await
-    }
-
-    async fn new_memory_only_with_cache_articles(
-        memory_capacity: u64,
-        cache_articles: bool,
-    ) -> anyhow::Result<Self> {
         use foyer::NoopIoEngineConfig;
 
         let memory_capacity_usize: usize = memory_capacity
@@ -641,8 +594,7 @@ impl HybridArticleCache {
             memory_capacity,
             disk_capacity: 0, // No disk in memory-only mode
             disk_path: std::path::PathBuf::new(),
-            ttl: Duration::from_hours(1),
-            cache_articles,
+            ttl: Duration::from_secs(3600),
             compression: CompressionCodec::None,
             shards: 1,
         };
@@ -697,25 +649,6 @@ mod tests {
         let stats = cache.stats();
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 0);
-
-        cache.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_hybrid_cache_availability_only_stores_no_payload() {
-        let cache = HybridArticleCache::new_memory_only_with_cache_articles(1024 * 1024, false)
-            .await
-            .unwrap();
-
-        let msg_id = MessageId::from_borrowed("<test123@example.com>").unwrap();
-        let buffer = b"220 0 <test123@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-        cache
-            .upsert_ingest(msg_id.clone(), buffer, BackendId::from_index(0), 0.into())
-            .await;
-
-        let entry = cache.get(&msg_id).await.unwrap();
-        assert_eq!(entry.payload_len(), 0);
-        assert!(entry.should_try_backend(BackendId::from_index(0)));
 
         cache.close().await.unwrap();
     }
