@@ -44,7 +44,7 @@ impl ClientSession {
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<CacheLookupResult> {
-        let Some(msg_id_for_lookup) = request.message_id_value() else {
+        let Some(msg_id_for_lookup) = request.message_id() else {
             request.record_cache_status(RequestCacheStatus::Miss);
             return Ok(CacheLookupResult::Miss);
         };
@@ -54,12 +54,11 @@ impl ClientSession {
             self.client_addr, msg_id_for_lookup
         );
 
-        let Some(cached) = self.cache.get(&msg_id_for_lookup).await else {
+        let Some(cached) = self.cache.get_request_message_id(msg_id_for_lookup).await else {
             debug!("Cache MISS for message-ID: {}", msg_id_for_lookup);
             request.record_cache_status(RequestCacheStatus::Miss);
             return Ok(CacheLookupResult::Miss);
         };
-        drop(msg_id_for_lookup);
 
         // Extract stored availability before any early returns so we can pass it back.
         // Cache-hit metadata should preserve both checked and missing bits; retry routing
@@ -91,10 +90,13 @@ impl ClientSession {
                 precheck::spawn_background_precheck(
                     self.precheck_deps(router),
                     request.clone(),
-                    request
-                        .message_id_value()
-                        .expect("cached request still has message id")
-                        .to_owned(),
+                    MessageId::from_borrowed(
+                        request
+                            .message_id()
+                            .expect("cached request still has message id"),
+                    )
+                    .expect("cached request has validated message id")
+                    .to_owned(),
                 );
             }
             request.record_cache_status(RequestCacheStatus::PartialHit);
@@ -119,10 +121,10 @@ impl ClientSession {
         // STAT is synthesized (tiny response), everything else writes directly from typed payload sections.
         let request_kind = request.kind();
         let msg_id_for_write = request
-            .message_id_value()
+            .message_id()
             .expect("cached request still has message id");
         let Some(write) =
-            write_cached_article_response(client_write, &cached, request_kind, &msg_id_for_write)
+            write_cached_article_response(client_write, &cached, request_kind, msg_id_for_write)
                 .await?
         else {
             let status_code = cached.status_code().as_u16();
@@ -133,7 +135,6 @@ impl ClientSession {
             request.record_cache_status(RequestCacheStatus::PartialHit);
             return Ok(CacheLookupResult::PartialHit);
         };
-        drop(msg_id_for_write);
         *backend_to_client_bytes = backend_to_client_bytes.add(write.wire_len.get());
 
         request.record_cache_response(write.metadata());
@@ -268,12 +269,12 @@ pub(super) async fn write_cached_article_response<W>(
     client_write: &mut W,
     cached: &crate::cache::ArticleEntry,
     request_kind: RequestKind,
-    msg_id: &MessageId<'_>,
+    message_id: &str,
 ) -> std::io::Result<Option<CachedResponseWrite>>
 where
     W: AsyncWrite + Unpin,
 {
-    let Some(response) = cached.response_for(request_kind, msg_id.as_str()) else {
+    let Some(response) = cached.response_for(request_kind, message_id) else {
         return Ok(None);
     };
     let wire_len = response.wire_len();

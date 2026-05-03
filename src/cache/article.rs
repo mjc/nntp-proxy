@@ -948,7 +948,15 @@ impl ArticleCache {
     pub async fn get(&self, message_id: &MessageId<'_>) -> Option<ArticleEntry> {
         // moka::Cache<Arc<str>, V> supports get(&str) via Borrow<str> trait
         // This is zero-allocation: no Arc<str> is created for the lookup
-        let result = self.cache.get(message_id.without_brackets()).await;
+        self.get_by_cache_key(message_id.without_brackets()).await
+    }
+
+    /// Get an article by the cache key form of a message ID (without brackets).
+    ///
+    /// This is the request hot path: `RequestContext` has already validated the
+    /// message-id span, so callers can avoid rebuilding a `MessageId` wrapper.
+    pub(crate) async fn get_by_cache_key(&self, key: &str) -> Option<ArticleEntry> {
+        let result = self.cache.get(key).await;
 
         match result {
             Some(entry) if !entry.is_expired(self.ttl_millis) => {
@@ -959,7 +967,7 @@ impl ArticleCache {
                 // Entry exists but expired by tier-aware TTL - invalidate and treat as cache miss
                 // Invalidating immediately frees capacity rather than waiting for LRU eviction,
                 // preventing repeated cache misses on the same stale key
-                self.cache.invalidate(message_id.without_brackets()).await;
+                self.cache.invalidate(key).await;
                 self.misses.fetch_add(1, Ordering::Relaxed);
                 None
             }

@@ -334,6 +334,26 @@ impl UnifiedCache {
         }
     }
 
+    /// Get an article from a validated request message-id string (`<...>`).
+    ///
+    /// Memory cache hits avoid rebuilding a `MessageId`; hybrid cache still uses
+    /// the typed wrapper because its disk key path owns `String`s internally.
+    pub async fn get_request_message_id(&self, message_id: &str) -> Option<ArticleEntry> {
+        match self {
+            Self::Memory(cache) => {
+                let key = message_id.strip_prefix('<')?.strip_suffix('>')?;
+                cache.get_by_cache_key(key).await
+            }
+            Self::Hybrid(cache) => {
+                let message_id = MessageId::from_borrowed(message_id).ok()?;
+                cache
+                    .get(&message_id)
+                    .await
+                    .map(|entry| entry.to_article_entry())
+            }
+        }
+    }
+
     /// Upsert (insert or update) an article in the cache
     ///
     /// The tier is used for tier-aware TTL calculation (higher tier = longer TTL).
