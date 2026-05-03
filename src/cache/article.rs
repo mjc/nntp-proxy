@@ -303,7 +303,7 @@ impl ArticleEntry {
     }
 
     #[must_use]
-    pub fn availability_only(status_code: StatusCode, tier: ttl::CacheTier) -> Self {
+    pub(crate) fn availability_only(status_code: StatusCode, tier: ttl::CacheTier) -> Self {
         Self {
             backend_availability: ArticleAvailability::new(),
             status_code,
