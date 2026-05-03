@@ -600,7 +600,7 @@ pub(crate) fn parse_payload_chunks<'a>(
         return CachedPayload::Missing;
     }
 
-    let mut status_line = Vec::new();
+    let mut status_line = smallvec::SmallVec::<[u8; 128]>::new();
     let mut payload_with_tail = Vec::new();
     let mut in_status = true;
 
