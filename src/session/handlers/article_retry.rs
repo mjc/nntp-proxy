@@ -771,6 +771,10 @@ impl ClientSession {
         msg_id: Option<&crate::types::MessageId<'_>>,
         availability: &crate::cache::ArticleAvailability,
     ) {
+        if availability.checked_bits() == 0 {
+            return;
+        }
+
         if let Some(msg_id_ref) = msg_id {
             self.cache
                 .sync_availability(msg_id_ref.clone(), availability)
