@@ -1,8 +1,7 @@
 //! Benchmarks for turning client read buffers into typed request contexts.
 //!
 //! The `typed_contexts` benches model the current request-boundary behavior:
-//! each complete line becomes a `RequestContext`. The raw-slice baseline models
-//! the lower bound before typed classification work.
+//! each complete line becomes a `RequestContext`.
 //!
 //! Run with: cargo bench --bench request_batch_parse
 
@@ -24,23 +23,6 @@ fn parse_typed_contexts(buffer: &[u8]) -> usize {
             black_box(RequestContext::from_request_line(RequestLine::parse(
                 &buffer[start..end],
             )));
-            count += 1;
-        }
-        start = end;
-    }
-
-    count
-}
-
-#[inline]
-fn parse_raw_command_slices(buffer: &[u8]) -> usize {
-    let mut start = 0;
-    let mut count = 0;
-
-    while let Some(relative_lf) = buffer[start..].iter().position(|byte| *byte == b'\n') {
-        let end = start + relative_lf + 1;
-        if end >= 2 && buffer[end - 2] == b'\r' {
-            black_box(&buffer[start..end]);
             count += 1;
         }
         start = end;
@@ -81,7 +63,6 @@ macro_rules! bench_batches {
 }
 
 bench_batches!(typed_contexts, parse_typed_contexts);
-bench_batches!(raw_slice_baseline, parse_raw_command_slices);
 
 mod mixed_buffers {
     use super::{Bencher, black_box, parse_typed_contexts};
