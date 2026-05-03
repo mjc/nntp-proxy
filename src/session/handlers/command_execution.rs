@@ -426,7 +426,11 @@ impl ClientSession {
                     .write_all(params.first_chunk)
                     .await
                     .map_err(classify_buffered_response_write_err)?;
-                self.maybe_cache_upsert(params.msg_id, b"223\r\n", ctx.backend_id);
+                self.maybe_cache_upsert_buffer(
+                    params.msg_id,
+                    crate::cache::CacheIngestResponse::from(b"223\r\n".as_slice()),
+                    ctx.backend_id,
+                );
                 Ok(params.first_chunk.len() as u64)
             }
             (false, _) => {
@@ -468,19 +472,6 @@ impl ClientSession {
         self.metrics.record_send_recv_micros(backend_id, send, recv);
     }
 
-    /// Cache article data if message ID is present
-    #[inline]
-    fn maybe_cache_upsert(
-        &self,
-        msg_id: Option<&crate::types::MessageId<'_>>,
-        data: &[u8],
-        backend_id: BackendId,
-    ) {
-        if let Some(msg_id_ref) = msg_id {
-            let tier = self.tier_for_backend(backend_id);
-            self.spawn_cache_upsert(msg_id_ref, data, backend_id, tier);
-        }
-    }
     #[inline]
     fn maybe_cache_upsert_buffer(
         &self,

@@ -141,22 +141,6 @@ impl ClientSession {
         Ok(CacheLookupResult::Hit)
     }
 
-    /// Spawn async cache upsert task
-    ///
-    /// This is fire-and-forget - we don't wait for the cache to update.
-    /// Used after successfully streaming a response to update availability tracking.
-    ///
-    /// The tier is used for tier-aware TTL (higher tier = longer TTL).
-    pub(super) fn spawn_cache_upsert(
-        &self,
-        msg_id: &crate::types::MessageId<'_>,
-        buffer: &[u8],
-        backend_id: crate::types::BackendId,
-        tier: CacheTier,
-    ) {
-        self.spawn_cache_upsert_buffer(msg_id, buffer.into(), backend_id, tier);
-    }
-
     /// Spawn async cache upsert task with owned hot-path storage.
     pub(super) fn spawn_cache_upsert_buffer(
         &self,
