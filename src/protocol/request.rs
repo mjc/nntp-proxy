@@ -9,7 +9,7 @@ use smallvec::SmallVec;
 use super::StatusCode;
 use crate::types::{BackendId, MessageId};
 
-const MAX_COMMAND_LINE_OCTETS: usize = 512;
+pub(crate) const MAX_COMMAND_LINE_OCTETS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestKind {

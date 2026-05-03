@@ -104,7 +104,7 @@ impl ClientSession {
                     match result {
                         Ok(0) => break, // Client disconnected
                         Ok(_) => {
-                            if line.len() > 512 {
+                            if line.len() > crate::protocol::MAX_COMMAND_LINE_OCTETS {
                                 use crate::protocol::COMMAND_TOO_LONG;
                                 client_write.write_all(COMMAND_TOO_LONG).await?;
                                 client_write.flush().await?;

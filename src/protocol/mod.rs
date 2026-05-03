@@ -19,9 +19,9 @@ pub use article::{Article, HeaderIter, Headers, ParseError, yenc};
 
 // Re-export response types and utilities
 pub(crate) use request::{
-    RequestCacheArticleNumber, RequestCacheAvailability, RequestCacheEntryMetadata,
-    RequestCachePayloadKind, RequestCacheStatus, RequestCacheTier, RequestCacheTimestampMillis,
-    RequestResponseMetadata, ResponsePayloadLen,
+    MAX_COMMAND_LINE_OCTETS, RequestCacheArticleNumber, RequestCacheAvailability,
+    RequestCacheEntryMetadata, RequestCachePayloadKind, RequestCacheStatus, RequestCacheTier,
+    RequestCacheTimestampMillis, RequestResponseMetadata, ResponsePayloadLen,
 };
 pub use request::{
     RequestContext, RequestKind, RequestRouteClass, RequestWireLen, ResponseWireLen,

@@ -202,7 +202,7 @@ impl ClientSession {
             }
             Ok(_) => {
                 // RFC 3977 §3.1: 512-byte command limit — return 501 and keep session alive
-                if command_buf.len() > 512 {
+                if command_buf.len() > crate::protocol::MAX_COMMAND_LINE_OCTETS {
                     return Ok(RequestBatch::first_oversized());
                 }
             }
@@ -236,7 +236,7 @@ impl ClientSession {
                 Ok(_) => {
                     // M4: Reject oversized commands (end batch on invalid command)
                     // Mark as oversized so caller sends 500 error instead of forwarding
-                    if command_buf.len() > 512 {
+                    if command_buf.len() > crate::protocol::MAX_COMMAND_LINE_OCTETS {
                         return Ok(RequestBatch::contexts_with_trailing_oversized(
                             batch_contexts,
                             command_buf.len(),
