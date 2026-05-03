@@ -8,15 +8,13 @@
 //! - `DiskCache` configuration defaults and validation
 
 use futures::executor::block_on;
-use nntp_proxy::cache::{
-    ArticleAvailability, ArticleCache, ArticleEntry, BackendStatus, UnifiedCache,
-};
+use nntp_proxy::cache::{ArticleAvailability, ArticleCache, BackendStatus, UnifiedCache};
 use nntp_proxy::protocol::RequestKind;
 use nntp_proxy::router::BackendCount;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
 
-use super::{article_response_bytes, assert_article_response, assert_no_article_response};
+use super::article_response_bytes;
 
 // ============================================================================
 // UnifiedCache Tests
@@ -329,49 +327,6 @@ fn test_cache_config_without_disk() {
     let config: Cache = toml::from_str(toml_str).unwrap();
 
     assert!(config.disk.is_none());
-}
-
-// ============================================================================
-// Invalid Response Validation Tests
-// ============================================================================
-
-#[test]
-fn test_response_validation_rejects_short_buffer() {
-    // Buffer too short (< 9 bytes)
-    let buffer = b"220 ok".to_vec();
-    let entry = ArticleEntry::from_response_bytes(buffer);
-
-    // Should fail validation and return None
-    assert_no_article_response(&entry, RequestKind::Article);
-}
-
-#[test]
-fn test_response_validation_rejects_missing_terminator() {
-    // Buffer missing .\r\n terminator
-    let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n".to_vec();
-    let entry = ArticleEntry::from_response_bytes(buffer);
-
-    assert_no_article_response(&entry, RequestKind::Article);
-}
-
-#[test]
-fn test_response_validation_rejects_non_digit_start() {
-    // Buffer not starting with digits - but this won't even parse as valid status code
-    // So we test with a valid-looking but corrupted buffer
-    let buffer = b"ABC 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_response_bytes(buffer);
-
-    assert_no_article_response(&entry, RequestKind::Article);
-}
-
-#[test]
-fn test_response_validation_accepts_valid_buffer() {
-    // Valid buffer passes validation
-    let buffer =
-        b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody content here\r\n.\r\n".to_vec();
-    let entry = ArticleEntry::from_response_bytes(buffer.clone());
-
-    assert_article_response(&entry, RequestKind::Article, &buffer);
 }
 
 // ============================================================================

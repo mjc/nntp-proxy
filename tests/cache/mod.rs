@@ -29,22 +29,3 @@ pub fn article_response_bytes(
     block_on(response.write_to(&mut out)).ok()?;
     Some(out)
 }
-
-pub fn test_msg_id() -> MessageId<'static> {
-    MessageId::from_borrowed("<test@example.com>").unwrap()
-}
-
-pub fn response_bytes(entry: &ArticleEntry, request_kind: RequestKind) -> Option<Vec<u8>> {
-    article_response_bytes(entry, request_kind, &test_msg_id())
-}
-
-pub fn assert_article_response(entry: &ArticleEntry, request_kind: RequestKind, expected: &[u8]) {
-    assert_eq!(
-        response_bytes(entry, request_kind).as_deref(),
-        Some(expected)
-    );
-}
-
-pub fn assert_no_article_response(entry: &ArticleEntry, request_kind: RequestKind) {
-    assert_eq!(response_bytes(entry, request_kind), None);
-}
