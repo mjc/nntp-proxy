@@ -1,6 +1,6 @@
-//! Benchmarks for typed cache ingestion from responses.
+//! Benchmarks for cache ingestion from backend responses.
 //!
-//! Run with: cargo bench --bench cache_ingest_semantic
+//! Run with: cargo bench --bench cache_ingest
 
 use divan::{Bencher, black_box};
 use nntp_proxy::cache::ArticleCache;
@@ -28,7 +28,7 @@ const BODY_RESPONSE: &[u8] = b"222 42 <bench@example.com>\r\nBody line\r\n.\r\n"
 const STAT_RESPONSE: &[u8] = b"223 42 <bench@example.com>\r\n";
 const MISSING_RESPONSE: &[u8] = b"430 No article\r\n";
 
-mod semantic_ingest {
+mod ingest {
     use super::{
         ArticleCache, BODY_RESPONSE, BackendId, Bencher, Duration, HEAD_RESPONSE, MISSING_RESPONSE,
         MessageId, STAT_RESPONSE, article_response, black_box,

@@ -147,7 +147,7 @@ name = "cache_response_generation"
 harness = false
 
 [[bench]]
-name = "cache_ingest_semantic"
+name = "cache_ingest"
 harness = false
 
 [[bench]]
