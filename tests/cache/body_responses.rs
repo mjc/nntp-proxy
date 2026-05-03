@@ -145,7 +145,7 @@ fn test_serves_request_kind_head_response() {
 }
 
 #[test]
-fn test_response_for_request_verbs_uppercase() {
+fn test_response_for_body_kind() {
     let body_response = b"222 0 <test@example.com>\r\nBody\r\n.\r\n".to_vec();
     let entry = ArticleEntry::from_response_bytes(body_response);
 

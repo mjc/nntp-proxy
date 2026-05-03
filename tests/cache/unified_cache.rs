@@ -170,14 +170,14 @@ async fn test_cache_stats_provider_unified_cache_memory() {
 // ============================================================================
 
 #[test]
-fn test_response_for_request_stat_synthesizes_223() {
+fn test_response_for_stat_synthesizes_223() {
     let response = response_bytes(&article_entry(), RequestKind::Stat).unwrap();
 
     assert!(String::from_utf8_lossy(&response).starts_with("223 0 <test@example.com>\r\n"));
 }
 
 #[test]
-fn test_response_for_request_body_from_article_allocates_nothing() {
+fn test_response_for_body_from_article_allocates_nothing() {
     let entry = article_entry();
     let msg_id = test_msg_id();
 
@@ -218,7 +218,7 @@ fn test_response_exposes_typed_status() {
 }
 
 #[test]
-fn test_response_for_request_handles_near_limit_message_id_without_allocation() {
+fn test_response_for_handles_near_limit_message_id_without_allocation() {
     let entry = article_entry();
     let local = "a".repeat(520);
     let msg_id_text = format!("<{local}@example.com>");
@@ -238,28 +238,28 @@ fn test_response_for_request_handles_near_limit_message_id_without_allocation() 
 }
 
 #[test]
-fn test_response_for_request_stat_from_body() {
+fn test_response_for_stat_from_body() {
     let response = response_bytes(&body_entry(), RequestKind::Stat).unwrap();
 
     assert!(String::from_utf8_lossy(&response).starts_with("223 0 <test@example.com>\r\n"));
 }
 
 #[test]
-fn test_response_for_request_stat_from_head() {
+fn test_response_for_stat_from_head() {
     let response = response_bytes(&head_entry(), RequestKind::Stat).unwrap();
 
     assert!(String::from_utf8_lossy(&response).starts_with("223 0 <test@example.com>\r\n"));
 }
 
 #[test]
-fn test_response_for_request_430_returns_none_for_stat() {
+fn test_response_for_430_returns_none_for_stat() {
     let entry = ArticleEntry::from_response_bytes(b"430 No Such Article\r\n");
 
     assert_no_article_response(&entry, RequestKind::Stat);
 }
 
 #[test]
-fn test_response_for_request_article_direct_match() {
+fn test_response_for_article_direct_match() {
     assert_article_response(
         &article_entry(),
         RequestKind::Article,
@@ -268,7 +268,7 @@ fn test_response_for_request_article_direct_match() {
 }
 
 #[test]
-fn test_response_for_request_body_from_article() {
+fn test_response_for_body_from_article() {
     assert_article_response(
         &article_entry(),
         RequestKind::Body,
@@ -277,7 +277,7 @@ fn test_response_for_request_body_from_article() {
 }
 
 #[test]
-fn test_response_for_request_head_from_article() {
+fn test_response_for_head_from_article() {
     assert_article_response(
         &article_entry(),
         RequestKind::Head,
@@ -286,17 +286,17 @@ fn test_response_for_request_head_from_article() {
 }
 
 #[test]
-fn test_response_for_request_body_cannot_serve_article() {
+fn test_response_for_body_cannot_serve_article() {
     assert_no_article_response(&body_entry(), RequestKind::Article);
 }
 
 #[test]
-fn test_response_for_request_head_cannot_serve_body() {
+fn test_response_for_head_cannot_serve_body() {
     assert_no_article_response(&head_entry(), RequestKind::Body);
 }
 
 #[test]
-fn test_response_for_request_validates_buffer() {
+fn test_response_for_validates_buffer() {
     // Create an invalid buffer (missing .\r\n terminator)
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody".to_vec();
     let entry = ArticleEntry::from_response_bytes(buffer);
@@ -306,7 +306,7 @@ fn test_response_for_request_validates_buffer() {
 }
 
 #[test]
-fn test_response_for_request_empty_message_id() {
+fn test_response_for_empty_message_id() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
     let entry = ArticleEntry::from_response_bytes(buffer);
 
@@ -729,7 +729,7 @@ fn test_hybrid_entry_complete_article_detection() {
 }
 
 #[test]
-fn test_hybrid_entry_response_for_request_article() {
+fn test_hybrid_entry_response_for_article() {
     let buffer = make_valid_article_buffer();
     let entry = hybrid_article();
 
@@ -739,7 +739,7 @@ fn test_hybrid_entry_response_for_request_article() {
 }
 
 #[test]
-fn test_hybrid_entry_response_for_request_stat_synthesized() {
+fn test_hybrid_entry_response_for_stat_synthesized() {
     let entry = hybrid_article();
 
     let response = hybrid_response_bytes(&entry, RequestKind::Stat, "<test@example.com>");
@@ -750,7 +750,7 @@ fn test_hybrid_entry_response_for_request_stat_synthesized() {
 }
 
 #[test]
-fn test_hybrid_entry_response_for_request_430_returns_none() {
+fn test_hybrid_entry_response_for_430_returns_none() {
     let entry = hybrid_missing();
 
     // 430 stubs should not serve ARTICLE requests
