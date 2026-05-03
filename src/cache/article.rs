@@ -343,7 +343,10 @@ impl ArticleEntry {
 
     /// Ingest a cold response bytes with a specific provider tier.
     #[must_use]
-    pub fn from_response_bytes_with_tier(buffer: impl AsRef<[u8]>, tier: ttl::CacheTier) -> Self {
+    pub(crate) fn from_response_bytes_with_tier(
+        buffer: impl AsRef<[u8]>,
+        tier: ttl::CacheTier,
+    ) -> Self {
         let buffer = buffer.as_ref();
         let status_code = StatusCode::parse(buffer).unwrap_or_else(|| StatusCode::new(430));
         let payload = parse_payload(status_code, buffer);
