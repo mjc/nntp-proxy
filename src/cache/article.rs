@@ -80,16 +80,16 @@ pub(crate) enum CachedPayload {
     AvailabilityOnly,
     Article {
         article_number: Option<CachedArticleNumber>,
-        headers: Box<[u8]>,
-        body: Box<[u8]>,
+        headers: Arc<[u8]>,
+        body: Arc<[u8]>,
     },
     Head {
         article_number: Option<CachedArticleNumber>,
-        headers: Box<[u8]>,
+        headers: Arc<[u8]>,
     },
     Body {
         article_number: Option<CachedArticleNumber>,
-        body: Box<[u8]>,
+        body: Arc<[u8]>,
     },
     Stat {
         article_number: Option<CachedArticleNumber>,
@@ -681,7 +681,7 @@ fn payload_for_chunked_status(
             } else {
                 CachedPayload::Article {
                     article_number,
-                    headers: Box::from([]),
+                    headers: Arc::from([]),
                     body: copy_chunked_range(buffer, payload_start, payload_end),
                 }
             }
@@ -732,7 +732,7 @@ fn copy_chunked_range(
     buffer: &crate::pool::ChunkedResponse,
     start: usize,
     end: usize,
-) -> Box<[u8]> {
+) -> Arc<[u8]> {
     let len = end.saturating_sub(start);
     let mut output = Vec::with_capacity(len);
     let mut position = 0;
@@ -754,7 +754,7 @@ fn copy_chunked_range(
         output.extend_from_slice(&chunk[copy_start..copy_end]);
     }
 
-    output.into_boxed_slice()
+    Arc::from(output.into_boxed_slice())
 }
 
 fn payload_without_multiline_terminator(code: u16, payload: &[u8]) -> Option<&[u8]> {
@@ -787,7 +787,7 @@ fn payload_for_status(
             } else {
                 CachedPayload::Article {
                     article_number,
-                    headers: Box::from([]),
+                    headers: Arc::from([]),
                     body: payload.into(),
                 }
             }
@@ -904,7 +904,7 @@ impl ArticleCache {
                 //
                 // Value: ArticleEntry
                 //   - Struct inline metadata: availability, status, tier, timestamp, payload tag
-                //   - Semantic boxed payload sections: headers/body slice metadata and bytes
+                //   - Shared semantic payload sections: headers/body slice metadata and bytes
                 //   - Allocator overhead for present payload sections
                 //
                 // Moka internal per-entry overhead is MUCH larger than the data itself:
@@ -920,7 +920,7 @@ impl ArticleCache {
                 //
                 const ARC_STR_OVERHEAD: usize = 16 + 16; // Arc control block + allocator
                 const ENTRY_STRUCT: usize = 64; // ArticleEntry inline metadata and enum tag
-                const PAYLOAD_OVERHEAD: usize = 2 * (16 + 16); // Up to headers/body boxed slices + allocators
+                const PAYLOAD_OVERHEAD: usize = 2 * (16 + 16); // Up to headers/body shared slices + allocators
                 // Moka internal structures - empirically measured to address memory reporting gap.
                 // See moka issue #473: https://github.com/moka-rs/moka/issues/473
                 // Observed ratio: 362MB RSS / 36MB weighted_size() = 10x
@@ -1646,10 +1646,10 @@ mod tests {
     }
 
     #[test]
-    fn article_entry_stores_payload_sections_as_boxed_slices() {
-        trait BoxedSlice {}
-        impl BoxedSlice for Box<[u8]> {}
-        fn assert_boxed_slice<T: BoxedSlice>(_: &T) {}
+    fn article_entry_stores_payload_sections_as_shared_slices() {
+        trait SharedSlice {}
+        impl SharedSlice for Arc<[u8]> {}
+        fn assert_shared_slice<T: SharedSlice>(_: &T) {}
 
         let entry = entry_from_wire_response(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
@@ -1657,10 +1657,33 @@ mod tests {
 
         match &entry.payload {
             CachedPayload::Article { headers, body, .. } => {
-                assert_boxed_slice(headers);
-                assert_boxed_slice(body);
+                assert_shared_slice(headers);
+                assert_shared_slice(body);
             }
             other => panic!("expected article payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn article_entry_clone_shares_payload_sections() {
+        let entry = entry_from_wire_response(
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+        );
+        let cloned = entry.clone();
+
+        match (&entry.payload, &cloned.payload) {
+            (
+                CachedPayload::Article { headers, body, .. },
+                CachedPayload::Article {
+                    headers: cloned_headers,
+                    body: cloned_body,
+                    ..
+                },
+            ) => {
+                assert!(std::ptr::eq(headers.as_ptr(), cloned_headers.as_ptr()));
+                assert!(std::ptr::eq(body.as_ptr(), cloned_body.as_ptr()));
+            }
+            other => panic!("expected cloned article payload, got {other:?}"),
         }
     }
 

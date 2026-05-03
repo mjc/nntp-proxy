@@ -344,7 +344,7 @@ fn write_section(writer: &mut impl Write, data: &[u8]) -> foyer::Result<()> {
     writer.write_all(data).map_err(foyer::Error::io_error)
 }
 
-fn read_section(reader: &mut impl Read) -> foyer::Result<Box<[u8]>> {
+fn read_section(reader: &mut impl Read) -> foyer::Result<std::sync::Arc<[u8]>> {
     let mut len_bytes = [0u8; 4];
     reader
         .read_exact(&mut len_bytes)
@@ -361,7 +361,7 @@ fn read_section(reader: &mut impl Read) -> foyer::Result<Box<[u8]>> {
             format!("Expected {} bytes, got {}", len, data.len()),
         )));
     }
-    Ok(data.into_boxed_slice())
+    Ok(std::sync::Arc::from(data.into_boxed_slice()))
 }
 
 fn encoded_payload_size(payload: &CachedPayload) -> usize {
