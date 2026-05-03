@@ -58,6 +58,13 @@ fn memory_cache() -> Cache {
     }
 }
 
+fn metadata_only_cache() -> Cache {
+    Cache {
+        cache_articles: false,
+        ..memory_cache()
+    }
+}
+
 async fn spawn_backend(listener: TcpListener, response: Arc<[u8]>) {
     tokio::spawn(async move {
         loop {
@@ -238,5 +245,19 @@ mod cache_hit_roundtrip {
     #[divan::bench(sample_count = 100, sample_size = 10)]
     fn article_768k(bencher: Bencher) {
         bench_roundtrip(bencher, 768 * 1024, Some(memory_cache()), true);
+    }
+}
+
+mod cache_miss_roundtrip {
+    use super::{Bencher, bench_roundtrip, metadata_only_cache};
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn article_64k(bencher: Bencher) {
+        bench_roundtrip(bencher, 64 * 1024, Some(metadata_only_cache()), false);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 10)]
+    fn article_768k(bencher: Bencher) {
+        bench_roundtrip(bencher, 768 * 1024, Some(metadata_only_cache()), false);
     }
 }
