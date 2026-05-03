@@ -293,15 +293,7 @@ pub struct ArticleEntry {
 }
 
 impl ArticleEntry {
-    /// Ingest a cold response bytes into a typed semantic cache entry.
-    ///
-    /// This is the boundary for cold responses read from the wire. The entry
-    /// stores parsed metadata and payload sections, not the original response.
-    #[must_use]
-    pub fn from_response_bytes(buffer: impl AsRef<[u8]>) -> Self {
-        Self::from_response_bytes_with_tier(buffer, ttl::CacheTier::new(0))
-    }
-
+    /// Create an availability-only cache entry without payload bytes.
     #[must_use]
     pub(crate) fn availability_only(status_code: StatusCode, tier: ttl::CacheTier) -> Self {
         Self {
@@ -1151,9 +1143,13 @@ mod tests {
     use futures::executor::block_on;
     use std::time::Duration;
 
+    fn entry_from_response_bytes(buffer: impl AsRef<[u8]>) -> ArticleEntry {
+        ArticleEntry::from_response_bytes_with_tier(buffer, ttl::CacheTier::new(0))
+    }
+
     fn create_test_article(msgid: &str) -> ArticleEntry {
         let buffer = format!("220 0 {msgid}\r\nSubject: Test\r\n\r\nBody\r\n.\r\n").into_bytes();
-        ArticleEntry::from_response_bytes(buffer)
+        entry_from_response_bytes(buffer)
     }
 
     fn rendered(entry: &ArticleEntry, request_kind: RequestKind, msgid: &str) -> Vec<u8> {
@@ -1247,9 +1243,8 @@ mod tests {
 
     #[test]
     fn body_payload_serves_body_and_stat_only() {
-        let entry = ArticleEntry::from_response_bytes(
-            b"222 0 <test@example.com>\r\nBody content only\r\n.\r\n",
-        );
+        let entry =
+            entry_from_response_bytes(b"222 0 <test@example.com>\r\nBody content only\r\n.\r\n");
 
         assert_serves(
             &entry,
@@ -1264,7 +1259,7 @@ mod tests {
 
     #[test]
     fn article_payload_serves_article_head_body_and_stat() {
-        let entry = ArticleEntry::from_response_bytes(
+        let entry = entry_from_response_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         );
 
@@ -1281,9 +1276,8 @@ mod tests {
 
     #[test]
     fn head_payload_serves_head_and_stat_only() {
-        let entry = ArticleEntry::from_response_bytes(
-            b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n",
-        );
+        let entry =
+            entry_from_response_bytes(b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n");
 
         assert_serves(
             &entry,
@@ -1299,9 +1293,8 @@ mod tests {
     #[test]
     fn body_payload_completeness_requires_semantic_body() {
         let complete =
-            ArticleEntry::from_response_bytes(b"222 0 <test@example.com>\r\nBody content\r\n.\r\n");
-        let metadata_only =
-            ArticleEntry::from_response_bytes(b"222 0 <test@example.com>\r\n".as_slice());
+            entry_from_response_bytes(b"222 0 <test@example.com>\r\nBody content\r\n.\r\n");
+        let metadata_only = entry_from_response_bytes(b"222 0 <test@example.com>\r\n".as_slice());
 
         assert!(complete.is_complete_article());
         assert!(!metadata_only.is_complete_article());
@@ -1388,7 +1381,7 @@ mod tests {
     #[test]
     fn test_article_entry_basic() {
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = ArticleEntry::from_response_bytes(buffer.clone());
+        let entry = entry_from_response_bytes(buffer.clone());
 
         assert_eq!(entry.status_code(), StatusCode::new(220));
         assert_eq!(
@@ -1403,7 +1396,7 @@ mod tests {
 
     #[test]
     fn article_entry_ingests_response_bytes_by_name() {
-        let entry = ArticleEntry::from_response_bytes(
+        let entry = entry_from_response_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         );
 
@@ -1413,7 +1406,7 @@ mod tests {
 
     #[test]
     fn article_entry_ingests_borrowed_response_bytes() {
-        let entry = ArticleEntry::from_response_bytes(
+        let entry = entry_from_response_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".as_slice(),
         );
 
@@ -1423,7 +1416,7 @@ mod tests {
 
     #[test]
     fn article_entry_defaults_to_tier_zero() {
-        let entry = ArticleEntry::from_response_bytes(b"220 0 <test@example.com>\r\n.\r\n");
+        let entry = entry_from_response_bytes(b"220 0 <test@example.com>\r\n.\r\n");
 
         assert_eq!(entry.tier(), ttl::CacheTier::new(0));
     }
@@ -1444,7 +1437,7 @@ mod tests {
         impl BoxedSlice for Box<[u8]> {}
         fn assert_boxed_slice<T: BoxedSlice>(_: &T) {}
 
-        let entry = ArticleEntry::from_response_bytes(
+        let entry = entry_from_response_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         );
 
@@ -1504,31 +1497,29 @@ mod tests {
     #[test]
     fn test_is_complete_article() {
         // Metadata-only responses should NOT be complete articles
-        let metadata_only_430 = ArticleEntry::from_response_bytes(b"430\r\n");
+        let metadata_only_430 = entry_from_response_bytes(b"430\r\n");
         assert!(!metadata_only_430.is_complete_article());
 
-        let metadata_only_220 = ArticleEntry::from_response_bytes(b"220\r\n");
+        let metadata_only_220 = entry_from_response_bytes(b"220\r\n");
         assert!(!metadata_only_220.is_complete_article());
 
-        let metadata_only_223 = ArticleEntry::from_response_bytes(b"223\r\n");
+        let metadata_only_223 = entry_from_response_bytes(b"223\r\n");
         assert!(!metadata_only_223.is_complete_article());
 
         // Full article SHOULD be complete
-        let full = ArticleEntry::from_response_bytes(
+        let full = entry_from_response_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         );
         assert!(full.is_complete_article());
 
         // Wrong status code (not 220) should NOT be complete article
-        let head_response = ArticleEntry::from_response_bytes(
-            b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n",
-        );
+        let head_response =
+            entry_from_response_bytes(b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n");
         assert!(!head_response.is_complete_article());
 
         // Missing terminator should NOT be complete
-        let no_terminator = ArticleEntry::from_response_bytes(
-            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n",
-        );
+        let no_terminator =
+            entry_from_response_bytes(b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n");
         assert!(!no_terminator.is_complete_article());
     }
 
@@ -1916,7 +1907,7 @@ mod tests {
             "222 0 <test@example.com>\r\n{}\r\n.\r\n",
             std::str::from_utf8(&body).unwrap()
         );
-        let article = ArticleEntry::from_response_bytes(response.as_bytes());
+        let article = entry_from_response_bytes(response.as_bytes());
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
         cache.insert(msgid.clone(), article).await;
@@ -1936,7 +1927,7 @@ mod tests {
                 msgid.as_str(),
                 std::str::from_utf8(&body).unwrap()
             );
-            let article = ArticleEntry::from_response_bytes(response.as_bytes());
+            let article = entry_from_response_bytes(response.as_bytes());
             cache.insert(msgid, article).await;
             cache.sync().await;
         }
@@ -1961,7 +1952,7 @@ mod tests {
 
         // Create small metadata-only response (53 bytes)
         let metadata_only = b"223 0 <test@example.com>\r\n".to_vec();
-        let article = ArticleEntry::from_response_bytes(metadata_only);
+        let article = entry_from_response_bytes(metadata_only);
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
         cache.insert(msgid, article).await;
@@ -1977,7 +1968,7 @@ mod tests {
             let msgid_str = format!("<metadata_only{i}@example.com>");
             let msgid = MessageId::new(msgid_str).unwrap();
             let metadata_only = format!("223 0 {}\r\n", msgid.as_str());
-            let article = ArticleEntry::from_response_bytes(metadata_only.as_bytes());
+            let article = entry_from_response_bytes(metadata_only.as_bytes());
             cache.insert(msgid, article).await;
         }
 
