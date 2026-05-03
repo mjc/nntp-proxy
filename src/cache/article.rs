@@ -347,10 +347,7 @@ impl CachedArticle {
 
     /// Parse a contiguous ingest response into typed cache metadata and payload.
     #[must_use]
-    pub fn from_contiguous_ingest_with_tier(
-        response: impl AsRef<[u8]>,
-        tier: ttl::CacheTier,
-    ) -> Self {
+    fn from_contiguous_ingest_with_tier(response: impl AsRef<[u8]>, tier: ttl::CacheTier) -> Self {
         let response = response.as_ref();
         let status_code = StatusCode::parse(response).unwrap_or_else(|| StatusCode::new(430));
         let payload = parse_payload(status_code, response);
@@ -364,10 +361,11 @@ impl CachedArticle {
     }
 
     #[must_use]
-    pub(crate) fn from_ingest_response_with_tier(
-        buffer: super::CacheIngestResponse,
+    pub fn from_ingest_response_with_tier(
+        buffer: impl Into<super::CacheIngestResponse>,
         tier: ttl::CacheTier,
     ) -> Self {
+        let buffer = buffer.into();
         match buffer {
             super::CacheIngestResponse::Owned(buffer) => {
                 Self::from_contiguous_ingest_with_tier(buffer, tier)
@@ -385,7 +383,7 @@ impl CachedArticle {
     }
 
     #[must_use]
-    pub fn from_chunked_ingest_with_tier(
+    fn from_chunked_ingest_with_tier(
         buffer: &crate::pool::ChunkedResponse,
         tier: ttl::CacheTier,
     ) -> Self {
@@ -1693,8 +1691,7 @@ mod tests {
         let entry = CachedArticle::from_ingest_response_with_tier(
             smallvec::SmallVec::<[u8; 128]>::from_slice(
                 b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
-            )
-            .into(),
+            ),
             ttl::CacheTier::new(0),
         );
 
@@ -1719,8 +1716,7 @@ mod tests {
             "test response must span chunks"
         );
 
-        let entry =
-            CachedArticle::from_ingest_response_with_tier(response.into(), ttl::CacheTier::new(0));
+        let entry = CachedArticle::from_ingest_response_with_tier(response, ttl::CacheTier::new(0));
 
         assert_eq!(entry.status_code(), StatusCode::new(220));
         match entry.payload {
@@ -1745,8 +1741,7 @@ mod tests {
             b"220 123456789 <very-long-message-id-that-spans-chunks@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         );
 
-        let entry =
-            CachedArticle::from_ingest_response_with_tier(response.into(), ttl::CacheTier::new(0));
+        let entry = CachedArticle::from_ingest_response_with_tier(response, ttl::CacheTier::new(0));
 
         assert_eq!(
             entry.article_number(),

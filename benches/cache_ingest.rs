@@ -4,8 +4,8 @@
 
 use divan::{Bencher, black_box};
 use nntp_proxy::cache::ArticleCache;
-use nntp_proxy::cache::CachedArticle;
 use nntp_proxy::cache::ttl::CacheTier;
+use nntp_proxy::cache::{CacheIngestResponse, CachedArticle};
 use nntp_proxy::pool::{BufferPool, ChunkedResponse};
 use nntp_proxy::types::{BackendId, BufferSize, MessageId};
 use std::time::Duration;
@@ -100,8 +100,8 @@ mod cache_upsert {
 
 mod entry_parse {
     use super::{
-        Bencher, BufferPool, BufferSize, CacheTier, CachedArticle, ChunkedResponse,
-        article_response, black_box,
+        Bencher, BufferPool, BufferSize, CacheIngestResponse, CacheTier, CachedArticle,
+        ChunkedResponse, article_response, black_box,
     };
 
     fn chunked_response(bytes: &[u8]) -> ChunkedResponse {
@@ -121,12 +121,12 @@ mod entry_parse {
             #[divan::bench(sample_count = $samples, sample_size = 100)]
             fn $name(bencher: Bencher) {
                 let bytes = $bytes;
-                let chunked = chunked_response(&bytes);
                 bencher
                     .counter(divan::counter::BytesCount::new(bytes.len()))
-                    .bench(|| {
-                        black_box(CachedArticle::from_chunked_ingest_with_tier(
-                            black_box(&chunked),
+                    .with_inputs(|| chunked_response(&bytes))
+                    .bench_values(|chunked| {
+                        black_box(CachedArticle::from_ingest_response_with_tier(
+                            CacheIngestResponse::Chunked(black_box(chunked)),
                             CacheTier::new(0),
                         ))
                     });
