@@ -441,10 +441,9 @@ mod tests {
 
     #[test]
     fn test_very_long_commands() {
-        // Very long stateless command
+        // Oversized requests are rejected before stateless routing.
         let long_cmd = format!("LIST {}", "A".repeat(10000));
-        let action = classify(&long_cmd);
-        assert_eq!(action, CommandAction::ForwardStateless);
+        assert!(matches!(classify(&long_cmd), CommandAction::Reject(_)));
 
         // Very long GROUP name (stateful)
         let long_group = format!("GROUP {}", "alt.".repeat(1000));
