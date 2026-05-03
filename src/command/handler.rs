@@ -54,7 +54,7 @@ impl RejectResponse {
     }
 
     #[must_use]
-    pub fn metadata(self) -> RequestResponseMetadata {
+    pub(crate) fn metadata(self) -> RequestResponseMetadata {
         RequestResponseMetadata::new(self.status(), self.len().into())
     }
 

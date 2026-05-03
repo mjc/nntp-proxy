@@ -11,7 +11,7 @@ use tokio::io::AsyncWriteExt;
 
 /// Result of handling an auth command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AuthResult {
+pub(crate) enum AuthResult {
     /// Authentication succeeded
     Authenticated {
         bytes: BackendToClientBytes,
@@ -33,7 +33,7 @@ impl AuthResult {
     }
 
     #[must_use]
-    pub const fn response_metadata(self) -> RequestResponseMetadata {
+    pub(crate) const fn response_metadata(self) -> RequestResponseMetadata {
         match self {
             Self::Authenticated { response, .. } | Self::NotAuthenticated { response, .. } => {
                 response

@@ -105,16 +105,16 @@ impl From<usize> for ResponseWireLen {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct ResponsePayloadLen(usize);
+pub(crate) struct ResponsePayloadLen(usize);
 
 impl ResponsePayloadLen {
     #[must_use]
-    pub const fn new(value: usize) -> Self {
+    pub(crate) const fn new(value: usize) -> Self {
         Self(value)
     }
 
     #[must_use]
-    pub const fn get(self) -> usize {
+    pub(crate) const fn get(self) -> usize {
         self.0
     }
 }
@@ -126,24 +126,24 @@ impl From<usize> for ResponsePayloadLen {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct RequestResponseMetadata {
+pub(crate) struct RequestResponseMetadata {
     status: StatusCode,
     wire_len: ResponseWireLen,
 }
 
 impl RequestResponseMetadata {
     #[must_use]
-    pub const fn new(status: StatusCode, wire_len: ResponseWireLen) -> Self {
+    pub(crate) const fn new(status: StatusCode, wire_len: ResponseWireLen) -> Self {
         Self { status, wire_len }
     }
 
     #[must_use]
-    pub const fn status(self) -> StatusCode {
+    pub(crate) const fn status(self) -> StatusCode {
         self.status
     }
 
     #[must_use]
-    pub const fn wire_len(self) -> ResponseWireLen {
+    pub(crate) const fn wire_len(self) -> ResponseWireLen {
         self.wire_len
     }
 }
@@ -582,13 +582,13 @@ impl RequestContext {
 
     #[inline]
     #[must_use]
-    pub const fn response_metadata(&self) -> Option<RequestResponseMetadata> {
+    pub(crate) const fn response_metadata(&self) -> Option<RequestResponseMetadata> {
         self.response
     }
 
     #[inline]
     #[must_use]
-    pub const fn response_payload_len(&self) -> Option<ResponsePayloadLen> {
+    pub(crate) const fn response_payload_len(&self) -> Option<ResponsePayloadLen> {
         match &self.response_payload {
             Some(response) => Some(ResponsePayloadLen::new(response.len())),
             None => None,
@@ -596,7 +596,7 @@ impl RequestContext {
     }
 
     #[inline]
-    pub fn complete_backend_response(
+    pub(crate) fn complete_backend_response(
         &mut self,
         backend_id: BackendId,
         status: StatusCode,
@@ -607,7 +607,7 @@ impl RequestContext {
         self.response_payload = Some(response);
     }
 
-    pub async fn write_response_payload_to<W>(&self, writer: &mut W) -> std::io::Result<()>
+    pub(crate) async fn write_response_payload_to<W>(&self, writer: &mut W) -> std::io::Result<()>
     where
         W: tokio::io::AsyncWriteExt + Unpin,
     {
@@ -619,8 +619,9 @@ impl RequestContext {
     }
 
     #[inline]
+    #[cfg(test)]
     #[must_use]
-    pub fn response_payload_eq(&self, expected: &[u8]) -> Option<bool> {
+    pub(crate) fn response_payload_eq(&self, expected: &[u8]) -> Option<bool> {
         let response = self.response_payload.as_ref()?;
         if response.len() != expected.len() {
             return Some(false);
@@ -638,8 +639,9 @@ impl RequestContext {
     }
 
     #[inline]
+    #[cfg(test)]
     #[must_use]
-    pub const fn response_payload_is_empty(&self) -> Option<bool> {
+    pub(crate) const fn response_payload_is_empty(&self) -> Option<bool> {
         match &self.response_payload {
             Some(response) => Some(response.is_empty()),
             None => None,
@@ -647,7 +649,7 @@ impl RequestContext {
     }
 
     #[inline]
-    pub const fn record_backend_response(
+    pub(crate) const fn record_backend_response(
         &mut self,
         backend_id: BackendId,
         response: RequestResponseMetadata,
@@ -657,7 +659,7 @@ impl RequestContext {
     }
 
     #[inline]
-    pub const fn record_cache_response(
+    pub(crate) const fn record_cache_response(
         &mut self,
         backend_id: BackendId,
         response: RequestResponseMetadata,
@@ -668,7 +670,7 @@ impl RequestContext {
     }
 
     #[inline]
-    pub const fn record_local_response(&mut self, response: RequestResponseMetadata) {
+    pub(crate) const fn record_local_response(&mut self, response: RequestResponseMetadata) {
         self.response = Some(response);
     }
 

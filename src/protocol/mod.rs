@@ -21,10 +21,10 @@ pub use article::{Article, HeaderIter, Headers, ParseError, yenc};
 pub(crate) use request::{
     RequestCacheArticleNumber, RequestCacheAvailability, RequestCacheEntryMetadata,
     RequestCachePayloadKind, RequestCacheStatus, RequestCacheTier, RequestCacheTimestampMillis,
+    RequestResponseMetadata, ResponsePayloadLen,
 };
 pub use request::{
-    RequestContext, RequestKind, RequestLine, RequestResponseMetadata, RequestRouteClass,
-    RequestWireLen, ResponsePayloadLen, ResponseWireLen,
+    RequestContext, RequestKind, RequestLine, RequestRouteClass, RequestWireLen, ResponseWireLen,
 };
 pub use response::StatusCode;
 
