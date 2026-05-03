@@ -609,7 +609,7 @@ mod tests {
     fn test_format_hex_preview_full_response() {
         let data = b"430 No such article\r\n";
         let result = format_hex_preview(data, 256);
-        // Should show full response in hex
+        // Should show every byte in the preview
         assert!(result.starts_with("34 33 30 20")); // "430 "
         assert!(result.ends_with("0d 0a")); // \r\n
         assert_eq!(result.split_whitespace().count(), data.len());

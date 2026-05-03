@@ -426,7 +426,7 @@ pub(crate) async fn read_response_into_context(
     Ok(())
 }
 
-/// Read and validate a full response after the first chunk has already been prefetched.
+/// Buffer the current request's complete backend response after the first chunk was prefetched.
 ///
 /// Used by the direct per-command path, which performs the initial command send/read
 /// before deciding how to route the response.
