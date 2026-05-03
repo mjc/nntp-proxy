@@ -135,6 +135,7 @@ async fn spawn_proxy(listener: TcpListener, proxy: NntpProxy, mode: RoutingMode)
 struct BenchProxy {
     stream: TcpStream,
     read_buffer: Vec<u8>,
+    drain_buffer: Box<[u8]>,
 }
 
 impl BenchProxy {
@@ -163,6 +164,7 @@ impl BenchProxy {
         Self {
             stream,
             read_buffer,
+            drain_buffer: vec![0; body_len + 512].into_boxed_slice(),
         }
     }
 
@@ -172,6 +174,14 @@ impl BenchProxy {
             .await
             .unwrap();
         read_multiline(&mut self.stream, &mut self.read_buffer).await
+    }
+
+    async fn article_roundtrip_drain(&mut self) -> usize {
+        self.stream
+            .write_all(b"ARTICLE <bench@example.com>\r\n")
+            .await
+            .unwrap();
+        read_multiline_into(&mut self.stream, &mut self.drain_buffer).await
     }
 }
 
@@ -200,7 +210,30 @@ async fn read_multiline(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> usize {
     }
 }
 
-fn bench_roundtrip(bencher: Bencher, body_len: usize, cache: Option<Cache>, warm_cache: bool) {
+async fn read_multiline_into(stream: &mut TcpStream, buffer: &mut [u8]) -> usize {
+    let mut total = 0;
+    loop {
+        let n = stream.read(&mut buffer[total..]).await.unwrap();
+        assert_ne!(n, 0, "proxy closed during benchmark response");
+        total += n;
+        if buffer[..total].ends_with(b"\r\n.\r\n") {
+            return total;
+        }
+    }
+}
+
+enum ReadMode {
+    Collect,
+    Drain,
+}
+
+fn bench_roundtrip(
+    bencher: Bencher,
+    body_len: usize,
+    cache: Option<Cache>,
+    warm_cache: bool,
+    read_mode: ReadMode,
+) {
     let rt = Runtime::new().unwrap();
     let mut proxy = rt.block_on(BenchProxy::start(body_len, cache));
     if warm_cache {
@@ -211,23 +244,47 @@ fn bench_roundtrip(bencher: Bencher, body_len: usize, cache: Option<Cache>, warm
 
     bencher
         .counter(divan::counter::BytesCount::new(body_len))
-        .bench(|| black_box(rt.block_on(proxy.lock().unwrap().article_roundtrip())));
+        .bench(|| {
+            let mut proxy = proxy.lock().unwrap();
+            let bytes = match read_mode {
+                ReadMode::Collect => rt.block_on(proxy.article_roundtrip()),
+                ReadMode::Drain => rt.block_on(proxy.article_roundtrip_drain()),
+            };
+            black_box(bytes)
+        });
 }
 
 mod backend_roundtrip {
-    use super::{Bencher, bench_roundtrip};
+    use super::{Bencher, ReadMode, bench_roundtrip};
 
     #[divan::bench(sample_count = 100, sample_size = 20)]
     fn article_64k(bencher: Bencher) {
-        bench_roundtrip(bencher, 64 * 1024, None, false);
+        bench_roundtrip(bencher, 64 * 1024, None, false, ReadMode::Collect);
     }
 }
 
 mod cache_hit_roundtrip {
-    use super::{Bencher, bench_roundtrip, memory_cache};
+    use super::{Bencher, ReadMode, bench_roundtrip, memory_cache};
 
     #[divan::bench(sample_count = 100, sample_size = 20)]
     fn article_64k(bencher: Bencher) {
-        bench_roundtrip(bencher, 64 * 1024, Some(memory_cache()), true);
+        bench_roundtrip(
+            bencher,
+            64 * 1024,
+            Some(memory_cache()),
+            true,
+            ReadMode::Collect,
+        );
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 20)]
+    fn article_64k_drain(bencher: Bencher) {
+        bench_roundtrip(
+            bencher,
+            64 * 1024,
+            Some(memory_cache()),
+            true,
+            ReadMode::Drain,
+        );
     }
 }
