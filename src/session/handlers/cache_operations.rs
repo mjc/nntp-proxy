@@ -293,7 +293,6 @@ mod tests {
         .with_cache(Arc::new(UnifiedCache::memory(
             1024,
             Duration::from_secs(60),
-            true,
         )))
         .build()
     }

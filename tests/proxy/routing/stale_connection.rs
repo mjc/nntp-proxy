@@ -517,12 +517,11 @@ fn test_availability_merge_430_overrides_has() {
 /// The cache correctly maintains 430 state until TTL expiry.
 #[tokio::test]
 async fn test_430_cache_is_authoritative() -> Result<()> {
-    use nntp_proxy::cache::{ArticleAvailability, ArticleCache};
+    use nntp_proxy::cache::{ArticleAvailability, UnifiedCache};
     use nntp_proxy::router::BackendCount;
     use nntp_proxy::types::{BackendId, MessageId};
-    use std::time::Duration;
 
-    let cache = ArticleCache::new(1024 * 1024, Duration::from_secs(300), false);
+    let cache = UnifiedCache::availability(1024 * 1024);
     let msg_id = MessageId::from_borrowed("<auth430@test.com>")?;
 
     // Record backends as 430 using the public API

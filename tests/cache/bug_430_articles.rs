@@ -25,7 +25,7 @@ use super::article_response_bytes;
 #[tokio::test]
 async fn test_sync_availability_does_not_create_430_metadata_only_when_backend_has_article()
 -> Result<()> {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
     let msg_id = MessageId::new("<test@example.com>".to_string())?;
 
     // Simulate the scenario: backend 0 has the article
@@ -61,7 +61,7 @@ async fn test_sync_availability_does_not_create_430_metadata_only_when_backend_h
 /// Test the full race condition scenario
 #[tokio::test]
 async fn test_race_condition_upsert_vs_sync_availability() -> Result<()> {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
     let msg_id = MessageId::new("<race@example.com>".to_string())?;
 
     // Simulate the race: sync_availability runs BEFORE upsert
@@ -99,7 +99,7 @@ async fn test_race_condition_upsert_vs_sync_availability() -> Result<()> {
 /// Test that repeated requests don't get 430 due to corrupted cache
 #[tokio::test]
 async fn test_second_request_gets_article_not_430() -> Result<()> {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
     let msg_id = MessageId::new("<second@example.com>".to_string())?;
 
     // First request: upsert the article
@@ -207,7 +207,7 @@ fn test_record_has_clears_missing() {
 /// Test `sync_availability` with mixed availability (some have, some missing)
 #[tokio::test]
 async fn test_sync_availability_mixed_results() -> Result<()> {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
     let msg_id = MessageId::new("<mixed@example.com>".to_string())?;
 
     // Simulate: backend 0 returned 430, backend 1 has it
@@ -233,7 +233,7 @@ async fn test_sync_availability_mixed_results() -> Result<()> {
 /// Test `sync_availability` creates missing entry only when ALL backends are missing
 #[tokio::test]
 async fn test_sync_availability_creates_430_when_all_missing() -> Result<()> {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
     let msg_id = MessageId::new("<allmissing@example.com>".to_string())?;
 
     // All backends returned 430
@@ -290,7 +290,7 @@ fn test_all_exhausted_with_backend_count() {
 /// serve it directly - we should fall through to backend routing.
 #[tokio::test]
 async fn test_430_metadata_only_not_served_directly() -> Result<()> {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
     let msg_id = MessageId::new("<metadata_only@example.com>".to_string())?;
 
     // Create a missing entry in the cache (simulating all backends returned 430 previously)
@@ -317,7 +317,7 @@ async fn test_concurrent_upsert_and_sync() -> Result<()> {
     use std::sync::Arc;
     use tokio::sync::Barrier;
 
-    let cache = Arc::new(ArticleCache::new(1_000_000, Duration::from_secs(300), true));
+    let cache = Arc::new(ArticleCache::new(1_000_000, Duration::from_secs(300)));
     let msg_id = MessageId::new("<concurrent@example.com>".to_string())?;
 
     // Use a barrier to synchronize the two operations
@@ -368,7 +368,7 @@ async fn test_concurrent_upsert_and_sync() -> Result<()> {
 /// Test that metadata-only responses don't get served when `cache_articles=true`
 #[tokio::test]
 async fn test_metadata_only_not_served_as_article() -> Result<()> {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
     let msg_id = MessageId::new("<metadata_only-test@example.com>".to_string())?;
 
     // Simulate STAT precheck creating a metadata-only response
@@ -404,7 +404,7 @@ async fn test_metadata_only_not_served_as_article() -> Result<()> {
 /// Test the full scenario: precheck creates a metadata-only response, then ARTICLE command needs real body
 #[tokio::test]
 async fn test_precheck_metadata_only_then_article_request() -> Result<()> {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
     let msg_id = MessageId::new("<precheck-then-article@example.com>".to_string())?;
 
     // Step 1: STAT precheck creates a metadata-only response

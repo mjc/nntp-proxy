@@ -545,7 +545,7 @@ mod tests {
 
         let deps = OwnedDeps {
             router: Arc::new(selector),
-            cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60), true)),
+            cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
             buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 2),
             metrics: MetricsCollector::new(1),
             cache_articles: true,
@@ -558,13 +558,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_precheck_availability_hit_records_no_payload() {
-        use crate::cache::CachedPayloadKind;
+    async fn cache_precheck_availability_hit_does_not_persist_positive_entry() {
         use crate::cache::UnifiedCache;
         use crate::types::BackendId;
 
         let backend_id = BackendId::from_index(0);
-        let cache = UnifiedCache::memory(100, Duration::from_secs(60), false);
+        let cache = UnifiedCache::availability(100);
         let msg_id = MessageId::new("<test@example.com>".to_string()).unwrap();
 
         cache_precheck_hit(
@@ -576,10 +575,9 @@ mod tests {
         )
         .await;
 
-        let entry = cache.get(&msg_id).await.expect("entry cached");
-        assert_eq!(entry.status_code(), StatusCode::new(223));
-        assert_eq!(entry.payload_kind(), CachedPayloadKind::AvailabilityOnly);
-        assert_eq!(entry.payload_len().get(), 0);
-        assert!(entry.has_availability_info());
+        assert!(
+            cache.get(&msg_id).await.is_none(),
+            "availability-only index should persist negatives, not optimistic positive hits"
+        );
     }
 }

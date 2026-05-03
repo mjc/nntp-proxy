@@ -230,7 +230,7 @@ fn test_is_expired_future_timestamp() {
 #[tokio::test]
 async fn test_cache_tier_0_expires_at_base_ttl() {
     // Use very short TTL for testing
-    let cache = ArticleCache::new(1_000_000, Duration::from_millis(50), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_millis(50));
 
     let msg_id = MessageId::from_borrowed("<tier0-test@example.com>").unwrap();
 
@@ -250,7 +250,7 @@ async fn test_cache_tier_0_expires_at_base_ttl() {
 #[tokio::test]
 async fn test_cache_higher_tier_longer_ttl() {
     // Use 200ms base TTL for more reliable timing
-    let cache = ArticleCache::new(1_000_000, Duration::from_millis(200), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_millis(200));
 
     let msg_id = MessageId::from_borrowed("<tier1-test@example.com>").unwrap();
 
@@ -283,7 +283,7 @@ async fn test_cache_higher_tier_longer_ttl() {
 #[tokio::test]
 async fn test_cache_tier_2_even_longer() {
     // Use 200ms base TTL for more reliable timing
-    let cache = ArticleCache::new(1_000_000, Duration::from_millis(200), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_millis(200));
 
     let msg_id = MessageId::from_borrowed("<tier2-test@example.com>").unwrap();
 
@@ -303,7 +303,7 @@ async fn test_cache_tier_2_even_longer() {
 
 #[tokio::test]
 async fn test_cache_preserves_tier_on_get() {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(60), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(60));
 
     let msg_id = MessageId::from_borrowed("<tier-preserve@example.com>").unwrap();
 
@@ -316,7 +316,7 @@ async fn test_cache_preserves_tier_on_get() {
 
 #[tokio::test]
 async fn test_cache_upsert_updates_tier_with_larger_buffer() {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(60), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(60));
 
     let msg_id = MessageId::from_borrowed("<tier-update@example.com>").unwrap();
     let buffer_large = article_bytes(msg_id.as_str(), "Larger body content here");
@@ -343,7 +343,7 @@ async fn test_cache_upsert_updates_tier_with_larger_buffer() {
 #[tokio::test]
 async fn test_cache_upsert_keeps_tier_without_replacement() {
     // Verify that tier is NOT updated when buffer isn't replaced
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(60), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(60));
 
     let msg_id = MessageId::from_borrowed("<tier-keep@example.com>").unwrap();
     let buffer = article_bytes(msg_id.as_str(), "Body");

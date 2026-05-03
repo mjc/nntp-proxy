@@ -38,7 +38,7 @@ mod ingest {
             #[divan::bench(sample_count = $samples, sample_size = 100)]
             fn $name(bencher: Bencher) {
                 let rt = tokio::runtime::Runtime::new().unwrap();
-                let cache = ArticleCache::new(16 * 1024 * 1024, Duration::from_secs(300), true);
+                let cache = ArticleCache::new(16 * 1024 * 1024, Duration::from_secs(300));
                 let bytes = $bytes;
                 bencher
                     .counter(divan::counter::BytesCount::new(bytes.len()))
@@ -76,7 +76,7 @@ mod cache_upsert {
     #[divan::bench(sample_count = 100, sample_size = 50)]
     fn response(bencher: Bencher) {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let cache = ArticleCache::new(16 * 1024 * 1024, Duration::from_secs(300), true);
+        let cache = ArticleCache::new(16 * 1024 * 1024, Duration::from_secs(300));
         let bytes = article_response(64 * 1024);
 
         bencher
@@ -120,7 +120,7 @@ mod chunked_ingest {
             #[divan::bench(sample_count = $samples, sample_size = 100)]
             fn $name(bencher: Bencher) {
                 let rt = tokio::runtime::Runtime::new().unwrap();
-                let cache = ArticleCache::new(16 * 1024 * 1024, Duration::from_secs(300), true);
+                let cache = ArticleCache::new(16 * 1024 * 1024, Duration::from_secs(300));
                 let bytes = $bytes;
                 bencher
                     .counter(divan::counter::BytesCount::new(bytes.len()))

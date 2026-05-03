@@ -634,11 +634,7 @@ mod tests {
         let config = create_test_config();
         let proxy = NntpProxy::new_sync(config, RoutingMode::Hybrid).unwrap();
 
-        let _empty_cache = Arc::new(crate::cache::UnifiedCache::memory(
-            100,
-            std::time::Duration::from_secs(3600),
-            false,
-        ));
+        let _empty_cache = Arc::new(crate::cache::UnifiedCache::availability(100));
         assert_eq!(proxy.routing_mode_display_name(), "per-command");
     }
 

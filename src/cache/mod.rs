@@ -15,6 +15,7 @@
 
 mod article;
 mod availability;
+mod availability_index;
 mod hybrid;
 mod hybrid_codec;
 pub mod ttl;
@@ -26,6 +27,7 @@ pub(crate) use article::CachedArticleNumber;
 pub(crate) use article::CachedPayloadKind;
 pub use article::{ArticleCache, CachedArticle};
 pub use availability::{ArticleAvailability, BackendStatus, MAX_BACKENDS};
+pub use availability_index::AvailabilityIndex;
 pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
 
 use crate::protocol::StatusCode;
@@ -55,6 +57,7 @@ impl CacheIngestResponse {
         }
     }
 
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn status_code(&self) -> Option<StatusCode> {
         match self {
@@ -224,7 +227,7 @@ mod tests {
 
     #[tokio::test]
     async fn unified_cache_records_typed_availability_without_payload() {
-        let cache = UnifiedCache::memory(1000, std::time::Duration::from_secs(60), true);
+        let cache = UnifiedCache::memory(1000, std::time::Duration::from_secs(60));
         let msg_id = MessageId::new("<typed-availability@example>".to_string()).unwrap();
         let backend_id = BackendId::from_index(1);
 
@@ -295,6 +298,17 @@ impl CacheStatsProvider for ArticleCache {
     }
 }
 
+impl CacheStatsProvider for AvailabilityIndex {
+    fn display_stats(&self) -> CacheDisplayStats {
+        CacheDisplayStats {
+            entry_count: self.entry_count(),
+            size_bytes: self.used_bytes(),
+            hit_rate: self.hit_rate(),
+            disk: None,
+        }
+    }
+}
+
 impl CacheStatsProvider for HybridArticleCache {
     fn display_stats(&self) -> CacheDisplayStats {
         let stats = self.stats();
@@ -321,6 +335,8 @@ impl CacheStatsProvider for HybridArticleCache {
 /// allowing the proxy to use either based on configuration.
 #[derive(Debug)]
 pub enum UnifiedCache {
+    /// Availability-only negative index with exact key matches.
+    Availability(AvailabilityIndex),
     /// Memory-only cache using moka
     Memory(ArticleCache),
     /// Hybrid memory+disk cache using foyer
@@ -328,10 +344,16 @@ pub enum UnifiedCache {
 }
 
 impl UnifiedCache {
+    /// Create an availability-only negative index.
+    #[must_use]
+    pub fn availability(capacity: u64) -> Self {
+        Self::Availability(AvailabilityIndex::new(capacity))
+    }
+
     /// Create a memory-only cache
     #[must_use]
-    pub fn memory(capacity: u64, ttl: std::time::Duration, cache_articles: bool) -> Self {
-        Self::Memory(ArticleCache::new(capacity, ttl, cache_articles))
+    pub fn memory(capacity: u64, ttl: std::time::Duration) -> Self {
+        Self::Memory(ArticleCache::new(capacity, ttl))
     }
 
     /// Create a hybrid cache (async because foyer needs async initialization)
@@ -342,6 +364,7 @@ impl UnifiedCache {
     /// Get an article from the cache
     pub async fn get(&self, message_id: &MessageId<'_>) -> Option<CachedArticle> {
         match self {
+            Self::Availability(index) => index.get(message_id),
             Self::Memory(cache) => cache.get(message_id).await,
             Self::Hybrid(cache) => cache
                 .get(message_id)
@@ -356,6 +379,7 @@ impl UnifiedCache {
     /// the typed wrapper because its disk key path owns `String`s internally.
     pub async fn get_request_message_id(&self, message_id: &str) -> Option<CachedArticle> {
         match self {
+            Self::Availability(index) => index.get_request_message_id(message_id),
             Self::Memory(cache) => {
                 let key = message_id.strip_prefix('<')?.strip_suffix('>')?;
                 cache.get_by_cache_key(key).await
@@ -379,6 +403,7 @@ impl UnifiedCache {
     ) {
         let buffer = buffer.into();
         match self {
+            Self::Availability(_) => {}
             Self::Memory(cache) => {
                 cache
                     .upsert_ingest(message_id, buffer, backend_id, tier)
@@ -395,6 +420,7 @@ impl UnifiedCache {
     /// Record that a backend returned 430 for this article
     pub async fn record_backend_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
         match self {
+            Self::Availability(index) => index.record_backend_missing(&message_id, backend_id),
             Self::Memory(cache) => cache.record_backend_missing(message_id, backend_id).await,
             Self::Hybrid(cache) => cache.record_missing(message_id, backend_id).await,
         }
@@ -409,6 +435,7 @@ impl UnifiedCache {
         tier: ttl::CacheTier,
     ) {
         match self {
+            Self::Availability(_) => {}
             Self::Memory(cache) => {
                 cache
                     .record_backend_has_status(message_id, status_code, backend_id, tier)
@@ -429,8 +456,28 @@ impl UnifiedCache {
         availability: &ArticleAvailability,
     ) {
         match self {
+            Self::Availability(index) => index.sync_availability(&message_id, availability),
             Self::Memory(cache) => cache.sync_availability(message_id, availability).await,
             Self::Hybrid(cache) => cache.sync_availability(message_id, availability).await,
+        }
+    }
+
+    /// Load persisted availability state if this is an availability-only cache.
+    pub fn load_from_disk(&self, path: &std::path::Path) -> anyhow::Result<bool> {
+        match self {
+            Self::Availability(index) => index.load_from_path(path),
+            Self::Memory(_) | Self::Hybrid(_) => Ok(false),
+        }
+    }
+
+    /// Save persisted availability state if this is an availability-only cache.
+    pub fn save_to_disk(&self, path: &std::path::Path) -> anyhow::Result<bool> {
+        match self {
+            Self::Availability(index) => {
+                index.save_to_path(path)?;
+                Ok(true)
+            }
+            Self::Memory(_) | Self::Hybrid(_) => Ok(false),
         }
     }
 
@@ -438,6 +485,7 @@ impl UnifiedCache {
     #[must_use]
     pub fn capacity(&self) -> u64 {
         match self {
+            Self::Availability(index) => index.capacity_bytes(),
             Self::Memory(cache) => cache.capacity(),
             Self::Hybrid(cache) => cache.stats().memory_capacity,
         }
@@ -447,6 +495,7 @@ impl UnifiedCache {
     #[must_use]
     pub fn entry_count(&self) -> u64 {
         match self {
+            Self::Availability(index) => index.entry_count(),
             Self::Memory(cache) => cache.entry_count(),
             Self::Hybrid(_cache) => 0, // foyer doesn't expose this easily
         }
@@ -456,6 +505,7 @@ impl UnifiedCache {
     #[must_use]
     pub fn weighted_size(&self) -> u64 {
         match self {
+            Self::Availability(index) => index.used_bytes(),
             Self::Memory(cache) => cache.weighted_size(),
             Self::Hybrid(cache) => cache.stats().memory_capacity,
         }
@@ -465,6 +515,7 @@ impl UnifiedCache {
     #[must_use]
     pub fn hit_rate(&self) -> f64 {
         match self {
+            Self::Availability(index) => index.hit_rate(),
             Self::Memory(cache) => cache.hit_rate(),
             Self::Hybrid(cache) => cache.stats().hit_rate(),
         }
@@ -476,11 +527,18 @@ impl UnifiedCache {
         matches!(self, Self::Hybrid(_))
     }
 
+    /// Check if this cache is the dedicated availability-only index.
+    #[must_use]
+    pub const fn is_availability_only(&self) -> bool {
+        matches!(self, Self::Availability(_))
+    }
+
     /// Run pending background tasks (for testing)
     ///
     /// Ensures all async maintenance tasks complete for deterministic testing.
     pub async fn sync(&self) {
         match self {
+            Self::Availability(_) => {}
             Self::Memory(cache) => cache.sync().await,
             Self::Hybrid(_) => {} // foyer handles this differently
         }
@@ -492,6 +550,7 @@ impl UnifiedCache {
     /// For memory cache, this is a no-op (no persistent state).
     pub async fn close(&self) -> anyhow::Result<()> {
         match self {
+            Self::Availability(_) => Ok(()),
             Self::Memory(_) => Ok(()), // No persistent state
             Self::Hybrid(cache) => cache.close().await,
         }
@@ -501,6 +560,7 @@ impl UnifiedCache {
 impl CacheStatsProvider for UnifiedCache {
     fn display_stats(&self) -> CacheDisplayStats {
         match self {
+            Self::Availability(index) => index.display_stats(),
             Self::Memory(cache) => cache.display_stats(),
             Self::Hybrid(cache) => cache.display_stats(),
         }

@@ -32,7 +32,7 @@ fn cached_article() -> CachedArticle {
 }
 
 fn cache_entry_from_bytes(response: impl AsRef<[u8]>) -> CachedArticle {
-    let cache = ArticleCache::new(1024 * 1024, Duration::from_secs(300), true);
+    let cache = ArticleCache::new(1024 * 1024, Duration::from_secs(300));
     let msg_id = MessageId::from_borrowed(MSG_ID).unwrap();
 
     block_on(async {

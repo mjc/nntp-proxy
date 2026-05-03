@@ -92,8 +92,6 @@ pub struct HybridCacheConfig {
     pub disk_path: std::path::PathBuf,
     /// Time-to-live for cached articles (not directly used by foyer, but kept for API consistency)
     pub ttl: Duration,
-    /// Whether to cache full article bodies
-    pub cache_articles: bool,
     /// Compression codec for disk storage (lz4, zstd, or none)
     pub compression: CompressionCodec,
     /// Number of shards for concurrent access
@@ -107,7 +105,6 @@ impl Default for HybridCacheConfig {
             disk_capacity: 10 * 1024 * 1024 * 1024, // 10 GB disk
             disk_path: std::path::PathBuf::from("/var/cache/nntp-proxy"),
             ttl: Duration::from_secs(3600), // 1 hour
-            cache_articles: true,
             compression: CompressionCodec::Lz4,
             shards: 16, // Match indexer shards for consistent lock contention
         }
@@ -362,26 +359,11 @@ impl HybridArticleCache {
     ) {
         let buffer = buffer.into();
         let key = message_id.without_brackets().to_string();
-        let mut entry = if self.config.cache_articles {
-            let buffer_len = buffer.len();
-            let Some(entry) = DiskCachedArticle::from_ingest_response_with_tier(buffer, tier)
-            else {
-                warn!(msg_id = %key, buffer_len, "Cannot cache: invalid status code");
-                return;
-            };
-            entry
-        } else {
-            let Some(status_code) = buffer
-                .status_code()
-                .and_then(|code| CacheableStatusCode::try_from(code.as_u16()).ok())
-            else {
-                warn!(
-                    msg_id = %key,
-                    "Cannot cache: invalid status code"
-                );
-                return;
-            };
-            DiskCachedArticle::availability_only(status_code, tier)
+        let buffer_len = buffer.len();
+        let Some(mut entry) = DiskCachedArticle::from_ingest_response_with_tier(buffer, tier)
+        else {
+            warn!(msg_id = %key, buffer_len, "Cannot cache: invalid status code");
+            return;
         };
         let entry_len = entry.payload_len();
 
@@ -407,11 +389,7 @@ impl HybridArticleCache {
 
         entry.record_backend_has(backend_id);
         self.cache.insert(key.clone(), entry);
-        if self.config.cache_articles {
-            debug!(msg_id = %key, stored_bytes = entry_len.get(), tier = tier.get(), "Hybrid cache upsert");
-        } else {
-            debug!(msg_id = %key, stored_bytes = entry_len.get(), tier = tier.get(), "Hybrid cache upsert (availability only)");
-        }
+        debug!(msg_id = %key, stored_bytes = entry_len.get(), tier = tier.get(), "Hybrid cache upsert");
     }
 
     /// Record that a backend doesn't have an article (430 response)
@@ -590,13 +568,6 @@ impl HybridArticleCache {
     /// to `NoopEngineConfig` — a trivially synchronous engine that spawns zero
     /// background tasks. Safe with any tokio runtime flavor.
     pub async fn new_memory_only(memory_capacity: u64) -> anyhow::Result<Self> {
-        Self::new_memory_only_with_cache_articles(memory_capacity, true).await
-    }
-
-    async fn new_memory_only_with_cache_articles(
-        memory_capacity: u64,
-        cache_articles: bool,
-    ) -> anyhow::Result<Self> {
         use foyer::NoopIoEngineConfig;
 
         let memory_capacity_usize: usize = memory_capacity
@@ -624,7 +595,6 @@ impl HybridArticleCache {
             disk_capacity: 0, // No disk in memory-only mode
             disk_path: std::path::PathBuf::new(),
             ttl: Duration::from_secs(3600),
-            cache_articles,
             compression: CompressionCodec::None,
             shards: 1,
         };
@@ -679,25 +649,6 @@ mod tests {
         let stats = cache.stats();
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 0);
-
-        cache.close().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_hybrid_cache_availability_only_stores_no_payload() {
-        let cache = HybridArticleCache::new_memory_only_with_cache_articles(1024 * 1024, false)
-            .await
-            .unwrap();
-
-        let msg_id = MessageId::from_borrowed("<test123@example.com>").unwrap();
-        let buffer = b"220 0 <test123@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-        cache
-            .upsert_ingest(msg_id.clone(), buffer, BackendId::from_index(0), 0.into())
-            .await;
-
-        let entry = cache.get(&msg_id).await.unwrap();
-        assert_eq!(entry.payload_len(), 0);
-        assert!(entry.should_try_backend(BackendId::from_index(0)));
 
         cache.close().await.unwrap();
     }

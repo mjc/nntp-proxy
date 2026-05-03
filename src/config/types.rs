@@ -204,6 +204,7 @@ pub struct Cache {
     /// When false:
     /// - Cache still tracks backend availability (smart routing, 430 retry)
     /// - Article bodies are NOT stored (saves ~750KB per article)
+    /// - Uses the dedicated availability-only index with bounded LRU eviction
     /// - Useful for availability-only mode with limited memory
     ///
     /// When true:
@@ -233,6 +234,13 @@ pub struct Cache {
     /// creating a two-tier cache (memory → disk → backend).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk: Option<DiskCache>,
+
+    /// Path to the availability persistence file (optional).
+    ///
+    /// Only used when `cache_articles = false`. When omitted, the proxy uses
+    /// "availability.idx" alongside the config file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability_file: Option<std::path::PathBuf>,
 }
 
 /// Compression codec for disk cache storage
@@ -328,6 +336,7 @@ impl Default for Cache {
             cache_articles: defaults::cache_articles(),
             adaptive_precheck: defaults::adaptive_precheck(),
             disk: None,
+            availability_file: None,
         }
     }
 }

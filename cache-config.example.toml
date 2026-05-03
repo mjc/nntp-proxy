@@ -26,8 +26,11 @@ max_capacity = "64mb"
 # Time-to-live for cached articles (default: 1 hour)
 ttl_secs = 3600
 # Cache article bodies (default: true)
-# Set to false for availability-only mode (tracks which backends have articles)
+# Set to false for availability-only mode (dedicated exact negative index with LRU eviction)
 cache_articles = true
+# Optional persistence file for availability-only mode
+# Saves every 30 seconds and on shutdown; defaults to "availability.idx" next to the config
+# availability_file = "/var/cache/nntp-proxy/availability.idx"
 # Enable adaptive prechecking for STAT/HEAD commands (default: false)
 # Queries all backends simultaneously to build availability data
 adaptive_precheck = false

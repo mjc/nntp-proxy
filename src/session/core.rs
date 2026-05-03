@@ -191,8 +191,7 @@ impl ClientSessionBuilder {
 impl ClientSession {
     /// Create default cache for availability tracking only (no content caching)
     fn default_cache() -> Arc<crate::cache::UnifiedCache> {
-        const DEFAULT_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
-        Arc::new(crate::cache::UnifiedCache::memory(0, DEFAULT_TTL, false))
+        Arc::new(crate::cache::UnifiedCache::availability(0))
     }
 
     /// Create a new client session for 1:1 backend mapping
@@ -242,11 +241,7 @@ impl ClientSession {
             auth_state: AuthState::new(),
             metrics,
             connection_stats: None,
-            cache: Arc::new(crate::cache::UnifiedCache::memory(
-                0,
-                std::time::Duration::from_secs(3600),
-                false,
-            )),
+            cache: Arc::new(crate::cache::UnifiedCache::availability(0)),
             cache_articles: true,
             adaptive_precheck: false,
         }
@@ -288,11 +283,7 @@ impl ClientSession {
             auth_handler,
             metrics,
             connection_stats: None,
-            cache: Arc::new(crate::cache::UnifiedCache::memory(
-                0,
-                std::time::Duration::from_secs(3600),
-                false,
-            )),
+            cache: Arc::new(crate::cache::UnifiedCache::availability(0)),
             cache_articles: true,
             adaptive_precheck: false,
         }
@@ -890,7 +881,7 @@ mod tests {
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
         let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
-        let cache = Arc::new(UnifiedCache::memory(100, Duration::from_secs(3600), true));
+        let cache = Arc::new(UnifiedCache::memory(100, Duration::from_secs(3600)));
 
         let session = ClientSession::builder(
             addr.into(),

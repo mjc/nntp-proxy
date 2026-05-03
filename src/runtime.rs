@@ -297,6 +297,7 @@ pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
 pub fn spawn_shutdown_handler(
     proxy: &std::sync::Arc<crate::NntpProxy>,
     stats_path: std::path::PathBuf,
+    availability_path: Option<std::path::PathBuf>,
     server_names: Vec<String>,
 ) -> tokio::sync::mpsc::Receiver<()> {
     use std::sync::Arc;
@@ -314,6 +315,15 @@ pub fn spawn_shutdown_handler(
         match save_metrics_to_disk_blocking(metrics, stats_path.clone(), server_names).await {
             Ok(()) => info!("Metrics saved to {}", stats_path.display()),
             Err(e) => warn!("Failed to save metrics on shutdown: {}", e),
+        }
+
+        if let Some(path) = availability_path.clone() {
+            let cache = proxy.cache().clone();
+            match save_availability_to_disk_blocking(cache, path.clone()).await {
+                Ok(true) => info!("Availability index saved to {}", path.display()),
+                Ok(false) => {}
+                Err(e) => warn!("Failed to save availability index on shutdown: {}", e),
+            }
         }
 
         // Notify listeners
@@ -338,6 +348,14 @@ pub async fn save_metrics_to_disk_blocking(
     server_names: Vec<String>,
 ) -> Result<()> {
     tokio::task::spawn_blocking(move || metrics.save_to_disk(&stats_path, &server_names)).await?
+}
+
+/// Save availability state on Tokio's blocking thread pool.
+pub async fn save_availability_to_disk_blocking(
+    cache: std::sync::Arc<crate::cache::UnifiedCache>,
+    availability_path: std::path::PathBuf,
+) -> Result<bool> {
+    tokio::task::spawn_blocking(move || cache.save_to_disk(&availability_path)).await?
 }
 
 /// Run the main accept loop for client connections
@@ -422,6 +440,30 @@ pub fn resolve_stats_file_path(
     }
 }
 
+/// Resolve the availability persistence path for availability-only mode.
+///
+/// Returns None unless `cache_articles = false`. If `availability_file` is
+/// configured, use it; otherwise default to "availability.idx" alongside config.
+#[must_use]
+pub fn resolve_availability_file_path(
+    config_path: &str,
+    cache_config: Option<&crate::config::Cache>,
+) -> Option<std::path::PathBuf> {
+    use std::path::Path;
+
+    let cache_config = cache_config?;
+    if cache_config.cache_articles {
+        return None;
+    }
+
+    Some(cache_config.availability_file.clone().unwrap_or_else(|| {
+        let config_dir = Path::new(config_path)
+            .parent()
+            .unwrap_or_else(|| Path::new("."));
+        config_dir.join("availability.idx")
+    }))
+}
+
 /// Load metrics from disk if the stats file exists
 ///
 /// Returns None if file doesn't exist, is empty, or can't be parsed.
@@ -459,6 +501,41 @@ pub fn load_metrics_from_disk(
     }
 }
 
+/// Load availability state from disk if the file exists.
+///
+/// Returns true when an availability-only cache was restored successfully.
+pub fn load_availability_from_disk(
+    cache: &std::sync::Arc<crate::cache::UnifiedCache>,
+    availability_path: &std::path::Path,
+) -> bool {
+    use tracing::{info, warn};
+
+    match cache.load_from_disk(availability_path) {
+        Ok(true) => {
+            info!(
+                "Restored availability index from {}",
+                availability_path.display()
+            );
+            true
+        }
+        Ok(false) => {
+            info!(
+                "Availability file {} is missing or not needed, starting fresh",
+                availability_path.display()
+            );
+            false
+        }
+        Err(e) => {
+            warn!(
+                "Failed to load availability index from {}: {}, starting fresh",
+                availability_path.display(),
+                e
+            );
+            false
+        }
+    }
+}
+
 /// Spawn background task to periodically save metrics to disk
 ///
 /// Saves every 30 seconds. Logs errors but doesn't fail.
@@ -481,6 +558,39 @@ pub fn spawn_metrics_saver(
             let metrics = proxy.metrics().clone();
             if let Err(e) = save_metrics_to_disk_blocking(metrics, path, names).await {
                 warn!("Failed to save metrics to {}: {}", stats_path.display(), e);
+            }
+        }
+    });
+}
+
+/// Spawn background task to periodically save availability state to disk.
+///
+/// Saves every 30 seconds when the proxy uses the dedicated availability index.
+pub fn spawn_availability_saver(
+    proxy: &std::sync::Arc<crate::NntpProxy>,
+    availability_path: Option<std::path::PathBuf>,
+) {
+    use std::sync::Arc;
+    use tracing::warn;
+
+    let Some(availability_path) = availability_path else {
+        return;
+    };
+
+    let proxy = Arc::clone(proxy);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let cache = proxy.cache().clone();
+            let path = availability_path.clone();
+            if let Err(e) = save_availability_to_disk_blocking(cache, path.clone()).await {
+                warn!(
+                    "Failed to save availability index to {}: {}",
+                    path.display(),
+                    e
+                );
             }
         }
     });
@@ -798,5 +908,35 @@ mod tests {
         let result = load_metrics_from_disk(nonexistent_path, &[]);
 
         assert!(result.is_none(), "Missing file should return None");
+    }
+
+    #[test]
+    fn test_resolve_availability_file_path_none_for_full_cache() {
+        let cache = crate::config::Cache::default();
+        assert!(resolve_availability_file_path("config.toml", Some(&cache)).is_none());
+    }
+
+    #[test]
+    fn test_resolve_availability_file_path_default_for_availability_only() {
+        let mut cache = crate::config::Cache::default();
+        cache.cache_articles = false;
+
+        let result = resolve_availability_file_path("/etc/nntp-proxy/config.toml", Some(&cache))
+            .expect("availability-only mode should resolve a path");
+
+        assert_eq!(result.file_name().unwrap(), "availability.idx");
+        assert!(result.to_string_lossy().contains("nntp-proxy"));
+    }
+
+    #[test]
+    fn test_resolve_availability_file_path_with_configured() {
+        let mut cache = crate::config::Cache::default();
+        cache.cache_articles = false;
+        cache.availability_file = Some(std::path::PathBuf::from("/custom/path/availability.idx"));
+
+        let result = resolve_availability_file_path("config.toml", Some(&cache))
+            .expect("configured path should be used");
+
+        assert_eq!(result, cache.availability_file.unwrap());
     }
 }
