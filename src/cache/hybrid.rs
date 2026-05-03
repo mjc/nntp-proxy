@@ -374,7 +374,9 @@ impl HybridArticleCache {
         let key = message_id.without_brackets().to_string();
         let mut entry = if self.config.cache_articles {
             let buffer_len = buffer.len();
-            let Some(entry) = DiskCachedArticle::from_ingest_bytes_with_tier(buffer, tier) else {
+            let Some(entry) =
+                DiskCachedArticle::from_backend_response_bytes_with_tier(buffer, tier)
+            else {
                 warn!(msg_id = %key, buffer_len, "Cannot cache: invalid status code");
                 return;
             };

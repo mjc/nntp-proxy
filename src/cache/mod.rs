@@ -135,7 +135,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn ingest_bytes_equality_spans_storage_forms() {
+    async fn backend_response_bytes_equality_spans_storage_forms() {
         let bytes = b"220 0 <test@example.com>\r\nBody\r\n.\r\n";
         let pool =
             crate::pool::BufferPool::new(crate::types::BufferSize::try_new(1024).unwrap(), 1)
@@ -160,7 +160,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ingest_bytes_status_code_spans_storage_forms() {
+    async fn backend_response_bytes_status_code_spans_storage_forms() {
         let bytes = b"220 0 <test@example.com>\r\nBody\r\n.\r\n";
         let pool =
             crate::pool::BufferPool::new(crate::types::BufferSize::try_new(1024).unwrap(), 1)
@@ -193,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_bytes_from_short_slice_uses_inline_storage() {
+    fn backend_response_bytes_from_short_slice_uses_inline_storage() {
         let buffer = BackendResponseBytes::from(b"223\r\n".as_slice());
 
         assert!(matches!(buffer, BackendResponseBytes::Inline(_)));
@@ -201,7 +201,7 @@ mod tests {
     }
 
     #[test]
-    fn ingest_bytes_from_vec_stores_tight_owned_slice() {
+    fn backend_response_bytes_from_vec_stores_tight_owned_slice() {
         let buffer = BackendResponseBytes::from(Vec::from(&b"220 1 <tight@example>\r\n.\r\n"[..]));
 
         assert!(matches!(buffer, BackendResponseBytes::Owned(_)));

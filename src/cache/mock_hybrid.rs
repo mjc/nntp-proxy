@@ -65,9 +65,10 @@ impl MockHybridCache {
         let key = message_id.without_brackets().to_string();
         let mut storage = self.storage.lock().unwrap();
 
-        let Some(mut entry) =
-            DiskCachedArticle::from_ingest_bytes_with_tier(buffer, super::ttl::CacheTier::new(0))
-        else {
+        let Some(mut entry) = DiskCachedArticle::from_backend_response_bytes_with_tier(
+            buffer,
+            super::ttl::CacheTier::new(0),
+        ) else {
             return;
         };
         let entry_len = entry.payload_len();
