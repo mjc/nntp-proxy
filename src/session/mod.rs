@@ -165,7 +165,7 @@
 //!   - Distinguishes backend errors from client disconnects
 
 pub mod auth_state;
-pub mod backend;
+pub(crate) mod backend;
 pub(crate) mod common;
 pub(crate) mod connection;
 pub mod core;

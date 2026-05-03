@@ -30,7 +30,7 @@ use crate::protocol::{RequestContext, StatusCode};
 
 /// Response status parse warnings (pure data)
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResponseWarning {
+pub(crate) enum ResponseWarning {
     /// Response too short to be valid
     ShortResponse { bytes: usize, min: usize },
     /// Response code is invalid
@@ -41,9 +41,9 @@ pub enum ResponseWarning {
 
 /// Parsed backend response status (pure data)
 #[derive(Debug)]
-pub struct BackendStatusParse {
-    pub status_code: Option<StatusCode>,
-    pub warnings: SmallVec<[ResponseWarning; 0]>,
+pub(crate) struct BackendStatusParse {
+    pub(crate) status_code: Option<StatusCode>,
+    pub(crate) warnings: SmallVec<[ResponseWarning; 0]>,
 }
 
 /// Parse backend response status (pure function - easily testable)
@@ -61,7 +61,7 @@ pub struct BackendStatusParse {
 /// # Returns
 /// `BackendStatusParse` with parsed status and any warnings
 #[must_use]
-pub fn parse_backend_status(
+pub(crate) fn parse_backend_status(
     chunk: &[u8],
     bytes_read: usize,
     min_length: usize,
@@ -136,7 +136,7 @@ where
 /// assert!(hex.starts_with("34 33 30 20")); // "430 "
 /// ```
 #[must_use]
-pub fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
+pub(crate) fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
     let preview = &data[..data.len().min(max_bytes)];
     preview
         .iter()
@@ -217,7 +217,7 @@ impl BackendFirstResponse {
 }
 
 /// Write a typed request to a backend without building a temporary command buffer.
-pub async fn write_request<C>(conn: &mut C, request: &RequestContext) -> std::io::Result<()>
+pub(crate) async fn write_request<C>(conn: &mut C, request: &RequestContext) -> std::io::Result<()>
 where
     C: tokio::io::AsyncWrite + Unpin,
 {

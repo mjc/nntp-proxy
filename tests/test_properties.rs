@@ -659,37 +659,10 @@ proptest! {
 }
 
 // =============================================================================
-// 11. parse_backend_status - status parse robustness
+// 11. NNTP status and multiline response robustness
 // =============================================================================
 
-use nntp_proxy::session::backend::parse_backend_status;
-
 proptest! {
-    #[test]
-    fn prop_parse_backend_status_never_panics(
-        data in prop::collection::vec(any::<u8>(), 0..200)
-    ) {
-        // parse_backend_status should never panic on arbitrary bytes
-        let _ = parse_backend_status(&data, data.len(), nntp_proxy::protocol::MIN_RESPONSE_LENGTH);
-    }
-
-    #[test]
-    fn prop_valid_nntp_response_never_classified_invalid(
-        code in 100u16..=599u16,
-        text in r"[A-Za-z0-9 ]{1,30}"
-    ) {
-        // Generate valid NNTP response: "{code} {text}\r\n"
-        let response = format!("{code} {text}\r\n");
-        let data = response.as_bytes();
-        let validated = parse_backend_status(data, data.len(), nntp_proxy::protocol::MIN_RESPONSE_LENGTH);
-
-        let status = validated
-            .status_code
-            .expect("valid NNTP response should parse status code");
-        prop_assert_eq!(status.as_u16(), code,
-            "Parsed status code should match generated code");
-    }
-
     #[test]
     fn prop_status_code_parse_roundtrip(code in 100u16..=599u16) {
         // Format as "{code} text\r\n", parse, check roundtrip
@@ -717,12 +690,11 @@ proptest! {
         response.push_str(".\r\n");
 
         let data = response.as_bytes();
-        let validated = parse_backend_status(data, data.len(), nntp_proxy::protocol::MIN_RESPONSE_LENGTH);
 
         prop_assert_eq!(
-            validated.status_code.map(|status| status.as_u16()),
+            StatusCode::parse(data).map(|status| status.as_u16()),
             Some(code),
-            "Code {} should parse as backend status",
+            "Code {} should parse as response status",
             code
         );
 
