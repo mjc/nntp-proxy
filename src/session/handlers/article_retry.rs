@@ -307,7 +307,7 @@ impl ClientSession {
 
             return Ok(BatchStep::BackendDead);
         };
-        let is_multiline_body = request.response_body_kind(status_code).is_multiline();
+        let is_multiline_body = request.response_framing(status_code).is_multiline();
 
         // --- Handle 430 (article not found on this backend) ---
         if status_code.as_u16() == 430 {

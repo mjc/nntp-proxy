@@ -172,7 +172,7 @@ impl ClientSession {
         }
 
         // Success - stream response
-        let is_multiline_body = request.response_body_kind(status_code).is_multiline();
+        let is_multiline_body = request.response_framing(status_code).is_multiline();
         debug!(
             client = %self.client_addr,
             backend = backend_id.as_index(),
@@ -345,7 +345,7 @@ impl ClientSession {
         let code = params.status_code.as_u16();
         let is_multiline_body = params
             .request
-            .response_body_kind(params.status_code)
+            .response_framing(params.status_code)
             .is_multiline();
 
         let cache_action = determine_cache_action_for_request(

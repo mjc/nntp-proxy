@@ -362,7 +362,7 @@ mod tests {
         assert_eq!(resp.status_code(), Some(StatusCode::new(200)));
         assert!(
             !request
-                .response_body_kind(resp.status_code().unwrap())
+                .response_framing(resp.status_code().unwrap())
                 .is_multiline()
         );
     }
@@ -388,7 +388,7 @@ mod tests {
         assert_eq!(resp.status_code(), Some(StatusCode::new(111)));
         assert!(
             !request
-                .response_body_kind(resp.status_code().unwrap())
+                .response_framing(resp.status_code().unwrap())
                 .is_multiline()
         );
         assert_eq!(&buffer[..resp.bytes_read], b"111 20260501173336\r\n");
@@ -414,7 +414,7 @@ mod tests {
         assert_eq!(resp.status_code(), Some(StatusCode::new(211)));
         assert!(
             !request
-                .response_body_kind(resp.status_code().unwrap())
+                .response_framing(resp.status_code().unwrap())
                 .is_multiline()
         );
     }

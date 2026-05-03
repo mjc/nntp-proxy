@@ -24,7 +24,8 @@ pub(crate) use request::{
     RequestCacheTimestampMillis, RequestResponseMetadata, ResponsePayloadLen,
 };
 pub use request::{
-    RequestContext, RequestKind, RequestRouteClass, RequestWireLen, ResponseWireLen,
+    RequestContext, RequestKind, RequestRouteClass, RequestWireLen, ResponseFraming,
+    ResponseWireLen,
 };
 pub use response::StatusCode;
 

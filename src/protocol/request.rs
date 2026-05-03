@@ -43,12 +43,12 @@ pub enum RequestKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResponseBodyKind {
+pub enum ResponseFraming {
     SingleLine,
     Multiline,
 }
 
-impl ResponseBodyKind {
+impl ResponseFraming {
     #[must_use]
     pub const fn is_multiline(self) -> bool {
         matches!(self, Self::Multiline)
@@ -776,10 +776,10 @@ impl RequestContext {
     }
 
     #[must_use]
-    pub fn response_body_kind(&self, status: StatusCode) -> ResponseBodyKind {
+    pub fn response_framing(&self, status: StatusCode) -> ResponseFraming {
         let code = status.as_u16();
         if status.is_error() {
-            return ResponseBodyKind::SingleLine;
+            return ResponseFraming::SingleLine;
         }
 
         if matches!(
@@ -796,9 +796,9 @@ impl RequestContext {
                 | (RequestKind::NewNews, 230)
                 | (RequestKind::NewGroups, 231)
         ) {
-            ResponseBodyKind::Multiline
+            ResponseFraming::Multiline
         } else {
-            ResponseBodyKind::SingleLine
+            ResponseFraming::SingleLine
         }
     }
 }
@@ -1319,16 +1319,16 @@ mod tests {
         let group = request_context(b"GROUP alt.test\r\n");
         let listgroup = request_context(b"LISTGROUP alt.test\r\n");
         assert_eq!(
-            group.response_body_kind(StatusCode::new(211)),
-            ResponseBodyKind::SingleLine
+            group.response_framing(StatusCode::new(211)),
+            ResponseFraming::SingleLine
         );
         assert_eq!(
-            listgroup.response_body_kind(StatusCode::new(211)),
-            ResponseBodyKind::Multiline
+            listgroup.response_framing(StatusCode::new(211)),
+            ResponseFraming::Multiline
         );
         assert_eq!(
-            request_context(b"ARTICLE <x@y>\r\n").response_body_kind(StatusCode::new(430)),
-            ResponseBodyKind::SingleLine
+            request_context(b"ARTICLE <x@y>\r\n").response_framing(StatusCode::new(430)),
+            ResponseFraming::SingleLine
         );
     }
 }

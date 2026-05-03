@@ -34,7 +34,7 @@ fn should_capture_for_cache(
     has_message_id: bool,
 ) -> bool {
     cache_articles
-        && request.response_body_kind(response_code).is_multiline()
+        && request.response_framing(response_code).is_multiline()
         && has_message_id
         && matches!(response_code.as_u16(), 220 | 222)
 }
@@ -84,7 +84,7 @@ pub fn determine_cache_action_for_request(
         return CacheAction::None;
     }
 
-    let is_multiline_body = request.response_body_kind(response_code).is_multiline();
+    let is_multiline_body = request.response_framing(response_code).is_multiline();
 
     if should_capture_for_cache(request, response_code, cache_articles, has_message_id) {
         CacheAction::CaptureArticle
