@@ -159,10 +159,7 @@ impl ClientSession {
         }
 
         // Success - stream response
-        let response_is_multiline = matches!(
-            request.response_shape(status_code),
-            crate::protocol::ResponseShape::Multiline
-        );
+        let response_is_multiline = request.is_multiline_response(status_code);
         debug!(
             client = %self.client_addr,
             backend = backend_id.as_index(),
@@ -330,10 +327,7 @@ impl ClientSession {
         params: ResponseStreamParams<'_>,
     ) -> Result<u64, StreamingError> {
         let code = params.status_code.as_u16();
-        let response_is_multiline = matches!(
-            params.request.response_shape(params.status_code),
-            crate::protocol::ResponseShape::Multiline
-        );
+        let response_is_multiline = params.request.is_multiline_response(params.status_code);
 
         let cache_action = determine_cache_action_for_request(
             params.request,

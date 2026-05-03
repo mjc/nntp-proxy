@@ -8,7 +8,7 @@ use std::sync::Arc;
 use crate::cache::{ArticleAvailability, ArticleEntry, UnifiedCache};
 use crate::metrics::MetricsCollector;
 use crate::pool::BufferPool;
-use crate::protocol::{RequestContext, ResponseShape, StatusCode};
+use crate::protocol::{RequestContext, StatusCode};
 use crate::router::BackendSelector;
 use crate::session::backend;
 use crate::types::{BackendId, MessageId};
@@ -126,8 +126,7 @@ async fn execute_backend_query(
                 return Err(());
             };
 
-            let response_shape = request.response_shape(status_code);
-            let response = if matches!(response_shape, ResponseShape::Multiline) {
+            let response = if request.is_multiline_response(status_code) {
                 use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
                 let mut response = deps
                     .cache_articles

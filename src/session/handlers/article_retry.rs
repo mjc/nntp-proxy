@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
-use crate::protocol::{RequestContext, ResponseShape};
+use crate::protocol::RequestContext;
 use crate::session::handlers::pipeline::RequestBatch;
 use crate::session::precheck;
 
@@ -307,10 +307,7 @@ impl ClientSession {
 
             return Ok(BatchStep::BackendDead);
         };
-        let response_is_multiline = matches!(
-            request.response_shape(status_code),
-            ResponseShape::Multiline
-        );
+        let response_is_multiline = request.is_multiline_response(status_code);
 
         // --- Handle 430 (article not found on this backend) ---
         if status_code.as_u16() == 430 {
