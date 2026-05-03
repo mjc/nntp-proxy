@@ -382,7 +382,7 @@ impl HybridArticleCache {
         } else {
             let Some(status_code) = buffer
                 .status_code()
-                .and_then(|code| super::CacheableStatusCode::try_from(code.as_u16()).ok())
+                .and_then(|code| CacheableStatusCode::try_from(code.as_u16()).ok())
             else {
                 warn!(
                     msg_id = %key,

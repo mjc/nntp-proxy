@@ -25,7 +25,6 @@ pub(crate) use article::CachedPayloadKind;
 pub use article::{ArticleCache, ArticleEntry, CachedArticleNumber};
 pub use availability::{ArticleAvailability, BackendStatus, MAX_BACKENDS};
 pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
-pub(crate) use hybrid_codec::CacheableStatusCode;
 pub use hybrid_codec::HybridArticleEntry;
 
 use crate::protocol::StatusCode;
