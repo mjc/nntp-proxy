@@ -8,7 +8,7 @@
 
 use divan::{Bencher, black_box};
 use futures::executor::block_on;
-use nntp_proxy::cache::{ArticleEntry, CacheableStatusCode};
+use nntp_proxy::cache::ArticleEntry;
 use nntp_proxy::protocol::{RequestKind, StatusCode};
 
 fn main() {
@@ -66,10 +66,7 @@ mod article_derived_hits {
 }
 
 mod no_payload_entries {
-    use super::{
-        ArticleEntry, Bencher, CacheableStatusCode, RequestKind, StatusCode, black_box,
-        write_cached_response,
-    };
+    use super::{ArticleEntry, Bencher, RequestKind, StatusCode, black_box, write_cached_response};
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
     fn missing_entry_returns_none(bencher: Bencher) {
@@ -85,10 +82,7 @@ mod no_payload_entries {
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
     fn availability_only_returns_none(bencher: Bencher) {
-        let entry = ArticleEntry::availability_only(
-            StatusCode::new(CacheableStatusCode::Article.as_u16()),
-            0.into(),
-        );
+        let entry = ArticleEntry::availability_only(StatusCode::new(220), 0.into());
 
         bencher.bench(|| {
             black_box(write_cached_response(

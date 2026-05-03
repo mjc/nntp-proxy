@@ -70,7 +70,7 @@ impl CachedSectionLen {
 /// The `repr(u16)` allows efficient serialization as a 2-byte wire format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
-pub enum CacheableStatusCode {
+pub(crate) enum CacheableStatusCode {
     /// 220 — Full article (headers + body)
     Article = 220,
     /// 221 — Headers only
@@ -87,7 +87,7 @@ impl CacheableStatusCode {
     /// Get the raw u16 value
     #[inline]
     #[must_use]
-    pub const fn as_u16(self) -> u16 {
+    pub(crate) const fn as_u16(self) -> u16 {
         self as u16
     }
 }
@@ -446,7 +446,10 @@ impl HybridArticleEntry {
     }
 
     #[must_use]
-    pub fn availability_only(status_code: CacheableStatusCode, tier: ttl::CacheTier) -> Self {
+    pub(crate) fn availability_only(
+        status_code: CacheableStatusCode,
+        tier: ttl::CacheTier,
+    ) -> Self {
         Self {
             status_code,
             availability: ArticleAvailability::new(),

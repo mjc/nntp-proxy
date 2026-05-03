@@ -559,57 +559,6 @@ proptest! {
 }
 
 // =============================================================================
-// 9. CacheableStatusCode - TryFrom exhaustiveness
-// =============================================================================
-
-use nntp_proxy::cache::CacheableStatusCode;
-
-proptest! {
-    #[test]
-    fn prop_cacheable_status_code_roundtrip(
-        variant in prop::sample::select(vec![
-            CacheableStatusCode::Article,
-            CacheableStatusCode::Head,
-            CacheableStatusCode::Body,
-            CacheableStatusCode::Stat,
-            CacheableStatusCode::Missing,
-        ])
-    ) {
-        // Every valid variant roundtrips: as_u16 -> try_from -> same variant
-        let raw = variant.as_u16();
-        let back = CacheableStatusCode::try_from(raw);
-        prop_assert!(back.is_ok(),
-            "Roundtrip failed for variant {:?} (code {})", variant, raw);
-        prop_assert_eq!(back.unwrap(), variant,
-            "Roundtrip produced different variant for code {}", raw);
-    }
-
-    #[test]
-    fn prop_cacheable_status_code_rejects_invalid(code in any::<u16>()) {
-        let valid_codes = [220u16, 221, 222, 223, 430];
-        let result = CacheableStatusCode::try_from(code);
-
-        if valid_codes.contains(&code) {
-            prop_assert!(result.is_ok(),
-                "Valid code {} should succeed", code);
-        } else {
-            prop_assert!(result.is_err(),
-                "Invalid code {} should be rejected", code);
-            prop_assert_eq!(result.unwrap_err(), code,
-                "Error should carry the rejected code {}", code);
-        }
-    }
-
-    #[test]
-    fn prop_cacheable_status_code_all_u16_handled(code in any::<u16>()) {
-        // Every u16 value is handled: either success or error, never panic
-        let result = CacheableStatusCode::try_from(code);
-        prop_assert!(result.is_ok() || result.is_err(),
-            "Code {} must be either Ok or Err", code);
-    }
-}
-
-// =============================================================================
 // 10. BackendSelector load tracking - Router state properties
 // =============================================================================
 
