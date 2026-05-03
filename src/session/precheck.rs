@@ -14,18 +14,20 @@ use crate::session::backend;
 use crate::session::handlers::should_sample_backend_timing;
 use crate::types::{BackendId, MessageId};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) enum PrecheckHit {
     Payload(crate::cache::CacheIngestBytes),
     Availability(StatusCode),
 }
 
 /// Result of querying a backend for an article.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 pub(crate) enum QueryResult {
     Found(BackendId, PrecheckHit),
     Missing(BackendId),
-    Error(BackendId),
+    Error,
 }
 
 /// Shared dependencies for precheck operations.
@@ -83,7 +85,7 @@ async fn query_backend(
     request: &RequestContext,
 ) -> QueryResult {
     let Some(provider) = deps.router.backend_provider(backend_id) else {
-        return QueryResult::Error(backend_id);
+        return QueryResult::Error;
     };
 
     // Track pending count for load balancing
@@ -94,7 +96,7 @@ async fn query_backend(
         execute_backend_query(deps, provider, backend_id, request).await,
         backend = backend_id.as_index()
     )
-    .unwrap_or(QueryResult::Error(backend_id));
+    .unwrap_or(QueryResult::Error);
 
     // Always decrement pending count when done
     deps.router.complete_command(backend_id);
@@ -113,7 +115,7 @@ async fn execute_backend_query(
     request: &RequestContext,
 ) -> Result<QueryResult, ()> {
     let Ok(conn_raw) = provider.get_pooled_connection().await else {
-        return Ok(QueryResult::Error(backend_id));
+        return Ok(QueryResult::Error);
     };
     let mut conn = crate::pool::ConnectionGuard::new(conn_raw, provider.clone());
 
@@ -227,7 +229,7 @@ async fn execute_backend_query(
                     deps.metrics.record_error_4xx(backend_id);
                     QueryResult::Missing(backend_id)
                 }
-                _ => QueryResult::Error(backend_id),
+                _ => QueryResult::Error,
             };
 
             let _ = conn.release(); // response received; connection healthy, return to pool
@@ -354,7 +356,7 @@ fn summarize(results: Vec<QueryResult>) -> (Option<(BackendId, PrecheckHit)>, Ar
             QueryResult::Missing(id) => {
                 availability.record_missing(id);
             }
-            QueryResult::Error(_) => {}
+            QueryResult::Error => {}
         }
     }
 
@@ -552,7 +554,7 @@ mod tests {
         let request =
             RequestContext::parse(b"ARTICLE <test@example.com>\r\n").expect("valid request line");
         let result = query_backend(&deps, backend_id, &request).await;
-        assert_eq!(result, QueryResult::Error(backend_id));
+        assert_eq!(result, QueryResult::Error);
     }
 
     #[tokio::test]

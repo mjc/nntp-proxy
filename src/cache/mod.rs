@@ -70,6 +70,7 @@ impl CacheIngestBytes {
     }
 }
 
+#[cfg(test)]
 impl PartialEq for CacheIngestBytes {
     fn eq(&self, other: &Self) -> bool {
         fn chunks<'a>(buf: &'a CacheIngestBytes) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
@@ -91,6 +92,7 @@ impl PartialEq for CacheIngestBytes {
     }
 }
 
+#[cfg(test)]
 impl Eq for CacheIngestBytes {}
 
 impl From<Vec<u8>> for CacheIngestBytes {
