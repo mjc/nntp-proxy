@@ -234,31 +234,7 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    stream_multiline_response_impl(backend_read, client_write, first_chunk, 0, ctx, None, None)
-        .await
-}
-
-pub(crate) async fn stream_multiline_response_from<R, W>(
-    backend_read: &mut R,
-    client_write: &mut W,
-    first_chunk: &[u8],
-    first_chunk_scan_start: usize,
-    ctx: &StreamContext<'_>,
-) -> Result<u64, StreamingError>
-where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
-    stream_multiline_response_impl(
-        backend_read,
-        client_write,
-        first_chunk,
-        first_chunk_scan_start,
-        ctx,
-        None,
-        None,
-    )
-    .await
+    stream_multiline_response_impl(backend_read, client_write, first_chunk, ctx, None, None).await
 }
 
 /// Stream multiline response and optionally capture for caching
@@ -278,7 +254,6 @@ where
         backend_read,
         client_write,
         first_chunk,
-        0,
         ctx,
         Some(capture),
         None,
@@ -455,19 +430,9 @@ pub(crate) async fn read_response_into_context(
 ///
 /// Used by the direct per-command path, which performs the initial command send/read
 /// before deciding how to route the response.
-#[cfg(test)]
-async fn buffer_multiline_response(
+pub(crate) async fn buffer_multiline_response(
     conn: &mut crate::stream::ConnectionStream,
     first_chunk: &[u8],
-    ctx: &StreamContext<'_>,
-) -> Result<crate::pool::ChunkedResponse, StreamingError> {
-    buffer_multiline_response_from(conn, first_chunk, 0, ctx).await
-}
-
-pub(crate) async fn buffer_multiline_response_from(
-    conn: &mut crate::stream::ConnectionStream,
-    first_chunk: &[u8],
-    first_chunk_scan_start: usize,
     ctx: &StreamContext<'_>,
 ) -> Result<crate::pool::ChunkedResponse, StreamingError> {
     use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
@@ -477,7 +442,7 @@ pub(crate) async fn buffer_multiline_response_from(
     validate_response_prefix(first_chunk, "prefetched")?;
 
     let mut tail = TailBuffer::default();
-    match tail.detect_terminator_from(first_chunk, first_chunk_scan_start) {
+    match tail.detect_terminator(first_chunk) {
         TerminatorStatus::FoundAt(pos) => {
             captured.extend_from_slice(ctx.buffer_pool, &first_chunk[..pos]);
             if pos < first_chunk.len() {
@@ -539,7 +504,6 @@ where
         backend_read,
         client_write,
         first_chunk,
-        0,
         ctx,
         None,
         Some(leftover),
@@ -559,7 +523,6 @@ enum ChunkResult {
 #[derive(Clone, Copy)]
 enum TerminatorScan {
     Exact,
-    ExactFrom(usize),
     BoundaryOnly,
 }
 
@@ -596,7 +559,6 @@ where
     // Detect terminator location: within chunk or spanning boundary
     let status = match state.options.terminator_scan {
         TerminatorScan::Exact => tail.detect_terminator(data),
-        TerminatorScan::ExactFrom(start) => tail.detect_terminator_from(data, start),
         TerminatorScan::BoundaryOnly => tail.detect_terminal_boundary(data),
     };
     let write_len = status.write_len(data.len());
@@ -644,7 +606,6 @@ async fn stream_multiline_response_impl<R, W>(
     backend_read: &mut R,
     client_write: &mut W,
     first_chunk: &[u8],
-    first_chunk_scan_start: usize,
     ctx: &StreamContext<'_>,
     mut capture: Option<&mut crate::pool::ChunkedResponse>,
     mut leftover_out: Option<&mut crate::pool::PooledBuffer>,
@@ -667,7 +628,7 @@ where
             total_bytes: &mut total_bytes,
             ctx,
             options: ChunkProcessOptions {
-                terminator_scan: TerminatorScan::ExactFrom(first_chunk_scan_start),
+                terminator_scan: TerminatorScan::Exact,
             },
         },
     )

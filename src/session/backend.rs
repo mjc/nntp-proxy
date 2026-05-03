@@ -144,8 +144,6 @@ pub(crate) fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
 pub(crate) struct BackendFirstResponse {
     /// Number of bytes read into buffer
     pub(crate) bytes_read: usize,
-    /// Byte offset immediately after the status line.
-    pub(crate) status_line_end: usize,
     /// Parsed status code, if present
     pub(crate) status_code: Option<StatusCode>,
     /// Any validation warnings
@@ -158,12 +156,6 @@ impl BackendFirstResponse {
     #[must_use]
     pub(crate) const fn status_code(&self) -> Option<StatusCode> {
         self.status_code
-    }
-
-    #[inline]
-    #[must_use]
-    pub(crate) const fn body_scan_start(&self) -> usize {
-        self.status_line_end
     }
 
     /// Log validation warnings with context
@@ -263,8 +255,6 @@ where
     read_until_status_line(conn, buffer).await?;
     let min_len = crate::protocol::MIN_RESPONSE_LENGTH;
     let total = buffer.initialized();
-    let status_line_end =
-        status_line_end(&buffer[..total]).expect("read_until_status_line ensured status line");
     let recv_elapsed = recv_start.elapsed();
 
     let validated = parse_backend_status(&buffer[..total], total, min_len);
@@ -273,7 +263,6 @@ where
     Ok((
         BackendFirstResponse {
             bytes_read: total,
-            status_line_end,
             status_code: validated.status_code,
             warnings: validated.warnings,
         },
@@ -411,7 +400,6 @@ mod tests {
         // Create a 430 response
         let response = BackendFirstResponse {
             bytes_read: 20,
-            status_line_end: 20,
             status_code: Some(StatusCode::new(430)),
             warnings: SmallVec::new(),
         };
@@ -420,7 +408,6 @@ mod tests {
         // Create a 220 response
         let response = BackendFirstResponse {
             bytes_read: 30,
-            status_line_end: 30,
             status_code: Some(StatusCode::new(220)),
             warnings: SmallVec::new(),
         };
@@ -431,7 +418,6 @@ mod tests {
     fn test_backend_first_response_status_code() {
         let response = BackendFirstResponse {
             bytes_read: 10,
-            status_line_end: 10,
             status_code: Some(StatusCode::new(211)),
             warnings: SmallVec::new(),
         };

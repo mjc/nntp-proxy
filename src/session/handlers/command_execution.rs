@@ -58,7 +58,6 @@ struct ResponseStreamParams<'a> {
     msg_id: Option<&'a crate::types::MessageId<'a>>,
     status_code: StatusCode,
     first_chunk: &'a [u8],
-    first_chunk_scan_start: usize,
 }
 
 /// Any client write failure after the full backend response is already buffered is terminal.
@@ -186,7 +185,6 @@ impl ClientSession {
                     msg_id,
                     status_code,
                     first_chunk: &state.buffer[..cmd_response.bytes_read],
-                    first_chunk_scan_start: cmd_response.body_scan_start(),
                 },
             )
             .await
@@ -349,13 +347,9 @@ impl ClientSession {
 
         match (expects_multiline_body, cache_action) {
             (true, CacheAction::CaptureArticle) => {
-                let captured = streaming::buffer_multiline_response_from(
-                    pooled_conn,
-                    params.first_chunk,
-                    params.first_chunk_scan_start,
-                    ctx,
-                )
-                .await?;
+                let captured =
+                    streaming::buffer_multiline_response(pooled_conn, params.first_chunk, ctx)
+                        .await?;
                 captured
                     .write_all_to(client_write)
                     .await
@@ -376,11 +370,10 @@ impl ClientSession {
                 // Availability-only mode should not buffer the article body.
                 // Keep first-byte latency and memory bounded by streaming directly,
                 // then cache only typed availability metadata after the terminator is seen.
-                let bytes = streaming::stream_multiline_response_from(
+                let bytes = streaming::stream_multiline_response(
                     &mut **pooled_conn,
                     client_write,
                     params.first_chunk,
-                    params.first_chunk_scan_start,
                     ctx,
                 )
                 .await?;
@@ -395,11 +388,10 @@ impl ClientSession {
                 Ok(bytes)
             }
             (true, _) => {
-                streaming::stream_multiline_response_from(
+                streaming::stream_multiline_response(
                     &mut **pooled_conn,
                     client_write,
                     params.first_chunk,
-                    params.first_chunk_scan_start,
                     ctx,
                 )
                 .await
