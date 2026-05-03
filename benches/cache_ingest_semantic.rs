@@ -47,7 +47,7 @@ mod semantic_ingest {
                         rt.block_on(async {
                             let msg_id = MessageId::from_borrowed("<bench@example.com>").unwrap();
                             cache
-                                .upsert_response(
+                                .upsert_backend_response(
                                     msg_id,
                                     black_box(bytes.as_slice()),
                                     BackendId::from_index(0),
@@ -86,7 +86,7 @@ mod cache_upsert {
                 rt.block_on(async {
                     let msg_id = MessageId::from_borrowed("<bench@example.com>").unwrap();
                     cache
-                        .upsert_response(
+                        .upsert_backend_response(
                             msg_id,
                             black_box(bytes.as_slice()),
                             BackendId::from_index(0),
