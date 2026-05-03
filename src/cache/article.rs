@@ -588,7 +588,7 @@ pub(crate) fn parse_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPay
             _ => CachedPayload::AvailabilityOnly,
         };
     };
-    cached_payload_from_bytes(code, article_number, payload)
+    payload_for_status(code, article_number, payload)
 }
 
 pub(crate) fn parse_payload_chunks<'a>(
@@ -622,13 +622,13 @@ pub(crate) fn parse_payload_chunks<'a>(
     }
 
     let article_number = parse_article_number(&status_line);
-    if !strip_multiline_terminator_in_place(code, &mut payload_with_tail) {
+    let Some(payload) = payload_without_multiline_terminator(code, &payload_with_tail) else {
         return match code {
             223 => CachedPayload::Stat { article_number },
             _ => CachedPayload::AvailabilityOnly,
         };
-    }
-    cached_payload_from_vec(code, article_number, payload_with_tail)
+    };
+    payload_for_status(code, article_number, payload)
 }
 
 fn payload_without_multiline_terminator(code: u16, payload: &[u8]) -> Option<&[u8]> {
@@ -645,30 +645,7 @@ fn payload_without_multiline_terminator(code: u16, payload: &[u8]) -> Option<&[u
     })
 }
 
-fn strip_multiline_terminator_in_place(code: u16, payload: &mut Vec<u8>) -> bool {
-    if !matches!(code, 220..=222) {
-        return true;
-    }
-
-    if payload == b".\r\n" {
-        payload.clear();
-        return true;
-    }
-
-    if payload.ends_with(b"\r\n.\r\n") {
-        payload.truncate(payload.len() - 5);
-        return true;
-    }
-
-    if payload.ends_with(b".\r\n") && payload.len() == 3 {
-        payload.clear();
-        return true;
-    }
-
-    false
-}
-
-fn cached_payload_from_bytes(
+fn payload_for_status(
     code: u16,
     article_number: Option<CachedArticleNumber>,
     payload: &[u8],
@@ -696,42 +673,6 @@ fn cached_payload_from_bytes(
         222 => CachedPayload::Body {
             article_number,
             body: payload.into(),
-        },
-        223 => CachedPayload::Stat { article_number },
-        _ => CachedPayload::AvailabilityOnly,
-    }
-}
-
-fn cached_payload_from_vec(
-    code: u16,
-    article_number: Option<CachedArticleNumber>,
-    mut payload: Vec<u8>,
-) -> CachedPayload {
-    match code {
-        220 => {
-            if let Some(split) = memchr::memmem::find(&payload, b"\r\n\r\n") {
-                let body = payload.split_off(split + 4);
-                payload.truncate(split);
-                CachedPayload::Article {
-                    article_number,
-                    headers: payload.into_boxed_slice(),
-                    body: body.into_boxed_slice(),
-                }
-            } else {
-                CachedPayload::Article {
-                    article_number,
-                    headers: Box::from([]),
-                    body: payload.into_boxed_slice(),
-                }
-            }
-        }
-        221 => CachedPayload::Head {
-            article_number,
-            headers: payload.into_boxed_slice(),
-        },
-        222 => CachedPayload::Body {
-            article_number,
-            body: payload.into_boxed_slice(),
         },
         223 => CachedPayload::Stat { article_number },
         _ => CachedPayload::AvailabilityOnly,
