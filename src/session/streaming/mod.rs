@@ -354,7 +354,7 @@ async fn fill_multiline_response(
 }
 
 /// Read a complete NNTP response using request-aware framing.
-pub(crate) async fn read_full_response_for_request(
+pub(crate) async fn buffer_response_for_request(
     request: &crate::protocol::RequestContext,
     io_buffer: &mut crate::pool::PooledBuffer,
     conn: &mut crate::stream::ConnectionStream,
@@ -419,8 +419,7 @@ pub(crate) async fn read_response_into_context(
     backend_id: crate::types::BackendId,
 ) -> Result<(), StreamingError> {
     let status_code =
-        read_full_response_for_request(request, io_buffer, conn, result_buf, pool, backend_id)
-            .await?;
+        buffer_response_for_request(request, io_buffer, conn, result_buf, pool, backend_id).await?;
     let response = std::mem::take(result_buf);
     request.complete_backend_response(backend_id, status_code, response);
     Ok(())

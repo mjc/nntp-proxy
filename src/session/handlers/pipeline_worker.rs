@@ -246,14 +246,14 @@ async fn execute_pipeline_batch(
     (true, batch)
 }
 
-/// Read a complete NNTP response (status line + multiline body if applicable).
+/// Buffer the complete response shape for the supplied request context.
 ///
 /// Fills `result_buf` with the response bytes for the supplied request context
 /// and returns the parsed status code.
 ///
 /// `result_buf` is cleared and reused for each response to avoid per-response allocations.
 #[cfg(test)]
-async fn read_full_response(
+async fn buffer_response_for_request(
     request_line: &[u8],
     buffer: &mut crate::pool::PooledBuffer,
     conn: &mut crate::stream::ConnectionStream,
@@ -261,7 +261,7 @@ async fn read_full_response(
     pool: &BufferPool,
 ) -> Result<crate::protocol::StatusCode> {
     let request = crate::protocol::RequestContext::parse(request_line).expect("valid request line");
-    crate::session::streaming::read_full_response_for_request(
+    crate::session::streaming::buffer_response_for_request(
         &request,
         buffer,
         conn,
@@ -435,17 +435,17 @@ mod tests {
         (success, results, conn.has_leftover(), conn.leftover_len())
     }
 
-    // ─── read_full_response unit tests ───────────────────────────────────────
+    // ─── buffer_response_for_request unit tests ───────────────────────────────────────
 
     #[tokio::test]
-    async fn test_read_full_response_single_line() {
+    async fn test_buffer_response_for_request_single_line() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
         let mut conn = mock_backend_conn(b"430 No such article\r\n").await;
 
-        let status = read_full_response(
+        let status = buffer_response_for_request(
             ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
@@ -461,7 +461,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_full_response_single_line_split_after_status_code() {
+    async fn test_buffer_response_for_request_single_line_split_after_status_code() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
         let mut result_buf = crate::pool::ChunkedResponse::default();
@@ -469,10 +469,15 @@ mod tests {
         let mut conn =
             mock_backend_conn_chunked(vec![b"111".to_vec(), b" 20260501173336\r\n".to_vec()]).await;
 
-        let status =
-            read_full_response(DATE_REQUEST, &mut buffer, &mut conn, &mut result_buf, &pool)
-                .await
-                .expect("should wait for complete status line");
+        let status = buffer_response_for_request(
+            DATE_REQUEST,
+            &mut buffer,
+            &mut conn,
+            &mut result_buf,
+            &pool,
+        )
+        .await
+        .expect("should wait for complete status line");
 
         assert_eq!(status.as_u16(), 111);
         assert_eq!(result_buf.to_vec(), b"111 20260501173336\r\n");
@@ -480,7 +485,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_full_response_multiline() {
+    async fn test_buffer_response_for_request_multiline() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
         let mut result_buf = crate::pool::ChunkedResponse::default();
@@ -488,7 +493,7 @@ mod tests {
         let response = b"220 0 <msg@id> article\r\nSubject: test\r\n\r\nBody line\r\n.\r\n";
         let mut conn = mock_backend_conn(response).await;
 
-        let status = read_full_response(
+        let status = buffer_response_for_request(
             ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
@@ -504,7 +509,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_full_response_multiline_across_chunks() {
+    async fn test_buffer_response_for_request_multiline_across_chunks() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
         let mut result_buf = crate::pool::ChunkedResponse::default();
@@ -515,7 +520,7 @@ mod tests {
 
         let mut conn = mock_backend_conn_chunked(vec![chunk1, chunk2]).await;
 
-        let status = read_full_response(
+        let status = buffer_response_for_request(
             ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
@@ -534,7 +539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_full_response_with_leftover() {
+    async fn test_buffer_response_for_request_with_leftover() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
         let mut result_buf = crate::pool::ChunkedResponse::default();
@@ -544,7 +549,7 @@ mod tests {
         let mut conn = mock_backend_conn(packed).await;
 
         // First read should get the multiline response and save leftover
-        let status1 = read_full_response(
+        let status1 = buffer_response_for_request(
             ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
@@ -562,7 +567,7 @@ mod tests {
         );
 
         // Second read should consume leftover and return the 430
-        let status2 = read_full_response(
+        let status2 = buffer_response_for_request(
             ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
@@ -577,7 +582,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_full_response_uses_request_context_for_same_status_framing() {
+    async fn test_buffer_response_for_request_uses_request_context_for_same_status_framing() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
         let mut result_buf = crate::pool::ChunkedResponse::default();
@@ -585,7 +590,7 @@ mod tests {
         let packed = b"211 3 10 12 group.name\r\n211 3 10 12 group.name\r\n10\r\n11\r\n12\r\n.\r\n";
         let mut conn = mock_backend_conn(packed).await;
 
-        let group_status = read_full_response(
+        let group_status = buffer_response_for_request(
             b"GROUP group.name\r\n",
             &mut buffer,
             &mut conn,
@@ -598,7 +603,7 @@ mod tests {
         assert_eq!(result_buf.to_vec(), b"211 3 10 12 group.name\r\n");
         assert!(conn.has_leftover());
 
-        let listgroup_status = read_full_response(
+        let listgroup_status = buffer_response_for_request(
             b"LISTGROUP group.name\r\n",
             &mut buffer,
             &mut conn,
@@ -615,7 +620,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_full_response_eof_mid_stream() {
+    async fn test_buffer_response_for_request_eof_mid_stream() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
         let mut result_buf = crate::pool::ChunkedResponse::default();
@@ -623,7 +628,7 @@ mod tests {
         // Multiline response without terminator — server disconnects
         let mut conn = mock_backend_conn(b"220 0 <a@b> article\r\nBody line\r\n").await;
 
-        let result = read_full_response(
+        let result = buffer_response_for_request(
             ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
@@ -640,14 +645,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_full_response_invalid_status() {
+    async fn test_buffer_response_for_request_invalid_status() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
         let mut conn = mock_backend_conn(b"garbage data here\r\n").await;
 
-        let result = read_full_response(
+        let result = buffer_response_for_request(
             ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
@@ -659,7 +664,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_full_response_short_leftover_triggers_h5() {
+    async fn test_buffer_response_for_request_short_leftover_triggers_h5() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
         let mut result_buf = crate::pool::ChunkedResponse::default();
@@ -669,7 +674,7 @@ mod tests {
         // Leftover is only 2 bytes — too short to validate, triggers H5 additional read
         conn.stash_leftover(b"43").unwrap();
 
-        let status = read_full_response(
+        let status = buffer_response_for_request(
             ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
@@ -684,7 +689,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_full_response_empty_connection() {
+    async fn test_buffer_response_for_request_empty_connection() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
         let mut result_buf = crate::pool::ChunkedResponse::default();
@@ -692,7 +697,7 @@ mod tests {
         // Server immediately closes
         let mut conn = mock_backend_conn(b"").await;
 
-        let result = read_full_response(
+        let result = buffer_response_for_request(
             ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
@@ -1149,7 +1154,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn prop_read_full_response_preserves_intra_batch_single_line_framing(
+        fn prop_buffer_response_for_request_preserves_intra_batch_single_line_framing(
             // RFC 3977 command/response model:
             // - client may pipeline multiple commands on one TCP stream
             // - server processes them in order and sends responses in that order
@@ -1184,7 +1189,7 @@ mod tests {
                 let mut conn = mock_backend_conn(&wire).await;
 
                 for (idx, expected) in responses.iter().enumerate() {
-                    let status = read_full_response(
+                    let status = buffer_response_for_request(
                         STAT_REQUEST,
                         &mut buffer,
                         &mut conn,
@@ -1255,7 +1260,7 @@ mod tests {
     }
 
     // NOTE: This test is skipped because TCP read sizes are unpredictable in tests.
-    // The bounds check in `read_full_response` prevents leftover from exceeding
+    // The bounds check in `buffer_response_for_request` prevents leftover from exceeding
     // MAX_LEFTOVER_BYTES (128KB), but triggering this in a test is difficult because:
     // 1. TCP reads are typically 8-16KB, not the full 724KB buffer size
     // 2. We can't control how TCP splits data across reads
@@ -1301,7 +1306,7 @@ mod tests {
 
         let mut conn = mock_backend_conn_chunked(chunks).await;
 
-        let result = read_full_response(
+        let result = buffer_response_for_request(
             ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
@@ -1338,7 +1343,7 @@ mod tests {
 
         let mut conn = mock_backend_conn(&normal_data).await;
 
-        let result = read_full_response(
+        let result = buffer_response_for_request(
             ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
