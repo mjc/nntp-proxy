@@ -14,6 +14,12 @@ use tokio::io::AsyncBufReadExt;
 /// Maximum pipeline depth (number of commands read from client buffer at once)
 const MAX_PIPELINE_DEPTH: usize = 16;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RequestRejection {
+    Oversized { wire_len: usize },
+    Invalid,
+}
+
 /// A batch of requests read from the client's TCP buffer.
 ///
 /// Uses typed contexts for pipelineable requests and the trailing
@@ -23,17 +29,10 @@ pub(super) struct RequestBatch {
     contexts: smallvec::SmallVec<[RequestContext; 4]>,
     /// Typed context for trailing non-pipelineable command if present.
     trailing_context: Option<RequestContext>,
-    /// True if the trailing command exceeded the 512-byte RFC 3977 limit
-    trailing_oversized: bool,
-    /// True if the trailing command was rejected before context creation.
-    trailing_invalid: bool,
-    /// Wire length for a trailing oversized command rejected before context creation.
-    trailing_wire_len: usize,
-    /// True if the first (blocking) command exceeded the 512-byte RFC 3977 limit.
-    /// The batch is otherwise empty; caller must send 501 and continue.
-    first_oversized: bool,
-    /// True if the first command was rejected before context creation.
-    first_invalid: bool,
+    /// Rejection for the first command, before context creation.
+    first_rejection: Option<RequestRejection>,
+    /// Rejection for a trailing command after pipelineable contexts.
+    trailing_rejection: Option<RequestRejection>,
 }
 
 impl RequestBatch {
@@ -41,24 +40,21 @@ impl RequestBatch {
         Self {
             contexts: smallvec::SmallVec::new(),
             trailing_context: None,
-            trailing_oversized: false,
-            trailing_invalid: false,
-            trailing_wire_len: 0,
-            first_oversized: false,
-            first_invalid: false,
+            first_rejection: None,
+            trailing_rejection: None,
         }
     }
 
     fn first_oversized() -> Self {
         Self {
-            first_oversized: true,
+            first_rejection: Some(RequestRejection::Oversized { wire_len: 0 }),
             ..Self::empty()
         }
     }
 
     fn first_invalid() -> Self {
         Self {
-            first_invalid: true,
+            first_rejection: Some(RequestRejection::Invalid),
             ..Self::empty()
         }
     }
@@ -77,11 +73,10 @@ impl RequestBatch {
         Self {
             contexts,
             trailing_context: None,
-            trailing_oversized: true,
-            trailing_invalid: false,
-            trailing_wire_len,
-            first_oversized: false,
-            first_invalid: false,
+            first_rejection: None,
+            trailing_rejection: Some(RequestRejection::Oversized {
+                wire_len: trailing_wire_len,
+            }),
         }
     }
 
@@ -89,11 +84,8 @@ impl RequestBatch {
         Self {
             contexts,
             trailing_context: None,
-            trailing_oversized: false,
-            trailing_invalid: true,
-            trailing_wire_len: 0,
-            first_oversized: false,
-            first_invalid: false,
+            first_rejection: None,
+            trailing_rejection: Some(RequestRejection::Invalid),
         }
     }
 
@@ -104,11 +96,8 @@ impl RequestBatch {
         Self {
             contexts,
             trailing_context: Some(trailing_context),
-            trailing_oversized: false,
-            trailing_invalid: false,
-            trailing_wire_len: 0,
-            first_oversized: false,
-            first_invalid: false,
+            first_rejection: None,
+            trailing_rejection: None,
         }
     }
 
@@ -123,9 +112,8 @@ impl RequestBatch {
     pub(super) fn is_empty(&self) -> bool {
         self.contexts.is_empty()
             && self.trailing_context.is_none()
-            && !self.trailing_oversized
-            && !self.trailing_invalid
-            && !self.first_invalid
+            && self.first_rejection.is_none()
+            && self.trailing_rejection.is_none()
     }
 
     /// Get a typed context by index from the pipelineable commands.
@@ -155,28 +143,37 @@ impl RequestBatch {
 
     /// Whether the trailing command exceeded the 512-byte RFC 3977 limit
     pub const fn is_trailing_oversized(&self) -> bool {
-        self.trailing_oversized
+        matches!(
+            self.trailing_rejection,
+            Some(RequestRejection::Oversized { .. })
+        )
     }
 
     /// Whether the trailing command was syntactically invalid.
     pub const fn is_trailing_invalid(&self) -> bool {
-        self.trailing_invalid
+        matches!(self.trailing_rejection, Some(RequestRejection::Invalid))
     }
 
     /// Wire length for the trailing oversized command, if any.
     pub const fn trailing_wire_len(&self) -> usize {
-        self.trailing_wire_len
+        match self.trailing_rejection {
+            Some(RequestRejection::Oversized { wire_len }) => wire_len,
+            Some(RequestRejection::Invalid) | None => 0,
+        }
     }
 
     /// Whether the *first* command (blocking read) exceeded the 512-byte limit.
     /// When true, the batch is otherwise empty — caller should send 501 and continue.
     pub const fn is_first_oversized(&self) -> bool {
-        self.first_oversized
+        matches!(
+            self.first_rejection,
+            Some(RequestRejection::Oversized { .. })
+        )
     }
 
     /// Whether the first command was syntactically invalid.
     pub const fn is_first_invalid(&self) -> bool {
-        self.first_invalid
+        matches!(self.first_rejection, Some(RequestRejection::Invalid))
     }
 }
 
