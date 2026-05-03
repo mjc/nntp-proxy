@@ -215,18 +215,6 @@ impl BackendQueue {
             notified.await;
         }
     }
-
-    /// Current queue depth (approximate, for metrics)
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.depth.load(Ordering::Relaxed)
-    }
-
-    /// Whether the queue is empty
-    #[inline]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
 }
 
 // QueuedContext contains a oneshot::Sender which isn't Debug
@@ -251,6 +239,10 @@ mod tests {
         RequestContext::from_request_line(RequestLine::parse(line))
     }
 
+    fn queue_depth(queue: &BackendQueue) -> usize {
+        queue.depth.load(Ordering::Relaxed)
+    }
+
     #[test]
     fn test_queue_enqueue_dequeue() {
         let queue = BackendQueue::new(10);
@@ -261,7 +253,7 @@ mod tests {
                 tx,
             ))
             .unwrap();
-        assert_eq!(queue.len(), 1);
+        assert_eq!(queue_depth(&queue), 1);
     }
 
     #[test]
@@ -302,11 +294,11 @@ mod tests {
 
         let batch = queue.dequeue_batch(3, Vec::new()).await;
         assert_eq!(batch.len(), 3);
-        assert_eq!(queue.len(), 2);
+        assert_eq!(queue_depth(&queue), 2);
 
         let batch = queue.dequeue_batch(10, batch).await;
         assert_eq!(batch.len(), 2);
-        assert_eq!(queue.len(), 0);
+        assert_eq!(queue_depth(&queue), 0);
     }
 
     #[tokio::test]
