@@ -1166,14 +1166,7 @@ mod tests {
         ArticleEntry::from_response_bytes(buffer)
     }
 
-    fn rendered(entry: &ArticleEntry, verb: &str, msgid: &str) -> Vec<u8> {
-        let request_kind = match verb {
-            "ARTICLE" => RequestKind::Article,
-            "HEAD" => RequestKind::Head,
-            "BODY" => RequestKind::Body,
-            "STAT" => RequestKind::Stat,
-            _ => panic!("unsupported test verb {verb}"),
-        };
+    fn rendered(entry: &ArticleEntry, request_kind: RequestKind, msgid: &str) -> Vec<u8> {
         let response = entry.response_for(request_kind, msgid).unwrap();
         let mut out = Vec::with_capacity(response.wire_len().get());
         block_on(response.write_to(&mut out)).unwrap();
@@ -1254,7 +1247,10 @@ mod tests {
         let entry = ArticleEntry::from_response_bytes(buffer.clone());
 
         assert_eq!(entry.status_code(), StatusCode::new(220));
-        assert_eq!(rendered(&entry, "ARTICLE", "<test@example.com>"), buffer);
+        assert_eq!(
+            rendered(&entry, RequestKind::Article, "<test@example.com>"),
+            buffer
+        );
 
         // Default: should try all backends
         assert!(entry.should_try_backend(BackendId::from_index(0)));
@@ -1432,8 +1428,12 @@ mod tests {
             "Arc<str> cache should support Borrow<str> lookups"
         );
         assert_eq!(
-            rendered(&retrieved.unwrap(), "ARTICLE", "<test123@example.com>"),
-            rendered(&article, "ARTICLE", "<test123@example.com>"),
+            rendered(
+                &retrieved.unwrap(),
+                RequestKind::Article,
+                "<test123@example.com>"
+            ),
+            rendered(&article, RequestKind::Article, "<test123@example.com>"),
             "Retrieved article should match inserted article"
         );
     }
@@ -1462,8 +1462,8 @@ mod tests {
 
         let retrieved = cache.get(&msgid).await.unwrap();
         assert_eq!(
-            rendered(&retrieved, "ARTICLE", "<article@example.com>"),
-            rendered(&article, "ARTICLE", "<article@example.com>")
+            rendered(&retrieved, RequestKind::Article, "<article@example.com>"),
+            rendered(&article, RequestKind::Article, "<article@example.com>")
         );
     }
 
@@ -1485,7 +1485,7 @@ mod tests {
 
         let retrieved = cache.get(&msgid).await.unwrap();
         assert_eq!(
-            rendered(&retrieved, "ARTICLE", "<test@example.com>"),
+            rendered(&retrieved, RequestKind::Article, "<test@example.com>"),
             buffer
         );
         // Default: should try all backends
@@ -1718,8 +1718,8 @@ mod tests {
 
         let cloned = article.clone();
         assert_eq!(
-            rendered(&article, "ARTICLE", "<test@example.com>"),
-            rendered(&cloned, "ARTICLE", "<test@example.com>")
+            rendered(&article, RequestKind::Article, "<test@example.com>"),
+            rendered(&cloned, RequestKind::Article, "<test@example.com>")
         );
     }
 
