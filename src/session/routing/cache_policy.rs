@@ -28,13 +28,16 @@ pub enum CacheAction {
 /// - 223 = STAT (status only)
 #[inline]
 pub fn should_capture_for_cache(
+    request: &RequestContext,
     response_code: StatusCode,
-    response_shape: ResponseShape,
     cache_articles: bool,
     has_message_id: bool,
 ) -> bool {
     cache_articles
-        && matches!(response_shape, ResponseShape::Multiline)
+        && matches!(
+            request.response_shape(response_code),
+            ResponseShape::Multiline
+        )
         && has_message_id
         && matches!(response_code.as_u16(), 220 | 222)
 }
@@ -86,12 +89,7 @@ pub fn determine_cache_action_for_request(
 
     let response_shape = request.response_shape(response_code);
 
-    if should_capture_for_cache(
-        response_code,
-        response_shape,
-        cache_articles,
-        has_message_id,
-    ) {
+    if should_capture_for_cache(request, response_code, cache_articles, has_message_id) {
         CacheAction::CaptureArticle
     } else if matches!(response_shape, ResponseShape::Multiline)
         && should_track_availability(response_code, has_message_id)
@@ -108,28 +106,32 @@ pub fn determine_cache_action_for_request(
 mod tests {
     use super::*;
 
+    fn request(command: &str) -> RequestContext {
+        RequestContext::from_request_line(crate::protocol::RequestLine::parse(command.as_bytes()))
+    }
+
     // Tests for should_capture_for_cache
 
     #[test]
     fn test_should_capture_for_cache_article_response() {
         // 220 (ARTICLE) and 222 (BODY) with all conditions met should capture
         assert!(should_capture_for_cache(
+            &request("ARTICLE <test@example.com>"),
             StatusCode::new(220),
-            ResponseShape::Multiline,
             true,
             true
         ));
         assert!(should_capture_for_cache(
+            &request("BODY <test@example.com>"),
             StatusCode::new(222),
-            ResponseShape::Multiline,
             true,
             true
         ));
 
         // 221 (HEAD) should NOT capture (headers only)
         assert!(!should_capture_for_cache(
+            &request("HEAD <test@example.com>"),
             StatusCode::new(221),
-            ResponseShape::Multiline,
             true,
             true
         ));
@@ -137,34 +139,34 @@ mod tests {
 
     #[test]
     fn test_should_capture_for_cache_requires_all_conditions() {
-        // Not multiline
+        // Response is not multiline for this request.
         assert!(!should_capture_for_cache(
+            &request("STAT <test@example.com>"),
             StatusCode::new(220),
-            ResponseShape::SingleLine,
             true,
             true
         ));
 
         // Cache disabled
         assert!(!should_capture_for_cache(
+            &request("ARTICLE <test@example.com>"),
             StatusCode::new(220),
-            ResponseShape::Multiline,
             false,
             true
         ));
 
         // No message-ID
         assert!(!should_capture_for_cache(
+            &request("ARTICLE <test@example.com>"),
             StatusCode::new(220),
-            ResponseShape::Multiline,
             true,
             false
         ));
 
         // Wrong response code
         assert!(!should_capture_for_cache(
+            &request("ARTICLE <test@example.com>"),
             StatusCode::new(430),
-            ResponseShape::Multiline,
             true,
             true
         ));
@@ -174,26 +176,26 @@ mod tests {
     fn test_should_capture_for_cache_220_and_222() {
         // 220 (ARTICLE) and 222 (BODY) responses should be captured
         assert!(should_capture_for_cache(
+            &request("ARTICLE <test@example.com>"),
             StatusCode::new(220),
-            ResponseShape::Multiline,
             true,
             true
         ));
         assert!(should_capture_for_cache(
+            &request("BODY <test@example.com>"),
             StatusCode::new(222),
-            ResponseShape::Multiline,
             true,
             true
         )); // BODY
         assert!(!should_capture_for_cache(
+            &request("HEAD <test@example.com>"),
             StatusCode::new(221),
-            ResponseShape::Multiline,
             true,
             true
         )); // HEAD
         assert!(!should_capture_for_cache(
+            &request("STAT <test@example.com>"),
             StatusCode::new(223),
-            ResponseShape::Multiline,
             true,
             true
         )); // STAT
