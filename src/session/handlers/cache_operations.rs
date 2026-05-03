@@ -6,9 +6,8 @@
 use crate::cache::ArticleAvailability;
 use crate::cache::ttl::CacheTier;
 use crate::protocol::{
-    RequestCacheArticleNumber, RequestCacheAvailability, RequestCacheEntryMetadata,
-    RequestCachePayloadKind, RequestCacheStatus, RequestCacheTier, RequestCacheTimestampMillis,
-    RequestContext, RequestKind, RequestResponseMetadata, ResponseWireLen, StatusCode,
+    RequestCacheEntryMetadata, RequestCacheStatus, RequestContext, RequestKind,
+    RequestResponseMetadata, ResponseWireLen, StatusCode,
 };
 use crate::router::BackendSelector;
 use crate::session::{ClientSession, precheck};
@@ -199,41 +198,11 @@ impl ClientSession {
     }
 }
 
-fn cache_availability_metadata(availability: &ArticleAvailability) -> RequestCacheAvailability {
-    RequestCacheAvailability::from_bits(availability.checked_bits(), availability.missing_bits())
-}
-
 fn cache_entry_metadata(
     cached: &crate::cache::CachedArticle,
     availability: &ArticleAvailability,
 ) -> RequestCacheEntryMetadata {
-    RequestCacheEntryMetadata::new(
-        cached.status_code(),
-        cache_availability_metadata(availability),
-        RequestCacheTier::new(cached.tier().get()),
-        RequestCacheTimestampMillis::new(cached.inserted_at().get()),
-        cache_payload_kind(cached.payload_kind()),
-        cache_article_number(cached.article_number()),
-    )
-}
-
-fn cache_article_number(
-    article_number: Option<crate::cache::CachedArticleNumber>,
-) -> Option<RequestCacheArticleNumber> {
-    article_number.map(|number| RequestCacheArticleNumber::new(number.get()))
-}
-
-fn cache_payload_kind(payload: crate::cache::CachedPayloadKind) -> RequestCachePayloadKind {
-    match payload {
-        crate::cache::CachedPayloadKind::Missing => RequestCachePayloadKind::Missing,
-        crate::cache::CachedPayloadKind::AvailabilityOnly => {
-            RequestCachePayloadKind::AvailabilityOnly
-        }
-        crate::cache::CachedPayloadKind::Article => RequestCachePayloadKind::Article,
-        crate::cache::CachedPayloadKind::Head => RequestCachePayloadKind::Head,
-        crate::cache::CachedPayloadKind::Body => RequestCachePayloadKind::Body,
-        crate::cache::CachedPayloadKind::Stat => RequestCachePayloadKind::Stat,
-    }
+    cached.request_cache_metadata(availability)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,6 +245,9 @@ mod tests {
     use crate::cache::UnifiedCache;
     use crate::metrics::MetricsCollector;
     use crate::pool::{BufferPool, DeadpoolConnectionProvider};
+    use crate::protocol::{
+        RequestCacheArticleNumber, RequestCachePayloadKind, RequestCacheTimestampMillis,
+    };
     use crate::types::{BufferSize, ClientAddress, ServerName};
     use std::net::SocketAddr;
     use std::time::Duration;

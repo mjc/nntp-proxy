@@ -3,7 +3,11 @@
 //! This module provides article caching with per-backend availability tracking.
 //! The availability tracking type itself lives in [`super::availability`].
 
-use crate::protocol::{RequestKind, StatusCode};
+use crate::protocol::{
+    RequestCacheArticleNumber, RequestCacheAvailability, RequestCacheEntryMetadata,
+    RequestCachePayloadKind, RequestCacheTier, RequestCacheTimestampMillis, RequestKind,
+    StatusCode,
+};
 use crate::router::BackendCount;
 use crate::types::{BackendId, MessageId};
 use moka::future::Cache;
@@ -94,16 +98,6 @@ pub(crate) enum CachedPayload {
     Stat {
         article_number: Option<CachedArticleNumber>,
     },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum CachedPayloadKind {
-    Missing,
-    AvailabilityOnly,
-    Article,
-    Head,
-    Body,
-    Stat,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -257,18 +251,6 @@ impl CachedPayload {
     }
 
     #[must_use]
-    pub const fn kind(&self) -> CachedPayloadKind {
-        match self {
-            Self::Missing => CachedPayloadKind::Missing,
-            Self::AvailabilityOnly => CachedPayloadKind::AvailabilityOnly,
-            Self::Article { .. } => CachedPayloadKind::Article,
-            Self::Head { .. } => CachedPayloadKind::Head,
-            Self::Body { .. } => CachedPayloadKind::Body,
-            Self::Stat { .. } => CachedPayloadKind::Stat,
-        }
-    }
-
-    #[must_use]
     pub(crate) const fn article_number(&self) -> Option<CachedArticleNumber> {
         match self {
             Self::Article { article_number, .. }
@@ -276,6 +258,24 @@ impl CachedPayload {
             | Self::Body { article_number, .. }
             | Self::Stat { article_number } => *article_number,
             Self::Missing | Self::AvailabilityOnly => None,
+        }
+    }
+
+    const fn request_payload_kind(&self) -> RequestCachePayloadKind {
+        match self {
+            Self::Missing => RequestCachePayloadKind::Missing,
+            Self::AvailabilityOnly => RequestCachePayloadKind::AvailabilityOnly,
+            Self::Article { .. } => RequestCachePayloadKind::Article,
+            Self::Head { .. } => RequestCachePayloadKind::Head,
+            Self::Body { .. } => RequestCachePayloadKind::Body,
+            Self::Stat { .. } => RequestCachePayloadKind::Stat,
+        }
+    }
+
+    const fn request_article_number(&self) -> Option<RequestCacheArticleNumber> {
+        match self.article_number() {
+            Some(number) => Some(RequestCacheArticleNumber::new(number.get())),
+            None => None,
         }
     }
 }
@@ -435,14 +435,28 @@ impl CachedArticle {
 
     #[inline]
     #[must_use]
-    pub(crate) const fn payload_kind(&self) -> CachedPayloadKind {
-        self.payload.kind()
+    #[cfg(test)]
+    pub(crate) const fn article_number(&self) -> Option<CachedArticleNumber> {
+        self.payload.article_number()
     }
 
     #[inline]
     #[must_use]
-    pub(crate) const fn article_number(&self) -> Option<CachedArticleNumber> {
-        self.payload.article_number()
+    pub(crate) const fn request_cache_metadata(
+        &self,
+        availability: &ArticleAvailability,
+    ) -> RequestCacheEntryMetadata {
+        RequestCacheEntryMetadata::new(
+            self.status_code,
+            RequestCacheAvailability::from_bits(
+                availability.checked_bits(),
+                availability.missing_bits(),
+            ),
+            RequestCacheTier::new(self.tier.get()),
+            RequestCacheTimestampMillis::new(self.inserted_at.get()),
+            self.payload.request_payload_kind(),
+            self.payload.request_article_number(),
+        )
     }
 
     #[inline]

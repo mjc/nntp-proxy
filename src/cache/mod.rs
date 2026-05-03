@@ -23,8 +23,6 @@ pub mod ttl;
 #[cfg(test)]
 mod mock_hybrid;
 
-pub(crate) use article::CachedArticleNumber;
-pub(crate) use article::CachedPayloadKind;
 pub use article::{ArticleCache, CachedArticle};
 pub use availability::{ArticleAvailability, BackendStatus, MAX_BACKENDS};
 pub use availability_index::AvailabilityIndex;
@@ -242,7 +240,12 @@ mod tests {
 
         let entry = cache.get(&msg_id).await.expect("entry is recorded");
         assert_eq!(entry.status_code(), StatusCode::new(220));
-        assert_eq!(entry.payload_kind(), CachedPayloadKind::AvailabilityOnly);
+        assert_eq!(
+            entry
+                .request_cache_metadata(&entry.availability())
+                .payload_kind(),
+            crate::protocol::RequestCachePayloadKind::AvailabilityOnly
+        );
         assert_eq!(entry.payload_len().get(), 0);
         assert!(entry.has_availability_info());
         assert!(entry.should_try_backend(backend_id));
