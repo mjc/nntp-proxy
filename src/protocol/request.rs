@@ -51,7 +51,7 @@ pub enum RequestRouteClass {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RequestCacheStatus {
+pub(crate) enum RequestCacheStatus {
     Hit,
     PartialHit,
     Miss,
@@ -149,40 +149,35 @@ impl RequestResponseMetadata {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub struct RequestCacheAvailability {
+pub(crate) struct RequestCacheAvailability {
     checked: u8,
     missing: u8,
 }
 
 impl RequestCacheAvailability {
     #[must_use]
-    pub const fn from_bits(checked: u8, missing: u8) -> Self {
+    pub(crate) const fn from_bits(checked: u8, missing: u8) -> Self {
         Self { checked, missing }
     }
 
     #[must_use]
-    pub const fn checked_bits(self) -> u8 {
+    pub(crate) const fn checked_bits(self) -> u8 {
         self.checked
     }
 
     #[must_use]
-    pub const fn missing_bits(self) -> u8 {
+    pub(crate) const fn missing_bits(self) -> u8 {
         self.missing
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct RequestCacheTier(u8);
+pub(crate) struct RequestCacheTier(u8);
 
 impl RequestCacheTier {
     #[must_use]
-    pub const fn new(value: u8) -> Self {
+    pub(crate) const fn new(value: u8) -> Self {
         Self(value)
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u8 {
-        self.0
     }
 }
 
@@ -193,17 +188,12 @@ impl From<u8> for RequestCacheTier {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub struct RequestCacheTimestampMillis(u64);
+pub(crate) struct RequestCacheTimestampMillis(u64);
 
 impl RequestCacheTimestampMillis {
     #[must_use]
-    pub const fn new(value: u64) -> Self {
+    pub(crate) const fn new(value: u64) -> Self {
         Self(value)
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
     }
 }
 
@@ -214,7 +204,7 @@ impl From<u64> for RequestCacheTimestampMillis {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RequestCachePayloadKind {
+pub(crate) enum RequestCachePayloadKind {
     Missing,
     AvailabilityOnly,
     Article,
@@ -224,17 +214,12 @@ pub enum RequestCachePayloadKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct RequestCacheArticleNumber(u64);
+pub(crate) struct RequestCacheArticleNumber(u64);
 
 impl RequestCacheArticleNumber {
     #[must_use]
-    pub const fn new(value: u64) -> Self {
+    pub(crate) const fn new(value: u64) -> Self {
         Self(value)
-    }
-
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
     }
 }
 
@@ -354,7 +339,7 @@ impl Clone for RequestContext {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RequestCacheEntryMetadata {
+pub(crate) struct RequestCacheEntryMetadata {
     status: StatusCode,
     availability: RequestCacheAvailability,
     tier: RequestCacheTier,
@@ -365,7 +350,7 @@ pub struct RequestCacheEntryMetadata {
 
 impl RequestCacheEntryMetadata {
     #[must_use]
-    pub const fn new(
+    pub(crate) const fn new(
         status: StatusCode,
         availability: RequestCacheAvailability,
         tier: RequestCacheTier,
@@ -389,27 +374,31 @@ impl RequestCacheEntryMetadata {
     }
 
     #[must_use]
-    pub const fn availability(self) -> RequestCacheAvailability {
+    pub(crate) const fn availability(self) -> RequestCacheAvailability {
         self.availability
     }
 
+    #[cfg(test)]
     #[must_use]
-    pub const fn tier(self) -> RequestCacheTier {
+    pub(crate) const fn tier(self) -> RequestCacheTier {
         self.tier
     }
 
+    #[cfg(test)]
     #[must_use]
-    pub const fn timestamp(self) -> RequestCacheTimestampMillis {
+    pub(crate) const fn timestamp(self) -> RequestCacheTimestampMillis {
         self.timestamp
     }
 
+    #[cfg(test)]
     #[must_use]
-    pub const fn payload_kind(self) -> RequestCachePayloadKind {
+    pub(crate) const fn payload_kind(self) -> RequestCachePayloadKind {
         self.payload_kind
     }
 
+    #[cfg(test)]
     #[must_use]
-    pub const fn article_number(self) -> Option<RequestCacheArticleNumber> {
+    pub(crate) const fn article_number(self) -> Option<RequestCacheArticleNumber> {
         self.article_number
     }
 }
@@ -488,15 +477,16 @@ impl RequestContext {
         self.backend_id
     }
 
+    #[cfg(test)]
     #[inline]
     #[must_use]
-    pub const fn cache_status(&self) -> Option<RequestCacheStatus> {
+    pub(crate) const fn cache_status(&self) -> Option<RequestCacheStatus> {
         self.cache_status
     }
 
     #[inline]
     #[must_use]
-    pub const fn cache_availability(&self) -> Option<RequestCacheAvailability> {
+    pub(crate) const fn cache_availability(&self) -> Option<RequestCacheAvailability> {
         match self.cache_entry {
             Some(entry) => Some(entry.availability()),
             None => None,
@@ -512,55 +502,63 @@ impl RequestContext {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     #[must_use]
-    pub const fn cache_entry_tier(&self) -> Option<RequestCacheTier> {
+    pub(crate) const fn cache_entry_tier(&self) -> Option<RequestCacheTier> {
         match self.cache_entry {
             Some(entry) => Some(entry.tier()),
             None => None,
         }
     }
 
+    #[cfg(test)]
     #[inline]
     #[must_use]
-    pub const fn cache_entry_timestamp(&self) -> Option<RequestCacheTimestampMillis> {
+    pub(crate) const fn cache_entry_timestamp(&self) -> Option<RequestCacheTimestampMillis> {
         match self.cache_entry {
             Some(entry) => Some(entry.timestamp()),
             None => None,
         }
     }
 
+    #[cfg(test)]
     #[inline]
     #[must_use]
-    pub const fn cache_payload_kind(&self) -> Option<RequestCachePayloadKind> {
+    pub(crate) const fn cache_payload_kind(&self) -> Option<RequestCachePayloadKind> {
         match self.cache_entry {
             Some(entry) => Some(entry.payload_kind()),
             None => None,
         }
     }
 
+    #[cfg(test)]
     #[inline]
     #[must_use]
-    pub const fn cache_article_number(&self) -> Option<RequestCacheArticleNumber> {
+    pub(crate) const fn cache_article_number(&self) -> Option<RequestCacheArticleNumber> {
         match self.cache_entry {
             Some(entry) => entry.article_number(),
             None => None,
         }
     }
 
+    #[cfg(test)]
     #[inline]
     #[must_use]
-    pub const fn cache_entry_metadata(&self) -> Option<RequestCacheEntryMetadata> {
+    pub(crate) const fn cache_entry_metadata(&self) -> Option<RequestCacheEntryMetadata> {
         self.cache_entry
     }
 
     #[inline]
-    pub const fn record_cache_status(&mut self, status: RequestCacheStatus) {
+    pub(crate) const fn record_cache_status(&mut self, status: RequestCacheStatus) {
         self.cache_status = Some(status);
     }
 
     #[inline]
-    pub const fn record_cache_entry_metadata(&mut self, metadata: RequestCacheEntryMetadata) {
+    pub(crate) const fn record_cache_entry_metadata(
+        &mut self,
+        metadata: RequestCacheEntryMetadata,
+    ) {
         self.cache_entry = Some(metadata);
     }
 

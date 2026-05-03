@@ -18,9 +18,11 @@ mod responses;
 pub use article::{Article, HeaderIter, Headers, ParseError, yenc};
 
 // Re-export response types and utilities
-pub use request::{
+pub(crate) use request::{
     RequestCacheArticleNumber, RequestCacheAvailability, RequestCacheEntryMetadata,
     RequestCachePayloadKind, RequestCacheStatus, RequestCacheTier, RequestCacheTimestampMillis,
+};
+pub use request::{
     RequestContext, RequestKind, RequestLine, RequestResponseMetadata, RequestRouteClass,
     RequestWireLen, ResponsePayloadLen, ResponseWireLen,
 };
