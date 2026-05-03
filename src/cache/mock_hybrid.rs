@@ -139,7 +139,7 @@ mod tests {
         MessageId::from_borrowed(value).unwrap()
     }
 
-    fn wire_response(
+    fn render_response(
         entry: &DiskArticleEntry,
         request_kind: RequestKind,
         message_id: &MessageId<'_>,
@@ -152,7 +152,7 @@ mod tests {
 
     fn assert_article(entry: &DiskArticleEntry, message_id: &MessageId<'_>, expected: &[u8]) {
         assert_eq!(
-            wire_response(entry, RequestKind::Article, message_id).unwrap(),
+            render_response(entry, RequestKind::Article, message_id).unwrap(),
             expected
         );
     }

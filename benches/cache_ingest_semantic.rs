@@ -1,4 +1,4 @@
-//! Benchmarks for typed cache ingestion from wire responses.
+//! Benchmarks for typed cache ingestion from responses.
 //!
 //! Run with: cargo bench --bench cache_ingest_semantic
 
@@ -75,7 +75,7 @@ mod cache_upsert {
     };
 
     #[divan::bench(sample_count = 100, sample_size = 50)]
-    fn wire_response(bencher: Bencher) {
+    fn response(bencher: Bencher) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let cache = ArticleCache::new(16 * 1024 * 1024, Duration::from_secs(300), true);
         let bytes = article_response(64 * 1024);

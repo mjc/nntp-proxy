@@ -345,9 +345,9 @@ impl ArticleEntry {
         }
     }
 
-    /// Parse a cold backend wire response into typed cache metadata and payload.
+    /// Parse a cold backend response into typed cache metadata and payload.
     #[must_use]
-    pub fn from_wire_response_with_tier(response: impl AsRef<[u8]>, tier: ttl::CacheTier) -> Self {
+    pub fn from_response_with_tier(response: impl AsRef<[u8]>, tier: ttl::CacheTier) -> Self {
         let response = response.as_ref();
         let status_code = StatusCode::parse(response).unwrap_or_else(|| StatusCode::new(430));
         let payload = parse_payload(status_code, response);
@@ -366,18 +366,14 @@ impl ArticleEntry {
         tier: ttl::CacheTier,
     ) -> Self {
         match buffer {
-            super::CacheIngestBytes::Boxed(buffer) => {
-                Self::from_wire_response_with_tier(buffer, tier)
-            }
+            super::CacheIngestBytes::Boxed(buffer) => Self::from_response_with_tier(buffer, tier),
             super::CacheIngestBytes::Pooled(buffer) => {
-                Self::from_wire_response_with_tier(buffer.as_ref(), tier)
+                Self::from_response_with_tier(buffer.as_ref(), tier)
             }
             super::CacheIngestBytes::Chunked(buffer) => {
                 Self::from_chunked_response_with_tier(&buffer, tier)
             }
-            super::CacheIngestBytes::Small(buffer) => {
-                Self::from_wire_response_with_tier(buffer, tier)
-            }
+            super::CacheIngestBytes::Small(buffer) => Self::from_response_with_tier(buffer, tier),
         }
     }
 
@@ -1318,13 +1314,13 @@ mod tests {
         }
     }
 
-    fn entry_from_wire_response(buffer: impl AsRef<[u8]>) -> ArticleEntry {
-        ArticleEntry::from_wire_response_with_tier(buffer, ttl::CacheTier::new(0))
+    fn entry_from_response(buffer: impl AsRef<[u8]>) -> ArticleEntry {
+        ArticleEntry::from_response_with_tier(buffer, ttl::CacheTier::new(0))
     }
 
     fn create_test_article(msgid: &str) -> ArticleEntry {
         let buffer = format!("220 0 {msgid}\r\nSubject: Test\r\n\r\nBody\r\n.\r\n").into_bytes();
-        entry_from_wire_response(buffer)
+        entry_from_response(buffer)
     }
 
     fn rendered(entry: &ArticleEntry, request_kind: RequestKind, msgid: &str) -> Vec<u8> {
@@ -1436,8 +1432,7 @@ mod tests {
 
     #[test]
     fn body_payload_serves_body_and_stat_only() {
-        let entry =
-            entry_from_wire_response(b"222 0 <test@example.com>\r\nBody content only\r\n.\r\n");
+        let entry = entry_from_response(b"222 0 <test@example.com>\r\nBody content only\r\n.\r\n");
 
         assert_serves(
             &entry,
@@ -1452,9 +1447,8 @@ mod tests {
 
     #[test]
     fn article_payload_serves_article_head_body_and_stat() {
-        let entry = entry_from_wire_response(
-            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
-        );
+        let entry =
+            entry_from_response(b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n");
 
         assert_serves(
             &entry,
@@ -1469,7 +1463,7 @@ mod tests {
 
     #[test]
     fn head_payload_serves_head_and_stat_only() {
-        let entry = entry_from_wire_response(b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n");
+        let entry = entry_from_response(b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n");
 
         assert_serves(
             &entry,
@@ -1484,9 +1478,8 @@ mod tests {
 
     #[test]
     fn body_payload_completeness_requires_semantic_body() {
-        let complete =
-            entry_from_wire_response(b"222 0 <test@example.com>\r\nBody content\r\n.\r\n");
-        let metadata_only = entry_from_wire_response(b"222 0 <test@example.com>\r\n".as_slice());
+        let complete = entry_from_response(b"222 0 <test@example.com>\r\nBody content\r\n.\r\n");
+        let metadata_only = entry_from_response(b"222 0 <test@example.com>\r\n".as_slice());
 
         assert!(complete.is_complete_article());
         assert!(!metadata_only.is_complete_article());
@@ -1573,7 +1566,7 @@ mod tests {
     #[test]
     fn test_article_entry_basic() {
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = entry_from_wire_response(buffer.clone());
+        let entry = entry_from_response(buffer.clone());
 
         assert_eq!(entry.status_code(), StatusCode::new(220));
         assert_eq!(
@@ -1587,18 +1580,17 @@ mod tests {
     }
 
     #[test]
-    fn article_entry_ingests_wire_response_by_name() {
-        let entry = entry_from_wire_response(
-            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
-        );
+    fn article_entry_ingests_response_by_name() {
+        let entry =
+            entry_from_response(b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n");
 
         assert_eq!(entry.status_code(), StatusCode::new(220));
         assert!(matches!(entry.payload, CachedPayload::Article { .. }));
     }
 
     #[test]
-    fn article_entry_ingests_borrowed_wire_response() {
-        let entry = entry_from_wire_response(
+    fn article_entry_ingests_borrowed_response() {
+        let entry = entry_from_response(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".as_slice(),
         );
 
@@ -1608,14 +1600,14 @@ mod tests {
 
     #[test]
     fn article_entry_defaults_to_tier_zero() {
-        let entry = entry_from_wire_response(b"220 0 <test@example.com>\r\n.\r\n");
+        let entry = entry_from_response(b"220 0 <test@example.com>\r\n.\r\n");
 
         assert_eq!(entry.tier(), ttl::CacheTier::new(0));
     }
 
     #[test]
     fn article_entry_can_ingest_with_tier_internally() {
-        let entry = ArticleEntry::from_wire_response_with_tier(
+        let entry = ArticleEntry::from_response_with_tier(
             b"220 0 <test@example.com>\r\n.\r\n",
             ttl::CacheTier::new(5),
         );
@@ -1629,9 +1621,8 @@ mod tests {
         impl SharedSlice for Arc<[u8]> {}
         fn assert_shared_slice<T: SharedSlice>(_: &T) {}
 
-        let entry = entry_from_wire_response(
-            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
-        );
+        let entry =
+            entry_from_response(b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n");
 
         match &entry.payload {
             CachedPayload::Article { headers, body, .. } => {
@@ -1644,9 +1635,8 @@ mod tests {
 
     #[test]
     fn article_entry_clone_shares_payload_sections() {
-        let entry = entry_from_wire_response(
-            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
-        );
+        let entry =
+            entry_from_response(b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n");
         let cloned = entry.clone();
 
         match (&entry.payload, &cloned.payload) {
@@ -1712,29 +1702,28 @@ mod tests {
     #[test]
     fn test_is_complete_article() {
         // Metadata-only responses should NOT be complete articles
-        let metadata_only_430 = entry_from_wire_response(b"430\r\n");
+        let metadata_only_430 = entry_from_response(b"430\r\n");
         assert!(!metadata_only_430.is_complete_article());
 
-        let metadata_only_220 = entry_from_wire_response(b"220\r\n");
+        let metadata_only_220 = entry_from_response(b"220\r\n");
         assert!(!metadata_only_220.is_complete_article());
 
-        let metadata_only_223 = entry_from_wire_response(b"223\r\n");
+        let metadata_only_223 = entry_from_response(b"223\r\n");
         assert!(!metadata_only_223.is_complete_article());
 
         // Full article SHOULD be complete
-        let full = entry_from_wire_response(
-            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
-        );
+        let full =
+            entry_from_response(b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n");
         assert!(full.is_complete_article());
 
         // Wrong status code (not 220) should NOT be complete article
         let head_response =
-            entry_from_wire_response(b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n");
+            entry_from_response(b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n");
         assert!(!head_response.is_complete_article());
 
         // Missing terminator should NOT be complete
         let no_terminator =
-            entry_from_wire_response(b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n");
+            entry_from_response(b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n");
         assert!(!no_terminator.is_complete_article());
     }
 
@@ -2122,7 +2111,7 @@ mod tests {
             "222 0 <test@example.com>\r\n{}\r\n.\r\n",
             std::str::from_utf8(&body).unwrap()
         );
-        let article = entry_from_wire_response(response.as_bytes());
+        let article = entry_from_response(response.as_bytes());
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
         cache.insert(msgid.clone(), article).await;
@@ -2142,7 +2131,7 @@ mod tests {
                 msgid.as_str(),
                 std::str::from_utf8(&body).unwrap()
             );
-            let article = entry_from_wire_response(response.as_bytes());
+            let article = entry_from_response(response.as_bytes());
             cache.insert(msgid, article).await;
             cache.sync().await;
         }
@@ -2167,14 +2156,14 @@ mod tests {
 
         // Create small metadata-only response (53 bytes)
         let metadata_only = b"223 0 <test@example.com>\r\n".to_vec();
-        let article = entry_from_wire_response(metadata_only);
+        let article = entry_from_response(metadata_only);
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
         cache.insert(msgid, article).await;
         cache.sync().await;
 
         // With MOKA_OVERHEAD = 2000: parsed metadata + availability + overhead
-        // fit comfortably without pretending the whole wire response is retained
+        // fit comfortably without pretending the whole response is retained
         // With 2.5x small response multiplier: ~5400 bytes per response
         // 1MB capacity should fit ~185 metadata-only responses
 
@@ -2183,7 +2172,7 @@ mod tests {
             let msgid_str = format!("<metadata_only{i}@example.com>");
             let msgid = MessageId::new(msgid_str).unwrap();
             let metadata_only = format!("223 0 {}\r\n", msgid.as_str());
-            let article = entry_from_wire_response(metadata_only.as_bytes());
+            let article = entry_from_response(metadata_only.as_bytes());
             cache.insert(msgid, article).await;
         }
 
