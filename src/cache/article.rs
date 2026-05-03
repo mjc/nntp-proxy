@@ -107,21 +107,21 @@ pub(crate) enum CachedPayloadKind {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct CachedArticleResponse<'a> {
+pub struct CachedResponseWire<'a> {
     status: StatusCode,
     status_line: StackStatusLine,
-    payload: CachedArticleResponsePayload<'a>,
+    payload: CachedResponseWirePayload<'a>,
 }
 
 #[derive(Debug, Clone, Copy)]
-enum CachedArticleResponsePayload<'a> {
+enum CachedResponseWirePayload<'a> {
     None,
     Article { headers: &'a [u8], body: &'a [u8] },
     Head { headers: &'a [u8] },
     Body { body: &'a [u8] },
 }
 
-impl CachedArticleResponse<'_> {
+impl CachedResponseWire<'_> {
     fn wire_len_usize(&self) -> usize {
         self.status_line.len() + self.payload_len()
     }
@@ -148,8 +148,8 @@ impl CachedArticleResponse<'_> {
         use tokio::io::AsyncWriteExt as _;
 
         match self.payload {
-            CachedArticleResponsePayload::None => writer.write_all(self.status_line()).await?,
-            CachedArticleResponsePayload::Article { headers, body } => {
+            CachedResponseWirePayload::None => writer.write_all(self.status_line()).await?,
+            CachedResponseWirePayload::Article { headers, body } => {
                 let mut slices = [
                     IoSlice::new(self.status_line()),
                     IoSlice::new(headers),
@@ -159,7 +159,7 @@ impl CachedArticleResponse<'_> {
                 ];
                 crate::io_util::write_all_vectored(writer, &mut slices).await?;
             }
-            CachedArticleResponsePayload::Head { headers } => {
+            CachedResponseWirePayload::Head { headers } => {
                 let mut slices = [
                     IoSlice::new(self.status_line()),
                     IoSlice::new(headers),
@@ -167,7 +167,7 @@ impl CachedArticleResponse<'_> {
                 ];
                 crate::io_util::write_all_vectored(writer, &mut slices).await?;
             }
-            CachedArticleResponsePayload::Body { body } => {
+            CachedResponseWirePayload::Body { body } => {
                 let mut slices = [
                     IoSlice::new(self.status_line()),
                     IoSlice::new(body),
@@ -181,12 +181,12 @@ impl CachedArticleResponse<'_> {
 
     fn payload_len(&self) -> usize {
         match self.payload {
-            CachedArticleResponsePayload::None => 0,
-            CachedArticleResponsePayload::Article { headers, body } => {
+            CachedResponseWirePayload::None => 0,
+            CachedResponseWirePayload::Article { headers, body } => {
                 headers.len() + 4 + body.len() + 5
             }
-            CachedArticleResponsePayload::Head { headers } => headers.len() + 5,
-            CachedArticleResponsePayload::Body { body } => body.len() + 5,
+            CachedResponseWirePayload::Head { headers } => headers.len() + 5,
+            CachedResponseWirePayload::Body { body } => body.len() + 5,
         }
     }
 }
@@ -530,7 +530,7 @@ impl CachedArticle {
         &self,
         request_kind: RequestKind,
         message_id: &str,
-    ) -> Option<CachedArticleResponse<'_>> {
+    ) -> Option<CachedResponseWire<'_>> {
         cached_response_for_payload(&self.payload, request_kind, message_id)
     }
 }
@@ -539,7 +539,7 @@ pub(crate) fn cached_response_for_payload<'a>(
     payload: &'a CachedPayload,
     request_kind: RequestKind,
     message_id: &str,
-) -> Option<CachedArticleResponse<'a>> {
+) -> Option<CachedResponseWire<'a>> {
     let article_number = match payload {
         CachedPayload::Article { article_number, .. }
         | CachedPayload::Head { article_number, .. }
@@ -556,33 +556,33 @@ pub(crate) fn cached_response_for_payload<'a>(
             | CachedPayload::Head { .. }
             | CachedPayload::Body { .. }
             | CachedPayload::Stat { .. },
-        ) => Some(CachedArticleResponse {
+        ) => Some(CachedResponseWire {
             status: StatusCode::new(223),
             status_line: StackStatusLine::new(223, number, message_id)?,
-            payload: CachedArticleResponsePayload::None,
+            payload: CachedResponseWirePayload::None,
         }),
         (RequestKind::Article, CachedPayload::Article { headers, body, .. }) => {
-            Some(CachedArticleResponse {
+            Some(CachedResponseWire {
                 status: StatusCode::new(220),
                 status_line: StackStatusLine::new(220, number, message_id)?,
-                payload: CachedArticleResponsePayload::Article { headers, body },
+                payload: CachedResponseWirePayload::Article { headers, body },
             })
         }
         (
             RequestKind::Head,
             CachedPayload::Article { headers, .. } | CachedPayload::Head { headers, .. },
-        ) => Some(CachedArticleResponse {
+        ) => Some(CachedResponseWire {
             status: StatusCode::new(221),
             status_line: StackStatusLine::new(221, number, message_id)?,
-            payload: CachedArticleResponsePayload::Head { headers },
+            payload: CachedResponseWirePayload::Head { headers },
         }),
         (
             RequestKind::Body,
             CachedPayload::Article { body, .. } | CachedPayload::Body { body, .. },
-        ) => Some(CachedArticleResponse {
+        ) => Some(CachedResponseWire {
             status: StatusCode::new(222),
             status_line: StackStatusLine::new(222, number, message_id)?,
-            payload: CachedArticleResponsePayload::Body { body },
+            payload: CachedResponseWirePayload::Body { body },
         }),
         _ => None,
     }

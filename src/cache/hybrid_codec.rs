@@ -463,7 +463,7 @@ impl DiskCachedArticle {
         &self,
         request_kind: crate::protocol::RequestKind,
         message_id: &str,
-    ) -> Option<super::article::CachedArticleResponse<'_>> {
+    ) -> Option<super::article::CachedResponseWire<'_>> {
         super::article::cached_response_for_payload(&self.payload, request_kind, message_id)
     }
 
