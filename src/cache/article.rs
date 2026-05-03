@@ -494,10 +494,10 @@ impl ArticleEntry {
     ///
     /// Returns true if:
     /// 1. Status code is 220 (ARTICLE) or 222 (BODY)
-    /// 2. Buffer contains actual content (not just a stub like "220\r\n")
+    /// 2. Buffer contains actual content (not just a status line like "220\r\n")
     ///
     /// A complete response ends with ".\r\n" and is significantly longer
-    /// than a stub. Stubs are typically 5-6 bytes (e.g., "220\r\n" or "223\r\n").
+    /// than a status-only availability response.
     ///
     /// This is used when `cache_articles=true` to determine if we can serve
     /// directly from cache or need to fetch additional data.
@@ -804,7 +804,7 @@ impl ArticleCache {
                 let buffer_size = PAYLOAD_OVERHEAD + entry.payload_len().get();
                 let base_size = key_size + buffer_size + ENTRY_STRUCT + MOKA_OVERHEAD;
 
-                // Stubs (availability-only entries) have higher relative overhead
+                // Availability-only entries have higher relative overhead
                 // due to allocator fragmentation on small allocations.
                 // Complete articles are dominated by content size, so no multiplier needed.
                 let weighted_size = if entry.is_complete_article() {
@@ -922,8 +922,8 @@ impl ArticleCache {
                     let new_complete = new_entry_template.is_complete_article();
 
                     let should_replace = match (existing_complete, new_complete) {
-                        (false, true) => true,  // Stub → Complete: Always replace
-                        (true, false) => false, // Complete → Stub: Never replace
+                        (false, true) => true,  // Availability-only -> complete: always replace
+                        (true, false) => false, // Complete -> availability-only: never replace
                         (true, true) | (false, false) => {
                             new_entry_template.payload_len() > entry.payload_len()
                         }
@@ -1072,7 +1072,7 @@ impl ArticleCache {
                         // Don't create a missing entry - let upsert() handle it with the real article data.
                         Op::Nop
                     } else {
-                        // All checked backends returned 430 - create stub to track this
+                        // All checked backends returned 430 - create a missing entry to track this.
                         let mut entry = ArticleEntry::missing(ttl::CacheTier::new(0));
                         entry.backend_availability = availability;
                         Op::Put(entry)

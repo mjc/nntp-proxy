@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upsert_keeps_existing_semantic_payload_over_longer_wire_stub() {
+    async fn upsert_keeps_existing_semantic_payload_over_longer_status_only_response() {
         let cache = MockHybridCache::new(1024);
         cache
             .upsert(
@@ -190,7 +190,7 @@ mod tests {
             entry
                 .response_for(RequestKind::Article, "<mock-hybrid@example>")
                 .is_some(),
-            "longer raw wire stubs must not replace semantic article payloads"
+            "longer status-only responses must not replace semantic article payloads"
         );
         assert!(entry.should_try_backend(BackendId::from_index(1)));
     }

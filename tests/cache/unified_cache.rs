@@ -753,10 +753,10 @@ fn test_hybrid_entry_response_for_stat_synthesized() {
 fn test_hybrid_entry_response_for_430_returns_none() {
     let entry = hybrid_missing();
 
-    // 430 stubs should not serve ARTICLE requests
+    // missing entries should not serve ARTICLE requests
     assert!(hybrid_response_bytes(&entry, RequestKind::Article, "<test@example.com>").is_none());
 
-    // 430 stubs should not serve STAT either (article doesn't exist)
+    // missing entries should not serve STAT either (article doesn't exist)
     assert!(hybrid_response_bytes(&entry, RequestKind::Stat, "<test@example.com>").is_none());
 }
 

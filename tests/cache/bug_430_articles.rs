@@ -5,11 +5,11 @@
 //!
 //! 1. `spawn_cache_upsert()` is fire-and-forget (async)
 //! 2. `sync_availability()` runs immediately after success
-//! 3. If upsert hasn't completed, `sync_availability` creates a 430 stub
-//! 4. The 430 stub overwrites the real article when upsert finally runs
-//!    OR the 430 stub is served on the next request before upsert completes
+//! 3. If upsert hasn't completed, `sync_availability` creates a missing entry
+//! 4. The missing entry overwrites the real article when upsert finally runs
+//!    OR the missing entry is served on the next request before upsert completes
 //!
-//! This test verifies the fix: `sync_availability` should not create 430 stubs
+//! This test verifies the fix: `sync_availability` should not create missing entries
 //! when the availability shows a backend HAS the article.
 
 use anyhow::Result;
@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use super::article_response_bytes;
 
-/// Test that `sync_availability` does NOT create a 430 stub when a backend has the article
+/// Test that `sync_availability` does NOT create a missing entry when a backend has the article
 #[tokio::test]
 async fn test_sync_availability_does_not_create_430_stub_when_backend_has_article() -> Result<()> {
     let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
@@ -47,7 +47,7 @@ async fn test_sync_availability_does_not_create_430_stub_when_backend_has_articl
         let status = entry.status_code();
         assert!(
             status.as_u16() != 430,
-            "sync_availability should NOT create 430 stub when backend has article! \
+            "sync_availability should NOT create missing entry when backend has article! \
              Got status code: {:?}",
             status
         );
@@ -81,14 +81,14 @@ async fn test_race_condition_upsert_vs_sync_availability() -> Result<()> {
         )
         .await;
 
-    // The cached entry should be the article, not a 430 stub
+    // The cached entry should be the article, not a missing entry
     let cached = cache.get(&msg_id).await.expect("Should have cache entry");
     let status = cached.status_code();
 
     assert_eq!(
         status.as_u16(),
         220,
-        "After upsert, cache should have article (220), not 430 stub. Got: {}",
+        "After upsert, cache should have article (220), not missing entry. Got: {}",
         status.as_u16()
     );
 
@@ -214,14 +214,14 @@ async fn test_sync_availability_mixed_results() -> Result<()> {
     availability.record_missing(BackendId::from_index(0));
     availability.record_has(BackendId::from_index(1));
 
-    // sync_availability should NOT create 430 stub because backend 1 has it
+    // sync_availability should NOT create missing entry because backend 1 has it
     cache.sync_availability(msg_id.clone(), &availability).await;
 
     let cached = cache.get(&msg_id).await;
     if let Some(entry) = cached {
         assert!(
             entry.status_code().as_u16() != 430,
-            "Should not create 430 stub when one backend has article"
+            "Should not create missing entry when one backend has article"
         );
     }
     // No entry is also acceptable
@@ -229,7 +229,7 @@ async fn test_sync_availability_mixed_results() -> Result<()> {
     Ok(())
 }
 
-/// Test `sync_availability` creates 430 stub only when ALL backends are missing
+/// Test `sync_availability` creates missing entry only when ALL backends are missing
 #[tokio::test]
 async fn test_sync_availability_creates_430_when_all_missing() -> Result<()> {
     let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
@@ -240,14 +240,14 @@ async fn test_sync_availability_creates_430_when_all_missing() -> Result<()> {
     availability.record_missing(BackendId::from_index(0));
     availability.record_missing(BackendId::from_index(1));
 
-    // Should create 430 stub
+    // Should create missing entry
     cache.sync_availability(msg_id.clone(), &availability).await;
 
     let cached = cache.get(&msg_id).await.expect("Should have cache entry");
     assert_eq!(
         cached.status_code().as_u16(),
         430,
-        "Should create 430 stub when all backends are missing"
+        "Should create missing entry when all backends are missing"
     );
 
     // Verify availability is preserved
@@ -283,16 +283,16 @@ fn test_all_exhausted_with_backend_count() {
     assert!(!availability.all_exhausted(BackendCount::new(3)));
 }
 
-/// Test that `try_serve_from_cache` doesn't serve 430 stubs when `cache_articles=true`
+/// Test that `try_serve_from_cache` doesn't serve missing entries when `cache_articles=true`
 ///
-/// This is a critical edge case: if a 430 stub is in the cache, we should NOT
+/// This is a critical edge case: if a missing entry is in the cache, we should NOT
 /// serve it directly - we should fall through to backend routing.
 #[tokio::test]
 async fn test_430_stub_not_served_directly() -> Result<()> {
     let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
     let msg_id = MessageId::new("<stub@example.com>".to_string())?;
 
-    // Create a 430 stub in the cache (simulating all backends returned 430 previously)
+    // Create a missing entry in the cache (simulating all backends returned 430 previously)
     let mut availability = ArticleAvailability::new();
     availability.record_missing(BackendId::from_index(0));
     availability.record_missing(BackendId::from_index(1));
@@ -302,7 +302,7 @@ async fn test_430_stub_not_served_directly() -> Result<()> {
     let cached = cache.get(&msg_id).await.expect("Should have stub");
     assert_eq!(cached.status_code().as_u16(), 430);
 
-    // When we have a 430 stub, the availability info shows all backends exhausted
+    // When we have a missing entry, the availability info shows all backends exhausted
     // The session handler should check all_exhausted and send 430 only if true
     // (This test documents the expected behavior - actual implementation is in session handler)
     assert!(cached.all_backends_exhausted(BackendCount::new(2)));
@@ -352,12 +352,12 @@ async fn test_concurrent_upsert_and_sync() -> Result<()> {
     upsert_task.await?;
     sync_task.await?;
 
-    // Regardless of order, we should NOT have a 430 stub
+    // Regardless of order, we should NOT have a missing entry
     let article = cache.get(&msg_id).await;
     if let Some(entry) = article {
         assert!(
             entry.status_code().as_u16() != 430,
-            "Concurrent operations should not result in 430 stub when backend has article"
+            "Concurrent operations should not result in missing entry when backend has article"
         );
     }
 
@@ -373,11 +373,11 @@ async fn test_concurrent_upsert_and_sync() -> Result<()> {
 fn test_is_complete_article_rejects_stubs() {
     use nntp_proxy::cache::ArticleEntry;
 
-    // 430 stub
+    // missing entry
     let stub_430 = ArticleEntry::from_response_bytes(b"430\r\n");
     assert!(
         !stub_430.is_complete_article(),
-        "430 stub should not be complete article"
+        "missing entry should not be complete article"
     );
 
     // 220 stub (from availability tracking)

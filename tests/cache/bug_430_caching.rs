@@ -109,7 +109,7 @@ async fn test_430_increments_4xx_metrics() {
 #[allow(clippy::collection_is_never_read)] // msg_ids keeps borrowed strings alive; never read by design
 async fn test_cache_grows_with_430_responses() {
     // With MOKA_OVERHEAD=2000 and 2.5x multiplier for small entries:
-    // Each 430 stub (~5 bytes) weighs approx (5 + 68 + 40 + 2000) * 2.5 ≈ 5280 bytes
+    // Each missing entry stores no payload and weighs approx (0 + 68 + 40 + 2000) * 2.5.
     // So 100 entries need ~528KB capacity
     let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
 
@@ -147,7 +147,7 @@ async fn test_cache_grows_with_430_responses() {
 #[allow(clippy::collection_is_never_read)] // msg_ids keeps borrowed strings alive; never read by design
 async fn test_regression_bug_symptoms_fixed() {
     // With MOKA_OVERHEAD=2000 and 2.5x multiplier for small entries:
-    // Each 430 stub (~5 bytes) weighs approx (5 + 68 + 40 + 2000) * 2.5 ≈ 5280 bytes
+    // Each missing entry stores no payload and weighs approx (0 + 68 + 40 + 2000) * 2.5.
     // So 500 entries need ~2.64MB capacity
     let cache = ArticleCache::new(5_000_000, Duration::from_secs(300), true);
     let metrics = MetricsCollector::new(2);

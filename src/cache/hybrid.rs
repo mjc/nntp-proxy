@@ -350,7 +350,7 @@ impl HybridArticleCache {
     /// in a background task (non-blocking).
     ///
     /// **UPSERT SEMANTICS**: Never overwrites a larger semantic payload with a smaller one.
-    /// A cached full article (220/222 response) must not be replaced by a STAT stub.
+    /// A cached full article (220/222 response) must not be replaced by STAT availability.
     ///
     /// The tier is stored with the entry for tier-aware TTL calculation.
     pub async fn upsert(
@@ -419,7 +419,7 @@ impl HybridArticleCache {
         if self.config.cache_articles {
             debug!(msg_id = %key, stored_bytes = entry_len.get(), tier = tier.get(), "Hybrid cache upsert");
         } else {
-            debug!(msg_id = %key, stored_bytes = entry_len.get(), tier = tier.get(), "Hybrid cache upsert (stub)");
+            debug!(msg_id = %key, stored_bytes = entry_len.get(), tier = tier.get(), "Hybrid cache upsert (availability only)");
         }
     }
 
@@ -493,7 +493,7 @@ impl HybridArticleCache {
 
         let key = message_id.without_brackets().to_string();
 
-        // Get existing entry or conditionally create a stub
+        // Get existing entry or conditionally create a missing entry.
         let updated_entry = match self.cache.get(&key).await {
             Ok(Some(existing)) => {
                 // Merge availability into existing entry
