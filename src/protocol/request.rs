@@ -303,11 +303,6 @@ impl<'a> RequestLine<'a> {
     }
 
     #[must_use]
-    pub fn request_wire_len(&self) -> RequestWireLen {
-        (self.verb.len() + usize::from(!self.args.is_empty()) + self.args.len() + 2).into()
-    }
-
-    #[must_use]
     pub fn route_class(&self) -> RequestRouteClass {
         route_class(self.kind, self.message_id.is_some())
     }
@@ -934,7 +929,6 @@ mod tests {
             parsed.message_id_value(),
             Some(MessageId::from_borrowed("<a@b>").unwrap())
         );
-        assert_eq!(parsed.request_wire_len(), RequestWireLen::new(15));
         assert_eq!(parsed.route_class(), RequestRouteClass::ArticleByMessageId);
     }
 
@@ -947,7 +941,7 @@ mod tests {
         assert_eq!(ctx.verb(), b"BODY");
         assert_eq!(ctx.args(), b"<a@b>");
         assert_eq!(ctx.message_id(), Some("<a@b>"));
-        assert_eq!(ctx.request_wire_len(), parsed.request_wire_len());
+        assert_eq!(ctx.request_wire_len(), RequestWireLen::new(12));
     }
 
     #[tokio::test]
