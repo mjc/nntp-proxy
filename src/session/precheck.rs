@@ -200,9 +200,9 @@ async fn execute_backend_query(
                     PrecheckHit::Availability(status_code)
                 }
             } else if deps.cache_articles {
-                let mut response = Vec::with_capacity(cmd_response.bytes_read);
-                response.extend_from_slice(&buffer[..cmd_response.bytes_read]);
-                PrecheckHit::Payload(crate::cache::CacheIngestResponse::from(response))
+                PrecheckHit::Payload(crate::cache::CacheIngestResponse::from(
+                    &buffer[..cmd_response.bytes_read],
+                ))
             } else {
                 PrecheckHit::Availability(status_code)
             };
