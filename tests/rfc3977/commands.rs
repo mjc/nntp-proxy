@@ -187,12 +187,12 @@ fn test_standard_commands_under_512_octets() {
 
 #[test]
 fn test_long_message_id_command_length() {
-    // Very long message-ID may exceed 512 but the library doesn't enforce
-    let long_id = format!("<{}@example.com>", "x".repeat(450));
+    let long_id = format!("<{}@example.com>", "x".repeat(500));
     let cmd = protocol::article_request(&msgid(&long_id));
-    // We produce the command; server will reject if too long
-    assert!(cmd.request_wire_len().get() > 0);
-    assert!(wire(&cmd).ends_with(b"\r\n"));
+    let wire = wire(&cmd);
+
+    assert!(wire.len() > 512);
+    assert!(RequestContext::parse(&wire).is_none());
 }
 
 // === Request Classification ===

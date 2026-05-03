@@ -1,14 +1,15 @@
 //! Typed NNTP request context.
 //!
-//! A `RequestContext` is created after the command line has passed the RFC
-//! length/read boundary checks. It owns the verb and argument bytes so it can
-//! move across backend worker queues without carrying a redundant full wire
-//! command buffer.
+//! A `RequestContext` is created at the validated request boundary. It owns the
+//! verb and argument bytes so it can move across backend worker queues without
+//! carrying a redundant full wire command buffer.
 
 use smallvec::SmallVec;
 
 use super::StatusCode;
 use crate::types::{BackendId, MessageId};
+
+const MAX_COMMAND_LINE_OCTETS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestKind {
@@ -405,6 +406,10 @@ impl RequestCacheEntryMetadata {
 impl RequestContext {
     #[must_use]
     pub fn parse(line: &[u8]) -> Option<Self> {
+        if line.len() > MAX_COMMAND_LINE_OCTETS {
+            return None;
+        }
+
         let line = RequestLine::parse(line);
         (!line.verb().is_empty()).then(|| Self::from_request_line(line))
     }
@@ -1037,6 +1042,16 @@ mod tests {
         assert!(RequestContext::parse(b"").is_none());
         assert!(RequestContext::parse(b"\r\n").is_none());
         assert!(RequestContext::parse(b"   \r\n").is_none());
+    }
+
+    #[test]
+    fn request_context_parse_rejects_oversized_request_lines() {
+        let mut line = b"ARTICLE <".to_vec();
+        line.extend(std::iter::repeat_n(b'a', 496));
+        line.extend_from_slice(b"@example.com>\r\n");
+
+        assert_eq!(line.len(), 520);
+        assert!(RequestContext::parse(&line).is_none());
     }
 
     #[tokio::test]
