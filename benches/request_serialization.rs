@@ -151,7 +151,7 @@ mod response_shape {
             .counter(divan::counter::ItemsCount::new(cases.len()))
             .bench(|| {
                 cases.iter().fold(0usize, |count, (request, status)| {
-                    black_box(request.response_shape(black_box(*status)));
+                    black_box(request.is_multiline_response(black_box(*status)));
                     count + 1
                 })
             });

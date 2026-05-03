@@ -22,7 +22,7 @@ pub use request::{
     RequestCacheArticleNumber, RequestCacheAvailability, RequestCacheEntryMetadata,
     RequestCachePayloadKind, RequestCacheStatus, RequestCacheTier, RequestCacheTimestampMillis,
     RequestContext, RequestKind, RequestLine, RequestResponseMetadata, RequestRouteClass,
-    RequestWireLen, ResponsePayloadLen, ResponseShape, ResponseWireLen,
+    RequestWireLen, ResponsePayloadLen, ResponseWireLen,
 };
 pub use response::StatusCode;
 

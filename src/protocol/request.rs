@@ -42,12 +42,6 @@ pub enum RequestKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResponseShape {
-    SingleLine,
-    Multiline,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestRouteClass {
     ArticleByMessageId,
     Stateless,
@@ -760,13 +754,13 @@ impl RequestContext {
     }
 
     #[must_use]
-    pub fn response_shape(&self, status: StatusCode) -> ResponseShape {
+    pub fn is_multiline_response(&self, status: StatusCode) -> bool {
         let code = status.as_u16();
         if status.is_error() {
-            return ResponseShape::SingleLine;
+            return false;
         }
 
-        let multiline = matches!(
+        matches!(
             (self.kind, code),
             (RequestKind::Article, 220)
                 | (RequestKind::Head, 221)
@@ -779,17 +773,7 @@ impl RequestContext {
                 | (RequestKind::Hdr | RequestKind::Xhdr, 225)
                 | (RequestKind::NewNews, 230)
                 | (RequestKind::NewGroups, 231)
-        );
-        if multiline {
-            ResponseShape::Multiline
-        } else {
-            ResponseShape::SingleLine
-        }
-    }
-
-    #[must_use]
-    pub fn is_multiline_response(&self, status: StatusCode) -> bool {
-        matches!(self.response_shape(status), ResponseShape::Multiline)
+        )
     }
 }
 
@@ -1202,20 +1186,11 @@ mod tests {
     }
 
     #[test]
-    fn request_aware_response_shape() {
+    fn request_aware_multiline_response_detection() {
         let group = request_context(b"GROUP alt.test\r\n");
         let listgroup = request_context(b"LISTGROUP alt.test\r\n");
-        assert_eq!(
-            group.response_shape(StatusCode::new(211)),
-            ResponseShape::SingleLine
-        );
-        assert_eq!(
-            listgroup.response_shape(StatusCode::new(211)),
-            ResponseShape::Multiline
-        );
-        assert_eq!(
-            request_context(b"ARTICLE <x@y>\r\n").response_shape(StatusCode::new(430)),
-            ResponseShape::SingleLine
-        );
+        assert!(!group.is_multiline_response(StatusCode::new(211)));
+        assert!(listgroup.is_multiline_response(StatusCode::new(211)));
+        assert!(!request_context(b"ARTICLE <x@y>\r\n").is_multiline_response(StatusCode::new(430)));
     }
 }
