@@ -357,7 +357,7 @@ impl UnifiedCache {
     /// Upsert (insert or update) an article in the cache
     ///
     /// The tier is used for tier-aware TTL calculation (higher tier = longer TTL).
-    pub async fn upsert_wire_response(
+    pub async fn upsert_response(
         &self,
         message_id: MessageId<'_>,
         buffer: impl AsRef<[u8]>,

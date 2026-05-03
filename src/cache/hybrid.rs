@@ -353,7 +353,7 @@ impl HybridArticleCache {
     /// A cached full article (220/222 response) must not be replaced by STAT availability.
     ///
     /// The tier is stored with the entry for tier-aware TTL calculation.
-    pub async fn upsert_wire_response(
+    pub async fn upsert_response(
         &self,
         message_id: MessageId<'_>,
         buffer: impl AsRef<[u8]>,
@@ -670,7 +670,7 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<test123@example.com>").unwrap();
         let buffer = b"220 0 <test123@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         cache
-            .upsert_wire_response(msg_id, buffer.clone(), BackendId::from_index(0), 0.into())
+            .upsert_response(msg_id, buffer.clone(), BackendId::from_index(0), 0.into())
             .await;
 
         // Retrieve it
@@ -701,7 +701,7 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<test123@example.com>").unwrap();
         let buffer = b"220 0 <test123@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         cache
-            .upsert_wire_response(msg_id.clone(), buffer, BackendId::from_index(0), 0.into())
+            .upsert_response(msg_id.clone(), buffer, BackendId::from_index(0), 0.into())
             .await;
 
         let entry = cache.get(&msg_id).await.unwrap();

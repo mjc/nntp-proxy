@@ -983,7 +983,7 @@ impl ArticleCache {
     /// The tier is stored with the entry for tier-aware TTL calculation.
     ///
     /// CRITICAL: Always re-insert to refresh TTL, and mark backend as having the article.
-    pub async fn upsert_wire_response(
+    pub async fn upsert_response(
         &self,
         message_id: MessageId<'_>,
         buffer: impl AsRef<[u8]>,
@@ -1503,7 +1503,7 @@ mod tests {
         );
 
         cache
-            .upsert_wire_response(
+            .upsert_response(
                 msg_id.clone(),
                 complete.as_bytes().to_vec(),
                 backend_id,
@@ -1511,7 +1511,7 @@ mod tests {
             )
             .await;
         cache
-            .upsert_wire_response(
+            .upsert_response(
                 msg_id.clone(),
                 b"222 0 <test@example.com>\r\n".to_vec(),
                 backend_id,
@@ -1538,7 +1538,7 @@ mod tests {
         );
 
         cache
-            .upsert_wire_response(
+            .upsert_response(
                 msg_id.clone(),
                 b"222 0 <test@example.com>\r\n".to_vec(),
                 backend_id,
@@ -1555,7 +1555,7 @@ mod tests {
         );
 
         cache
-            .upsert_wire_response(
+            .upsert_response(
                 msg_id.clone(),
                 complete.as_bytes().to_vec(),
                 backend_id,
@@ -1842,7 +1842,7 @@ mod tests {
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
 
         cache
-            .upsert_wire_response(
+            .upsert_response(
                 msgid.clone(),
                 buffer.clone(),
                 BackendId::from_index(0),
@@ -1869,7 +1869,7 @@ mod tests {
 
         // Insert with backend 0
         cache
-            .upsert_wire_response(
+            .upsert_response(
                 msgid.clone(),
                 buffer.clone(),
                 BackendId::from_index(0),
@@ -1879,7 +1879,7 @@ mod tests {
 
         // Update with backend 1 - does nothing (entry already exists)
         cache
-            .upsert_wire_response(
+            .upsert_response(
                 msgid.clone(),
                 buffer.clone(),
                 BackendId::from_index(1),
@@ -2031,7 +2031,7 @@ mod tests {
         let full_size = buffer.len();
 
         cache_metadata_only
-            .upsert_wire_response(msgid.clone(), buffer, BackendId::from_index(0), 0.into())
+            .upsert_response(msgid.clone(), buffer, BackendId::from_index(0), 0.into())
             .await;
         cache_metadata_only.sync().await;
 
@@ -2051,7 +2051,7 @@ mod tests {
         let original_payload_size = b"Subject: Test2".len() + b"Body2".len();
 
         cache_full
-            .upsert_wire_response(msgid2.clone(), buffer2, BackendId::from_index(0), 0.into())
+            .upsert_response(msgid2.clone(), buffer2, BackendId::from_index(0), 0.into())
             .await;
         cache_full.sync().await;
 
