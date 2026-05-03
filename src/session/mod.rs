@@ -167,7 +167,7 @@
 pub mod auth_state;
 pub mod backend;
 pub(crate) mod common;
-pub mod connection;
+pub(crate) mod connection;
 pub mod core;
 pub mod handlers;
 pub mod metrics_ext;
