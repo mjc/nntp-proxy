@@ -369,7 +369,7 @@ impl RequestCacheEntryMetadata {
     }
 
     #[must_use]
-    pub const fn status(self) -> StatusCode {
+    pub(crate) const fn status(self) -> StatusCode {
         self.status
     }
 

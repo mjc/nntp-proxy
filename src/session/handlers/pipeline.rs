@@ -91,32 +91,32 @@ impl RequestBatch {
     }
 
     /// Whether this batch is empty (client disconnected)
-    pub fn is_empty(&self) -> bool {
+    pub(super) fn is_empty(&self) -> bool {
         self.contexts.is_empty() && self.trailing_context.is_none() && !self.trailing_oversized
     }
 
     /// Get a typed context by index from the pipelineable commands.
-    pub fn context(&self, i: usize) -> &RequestContext {
+    pub(super) fn context(&self, i: usize) -> &RequestContext {
         &self.contexts[i]
     }
 
     /// Get a mutable typed context by index from the pipelineable commands.
-    pub fn context_mut(&mut self, i: usize) -> &mut RequestContext {
+    pub(super) fn context_mut(&mut self, i: usize) -> &mut RequestContext {
         &mut self.contexts[i]
     }
 
     /// Get the trailing typed context if present.
-    pub fn trailing_context(&self) -> Option<&RequestContext> {
+    pub(super) fn trailing_context(&self) -> Option<&RequestContext> {
         self.trailing_context.as_ref()
     }
 
     /// Get the trailing typed context mutably if present.
-    pub fn trailing_context_mut(&mut self) -> Option<&mut RequestContext> {
+    pub(super) fn trailing_context_mut(&mut self) -> Option<&mut RequestContext> {
         self.trailing_context.as_mut()
     }
 
     /// Number of pipelineable commands
-    pub fn len(&self) -> usize {
+    pub(super) fn len(&self) -> usize {
         self.contexts.len()
     }
 
