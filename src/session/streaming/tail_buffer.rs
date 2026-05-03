@@ -97,7 +97,7 @@ impl TailBuffer {
     /// Detect terminator in chunk, considering possible boundary spanning
     ///
     /// **Performance**: `find_terminator_end()` checks end first (O(1)),
-    /// only scans with memchr if terminator is mid-chunk (rare).
+    /// only scans with `memmem` if terminator is mid-chunk (rare).
     /// This optimizes the 99% case where terminator is at chunk end.
     #[must_use]
     pub fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
@@ -119,31 +119,19 @@ impl TailBuffer {
 /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1),
 /// the terminator is exactly "\r\n.\r\n" (CRLF, dot, CRLF).
 ///
-/// **Optimization**: Uses `memchr::memchr_iter()` to find '\r' bytes (SIMD-accelerated),
-/// then validates the full 5-byte pattern. This eliminates the need to create new slices
-/// on each iteration (which the manual loop approach requires with `&data[pos..]`).
-///
-/// Benchmarks show this is **72% faster for small responses** (37ns → 13ns) and
-/// **64% faster for medium responses** (109ns → 40ns) compared to the manual loop
-/// that creates a new slice on each iteration.
-///
 /// **Hot path optimization**: Check end first (99% case for streaming chunks),
-/// then scan forward if needed. Compiler optimizes slice comparison to memcmp.
+/// then use the crate's SIMD substring search for mid-chunk leftovers.
 #[inline]
 fn find_terminator_end(data: &[u8]) -> Option<usize> {
-    const TERMINATOR: [u8; 5] = *b"\r\n.\r\n";
+    const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
 
-    // Fast path: check suffix, or slow path: scan for terminator mid-chunk
-    data.len()
-        .checked_sub(5)
-        .filter(|&start| data[start..] == TERMINATOR)
-        .map(|_| data.len())
-        .or_else(|| {
-            memchr::memchr_iter(b'\r', data)
-                .take_while(|&pos| pos + 5 <= data.len())
-                .find(|&pos| data[pos..pos + 5] == TERMINATOR)
-                .map(|pos| pos + 5)
-        })
+    data.len().checked_sub(TERMINATOR.len()).and_then(|start| {
+        if data[start..] == *TERMINATOR {
+            Some(data.len())
+        } else {
+            memchr::memmem::find(data, TERMINATOR).map(|pos| pos + TERMINATOR.len())
+        }
+    })
 }
 
 /// Find spanning terminator across boundary between tail and current chunk
