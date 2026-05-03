@@ -7,10 +7,10 @@
 //! - Tier 10: 1024x base TTL (~43 days with 1h base)
 //! - etc. (capped at tier 63 to prevent shift overflow)
 
+use nntp_proxy::cache::ArticleCache;
 use nntp_proxy::cache::ttl::{
     CacheTier, MAX_TTL_TIER, effective_ttl, is_expired, now_millis, ttl_multiplier,
 };
-use nntp_proxy::cache::{ArticleCache, ArticleEntry};
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
 
@@ -208,32 +208,6 @@ fn test_is_expired_future_timestamp() {
     let future = now_millis().saturating_add(10000);
     // Should not be expired - elapsed would be 0 due to saturating_sub
     assert!(!is_expired(future, 1000, CacheTier::new(0)));
-}
-
-// =============================================================================
-// ArticleEntry tier tests
-// =============================================================================
-
-#[test]
-fn test_article_entry_tier_default() {
-    let entry = ArticleEntry::from_response_bytes(b"220 0 <test@example.com>\r\n.\r\n");
-    assert_eq!(entry.tier().get(), 0);
-}
-
-#[test]
-fn test_article_entry_with_tier() {
-    let mut entry = ArticleEntry::from_response_bytes(b"220 0 <test@example.com>\r\n.\r\n");
-    entry.set_tier(CacheTier::new(3));
-    assert_eq!(entry.tier().get(), 3);
-}
-
-#[test]
-fn test_article_entry_set_tier() {
-    let mut entry = ArticleEntry::from_response_bytes(b"220 0 <test@example.com>\r\n.\r\n");
-    assert_eq!(entry.tier().get(), 0);
-
-    entry.set_tier(CacheTier::new(5));
-    assert_eq!(entry.tier().get(), 5);
 }
 
 // =============================================================================

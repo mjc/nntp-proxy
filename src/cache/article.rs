@@ -420,12 +420,6 @@ impl ArticleEntry {
         self.inserted_at
     }
 
-    /// Set the tier (used when updating entry)
-    #[inline]
-    pub const fn set_tier(&mut self, tier: ttl::CacheTier) {
-        self.tier = tier;
-    }
-
     #[inline]
     #[must_use]
     pub(crate) const fn payload_kind(&self) -> CachedPayloadKind {
@@ -1430,6 +1424,23 @@ mod tests {
 
         assert_eq!(entry.status_code(), StatusCode::new(220));
         assert!(matches!(entry.payload, CachedPayload::Article { .. }));
+    }
+
+    #[test]
+    fn article_entry_defaults_to_tier_zero() {
+        let entry = ArticleEntry::from_response_bytes(b"220 0 <test@example.com>\r\n.\r\n");
+
+        assert_eq!(entry.tier(), ttl::CacheTier::new(0));
+    }
+
+    #[test]
+    fn article_entry_can_ingest_with_tier_internally() {
+        let entry = ArticleEntry::from_response_bytes_with_tier(
+            b"220 0 <test@example.com>\r\n.\r\n",
+            ttl::CacheTier::new(5),
+        );
+
+        assert_eq!(entry.tier(), ttl::CacheTier::new(5));
     }
 
     #[test]
