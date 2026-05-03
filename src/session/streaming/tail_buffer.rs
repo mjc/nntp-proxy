@@ -97,7 +97,7 @@ impl TailBuffer {
     /// Detect terminator in chunk, considering possible boundary spanning
     ///
     /// **Performance**: `find_terminator_end()` checks end first (O(1)),
-    /// only scans with `memmem` if terminator is mid-chunk (rare).
+    /// then scans candidate dot bytes if terminator is mid-chunk (rare).
     /// This optimizes the 99% case where terminator is at chunk end.
     #[must_use]
     pub fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
@@ -120,7 +120,7 @@ impl TailBuffer {
 /// the terminator is exactly "\r\n.\r\n" (CRLF, dot, CRLF).
 ///
 /// **Hot path optimization**: Check end first (99% case for streaming chunks),
-/// then use the crate's SIMD substring search for mid-chunk leftovers.
+/// then scan for the terminator's distinguishing dot byte for mid-chunk leftovers.
 #[inline]
 fn find_terminator_end(data: &[u8]) -> Option<usize> {
     const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
@@ -129,7 +129,11 @@ fn find_terminator_end(data: &[u8]) -> Option<usize> {
         if data[start..] == *TERMINATOR {
             Some(data.len())
         } else {
-            memchr::memmem::find(data, TERMINATOR).map(|pos| pos + TERMINATOR.len())
+            memchr::memchr_iter(b'.', data)
+                .skip_while(|&pos| pos < 2)
+                .take_while(|&pos| pos + 3 <= data.len())
+                .find(|&pos| data[pos - 2..pos + 3] == *TERMINATOR)
+                .map(|pos| pos + 3)
         }
     })
 }
