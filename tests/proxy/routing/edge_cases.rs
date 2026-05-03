@@ -24,7 +24,6 @@ fn test_complete_command_on_wrong_backend() {
         ServerName::try_new("test".to_string()).unwrap(),
         super::create_test_provider(),
         0, // tier
-        None,
     );
 
     // Complete command on non-existent backend (different ID)
@@ -61,7 +60,6 @@ fn test_release_stateful_when_count_is_zero() {
         ServerName::try_new("test".to_string()).unwrap(),
         super::create_test_provider(),
         0, // tier
-        None,
     );
 
     // Release without acquiring should not underflow (fetch_update prevents it)
@@ -94,7 +92,6 @@ fn test_excessive_complete_command_calls() {
         ServerName::try_new("test".to_string()).unwrap(),
         super::create_test_provider(),
         0, // tier
-        None,
     );
 
     // Route one command
@@ -128,7 +125,6 @@ fn test_large_number_of_backends() {
             ServerName::try_new(format!("backend-{i}")).unwrap(),
             super::create_test_provider(),
             0, // tier
-            None,
         );
     }
 
@@ -151,7 +147,6 @@ fn test_backend_provider_retrieval() {
         ServerName::try_new("test".to_string()).unwrap(),
         super::create_test_provider(),
         0, // tier
-        None,
     );
 
     let provider = router.backend_provider(backend_id);
@@ -173,7 +168,6 @@ fn test_single_backend_round_robin() {
         ServerName::try_new("solo".to_string()).unwrap(),
         super::create_test_provider(),
         0, // tier
-        None,
     );
 
     // All commands should route to the same backend
@@ -203,7 +197,6 @@ fn test_stateful_acquisition_with_max_connections_1() {
         ServerName::try_new("minimal-backend".to_string()).unwrap(),
         provider,
         0, // tier
-        None,
     );
 
     // Should never be able to acquire stateful (all reserved for PCR)
@@ -222,7 +215,6 @@ fn test_concurrent_route_calls() {
             ServerName::try_new(format!("backend-{i}")).unwrap(),
             super::create_test_provider(),
             0, // tier
-            None,
         );
     }
 
@@ -287,7 +279,6 @@ fn test_stateful_acquire_release_interleaved() {
         ServerName::try_new("test".to_string()).unwrap(),
         provider,
         0, // tier
-        None,
     );
 
     // Acquire, release, acquire pattern
@@ -320,7 +311,6 @@ fn test_wrap_around_with_large_counter() {
             ServerName::try_new(format!("backend-{i}")).unwrap(),
             super::create_test_provider(),
             0, // tier
-            None,
         );
     }
 

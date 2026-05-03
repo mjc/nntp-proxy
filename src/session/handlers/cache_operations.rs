@@ -401,7 +401,6 @@ mod tests {
                 None,
             ),
             0,
-            None,
         );
         let router = Arc::new(router);
 
@@ -473,7 +472,6 @@ mod tests {
                 None,
             ),
             0,
-            None,
         );
         let router = Arc::new(router);
         let mut metrics = BackendToClientBytes::zero();

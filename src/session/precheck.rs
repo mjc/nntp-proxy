@@ -527,7 +527,6 @@ mod tests {
             ServerName::try_new("test-server".to_string()).unwrap(),
             provider,
             0,
-            None,
         );
 
         let deps = OwnedDeps {

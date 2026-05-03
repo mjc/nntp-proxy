@@ -25,7 +25,6 @@
 //!     ServerName::try_new("server1".to_string()).unwrap(),
 //!     provider,
 //!     0, // tier (lower = higher priority)
-//!     None, // pipeline_queue
 //! );
 //!
 //! // Route a command
@@ -46,7 +45,7 @@ use std::cmp::Ordering as CmpOrdering;
 use std::sync::Arc;
 use tracing::{debug, info};
 
-pub use backend_queue::BackendQueue;
+pub(crate) use backend_queue::BackendQueue;
 
 use crate::config::BackendSelectionStrategy;
 use crate::pool::DeadpoolConnectionProvider;
@@ -301,8 +300,18 @@ impl BackendSelector {
     /// * `name` - Human-readable name for logging
     /// * `provider` - Connection pool provider
     /// * `tier` - Server tier (lower = higher priority, 0 is highest)
-    /// * `pipeline_queue` - Optional pipeline queue for request multiplexing
     pub fn add_backend(
+        &mut self,
+        backend_id: BackendId,
+        name: ServerName,
+        provider: DeadpoolConnectionProvider,
+        tier: u8,
+    ) {
+        self.add_backend_with_queue(backend_id, name, provider, tier, None);
+    }
+
+    /// Add a backend server with an optional internal pipeline queue.
+    pub(crate) fn add_backend_with_queue(
         &mut self,
         backend_id: BackendId,
         name: ServerName,
@@ -528,7 +537,7 @@ impl BackendSelector {
 
     /// Get the pipeline queue for a backend (if pipelining is enabled)
     #[must_use]
-    pub fn get_backend_queue(&self, backend_id: BackendId) -> Option<&Arc<BackendQueue>> {
+    pub(crate) fn get_backend_queue(&self, backend_id: BackendId) -> Option<&Arc<BackendQueue>> {
         self.find_backend(backend_id)
             .and_then(|b| b.pipeline_queue.as_ref())
     }
@@ -681,7 +690,6 @@ mod tests {
             ServerName::try_new("test-server".to_string()).unwrap(),
             provider,
             0,
-            None,
         );
         (Arc::new(selector), backend_id)
     }

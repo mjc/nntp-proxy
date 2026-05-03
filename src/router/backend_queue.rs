@@ -100,7 +100,7 @@ pub(crate) enum QueueError {
 
 /// Lock-free per-backend request queue with async notification
 #[derive(Debug)]
-pub struct BackendQueue {
+pub(crate) struct BackendQueue {
     queue: SegQueue<QueuedContext>,
     notify: Notify,
     depth: AtomicUsize,

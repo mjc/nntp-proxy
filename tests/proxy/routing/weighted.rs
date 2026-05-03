@@ -15,7 +15,6 @@ fn test_total_weight_accumulation() {
         ServerName::try_new("backend1".to_string()).unwrap(),
         create_backend("backend1", 20),
         0, // tier
-        None,
     );
     assert_eq!(selector.total_weight(), 20);
 
@@ -24,7 +23,6 @@ fn test_total_weight_accumulation() {
         ServerName::try_new("backend2".to_string()).unwrap(),
         create_backend("backend2", 30),
         0, // tier
-        None,
     );
     assert_eq!(selector.total_weight(), 50);
 
@@ -33,7 +31,6 @@ fn test_total_weight_accumulation() {
         ServerName::try_new("backend3".to_string()).unwrap(),
         create_backend("backend3", 50),
         0, // tier
-        None,
     );
     assert_eq!(selector.total_weight(), 100);
 }
@@ -48,14 +45,12 @@ fn test_weighted_distribution_equal_weights() {
         ServerName::try_new("backend0".to_string()).unwrap(),
         create_backend("backend0", 10),
         0, // tier
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("backend1".to_string()).unwrap(),
         create_backend("backend1", 10),
         0, // tier
-        None,
     );
 
     // Total weight = 20
@@ -94,14 +89,12 @@ fn test_weighted_distribution_unequal_weights() {
         ServerName::try_new("small".to_string()).unwrap(),
         create_backend("small", 40),
         0, // tier
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("large".to_string()).unwrap(),
         create_backend("large", 50),
         0, // tier
-        None,
     );
 
     assert_eq!(selector.total_weight(), 90);
@@ -141,21 +134,18 @@ fn test_weighted_distribution_three_backends() {
         ServerName::try_new("small".to_string()).unwrap(),
         create_backend("small", 10),
         0, // tier
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("medium".to_string()).unwrap(),
         create_backend("medium", 20),
         0, // tier
-        None,
     );
     selector.add_backend(
         BackendId::from_index(2),
         ServerName::try_new("large".to_string()).unwrap(),
         create_backend("large", 30),
         0, // tier
-        None,
     );
 
     assert_eq!(selector.total_weight(), 60);
@@ -198,14 +188,12 @@ fn test_weighted_real_world_scenario() {
         ServerName::try_new("usenet.farm".to_string()).unwrap(),
         create_backend("usenet.farm", 40),
         0, // tier
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("NewsDemon".to_string()).unwrap(),
         create_backend("NewsDemon", 50),
         0, // tier
-        None,
     );
 
     assert_eq!(selector.total_weight(), 90);
@@ -249,14 +237,12 @@ fn test_weighted_extreme_imbalance() {
         ServerName::try_new("tiny".to_string()).unwrap(),
         create_backend("tiny", 1),
         0, // tier
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("huge".to_string()).unwrap(),
         create_backend("huge", 99),
         0, // tier
-        None,
     );
 
     assert_eq!(selector.total_weight(), 100);
@@ -292,14 +278,12 @@ fn test_weighted_consistency_across_runs() {
         ServerName::try_new("b0".to_string()).unwrap(),
         create_backend("b0", 30),
         0, // tier
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("b1".to_string()).unwrap(),
         create_backend("b1", 70),
         0, // tier
-        None,
     );
 
     // Run the test multiple times to ensure consistency
@@ -335,7 +319,6 @@ fn test_zero_weight_backend_handled() {
         ServerName::try_new("zero".to_string()).unwrap(),
         create_backend("zero", 0),
         0, // tier
-        None,
     );
 
     assert_eq!(selector.total_weight(), 0);
@@ -354,14 +337,12 @@ fn test_mixed_zero_and_nonzero_weights() {
         ServerName::try_new("zero".to_string()).unwrap(),
         create_backend("zero", 0),
         0, // tier
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("normal".to_string()).unwrap(),
         create_backend("normal", 10),
         0, // tier
-        None,
     );
 
     assert_eq!(selector.total_weight(), 10);
@@ -387,7 +368,6 @@ fn test_weighted_with_varying_pool_sizes() {
             ServerName::try_new(format!("backend-{i}")).unwrap(),
             create_backend(&format!("backend-{i}"), size),
             0, // tier
-            None,
         );
     }
 
@@ -428,7 +408,6 @@ fn test_weighted_single_backend() {
         ServerName::try_new("only".to_string()).unwrap(),
         create_backend("only", 42),
         0, // tier
-        None,
     );
 
     assert_eq!(selector.total_weight(), 42);
@@ -450,14 +429,12 @@ fn test_weighted_distribution_precision() {
         ServerName::try_new("b0".to_string()).unwrap(),
         create_backend("b0", 13),
         0, // tier
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("b1".to_string()).unwrap(),
         create_backend("b1", 17),
         0, // tier
-        None,
     );
 
     assert_eq!(selector.total_weight(), 30);

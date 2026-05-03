@@ -188,7 +188,7 @@ impl NntpProxyBuilder {
                     } else {
                         None
                     };
-                    r.add_backend(
+                    r.add_backend_with_queue(
                         backend_id,
                         servers[idx].name.clone(),
                         provider.clone(),

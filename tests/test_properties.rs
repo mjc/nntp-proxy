@@ -579,7 +579,6 @@ proptest! {
                 nntp_proxy::types::ServerName::try_new(format!("server-{i}")).unwrap(),
                 provider,
                 0,
-            None,
             );
 
             prop_assert_eq!(selector.backend_count().get(), i + 1,
@@ -620,13 +619,11 @@ proptest! {
             id0,
             nntp_proxy::types::ServerName::try_new("server-0".to_string()).unwrap(),
             provider0, 0,
-            None,
         );
         selector.add_backend(
             id1,
             nntp_proxy::types::ServerName::try_new("server-1".to_string()).unwrap(),
             provider1, 0,
-            None,
         );
 
         // Route many commands and count distribution
