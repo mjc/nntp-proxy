@@ -11,7 +11,7 @@ use nntp_proxy::RoutingMode;
 use std::time::Duration;
 
 use crate::test_helpers::{
-    connect_and_read_greeting, send_article_read_full_response, setup_proxy_with_backends,
+    connect_and_read_greeting, send_article_read_multiline_response, setup_proxy_with_backends,
 };
 
 #[tokio::test]
@@ -30,7 +30,7 @@ async fn test_all_backends_exhausted_returns_430() -> Result<()> {
     let mut client = connect_and_read_greeting(proxy_port).await?;
 
     let (status, body) =
-        send_article_read_full_response(&mut client, "<missing@example.com>").await?;
+        send_article_read_multiline_response(&mut client, "<missing@example.com>").await?;
 
     assert!(
         status.starts_with("430"),
@@ -50,7 +50,7 @@ async fn test_single_backend_immediate_430() -> Result<()> {
     let mut client = connect_and_read_greeting(proxy_port).await?;
 
     let (status, body) =
-        send_article_read_full_response(&mut client, "<only-backend@example.com>").await?;
+        send_article_read_multiline_response(&mut client, "<only-backend@example.com>").await?;
 
     assert!(
         status.starts_with("430"),
@@ -76,18 +76,21 @@ async fn test_availability_learned_across_requests() -> Result<()> {
     let mut client = connect_and_read_greeting(proxy_port).await?;
 
     // First request learns Backend1=430, Backend2=220
-    let (status1, _) = send_article_read_full_response(&mut client, "<first@example.com>").await?;
+    let (status1, _) =
+        send_article_read_multiline_response(&mut client, "<first@example.com>").await?;
     assert!(status1.starts_with("220"), "First request should succeed");
 
     // Second request should use learned availability
-    let (status2, _) = send_article_read_full_response(&mut client, "<second@example.com>").await?;
+    let (status2, _) =
+        send_article_read_multiline_response(&mut client, "<second@example.com>").await?;
     assert!(
         status2.starts_with("220"),
         "Second request uses learned availability"
     );
 
     // Third request for different article
-    let (status3, _) = send_article_read_full_response(&mut client, "<third@example.com>").await?;
+    let (status3, _) =
+        send_article_read_multiline_response(&mut client, "<third@example.com>").await?;
     assert!(
         status3.starts_with("220"),
         "Third request uses learned availability"
@@ -112,7 +115,7 @@ async fn test_partial_backend_availability() -> Result<()> {
     let mut client = connect_and_read_greeting(proxy_port).await?;
 
     let (status, body) =
-        send_article_read_full_response(&mut client, "<partial@example.com>").await?;
+        send_article_read_multiline_response(&mut client, "<partial@example.com>").await?;
 
     assert!(status.starts_with("220"), "Should find article on Backend2");
     assert!(!body.is_empty());
@@ -137,7 +140,7 @@ async fn test_availability_different_per_article() -> Result<()> {
     // Request multiple articles - each might be on different backends
     for i in 0..5 {
         let msgid = format!("<article-{i}@example.com>");
-        let (status, _) = send_article_read_full_response(&mut client, &msgid).await?;
+        let (status, _) = send_article_read_multiline_response(&mut client, &msgid).await?;
 
         // Each article should either succeed or fail (no partial state)
         assert!(
@@ -167,7 +170,8 @@ async fn test_retry_stops_after_all_backends_tried() -> Result<()> {
 
     // Should try all 4 backends then return 430
     let start = std::time::Instant::now();
-    let (status, _) = send_article_read_full_response(&mut client, "<retry@example.com>").await?;
+    let (status, _) =
+        send_article_read_multiline_response(&mut client, "<retry@example.com>").await?;
     let duration = start.elapsed();
 
     assert!(
@@ -197,7 +201,7 @@ async fn test_availability_works_in_hybrid_mode() -> Result<()> {
 
     // Hybrid mode should still use availability tracking for stateless commands
     let (status, body) =
-        send_article_read_full_response(&mut client, "<hybrid@example.com>").await?;
+        send_article_read_multiline_response(&mut client, "<hybrid@example.com>").await?;
 
     assert!(
         status.starts_with("220"),
@@ -230,7 +234,7 @@ async fn test_maximum_backends_bitset_limit() -> Result<()> {
     let mut client = connect_and_read_greeting(proxy_port).await?;
 
     let (status, body) =
-        send_article_read_full_response(&mut client, "<max-backends@example.com>").await?;
+        send_article_read_multiline_response(&mut client, "<max-backends@example.com>").await?;
 
     assert!(
         status.starts_with("220"),
@@ -264,7 +268,7 @@ async fn test_concurrent_requests_same_article() -> Result<()> {
     for mut client in clients {
         let msgid = msgid.to_string();
         tasks.push(tokio::spawn(async move {
-            send_article_read_full_response(&mut client, &msgid).await
+            send_article_read_multiline_response(&mut client, &msgid).await
         }));
     }
 

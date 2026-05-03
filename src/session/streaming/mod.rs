@@ -934,12 +934,12 @@ mod tests {
         }
         let terminator = b".\r\n";
 
-        let mut full_response = Vec::new();
-        full_response.extend_from_slice(header);
-        full_response.extend_from_slice(&body);
-        full_response.extend_from_slice(terminator);
+        let mut expected_response = Vec::new();
+        expected_response.extend_from_slice(header);
+        expected_response.extend_from_slice(&body);
+        expected_response.extend_from_slice(terminator);
 
-        let mut reader = Cursor::new(&full_response[header.len()..]);
+        let mut reader = Cursor::new(&expected_response[header.len()..]);
         let mut writer = Vec::new();
         let pool = test_helpers::make_pool();
         let ctx = test_helpers::make_ctx(&pool);
@@ -947,8 +947,8 @@ mod tests {
         let result = stream_multiline_response(&mut reader, &mut writer, header, &ctx).await;
 
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), full_response.len() as u64);
-        assert_eq!(&writer[..], &full_response[..]);
+        assert_eq!(result.unwrap(), expected_response.len() as u64);
+        assert_eq!(&writer[..], &expected_response[..]);
     }
 
     #[tokio::test]

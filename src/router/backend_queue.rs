@@ -54,7 +54,7 @@ impl std::fmt::Display for PipelineError {
 
 /// A request queued for pipeline execution on a backend
 pub(crate) struct QueuedContext {
-    /// Typed request context. Owns verb/args, not redundant full wire bytes.
+    /// Typed request context. Owns verb/args, not redundant serialized bytes.
     pub context: RequestContext,
     /// Return path to the client session that queued this request.
     client_return: oneshot::Sender<PipelineResponse>,

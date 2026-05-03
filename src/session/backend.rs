@@ -618,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn test_format_hex_preview_full_response() {
+    fn test_format_hex_preview_response_bytes() {
         let data = b"430 No such article\r\n";
         let result = format_hex_preview(data, 256);
         // Should show every byte in the preview

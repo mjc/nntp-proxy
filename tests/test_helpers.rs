@@ -529,9 +529,9 @@ pub async fn connect_and_read_greeting(proxy_port: u16) -> Result<tokio::net::Tc
     Ok(stream)
 }
 
-/// Send ARTICLE command and read full multiline response
+/// Send ARTICLE command and read its multiline response.
 #[allow(dead_code)] // Used by test_430_retry.rs
-pub async fn send_article_read_full_response(
+pub async fn send_article_read_multiline_response(
     stream: &mut tokio::net::TcpStream,
     message_id: &str,
 ) -> Result<(String, Vec<String>)> {

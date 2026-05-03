@@ -2,7 +2,7 @@
 //!
 //! A `RequestContext` is created at the validated request boundary. It owns the
 //! verb and argument bytes so it can move across backend worker queues without
-//! carrying a redundant full wire command buffer.
+//! carrying a redundant serialized command buffer.
 
 use smallvec::SmallVec;
 

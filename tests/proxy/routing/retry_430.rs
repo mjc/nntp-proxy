@@ -8,7 +8,7 @@ use anyhow::Result;
 use nntp_proxy::RoutingMode;
 
 use crate::test_helpers::{
-    connect_and_read_greeting, send_article_read_full_response, setup_proxy_with_backends,
+    connect_and_read_greeting, send_article_read_multiline_response, setup_proxy_with_backends,
 };
 
 #[tokio::test]
@@ -31,7 +31,8 @@ async fn test_430_retry_finds_article_on_second_backend() -> Result<()> {
     let mut client = connect_and_read_greeting(proxy_port).await?;
 
     eprintln!("Sending ARTICLE command...");
-    let (status, body) = send_article_read_full_response(&mut client, "<test@example.com>").await?;
+    let (status, body) =
+        send_article_read_multiline_response(&mut client, "<test@example.com>").await?;
 
     eprintln!("Got response: {}", status.trim());
 
@@ -57,7 +58,8 @@ async fn test_430_retry_tries_all_backends_before_giving_up() -> Result<()> {
 
     // Connect and request article
     let mut client = connect_and_read_greeting(proxy_port).await?;
-    let (status, body) = send_article_read_full_response(&mut client, "<test@example.com>").await?;
+    let (status, body) =
+        send_article_read_multiline_response(&mut client, "<test@example.com>").await?;
 
     // Should get 430 after trying all backends
     assert!(
@@ -84,7 +86,8 @@ async fn test_430_retry_finds_article_on_third_backend() -> Result<()> {
 
     // Connect and request article
     let mut client = connect_and_read_greeting(proxy_port).await?;
-    let (status, body) = send_article_read_full_response(&mut client, "<test@example.com>").await?;
+    let (status, body) =
+        send_article_read_multiline_response(&mut client, "<test@example.com>").await?;
 
     // Should get article from Backend3
     assert!(
@@ -107,7 +110,8 @@ async fn test_430_retry_works_in_hybrid_mode() -> Result<()> {
 
     // Connect and request article (stateless command, should use retry logic)
     let mut client = connect_and_read_greeting(proxy_port).await?;
-    let (status, body) = send_article_read_full_response(&mut client, "<test@example.com>").await?;
+    let (status, body) =
+        send_article_read_multiline_response(&mut client, "<test@example.com>").await?;
 
     assert!(
         status.starts_with("220"),
@@ -134,13 +138,13 @@ async fn test_430_retry_multiple_articles_different_patterns() -> Result<()> {
 
     // First request - Round-robin should try Backend1 first (has article)
     let (status1, body1) =
-        send_article_read_full_response(&mut client, "<first@example.com>").await?;
+        send_article_read_multiline_response(&mut client, "<first@example.com>").await?;
     assert!(status1.starts_with("220"), "First request should succeed");
     assert!(!body1.is_empty());
 
     // Second request - Round-robin tries Backend2 (430), should retry to Backend1
     let (status2, body2) =
-        send_article_read_full_response(&mut client, "<second@example.com>").await?;
+        send_article_read_multiline_response(&mut client, "<second@example.com>").await?;
     assert!(
         status2.starts_with("220"),
         "Second request should succeed after retry"
@@ -162,7 +166,8 @@ async fn test_430_retry_only_retries_for_430() -> Result<()> {
     let mut client = connect_and_read_greeting(proxy_port).await?;
 
     // Normal article request should work
-    let (status, body) = send_article_read_full_response(&mut client, "<test@example.com>").await?;
+    let (status, body) =
+        send_article_read_multiline_response(&mut client, "<test@example.com>").await?;
     assert!(status.starts_with("220"), "Expected article");
     assert!(!body.is_empty());
 
@@ -176,7 +181,8 @@ async fn test_430_retry_with_single_backend() -> Result<()> {
         setup_proxy_with_backends(vec![("OnlyBackend", false)], RoutingMode::PerCommand).await?;
 
     let mut client = connect_and_read_greeting(proxy_port).await?;
-    let (status, body) = send_article_read_full_response(&mut client, "<test@example.com>").await?;
+    let (status, body) =
+        send_article_read_multiline_response(&mut client, "<test@example.com>").await?;
 
     assert!(
         status.starts_with("430"),

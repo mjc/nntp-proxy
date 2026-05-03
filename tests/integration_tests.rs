@@ -1319,7 +1319,7 @@ async fn test_oversized_pipelined_command_rejected_with_500() -> Result<()> {
 
     // Read response to the oversized command — should be 501 error, not forwarded
     // (may have arrived in the same read above, check that too)
-    let full_response = if response.contains("501") {
+    let observed_response = if response.contains("501") {
         response.to_string()
     } else {
         let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
@@ -1327,8 +1327,8 @@ async fn test_oversized_pipelined_command_rejected_with_500() -> Result<()> {
     };
 
     assert!(
-        full_response.contains("501"),
-        "Expected 501 error for oversized command, got: {full_response}"
+        observed_response.contains("501"),
+        "Expected 501 error for oversized command, got: {observed_response}"
     );
 
     client.write_all(b"QUIT\r\n").await?;
@@ -1372,7 +1372,7 @@ async fn test_empty_pipelined_command_rejected_with_501() -> Result<()> {
         "Expected 223 for valid STAT, got: {response}"
     );
 
-    let full_response = if response.contains("501") {
+    let observed_response = if response.contains("501") {
         response.to_string()
     } else {
         let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
@@ -1380,8 +1380,8 @@ async fn test_empty_pipelined_command_rejected_with_501() -> Result<()> {
     };
 
     assert!(
-        full_response.contains("501 Syntax error in command"),
-        "Expected 501 syntax error for empty command, got: {full_response}"
+        observed_response.contains("501 Syntax error in command"),
+        "Expected 501 syntax error for empty command, got: {observed_response}"
     );
 
     client.write_all(b"QUIT\r\n").await?;
