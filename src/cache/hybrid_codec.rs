@@ -375,16 +375,10 @@ fn encoded_payload_size(payload: &CachedPayload) -> usize {
 }
 
 impl HybridArticleEntry {
-    /// Ingest cold response bytes into a typed hybrid cache entry.
+    /// Ingest cold response bytes with a specific provider tier.
     ///
     /// Returns `None` if the status code is invalid or not cacheable. The entry
     /// stores semantic payload sections, not the original response.
-    #[must_use]
-    pub fn from_response_bytes(buffer: impl AsRef<[u8]>) -> Option<Self> {
-        Self::from_response_bytes_with_tier(buffer, ttl::CacheTier::new(0))
-    }
-
-    /// Ingest cold response bytes with a specific provider tier.
     #[must_use]
     pub(crate) fn from_response_bytes_with_tier(
         buffer: impl AsRef<[u8]>,
@@ -724,11 +718,15 @@ mod tests {
     // HybridArticleEntry tests
     // =========================================================================
 
+    fn hybrid_entry_from_response_bytes(buffer: impl AsRef<[u8]>) -> Option<HybridArticleEntry> {
+        HybridArticleEntry::from_response_bytes_with_tier(buffer, ttl::CacheTier::new(0))
+    }
+
     #[test]
     fn test_hybrid_entry_basic() {
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         let mut entry =
-            HybridArticleEntry::from_response_bytes(buffer.clone()).expect("valid status code");
+            hybrid_entry_from_response_bytes(buffer.clone()).expect("valid status code");
 
         assert_eq!(
             render_response(&entry, RequestKind::Article, "<test@example.com>").unwrap(),
@@ -747,7 +745,7 @@ mod tests {
 
     #[test]
     fn hybrid_entry_ingests_response_bytes_by_name() {
-        let entry = HybridArticleEntry::from_response_bytes(
+        let entry = hybrid_entry_from_response_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         )
         .expect("valid status code");
@@ -758,7 +756,7 @@ mod tests {
 
     #[test]
     fn hybrid_entry_ingests_borrowed_response_bytes() {
-        let entry = HybridArticleEntry::from_response_bytes(
+        let entry = hybrid_entry_from_response_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".as_slice(),
         )
         .expect("valid status code");
@@ -818,8 +816,7 @@ mod tests {
     #[test]
     fn test_hybrid_entry_response_do_not_clone_payload() {
         let buffer = b"220 7 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry =
-            HybridArticleEntry::from_response_bytes(buffer.clone()).expect("valid status code");
+        let entry = hybrid_entry_from_response_bytes(buffer.clone()).expect("valid status code");
 
         let response = entry
             .response_for(RequestKind::Head, "<test@example.com>")
@@ -835,7 +832,7 @@ mod tests {
 
     #[test]
     fn test_hybrid_entry_availability() {
-        let mut entry = HybridArticleEntry::from_response_bytes(b"220 ok\r\n").expect("valid");
+        let mut entry = hybrid_entry_from_response_bytes(b"220 ok\r\n").expect("valid");
 
         for i in 0..8 {
             assert!(entry.should_try_backend(BackendId::from_index(i)));
@@ -858,21 +855,18 @@ mod tests {
 
     #[test]
     fn test_hybrid_entry_command_matching() {
-        let article =
-            HybridArticleEntry::from_response_bytes(b"220 0 <id>\r\nH: V\r\n\r\nB\r\n.\r\n")
-                .expect("valid");
+        let article = hybrid_entry_from_response_bytes(b"220 0 <id>\r\nH: V\r\n\r\nB\r\n.\r\n")
+            .expect("valid");
         assert!(article.response_for(RequestKind::Article, "<id>").is_some());
         assert!(article.response_for(RequestKind::Body, "<id>").is_some());
         assert!(article.response_for(RequestKind::Head, "<id>").is_some());
 
-        let body =
-            HybridArticleEntry::from_response_bytes(b"222 0 <id>\r\nB\r\n.\r\n").expect("valid");
+        let body = hybrid_entry_from_response_bytes(b"222 0 <id>\r\nB\r\n.\r\n").expect("valid");
         assert!(body.response_for(RequestKind::Article, "<id>").is_none());
         assert!(body.response_for(RequestKind::Body, "<id>").is_some());
         assert!(body.response_for(RequestKind::Head, "<id>").is_none());
 
-        let head =
-            HybridArticleEntry::from_response_bytes(b"221 0 <id>\r\nH: V\r\n.\r\n").expect("valid");
+        let head = hybrid_entry_from_response_bytes(b"221 0 <id>\r\nH: V\r\n.\r\n").expect("valid");
         assert!(head.response_for(RequestKind::Article, "<id>").is_none());
         assert!(head.response_for(RequestKind::Body, "<id>").is_none());
         assert!(head.response_for(RequestKind::Head, "<id>").is_some());
@@ -880,16 +874,16 @@ mod tests {
 
     #[test]
     fn test_hybrid_entry_rejects_invalid() {
-        assert!(HybridArticleEntry::from_response_bytes(b"999 invalid\r\n").is_none());
-        assert!(HybridArticleEntry::from_response_bytes(vec![]).is_none());
-        assert!(HybridArticleEntry::from_response_bytes(b"20").is_none());
-        assert!(HybridArticleEntry::from_response_bytes(b"abc\r\n").is_none());
+        assert!(hybrid_entry_from_response_bytes(b"999 invalid\r\n").is_none());
+        assert!(hybrid_entry_from_response_bytes(vec![]).is_none());
+        assert!(hybrid_entry_from_response_bytes(b"20").is_none());
+        assert!(hybrid_entry_from_response_bytes(b"abc\r\n").is_none());
 
-        assert!(HybridArticleEntry::from_response_bytes(b"220 article\r\n").is_some());
-        assert!(HybridArticleEntry::from_response_bytes(b"221 head\r\n").is_some());
-        assert!(HybridArticleEntry::from_response_bytes(b"222 body\r\n").is_some());
-        assert!(HybridArticleEntry::from_response_bytes(b"223 stat\r\n").is_some());
-        assert!(HybridArticleEntry::from_response_bytes(b"430 not found\r\n").is_some());
+        assert!(hybrid_entry_from_response_bytes(b"220 article\r\n").is_some());
+        assert!(hybrid_entry_from_response_bytes(b"221 head\r\n").is_some());
+        assert!(hybrid_entry_from_response_bytes(b"222 body\r\n").is_some());
+        assert!(hybrid_entry_from_response_bytes(b"223 stat\r\n").is_some());
+        assert!(hybrid_entry_from_response_bytes(b"430 not found\r\n").is_some());
     }
 
     // =========================================================================
@@ -898,11 +892,11 @@ mod tests {
 
     #[test]
     fn test_entry_status_code_returns_protocol_status_code() {
-        let entry = HybridArticleEntry::from_response_bytes(b"220 0 <id>\r\n").unwrap();
+        let entry = hybrid_entry_from_response_bytes(b"220 0 <id>\r\n").unwrap();
         let sc = entry.status_code();
         assert_eq!(sc.as_u16(), 220);
 
-        let entry = HybridArticleEntry::from_response_bytes(b"430 not found\r\n").unwrap();
+        let entry = hybrid_entry_from_response_bytes(b"430 not found\r\n").unwrap();
         let sc = entry.status_code();
         assert_eq!(sc.as_u16(), 430);
     }
@@ -917,7 +911,7 @@ mod tests {
             (b"430 missing\r\n", 430),
         ];
         for (buf, expected) in cases {
-            let entry = HybridArticleEntry::from_response_bytes(buf)
+            let entry = hybrid_entry_from_response_bytes(buf)
                 .unwrap_or_else(|| panic!("should accept code {expected}"));
             assert_eq!(entry.status_code().as_u16(), *expected);
         }
@@ -928,7 +922,7 @@ mod tests {
         for code in [200, 201, 211, 411, 480, 500, 502] {
             let buf = format!("{code} response\r\n").into_bytes();
             assert!(
-                HybridArticleEntry::from_response_bytes(buf).is_none(),
+                hybrid_entry_from_response_bytes(buf).is_none(),
                 "code {code} should be rejected"
             );
         }
@@ -940,10 +934,9 @@ mod tests {
 
     #[test]
     fn test_code_encode_decode_roundtrip_article() {
-        let entry = HybridArticleEntry::from_response_bytes(
-            b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n",
-        )
-        .unwrap();
+        let entry =
+            hybrid_entry_from_response_bytes(b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n")
+                .unwrap();
         let mut buf = Vec::new();
         entry.encode(&mut buf).unwrap();
         let decoded = HybridArticleEntry::decode(&mut buf.as_slice()).unwrap();
@@ -962,7 +955,7 @@ mod tests {
             b"430 missing\r\n",
         ];
         for raw in buffers {
-            let entry = HybridArticleEntry::from_response_bytes(raw).unwrap();
+            let entry = hybrid_entry_from_response_bytes(raw).unwrap();
             let mut encoded = Vec::new();
             entry.encode(&mut encoded).unwrap();
             let decoded = HybridArticleEntry::decode(&mut encoded.as_slice()).unwrap();
@@ -1002,7 +995,7 @@ mod tests {
 
     #[test]
     fn test_code_encode_decode_preserves_availability() {
-        let mut entry = HybridArticleEntry::from_response_bytes(b"220 ok\r\n").unwrap();
+        let mut entry = hybrid_entry_from_response_bytes(b"220 ok\r\n").unwrap();
         entry.record_backend_has(BackendId::from_index(0));
         entry.record_backend_missing(BackendId::from_index(2));
 
@@ -1017,7 +1010,7 @@ mod tests {
 
     #[test]
     fn test_code_estimated_size() {
-        let entry = HybridArticleEntry::from_response_bytes(b"220 article\r\n").unwrap();
+        let entry = hybrid_entry_from_response_bytes(b"220 article\r\n").unwrap();
         let expected = 4 + 2 + 2 + 8 + 1 + 1;
         assert_eq!(entry.estimated_size(), expected);
     }
@@ -1028,43 +1021,41 @@ mod tests {
 
     #[test]
     fn test_is_complete_article_220() {
-        let entry = HybridArticleEntry::from_response_bytes(
-            b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n",
-        )
-        .unwrap();
+        let entry =
+            hybrid_entry_from_response_bytes(b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n")
+                .unwrap();
         assert!(entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_222() {
         let entry =
-            HybridArticleEntry::from_response_bytes(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n")
-                .unwrap();
+            hybrid_entry_from_response_bytes(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n").unwrap();
         assert!(entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_false_for_head() {
         let entry =
-            HybridArticleEntry::from_response_bytes(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
+            hybrid_entry_from_response_bytes(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
         assert!(!entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_false_for_stat() {
-        let entry = HybridArticleEntry::from_response_bytes(b"223 0 <t@x>\r\n").unwrap();
+        let entry = hybrid_entry_from_response_bytes(b"223 0 <t@x>\r\n").unwrap();
         assert!(!entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_false_for_430() {
-        let entry = HybridArticleEntry::from_response_bytes(b"430 not found\r\n").unwrap();
+        let entry = hybrid_entry_from_response_bytes(b"430 not found\r\n").unwrap();
         assert!(!entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_false_for_too_small_buffer() {
-        let entry = HybridArticleEntry::from_response_bytes(b"220 ok\r\n.\r\n").unwrap();
+        let entry = hybrid_entry_from_response_bytes(b"220 ok\r\n.\r\n").unwrap();
         assert!(!entry.is_complete_article());
     }
 
@@ -1074,10 +1065,9 @@ mod tests {
 
     #[test]
     fn test_response_for_stat_from_220() {
-        let entry = HybridArticleEntry::from_response_bytes(
-            b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n",
-        )
-        .unwrap();
+        let entry =
+            hybrid_entry_from_response_bytes(b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n")
+                .unwrap();
         let resp = render_response(&entry, RequestKind::Stat, "<t@x>").expect("should serve STAT");
         assert_eq!(resp, b"223 0 <t@x>\r\n");
     }
@@ -1085,7 +1075,7 @@ mod tests {
     #[test]
     fn test_response_for_stat_from_221() {
         let entry =
-            HybridArticleEntry::from_response_bytes(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
+            hybrid_entry_from_response_bytes(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
         let resp = render_response(&entry, RequestKind::Stat, "<t@x>")
             .expect("should serve STAT from head");
         assert_eq!(resp, b"223 0 <t@x>\r\n");
@@ -1094,8 +1084,7 @@ mod tests {
     #[test]
     fn test_response_for_stat_from_222() {
         let entry =
-            HybridArticleEntry::from_response_bytes(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n")
-                .unwrap();
+            hybrid_entry_from_response_bytes(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n").unwrap();
         let resp = render_response(&entry, RequestKind::Stat, "<t@x>")
             .expect("should serve STAT from body");
         assert_eq!(resp, b"223 0 <t@x>\r\n");
@@ -1103,14 +1092,14 @@ mod tests {
 
     #[test]
     fn test_response_for_stat_not_from_430() {
-        let entry = HybridArticleEntry::from_response_bytes(b"430 not found\r\n").unwrap();
+        let entry = hybrid_entry_from_response_bytes(b"430 not found\r\n").unwrap();
         assert!(render_response(&entry, RequestKind::Stat, "<t@x>").is_none());
     }
 
     #[test]
     fn test_response_for_article_direct() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = HybridArticleEntry::from_response_bytes(buf.clone()).unwrap();
+        let entry = hybrid_entry_from_response_bytes(buf.clone()).unwrap();
         let resp =
             render_response(&entry, RequestKind::Article, "<t@x>").expect("should serve ARTICLE");
         assert_eq!(resp, buf);
@@ -1126,7 +1115,7 @@ mod tests {
     #[test]
     fn test_response_for_body_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = HybridArticleEntry::from_response_bytes(buf.clone()).unwrap();
+        let entry = hybrid_entry_from_response_bytes(buf.clone()).unwrap();
         let resp = render_response(&entry, RequestKind::Body, "<t@x>").expect("220 can serve BODY");
         assert_eq!(resp, b"222 0 <t@x>\r\nBody\r\n.\r\n");
     }
@@ -1134,7 +1123,7 @@ mod tests {
     #[test]
     fn test_response_for_head_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = HybridArticleEntry::from_response_bytes(buf.clone()).unwrap();
+        let entry = hybrid_entry_from_response_bytes(buf.clone()).unwrap();
         let resp = render_response(&entry, RequestKind::Head, "<t@x>").expect("220 can serve HEAD");
         assert_eq!(resp, b"221 0 <t@x>\r\nSubject: T\r\n.\r\n");
     }
@@ -1142,15 +1131,14 @@ mod tests {
     #[test]
     fn test_response_for_body_cannot_serve_article() {
         let entry =
-            HybridArticleEntry::from_response_bytes(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n")
-                .unwrap();
+            hybrid_entry_from_response_bytes(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n").unwrap();
         assert!(render_response(&entry, RequestKind::Article, "<t@x>").is_none());
     }
 
     #[test]
     fn test_response_for_head_cannot_serve_body() {
         let entry =
-            HybridArticleEntry::from_response_bytes(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
+            hybrid_entry_from_response_bytes(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
         assert!(render_response(&entry, RequestKind::Body, "<t@x>").is_none());
     }
 
@@ -1166,7 +1154,7 @@ mod tests {
 
     #[test]
     fn test_with_tier_zero_default() {
-        let entry = HybridArticleEntry::from_response_bytes(b"220 ok\r\n").unwrap();
+        let entry = hybrid_entry_from_response_bytes(b"220 ok\r\n").unwrap();
         assert_eq!(entry.tier().get(), 0);
     }
 
@@ -1187,7 +1175,7 @@ mod tests {
 
     #[test]
     fn prop_hybrid_article_encode_decode_roundtrip_220() {
-        let original = HybridArticleEntry::from_response_bytes(
+        let original = hybrid_entry_from_response_bytes(
             b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n",
         )
         .unwrap();
@@ -1204,7 +1192,7 @@ mod tests {
 
     #[test]
     fn prop_hybrid_article_encode_decode_roundtrip_221() {
-        let original = HybridArticleEntry::from_response_bytes(
+        let original = hybrid_entry_from_response_bytes(
             b"221 headers\r\nMid: <test@example.com>\r\n\r\n.\r\n",
         )
         .unwrap();
@@ -1221,8 +1209,7 @@ mod tests {
     #[test]
     fn prop_hybrid_article_encode_decode_roundtrip_222() {
         let original =
-            HybridArticleEntry::from_response_bytes(b"222 body\r\n\r\nbody content\r\n.\r\n")
-                .unwrap();
+            hybrid_entry_from_response_bytes(b"222 body\r\n\r\nbody content\r\n.\r\n").unwrap();
 
         let mut buffer = Vec::new();
         original.encode(&mut buffer).unwrap();
@@ -1235,7 +1222,7 @@ mod tests {
 
     #[test]
     fn prop_hybrid_article_encode_decode_roundtrip_223() {
-        let original = HybridArticleEntry::from_response_bytes(b"223 stat\r\n.\r\n").unwrap();
+        let original = hybrid_entry_from_response_bytes(b"223 stat\r\n.\r\n").unwrap();
 
         let mut buffer = Vec::new();
         original.encode(&mut buffer).unwrap();
@@ -1248,7 +1235,7 @@ mod tests {
 
     #[test]
     fn prop_hybrid_article_encode_decode_roundtrip_430() {
-        let original = HybridArticleEntry::from_response_bytes(b"430 missing\r\n.\r\n").unwrap();
+        let original = hybrid_entry_from_response_bytes(b"430 missing\r\n.\r\n").unwrap();
 
         let mut buffer = Vec::new();
         original.encode(&mut buffer).unwrap();
@@ -1270,7 +1257,7 @@ mod tests {
         ];
 
         for code in &codes {
-            let entry = HybridArticleEntry::from_response_bytes(code).unwrap();
+            let entry = hybrid_entry_from_response_bytes(code).unwrap();
             let estimated = entry.estimated_size();
 
             let mut buffer = Vec::new();
@@ -1328,7 +1315,7 @@ mod tests {
 
     #[test]
     fn prop_hybrid_article_preserves_availability() {
-        let entry = HybridArticleEntry::from_response_bytes(
+        let entry = hybrid_entry_from_response_bytes(
             b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n",
         )
         .unwrap();
