@@ -733,14 +733,20 @@ impl RequestContext {
     where
         W: tokio::io::AsyncWrite + Unpin,
     {
-        use tokio::io::AsyncWriteExt as _;
+        use std::io::IoSlice;
 
-        writer.write_all(self.verb()).await?;
-        if !self.args().is_empty() {
-            writer.write_all(b" ").await?;
-            writer.write_all(self.args()).await?;
+        if self.args().is_empty() {
+            let mut slices = [IoSlice::new(self.verb()), IoSlice::new(b"\r\n")];
+            write_all_vectored(writer, &mut slices).await
+        } else {
+            let mut slices = [
+                IoSlice::new(self.verb()),
+                IoSlice::new(b" "),
+                IoSlice::new(self.args()),
+                IoSlice::new(b"\r\n"),
+            ];
+            write_all_vectored(writer, &mut slices).await
         }
-        writer.write_all(b"\r\n").await
     }
 
     #[must_use]
@@ -885,10 +891,84 @@ fn find_message_id(args: &[u8]) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
+async fn write_all_vectored<W>(
+    writer: &mut W,
+    slices: &mut [std::io::IoSlice<'_>],
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use std::future::poll_fn;
+    use std::io::{Error, ErrorKind, IoSlice};
+    use std::pin::Pin;
+
+    let mut remaining = slices;
+    while !remaining.is_empty() {
+        let written =
+            poll_fn(|cx| Pin::new(&mut *writer).poll_write_vectored(cx, remaining)).await?;
+        if written == 0 {
+            return Err(Error::new(
+                ErrorKind::WriteZero,
+                "failed to write typed request",
+            ));
+        }
+        IoSlice::advance_slices(&mut remaining, written);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use futures::executor::block_on;
+    use std::io::IoSlice;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::AsyncWrite;
+
+    #[derive(Default)]
+    struct CountingWriter {
+        bytes: Vec<u8>,
+        writes: usize,
+        vectored_writes: usize,
+    }
+
+    impl AsyncWrite for CountingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.writes += 1;
+            self.bytes.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            self.vectored_writes += 1;
+            let len = bufs.iter().map(|buf| buf.len()).sum();
+            bufs.iter()
+                .for_each(|buf| self.bytes.extend_from_slice(buf));
+            Poll::Ready(Ok(len))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     fn wire(context: &RequestContext) -> Vec<u8> {
         let mut out = Vec::with_capacity(context.request_wire_len().get());
@@ -918,6 +998,18 @@ mod tests {
         assert_eq!(ctx.response_wire_len(), None);
         assert!(ctx.is_pipelineable());
         assert_eq!(wire(&ctx), b"ARTICLE <a@b>\r\n");
+    }
+
+    #[test]
+    fn typed_request_context_uses_vectored_write() {
+        let ctx = request_context(b"ARTICLE <a@b>\r\n");
+        let mut out = CountingWriter::default();
+
+        block_on(ctx.write_wire_to(&mut out)).unwrap();
+
+        assert_eq!(out.bytes, b"ARTICLE <a@b>\r\n");
+        assert_eq!(out.writes, 0);
+        assert_eq!(out.vectored_writes, 1);
     }
 
     #[test]
