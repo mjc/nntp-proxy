@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::runtime::Runtime;
+use tokio::runtime::Builder;
 
 fn main() {
     divan::main();
@@ -199,7 +199,7 @@ async fn read_multiline_into(stream: &mut TcpStream, buffer: &mut [u8]) -> usize
 }
 
 fn bench_roundtrip(bencher: Bencher, body_len: usize, cache: Option<Cache>, warm_cache: bool) {
-    let rt = Runtime::new().unwrap();
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
     let mut proxy = rt.block_on(BenchProxy::start(body_len, cache));
     if warm_cache {
         let bytes = rt.block_on(proxy.article_roundtrip());
