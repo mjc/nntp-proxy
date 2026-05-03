@@ -143,23 +143,23 @@ pub(crate) fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
 #[derive(Debug)]
 pub(crate) struct BackendFirstResponse {
     /// Number of bytes read into buffer
-    pub bytes_read: usize,
+    pub(crate) bytes_read: usize,
     /// Parsed status code, if present
-    pub status_code: Option<StatusCode>,
+    pub(crate) status_code: Option<StatusCode>,
     /// Any validation warnings
-    pub warnings: SmallVec<[ResponseWarning; 0]>,
+    pub(crate) warnings: SmallVec<[ResponseWarning; 0]>,
 }
 
 impl BackendFirstResponse {
     /// Get status code if valid
     #[inline]
     #[must_use]
-    pub const fn status_code(&self) -> Option<StatusCode> {
+    pub(crate) const fn status_code(&self) -> Option<StatusCode> {
         self.status_code
     }
 
     /// Log validation warnings with context
-    pub fn log_warnings(
+    pub(crate) fn log_warnings(
         &self,
         buffer: &[u8],
         client_addr: impl std::fmt::Display,
