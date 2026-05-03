@@ -588,7 +588,7 @@ pub(crate) fn parse_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPay
             _ => CachedPayload::AvailabilityOnly,
         };
     };
-    payload_from_semantic_bytes(code, article_number, payload)
+    cached_payload_from_bytes(code, article_number, payload)
 }
 
 pub(crate) fn parse_payload_chunks<'a>(
@@ -628,7 +628,7 @@ pub(crate) fn parse_payload_chunks<'a>(
             _ => CachedPayload::AvailabilityOnly,
         };
     }
-    payload_from_semantic_vec(code, article_number, payload_with_tail)
+    cached_payload_from_vec(code, article_number, payload_with_tail)
 }
 
 fn payload_without_multiline_terminator(code: u16, payload: &[u8]) -> Option<&[u8]> {
@@ -668,7 +668,7 @@ fn strip_multiline_terminator_in_place(code: u16, payload: &mut Vec<u8>) -> bool
     false
 }
 
-fn payload_from_semantic_bytes(
+fn cached_payload_from_bytes(
     code: u16,
     article_number: Option<CachedArticleNumber>,
     payload: &[u8],
@@ -702,7 +702,7 @@ fn payload_from_semantic_bytes(
     }
 }
 
-fn payload_from_semantic_vec(
+fn cached_payload_from_vec(
     code: u16,
     article_number: Option<CachedArticleNumber>,
     mut payload: Vec<u8>,
