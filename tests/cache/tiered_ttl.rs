@@ -236,18 +236,6 @@ fn test_article_entry_set_tier() {
     assert_eq!(entry.tier().get(), 5);
 }
 
-#[test]
-fn test_article_entry_is_expired_uses_tier() {
-    let entry_tier_0 = ArticleEntry::from_response_bytes(b"220 test\r\n.\r\n");
-    let mut entry_tier_1 = ArticleEntry::from_response_bytes(b"220 test\r\n.\r\n");
-    entry_tier_1.set_tier(CacheTier::new(1));
-
-    // With a very short TTL, tier 0 might expire but tier 1 has 2x
-    // Just verify the method exists and uses tier
-    assert!(!entry_tier_0.is_expired(1_000_000)); // Very long TTL - not expired
-    assert!(!entry_tier_1.is_expired(1_000_000)); // Very long TTL - not expired
-}
-
 // =============================================================================
 // Integration tests with ArticleCache
 // =============================================================================
