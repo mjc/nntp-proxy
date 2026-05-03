@@ -558,8 +558,8 @@ impl DiskCachedArticle {
     /// See [`super::ttl`] for the TTL formula.
     #[inline]
     #[must_use]
-    pub(crate) fn is_expired(&self, base_ttl_millis: u64) -> bool {
-        ttl::is_expired(self.timestamp.get(), base_ttl_millis, self.tier)
+    pub(crate) fn is_expired(&self, base_ttl: ttl::CacheTtlMillis) -> bool {
+        ttl::is_expired(self.timestamp, base_ttl, self.tier)
     }
 
     /// Get the tier of the backend that provided this article

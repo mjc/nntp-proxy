@@ -407,8 +407,8 @@ impl CachedArticle {
     /// See [`super::ttl`] for the TTL formula.
     #[inline]
     #[must_use]
-    pub(crate) fn is_expired(&self, base_ttl_millis: u64) -> bool {
-        ttl::is_expired(self.inserted_at.get(), base_ttl_millis, self.tier)
+    pub(crate) fn is_expired(&self, base_ttl: ttl::CacheTtlMillis) -> bool {
+        ttl::is_expired(self.inserted_at, base_ttl, self.tier)
     }
 
     /// Get the tier of the backend that provided this article
@@ -840,7 +840,7 @@ pub struct ArticleCache {
     capacity: u64,
     cache_articles: bool,
     /// Base TTL in milliseconds (used for tier-aware expiration via `effective_ttl`)
-    ttl_millis: u64,
+    ttl_millis: ttl::CacheTtlMillis,
 }
 
 impl ArticleCache {
@@ -924,7 +924,7 @@ impl ArticleCache {
             misses: Arc::new(AtomicU64::new(0)),
             capacity: max_capacity,
             cache_articles,
-            ttl_millis: ttl.as_millis() as u64,
+            ttl_millis: ttl::CacheTtlMillis::from_duration(ttl),
         }
     }
 

@@ -131,7 +131,7 @@ pub struct HybridArticleCache {
     disk_hits: AtomicU64,
     config: HybridCacheConfig,
     /// Base TTL in milliseconds (used for tier-aware expiration via `effective_ttl`)
-    ttl_millis: u64,
+    ttl_millis: ttl::CacheTtlMillis,
 }
 
 impl std::fmt::Debug for HybridArticleCache {
@@ -291,7 +291,7 @@ impl HybridArticleCache {
             "Hybrid article cache initialized"
         );
 
-        let ttl_millis = config.ttl.as_millis() as u64;
+        let ttl_millis = ttl::CacheTtlMillis::from_duration(config.ttl);
         Ok(Self {
             cache,
             hits: AtomicU64::new(0),
@@ -646,7 +646,7 @@ impl HybridArticleCache {
             misses: AtomicU64::new(0),
             disk_hits: AtomicU64::new(0),
             config,
-            ttl_millis: 3600 * 1000, // 1 hour in milliseconds
+            ttl_millis: ttl::CacheTtlMillis::new(3600 * 1000), // 1 hour in milliseconds
         })
     }
 }
