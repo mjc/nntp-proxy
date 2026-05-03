@@ -231,7 +231,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_quit_command_uses_typed_request_kind() {
-        let request = RequestContext::parse(b"quit\r\n");
+        let request = RequestContext::parse(b"quit\r\n").expect("valid request line");
         let mut written = Vec::new();
 
         let status = handle_quit_command(&request, &mut written).await.unwrap();
@@ -247,7 +247,7 @@ mod tests {
 
     #[tokio::test]
     async fn handle_quit_command_ignores_non_quit_request_contexts() {
-        let request = RequestContext::parse(b"HELP\r\n");
+        let request = RequestContext::parse(b"HELP\r\n").expect("valid request line");
         let mut written = Vec::new();
 
         let status = handle_quit_command(&request, &mut written).await.unwrap();

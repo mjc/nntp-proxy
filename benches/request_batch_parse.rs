@@ -19,8 +19,10 @@ fn parse_typed_contexts(buffer: &[u8]) -> usize {
 
     while let Some(relative_lf) = buffer[start..].iter().position(|byte| *byte == b'\n') {
         let end = start + relative_lf + 1;
-        if end >= 2 && buffer[end - 2] == b'\r' {
-            black_box(RequestContext::parse(&buffer[start..end]));
+        if end >= 2
+            && buffer[end - 2] == b'\r'
+            && black_box(RequestContext::parse(&buffer[start..end])).is_some()
+        {
             count += 1;
         }
         start = end;

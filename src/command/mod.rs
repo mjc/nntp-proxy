@@ -6,4 +6,4 @@
 
 mod handler;
 
-pub use handler::{AuthAction, CommandAction, CommandHandler};
+pub use handler::{AuthAction, CommandAction, CommandHandler, RejectResponse};

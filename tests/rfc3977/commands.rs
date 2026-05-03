@@ -41,7 +41,7 @@ fn standard_requests() -> Vec<RequestContext> {
 }
 
 fn assert_class(line: &str, kind: RequestKind, route_class: RequestRouteClass) {
-    let request = RequestContext::parse(line.as_bytes());
+    let request = RequestContext::parse(line.as_bytes()).expect("valid request line");
     assert_eq!(request.kind(), kind, "{line}");
     assert_eq!(request.route_class(), route_class, "{line}");
 }
@@ -320,6 +320,6 @@ fn test_classify_commands() {
     .into_iter()
     .for_each(|(line, kind, route_class)| assert_class(line, kind, route_class));
 
-    let _ = RequestContext::parse(b"");
-    let _ = RequestContext::parse(b"   ");
+    assert!(RequestContext::parse(b"").is_none());
+    assert!(RequestContext::parse(b"   ").is_none());
 }

@@ -19,8 +19,15 @@ use nntp_proxy::protocol::RequestContext;
 use nntp_proxy::session::ClientSession;
 
 fn classify(command: &str) -> CommandAction<'static> {
-    let request = Box::leak(Box::new(RequestContext::parse(command.as_bytes())));
-    CommandHandler::classify_request(request)
+    RequestContext::parse(command.as_bytes()).map_or_else(
+        || {
+            CommandAction::Reject(nntp_proxy::command::RejectResponse::new(
+                nntp_proxy::protocol::codes::COMMAND_SYNTAX_ERROR,
+                "501 Syntax error in command\r\n",
+            ))
+        },
+        |request| CommandHandler::classify_request(Box::leak(Box::new(request))),
+    )
 }
 
 fn auth_handler(username: &str, password: &str) -> Arc<AuthHandler> {

@@ -66,7 +66,7 @@ mod tests {
         auth_enabled: bool,
         routing_mode: RoutingMode,
     ) -> CommandRoutingDecision {
-        let request = RequestContext::parse(command.as_bytes());
+        let request = RequestContext::parse(command.as_bytes()).expect("valid request line");
         decide_request_routing(&request, is_authenticated, auth_enabled, routing_mode)
     }
 
@@ -240,7 +240,7 @@ mod tests {
 
     #[test]
     fn test_decide_request_routing_unknown_extensions_are_stateful() {
-        let request = RequestContext::parse(b"XFOO arg\r\n");
+        let request = RequestContext::parse(b"XFOO arg\r\n").expect("valid request line");
         assert_eq!(
             decide_request_routing(&request, true, false, RoutingMode::Hybrid),
             CommandRoutingDecision::SwitchToStateful

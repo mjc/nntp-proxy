@@ -260,7 +260,7 @@ async fn read_full_response(
     result_buf: &mut crate::pool::ChunkedResponse,
     pool: &BufferPool,
 ) -> Result<crate::protocol::StatusCode> {
-    let request = crate::protocol::RequestContext::parse(request_line);
+    let request = crate::protocol::RequestContext::parse(request_line).expect("valid request line");
     crate::session::streaming::read_full_response_for_request(
         &request,
         buffer,
@@ -314,7 +314,7 @@ mod tests {
     }
 
     fn request_context(line: &[u8]) -> RequestContext {
-        RequestContext::parse(line)
+        RequestContext::parse(line).expect("valid request line")
     }
 
     fn expect_success_status(response: PipelineResponse) -> u16 {

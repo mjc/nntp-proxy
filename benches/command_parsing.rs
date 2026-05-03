@@ -25,7 +25,12 @@ macro_rules! bench_command {
 
             #[divan::bench(name = "classifier", sample_count = 1000, sample_size = 100)]
             fn classifier(bencher: Bencher) {
-                bencher.bench(|| black_box(RequestContext::parse(black_box($command.as_bytes()))));
+                bencher.bench(|| {
+                    black_box(
+                        RequestContext::parse(black_box($command.as_bytes()))
+                            .expect("valid request line"),
+                    )
+                });
             }
         }
     };
@@ -142,7 +147,10 @@ mod realistic_workload {
             .counter(divan::counter::ItemsCount::new(COMMANDS.len()))
             .bench(|| {
                 for cmd in COMMANDS {
-                    black_box(RequestContext::parse(black_box(cmd.as_bytes())));
+                    black_box(
+                        RequestContext::parse(black_box(cmd.as_bytes()))
+                            .expect("valid request line"),
+                    );
                 }
             });
     }

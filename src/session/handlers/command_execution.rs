@@ -508,7 +508,7 @@ mod tests {
     use crate::types::BackendId;
 
     fn request_context(line: &[u8]) -> RequestContext {
-        RequestContext::parse(line)
+        RequestContext::parse(line).expect("valid request line")
     }
 
     #[test]

@@ -200,7 +200,7 @@ mod tests {
 
     #[test]
     fn stateful_initial_client_bytes_uses_typed_wire_len() {
-        let request = RequestContext::parse(b"group alt.test\r\n");
+        let request = RequestContext::parse(b"group alt.test\r\n").expect("valid request line");
 
         assert_eq!(
             super::stateful_initial_client_bytes(10, &request),

@@ -59,7 +59,7 @@ fn write_request_slices(sink: &mut FixedSink, request: &RequestContext) -> usize
 }
 
 fn request_context(line: &[u8]) -> RequestContext {
-    RequestContext::parse(line)
+    RequestContext::parse(line).expect("valid request line")
 }
 
 mod single_request {

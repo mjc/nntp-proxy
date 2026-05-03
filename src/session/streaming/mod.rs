@@ -938,7 +938,8 @@ mod tests {
         let mut captured = crate::pool::ChunkedResponse::default();
         let mut conn = test_helpers::mock_backend_conn(vec![response.to_vec()]).await;
         let backend_id = crate::types::BackendId::from_index(1);
-        let mut request = crate::protocol::RequestContext::parse(b"STAT <test@example>\r\n");
+        let mut request = crate::protocol::RequestContext::parse(b"STAT <test@example>\r\n")
+            .expect("valid request line");
 
         read_response_into_context(
             &mut request,

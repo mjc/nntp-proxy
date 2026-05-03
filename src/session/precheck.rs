@@ -536,7 +536,8 @@ mod tests {
             cache_articles: true,
         };
 
-        let request = RequestContext::parse(b"ARTICLE <test@example.com>\r\n");
+        let request =
+            RequestContext::parse(b"ARTICLE <test@example.com>\r\n").expect("valid request line");
         let result = query_backend(&deps, backend_id, &request).await;
         assert_eq!(result, QueryResult::Error(backend_id));
     }

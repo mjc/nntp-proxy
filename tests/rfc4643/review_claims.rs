@@ -12,7 +12,9 @@ use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 
 fn classify(command: &str) -> CommandAction<'static> {
-    let request = Box::leak(Box::new(RequestContext::parse(command.as_bytes())));
+    let request = Box::leak(Box::new(
+        RequestContext::parse(command.as_bytes()).expect("valid request line"),
+    ));
     CommandHandler::classify_request(request)
 }
 

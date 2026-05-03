@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn local_response_records_typed_status_and_wire_len() {
-        let mut request = RequestContext::parse(b"QUIT\r\n");
+        let mut request = RequestContext::parse(b"QUIT\r\n").expect("valid request line");
 
         super::record_local_response(
             &mut request,

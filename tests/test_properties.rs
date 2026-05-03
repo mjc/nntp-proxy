@@ -37,6 +37,8 @@ proptest! {
 
         let upper_result = RequestContext::parse(upper.as_bytes());
         let lower_result = RequestContext::parse(lower.as_bytes());
+        let upper_result = upper_result.expect("generated uppercase command is valid");
+        let lower_result = lower_result.expect("generated lowercase command is valid");
 
         // Same classification regardless of case
         prop_assert_eq!(upper_result.kind(), lower_result.kind(), "UPPER vs lower kind differs: {} vs {}", upper, lower);
@@ -48,6 +50,8 @@ proptest! {
         let with_crlf = format!("{s}\r\n");
         let result1 = RequestContext::parse(with_crlf.as_bytes());
         let result2 = RequestContext::parse(s.as_bytes());
+        let result1 = result1.expect("generated command with CRLF is valid");
+        let result2 = result2.expect("generated command is valid");
 
         // Request line endings do not affect classification.
         prop_assert_eq!(result1.kind(), result2.kind(), "Line ending changed kind: '{}' vs '{}'", with_crlf, s);
@@ -61,7 +65,8 @@ proptest! {
     ) {
         // With angle brackets, should be ArticleByMessageId
         let with_brackets = format!("{cmd} <{arg}>");
-        let request = RequestContext::parse(with_brackets.as_bytes());
+        let request = RequestContext::parse(with_brackets.as_bytes())
+            .expect("generated message-id command is valid");
         prop_assert_eq!(request.route_class(), RequestRouteClass::ArticleByMessageId);
     }
 
@@ -71,8 +76,11 @@ proptest! {
         let result1 = RequestContext::parse(s.as_bytes());
         let result2 = RequestContext::parse(s.as_bytes());
 
-        prop_assert_eq!(result1.kind(), result2.kind(), "Kind not deterministic for: {}", s);
-        prop_assert_eq!(result1.route_class(), result2.route_class(), "Route not deterministic for: {}", s);
+        prop_assert_eq!(result1.is_some(), result2.is_some(), "Validity not deterministic for: {}", s);
+        if let (Some(result1), Some(result2)) = (result1, result2) {
+            prop_assert_eq!(result1.kind(), result2.kind(), "Kind not deterministic for: {}", s);
+            prop_assert_eq!(result1.route_class(), result2.route_class(), "Route not deterministic for: {}", s);
+        }
     }
 }
 

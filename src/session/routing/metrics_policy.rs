@@ -50,7 +50,7 @@ mod tests {
     use super::*;
 
     fn determine_metrics_action(command: &str, response_code: u16) -> MetricsAction {
-        let request = RequestContext::parse(command.as_bytes());
+        let request = RequestContext::parse(command.as_bytes()).expect("valid request line");
         determine_metrics_action_for_request(&request, StatusCode::new(response_code))
     }
 

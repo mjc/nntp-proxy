@@ -398,12 +398,7 @@ impl RequestCacheEntryMetadata {
 
 impl RequestContext {
     #[must_use]
-    pub fn parse(line: &[u8]) -> Self {
-        Self::from_request_line(RequestLine::parse(line))
-    }
-
-    #[must_use]
-    pub(crate) fn parse_valid_client_line(line: &[u8]) -> Option<Self> {
+    pub fn parse(line: &[u8]) -> Option<Self> {
         let line = RequestLine::parse(line);
         (!line.verb().is_empty()).then(|| Self::from_request_line(line))
     }
@@ -902,7 +897,7 @@ mod tests {
     }
 
     fn request_context(line: &[u8]) -> RequestContext {
-        RequestContext::parse(line)
+        RequestContext::parse(line).expect("valid request line")
     }
 
     #[test]
@@ -955,13 +950,20 @@ mod tests {
 
     #[test]
     fn request_context_parses_wire_line_at_boundary() {
-        let ctx = RequestContext::parse(b"BODY <a@b>\r\n");
+        let ctx = RequestContext::parse(b"BODY <a@b>\r\n").expect("valid request line");
 
         assert_eq!(ctx.kind(), RequestKind::Body);
         assert_eq!(ctx.verb(), b"BODY");
         assert_eq!(ctx.args(), b"<a@b>");
         assert_eq!(ctx.message_id(), Some("<a@b>"));
         assert_eq!(ctx.request_wire_len(), RequestWireLen::new(12));
+    }
+
+    #[test]
+    fn request_context_parse_rejects_empty_request_lines() {
+        assert!(RequestContext::parse(b"").is_none());
+        assert!(RequestContext::parse(b"\r\n").is_none());
+        assert!(RequestContext::parse(b"   \r\n").is_none());
     }
 
     #[tokio::test]

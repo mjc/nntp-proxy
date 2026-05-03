@@ -178,8 +178,10 @@ mod tests {
     use super::*;
 
     fn classify(command: &str) -> CommandAction<'static> {
-        let request = Box::leak(Box::new(RequestContext::parse(command.as_bytes())));
-        CommandHandler::classify_request(request)
+        RequestContext::parse(command.as_bytes())
+            .map_or(CommandAction::Reject(STATEFUL_REJECT), |request| {
+                CommandHandler::classify_request(Box::leak(Box::new(request)))
+            })
     }
 
     #[test]

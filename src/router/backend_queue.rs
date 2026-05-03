@@ -235,7 +235,7 @@ mod tests {
     use std::sync::Arc;
 
     fn request_context(line: &[u8]) -> RequestContext {
-        RequestContext::parse(line)
+        RequestContext::parse(line).expect("valid request line")
     }
 
     fn queue_depth(queue: &BackendQueue) -> usize {

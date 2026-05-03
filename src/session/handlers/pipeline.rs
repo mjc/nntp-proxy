@@ -209,7 +209,7 @@ impl ClientSession {
             Err(e) => return Err(e.into()),
         }
 
-        let Some(request) = RequestContext::parse_valid_client_line(command_buf) else {
+        let Some(request) = RequestContext::parse(command_buf) else {
             return Ok(RequestBatch::first_invalid());
         };
         if !request.is_pipelineable() {
@@ -242,7 +242,7 @@ impl ClientSession {
                             command_buf.len(),
                         ));
                     }
-                    let Some(request) = RequestContext::parse_valid_client_line(command_buf) else {
+                    let Some(request) = RequestContext::parse(command_buf) else {
                         return Ok(RequestBatch::contexts_with_trailing_invalid(batch_contexts));
                     };
                     if !request.is_pipelineable() {

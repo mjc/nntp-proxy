@@ -320,7 +320,7 @@ mod tests {
     }
 
     fn request_context(line: &[u8]) -> RequestContext {
-        RequestContext::parse(line)
+        RequestContext::parse(line).expect("valid request line")
     }
 
     #[tokio::test]

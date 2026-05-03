@@ -111,7 +111,7 @@ impl ClientSession {
                                 state.add_backend_to_client(COMMAND_TOO_LONG.len() as u64);
                                 continue;
                             }
-                            let Some(request) = RequestContext::parse_valid_client_line(&line) else {
+                            let Some(request) = RequestContext::parse(&line) else {
                                 client_write
                                     .write_all(crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE)
                                     .await?;

@@ -36,7 +36,7 @@ supported! {
     ];
     #[inline(never)]
     fn classify_request_line(verb: &[u8]) -> RequestKind {
-        RequestContext::parse(verb).kind()
+        RequestContext::parse(verb).expect("valid request line").kind()
     }
 
     #[inline(never)]
