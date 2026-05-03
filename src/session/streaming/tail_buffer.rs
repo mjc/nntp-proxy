@@ -124,25 +124,6 @@ impl TailBuffer {
             TerminatorStatus::NotFound
         }
     }
-
-    /// Detect terminator in chunk, starting the full-chunk scan at `start`.
-    ///
-    /// This is for first response chunks whose status line has already been
-    /// parsed. Boundary-spanning detection still only applies when `start == 0`,
-    /// because nonzero starts intentionally discard earlier bytes as impossible
-    /// terminator starts.
-    #[must_use]
-    pub fn detect_terminator_from(&self, chunk: &[u8], start: usize) -> TerminatorStatus {
-        let start = start.min(chunk.len());
-        if let Some(pos) = find_terminator_end(&chunk[start..]) {
-            TerminatorStatus::FoundAt(start + pos)
-        } else if start == 0 {
-            self.find_spanning_terminator(chunk)
-                .map_or(TerminatorStatus::NotFound, TerminatorStatus::FoundAt)
-        } else {
-            TerminatorStatus::NotFound
-        }
-    }
 }
 
 /// Find the position of the NNTP multiline terminator in data
@@ -437,27 +418,6 @@ mod tests {
             }
             TerminatorStatus::NotFound => panic!("Expected FoundAt, got {status:?}"),
         }
-    }
-
-    #[test]
-    fn test_detect_terminator_from_skips_prefix() {
-        let tail = TailBuffer::default();
-        let chunk = b"ignored\r\n.\r\n220 Article\r\nbody\r\n.\r\n";
-        let start = b"ignored\r\n.\r\n220 Article\r\n".len();
-
-        let status = tail.detect_terminator_from(chunk, start);
-
-        assert_eq!(status.write_len(chunk.len()), chunk.len());
-    }
-
-    #[test]
-    fn test_detect_terminator_from_preserves_zero_start_spanning() {
-        let mut tail = TailBuffer::default();
-        tail.update(b"article content\r\n");
-
-        let status = tail.detect_terminator_from(b".\r\n", 0);
-
-        assert_eq!(status.write_len(3), 3);
     }
 
     #[test]
