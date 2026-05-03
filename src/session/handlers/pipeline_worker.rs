@@ -253,13 +253,14 @@ async fn execute_pipeline_batch(
 /// `result_buf` is cleared and reused for each response to avoid per-response allocations.
 #[cfg(test)]
 async fn read_full_response(
+    request_line: &[u8],
     buffer: &mut crate::pool::PooledBuffer,
     conn: &mut crate::stream::ConnectionStream,
     result_buf: &mut crate::pool::ChunkedResponse,
     pool: &BufferPool,
 ) -> Result<crate::protocol::StatusCode> {
     let request = crate::protocol::RequestContext::from_request_line(
-        crate::protocol::RequestLine::parse(b"ARTICLE <test@example>\r\n"),
+        crate::protocol::RequestLine::parse(request_line),
     );
     crate::session::streaming::read_full_response_for_request(
         &request,
@@ -441,9 +442,15 @@ mod tests {
 
         let mut conn = mock_backend_conn(b"430 No such article\r\n").await;
 
-        let status = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool)
-            .await
-            .expect("should parse single-line response");
+        let status = read_full_response(
+            b"ARTICLE <test@example>\r\n",
+            &mut buffer,
+            &mut conn,
+            &mut result_buf,
+            &pool,
+        )
+        .await
+        .expect("should parse single-line response");
 
         assert_eq!(status.as_u16(), 430);
         assert_eq!(result_buf.to_vec(), b"430 No such article\r\n");
@@ -459,9 +466,10 @@ mod tests {
         let mut conn =
             mock_backend_conn_chunked(vec![b"111".to_vec(), b" 20260501173336\r\n".to_vec()]).await;
 
-        let status = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool)
-            .await
-            .expect("should wait for complete status line");
+        let status =
+            read_full_response(b"DATE\r\n", &mut buffer, &mut conn, &mut result_buf, &pool)
+                .await
+                .expect("should wait for complete status line");
 
         assert_eq!(status.as_u16(), 111);
         assert_eq!(result_buf.to_vec(), b"111 20260501173336\r\n");
@@ -477,9 +485,15 @@ mod tests {
         let response = b"220 0 <msg@id> article\r\nSubject: test\r\n\r\nBody line\r\n.\r\n";
         let mut conn = mock_backend_conn(response).await;
 
-        let status = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool)
-            .await
-            .expect("should parse multiline response");
+        let status = read_full_response(
+            b"ARTICLE <test@example>\r\n",
+            &mut buffer,
+            &mut conn,
+            &mut result_buf,
+            &pool,
+        )
+        .await
+        .expect("should parse multiline response");
 
         assert_eq!(status.as_u16(), 220);
         assert_eq!(result_buf.to_vec(), response);
@@ -498,9 +512,15 @@ mod tests {
 
         let mut conn = mock_backend_conn_chunked(vec![chunk1, chunk2]).await;
 
-        let status = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool)
-            .await
-            .expect("should detect terminator across chunks");
+        let status = read_full_response(
+            b"ARTICLE <test@example>\r\n",
+            &mut buffer,
+            &mut conn,
+            &mut result_buf,
+            &pool,
+        )
+        .await
+        .expect("should detect terminator across chunks");
 
         assert_eq!(status.as_u16(), 220);
         assert!(
@@ -521,9 +541,15 @@ mod tests {
         let mut conn = mock_backend_conn(packed).await;
 
         // First read should get the multiline response and save leftover
-        let status1 = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool)
-            .await
-            .expect("should parse first response");
+        let status1 = read_full_response(
+            b"ARTICLE <test@example>\r\n",
+            &mut buffer,
+            &mut conn,
+            &mut result_buf,
+            &pool,
+        )
+        .await
+        .expect("should parse first response");
 
         assert_eq!(status1.as_u16(), 220);
         assert!(result_buf.ends_with(b"\r\n.\r\n"));
@@ -533,12 +559,56 @@ mod tests {
         );
 
         // Second read should consume leftover and return the 430
-        let status2 = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool)
-            .await
-            .expect("should parse second response from leftover");
+        let status2 = read_full_response(
+            b"ARTICLE <test@example>\r\n",
+            &mut buffer,
+            &mut conn,
+            &mut result_buf,
+            &pool,
+        )
+        .await
+        .expect("should parse second response from leftover");
 
         assert_eq!(status2.as_u16(), 430);
         assert_eq!(result_buf.to_vec(), b"430 No such article\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_read_full_response_uses_request_context_for_same_status_framing() {
+        let pool = BufferPool::for_tests();
+        let mut buffer = pool.acquire().await;
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+
+        let packed = b"211 3 10 12 group.name\r\n211 3 10 12 group.name\r\n10\r\n11\r\n12\r\n.\r\n";
+        let mut conn = mock_backend_conn(packed).await;
+
+        let group_status = read_full_response(
+            b"GROUP group.name\r\n",
+            &mut buffer,
+            &mut conn,
+            &mut result_buf,
+            &pool,
+        )
+        .await
+        .expect("GROUP 211 is single-line");
+        assert_eq!(group_status.as_u16(), 211);
+        assert_eq!(result_buf.to_vec(), b"211 3 10 12 group.name\r\n");
+        assert!(conn.has_leftover());
+
+        let listgroup_status = read_full_response(
+            b"LISTGROUP group.name\r\n",
+            &mut buffer,
+            &mut conn,
+            &mut result_buf,
+            &pool,
+        )
+        .await
+        .expect("LISTGROUP 211 is multiline");
+        assert_eq!(listgroup_status.as_u16(), 211);
+        assert_eq!(
+            result_buf.to_vec(),
+            b"211 3 10 12 group.name\r\n10\r\n11\r\n12\r\n.\r\n"
+        );
     }
 
     #[tokio::test]
@@ -550,7 +620,14 @@ mod tests {
         // Multiline response without terminator — server disconnects
         let mut conn = mock_backend_conn(b"220 0 <a@b> article\r\nBody line\r\n").await;
 
-        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool).await;
+        let result = read_full_response(
+            b"ARTICLE <test@example>\r\n",
+            &mut buffer,
+            &mut conn,
+            &mut result_buf,
+            &pool,
+        )
+        .await;
         assert!(result.is_err(), "EOF before terminator should be an error");
         let err = result.unwrap_err().to_string();
         assert!(
@@ -567,7 +644,14 @@ mod tests {
 
         let mut conn = mock_backend_conn(b"garbage data here\r\n").await;
 
-        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool).await;
+        let result = read_full_response(
+            b"ARTICLE <test@example>\r\n",
+            &mut buffer,
+            &mut conn,
+            &mut result_buf,
+            &pool,
+        )
+        .await;
         assert!(result.is_err(), "Invalid status code should be an error");
     }
 
@@ -582,9 +666,15 @@ mod tests {
         // Leftover is only 2 bytes — too short to validate, triggers H5 additional read
         conn.stash_leftover(b"43").unwrap();
 
-        let status = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool)
-            .await
-            .expect("short leftover + read should produce valid response");
+        let status = read_full_response(
+            b"ARTICLE <test@example>\r\n",
+            &mut buffer,
+            &mut conn,
+            &mut result_buf,
+            &pool,
+        )
+        .await
+        .expect("short leftover + read should produce valid response");
 
         assert_eq!(status.as_u16(), 430);
         assert!(result_buf.starts_with(b"430"));
@@ -599,7 +689,14 @@ mod tests {
         // Server immediately closes
         let mut conn = mock_backend_conn(b"").await;
 
-        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool).await;
+        let result = read_full_response(
+            b"ARTICLE <test@example>\r\n",
+            &mut buffer,
+            &mut conn,
+            &mut result_buf,
+            &pool,
+        )
+        .await;
         assert!(result.is_err(), "Empty connection should be an error");
     }
 
@@ -1095,7 +1192,13 @@ mod tests {
                 let mut conn = mock_backend_conn(&wire).await;
 
                 for (idx, expected) in responses.iter().enumerate() {
-                    let status = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool)
+                    let status = read_full_response(
+                        b"STAT <test@example>\r\n",
+                        &mut buffer,
+                        &mut conn,
+                        &mut result_buf,
+                        &pool,
+                    )
                         .await
                         .expect("packed single-line response should parse");
 
@@ -1206,7 +1309,14 @@ mod tests {
 
         let mut conn = mock_backend_conn_chunked(chunks).await;
 
-        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool).await;
+        let result = read_full_response(
+            b"ARTICLE <test@example>\r\n",
+            &mut buffer,
+            &mut conn,
+            &mut result_buf,
+            &pool,
+        )
+        .await;
 
         // Should fail with bounds check error (if TCP delivers enough data in one read)
         assert!(
@@ -1236,7 +1346,14 @@ mod tests {
 
         let mut conn = mock_backend_conn(&normal_data).await;
 
-        let result = read_full_response(&mut buffer, &mut conn, &mut result_buf, &pool).await;
+        let result = read_full_response(
+            b"ARTICLE <test@example>\r\n",
+            &mut buffer,
+            &mut conn,
+            &mut result_buf,
+            &pool,
+        )
+        .await;
 
         // Should succeed
         assert!(
