@@ -6,7 +6,7 @@
 // Methods are async to match the HybridArticleCache trait interface; no internal awaits needed.
 #![allow(clippy::unused_async)]
 
-use super::hybrid_codec::HybridArticleEntry;
+use super::hybrid_codec::DiskArticleEntry;
 use super::{CacheIngestBytes, HybridCacheStats};
 use crate::types::{BackendId, MessageId};
 use std::collections::HashMap;
@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 /// Mock hybrid cache for testing
 #[derive(Clone)]
 struct MockHybridCache {
-    storage: Arc<Mutex<HashMap<String, HybridArticleEntry>>>,
+    storage: Arc<Mutex<HashMap<String, DiskArticleEntry>>>,
     hits: Arc<AtomicU64>,
     misses: Arc<AtomicU64>,
     disk_hits: Arc<AtomicU64>,
@@ -33,7 +33,7 @@ impl MockHybridCache {
         }
     }
 
-    async fn get(&self, message_id: &MessageId<'_>) -> Option<HybridArticleEntry> {
+    async fn get(&self, message_id: &MessageId<'_>) -> Option<DiskArticleEntry> {
         let key = message_id.without_brackets().to_string();
         let storage = self.storage.lock().unwrap();
 
@@ -66,7 +66,7 @@ impl MockHybridCache {
         let mut storage = self.storage.lock().unwrap();
 
         let Some(mut entry) =
-            HybridArticleEntry::from_ingest_bytes_with_tier(buffer, super::ttl::CacheTier::new(0))
+            DiskArticleEntry::from_ingest_bytes_with_tier(buffer, super::ttl::CacheTier::new(0))
         else {
             return;
         };
@@ -96,7 +96,7 @@ impl MockHybridCache {
             updated.record_backend_missing(backend_id);
             updated
         } else {
-            let mut entry = HybridArticleEntry::missing(super::ttl::CacheTier::new(0));
+            let mut entry = DiskArticleEntry::missing(super::ttl::CacheTier::new(0));
             entry.record_backend_missing(backend_id);
             entry
         };
@@ -140,7 +140,7 @@ mod tests {
     }
 
     fn response_bytes(
-        entry: &HybridArticleEntry,
+        entry: &DiskArticleEntry,
         request_kind: RequestKind,
         message_id: &MessageId<'_>,
     ) -> Option<Vec<u8>> {
@@ -150,14 +150,14 @@ mod tests {
         Some(out)
     }
 
-    fn assert_article(entry: &HybridArticleEntry, message_id: &MessageId<'_>, expected: &[u8]) {
+    fn assert_article(entry: &DiskArticleEntry, message_id: &MessageId<'_>, expected: &[u8]) {
         assert_eq!(
             response_bytes(entry, RequestKind::Article, message_id).unwrap(),
             expected
         );
     }
 
-    fn assert_availability(entry: &HybridArticleEntry, cases: &[(usize, bool)]) {
+    fn assert_availability(entry: &DiskArticleEntry, cases: &[(usize, bool)]) {
         cases.iter().for_each(|(backend_index, should_try)| {
             assert_eq!(
                 entry.should_try_backend(BackendId::from_index(*backend_index)),

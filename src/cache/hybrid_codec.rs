@@ -1,6 +1,6 @@
-//! Hybrid cache entry type and foyer codec
+//! Disk cache entry type and foyer codec
 //!
-//! Contains `HybridArticleEntry` and its manual `Code` implementation for
+//! Contains `DiskArticleEntry` and its manual `Code` implementation for
 //! efficient serialization to/from foyer's disk cache.
 //!
 //! # Wire Format
@@ -18,7 +18,7 @@ use super::article::{CachedArticleNumber, CachedPayload, parse_payload, parse_pa
 use super::availability::ArticleAvailability;
 use super::ttl;
 
-const HYBRID_ENTRY_MAGIC_V3: u32 = 0x4e50_4333; // "NPC3"
+const DISK_ENTRY_MAGIC_V3: u32 = 0x4e50_4333; // "NPC3"
 const PAYLOAD_MISSING: u8 = 0;
 const PAYLOAD_AVAILABILITY_ONLY: u8 = 1;
 const PAYLOAD_ARTICLE: u8 = 2;
@@ -105,7 +105,7 @@ impl TryFrom<u16> for CacheableStatusCode {
     }
 }
 
-/// Cache entry for hybrid storage
+/// Typed article entry stored by the disk cache.
 ///
 /// INVARIANT: Every entry has a valid NNTP status code (220, 221, 222, 223, 430).
 /// This is enforced at construction - `new()` returns `Option<Self>`.
@@ -115,7 +115,7 @@ impl TryFrom<u16> for CacheableStatusCode {
 /// - Simple binary format:
 ///   [magic:u32][status:u16][checked:u8][missing:u8][timestamp:u64][tier:u8][typed-payload]
 #[derive(Clone, Debug)]
-pub(crate) struct HybridArticleEntry {
+pub(crate) struct DiskArticleEntry {
     /// Validated NNTP status code — only cacheable codes are representable
     status_code: CacheableStatusCode,
     /// Backend availability tracking (checked/missing bitsets)
@@ -131,10 +131,10 @@ pub(crate) struct HybridArticleEntry {
 }
 
 /// Manual Code implementation to avoid bincode's vec resizing overhead
-impl Code for HybridArticleEntry {
+impl Code for DiskArticleEntry {
     fn encode(&self, writer: &mut impl Write) -> foyer::Result<()> {
         writer
-            .write_all(&HYBRID_ENTRY_MAGIC_V3.to_le_bytes())
+            .write_all(&DISK_ENTRY_MAGIC_V3.to_le_bytes())
             .map_err(foyer::Error::io_error)?;
         writer
             .write_all(&self.status_code.as_u16().to_le_bytes())
@@ -161,7 +161,7 @@ impl Code for HybridArticleEntry {
             .read_exact(&mut magic)
             .map_err(foyer::Error::io_error)?;
         let magic = u32::from_le_bytes(magic);
-        if magic != HYBRID_ENTRY_MAGIC_V3 {
+        if magic != DISK_ENTRY_MAGIC_V3 {
             return Err(foyer::Error::io_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "old hybrid cache entry format",
@@ -372,7 +372,7 @@ fn encoded_payload_size(payload: &CachedPayload) -> usize {
     }
 }
 
-impl HybridArticleEntry {
+impl DiskArticleEntry {
     /// Ingest cold response bytes with a specific provider tier.
     ///
     /// Returns `None` if the status code is invalid or not cacheable. The entry
@@ -576,7 +576,7 @@ mod tests {
     use crate::types::BackendId;
     use futures::executor::block_on;
 
-    fn assert_entry_eq(original: &HybridArticleEntry, decoded: &HybridArticleEntry) {
+    fn assert_entry_eq(original: &DiskArticleEntry, decoded: &DiskArticleEntry) {
         assert_eq!(original.status_code, decoded.status_code);
         assert_eq!(original.availability, decoded.availability);
         assert_eq!(original.timestamp, decoded.timestamp);
@@ -585,7 +585,7 @@ mod tests {
     }
 
     fn render_response(
-        entry: &HybridArticleEntry,
+        entry: &DiskArticleEntry,
         request_kind: RequestKind,
         message_id: &str,
     ) -> Option<Vec<u8>> {
@@ -703,18 +703,17 @@ mod tests {
     }
 
     // =========================================================================
-    // HybridArticleEntry tests
+    // DiskArticleEntry tests
     // =========================================================================
 
-    fn hybrid_entry_from_response_bytes(buffer: impl AsRef<[u8]>) -> Option<HybridArticleEntry> {
-        HybridArticleEntry::from_response_bytes_with_tier(buffer, ttl::CacheTier::new(0))
+    fn disk_entry_from_response_bytes(buffer: impl AsRef<[u8]>) -> Option<DiskArticleEntry> {
+        DiskArticleEntry::from_response_bytes_with_tier(buffer, ttl::CacheTier::new(0))
     }
 
     #[test]
-    fn test_hybrid_entry_basic() {
+    fn test_disk_entry_basic() {
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-        let mut entry =
-            hybrid_entry_from_response_bytes(buffer.clone()).expect("valid status code");
+        let mut entry = disk_entry_from_response_bytes(buffer.clone()).expect("valid status code");
 
         assert_eq!(
             render_response(&entry, RequestKind::Article, "<test@example.com>").unwrap(),
@@ -732,8 +731,8 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_entry_ingests_response_bytes_by_name() {
-        let entry = hybrid_entry_from_response_bytes(
+    fn disk_entry_ingests_response_bytes_by_name() {
+        let entry = disk_entry_from_response_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         )
         .expect("valid status code");
@@ -743,8 +742,8 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_entry_ingests_borrowed_response_bytes() {
-        let entry = hybrid_entry_from_response_bytes(
+    fn disk_entry_ingests_borrowed_response_bytes() {
+        let entry = disk_entry_from_response_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".as_slice(),
         )
         .expect("valid status code");
@@ -754,8 +753,8 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_entry_ingests_ingest_bytes_without_required_vec() {
-        let entry = HybridArticleEntry::from_ingest_bytes_with_tier(
+    fn disk_entry_ingests_ingest_bytes_without_required_vec() {
+        let entry = DiskArticleEntry::from_ingest_bytes_with_tier(
             smallvec::SmallVec::<[u8; 128]>::from_slice(
                 b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
             )
@@ -769,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn hybrid_entry_ingests_chunked_ingest_bytes_without_flattening_response() {
+    fn disk_entry_ingests_chunked_ingest_bytes_without_flattening_response() {
         let pool = crate::pool::BufferPool::new(
             crate::types::BufferSize::try_new(1024).expect("valid buffer size"),
             1,
@@ -785,11 +784,9 @@ mod tests {
             "test response must span chunks"
         );
 
-        let entry = HybridArticleEntry::from_ingest_bytes_with_tier(
-            response.into(),
-            ttl::CacheTier::new(0),
-        )
-        .expect("valid status code");
+        let entry =
+            DiskArticleEntry::from_ingest_bytes_with_tier(response.into(), ttl::CacheTier::new(0))
+                .expect("valid status code");
 
         assert_eq!(entry.status_code().as_u16(), 220);
         match entry.payload {
@@ -802,9 +799,9 @@ mod tests {
     }
 
     #[test]
-    fn test_hybrid_entry_response_do_not_clone_payload() {
+    fn test_disk_entry_response_do_not_clone_payload() {
         let buffer = b"220 7 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = hybrid_entry_from_response_bytes(buffer.clone()).expect("valid status code");
+        let entry = disk_entry_from_response_bytes(buffer.clone()).expect("valid status code");
 
         let response = entry
             .response_for(RequestKind::Head, "<test@example.com>")
@@ -819,8 +816,8 @@ mod tests {
     }
 
     #[test]
-    fn test_hybrid_entry_availability() {
-        let mut entry = hybrid_entry_from_response_bytes(b"220 ok\r\n").expect("valid");
+    fn test_disk_entry_availability() {
+        let mut entry = disk_entry_from_response_bytes(b"220 ok\r\n").expect("valid");
 
         for i in 0..8 {
             assert!(entry.should_try_backend(BackendId::from_index(i)));
@@ -842,36 +839,36 @@ mod tests {
     }
 
     #[test]
-    fn test_hybrid_entry_command_matching() {
-        let article = hybrid_entry_from_response_bytes(b"220 0 <id>\r\nH: V\r\n\r\nB\r\n.\r\n")
-            .expect("valid");
+    fn test_disk_entry_command_matching() {
+        let article =
+            disk_entry_from_response_bytes(b"220 0 <id>\r\nH: V\r\n\r\nB\r\n.\r\n").expect("valid");
         assert!(article.response_for(RequestKind::Article, "<id>").is_some());
         assert!(article.response_for(RequestKind::Body, "<id>").is_some());
         assert!(article.response_for(RequestKind::Head, "<id>").is_some());
 
-        let body = hybrid_entry_from_response_bytes(b"222 0 <id>\r\nB\r\n.\r\n").expect("valid");
+        let body = disk_entry_from_response_bytes(b"222 0 <id>\r\nB\r\n.\r\n").expect("valid");
         assert!(body.response_for(RequestKind::Article, "<id>").is_none());
         assert!(body.response_for(RequestKind::Body, "<id>").is_some());
         assert!(body.response_for(RequestKind::Head, "<id>").is_none());
 
-        let head = hybrid_entry_from_response_bytes(b"221 0 <id>\r\nH: V\r\n.\r\n").expect("valid");
+        let head = disk_entry_from_response_bytes(b"221 0 <id>\r\nH: V\r\n.\r\n").expect("valid");
         assert!(head.response_for(RequestKind::Article, "<id>").is_none());
         assert!(head.response_for(RequestKind::Body, "<id>").is_none());
         assert!(head.response_for(RequestKind::Head, "<id>").is_some());
     }
 
     #[test]
-    fn test_hybrid_entry_rejects_invalid() {
-        assert!(hybrid_entry_from_response_bytes(b"999 invalid\r\n").is_none());
-        assert!(hybrid_entry_from_response_bytes(vec![]).is_none());
-        assert!(hybrid_entry_from_response_bytes(b"20").is_none());
-        assert!(hybrid_entry_from_response_bytes(b"abc\r\n").is_none());
+    fn test_disk_entry_rejects_invalid() {
+        assert!(disk_entry_from_response_bytes(b"999 invalid\r\n").is_none());
+        assert!(disk_entry_from_response_bytes(vec![]).is_none());
+        assert!(disk_entry_from_response_bytes(b"20").is_none());
+        assert!(disk_entry_from_response_bytes(b"abc\r\n").is_none());
 
-        assert!(hybrid_entry_from_response_bytes(b"220 article\r\n").is_some());
-        assert!(hybrid_entry_from_response_bytes(b"221 head\r\n").is_some());
-        assert!(hybrid_entry_from_response_bytes(b"222 body\r\n").is_some());
-        assert!(hybrid_entry_from_response_bytes(b"223 stat\r\n").is_some());
-        assert!(hybrid_entry_from_response_bytes(b"430 not found\r\n").is_some());
+        assert!(disk_entry_from_response_bytes(b"220 article\r\n").is_some());
+        assert!(disk_entry_from_response_bytes(b"221 head\r\n").is_some());
+        assert!(disk_entry_from_response_bytes(b"222 body\r\n").is_some());
+        assert!(disk_entry_from_response_bytes(b"223 stat\r\n").is_some());
+        assert!(disk_entry_from_response_bytes(b"430 not found\r\n").is_some());
     }
 
     // =========================================================================
@@ -880,11 +877,11 @@ mod tests {
 
     #[test]
     fn test_entry_status_code_returns_protocol_status_code() {
-        let entry = hybrid_entry_from_response_bytes(b"220 0 <id>\r\n").unwrap();
+        let entry = disk_entry_from_response_bytes(b"220 0 <id>\r\n").unwrap();
         let sc = entry.status_code();
         assert_eq!(sc.as_u16(), 220);
 
-        let entry = hybrid_entry_from_response_bytes(b"430 not found\r\n").unwrap();
+        let entry = disk_entry_from_response_bytes(b"430 not found\r\n").unwrap();
         let sc = entry.status_code();
         assert_eq!(sc.as_u16(), 430);
     }
@@ -899,7 +896,7 @@ mod tests {
             (b"430 missing\r\n", 430),
         ];
         for (buf, expected) in cases {
-            let entry = hybrid_entry_from_response_bytes(buf)
+            let entry = disk_entry_from_response_bytes(buf)
                 .unwrap_or_else(|| panic!("should accept code {expected}"));
             assert_eq!(entry.status_code().as_u16(), *expected);
         }
@@ -910,7 +907,7 @@ mod tests {
         for code in [200, 201, 211, 411, 480, 500, 502] {
             let buf = format!("{code} response\r\n").into_bytes();
             assert!(
-                hybrid_entry_from_response_bytes(buf).is_none(),
+                disk_entry_from_response_bytes(buf).is_none(),
                 "code {code} should be rejected"
             );
         }
@@ -923,11 +920,11 @@ mod tests {
     #[test]
     fn test_code_encode_decode_roundtrip_article() {
         let entry =
-            hybrid_entry_from_response_bytes(b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n")
+            disk_entry_from_response_bytes(b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n")
                 .unwrap();
         let mut buf = Vec::new();
         entry.encode(&mut buf).unwrap();
-        let decoded = HybridArticleEntry::decode(&mut buf.as_slice()).unwrap();
+        let decoded = DiskArticleEntry::decode(&mut buf.as_slice()).unwrap();
 
         assert_eq!(decoded.status_code().as_u16(), 220);
         assert_entry_eq(&entry, &decoded);
@@ -943,10 +940,10 @@ mod tests {
             b"430 missing\r\n",
         ];
         for raw in buffers {
-            let entry = hybrid_entry_from_response_bytes(raw).unwrap();
+            let entry = disk_entry_from_response_bytes(raw).unwrap();
             let mut encoded = Vec::new();
             entry.encode(&mut encoded).unwrap();
-            let decoded = HybridArticleEntry::decode(&mut encoded.as_slice()).unwrap();
+            let decoded = DiskArticleEntry::decode(&mut encoded.as_slice()).unwrap();
             assert_eq!(decoded.status_code().as_u16(), entry.status_code().as_u16());
             assert_entry_eq(&entry, &decoded);
         }
@@ -962,13 +959,13 @@ mod tests {
         buf.extend_from_slice(&5u32.to_le_bytes());
         buf.extend_from_slice(b"hello");
 
-        let result = HybridArticleEntry::decode(&mut buf.as_slice());
+        let result = DiskArticleEntry::decode(&mut buf.as_slice());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_code_encode_decode_preserves_tier() {
-        let entry = HybridArticleEntry::from_response_bytes_with_tier(
+        let entry = DiskArticleEntry::from_response_bytes_with_tier(
             b"220 article\r\n",
             ttl::CacheTier::new(3),
         )
@@ -977,19 +974,19 @@ mod tests {
 
         let mut encoded = Vec::new();
         entry.encode(&mut encoded).unwrap();
-        let decoded = HybridArticleEntry::decode(&mut encoded.as_slice()).unwrap();
+        let decoded = DiskArticleEntry::decode(&mut encoded.as_slice()).unwrap();
         assert_eq!(decoded.tier().get(), 3);
     }
 
     #[test]
     fn test_code_encode_decode_preserves_availability() {
-        let mut entry = hybrid_entry_from_response_bytes(b"220 ok\r\n").unwrap();
+        let mut entry = disk_entry_from_response_bytes(b"220 ok\r\n").unwrap();
         entry.record_backend_has(BackendId::from_index(0));
         entry.record_backend_missing(BackendId::from_index(2));
 
         let mut encoded = Vec::new();
         entry.encode(&mut encoded).unwrap();
-        let decoded = HybridArticleEntry::decode(&mut encoded.as_slice()).unwrap();
+        let decoded = DiskArticleEntry::decode(&mut encoded.as_slice()).unwrap();
 
         assert!(decoded.should_try_backend(BackendId::from_index(0)));
         assert!(decoded.should_try_backend(BackendId::from_index(1)));
@@ -998,7 +995,7 @@ mod tests {
 
     #[test]
     fn test_code_estimated_size() {
-        let entry = hybrid_entry_from_response_bytes(b"220 article\r\n").unwrap();
+        let entry = disk_entry_from_response_bytes(b"220 article\r\n").unwrap();
         let expected = 4 + 2 + 2 + 8 + 1 + 1;
         assert_eq!(entry.estimated_size(), expected);
     }
@@ -1010,7 +1007,7 @@ mod tests {
     #[test]
     fn test_is_complete_article_220() {
         let entry =
-            hybrid_entry_from_response_bytes(b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n")
+            disk_entry_from_response_bytes(b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n")
                 .unwrap();
         assert!(entry.is_complete_article());
     }
@@ -1018,32 +1015,31 @@ mod tests {
     #[test]
     fn test_is_complete_article_222() {
         let entry =
-            hybrid_entry_from_response_bytes(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n").unwrap();
+            disk_entry_from_response_bytes(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n").unwrap();
         assert!(entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_false_for_head() {
-        let entry =
-            hybrid_entry_from_response_bytes(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
+        let entry = disk_entry_from_response_bytes(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
         assert!(!entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_false_for_stat() {
-        let entry = hybrid_entry_from_response_bytes(b"223 0 <t@x>\r\n").unwrap();
+        let entry = disk_entry_from_response_bytes(b"223 0 <t@x>\r\n").unwrap();
         assert!(!entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_false_for_430() {
-        let entry = hybrid_entry_from_response_bytes(b"430 not found\r\n").unwrap();
+        let entry = disk_entry_from_response_bytes(b"430 not found\r\n").unwrap();
         assert!(!entry.is_complete_article());
     }
 
     #[test]
     fn test_is_complete_article_false_for_too_small_buffer() {
-        let entry = hybrid_entry_from_response_bytes(b"220 ok\r\n.\r\n").unwrap();
+        let entry = disk_entry_from_response_bytes(b"220 ok\r\n.\r\n").unwrap();
         assert!(!entry.is_complete_article());
     }
 
@@ -1054,7 +1050,7 @@ mod tests {
     #[test]
     fn test_response_for_stat_from_220() {
         let entry =
-            hybrid_entry_from_response_bytes(b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n")
+            disk_entry_from_response_bytes(b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n")
                 .unwrap();
         let resp = render_response(&entry, RequestKind::Stat, "<t@x>").expect("should serve STAT");
         assert_eq!(resp, b"223 0 <t@x>\r\n");
@@ -1062,8 +1058,7 @@ mod tests {
 
     #[test]
     fn test_response_for_stat_from_221() {
-        let entry =
-            hybrid_entry_from_response_bytes(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
+        let entry = disk_entry_from_response_bytes(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
         let resp = render_response(&entry, RequestKind::Stat, "<t@x>")
             .expect("should serve STAT from head");
         assert_eq!(resp, b"223 0 <t@x>\r\n");
@@ -1072,7 +1067,7 @@ mod tests {
     #[test]
     fn test_response_for_stat_from_222() {
         let entry =
-            hybrid_entry_from_response_bytes(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n").unwrap();
+            disk_entry_from_response_bytes(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n").unwrap();
         let resp = render_response(&entry, RequestKind::Stat, "<t@x>")
             .expect("should serve STAT from body");
         assert_eq!(resp, b"223 0 <t@x>\r\n");
@@ -1080,14 +1075,14 @@ mod tests {
 
     #[test]
     fn test_response_for_stat_not_from_430() {
-        let entry = hybrid_entry_from_response_bytes(b"430 not found\r\n").unwrap();
+        let entry = disk_entry_from_response_bytes(b"430 not found\r\n").unwrap();
         assert!(render_response(&entry, RequestKind::Stat, "<t@x>").is_none());
     }
 
     #[test]
     fn test_response_for_article_direct() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = hybrid_entry_from_response_bytes(buf.clone()).unwrap();
+        let entry = disk_entry_from_response_bytes(buf.clone()).unwrap();
         let resp =
             render_response(&entry, RequestKind::Article, "<t@x>").expect("should serve ARTICLE");
         assert_eq!(resp, buf);
@@ -1103,7 +1098,7 @@ mod tests {
     #[test]
     fn test_response_for_body_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = hybrid_entry_from_response_bytes(buf.clone()).unwrap();
+        let entry = disk_entry_from_response_bytes(buf.clone()).unwrap();
         let resp = render_response(&entry, RequestKind::Body, "<t@x>").expect("220 can serve BODY");
         assert_eq!(resp, b"222 0 <t@x>\r\nBody\r\n.\r\n");
     }
@@ -1111,7 +1106,7 @@ mod tests {
     #[test]
     fn test_response_for_head_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = hybrid_entry_from_response_bytes(buf.clone()).unwrap();
+        let entry = disk_entry_from_response_bytes(buf.clone()).unwrap();
         let resp = render_response(&entry, RequestKind::Head, "<t@x>").expect("220 can serve HEAD");
         assert_eq!(resp, b"221 0 <t@x>\r\nSubject: T\r\n.\r\n");
     }
@@ -1119,51 +1114,45 @@ mod tests {
     #[test]
     fn test_response_for_body_cannot_serve_article() {
         let entry =
-            hybrid_entry_from_response_bytes(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n").unwrap();
+            disk_entry_from_response_bytes(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n").unwrap();
         assert!(render_response(&entry, RequestKind::Article, "<t@x>").is_none());
     }
 
     #[test]
     fn test_response_for_head_cannot_serve_body() {
-        let entry =
-            hybrid_entry_from_response_bytes(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
+        let entry = disk_entry_from_response_bytes(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
         assert!(render_response(&entry, RequestKind::Body, "<t@x>").is_none());
     }
 
     #[test]
     fn test_with_tier_sets_tier() {
-        let entry = HybridArticleEntry::from_response_bytes_with_tier(
-            b"220 ok\r\n",
-            ttl::CacheTier::new(5),
-        )
-        .unwrap();
+        let entry =
+            DiskArticleEntry::from_response_bytes_with_tier(b"220 ok\r\n", ttl::CacheTier::new(5))
+                .unwrap();
         assert_eq!(entry.tier().get(), 5);
     }
 
     #[test]
     fn test_with_tier_zero_default() {
-        let entry = hybrid_entry_from_response_bytes(b"220 ok\r\n").unwrap();
+        let entry = disk_entry_from_response_bytes(b"220 ok\r\n").unwrap();
         assert_eq!(entry.tier().get(), 0);
     }
 
     #[test]
     fn test_with_tier_rejects_invalid_code() {
         assert!(
-            HybridArticleEntry::from_response_bytes_with_tier(
-                b"999 bad\r\n",
-                ttl::CacheTier::new(0)
-            )
-            .is_none()
+            DiskArticleEntry::from_response_bytes_with_tier(b"999 bad\r\n", ttl::CacheTier::new(0))
+                .is_none()
         );
     }
 
     // =========================================================================
-    // Property tests for HybridArticleEntry codec
+    // Property tests for DiskArticleEntry codec
     // =========================================================================
 
     #[test]
-    fn prop_hybrid_article_encode_decode_roundtrip_220() {
-        let original = hybrid_entry_from_response_bytes(
+    fn prop_disk_entry_encode_decode_roundtrip_220() {
+        let original = disk_entry_from_response_bytes(
             b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n",
         )
         .unwrap();
@@ -1172,70 +1161,69 @@ mod tests {
         original.encode(&mut buffer).unwrap();
 
         let mut reader = std::io::Cursor::new(buffer);
-        let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
+        let decoded = DiskArticleEntry::decode(&mut reader).unwrap();
 
         assert_entry_eq(&original, &decoded);
         assert_eq!(original.tier().get(), decoded.tier().get());
     }
 
     #[test]
-    fn prop_hybrid_article_encode_decode_roundtrip_221() {
-        let original = hybrid_entry_from_response_bytes(
-            b"221 headers\r\nMid: <test@example.com>\r\n\r\n.\r\n",
-        )
-        .unwrap();
-
-        let mut buffer = Vec::new();
-        original.encode(&mut buffer).unwrap();
-
-        let mut reader = std::io::Cursor::new(buffer);
-        let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
-
-        assert_entry_eq(&original, &decoded);
-    }
-
-    #[test]
-    fn prop_hybrid_article_encode_decode_roundtrip_222() {
+    fn prop_disk_entry_encode_decode_roundtrip_221() {
         let original =
-            hybrid_entry_from_response_bytes(b"222 body\r\n\r\nbody content\r\n.\r\n").unwrap();
+            disk_entry_from_response_bytes(b"221 headers\r\nMid: <test@example.com>\r\n\r\n.\r\n")
+                .unwrap();
 
         let mut buffer = Vec::new();
         original.encode(&mut buffer).unwrap();
 
         let mut reader = std::io::Cursor::new(buffer);
-        let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
+        let decoded = DiskArticleEntry::decode(&mut reader).unwrap();
 
         assert_entry_eq(&original, &decoded);
     }
 
     #[test]
-    fn prop_hybrid_article_encode_decode_roundtrip_223() {
-        let original = hybrid_entry_from_response_bytes(b"223 stat\r\n.\r\n").unwrap();
+    fn prop_disk_entry_encode_decode_roundtrip_222() {
+        let original =
+            disk_entry_from_response_bytes(b"222 body\r\n\r\nbody content\r\n.\r\n").unwrap();
 
         let mut buffer = Vec::new();
         original.encode(&mut buffer).unwrap();
 
         let mut reader = std::io::Cursor::new(buffer);
-        let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
+        let decoded = DiskArticleEntry::decode(&mut reader).unwrap();
 
         assert_entry_eq(&original, &decoded);
     }
 
     #[test]
-    fn prop_hybrid_article_encode_decode_roundtrip_430() {
-        let original = hybrid_entry_from_response_bytes(b"430 missing\r\n.\r\n").unwrap();
+    fn prop_disk_entry_encode_decode_roundtrip_223() {
+        let original = disk_entry_from_response_bytes(b"223 stat\r\n.\r\n").unwrap();
 
         let mut buffer = Vec::new();
         original.encode(&mut buffer).unwrap();
 
         let mut reader = std::io::Cursor::new(buffer);
-        let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
+        let decoded = DiskArticleEntry::decode(&mut reader).unwrap();
 
         assert_entry_eq(&original, &decoded);
     }
 
     #[test]
-    fn prop_hybrid_article_estimated_size_matches_encoded() {
+    fn prop_disk_entry_encode_decode_roundtrip_430() {
+        let original = disk_entry_from_response_bytes(b"430 missing\r\n.\r\n").unwrap();
+
+        let mut buffer = Vec::new();
+        original.encode(&mut buffer).unwrap();
+
+        let mut reader = std::io::Cursor::new(buffer);
+        let decoded = DiskArticleEntry::decode(&mut reader).unwrap();
+
+        assert_entry_eq(&original, &decoded);
+    }
+
+    #[test]
+    fn prop_disk_entry_estimated_size_matches_encoded() {
         let codes: Vec<&[u8]> = vec![
             b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n",
             b"221 headers\r\nMid: <test@example.com>\r\n\r\n.\r\n",
@@ -1245,7 +1233,7 @@ mod tests {
         ];
 
         for code in &codes {
-            let entry = hybrid_entry_from_response_bytes(code).unwrap();
+            let entry = disk_entry_from_response_bytes(code).unwrap();
             let estimated = entry.estimated_size();
 
             let mut buffer = Vec::new();
@@ -1261,7 +1249,7 @@ mod tests {
     }
 
     #[test]
-    fn prop_hybrid_article_decode_rejects_invalid_status_code() {
+    fn prop_disk_entry_decode_rejects_invalid_status_code() {
         // Create a valid encoding but with an invalid status code
         let mut buffer = Vec::new();
 
@@ -1277,15 +1265,15 @@ mod tests {
         buffer.extend_from_slice(&0u32.to_le_bytes());
 
         let mut reader = std::io::Cursor::new(buffer);
-        let result = HybridArticleEntry::decode(&mut reader);
+        let result = DiskArticleEntry::decode(&mut reader);
 
         assert!(result.is_err(), "Should reject invalid status code 500");
     }
 
     #[test]
-    fn prop_hybrid_article_preserves_tier() {
+    fn prop_disk_entry_preserves_tier() {
         for tier in [0u8, 1, 5, 10, 255] {
-            let entry = HybridArticleEntry::from_response_bytes_with_tier(
+            let entry = DiskArticleEntry::from_response_bytes_with_tier(
                 b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n",
                 ttl::CacheTier::new(tier),
             )
@@ -1295,15 +1283,15 @@ mod tests {
             entry.encode(&mut buffer).unwrap();
 
             let mut reader = std::io::Cursor::new(buffer);
-            let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
+            let decoded = DiskArticleEntry::decode(&mut reader).unwrap();
 
             assert_eq!(tier, decoded.tier().get(), "Tier mismatch");
         }
     }
 
     #[test]
-    fn prop_hybrid_article_preserves_availability() {
-        let entry = hybrid_entry_from_response_bytes(
+    fn prop_disk_entry_preserves_availability() {
+        let entry = disk_entry_from_response_bytes(
             b"220 article\r\nMid: <test@example.com>\r\n\r\nbody\r\n.\r\n",
         )
         .unwrap();
@@ -1312,7 +1300,7 @@ mod tests {
         entry.encode(&mut buffer).unwrap();
 
         let mut reader = std::io::Cursor::new(buffer);
-        let decoded = HybridArticleEntry::decode(&mut reader).unwrap();
+        let decoded = DiskArticleEntry::decode(&mut reader).unwrap();
 
         // Compare the bitset representation
         assert_eq!(
