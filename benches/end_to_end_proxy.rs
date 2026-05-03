@@ -20,6 +20,10 @@ fn main() {
 }
 
 const MSG_ID: &str = "<bench@example.com>";
+const ARTICLE_64K: usize = 64 * 1024;
+const ARTICLE_768K: usize = 768 * 1024;
+const ARTICLE_AVG_788K: usize = 788 * 1024;
+const ARTICLE_LARGE_1536K: usize = 1536 * 1024;
 
 fn article_response(body_len: usize) -> Vec<u8> {
     let body = "x".repeat(body_len);
@@ -54,6 +58,7 @@ fn memory_cache() -> Cache {
         ttl: Duration::from_mins(5),
         cache_articles: true,
         adaptive_precheck: false,
+        availability_file: None,
         disk: None,
     }
 }
@@ -221,43 +226,86 @@ fn bench_roundtrip(bencher: Bencher, body_len: usize, cache: Option<Cache>, warm
 }
 
 mod backend_roundtrip {
+    use super::{ARTICLE_64K, ARTICLE_768K, ARTICLE_AVG_788K, ARTICLE_LARGE_1536K};
     use super::{Bencher, bench_roundtrip};
 
     #[divan::bench(sample_count = 100, sample_size = 20)]
     fn article_64k(bencher: Bencher) {
-        bench_roundtrip(bencher, 64 * 1024, None, false);
+        bench_roundtrip(bencher, ARTICLE_64K, None, false);
     }
 
     #[divan::bench(sample_count = 100, sample_size = 10)]
     fn article_768k(bencher: Bencher) {
-        bench_roundtrip(bencher, 768 * 1024, None, false);
+        bench_roundtrip(bencher, ARTICLE_768K, None, false);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 10)]
+    fn article_avg_788k(bencher: Bencher) {
+        bench_roundtrip(bencher, ARTICLE_AVG_788K, None, false);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 5)]
+    fn article_large_1536k(bencher: Bencher) {
+        bench_roundtrip(bencher, ARTICLE_LARGE_1536K, None, false);
     }
 }
 
 mod cache_hit_roundtrip {
+    use super::{ARTICLE_64K, ARTICLE_768K, ARTICLE_AVG_788K, ARTICLE_LARGE_1536K};
     use super::{Bencher, bench_roundtrip, memory_cache};
 
     #[divan::bench(sample_count = 100, sample_size = 20)]
     fn article_64k(bencher: Bencher) {
-        bench_roundtrip(bencher, 64 * 1024, Some(memory_cache()), true);
+        bench_roundtrip(bencher, ARTICLE_64K, Some(memory_cache()), true);
     }
 
     #[divan::bench(sample_count = 100, sample_size = 10)]
     fn article_768k(bencher: Bencher) {
-        bench_roundtrip(bencher, 768 * 1024, Some(memory_cache()), true);
+        bench_roundtrip(bencher, ARTICLE_768K, Some(memory_cache()), true);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 10)]
+    fn article_avg_788k(bencher: Bencher) {
+        bench_roundtrip(bencher, ARTICLE_AVG_788K, Some(memory_cache()), true);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 5)]
+    fn article_large_1536k(bencher: Bencher) {
+        bench_roundtrip(bencher, ARTICLE_LARGE_1536K, Some(memory_cache()), true);
     }
 }
 
 mod cache_miss_roundtrip {
+    use super::{ARTICLE_64K, ARTICLE_768K, ARTICLE_AVG_788K, ARTICLE_LARGE_1536K};
     use super::{Bencher, bench_roundtrip, metadata_only_cache};
 
     #[divan::bench(sample_count = 100, sample_size = 20)]
     fn article_64k(bencher: Bencher) {
-        bench_roundtrip(bencher, 64 * 1024, Some(metadata_only_cache()), false);
+        bench_roundtrip(bencher, ARTICLE_64K, Some(metadata_only_cache()), false);
     }
 
     #[divan::bench(sample_count = 100, sample_size = 10)]
     fn article_768k(bencher: Bencher) {
-        bench_roundtrip(bencher, 768 * 1024, Some(metadata_only_cache()), false);
+        bench_roundtrip(bencher, ARTICLE_768K, Some(metadata_only_cache()), false);
+    }
+
+    #[divan::bench(sample_count = 100, sample_size = 10)]
+    fn article_avg_788k(bencher: Bencher) {
+        bench_roundtrip(
+            bencher,
+            ARTICLE_AVG_788K,
+            Some(metadata_only_cache()),
+            false,
+        );
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 5)]
+    fn article_large_1536k(bencher: Bencher) {
+        bench_roundtrip(
+            bencher,
+            ARTICLE_LARGE_1536K,
+            Some(metadata_only_cache()),
+            false,
+        );
     }
 }

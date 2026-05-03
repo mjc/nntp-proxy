@@ -233,11 +233,10 @@ mod availability_cache {
             let id = next_id.fetch_add(1, Ordering::Relaxed);
             let msg_id = MessageId::new(format!("<bench-{id}@example.com>")).unwrap();
             rt.block_on(async {
-                black_box(
-                    cache
-                        .record_backend_missing(msg_id, BackendId::from_index(0))
-                        .await,
-                );
+                cache
+                    .record_backend_missing(msg_id, BackendId::from_index(0))
+                    .await;
+                black_box(());
             });
         });
     }
@@ -254,7 +253,10 @@ mod availability_cache {
         bencher.bench(|| {
             let id = next_id.fetch_add(1, Ordering::Relaxed);
             let msg_id = MessageId::new(format!("<sync-{id}@example.com>")).unwrap();
-            rt.block_on(async { black_box(cache.sync_availability(msg_id, &availability).await) })
+            rt.block_on(async {
+                cache.sync_availability(msg_id, &availability).await;
+                black_box(())
+            })
         });
     }
 }
