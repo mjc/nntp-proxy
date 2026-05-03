@@ -307,12 +307,12 @@ impl ClientSession {
 
             return Ok(BatchStep::BackendDead);
         };
-        let response_is_multiline = request.is_multiline_response(status_code);
+        let expects_multiline_body = request.expects_multiline_body(status_code);
 
         // --- Handle 430 (article not found on this backend) ---
         if status_code.as_u16() == 430 {
             // Single-line 430: split at line boundary, saving the next response's prefix.
-            if !response_is_multiline {
+            if !expects_multiline_body {
                 super::split_single_line_response(chunk_data, leftover);
             }
 
@@ -338,7 +338,7 @@ impl ClientSession {
             .client_to_backend_bytes
             .add(request.request_wire_len().get());
 
-        let bytes_written = if response_is_multiline {
+        let bytes_written = if expects_multiline_body {
             let ctx = streaming::StreamContext {
                 client_addr: self.client_addr,
                 backend_id,

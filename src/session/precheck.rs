@@ -126,7 +126,7 @@ async fn execute_backend_query(
                 return Err(());
             };
 
-            let response = if request.is_multiline_response(status_code) {
+            let response = if request.expects_multiline_body(status_code) {
                 use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
                 let mut response = deps
                     .cache_articles

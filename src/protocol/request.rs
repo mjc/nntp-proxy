@@ -754,7 +754,7 @@ impl RequestContext {
     }
 
     #[must_use]
-    pub fn is_multiline_response(&self, status: StatusCode) -> bool {
+    pub fn expects_multiline_body(&self, status: StatusCode) -> bool {
         let code = status.as_u16();
         if status.is_error() {
             return false;
@@ -1186,11 +1186,13 @@ mod tests {
     }
 
     #[test]
-    fn request_aware_multiline_response_detection() {
+    fn request_aware_multiline_body_expectation() {
         let group = request_context(b"GROUP alt.test\r\n");
         let listgroup = request_context(b"LISTGROUP alt.test\r\n");
-        assert!(!group.is_multiline_response(StatusCode::new(211)));
-        assert!(listgroup.is_multiline_response(StatusCode::new(211)));
-        assert!(!request_context(b"ARTICLE <x@y>\r\n").is_multiline_response(StatusCode::new(430)));
+        assert!(!group.expects_multiline_body(StatusCode::new(211)));
+        assert!(listgroup.expects_multiline_body(StatusCode::new(211)));
+        assert!(
+            !request_context(b"ARTICLE <x@y>\r\n").expects_multiline_body(StatusCode::new(430))
+        );
     }
 }

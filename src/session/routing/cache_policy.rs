@@ -34,7 +34,7 @@ fn should_capture_for_cache(
     has_message_id: bool,
 ) -> bool {
     cache_articles
-        && request.is_multiline_response(response_code)
+        && request.expects_multiline_body(response_code)
         && has_message_id
         && matches!(response_code.as_u16(), 220 | 222)
 }
@@ -85,11 +85,11 @@ pub fn determine_cache_action_for_request(
         return CacheAction::None;
     }
 
-    let response_is_multiline = request.is_multiline_response(response_code);
+    let expects_multiline_body = request.expects_multiline_body(response_code);
 
     if should_capture_for_cache(request, response_code, cache_articles, has_message_id) {
         CacheAction::CaptureArticle
-    } else if response_is_multiline && should_track_availability(response_code, has_message_id) {
+    } else if expects_multiline_body && should_track_availability(response_code, has_message_id) {
         CacheAction::TrackAvailability
     } else if response_code.as_u16() == 223 {
         CacheAction::TrackStat
