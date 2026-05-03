@@ -649,13 +649,8 @@ impl RequestContext {
     }
 
     #[inline]
-    pub(crate) const fn record_cache_response(
-        &mut self,
-        backend_id: BackendId,
-        response: RequestResponseMetadata,
-    ) {
+    pub(crate) const fn record_cache_response(&mut self, response: RequestResponseMetadata) {
         self.cache_status = Some(RequestCacheStatus::Hit);
-        self.backend_id = Some(backend_id);
         self.response = Some(response);
     }
 
@@ -1152,16 +1147,15 @@ mod tests {
     #[test]
     fn request_context_records_cache_response_when_served() {
         let mut ctx = request_context(b"HEAD <a@b>\r\n");
-        let backend_id = BackendId::from_index(1);
         let status = StatusCode::new(221);
 
-        ctx.record_cache_response(
-            backend_id,
-            RequestResponseMetadata::new(status, ResponseWireLen::new(24)),
-        );
+        ctx.record_cache_response(RequestResponseMetadata::new(
+            status,
+            ResponseWireLen::new(24),
+        ));
 
         assert_eq!(ctx.cache_status(), Some(RequestCacheStatus::Hit));
-        assert_eq!(ctx.backend_id(), Some(backend_id));
+        assert_eq!(ctx.backend_id(), None);
         assert_eq!(ctx.response_status(), Some(status));
         assert_eq!(ctx.response_wire_len(), Some(ResponseWireLen::new(24)));
         assert_eq!(wire(&ctx), b"HEAD <a@b>\r\n");

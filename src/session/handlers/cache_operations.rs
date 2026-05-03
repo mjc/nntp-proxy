@@ -10,7 +10,7 @@ use crate::protocol::{
     RequestCachePayloadKind, RequestCacheStatus, RequestCacheTier, RequestCacheTimestampMillis,
     RequestContext, RequestResponseMetadata, ResponseWireLen, StatusCode,
 };
-use crate::router::{BackendSelector, CommandGuard};
+use crate::router::BackendSelector;
 use crate::session::{ClientSession, precheck};
 use crate::types::{BackendId, BackendToClientBytes, MessageId};
 use anyhow::Result;
@@ -125,10 +125,7 @@ impl ClientSession {
         };
         *backend_to_client_bytes = backend_to_client_bytes.add(write.wire_len.get());
 
-        let backend_id = router.route(self.client_id)?;
-        let guard = CommandGuard::new(router.clone(), backend_id);
-        guard.complete();
-        request.record_cache_response(backend_id, write.metadata());
+        request.record_cache_response(write.metadata());
         Ok(CacheLookupResult::Hit)
     }
 
@@ -386,22 +383,7 @@ mod tests {
             )
             .await;
 
-        let mut router = BackendSelector::new();
-        let backend_id = BackendId::from_index(0);
-        router.add_backend(
-            backend_id,
-            ServerName::try_new("cache-hit-backend".to_string()).expect("server name"),
-            DeadpoolConnectionProvider::new(
-                "127.0.0.1".to_string(),
-                119,
-                "cache-hit-backend".to_string(),
-                1,
-                None,
-                None,
-            ),
-            0,
-        );
-        let router = Arc::new(router);
+        let router = Arc::new(BackendSelector::new());
 
         let mut metrics = BackendToClientBytes::zero();
         let (mut client, mut server) = tcp_write_pair().await;
@@ -428,7 +410,7 @@ mod tests {
         assert!(matches!(result, CacheLookupResult::Hit));
         assert_eq!(written, expected);
         assert_eq!(request.cache_status(), Some(RequestCacheStatus::Hit));
-        assert_eq!(request.backend_id(), Some(backend_id));
+        assert_eq!(request.backend_id(), None);
         assert_eq!(request.response_status(), Some(StatusCode::new(220)));
         assert_eq!(
             request.cache_article_number(),

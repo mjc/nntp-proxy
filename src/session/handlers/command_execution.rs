@@ -22,7 +22,7 @@ use tracing::{debug, warn};
 /// Result of attempting to execute a command on a backend
 pub(super) enum BackendAttemptResult {
     /// Article found - response streamed successfully
-    Success { backend_id: BackendId },
+    Success,
     /// Article not found (430) - try next backend
     /// Note: The 430 response is read and drained, just not stored
     ArticleNotFound { backend_id: BackendId },
@@ -38,7 +38,7 @@ impl BackendAttemptResult {
         response: RequestResponseMetadata,
     ) -> Self {
         request.record_backend_response(backend_id, response);
-        Self::Success { backend_id }
+        Self::Success
     }
 }
 
@@ -512,20 +512,13 @@ mod tests {
     }
 
     #[test]
-    fn backend_attempt_success_carries_backend_id() {
+    fn backend_attempt_success_records_success() {
         let backend_id = BackendId::from_index(1);
         let response = RequestResponseMetadata::new(StatusCode::new(220), ResponseWireLen::new(42));
         let mut request = request_context(b"ARTICLE <test@example.com>\r\n");
         let result = BackendAttemptResult::success(&mut request, backend_id, response);
 
-        match result {
-            BackendAttemptResult::Success {
-                backend_id: actual_backend,
-            } => {
-                assert_eq!(actual_backend, backend_id);
-            }
-            _ => panic!("expected success"),
-        }
+        assert!(matches!(result, BackendAttemptResult::Success));
     }
 
     #[test]
@@ -536,10 +529,7 @@ mod tests {
 
         let result = BackendAttemptResult::success(&mut request, backend_id, response);
 
-        assert!(matches!(
-            result,
-            BackendAttemptResult::Success { backend_id: actual } if actual == backend_id
-        ));
+        assert!(matches!(result, BackendAttemptResult::Success));
         assert_eq!(request.backend_id(), Some(backend_id));
         assert_eq!(request.response_metadata(), Some(response));
     }

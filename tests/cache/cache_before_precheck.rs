@@ -211,7 +211,10 @@ async fn test_stat_cache_hit_zero_backend_queries() {
         while let Ok((stream, addr)) = listener.accept().await {
             let proxy = proxy.clone();
             tokio::spawn(async move {
-                proxy.handle_client(stream, addr.into()).await.ok();
+                proxy
+                    .handle_client_per_command_routing(stream, addr.into())
+                    .await
+                    .ok();
             });
         }
     });
@@ -313,7 +316,10 @@ async fn test_head_cache_hit_zero_backend_queries() {
         while let Ok((stream, addr)) = listener.accept().await {
             let proxy = proxy.clone();
             tokio::spawn(async move {
-                proxy.handle_client(stream, addr.into()).await.ok();
+                proxy
+                    .handle_client_per_command_routing(stream, addr.into())
+                    .await
+                    .ok();
             });
         }
     });
@@ -418,7 +424,10 @@ async fn test_article_cache_hit_zero_backend_queries() {
         while let Ok((stream, addr)) = listener.accept().await {
             let proxy = proxy.clone();
             tokio::spawn(async move {
-                proxy.handle_client(stream, addr.into()).await.ok();
+                proxy
+                    .handle_client_per_command_routing(stream, addr.into())
+                    .await
+                    .ok();
             });
         }
     });
@@ -456,6 +465,7 @@ async fn test_article_cache_hit_zero_backend_queries() {
     let first_queries = counter.get();
     assert_eq!(first_queries, 1, "First ARTICLE should query backend once");
 
+    tokio::time::sleep(Duration::from_millis(100)).await;
     counter.reset();
 
     // Second ARTICLE - MUST hit cache
@@ -478,11 +488,90 @@ async fn test_article_cache_hit_zero_backend_queries() {
 
     let second_queries = counter.get();
 
-    assert!(
-        second_queries <= 1,
-        "CRITICAL BUG: ARTICLE cache hit triggered {second_queries} backend queries! Should be 0 (or 1 for background recheck). \
-         Cache check must happen BEFORE backend queries."
+    assert_eq!(
+        second_queries, 0,
+        "CRITICAL BUG: ARTICLE cache hit triggered {second_queries} backend queries. \
+         Cache hits must not pick or query a backend."
     );
+
+    write_half.write_all(b"QUIT\r\n").await.unwrap();
+}
+
+/// Fake-backend test: without article payload caching, ARTICLE requests still go upstream.
+#[tokio::test]
+async fn test_article_without_payload_cache_queries_backend_each_time() {
+    let proxy_port = get_available_port().await.unwrap();
+    let backend_port = get_available_port().await.unwrap();
+
+    let counter = BackendQueryCounter::new();
+    let _mock = spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), true);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let config = Config {
+        servers: vec![
+            Server::builder("127.0.0.1", Port::try_new(backend_port).unwrap())
+                .name("TestBackend")
+                .build()
+                .unwrap(),
+        ],
+        cache: Some(Cache {
+            cache_articles: false,
+            adaptive_precheck: false,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand)
+        .await
+        .unwrap();
+    let listener = TcpListener::bind(format!("127.0.0.1:{proxy_port}"))
+        .await
+        .unwrap();
+    let _proxy_handle = tokio::spawn(async move {
+        while let Ok((stream, addr)) = listener.accept().await {
+            let proxy = proxy.clone();
+            tokio::spawn(async move {
+                proxy
+                    .handle_client_per_command_routing(stream, addr.into())
+                    .await
+                    .ok();
+            });
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
+        .await
+        .unwrap();
+    let (read_half, mut write_half) = client.split();
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+
+    for expected_queries in 1..=2 {
+        write_half
+            .write_all(b"ARTICLE <no-payload-cache@example.com>\r\n")
+            .await
+            .unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("220"), "Should get 220 response: {line}");
+
+        loop {
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            if line.trim() == "." {
+                break;
+            }
+        }
+
+        assert_eq!(
+            counter.get(),
+            expected_queries,
+            "cache_articles=false should not serve ARTICLE payloads from cache"
+        );
+    }
 
     write_half.write_all(b"QUIT\r\n").await.unwrap();
 }
@@ -523,7 +612,10 @@ async fn test_cached_430_zero_backend_queries() {
         while let Ok((stream, addr)) = listener.accept().await {
             let proxy = proxy.clone();
             tokio::spawn(async move {
-                proxy.handle_client(stream, addr.into()).await.ok();
+                proxy
+                    .handle_client_per_command_routing(stream, addr.into())
+                    .await
+                    .ok();
             });
         }
     });

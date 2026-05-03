@@ -431,7 +431,7 @@ impl ClientSession {
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         client_to_backend_bytes: &mut ClientToBackendBytes,
         backend_to_client_bytes: &mut BackendToClientBytes,
-    ) -> Result<crate::types::BackendId, SessionError> {
+    ) -> Result<(), SessionError> {
         debug!(
             "Client {} ENTERED route_and_execute_request: kind={:?}, verb={:?}",
             self.client_addr,
@@ -458,11 +458,7 @@ impl ClientSession {
             )
             .await?
         {
-            CacheLookupResult::Hit => {
-                return Ok(request
-                    .backend_id()
-                    .expect("cache hit records selected backend id"));
-            }
+            CacheLookupResult::Hit => return Ok(()),
             CacheLookupResult::PartialHit => request.cache_availability().map(|availability| {
                 crate::cache::ArticleAvailability::from_bits(
                     availability.checked_bits(),
@@ -505,7 +501,7 @@ impl ClientSession {
                     crate::protocol::NO_SUCH_ARTICLE.len()
                 };
             *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written);
-            return Ok(BackendId::from_index(0));
+            return Ok(());
         }
 
         // Detect large-transfer commands that should skip the pipeline.
@@ -569,10 +565,7 @@ impl ClientSession {
                                     .add(completed.context.request_wire_len().get());
                                 self.metrics.record_pipeline_complete();
                                 guard.complete();
-                                return Ok(completed
-                                    .context
-                                    .backend_id()
-                                    .expect("completed queued request records backend id"));
+                                return Ok(());
                             }
                             Ok(Ok(completed)) => {
                                 let completed_backend_id = completed
@@ -663,9 +656,6 @@ impl ClientSession {
         // Future: This could be made configurable if latency becomes critical for
         // workloads where articles definitively don't exist.
 
-        // Track last backend tried for metrics/return value
-        let mut last_backend: Option<crate::types::BackendId> = None;
-
         // Try backends until success or exhaustion
         while !availability.all_exhausted(router.backend_count()) {
             let attempt = self
@@ -682,7 +672,7 @@ impl ClientSession {
                 )
                 .await;
             match attempt {
-                Ok(BackendAttemptResult::Success { backend_id }) => {
+                Ok(BackendAttemptResult::Success) => {
                     let response = request
                         .response_metadata()
                         .expect("successful direct attempt records response metadata");
@@ -693,10 +683,13 @@ impl ClientSession {
                     // recorded some 430s from other backends along the way)
                     self.sync_availability_if_needed(msg_id.as_ref(), &availability)
                         .await;
-                    return Ok(backend_id);
+                    return Ok(());
                 }
                 Ok(BackendAttemptResult::ArticleNotFound { backend_id }) => {
-                    last_backend = Some(backend_id);
+                    debug!(
+                        "Client {} backend {:?} returned 430 during retry",
+                        self.client_addr, backend_id
+                    );
                 }
                 Ok(BackendAttemptResult::BackendUnavailable) => {
                     // Continue to next backend
@@ -733,7 +726,7 @@ impl ClientSession {
         self.send_430_to_client(client_write, backend_to_client_bytes)
             .await?;
 
-        Ok(last_backend.unwrap_or_else(|| crate::types::BackendId::from_index(0)))
+        Ok(())
     }
 
     /// Load article availability from cache or create fresh tracker
