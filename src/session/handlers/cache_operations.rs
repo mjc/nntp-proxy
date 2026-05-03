@@ -94,12 +94,12 @@ impl ClientSession {
             return Ok(CacheLookupResult::PartialHit);
         }
 
-        // Check if this is a complete article we can serve
-        // Stubs from STAT/HEAD precheck or availability tracking should not be served
+        // Check if this is a complete article we can serve.
+        // Availability-only or missing entries should not be served as article payloads.
         // Exception: STAT can be answered from any cache entry (we just need to know it exists)
         if !request.is_stat() && !cached.is_complete_article() {
             debug!(
-                "Client {} cache entry for {} is a stub (payload_len={}), fetching full article",
+                "Client {} cache entry for {} has no complete payload (payload_len={}), fetching full article",
                 self.client_addr,
                 msg_id_ref,
                 cached.payload_len().get()
