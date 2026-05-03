@@ -127,8 +127,12 @@ impl TcpManager {
         };
 
         // Pre-connect options (buffer sizes, reuse)
-        socket.set_recv_buffer_size(POOL_RECV_BUFFER as u32)?;
-        socket.set_send_buffer_size(POOL_SEND_BUFFER as u32)?;
+        socket.set_recv_buffer_size(
+            u32::try_from(POOL_RECV_BUFFER).expect("pool receive buffer fits u32"),
+        )?;
+        socket.set_send_buffer_size(
+            u32::try_from(POOL_SEND_BUFFER).expect("pool send buffer fits u32"),
+        )?;
         socket.set_reuseaddr(true)?;
 
         // Async connect — does NOT block the tokio worker thread

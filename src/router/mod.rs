@@ -145,6 +145,9 @@ impl TrafficShare {
     #[must_use]
     pub fn from_weight(max_connections: usize, total_weight: TotalWeight) -> Self {
         if total_weight.get() > 0 {
+            // Traffic share is a display percentage; routing uses the original
+            // integer weights, so precision loss here cannot affect selection.
+            #[allow(clippy::cast_precision_loss)]
             Self::new((max_connections as f64 / total_weight.get() as f64) * 100.0)
         } else {
             Self::new(0.0)

@@ -81,7 +81,7 @@ impl RuntimeConfig {
         };
 
         if self.enable_cpu_pinning {
-            pin_to_cpu_cores(self.worker_threads)?;
+            pin_to_cpu_cores(self.worker_threads);
         }
 
         Ok(rt)
@@ -101,7 +101,7 @@ impl Default for RuntimeConfig {
 /// # Arguments
 /// * `num_cores` - Number of CPU cores to pin to (`0..num_cores`)
 #[cfg(target_os = "linux")]
-fn pin_to_cpu_cores(num_cores: usize) -> Result<()> {
+fn pin_to_cpu_cores(num_cores: usize) {
     use nix::sched::{CpuSet, sched_setaffinity};
     use nix::unistd::Pid;
 
@@ -116,22 +116,19 @@ fn pin_to_cpu_cores(num_cores: usize) -> Result<()> {
                 "Successfully pinned process to {} CPU cores for optimal performance",
                 num_cores
             );
-            Ok(())
         }
         Err(e) => {
             tracing::warn!(
                 "Failed to set CPU affinity: {}, continuing without pinning",
                 e
             );
-            Ok(()) // Non-fatal
         }
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pin_to_cpu_cores(_num_cores: usize) -> Result<()> {
+fn pin_to_cpu_cores(_num_cores: usize) {
     tracing::info!("CPU pinning not available on this platform");
-    Ok(())
 }
 
 /// Wait for shutdown signal (Ctrl+C or SIGTERM on Unix)
@@ -578,8 +575,7 @@ mod tests {
     #[test]
     fn test_pin_to_cpu_cores_non_fatal() {
         // Should not panic even if pinning fails
-        let result = pin_to_cpu_cores(1);
-        assert!(result.is_ok());
+        pin_to_cpu_cores(1);
     }
 
     // Edge case tests
@@ -672,39 +668,34 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_pin_to_cpu_cores_linux_single_core() {
-        let result = pin_to_cpu_cores(1);
-        assert!(result.is_ok());
+        pin_to_cpu_cores(1);
     }
 
     #[test]
     #[cfg(target_os = "linux")]
     fn test_pin_to_cpu_cores_linux_multi_core() {
-        let result = pin_to_cpu_cores(4);
-        assert!(result.is_ok());
+        pin_to_cpu_cores(4);
     }
 
     #[test]
     #[cfg(target_os = "linux")]
     fn test_pin_to_cpu_cores_linux_zero_cores() {
         // Edge case: 0 cores should still succeed (no-op)
-        let result = pin_to_cpu_cores(0);
-        assert!(result.is_ok());
+        pin_to_cpu_cores(0);
     }
 
     #[test]
     #[cfg(target_os = "linux")]
     fn test_pin_to_cpu_cores_linux_many_cores() {
         // Try to pin to more cores than available - should not panic
-        let result = pin_to_cpu_cores(1024);
-        assert!(result.is_ok()); // Best-effort, won't fail
+        pin_to_cpu_cores(1024);
     }
 
     #[test]
     #[cfg(not(target_os = "linux"))]
     fn test_pin_to_cpu_cores_non_linux() {
         // Non-Linux platforms should gracefully no-op
-        let result = pin_to_cpu_cores(4);
-        assert!(result.is_ok());
+        pin_to_cpu_cores(4);
     }
 
     // Default implementation tests

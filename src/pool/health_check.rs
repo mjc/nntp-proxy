@@ -17,6 +17,13 @@ use crate::constants::pool::{
 };
 use crate::stream::ConnectionStream;
 
+#[allow(clippy::cast_precision_loss)]
+fn count_as_f64_for_rate(value: u64) -> f64 {
+    // Health-check failure rate is an approximate monitoring value. The exact
+    // checked/failed counters remain stored as u64.
+    value as f64
+}
+
 /// Errors that can occur during connection health checks
 #[derive(Debug, Error)]
 pub enum HealthCheckError {
@@ -92,7 +99,7 @@ impl HealthCheckMetrics {
             0.0
         } else {
             let failed = self.connections_failed.load(Ordering::Relaxed);
-            failed as f64 / checked as f64
+            count_as_f64_for_rate(failed) / count_as_f64_for_rate(checked)
         }
     }
 

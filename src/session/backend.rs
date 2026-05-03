@@ -18,6 +18,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::pool::PooledBuffer;
 use crate::protocol::{RequestContext, StatusCode};
 
+fn duration_micros_u64(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
 // ─── Response status parsing ────────────────────────────────────────────────
 
 /// Response status parse warnings (pure data)
@@ -280,9 +284,9 @@ where
             status_code: validated.status_code,
             warnings: validated.warnings,
         },
-        elapsed.as_micros() as u64,
-        send_elapsed.as_micros() as u64,
-        recv_elapsed.as_micros() as u64,
+        duration_micros_u64(elapsed),
+        duration_micros_u64(send_elapsed),
+        duration_micros_u64(recv_elapsed),
     ))
 }
 

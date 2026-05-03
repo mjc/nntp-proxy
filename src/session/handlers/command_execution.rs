@@ -271,7 +271,10 @@ impl ClientSession {
         Ok(BackendAttemptResult::success(
             request,
             backend_id,
-            RequestResponseMetadata::new(status_code, (bytes_written as usize).into()),
+            RequestResponseMetadata::new(
+                status_code,
+                usize::try_from(bytes_written).unwrap_or(usize::MAX).into(),
+            ),
         ))
     }
 

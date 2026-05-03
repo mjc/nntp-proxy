@@ -204,8 +204,12 @@ impl BackendInfo {
     /// Lower ratios indicate less loaded backends.
     #[must_use]
     pub(super) fn load_ratio(&self) -> LoadRatio {
+        // Load ratio is a relative routing score. Exact integer counts are kept
+        // separately; float precision is sufficient for comparing backend load.
+        #[allow(clippy::cast_precision_loss)]
         let max_conns = self.provider.max_size() as f64;
         if max_conns > 0.0 {
+            #[allow(clippy::cast_precision_loss)]
             let pending = self.pending_count.get() as f64;
             LoadRatio::new(pending / max_conns)
         } else {

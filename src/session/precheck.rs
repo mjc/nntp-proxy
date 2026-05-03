@@ -31,6 +31,7 @@ pub(crate) enum QueryResult {
 }
 
 /// Shared dependencies for precheck operations.
+#[derive(Clone, Copy)]
 pub struct PrecheckDeps<'a> {
     pub router: &'a Arc<BackendSelector>,
     pub cache: &'a Arc<UnifiedCache>,
@@ -49,7 +50,7 @@ struct OwnedDeps {
 }
 
 impl PrecheckDeps<'_> {
-    fn to_owned(&self) -> OwnedDeps {
+    fn clone_deps(&self) -> OwnedDeps {
         OwnedDeps {
             router: Arc::clone(self.router),
             cache: Arc::clone(self.cache),
@@ -385,7 +386,7 @@ pub async fn precheck(
         return Some(cached);
     }
 
-    let owned = deps.to_owned();
+    let owned = deps.clone_deps();
     let found = query_all_backends_racing(&owned, request, msg_id).await;
 
     // Cache the found result and return it
@@ -414,7 +415,7 @@ pub fn spawn_background_precheck(
     request: RequestContext,
     msg_id: MessageId<'static>,
 ) {
-    let owned = deps.to_owned();
+    let owned = deps.clone_deps();
     tokio::spawn(async move {
         // Check cache first - if we have a complete article, no need to query backends
         if let Some(cached) = owned.cache.get(&msg_id).await

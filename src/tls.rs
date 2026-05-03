@@ -330,7 +330,7 @@ impl TlsManager {
         }
 
         // 2. Try to load system certificates
-        let system_count = Self::load_system_certificates_sync(&mut root_store)?;
+        let system_count = Self::load_system_certificates_sync(&mut root_store);
         if system_count > 0 {
             debug!(
                 "TLS: Loaded {} certificates from system store",
@@ -376,9 +376,7 @@ impl TlsManager {
     }
 
     /// Load system certificates, returning count of successfully loaded certificates
-    fn load_system_certificates_sync(
-        root_store: &mut RootCertStore,
-    ) -> Result<usize, anyhow::Error> {
+    fn load_system_certificates_sync(root_store: &mut RootCertStore) -> usize {
         let cert_result = rustls_native_certs::load_native_certs();
         let mut added_count = 0;
 
@@ -393,7 +391,7 @@ impl TlsManager {
             warn!("TLS: Certificate loading error: {}", error);
         }
 
-        Ok(added_count)
+        added_count
     }
 
     /// Create optimized client configuration using ring crypto provider

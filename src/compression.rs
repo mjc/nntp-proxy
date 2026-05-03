@@ -16,6 +16,11 @@ const COMPRESSED_BUF_SIZE: usize = 8192;
 const WRITE_BUF_SIZE: usize = 16384; // Pre-allocated for poll_write compressed output
 const DEFAULT_COMPRESS_LEVEL: u32 = 1; // Fast compression (latency > ratio for a proxy)
 
+fn counter_delta_to_usize(before: u64, after: u64) -> usize {
+    let delta = after.saturating_sub(before);
+    usize::try_from(delta).expect("flate2 byte counter delta is bounded by the caller buffer size")
+}
+
 /// Tracks whether a pre-allocated output buffer has pending data to drain.
 #[derive(Debug, Clone, Copy)]
 enum DrainState {
@@ -64,7 +69,7 @@ fn poll_compress_drain<S: AsyncWrite>(
         compressor
             .compress(&[], buf, flush)
             .map_err(io::Error::other)?;
-        let produced = (compressor.total_out() - before_out) as usize;
+        let produced = counter_delta_to_usize(before_out, compressor.total_out());
 
         if produced > 0 {
             *state = DrainState::Draining {
@@ -100,8 +105,8 @@ fn try_decompress(
         .decompress(input, out_slice, flate2::FlushDecompress::None)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    let consumed = (decompressor.total_in() - before_in) as usize;
-    let produced = (decompressor.total_out() - before_out) as usize;
+    let consumed = counter_delta_to_usize(before_in, decompressor.total_in());
+    let produced = counter_delta_to_usize(before_out, decompressor.total_out());
 
     if produced > 0 {
         *stats += produced as u64;
@@ -263,8 +268,8 @@ impl<S: AsyncWrite> AsyncWrite for DecompressStream<S> {
             .compress(buf, this.write_buf, flate2::FlushCompress::None)
             .map_err(io::Error::other)?;
 
-        let consumed = (this.compressor.total_in() - before_in) as usize;
-        let produced = (this.compressor.total_out() - before_out) as usize;
+        let consumed = counter_delta_to_usize(before_in, this.compressor.total_in());
+        let produced = counter_delta_to_usize(before_out, this.compressor.total_out());
 
         if produced > 0 {
             *this.write_drain = DrainState::Draining {

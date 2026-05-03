@@ -3,6 +3,13 @@
 use crate::metrics::types::{CommandCount, ErrorCount};
 use crate::types::{BytesPerSecondRate, BytesReceived, BytesSent, TotalConnections};
 
+#[allow(clippy::cast_precision_loss)]
+fn count_as_f64_for_rate(value: u64) -> f64 {
+    // User error rates are derived display metrics. The underlying counters
+    // remain exact integers; floating point is only used for the percentage.
+    value as f64
+}
+
 /// Statistics for a single user (snapshot)
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct UserStats {
@@ -54,7 +61,7 @@ impl UserStats {
     pub fn error_rate_percent(&self) -> f64 {
         let total_cmds = self.total_commands.get();
         if total_cmds > 0 {
-            (self.errors.get() as f64 / total_cmds as f64) * 100.0
+            (count_as_f64_for_rate(self.errors.get()) / count_as_f64_for_rate(total_cmds)) * 100.0
         } else {
             0.0
         }

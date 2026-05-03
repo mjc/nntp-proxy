@@ -403,7 +403,7 @@ impl ClientSession {
             chunk_data.len() as u64
         };
 
-        *state.backend_to_client_bytes = state.backend_to_client_bytes.add(bytes_written as usize);
+        *state.backend_to_client_bytes = state.backend_to_client_bytes.add_u64(bytes_written);
 
         // Record metrics
         self.metrics.record_command(backend_id);
