@@ -5,6 +5,10 @@
 
 use super::*;
 
+fn usize_to_f64(value: usize) -> f64 {
+    f64::from(u32::try_from(value).expect("test values fit in u32"))
+}
+
 #[test]
 fn test_total_weight_accumulation() {
     let mut selector = BackendSelector::new();
@@ -384,17 +388,17 @@ fn test_weighted_with_varying_pool_sizes() {
 
     // Verify each backend gets approximately its weighted share
     for (i, &size) in pool_sizes.iter().enumerate() {
-        let expected = (size as f64 / total as f64) * num_requests as f64;
+        let expected = (usize_to_f64(size) / usize_to_f64(total)) * usize_to_f64(num_requests);
         let tolerance = expected * 0.10; // 10% tolerance
 
         assert!(
-            (f64::from(counts[i]) - expected).abs() < tolerance,
+            (usize_to_f64(counts[i]) - expected).abs() < tolerance,
             "Backend {} (size {}) expected ~{:.0}, got {} (diff: {:.0})",
             i,
             size,
             expected,
             counts[i],
-            (f64::from(counts[i]) - expected).abs()
+            (usize_to_f64(counts[i]) - expected).abs()
         );
     }
 }

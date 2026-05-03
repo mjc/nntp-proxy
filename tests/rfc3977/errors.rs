@@ -36,10 +36,9 @@ fn error_codes() -> impl Iterator<Item = u16> {
 
 #[test]
 fn test_error_code_constants_match_expected_values() {
-    TEMPORARY_ERRORS
-        .iter()
-        .chain(PERMANENT_ERRORS.iter())
-        .for_each(|(constant, expected)| assert_eq!(constant, expected));
+    for (constant, expected) in TEMPORARY_ERRORS.iter().chain(PERMANENT_ERRORS.iter()) {
+        assert_eq!(constant, expected);
+    }
 }
 
 #[test]
@@ -73,15 +72,13 @@ fn test_error_responses_are_errors() {
 
 #[test]
 fn test_error_boundaries() {
-    [
+    for (code, continuation, error, success) in [
         (399, true, false, true),
         (400, false, true, false),
         (499, false, true, false),
         (500, false, true, false),
         (599, false, true, false),
-    ]
-    .into_iter()
-    .for_each(|(code, continuation, error, success)| {
+    ] {
         let status = StatusCode::new(code);
         assert_eq!(
             status.is_continuation(),
@@ -90,7 +87,7 @@ fn test_error_boundaries() {
         );
         assert_eq!(status.is_error(), error, "error {code}");
         assert_eq!(status.is_success(), success, "success {code}");
-    });
+    }
 }
 
 #[test]

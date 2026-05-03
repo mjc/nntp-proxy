@@ -8,79 +8,93 @@ fn status(code: u16) -> StatusCode {
     StatusCode::new(code)
 }
 
-fn assert_status_flags(
-    code: u16,
-    success: bool,
-    error: bool,
-    informational: bool,
-    continuation: bool,
-) {
+#[derive(Clone, Copy)]
+enum StatusCategory {
+    Informational,
+    Success,
+    Continuation,
+    Error,
+}
+
+const STATUS_CATEGORY_CASES: &[(u16, StatusCategory)] = &[
+    (100, StatusCategory::Informational),
+    (199, StatusCategory::Informational),
+    (200, StatusCategory::Success),
+    (299, StatusCategory::Success),
+    (300, StatusCategory::Continuation),
+    (335, StatusCategory::Continuation),
+    (381, StatusCategory::Continuation),
+    (399, StatusCategory::Continuation),
+    (400, StatusCategory::Error),
+    (430, StatusCategory::Error),
+    (499, StatusCategory::Error),
+    (500, StatusCategory::Error),
+];
+
+fn assert_status_flags(code: u16, category: StatusCategory) {
     let status = status(code);
-    assert_eq!(status.is_success(), success, "success {code}");
-    assert_eq!(status.is_error(), error, "error {code}");
-    assert_eq!(
-        status.is_informational(),
-        informational,
-        "informational {code}"
-    );
-    assert_eq!(
-        status.is_continuation(),
-        continuation,
-        "continuation {code}"
-    );
+    match category {
+        StatusCategory::Informational => {
+            assert!(!status.is_success(), "success {code}");
+            assert!(!status.is_error(), "error {code}");
+            assert!(status.is_informational(), "informational {code}");
+            assert!(!status.is_continuation(), "continuation {code}");
+        }
+        StatusCategory::Success => {
+            assert!(status.is_success(), "success {code}");
+            assert!(!status.is_error(), "error {code}");
+            assert!(!status.is_informational(), "informational {code}");
+            assert!(!status.is_continuation(), "continuation {code}");
+        }
+        StatusCategory::Continuation => {
+            assert!(status.is_success(), "success {code}");
+            assert!(!status.is_error(), "error {code}");
+            assert!(!status.is_informational(), "informational {code}");
+            assert!(status.is_continuation(), "continuation {code}");
+        }
+        StatusCategory::Error => {
+            assert!(!status.is_success(), "success {code}");
+            assert!(status.is_error(), "error {code}");
+            assert!(!status.is_informational(), "informational {code}");
+            assert!(!status.is_continuation(), "continuation {code}");
+        }
+    }
 }
 
 // StatusCode classification
 
 #[test]
 fn test_status_code_categories_and_boundaries() {
-    [
-        (100, false, false, true, false),
-        (199, false, false, true, false),
-        (200, true, false, false, false),
-        (299, true, false, false, false),
-        (300, true, false, false, true),
-        (335, true, false, false, true),
-        (381, true, false, false, true),
-        (399, true, false, false, true),
-        (400, false, true, false, false),
-        (430, false, true, false, false),
-        (499, false, true, false, false),
-        (500, false, true, false, false),
-    ]
-    .into_iter()
-    .for_each(|(code, success, error, informational, continuation)| {
-        assert_status_flags(code, success, error, informational, continuation);
-    });
+    for (code, category) in STATUS_CATEGORY_CASES {
+        assert_status_flags(*code, *category);
+    }
 }
 
 #[test]
 fn test_known_success_and_continuation_codes() {
-    [
+    for code in [
         200, 201, 205, 211, 215, 220, 221, 222, 223, 224, 225, 230, 231, 281, 282,
-    ]
-    .into_iter()
-    .for_each(|code| {
+    ] {
         let status = status(code);
         assert!(status.is_success(), "Code {code} should be success");
         assert!(!status.is_error(), "Code {code} should not be error");
-    });
+    }
 
-    [335, 340, 381, 383].into_iter().for_each(|code| {
+    for code in [335, 340, 381, 383] {
         let status = status(code);
         assert!(
             status.is_continuation(),
             "Code {code} should be continuation"
         );
         assert!(status.is_success(), "Code {code} should also be success");
-    });
+    }
 }
 
 // StatusCode::parse() tests
 
 #[test]
 fn test_status_code_parse_valid_inputs() {
-    [
+    for (input, code) in [
         (b"200 Service ready\r\n".as_slice(), 200),
         (b"200".as_slice(), 200),
         (b"200 ".as_slice(), 200),
@@ -90,9 +104,9 @@ fn test_status_code_parse_valid_inputs() {
         (b"200 Welcome! <server@example>\r\n".as_slice(), 200),
         (b"200  multiple  spaces  \r\n".as_slice(), 200),
         ("200 Привет мир\r\n".as_bytes(), 200),
-    ]
-    .into_iter()
-    .for_each(|(input, code)| assert_eq!(StatusCode::parse(input), Some(status(code))));
+    ] {
+        assert_eq!(StatusCode::parse(input), Some(status(code)));
+    }
 
     let long_msg = format!("200 {}\r\n", "x".repeat(1000));
     assert_eq!(StatusCode::parse(long_msg.as_bytes()), Some(status(200)));
@@ -100,16 +114,16 @@ fn test_status_code_parse_valid_inputs() {
 
 #[test]
 fn test_status_code_parse_invalid_inputs() {
-    [
+    for input in [
         b"".as_slice(),
         b"20".as_slice(),
         b"2".as_slice(),
         b"2X0 Error\r\n".as_slice(),
         b"ABC Invalid\r\n".as_slice(),
         b" 200 Error\r\n".as_slice(),
-    ]
-    .into_iter()
-    .for_each(|input| assert_eq!(StatusCode::parse(input), None));
+    ] {
+        assert_eq!(StatusCode::parse(input), None);
+    }
 }
 
 // Setup/auth status helpers
@@ -128,24 +142,24 @@ fn test_status_code_special_categories() {
 
 #[test]
 fn test_status_success_method() {
-    [200, 281, 381]
-        .into_iter()
-        .for_each(|code| assert!(status(code).is_success(), "success {code}"));
-    [400, 500]
-        .into_iter()
-        .for_each(|code| assert!(!status(code).is_success(), "not success {code}"));
+    for code in [200, 281, 381] {
+        assert!(status(code).is_success(), "success {code}");
+    }
+    for code in [400, 500] {
+        assert!(!status(code).is_success(), "not success {code}");
+    }
 }
 
 #[test]
 fn test_status_code_extraction() {
-    [
+    for (response, expected) in [
         (b"200 OK\r\n".as_slice(), Some(status(200))),
         (b"205 Bye\r\n".as_slice(), Some(status(205))),
         (b"281 OK\r\n".as_slice(), Some(status(281))),
         (b"".as_slice(), None),
-    ]
-    .into_iter()
-    .for_each(|(response, expected)| assert_eq!(StatusCode::parse(response), expected));
+    ] {
+        assert_eq!(StatusCode::parse(response), expected);
+    }
 }
 
 #[test]

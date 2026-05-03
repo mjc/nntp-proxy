@@ -16,23 +16,23 @@ use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
 
 fn assert_multiplier_cases(cases: &[(u8, u64)]) {
-    cases.iter().for_each(|(tier, expected)| {
+    for (tier, expected) in cases {
         assert_eq!(
             ttl_multiplier(CacheTier::new(*tier)),
             *expected,
             "tier {tier}"
         );
-    });
+    }
 }
 
 fn assert_effective_ttl_cases(base_ttl: u64, cases: &[(u8, u64)]) {
-    cases.iter().for_each(|(tier, expected)| {
+    for (tier, expected) in cases {
         assert_eq!(
             effective_ttl_ms(base_ttl, CacheTier::new(*tier)),
             *expected,
             "tier {tier}"
         );
-    });
+    }
 }
 
 const fn effective_ttl_ms(base_ttl: u64, tier: CacheTier) -> u64 {
@@ -156,9 +156,9 @@ fn test_max_ttl_tier_constant() {
 fn test_is_expired_fresh_entry() {
     let now = now_millis();
     // Just inserted with 1s TTL - should not be expired
-    [0, 1, 63].into_iter().for_each(|tier| {
+    for tier in [0, 1, 63] {
         assert!(!is_expired_ms(now, 1000, CacheTier::new(tier)));
-    });
+    }
 }
 
 #[test]
@@ -201,18 +201,20 @@ fn test_is_expired_high_tier_extension() {
     // 100s ago with 1s base TTL
     let inserted = now.saturating_sub(100_000);
 
-    (0..=6).for_each(|tier| assert!(is_expired_ms(inserted, 1000, CacheTier::new(tier))));
-    [7, 10].into_iter().for_each(|tier| {
+    for tier in 0..=6 {
+        assert!(is_expired_ms(inserted, 1000, CacheTier::new(tier)));
+    }
+    for tier in [7, 10] {
         assert!(!is_expired_ms(inserted, 1000, CacheTier::new(tier)));
-    });
+    }
 }
 
 #[test]
 fn test_is_expired_zero_ttl_always_expires() {
     let now = now_millis();
-    [0, 1, 63].into_iter().for_each(|tier| {
+    for tier in [0, 1, 63] {
         assert!(is_expired_ms(now, 0, CacheTier::new(tier)));
-    });
+    }
 }
 
 #[test]

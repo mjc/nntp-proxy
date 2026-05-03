@@ -64,12 +64,28 @@ pub(super) struct ArticleAttemptState<'a> {
 type BackendTimings = (u64, u64, u64);
 
 /// Parameters describing the response to stream to the client
+#[derive(Clone, Copy)]
 struct ResponseStreamParams<'a> {
     request: &'a RequestContext,
     msg_id: Option<&'a crate::types::MessageId<'a>>,
     status_code: StatusCode,
     first_chunk: &'a [u8],
 }
+
+struct InvalidBackendResponseContext<'a> {
+    provider: &'a crate::pool::DeadpoolConnectionProvider,
+    request: &'a RequestContext,
+    availability: &'a mut crate::cache::ArticleAvailability,
+    buffer: &'a crate::pool::PooledBuffer,
+    conn: crate::pool::ConnectionGuard,
+    bytes_read: usize,
+}
+
+type PreparedBackendAttempt = Option<(
+    crate::pool::ConnectionGuard,
+    backend::BackendFirstResponse,
+    StatusCode,
+)>;
 
 /// Any client write failure after the full backend response is already buffered is terminal.
 ///
@@ -93,21 +109,51 @@ impl ClientSession {
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         state: &mut ArticleAttemptState<'_>,
     ) -> Result<BackendAttemptResult, SessionError> {
-        // Select least-loaded available backend
         let backend_id =
             router.route_with_availability(self.client_id, Some(state.availability))?;
-
-        // RAII guard ensures complete_command is called on all exit paths (clone Arc here)
         let guard = CommandGuard::new(router.clone(), backend_id);
-
-        // Get connection provider
         let Some(provider) = router.backend_provider(backend_id) else {
             state.availability.record_missing(backend_id);
-            // guard drops here → complete_command called automatically
             return Ok(BackendAttemptResult::BackendUnavailable);
         };
 
-        // Retry once on backend error (fresh connection on second attempt)
+        let Some((conn, cmd_response, status_code)) = self
+            .prepare_backend_attempt(provider, backend_id, request, state)
+            .await?
+        else {
+            return Ok(BackendAttemptResult::BackendUnavailable);
+        };
+
+        if status_code.as_u16() == 430 {
+            self.handle_430_availability(backend_id, state.availability);
+            let _ = conn.release();
+            return Ok(BackendAttemptResult::ArticleNotFound { backend_id });
+        }
+
+        let response = self
+            .stream_successful_backend_response(
+                conn,
+                client_write,
+                backend_id,
+                ResponseStreamParams {
+                    request,
+                    msg_id,
+                    status_code,
+                    first_chunk: &state.buffer[..cmd_response.bytes_read],
+                },
+            )
+            .await?;
+        guard.complete();
+        Ok(BackendAttemptResult::success(request, backend_id, response))
+    }
+
+    async fn prepare_backend_attempt(
+        &self,
+        provider: &crate::pool::DeadpoolConnectionProvider,
+        backend_id: BackendId,
+        request: &RequestContext,
+        state: &mut ArticleAttemptState<'_>,
+    ) -> Result<PreparedBackendAttempt, SessionError> {
         let (conn, cmd_response, timings) = retry_once!(
             self.execute_backend_attempt(provider, backend_id, request, state.buffer)
                 .await,
@@ -123,139 +169,156 @@ impl ClientSession {
             .client_to_backend_bytes
             .add(request.request_wire_len().get());
 
-        // Reject invalid responses - never forward garbage to client
         let Some(status_code) = cmd_response.status_code() else {
-            // Safely clamp buffer slice to prevent panic on out-of-bounds bytes_read
-            let bytes_to_read = cmd_response.bytes_read.min(state.buffer.len());
-
-            tracing::warn!(
-                client = %self.client_addr,
-                backend = ?backend_id,
-                command_verb = ?request.verb(),
-                bytes_read = cmd_response.bytes_read,
-                first_bytes_hex = %crate::session::backend::format_hex_preview(
-                    &state.buffer[..bytes_to_read], 256
-                ),
-                first_bytes_utf8 = %String::from_utf8_lossy(
-                    &state.buffer[..bytes_to_read.min(256)]
-                ),
-                "Backend returned invalid/unparseable response, attempting to salvage connection"
+            self.handle_invalid_backend_response(
+                backend_id,
+                InvalidBackendResponseContext {
+                    provider,
+                    request,
+                    availability: state.availability,
+                    buffer: state.buffer,
+                    conn,
+                    bytes_read: cmd_response.bytes_read,
+                },
             );
-            // Mark backend as unavailable for this article so we try next one
-            state.availability.record_missing(backend_id);
-
-            // Try to salvage connection with DATE health check
-            // Spawn in background so client can retry immediately
-            let request_kind = request.kind();
-            let provider_for_salvage = provider.clone();
-            let conn_for_salvage = conn.release(); // hand off; salvage decides pool fate
-            tokio::spawn(async move {
-                tracing::debug!(
-                    backend = ?backend_id,
-                    request_kind = ?request_kind,
-                    "Attempting to salvage connection after Invalid response"
-                );
-                crate::pool::salvage_with_health_check(conn_for_salvage, provider_for_salvage)
-                    .await;
-            });
-
-            // guard drops here → complete_command called automatically
-            return Ok(BackendAttemptResult::BackendUnavailable);
+            return Ok(None);
         };
 
-        // Handle 430 - article not found
-        // Note: response is already read into buffer, keeping connection clean
-        if status_code.as_u16() == 430 {
-            self.handle_430_availability(backend_id, state.availability);
-            let _ = conn.release(); // connection is healthy; return to pool
-            return Ok(BackendAttemptResult::ArticleNotFound { backend_id });
-        }
+        Ok(Some((conn, cmd_response, status_code)))
+    }
 
-        // Success - stream response
-        let is_multiline_body = request.expects_multiline_response(status_code);
+    fn handle_invalid_backend_response(
+        &self,
+        backend_id: BackendId,
+        ctx: InvalidBackendResponseContext<'_>,
+    ) {
+        let InvalidBackendResponseContext {
+            provider,
+            request,
+            availability,
+            buffer,
+            conn,
+            bytes_read,
+        } = ctx;
+        let bytes_to_read = bytes_read.min(buffer.len());
+        tracing::warn!(
+            client = %self.client_addr,
+            backend = ?backend_id,
+            command_verb = ?request.verb(),
+            bytes_read,
+            first_bytes_hex = %crate::session::backend::format_hex_preview(
+                &buffer[..bytes_to_read], 256
+            ),
+            first_bytes_utf8 = %String::from_utf8_lossy(&buffer[..bytes_to_read.min(256)]),
+            "Backend returned invalid/unparseable response, attempting to salvage connection"
+        );
+        availability.record_missing(backend_id);
+
+        let request_kind = request.kind();
+        let provider_for_salvage = provider.clone();
+        let conn_for_salvage = conn.release();
+        tokio::spawn(async move {
+            tracing::debug!(
+                backend = ?backend_id,
+                request_kind = ?request_kind,
+                "Attempting to salvage connection after Invalid response"
+            );
+            crate::pool::salvage_with_health_check(conn_for_salvage, provider_for_salvage).await;
+        });
+    }
+
+    async fn stream_successful_backend_response(
+        &self,
+        mut conn: crate::pool::ConnectionGuard,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        backend_id: BackendId,
+        params: ResponseStreamParams<'_>,
+    ) -> Result<RequestResponseMetadata, SessionError> {
+        let is_multiline_body = params
+            .request
+            .expects_multiline_response(params.status_code);
         debug!(
             client = %self.client_addr,
             backend = backend_id.as_index(),
-            command_verb = ?request.verb(),
-            first_chunk_bytes = cmd_response.bytes_read,
-            status_code = status_code.as_u16(),
+            command_verb = ?params.request.verb(),
+            first_chunk_bytes = params.first_chunk.len(),
+            status_code = params.status_code.as_u16(),
             is_multiline_body,
             "Streaming backend response to client"
         );
-        let mut conn = conn;
         let stream_ctx = streaming::StreamContext {
             client_addr: self.client_addr,
             backend_id,
             buffer_pool: &self.buffer_pool,
         };
         let bytes_written = match self
-            .stream_response_to_client(
-                &mut conn,
-                client_write,
-                &stream_ctx,
-                ResponseStreamParams {
-                    request,
-                    msg_id,
-                    status_code,
-                    first_chunk: &state.buffer[..cmd_response.bytes_read],
-                },
-            )
+            .stream_response_to_client(&mut conn, client_write, &stream_ctx, params)
             .await
         {
             Ok(bytes) => bytes,
-            Err(e) => {
-                // guard drops here → complete_command called automatically
-                // (prevents TUI in-flight count drift on streaming errors)
-                if e.must_remove_connection() {
-                    // Backend error or dirty disconnect (drain failed) —
-                    // connection in unknown state; ConnectionGuard removes from pool on drop.
-                    warn!(
-                        client = %self.client_addr,
-                        backend = backend_id.as_index(),
-                        command_verb = ?request.verb(),
-                        error = %e,
-                        "Streaming error, removing connection from pool"
-                    );
-                    self.metrics.record_error(backend_id);
-                    self.metrics.user_error(self.username());
-                } else {
-                    // Client disconnect after a fully buffered response keeps the backend
-                    // clean, but unexpected trailing bytes still make this pooled borrow
-                    // unsafe to reuse across sessions.
-                    if conn.has_leftover() {
-                        warn!(
-                            client = %self.client_addr,
-                            backend = backend_id.as_index(),
-                            command_verb = ?request.verb(),
-                            leftover_bytes = conn.leftover_len(),
-                            "Buffered direct-path response ended with trailing backend bytes; retiring connection"
-                        );
-                    } else {
-                        let _ = conn.release();
-                    }
-                }
-                // SessionError::from(StreamingError) preserves ClientDisconnect signal.
-                return Err(SessionError::from(e));
-            }
+            Err(e) => return Err(self.handle_streaming_error(conn, backend_id, params.request, e)),
         };
 
         debug!(
             client = %self.client_addr,
             backend = backend_id.as_index(),
-            msg_id = ?msg_id,
-            bytes_written = bytes_written,
+            msg_id = ?params.msg_id,
+            bytes_written,
             "Article streaming complete"
         );
         self.record_response_metrics(
             backend_id,
-            request,
-            status_code,
-            request.request_wire_len().as_u64(),
+            params.request,
+            params.status_code,
+            params.request.request_wire_len().as_u64(),
             bytes_written,
         );
+        self.release_or_retire_connection(conn, backend_id, params.request);
 
-        // Explicitly complete the guard on the success path
-        guard.complete();
+        Ok(RequestResponseMetadata::new(
+            params.status_code,
+            usize::try_from(bytes_written).unwrap_or(usize::MAX).into(),
+        ))
+    }
+
+    fn handle_streaming_error(
+        &self,
+        conn: crate::pool::ConnectionGuard,
+        backend_id: BackendId,
+        request: &RequestContext,
+        error: StreamingError,
+    ) -> SessionError {
+        if error.must_remove_connection() {
+            warn!(
+                client = %self.client_addr,
+                backend = backend_id.as_index(),
+                command_verb = ?request.verb(),
+                error = %error,
+                "Streaming error, removing connection from pool"
+            );
+            self.metrics.record_error(backend_id);
+            self.metrics.user_error(self.username());
+        } else if conn.has_leftover() {
+            warn!(
+                client = %self.client_addr,
+                backend = backend_id.as_index(),
+                command_verb = ?request.verb(),
+                leftover_bytes = conn.leftover_len(),
+                "Buffered direct-path response ended with trailing backend bytes; retiring connection"
+            );
+        } else {
+            let _ = conn.release();
+        }
+
+        SessionError::from(error)
+    }
+
+    fn release_or_retire_connection(
+        &self,
+        conn: crate::pool::ConnectionGuard,
+        backend_id: BackendId,
+        request: &RequestContext,
+    ) {
         if conn.has_leftover() {
             warn!(
                 client = %self.client_addr,
@@ -265,17 +328,8 @@ impl ClientSession {
                 "Direct per-command response left trailing backend bytes; retiring connection"
             );
         } else {
-            let _ = conn.release(); // streaming completed; connection healthy, return to pool
+            let _ = conn.release();
         }
-
-        Ok(BackendAttemptResult::success(
-            request,
-            backend_id,
-            RequestResponseMetadata::new(
-                status_code,
-                usize::try_from(bytes_written).unwrap_or(usize::MAX).into(),
-            ),
-        ))
     }
 
     /// Execute a single backend attempt - get connection and execute command

@@ -76,18 +76,30 @@ impl BufferSize {
 
     /// Create command buffer size instance
     #[must_use]
+    ///
+    /// # Panics
+    /// Panics only if the built-in command buffer constant stops satisfying the
+    /// validated `BufferSize` invariants.
     pub fn command() -> Self {
         Self::try_new(Self::COMMAND).unwrap()
     }
 
     /// Create medium buffer size instance
     #[must_use]
+    ///
+    /// # Panics
+    /// Panics only if the built-in medium buffer constant stops satisfying the
+    /// validated `BufferSize` invariants.
     pub fn medium() -> Self {
         Self::try_new(Self::MEDIUM).unwrap()
     }
 
     /// Create large buffer size instance
     #[must_use]
+    ///
+    /// # Panics
+    /// Panics only if the built-in large buffer constant stops satisfying the
+    /// validated `BufferSize` invariants.
     pub fn large() -> Self {
         Self::try_new(Self::LARGE).unwrap()
     }

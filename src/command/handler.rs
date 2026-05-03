@@ -123,15 +123,19 @@ impl CommandHandler {
     #[must_use]
     pub fn classify_request(request: &RequestContext) -> CommandAction<'_> {
         match request.kind() {
-            RequestKind::AuthInfo => {
-                if let Some(username) = strip_authinfo_arg(request.args(), b"USER") {
-                    CommandAction::InterceptAuth(AuthAction::RequestPassword(username))
-                } else if let Some(password) = strip_authinfo_arg(request.args(), b"PASS") {
-                    CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password })
-                } else {
-                    CommandAction::InterceptAuth(AuthAction::UnknownSubcommand)
-                }
-            }
+            RequestKind::AuthInfo => strip_authinfo_arg(request.args(), b"USER").map_or_else(
+                || {
+                    strip_authinfo_arg(request.args(), b"PASS").map_or(
+                        CommandAction::InterceptAuth(AuthAction::UnknownSubcommand),
+                        |password| {
+                            CommandAction::InterceptAuth(AuthAction::ValidateAndRespond {
+                                password,
+                            })
+                        },
+                    )
+                },
+                |username| CommandAction::InterceptAuth(AuthAction::RequestPassword(username)),
+            ),
             RequestKind::Capabilities => CommandAction::InterceptCapabilities,
             RequestKind::Post => CommandAction::Reject(POST_REJECT),
             RequestKind::Ihave => CommandAction::Reject(TRANSIT_REJECT),

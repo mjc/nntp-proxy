@@ -147,7 +147,8 @@ impl TrafficShare {
         if total_weight.get() > 0 {
             // Traffic share is a display percentage; routing uses the original
             // integer weights, so precision loss here cannot affect selection.
-            #[allow(clippy::cast_precision_loss)]
+            #[allow(clippy::cast_precision_loss)] // This is a display-only capacity percentage.
+            // Display-only percentage; backend weights stay in integer form.
             Self::new((max_connections as f64 / total_weight.get() as f64) * 100.0)
         } else {
             Self::new(0.0)
@@ -489,11 +490,18 @@ impl BackendSelector {
     }
 
     /// Select a backend for a client request.
+    ///
+    /// # Errors
+    /// Returns an error when no backend is currently eligible for routing.
     pub fn route(&self, client_id: ClientId) -> Result<BackendId> {
         self.route_with_availability(client_id, None)
     }
 
     /// Select a backend for a client request, optionally filtering by availability.
+    ///
+    /// # Errors
+    /// Returns an error when no backend remains eligible after applying the
+    /// optional availability filter.
     pub fn route_with_availability(
         &self,
         _client_id: ClientId,
@@ -580,7 +588,7 @@ impl BackendSelector {
     /// Returns true if acquisition succeeded (within max_connections-1 limit)
     /// Returns false if all stateful slots are taken (need to keep 1 for PCR)
     pub fn try_acquire_stateful(&self, backend_id: BackendId) -> bool {
-        if let Some(backend) = self.find_backend(backend_id) {
+        self.find_backend(backend_id).is_some_and(|backend| {
             // Get max connections from the provider's pool
             let max_connections = backend.provider.max_size();
 
@@ -609,9 +617,7 @@ impl BackendSelector {
             }
 
             acquired
-        } else {
-            false
-        }
+        })
     }
 
     /// Release a stateful connection slot

@@ -335,6 +335,10 @@ impl UnifiedCache {
     }
 
     /// Create a hybrid cache (async because foyer needs async initialization)
+    ///
+    /// # Errors
+    /// Returns any foyer setup, filesystem, or validation error from the hybrid
+    /// cache constructor.
     pub async fn hybrid(config: HybridCacheConfig) -> anyhow::Result<Self> {
         Ok(Self::Hybrid(HybridArticleCache::new(config).await?))
     }
@@ -490,6 +494,9 @@ impl UnifiedCache {
     ///
     /// For hybrid cache, this ensures all enqueued disk writes complete before returning.
     /// For memory cache, this is a no-op (no persistent state).
+    ///
+    /// # Errors
+    /// Returns any error raised while flushing and closing the hybrid disk cache.
     pub async fn close(&self) -> anyhow::Result<()> {
         match self {
             Self::Memory(_) => Ok(()), // No persistent state

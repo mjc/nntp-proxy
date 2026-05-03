@@ -15,6 +15,13 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
+fn assert_f64_eq(actual: f64, expected: f64) {
+    assert!(
+        (actual - expected).abs() < f64::EPSILON,
+        "expected {expected}, got {actual}"
+    );
+}
+
 /// Test that a healthy connection passes TCP alive check
 #[tokio::test]
 async fn test_tcp_alive_check_healthy_connection() -> Result<()> {
@@ -246,7 +253,7 @@ fn test_health_check_metrics_initialization() {
     assert_eq!(metrics.cycles_run(), 0);
     assert_eq!(metrics.connections_checked(), 0);
     assert_eq!(metrics.connections_failed(), 0);
-    assert_eq!(metrics.failure_rate(), 0.0);
+    assert_f64_eq(metrics.failure_rate(), 0.0);
 }
 
 /// Test health check metrics recording a cycle
@@ -259,7 +266,7 @@ fn test_health_check_metrics_record_cycle() {
     assert_eq!(metrics.cycles_run(), 1);
     assert_eq!(metrics.connections_checked(), 10);
     assert_eq!(metrics.connections_failed(), 2);
-    assert_eq!(metrics.failure_rate(), 0.2);
+    assert_f64_eq(metrics.failure_rate(), 0.2);
 }
 
 /// Test health check metrics multiple cycles
@@ -286,16 +293,16 @@ fn test_health_check_metrics_failure_rate_edge_cases() {
     let mut metrics = HealthCheckMetrics::new();
 
     // No checks yet
-    assert_eq!(metrics.failure_rate(), 0.0);
+    assert_f64_eq(metrics.failure_rate(), 0.0);
 
     // All pass
     metrics.record_cycle(10, 0);
-    assert_eq!(metrics.failure_rate(), 0.0);
+    assert_f64_eq(metrics.failure_rate(), 0.0);
 
     // All fail
     metrics = HealthCheckMetrics::new();
     metrics.record_cycle(5, 5);
-    assert_eq!(metrics.failure_rate(), 1.0);
+    assert_f64_eq(metrics.failure_rate(), 1.0);
 }
 
 /// Test health check metrics with only failures
@@ -309,7 +316,7 @@ fn test_health_check_metrics_all_failures() {
     assert_eq!(metrics.cycles_run(), 2);
     assert_eq!(metrics.connections_checked(), 15);
     assert_eq!(metrics.connections_failed(), 15);
-    assert_eq!(metrics.failure_rate(), 1.0);
+    assert_f64_eq(metrics.failure_rate(), 1.0);
 }
 
 /// Test DATE command is correctly formatted

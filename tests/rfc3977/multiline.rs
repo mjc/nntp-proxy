@@ -29,7 +29,7 @@ fn parse_raw_multiline_response(raw: &str) -> Vec<String> {
 
 #[test]
 fn test_dot_stuffing_rules() {
-    [
+    for (line, expected) in [
         (".", "."),
         ("..", "."),
         ("...", ".."),
@@ -43,14 +43,14 @@ fn test_dot_stuffing_rules() {
         ("End with dot.", "End with dot."),
         (" ..test", " ..test"),
         ("Hello\0World", "Hello\0World"),
-    ]
-    .into_iter()
-    .for_each(|(line, expected)| assert_eq!(unstuff_line(line), expected));
+    ] {
+        assert_eq!(unstuff_line(line), expected);
+    }
 }
 
 #[test]
 fn test_multiline_body_parsing() {
-    [
+    for (lines, expected) in [
         (
             ["Line 1", "Line 2", "Line 3", "."].as_slice(),
             vec!["Line 1", "Line 2", "Line 3"],
@@ -70,9 +70,9 @@ fn test_multiline_body_parsing() {
             vec![".", "..", "..."],
         ),
         (["Data", "."].as_slice(), vec!["Data"]),
-    ]
-    .into_iter()
-    .for_each(|(lines, expected)| assert_eq!(parse_multiline_body(lines), expected));
+    ] {
+        assert_eq!(parse_multiline_body(lines), expected);
+    }
 }
 
 #[test]
@@ -106,16 +106,16 @@ fn test_multiline_article_and_xover_shapes() {
 
 #[test]
 fn test_raw_crlf_multiline_parsing() {
-    [
+    for (raw, expected) in [
         ("Line 1\r\nLine 2\r\n.\r\n", vec!["Line 1", "Line 2"]),
         (
             "Normal\r\n..Dot-stuffed\r\n.\r\n",
             vec!["Normal", ".Dot-stuffed"],
         ),
         (".\r\n", vec![]),
-    ]
-    .into_iter()
-    .for_each(|(raw, expected)| assert_eq!(parse_raw_multiline_response(raw), expected));
+    ] {
+        assert_eq!(parse_raw_multiline_response(raw), expected);
+    }
 }
 
 #[test]
@@ -133,12 +133,10 @@ fn test_crlf_article_separator_and_terminator_format() {
 
 #[test]
 fn test_bare_and_mixed_line_endings_are_not_crlf_sequences() {
-    [("Line1\nLine2\n.\n", '\n'), ("Line1\rLine2\r.\r", '\r')]
-        .into_iter()
-        .for_each(|(raw, separator)| {
-            assert_eq!(raw.split("\r\n").filter(|s| !s.is_empty()).count(), 1);
-            assert_eq!(raw.split(separator).filter(|s| !s.is_empty()).count(), 3);
-        });
+    for (raw, separator) in [("Line1\nLine2\n.\n", '\n'), ("Line1\rLine2\r.\r", '\r')] {
+        assert_eq!(raw.split("\r\n").filter(|s| !s.is_empty()).count(), 1);
+        assert_eq!(raw.split(separator).filter(|s| !s.is_empty()).count(), 3);
+    }
 
     let mixed = "Line1\r\nLine2\nLine3\r\n.\r\n";
     let crlf_lines = mixed
@@ -157,7 +155,7 @@ fn test_protocol_constants() {
 
 #[test]
 fn test_tail_buffer_terminator_detection() {
-    [
+    for (response, found) in [
         (
             b"220 Article follows\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".as_slice(),
             true,
@@ -170,14 +168,12 @@ fn test_tail_buffer_terminator_detection() {
             b"222 Body\r\n..Content starting with dot\r\n.\r\n".as_slice(),
             true,
         ),
-    ]
-    .into_iter()
-    .for_each(|(response, found)| {
+    ] {
         assert_eq!(
             TailBuffer::default().detect_terminator(response).is_found(),
             found
         );
-    });
+    }
 
     let response = b"222 Body\r\n..Content starting with dot\r\n.\r\n";
     let body_start = b"222 Body\r\n".len();

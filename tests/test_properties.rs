@@ -4,9 +4,12 @@
 //! using property-based testing with arbitrary input generation.
 use nntp_proxy::cache::ArticleAvailability;
 use nntp_proxy::cache::ttl::{CacheTier, CacheTtlMillis, effective_ttl};
-use nntp_proxy::protocol::{RequestContext, RequestRouteClass, StatusCode};
-use nntp_proxy::types::MessageId;
+use nntp_proxy::protocol::{Headers, RequestContext, RequestRouteClass, StatusCode};
+use nntp_proxy::router::BackendCount;
+use nntp_proxy::session::streaming::tail_buffer::TailBuffer;
+use nntp_proxy::types::{BackendId, MessageId};
 use proptest::prelude::*;
+use std::fmt::Write as _;
 
 const fn effective_ttl_ms(base_ttl: u64, tier: CacheTier) -> u64 {
     effective_ttl(CacheTtlMillis::new(base_ttl), tier).get()
@@ -91,18 +94,18 @@ proptest! {
     ) {
         let mut avail = ArticleAvailability::new();
         for (backend_id, op) in ops {
-            let id = nntp_proxy::types::BackendId::from_index(backend_id as usize);
-            match op {
-                0 => { avail.record_missing(id); }
-                _ => { avail.record_has(id); }
+            let id = BackendId::from_index(usize::from(backend_id));
+            if op == 0 {
+                avail.record_missing(id);
+            } else {
+                avail.record_has(id);
             }
         }
     }
 
     #[test]
     fn prop_record_missing_idempotent(backend_id in 0..8u8) {
-        use nntp_proxy::types::BackendId;
-        let id = BackendId::from_index(backend_id as usize);
+        let id = BackendId::from_index(usize::from(backend_id));
         let mut avail1 = ArticleAvailability::new();
         let mut avail2 = ArticleAvailability::new();
 
@@ -116,8 +119,7 @@ proptest! {
 
     #[test]
     fn prop_record_has_clears_missing(backend_id in 0..8u8) {
-        use nntp_proxy::types::BackendId;
-        let id = BackendId::from_index(backend_id as usize);
+        let id = BackendId::from_index(usize::from(backend_id));
         let mut avail = ArticleAvailability::new();
 
         avail.record_missing(id);
@@ -129,8 +131,7 @@ proptest! {
 
     #[test]
     fn prop_should_try_inverse_of_is_missing(backend_id in 0..8u8) {
-        use nntp_proxy::types::BackendId;
-        let id = BackendId::from_index(backend_id as usize);
+        let id = BackendId::from_index(usize::from(backend_id));
         let mut avail = ArticleAvailability::new();
 
         // Initially should_try is true, is_missing is false
@@ -149,8 +150,6 @@ proptest! {
     fn prop_all_exhausted_consistency(
         num_backends in 1..=8usize
     ) {
-        use nntp_proxy::types::BackendId;
-        use nntp_proxy::router::BackendCount;
         let mut avail = ArticleAvailability::new();
         let count = BackendCount::new(num_backends);
 
@@ -499,8 +498,6 @@ proptest! {
 // 8. Headers::parse - RFC parser robustness
 // =============================================================================
 
-use nntp_proxy::protocol::Headers;
-
 proptest! {
     #[test]
     fn prop_headers_parse_never_panics(data in prop::collection::vec(any::<u8>(), 0..200)) {
@@ -550,7 +547,7 @@ proptest! {
         let count = names.len().min(values.len());
         let mut raw = String::new();
         for i in 0..count {
-            raw.push_str(&format!("{}: {}\r\n", names[i], values[i]));
+            writeln!(&mut raw, "{}: {}", names[i], values[i]).expect("writing to String cannot fail");
         }
 
         if let Ok(headers) = Headers::parse(raw.as_bytes()) {
@@ -649,7 +646,7 @@ proptest! {
 
         // With equal weights, each backend should get roughly 50% of requests
         // Allow 30% tolerance for small sample sizes
-        let min_expected = (num_requests as f64 * 0.20) as usize;
+        let min_expected = num_requests / 5;
         prop_assert!(count0 >= min_expected,
             "Backend 0 got {} out of {} requests, expected at least {}",
             count0, num_requests, min_expected);
@@ -700,7 +697,6 @@ proptest! {
         );
 
         // Terminator detection should find the real terminator, not a false positive
-        use nntp_proxy::session::streaming::tail_buffer::TailBuffer;
         let tail = TailBuffer::default();
         let status = tail.detect_terminator(data);
         prop_assert!(status.is_found(),
@@ -712,8 +708,6 @@ proptest! {
         data in prop::collection::vec(any::<u8>(), 0..500)
     ) {
         // TailBuffer::detect_terminator result should match naive memmem::find
-        use nntp_proxy::session::streaming::tail_buffer::TailBuffer;
-
         let tail = TailBuffer::default();
         let status = tail.detect_terminator(&data);
 

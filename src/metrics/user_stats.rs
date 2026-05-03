@@ -3,7 +3,7 @@
 use crate::metrics::types::{CommandCount, ErrorCount};
 use crate::types::{BytesPerSecondRate, BytesReceived, BytesSent, TotalConnections};
 
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss)] // User error percentages are display metrics derived from exact counters.
 const fn count_as_f64_for_rate(value: u64) -> f64 {
     // User error rates are derived display metrics. The underlying counters
     // remain exact integers; floating point is only used for the percentage.

@@ -4,6 +4,13 @@ use nntp_proxy::metrics::UserStats;
 use nntp_proxy::metrics::types::{CommandCount, ErrorCount};
 use nntp_proxy::types::{BytesPerSecondRate, BytesReceived, BytesSent, TotalConnections};
 
+fn assert_f64_eq(actual: f64, expected: f64) {
+    assert!(
+        (actual - expected).abs() < f64::EPSILON,
+        "expected {expected}, got {actual}"
+    );
+}
+
 #[test]
 fn test_user_stats_new() {
     let stats = UserStats::new("testuser");
@@ -110,7 +117,7 @@ fn test_error_rate_percent_no_commands() {
     };
 
     // Zero commands should return 0% error rate (avoid division by zero)
-    assert_eq!(stats.error_rate_percent(), 0.0);
+    assert_f64_eq(stats.error_rate_percent(), 0.0);
 }
 
 #[test]
@@ -122,7 +129,7 @@ fn test_error_rate_percent_no_errors() {
         ..Default::default()
     };
 
-    assert_eq!(stats.error_rate_percent(), 0.0);
+    assert_f64_eq(stats.error_rate_percent(), 0.0);
 }
 
 #[test]
@@ -134,7 +141,7 @@ fn test_error_rate_percent_some_errors() {
         ..Default::default()
     };
 
-    assert_eq!(stats.error_rate_percent(), 5.0);
+    assert_f64_eq(stats.error_rate_percent(), 5.0);
 }
 
 #[test]
@@ -146,7 +153,7 @@ fn test_error_rate_percent_all_errors() {
         ..Default::default()
     };
 
-    assert_eq!(stats.error_rate_percent(), 100.0);
+    assert_f64_eq(stats.error_rate_percent(), 100.0);
 }
 
 #[test]

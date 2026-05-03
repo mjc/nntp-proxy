@@ -36,36 +36,32 @@ fn auth_handler(username: &str, password: &str) -> Arc<AuthHandler> {
 
 #[tokio::test]
 async fn test_auth_handler_enabled_state() {
-    [
+    for (username, password, enabled) in [
         (None, None, false),
         (Some("user"), Some("pass"), true),
         (Some("user"), None, false),
         (None, Some("pass"), false),
-    ]
-    .into_iter()
-    .for_each(|(username, password, enabled)| {
+    ] {
         let handler = AuthHandler::new(
             username.map(ToOwned::to_owned),
             password.map(ToOwned::to_owned),
         )
         .unwrap();
         assert_eq!(handler.is_enabled(), enabled);
-    });
+    }
 }
 
 #[tokio::test]
 async fn test_auth_handler_validates_credentials() {
     let handler = auth_handler("alice", "secret123");
-    [
+    for (username, password, valid) in [
         ("alice", "secret123", true),
         ("alice", "wrongpass", false),
         ("bob", "secret123", false),
         ("bob", "wrongpass", false),
-    ]
-    .into_iter()
-    .for_each(|(username, password, valid)| {
+    ] {
         assert_eq!(handler.validate_credentials(username, password), valid);
-    });
+    }
 }
 
 #[tokio::test]
@@ -101,16 +97,14 @@ async fn test_auth_handler_empty_string_credentials() {
 #[tokio::test]
 async fn test_auth_handler_case_sensitive() {
     let handler = auth_handler("Alice", "Secret");
-    [
+    for (username, password, valid) in [
         ("Alice", "Secret", true),
         ("alice", "Secret", false),
         ("Alice", "secret", false),
         ("ALICE", "SECRET", false),
-    ]
-    .into_iter()
-    .for_each(|(username, password, valid)| {
+    ] {
         assert_eq!(handler.validate_credentials(username, password), valid);
-    });
+    }
 }
 
 #[tokio::test]
@@ -138,52 +132,50 @@ async fn test_auth_handler_unicode_credentials() {
 
 #[tokio::test]
 async fn test_auth_handler_debug_output() {
-    [
+    for (handler, enabled) in [
         (auth_handler("supersecret", "topsecretpassword"), true),
         (Arc::new(AuthHandler::new(None, None).unwrap()), false),
-    ]
-    .into_iter()
-    .for_each(|(handler, enabled)| {
+    ] {
         let debug_output = format!("{handler:?}");
         assert!(!debug_output.contains("supersecret"));
         assert!(!debug_output.contains("topsecretpassword"));
         assert!(debug_output.contains("AuthHandler"));
         assert!(debug_output.contains(&format!("enabled: {enabled}")));
-    });
+    }
 }
 
 #[tokio::test]
 async fn test_auth_command_sequence_valid() {
-    [
+    for (command, expected, is_user) in [
         ("AUTHINFO USER alice\r\n", "alice", true),
         ("AUTHINFO PASS secret\r\n", "secret", false),
-    ]
-    .into_iter()
-    .for_each(|(command, expected, is_user)| match classify(command) {
-        CommandAction::InterceptAuth(AuthAction::RequestPassword(username)) if is_user => {
-            assert_eq!(username, expected);
+    ] {
+        match classify(command) {
+            CommandAction::InterceptAuth(AuthAction::RequestPassword(username)) if is_user => {
+                assert_eq!(username, expected);
+            }
+            CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password })
+                if !is_user =>
+            {
+                assert_eq!(password, expected);
+            }
+            action => panic!("unexpected auth action: {action:?}"),
         }
-        CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { password }) if !is_user => {
-            assert_eq!(password, expected);
-        }
-        action => panic!("unexpected auth action: {action:?}"),
-    });
+    }
 }
 
 #[tokio::test]
 async fn test_auth_responses_are_valid_nntp() {
     let handler = auth_handler("user", "pass");
 
-    [
+    for (response, prefix) in [
         (handler.user_response(), "381"),
         (handler.pass_response(), "281"),
-    ]
-    .into_iter()
-    .for_each(|(response, prefix)| {
+    ] {
         let response = String::from_utf8_lossy(response);
         assert!(response.starts_with(prefix));
         assert!(response.ends_with("\r\n"));
-    });
+    }
 }
 
 #[tokio::test]
@@ -231,9 +223,9 @@ async fn test_reject_response_formatting() {
 
 #[tokio::test]
 async fn test_command_classification_for_stateless() {
-    ["ARTICLE <msgid@example.com>\r\n", "LIST\r\n"]
-        .into_iter()
-        .for_each(|command| assert_eq!(classify(command), CommandAction::ForwardStateless));
+    for command in ["ARTICLE <msgid@example.com>\r\n", "LIST\r\n"] {
+        assert_eq!(classify(command), CommandAction::ForwardStateless);
+    }
 }
 
 #[tokio::test]
@@ -278,7 +270,7 @@ async fn test_session_with_disabled_auth() {
 async fn test_config_client_auth_enabled_state() {
     use nntp_proxy::config::{ClientAuth, UserCredentials};
 
-    [
+    for (config, enabled) in [
         (
             ClientAuth {
                 users: vec![UserCredentials {
@@ -297,9 +289,9 @@ async fn test_config_client_auth_enabled_state() {
             false,
         ),
         (ClientAuth::default(), false),
-    ]
-    .into_iter()
-    .for_each(|(config, enabled)| assert_eq!(config.is_enabled(), enabled));
+    ] {
+        assert_eq!(config.is_enabled(), enabled);
+    }
 }
 
 #[tokio::test]
@@ -403,19 +395,19 @@ async fn test_auth_with_whitespace_only_command() {
 
 #[tokio::test]
 async fn test_auth_case_variations() {
-    [
+    for (command, is_user) in [
         ("AUTHINFO USER test\r\n", true),
         ("authinfo user test\r\n", true),
         ("Authinfo user test\r\n", true),
         ("AUTHINFO PASS secret\r\n", false),
         ("authinfo pass secret\r\n", false),
-    ]
-    .into_iter()
-    .for_each(|(command, is_user)| match classify(command) {
-        CommandAction::InterceptAuth(AuthAction::RequestPassword(_)) if is_user => {}
-        CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { .. }) if !is_user => {}
-        action => panic!("unexpected auth action for {command:?}: {action:?}"),
-    });
+    ] {
+        match classify(command) {
+            CommandAction::InterceptAuth(AuthAction::RequestPassword(_)) if is_user => {}
+            CommandAction::InterceptAuth(AuthAction::ValidateAndRespond { .. }) if !is_user => {}
+            action => panic!("unexpected auth action for {command:?}: {action:?}"),
+        }
+    }
 }
 
 #[tokio::test]

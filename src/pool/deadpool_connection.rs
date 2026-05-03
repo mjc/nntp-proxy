@@ -75,6 +75,9 @@ impl TcpManager {
     /// If `options.tls_config` is `Some` with `use_tls = true`, the TLS manager is
     /// pre-initialized (certificates loaded). If `None` or `use_tls = false`,
     /// plain TCP connections are used.
+    ///
+    /// # Errors
+    /// Returns any TLS initialization error when TLS is enabled for the manager.
     pub fn new(
         host: String,
         port: u16,

@@ -5,7 +5,7 @@
 
 // Each integration test crate compiles `mod test_helpers;` independently, so
 // some shared helpers are intentionally unused in any given test target.
-#![allow(dead_code)]
+#![allow(dead_code)] // Shared helpers are intentionally unused in some integration-test crates.
 
 use anyhow::Result;
 use nntp_proxy::NntpProxy;
@@ -80,12 +80,10 @@ impl MockNntpServer {
                 let mut pending = bytes::BytesMut::new();
                 let mut buffer = [0; 1024];
 
-                loop {
-                    let n = match stream.read(&mut buffer).await {
-                        Ok(0) => break,
-                        Ok(n) => n,
-                        Err(_) => break,
-                    };
+                while let Ok(n) = stream.read(&mut buffer).await {
+                    if n == 0 {
+                        break;
+                    }
 
                     pending.extend_from_slice(&buffer[..n]);
 
@@ -200,6 +198,10 @@ impl MockNntpServer {
         .abort_handle()
     }
 
+    /// Spawn the mock server on a pre-bound listener.
+    ///
+    /// The returned [`AbortHandle`] can be used to stop the server task.
+    #[must_use]
     pub fn spawn_on_listener(self, listener: TcpListener) -> AbortHandle {
         self.spawn_with_listener(listener)
     }
@@ -262,6 +264,9 @@ pub fn spawn_mock_server(port: u16, server_name: &str) -> AbortHandle {
 /// let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
 /// spawn_test_proxy(proxy, 8119, true).await;
 /// ```
+///
+/// # Panics
+/// Panics if the test proxy cannot bind to the requested loopback port.
 pub async fn spawn_test_proxy(proxy: NntpProxy, port: u16, per_command_routing: bool) {
     let proxy_addr = format!("127.0.0.1:{port}");
     let listener = TcpListener::bind(&proxy_addr).await.unwrap();
@@ -288,6 +293,9 @@ pub async fn spawn_test_proxy(proxy: NntpProxy, port: u16, per_command_routing: 
 ///
 /// Binds to 127.0.0.1:0 to let the OS assign a random available port,
 /// then immediately releases it for use by the caller.
+///
+/// # Errors
+/// Returns any bind or local-address error from the OS.
 pub async fn get_available_port() -> Result<u16> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
@@ -295,7 +303,10 @@ pub async fn get_available_port() -> Result<u16> {
     Ok(port)
 }
 
-/// Create a test configuration with servers on the given ports
+/// Create a test configuration with servers on the given ports.
+///
+/// # Panics
+/// Panics if any supplied port or generated server config is invalid.
 #[must_use]
 pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
     use nntp_proxy::types::{MaxConnections, Port};
@@ -323,8 +334,8 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
 /// * `addr` - Address to connect to (e.g., "127.0.0.1:8080")
 /// * `max_attempts` - Maximum number of connection attempts
 ///
-/// # Returns
-/// Ok(()) if connection succeeds, Err otherwise
+/// # Errors
+/// Returns an error if the server never becomes reachable within the allotted attempts.
 pub async fn wait_for_server(addr: &str, max_attempts: u32) -> Result<()> {
     for attempt in 1..=max_attempts {
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -360,6 +371,9 @@ pub async fn wait_for_server(addr: &str, max_attempts: u32) -> Result<()> {
 /// let pool = create_test_buffer_pool();
 /// let session = ClientSession::new(addr.into(), pool, auth_handler);
 /// ```
+///
+/// # Panics
+/// Panics if the built-in test buffer size stops satisfying validation.
 #[must_use]
 pub fn create_test_buffer_pool() -> nntp_proxy::pool::BufferPool {
     use nntp_proxy::pool::BufferPool;
@@ -368,13 +382,19 @@ pub fn create_test_buffer_pool() -> nntp_proxy::pool::BufferPool {
     BufferPool::new(BufferSize::try_new(8192).unwrap(), 4)
 }
 
-/// Create a test auth handler with standard credentials (user/pass)
+/// Create a test auth handler with standard credentials (user/pass).
+///
+/// # Panics
+/// Panics if constructing the test auth handler fails.
 #[must_use]
 pub fn create_test_auth_handler() -> std::sync::Arc<nntp_proxy::auth::AuthHandler> {
     create_test_auth_handler_with("user", "pass")
 }
 
-/// Create a test auth handler with custom credentials
+/// Create a test auth handler with custom credentials.
+///
+/// # Panics
+/// Panics if constructing the test auth handler fails.
 #[must_use]
 pub fn create_test_auth_handler_with(
     username: &str,
@@ -386,7 +406,10 @@ pub fn create_test_auth_handler_with(
     )
 }
 
-/// Create a disabled (no-auth) test auth handler
+/// Create a disabled (no-auth) test auth handler.
+///
+/// # Panics
+/// Panics if constructing the disabled test auth handler fails.
 #[must_use]
 pub fn create_test_auth_handler_disabled() -> std::sync::Arc<nntp_proxy::auth::AuthHandler> {
     std::sync::Arc::new(nntp_proxy::auth::AuthHandler::new(None, None).unwrap())
@@ -407,6 +430,9 @@ pub fn create_test_router() -> std::sync::Arc<nntp_proxy::router::BackendSelecto
 /// let addr = create_test_addr();
 /// let session = ClientSession::new(addr.into(), pool, auth);
 /// ```
+///
+/// # Panics
+/// Panics if the built-in loopback socket address literal becomes invalid.
 #[must_use]
 pub fn create_test_addr() -> std::net::SocketAddr {
     "127.0.0.1:9999".parse().unwrap()
@@ -426,6 +452,9 @@ pub fn create_test_addr() -> std::net::SocketAddr {
 /// 5. Waiting for everything to be ready
 ///
 /// Returns: (`proxy_port`, Vec<`backend_port`>, Vec<`mock_handles`>)
+///
+/// # Errors
+/// Returns any listener bind, address lookup, or proxy construction error.
 pub async fn setup_proxy_with_backends(
     backend_configs: Vec<(&str, bool)>, // (name, has_article)
     routing_mode: nntp_proxy::RoutingMode,
@@ -485,15 +514,12 @@ pub async fn setup_proxy_with_backends(
                 let mode = routing_mode;
                 tokio::spawn(async move {
                     use nntp_proxy::RoutingMode;
-                    let result = match mode {
-                        RoutingMode::PerCommand | RoutingMode::Hybrid => {
-                            proxy_clone
-                                .handle_client_per_command_routing(stream, addr.into())
-                                .await
-                        }
-                        RoutingMode::Stateful => {
-                            proxy_clone.handle_client(stream, addr.into()).await
-                        }
+                    let result = if matches!(mode, RoutingMode::PerCommand | RoutingMode::Hybrid) {
+                        proxy_clone
+                            .handle_client_per_command_routing(stream, addr.into())
+                            .await
+                    } else {
+                        proxy_clone.handle_client(stream, addr.into()).await
                     };
                     if let Err(e) = result {
                         eprintln!("Proxy error handling client: {e}");
@@ -508,7 +534,10 @@ pub async fn setup_proxy_with_backends(
     Ok((proxy_port, backend_ports, mock_handles))
 }
 
-/// Connect to proxy and read greeting
+/// Connect to proxy and read greeting.
+///
+/// # Errors
+/// Returns any connection or read error, or an error if the greeting is unexpected.
 pub async fn connect_and_read_greeting(proxy_port: u16) -> Result<tokio::net::TcpStream> {
     use tokio::io::AsyncBufReadExt;
 
@@ -527,6 +556,9 @@ pub async fn connect_and_read_greeting(proxy_port: u16) -> Result<tokio::net::Tc
 }
 
 /// Send ARTICLE command and read its multiline response.
+///
+/// # Errors
+/// Returns any socket read/write error while exchanging the ARTICLE command.
 pub async fn send_article_read_multiline_response(
     stream: &mut tokio::net::TcpStream,
     message_id: &str,
@@ -569,7 +601,10 @@ pub async fn send_article_read_multiline_response(
 // compiles test_helpers.rs as a module, they appear "unused" in some compilations.
 // This is expected behavior for the `mod test_helpers;` pattern.
 
-/// Create a basic server configuration for testing (no TLS)
+/// Create a basic server configuration for testing (no TLS).
+///
+/// # Panics
+/// Panics if the supplied port or generated server config is invalid.
 #[must_use]
 pub fn create_test_server_config(host: &str, port: u16, name: &str) -> Server {
     Server::builder(host, Port::try_new(port).unwrap())
@@ -579,7 +614,10 @@ pub fn create_test_server_config(host: &str, port: u16, name: &str) -> Server {
         .expect("Valid server config")
 }
 
-/// Create a server configuration with authentication
+/// Create a server configuration with authentication.
+///
+/// # Panics
+/// Panics if the supplied port or generated server config is invalid.
 #[must_use]
 pub fn create_test_server_config_with_auth(
     host: &str,
@@ -597,7 +635,10 @@ pub fn create_test_server_config_with_auth(
         .expect("Valid server config")
 }
 
-/// Create a TLS-enabled server configuration
+/// Create a TLS-enabled server configuration.
+///
+/// # Panics
+/// Panics if the supplied port or generated server config is invalid.
 #[must_use]
 pub fn create_test_server_config_with_tls(
     host: &str,
@@ -619,7 +660,10 @@ pub fn create_test_server_config_with_tls(
     builder.build().expect("Valid server config")
 }
 
-/// Create a server configuration with custom `max_connections`
+/// Create a server configuration with custom `max_connections`.
+///
+/// # Panics
+/// Panics if the supplied port, max-connections value, or server config is invalid.
 #[must_use]
 pub fn create_test_server_config_with_max_connections(
     host: &str,
@@ -634,7 +678,10 @@ pub fn create_test_server_config_with_max_connections(
         .expect("Valid server config")
 }
 
-/// Create a full Config with client authentication enabled
+/// Create a full Config with client authentication enabled.
+///
+/// # Panics
+/// Panics if any generated backend server config is invalid.
 #[must_use]
 pub fn create_test_config_with_auth(
     backend_ports: Vec<u16>,

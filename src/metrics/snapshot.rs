@@ -3,7 +3,7 @@
 //! Contains the immutable `MetricsSnapshot` struct with functional methods
 //! for querying and aggregating metrics across backends.
 
-#![allow(clippy::cast_precision_loss, clippy::float_cmp)]
+#![allow(clippy::cast_precision_loss, clippy::float_cmp)] // Snapshot rates are presentation values; tests use exact deterministic fixtures.
 
 // Snapshot rates are presentation/monitoring values, and the tests exercise
 // exact deterministic fixtures rather than fuzzy comparisons.

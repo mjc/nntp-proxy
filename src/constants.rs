@@ -30,7 +30,8 @@ pub mod buffer {
     /// This is a conservative default; increase via config for higher concurrency
     pub const POOL_COUNT: usize = 50;
 
-    /// Size of each capture buffer (772KB, page-aligned)
+    /// Size of each capture buffer (772KB, page-aligned).
+    ///
     /// Sized to capture typical yEnc articles plus NNTP framing without
     /// reallocation. The extra 4KB avoids needless growth when payloads are
     /// near 768KB and only exceed it by status-line/terminator overhead.

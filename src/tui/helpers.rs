@@ -26,6 +26,7 @@ const SPARKLINE_WIDTH: usize = 15;
 ///
 /// # Returns
 /// A string of length `SPARKLINE_WIDTH` with filled/empty blocks
+// Sparkline fill count is a bounded UI-only conversion from integer percentages.
 #[allow(
     clippy::cast_precision_loss,
     clippy::cast_possible_truncation,

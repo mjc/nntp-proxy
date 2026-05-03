@@ -131,20 +131,25 @@ fn pin_to_cpu_cores(_num_cores: usize) {
 
 /// Wait for shutdown signal (Ctrl+C or SIGTERM on Unix)
 ///
-/// This is a common utility for all binary targets.
+/// This is a common utility for all binary targets. Handler installation
+/// failures are logged and treated as an immediate shutdown signal.
 pub async fn shutdown_signal() {
+    use tracing::warn;
+
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C handler");
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            warn!("Failed to install Ctrl+C handler: {error}");
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("Failed to install signal handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => warn!("Failed to install SIGTERM handler: {error}"),
+        }
     };
 
     #[cfg(not(unix))]
@@ -330,6 +335,10 @@ pub fn spawn_shutdown_handler(
 /// `MetricsCollector::save_to_disk` uses `std::fs`, so callers from async
 /// tasks should delegate here instead of running filesystem work on a runtime
 /// worker.
+///
+/// # Errors
+/// Returns an error if the blocking task panics/cancels or if writing the
+/// metrics JSON fails.
 pub async fn save_metrics_to_disk_blocking(
     metrics: crate::metrics::MetricsCollector,
     stats_path: std::path::PathBuf,
@@ -409,15 +418,16 @@ pub fn resolve_stats_file_path(
 ) -> std::path::PathBuf {
     use std::path::Path;
 
-    if let Some(path) = configured_path {
-        path.clone()
-    } else {
-        // Default to stats.json alongside config file
-        let config_dir = Path::new(config_path)
-            .parent()
-            .unwrap_or_else(|| Path::new("."));
-        config_dir.join("stats.json")
-    }
+    configured_path.map_or_else(
+        || {
+            // Default to stats.json alongside config file
+            let config_dir = Path::new(config_path)
+                .parent()
+                .unwrap_or_else(|| Path::new("."));
+            config_dir.join("stats.json")
+        },
+        std::clone::Clone::clone,
+    )
 }
 
 /// Load metrics from disk if the stats file exists
@@ -495,10 +505,10 @@ pub fn spawn_idle_connection_clearer(proxy: &std::sync::Arc<crate::NntpProxy>) {
     use std::sync::Arc;
     use std::time::Duration;
 
-    let proxy = Arc::clone(proxy);
-
     /// How often to check for idle backends
     const CHECK_INTERVAL: Duration = Duration::from_mins(1);
+
+    let proxy = Arc::clone(proxy);
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(CHECK_INTERVAL);

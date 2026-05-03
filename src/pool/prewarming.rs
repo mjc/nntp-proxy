@@ -68,6 +68,10 @@ async fn prewarm_single_pool(
 
 /// Prewarm all connection pools before accepting clients
 /// Creates all connections concurrently across all pools
+///
+/// # Errors
+/// Returns any task join failure or backend prewarming error from the
+/// underlying providers.
 pub async fn prewarm_pools(
     providers: &[DeadpoolConnectionProvider],
     servers: &[Server],

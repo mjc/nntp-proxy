@@ -162,7 +162,7 @@ pub const fn replacement_cooldown() -> Duration {
 
 /// Default connection replacement cooldown option (Some(30 seconds))
 #[inline]
-#[allow(clippy::unnecessary_wraps)]
+#[allow(clippy::unnecessary_wraps)] // Config defaults model an optional field even when the default is always present.
 pub const fn replacement_cooldown_option() -> Option<Duration> {
     // This mirrors optional config fields and keeps the default plumbing
     // uniform even though the default itself is always present.

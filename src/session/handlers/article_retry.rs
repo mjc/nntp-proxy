@@ -3,6 +3,7 @@
 //! Handles routing article commands across backends, using `ArticleAvailability`
 //! to skip backends that have already returned 430 for a given article.
 
+use crate::cache::ArticleAvailability;
 use crate::router::backend_queue::QueuedContext;
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::ClientSession;
@@ -49,6 +50,32 @@ enum BatchStep {
     /// Backend/protocol failure; caller must close the client session and remove
     /// the backend connection. It is not safe to synthesize article responses.
     BackendDead,
+}
+
+/// Outcome of writing a validated backend response to the client.
+enum BatchWriteOutcome {
+    /// Response bytes were written successfully.
+    Written(u64),
+    /// Processing must stop with the returned step.
+    Step(BatchStep),
+}
+
+/// Client-side write state shared across cache, precheck, pipeline, and direct routing paths.
+struct RequestExecutionIo<'a, 'b> {
+    client_write: &'a mut tokio::net::tcp::WriteHalf<'b>,
+    client_to_backend_bytes: &'a mut ClientToBackendBytes,
+    backend_to_client_bytes: &'a mut BackendToClientBytes,
+}
+
+/// Result of preparing a request before pipeline/direct backend execution.
+enum PreparedRequest {
+    /// The response was already written to the client.
+    Served,
+    /// Continue with backend routing using the resolved message ID and availability.
+    Continue {
+        msg_id: Option<crate::types::MessageId<'static>>,
+        availability: Option<ArticleAvailability>,
+    },
 }
 
 impl ClientSession {
@@ -196,16 +223,80 @@ impl ClientSession {
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         state: &mut BatchPipelineState<'_>,
     ) -> Result<BatchStep> {
-        use crate::session::routing::{MetricsAction, determine_metrics_action_for_request};
-        use crate::session::{backend, streaming};
+        use crate::session::backend;
 
         let backend_id = bcc.backend_id;
         let request = batch.context(idx);
         let msg_id = request.message_id_value();
-        let leftover = &mut bcc.leftover;
-        let chunk_data = &mut bcc.chunk_data;
+        let from_leftover = match self.read_batch_response_chunk(batch, idx, bcc).await {
+            Ok(from_leftover) => from_leftover,
+            Err(step) => return Ok(step),
+        };
+        let chunk_data = &mut *bcc.chunk_data;
+        let chunk = &chunk_data[..];
 
-        // --- Read first chunk (from leftover or fresh read) ---
+        // --- Validate response ---
+        let validated =
+            backend::parse_backend_status(chunk, chunk.len(), crate::protocol::MIN_RESPONSE_LENGTH);
+        let Some(status_code) = validated.status_code else {
+            self.log_invalid_batch_response(request, idx, batch, backend_id, chunk, from_leftover);
+            return Ok(BatchStep::BackendDead);
+        };
+        let is_multiline_body = request.expects_multiline_response(status_code);
+
+        // --- Handle 430 (article not found on this backend) ---
+        if status_code.as_u16() == 430 {
+            return self
+                .handle_batch_not_found(
+                    request,
+                    msg_id,
+                    is_multiline_body,
+                    bcc,
+                    client_write,
+                    state,
+                )
+                .await;
+        }
+
+        // --- Success: stream response to client ---
+        *state.client_to_backend_bytes = state
+            .client_to_backend_bytes
+            .add(request.request_wire_len().get());
+
+        let bytes_written = match self
+            .write_batch_success_response(batch, idx, bcc, client_write, is_multiline_body)
+            .await?
+        {
+            BatchWriteOutcome::Written(bytes) => bytes,
+            BatchWriteOutcome::Step(step) => return Ok(step),
+        };
+
+        *state.backend_to_client_bytes = state.backend_to_client_bytes.add_u64(bytes_written);
+
+        self.record_batch_response_metrics(request, backend_id, status_code, bytes_written);
+
+        Ok(BatchStep::Continue)
+    }
+
+    async fn read_batch_response_chunk(
+        &self,
+        batch: &RequestBatch,
+        idx: usize,
+        bcc: &mut BatchConnContext<'_>,
+    ) -> std::result::Result<bool, BatchStep> {
+        let BatchConnContext {
+            conn,
+            backend_id,
+            buffer,
+            leftover,
+            chunk_data,
+        } = bcc;
+        let backend_id = *backend_id;
+        let conn = &mut ***conn;
+        let buffer = &mut **buffer;
+        let leftover = &mut **leftover;
+        let chunk_data = &mut **chunk_data;
+
         chunk_data.clear();
         let from_leftover = !leftover.is_empty();
         if from_leftover {
@@ -216,15 +307,15 @@ impl ClientSession {
             debug!(
                 client = %self.client_addr,
                 backend = ?backend_id,
-                idx = idx,
-                leftover_len = leftover_len,
+                idx,
+                leftover_len,
                 leftover_hex = %leftover_hex,
                 "Batch response starting from leftover bytes"
             );
         } else {
-            match bcc.buffer.read_from(&mut **bcc.conn).await {
+            match buffer.read_from(conn).await {
                 Ok(bytes_read) if bytes_read > 0 => {
-                    chunk_data.extend_from_slice(&bcc.buffer[..bytes_read]);
+                    chunk_data.extend_from_slice(&buffer[..bytes_read]);
                 }
                 Ok(_) => {
                     warn!(
@@ -234,9 +325,7 @@ impl ClientSession {
                         total_commands = batch.len(),
                         "Backend EOF during batch read; closing client connection"
                     );
-                    // Backend dead — unconditional remove (write/flush already succeeded,
-                    // so this is a backend-side failure, not a client disconnect).
-                    return Ok(BatchStep::BackendDead);
+                    return Err(BatchStep::BackendDead);
                 }
                 Err(e) => {
                     warn!(
@@ -247,17 +336,39 @@ impl ClientSession {
                         error = %e,
                         "Backend read error during batch; closing client connection"
                     );
-                    // Backend dead — unconditional remove.
-                    return Ok(BatchStep::BackendDead);
+                    return Err(BatchStep::BackendDead);
                 }
             }
         }
 
-        // --- Read through the complete status line before classifying ---
-        while backend::status_line_end(chunk_data).is_none() {
-            match bcc.buffer.read_from(&mut **bcc.conn).await {
+        match self.extend_batch_status_line(idx, bcc).await {
+            Ok(()) => {}
+            Err(step) => return Err(step),
+        }
+        Ok(from_leftover)
+    }
+
+    async fn extend_batch_status_line(
+        &self,
+        idx: usize,
+        bcc: &mut BatchConnContext<'_>,
+    ) -> std::result::Result<(), BatchStep> {
+        let BatchConnContext {
+            conn,
+            backend_id,
+            buffer,
+            chunk_data,
+            ..
+        } = bcc;
+        let backend_id = *backend_id;
+        let conn = &mut ***conn;
+        let buffer = &mut **buffer;
+        let chunk_data = &mut **chunk_data;
+
+        while crate::session::backend::status_line_end(chunk_data).is_none() {
+            match buffer.read_from(conn).await {
                 Ok(bytes_read) if bytes_read > 0 => {
-                    chunk_data.extend_from_slice(&bcc.buffer[..bytes_read]);
+                    chunk_data.extend_from_slice(&buffer[..bytes_read]);
                 }
                 Ok(_) => {
                     warn!(
@@ -267,8 +378,7 @@ impl ClientSession {
                         partial_bytes = chunk_data.len(),
                         "Backend EOF before complete status line; closing client connection"
                     );
-                    // Backend dead — partial read means backend state unknown.
-                    return Ok(BatchStep::BackendDead);
+                    return Err(BatchStep::BackendDead);
                 }
                 Err(e) => {
                     warn!(
@@ -279,75 +389,104 @@ impl ClientSession {
                         error = %e,
                         "Backend read error before complete status line; closing client connection"
                     );
-                    // Backend dead — partial read means backend state unknown.
-                    return Ok(BatchStep::BackendDead);
+                    return Err(BatchStep::BackendDead);
                 }
             }
         }
 
-        let chunk = &chunk_data[..];
+        Ok(())
+    }
 
-        // --- Validate response ---
-        let validated =
-            backend::parse_backend_status(chunk, chunk.len(), crate::protocol::MIN_RESPONSE_LENGTH);
-        let Some(status_code) = validated.status_code else {
-            warn!(
-                client = %self.client_addr,
-                backend = ?backend_id,
-                request_kind = ?request.kind(),
-                request_verb = ?request.verb(),
-                response_index = idx + 1,
-                total_commands = batch.len(),
-                chunk_len = chunk.len(),
-                first_bytes_hex = %crate::session::backend::format_hex_preview(chunk, 256),
-                first_bytes_utf8 = %String::from_utf8_lossy(&chunk[..chunk.len().min(256)]),
-                source = if from_leftover { "leftover" } else { "fresh_read" },
-                "Backend returned Invalid response during batch, aborting batch"
-            );
+    fn log_invalid_batch_response(
+        &self,
+        request: &RequestContext,
+        idx: usize,
+        batch: &RequestBatch,
+        backend_id: BackendId,
+        chunk: &[u8],
+        from_leftover: bool,
+    ) {
+        warn!(
+            client = %self.client_addr,
+            backend = ?backend_id,
+            request_kind = ?request.kind(),
+            request_verb = ?request.verb(),
+            response_index = idx + 1,
+            total_commands = batch.len(),
+            chunk_len = chunk.len(),
+            first_bytes_hex = %crate::session::backend::format_hex_preview(chunk, 256),
+            first_bytes_utf8 = %String::from_utf8_lossy(&chunk[..chunk.len().min(256)]),
+            source = if from_leftover { "leftover" } else { "fresh_read" },
+            "Backend returned Invalid response during batch, aborting batch"
+        );
+    }
 
-            return Ok(BatchStep::BackendDead);
-        };
-        let is_multiline_body = request.expects_multiline_response(status_code);
+    async fn handle_batch_not_found(
+        &self,
+        request: &RequestContext,
+        msg_id: Option<crate::types::MessageId<'_>>,
+        is_multiline_body: bool,
+        bcc: &mut BatchConnContext<'_>,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        state: &mut BatchPipelineState<'_>,
+    ) -> Result<BatchStep> {
+        let backend_id = bcc.backend_id;
+        let leftover = &mut *bcc.leftover;
+        let chunk_data = &mut *bcc.chunk_data;
 
-        // --- Handle 430 (article not found on this backend) ---
-        if status_code.as_u16() == 430 {
-            // Single-line 430: split at line boundary, saving the next response's prefix.
-            if !is_multiline_body {
-                super::split_single_line_response(chunk_data, leftover);
-            }
-
-            self.send_430_to_client(client_write, state.backend_to_client_bytes)
-                .await?;
-            *state.client_to_backend_bytes = state
-                .client_to_backend_bytes
-                .add(request.request_wire_len().get());
-
-            if let Some(mid) = msg_id.as_ref() {
-                self.cache
-                    .record_backend_missing(mid.clone(), backend_id)
-                    .await;
-            }
-            self.metrics.record_command(backend_id);
-            self.metrics.record_error_4xx(backend_id);
-            self.metrics.user_command(self.username());
-            return Ok(BatchStep::Continue);
+        if !is_multiline_body {
+            super::split_single_line_response(chunk_data, leftover);
         }
 
-        // --- Success: stream response to client ---
+        self.send_430_to_client(client_write, state.backend_to_client_bytes)
+            .await?;
         *state.client_to_backend_bytes = state
             .client_to_backend_bytes
             .add(request.request_wire_len().get());
 
-        let bytes_written = if is_multiline_body {
+        if let Some(mid) = msg_id.as_ref() {
+            self.cache
+                .record_backend_missing(mid.clone(), backend_id)
+                .await;
+        }
+        self.metrics.record_command(backend_id);
+        self.metrics.record_error_4xx(backend_id);
+        self.metrics.user_command(self.username());
+        Ok(BatchStep::Continue)
+    }
+
+    async fn write_batch_success_response(
+        &self,
+        batch: &RequestBatch,
+        idx: usize,
+        bcc: &mut BatchConnContext<'_>,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        is_multiline_body: bool,
+    ) -> Result<BatchWriteOutcome> {
+        use crate::session::streaming;
+
+        let BatchConnContext {
+            conn,
+            backend_id,
+            leftover,
+            chunk_data,
+            ..
+        } = bcc;
+        let backend_id = *backend_id;
+        let conn = &mut ***conn;
+        let leftover = &mut **leftover;
+        let chunk_data = &mut **chunk_data;
+
+        if is_multiline_body {
             let ctx = streaming::StreamContext {
                 client_addr: self.client_addr,
                 backend_id,
                 buffer_pool: &self.buffer_pool,
             };
-            match streaming::stream_multiline_response_pipelined(
-                &mut **bcc.conn,
+            return match streaming::stream_multiline_response_pipelined(
+                conn,
                 client_write,
-                chunk,
+                &chunk_data[..],
                 &ctx,
                 leftover,
             )
@@ -357,30 +496,18 @@ impl ClientSession {
                     debug!(
                         client = %self.client_addr,
                         backend = ?backend_id,
-                        idx = idx,
+                        idx,
                         bytes_written = bytes,
                         new_leftover_len = leftover.len(),
                         new_leftover_hex = %crate::session::backend::format_hex_preview(leftover, 64),
                         "Batch multiline response streamed"
                     );
-                    bytes
+                    Ok(BatchWriteOutcome::Written(bytes))
                 }
                 Err(crate::session::streaming::StreamingError::ClientDisconnect(io_err)) => {
-                    // Client disconnected — backend was cleanly drained by the streaming layer.
-                    return Ok(BatchStep::ClientDisconnect(io_err));
+                    Ok(BatchWriteOutcome::Step(BatchStep::ClientDisconnect(io_err)))
                 }
                 Err(e) => {
-                    // Backend died mid-article after partial data was already written to the
-                    // client. Sending 430s for the remaining commands would inject garbage into
-                    // the middle of the in-progress article body — corrupting the protocol
-                    // stream and causing nzbget/sabnzbd to see BrokenPipe or hang waiting for
-                    // \r\n.\r\n that never arrives.
-                    //
-                    // The only safe recovery is to close the client connection; the download
-                    // client will retry the segment on a fresh connection.
-                    //
-                    // ConnectionGuard drop → remove_with_cooldown (must_remove_connection()
-                    // is always true for BackendEof / BackendDirty / Io).
                     warn!(
                         client = %self.client_addr,
                         backend = ?backend_id,
@@ -390,34 +517,38 @@ impl ClientSession {
                         "Backend died mid-batch article after partial data sent to client; \
                          closing client connection to prevent protocol corruption"
                     );
-                    return Ok(BatchStep::ClientDisconnect(std::io::Error::new(
-                        std::io::ErrorKind::BrokenPipe,
-                        "backend error mid-batch; partial article already sent",
-                    )));
+                    Ok(BatchWriteOutcome::Step(BatchStep::ClientDisconnect(
+                        std::io::Error::new(
+                            std::io::ErrorKind::BrokenPipe,
+                            "backend error mid-batch; partial article already sent",
+                        ),
+                    )))
                 }
-            }
-        } else {
-            // Single-line response: split at line boundary, saving the next response's prefix.
-            super::split_single_line_response(chunk_data, leftover);
-            client_write.write_all(&chunk_data[..]).await?;
-            chunk_data.len() as u64
-        };
+            };
+        }
 
-        *state.backend_to_client_bytes = state.backend_to_client_bytes.add_u64(bytes_written);
+        super::split_single_line_response(chunk_data, leftover);
+        client_write.write_all(&chunk_data[..]).await?;
+        Ok(BatchWriteOutcome::Written(chunk_data.len() as u64))
+    }
 
-        // Record metrics
+    fn record_batch_response_metrics(
+        &self,
+        request: &RequestContext,
+        backend_id: BackendId,
+        status_code: crate::protocol::StatusCode,
+        bytes_written: u64,
+    ) {
+        use crate::session::routing::{MetricsAction, determine_metrics_action_for_request};
+
         self.metrics.record_command(backend_id);
         self.metrics.user_command(self.username());
         match determine_metrics_action_for_request(request, status_code) {
-            MetricsAction::Article => {
-                self.metrics.record_article(backend_id, bytes_written);
-            }
+            MetricsAction::Article => self.metrics.record_article(backend_id, bytes_written),
             MetricsAction::Error4xx => self.metrics.record_error_4xx(backend_id),
             MetricsAction::Error5xx => self.metrics.record_error_5xx(backend_id),
             MetricsAction::None => {}
         }
-
-        Ok(BatchStep::Continue)
     }
 
     /// Route a single request to a backend and execute it
@@ -432,6 +563,37 @@ impl ClientSession {
         client_to_backend_bytes: &mut ClientToBackendBytes,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<(), SessionError> {
+        self.log_route_request(request);
+
+        let mut io = RequestExecutionIo {
+            client_write,
+            client_to_backend_bytes,
+            backend_to_client_bytes,
+        };
+        let (msg_id, mut availability) = match self
+            .prepare_request_execution(&router, request, &mut io)
+            .await?
+        {
+            PreparedRequest::Served => return Ok(()),
+            PreparedRequest::Continue {
+                msg_id,
+                availability,
+            } => (msg_id, availability),
+        };
+
+        if !request.is_large_transfer()
+            && self
+                .try_pipeline_request(&router, request, &mut io, &mut availability)
+                .await?
+        {
+            return Ok(());
+        }
+
+        self.execute_article_retry_loop(&router, request, msg_id, availability, &mut io)
+            .await
+    }
+
+    fn log_route_request(&self, request: &RequestContext) {
         debug!(
             "Client {} ENTERED route_and_execute_request: kind={:?}, verb={:?}",
             self.client_addr,
@@ -444,174 +606,192 @@ impl ClientSession {
             request.message_id(),
             self.cache_articles
         );
+    }
 
-        // Try cache first - may return early if cache hit.
-        // On partial hit, the request carries availability info to avoid a redundant cache.get().
-        let cached_availability = match self
-            .try_serve_from_cache(request, &router, client_write, backend_to_client_bytes)
+    async fn prepare_request_execution(
+        &self,
+        router: &Arc<BackendSelector>,
+        request: &mut RequestContext,
+        io: &mut RequestExecutionIo<'_, '_>,
+    ) -> Result<PreparedRequest, SessionError> {
+        let availability = match self
+            .try_serve_from_cache(request, router, io.client_write, io.backend_to_client_bytes)
             .await?
         {
-            CacheLookupResult::Hit => return Ok(()),
-            CacheLookupResult::PartialHit => request.cache_availability().map(|availability| {
-                crate::cache::ArticleAvailability::from_bits(
-                    availability.checked_bits(),
-                    availability.missing_bits(),
-                )
-            }),
+            CacheLookupResult::Hit => return Ok(PreparedRequest::Served),
+            CacheLookupResult::PartialHit => request
+                .cache_availability()
+                .map(Self::request_cache_availability),
             CacheLookupResult::Miss => None,
         };
         let msg_id = request.message_id_value().map(|msg_id| msg_id.to_owned());
 
-        // H3: Hoist availability loading before pipeline/retry branch (compute once, use in both paths)
-        // O1: cached_availability already contains the result of cache.get() - reuse it
-        let mut availability = cached_availability;
-
-        // Adaptive prechecking for STAT/HEAD commands (if enabled and cache missed)
-        if self.adaptive_precheck
-            && let Some(ref msg_id_ref) = msg_id
-            && (request.is_stat() || request.is_head())
+        if self
+            .try_adaptive_precheck(router, request, io, msg_id.as_ref())
+            .await?
         {
-            let deps = self.precheck_deps(&router);
-            let bytes_written =
-                if let Some(entry) = precheck::precheck(&deps, request, msg_id_ref).await {
-                    if let Some(write) = write_cached_article_response(
-                        client_write,
-                        &entry,
-                        request.kind(),
-                        msg_id_ref.as_str(),
-                    )
-                    .await
-                    .map_err(|e| SessionError::from(anyhow::Error::from(e)))?
-                    {
-                        write.wire_len.get()
-                    } else {
-                        client_write
-                            .write_all(crate::protocol::NO_SUCH_ARTICLE)
-                            .await
-                            .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
-                        crate::protocol::NO_SUCH_ARTICLE.len()
-                    }
-                } else {
-                    client_write
-                        .write_all(crate::protocol::NO_SUCH_ARTICLE)
-                        .await
-                        .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
-                    crate::protocol::NO_SUCH_ARTICLE.len()
-                };
-            *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written);
-            return Ok(());
+            return Ok(PreparedRequest::Served);
         }
 
-        // Detect large-transfer commands that should skip the pipeline.
-        // ARTICLE and BODY responses can be many megabytes; the pipeline worker
-        // serializes all clients through one connection per backend, killing
-        // throughput. These commands fall through to the direct streaming path
-        // which gives each client its own pooled connection (~120 MB/s).
-        let is_large_transfer = request.is_large_transfer();
+        Ok(PreparedRequest::Continue {
+            msg_id,
+            availability,
+        })
+    }
 
-        // Try pipeline path: if the routed backend has a pipeline queue, enqueue
-        // the command and await the response instead of acquiring a direct connection.
-        // This allows N client sessions to share M backend connections (N >> M).
-        // NOTE: Pipeline path uses availability-aware routing to respect 430s.
-        if !is_large_transfer {
-            // H3: Use pre-loaded availability (no redundant cache lookup)
-            // Route with availability awareness (avoids backends that returned 430)
-            if let Ok(backend_id) =
-                router.route_with_availability(self.client_id, availability.as_ref())
-                && let Some(queue) = router.get_backend_queue(backend_id)
+    const fn request_cache_availability(
+        availability: crate::protocol::RequestCacheAvailability,
+    ) -> ArticleAvailability {
+        ArticleAvailability::from_bits(availability.checked_bits(), availability.missing_bits())
+    }
+
+    async fn try_adaptive_precheck(
+        &self,
+        router: &Arc<BackendSelector>,
+        request: &RequestContext,
+        io: &mut RequestExecutionIo<'_, '_>,
+        msg_id: Option<&crate::types::MessageId<'static>>,
+    ) -> Result<bool, SessionError> {
+        if !self.adaptive_precheck || !(request.is_stat() || request.is_head()) {
+            return Ok(false);
+        }
+        let Some(msg_id) = msg_id else {
+            return Ok(false);
+        };
+
+        let deps = self.precheck_deps(router);
+        let bytes_written = if let Some(entry) = precheck::precheck(&deps, request, msg_id).await {
+            if let Some(write) = write_cached_article_response(
+                io.client_write,
+                &entry,
+                request.kind(),
+                msg_id.as_str(),
+            )
+            .await
+            .map_err(|e| SessionError::from(anyhow::Error::from(e)))?
             {
-                // Wrap in guard - decrements pending_count on all exit paths
-                let guard = CommandGuard::new(router.clone(), backend_id);
+                write.wire_len.get()
+            } else {
+                Self::write_no_such_article_response(io.client_write).await?
+            }
+        } else {
+            Self::write_no_such_article_response(io.client_write).await?
+        };
+        *io.backend_to_client_bytes = io.backend_to_client_bytes.add(bytes_written);
+        Ok(true)
+    }
 
-                debug!(
-                    "Client {} using pipeline path for backend {:?}: kind={:?}, verb={:?}",
-                    self.client_addr,
-                    backend_id,
-                    request.kind(),
-                    request.verb()
-                );
+    async fn write_no_such_article_response(
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+    ) -> Result<usize, SessionError> {
+        client_write
+            .write_all(crate::protocol::NO_SUCH_ARTICLE)
+            .await
+            .map(|()| crate::protocol::NO_SUCH_ARTICLE.len())
+            .map_err(|e| SessionError::from(anyhow::Error::from(e)))
+    }
 
-                let (tx, rx) = tokio::sync::oneshot::channel();
-                let queued_context = QueuedContext::new(request.clone(), tx);
+    async fn try_pipeline_request(
+        &self,
+        router: &Arc<BackendSelector>,
+        request: &RequestContext,
+        io: &mut RequestExecutionIo<'_, '_>,
+        availability: &mut Option<ArticleAvailability>,
+    ) -> Result<bool, SessionError> {
+        if let Ok(backend_id) =
+            router.route_with_availability(self.client_id, availability.as_ref())
+            && let Some(queue) = router.get_backend_queue(backend_id)
+        {
+            let guard = CommandGuard::new(router.clone(), backend_id);
+            debug!(
+                "Client {} using pipeline path for backend {:?}: kind={:?}, verb={:?}",
+                self.client_addr,
+                backend_id,
+                request.kind(),
+                request.verb()
+            );
 
-                // Enqueue with backpressure - fail fast if queue is full
-                match queue.try_enqueue(queued_context) {
-                    Ok(()) => {
-                        self.metrics.record_pipeline_enqueue();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let queued_context = QueuedContext::new(request.clone(), tx);
 
-                        // Await response from the pipeline worker
-                        match rx.await {
-                            Ok(Ok(completed))
-                                if completed
-                                    .context
-                                    .response_metadata()
-                                    .is_some_and(|response| response.status().as_u16() != 430) =>
-                            {
-                                // Success - article found, return immediately
-                                completed
-                                    .context
-                                    .write_response_payload_to(client_write)
-                                    .await
-                                    .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
-                                let response = completed
-                                    .context
-                                    .response_metadata()
-                                    .expect("completed queued request records response metadata");
-                                *backend_to_client_bytes =
-                                    backend_to_client_bytes.add(response.wire_len().get());
-                                *client_to_backend_bytes = client_to_backend_bytes
-                                    .add(completed.context.request_wire_len().get());
-                                self.metrics.record_pipeline_complete();
-                                guard.complete();
-                                return Ok(());
-                            }
-                            Ok(Ok(completed)) => {
-                                let completed_backend_id = completed
-                                    .context
-                                    .backend_id()
-                                    .expect("completed queued request records backend id");
-                                // 430 (article not found) - fall through to retry loop
-                                debug!(
-                                    "Client {} pipeline got 430 from backend {:?}, falling through to retry loop",
-                                    self.client_addr, completed_backend_id
-                                );
-                                // O2: Record this backend as missing in local availability (no cache round-trip)
-                                let avail = availability.get_or_insert_default();
-                                avail.record_missing(completed_backend_id);
-                                self.metrics.record_pipeline_complete();
-                                self.metrics.record_error_4xx(completed_backend_id);
-                                // Fall through - guard drops, decrementing pending_count
-                            }
-                            Ok(Err(e)) => {
-                                debug!(
-                                    "Client {} pipeline error for backend {:?}: {}",
-                                    self.client_addr, backend_id, e
-                                );
-                                // Fall through - guard drops, decrementing pending_count
-                            }
-                            Err(_) => {
-                                debug!(
-                                    "Client {} pipeline worker dropped response channel",
-                                    self.client_addr
-                                );
-                                // Fall through - guard drops, decrementing pending_count
-                            }
+            match queue.try_enqueue(queued_context) {
+                Ok(()) => {
+                    self.metrics.record_pipeline_enqueue();
+
+                    match rx.await {
+                        Ok(Ok(completed))
+                            if completed
+                                .context
+                                .response_metadata()
+                                .is_some_and(|response| response.status().as_u16() != 430) =>
+                        {
+                            completed
+                                .context
+                                .write_response_payload_to(io.client_write)
+                                .await
+                                .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                            let response = completed
+                                .context
+                                .response_metadata()
+                                .expect("completed queued request records response metadata");
+                            *io.backend_to_client_bytes =
+                                io.backend_to_client_bytes.add(response.wire_len().get());
+                            *io.client_to_backend_bytes = io
+                                .client_to_backend_bytes
+                                .add(completed.context.request_wire_len().get());
+                            self.metrics.record_pipeline_complete();
+                            guard.complete();
+                            return Ok(true);
+                        }
+                        Ok(Ok(completed)) => {
+                            let completed_backend_id = completed
+                                .context
+                                .backend_id()
+                                .expect("completed queued request records backend id");
+                            debug!(
+                                "Client {} pipeline got 430 from backend {:?}, falling through to retry loop",
+                                self.client_addr, completed_backend_id
+                            );
+                            availability
+                                .get_or_insert_default()
+                                .record_missing(completed_backend_id);
+                            self.metrics.record_pipeline_complete();
+                            self.metrics.record_error_4xx(completed_backend_id);
+                        }
+                        Ok(Err(e)) => {
+                            debug!(
+                                "Client {} pipeline error for backend {:?}: {}",
+                                self.client_addr, backend_id, e
+                            );
+                        }
+                        Err(_) => {
+                            debug!(
+                                "Client {} pipeline worker dropped response channel",
+                                self.client_addr
+                            );
                         }
                     }
-                    Err(e) => {
-                        debug!(
-                            "Client {} pipeline queue full for backend {:?}: {}",
-                            self.client_addr, backend_id, e
-                        );
-                        // Fall through - guard drops, decrementing pending_count
-                    }
                 }
-                // Guard drops here if we fell through from any path
+                Err(e) => {
+                    debug!(
+                        "Client {} pipeline queue full for backend {:?}: {}",
+                        self.client_addr, backend_id, e
+                    );
+                }
             }
         }
 
-        // Execute command with availability-aware backend selection.
-        // Load availability from cache if not already checked
+        Ok(false)
+    }
+
+    async fn execute_article_retry_loop(
+        &self,
+        router: &Arc<BackendSelector>,
+        request: &mut RequestContext,
+        msg_id: Option<crate::types::MessageId<'static>>,
+        availability: Option<ArticleAvailability>,
+        io: &mut RequestExecutionIo<'_, '_>,
+    ) -> Result<(), SessionError> {
         debug!(
             "Client {} starting availability routing for request kind={:?}, verb={:?}",
             self.client_addr,
@@ -620,8 +800,6 @@ impl ClientSession {
         );
 
         let mut buffer = self.buffer_pool.acquire().await;
-
-        // H3: Use pre-loaded availability (already computed above)
         let mut availability = availability.unwrap_or_default();
         debug!(
             "Client {} availability routing: missing_bits={:08b}, backend_count={}",
@@ -630,42 +808,17 @@ impl ClientSession {
             router.backend_count().get()
         );
 
-        // DESIGN DECISION: No early-return on cached all_exhausted()
-        //
-        // We intentionally DO NOT return 430 immediately when cache indicates all
-        // backends returned 430, even though this would be faster. Reasons:
-        //
-        // 1. 430 responses don't mean "article doesn't exist" - they mean "this
-        //    backend doesn't have it right now". Backends can acquire articles
-        //    via propagation or spool reconstruction.
-        //
-        // 2. Cached 430s can become stale:
-        //    - Backends come back online after being down
-        //    - New articles arrive on backends via propagation
-        //    - Cache entry is old (close to TTL expiration)
-        //
-        // 3. The cache TTL (default 5-10 min) isn't an authoritative staleness
-        //    indicator - it's a tradeoff between memory and query reduction.
-        //
-        // Trade-off: We prefer resilience (always checking) over latency (trusting
-        // cache completely). The availability tracking still skips backends we
-        // know returned 430, so we only try backends we haven't heard from.
-        //
-        // Future: This could be made configurable if latency becomes critical for
-        // workloads where articles definitively don't exist.
-
-        // Try backends until success or exhaustion
         while !availability.all_exhausted(router.backend_count()) {
             let attempt = self
                 .try_backend_for_article(
-                    &router,
+                    router,
                     request,
                     msg_id.as_ref(),
-                    client_write,
+                    io.client_write,
                     &mut ArticleAttemptState {
                         availability: &mut availability,
                         buffer: &mut buffer,
-                        client_to_backend_bytes,
+                        client_to_backend_bytes: io.client_to_backend_bytes,
                     },
                 )
                 .await;
@@ -674,11 +827,8 @@ impl ClientSession {
                     let response = request
                         .response_metadata()
                         .expect("successful direct attempt records response metadata");
-                    *backend_to_client_bytes =
-                        backend_to_client_bytes.add(response.wire_len().get());
-                    // complete_command already called by CommandGuard inside try_backend_for_article
-                    // Sync availability to cache before returning (got a success, but we may have
-                    // recorded some 430s from other backends along the way)
+                    *io.backend_to_client_bytes =
+                        io.backend_to_client_bytes.add(response.wire_len().get());
                     self.sync_availability_if_needed(msg_id.as_ref(), &availability)
                         .await;
                     return Ok(());
@@ -689,11 +839,8 @@ impl ClientSession {
                         self.client_addr, backend_id
                     );
                 }
-                Ok(BackendAttemptResult::BackendUnavailable) => {
-                    // Continue to next backend
-                }
+                Ok(BackendAttemptResult::BackendUnavailable) => {}
                 Err(e @ SessionError::ClientDisconnect(_)) => {
-                    // Client disconnected - stop trying backends
                     debug!(
                         "Client {} disconnected, stopping retry loop",
                         self.client_addr
@@ -701,27 +848,22 @@ impl ClientSession {
                     return Err(e);
                 }
                 Err(SessionError::Backend(e)) => {
-                    // Backend error (timeout, connection error, etc.)
-                    // Log at warn level so root cause is visible before any
-                    // downstream ConnectionLimitExceeded errors
                     warn!(
                         client = %self.client_addr,
                         error = %e,
                         "Backend error during article retry (will try next backend)"
                     );
-                    // Continue to next backend
                 }
             }
         }
 
-        // All backends exhausted - sync availability to cache and send final 430
         debug!(
             "Client {} all backends exhausted for {:?}, sending 430",
             self.client_addr, msg_id
         );
         self.sync_availability_if_needed(msg_id.as_ref(), &availability)
             .await;
-        self.send_430_to_client(client_write, backend_to_client_bytes)
+        self.send_430_to_client(io.client_write, io.backend_to_client_bytes)
             .await?;
 
         Ok(())

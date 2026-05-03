@@ -16,6 +16,10 @@ pub struct MessageId<'a>(Cow<'a, str>);
 
 impl<'a> MessageId<'a> {
     /// Create owned `MessageId` from String with validation
+    ///
+    /// # Errors
+    /// Returns `ValidationError::InvalidMessageId` when the string is not a
+    /// valid RFC-style NNTP message ID.
     pub fn new(s: String) -> Result<Self, ValidationError> {
         Self::validate(&s)?;
         Ok(Self(Cow::Owned(s)))
@@ -23,6 +27,10 @@ impl<'a> MessageId<'a> {
 
     /// Create borrowed `MessageId` from &str (zero-copy)
     #[inline]
+    ///
+    /// # Errors
+    /// Returns `ValidationError::InvalidMessageId` when the string is not a
+    /// valid RFC-style NNTP message ID.
     pub fn from_borrowed(s: &'a str) -> Result<Self, ValidationError> {
         Self::validate(s)?;
         Ok(Self(Cow::Borrowed(s)))
@@ -39,6 +47,10 @@ impl<'a> MessageId<'a> {
     }
 
     /// Create owned `MessageId`, auto-wrapping in angle brackets if needed
+    ///
+    /// # Errors
+    /// Returns `ValidationError::InvalidMessageId` if the resulting wrapped
+    /// value is still not a valid message ID.
     pub fn from_str_or_wrap(s: impl AsRef<str>) -> Result<MessageId<'static>, ValidationError> {
         let s = s.as_ref();
         if s.is_empty() {

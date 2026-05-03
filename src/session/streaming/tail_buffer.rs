@@ -116,13 +116,13 @@ impl TailBuffer {
     /// This optimizes the 99% case where terminator is at chunk end.
     #[must_use]
     pub fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
-        if let Some(pos) = find_terminator_end(chunk) {
-            TerminatorStatus::FoundAt(pos)
-        } else if let Some(end) = self.find_spanning_terminator(chunk) {
-            TerminatorStatus::FoundAt(end)
-        } else {
-            TerminatorStatus::NotFound
-        }
+        find_terminator_end(chunk).map_or_else(
+            || {
+                self.find_spanning_terminator(chunk)
+                    .map_or(TerminatorStatus::NotFound, TerminatorStatus::FoundAt)
+            },
+            TerminatorStatus::FoundAt,
+        )
     }
 }
 

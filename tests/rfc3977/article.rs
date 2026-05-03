@@ -79,7 +79,7 @@ fn assert_article_shape(
 
 #[test]
 fn test_parse_valid_article_shapes() {
-    [
+    for (input, article_number, message_id, has_headers, has_body) in [
         (
             VALID_ARTICLE_TEXT,
             Some(12345),
@@ -98,13 +98,9 @@ fn test_parse_valid_article_shapes() {
         (VALID_BODY, Some(12345), "<test@example.com>", false, true),
         (VALID_STAT, Some(12345), "<test@example.com>", false, false),
         (ARTICLE_BY_MSGID, Some(0), "<msgid@example.com>", true, true),
-    ]
-    .into_iter()
-    .for_each(
-        |(input, article_number, message_id, has_headers, has_body)| {
-            assert_article_shape(input, article_number, message_id, has_headers, has_body);
-        },
-    );
+    ] {
+        assert_article_shape(input, article_number, message_id, has_headers, has_body);
+    }
 }
 
 #[test]
@@ -137,7 +133,7 @@ fn test_article_content_accessors() {
 
 #[test]
 fn test_parse_error_cases() {
-    [
+    for (input, expected) in [
         (
             b"220 12345 <test@example.com>\r\nSubject: Bad\r\nBody without separator\r\n.\r\n"
                 .as_slice(),
@@ -164,9 +160,7 @@ fn test_parse_error_cases() {
                 .as_slice(),
             "invalid yenc",
         ),
-    ]
-    .into_iter()
-    .for_each(|(input, expected)| {
+    ] {
         let result: Result<Article<'_>, _> = input.try_into();
         match (result, expected) {
             (Err(ParseError::MissingSeparator), "missing separator")
@@ -177,7 +171,7 @@ fn test_parse_error_cases() {
             | (Err(ParseError::InvalidYenc(_)), "invalid yenc") => {}
             (other, expected) => panic!("expected {expected}, got {other:?}"),
         }
-    });
+    }
 }
 
 #[test]
@@ -281,19 +275,17 @@ mod headers_tests {
 
     #[test]
     fn test_headers_invalid_inputs() {
-        [
+        for input in [
             b"Subject: Test\nFrom: Bad".as_slice(),
             b"Subject Test\r\n".as_slice(),
             b": Value\r\n".as_slice(),
             b"Bad Name: Value\r\n".as_slice(),
-        ]
-        .into_iter()
-        .for_each(|input| {
+        ] {
             assert!(matches!(
                 Headers::parse(input),
                 Err(ParseError::InvalidHeader(_))
             ));
-        });
+        }
     }
 
     #[test]

@@ -133,7 +133,7 @@ pub fn now_millis() -> u64 {
         .map_or(0, duration_millis_u64)
 }
 
-#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation)] // `Duration::as_millis` is saturated back into our u64 TTL counter.
 fn duration_millis_u64(duration: std::time::Duration) -> u64 {
     // TTLs and timestamps are stored as u64 millisecond counters. Saturating on
     // overflow preserves ordering while avoiding a noisy error path here.

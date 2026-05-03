@@ -14,6 +14,10 @@ use crate::constants::buffer::{COMMAND, READER_CAPACITY};
 
 impl ClientSession {
     /// Handle stateful session - acquire backend and proxy bidirectionally
+    ///
+    /// # Errors
+    /// Returns an error if the proxy cannot acquire a backend connection, send an
+    /// initial backend-unavailable response, or proxy bytes in either direction.
     pub async fn handle_stateful_session(
         &self,
         mut client_stream: TcpStream,

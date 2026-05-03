@@ -270,6 +270,9 @@ impl TlsManager {
     /// **Performance**: Loads and parses certificates once during initialization
     /// instead of on every connection, eliminating certificate parsing overhead
     /// (DER parsing, X.509 validation, signature verification).
+    ///
+    /// # Errors
+    /// Returns any certificate-loading or rustls configuration error.
     pub fn new(config: TlsConfig) -> Result<Self, anyhow::Error> {
         // Load certificates once during initialization
         let cert_result = Self::load_certificates_sync(&config)?;
@@ -289,6 +292,10 @@ impl TlsManager {
     }
 
     /// Perform TLS handshake
+    ///
+    /// # Errors
+    /// Returns any SNI conversion, connector, or handshake error for the
+    /// backend connection.
     pub async fn handshake(
         &self,
         stream: TcpStream,

@@ -54,10 +54,10 @@ impl std::str::FromStr for CacheCapacity {
         }
 
         // Fallback to plain number (bytes)
-        match s.parse::<u64>() {
-            Ok(bytes) => Self::try_new(bytes).map_err(|e| e.to_string()),
-            Err(_) => Err(format!("Invalid cache capacity: {s}")),
-        }
+        s.parse::<u64>().map_or_else(
+            |_| Err(format!("Invalid cache capacity: {s}")),
+            |bytes| Self::try_new(bytes).map_err(|e| e.to_string()),
+        )
     }
 }
 

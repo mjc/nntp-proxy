@@ -22,7 +22,7 @@ use crate::session::SessionError;
 
 use super::NntpProxy;
 
-#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation)] // Elapsed nanoseconds are saturated into a monotonic u64 diagnostic counter.
 fn elapsed_nanos_u64(start: std::time::Instant) -> u64 {
     // This is a monotonic diagnostic timestamp. Saturating on overflow keeps
     // the last-activity marker valid without threading error handling through

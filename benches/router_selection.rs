@@ -38,7 +38,7 @@ fn make_router(strategy: BackendSelectionStrategy, num_backends: usize) -> Arc<B
             BackendId::from_index(i),
             ServerName::try_new(name).unwrap(),
             make_provider(10),
-            (i / 2) as u8, // Tier 0 for first 2, tier 1 for next 2, etc.
+            u8::try_from(i / 2).expect("benchmark tier fits in u8"), // Tier 0 for first 2, tier 1 for next 2, etc.
         );
     }
     Arc::new(selector)

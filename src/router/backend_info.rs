@@ -160,7 +160,10 @@ impl StatefulCount {
 
     /// Release a stateful slot (decrement if > 0)
     ///
-    /// Returns `Ok(previous_value)` if successfully decremented, Err(0) if already zero
+    /// Returns `Ok(previous_value)` if successfully decremented, `Err(0)` if already zero
+    ///
+    /// # Errors
+    /// Returns `Err(0)` when the counter is already zero and cannot be decremented.
     pub fn release(&self) -> Result<usize, usize> {
         self.0
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
@@ -207,9 +210,13 @@ impl BackendInfo {
         // Load ratio is a relative routing score. Exact integer counts are kept
         // separately; float precision is sufficient for comparing backend load.
         #[allow(clippy::cast_precision_loss)]
+        // This relative load score is display/ranking data, not exact accounting.
+        // Ratio comparisons do not require exact integer preservation.
         let max_conns = self.provider.max_size() as f64;
         if max_conns > 0.0 {
             #[allow(clippy::cast_precision_loss)]
+            // Pending counts only feed the relative load score.
+            // Pending counts only feed the relative load score.
             let pending = self.pending_count.get() as f64;
             LoadRatio::new(pending / max_conns)
         } else {

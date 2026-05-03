@@ -61,8 +61,8 @@ use super::ttl;
 
 const HYBRID_CACHE_NAME: &str = "nntp-article-cache-v3";
 
-#[allow(clippy::cast_precision_loss)]
-fn count_as_f64(value: u64) -> f64 {
+#[allow(clippy::cast_precision_loss)] // Hit rates are display metrics derived from exact integer counters.
+const fn count_as_f64(value: u64) -> f64 {
     // Cache hit ratios are presentation metrics; exact counters remain stored
     // separately and are not fed back into cache behavior.
     value as f64
@@ -604,6 +604,9 @@ impl HybridArticleCache {
     /// Uses `NoopIoEngineConfig` without a block engine config so foyer falls back
     /// to `NoopEngineConfig` — a trivially synchronous engine that spawns zero
     /// background tasks. Safe with any tokio runtime flavor.
+    ///
+    /// # Errors
+    /// Returns any initialization error from the underlying test-only cache path.
     pub async fn new_memory_only(memory_capacity: u64) -> anyhow::Result<Self> {
         Self::new_memory_only_with_cache_articles(memory_capacity, true).await
     }

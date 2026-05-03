@@ -161,7 +161,7 @@ where
 /// Handle successful authentication with all side effects
 ///
 /// Sets username, records connection stats, updates metrics
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value)] // The owned username is consumed as part of session state updates.
 pub fn on_authentication_success(
     client_addr: impl std::fmt::Display,
     username: Option<String>,

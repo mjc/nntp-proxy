@@ -9,6 +9,10 @@ mod tests {
     };
     use crate::types::tui::{Throughput, Timestamp};
 
+    fn assert_f64_eq(actual: f64, expected: f64) {
+        assert_eq!(actual.to_bits(), expected.to_bits());
+    }
+
     // ========================================================================
     // Layout Tests
     // ========================================================================
@@ -87,7 +91,7 @@ mod tests {
         let bounds_high = calculate_chart_bounds(max_throughput_high);
 
         // Should round up nicely
-        assert_eq!(bounds_high, 16_000_000.0);
+        assert_f64_eq(bounds_high, 16_000_000.0);
     }
 
     #[test]
@@ -138,7 +142,7 @@ mod tests {
 
         // Exactly at minimum
         let bounds_min = calculate_chart_bounds(chart::MIN_THROUGHPUT);
-        assert_eq!(bounds_min, chart::MIN_THROUGHPUT);
+        assert_f64_eq(bounds_min, chart::MIN_THROUGHPUT);
 
         // Slightly above minimum
         let bounds_above = calculate_chart_bounds(chart::MIN_THROUGHPUT + 1000.0);

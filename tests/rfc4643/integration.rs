@@ -10,11 +10,12 @@
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinSet;
 
-use crate::test_helpers::wait_for_server;
+use crate::test_helpers::{create_test_auth_handler_with, create_test_config, wait_for_server};
 
-use nntp_proxy::command::{CommandAction, CommandHandler};
-use nntp_proxy::config::UserCredentials;
+use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
+use nntp_proxy::config::{ClientAuth, Config, HealthCheck, Proxy, UserCredentials};
 use nntp_proxy::protocol::RequestContext;
 
 fn classify(command: &str) -> CommandAction<'static> {
@@ -36,9 +37,6 @@ async fn test_auth_flow_complete_with_valid_credentials() {
         .unwrap();
 
     // Create config with auth
-    use crate::test_helpers::create_test_config;
-    use nntp_proxy::config::ClientAuth;
-
     let mut config = create_test_config(vec![(backend_port, "backend-1")]);
     config.client_auth = ClientAuth {
         users: vec![UserCredentials {
@@ -115,7 +113,6 @@ async fn test_auth_disabled_allows_immediate_commands() {
         .unwrap();
 
     // Create config WITHOUT auth
-    use crate::test_helpers::create_test_config;
     let config = create_test_config(vec![(backend_port, "backend-1")]);
 
     // Ensure auth is disabled
@@ -167,9 +164,6 @@ async fn test_auth_command_intercepted_not_sent_to_backend() {
     wait_for_server(&format!("127.0.0.1:{backend_port}"), 10)
         .await
         .unwrap();
-
-    use crate::test_helpers::create_test_config;
-    use nntp_proxy::config::ClientAuth;
 
     let mut config = create_test_config(vec![(backend_port, "backend-1")]);
     config.client_auth = ClientAuth {
@@ -223,10 +217,6 @@ async fn test_auth_command_intercepted_not_sent_to_backend() {
 #[tokio::test]
 async fn test_multiple_clients_with_auth() {
     let backend_port = 19122;
-
-    use crate::test_helpers::create_test_config;
-    use nntp_proxy::config::ClientAuth;
-    use tokio::task::JoinSet;
 
     // Start mock backend
     let _backend_handle = crate::test_helpers::spawn_mock_server(backend_port, "test-backend");
@@ -305,9 +295,6 @@ async fn test_multiple_clients_with_auth() {
 
 #[tokio::test]
 async fn test_auth_handler_integration() {
-    use crate::test_helpers::create_test_auth_handler_with;
-    use nntp_proxy::command::{AuthAction, CommandAction};
-
     let handler = create_test_auth_handler_with("alice", "secret");
 
     // Test command classification
@@ -348,8 +335,6 @@ async fn test_auth_handler_integration() {
 
 #[tokio::test]
 async fn test_config_auth_round_trip() {
-    use nntp_proxy::config::{ClientAuth, Config, HealthCheck, Proxy};
-
     // Create config with auth
     let config = Config {
         servers: vec![],

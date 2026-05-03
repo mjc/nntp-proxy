@@ -570,88 +570,99 @@ async fn test_430_cache_is_authoritative() -> Result<()> {
 /// 3. Clear all connection pools (simulating idle timeout)
 /// 4. Verify the availability cache still correctly identifies which backend has the article
 /// 5. Make a request and verify it routes to the correct backend (backend 1)
+fn spawn_article_stat_backend(
+    port: u16,
+    greeting: &'static [u8],
+    article_response: &'static [u8],
+    request_count: Arc<AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let requests = request_count.clone();
+            tokio::spawn(async move {
+                stream.write_all(greeting).await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+
+                while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                    let cmd = line.trim().to_uppercase();
+                    let writer = reader.get_mut();
+
+                    if cmd.starts_with("ARTICLE") || cmd.starts_with("STAT") {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        writer.write_all(article_response).await.unwrap();
+                    } else if cmd.starts_with("DATE") {
+                        writer.write_all(b"111 20251220120000\r\n").await.unwrap();
+                    } else if cmd.starts_with("QUIT") {
+                        writer.write_all(b"205 Goodbye\r\n").await.unwrap();
+                        break;
+                    } else {
+                        writer.write_all(b"200 OK\r\n").await.unwrap();
+                    }
+                    line.clear();
+                }
+            });
+        }
+    })
+}
+
+async fn start_cached_per_command_proxy(proxy: Arc<NntpProxy>, proxy_addr: &str) -> Result<()> {
+    let listener = TcpListener::bind(proxy_addr).await?;
+    tokio::spawn(async move {
+        while let Ok((stream, addr)) = listener.accept().await {
+            let proxy = proxy.clone();
+            tokio::spawn(async move {
+                let _ = proxy
+                    .handle_client_per_command_routing(stream, addr.into())
+                    .await;
+            });
+        }
+    });
+    wait_for_server(proxy_addr, 20).await
+}
+
+async fn request_cached_stat(proxy_addr: &str) -> Result<String> {
+    let mut client = TcpStream::connect(proxy_addr).await?;
+    let mut reader = BufReader::new(&mut client);
+    let mut line = String::new();
+
+    reader.read_line(&mut line).await?;
+    line.clear();
+    reader
+        .get_mut()
+        .write_all(b"STAT <pool-test@example.com>\r\n")
+        .await?;
+    reader.read_line(&mut line).await?;
+    let response = line.clone();
+    reader.get_mut().write_all(b"QUIT\r\n").await?;
+    Ok(response)
+}
+
 #[tokio::test]
 async fn test_availability_survives_pool_clearing() -> Result<()> {
     // Backend 0: Returns 430 for our test article
     let port0 = get_available_port().await?;
     let backend0_requests = Arc::new(AtomicUsize::new(0));
-    let backend0_requests_clone = backend0_requests.clone();
-
-    let handle0 = tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{port0}"))
-            .await
-            .unwrap();
-
-        while let Ok((mut stream, _)) = listener.accept().await {
-            let requests = backend0_requests_clone.clone();
-            tokio::spawn(async move {
-                stream.write_all(b"200 Backend0 Ready\r\n").await.unwrap();
-                let mut reader = BufReader::new(stream);
-                let mut line = String::new();
-
-                while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
-                    let cmd = line.trim().to_uppercase();
-                    let writer = reader.get_mut();
-
-                    if cmd.starts_with("ARTICLE") || cmd.starts_with("STAT") {
-                        requests.fetch_add(1, Ordering::SeqCst);
-                        // Backend 0 does NOT have this article
-                        writer.write_all(b"430 No such article\r\n").await.unwrap();
-                    } else if cmd.starts_with("DATE") {
-                        writer.write_all(b"111 20251220120000\r\n").await.unwrap();
-                    } else if cmd.starts_with("QUIT") {
-                        writer.write_all(b"205 Goodbye\r\n").await.unwrap();
-                        break;
-                    } else {
-                        writer.write_all(b"200 OK\r\n").await.unwrap();
-                    }
-                    line.clear();
-                }
-            });
-        }
-    });
+    let handle0 = spawn_article_stat_backend(
+        port0,
+        b"200 Backend0 Ready\r\n",
+        b"430 No such article\r\n",
+        backend0_requests.clone(),
+    );
 
     // Backend 1: Has the article
     let port1 = get_available_port().await?;
     let backend1_requests = Arc::new(AtomicUsize::new(0));
-    let backend1_requests_clone = backend1_requests.clone();
-
-    let handle1 = tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{port1}"))
-            .await
-            .unwrap();
-
-        while let Ok((mut stream, _)) = listener.accept().await {
-            let requests = backend1_requests_clone.clone();
-            tokio::spawn(async move {
-                stream.write_all(b"200 Backend1 Ready\r\n").await.unwrap();
-                let mut reader = BufReader::new(stream);
-                let mut line = String::new();
-
-                while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
-                    let cmd = line.trim().to_uppercase();
-                    let writer = reader.get_mut();
-
-                    if cmd.starts_with("ARTICLE") || cmd.starts_with("STAT") {
-                        requests.fetch_add(1, Ordering::SeqCst);
-                        // Backend 1 HAS this article
-                        writer
-                            .write_all(b"223 0 <pool-test@example.com> article exists\r\n")
-                            .await
-                            .unwrap();
-                    } else if cmd.starts_with("DATE") {
-                        writer.write_all(b"111 20251220120000\r\n").await.unwrap();
-                    } else if cmd.starts_with("QUIT") {
-                        writer.write_all(b"205 Goodbye\r\n").await.unwrap();
-                        break;
-                    } else {
-                        writer.write_all(b"200 OK\r\n").await.unwrap();
-                    }
-                    line.clear();
-                }
-            });
-        }
-    });
+    let handle1 = spawn_article_stat_backend(
+        port1,
+        b"200 Backend1 Ready\r\n",
+        b"223 0 <pool-test@example.com> article exists\r\n",
+        backend1_requests.clone(),
+    );
 
     wait_for_server(&format!("127.0.0.1:{port0}"), 20).await?;
     wait_for_server(&format!("127.0.0.1:{port1}"), 20).await?;
@@ -675,46 +686,14 @@ async fn test_availability_survives_pool_clearing() -> Result<()> {
     // The proxy will try backend 0 first, get 430, then try backend 1, get success
     let proxy_port = get_available_port().await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
-    let listener = TcpListener::bind(&proxy_addr).await?;
-
-    // Spawn proxy accept loop that handles multiple connections
-    tokio::spawn({
-        let proxy = proxy.clone();
-        async move {
-            while let Ok((stream, addr)) = listener.accept().await {
-                let p = proxy.clone();
-                tokio::spawn(async move {
-                    let _ = p
-                        .handle_client_per_command_routing(stream, addr.into())
-                        .await;
-                });
-            }
-        }
-    });
-
-    wait_for_server(&proxy_addr, 20).await?;
+    start_cached_per_command_proxy(proxy.clone(), &proxy_addr).await?;
 
     {
-        let mut client = TcpStream::connect(&proxy_addr).await?;
-        let mut reader = BufReader::new(&mut client);
-        let mut line = String::new();
-
-        // Read greeting
-        reader.read_line(&mut line).await?;
-        line.clear();
-
-        // Request article - this learns availability
-        reader
-            .get_mut()
-            .write_all(b"STAT <pool-test@example.com>\r\n")
-            .await?;
-        reader.read_line(&mut line).await?;
+        let line = request_cached_stat(&proxy_addr).await?;
         assert!(
             line.starts_with("223"),
             "Should get article from backend 1 after backend 0 returns 430"
         );
-
-        reader.get_mut().write_all(b"QUIT\r\n").await?;
     }
 
     // Verify backend 0 was tried (got 430)
@@ -742,20 +721,7 @@ async fn test_availability_survives_pool_clearing() -> Result<()> {
     // The availability cache should remember that backend 0 returned 430
     // So it should go DIRECTLY to backend 1 without trying backend 0 again
     {
-        let mut client = TcpStream::connect(&proxy_addr).await?;
-        let mut reader = BufReader::new(&mut client);
-        let mut line = String::new();
-
-        // Read greeting
-        reader.read_line(&mut line).await?;
-        line.clear();
-
-        // Request the SAME article again
-        reader
-            .get_mut()
-            .write_all(b"STAT <pool-test@example.com>\r\n")
-            .await?;
-        reader.read_line(&mut line).await?;
+        let line = request_cached_stat(&proxy_addr).await?;
 
         // CRITICAL: Should still get 223 (success) from backend 1
         assert!(
@@ -763,8 +729,6 @@ async fn test_availability_survives_pool_clearing() -> Result<()> {
             "After pool clear, should still get article from correct backend. Got: {}",
             line.trim()
         );
-
-        reader.get_mut().write_all(b"QUIT\r\n").await?;
     }
 
     // CRITICAL ASSERTION: Backend 0 should NOT have been tried again

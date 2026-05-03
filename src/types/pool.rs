@@ -3,7 +3,7 @@
 use nutype::nutype;
 use std::fmt;
 
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss)] // Pool percentages are display values derived from exact usize counters.
 const fn pool_count_as_f64(value: usize) -> f64 {
     // Pool utilization is a percentage for display/thresholding. The exact
     // connection counts remain available as usize newtypes.

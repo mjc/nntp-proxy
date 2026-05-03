@@ -17,7 +17,7 @@ use crate::constants::pool::{
 };
 use crate::stream::ConnectionStream;
 
-#[allow(clippy::cast_precision_loss)]
+#[allow(clippy::cast_precision_loss)] // Failure rates are approximate monitoring values derived from exact counters.
 const fn count_as_f64_for_rate(value: u64) -> f64 {
     // Health-check failure rate is an approximate monitoring value. The exact
     // checked/failed counters remain stored as u64.

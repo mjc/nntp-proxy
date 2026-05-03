@@ -279,14 +279,14 @@ pub struct TuiApp {
 }
 
 impl TuiApp {
-    #[allow(clippy::cast_precision_loss)]
+    #[allow(clippy::cast_precision_loss)] // TUI rates are derived display values, not exact persisted counters.
     const fn counter_as_f64(value: u64) -> f64 {
         // TUI throughput and rate calculations are display-only aggregates.
         // The exact counters remain stored as integers in the metrics snapshot.
         value as f64
     }
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // UI throughput truncates fractional, non-negative bytes/sec for display.
     const fn throughput_as_u64(rate: Throughput) -> u64 {
         // Displayed per-user byte rates are derived from non-negative throughput
         // samples; truncating fractional bytes/sec matches the existing UI.
@@ -598,6 +598,10 @@ mod tests {
         TuiApp::new(metrics, router, servers)
     }
 
+    fn assert_f64_eq(actual: f64, expected: f64) {
+        assert_eq!(actual.to_bits(), expected.to_bits());
+    }
+
     /// Test for the bug where `previous_snapshot` was set to self.snapshot instead of `new_snapshot`.
     /// This caused the TUI to skip every other snapshot, calculating deltas over 2x the time period
     /// and showing 2x the actual throughput.
@@ -816,30 +820,30 @@ mod tests {
     fn test_calculate_rate() {
         // Zero time should give zero rate
         let rate = TuiApp::calculate_rate(1000, 0.0);
-        assert_eq!(rate.get(), 0.0);
+        assert_f64_eq(rate.get(), 0.0);
 
         // 1000 bytes in 1 second = 1000 B/s
         let rate = TuiApp::calculate_rate(1000, 1.0);
-        assert_eq!(rate.get(), 1000.0);
+        assert_f64_eq(rate.get(), 1000.0);
 
         // 1000 bytes in 0.5 seconds = 2000 B/s
         let rate = TuiApp::calculate_rate(1000, 0.5);
-        assert_eq!(rate.get(), 2000.0);
+        assert_f64_eq(rate.get(), 2000.0);
     }
 
     #[test]
     fn test_calculate_command_rate() {
         // Zero time should give zero rate
         let rate = TuiApp::calculate_command_rate(100, 0.0);
-        assert_eq!(rate.get(), 0.0);
+        assert_f64_eq(rate.get(), 0.0);
 
         // 100 commands in 1 second = 100 cmd/s
         let rate = TuiApp::calculate_command_rate(100, 1.0);
-        assert_eq!(rate.get(), 100.0);
+        assert_f64_eq(rate.get(), 100.0);
 
         // 50 commands in 0.5 seconds = 100 cmd/s
         let rate = TuiApp::calculate_command_rate(50, 0.5);
-        assert_eq!(rate.get(), 100.0);
+        assert_f64_eq(rate.get(), 100.0);
     }
 
     #[test]
@@ -874,9 +878,9 @@ mod tests {
             CommandsPerSecond::new(50.0),
         );
 
-        assert_eq!(point.sent_per_sec().get(), 1000.0);
-        assert_eq!(point.received_per_sec().get(), 2000.0);
-        assert_eq!(point.commands_per_sec().unwrap().get(), 50.0);
+        assert_f64_eq(point.sent_per_sec().get(), 1000.0);
+        assert_f64_eq(point.received_per_sec().get(), 2000.0);
+        assert_f64_eq(point.commands_per_sec().unwrap().get(), 50.0);
 
         let client_point = ThroughputPoint::new_client(
             Timestamp::now(),
@@ -884,8 +888,8 @@ mod tests {
             Throughput::new(1500.0),
         );
 
-        assert_eq!(client_point.sent_per_sec().get(), 500.0);
-        assert_eq!(client_point.received_per_sec().get(), 1500.0);
+        assert_f64_eq(client_point.sent_per_sec().get(), 500.0);
+        assert_f64_eq(client_point.received_per_sec().get(), 1500.0);
         assert!(client_point.commands_per_sec().is_none());
     }
 
@@ -903,7 +907,7 @@ mod tests {
         history.push(point1);
 
         assert!(history.latest().is_some());
-        assert_eq!(history.latest().unwrap().sent_per_sec().get(), 100.0);
+        assert_f64_eq(history.latest().unwrap().sent_per_sec().get(), 100.0);
 
         let point2 = ThroughputPoint::new_client(
             Timestamp::now(),
@@ -913,7 +917,7 @@ mod tests {
         history.push(point2);
 
         // Latest should be point2
-        assert_eq!(history.latest().unwrap().sent_per_sec().get(), 300.0);
+        assert_f64_eq(history.latest().unwrap().sent_per_sec().get(), 300.0);
     }
 
     // Tests for TuiAppBuilder

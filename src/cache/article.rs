@@ -14,8 +14,8 @@ use std::time::Duration;
 use super::availability::ArticleAvailability;
 use super::ttl;
 
-#[allow(clippy::cast_precision_loss)]
-fn count_as_f64(value: u64) -> f64 {
+#[allow(clippy::cast_precision_loss)] // Hit rates are display metrics derived from exact integer counters.
+const fn count_as_f64(value: u64) -> f64 {
     // Cache hit rates are display/monitoring values; the exact counters remain
     // stored as integers and are not used for control flow here.
     value as f64
@@ -1288,6 +1288,7 @@ pub struct CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::router::BackendCount;
     use crate::types::MessageId;
     use futures::executor::block_on;
     use std::io::IoSlice;
@@ -1321,8 +1322,9 @@ mod tests {
         ) -> Poll<std::io::Result<usize>> {
             self.vectored_writes += 1;
             let len = bufs.iter().map(|buf| buf.len()).sum();
-            bufs.iter()
-                .for_each(|buf| self.bytes.extend_from_slice(buf));
+            for buf in bufs {
+                self.bytes.extend_from_slice(buf);
+            }
             Poll::Ready(Ok(len))
         }
 
@@ -1360,13 +1362,13 @@ mod tests {
     }
 
     fn assert_serves(entry: &CachedArticle, cases: &[(RequestKind, bool)]) {
-        cases.iter().for_each(|(request_kind, expected)| {
+        for (request_kind, expected) in cases {
             assert_eq!(
                 serves(entry, *request_kind, "<test@example.com>"),
                 *expected,
                 "serve decision for {request_kind:?}"
             );
-        });
+        }
     }
 
     #[tokio::test]
@@ -1802,7 +1804,6 @@ mod tests {
 
     #[test]
     fn test_cached_article_all_backends_exhausted() {
-        use crate::router::BackendCount;
         let backend0 = BackendId::from_index(0);
         let backend1 = BackendId::from_index(1);
         let mut entry = create_test_cached_article("<test@example.com>");
@@ -2017,7 +2018,6 @@ mod tests {
         assert!(!entry.should_try_backend(BackendId::from_index(1)));
 
         // Verify all backends exhausted
-        use crate::router::BackendCount;
         assert!(
             entry.all_backends_exhausted(BackendCount::new(2)),
             "All backends should be exhausted"

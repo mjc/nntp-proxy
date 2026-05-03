@@ -157,7 +157,7 @@ impl<D> ByteCounter<D> {
 
     #[must_use]
     #[inline]
-    #[allow(clippy::needless_pass_by_value)]
+    #[allow(clippy::needless_pass_by_value)] // Value semantics keep fluent byte-counter arithmetic ergonomic.
     pub const fn saturating_sub(self, other: Self) -> Self {
         // Byte counters are cheap value types and are used in fluent arithmetic
         // chains, so by-value subtraction keeps the API ergonomic.

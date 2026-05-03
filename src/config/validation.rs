@@ -20,6 +20,9 @@ impl Config {
     /// - At least one server configured
     /// - Maximum 8 servers (bitset limitation for article availability tracking)
     /// - Keep-alive intervals are in recommended ranges
+    ///
+    /// # Errors
+    /// Returns an error if semantic validation fails after deserialization.
     pub fn validate(&self) -> Result<()> {
         if self.servers.is_empty() {
             return Err(anyhow::anyhow!(
