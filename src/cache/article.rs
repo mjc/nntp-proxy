@@ -474,14 +474,6 @@ impl ArticleEntry {
         self.backend_availability.all_exhausted(total_backends)
     }
 
-    /// Get backends that might have this article
-    #[must_use]
-    pub fn available_backends(&self, total_backends: BackendCount) -> Vec<BackendId> {
-        self.backend_availability
-            .available_backends(total_backends)
-            .collect()
-    }
-
     /// Check if this cache entry has useful availability information
     ///
     /// Returns true if at least one backend has been tried (marked as missing or has article).
@@ -522,7 +514,7 @@ impl ArticleEntry {
     ///
     /// Creates a fresh `ArticleAvailability` with backends marked missing based on
     /// cached knowledge (backends that previously returned 430).
-    pub fn to_availability(&self, total_backends: BackendCount) -> ArticleAvailability {
+    pub(crate) fn to_availability(&self, total_backends: BackendCount) -> ArticleAvailability {
         let mut availability = ArticleAvailability::new();
 
         // Mark backends we know don't have this article
