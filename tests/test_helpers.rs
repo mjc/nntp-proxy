@@ -2,8 +2,6 @@
 //!
 //! This module provides reusable test utilities to reduce duplication
 //! in integration tests.
-// Test helpers don't need exhaustive doc coverage.
-#![allow(clippy::missing_errors_doc, clippy::missing_panics_doc)]
 
 use anyhow::Result;
 use nntp_proxy::NntpProxy;

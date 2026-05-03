@@ -2,7 +2,6 @@
 //!
 //! Now that we use the yenc crate, these benchmarks just verify
 //! we're getting expected performance from it.
-#![allow(clippy::cast_possible_truncation)]
 
 use divan::{Bencher, black_box};
 

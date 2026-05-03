@@ -2,14 +2,6 @@
 //!
 //! These tests verify invariants and algebraic properties of core functions
 //! using property-based testing with arbitrary input generation.
-#![allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-#![allow(clippy::items_after_statements)]
-#![allow(clippy::format_push_string)]
-
 use nntp_proxy::cache::ArticleAvailability;
 use nntp_proxy::cache::ttl::{CacheTier, CacheTtlMillis, effective_ttl};
 use nntp_proxy::protocol::{RequestContext, RequestRouteClass, StatusCode};
