@@ -475,6 +475,13 @@ impl ArticleEntry {
         self.backend_availability.has_availability_info()
     }
 
+    /// Return the typed backend availability metadata stored with this entry.
+    #[inline]
+    #[must_use]
+    pub const fn availability(&self) -> ArticleAvailability {
+        self.backend_availability
+    }
+
     /// Check if this cache entry contains a complete article (220) or body (222)
     ///
     /// Returns true if:

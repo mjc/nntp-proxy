@@ -61,8 +61,10 @@ impl ClientSession {
             return Ok(CacheLookupResult::Miss);
         };
 
-        // Extract availability before any early returns so we can pass it back
-        let availability = cached.to_availability(router.backend_count());
+        // Extract stored availability before any early returns so we can pass it back.
+        // Cache-hit metadata should preserve both checked and missing bits; retry routing
+        // can derive backend attempts later when it actually needs router.backend_count().
+        let availability = cached.availability();
         request.record_cache_entry_metadata(cache_entry_metadata(&cached, &availability));
 
         if !cached.has_availability_info() {
@@ -412,6 +414,20 @@ mod tests {
         assert_eq!(request.cache_status(), Some(RequestCacheStatus::Hit));
         assert_eq!(request.backend_id(), None);
         assert_eq!(request.response_status(), Some(StatusCode::new(220)));
+        assert_eq!(
+            request
+                .cache_availability()
+                .expect("cache hit records availability")
+                .checked_bits(),
+            0b0000_0001
+        );
+        assert_eq!(
+            request
+                .cache_availability()
+                .expect("cache hit records availability")
+                .missing_bits(),
+            0
+        );
         assert_eq!(
             request.cache_article_number(),
             Some(RequestCacheArticleNumber::new(0))
