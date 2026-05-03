@@ -23,11 +23,11 @@ use crate::types::BackendId;
 
 /// Configuration for the pipeline worker
 #[derive(Debug, Clone)]
-pub struct PipelineWorkerConfig {
+pub(crate) struct PipelineWorkerConfig {
     /// Maximum number of commands in a single pipeline batch
-    pub batch_size: usize,
+    pub(crate) batch_size: usize,
     /// Backend identifier for logging/metrics
-    pub backend_id: BackendId,
+    pub(crate) backend_id: BackendId,
 }
 
 /// Run the pipeline worker loop for a single backend.
@@ -41,7 +41,7 @@ pub struct PipelineWorkerConfig {
 ///
 /// On connection errors, the entire remaining batch is failed and the worker
 /// retries with a fresh connection on the next iteration.
-pub async fn backend_pipeline_worker(
+pub(crate) async fn backend_pipeline_worker(
     config: PipelineWorkerConfig,
     queue: Arc<BackendQueue>,
     provider: Arc<DeadpoolConnectionProvider>,
