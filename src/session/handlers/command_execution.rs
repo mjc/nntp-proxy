@@ -377,7 +377,11 @@ impl ClientSession {
                     ctx,
                 )
                 .await?;
-                if let Some(msg_id) = params.msg_id {
+                if let Some(msg_id) = params.msg_id
+                    && !params
+                        .request
+                        .cache_records_backend_has_article(ctx.backend_id)
+                {
                     self.spawn_cache_upsert_availability(
                         msg_id,
                         params.status_code,

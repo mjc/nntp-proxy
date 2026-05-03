@@ -169,6 +169,12 @@ impl RequestCacheAvailability {
     pub(crate) const fn missing_bits(self) -> u8 {
         self.missing
     }
+
+    #[must_use]
+    pub(crate) fn backend_has_article(self, backend_id: BackendId) -> bool {
+        let mask = 1u8 << backend_id.as_index();
+        self.checked & mask != 0 && self.missing & mask == 0
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
@@ -481,6 +487,13 @@ impl RequestContext {
             Some(entry) => Some(entry.availability()),
             None => None,
         }
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn cache_records_backend_has_article(&self, backend_id: BackendId) -> bool {
+        self.cache_availability()
+            .is_some_and(|availability| availability.backend_has_article(backend_id))
     }
 
     #[inline]
@@ -1142,6 +1155,24 @@ mod tests {
         assert_eq!(ctx.cache_article_number(), article_number);
         assert_eq!(ctx.response_status(), None);
         assert_eq!(wire(&ctx), b"ARTICLE <a@b>\r\n");
+    }
+
+    #[test]
+    fn request_context_detects_cached_backend_has_article() {
+        let mut ctx = request_context(b"ARTICLE <a@b>\r\n");
+
+        ctx.record_cache_entry_metadata(RequestCacheEntryMetadata::new(
+            StatusCode::new(220),
+            RequestCacheAvailability::from_bits(0b0000_0110, 0b0000_0010),
+            RequestCacheTier::new(0),
+            RequestCacheTimestampMillis::new(1),
+            RequestCachePayloadKind::AvailabilityOnly,
+            None,
+        ));
+
+        assert!(!ctx.cache_records_backend_has_article(BackendId::from_index(0)));
+        assert!(!ctx.cache_records_backend_has_article(BackendId::from_index(1)));
+        assert!(ctx.cache_records_backend_has_article(BackendId::from_index(2)));
     }
 
     #[test]
