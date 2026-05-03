@@ -225,8 +225,23 @@ pub(crate) async fn send_request<C>(
 where
     C: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    let (response, _, _, _) = send_request_timed(conn, request, buffer).await?;
-    Ok(response)
+    write_request(conn, request).await?;
+
+    let n = buffer.read_from(conn).await?;
+    if n == 0 {
+        anyhow::bail!("Backend connection closed unexpectedly");
+    }
+
+    read_until_status_line(conn, buffer).await?;
+    let min_len = crate::protocol::MIN_RESPONSE_LENGTH;
+    let total = buffer.initialized();
+    let validated = parse_backend_status(&buffer[..total], total, min_len);
+
+    Ok(BackendFirstResponse {
+        bytes_read: total,
+        status_code: validated.status_code,
+        warnings: validated.warnings,
+    })
 }
 
 /// Send a typed request with timing measurements.
