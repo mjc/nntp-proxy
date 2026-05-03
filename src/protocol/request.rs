@@ -400,6 +400,11 @@ impl RequestCacheEntryMetadata {
 
 impl RequestContext {
     #[must_use]
+    pub fn parse(line: &[u8]) -> Self {
+        Self::from_request_line(RequestLine::parse(line))
+    }
+
+    #[must_use]
     pub fn from_request_line(line: RequestLine<'_>) -> Self {
         Self::from_parts(
             line.kind(),
@@ -936,6 +941,17 @@ mod tests {
     fn request_context_owns_borrowed_request_line() {
         let parsed = RequestLine::parse(b"BODY <a@b>\r\n");
         let ctx = RequestContext::from_request_line(parsed);
+
+        assert_eq!(ctx.kind(), RequestKind::Body);
+        assert_eq!(ctx.verb(), b"BODY");
+        assert_eq!(ctx.args(), b"<a@b>");
+        assert_eq!(ctx.message_id(), Some("<a@b>"));
+        assert_eq!(ctx.request_wire_len(), RequestWireLen::new(12));
+    }
+
+    #[test]
+    fn request_context_parses_wire_line_at_boundary() {
+        let ctx = RequestContext::parse(b"BODY <a@b>\r\n");
 
         assert_eq!(ctx.kind(), RequestKind::Body);
         assert_eq!(ctx.verb(), b"BODY");
