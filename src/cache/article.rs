@@ -852,27 +852,12 @@ impl ArticleCache {
         // Build cache with byte-based capacity using weigher
         // max_capacity is total bytes allowed
         //
-        // IMPORTANT: Moka's time_to_live must be set to the MAXIMUM tier-aware TTL
-        // so that high-tier entries aren't evicted prematurely by Moka.
-        // Our is_expired() method handles per-entry expiration based on tier.
-        //
-        // Moka has a hard limit of ~1000 years for TTL. For very high tier multipliers
-        // (e.g., tier 63 = 2^63), we cap at 100 years which is more than enough.
-        // We handle per-entry expiration ourselves in get() based on actual tier.
-        const MAX_MOKA_TTL: Duration = Duration::from_secs(100 * 365 * 24 * 3600); // 100 years
-
-        // For zero TTL, use Duration::ZERO so entries expire immediately in Moka too
-        let max_tier_ttl = if ttl.is_zero() {
-            Duration::ZERO
-        } else {
-            // Non-zero TTL: multiply by max tier multiplier (2^63) and cap at MAX_MOKA_TTL
-            // Since 2^63 > u32::MAX, the multiplier will overflow u32, so just use MAX_MOKA_TTL
-            MAX_MOKA_TTL
-        };
-        let cache = Cache::builder()
-            .max_capacity(max_capacity)
-            .time_to_live(max_tier_ttl)
-            .weigher(move |key: &Arc<str>, entry: &ArticleEntry| -> u32 {
+        // We handle tier-aware expiration ourselves in get(). A giant Moka TTL
+        // only adds timer-wheel/read bookkeeping without expiring normal entries
+        // at the effective tier TTL. Keep Moka TTL only for the zero-TTL case so
+        // tests and pathological configs still expire immediately.
+        let builder = Cache::builder().max_capacity(max_capacity).weigher(
+            move |key: &Arc<str>, entry: &ArticleEntry| -> u32 {
                 // Calculate actual memory footprint for accurate capacity tracking.
                 //
                 // Memory layout per cache entry:
@@ -922,8 +907,13 @@ impl ArticleCache {
                 };
 
                 weighted_size.try_into().unwrap_or(u32::MAX)
-            })
-            .build();
+            },
+        );
+        let cache = if ttl.is_zero() {
+            builder.time_to_live(Duration::ZERO).build()
+        } else {
+            builder.build()
+        };
 
         Self {
             cache: Arc::new(cache),
