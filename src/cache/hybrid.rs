@@ -729,6 +729,11 @@ mod tests {
         // Check availability
         let msg_id = MessageId::from_borrowed("<missing@example.com>").unwrap();
         let entry = cache.get(&msg_id).await.unwrap();
+        assert_eq!(
+            entry.payload_len().get(),
+            0,
+            "missing hybrid cache entries must not retain response payload bytes"
+        );
         assert!(!entry.should_try_backend(BackendId::from_index(0)));
         assert!(entry.should_try_backend(BackendId::from_index(1)));
 

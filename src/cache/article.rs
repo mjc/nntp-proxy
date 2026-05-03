@@ -1583,6 +1583,11 @@ mod tests {
         );
 
         assert!(matches!(entry.payload, CachedPayload::Missing));
+        assert_eq!(
+            entry.payload_len().get(),
+            0,
+            "missing cache entries must not retain response payload bytes"
+        );
 
         // Record backend 1 also returned 430
         cache
