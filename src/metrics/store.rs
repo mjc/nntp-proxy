@@ -546,7 +546,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::significant_drop_tightening)] // DashMap ref scope is fine for test clarity
     fn test_metrics_store_save_load_roundtrip() {
         let temp_dir = TempDir::new().unwrap();
         let stats_path = temp_dir.path().join("stats.json");

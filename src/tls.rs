@@ -376,7 +376,6 @@ impl TlsManager {
     }
 
     /// Load system certificates, returning count of successfully loaded certificates
-    #[allow(clippy::unnecessary_wraps)] // Errors logged as warnings; always returns Ok(count)
     fn load_system_certificates_sync(
         root_store: &mut RootCertStore,
     ) -> Result<usize, anyhow::Error> {

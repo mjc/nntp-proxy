@@ -204,7 +204,6 @@ impl<'a> Headers<'a> {
 
     /// Iterate over all headers (zero-copy)
     #[must_use]
-    #[allow(clippy::iter_without_into_iter)] // IntoIterator impl would require a wrapper type
     pub const fn iter(&self) -> HeaderIter<'a> {
         HeaderIter {
             data: self.data,

@@ -161,7 +161,6 @@ where
 /// Handle successful authentication with all side effects
 ///
 /// Sets username, records connection stats, updates metrics
-#[allow(clippy::needless_pass_by_value)]
 pub fn on_authentication_success(
     client_addr: impl std::fmt::Display,
     username: Option<String>,

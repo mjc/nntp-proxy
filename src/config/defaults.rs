@@ -150,7 +150,6 @@ pub const fn replacement_cooldown() -> Duration {
 
 /// Default connection replacement cooldown option (Some(30 seconds))
 #[inline]
-#[allow(clippy::unnecessary_wraps)] // Option required for use with .or_else(defaults::replacement_cooldown_option)
 pub const fn replacement_cooldown_option() -> Option<Duration> {
     Some(replacement_cooldown())
 }

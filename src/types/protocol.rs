@@ -32,7 +32,6 @@ impl<'a> MessageId<'a> {
     ///
     /// # Safety
     /// Caller must ensure: `s.len() >= 3`, `s.starts_with('<')`, `s.ends_with('>')`
-    #[allow(clippy::inline_always)] // zero-overhead wrapper for a hot unchecked path
     #[inline(always)]
     #[must_use]
     pub const unsafe fn from_str_unchecked(s: &'a str) -> Self {

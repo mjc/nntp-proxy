@@ -654,7 +654,6 @@ impl BufferPool {
         }
     }
 
-    #[allow(clippy::unused_async)] // async for API consistency with acquire_capture and future pool implementations
     pub async fn acquire(&self) -> PooledBuffer {
         self.acquire_now()
     }
@@ -701,7 +700,6 @@ impl BufferPool {
         }
     }
 
-    #[allow(clippy::unused_async)] // async for API consistency with acquire and future pool implementations
     pub async fn acquire_capture(&self) -> PooledBuffer {
         self.acquire_capture_now()
     }

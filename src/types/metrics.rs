@@ -157,7 +157,6 @@ impl<D> ByteCounter<D> {
 
     #[must_use]
     #[inline]
-    #[allow(clippy::needless_pass_by_value)] // Copy type; by-value is idiomatic like u64::saturating_sub
     pub const fn saturating_sub(self, other: Self) -> Self {
         Self {
             bytes: self.bytes.saturating_sub(other.bytes),

@@ -153,7 +153,6 @@ impl NntpProxy {
 
     /// Log backend routing selection
     #[inline]
-    #[allow(clippy::unused_self)]
     pub(super) fn log_routing_selection(
         &self,
         client_addr: ClientAddress,
@@ -223,7 +222,6 @@ impl NntpProxy {
 
     /// Generate short session ID for logging
     #[inline]
-    #[allow(clippy::unused_self)]
     pub(super) fn generate_session_id(&self, session: &ClientSession) -> String {
         crate::formatting::short_id(session.client_id().as_uuid())
     }
@@ -240,7 +238,6 @@ impl NntpProxy {
 
     /// Apply TCP optimizations to client socket
     #[inline]
-    #[allow(clippy::unused_self)]
     pub(super) fn apply_tcp_optimizations(&self, client_stream: &TcpStream) {
         use crate::network::TcpOptimizer;
         TcpOptimizer::new(client_stream)
