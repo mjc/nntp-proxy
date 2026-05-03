@@ -1,25 +1,3 @@
-[lints.clippy]
-# f64 precision: metrics compute rates/percentages; integer-to-float promotion is fine
-cast_precision_loss = "allow"
-# Test assertions on exact computed float values are deterministic
-float_cmp = "allow"
-# Not writing docs.rs-style API docs for every function
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-# Complex state machine handlers exceed 100 lines; refactoring would reduce clarity
-too_many_lines = "allow"
-# #[inline(always)] on hot-path classifier functions is intentional
-inline_always = "allow"
-# `use` imports in test function bodies are acceptable; reordering would reduce readability
-items_after_statements = "allow"
-# `use super::*` in test modules is idiomatic
-wildcard_imports = "allow"
-# u64/usize casts are 64-bit only; 32-bit targets not supported
-cast_possible_truncation = "allow"
-cast_sign_loss = "allow"
-# Mock impls and public APIs keep async for interface compatibility
-unused_async = "allow"
-
 [package]
 name = "nntp-proxy"
 version = "0.4.0"
