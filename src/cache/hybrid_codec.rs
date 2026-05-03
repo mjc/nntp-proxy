@@ -386,7 +386,7 @@ impl HybridArticleEntry {
 
     /// Ingest cold response bytes with a specific provider tier.
     #[must_use]
-    pub fn from_response_bytes_with_tier(
+    pub(crate) fn from_response_bytes_with_tier(
         buffer: impl AsRef<[u8]>,
         tier: ttl::CacheTier,
     ) -> Option<Self> {
