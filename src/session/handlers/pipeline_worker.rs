@@ -297,6 +297,10 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    const ARTICLE_REQUEST: &[u8] = b"ARTICLE <test@example>\r\n";
+    const DATE_REQUEST: &[u8] = b"DATE\r\n";
+    const STAT_REQUEST: &[u8] = b"STAT <test@example>\r\n";
+
     fn queued_context(
         command: &str,
     ) -> (
@@ -443,7 +447,7 @@ mod tests {
         let mut conn = mock_backend_conn(b"430 No such article\r\n").await;
 
         let status = read_full_response(
-            b"ARTICLE <test@example>\r\n",
+            ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
             &mut result_buf,
@@ -467,7 +471,7 @@ mod tests {
             mock_backend_conn_chunked(vec![b"111".to_vec(), b" 20260501173336\r\n".to_vec()]).await;
 
         let status =
-            read_full_response(b"DATE\r\n", &mut buffer, &mut conn, &mut result_buf, &pool)
+            read_full_response(DATE_REQUEST, &mut buffer, &mut conn, &mut result_buf, &pool)
                 .await
                 .expect("should wait for complete status line");
 
@@ -486,7 +490,7 @@ mod tests {
         let mut conn = mock_backend_conn(response).await;
 
         let status = read_full_response(
-            b"ARTICLE <test@example>\r\n",
+            ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
             &mut result_buf,
@@ -513,7 +517,7 @@ mod tests {
         let mut conn = mock_backend_conn_chunked(vec![chunk1, chunk2]).await;
 
         let status = read_full_response(
-            b"ARTICLE <test@example>\r\n",
+            ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
             &mut result_buf,
@@ -542,7 +546,7 @@ mod tests {
 
         // First read should get the multiline response and save leftover
         let status1 = read_full_response(
-            b"ARTICLE <test@example>\r\n",
+            ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
             &mut result_buf,
@@ -560,7 +564,7 @@ mod tests {
 
         // Second read should consume leftover and return the 430
         let status2 = read_full_response(
-            b"ARTICLE <test@example>\r\n",
+            ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
             &mut result_buf,
@@ -621,7 +625,7 @@ mod tests {
         let mut conn = mock_backend_conn(b"220 0 <a@b> article\r\nBody line\r\n").await;
 
         let result = read_full_response(
-            b"ARTICLE <test@example>\r\n",
+            ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
             &mut result_buf,
@@ -645,7 +649,7 @@ mod tests {
         let mut conn = mock_backend_conn(b"garbage data here\r\n").await;
 
         let result = read_full_response(
-            b"ARTICLE <test@example>\r\n",
+            ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
             &mut result_buf,
@@ -667,7 +671,7 @@ mod tests {
         conn.stash_leftover(b"43").unwrap();
 
         let status = read_full_response(
-            b"ARTICLE <test@example>\r\n",
+            ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
             &mut result_buf,
@@ -690,7 +694,7 @@ mod tests {
         let mut conn = mock_backend_conn(b"").await;
 
         let result = read_full_response(
-            b"ARTICLE <test@example>\r\n",
+            ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
             &mut result_buf,
@@ -1193,7 +1197,7 @@ mod tests {
 
                 for (idx, expected) in responses.iter().enumerate() {
                     let status = read_full_response(
-                        b"STAT <test@example>\r\n",
+                        STAT_REQUEST,
                         &mut buffer,
                         &mut conn,
                         &mut result_buf,
@@ -1310,7 +1314,7 @@ mod tests {
         let mut conn = mock_backend_conn_chunked(chunks).await;
 
         let result = read_full_response(
-            b"ARTICLE <test@example>\r\n",
+            ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
             &mut result_buf,
@@ -1347,7 +1351,7 @@ mod tests {
         let mut conn = mock_backend_conn(&normal_data).await;
 
         let result = read_full_response(
-            b"ARTICLE <test@example>\r\n",
+            ARTICLE_REQUEST,
             &mut buffer,
             &mut conn,
             &mut result_buf,
