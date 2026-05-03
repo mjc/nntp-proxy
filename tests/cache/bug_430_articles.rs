@@ -3,7 +3,7 @@
 //! BUG: When `cache_articles=true`, the proxy returns 430 for articles that backends
 //! actually have. This is caused by a race condition:
 //!
-//! 1. `spawn_cache_upsert()` is fire-and-forget (async)
+//! 1. Cache article upserts are fire-and-forget (async)
 //! 2. `sync_availability()` runs immediately after success
 //! 3. If upsert hasn't completed, `sync_availability` creates a missing entry
 //! 4. The missing entry overwrites the real article when upsert finally runs
