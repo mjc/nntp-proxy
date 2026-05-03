@@ -123,7 +123,7 @@ pub struct HybridArticleEntry {
     /// Backend availability tracking (checked/missing bitsets)
     pub(super) availability: ArticleAvailability,
     /// Unix timestamp when availability info was last updated (milliseconds since epoch)
-    /// Used to expire stale availability-only entries (430 stubs, STAT responses)
+    /// Used to expire stale availability-only entries (missing articles, STAT responses)
     /// and for tier-aware TTL calculation
     pub(super) timestamp: ttl::CacheTimestampMillis,
     /// Server tier (lower = higher priority)
@@ -456,6 +456,17 @@ impl HybridArticleEntry {
             timestamp: ttl::CacheTimestampMillis::now(),
             tier,
             payload: CachedPayload::AvailabilityOnly,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn missing(tier: ttl::CacheTier) -> Self {
+        Self {
+            status_code: CacheableStatusCode::Missing,
+            availability: ArticleAvailability::new(),
+            timestamp: ttl::CacheTimestampMillis::now(),
+            tier,
+            payload: CachedPayload::Missing,
         }
     }
 

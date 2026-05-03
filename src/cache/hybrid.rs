@@ -433,10 +433,7 @@ impl HybridArticleCache {
             updated.record_backend_missing(backend_id);
             updated
         } else {
-            // Create stub entry for availability tracking
-            // SAFETY: "430\r\n" is a valid NNTP response
-            let mut entry = HybridArticleEntry::from_response_bytes(b"430\r\n")
-                .expect("430 is a valid status code");
+            let mut entry = HybridArticleEntry::missing(super::ttl::CacheTier::new(0));
             entry.record_backend_missing(backend_id);
             entry
         };
@@ -481,7 +478,7 @@ impl HybridArticleCache {
     /// backends that returned 430 during this request. Much more efficient
     /// than calling `record_missing` for each backend individually.
     ///
-    /// IMPORTANT: Only creates a 430 stub entry if ALL checked backends returned 430.
+    /// IMPORTANT: Only creates a missing entry if ALL checked backends returned 430.
     /// If any backend successfully provided the article, we skip creating an entry
     /// (the actual article will be cached via upsert, which may race with this call).
     pub async fn sync_availability(
@@ -505,16 +502,14 @@ impl HybridArticleCache {
                 Some(entry)
             }
             _ => {
-                // No existing entry - only create a 430 stub if ALL backends returned 430
+                // No existing entry - only create a missing entry if all checked backends returned 430.
                 if availability.any_backend_has_article() {
                     // A backend successfully provided the article.
-                    // Don't create a 430 stub - let upsert() handle it with the real article data.
+                    // Don't create a missing entry - let upsert() handle it with the real article data.
                     None
                 } else {
-                    // All checked backends returned 430 - create stub to track this
-                    // SAFETY: "430\r\n" is a valid NNTP response
-                    let mut entry = HybridArticleEntry::from_response_bytes(b"430\r\n")
-                        .expect("430 is a valid status code");
+                    // All checked backends returned 430 - create typed missing entry.
+                    let mut entry = HybridArticleEntry::missing(super::ttl::CacheTier::new(0));
                     entry.availability = *availability;
                     self.misses.fetch_add(1, Ordering::Relaxed);
                     Some(entry)

@@ -314,6 +314,17 @@ impl ArticleEntry {
     }
 
     #[must_use]
+    pub(crate) fn missing(tier: ttl::CacheTier) -> Self {
+        Self {
+            backend_availability: ArticleAvailability::new(),
+            status_code: StatusCode::new(430),
+            payload: CachedPayload::Missing,
+            tier,
+            inserted_at: ttl::CacheTimestampMillis::now(),
+        }
+    }
+
+    #[must_use]
     pub(crate) const fn from_parts(
         status_code: StatusCode,
         payload: CachedPayload,
@@ -979,7 +990,7 @@ impl ArticleCache {
     /// and provides key-level locking for concurrent operations.
     ///
     /// If the article is already cached, updates the availability bitset.
-    /// If not cached, creates a new cache entry with a 430 stub.
+    /// If not cached, creates a typed missing cache entry.
     /// This prevents repeated queries to backends that don't have the article.
     ///
     /// Note: We don't store the actual backend 430 response because:
@@ -1000,7 +1011,7 @@ impl ArticleCache {
                     entry
                 } else {
                     // First 430 for this article - create typed missing entry.
-                    let mut entry = ArticleEntry::from_response_bytes(b"430\r\n");
+                    let mut entry = ArticleEntry::missing(ttl::CacheTier::new(0));
                     entry.record_backend_missing(backend_id);
                     entry
                 };
@@ -1025,7 +1036,7 @@ impl ArticleCache {
     /// backends that returned 430 during this request. Much more efficient
     /// than calling `record_backend_missing` for each backend individually.
     ///
-    /// IMPORTANT: Only creates a 430 stub entry if ALL checked backends returned 430.
+    /// IMPORTANT: Only creates a missing entry if ALL checked backends returned 430.
     /// If any backend successfully provided the article, we skip creating an entry
     /// (the actual article will be cached via upsert, which may race with this call).
     pub async fn sync_availability(
@@ -1055,14 +1066,14 @@ impl ArticleCache {
                     entry.backend_availability.merge_from(&availability);
                     Op::Put(entry)
                 } else {
-                    // No existing entry - only create a 430 stub if ALL backends returned 430
+                    // No existing entry - only create a missing entry if all checked backends returned 430.
                     if availability.any_backend_has_article() {
                         // A backend successfully provided the article.
-                        // Don't create a 430 stub - let upsert() handle it with the real article data.
+                        // Don't create a missing entry - let upsert() handle it with the real article data.
                         Op::Nop
                     } else {
                         // All checked backends returned 430 - create stub to track this
-                        let mut entry = ArticleEntry::from_response_bytes(b"430\r\n");
+                        let mut entry = ArticleEntry::missing(ttl::CacheTier::new(0));
                         entry.backend_availability = availability;
                         Op::Put(entry)
                     }

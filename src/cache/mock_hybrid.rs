@@ -95,8 +95,7 @@ impl MockHybridCache {
             updated.record_backend_missing(backend_id);
             updated
         } else {
-            let mut entry =
-                HybridArticleEntry::from_response_bytes(b"430\r\n").expect("430 is valid");
+            let mut entry = HybridArticleEntry::missing(super::ttl::CacheTier::new(0));
             entry.record_backend_missing(backend_id);
             entry
         };
