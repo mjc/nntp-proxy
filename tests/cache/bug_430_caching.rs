@@ -106,7 +106,6 @@ async fn test_430_increments_4xx_metrics() {
 
 /// Test cache growth with missing articles
 #[tokio::test]
-#[allow(clippy::collection_is_never_read)] // msg_ids keeps borrowed strings alive; never read by design
 async fn test_cache_grows_with_430_responses() {
     // With MOKA_OVERHEAD=2000 and 2.5x multiplier for small entries:
     // Each missing entry stores no payload and weighs approx (0 + 68 + 40 + 2000) * 2.5.
@@ -135,6 +134,7 @@ async fn test_cache_grows_with_430_responses() {
 
     // Cache should have 100 entries now
     let stats = cache.stats();
+    assert_eq!(msg_ids.len(), 100);
     assert!(
         stats.entry_count >= 100,
         "Cache should have at least 100 entries, got {}",
@@ -144,7 +144,6 @@ async fn test_cache_grows_with_430_responses() {
 
 /// Regression test: Verify bug symptoms are fixed
 #[tokio::test]
-#[allow(clippy::collection_is_never_read)] // msg_ids keeps borrowed strings alive; never read by design
 async fn test_regression_bug_symptoms_fixed() {
     // With MOKA_OVERHEAD=2000 and 2.5x multiplier for small entries:
     // Each missing entry stores no payload and weighs approx (0 + 68 + 40 + 2000) * 2.5.
@@ -174,6 +173,7 @@ async fn test_regression_bug_symptoms_fixed() {
 
     // BUG SYMPTOM 1: Cache should have hundreds of entries, not just 5
     let stats = cache.stats();
+    assert_eq!(msg_ids.len(), 500);
     assert!(
         stats.entry_count >= 500,
         "Cache should have 500+ entries (was 5 before fix), got {}",
