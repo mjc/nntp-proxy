@@ -131,11 +131,6 @@ impl CachedArticleResponse<'_> {
         self.wire_len_usize().into()
     }
 
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.wire_len_usize() == 0
-    }
-
     fn status_line(&self) -> &[u8] {
         self.status_line.as_slice()
     }
