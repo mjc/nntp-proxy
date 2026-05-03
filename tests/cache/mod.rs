@@ -16,7 +16,6 @@ pub mod bug_430_articles;
 pub mod bug_430_caching;
 pub mod cache_before_precheck;
 pub mod helpers;
-pub mod hybrid_integration;
 pub mod racing_precheck;
 pub mod tiered_ttl;
 pub mod unified_cache;

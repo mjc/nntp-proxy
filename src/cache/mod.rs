@@ -19,7 +19,8 @@ mod hybrid;
 mod hybrid_codec;
 pub mod ttl;
 
-pub mod mock_hybrid;
+#[cfg(test)]
+mod mock_hybrid;
 
 pub(crate) use article::CachedArticleNumber;
 pub(crate) use article::CachedPayloadKind;

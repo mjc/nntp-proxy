@@ -6,7 +6,7 @@
 // Methods are async to match the HybridArticleCache trait interface; no internal awaits needed.
 #![allow(clippy::unused_async)]
 
-use super::{ArticleAvailability, CacheIngestBytes, HybridArticleEntry, HybridCacheStats};
+use super::{CacheIngestBytes, HybridArticleEntry, HybridCacheStats};
 use crate::types::{BackendId, MessageId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex};
 
 /// Mock hybrid cache for testing
 #[derive(Clone)]
-pub struct MockHybridCache {
+struct MockHybridCache {
     storage: Arc<Mutex<HashMap<String, HybridArticleEntry>>>,
     hits: Arc<AtomicU64>,
     misses: Arc<AtomicU64>,
@@ -23,7 +23,7 @@ pub struct MockHybridCache {
 
 impl MockHybridCache {
     #[must_use]
-    pub fn new(_memory_capacity: u64) -> Self {
+    fn new(_memory_capacity: u64) -> Self {
         Self {
             storage: Arc::new(Mutex::new(HashMap::new())),
             hits: Arc::new(AtomicU64::new(0)),
@@ -32,7 +32,7 @@ impl MockHybridCache {
         }
     }
 
-    pub async fn get(&self, message_id: &MessageId<'_>) -> Option<HybridArticleEntry> {
+    async fn get(&self, message_id: &MessageId<'_>) -> Option<HybridArticleEntry> {
         let key = message_id.without_brackets().to_string();
         let storage = self.storage.lock().unwrap();
 
@@ -45,7 +45,7 @@ impl MockHybridCache {
         }
     }
 
-    pub async fn upsert(
+    async fn upsert(
         &self,
         message_id: MessageId<'_>,
         buffer: impl AsRef<[u8]>,
@@ -55,7 +55,7 @@ impl MockHybridCache {
             .await;
     }
 
-    pub(crate) async fn upsert_ingest(
+    async fn upsert_ingest(
         &self,
         message_id: MessageId<'_>,
         buffer: CacheIngestBytes,
@@ -86,7 +86,7 @@ impl MockHybridCache {
         storage.insert(key, entry);
     }
 
-    pub async fn record_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
+    async fn record_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
         let key = message_id.without_brackets().to_string();
         let mut storage = self.storage.lock().unwrap();
 
@@ -104,58 +104,8 @@ impl MockHybridCache {
         storage.insert(key, entry);
     }
 
-    pub async fn sync_availability(
-        &self,
-        message_id: MessageId<'_>,
-        availability: &ArticleAvailability,
-    ) {
-        if availability.checked_bits() == 0 {
-            return;
-        }
-
-        let key = message_id.without_brackets().to_string();
-        let mut storage = self.storage.lock().unwrap();
-
-        let updated = match storage.get(&key) {
-            Some(existing) => {
-                let mut entry = existing.clone();
-                // Manually merge availability bits
-                for i in 0..8 {
-                    let backend_id = BackendId::from_index(i);
-                    if availability.should_try(backend_id) {
-                        entry.record_backend_has(backend_id);
-                    } else if availability.is_missing(backend_id) {
-                        entry.record_backend_missing(backend_id);
-                    }
-                }
-                Some(entry)
-            }
-            None => {
-                if availability.any_backend_has_article() {
-                    None
-                } else {
-                    let mut entry =
-                        HybridArticleEntry::from_response_bytes(b"430\r\n").expect("430 is valid");
-                    for i in 0..8 {
-                        let backend_id = BackendId::from_index(i);
-                        if availability.should_try(backend_id) {
-                            entry.record_backend_has(backend_id);
-                        } else if availability.is_missing(backend_id) {
-                            entry.record_backend_missing(backend_id);
-                        }
-                    }
-                    Some(entry)
-                }
-            }
-        };
-
-        if let Some(entry) = updated {
-            storage.insert(key, entry);
-        }
-    }
-
     #[must_use]
-    pub fn stats(&self) -> HybridCacheStats {
+    fn stats(&self) -> HybridCacheStats {
         HybridCacheStats {
             hits: self.hits.load(Ordering::Relaxed),
             misses: self.misses.load(Ordering::Relaxed),
@@ -169,7 +119,7 @@ impl MockHybridCache {
         }
     }
 
-    pub async fn close(&self) -> anyhow::Result<()> {
+    async fn close(&self) -> anyhow::Result<()> {
         Ok(())
     }
 }
