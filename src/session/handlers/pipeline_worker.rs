@@ -777,6 +777,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pipeline_batch_completes_mixed_clients_in_connection_fifo() {
+        use tokio::io::AsyncReadExt;
+
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(3);
+        let backend_id = BackendId::from_index(0);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            stream
+                .write_all(
+                    b"223 0 <c1-r1@example> status\r\n\
+                      430 No such article\r\n\
+                      223 0 <c3-r1@example> status\r\n",
+                )
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = ConnectionStream::plain(stream);
+
+        let (client1_req1, client1_rx1) = queued_context("STAT <c1-r1@example>\r\n");
+        let (client2_req1, client2_rx1) = queued_context("STAT <c2-r1@example>\r\n");
+        let (client1_req2, client1_rx2) = queued_context("STAT <c1-r2@example>\r\n");
+        let batch = vec![client1_req1, client2_req1, client1_req2];
+
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+
+        let (success, _batch) = execute_pipeline_batch(
+            backend_id,
+            &mut conn,
+            batch,
+            &metrics,
+            &pool,
+            &mut result_buf,
+        )
+        .await;
+        assert!(success);
+
+        let client1_first = client1_rx1.await.unwrap().unwrap();
+        let client2_first = client2_rx1.await.unwrap().unwrap();
+        let client1_second = client1_rx2.await.unwrap().unwrap();
+
+        let completed = [client1_first, client2_first, client1_second].map(|completed| {
+            (
+                completed.context.message_id().map(str::to_owned),
+                completed
+                    .context
+                    .response_metadata()
+                    .map(|response| response.status().as_u16()),
+            )
+        });
+
+        assert_eq!(
+            completed,
+            [
+                (Some("<c1-r1@example>".to_owned()), Some(223)),
+                (Some("<c2-r1@example>".to_owned()), Some(430)),
+                (Some("<c1-r2@example>".to_owned()), Some(223)),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn test_pipeline_batch_server_disconnect_mid_batch() {
         use tokio::io::AsyncReadExt;
 
