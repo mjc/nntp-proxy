@@ -11,6 +11,7 @@ use crate::pool::BufferPool;
 use crate::protocol::{RequestContext, StatusCode};
 use crate::router::BackendSelector;
 use crate::session::backend;
+use crate::session::handlers::should_sample_backend_timing;
 use crate::types::{BackendId, MessageId};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -118,9 +119,19 @@ async fn execute_backend_query(
 
     let mut buffer = deps.buffer_pool.acquire().await;
 
-    // Use shared backend request execution with timing
-    match backend::send_request_timed(&mut **conn, request, &mut buffer).await {
-        Ok((cmd_response, ttfb, send, recv)) => {
+    let response = if should_sample_backend_timing() {
+        backend::send_request_timed(&mut **conn, request, &mut buffer)
+            .await
+            .map(|(response, ttfb, send, recv)| (response, Some((ttfb, send, recv))))
+    } else {
+        backend::send_request(&mut **conn, request, &mut buffer)
+            .await
+            .map(|response| (response, None))
+    };
+
+    // Use shared backend request execution with sampled timing
+    match response {
+        Ok((cmd_response, timings)) => {
             let Some(status_code) = cmd_response.status_code() else {
                 // Invalid response - conn drops → remove_with_cooldown
                 return Err(());
@@ -196,21 +207,23 @@ async fn execute_backend_query(
 
             let result = match status_code.as_u16() {
                 220..=223 => {
-                    // Record successful command and timing
                     tracing::debug!(
                         backend = backend_id.as_index(),
-                        ttfb_us = ttfb,
                         "precheck recording command to metrics"
                     );
                     deps.metrics.record_command(backend_id);
-                    deps.metrics.record_ttfb_micros(backend_id, ttfb);
-                    deps.metrics.record_send_recv_micros(backend_id, send, recv);
+                    if let Some((ttfb, send, recv)) = timings {
+                        deps.metrics.record_ttfb_micros(backend_id, ttfb);
+                        deps.metrics.record_send_recv_micros(backend_id, send, recv);
+                    }
                     QueryResult::Found(backend_id, response)
                 }
                 430 => {
                     deps.metrics.record_command(backend_id);
-                    deps.metrics.record_ttfb_micros(backend_id, ttfb);
-                    deps.metrics.record_send_recv_micros(backend_id, send, recv);
+                    if let Some((ttfb, send, recv)) = timings {
+                        deps.metrics.record_ttfb_micros(backend_id, ttfb);
+                        deps.metrics.record_send_recv_micros(backend_id, send, recv);
+                    }
                     deps.metrics.record_error_4xx(backend_id);
                     QueryResult::Missing(backend_id)
                 }

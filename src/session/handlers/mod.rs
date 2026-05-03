@@ -38,6 +38,7 @@ pub(super) fn split_single_line_response(
 }
 mod cache_operations;
 mod command_execution;
+pub(crate) use command_execution::should_sample_backend_timing;
 mod hybrid;
 mod per_command;
 mod pipeline;

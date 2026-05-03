@@ -24,7 +24,7 @@ const BACKEND_TIMING_SAMPLE_MASK: u64 = 0x0f;
 static BACKEND_TIMING_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
-fn should_sample_backend_timing() -> bool {
+pub(crate) fn should_sample_backend_timing() -> bool {
     BACKEND_TIMING_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed) & BACKEND_TIMING_SAMPLE_MASK == 0
 }
 
