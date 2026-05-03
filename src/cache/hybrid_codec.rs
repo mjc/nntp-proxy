@@ -14,7 +14,9 @@ use crate::types::BackendId;
 use foyer::Code;
 use std::io::{Read, Write};
 
-use super::article::{CachedArticleNumber, CachedPayload, parse_payload, parse_payload_chunks};
+use super::article::{
+    CachedArticleNumber, CachedPayload, parse_payload, parse_payload_chunked_response,
+};
 use super::availability::ArticleAvailability;
 use super::ttl;
 
@@ -426,7 +428,7 @@ impl DiskArticleEntry {
         buffer.copy_prefix_into(3, &mut prefix);
         let raw_code = StatusCode::parse(&prefix)?.as_u16();
         let status_code = CacheableStatusCode::try_from(raw_code).ok()?;
-        let payload = parse_payload_chunks(StatusCode::new(raw_code), buffer.iter_chunks());
+        let payload = parse_payload_chunked_response(StatusCode::new(raw_code), buffer);
 
         Some(Self {
             status_code,

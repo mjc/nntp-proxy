@@ -377,7 +377,7 @@ impl ArticleEntry {
         let mut prefix = smallvec::SmallVec::<[u8; 128]>::new();
         buffer.copy_prefix_into(3, &mut prefix);
         let status_code = StatusCode::parse(&prefix).unwrap_or_else(|| StatusCode::new(430));
-        let payload = parse_payload_chunks(status_code, buffer.iter_chunks());
+        let payload = parse_payload_chunked_response(status_code, buffer);
         Self {
             backend_availability: ArticleAvailability::new(),
             status_code,
@@ -591,44 +591,158 @@ pub(crate) fn parse_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPay
     payload_for_status(code, article_number, payload)
 }
 
-pub(crate) fn parse_payload_chunks<'a>(
+pub(crate) fn parse_payload_chunked_response(
     status_code: StatusCode,
-    chunks: impl IntoIterator<Item = &'a [u8]>,
+    buffer: &crate::pool::ChunkedResponse,
 ) -> CachedPayload {
     let code = status_code.as_u16();
     if code == 430 {
         return CachedPayload::Missing;
     }
 
-    let mut status_line = smallvec::SmallVec::<[u8; 128]>::new();
-    let mut payload_with_tail = Vec::new();
-    let mut in_status = true;
+    let Some((status_end, status_line)) = chunked_status_line(buffer) else {
+        return CachedPayload::AvailabilityOnly;
+    };
+    let article_number = parse_article_number(&status_line);
 
-    for chunk in chunks {
+    match code {
+        220..=222 => {
+            let Some(payload_end) = chunked_multiline_payload_end(buffer, status_end) else {
+                return CachedPayload::AvailabilityOnly;
+            };
+            payload_for_chunked_status(code, article_number, buffer, status_end, payload_end)
+        }
+        223 => CachedPayload::Stat { article_number },
+        _ => CachedPayload::AvailabilityOnly,
+    }
+}
+
+fn chunked_status_line(
+    buffer: &crate::pool::ChunkedResponse,
+) -> Option<(usize, smallvec::SmallVec<[u8; 128]>)> {
+    let mut status_line = smallvec::SmallVec::<[u8; 128]>::new();
+    let mut position = 0;
+
+    for chunk in buffer.iter_chunks() {
         for &byte in chunk {
-            if in_status {
-                status_line.push(byte);
-                if status_line.ends_with(b"\r\n") {
-                    in_status = false;
-                }
-            } else {
-                payload_with_tail.push(byte);
+            status_line.push(byte);
+            position += 1;
+            if status_line.ends_with(b"\r\n") {
+                return Some((position, status_line));
             }
         }
     }
 
-    if in_status {
-        return CachedPayload::AvailabilityOnly;
+    None
+}
+
+fn chunked_multiline_payload_end(
+    buffer: &crate::pool::ChunkedResponse,
+    payload_start: usize,
+) -> Option<usize> {
+    let payload_len = buffer.len().checked_sub(payload_start)?;
+    if payload_len == 3 && buffer.ends_with(b".\r\n") {
+        return Some(payload_start);
+    }
+    buffer
+        .ends_with(b"\r\n.\r\n")
+        .then(|| buffer.len().saturating_sub(5))
+}
+
+fn payload_for_chunked_status(
+    code: u16,
+    article_number: Option<CachedArticleNumber>,
+    buffer: &crate::pool::ChunkedResponse,
+    payload_start: usize,
+    payload_end: usize,
+) -> CachedPayload {
+    match code {
+        220 => {
+            if let Some(split) =
+                find_sequence_in_chunked_range(buffer, b"\r\n\r\n", payload_start, payload_end)
+            {
+                CachedPayload::Article {
+                    article_number,
+                    headers: copy_chunked_range(buffer, payload_start, split),
+                    body: copy_chunked_range(buffer, split + 4, payload_end),
+                }
+            } else {
+                CachedPayload::Article {
+                    article_number,
+                    headers: Box::from([]),
+                    body: copy_chunked_range(buffer, payload_start, payload_end),
+                }
+            }
+        }
+        221 => CachedPayload::Head {
+            article_number,
+            headers: copy_chunked_range(buffer, payload_start, payload_end),
+        },
+        222 => CachedPayload::Body {
+            article_number,
+            body: copy_chunked_range(buffer, payload_start, payload_end),
+        },
+        _ => CachedPayload::AvailabilityOnly,
+    }
+}
+
+fn find_sequence_in_chunked_range(
+    buffer: &crate::pool::ChunkedResponse,
+    needle: &[u8; 4],
+    start: usize,
+    end: usize,
+) -> Option<usize> {
+    let mut position = 0;
+    let mut window = [0_u8; 4];
+    let mut seen = 0_usize;
+
+    for chunk in buffer.iter_chunks() {
+        for &byte in chunk {
+            if position >= end {
+                return None;
+            }
+            if position >= start {
+                window.copy_within(1.., 0);
+                window[3] = byte;
+                seen += 1;
+                if seen >= 4 && &window == needle {
+                    return Some(position + 1 - 4);
+                }
+            }
+            position += 1;
+        }
     }
 
-    let article_number = parse_article_number(&status_line);
-    let Some(payload) = payload_without_multiline_terminator(code, &payload_with_tail) else {
-        return match code {
-            223 => CachedPayload::Stat { article_number },
-            _ => CachedPayload::AvailabilityOnly,
-        };
-    };
-    payload_for_status(code, article_number, payload)
+    None
+}
+
+fn copy_chunked_range(
+    buffer: &crate::pool::ChunkedResponse,
+    start: usize,
+    end: usize,
+) -> Box<[u8]> {
+    let len = end.saturating_sub(start);
+    let mut output = Vec::with_capacity(len);
+    let mut position = 0;
+
+    for chunk in buffer.iter_chunks() {
+        let chunk_start = position;
+        let chunk_end = position + chunk.len();
+        position = chunk_end;
+
+        if chunk_end <= start {
+            continue;
+        }
+        if chunk_start >= end {
+            break;
+        }
+
+        let copy_start = start.saturating_sub(chunk_start);
+        let copy_end = (end.min(chunk_end)) - chunk_start;
+        output.extend_from_slice(&chunk[copy_start..copy_end]);
+    }
+
+    output.into_boxed_slice()
 }
 
 fn payload_without_multiline_terminator(code: u16, payload: &[u8]) -> Option<&[u8]> {
