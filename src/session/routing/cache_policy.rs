@@ -27,7 +27,7 @@ pub enum CacheAction {
 /// - 222 = BODY (body only - cache this for yEnc content)
 /// - 223 = STAT (status only)
 #[inline]
-pub fn should_capture_for_cache(
+fn should_capture_for_cache(
     request: &RequestContext,
     response_code: StatusCode,
     cache_articles: bool,
@@ -50,11 +50,12 @@ pub fn should_track_availability(response_code: StatusCode, has_message_id: bool
 
 /// Determine caching action for a response
 ///
-/// Response codes uniquely identify the command type:
-/// - 220 = ARTICLE (cache full article if enabled)
-/// - 221 = HEAD (track availability)
-/// - 222 = BODY (track availability)
-/// - 223 = STAT (track availability)
+/// The request context determines whether the status code carries a multiline
+/// payload for this command:
+/// - ARTICLE + 220 = capture full article if enabled
+/// - HEAD + 221 = track availability
+/// - BODY + 222 = capture body payload if enabled, otherwise track availability
+/// - STAT + 223 = track availability
 ///
 /// The command is validated to ensure it's not a stateful command
 /// that would require mode switching (GROUP, NEXT, XOVER, etc.)
@@ -256,7 +257,7 @@ mod tests {
 
     #[test]
     fn test_determine_cache_action_track_stat() {
-        // Track STAT (223) - not multiline
+        // Track STAT (223) as availability-only metadata.
         assert_eq!(
             determine_cache_action("STAT <test@example.com>", 223, false, true),
             CacheAction::TrackStat
