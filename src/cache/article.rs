@@ -285,7 +285,7 @@ impl CachedPayload {
 /// Stores typed response metadata and semantic payload only. Status lines and
 /// multiline terminators are regenerated when serving cache hits.
 #[derive(Clone, Debug)]
-pub struct ArticleEntry {
+pub struct CachedArticle {
     /// Backend availability bitset (2 bytes)
     ///
     /// No mutex needed: moka clones entries on `get()`, and updates go through
@@ -304,7 +304,7 @@ pub struct ArticleEntry {
     inserted_at: ttl::CacheTimestampMillis,
 }
 
-impl ArticleEntry {
+impl CachedArticle {
     /// Create an availability-only cache entry without payload bytes.
     #[must_use]
     pub(crate) fn availability_only(status_code: StatusCode, tier: ttl::CacheTier) -> Self {
@@ -827,7 +827,7 @@ fn parse_article_number(status_line: &[u8]) -> Option<CachedArticleNumber> {
 /// Formula: `effective_ttl = base_ttl * (2 ^ tier)`
 #[derive(Clone, Debug)]
 pub struct ArticleCache {
-    cache: Arc<Cache<Arc<str>, ArticleEntry>>,
+    cache: Arc<Cache<Arc<str>, CachedArticle>>,
     hits: Arc<AtomicU64>,
     misses: Arc<AtomicU64>,
     capacity: u64,
@@ -853,7 +853,7 @@ impl ArticleCache {
         // at the effective tier TTL. Keep Moka TTL only for the zero-TTL case so
         // tests and pathological configs still expire immediately.
         let builder = Cache::builder().max_capacity(max_capacity).weigher(
-            move |key: &Arc<str>, entry: &ArticleEntry| -> u32 {
+            move |key: &Arc<str>, entry: &CachedArticle| -> u32 {
                 // Calculate actual memory footprint for accurate capacity tracking.
                 //
                 // Memory layout per cache entry:
@@ -863,7 +863,7 @@ impl ArticleCache {
                 //   - String data: key.len() bytes
                 //   - Allocator overhead: ~16 bytes (malloc metadata, alignment)
                 //
-                // Value: ArticleEntry
+                // Value: CachedArticle
                 //   - Struct inline metadata: availability, status, tier, timestamp, payload tag
                 //   - Shared semantic payload sections: headers/body slice metadata and bytes
                 //   - Allocator overhead for present payload sections
@@ -880,7 +880,7 @@ impl ArticleCache {
                 // Our observed ratio: 362MB RSS / 36MB weighted = 10x
                 //
                 const ARC_STR_OVERHEAD: usize = 16 + 16; // Arc control block + allocator
-                const ENTRY_STRUCT: usize = 64; // ArticleEntry inline metadata and enum tag
+                const ENTRY_STRUCT: usize = 64; // CachedArticle inline metadata and enum tag
                 const PAYLOAD_OVERHEAD: usize = 2 * (16 + 16); // Up to headers/body shared slices + allocators
                 // Moka internal structures - empirically measured to address memory reporting gap.
                 // See moka issue #473: https://github.com/moka-rs/moka/issues/473
@@ -931,7 +931,7 @@ impl ArticleCache {
     ///
     /// **Tier-aware TTL**: Even if moka hasn't expired the entry yet, we check if the entry
     /// is expired based on tier-aware TTL. Higher tier entries get longer TTLs.
-    pub async fn get(&self, message_id: &MessageId<'_>) -> Option<ArticleEntry> {
+    pub async fn get(&self, message_id: &MessageId<'_>) -> Option<CachedArticle> {
         // moka::Cache<Arc<str>, V> supports get(&str) via Borrow<str> trait
         // This is zero-allocation: no Arc<str> is created for the lookup
         self.get_by_cache_key(message_id.without_brackets()).await
@@ -941,7 +941,7 @@ impl ArticleCache {
     ///
     /// This is the request hot path: `RequestContext` has already validated the
     /// message-id span, so callers can avoid rebuilding a `MessageId` wrapper.
-    pub(crate) async fn get_by_cache_key(&self, key: &str) -> Option<ArticleEntry> {
+    pub(crate) async fn get_by_cache_key(&self, key: &str) -> Option<CachedArticle> {
         let result = self.cache.get(key).await;
 
         match result {
@@ -1001,12 +1001,12 @@ impl ArticleCache {
         let cache_articles = self.cache_articles;
 
         let new_entry_template = if cache_articles {
-            ArticleEntry::from_ingest_bytes_with_tier(buffer, tier)
+            CachedArticle::from_ingest_bytes_with_tier(buffer, tier)
         } else {
             let Some(status_code) = buffer.status_code() else {
                 return;
             };
-            ArticleEntry::availability_only(status_code, tier)
+            CachedArticle::availability_only(status_code, tier)
         };
 
         // Use atomic upsert - this provides key-level locking and eliminates
@@ -1062,7 +1062,7 @@ impl ArticleCache {
         tier: ttl::CacheTier,
     ) {
         let key: Arc<str> = message_id.without_brackets().into();
-        let new_entry_template = ArticleEntry::availability_only(status_code, tier);
+        let new_entry_template = CachedArticle::availability_only(status_code, tier);
 
         self.cache
             .entry(key)
@@ -1111,7 +1111,7 @@ impl ArticleCache {
                     entry
                 } else {
                     // First 430 for this article - create typed missing entry.
-                    let mut entry = ArticleEntry::missing(ttl::CacheTier::new(0));
+                    let mut entry = CachedArticle::missing(ttl::CacheTier::new(0));
                     entry.record_backend_missing(backend_id);
                     entry
                 };
@@ -1173,7 +1173,7 @@ impl ArticleCache {
                         Op::Nop
                     } else {
                         // All checked backends returned 430 - create a missing entry to track this.
-                        let mut entry = ArticleEntry::missing(ttl::CacheTier::new(0));
+                        let mut entry = CachedArticle::missing(ttl::CacheTier::new(0));
                         entry.backend_availability = availability;
                         Op::Put(entry)
                     }
@@ -1203,7 +1203,7 @@ impl ArticleCache {
     /// This is a low-level method that bypasses the usual upsert logic.
     /// Only use this in tests where you need precise control over cache state.
     #[cfg(test)]
-    pub(crate) async fn insert(&self, message_id: MessageId<'_>, entry: ArticleEntry) {
+    pub(crate) async fn insert(&self, message_id: MessageId<'_>, entry: CachedArticle) {
         let key: Arc<str> = message_id.without_brackets().into();
         self.cache.insert(key, entry).await;
     }
@@ -1314,27 +1314,27 @@ mod tests {
         }
     }
 
-    fn entry_from_response(buffer: impl AsRef<[u8]>) -> ArticleEntry {
-        ArticleEntry::from_response_with_tier(buffer, ttl::CacheTier::new(0))
+    fn cached_article_from_response(buffer: impl AsRef<[u8]>) -> CachedArticle {
+        CachedArticle::from_response_with_tier(buffer, ttl::CacheTier::new(0))
     }
 
-    fn create_test_article(msgid: &str) -> ArticleEntry {
+    fn create_test_cached_article(msgid: &str) -> CachedArticle {
         let buffer = format!("220 0 {msgid}\r\nSubject: Test\r\n\r\nBody\r\n.\r\n").into_bytes();
-        entry_from_response(buffer)
+        cached_article_from_response(buffer)
     }
 
-    fn rendered(entry: &ArticleEntry, request_kind: RequestKind, msgid: &str) -> Vec<u8> {
+    fn rendered(entry: &CachedArticle, request_kind: RequestKind, msgid: &str) -> Vec<u8> {
         let response = entry.response_for(request_kind, msgid).unwrap();
         let mut out = Vec::with_capacity(response.wire_len().get());
         block_on(response.write_to(&mut out)).unwrap();
         out
     }
 
-    fn serves(entry: &ArticleEntry, request_kind: RequestKind, msgid: &str) -> bool {
+    fn serves(entry: &CachedArticle, request_kind: RequestKind, msgid: &str) -> bool {
         entry.response_for(request_kind, msgid).is_some()
     }
 
-    fn assert_serves(entry: &ArticleEntry, cases: &[(RequestKind, bool)]) {
+    fn assert_serves(entry: &CachedArticle, cases: &[(RequestKind, bool)]) {
         cases.iter().for_each(|(request_kind, expected)| {
             assert_eq!(
                 serves(entry, *request_kind, "<test@example.com>"),
@@ -1346,7 +1346,7 @@ mod tests {
 
     #[tokio::test]
     async fn cached_article_response_writes_wire_slices() {
-        let entry = create_test_article("<test@example.com>");
+        let entry = create_test_cached_article("<test@example.com>");
         let response = entry
             .response_for(RequestKind::Article, "<test@example.com>")
             .unwrap();
@@ -1362,7 +1362,7 @@ mod tests {
 
     #[tokio::test]
     async fn cached_article_response_uses_vectored_write() {
-        let entry = create_test_article("<test@example.com>");
+        let entry = create_test_cached_article("<test@example.com>");
         let response = entry
             .response_for(RequestKind::Article, "<test@example.com>")
             .unwrap();
@@ -1380,7 +1380,7 @@ mod tests {
 
     #[test]
     fn cached_article_response_exposes_typed_wire_len() {
-        let entry = create_test_article("<test@example.com>");
+        let entry = create_test_cached_article("<test@example.com>");
         let response = entry
             .response_for(RequestKind::Stat, "<test@example.com>")
             .unwrap();
@@ -1393,7 +1393,7 @@ mod tests {
 
     #[tokio::test]
     async fn cached_article_response_writes_derived_wire_shapes() {
-        let entry = create_test_article("<test@example.com>");
+        let entry = create_test_cached_article("<test@example.com>");
         let cases = [
             (
                 RequestKind::Head,
@@ -1432,7 +1432,8 @@ mod tests {
 
     #[test]
     fn body_payload_serves_body_and_stat_only() {
-        let entry = entry_from_response(b"222 0 <test@example.com>\r\nBody content only\r\n.\r\n");
+        let entry =
+            cached_article_from_response(b"222 0 <test@example.com>\r\nBody content only\r\n.\r\n");
 
         assert_serves(
             &entry,
@@ -1447,8 +1448,9 @@ mod tests {
 
     #[test]
     fn article_payload_serves_article_head_body_and_stat() {
-        let entry =
-            entry_from_response(b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n");
+        let entry = cached_article_from_response(
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+        );
 
         assert_serves(
             &entry,
@@ -1463,7 +1465,8 @@ mod tests {
 
     #[test]
     fn head_payload_serves_head_and_stat_only() {
-        let entry = entry_from_response(b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n");
+        let entry =
+            cached_article_from_response(b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n");
 
         assert_serves(
             &entry,
@@ -1478,8 +1481,10 @@ mod tests {
 
     #[test]
     fn body_payload_completeness_requires_semantic_body() {
-        let complete = entry_from_response(b"222 0 <test@example.com>\r\nBody content\r\n.\r\n");
-        let metadata_only = entry_from_response(b"222 0 <test@example.com>\r\n".as_slice());
+        let complete =
+            cached_article_from_response(b"222 0 <test@example.com>\r\nBody content\r\n.\r\n");
+        let metadata_only =
+            cached_article_from_response(b"222 0 <test@example.com>\r\n".as_slice());
 
         assert!(complete.is_complete_article());
         assert!(!metadata_only.is_complete_article());
@@ -1564,9 +1569,9 @@ mod tests {
     }
 
     #[test]
-    fn test_article_entry_basic() {
+    fn test_cached_article_basic() {
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = entry_from_response(buffer.clone());
+        let entry = cached_article_from_response(buffer.clone());
 
         assert_eq!(entry.status_code(), StatusCode::new(220));
         assert_eq!(
@@ -1580,17 +1585,18 @@ mod tests {
     }
 
     #[test]
-    fn article_entry_ingests_response_by_name() {
-        let entry =
-            entry_from_response(b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n");
+    fn cached_article_ingests_response_by_name() {
+        let entry = cached_article_from_response(
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+        );
 
         assert_eq!(entry.status_code(), StatusCode::new(220));
         assert!(matches!(entry.payload, CachedPayload::Article { .. }));
     }
 
     #[test]
-    fn article_entry_ingests_borrowed_response() {
-        let entry = entry_from_response(
+    fn cached_article_ingests_borrowed_response() {
+        let entry = cached_article_from_response(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".as_slice(),
         );
 
@@ -1599,15 +1605,15 @@ mod tests {
     }
 
     #[test]
-    fn article_entry_defaults_to_tier_zero() {
-        let entry = entry_from_response(b"220 0 <test@example.com>\r\n.\r\n");
+    fn cached_article_defaults_to_tier_zero() {
+        let entry = cached_article_from_response(b"220 0 <test@example.com>\r\n.\r\n");
 
         assert_eq!(entry.tier(), ttl::CacheTier::new(0));
     }
 
     #[test]
-    fn article_entry_can_ingest_with_tier_internally() {
-        let entry = ArticleEntry::from_response_with_tier(
+    fn cached_article_can_ingest_with_tier_internally() {
+        let entry = CachedArticle::from_response_with_tier(
             b"220 0 <test@example.com>\r\n.\r\n",
             ttl::CacheTier::new(5),
         );
@@ -1616,13 +1622,14 @@ mod tests {
     }
 
     #[test]
-    fn article_entry_stores_payload_sections_as_shared_slices() {
+    fn cached_article_stores_payload_sections_as_shared_slices() {
         trait SharedSlice {}
         impl SharedSlice for Arc<[u8]> {}
         fn assert_shared_slice<T: SharedSlice>(_: &T) {}
 
-        let entry =
-            entry_from_response(b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n");
+        let entry = cached_article_from_response(
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+        );
 
         match &entry.payload {
             CachedPayload::Article { headers, body, .. } => {
@@ -1634,9 +1641,10 @@ mod tests {
     }
 
     #[test]
-    fn article_entry_clone_shares_payload_sections() {
-        let entry =
-            entry_from_response(b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n");
+    fn cached_article_clone_shares_payload_sections() {
+        let entry = cached_article_from_response(
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+        );
         let cloned = entry.clone();
 
         match (&entry.payload, &cloned.payload) {
@@ -1656,8 +1664,8 @@ mod tests {
     }
 
     #[test]
-    fn article_entry_ingests_ingest_bytes_without_required_vec() {
-        let entry = ArticleEntry::from_ingest_bytes_with_tier(
+    fn cached_article_ingests_ingest_bytes_without_required_vec() {
+        let entry = CachedArticle::from_ingest_bytes_with_tier(
             smallvec::SmallVec::<[u8; 128]>::from_slice(
                 b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
             )
@@ -1670,7 +1678,7 @@ mod tests {
     }
 
     #[test]
-    fn article_entry_ingests_chunked_ingest_bytes_without_flattening_response() {
+    fn cached_article_ingests_chunked_ingest_bytes_without_flattening_response() {
         let pool = crate::pool::BufferPool::new(
             crate::types::BufferSize::try_new(1024).expect("valid buffer size"),
             1,
@@ -1687,7 +1695,7 @@ mod tests {
         );
 
         let entry =
-            ArticleEntry::from_ingest_bytes_with_tier(response.into(), ttl::CacheTier::new(0));
+            CachedArticle::from_ingest_bytes_with_tier(response.into(), ttl::CacheTier::new(0));
 
         assert_eq!(entry.status_code(), StatusCode::new(220));
         match entry.payload {
@@ -1702,36 +1710,38 @@ mod tests {
     #[test]
     fn test_is_complete_article() {
         // Metadata-only responses should NOT be complete articles
-        let metadata_only_430 = entry_from_response(b"430\r\n");
+        let metadata_only_430 = cached_article_from_response(b"430\r\n");
         assert!(!metadata_only_430.is_complete_article());
 
-        let metadata_only_220 = entry_from_response(b"220\r\n");
+        let metadata_only_220 = cached_article_from_response(b"220\r\n");
         assert!(!metadata_only_220.is_complete_article());
 
-        let metadata_only_223 = entry_from_response(b"223\r\n");
+        let metadata_only_223 = cached_article_from_response(b"223\r\n");
         assert!(!metadata_only_223.is_complete_article());
 
         // Full article SHOULD be complete
-        let full =
-            entry_from_response(b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n");
+        let full = cached_article_from_response(
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+        );
         assert!(full.is_complete_article());
 
         // Wrong status code (not 220) should NOT be complete article
         let head_response =
-            entry_from_response(b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n");
+            cached_article_from_response(b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n");
         assert!(!head_response.is_complete_article());
 
         // Missing terminator should NOT be complete
-        let no_terminator =
-            entry_from_response(b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n");
+        let no_terminator = cached_article_from_response(
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n",
+        );
         assert!(!no_terminator.is_complete_article());
     }
 
     #[test]
-    fn test_article_entry_record_backend_missing() {
+    fn test_cached_article_record_backend_missing() {
         let backend0 = BackendId::from_index(0);
         let backend1 = BackendId::from_index(1);
-        let mut entry = create_test_article("<test@example.com>");
+        let mut entry = create_test_cached_article("<test@example.com>");
 
         // Initially should try both
         assert!(entry.should_try_backend(backend0));
@@ -1746,11 +1756,11 @@ mod tests {
     }
 
     #[test]
-    fn test_article_entry_all_backends_exhausted() {
+    fn test_cached_article_all_backends_exhausted() {
         use crate::router::BackendCount;
         let backend0 = BackendId::from_index(0);
         let backend1 = BackendId::from_index(1);
-        let mut entry = create_test_article("<test@example.com>");
+        let mut entry = create_test_cached_article("<test@example.com>");
 
         // Not all exhausted yet
         assert!(!entry.all_backends_exhausted(BackendCount::new(2)));
@@ -1770,7 +1780,7 @@ mod tests {
 
         // Create a MessageId and insert an article
         let msgid = MessageId::from_borrowed("<test123@example.com>").unwrap();
-        let article = create_test_article("<test123@example.com>");
+        let article = create_test_cached_article("<test123@example.com>");
 
         cache.insert(msgid.clone(), article.clone()).await;
 
@@ -1812,7 +1822,7 @@ mod tests {
         let cache = ArticleCache::new(10, Duration::from_secs(300), true);
 
         let msgid = MessageId::from_borrowed("<article@example.com>").unwrap();
-        let article = create_test_article("<article@example.com>");
+        let article = create_test_cached_article("<article@example.com>");
 
         cache.insert(msgid.clone(), article.clone()).await;
 
@@ -1887,7 +1897,7 @@ mod tests {
         let cache = ArticleCache::new(100, Duration::from_secs(300), true);
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
-        let article = create_test_article("<test@example.com>");
+        let article = create_test_cached_article("<test@example.com>");
 
         cache.insert(msgid.clone(), article).await;
 
@@ -1979,7 +1989,7 @@ mod tests {
 
         // Insert one article
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
-        let article = create_test_article("<test@example.com>");
+        let article = create_test_cached_article("<test@example.com>");
         cache.insert(msgid, article).await;
 
         // Wait for background tasks
@@ -1995,7 +2005,7 @@ mod tests {
         let cache = ArticleCache::new(1024 * 1024, Duration::from_millis(50), true); // 1MB
 
         let msgid = MessageId::from_borrowed("<expire@example.com>").unwrap();
-        let article = create_test_article("<expire@example.com>");
+        let article = create_test_cached_article("<expire@example.com>");
 
         cache.insert(msgid.clone(), article).await;
 
@@ -2057,7 +2067,7 @@ mod tests {
         for i in 1..=3 {
             let msgid_str = format!("<article{i}@example.com>");
             let msgid = MessageId::new(msgid_str).unwrap();
-            let article = create_test_article(msgid.as_ref());
+            let article = create_test_cached_article(msgid.as_ref());
             cache.insert(msgid, article).await;
             cache.sync().await; // Force eviction
         }
@@ -2074,8 +2084,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_article_entry_clone() {
-        let article = create_test_article("<test@example.com>");
+    async fn test_cached_article_clone() {
+        let article = create_test_cached_article("<test@example.com>");
 
         let cloned = article.clone();
         assert_eq!(
@@ -2090,7 +2100,7 @@ mod tests {
         let cache2 = cache1.clone();
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
-        let article = create_test_article("<test@example.com>");
+        let article = create_test_cached_article("<test@example.com>");
 
         cache1.insert(msgid.clone(), article).await;
         cache1.sync().await;
@@ -2111,7 +2121,7 @@ mod tests {
             "222 0 <test@example.com>\r\n{}\r\n.\r\n",
             std::str::from_utf8(&body).unwrap()
         );
-        let article = entry_from_response(response.as_bytes());
+        let article = cached_article_from_response(response.as_bytes());
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
         cache.insert(msgid.clone(), article).await;
@@ -2131,7 +2141,7 @@ mod tests {
                 msgid.as_str(),
                 std::str::from_utf8(&body).unwrap()
             );
-            let article = entry_from_response(response.as_bytes());
+            let article = cached_article_from_response(response.as_bytes());
             cache.insert(msgid, article).await;
             cache.sync().await;
         }
@@ -2156,7 +2166,7 @@ mod tests {
 
         // Create small metadata-only response (53 bytes)
         let metadata_only = b"223 0 <test@example.com>\r\n".to_vec();
-        let article = entry_from_response(metadata_only);
+        let article = cached_article_from_response(metadata_only);
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
         cache.insert(msgid, article).await;
@@ -2172,7 +2182,7 @@ mod tests {
             let msgid_str = format!("<metadata_only{i}@example.com>");
             let msgid = MessageId::new(msgid_str).unwrap();
             let metadata_only = format!("223 0 {}\r\n", msgid.as_str());
-            let article = entry_from_response(metadata_only.as_bytes());
+            let article = cached_article_from_response(metadata_only.as_bytes());
             cache.insert(msgid, article).await;
         }
 
@@ -2195,7 +2205,7 @@ mod tests {
 
         // Use owned MessageId
         let msgid = MessageId::new("<owned@example.com>".to_string()).unwrap();
-        let article = create_test_article("<owned@example.com>");
+        let article = create_test_cached_article("<owned@example.com>");
 
         cache.insert(msgid.clone(), article).await;
 

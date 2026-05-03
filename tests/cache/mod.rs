@@ -4,7 +4,7 @@
 //! tiered TTL, adaptive prechecking, and cache integration with hybrid mode.
 
 use futures::executor::block_on;
-use nntp_proxy::cache::ArticleEntry;
+use nntp_proxy::cache::CachedArticle;
 use nntp_proxy::protocol::RequestKind;
 use nntp_proxy::types::MessageId;
 
@@ -20,7 +20,7 @@ pub mod tiered_ttl;
 pub mod unified_cache;
 
 pub fn article_response_bytes(
-    entry: &ArticleEntry,
+    entry: &CachedArticle,
     request_kind: RequestKind,
     message_id: &MessageId<'_>,
 ) -> Option<Vec<u8>> {

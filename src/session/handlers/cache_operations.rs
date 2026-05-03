@@ -220,7 +220,7 @@ fn cache_availability_metadata(availability: &ArticleAvailability) -> RequestCac
 }
 
 fn cache_entry_metadata(
-    cached: &crate::cache::ArticleEntry,
+    cached: &crate::cache::CachedArticle,
     availability: &ArticleAvailability,
 ) -> RequestCacheEntryMetadata {
     RequestCacheEntryMetadata::new(
@@ -267,7 +267,7 @@ impl CachedResponseWrite {
 
 pub(super) async fn write_cached_article_response<W>(
     client_write: &mut W,
-    cached: &crate::cache::ArticleEntry,
+    cached: &crate::cache::CachedArticle,
     request_kind: RequestKind,
     message_id: &str,
 ) -> std::io::Result<Option<CachedResponseWrite>>

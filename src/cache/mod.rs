@@ -24,7 +24,7 @@ mod mock_hybrid;
 
 pub(crate) use article::CachedArticleNumber;
 pub(crate) use article::CachedPayloadKind;
-pub use article::{ArticleCache, ArticleEntry};
+pub use article::{ArticleCache, CachedArticle};
 pub use availability::{ArticleAvailability, BackendStatus, MAX_BACKENDS};
 pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
 
@@ -324,13 +324,13 @@ impl UnifiedCache {
     }
 
     /// Get an article from the cache
-    pub async fn get(&self, message_id: &MessageId<'_>) -> Option<ArticleEntry> {
+    pub async fn get(&self, message_id: &MessageId<'_>) -> Option<CachedArticle> {
         match self {
             Self::Memory(cache) => cache.get(message_id).await,
             Self::Hybrid(cache) => cache
                 .get(message_id)
                 .await
-                .map(|entry| entry.to_article_entry()),
+                .map(|entry| entry.to_cached_article()),
         }
     }
 
@@ -338,7 +338,7 @@ impl UnifiedCache {
     ///
     /// Memory cache hits avoid rebuilding a `MessageId`; hybrid cache still uses
     /// the typed wrapper because its disk key path owns `String`s internally.
-    pub async fn get_request_message_id(&self, message_id: &str) -> Option<ArticleEntry> {
+    pub async fn get_request_message_id(&self, message_id: &str) -> Option<CachedArticle> {
         match self {
             Self::Memory(cache) => {
                 let key = message_id.strip_prefix('<')?.strip_suffix('>')?;
@@ -349,7 +349,7 @@ impl UnifiedCache {
                 cache
                     .get(&message_id)
                     .await
-                    .map(|entry| entry.to_article_entry())
+                    .map(|entry| entry.to_cached_article())
             }
         }
     }

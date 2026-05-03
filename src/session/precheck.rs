@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use crate::cache::{ArticleAvailability, ArticleEntry, UnifiedCache};
+use crate::cache::{ArticleAvailability, CachedArticle, UnifiedCache};
 use crate::metrics::MetricsCollector;
 use crate::pool::BufferPool;
 use crate::protocol::{RequestContext, StatusCode};
@@ -375,7 +375,7 @@ pub async fn precheck(
     deps: &PrecheckDeps<'_>,
     request: &RequestContext,
     msg_id: &MessageId<'_>,
-) -> Option<ArticleEntry> {
+) -> Option<CachedArticle> {
     // Check cache first - if we have a complete article, return it immediately
     if let Some(cached) = deps.cache.get(msg_id).await
         && cached.is_complete_article()

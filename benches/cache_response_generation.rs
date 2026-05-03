@@ -8,7 +8,7 @@
 
 use divan::{Bencher, black_box};
 use futures::executor::block_on;
-use nntp_proxy::cache::{ArticleCache, ArticleEntry};
+use nntp_proxy::cache::{ArticleCache, CachedArticle};
 use nntp_proxy::protocol::RequestKind;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
@@ -27,11 +27,11 @@ This is the benchmark body.\r\n\
 It has multiple lines.\r\n\
 .\r\n";
 
-fn article_entry() -> ArticleEntry {
+fn cached_article() -> CachedArticle {
     cache_entry_from_bytes(ARTICLE_RESPONSE)
 }
 
-fn cache_entry_from_bytes(response: impl AsRef<[u8]>) -> ArticleEntry {
+fn cache_entry_from_bytes(response: impl AsRef<[u8]>) -> CachedArticle {
     let cache = ArticleCache::new(1024 * 1024, Duration::from_secs(300), true);
     let msg_id = MessageId::from_borrowed(MSG_ID).unwrap();
 
@@ -48,7 +48,7 @@ fn cache_entry_from_bytes(response: impl AsRef<[u8]>) -> ArticleEntry {
     })
 }
 
-fn write_cached_response(entry: &ArticleEntry, request_kind: RequestKind) -> usize {
+fn write_cached_response(entry: &CachedArticle, request_kind: RequestKind) -> usize {
     entry
         .response_for(request_kind, MSG_ID)
         .map(|response| {
@@ -60,13 +60,13 @@ fn write_cached_response(entry: &ArticleEntry, request_kind: RequestKind) -> usi
 }
 
 mod article_derived_hits {
-    use super::{Bencher, RequestKind, article_entry, black_box, write_cached_response};
+    use super::{Bencher, RequestKind, black_box, cached_article, write_cached_response};
 
     macro_rules! bench_cached_response {
         ($name:ident, $request_kind:expr) => {
             #[divan::bench(sample_count = 1000, sample_size = 1000)]
             fn $name(bencher: Bencher) {
-                let entry = article_entry();
+                let entry = cached_article();
 
                 bencher.bench(|| {
                     black_box(write_cached_response(

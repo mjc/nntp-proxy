@@ -473,8 +473,8 @@ impl DiskCachedArticle {
     }
 
     #[must_use]
-    pub(crate) fn to_article_entry(&self) -> super::article::ArticleEntry {
-        super::article::ArticleEntry::from_parts(
+    pub(crate) fn to_cached_article(&self) -> super::article::CachedArticle {
+        super::article::CachedArticle::from_parts(
             StatusCode::new(self.status_code.as_u16()),
             self.payload.clone(),
             self.availability,

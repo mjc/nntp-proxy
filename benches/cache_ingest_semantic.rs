@@ -4,7 +4,7 @@
 
 use divan::{Bencher, black_box};
 use nntp_proxy::cache::ArticleCache;
-use nntp_proxy::cache::ArticleEntry;
+use nntp_proxy::cache::CachedArticle;
 use nntp_proxy::cache::ttl::CacheTier;
 use nntp_proxy::pool::{BufferPool, ChunkedResponse};
 use nntp_proxy::types::{BackendId, BufferSize, MessageId};
@@ -100,7 +100,7 @@ mod cache_upsert {
 
 mod entry_parse {
     use super::{
-        ArticleEntry, Bencher, BufferPool, BufferSize, CacheTier, ChunkedResponse,
+        Bencher, BufferPool, BufferSize, CacheTier, CachedArticle, ChunkedResponse,
         article_response, black_box,
     };
 
@@ -125,7 +125,7 @@ mod entry_parse {
                 bencher
                     .counter(divan::counter::BytesCount::new(bytes.len()))
                     .bench(|| {
-                        black_box(ArticleEntry::from_chunked_response_with_tier(
+                        black_box(CachedArticle::from_chunked_response_with_tier(
                             black_box(&chunked),
                             CacheTier::new(0),
                         ))
