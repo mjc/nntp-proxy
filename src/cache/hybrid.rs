@@ -61,6 +61,13 @@ use super::ttl;
 
 const HYBRID_CACHE_NAME: &str = "nntp-article-cache-v3";
 
+#[allow(clippy::cast_precision_loss)]
+fn count_as_f64(value: u64) -> f64 {
+    // Cache hit ratios are presentation metrics; exact counters remain stored
+    // separately and are not fed back into cache behavior.
+    value as f64
+}
+
 /// Check available disk space at the given path using df command
 fn check_available_space(path: &Path) -> Option<u64> {
     // Try to use statfs on Linux/Unix
@@ -149,6 +156,11 @@ impl HybridArticleCache {
     /// Create a new hybrid cache with the given configuration
     ///
     /// This will create the disk cache directory if it doesn't exist.
+    ///
+    /// # Errors
+    /// Returns any filesystem, disk-space validation, or foyer initialization
+    /// error encountered while constructing the hybrid cache.
+    #[allow(clippy::too_many_lines)] // This setup wires several orthogonal cache subsystems in one constructor.
     pub async fn new(config: HybridCacheConfig) -> anyhow::Result<Self> {
         // Ensure disk cache directory exists
         std::fs::create_dir_all(&config.disk_path).map_err(|e| {
@@ -533,6 +545,9 @@ impl HybridArticleCache {
     ///
     /// Flushes pending writes to disk before returning.
     /// This waits for all enqueued disk writes to complete.
+    ///
+    /// # Errors
+    /// Returns any foyer shutdown error while draining pending disk-cache writes.
     pub async fn close(&self) -> anyhow::Result<()> {
         self.cache
             .close()
@@ -567,7 +582,7 @@ impl HybridCacheStats {
         if total == 0 {
             0.0
         } else {
-            (self.hits as f64 / total as f64) * 100.0
+            (count_as_f64(self.hits) / count_as_f64(total)) * 100.0
         }
     }
 
@@ -577,7 +592,7 @@ impl HybridCacheStats {
         if self.hits == 0 {
             0.0
         } else {
-            (self.disk_hits as f64 / self.hits as f64) * 100.0
+            (count_as_f64(self.disk_hits) / count_as_f64(self.hits)) * 100.0
         }
     }
 }

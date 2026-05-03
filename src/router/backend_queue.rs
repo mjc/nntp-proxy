@@ -22,6 +22,19 @@ pub struct CompletedPipelineRequest {
     pub context: RequestContext,
 }
 
+struct EnqueueGuard<'a> {
+    depth: &'a AtomicUsize,
+    committed: bool,
+}
+
+impl Drop for EnqueueGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.depth.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
+
 /// Response sent back to a client session from the pipeline worker.
 pub type PipelineResponse = Result<CompletedPipelineRequest, PipelineError>;
 
@@ -147,19 +160,6 @@ impl BackendQueue {
             ) {
                 Ok(_) => break,
                 Err(actual) => current = actual,
-            }
-        }
-
-        // RAII guard ensures depth is decremented if we don't commit
-        struct EnqueueGuard<'a> {
-            depth: &'a AtomicUsize,
-            committed: bool,
-        }
-        impl Drop for EnqueueGuard<'_> {
-            fn drop(&mut self) {
-                if !self.committed {
-                    self.depth.fetch_sub(1, Ordering::AcqRel);
-                }
             }
         }
 
@@ -343,9 +343,9 @@ mod tests {
             ),
         ];
 
-        cases.into_iter().for_each(|(error, expected)| {
+        for (error, expected) in cases {
             assert_eq!(error.to_string(), expected);
-        });
+        }
     }
 
     #[test]

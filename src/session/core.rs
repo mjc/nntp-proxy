@@ -494,7 +494,10 @@ mod tests {
 
         assert_eq!(sessions.len(), 5);
         for (i, session) in sessions.iter().enumerate() {
-            assert_eq!(session.client_addr.port(), 8000 + i as u16);
+            assert_eq!(
+                session.client_addr.port(),
+                8000 + u16::try_from(i).expect("test session index fits into u16"),
+            );
         }
     }
 

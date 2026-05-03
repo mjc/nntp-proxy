@@ -197,6 +197,7 @@ impl From<Timestamp> for Instant {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // These newtype tests intentionally compare exact fixture values and zero constructors.
 mod tests {
     use super::*;
 

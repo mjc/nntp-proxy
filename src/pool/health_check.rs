@@ -219,6 +219,7 @@ pub async fn check_date_response(conn: &mut ConnectionStream) -> Result<(), Heal
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // These tests assert exact health-check failure rates from fixed counters.
 mod tests {
     use super::*;
 

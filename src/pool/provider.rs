@@ -773,6 +773,7 @@ impl ConnectionProvider for DeadpoolConnectionProvider {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // These tests compare exact derived failure-rate fixtures.
 mod tests {
     use super::*;
 

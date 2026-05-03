@@ -288,6 +288,7 @@ pub fn calculate_chart_bounds(max_throughput: f64) -> f64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // These helper tests use exact expected fixture values for chart math.
 mod tests {
     use super::*;
 
@@ -357,7 +358,9 @@ mod tests {
         for i in 0..60 {
             points.push(ChartPoint::new(
                 ChartX::from(i),
-                ChartY::from((i * 1000) as f64),
+                ChartY::from(f64::from(
+                    u32::try_from(i * 1000).expect("test value fits into u32"),
+                )),
             ));
         }
 

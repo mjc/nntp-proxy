@@ -476,6 +476,7 @@ impl ErrorRatePercent {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // These tests intentionally compare exact fixed outputs and zero cases.
 mod tests {
     use super::*;
 

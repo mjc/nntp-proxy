@@ -14,6 +14,13 @@ use std::time::Duration;
 use super::availability::ArticleAvailability;
 use super::ttl;
 
+#[allow(clippy::cast_precision_loss)]
+fn count_as_f64(value: u64) -> f64 {
+    // Cache hit rates are display/monitoring values; the exact counters remain
+    // stored as integers and are not used for control flow here.
+    value as f64
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CachedArticleNumber(u64);
 
@@ -704,23 +711,19 @@ fn payload_for_chunked_status(
     payload_end: usize,
 ) -> CachedPayload {
     match code {
-        220 => {
-            if let Some(split) =
-                find_sequence_in_chunked_range(buffer, b"\r\n\r\n", payload_start, payload_end)
-            {
-                CachedPayload::Article {
-                    article_number,
-                    headers: copy_chunked_range(buffer, payload_start, split),
-                    body: copy_chunked_range(buffer, split + 4, payload_end),
-                }
-            } else {
-                CachedPayload::Article {
+        220 => find_sequence_in_chunked_range(buffer, *b"\r\n\r\n", payload_start, payload_end)
+            .map_or_else(
+                || CachedPayload::Article {
                     article_number,
                     headers: Arc::from([]),
                     body: copy_chunked_range(buffer, payload_start, payload_end),
-                }
-            }
-        }
+                },
+                |split| CachedPayload::Article {
+                    article_number,
+                    headers: copy_chunked_range(buffer, payload_start, split),
+                    body: copy_chunked_range(buffer, split + 4, payload_end),
+                },
+            ),
         221 => CachedPayload::Head {
             article_number,
             headers: copy_chunked_range(buffer, payload_start, payload_end),
@@ -735,7 +738,7 @@ fn payload_for_chunked_status(
 
 fn find_sequence_in_chunked_range(
     buffer: &crate::pool::ChunkedResponse,
-    needle: &[u8; 4],
+    needle: [u8; 4],
     start: usize,
     end: usize,
 ) -> Option<usize> {
@@ -752,7 +755,7 @@ fn find_sequence_in_chunked_range(
                 window.copy_within(1.., 0);
                 window[3] = byte;
                 seen += 1;
-                if seen >= 4 && &window == needle {
+                if seen >= 4 && window == needle {
                     return Some(position + 1 - 4);
                 }
             }
@@ -812,21 +815,18 @@ fn payload_for_status(
     payload: &[u8],
 ) -> CachedPayload {
     match code {
-        220 => {
-            if let Some(split) = memchr::memmem::find(payload, b"\r\n\r\n") {
-                CachedPayload::Article {
-                    article_number,
-                    headers: payload[..split].into(),
-                    body: payload[split + 4..].into(),
-                }
-            } else {
-                CachedPayload::Article {
-                    article_number,
-                    headers: Arc::from([]),
-                    body: payload.into(),
-                }
-            }
-        }
+        220 => memchr::memmem::find(payload, b"\r\n\r\n").map_or_else(
+            || CachedPayload::Article {
+                article_number,
+                headers: Arc::from([]),
+                body: payload.into(),
+            },
+            |split| CachedPayload::Article {
+                article_number,
+                headers: payload[..split].into(),
+                body: payload[split + 4..].into(),
+            },
+        ),
         221 => CachedPayload::Head {
             article_number,
             headers: payload.into(),
@@ -1125,16 +1125,19 @@ impl ArticleCache {
             .cache
             .entry(key)
             .and_upsert_with(|maybe_entry| {
-                let new_entry = if let Some(existing) = maybe_entry {
-                    let mut entry = existing.into_value();
-                    entry.record_backend_missing(backend_id);
-                    entry
-                } else {
-                    // First 430 for this article - create typed missing entry.
-                    let mut entry = CachedArticle::missing(ttl::CacheTier::new(0));
-                    entry.record_backend_missing(backend_id);
-                    entry
-                };
+                let new_entry = maybe_entry.map_or_else(
+                    || {
+                        // First 430 for this article - create typed missing entry.
+                        let mut entry = CachedArticle::missing(ttl::CacheTier::new(0));
+                        entry.record_backend_missing(backend_id);
+                        entry
+                    },
+                    |existing| {
+                        let mut entry = existing.into_value();
+                        entry.record_backend_missing(backend_id);
+                        entry
+                    },
+                );
 
                 std::future::ready(new_entry)
             })
@@ -1180,24 +1183,26 @@ impl ArticleCache {
             .cache
             .entry(key)
             .and_compute_with(|maybe_entry| {
-                let op = if let Some(existing) = maybe_entry {
-                    // Merge availability into existing entry
-                    let mut entry = existing.into_value();
-                    entry.backend_availability.merge_from(&availability);
-                    Op::Put(entry)
-                } else {
-                    // No existing entry - only create a missing entry if all checked backends returned 430.
-                    if availability.any_backend_has_article() {
-                        // A backend successfully provided the article.
-                        // Don't create a missing entry - let upsert() handle it with the real article data.
-                        Op::Nop
-                    } else {
-                        // All checked backends returned 430 - create a missing entry to track this.
-                        let mut entry = CachedArticle::missing(ttl::CacheTier::new(0));
-                        entry.backend_availability = availability;
+                let op = maybe_entry.map_or_else(
+                    || {
+                        if availability.any_backend_has_article() {
+                            // A backend successfully provided the article.
+                            // Don't create a missing entry - let upsert() handle it with the real article data.
+                            Op::Nop
+                        } else {
+                            // All checked backends returned 430 - create a missing entry to track this.
+                            let mut entry = CachedArticle::missing(ttl::CacheTier::new(0));
+                            entry.backend_availability = availability;
+                            Op::Put(entry)
+                        }
+                    },
+                    |existing| {
+                        // Merge availability into existing entry
+                        let mut entry = existing.into_value();
+                        entry.backend_availability.merge_from(&availability);
                         Op::Put(entry)
-                    }
-                };
+                    },
+                );
 
                 std::future::ready(op)
             })
@@ -1260,7 +1265,7 @@ impl ArticleCache {
         if total == 0 {
             0.0
         } else {
-            (hits as f64 / total as f64) * 100.0
+            (count_as_f64(hits) / count_as_f64(total)) * 100.0
         }
     }
 

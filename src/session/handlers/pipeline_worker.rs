@@ -402,9 +402,8 @@ mod tests {
             let mut received = 0usize;
             while received < expected_command_bytes {
                 match stream.read(&mut buf).await {
-                    Ok(0) => break,
+                    Ok(0) | Err(_) => break,
                     Ok(n) => received += n,
-                    Err(_) => break,
                 }
             }
             stream.write_all(&wire_data).await.unwrap();
@@ -1145,9 +1144,9 @@ mod tests {
             reused.is_empty(),
             "drained batch should be returned empty for reuse"
         );
-        [rx1.blocking_recv().unwrap(), rx2.blocking_recv().unwrap()]
-            .into_iter()
-            .for_each(|response| assert!(matches!(response, Err(e) if e == error)));
+        for response in [rx1.blocking_recv().unwrap(), rx2.blocking_recv().unwrap()] {
+            assert!(matches!(response, Err(e) if e == error));
+        }
     }
 
     proptest! {

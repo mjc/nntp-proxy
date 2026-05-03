@@ -132,6 +132,7 @@ impl fmt::Display for PoolUtilization {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // These tests compare exact percentage values from bounded pool math.
 mod tests {
     use super::*;
 
