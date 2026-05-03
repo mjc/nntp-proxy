@@ -1348,15 +1348,15 @@ mod tests {
 
     #[test]
     fn test_is_complete_article() {
-        // Stubs should NOT be complete articles
-        let stub_430 = ArticleEntry::from_response_bytes(b"430\r\n");
-        assert!(!stub_430.is_complete_article());
+        // Status-only responses should NOT be complete articles
+        let status_only_430 = ArticleEntry::from_response_bytes(b"430\r\n");
+        assert!(!status_only_430.is_complete_article());
 
-        let stub_220 = ArticleEntry::from_response_bytes(b"220\r\n");
-        assert!(!stub_220.is_complete_article());
+        let status_only_220 = ArticleEntry::from_response_bytes(b"220\r\n");
+        assert!(!status_only_220.is_complete_article());
 
-        let stub_223 = ArticleEntry::from_response_bytes(b"223\r\n");
-        assert!(!stub_223.is_complete_article());
+        let status_only_223 = ArticleEntry::from_response_bytes(b"223\r\n");
+        assert!(!status_only_223.is_complete_article());
 
         // Full article SHOULD be complete
         let full = ArticleEntry::from_response_bytes(
@@ -1663,18 +1663,18 @@ mod tests {
     #[tokio::test]
     async fn test_insert_respects_cache_articles_flag() {
         // Test with cache_articles=false - should store availability without payload bytes
-        let cache_stub = ArticleCache::new(1024 * 1024, Duration::from_secs(300), false);
+        let cache_status_only = ArticleCache::new(1024 * 1024, Duration::from_secs(300), false);
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         let full_size = buffer.len();
 
-        cache_stub
+        cache_status_only
             .upsert(msgid.clone(), buffer, BackendId::from_index(0), 0.into())
             .await;
-        cache_stub.sync().await;
+        cache_status_only.sync().await;
 
-        let retrieved = cache_stub.get(&msgid).await.unwrap();
+        let retrieved = cache_status_only.get(&msgid).await.unwrap();
         assert_eq!(
             retrieved.payload_kind(),
             CachedPayloadKind::AvailabilityOnly
@@ -1799,30 +1799,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_weigher_small_stubs() {
-        // Test that small stubs account for moka internal overhead correctly
+    async fn test_weigher_small_status_only_responses() {
+        // Test that small status-only responses account for moka internal overhead correctly
         // With MOKA_OVERHEAD = 2000 bytes (based on empirical 10x memory ratio from moka issue #473)
         let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), false); // 1MB capacity
 
-        // Create small stub (53 bytes)
-        let stub = b"223 0 <test@example.com>\r\n".to_vec();
-        let article = ArticleEntry::from_response_bytes(stub);
+        // Create small status-only response (53 bytes)
+        let status_only = b"223 0 <test@example.com>\r\n".to_vec();
+        let article = ArticleEntry::from_response_bytes(status_only);
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
         cache.insert(msgid, article).await;
         cache.sync().await;
 
-        // With MOKA_OVERHEAD = 2000: stub + Arc + availability + overhead
-        // ~53 + 68 + 40 + 2000 = ~2161 bytes per small stub
-        // With 2.5x small stub multiplier: ~5400 bytes per stub
-        // 1MB capacity should fit ~185 stubs
+        // With MOKA_OVERHEAD = 2000: response + Arc + availability + overhead
+        // ~53 + 68 + 40 + 2000 = ~2161 bytes per small status-only response
+        // With 2.5x small response multiplier: ~5400 bytes per response
+        // 1MB capacity should fit ~185 status-only responses
 
-        // Insert many small stubs
+        // Insert many small status-only responses
         for i in 2..=200 {
-            let msgid_str = format!("<stub{i}@example.com>");
+            let msgid_str = format!("<status_only{i}@example.com>");
             let msgid = MessageId::new(msgid_str).unwrap();
-            let stub = format!("223 0 {}\r\n", msgid.as_str());
-            let article = ArticleEntry::from_response_bytes(stub.as_bytes());
+            let status_only = format!("223 0 {}\r\n", msgid.as_str());
+            let article = ArticleEntry::from_response_bytes(status_only.as_bytes());
             cache.insert(msgid, article).await;
         }
 
@@ -1831,10 +1831,10 @@ mod tests {
         cache.sync().await;
 
         let stats = cache.stats();
-        // Should be able to fit ~150-185 small stubs in 1MB
+        // Should be able to fit ~150-185 small status-only responses in 1MB
         assert!(
             stats.entry_count >= 100,
-            "Cache should fit many small stubs (got {})",
+            "Cache should fit many small status-only responses (got {})",
             stats.entry_count
         );
     }

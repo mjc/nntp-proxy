@@ -588,7 +588,7 @@ fn make_valid_article_buffer() -> Vec<u8> {
     b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec()
 }
 
-fn make_430_stub_buffer() -> Vec<u8> {
+fn make_430_status_only_buffer() -> Vec<u8> {
     b"430 No such article\r\n".to_vec()
 }
 
@@ -597,7 +597,7 @@ fn hybrid_article() -> HybridArticleEntry {
 }
 
 fn hybrid_missing() -> HybridArticleEntry {
-    HybridArticleEntry::from_response_bytes(make_430_stub_buffer()).unwrap()
+    HybridArticleEntry::from_response_bytes(make_430_status_only_buffer()).unwrap()
 }
 
 fn record_missing(entry: &mut HybridArticleEntry, backends: &[usize]) {
@@ -709,7 +709,7 @@ fn test_hybrid_entry_all_backends_exhausted_all() {
 }
 
 #[test]
-fn test_hybrid_entry_430_stub_creation() {
+fn test_hybrid_entry_430_status_only_creation() {
     let entry = hybrid_missing();
 
     // 430 responses should be cached
@@ -851,7 +851,7 @@ fn test_hybrid_entry_serialization_estimated_size() {
 }
 
 #[test]
-fn test_hybrid_entry_serialization_430_stub() {
+fn test_hybrid_entry_serialization_430_status_only() {
     use foyer::Code;
     use std::io::Cursor;
 
