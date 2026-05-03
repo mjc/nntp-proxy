@@ -10,7 +10,6 @@ use nntp_proxy::config::{Cache, Config, Server};
 use nntp_proxy::types::{CacheCapacity, MaxConnections, Port};
 use nntp_proxy::{NntpProxy, RoutingMode};
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -206,12 +205,9 @@ fn bench_roundtrip(bencher: Bencher, body_len: usize, cache: Option<Cache>, warm
         let bytes = rt.block_on(proxy.article_roundtrip());
         assert!(bytes > body_len);
     }
-    let proxy = Mutex::new(proxy);
-
     bencher
         .counter(divan::counter::BytesCount::new(body_len))
-        .bench(|| {
-            let mut proxy = proxy.lock().unwrap();
+        .bench_local(|| {
             let bytes = rt.block_on(proxy.article_roundtrip());
             black_box(bytes)
         });
