@@ -89,7 +89,7 @@ impl CacheTtlMillis {
 
     #[must_use]
     pub fn from_duration(duration: std::time::Duration) -> Self {
-        Self(duration.as_millis() as u64)
+        Self(duration_millis_u64(duration))
     }
 }
 
@@ -130,7 +130,14 @@ pub const fn effective_ttl(base_ttl: CacheTtlMillis, tier: CacheTier) -> CacheTt
 pub fn now_millis() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
+        .map_or(0, duration_millis_u64)
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn duration_millis_u64(duration: std::time::Duration) -> u64 {
+    // TTLs and timestamps are stored as u64 millisecond counters. Saturating on
+    // overflow preserves ordering while avoiding a noisy error path here.
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Check if an entry has expired based on tier-aware TTL

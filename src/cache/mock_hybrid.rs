@@ -4,6 +4,11 @@
 //! behavior without foyer's complexity. Used in tests to avoid foyer's
 //! runtime issues.
 
+#![allow(clippy::needless_pass_by_value, clippy::unnecessary_wraps)]
+
+// This mock mirrors the production cache interface closely enough for tests,
+// including by-value message IDs and a no-op close method.
+
 use super::hybrid_codec::DiskCachedArticle;
 use super::{CacheIngestResponse, HybridCacheStats};
 use crate::types::{BackendId, MessageId};

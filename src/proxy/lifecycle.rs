@@ -22,6 +22,14 @@ use crate::session::SessionError;
 
 use super::NntpProxy;
 
+#[allow(clippy::cast_possible_truncation)]
+fn elapsed_nanos_u64(start: std::time::Instant) -> u64 {
+    // This is a monotonic diagnostic timestamp. Saturating on overflow keeps
+    // the last-activity marker valid without threading error handling through
+    // the shutdown path.
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 impl NntpProxy {
     // Helper methods for session management
 
@@ -52,7 +60,7 @@ impl NntpProxy {
 
         // When last client disconnects, record the timestamp
         if prev == 1 {
-            let nanos = self.start_instant.elapsed().as_nanos() as u64;
+            let nanos = elapsed_nanos_u64(self.start_instant);
             self.last_activity_nanos.store(nanos, Ordering::Relaxed);
         }
     }

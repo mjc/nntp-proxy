@@ -157,7 +157,10 @@ impl<D> ByteCounter<D> {
 
     #[must_use]
     #[inline]
+    #[allow(clippy::needless_pass_by_value)]
     pub const fn saturating_sub(self, other: Self) -> Self {
+        // Byte counters are cheap value types and are used in fluent arithmetic
+        // chains, so by-value subtraction keeps the API ergonomic.
         Self {
             bytes: self.bytes.saturating_sub(other.bytes),
             _direction: PhantomData,

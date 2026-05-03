@@ -3,6 +3,11 @@
 //! Contains the immutable `MetricsSnapshot` struct with functional methods
 //! for querying and aggregating metrics across backends.
 
+#![allow(clippy::cast_precision_loss, clippy::float_cmp)]
+
+// Snapshot rates are presentation/monitoring values, and the tests exercise
+// exact deterministic fixtures rather than fuzzy comparisons.
+
 use super::types::*;
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use std::sync::Arc;
