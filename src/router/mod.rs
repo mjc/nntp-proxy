@@ -37,7 +37,7 @@
 //! ```
 
 mod backend_info;
-pub mod backend_queue;
+pub(crate) mod backend_queue;
 mod strategies;
 
 use anyhow::Result;
