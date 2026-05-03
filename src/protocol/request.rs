@@ -786,6 +786,11 @@ impl RequestContext {
             ResponseShape::SingleLine
         }
     }
+
+    #[must_use]
+    pub fn is_multiline_response(&self, status: StatusCode) -> bool {
+        matches!(self.response_shape(status), ResponseShape::Multiline)
+    }
 }
 
 fn trim_line_end(mut line: &[u8]) -> &[u8] {

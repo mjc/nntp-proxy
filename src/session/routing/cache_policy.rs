@@ -3,7 +3,7 @@
 //! Pure functions for determining caching behavior based on response codes
 //! and command types.
 
-use crate::protocol::{RequestContext, RequestRouteClass, ResponseShape, StatusCode};
+use crate::protocol::{RequestContext, RequestRouteClass, StatusCode};
 
 /// Determine what caching action to take for a response
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,10 +34,7 @@ fn should_capture_for_cache(
     has_message_id: bool,
 ) -> bool {
     cache_articles
-        && matches!(
-            request.response_shape(response_code),
-            ResponseShape::Multiline
-        )
+        && request.is_multiline_response(response_code)
         && has_message_id
         && matches!(response_code.as_u16(), 220 | 222)
 }
@@ -88,13 +85,11 @@ pub fn determine_cache_action_for_request(
         return CacheAction::None;
     }
 
-    let response_shape = request.response_shape(response_code);
+    let response_is_multiline = request.is_multiline_response(response_code);
 
     if should_capture_for_cache(request, response_code, cache_articles, has_message_id) {
         CacheAction::CaptureArticle
-    } else if matches!(response_shape, ResponseShape::Multiline)
-        && should_track_availability(response_code, has_message_id)
-    {
+    } else if response_is_multiline && should_track_availability(response_code, has_message_id) {
         CacheAction::TrackAvailability
     } else if response_code.as_u16() == 223 {
         CacheAction::TrackStat

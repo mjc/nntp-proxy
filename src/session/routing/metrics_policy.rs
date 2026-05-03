@@ -2,7 +2,7 @@
 //!
 //! Pure functions for determining what metrics to record for a typed request response.
 
-use crate::protocol::{RequestContext, ResponseShape, StatusCode};
+use crate::protocol::{RequestContext, StatusCode};
 
 /// Determine what action to take for metrics recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,15 +33,12 @@ pub fn determine_metrics_action_for_request(
     status_code: StatusCode,
 ) -> MetricsAction {
     let response_code = status_code.as_u16();
-    let response_shape = request.response_shape(status_code);
 
     if (400..500).contains(&response_code) && response_code != 423 && response_code != 430 {
         MetricsAction::Error4xx
     } else if response_code >= 500 {
         MetricsAction::Error5xx
-    } else if matches!(response_shape, ResponseShape::Multiline)
-        && matches!(response_code, 220..=222)
-    {
+    } else if request.is_multiline_response(status_code) && matches!(response_code, 220..=222) {
         MetricsAction::Article
     } else {
         MetricsAction::None
