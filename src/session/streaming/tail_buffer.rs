@@ -94,6 +94,21 @@ impl TailBuffer {
         }
         find_spanning_terminator(self.as_slice(), self.len(), chunk, chunk.len())
     }
+    /// Detect only terminators at the chunk suffix or spanning the prior boundary.
+    ///
+    /// Direct, non-pipelined streaming can use this for full read buffers: with no
+    /// queued backend response after the current article, a terminator cannot be
+    /// followed by valid leftover bytes in the same full-size read.
+    #[must_use]
+    pub fn detect_terminal_boundary(&self, chunk: &[u8]) -> TerminatorStatus {
+        if is_terminator_suffix(chunk) {
+            TerminatorStatus::FoundAt(chunk.len())
+        } else if let Some(end) = self.find_spanning_terminator(chunk) {
+            TerminatorStatus::FoundAt(end)
+        } else {
+            TerminatorStatus::NotFound
+        }
+    }
     /// Detect terminator in chunk, considering possible boundary spanning
     ///
     /// **Performance**: `find_terminator_end()` checks end first (O(1)),
@@ -125,8 +140,8 @@ impl TailBuffer {
 fn find_terminator_end(data: &[u8]) -> Option<usize> {
     const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
 
-    data.len().checked_sub(TERMINATOR.len()).and_then(|start| {
-        if data[start..] == *TERMINATOR {
+    data.len().checked_sub(TERMINATOR.len()).and_then(|_| {
+        if is_terminator_suffix(data) {
             Some(data.len())
         } else {
             memchr::memchr_iter(b'.', data)
@@ -136,6 +151,15 @@ fn find_terminator_end(data: &[u8]) -> Option<usize> {
                 .map(|pos| pos + 3)
         }
     })
+}
+
+#[inline]
+fn is_terminator_suffix(data: &[u8]) -> bool {
+    const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
+
+    data.len()
+        .checked_sub(TERMINATOR.len())
+        .is_some_and(|start| data[start..] == *TERMINATOR)
 }
 
 /// Find spanning terminator across boundary between tail and current chunk
@@ -394,6 +418,38 @@ mod tests {
             }
             TerminatorStatus::NotFound => panic!("Expected FoundAt, got {status:?}"),
         }
+    }
+
+    #[test]
+    fn test_detect_terminal_boundary_ignores_mid_chunk_terminator() {
+        let tail = TailBuffer::default();
+        let chunk = b"Line 1\r\n.\r\nExtra data";
+
+        assert!(!tail.detect_terminal_boundary(chunk).is_found());
+    }
+
+    #[test]
+    fn test_detect_terminal_boundary_detects_suffix() {
+        let tail = TailBuffer::default();
+        let chunk = b"Line 1\r\n.\r\n";
+
+        assert_eq!(
+            tail.detect_terminal_boundary(chunk).write_len(chunk.len()),
+            chunk.len()
+        );
+    }
+
+    #[test]
+    fn test_detect_terminal_boundary_detects_spanning() {
+        let mut tail = TailBuffer::default();
+        tail.update(b"article content\r\n");
+
+        let chunk = b".\r\n";
+
+        assert_eq!(
+            tail.detect_terminal_boundary(chunk).write_len(chunk.len()),
+            3
+        );
     }
 
     #[test]
