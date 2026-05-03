@@ -1079,7 +1079,7 @@ impl ArticleCache {
     /// This is a low-level method that bypasses the usual upsert logic.
     /// Only use this in tests where you need precise control over cache state.
     #[cfg(test)]
-    pub async fn insert(&self, message_id: MessageId<'_>, entry: ArticleEntry) {
+    pub(crate) async fn insert(&self, message_id: MessageId<'_>, entry: ArticleEntry) {
         let key: Arc<str> = message_id.without_brackets().into();
         self.cache.insert(key, entry).await;
     }
