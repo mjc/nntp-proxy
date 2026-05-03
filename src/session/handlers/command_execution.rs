@@ -16,8 +16,17 @@ use crate::session::{ClientSession, backend, streaming};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
+
+const BACKEND_TIMING_SAMPLE_MASK: u64 = 0x0f;
+static BACKEND_TIMING_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[inline]
+fn should_sample_backend_timing() -> bool {
+    BACKEND_TIMING_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed) & BACKEND_TIMING_SAMPLE_MASK == 0
+}
 
 /// Result of attempting to execute a command on a backend
 pub(super) enum BackendAttemptResult {
@@ -51,6 +60,8 @@ pub(super) struct ArticleAttemptState<'a> {
     pub buffer: &'a mut crate::pool::PooledBuffer,
     pub client_to_backend_bytes: &'a mut ClientToBackendBytes,
 }
+
+type BackendTimings = (u64, u64, u64);
 
 /// Parameters describing the response to stream to the client
 struct ResponseStreamParams<'a> {
@@ -97,7 +108,7 @@ impl ClientSession {
         };
 
         // Retry once on backend error (fresh connection on second attempt)
-        let (conn, cmd_response, ttfb, send, recv) = retry_once!(
+        let (conn, cmd_response, timings) = retry_once!(
             self.execute_backend_attempt(provider, backend_id, request, state.buffer)
                 .await,
             client = self.client_addr,
@@ -105,7 +116,9 @@ impl ClientSession {
         )
         .map_err(SessionError::Backend)?;
 
-        self.record_timing_metrics(backend_id, ttfb, send, recv);
+        if let Some((ttfb, send, recv)) = timings {
+            self.record_timing_metrics(backend_id, ttfb, send, recv);
+        }
         *state.client_to_backend_bytes = state
             .client_to_backend_bytes
             .add(request.request_wire_len().get());
@@ -275,9 +288,7 @@ impl ClientSession {
     ) -> Result<(
         crate::pool::ConnectionGuard,
         backend::BackendFirstResponse,
-        u64,
-        u64,
-        u64,
+        Option<BackendTimings>,
     )> {
         let conn = provider.get_pooled_connection().await?;
         let mut guard = crate::pool::ConnectionGuard::new(conn, provider.clone());
@@ -287,7 +298,7 @@ impl ClientSession {
             .await;
 
         match result {
-            Ok((cmd_response, ttfb, send, recv)) => Ok((guard, cmd_response, ttfb, send, recv)),
+            Ok((cmd_response, timings)) => Ok((guard, cmd_response, timings)),
             Err(e) => Err(e), // guard drops → remove_with_cooldown
         }
     }
@@ -302,17 +313,22 @@ impl ClientSession {
         backend_id: crate::types::BackendId,
         request: &RequestContext,
         buffer: &mut crate::pool::PooledBuffer,
-    ) -> Result<(backend::BackendFirstResponse, u64, u64, u64)> {
+    ) -> Result<(backend::BackendFirstResponse, Option<BackendTimings>)> {
         self.metrics.record_command(backend_id);
         self.metrics.user_command(self.username());
 
-        let (response, ttfb, send, recv) =
-            backend::send_request_timed(conn, request, buffer).await?;
+        let (response, timings) = if should_sample_backend_timing() {
+            let (response, ttfb, send, recv) =
+                backend::send_request_timed(conn, request, buffer).await?;
+            (response, Some((ttfb, send, recv)))
+        } else {
+            (backend::send_request(conn, request, buffer).await?, None)
+        };
 
         // Log any validation warnings
         response.log_warnings(&buffer[..response.bytes_read], self.client_addr, backend_id);
 
-        Ok((response, ttfb, send, recv))
+        Ok((response, timings))
     }
 
     /// Stream response from backend to client and handle caching.

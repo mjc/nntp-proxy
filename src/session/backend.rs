@@ -241,12 +241,9 @@ where
     use std::time::Instant;
 
     let start = Instant::now();
-
-    let send_start = Instant::now();
     write_request(conn, request).await?;
-    let send_elapsed = send_start.elapsed();
+    let after_send = Instant::now();
 
-    let recv_start = Instant::now();
     let n = buffer.read_from(conn).await?;
     if n == 0 {
         anyhow::bail!("Backend connection closed unexpectedly");
@@ -255,10 +252,12 @@ where
     read_until_status_line(conn, buffer).await?;
     let min_len = crate::protocol::MIN_RESPONSE_LENGTH;
     let total = buffer.initialized();
-    let recv_elapsed = recv_start.elapsed();
+    let after_recv = Instant::now();
+    let send_elapsed = after_send.duration_since(start);
+    let recv_elapsed = after_recv.duration_since(after_send);
+    let elapsed = after_recv.duration_since(start);
 
     let validated = parse_backend_status(&buffer[..total], total, min_len);
-    let elapsed = start.elapsed();
 
     Ok((
         BackendFirstResponse {
