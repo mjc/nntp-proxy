@@ -56,7 +56,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use super::availability::ArticleAvailability;
-use super::hybrid_codec::{CacheableStatusCode, DiskArticleEntry};
+use super::hybrid_codec::{CacheableStatusCode, DiskCachedArticle};
 use super::ttl;
 
 const HYBRID_CACHE_NAME: &str = "nntp-article-cache-v3";
@@ -125,7 +125,7 @@ impl Default for HybridCacheConfig {
 /// Note: Keys are stored as `String` (message ID without brackets) because
 /// foyer requires keys to implement the `Code` trait for disk serialization.
 pub struct HybridArticleCache {
-    cache: HybridCache<String, DiskArticleEntry>,
+    cache: HybridCache<String, DiskCachedArticle>,
     hits: AtomicU64,
     misses: AtomicU64,
     disk_hits: AtomicU64,
@@ -241,7 +241,7 @@ impl HybridArticleCache {
             .with_eviction_config(LruConfig {
                 high_priority_pool_ratio: 0.1,
             })
-            .with_weighter(|_key: &String, value: &DiskArticleEntry| value.payload_len().get())
+            .with_weighter(|_key: &String, value: &DiskCachedArticle| value.payload_len().get())
             .storage()
             .with_io_engine_config(PsyncIoEngineConfig::new())
             .with_engine_config(
@@ -306,7 +306,7 @@ impl HybridArticleCache {
     ///
     /// Checks memory first, then disk. Returns None if not found in either tier.
     /// Applies tier-aware TTL expiration - higher tier entries get longer TTLs.
-    pub(crate) async fn get(&self, message_id: &MessageId<'_>) -> Option<DiskArticleEntry> {
+    pub(crate) async fn get(&self, message_id: &MessageId<'_>) -> Option<DiskCachedArticle> {
         let key = message_id.without_brackets().to_string();
         let result = self.cache.get(&key).await;
 
@@ -374,7 +374,7 @@ impl HybridArticleCache {
         let key = message_id.without_brackets().to_string();
         let mut entry = if self.config.cache_articles {
             let buffer_len = buffer.len();
-            let Some(entry) = DiskArticleEntry::from_ingest_bytes_with_tier(buffer, tier) else {
+            let Some(entry) = DiskCachedArticle::from_ingest_bytes_with_tier(buffer, tier) else {
                 warn!(msg_id = %key, buffer_len, "Cannot cache: invalid status code");
                 return;
             };
@@ -390,7 +390,7 @@ impl HybridArticleCache {
                 );
                 return;
             };
-            DiskArticleEntry::availability_only(status_code, tier)
+            DiskCachedArticle::availability_only(status_code, tier)
         };
         let entry_len = entry.payload_len();
 
@@ -433,7 +433,7 @@ impl HybridArticleCache {
             updated.record_backend_missing(backend_id);
             updated
         } else {
-            let mut entry = DiskArticleEntry::missing(super::ttl::CacheTier::new(0));
+            let mut entry = DiskCachedArticle::missing(super::ttl::CacheTier::new(0));
             entry.record_backend_missing(backend_id);
             entry
         };
@@ -464,7 +464,7 @@ impl HybridArticleCache {
             updated.record_backend_has_status(cacheable_status, backend_id, tier);
             updated
         } else {
-            let mut entry = DiskArticleEntry::availability_only(cacheable_status, tier);
+            let mut entry = DiskCachedArticle::availability_only(cacheable_status, tier);
             entry.record_backend_has(backend_id);
             entry
         };
@@ -509,7 +509,7 @@ impl HybridArticleCache {
                     None
                 } else {
                     // All checked backends returned 430 - create typed missing entry.
-                    let mut entry = DiskArticleEntry::missing(super::ttl::CacheTier::new(0));
+                    let mut entry = DiskCachedArticle::missing(super::ttl::CacheTier::new(0));
                     entry.availability = *availability;
                     self.misses.fetch_add(1, Ordering::Relaxed);
                     Some(entry)
@@ -622,7 +622,7 @@ impl HybridArticleCache {
             .with_eviction_config(LruConfig {
                 high_priority_pool_ratio: 0.1,
             })
-            .with_weighter(|_key: &String, value: &DiskArticleEntry| value.payload_len().get())
+            .with_weighter(|_key: &String, value: &DiskCachedArticle| value.payload_len().get())
             .storage()
             .with_io_engine_config(Box::new(NoopIoEngineConfig) as Box<dyn foyer::IoEngineConfig>);
 
