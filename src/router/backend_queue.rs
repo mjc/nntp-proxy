@@ -17,17 +17,17 @@ use crate::protocol::RequestContext;
 
 /// A queued request completed by one backend connection.
 #[derive(Debug)]
-pub struct CompletedPipelineRequest {
+pub(crate) struct CompletedPipelineRequest {
     /// Typed request context that was completed in backend-connection FIFO order.
     pub context: RequestContext,
 }
 
 /// Response sent back to a client session from the pipeline worker.
-pub type PipelineResponse = Result<CompletedPipelineRequest, PipelineError>;
+pub(crate) type PipelineResponse = Result<CompletedPipelineRequest, PipelineError>;
 
 /// Queue/worker failures reported back to the waiting session without heap allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PipelineError {
+pub(crate) enum PipelineError {
     ConnectionAcquire,
     WriteFailed { index: usize, batch_len: usize },
     FlushFailed,
@@ -53,7 +53,7 @@ impl std::fmt::Display for PipelineError {
 }
 
 /// A request queued for pipeline execution on a backend
-pub struct QueuedContext {
+pub(crate) struct QueuedContext {
     /// Typed request context. Owns verb/args, not redundant full wire bytes.
     pub context: RequestContext,
     /// Return path to the client session that queued this request.
@@ -63,7 +63,10 @@ pub struct QueuedContext {
 impl QueuedContext {
     /// Create a queued context with the client return path that should receive completion.
     #[must_use]
-    pub fn new(context: RequestContext, client_return: oneshot::Sender<PipelineResponse>) -> Self {
+    pub(crate) fn new(
+        context: RequestContext,
+        client_return: oneshot::Sender<PipelineResponse>,
+    ) -> Self {
         Self {
             context,
             client_return,
@@ -75,21 +78,21 @@ impl QueuedContext {
     /// Responses are matched by each backend connection's FIFO order; consuming
     /// the queued context here prevents delivering response data without its
     /// matching request context.
-    pub fn complete_context(self) {
+    pub(crate) fn complete_context(self) {
         let _ = self.client_return.send(Ok(CompletedPipelineRequest {
             context: self.context,
         }));
     }
 
     /// Complete this queued context with a queue/worker failure.
-    pub fn complete_error(self, error: PipelineError) {
+    pub(crate) fn complete_error(self, error: PipelineError) {
         let _ = self.client_return.send(Err(error));
     }
 }
 
 /// Errors returned when enqueuing fails
 #[derive(Debug, thiserror::Error)]
-pub enum QueueError {
+pub(crate) enum QueueError {
     /// Queue is at capacity; client should get a 503-like response
     #[error("pipeline queue full ({depth}/{max_depth})")]
     QueueFull { depth: usize, max_depth: usize },
@@ -107,7 +110,7 @@ pub struct BackendQueue {
 impl BackendQueue {
     /// Create a new queue with the given maximum depth
     #[must_use]
-    pub fn new(max_depth: usize) -> Self {
+    pub(crate) fn new(max_depth: usize) -> Self {
         Self {
             queue: SegQueue::new(),
             notify: Notify::new(),
@@ -127,7 +130,7 @@ impl BackendQueue {
     /// to the queue. A RAII guard ensures depth is decremented if the push is
     /// not committed (e.g., on panic). This prevents the invariant violation
     /// where depth > actual queue size.
-    pub fn try_enqueue(&self, request: QueuedContext) -> Result<(), QueueError> {
+    pub(crate) fn try_enqueue(&self, request: QueuedContext) -> Result<(), QueueError> {
         let mut current = self.depth.load(Ordering::Acquire);
         loop {
             if current >= self.max_depth {
@@ -178,7 +181,7 @@ impl BackendQueue {
     /// Takes ownership of `batch`, clears it, fills with at least 1 request (blocks until
     /// one is available), then greedily takes up to `max_batch` without waiting for more.
     /// Returns the filled Vec so the caller can thread ownership through a loop.
-    pub async fn dequeue_batch(
+    pub(crate) async fn dequeue_batch(
         &self,
         max_batch: usize,
         mut batch: Vec<QueuedContext>,
@@ -223,12 +226,6 @@ impl BackendQueue {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
-    }
-
-    /// Maximum queue depth
-    #[inline]
-    pub const fn max_depth(&self) -> usize {
-        self.max_depth
     }
 }
 
