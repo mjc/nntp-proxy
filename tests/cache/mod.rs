@@ -11,7 +11,6 @@ use nntp_proxy::types::MessageId;
 pub mod adaptive_precheck;
 pub mod article_availability;
 pub mod availability_only;
-pub mod body_responses;
 pub mod bug_430_articles;
 pub mod bug_430_caching;
 pub mod cache_before_precheck;
@@ -51,16 +50,6 @@ pub fn head_entry() -> ArticleEntry {
 
 pub fn response_bytes(entry: &ArticleEntry, request_kind: RequestKind) -> Option<Vec<u8>> {
     article_response_bytes(entry, request_kind, &test_msg_id())
-}
-
-pub fn assert_serves(entry: &ArticleEntry, cases: &[(RequestKind, bool)]) {
-    for (request_kind, expected) in cases {
-        assert_eq!(
-            response_bytes(entry, *request_kind).is_some(),
-            *expected,
-            "serve decision for {request_kind:?}"
-        );
-    }
 }
 
 pub fn assert_article_response(entry: &ArticleEntry, request_kind: RequestKind, expected: &[u8]) {
