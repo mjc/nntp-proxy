@@ -771,7 +771,7 @@ impl ClientSession {
         msg_id: Option<&crate::types::MessageId<'_>>,
         availability: &crate::cache::ArticleAvailability,
     ) {
-        if availability.checked_bits() == 0 {
+        if availability.missing_bits() == 0 {
             return;
         }
 
