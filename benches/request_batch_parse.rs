@@ -32,10 +32,13 @@ fn parse_typed_contexts(buffer: &[u8]) -> usize {
 }
 
 fn repeated_article_batch(count: usize) -> Vec<u8> {
-    (0..count)
-        .map(|i| format!("ARTICLE <bench-{i}@example.com>\r\n"))
-        .collect::<String>()
-        .into_bytes()
+    use std::fmt::Write as _;
+
+    let mut out = String::with_capacity(count * 32);
+    for i in 0..count {
+        write!(&mut out, "ARTICLE <bench-{i}@example.com>\r\n").unwrap();
+    }
+    out.into_bytes()
 }
 
 macro_rules! bench_batches {

@@ -165,8 +165,9 @@ async fn execute_pipeline_batch(
     let mut buffer = buffer_pool.acquire().await;
     // result_buf is passed in as a parameter (hoisted to worker loop)
 
-    let mut batch_iter = batch.drain(..).enumerate();
-    while let Some((i, mut req)) = batch_iter.next() {
+    batch.reverse();
+    let mut response_index = 0usize;
+    while let Some(mut req) = batch.pop() {
         // Read the response for this command
         match crate::session::streaming::read_response_into_context(
             &mut req.context,
@@ -196,7 +197,7 @@ async fn execute_pipeline_batch(
             Err(e) => {
                 warn!(
                     backend = ?backend_id,
-                    response_index = i + 1,
+                    response_index = response_index + 1,
                     batch_size = batch_len,
                     command_verb = ?req.context.verb(),
                     error = %e,
@@ -209,10 +210,10 @@ async fn execute_pipeline_batch(
 
                 // Fail remaining requests (no Vec allocation - iterate directly)
                 let error_msg = PipelineError::ConnectionLost {
-                    completed: i + 1,
+                    completed: response_index + 1,
                     batch_len,
                 };
-                for (_, remaining_req) in batch_iter {
+                while let Some(remaining_req) = batch.pop() {
                     remaining_req.complete_error(error_msg);
                 }
 
@@ -220,9 +221,8 @@ async fn execute_pipeline_batch(
                 return (false, batch);
             }
         }
+        response_index += 1;
     }
-    // Release the drain iterator's mutable borrow before returning batch
-    drop(batch_iter);
 
     // All responses processed successfully. Leftover is valid only while there
     // are more already-sent responses remaining in this borrow. If bytes remain
@@ -274,10 +274,10 @@ async fn buffer_response_for_request(
 
 /// Send error responses to all requests in a batch.
 ///
-/// Takes ownership of the Vec, drains it, and returns the empty Vec
+/// Takes ownership of the Vec, completes each request, and returns the empty Vec
 /// so the caller can reuse the allocation.
 fn fail_batch(mut batch: Vec<QueuedContext>, error: PipelineError) -> Vec<QueuedContext> {
-    for req in batch.drain(..) {
+    while let Some(req) = batch.pop() {
         req.complete_error(error);
     }
     batch

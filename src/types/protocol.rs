@@ -32,7 +32,7 @@ impl<'a> MessageId<'a> {
     ///
     /// # Safety
     /// Caller must ensure: `s.len() >= 3`, `s.starts_with('<')`, `s.ends_with('>')`
-    #[inline(always)]
+    #[inline]
     #[must_use]
     pub const unsafe fn from_str_unchecked(s: &'a str) -> Self {
         Self(Cow::Borrowed(s))

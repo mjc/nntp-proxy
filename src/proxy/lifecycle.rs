@@ -404,9 +404,7 @@ impl NntpProxy {
         self.check_and_clear_stale_pools();
         self.increment_active_clients();
 
-        let result = self
-            .handle_per_command_client(client_stream, client_addr)
-            .await;
+        let result = Box::pin(self.handle_per_command_client(client_stream, client_addr)).await;
 
         self.decrement_active_clients();
         result
@@ -431,7 +429,7 @@ impl NntpProxy {
         let session = self.create_session(client_addr, Some(self.router.clone()));
         let session_id = self.generate_session_id(&session);
 
-        let metrics = session.handle_per_command_routing(client_stream).await;
+        let metrics = Box::pin(session.handle_per_command_routing(client_stream)).await;
 
         self.finalize_per_command_session(metrics, client_addr, &session_id, &session)
     }

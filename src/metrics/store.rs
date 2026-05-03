@@ -592,6 +592,7 @@ mod tests {
 
         let bob = loaded.user_metrics.get("bob").unwrap();
         assert_eq!(bob.total_connections, 5);
+        drop(bob);
     }
 
     #[test]

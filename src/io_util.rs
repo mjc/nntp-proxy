@@ -2,7 +2,7 @@ use std::future::poll_fn;
 use std::io::{Error, ErrorKind, IoSlice};
 use std::pin::Pin;
 
-pub(crate) async fn write_all_vectored<W>(
+pub async fn write_all_vectored<W>(
     writer: &mut W,
     slices: &mut [IoSlice<'_>],
 ) -> std::io::Result<()>

@@ -542,7 +542,7 @@ struct ChunkProcessState<'a, R> {
 /// Returns `ChunkResult::Done` if terminator found, or
 /// `ChunkResult::Continue` to keep streaming. Total bytes are tracked
 /// via the `total_bytes` mutable reference.
-#[inline(always)]
+#[inline]
 async fn process_chunk<R, W>(
     data: &[u8],
     tail: &mut TailBuffer,
