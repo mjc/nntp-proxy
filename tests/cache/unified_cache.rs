@@ -4,7 +4,7 @@
 //! - `UnifiedCache` enum dispatch (memory vs hybrid)
 //! - `CacheStatsProvider` trait implementations
 //! - `ArticleEntry::response_for()` including STAT synthesis
-//! - `ArticleAvailability::from_bits()` and `ArticleEntry::set_availability()`
+//! - `ArticleAvailability::from_bits()`
 //! - `DiskCache` configuration defaults and validation
 
 use futures::executor::block_on;
@@ -246,53 +246,6 @@ fn test_availability_from_bits_roundtrip() {
         reconstructed.status(BackendId::from_index(3)),
         original.status(BackendId::from_index(3))
     );
-}
-
-// ============================================================================
-// ArticleEntry::set_availability() Tests
-// ============================================================================
-
-#[test]
-fn test_article_entry_set_availability() {
-    let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let mut entry = ArticleEntry::from_response_bytes(buffer);
-
-    // Initially no availability info
-    assert!(!entry.has_availability_info());
-
-    // Create availability with some backends marked
-    let mut avail = ArticleAvailability::new();
-    avail.record_missing(BackendId::from_index(0));
-    avail.record_has(BackendId::from_index(1));
-
-    entry.set_availability(avail);
-
-    // Now entry should have availability info
-    assert!(entry.has_availability_info());
-    assert!(!entry.should_try_backend(BackendId::from_index(0))); // missing
-    assert!(entry.should_try_backend(BackendId::from_index(1))); // has
-    assert!(entry.should_try_backend(BackendId::from_index(2))); // not checked = try
-}
-
-#[test]
-fn test_article_entry_set_availability_overwrites() {
-    let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-    let mut entry = ArticleEntry::from_response_bytes(buffer);
-
-    // Set initial availability
-    let mut avail1 = ArticleAvailability::new();
-    avail1.record_missing(BackendId::from_index(0));
-    entry.set_availability(avail1);
-
-    assert!(!entry.should_try_backend(BackendId::from_index(0)));
-
-    // Set new availability that overwrites
-    let mut avail2 = ArticleAvailability::new();
-    avail2.record_has(BackendId::from_index(0)); // Now backend 0 has it
-    entry.set_availability(avail2);
-
-    // Should reflect new availability
-    assert!(entry.should_try_backend(BackendId::from_index(0)));
 }
 
 // ============================================================================

@@ -457,11 +457,6 @@ impl ArticleEntry {
         self.backend_availability.record_has(backend_id);
     }
 
-    /// Set backend availability (used for hydrating from hybrid cache)
-    pub const fn set_availability(&mut self, availability: ArticleAvailability) {
-        self.backend_availability = availability;
-    }
-
     /// Check if all backends have been tried and none have the article
     #[must_use]
     pub fn all_backends_exhausted(&self, total_backends: BackendCount) -> bool {
