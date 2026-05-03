@@ -306,7 +306,7 @@ impl HybridArticleCache {
     ///
     /// Checks memory first, then disk. Returns None if not found in either tier.
     /// Applies tier-aware TTL expiration - higher tier entries get longer TTLs.
-    pub async fn get(&self, message_id: &MessageId<'_>) -> Option<HybridArticleEntry> {
+    pub(crate) async fn get(&self, message_id: &MessageId<'_>) -> Option<HybridArticleEntry> {
         let key = message_id.without_brackets().to_string();
         let result = self.cache.get(&key).await;
 

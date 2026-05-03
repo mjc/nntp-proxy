@@ -6,7 +6,8 @@
 // Methods are async to match the HybridArticleCache trait interface; no internal awaits needed.
 #![allow(clippy::unused_async)]
 
-use super::{CacheIngestBytes, HybridArticleEntry, HybridCacheStats};
+use super::hybrid_codec::HybridArticleEntry;
+use super::{CacheIngestBytes, HybridCacheStats};
 use crate::types::{BackendId, MessageId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

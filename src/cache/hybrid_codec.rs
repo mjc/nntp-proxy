@@ -9,9 +9,7 @@
 //! [magic:u32][status:u16][checked:u8][missing:u8][timestamp:u64][tier:u8][payload-kind:u8]...
 //! ```
 
-use crate::protocol::RequestKind;
 use crate::protocol::StatusCode;
-use crate::router::BackendCount;
 use crate::types::BackendId;
 use foyer::Code;
 use std::io::{Read, Write};
@@ -117,7 +115,7 @@ impl TryFrom<u16> for CacheableStatusCode {
 /// - Simple binary format:
 ///   [magic:u32][status:u16][checked:u8][missing:u8][timestamp:u64][tier:u8][typed-payload]
 #[derive(Clone, Debug)]
-pub struct HybridArticleEntry {
+pub(crate) struct HybridArticleEntry {
     /// Validated NNTP status code — only cacheable codes are representable
     status_code: CacheableStatusCode,
     /// Backend availability tracking (checked/missing bitsets)
@@ -465,9 +463,10 @@ impl HybridArticleEntry {
     }
 
     #[must_use]
-    pub fn response_for(
+    #[cfg(test)]
+    pub(crate) fn response_for(
         &self,
-        request_kind: RequestKind,
+        request_kind: crate::protocol::RequestKind,
         message_id: &str,
     ) -> Option<super::article::CachedArticleResponse<'_>> {
         super::article::response_for_payload(&self.payload, request_kind, message_id)
@@ -491,24 +490,26 @@ impl HybridArticleEntry {
 
     #[inline]
     #[must_use]
-    pub fn status_code(&self) -> StatusCode {
+    #[cfg(test)]
+    pub(crate) fn status_code(&self) -> StatusCode {
         StatusCode::new(self.status_code.as_u16())
     }
 
     /// Check if we should try fetching from this backend
     #[inline]
     #[must_use]
-    pub fn should_try_backend(&self, backend_id: BackendId) -> bool {
+    #[cfg(test)]
+    pub(crate) fn should_try_backend(&self, backend_id: BackendId) -> bool {
         self.availability.should_try(backend_id)
     }
 
     /// Record that a backend returned 430 (doesn't have this article)
-    pub fn record_backend_missing(&mut self, backend_id: BackendId) {
+    pub(crate) fn record_backend_missing(&mut self, backend_id: BackendId) {
         self.availability.record_missing(backend_id);
     }
 
     /// Record that a backend successfully provided this article
-    pub fn record_backend_has(&mut self, backend_id: BackendId) {
+    pub(crate) fn record_backend_has(&mut self, backend_id: BackendId) {
         self.availability.record_has(backend_id);
     }
 
@@ -528,16 +529,10 @@ impl HybridArticleEntry {
         self.record_backend_has(backend_id);
     }
 
-    /// Check if all backends have been tried and none have the article
-    #[must_use]
-    pub fn all_backends_exhausted(&self, total_backends: BackendCount) -> bool {
-        self.availability.all_exhausted(total_backends)
-    }
-
     /// Check if this cache entry contains a complete article (220) or body (222)
     #[inline]
     #[must_use]
-    pub fn is_complete_article(&self) -> bool {
+    pub(crate) fn is_complete_article(&self) -> bool {
         matches!(
             (&self.payload, self.status_code.as_u16()),
             (CachedPayload::Article { headers, body, .. }, 220)
@@ -551,18 +546,9 @@ impl HybridArticleEntry {
     /// Get backend availability as `ArticleAvailability` struct
     #[inline]
     #[must_use]
-    pub const fn availability(&self) -> ArticleAvailability {
+    #[cfg(test)]
+    pub(crate) const fn availability(&self) -> ArticleAvailability {
         self.availability
-    }
-
-    /// Check if we have any backend availability information
-    ///
-    /// Returns true if at least one backend has been checked.
-    /// Wrapper around `ArticleAvailability::has_availability_info()` for convenience.
-    #[inline]
-    #[must_use]
-    pub const fn has_availability_info(&self) -> bool {
-        self.availability.has_availability_info()
     }
 
     /// Check if this entry has expired based on tier-aware TTL
@@ -577,7 +563,8 @@ impl HybridArticleEntry {
     /// Get the tier of the backend that provided this article
     #[inline]
     #[must_use]
-    pub const fn tier(&self) -> ttl::CacheTier {
+    #[cfg(test)]
+    pub(crate) const fn tier(&self) -> ttl::CacheTier {
         self.tier
     }
 }
@@ -585,6 +572,7 @@ impl HybridArticleEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::RequestKind;
     use crate::types::BackendId;
     use futures::executor::block_on;
 
