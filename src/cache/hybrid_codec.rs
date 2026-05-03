@@ -399,21 +399,21 @@ impl DiskCachedArticle {
     }
 
     #[must_use]
-    pub(crate) fn from_backend_response_bytes_with_tier(
-        buffer: super::BackendResponseBytes,
+    pub(crate) fn from_ingest_response_with_tier(
+        buffer: super::CacheIngestResponse,
         tier: ttl::CacheTier,
     ) -> Option<Self> {
         match buffer {
-            super::BackendResponseBytes::Owned(buffer) => {
+            super::CacheIngestResponse::Owned(buffer) => {
                 Self::from_backend_response_with_tier(buffer, tier)
             }
-            super::BackendResponseBytes::Pooled(buffer) => {
+            super::CacheIngestResponse::Pooled(buffer) => {
                 Self::from_backend_response_with_tier(buffer.as_ref(), tier)
             }
-            super::BackendResponseBytes::Chunked(buffer) => {
+            super::CacheIngestResponse::Chunked(buffer) => {
                 Self::from_chunked_response_with_tier(&buffer, tier)
             }
-            super::BackendResponseBytes::Inline(buffer) => {
+            super::CacheIngestResponse::Inline(buffer) => {
                 Self::from_backend_response_with_tier(buffer, tier)
             }
         }
@@ -758,8 +758,8 @@ mod tests {
     }
 
     #[test]
-    fn disk_cached_article_ingests_backend_response_bytes_without_required_vec() {
-        let entry = DiskCachedArticle::from_backend_response_bytes_with_tier(
+    fn disk_cached_article_ingests_cache_ingest_response_without_required_vec() {
+        let entry = DiskCachedArticle::from_ingest_response_with_tier(
             smallvec::SmallVec::<[u8; 128]>::from_slice(
                 b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
             )
@@ -773,7 +773,7 @@ mod tests {
     }
 
     #[test]
-    fn disk_cached_article_ingests_chunked_backend_response_bytes_without_flattening_response() {
+    fn disk_cached_article_ingests_chunked_cache_ingest_response_without_flattening_response() {
         let pool = crate::pool::BufferPool::new(
             crate::types::BufferSize::try_new(1024).expect("valid buffer size"),
             1,
@@ -789,7 +789,7 @@ mod tests {
             "test response must span chunks"
         );
 
-        let entry = DiskCachedArticle::from_backend_response_bytes_with_tier(
+        let entry = DiskCachedArticle::from_ingest_response_with_tier(
             response.into(),
             ttl::CacheTier::new(0),
         )

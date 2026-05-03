@@ -367,15 +367,14 @@ impl HybridArticleCache {
     pub(crate) async fn upsert_ingest(
         &self,
         message_id: MessageId<'_>,
-        buffer: super::BackendResponseBytes,
+        buffer: super::CacheIngestResponse,
         backend_id: BackendId,
         tier: super::ttl::CacheTier,
     ) {
         let key = message_id.without_brackets().to_string();
         let mut entry = if self.config.cache_articles {
             let buffer_len = buffer.len();
-            let Some(entry) =
-                DiskCachedArticle::from_backend_response_bytes_with_tier(buffer, tier)
+            let Some(entry) = DiskCachedArticle::from_ingest_response_with_tier(buffer, tier)
             else {
                 warn!(msg_id = %key, buffer_len, "Cannot cache: invalid status code");
                 return;

@@ -364,21 +364,21 @@ impl CachedArticle {
     }
 
     #[must_use]
-    pub(crate) fn from_backend_response_bytes_with_tier(
-        buffer: super::BackendResponseBytes,
+    pub(crate) fn from_ingest_response_with_tier(
+        buffer: super::CacheIngestResponse,
         tier: ttl::CacheTier,
     ) -> Self {
         match buffer {
-            super::BackendResponseBytes::Owned(buffer) => {
+            super::CacheIngestResponse::Owned(buffer) => {
                 Self::from_backend_response_with_tier(buffer, tier)
             }
-            super::BackendResponseBytes::Pooled(buffer) => {
+            super::CacheIngestResponse::Pooled(buffer) => {
                 Self::from_backend_response_with_tier(buffer.as_ref(), tier)
             }
-            super::BackendResponseBytes::Chunked(buffer) => {
+            super::CacheIngestResponse::Chunked(buffer) => {
                 Self::from_chunked_response_with_tier(&buffer, tier)
             }
-            super::BackendResponseBytes::Inline(buffer) => {
+            super::CacheIngestResponse::Inline(buffer) => {
                 Self::from_backend_response_with_tier(buffer, tier)
             }
         }
@@ -1000,7 +1000,7 @@ impl ArticleCache {
     pub(crate) async fn upsert_ingest(
         &self,
         message_id: MessageId<'_>,
-        buffer: super::BackendResponseBytes,
+        buffer: super::CacheIngestResponse,
         backend_id: BackendId,
         tier: ttl::CacheTier,
     ) {
@@ -1008,7 +1008,7 @@ impl ArticleCache {
         let cache_articles = self.cache_articles;
 
         let new_entry_template = if cache_articles {
-            CachedArticle::from_backend_response_bytes_with_tier(buffer, tier)
+            CachedArticle::from_ingest_response_with_tier(buffer, tier)
         } else {
             let Some(status_code) = buffer.status_code() else {
                 return;
@@ -1674,8 +1674,8 @@ mod tests {
     }
 
     #[test]
-    fn cached_article_ingests_backend_response_bytes_without_required_vec() {
-        let entry = CachedArticle::from_backend_response_bytes_with_tier(
+    fn cached_article_ingests_cache_ingest_response_without_required_vec() {
+        let entry = CachedArticle::from_ingest_response_with_tier(
             smallvec::SmallVec::<[u8; 128]>::from_slice(
                 b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
             )
@@ -1688,7 +1688,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_article_ingests_chunked_backend_response_bytes_without_flattening_response() {
+    fn cached_article_ingests_chunked_cache_ingest_response_without_flattening_response() {
         let pool = crate::pool::BufferPool::new(
             crate::types::BufferSize::try_new(1024).expect("valid buffer size"),
             1,
@@ -1704,10 +1704,8 @@ mod tests {
             "test response must span chunks"
         );
 
-        let entry = CachedArticle::from_backend_response_bytes_with_tier(
-            response.into(),
-            ttl::CacheTier::new(0),
-        );
+        let entry =
+            CachedArticle::from_ingest_response_with_tier(response.into(), ttl::CacheTier::new(0));
 
         assert_eq!(entry.status_code(), StatusCode::new(220));
         match entry.payload {

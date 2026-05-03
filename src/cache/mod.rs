@@ -37,14 +37,14 @@ use smallvec::SmallVec;
 /// Hot-path code should hand off one of these owned forms directly instead of
 /// flattening into a fresh `Vec<u8>` before spawning cache work.
 #[derive(Debug)]
-pub(crate) enum BackendResponseBytes {
+pub(crate) enum CacheIngestResponse {
     Owned(Box<[u8]>),
     Pooled(crate::pool::PooledBuffer),
     Chunked(crate::pool::ChunkedResponse),
     Inline(SmallVec<[u8; 128]>),
 }
 
-impl BackendResponseBytes {
+impl CacheIngestResponse {
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         match self {
@@ -71,14 +71,14 @@ impl BackendResponseBytes {
 }
 
 #[cfg(test)]
-impl PartialEq for BackendResponseBytes {
+impl PartialEq for CacheIngestResponse {
     fn eq(&self, other: &Self) -> bool {
-        fn chunks<'a>(buf: &'a BackendResponseBytes) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
+        fn chunks<'a>(buf: &'a CacheIngestResponse) -> Box<dyn Iterator<Item = &'a [u8]> + 'a> {
             match buf {
-                BackendResponseBytes::Owned(v) => Box::new(std::iter::once(v.as_ref())),
-                BackendResponseBytes::Pooled(v) => Box::new(std::iter::once(v.as_ref())),
-                BackendResponseBytes::Chunked(v) => Box::new(v.iter_chunks()),
-                BackendResponseBytes::Inline(v) => Box::new(std::iter::once(v.as_slice())),
+                CacheIngestResponse::Owned(v) => Box::new(std::iter::once(v.as_ref())),
+                CacheIngestResponse::Pooled(v) => Box::new(std::iter::once(v.as_ref())),
+                CacheIngestResponse::Chunked(v) => Box::new(v.iter_chunks()),
+                CacheIngestResponse::Inline(v) => Box::new(std::iter::once(v.as_slice())),
             }
         }
 
@@ -93,33 +93,33 @@ impl PartialEq for BackendResponseBytes {
 }
 
 #[cfg(test)]
-impl Eq for BackendResponseBytes {}
+impl Eq for CacheIngestResponse {}
 
-impl From<Vec<u8>> for BackendResponseBytes {
+impl From<Vec<u8>> for CacheIngestResponse {
     fn from(value: Vec<u8>) -> Self {
         Self::Owned(value.into_boxed_slice())
     }
 }
 
-impl From<crate::pool::PooledBuffer> for BackendResponseBytes {
+impl From<crate::pool::PooledBuffer> for CacheIngestResponse {
     fn from(value: crate::pool::PooledBuffer) -> Self {
         Self::Pooled(value)
     }
 }
 
-impl From<crate::pool::ChunkedResponse> for BackendResponseBytes {
+impl From<crate::pool::ChunkedResponse> for CacheIngestResponse {
     fn from(value: crate::pool::ChunkedResponse) -> Self {
         Self::Chunked(value)
     }
 }
 
-impl From<SmallVec<[u8; 128]>> for BackendResponseBytes {
+impl From<SmallVec<[u8; 128]>> for CacheIngestResponse {
     fn from(value: SmallVec<[u8; 128]>) -> Self {
         Self::Inline(value)
     }
 }
 
-impl From<&[u8]> for BackendResponseBytes {
+impl From<&[u8]> for CacheIngestResponse {
     fn from(value: &[u8]) -> Self {
         let small = SmallVec::<[u8; 128]>::from_slice(value);
         if small.spilled() {
@@ -135,7 +135,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn backend_response_bytes_equality_spans_storage_forms() {
+    async fn cache_ingest_response_equality_spans_storage_forms() {
         let bytes = b"220 0 <test@example.com>\r\nBody\r\n.\r\n";
         let pool =
             crate::pool::BufferPool::new(crate::types::BufferSize::try_new(1024).unwrap(), 1)
@@ -150,17 +150,17 @@ mod tests {
         let small = SmallVec::<[u8; 128]>::from_slice(bytes);
 
         assert_eq!(
-            BackendResponseBytes::Owned(bytes.to_vec().into_boxed_slice()),
-            BackendResponseBytes::Pooled(pooled)
+            CacheIngestResponse::Owned(bytes.to_vec().into_boxed_slice()),
+            CacheIngestResponse::Pooled(pooled)
         );
         assert_eq!(
-            BackendResponseBytes::Chunked(chunked),
-            BackendResponseBytes::Inline(small)
+            CacheIngestResponse::Chunked(chunked),
+            CacheIngestResponse::Inline(small)
         );
     }
 
     #[tokio::test]
-    async fn backend_response_bytes_status_code_spans_storage_forms() {
+    async fn cache_ingest_response_status_code_spans_storage_forms() {
         let bytes = b"220 0 <test@example.com>\r\nBody\r\n.\r\n";
         let pool =
             crate::pool::BufferPool::new(crate::types::BufferSize::try_new(1024).unwrap(), 1)
@@ -175,36 +175,36 @@ mod tests {
         let small = SmallVec::<[u8; 128]>::from_slice(bytes);
 
         assert_eq!(
-            BackendResponseBytes::Owned(bytes.to_vec().into_boxed_slice()).status_code(),
+            CacheIngestResponse::Owned(bytes.to_vec().into_boxed_slice()).status_code(),
             Some(StatusCode::new(220))
         );
         assert_eq!(
-            BackendResponseBytes::Pooled(pooled).status_code(),
+            CacheIngestResponse::Pooled(pooled).status_code(),
             Some(StatusCode::new(220))
         );
         assert_eq!(
-            BackendResponseBytes::Chunked(chunked).status_code(),
+            CacheIngestResponse::Chunked(chunked).status_code(),
             Some(StatusCode::new(220))
         );
         assert_eq!(
-            BackendResponseBytes::Inline(small).status_code(),
+            CacheIngestResponse::Inline(small).status_code(),
             Some(StatusCode::new(220))
         );
     }
 
     #[test]
-    fn backend_response_bytes_from_short_slice_uses_inline_storage() {
-        let buffer = BackendResponseBytes::from(b"223\r\n".as_slice());
+    fn cache_ingest_response_from_short_slice_uses_inline_storage() {
+        let buffer = CacheIngestResponse::from(b"223\r\n".as_slice());
 
-        assert!(matches!(buffer, BackendResponseBytes::Inline(_)));
+        assert!(matches!(buffer, CacheIngestResponse::Inline(_)));
         assert_eq!(buffer.status_code(), Some(StatusCode::new(223)));
     }
 
     #[test]
-    fn backend_response_bytes_from_vec_stores_tight_owned_slice() {
-        let buffer = BackendResponseBytes::from(Vec::from(&b"220 1 <tight@example>\r\n.\r\n"[..]));
+    fn cache_ingest_response_from_vec_stores_tight_owned_slice() {
+        let buffer = CacheIngestResponse::from(Vec::from(&b"220 1 <tight@example>\r\n.\r\n"[..]));
 
-        assert!(matches!(buffer, BackendResponseBytes::Owned(_)));
+        assert!(matches!(buffer, CacheIngestResponse::Owned(_)));
         assert_eq!(buffer.status_code(), Some(StatusCode::new(220)));
     }
 
@@ -373,7 +373,7 @@ impl UnifiedCache {
     pub(crate) async fn upsert_ingest(
         &self,
         message_id: MessageId<'_>,
-        buffer: BackendResponseBytes,
+        buffer: CacheIngestResponse,
         backend_id: BackendId,
         tier: ttl::CacheTier,
     ) {
