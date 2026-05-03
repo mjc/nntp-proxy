@@ -2,7 +2,7 @@
 //!
 //! This test suite validates:
 //! 1. BODY (222) responses are cached when `cache_articles=true`
-//! 2. Upsert only replaces buffers when new buffer is larger (prevents status-only overwrite)
+//! 2. Upsert only replaces buffers when new buffer is larger (prevents metadata-only overwrite)
 //! 3. Typed cache rendering correctly validates cached response vs request kind
 //! 4. Cache serves BODY from cache but fetches full ARTICLE when needed
 
@@ -15,7 +15,7 @@ use std::time::Duration;
 use super::{article_entry, article_response_bytes, assert_serves, body_entry, head_entry};
 
 #[tokio::test]
-async fn test_upsert_prevents_status_only_overwrite() -> Result<()> {
+async fn test_upsert_prevents_metadata_only_overwrite() -> Result<()> {
     let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
     let msg_id = MessageId::from_str_or_wrap("test@example.com")?;
     let backend_id = BackendId::from_index(0);
@@ -40,10 +40,10 @@ async fn test_upsert_prevents_status_only_overwrite() -> Result<()> {
         full_article.as_bytes()
     );
 
-    // Second upsert: Try to overwrite with status-only response (53 bytes)
-    let status_only = b"222 0 <test@example.com>\r\n".to_vec();
+    // Second upsert: Try to overwrite with metadata-only response (53 bytes)
+    let metadata_only = b"222 0 <test@example.com>\r\n".to_vec();
     cache
-        .upsert(msg_id.clone(), status_only.clone(), backend_id, 0.into())
+        .upsert(msg_id.clone(), metadata_only.clone(), backend_id, 0.into())
         .await;
 
     let cached = cache
@@ -53,11 +53,11 @@ async fn test_upsert_prevents_status_only_overwrite() -> Result<()> {
     assert_eq!(
         article_response_bytes(&cached, RequestKind::Body, &msg_id).unwrap(),
         full_article.as_bytes(),
-        "Full article should NOT be overwritten by status-only response"
+        "Full article should NOT be overwritten by metadata-only response"
     );
     assert_ne!(
         article_response_bytes(&cached, RequestKind::Body, &msg_id),
-        Some(status_only)
+        Some(metadata_only)
     );
 
     Ok(())
@@ -69,19 +69,19 @@ async fn test_upsert_allows_larger_buffer_update() -> Result<()> {
     let msg_id = MessageId::from_str_or_wrap("test@example.com")?;
     let backend_id = BackendId::from_index(0);
 
-    // First upsert: Store status-only response
-    let status_only = b"222 0 <test@example.com>\r\n".to_vec();
+    // First upsert: Store metadata-only response
+    let metadata_only = b"222 0 <test@example.com>\r\n".to_vec();
     cache
-        .upsert(msg_id.clone(), status_only.clone(), backend_id, 0.into())
+        .upsert(msg_id.clone(), metadata_only.clone(), backend_id, 0.into())
         .await;
 
     let cached = cache
         .get(&msg_id)
         .await
-        .expect("Status-only response should be cached");
+        .expect("Metadata-only response should be cached");
     assert!(
         article_response_bytes(&cached, RequestKind::Body, &msg_id).is_none(),
-        "Status-only response should have no payload to serve"
+        "Metadata-only response should have no payload to serve"
     );
 
     // Second upsert: Replace with full article (larger)
@@ -102,7 +102,7 @@ async fn test_upsert_allows_larger_buffer_update() -> Result<()> {
     assert_eq!(
         article_response_bytes(&cached, RequestKind::Body, &msg_id).unwrap(),
         full_article.as_bytes(),
-        "Full article should replace status-only response"
+        "Full article should replace metadata-only response"
     );
 
     Ok(())
@@ -166,35 +166,35 @@ fn test_is_complete_article_accepts_body_responses() {
         "BODY (222) with content should be considered complete"
     );
 
-    // BODY status-only response should NOT be considered complete
-    let status_only = b"222 0 <test@example.com>\r\n".to_vec();
-    let entry = ArticleEntry::from_response_bytes(status_only);
+    // BODY metadata-only response should NOT be considered complete
+    let metadata_only = b"222 0 <test@example.com>\r\n".to_vec();
+    let entry = ArticleEntry::from_response_bytes(metadata_only);
 
     assert!(
         !entry.is_complete_article(),
-        "BODY (222) status-only response should NOT be considered complete"
+        "BODY (222) metadata-only response should NOT be considered complete"
     );
 }
 
 #[test]
-fn test_is_complete_article_rejects_status_only_responses() {
-    // Status-only responses are too small to be complete articles
-    let status_only_220 = b"220 0 <test@example.com>\r\n".to_vec();
-    let entry = ArticleEntry::from_response_bytes(status_only_220);
+fn test_is_complete_article_rejects_metadata_only_responses() {
+    // Metadata-only responses are too small to be complete articles
+    let metadata_only_220 = b"220 0 <test@example.com>\r\n".to_vec();
+    let entry = ArticleEntry::from_response_bytes(metadata_only_220);
     assert!(
         !entry.is_complete_article(),
-        "220 status-only response should not be complete"
+        "220 metadata-only response should not be complete"
     );
 
-    let status_only_222 = b"222 0 <test@example.com>\r\n".to_vec();
-    let entry = ArticleEntry::from_response_bytes(status_only_222);
+    let metadata_only_222 = b"222 0 <test@example.com>\r\n".to_vec();
+    let entry = ArticleEntry::from_response_bytes(metadata_only_222);
     assert!(
         !entry.is_complete_article(),
-        "222 status-only response should not be complete"
+        "222 metadata-only response should not be complete"
     );
 
-    let status_only_223 = b"223 0 <test@example.com>\r\n".to_vec();
-    let entry = ArticleEntry::from_response_bytes(status_only_223);
+    let metadata_only_223 = b"223 0 <test@example.com>\r\n".to_vec();
+    let entry = ArticleEntry::from_response_bytes(metadata_only_223);
     assert!(
         !entry.is_complete_article(),
         "223 (STAT) should never be complete"

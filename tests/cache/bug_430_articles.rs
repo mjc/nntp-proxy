@@ -23,7 +23,7 @@ use super::article_response_bytes;
 
 /// Test that `sync_availability` does NOT create a missing entry when a backend has the article
 #[tokio::test]
-async fn test_sync_availability_does_not_create_430_status_only_when_backend_has_article()
+async fn test_sync_availability_does_not_create_430_metadata_only_when_backend_has_article()
 -> Result<()> {
     let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
     let msg_id = MessageId::new("<test@example.com>".to_string())?;
@@ -39,7 +39,7 @@ async fn test_sync_availability_does_not_create_430_status_only_when_backend_has
     // Check what got cached
     let cached = cache.get(&msg_id).await;
 
-    // BUG: sync_availability creates a "430\r\n" status-only response even when availability shows
+    // BUG: sync_availability creates a "430\r\n" metadata-only response even when availability shows
     // backend 0 HAS the article. This is wrong - if a backend has it, we should
     // either not create an entry at all, or create a proper placeholder.
 
@@ -289,9 +289,9 @@ fn test_all_exhausted_with_backend_count() {
 /// This is a critical edge case: if a missing entry is in the cache, we should NOT
 /// serve it directly - we should fall through to backend routing.
 #[tokio::test]
-async fn test_430_status_only_not_served_directly() -> Result<()> {
+async fn test_430_metadata_only_not_served_directly() -> Result<()> {
     let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
-    let msg_id = MessageId::new("<status_only@example.com>".to_string())?;
+    let msg_id = MessageId::new("<metadata_only@example.com>".to_string())?;
 
     // Create a missing entry in the cache (simulating all backends returned 430 previously)
     let mut availability = ArticleAvailability::new();
@@ -366,40 +366,40 @@ async fn test_concurrent_upsert_and_sync() -> Result<()> {
 }
 
 // ============================================================================
-// Tests for is_complete_article() - preventing status-only response serving
+// Tests for is_complete_article() - preventing metadata-only response serving
 // ============================================================================
 
-/// Test that `is_complete_article` returns false for status-only responses
+/// Test that `is_complete_article` returns false for metadata-only responses
 #[test]
-fn test_is_complete_article_rejects_status_only_responses() {
+fn test_is_complete_article_rejects_metadata_only_responses() {
     use nntp_proxy::cache::ArticleEntry;
 
     // missing entry
-    let status_only_430 = ArticleEntry::from_response_bytes(b"430\r\n");
+    let metadata_only_430 = ArticleEntry::from_response_bytes(b"430\r\n");
     assert!(
-        !status_only_430.is_complete_article(),
+        !metadata_only_430.is_complete_article(),
         "missing entry should not be complete article"
     );
 
-    // 220 status-only response (from availability tracking)
-    let status_only_220 = ArticleEntry::from_response_bytes(b"220\r\n");
+    // 220 metadata-only response (from availability tracking)
+    let metadata_only_220 = ArticleEntry::from_response_bytes(b"220\r\n");
     assert!(
-        !status_only_220.is_complete_article(),
-        "220 status-only response should not be complete article"
+        !metadata_only_220.is_complete_article(),
+        "220 metadata-only response should not be complete article"
     );
 
-    // 223 status-only response (from STAT precheck)
-    let status_only_223 = ArticleEntry::from_response_bytes(b"223\r\n");
+    // 223 metadata-only response (from STAT precheck)
+    let metadata_only_223 = ArticleEntry::from_response_bytes(b"223\r\n");
     assert!(
-        !status_only_223.is_complete_article(),
-        "223 status-only response should not be complete article"
+        !metadata_only_223.is_complete_article(),
+        "223 metadata-only response should not be complete article"
     );
 
-    // 221 status-only response (from HEAD precheck)
-    let status_only_221 = ArticleEntry::from_response_bytes(b"221\r\n");
+    // 221 metadata-only response (from HEAD precheck)
+    let metadata_only_221 = ArticleEntry::from_response_bytes(b"221\r\n");
     assert!(
-        !status_only_221.is_complete_article(),
-        "221 status-only response should not be complete article"
+        !metadata_only_221.is_complete_article(),
+        "221 metadata-only response should not be complete article"
     );
 }
 
@@ -467,18 +467,18 @@ fn test_is_complete_article_accepts_220_and_222() {
     );
 }
 
-/// Test that status-only responses don't get served when `cache_articles=true`
+/// Test that metadata-only responses don't get served when `cache_articles=true`
 #[tokio::test]
-async fn test_status_only_not_served_as_article() -> Result<()> {
+async fn test_metadata_only_not_served_as_article() -> Result<()> {
     let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
-    let msg_id = MessageId::new("<status_only-test@example.com>".to_string())?;
+    let msg_id = MessageId::new("<metadata_only-test@example.com>".to_string())?;
 
-    // Simulate STAT precheck creating a status-only response
+    // Simulate STAT precheck creating a metadata-only response
     let mut availability = ArticleAvailability::new();
     availability.record_has(BackendId::from_index(0));
 
-    // First, put a 223 status-only response in the cache (as if from STAT precheck)
-    // We'll use upsert with a status-only response-like buffer to simulate this
+    // First, put a 223 metadata-only response in the cache (as if from STAT precheck)
+    // We'll use upsert with a metadata-only response-like buffer to simulate this
     cache
         .upsert(
             msg_id.clone(),
@@ -494,22 +494,22 @@ async fn test_status_only_not_served_as_article() -> Result<()> {
     // Verify it's NOT a complete article (what is_complete_article should return)
     assert!(
         !cached.is_complete_article(),
-        "STAT status-only response should not be identified as complete article"
+        "STAT metadata-only response should not be identified as complete article"
     );
 
-    // The session handler would check is_complete_article() and NOT serve this status-only response
+    // The session handler would check is_complete_article() and NOT serve this metadata-only response
     // Instead, it would fall through to fetch the real article from backend
 
     Ok(())
 }
 
-/// Test the full scenario: precheck creates a status-only response, then ARTICLE command needs real body
+/// Test the full scenario: precheck creates a metadata-only response, then ARTICLE command needs real body
 #[tokio::test]
-async fn test_precheck_status_only_then_article_request() -> Result<()> {
+async fn test_precheck_metadata_only_then_article_request() -> Result<()> {
     let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
     let msg_id = MessageId::new("<precheck-then-article@example.com>".to_string())?;
 
-    // Step 1: STAT precheck creates a status-only response
+    // Step 1: STAT precheck creates a metadata-only response
     cache
         .upsert(
             msg_id.clone(),
@@ -519,15 +519,15 @@ async fn test_precheck_status_only_then_article_request() -> Result<()> {
         )
         .await;
 
-    // Verify a status-only response exists but is not a complete article
+    // Verify a metadata-only response exists but is not a complete article
     let cached = cache
         .get(&msg_id)
         .await
-        .expect("Should have status-only response");
+        .expect("Should have metadata-only response");
     assert!(!cached.is_complete_article());
     assert!(cached.has_availability_info()); // Availability IS tracked
 
-    // Step 2: ARTICLE command comes in - should NOT serve the status-only response
+    // Step 2: ARTICLE command comes in - should NOT serve the metadata-only response
     // (In real code, is_complete_article() check causes fallthrough to backend fetch)
 
     // Step 3: Simulate backend fetch and upsert of real article
@@ -543,7 +543,7 @@ async fn test_precheck_status_only_then_article_request() -> Result<()> {
         )
         .await;
 
-    // Verify real article replaced status-only response
+    // Verify real article replaced metadata-only response
     let cached = cache.get(&msg_id).await.expect("Should have article");
     assert!(cached.is_complete_article());
     assert_eq!(cached.status_code().as_u16(), 220);
