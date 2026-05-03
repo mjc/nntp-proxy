@@ -1,28 +1,28 @@
 //! Metrics recording policy
 //!
-//! Pure functions for determining what metrics to record based on response codes.
+//! Pure functions for determining what metrics to record for a typed request response.
 
 use crate::protocol::{RequestContext, ResponseShape, StatusCode};
 
-/// Determine what action to take for metrics recording based on response code
+/// Determine what action to take for metrics recording.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetricsAction {
     /// Record 4xx error (excluding 423, 430)
     Error4xx,
     /// Record 5xx error
     Error5xx,
-    /// Record article metrics (success response for multiline)
+    /// Record article metrics for article-like multiline payload responses.
     Article,
     /// No special recording needed
     None,
 }
 
-/// Determine metrics recording action based on response code
+/// Determine metrics recording action for a typed request and status code.
 ///
 /// # Response Code Classification
 /// - 4xx errors (excluding 423, 430) → record as errors
 /// - 5xx errors → record as errors
-/// - 220-222 multiline → record as articles
+/// - ARTICLE/HEAD/BODY success payload responses → record as articles
 /// - Everything else → no special action
 ///
 /// # Excluded Error Codes
@@ -106,7 +106,7 @@ mod tests {
 
     #[test]
     fn test_determine_metrics_action_article_success() {
-        // Multiline 220-222 should record article
+        // Article-like success payload responses should record article metrics.
         assert_eq!(
             determine_metrics_action("ARTICLE <test@example.com>", 220),
             MetricsAction::Article
