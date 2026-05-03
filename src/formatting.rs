@@ -1,7 +1,7 @@
 //! Log formatting utilities
 
 #[allow(clippy::cast_precision_loss)]
-fn bytes_as_f64_for_display(bytes: u64) -> f64 {
+const fn bytes_as_f64_for_display(bytes: u64) -> f64 {
     // Human-readable log output is approximate by design; exact byte counts are
     // preserved in the integer path below and in metrics storage.
     bytes as f64

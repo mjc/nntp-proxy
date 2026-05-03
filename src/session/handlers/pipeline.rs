@@ -66,7 +66,7 @@ impl RequestBatch {
         }
     }
 
-    fn contexts_with_trailing_oversized(
+    const fn contexts_with_trailing_oversized(
         contexts: smallvec::SmallVec<[RequestContext; 4]>,
         trailing_wire_len: usize,
     ) -> Self {
@@ -80,7 +80,9 @@ impl RequestBatch {
         }
     }
 
-    fn contexts_with_trailing_invalid(contexts: smallvec::SmallVec<[RequestContext; 4]>) -> Self {
+    const fn contexts_with_trailing_invalid(
+        contexts: smallvec::SmallVec<[RequestContext; 4]>,
+    ) -> Self {
         Self {
             contexts,
             trailing_context: None,
@@ -89,7 +91,7 @@ impl RequestBatch {
         }
     }
 
-    fn contexts_with_trailing(
+    const fn contexts_with_trailing(
         contexts: smallvec::SmallVec<[RequestContext; 4]>,
         trailing_context: RequestContext,
     ) -> Self {
@@ -127,12 +129,12 @@ impl RequestBatch {
     }
 
     /// Get the trailing typed context if present.
-    pub(super) fn trailing_context(&self) -> Option<&RequestContext> {
+    pub(super) const fn trailing_context(&self) -> Option<&RequestContext> {
         self.trailing_context.as_ref()
     }
 
     /// Get the trailing typed context mutably if present.
-    pub(super) fn trailing_context_mut(&mut self) -> Option<&mut RequestContext> {
+    pub(super) const fn trailing_context_mut(&mut self) -> Option<&mut RequestContext> {
         self.trailing_context.as_mut()
     }
 

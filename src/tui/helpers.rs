@@ -171,19 +171,20 @@ pub fn format_throughput_label(value: f64) -> String {
 pub fn format_summary_throughput(latest_throughput: Option<&ThroughputPoint>) -> (String, String) {
     use super::constants::text;
 
-    latest_throughput
-        .map(|point| {
-            (
-                format!("{}{}", text::ARROW_UP, point.sent_per_sec()),
-                format!("{}{}", text::ARROW_DOWN, point.received_per_sec()),
-            )
-        })
-        .unwrap_or_else(|| {
+    latest_throughput.map_or_else(
+        || {
             (
                 format!("{}{}", text::ARROW_UP, text::DEFAULT_THROUGHPUT),
                 format!("{}{}", text::ARROW_DOWN, text::DEFAULT_THROUGHPUT),
             )
-        })
+        },
+        |point| {
+            (
+                format!("{}{}", text::ARROW_UP, point.sent_per_sec()),
+                format!("{}{}", text::ARROW_DOWN, point.received_per_sec()),
+            )
+        },
+    )
 }
 
 // ============================================================================

@@ -167,6 +167,10 @@ impl MetricsCollector {
     }
 
     /// Save metrics to disk (for persistence)
+    ///
+    /// # Errors
+    /// Returns any serialization or filesystem error from persisting the metrics
+    /// snapshot to `path`.
     pub fn save_to_disk(&self, path: &Path, server_names: &[String]) -> anyhow::Result<()> {
         self.inner.store.save(path, server_names)
     }

@@ -17,17 +17,17 @@ use crate::protocol::RequestContext;
 
 /// A queued request completed by one backend connection.
 #[derive(Debug)]
-pub(crate) struct CompletedPipelineRequest {
+pub struct CompletedPipelineRequest {
     /// Typed request context that was completed in backend-connection FIFO order.
     pub context: RequestContext,
 }
 
 /// Response sent back to a client session from the pipeline worker.
-pub(crate) type PipelineResponse = Result<CompletedPipelineRequest, PipelineError>;
+pub type PipelineResponse = Result<CompletedPipelineRequest, PipelineError>;
 
 /// Queue/worker failures reported back to the waiting session without heap allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PipelineError {
+pub enum PipelineError {
     ConnectionAcquire,
     WriteFailed { index: usize, batch_len: usize },
     FlushFailed,
@@ -53,7 +53,7 @@ impl std::fmt::Display for PipelineError {
 }
 
 /// A request queued for pipeline execution on a backend
-pub(crate) struct QueuedContext {
+pub struct QueuedContext {
     /// Typed request context. Owns verb/args, not redundant serialized bytes.
     pub context: RequestContext,
     /// Return path to the client session that queued this request.
@@ -63,7 +63,7 @@ pub(crate) struct QueuedContext {
 impl QueuedContext {
     /// Create a queued context with the client return path that should receive completion.
     #[must_use]
-    pub(crate) fn new(
+    pub(crate) const fn new(
         context: RequestContext,
         client_return: oneshot::Sender<PipelineResponse>,
     ) -> Self {
@@ -92,7 +92,7 @@ impl QueuedContext {
 
 /// Errors returned when enqueuing fails
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum QueueError {
+pub enum QueueError {
     /// Queue is at capacity; client should get a 503-like response
     #[error("pipeline queue full ({depth}/{max_depth})")]
     QueueFull { depth: usize, max_depth: usize },
@@ -100,7 +100,7 @@ pub(crate) enum QueueError {
 
 /// Lock-free per-backend request queue with async notification
 #[derive(Debug)]
-pub(crate) struct BackendQueue {
+pub struct BackendQueue {
     queue: SegQueue<QueuedContext>,
     notify: Notify,
     depth: AtomicUsize,

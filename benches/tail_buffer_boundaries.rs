@@ -4,7 +4,7 @@
 //! cross-read boundaries and false positives, which matter for pipelined article
 //! streaming and leftover correctness.
 //!
-//! Run with: cargo bench --bench tail_buffer_boundaries
+//! Run with: cargo bench --bench `tail_buffer_boundaries`
 
 use divan::{Bencher, black_box};
 use nntp_proxy::session::streaming::tail_buffer::TailBuffer;

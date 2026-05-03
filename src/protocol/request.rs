@@ -9,7 +9,7 @@ use smallvec::SmallVec;
 use super::StatusCode;
 use crate::types::{BackendId, MessageId};
 
-pub(crate) const MAX_COMMAND_LINE_OCTETS: usize = 512;
+pub const MAX_COMMAND_LINE_OCTETS: usize = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestKind {
@@ -52,7 +52,7 @@ pub enum RequestRouteClass {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum RequestCacheStatus {
+pub enum RequestCacheStatus {
     Hit,
     PartialHit,
     Miss,
@@ -106,7 +106,7 @@ impl From<usize> for ResponseWireLen {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub(crate) struct ResponsePayloadLen(usize);
+pub struct ResponsePayloadLen(usize);
 
 impl ResponsePayloadLen {
     #[must_use]
@@ -127,7 +127,7 @@ impl From<usize> for ResponsePayloadLen {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct RequestResponseMetadata {
+pub struct RequestResponseMetadata {
     status: StatusCode,
     wire_len: ResponseWireLen,
 }
@@ -150,7 +150,7 @@ impl RequestResponseMetadata {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
-pub(crate) struct RequestCacheAvailability {
+pub struct RequestCacheAvailability {
     checked: u8,
     missing: u8,
 }
@@ -179,7 +179,7 @@ impl RequestCacheAvailability {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub(crate) struct RequestCacheTier(u8);
+pub struct RequestCacheTier(u8);
 
 impl RequestCacheTier {
     #[must_use]
@@ -195,7 +195,7 @@ impl From<u8> for RequestCacheTier {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-pub(crate) struct RequestCacheTimestampMillis(u64);
+pub struct RequestCacheTimestampMillis(u64);
 
 impl RequestCacheTimestampMillis {
     #[must_use]
@@ -211,7 +211,7 @@ impl From<u64> for RequestCacheTimestampMillis {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum RequestCachePayloadKind {
+pub enum RequestCachePayloadKind {
     Missing,
     AvailabilityOnly,
     Article,
@@ -221,7 +221,7 @@ pub(crate) enum RequestCachePayloadKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct RequestCacheArticleNumber(u64);
+pub struct RequestCacheArticleNumber(u64);
 
 impl RequestCacheArticleNumber {
     #[must_use]
@@ -313,7 +313,7 @@ impl<'a> RequestLine<'a> {
 
     #[must_use]
     #[cfg(test)]
-    pub fn route_class(&self) -> RequestRouteClass {
+    pub const fn route_class(&self) -> RequestRouteClass {
         route_class(self.kind, self.message_id.is_some())
     }
 }
@@ -339,7 +339,7 @@ impl Clone for RequestContext {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct RequestCacheEntryMetadata {
+pub struct RequestCacheEntryMetadata {
     status: StatusCode,
     availability: RequestCacheAvailability,
     tier: RequestCacheTier,
@@ -439,15 +439,16 @@ impl RequestContext {
         let verb = SmallVec::from_slice(verb);
         let arg_len = args.iter().map(|part| part.len()).sum();
         let mut joined_args = SmallVec::<[u8; 512]>::with_capacity(arg_len);
-        args.iter()
-            .for_each(|part| joined_args.extend_from_slice(part));
+        for part in args {
+            joined_args.extend_from_slice(part);
+        }
         let kind = classify_verb(&verb);
         let message_id = find_message_id(&joined_args);
 
         Self::from_parts(kind, verb, joined_args, message_id)
     }
 
-    fn from_parts(
+    const fn from_parts(
         kind: RequestKind,
         verb: SmallVec<[u8; 16]>,
         args: SmallVec<[u8; 512]>,
@@ -722,17 +723,17 @@ impl RequestContext {
     }
 
     #[must_use]
-    pub fn route_class(&self) -> RequestRouteClass {
+    pub const fn route_class(&self) -> RequestRouteClass {
         route_class(self.kind, self.message_id.is_some())
     }
 
     #[must_use]
-    pub fn is_pipelineable(&self) -> bool {
+    pub const fn is_pipelineable(&self) -> bool {
         matches!(self.route_class(), RequestRouteClass::ArticleByMessageId)
     }
 
     #[must_use]
-    pub fn is_large_transfer(&self) -> bool {
+    pub const fn is_large_transfer(&self) -> bool {
         matches!(self.kind, RequestKind::Article | RequestKind::Body) && self.message_id.is_some()
     }
 
@@ -742,6 +743,9 @@ impl RequestContext {
     }
 
     /// Write the typed request as NNTP wire bytes without building a command buffer.
+    ///
+    /// # Errors
+    /// Returns any I/O error from writing the request bytes to `writer`.
     pub async fn write_wire_to<W>(&self, writer: &mut W) -> std::io::Result<()>
     where
         W: tokio::io::AsyncWrite + Unpin,
@@ -793,7 +797,7 @@ fn trim_line_end(mut line: &[u8]) -> &[u8] {
     line
 }
 
-fn route_class(kind: RequestKind, has_message_id: bool) -> RequestRouteClass {
+const fn route_class(kind: RequestKind, has_message_id: bool) -> RequestRouteClass {
     match kind {
         RequestKind::Capabilities | RequestKind::Quit | RequestKind::AuthInfo => {
             RequestRouteClass::Local
@@ -830,7 +834,7 @@ fn route_class(kind: RequestKind, has_message_id: bool) -> RequestRouteClass {
     }
 }
 
-fn classify_verb(verb: &[u8]) -> RequestKind {
+const fn classify_verb(verb: &[u8]) -> RequestKind {
     macro_rules! classify_verbs {
         ($verb:expr; $($len:literal => { $($lit:literal => $kind:expr),+ $(,)? }),+ $(,)?) => {{
             match $verb.len() {
@@ -938,8 +942,9 @@ mod tests {
         ) -> Poll<std::io::Result<usize>> {
             self.vectored_writes += 1;
             let len = bufs.iter().map(|buf| buf.len()).sum();
-            bufs.iter()
-                .for_each(|buf| self.bytes.extend_from_slice(buf));
+            for buf in bufs {
+                self.bytes.extend_from_slice(buf);
+            }
             Poll::Ready(Ok(len))
         }
 

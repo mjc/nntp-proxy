@@ -70,7 +70,7 @@ impl CachedSectionLen {
 /// The `repr(u16)` allows efficient serialization as a 2-byte wire format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u16)]
-pub(crate) enum CacheableStatusCode {
+pub enum CacheableStatusCode {
     /// 220 — Full article (headers + body)
     Article = 220,
     /// 221 — Headers only
@@ -117,7 +117,7 @@ impl TryFrom<u16> for CacheableStatusCode {
 /// - Simple binary format:
 ///   [magic:u32][status:u16][checked:u8][missing:u8][timestamp:u64][tier:u8][typed-payload]
 #[derive(Clone, Debug)]
-pub(crate) struct DiskCachedArticle {
+pub struct DiskCachedArticle {
     /// Validated NNTP status code — only cacheable codes are representable
     status_code: CacheableStatusCode,
     /// Backend availability tracking (checked/missing bitsets)
@@ -808,8 +808,7 @@ mod tests {
     #[test]
     fn test_disk_cached_article_response_do_not_clone_payload() {
         let buffer = b"220 7 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry =
-            disk_cached_article_from_ingest_bytes(buffer.clone()).expect("valid status code");
+        let entry = disk_cached_article_from_ingest_bytes(buffer).expect("valid status code");
 
         let response = entry
             .cached_response_for(RequestKind::Head, "<test@example.com>")
@@ -1146,7 +1145,7 @@ mod tests {
     #[test]
     fn test_cached_response_for_body_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = disk_cached_article_from_ingest_bytes(buf.clone()).unwrap();
+        let entry = disk_cached_article_from_ingest_bytes(buf).unwrap();
         let resp = render_response(&entry, RequestKind::Body, "<t@x>").expect("220 can serve BODY");
         assert_eq!(resp, b"222 0 <t@x>\r\nBody\r\n.\r\n");
     }
@@ -1154,7 +1153,7 @@ mod tests {
     #[test]
     fn test_cached_response_for_head_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
-        let entry = disk_cached_article_from_ingest_bytes(buf.clone()).unwrap();
+        let entry = disk_cached_article_from_ingest_bytes(buf).unwrap();
         let resp = render_response(&entry, RequestKind::Head, "<t@x>").expect("220 can serve HEAD");
         assert_eq!(resp, b"221 0 <t@x>\r\nSubject: T\r\n.\r\n");
     }

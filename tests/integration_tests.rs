@@ -491,7 +491,7 @@ async fn test_sequential_requests_no_delay() -> Result<()> {
         // Each response should arrive within 500ms (increased timeout for connection pool)
         // This test verifies that explicit flush() calls are not required for TCP streams,
         // and that responses are received promptly after write_all().
-        let n = timeout(Duration::from_millis(1000), client.read(&mut buffer))
+        let n = timeout(Duration::from_secs(1), client.read(&mut buffer))
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
@@ -589,7 +589,7 @@ async fn test_hybrid_mode_stateless_commands() -> Result<()> {
 
         // Read response
         buffer = [0; 1024];
-        let n = timeout(Duration::from_millis(2000), client.read(&mut buffer))
+        let n = timeout(Duration::from_secs(2), client.read(&mut buffer))
             .await
             .map_err(|_| anyhow::anyhow!("Timeout waiting for response to: {}", cmd.trim()))?
             .map_err(|e| anyhow::anyhow!("Read error for command {}: {}", cmd.trim(), e))?;
@@ -671,7 +671,7 @@ async fn test_hybrid_mode_stateful_switching() -> Result<()> {
 
     // Read response
     buffer = [0; 1024];
-    let n = timeout(Duration::from_millis(2000), client.read(&mut buffer))
+    let n = timeout(Duration::from_secs(2), client.read(&mut buffer))
         .await
         .map_err(|_| anyhow::anyhow!("Timeout waiting for GROUP response"))?
         .map_err(|e| anyhow::anyhow!("Read error for GROUP command: {e}"))?;
@@ -689,7 +689,7 @@ async fn test_hybrid_mode_stateful_switching() -> Result<()> {
 
         // Read response
         buffer = [0; 1024];
-        let n = timeout(Duration::from_millis(2000), client.read(&mut buffer))
+        let n = timeout(Duration::from_secs(2), client.read(&mut buffer))
             .await
             .map_err(|_| anyhow::anyhow!("Timeout waiting for response to: {}", cmd.trim()))?
             .map_err(|e| anyhow::anyhow!("Read error for command {}: {}", cmd.trim(), e))?;

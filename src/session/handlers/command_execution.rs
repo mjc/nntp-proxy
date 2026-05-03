@@ -24,7 +24,7 @@ const BACKEND_TIMING_SAMPLE_MASK: u64 = 0x0f;
 static BACKEND_TIMING_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
-pub(crate) fn should_sample_backend_timing() -> bool {
+pub fn should_sample_backend_timing() -> bool {
     BACKEND_TIMING_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed) & BACKEND_TIMING_SAMPLE_MASK == 0
 }
 
@@ -41,7 +41,7 @@ pub(super) enum BackendAttemptResult {
 
 impl BackendAttemptResult {
     #[must_use]
-    fn success(
+    const fn success(
         request: &mut RequestContext,
         backend_id: BackendId,
         response: RequestResponseMetadata,
@@ -76,7 +76,7 @@ struct ResponseStreamParams<'a> {
 /// The backend connection is already clean at this point, but the client may have received a
 /// partial prefix of the response. Retrying another backend on the same client socket would
 /// splice responses together and corrupt NNTP framing.
-fn classify_buffered_response_write_err(e: std::io::Error) -> StreamingError {
+const fn classify_buffered_response_write_err(e: std::io::Error) -> StreamingError {
     StreamingError::ClientDisconnect(e)
 }
 

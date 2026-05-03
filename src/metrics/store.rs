@@ -281,6 +281,9 @@ impl MetricsStore {
     ///
     /// Returns Ok(None) if file doesn't exist or is corrupt (logs warning, starts fresh).
     /// Returns Ok(Some(store)) on successful load.
+    ///
+    /// # Errors
+    /// Returns any filesystem error while reading `path` other than a missing file.
     pub fn load(path: &Path, server_names: &[String]) -> Result<Option<Self>> {
         // File doesn't exist - start fresh
         if !path.exists() {
@@ -370,6 +373,10 @@ impl MetricsStore {
     }
 
     /// Save to file atomically (tmp + rename)
+    ///
+    /// # Errors
+    /// Returns any serialization, filesystem, or atomic-rename error while
+    /// persisting the metrics store to disk.
     pub fn save(&self, path: &Path, server_names: &[String]) -> Result<()> {
         let _save_guard = SAVE_LOCK
             .lock()

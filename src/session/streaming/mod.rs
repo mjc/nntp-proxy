@@ -221,9 +221,6 @@ where
 ///
 /// This uses two buffers to enable concurrent read/write operations for maximum throughput.
 /// Essential for large article downloads (50MB+) where buffering would kill performance.
-///
-/// If `capture` is Some, the response will be captured into the Vec for caching.
-#[cfg_attr(not(test), allow(dead_code))]
 pub async fn stream_multiline_response<R, W>(
     backend_read: &mut R,
     client_write: &mut W,
@@ -235,30 +232,6 @@ where
     W: AsyncWriteExt + Unpin,
 {
     stream_multiline_response_impl(backend_read, client_write, first_chunk, ctx, None, None).await
-}
-
-/// Stream multiline response and optionally capture for caching
-#[allow(dead_code)]
-pub(crate) async fn stream_and_capture_multiline_response<R, W>(
-    backend_read: &mut R,
-    client_write: &mut W,
-    first_chunk: &[u8],
-    ctx: &StreamContext<'_>,
-    capture: &mut crate::pool::ChunkedResponse,
-) -> Result<u64, StreamingError>
-where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
-    stream_multiline_response_impl(
-        backend_read,
-        client_write,
-        first_chunk,
-        ctx,
-        Some(capture),
-        None,
-    )
-    .await
 }
 
 fn stash_leftover(

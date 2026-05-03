@@ -95,7 +95,10 @@ impl AuthHandler {
     }
 
     /// Handle an auth command - writes response to client and returns (`bytes_written`, `auth_success`)
-    /// This is the ONE place where auth interception happens
+    /// This is the ONE place where auth interception happens.
+    ///
+    /// # Errors
+    /// Returns any I/O error from writing the NNTP auth response to the client.
     pub async fn handle_auth_command<W>(
         &self,
         auth_action: AuthAction<'_>,
@@ -120,11 +123,8 @@ impl AuthHandler {
                 }
 
                 // Validate credentials
-                let auth_success = if let Some(username) = stored_username {
-                    self.validate_credentials(username, password)
-                } else {
-                    false
-                };
+                let auth_success = stored_username
+                    .is_some_and(|username| self.validate_credentials(username, password));
 
                 let response = if auth_success {
                     AUTH_ACCEPTED

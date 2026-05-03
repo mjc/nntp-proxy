@@ -106,7 +106,7 @@ impl Default for HybridCacheConfig {
             memory_capacity: 256 * 1024 * 1024,     // 256 MB memory
             disk_capacity: 10 * 1024 * 1024 * 1024, // 10 GB disk
             disk_path: std::path::PathBuf::from("/var/cache/nntp-proxy"),
-            ttl: Duration::from_secs(3600), // 1 hour
+            ttl: Duration::from_hours(1), // 1 hour
             cache_articles: true,
             compression: CompressionCodec::Lz4,
             shards: 16, // Match indexer shards for consistent lock contention
@@ -623,7 +623,7 @@ impl HybridArticleCache {
             memory_capacity,
             disk_capacity: 0, // No disk in memory-only mode
             disk_path: std::path::PathBuf::new(),
-            ttl: Duration::from_secs(3600),
+            ttl: Duration::from_hours(1),
             cache_articles,
             compression: CompressionCodec::None,
             shards: 1,

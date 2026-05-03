@@ -35,7 +35,7 @@ fn assert_effective_ttl_cases(base_ttl: u64, cases: &[(u8, u64)]) {
     });
 }
 
-fn effective_ttl_ms(base_ttl: u64, tier: CacheTier) -> u64 {
+const fn effective_ttl_ms(base_ttl: u64, tier: CacheTier) -> u64 {
     effective_ttl(CacheTtlMillis::new(base_ttl), tier).get()
 }
 
@@ -303,7 +303,7 @@ async fn test_cache_tier_2_even_longer() {
 
 #[tokio::test]
 async fn test_cache_preserves_tier_on_get() {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(60), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_mins(1), true);
 
     let msg_id = MessageId::from_borrowed("<tier-preserve@example.com>").unwrap();
 
@@ -316,7 +316,7 @@ async fn test_cache_preserves_tier_on_get() {
 
 #[tokio::test]
 async fn test_cache_upsert_updates_tier_with_larger_buffer() {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(60), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_mins(1), true);
 
     let msg_id = MessageId::from_borrowed("<tier-update@example.com>").unwrap();
     let buffer_large = article_bytes(msg_id.as_str(), "Larger body content here");
@@ -343,7 +343,7 @@ async fn test_cache_upsert_updates_tier_with_larger_buffer() {
 #[tokio::test]
 async fn test_cache_upsert_keeps_tier_without_replacement() {
     // Verify that tier is NOT updated when buffer isn't replaced
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(60), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_mins(1), true);
 
     let msg_id = MessageId::from_borrowed("<tier-keep@example.com>").unwrap();
     let buffer = article_bytes(msg_id.as_str(), "Body");

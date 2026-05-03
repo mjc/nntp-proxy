@@ -545,7 +545,7 @@ mod tests {
 
         let deps = OwnedDeps {
             router: Arc::new(selector),
-            cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60), true)),
+            cache: Arc::new(UnifiedCache::memory(100, Duration::from_mins(1), true)),
             buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 2),
             metrics: MetricsCollector::new(1),
             cache_articles: true,
@@ -564,7 +564,7 @@ mod tests {
         use crate::types::BackendId;
 
         let backend_id = BackendId::from_index(0);
-        let cache = UnifiedCache::memory(100, Duration::from_secs(60), false);
+        let cache = UnifiedCache::memory(100, Duration::from_mins(1), false);
         let msg_id = MessageId::new("<test@example.com>".to_string()).unwrap();
 
         cache_precheck_hit(

@@ -66,9 +66,7 @@ impl RuntimeConfig {
                 .enable_all()
                 .build()?
         } else {
-            let num_cpus = std::thread::available_parallelism()
-                .map(std::num::NonZero::get)
-                .unwrap_or(1);
+            let num_cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
             tracing::info!(
                 "Starting NNTP proxy with {} worker threads (detected {} CPUs)",
                 self.worker_threads,
@@ -268,7 +266,7 @@ pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
     // Cache is always present now
     let cache = Arc::clone(proxy.cache());
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_mins(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
@@ -500,7 +498,7 @@ pub fn spawn_idle_connection_clearer(proxy: &std::sync::Arc<crate::NntpProxy>) {
     let proxy = Arc::clone(proxy);
 
     /// How often to check for idle backends
-    const CHECK_INTERVAL: Duration = Duration::from_secs(60);
+    const CHECK_INTERVAL: Duration = Duration::from_mins(1);
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(CHECK_INTERVAL);

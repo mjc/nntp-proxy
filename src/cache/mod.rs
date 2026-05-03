@@ -224,7 +224,7 @@ mod tests {
 
     #[tokio::test]
     async fn unified_cache_records_typed_availability_without_payload() {
-        let cache = UnifiedCache::memory(1000, std::time::Duration::from_secs(60), true);
+        let cache = UnifiedCache::memory(1000, std::time::Duration::from_mins(1), true);
         let msg_id = MessageId::new("<typed-availability@example>".to_string()).unwrap();
         let backend_id = BackendId::from_index(1);
 

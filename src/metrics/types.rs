@@ -11,7 +11,7 @@
 use std::num::NonZeroU64;
 
 #[allow(clippy::cast_precision_loss)]
-fn count_as_f64_for_rate(value: u64) -> f64 {
+const fn count_as_f64_for_rate(value: u64) -> f64 {
     // Metrics rates and percentages are display/monitoring values. The source
     // counters remain exact u64s; this conversion is only for derived ratios.
     value as f64

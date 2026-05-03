@@ -8,7 +8,7 @@ use nntp_proxy::protocol::{RequestContext, RequestRouteClass, StatusCode};
 use nntp_proxy::types::MessageId;
 use proptest::prelude::*;
 
-fn effective_ttl_ms(base_ttl: u64, tier: CacheTier) -> u64 {
+const fn effective_ttl_ms(base_ttl: u64, tier: CacheTier) -> u64 {
     effective_ttl(CacheTtlMillis::new(base_ttl), tier).get()
 }
 

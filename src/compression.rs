@@ -202,7 +202,7 @@ impl<S: fmt::Debug> fmt::Debug for DecompressStream<S> {
             .field("compressed_len", &self.compressed_len)
             .field("bytes_compressed_in", &self.bytes_compressed_in)
             .field("bytes_decompressed_out", &self.bytes_decompressed_out)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 

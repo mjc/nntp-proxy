@@ -18,7 +18,7 @@ use super::article_response_bytes;
 
 #[tokio::test]
 async fn test_unified_cache_memory_construction() {
-    let cache = UnifiedCache::memory(1000, Duration::from_secs(60), true);
+    let cache = UnifiedCache::memory(1000, Duration::from_mins(1), true);
     assert!(!cache.is_hybrid());
     assert_eq!(cache.capacity(), 1000);
     assert_eq!(cache.entry_count(), 0);
@@ -26,7 +26,7 @@ async fn test_unified_cache_memory_construction() {
 
 #[tokio::test]
 async fn test_unified_cache_memory_get_miss() {
-    let cache = UnifiedCache::memory(1000, Duration::from_secs(60), true);
+    let cache = UnifiedCache::memory(1000, Duration::from_mins(1), true);
     let msg_id = MessageId::from_str_or_wrap("test@example.com").unwrap();
 
     let result = cache.get(&msg_id).await;
@@ -35,7 +35,7 @@ async fn test_unified_cache_memory_get_miss() {
 
 #[tokio::test]
 async fn test_unified_cache_memory_upsert_and_get() {
-    let cache = UnifiedCache::memory(100_000, Duration::from_secs(60), true);
+    let cache = UnifiedCache::memory(100_000, Duration::from_mins(1), true);
     let msg_id = MessageId::from_str_or_wrap("test@example.com").unwrap();
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
     let backend_id = BackendId::from_index(0);
@@ -55,7 +55,7 @@ async fn test_unified_cache_memory_upsert_and_get() {
 
 #[tokio::test]
 async fn test_unified_cache_memory_record_missing() {
-    let cache = UnifiedCache::memory(100_000, Duration::from_secs(60), true);
+    let cache = UnifiedCache::memory(100_000, Duration::from_mins(1), true);
     let msg_id = MessageId::from_str_or_wrap("missing@example.com").unwrap();
     let backend_id = BackendId::from_index(0);
 
@@ -71,7 +71,7 @@ async fn test_unified_cache_memory_record_missing() {
 
 #[tokio::test]
 async fn test_unified_cache_sync_availability() {
-    let cache = UnifiedCache::memory(100_000, Duration::from_secs(60), true);
+    let cache = UnifiedCache::memory(100_000, Duration::from_mins(1), true);
     let msg_id = MessageId::from_str_or_wrap("test@example.com").unwrap();
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
     let backend_id = BackendId::from_index(0);
@@ -97,13 +97,13 @@ async fn test_unified_cache_sync_availability() {
 
 #[tokio::test]
 async fn test_unified_cache_is_hybrid_false_for_memory() {
-    let cache = UnifiedCache::memory(1000, Duration::from_secs(60), true);
+    let cache = UnifiedCache::memory(1000, Duration::from_mins(1), true);
     assert!(!cache.is_hybrid());
 }
 
 #[tokio::test]
 async fn test_unified_cache_hit_rate_initially_zero() {
-    let cache = UnifiedCache::memory(1000, Duration::from_secs(60), true);
+    let cache = UnifiedCache::memory(1000, Duration::from_mins(1), true);
     // Hit rate should be 0 (or NaN which displays as 0) when no operations
     let hit_rate = cache.hit_rate();
     assert!(hit_rate == 0.0 || hit_rate.is_nan());
@@ -111,7 +111,7 @@ async fn test_unified_cache_hit_rate_initially_zero() {
 
 #[tokio::test]
 async fn test_unified_cache_weighted_size() {
-    let cache = UnifiedCache::memory(100_000, Duration::from_secs(60), true);
+    let cache = UnifiedCache::memory(100_000, Duration::from_mins(1), true);
     let msg_id = MessageId::from_str_or_wrap("test@example.com").unwrap();
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
 
@@ -137,7 +137,7 @@ async fn test_unified_cache_weighted_size() {
 async fn test_cache_stats_provider_article_cache() {
     use nntp_proxy::cache::CacheStatsProvider;
 
-    let cache = ArticleCache::new(10000, Duration::from_secs(60), true);
+    let cache = ArticleCache::new(10000, Duration::from_mins(1), true);
     let stats = cache.display_stats();
 
     assert_eq!(stats.entry_count, 0);
@@ -149,7 +149,7 @@ async fn test_cache_stats_provider_article_cache() {
 async fn test_cache_stats_provider_unified_cache_memory() {
     use nntp_proxy::cache::CacheStatsProvider;
 
-    let cache = UnifiedCache::memory(10000, Duration::from_secs(60), true);
+    let cache = UnifiedCache::memory(10000, Duration::from_mins(1), true);
     let stats = cache.display_stats();
 
     assert_eq!(stats.entry_count, 0);

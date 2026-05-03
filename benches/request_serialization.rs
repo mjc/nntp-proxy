@@ -4,7 +4,7 @@
 //! a fixed sink. The benchmark intentionally avoids `Vec` so regressions show up as
 //! extra instruction work in request construction or slice emission, not allocator noise.
 //!
-//! Run with: cargo bench --bench request_serialization
+//! Run with: cargo bench --bench `request_serialization`
 
 use divan::{Bencher, black_box};
 use nntp_proxy::protocol::{RequestContext, StatusCode};
@@ -29,7 +29,7 @@ impl Default for FixedSink {
 
 impl FixedSink {
     #[inline]
-    fn clear(&mut self) {
+    const fn clear(&mut self) {
         self.len = 0;
     }
 
@@ -41,7 +41,7 @@ impl FixedSink {
     }
 
     #[inline]
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         self.len
     }
 }
@@ -69,7 +69,7 @@ mod single_request {
         ($name:ident, $line:literal) => {
             #[divan::bench(sample_count = 1000, sample_size = 1000)]
             fn $name(bencher: Bencher) {
-                let request = request_context($line.as_bytes());
+                let request = request_context(b"ARTICLE <bench@example.com>\r\n");
                 bencher.bench(|| {
                     let mut sink = FixedSink::default();
                     black_box(write_request_slices(

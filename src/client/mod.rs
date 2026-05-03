@@ -75,6 +75,10 @@ impl NntpClient {
     ///
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets, e.g. `<abc@example.com>`
+    ///
+    /// # Errors
+    /// Returns any connection, write, or backend-response error encountered while
+    /// fetching the BODY response.
     #[inline]
     pub async fn fetch_body(
         &self,
@@ -90,6 +94,10 @@ impl NntpClient {
     ///
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets
+    ///
+    /// # Errors
+    /// Returns any connection, write, or backend-response error encountered while
+    /// fetching the HEAD response.
     #[inline]
     pub async fn fetch_head(
         &self,
@@ -105,6 +113,10 @@ impl NntpClient {
     ///
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets
+    ///
+    /// # Errors
+    /// Returns any connection, write, or backend-response error encountered while
+    /// fetching the ARTICLE response.
     #[inline]
     pub async fn fetch_article(
         &self,
@@ -120,6 +132,10 @@ impl NntpClient {
     ///
     /// # Returns
     /// `true` if article exists, `false` if 430 (not found)
+    ///
+    /// # Errors
+    /// Returns any connection or protocol error while issuing `STAT`, including
+    /// malformed or unexpected backend status codes.
     pub async fn stat(&self, message_id: &crate::types::MessageId<'_>) -> Result<bool> {
         let request = stat_request(message_id);
         let mut conn = self.get_connection().await?;
@@ -152,6 +168,10 @@ impl NntpClient {
     }
 
     /// Internal: fetch response into `PooledBuffer`
+    ///
+    /// # Errors
+    /// Returns any connection, write, read, or backend-status validation error
+    /// encountered while fetching the NNTP response.
     async fn fetch_response(&self, request: &RequestContext) -> Result<PooledBuffer> {
         let mut conn = self.get_connection().await?;
         let mut io_buffer = self.buffer_pool.acquire().await;
@@ -318,7 +338,7 @@ mod tests {
                         let mut cmd_buf = vec![0u8; 256];
                         loop {
                             tokio::select! {
-                                _ = wake.notified() => break,
+                                () = wake.notified() => break,
                                 result = stream.read(&mut cmd_buf) => {
                                     match result {
                                         Ok(n) if n > 0 => { let _ = stream.write_all(b"200 OK\r\n").await; }
@@ -363,7 +383,7 @@ mod tests {
                         let mut cmd_buf = vec![0u8; 256];
                         loop {
                             tokio::select! {
-                                _ = wake.notified() => break,
+                                () = wake.notified() => break,
                                 result = stream.read(&mut cmd_buf) => {
                                     match result {
                                         Ok(n) if n > 0 => { let _ = stream.write_all(b"200 OK\r\n").await; }
@@ -399,8 +419,8 @@ mod tests {
             .unwrap()
     }
 
-    /// Verify drain_multiline_into captures the complete response when it all
-    /// arrives in the first pre-read chunk (first_chunk_size == article length).
+    /// Verify `drain_multiline_into` captures the complete response when it all
+    /// arrives in the first pre-read chunk (`first_chunk_size` == article length).
     #[tokio::test]
     async fn test_drain_multiline_into_single_read() {
         use crate::pool::BufferPool;
@@ -428,12 +448,12 @@ mod tests {
         assert_eq!(&capture[..], article as &[u8]);
     }
 
-    /// Verify drain_multiline_into accumulates correctly across multiple reads,
+    /// Verify `drain_multiline_into` accumulates correctly across multiple reads,
     /// including when the NNTP terminator spans a read boundary (3+ reads).
     ///
     /// Uses an 8-byte I/O buffer against a 36-byte article, forcing 5 reads.
     /// Read 4 ends with `\r` and read 5 starts with `\n.\r\n`, so the terminator
-    /// `\r\n.\r\n` spans the boundary — exercising TailBuffer spanning detection.
+    /// `\r\n.\r\n` spans the boundary — exercising `TailBuffer` spanning detection.
     #[tokio::test]
     async fn test_drain_multiline_into_multi_read_spanning_terminator() {
         use crate::pool::BufferPool;

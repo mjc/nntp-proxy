@@ -49,6 +49,9 @@ pub use responses::{
 /// Sends the "201 NNTP Proxy Ready" greeting message.
 /// The greeting is flushed immediately to ensure the client receives it
 /// before we start processing commands.
+///
+/// # Errors
+/// Returns any socket write or flush error while sending the proxy greeting.
 pub async fn send_proxy_greeting(
     client_stream: &mut TcpStream,
     client_addr: impl std::fmt::Display,

@@ -346,7 +346,7 @@ mod tests {
 
         let cache = config.cache.as_ref().unwrap();
         assert_eq!(cache.max_capacity.get(), 128 * 1024 * 1024);
-        assert_eq!(cache.ttl, Duration::from_secs(7200));
+        assert_eq!(cache.ttl, Duration::from_hours(2));
         assert!(!cache.cache_articles);
     }
 

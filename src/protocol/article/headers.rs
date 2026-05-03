@@ -22,6 +22,9 @@ impl<'a> Headers<'a> {
     ///
     /// # Returns
     /// Validated Headers or `ParseError`
+    ///
+    /// # Errors
+    /// Returns `ParseError` when any header line violates RFC 5322 formatting rules.
     pub fn parse(data: &'a [u8]) -> Result<Self, ParseError> {
         Self::validate_headers(data)?;
         Ok(Headers { data })
@@ -215,6 +218,15 @@ impl<'a> Headers<'a> {
     #[must_use]
     pub const fn as_bytes(&self) -> &'a [u8] {
         self.data
+    }
+}
+
+impl<'a> IntoIterator for &Headers<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+    type IntoIter = HeaderIter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 

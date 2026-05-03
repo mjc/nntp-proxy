@@ -15,7 +15,7 @@ use super::availability::ArticleAvailability;
 use super::ttl;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct CachedArticleNumber(u64);
+pub struct CachedArticleNumber(u64);
 
 impl CachedArticleNumber {
     #[must_use]
@@ -36,7 +36,7 @@ impl From<u64> for CachedArticleNumber {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct CachedPayloadLen(usize);
+pub struct CachedPayloadLen(usize);
 
 impl CachedPayloadLen {
     #[must_use]
@@ -75,7 +75,7 @@ impl PartialOrd<usize> for CachedPayloadLen {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum CachedPayload {
+pub enum CachedPayload {
     Missing,
     AvailabilityOnly,
     Article {
@@ -97,7 +97,7 @@ pub(crate) enum CachedPayload {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum CachedPayloadKind {
+pub enum CachedPayloadKind {
     Missing,
     AvailabilityOnly,
     Article,
@@ -122,7 +122,7 @@ enum CachedResponseWirePayload<'a> {
 }
 
 impl CachedResponseWire<'_> {
-    fn wire_len_usize(&self) -> usize {
+    const fn wire_len_usize(&self) -> usize {
         self.status_line.len() + self.payload_len()
     }
 
@@ -179,7 +179,7 @@ impl CachedResponseWire<'_> {
         Ok(())
     }
 
-    fn payload_len(&self) -> usize {
+    const fn payload_len(&self) -> usize {
         match self.payload {
             CachedResponseWirePayload::None => 0,
             CachedResponseWirePayload::Article { headers, body } => {
@@ -239,7 +239,7 @@ impl StackStatusLine {
         &self.bytes[..self.len]
     }
 
-    fn len(&self) -> usize {
+    const fn len(&self) -> usize {
         self.len
     }
 }
@@ -540,7 +540,7 @@ impl CachedArticle {
     }
 }
 
-pub(crate) fn cached_response_for_payload<'a>(
+pub fn cached_response_for_payload<'a>(
     payload: &'a CachedPayload,
     request_kind: RequestKind,
     message_id: &str,
@@ -593,7 +593,7 @@ pub(crate) fn cached_response_for_payload<'a>(
     }
 }
 
-pub(crate) fn parse_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPayload {
+pub fn parse_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPayload {
     let code = status_code.as_u16();
     if code == 430 {
         return CachedPayload::Missing;
@@ -611,7 +611,7 @@ pub(crate) fn parse_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPay
     payload_for_status(code, article_number, payload)
 }
 
-pub(crate) fn parse_payload_chunked_response(
+pub fn parse_payload_chunked_response(
     status_code: StatusCode,
     buffer: &crate::pool::ChunkedResponse,
 ) -> CachedPayload {
@@ -1089,10 +1089,8 @@ impl ArticleCache {
         self.cache
             .entry(key)
             .and_upsert_with(|maybe_entry| {
-                let mut entry = maybe_entry.map_or_else(
-                    || new_entry_template.clone(),
-                    |existing| existing.into_value(),
-                );
+                let mut entry =
+                    maybe_entry.map_or_else(|| new_entry_template.clone(), moka::Entry::into_value);
                 if !entry.is_complete_article() {
                     entry.status_code = status_code;
                     entry.tier = tier;
@@ -1515,7 +1513,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_preserves_complete_body_over_metadata_only_response() {
-        let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
+        let cache = ArticleCache::new(1_000_000, Duration::from_mins(5), true);
         let msg_id = MessageId::from_str_or_wrap("test@example.com").unwrap();
         let backend_id = BackendId::from_index(0);
         let complete = format!(
@@ -1550,7 +1548,7 @@ mod tests {
 
     #[tokio::test]
     async fn upsert_replaces_metadata_only_body_with_complete_body() {
-        let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
+        let cache = ArticleCache::new(1_000_000, Duration::from_mins(5), true);
         let msg_id = MessageId::from_str_or_wrap("test@example.com").unwrap();
         let backend_id = BackendId::from_index(0);
         let complete = format!(
@@ -1818,7 +1816,7 @@ mod tests {
     #[tokio::test]
     async fn test_arc_str_borrow_lookup() {
         // Create cache with Arc<str> keys
-        let cache = ArticleCache::new(100, Duration::from_secs(300), true);
+        let cache = ArticleCache::new(100, Duration::from_mins(5), true);
 
         // Create a MessageId and insert an article
         let msgid = MessageId::from_borrowed("<test123@example.com>").unwrap();
@@ -1848,7 +1846,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_hit_miss() {
-        let cache = ArticleCache::new(100, Duration::from_secs(300), true);
+        let cache = ArticleCache::new(100, Duration::from_mins(5), true);
 
         let msgid = MessageId::from_borrowed("<nonexistent@example.com>").unwrap();
         let result = cache.get(&msgid).await;
@@ -1861,7 +1859,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_insert_and_retrieve() {
-        let cache = ArticleCache::new(10, Duration::from_secs(300), true);
+        let cache = ArticleCache::new(10, Duration::from_mins(5), true);
 
         let msgid = MessageId::from_borrowed("<article@example.com>").unwrap();
         let article = create_test_cached_article("<article@example.com>");
@@ -1877,7 +1875,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_upsert_new_entry() {
-        let cache = ArticleCache::new(100, Duration::from_secs(300), true);
+        let cache = ArticleCache::new(100, Duration::from_mins(5), true);
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
@@ -1903,7 +1901,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_upsert_existing_entry() {
-        let cache = ArticleCache::new(100, Duration::from_secs(300), true);
+        let cache = ArticleCache::new(100, Duration::from_mins(5), true);
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
@@ -1936,7 +1934,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_record_backend_missing() {
-        let cache = ArticleCache::new(100, Duration::from_secs(300), true);
+        let cache = ArticleCache::new(100, Duration::from_mins(5), true);
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
         let article = create_test_cached_article("<test@example.com>");
@@ -1965,7 +1963,7 @@ mod tests {
     /// - 4xx/5xx error counts not increasing (metrics bug)
     #[tokio::test]
     async fn test_record_backend_missing_creates_new_entry() {
-        let cache = ArticleCache::new(100, Duration::from_secs(300), true);
+        let cache = ArticleCache::new(100, Duration::from_mins(5), true);
 
         let msgid = MessageId::from_borrowed("<missing@example.com>").unwrap();
 
@@ -2023,7 +2021,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_stats() {
-        let cache = ArticleCache::new(1024 * 1024, Duration::from_secs(300), true); // 1MB
+        let cache = ArticleCache::new(1024 * 1024, Duration::from_mins(5), true); // 1MB
 
         // Initial stats
         let stats = cache.stats();
@@ -2065,7 +2063,7 @@ mod tests {
     #[tokio::test]
     async fn test_insert_respects_cache_articles_flag() {
         // Test with cache_articles=false - should store availability without payload bytes
-        let cache_metadata_only = ArticleCache::new(1024 * 1024, Duration::from_secs(300), false);
+        let cache_metadata_only = ArticleCache::new(1024 * 1024, Duration::from_mins(5), false);
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
@@ -2085,7 +2083,7 @@ mod tests {
         assert!(retrieved.payload_len() < full_size);
 
         // Test with cache_articles=true - should store full article
-        let cache_full = ArticleCache::new(1024 * 1024, Duration::from_secs(300), true);
+        let cache_full = ArticleCache::new(1024 * 1024, Duration::from_mins(5), true);
 
         let msgid2 = MessageId::from_borrowed("<test2@example.com>").unwrap();
         let buffer2 = b"220 0 <test2@example.com>\r\nSubject: Test2\r\n\r\nBody2\r\n.\r\n".to_vec();
@@ -2103,7 +2101,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_capacity_limit() {
-        let cache = ArticleCache::new(500, Duration::from_secs(300), true); // 500 bytes total
+        let cache = ArticleCache::new(500, Duration::from_mins(5), true); // 500 bytes total
 
         // Insert 3 articles (exceeds capacity)
         for i in 1..=3 {
@@ -2138,7 +2136,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_clone() {
-        let cache1 = ArticleCache::new(1024 * 1024, Duration::from_secs(300), true); // 1MB
+        let cache1 = ArticleCache::new(1024 * 1024, Duration::from_mins(5), true); // 1MB
         let cache2 = cache1.clone();
 
         let msgid = MessageId::from_borrowed("<test@example.com>").unwrap();
@@ -2155,7 +2153,7 @@ mod tests {
     async fn test_weigher_large_articles() {
         // Test that large article bodies use ACTUAL SIZE (no multiplier)
         // when cache_articles=true and buffer >10KB
-        let cache = ArticleCache::new(10 * 1024 * 1024, Duration::from_secs(300), true); // 10MB capacity
+        let cache = ArticleCache::new(10 * 1024 * 1024, Duration::from_mins(5), true); // 10MB capacity
 
         // Create a 750KB article (typical size)
         let body = vec![b'X'; 750_000];
@@ -2204,7 +2202,7 @@ mod tests {
     async fn test_weigher_small_metadata_only_responses() {
         // Test that small metadata-only responses account for moka internal overhead correctly
         // With MOKA_OVERHEAD = 2000 bytes (based on empirical 10x memory ratio from moka issue #473)
-        let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), false); // 1MB capacity
+        let cache = ArticleCache::new(1_000_000, Duration::from_mins(5), false); // 1MB capacity
 
         // Create small metadata-only response (53 bytes)
         let metadata_only = b"223 0 <test@example.com>\r\n".to_vec();
@@ -2243,7 +2241,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_cache_with_owned_message_id() {
-        let cache = ArticleCache::new(1024 * 1024, Duration::from_secs(300), true); // 1MB
+        let cache = ArticleCache::new(1024 * 1024, Duration::from_mins(5), true); // 1MB
 
         // Use owned MessageId
         let msgid = MessageId::new("<owned@example.com>".to_string()).unwrap();

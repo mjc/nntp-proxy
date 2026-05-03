@@ -3,7 +3,7 @@
 //! The `typed_contexts` benches model the current request-boundary behavior:
 //! each complete line becomes a `RequestContext`.
 //!
-//! Run with: cargo bench --bench request_batch_parse
+//! Run with: cargo bench --bench `request_batch_parse`
 
 use divan::{Bencher, black_box};
 use nntp_proxy::protocol::RequestContext;

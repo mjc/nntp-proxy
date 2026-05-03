@@ -167,6 +167,10 @@ impl Iterator for YencLines<'_> {
 /// - Proper line encoding (validates actual yenc data)
 ///
 /// Does NOT write to disk - validates in-memory only.
+///
+/// # Errors
+/// Returns `ParseError` when the body is missing required yEnc framing, has
+/// invalid footer/header metadata, or fails checksum/size validation.
 pub fn validate_yenc_structure(body: &[u8]) -> Result<(), ParseError> {
     let mut reader = BufReader::new(body);
     let mut lines = YencLines::new(&mut reader);

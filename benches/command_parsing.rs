@@ -27,7 +27,7 @@ macro_rules! bench_command {
             fn classifier(bencher: Bencher) {
                 bencher.bench(|| {
                     black_box(
-                        RequestContext::parse(black_box($command.as_bytes()))
+                        RequestContext::parse(black_box(b"IHAVE <unique@msgid.com>"))
                             .expect("valid request line"),
                     )
                 });

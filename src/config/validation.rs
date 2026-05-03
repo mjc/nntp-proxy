@@ -150,7 +150,7 @@ mod tests {
 
     #[test]
     fn test_validate_server_with_recommended_keepalive() {
-        let server = create_test_server("test", Some(Duration::from_secs(60)));
+        let server = create_test_server("test", Some(Duration::from_mins(1)));
         validate_server(&server);
     }
 
@@ -164,7 +164,7 @@ mod tests {
     #[test]
     fn test_validate_server_with_high_keepalive_warns() {
         // This should warn but not fail
-        let server = create_test_server("test", Some(Duration::from_secs(600)));
+        let server = create_test_server("test", Some(Duration::from_mins(10)));
         validate_server(&server);
     }
 

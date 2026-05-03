@@ -11,7 +11,7 @@ use tokio::io::AsyncWriteExt;
 
 /// Result of handling an auth command
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AuthResult {
+pub enum AuthResult {
     /// Authentication succeeded
     Authenticated {
         bytes: BackendToClientBytes,

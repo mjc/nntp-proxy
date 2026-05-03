@@ -276,7 +276,7 @@ mod tests {
         assert_eq!(tail.as_slice(), b".\r\n");
     }
 
-    /// Regression test: update() with successive small chunks must maintain the
+    /// Regression test: `update()` with successive small chunks must maintain the
     /// rolling window — not overwrite it — so terminators split across 3+ reads work.
     #[test]
     fn test_tail_buffer_update_successive_small_chunks() {

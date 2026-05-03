@@ -199,7 +199,9 @@ impl ClientSession {
     }
 }
 
-fn cache_availability_metadata(availability: &ArticleAvailability) -> RequestCacheAvailability {
+const fn cache_availability_metadata(
+    availability: &ArticleAvailability,
+) -> RequestCacheAvailability {
     RequestCacheAvailability::from_bits(availability.checked_bits(), availability.missing_bits())
 }
 
@@ -223,7 +225,7 @@ fn cache_article_number(
     article_number.map(|number| RequestCacheArticleNumber::new(number.get()))
 }
 
-fn cache_payload_kind(payload: crate::cache::CachedPayloadKind) -> RequestCachePayloadKind {
+const fn cache_payload_kind(payload: crate::cache::CachedPayloadKind) -> RequestCachePayloadKind {
     match payload {
         crate::cache::CachedPayloadKind::Missing => RequestCachePayloadKind::Missing,
         crate::cache::CachedPayloadKind::AvailabilityOnly => {
@@ -292,7 +294,7 @@ mod tests {
         )
         .with_cache(Arc::new(UnifiedCache::memory(
             1024,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             true,
         )))
         .build()

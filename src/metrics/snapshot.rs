@@ -8,7 +8,7 @@
 // Snapshot rates are presentation/monitoring values, and the tests exercise
 // exact deterministic fixtures rather than fuzzy comparisons.
 
-use super::types::*;
+use super::types::{ActiveConnections, BackendHealthStatus, ErrorRatePercent};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use std::sync::Arc;
 use std::time::Duration;
@@ -232,10 +232,12 @@ impl MetricsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::{
+        ArticleCount, CommandCount, ErrorCount, FailureCount, RecvMicros, SendMicros, TtfbMicros,
+    };
     use crate::types::BackendId;
 
     fn create_test_snapshot() -> MetricsSnapshot {
-        use crate::types::metrics::*;
         use crate::types::{ArticleBytesTotal, BytesReceived, BytesSent, TimingMeasurementCount};
 
         let backend1 = BackendStats {
@@ -282,7 +284,7 @@ mod tests {
             stateful_sessions: 2,
             client_to_backend_bytes: ClientToBackendBytes::new(1500),
             backend_to_client_bytes: BackendToClientBytes::new(3500),
-            uptime: Duration::from_secs(3600),
+            uptime: Duration::from_hours(1),
             backend_stats: vec![backend1, backend2].into(),
             user_stats: vec![],
             cache_entries: 0,

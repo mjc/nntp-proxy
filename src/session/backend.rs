@@ -26,7 +26,7 @@ fn duration_micros_u64(duration: std::time::Duration) -> u64 {
 
 /// Response status parse warnings (pure data)
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ResponseWarning {
+pub enum ResponseWarning {
     /// Response too short to be valid
     ShortResponse { bytes: usize, min: usize },
     /// Response code is invalid
@@ -37,7 +37,7 @@ pub(crate) enum ResponseWarning {
 
 /// Parsed backend response status (pure data)
 #[derive(Debug)]
-pub(crate) struct BackendStatusParse {
+pub struct BackendStatusParse {
     pub(crate) status_code: Option<StatusCode>,
     pub(crate) warnings: SmallVec<[ResponseWarning; 0]>,
 }
@@ -57,7 +57,7 @@ pub(crate) struct BackendStatusParse {
 /// # Returns
 /// `BackendStatusParse` with parsed status and any warnings
 #[must_use]
-pub(crate) fn parse_backend_status(
+pub fn parse_backend_status(
     chunk: &[u8],
     bytes_read: usize,
     min_length: usize,
@@ -95,7 +95,7 @@ pub(crate) fn parse_backend_status(
 /// NNTP status lines are CRLF-terminated. We also treat a bare LF as a line
 /// boundary here so callers do not classify a partial status line as complete.
 #[must_use]
-pub(crate) fn status_line_end(data: &[u8]) -> Option<usize> {
+pub fn status_line_end(data: &[u8]) -> Option<usize> {
     memchr::memchr(b'\n', data).map(|pos| pos + 1)
 }
 
@@ -132,7 +132,7 @@ where
 /// assert!(hex.starts_with("34 33 30 20")); // "430 "
 /// ```
 #[must_use]
-pub(crate) fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
+pub fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
     let preview = &data[..data.len().min(max_bytes)];
     preview
         .iter()
@@ -145,7 +145,7 @@ pub(crate) fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
 
 /// Metadata for the first backend response chunk.
 #[derive(Debug)]
-pub(crate) struct BackendFirstResponse {
+pub struct BackendFirstResponse {
     /// Number of bytes read into buffer
     pub(crate) bytes_read: usize,
     /// Parsed status code, if present
@@ -213,7 +213,7 @@ impl BackendFirstResponse {
 }
 
 /// Write a typed request to a backend without building a temporary command buffer.
-pub(crate) async fn write_request<C>(conn: &mut C, request: &RequestContext) -> std::io::Result<()>
+pub async fn write_request<C>(conn: &mut C, request: &RequestContext) -> std::io::Result<()>
 where
     C: tokio::io::AsyncWrite + Unpin,
 {
@@ -221,7 +221,7 @@ where
 }
 
 /// Send a typed request and read the first response chunk.
-pub(crate) async fn send_request<C>(
+pub async fn send_request<C>(
     conn: &mut C,
     request: &RequestContext,
     buffer: &mut PooledBuffer,
@@ -249,7 +249,7 @@ where
 }
 
 /// Send a typed request with timing measurements.
-pub(crate) async fn send_request_timed<C>(
+pub async fn send_request_timed<C>(
     conn: &mut C,
     request: &RequestContext,
     buffer: &mut PooledBuffer,

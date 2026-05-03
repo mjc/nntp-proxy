@@ -3,7 +3,7 @@
 //! These benches start a real proxy listener and a minimal local NNTP backend,
 //! then measure client `ARTICLE` request latency over a persistent connection.
 //!
-//! Run with: cargo bench --bench end_to_end_proxy
+//! Run with: cargo bench --bench `end_to_end_proxy`
 
 use divan::{Bencher, black_box};
 use nntp_proxy::config::{Cache, Config, Server};
@@ -51,7 +51,7 @@ fn bench_config(backend_port: u16, cache: Option<Cache>) -> Config {
 fn memory_cache() -> Cache {
     Cache {
         max_capacity: CacheCapacity::try_new(32 * 1024 * 1024).unwrap(),
-        ttl: Duration::from_secs(300),
+        ttl: Duration::from_mins(5),
         cache_articles: true,
         adaptive_precheck: false,
         disk: None,

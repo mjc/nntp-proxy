@@ -109,7 +109,7 @@ mod unified_cache {
     fn make_cache() -> Arc<UnifiedCache> {
         Arc::new(UnifiedCache::memory(
             1024 * 1024, // 1MB capacity
-            Duration::from_secs(300),
+            Duration::from_mins(5),
             true,
         ))
     }

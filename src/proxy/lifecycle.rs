@@ -636,7 +636,7 @@ mod tests {
 
         let _empty_cache = Arc::new(crate::cache::UnifiedCache::memory(
             100,
-            std::time::Duration::from_secs(3600),
+            std::time::Duration::from_hours(1),
             false,
         ));
         assert_eq!(proxy.routing_mode_display_name(), "per-command");
@@ -844,7 +844,7 @@ mod tests {
         for server in proxy.servers() {
             assert_eq!(
                 server.backend_idle_timeout,
-                Duration::from_secs(10 * 60),
+                Duration::from_mins(10),
                 "Server '{}' should have default 10-minute backend_idle_timeout",
                 server.name.as_ref(),
             );
@@ -993,7 +993,7 @@ mod tests {
                 Server::builder("server2.example.com", Port::try_new(119).unwrap())
                     .name("Long Timeout")
                     .max_connections(MaxConnections::try_new(2).unwrap())
-                    .backend_idle_timeout(Duration::from_secs(24 * 60 * 60)) // 24h
+                    .backend_idle_timeout(Duration::from_hours(24)) // 24h
                     .build()
                     .unwrap(),
             ],
@@ -1027,7 +1027,7 @@ mod tests {
                 Server::builder("server2.example.com", Port::try_new(119).unwrap())
                     .name("Long Timeout")
                     .max_connections(MaxConnections::try_new(2).unwrap())
-                    .backend_idle_timeout(Duration::from_secs(24 * 60 * 60))
+                    .backend_idle_timeout(Duration::from_hours(24))
                     .build()
                     .unwrap(),
             ],

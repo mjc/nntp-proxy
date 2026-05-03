@@ -128,9 +128,7 @@ impl ThreadCount {
 
     /// Get the number of available CPU cores (private helper)
     fn num_cpus() -> Self {
-        let count = std::thread::available_parallelism()
-            .map(std::num::NonZero::get)
-            .unwrap_or(1);
+        let count = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
         // SAFETY: available_parallelism always returns at least 1
         Self(NonZeroUsize::new(count).unwrap())
     }
