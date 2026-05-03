@@ -157,7 +157,7 @@ impl CachedArticleResponse<'_> {
                     IoSlice::new(body),
                     IoSlice::new(b"\r\n.\r\n"),
                 ];
-                write_all_vectored(writer, &mut slices).await?;
+                crate::io_util::write_all_vectored(writer, &mut slices).await?;
             }
             CachedArticleResponsePayload::Head { headers } => {
                 let mut slices = [
@@ -165,7 +165,7 @@ impl CachedArticleResponse<'_> {
                     IoSlice::new(headers),
                     IoSlice::new(b"\r\n.\r\n"),
                 ];
-                write_all_vectored(writer, &mut slices).await?;
+                crate::io_util::write_all_vectored(writer, &mut slices).await?;
             }
             CachedArticleResponsePayload::Body { body } => {
                 let mut slices = [
@@ -173,7 +173,7 @@ impl CachedArticleResponse<'_> {
                     IoSlice::new(body),
                     IoSlice::new(b"\r\n.\r\n"),
                 ];
-                write_all_vectored(writer, &mut slices).await?;
+                crate::io_util::write_all_vectored(writer, &mut slices).await?;
             }
         }
         Ok(())
@@ -803,33 +803,6 @@ fn payload_for_status(
         223 => CachedPayload::Stat { article_number },
         _ => CachedPayload::AvailabilityOnly,
     }
-}
-
-async fn write_all_vectored<W>(
-    writer: &mut W,
-    slices: &mut [std::io::IoSlice<'_>],
-) -> std::io::Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    use std::future::poll_fn;
-    use std::io::{Error, ErrorKind, IoSlice};
-    use std::pin::Pin;
-
-    let mut remaining = slices;
-    while !remaining.is_empty() {
-        let written =
-            poll_fn(|cx| Pin::new(&mut *writer).poll_write_vectored(cx, remaining)).await?;
-        if written == 0 {
-            return Err(Error::new(
-                ErrorKind::WriteZero,
-                "failed to write cached article response",
-            ));
-        }
-        IoSlice::advance_slices(&mut remaining, written);
-    }
-
-    Ok(())
 }
 
 fn parse_article_number(status_line: &[u8]) -> Option<CachedArticleNumber> {

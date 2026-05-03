@@ -64,6 +64,7 @@ pub mod client;
 pub mod compression;
 pub mod connection_error;
 pub mod formatting;
+mod io_util;
 pub mod logging;
 pub mod metrics;
 pub mod network;

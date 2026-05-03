@@ -737,7 +737,7 @@ impl RequestContext {
 
         if self.args().is_empty() {
             let mut slices = [IoSlice::new(self.verb()), IoSlice::new(b"\r\n")];
-            write_all_vectored(writer, &mut slices).await
+            crate::io_util::write_all_vectored(writer, &mut slices).await
         } else {
             let mut slices = [
                 IoSlice::new(self.verb()),
@@ -745,7 +745,7 @@ impl RequestContext {
                 IoSlice::new(self.args()),
                 IoSlice::new(b"\r\n"),
             ];
-            write_all_vectored(writer, &mut slices).await
+            crate::io_util::write_all_vectored(writer, &mut slices).await
         }
     }
 
@@ -889,33 +889,6 @@ fn find_message_id(args: &[u8]) -> Option<(usize, usize)> {
     let start = args.iter().position(|b| *b == b'<')?;
     let end = args[start..].iter().position(|b| *b == b'>')? + start + 1;
     Some((start, end))
-}
-
-async fn write_all_vectored<W>(
-    writer: &mut W,
-    slices: &mut [std::io::IoSlice<'_>],
-) -> std::io::Result<()>
-where
-    W: tokio::io::AsyncWrite + Unpin,
-{
-    use std::future::poll_fn;
-    use std::io::{Error, ErrorKind, IoSlice};
-    use std::pin::Pin;
-
-    let mut remaining = slices;
-    while !remaining.is_empty() {
-        let written =
-            poll_fn(|cx| Pin::new(&mut *writer).poll_write_vectored(cx, remaining)).await?;
-        if written == 0 {
-            return Err(Error::new(
-                ErrorKind::WriteZero,
-                "failed to write typed request",
-            ));
-        }
-        IoSlice::advance_slices(&mut remaining, written);
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
