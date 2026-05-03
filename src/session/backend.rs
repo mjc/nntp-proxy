@@ -283,6 +283,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::collections::VecDeque;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -539,6 +540,31 @@ mod tests {
                     .iter()
                     .all(|w| !matches!(w, ResponseWarning::UnusualStatusCode(_))),
                 "Normal status codes should not generate unusual code warnings"
+            );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_parse_backend_status_never_panics(
+            data in prop::collection::vec(any::<u8>(), 0..200)
+        ) {
+            let _ = parse_backend_status(&data, data.len(), crate::protocol::MIN_RESPONSE_LENGTH);
+        }
+
+        #[test]
+        fn prop_valid_nntp_response_never_classified_invalid(
+            code in 100u16..=599u16,
+            text in r"[A-Za-z0-9 ]{1,30}"
+        ) {
+            let response = format!("{code} {text}\r\n");
+            let data = response.as_bytes();
+            let parsed = parse_backend_status(data, data.len(), crate::protocol::MIN_RESPONSE_LENGTH);
+
+            prop_assert_eq!(
+                parsed.status_code.map(|status| status.as_u16()),
+                Some(code),
+                "parsed status code should match generated code"
             );
         }
     }
