@@ -1335,6 +1335,59 @@ async fn test_oversized_pipelined_command_rejected_with_500() -> Result<()> {
     Ok(())
 }
 
+/// Empty request lines are syntax errors and must not create request contexts
+/// or get forwarded to a backend.
+#[tokio::test]
+async fn test_empty_pipelined_command_rejected_with_501() -> Result<()> {
+    let mock_port = get_available_port().await?;
+    let proxy_port = get_available_port().await?;
+
+    let _mock = MockNntpServer::new(mock_port)
+        .with_name("TestServer")
+        .on_command("STAT", "223 0 <test@example.com> status\r\n")
+        .spawn();
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let config = create_test_config(vec![(mock_port, "TestServer")]);
+    let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
+
+    spawn_test_proxy(proxy, proxy_port, true).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
+    let mut buffer = [0; 4096];
+
+    let _n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
+
+    client
+        .write_all(b"STAT <valid@example.com>\r\n\r\n")
+        .await?;
+    client.flush().await?;
+
+    let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
+    let response = String::from_utf8_lossy(&buffer[..n]);
+    assert!(
+        response.contains("223"),
+        "Expected 223 for valid STAT, got: {response}"
+    );
+
+    let full_response = if response.contains("501") {
+        response.to_string()
+    } else {
+        let n = timeout(Duration::from_secs(2), client.read(&mut buffer)).await??;
+        String::from_utf8_lossy(&buffer[..n]).to_string()
+    };
+
+    assert!(
+        full_response.contains("501 Syntax error in command"),
+        "Expected 501 syntax error for empty command, got: {full_response}"
+    );
+
+    client.write_all(b"QUIT\r\n").await?;
+    Ok(())
+}
+
 /// Test that a partial command in the `BufReader` buffer doesn't cause the batch
 /// reader to block waiting for more data from the socket.
 ///
