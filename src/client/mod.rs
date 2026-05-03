@@ -382,7 +382,7 @@ mod tests {
         (addr, notify)
     }
 
-    async fn make_test_pool(addr: std::net::SocketAddr) -> crate::pool::deadpool_connection::Pool {
+    fn make_test_pool(addr: std::net::SocketAddr) -> crate::pool::deadpool_connection::Pool {
         let manager = crate::pool::deadpool_connection::TcpManager::new(
             addr.ip().to_string(),
             addr.port(),
@@ -408,7 +408,7 @@ mod tests {
 
         let article = b"220 body follows\r\nHello world\r\n.\r\n";
         let (addr, notify) = spawn_test_server(article).await;
-        let pool = make_test_pool(addr).await;
+        let pool = make_test_pool(addr);
         let buffer_pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 2);
 
         let mut conn = pool.get().await.unwrap();
@@ -443,7 +443,7 @@ mod tests {
         // Terminator \r\n.\r\n spans read 4 ("\r") → read 5 ("\n.\r\n").
         let article = b"220 article\r\nLine one\r\nLine two\r\n.\r\n";
         let (addr, notify) = spawn_test_server(article).await;
-        let pool = make_test_pool(addr).await;
+        let pool = make_test_pool(addr);
         // Tiny I/O buffer forces multiple reads and exercises the streaming loop
         let buffer_pool = BufferPool::new(BufferSize::try_new(8).unwrap(), 4);
 
@@ -468,7 +468,7 @@ mod tests {
 
         let article_prefix = b"220 body follows\r\npartial article";
         let (addr, notify) = spawn_truncated_test_server(article_prefix).await;
-        let pool = make_test_pool(addr).await;
+        let pool = make_test_pool(addr);
         let buffer_pool = BufferPool::new(BufferSize::try_new(8).unwrap(), 4);
 
         let mut conn = pool.get().await.unwrap();

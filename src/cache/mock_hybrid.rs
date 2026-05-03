@@ -31,7 +31,7 @@ impl MockHybridCache {
         }
     }
 
-    async fn get(&self, message_id: &MessageId<'_>) -> Option<DiskCachedArticle> {
+    fn get(&self, message_id: &MessageId<'_>) -> Option<DiskCachedArticle> {
         let key = message_id.without_brackets().to_string();
         let storage = self.storage.lock().unwrap();
 
@@ -44,17 +44,16 @@ impl MockHybridCache {
         }
     }
 
-    async fn upsert_backend_response(
+    fn upsert_backend_response(
         &self,
         message_id: MessageId<'_>,
         buffer: impl AsRef<[u8]>,
         backend_id: BackendId,
     ) {
-        self.upsert_ingest(message_id, buffer.as_ref().into(), backend_id)
-            .await;
+        self.upsert_ingest(message_id, buffer.as_ref().into(), backend_id);
     }
 
-    async fn upsert_ingest(
+    fn upsert_ingest(
         &self,
         message_id: MessageId<'_>,
         buffer: CacheIngestResponse,
@@ -86,7 +85,7 @@ impl MockHybridCache {
         storage.insert(key, entry);
     }
 
-    async fn record_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
+    fn record_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
         let key = message_id.without_brackets().to_string();
         let mut storage = self.storage.lock().unwrap();
 
@@ -118,7 +117,7 @@ impl MockHybridCache {
         }
     }
 
-    async fn close(&self) -> anyhow::Result<()> {
+    fn close(&self) -> anyhow::Result<()> {
         Ok(())
     }
 }
@@ -169,23 +168,19 @@ mod tests {
     #[tokio::test]
     async fn upsert_keeps_existing_semantic_payload_over_longer_metadata_only_response() {
         let cache = MockHybridCache::new(1024);
-        cache
-            .upsert_backend_response(
-                msg_id(),
-                b"220 1 <mock-hybrid@example>\r\nH: V\r\n\r\nBody\r\n.\r\n".as_slice(),
-                BackendId::from_index(0),
-            )
-            .await;
+        cache.upsert_backend_response(
+            msg_id(),
+            b"220 1 <mock-hybrid@example>\r\nH: V\r\n\r\nBody\r\n.\r\n".as_slice(),
+            BackendId::from_index(0),
+        );
 
-        cache
-            .upsert_backend_response(
-                msg_id(),
-                b"220 1 <mock-hybrid@example> long status line without payload\r\n".as_slice(),
-                BackendId::from_index(1),
-            )
-            .await;
+        cache.upsert_backend_response(
+            msg_id(),
+            b"220 1 <mock-hybrid@example> long status line without payload\r\n".as_slice(),
+            BackendId::from_index(1),
+        );
 
-        let entry = cache.get(&msg_id()).await.expect("entry remains cached");
+        let entry = cache.get(&msg_id()).expect("entry remains cached");
         assert!(
             entry
                 .cached_response_for(RequestKind::Article, "<mock-hybrid@example>")
@@ -202,16 +197,14 @@ mod tests {
         let message_id = msgid("<test@example.com>");
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n";
 
-        cache
-            .upsert_backend_response(
-                message_id.clone(),
-                buffer.as_slice(),
-                BackendId::from_index(0),
-            )
-            .await;
+        cache.upsert_backend_response(
+            message_id.clone(),
+            buffer.as_slice(),
+            BackendId::from_index(0),
+        );
 
         assert_article(
-            &cache.get(&message_id).await.expect("Entry should exist"),
+            &cache.get(&message_id).expect("Entry should exist"),
             &message_id,
             buffer,
         );
@@ -229,16 +222,14 @@ mod tests {
         let message_id = msgid("<borrowed@example.com>");
         let buffer = b"220 0 <borrowed@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n";
 
-        cache
-            .upsert_backend_response(
-                message_id.clone(),
-                buffer.as_slice(),
-                BackendId::from_index(0),
-            )
-            .await;
+        cache.upsert_backend_response(
+            message_id.clone(),
+            buffer.as_slice(),
+            BackendId::from_index(0),
+        );
 
         assert_article(
-            &cache.get(&message_id).await.expect("cached entry"),
+            &cache.get(&message_id).expect("cached entry"),
             &message_id,
             buffer,
         );
@@ -251,7 +242,7 @@ mod tests {
         let cache = MockHybridCache::new(1024 * 1024);
 
         let message_id = msgid("<nonexistent@example.com>");
-        let entry = cache.get(&message_id).await;
+        let entry = cache.get(&message_id);
 
         assert!(entry.is_none());
 
@@ -270,23 +261,19 @@ mod tests {
 
         let large_buffer =
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nLarge body content here\r\n.\r\n";
-        cache
-            .upsert_backend_response(
-                message_id.clone(),
-                large_buffer.as_slice(),
-                BackendId::from_index(0),
-            )
-            .await;
+        cache.upsert_backend_response(
+            message_id.clone(),
+            large_buffer.as_slice(),
+            BackendId::from_index(0),
+        );
 
-        cache
-            .upsert_backend_response(
-                message_id.clone(),
-                b"223 0 <test@example.com>\r\n".as_slice(),
-                BackendId::from_index(1),
-            )
-            .await;
+        cache.upsert_backend_response(
+            message_id.clone(),
+            b"223 0 <test@example.com>\r\n".as_slice(),
+            BackendId::from_index(1),
+        );
 
-        let entry = cache.get(&message_id).await.unwrap();
+        let entry = cache.get(&message_id).unwrap();
         assert_article(&entry, &message_id, large_buffer);
         assert_availability(&entry, &[(0, true), (1, true)]);
 
@@ -299,11 +286,9 @@ mod tests {
 
         let message_id = msgid("<missing@example.com>");
 
-        cache
-            .record_missing(message_id.clone(), BackendId::from_index(0))
-            .await;
+        cache.record_missing(message_id.clone(), BackendId::from_index(0));
 
-        let entry = cache.get(&message_id).await;
+        let entry = cache.get(&message_id);
         assert!(entry.is_some());
 
         let entry = entry.unwrap();
@@ -318,22 +303,16 @@ mod tests {
 
         let message_id = msgid("<avail@example.com>");
 
-        cache
-            .upsert_backend_response(
-                message_id.clone(),
-                b"220 0 <avail@example.com>\r\nBody\r\n.\r\n".as_slice(),
-                BackendId::from_index(0),
-            )
-            .await;
+        cache.upsert_backend_response(
+            message_id.clone(),
+            b"220 0 <avail@example.com>\r\nBody\r\n.\r\n".as_slice(),
+            BackendId::from_index(0),
+        );
 
-        cache
-            .record_missing(message_id.clone(), BackendId::from_index(1))
-            .await;
-        cache
-            .record_missing(message_id.clone(), BackendId::from_index(2))
-            .await;
+        cache.record_missing(message_id.clone(), BackendId::from_index(1));
+        cache.record_missing(message_id.clone(), BackendId::from_index(2));
 
-        let entry = cache.get(&message_id).await.unwrap();
+        let entry = cache.get(&message_id).unwrap();
         assert_availability(&entry, &[(0, true), (1, false), (2, false), (3, true)]);
 
         Ok(())
@@ -344,15 +323,13 @@ mod tests {
         let cache = MockHybridCache::new(1024 * 1024);
 
         let message_id = msgid("<test@example.com>");
-        cache
-            .upsert_backend_response(
-                message_id,
-                b"220 0 <test@example.com>\r\n.\r\n".as_slice(),
-                BackendId::from_index(0),
-            )
-            .await;
+        cache.upsert_backend_response(
+            message_id,
+            b"220 0 <test@example.com>\r\n.\r\n".as_slice(),
+            BackendId::from_index(0),
+        );
 
-        cache.close().await?;
+        cache.close()?;
 
         Ok(())
     }

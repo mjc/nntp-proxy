@@ -65,7 +65,7 @@ fn metadata_only_cache() -> Cache {
     }
 }
 
-async fn spawn_backend(listener: TcpListener, response: Arc<[u8]>) {
+fn spawn_backend(listener: TcpListener, response: Arc<[u8]>) {
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
@@ -117,7 +117,7 @@ async fn spawn_backend(listener: TcpListener, response: Arc<[u8]>) {
     });
 }
 
-async fn spawn_proxy(listener: TcpListener, proxy: NntpProxy, mode: RoutingMode) {
+fn spawn_proxy(listener: TcpListener, proxy: NntpProxy, mode: RoutingMode) {
     tokio::spawn(async move {
         loop {
             let Ok((stream, addr)) = listener.accept().await else {
@@ -147,14 +147,14 @@ impl BenchProxy {
     async fn start(body_len: usize, cache: Option<Cache>) -> Self {
         let backend_listener = bind_localhost().await;
         let backend_port = backend_listener.local_addr().unwrap().port();
-        spawn_backend(backend_listener, article_response(body_len).into()).await;
+        spawn_backend(backend_listener, article_response(body_len).into());
 
         let proxy_listener = bind_localhost().await;
         let proxy_addr = proxy_listener.local_addr().unwrap();
         let proxy = NntpProxy::new(bench_config(backend_port, cache), RoutingMode::PerCommand)
             .await
             .unwrap();
-        spawn_proxy(proxy_listener, proxy, RoutingMode::PerCommand).await;
+        spawn_proxy(proxy_listener, proxy, RoutingMode::PerCommand);
 
         let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
         stream.set_nodelay(true).unwrap();

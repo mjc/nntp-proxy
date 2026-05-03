@@ -655,7 +655,7 @@ impl BufferPool {
     }
 
     pub async fn acquire(&self) -> PooledBuffer {
-        self.acquire_now()
+        std::future::ready(self.acquire_now()).await
     }
 
     /// Get a capture buffer from the capture pool
@@ -701,7 +701,7 @@ impl BufferPool {
     }
 
     pub async fn acquire_capture(&self) -> PooledBuffer {
-        self.acquire_capture_now()
+        std::future::ready(self.acquire_capture_now()).await
     }
 }
 
