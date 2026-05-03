@@ -406,20 +406,12 @@ impl RequestCacheEntryMetadata {
 impl RequestContext {
     #[must_use]
     pub fn from_request_line(line: RequestLine<'_>) -> Self {
-        let verb = SmallVec::from_slice(line.verb());
-        let args = SmallVec::from_slice(line.args());
-
-        Self {
-            kind: line.kind(),
-            verb,
-            args,
-            message_id: line.message_id_span(),
-            cache_status: None,
-            cache_entry: None,
-            backend_id: None,
-            response: None,
-            response_payload: None,
-        }
+        Self::from_parts(
+            line.kind(),
+            SmallVec::from_slice(line.verb()),
+            SmallVec::from_slice(line.args()),
+            line.message_id_span(),
+        )
     }
 
     #[must_use]
@@ -429,17 +421,7 @@ impl RequestContext {
         let kind = classify_verb(&verb);
         let message_id = find_message_id(&args);
 
-        Self {
-            kind,
-            verb,
-            args,
-            message_id,
-            cache_status: None,
-            cache_entry: None,
-            backend_id: None,
-            response: None,
-            response_payload: None,
-        }
+        Self::from_parts(kind, verb, args, message_id)
     }
 
     #[must_use]
@@ -452,10 +434,19 @@ impl RequestContext {
         let kind = classify_verb(&verb);
         let message_id = find_message_id(&joined_args);
 
+        Self::from_parts(kind, verb, joined_args, message_id)
+    }
+
+    fn from_parts(
+        kind: RequestKind,
+        verb: SmallVec<[u8; 16]>,
+        args: SmallVec<[u8; 512]>,
+        message_id: Option<(usize, usize)>,
+    ) -> Self {
         Self {
             kind,
             verb,
-            args: joined_args,
+            args,
             message_id,
             cache_status: None,
             cache_entry: None,
