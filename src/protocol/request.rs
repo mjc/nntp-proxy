@@ -1315,7 +1315,7 @@ mod tests {
     }
 
     #[test]
-    fn request_aware_multiline_body_expectation() {
+    fn request_context_derives_response_framing() {
         let group = request_context(b"GROUP alt.test\r\n");
         let listgroup = request_context(b"LISTGROUP alt.test\r\n");
         assert_eq!(
