@@ -526,16 +526,16 @@ impl CachedArticle {
     }
 
     #[must_use]
-    pub fn response_for(
+    pub fn cached_response_for(
         &self,
         request_kind: RequestKind,
         message_id: &str,
     ) -> Option<CachedArticleResponse<'_>> {
-        response_for_payload(&self.payload, request_kind, message_id)
+        cached_response_for_payload(&self.payload, request_kind, message_id)
     }
 }
 
-pub(crate) fn response_for_payload<'a>(
+pub(crate) fn cached_response_for_payload<'a>(
     payload: &'a CachedPayload,
     request_kind: RequestKind,
     message_id: &str,
@@ -1324,14 +1324,14 @@ mod tests {
     }
 
     fn rendered(entry: &CachedArticle, request_kind: RequestKind, msgid: &str) -> Vec<u8> {
-        let response = entry.response_for(request_kind, msgid).unwrap();
+        let response = entry.cached_response_for(request_kind, msgid).unwrap();
         let mut out = Vec::with_capacity(response.wire_len().get());
         block_on(response.write_to(&mut out)).unwrap();
         out
     }
 
     fn serves(entry: &CachedArticle, request_kind: RequestKind, msgid: &str) -> bool {
-        entry.response_for(request_kind, msgid).is_some()
+        entry.cached_response_for(request_kind, msgid).is_some()
     }
 
     fn assert_serves(entry: &CachedArticle, cases: &[(RequestKind, bool)]) {
@@ -1348,7 +1348,7 @@ mod tests {
     async fn cached_article_response_writes_wire_slices() {
         let entry = create_test_cached_article("<test@example.com>");
         let response = entry
-            .response_for(RequestKind::Article, "<test@example.com>")
+            .cached_response_for(RequestKind::Article, "<test@example.com>")
             .unwrap();
         let mut out = Vec::new();
 
@@ -1364,7 +1364,7 @@ mod tests {
     async fn cached_article_response_uses_vectored_write() {
         let entry = create_test_cached_article("<test@example.com>");
         let response = entry
-            .response_for(RequestKind::Article, "<test@example.com>")
+            .cached_response_for(RequestKind::Article, "<test@example.com>")
             .unwrap();
         let mut out = CountingWriter::default();
 
@@ -1382,7 +1382,7 @@ mod tests {
     fn cached_article_response_exposes_typed_wire_len() {
         let entry = create_test_cached_article("<test@example.com>");
         let response = entry
-            .response_for(RequestKind::Stat, "<test@example.com>")
+            .cached_response_for(RequestKind::Stat, "<test@example.com>")
             .unwrap();
 
         assert_eq!(
@@ -1411,7 +1411,7 @@ mod tests {
 
         for (request_kind, expected) in cases {
             let response = entry
-                .response_for(request_kind, "<test@example.com>")
+                .cached_response_for(request_kind, "<test@example.com>")
                 .unwrap();
             let mut out = Vec::new();
 
@@ -1421,7 +1421,7 @@ mod tests {
         }
 
         let response = entry
-            .response_for(RequestKind::Body, "<test@example.com>")
+            .cached_response_for(RequestKind::Body, "<test@example.com>")
             .unwrap();
         let mut out = Vec::new();
 
@@ -1548,7 +1548,7 @@ mod tests {
                 .get(&msg_id)
                 .await
                 .expect("metadata entry")
-                .response_for(RequestKind::Body, msg_id.as_str())
+                .cached_response_for(RequestKind::Body, msg_id.as_str())
                 .is_none()
         );
 

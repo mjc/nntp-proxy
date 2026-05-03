@@ -144,7 +144,7 @@ mod tests {
         request_kind: RequestKind,
         message_id: &MessageId<'_>,
     ) -> Option<Vec<u8>> {
-        let response = entry.response_for(request_kind, message_id.as_str())?;
+        let response = entry.cached_response_for(request_kind, message_id.as_str())?;
         let mut out = Vec::with_capacity(response.wire_len().get());
         block_on(response.write_to(&mut out)).ok()?;
         Some(out)
@@ -189,7 +189,7 @@ mod tests {
         let entry = cache.get(&msg_id()).await.expect("entry remains cached");
         assert!(
             entry
-                .response_for(RequestKind::Article, "<mock-hybrid@example>")
+                .cached_response_for(RequestKind::Article, "<mock-hybrid@example>")
                 .is_some(),
             "longer metadata-only responses must not replace semantic article payloads"
         );

@@ -50,7 +50,7 @@ fn cache_entry_from_bytes(response: impl AsRef<[u8]>) -> CachedArticle {
 
 fn write_cached_response(entry: &CachedArticle, request_kind: RequestKind) -> usize {
     entry
-        .response_for(request_kind, MSG_ID)
+        .cached_response_for(request_kind, MSG_ID)
         .map(|response| {
             let mut sink = tokio::io::sink();
             block_on(response.write_to(&mut sink)).unwrap();
@@ -126,7 +126,7 @@ bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb@example.com>";
         bencher.bench(|| {
             black_box(
                 entry
-                    .response_for(black_box(RequestKind::Stat), black_box(LONG_MSG_ID))
+                    .cached_response_for(black_box(RequestKind::Stat), black_box(LONG_MSG_ID))
                     .map(|response| {
                         let mut sink = tokio::io::sink();
                         block_on(response.write_to(&mut sink)).unwrap();

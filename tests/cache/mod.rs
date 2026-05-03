@@ -24,7 +24,7 @@ pub fn article_response_bytes(
     request_kind: RequestKind,
     message_id: &MessageId<'_>,
 ) -> Option<Vec<u8>> {
-    let response = entry.response_for(request_kind, message_id.as_str())?;
+    let response = entry.cached_response_for(request_kind, message_id.as_str())?;
     let mut out = Vec::with_capacity(response.wire_len().get());
     block_on(response.write_to(&mut out)).ok()?;
     Some(out)

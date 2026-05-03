@@ -677,7 +677,7 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<test123@example.com>").unwrap();
         let entry = cache.get(&msg_id).await.unwrap();
         let response = entry
-            .response_for(crate::protocol::RequestKind::Article, msg_id.as_str())
+            .cached_response_for(crate::protocol::RequestKind::Article, msg_id.as_str())
             .unwrap();
         let mut rendered = Vec::with_capacity(response.wire_len().get());
         response.write_to(&mut rendered).await.unwrap();

@@ -3,7 +3,7 @@
 //! This test suite covers:
 //! - `UnifiedCache` enum dispatch (memory vs hybrid)
 //! - `CacheStatsProvider` trait implementations
-//! - `CachedArticle::response_for()` including STAT synthesis
+//! - `CachedArticle::cached_response_for()` including STAT synthesis
 //! - `ArticleAvailability::from_bits()`
 //! - `DiskCache` configuration defaults and validation
 

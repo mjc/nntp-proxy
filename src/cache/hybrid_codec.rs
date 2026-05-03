@@ -459,12 +459,12 @@ impl DiskCachedArticle {
 
     #[must_use]
     #[cfg(test)]
-    pub(crate) fn response_for(
+    pub(crate) fn cached_response_for(
         &self,
         request_kind: crate::protocol::RequestKind,
         message_id: &str,
     ) -> Option<super::article::CachedArticleResponse<'_>> {
-        super::article::response_for_payload(&self.payload, request_kind, message_id)
+        super::article::cached_response_for_payload(&self.payload, request_kind, message_id)
     }
 
     #[must_use]
@@ -584,7 +584,7 @@ mod tests {
         request_kind: RequestKind,
         message_id: &str,
     ) -> Option<Vec<u8>> {
-        let response = entry.response_for(request_kind, message_id)?;
+        let response = entry.cached_response_for(request_kind, message_id)?;
         let mut out = Vec::with_capacity(response.wire_len().get());
         block_on(response.write_to(&mut out)).ok()?;
         Some(out)
@@ -800,7 +800,7 @@ mod tests {
         let entry = disk_cached_article_from_response(buffer.clone()).expect("valid status code");
 
         let response = entry
-            .response_for(RequestKind::Head, "<test@example.com>")
+            .cached_response_for(RequestKind::Head, "<test@example.com>")
             .expect("article cache entry can serve HEAD");
 
         let mut rendered = Vec::with_capacity(response.wire_len().get());
@@ -838,20 +838,50 @@ mod tests {
     fn test_disk_cached_article_command_matching() {
         let article = disk_cached_article_from_response(b"220 0 <id>\r\nH: V\r\n\r\nB\r\n.\r\n")
             .expect("valid");
-        assert!(article.response_for(RequestKind::Article, "<id>").is_some());
-        assert!(article.response_for(RequestKind::Body, "<id>").is_some());
-        assert!(article.response_for(RequestKind::Head, "<id>").is_some());
+        assert!(
+            article
+                .cached_response_for(RequestKind::Article, "<id>")
+                .is_some()
+        );
+        assert!(
+            article
+                .cached_response_for(RequestKind::Body, "<id>")
+                .is_some()
+        );
+        assert!(
+            article
+                .cached_response_for(RequestKind::Head, "<id>")
+                .is_some()
+        );
 
         let body = disk_cached_article_from_response(b"222 0 <id>\r\nB\r\n.\r\n").expect("valid");
-        assert!(body.response_for(RequestKind::Article, "<id>").is_none());
-        assert!(body.response_for(RequestKind::Body, "<id>").is_some());
-        assert!(body.response_for(RequestKind::Head, "<id>").is_none());
+        assert!(
+            body.cached_response_for(RequestKind::Article, "<id>")
+                .is_none()
+        );
+        assert!(
+            body.cached_response_for(RequestKind::Body, "<id>")
+                .is_some()
+        );
+        assert!(
+            body.cached_response_for(RequestKind::Head, "<id>")
+                .is_none()
+        );
 
         let head =
             disk_cached_article_from_response(b"221 0 <id>\r\nH: V\r\n.\r\n").expect("valid");
-        assert!(head.response_for(RequestKind::Article, "<id>").is_none());
-        assert!(head.response_for(RequestKind::Body, "<id>").is_none());
-        assert!(head.response_for(RequestKind::Head, "<id>").is_some());
+        assert!(
+            head.cached_response_for(RequestKind::Article, "<id>")
+                .is_none()
+        );
+        assert!(
+            head.cached_response_for(RequestKind::Body, "<id>")
+                .is_none()
+        );
+        assert!(
+            head.cached_response_for(RequestKind::Head, "<id>")
+                .is_some()
+        );
     }
 
     #[test]
@@ -1040,11 +1070,11 @@ mod tests {
     }
 
     // =========================================================================
-    // response_for
+    // cached_response_for
     // =========================================================================
 
     #[test]
-    fn test_response_for_stat_from_220() {
+    fn test_cached_response_for_stat_from_220() {
         let entry =
             disk_cached_article_from_response(b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n")
                 .unwrap();
@@ -1053,7 +1083,7 @@ mod tests {
     }
 
     #[test]
-    fn test_response_for_stat_from_221() {
+    fn test_cached_response_for_stat_from_221() {
         let entry =
             disk_cached_article_from_response(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
         let resp = render_response(&entry, RequestKind::Stat, "<t@x>")
@@ -1062,7 +1092,7 @@ mod tests {
     }
 
     #[test]
-    fn test_response_for_stat_from_222() {
+    fn test_cached_response_for_stat_from_222() {
         let entry =
             disk_cached_article_from_response(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n").unwrap();
         let resp = render_response(&entry, RequestKind::Stat, "<t@x>")
@@ -1071,13 +1101,13 @@ mod tests {
     }
 
     #[test]
-    fn test_response_for_stat_not_from_430() {
+    fn test_cached_response_for_stat_not_from_430() {
         let entry = disk_cached_article_from_response(b"430 not found\r\n").unwrap();
         assert!(render_response(&entry, RequestKind::Stat, "<t@x>").is_none());
     }
 
     #[test]
-    fn test_response_for_article_direct() {
+    fn test_cached_response_for_article_direct() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
         let entry = disk_cached_article_from_response(buf.clone()).unwrap();
         let resp =
@@ -1085,7 +1115,7 @@ mod tests {
         assert_eq!(resp, buf);
 
         let response = entry
-            .response_for(RequestKind::Article, "<t@x>")
+            .cached_response_for(RequestKind::Article, "<t@x>")
             .expect("should serve ARTICLE by request kind");
         let mut out = Vec::with_capacity(response.wire_len().get());
         block_on(response.write_to(&mut out)).unwrap();
@@ -1093,7 +1123,7 @@ mod tests {
     }
 
     #[test]
-    fn test_response_for_body_from_220() {
+    fn test_cached_response_for_body_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
         let entry = disk_cached_article_from_response(buf.clone()).unwrap();
         let resp = render_response(&entry, RequestKind::Body, "<t@x>").expect("220 can serve BODY");
@@ -1101,7 +1131,7 @@ mod tests {
     }
 
     #[test]
-    fn test_response_for_head_from_220() {
+    fn test_cached_response_for_head_from_220() {
         let buf = b"220 0 <t@x>\r\nSubject: T\r\n\r\nBody\r\n.\r\n".to_vec();
         let entry = disk_cached_article_from_response(buf.clone()).unwrap();
         let resp = render_response(&entry, RequestKind::Head, "<t@x>").expect("220 can serve HEAD");
@@ -1109,14 +1139,14 @@ mod tests {
     }
 
     #[test]
-    fn test_response_for_body_cannot_serve_article() {
+    fn test_cached_response_for_body_cannot_serve_article() {
         let entry =
             disk_cached_article_from_response(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n").unwrap();
         assert!(render_response(&entry, RequestKind::Article, "<t@x>").is_none());
     }
 
     #[test]
-    fn test_response_for_head_cannot_serve_body() {
+    fn test_cached_response_for_head_cannot_serve_body() {
         let entry =
             disk_cached_article_from_response(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
         assert!(render_response(&entry, RequestKind::Body, "<t@x>").is_none());
