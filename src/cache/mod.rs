@@ -121,11 +121,10 @@ impl From<SmallVec<[u8; 128]>> for CacheIngestResponse {
 
 impl From<&[u8]> for CacheIngestResponse {
     fn from(value: &[u8]) -> Self {
-        let small = SmallVec::<[u8; 128]>::from_slice(value);
-        if small.spilled() {
-            Self::Owned(value.into())
+        if value.len() <= 128 {
+            Self::Inline(SmallVec::<[u8; 128]>::from_slice(value))
         } else {
-            Self::Inline(small)
+            Self::Owned(value.into())
         }
     }
 }
@@ -198,6 +197,15 @@ mod tests {
 
         assert!(matches!(buffer, CacheIngestResponse::Inline(_)));
         assert_eq!(buffer.status_code(), Some(StatusCode::new(223)));
+    }
+
+    #[test]
+    fn cache_ingest_response_from_large_slice_stores_owned_slice() {
+        let bytes = [b'x'; 129];
+
+        let buffer = CacheIngestResponse::from(bytes.as_slice());
+
+        assert!(matches!(buffer, CacheIngestResponse::Owned(_)));
     }
 
     #[test]
