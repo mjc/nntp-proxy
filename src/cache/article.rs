@@ -1174,6 +1174,20 @@ mod tests {
         out
     }
 
+    fn serves(entry: &ArticleEntry, request_kind: RequestKind, msgid: &str) -> bool {
+        entry.response_for(request_kind, msgid).is_some()
+    }
+
+    fn assert_serves(entry: &ArticleEntry, cases: &[(RequestKind, bool)]) {
+        cases.iter().for_each(|(request_kind, expected)| {
+            assert_eq!(
+                serves(entry, *request_kind, "<test@example.com>"),
+                *expected,
+                "serve decision for {request_kind:?}"
+            );
+        });
+    }
+
     #[tokio::test]
     async fn cached_article_response_writes_wire_slices() {
         let entry = create_test_article("<test@example.com>");
@@ -1240,6 +1254,146 @@ mod tests {
         response.write_to(&mut out).await.unwrap();
 
         assert_eq!(out, b"222 0 <test@example.com>\r\nBody\r\n.\r\n");
+    }
+
+    #[test]
+    fn body_payload_serves_body_and_stat_only() {
+        let entry = ArticleEntry::from_response_bytes(
+            b"222 0 <test@example.com>\r\nBody content only\r\n.\r\n",
+        );
+
+        assert_serves(
+            &entry,
+            &[
+                (RequestKind::Article, false),
+                (RequestKind::Body, true),
+                (RequestKind::Head, false),
+                (RequestKind::Stat, true),
+            ],
+        );
+    }
+
+    #[test]
+    fn article_payload_serves_article_head_body_and_stat() {
+        let entry = ArticleEntry::from_response_bytes(
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+        );
+
+        assert_serves(
+            &entry,
+            &[
+                (RequestKind::Article, true),
+                (RequestKind::Body, true),
+                (RequestKind::Head, true),
+                (RequestKind::Stat, true),
+            ],
+        );
+    }
+
+    #[test]
+    fn head_payload_serves_head_and_stat_only() {
+        let entry = ArticleEntry::from_response_bytes(
+            b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n",
+        );
+
+        assert_serves(
+            &entry,
+            &[
+                (RequestKind::Article, false),
+                (RequestKind::Body, false),
+                (RequestKind::Head, true),
+                (RequestKind::Stat, true),
+            ],
+        );
+    }
+
+    #[test]
+    fn body_payload_completeness_requires_semantic_body() {
+        let complete =
+            ArticleEntry::from_response_bytes(b"222 0 <test@example.com>\r\nBody content\r\n.\r\n");
+        let metadata_only =
+            ArticleEntry::from_response_bytes(b"222 0 <test@example.com>\r\n".as_slice());
+
+        assert!(complete.is_complete_article());
+        assert!(!metadata_only.is_complete_article());
+    }
+
+    #[tokio::test]
+    async fn upsert_preserves_complete_body_over_metadata_only_response() {
+        let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
+        let msg_id = MessageId::from_str_or_wrap("test@example.com").unwrap();
+        let backend_id = BackendId::from_index(0);
+        let complete = format!(
+            "222 0 <test@example.com>\r\n{}\r\n.\r\n",
+            "X".repeat(750_000)
+        );
+
+        cache
+            .upsert(
+                msg_id.clone(),
+                complete.as_bytes().to_vec(),
+                backend_id,
+                0.into(),
+            )
+            .await;
+        cache
+            .upsert(
+                msg_id.clone(),
+                b"222 0 <test@example.com>\r\n".to_vec(),
+                backend_id,
+                0.into(),
+            )
+            .await;
+
+        let cached = cache.get(&msg_id).await.expect("cached body");
+
+        assert_eq!(
+            rendered(&cached, RequestKind::Body, msg_id.as_str()),
+            complete.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_replaces_metadata_only_body_with_complete_body() {
+        let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
+        let msg_id = MessageId::from_str_or_wrap("test@example.com").unwrap();
+        let backend_id = BackendId::from_index(0);
+        let complete = format!(
+            "222 0 <test@example.com>\r\n{}\r\n.\r\n",
+            "X".repeat(750_000)
+        );
+
+        cache
+            .upsert(
+                msg_id.clone(),
+                b"222 0 <test@example.com>\r\n".to_vec(),
+                backend_id,
+                0.into(),
+            )
+            .await;
+        assert!(
+            cache
+                .get(&msg_id)
+                .await
+                .expect("metadata entry")
+                .response_for(RequestKind::Body, msg_id.as_str())
+                .is_none()
+        );
+
+        cache
+            .upsert(
+                msg_id.clone(),
+                complete.as_bytes().to_vec(),
+                backend_id,
+                0.into(),
+            )
+            .await;
+        let cached = cache.get(&msg_id).await.expect("cached body");
+
+        assert_eq!(
+            rendered(&cached, RequestKind::Body, msg_id.as_str()),
+            complete.as_bytes()
+        );
     }
 
     #[test]
