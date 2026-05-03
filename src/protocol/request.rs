@@ -43,19 +43,6 @@ pub enum RequestKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResponseFraming {
-    SingleLine,
-    Multiline,
-}
-
-impl ResponseFraming {
-    #[must_use]
-    pub const fn is_multiline(self) -> bool {
-        matches!(self, Self::Multiline)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestRouteClass {
     ArticleByMessageId,
     Stateless,
@@ -776,13 +763,13 @@ impl RequestContext {
     }
 
     #[must_use]
-    pub fn response_framing(&self, status: StatusCode) -> ResponseFraming {
+    pub fn expects_multiline_response(&self, status: StatusCode) -> bool {
         let code = status.as_u16();
         if status.is_error() {
-            return ResponseFraming::SingleLine;
+            return false;
         }
 
-        if matches!(
+        matches!(
             (self.kind, code),
             (RequestKind::Article, 220)
                 | (RequestKind::Head, 221)
@@ -795,11 +782,7 @@ impl RequestContext {
                 | (RequestKind::Hdr | RequestKind::Xhdr, 225)
                 | (RequestKind::NewNews, 230)
                 | (RequestKind::NewGroups, 231)
-        ) {
-            ResponseFraming::Multiline
-        } else {
-            ResponseFraming::SingleLine
-        }
+        )
     }
 }
 
@@ -1315,20 +1298,13 @@ mod tests {
     }
 
     #[test]
-    fn request_context_derives_response_framing() {
+    fn request_context_derives_multiline_response_expectation() {
         let group = request_context(b"GROUP alt.test\r\n");
         let listgroup = request_context(b"LISTGROUP alt.test\r\n");
-        assert_eq!(
-            group.response_framing(StatusCode::new(211)),
-            ResponseFraming::SingleLine
-        );
-        assert_eq!(
-            listgroup.response_framing(StatusCode::new(211)),
-            ResponseFraming::Multiline
-        );
-        assert_eq!(
-            request_context(b"ARTICLE <x@y>\r\n").response_framing(StatusCode::new(430)),
-            ResponseFraming::SingleLine
+        assert!(!group.expects_multiline_response(StatusCode::new(211)));
+        assert!(listgroup.expects_multiline_response(StatusCode::new(211)));
+        assert!(
+            !request_context(b"ARTICLE <x@y>\r\n").expects_multiline_response(StatusCode::new(430))
         );
     }
 }
