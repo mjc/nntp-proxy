@@ -100,6 +100,20 @@ impl BackendId {
     pub fn as_index(&self) -> usize {
         self.into_inner()
     }
+
+    /// Get this backend's bit within the u8 availability bitset.
+    ///
+    /// `ArticleAvailability` and request-cache availability are encoded as `u8`
+    /// bitsets, so only backend indexes `0..8` are representable.
+    #[inline]
+    #[must_use]
+    pub(crate) fn availability_bit(self) -> u8 {
+        let idx = self.as_index();
+        u32::try_from(idx)
+            .ok()
+            .and_then(|shift| 1u8.checked_shl(shift))
+            .unwrap_or_else(|| panic!("Backend index {idx} exceeds MAX_BACKENDS"))
+    }
 }
 
 impl fmt::Display for BackendId {
@@ -225,6 +239,18 @@ mod tests {
     fn test_backend_id_display() {
         let id = BackendId::from_index(5);
         assert_eq!(format!("{id}"), "Backend(5)");
+    }
+
+    #[test]
+    fn test_backend_id_availability_bit() {
+        assert_eq!(BackendId::from_index(0).availability_bit(), 0b0000_0001);
+        assert_eq!(BackendId::from_index(7).availability_bit(), 0b1000_0000);
+    }
+
+    #[test]
+    #[should_panic(expected = "Backend index 8 exceeds MAX_BACKENDS")]
+    fn test_backend_id_availability_bit_panics_when_index_exceeds_bitset() {
+        let _ = BackendId::from_index(8).availability_bit();
     }
 
     #[test]

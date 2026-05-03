@@ -173,7 +173,7 @@ impl RequestCacheAvailability {
 
     #[must_use]
     pub(crate) fn backend_has_article(self, backend_id: BackendId) -> bool {
-        let mask = 1u8 << backend_id.as_index();
+        let mask = backend_id.availability_bit();
         self.checked & mask != 0 && self.missing & mask == 0
     }
 }
@@ -1193,6 +1193,23 @@ mod tests {
         assert!(!ctx.cache_records_backend_has_article(BackendId::from_index(0)));
         assert!(!ctx.cache_records_backend_has_article(BackendId::from_index(1)));
         assert!(ctx.cache_records_backend_has_article(BackendId::from_index(2)));
+    }
+
+    #[test]
+    fn request_cache_availability_detects_highest_backend_bit() {
+        let availability = RequestCacheAvailability::from_bits(0b1000_0000, 0);
+
+        assert!(availability.backend_has_article(BackendId::from_index(7)));
+        assert!(!availability.backend_has_article(BackendId::from_index(6)));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "Backend index 8 exceeds MAX_BACKENDS")]
+    fn request_cache_availability_panics_for_out_of_range_backend() {
+        let availability = RequestCacheAvailability::from_bits(0, 0);
+
+        let _ = availability.backend_has_article(BackendId::from_index(8));
     }
 
     #[test]

@@ -355,7 +355,7 @@ impl AvailabilityIndex {
     }
 
     pub fn record_backend_missing(&self, message_id: &MessageId<'_>, backend_id: BackendId) {
-        self.insert_missing_bits(message_id.without_brackets(), 1u8 << backend_id.as_index());
+        self.insert_missing_bits(message_id.without_brackets(), backend_id.availability_bit());
     }
 
     pub fn sync_availability(
@@ -656,8 +656,31 @@ mod tests {
         assert!(!cached.should_try_backend(backend_id));
         assert_eq!(
             cached.availability().missing_bits(),
-            1u8 << backend_id.as_index()
+            backend_id.availability_bit()
         );
+    }
+
+    #[test]
+    fn record_missing_supports_highest_backend_bit() {
+        let index = AvailabilityIndex::new(8192);
+        let msg_id = MessageId::from_borrowed("<highest@example.com>").unwrap();
+        let backend_id = BackendId::from_index(7);
+
+        index.record_backend_missing(&msg_id, backend_id);
+
+        let cached = index.get(&msg_id).expect("negative entry");
+        assert_eq!(cached.availability().missing_bits(), 0b1000_0000);
+        assert!(!cached.should_try_backend(backend_id));
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "Backend index 8 exceeds MAX_BACKENDS")]
+    fn record_missing_panics_for_out_of_range_backend() {
+        let index = AvailabilityIndex::new(8192);
+        let msg_id = MessageId::from_borrowed("<panic@example.com>").unwrap();
+
+        index.record_backend_missing(&msg_id, BackendId::from_index(8));
     }
 
     #[test]

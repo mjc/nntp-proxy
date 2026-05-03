@@ -95,13 +95,9 @@ impl ArticleAvailability {
     /// Panics if `backend_id` >= 8. Config validation enforces max 8 backends.
     #[inline]
     pub fn record_missing(&mut self, backend_id: BackendId) -> &mut Self {
-        let idx = backend_id.as_index();
-        debug_assert!(
-            idx < MAX_BACKENDS,
-            "Backend index {idx} exceeds MAX_BACKENDS ({MAX_BACKENDS})"
-        );
-        self.checked |= 1u8 << idx; // Mark as checked
-        self.missing |= 1u8 << idx; // Mark as missing
+        let mask = backend_id.availability_bit();
+        self.checked |= mask; // Mark as checked
+        self.missing |= mask; // Mark as missing
         self
     }
 
@@ -117,13 +113,9 @@ impl ArticleAvailability {
     /// Panics if `backend_id` >= 8. Config validation enforces max 8 backends.
     #[inline]
     pub fn record_has(&mut self, backend_id: BackendId) -> &mut Self {
-        let idx = backend_id.as_index();
-        debug_assert!(
-            idx < MAX_BACKENDS,
-            "Backend index {idx} exceeds MAX_BACKENDS ({MAX_BACKENDS})"
-        );
-        self.checked |= 1u8 << idx; // Mark as checked
-        self.missing &= !(1u8 << idx); // Clear missing bit (has the article)
+        let mask = backend_id.availability_bit();
+        self.checked |= mask; // Mark as checked
+        self.missing &= !mask; // Clear missing bit (has the article)
         self
     }
 
@@ -158,12 +150,7 @@ impl ArticleAvailability {
     #[inline]
     #[must_use]
     pub fn is_missing(&self, backend_id: BackendId) -> bool {
-        let idx = backend_id.as_index();
-        debug_assert!(
-            idx < MAX_BACKENDS,
-            "Backend index {idx} exceeds MAX_BACKENDS ({MAX_BACKENDS})"
-        );
-        self.missing & (1u8 << idx) != 0
+        self.missing & backend_id.availability_bit() != 0
     }
 
     /// Check if we should attempt to fetch from this backend
@@ -206,11 +193,15 @@ impl ArticleAvailability {
             count <= MAX_BACKENDS,
             "Backend count {count} exceeds MAX_BACKENDS ({MAX_BACKENDS})"
         );
-        match count {
-            0 => true,
-            8 => self.missing == 0xFF,
-            n => self.missing & ((1u8 << n) - 1) == (1u8 << n) - 1,
-        }
+        let expected_missing = match count {
+            0 => 0,
+            MAX_BACKENDS => u8::MAX,
+            n => 1u8
+                .checked_shl(n as u32)
+                .map(|mask| mask - 1)
+                .expect("backend count exceeds u8 availability bitset"),
+        };
+        self.missing & expected_missing == expected_missing
     }
 
     /// Get an iterator over backends that should still be tried
@@ -273,12 +264,7 @@ impl ArticleAvailability {
     #[inline]
     #[must_use]
     pub fn status(&self, backend_id: BackendId) -> BackendStatus {
-        let idx = backend_id.as_index();
-        debug_assert!(
-            idx < MAX_BACKENDS,
-            "Backend index {idx} exceeds MAX_BACKENDS ({MAX_BACKENDS})"
-        );
-        let mask = 1u8 << idx;
+        let mask = backend_id.availability_bit();
         if self.checked & mask == 0 {
             BackendStatus::Unknown
         } else if self.missing & mask != 0 {
