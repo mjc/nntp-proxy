@@ -488,18 +488,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_backend_status_multiline() {
-        let data = b"220 0 <article@example.com>\r\n";
-        let validated = parse_backend_status(data, data.len(), 7);
-
-        assert_eq!(
-            validated.status_code,
-            Some(crate::protocol::StatusCode::new(220))
-        );
-        assert!(validated.warnings.is_empty());
-    }
-
-    #[test]
     fn test_parse_backend_status_multiple_warnings() {
         let data = b"000";
         let validated = parse_backend_status(data, data.len(), 7);

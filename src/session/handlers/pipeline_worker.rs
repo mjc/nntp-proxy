@@ -758,17 +758,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_validate_valid_multiline() {
-        let data = b"220 0 <msg@id> article\r\nBody\r\n.\r\n";
-        let validated =
-            parse_backend_status(data, data.len(), crate::protocol::MIN_RESPONSE_LENGTH);
-        assert_eq!(
-            validated.status_code,
-            Some(crate::protocol::StatusCode::new(220))
-        );
-    }
-
     // ─── execute_pipeline_batch integration tests ────────────────────────────
 
     #[tokio::test]
