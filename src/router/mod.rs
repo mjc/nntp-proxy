@@ -229,7 +229,6 @@ impl Drop for CommandGuard {
 ///     ServerName::try_new("backend-1".to_string()).unwrap(),
 ///     provider,
 ///     0, // tier (lower = higher priority)
-///     None, // pipeline_queue
 /// );
 ///
 /// // Route commands

@@ -41,7 +41,11 @@ macro_rules! retry_once {
                 tracing::warn!($($key = %$val,)* error = ?first_error, "Backend error, retrying once");
 
                 // Jittered backoff: 1–9ms prevents thundering-herd retries
-                let jitter_ms = rand::Rng::random_range(&mut rand::rng(), 1..10);
+                let jitter_ms = {
+                    use rand::RngExt as _;
+                    let mut rng = rand::rng();
+                    rng.random_range(1..10)
+                };
                 tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
 
                 match $expr {
@@ -104,7 +108,11 @@ mod tests {
     fn test_jitter_range() {
         // Verify jitter is in expected range (1-9ms)
         for _ in 0..100 {
-            let jitter_ms = rand::Rng::random_range(&mut rand::rng(), 1..10);
+            let jitter_ms = {
+                use rand::RngExt as _;
+                let mut rng = rand::rng();
+                rng.random_range(1..10)
+            };
             assert!(
                 (1..10).contains(&jitter_ms),
                 "Jitter {jitter_ms} out of range [1, 10)",

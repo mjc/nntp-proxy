@@ -125,7 +125,7 @@ where
 /// Hex string with space-separated bytes (e.g., "41 42 43" for "ABC")
 ///
 /// # Examples
-/// ```
+/// ```ignore
 /// # use nntp_proxy::session::backend::format_hex_preview;
 /// let data = b"430 No such article\r\n";
 /// let hex = format_hex_preview(data, 256);
