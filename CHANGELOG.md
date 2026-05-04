@@ -1,3 +1,11 @@
+## Unreleased
+
+- Fix: guard availability bit shifts to avoid UB/panic (BackendId::availability_bit).
+- Fix: correct full-buffer terminator handling in streaming; remove unsafe BoundaryOnly fast-path.
+- Fix: tighten message-id routing; restore multiline fallback for unknown commands.
+- Perf: UnifiedCache.get_miss ≈ 182 ns; cache hit 64KB ≈ 13.2 µs (backend ≈ 39.9 µs); cache hit 768KB ≈ 75 µs (backend ≈ 269 µs).
+- Docs: recommend buffer-pool sizing to avoid fallback allocations and maintain zero-allocation hot path.
+
 # Changelog
 
 All notable changes to this project will be documented in this file.
