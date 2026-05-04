@@ -5,7 +5,7 @@
 //! preallocated shard-local arena. When a shard fills, it evicts the least
 //! recently used entries and compacts the shard so bounded memory stays usable.
 
-use super::{ArticleAvailability, CachedArticle};
+use super::{ArticleAvailability, CachedArticle, ttl};
 use crate::io_util::atomic_replace_file;
 use crate::types::{BackendId, MessageId};
 use anyhow::{Context, Result};
@@ -14,13 +14,15 @@ use std::mem::{size_of, take};
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use twox_hash::XxHash64;
 
 const DEFAULT_SHARDS: usize = 16;
 const SLOT_BUDGET_DIVISOR: usize = 3;
 const LOAD_FACTOR_NUM: usize = 85;
 const LOAD_FACTOR_DEN: usize = 100;
-const PERSISTENCE_MAGIC: &[u8; 8] = b"ANEGIDX1";
+const PERSISTENCE_MAGIC: &[u8; 8] = b"ANEGIDX2";
+const LEGACY_PERSISTENCE_MAGIC: &[u8; 8] = b"ANEGIDX1";
 
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -33,6 +35,7 @@ struct Slot {
     missing: u8,
     occupied: bool,
     last_touch: u64,
+    inserted_at: u64,
 }
 
 impl Slot {
@@ -46,6 +49,7 @@ struct PersistedEntry {
     key: Vec<u8>,
     missing: u8,
     last_touch: u64,
+    inserted_at: u64,
 }
 
 #[derive(Debug)]
@@ -90,14 +94,36 @@ impl Shard {
         idx.wrapping_sub(home) & self.mask()
     }
 
-    fn lookup_missing(&mut self, hash: u64, key: &[u8], touch: u64) -> Option<u8> {
+    fn lookup_missing(
+        &mut self,
+        hash: u64,
+        key: &[u8],
+        touch: u64,
+        base_ttl: ttl::CacheTtlMillis,
+    ) -> Option<u8> {
         let index = self.lookup_slot_index(hash, key)?;
+        let slot = self.slots[index];
+        if ttl::is_expired(
+            ttl::CacheTimestampMillis::new(slot.inserted_at),
+            base_ttl,
+            ttl::CacheTier::new(0),
+        ) {
+            self.rebuild_excluding(index);
+            return None;
+        }
         let slot = &mut self.slots[index];
         slot.last_touch = touch;
         Some(slot.missing)
     }
 
-    fn insert_missing(&mut self, hash: u64, key: &[u8], missing_bits: u8, touch: u64) -> usize {
+    fn insert_missing(
+        &mut self,
+        hash: u64,
+        key: &[u8],
+        missing_bits: u8,
+        touch: u64,
+        inserted_at: u64,
+    ) -> usize {
         if missing_bits == 0 || key.is_empty() {
             return 0;
         }
@@ -106,6 +132,7 @@ impl Shard {
             let slot = &mut self.slots[existing];
             slot.missing |= missing_bits;
             slot.last_touch = touch;
+            slot.inserted_at = inserted_at;
             return 0;
         }
 
@@ -120,12 +147,20 @@ impl Shard {
             missing: missing_bits,
             occupied: true,
             last_touch: touch,
+            inserted_at,
         };
         debug_assert!(self.place_slot(new_slot));
         evicted
     }
 
-    fn restore_entry(&mut self, hash: u64, key: &[u8], missing_bits: u8, last_touch: u64) -> bool {
+    fn restore_entry(
+        &mut self,
+        hash: u64,
+        key: &[u8],
+        missing_bits: u8,
+        last_touch: u64,
+        inserted_at: u64,
+    ) -> bool {
         if missing_bits == 0 || key.is_empty() {
             return true;
         }
@@ -134,6 +169,7 @@ impl Shard {
             let slot = &mut self.slots[existing];
             slot.missing |= missing_bits;
             slot.last_touch = slot.last_touch.max(last_touch);
+            slot.inserted_at = slot.inserted_at.max(inserted_at);
             return true;
         }
 
@@ -148,6 +184,7 @@ impl Shard {
             missing: missing_bits,
             occupied: true,
             last_touch,
+            inserted_at,
         };
         self.place_slot(new_slot)
     }
@@ -239,7 +276,13 @@ impl Shard {
             if let Some(key) =
                 old_arena.get(slot.offset as usize..slot.offset as usize + slot.len as usize)
             {
-                let inserted = rebuilt.restore_entry(slot.hash, key, slot.missing, slot.last_touch);
+                let inserted = rebuilt.restore_entry(
+                    slot.hash,
+                    key,
+                    slot.missing,
+                    slot.last_touch,
+                    slot.inserted_at,
+                );
                 debug_assert!(
                     inserted,
                     "rebuilding shard should preserve existing entries"
@@ -291,16 +334,29 @@ pub struct AvailabilityIndex {
     dropped: AtomicU64,
     evictions: AtomicU64,
     clock: AtomicU64,
+    ttl: ttl::CacheTtlMillis,
 }
 
 impl AvailabilityIndex {
     #[must_use]
     pub fn new(capacity_bytes: u64) -> Self {
-        Self::with_shard_count(capacity_bytes, DEFAULT_SHARDS)
+        Self::with_ttl(capacity_bytes, Duration::MAX)
     }
 
     #[must_use]
+    pub fn with_ttl(capacity_bytes: u64, ttl: Duration) -> Self {
+        Self::with_ttl_and_shard_count(capacity_bytes, ttl, DEFAULT_SHARDS)
+    }
+
+    #[must_use]
+    #[cfg(test)]
     fn with_shard_count(capacity_bytes: u64, shard_limit: usize) -> Self {
+        Self::with_ttl_and_shard_count(capacity_bytes, Duration::MAX, shard_limit)
+    }
+
+    #[must_use]
+    fn with_ttl_and_shard_count(capacity_bytes: u64, ttl: Duration, shard_limit: usize) -> Self {
+        let ttl = ttl::CacheTtlMillis::from_duration(ttl);
         let total_bytes = capacity_bytes as usize;
         if total_bytes == 0 {
             return Self {
@@ -312,6 +368,7 @@ impl AvailabilityIndex {
                 dropped: AtomicU64::new(0),
                 evictions: AtomicU64::new(0),
                 clock: AtomicU64::new(0),
+                ttl,
             };
         }
 
@@ -340,6 +397,7 @@ impl AvailabilityIndex {
             dropped: AtomicU64::new(0),
             evictions: AtomicU64::new(0),
             clock: AtomicU64::new(0),
+            ttl,
         }
     }
 
@@ -380,8 +438,16 @@ impl AvailabilityIndex {
         self.reset();
         let mut max_touch = 0u64;
         for entry in entries {
+            if self.is_expired(entry.inserted_at) {
+                continue;
+            }
             max_touch = max_touch.max(entry.last_touch);
-            self.restore_entry(&entry.key, entry.missing, entry.last_touch);
+            self.restore_entry(
+                &entry.key,
+                entry.missing,
+                entry.last_touch,
+                entry.inserted_at,
+            );
         }
         self.clock.store(max_touch, Ordering::Relaxed);
         Ok(true)
@@ -405,13 +471,14 @@ impl AvailabilityIndex {
 
         let entries = self.snapshot_entries();
         let total_key_bytes: usize = entries.iter().map(|entry| entry.key.len()).sum();
-        let mut bytes = Vec::with_capacity(16 + entries.len() * 11 + total_key_bytes);
+        let mut bytes = Vec::with_capacity(16 + entries.len() * 19 + total_key_bytes);
         bytes.extend_from_slice(PERSISTENCE_MAGIC);
         bytes.extend_from_slice(&(entries.len() as u64).to_le_bytes());
         for entry in entries {
             bytes.extend_from_slice(&(entry.key.len() as u16).to_le_bytes());
             bytes.push(entry.missing);
             bytes.extend_from_slice(&entry.last_touch.to_le_bytes());
+            bytes.extend_from_slice(&entry.inserted_at.to_le_bytes());
             bytes.extend_from_slice(&entry.key);
         }
 
@@ -482,7 +549,7 @@ impl AvailabilityIndex {
         let hash = hash_key(key.as_bytes());
         let shard = self.shard_for(hash);
         let mut shard = shard.lock().unwrap_or_else(|e| e.into_inner());
-        let result = shard.lookup_missing(hash, key.as_bytes(), self.next_touch());
+        let result = shard.lookup_missing(hash, key.as_bytes(), self.next_touch(), self.ttl);
         drop(shard);
 
         match result {
@@ -505,7 +572,13 @@ impl AvailabilityIndex {
         let hash = hash_key(key.as_bytes());
         let shard = self.shard_for(hash);
         let mut shard = shard.lock().unwrap_or_else(|e| e.into_inner());
-        match shard.insert_missing(hash, key.as_bytes(), missing_bits, self.next_touch()) {
+        match shard.insert_missing(
+            hash,
+            key.as_bytes(),
+            missing_bits,
+            self.next_touch(),
+            ttl::now_millis(),
+        ) {
             usize::MAX => {
                 self.dropped.fetch_add(1, Ordering::Relaxed);
             }
@@ -518,7 +591,7 @@ impl AvailabilityIndex {
         }
     }
 
-    fn restore_entry(&self, key: &[u8], missing_bits: u8, last_touch: u64) {
+    fn restore_entry(&self, key: &[u8], missing_bits: u8, last_touch: u64, inserted_at: u64) {
         if missing_bits == 0 || key.is_empty() {
             return;
         }
@@ -526,7 +599,7 @@ impl AvailabilityIndex {
         let hash = hash_key(key);
         let shard = self.shard_for(hash);
         let mut shard = shard.lock().unwrap_or_else(|e| e.into_inner());
-        if !shard.restore_entry(hash, key, missing_bits, last_touch) {
+        if !shard.restore_entry(hash, key, missing_bits, last_touch, inserted_at) {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -548,11 +621,15 @@ impl AvailabilityIndex {
         for shard in &self.shards {
             let shard = shard.lock().unwrap_or_else(|e| e.into_inner());
             for slot in shard.slots.iter().copied().filter(|slot| slot.occupied) {
+                if self.is_expired(slot.inserted_at) {
+                    continue;
+                }
                 if let Some(key) = shard.entry_bytes(slot) {
                     entries.push(PersistedEntry {
                         key: key.to_vec(),
                         missing: slot.missing,
                         last_touch: slot.last_touch,
+                        inserted_at: slot.inserted_at,
                     });
                 }
             }
@@ -567,13 +644,25 @@ impl AvailabilityIndex {
     fn shard_for(&self, hash: u64) -> &Mutex<Shard> {
         &self.shards[(hash as usize) % self.shards.len()]
     }
+
+    fn is_expired(&self, inserted_at: u64) -> bool {
+        ttl::is_expired(
+            ttl::CacheTimestampMillis::new(inserted_at),
+            self.ttl,
+            ttl::CacheTier::new(0),
+        )
+    }
 }
 
 fn parse_entries(data: &[u8]) -> Result<Vec<PersistedEntry>> {
     if data.len() < PERSISTENCE_MAGIC.len() + size_of::<u64>() {
         anyhow::bail!("availability index file too short");
     }
-    if &data[..PERSISTENCE_MAGIC.len()] != PERSISTENCE_MAGIC {
+    let magic = &data[..PERSISTENCE_MAGIC.len()];
+    if magic == LEGACY_PERSISTENCE_MAGIC {
+        return Ok(Vec::new());
+    }
+    if magic != PERSISTENCE_MAGIC {
         anyhow::bail!("unknown availability index format");
     }
 
@@ -588,6 +677,7 @@ fn parse_entries(data: &[u8]) -> Result<Vec<PersistedEntry>> {
             .ok_or_else(|| anyhow::anyhow!("truncated availability missing bits"))?;
         cursor += 1;
         let last_touch = read_u64(data, &mut cursor)?;
+        let inserted_at = read_u64(data, &mut cursor)?;
         let key = data
             .get(cursor..cursor + key_len)
             .ok_or_else(|| anyhow::anyhow!("truncated availability key bytes"))?
@@ -597,6 +687,7 @@ fn parse_entries(data: &[u8]) -> Result<Vec<PersistedEntry>> {
             key,
             missing,
             last_touch,
+            inserted_at,
         });
     }
 
@@ -661,6 +752,22 @@ mod tests {
     }
 
     #[test]
+    fn record_missing_expires_after_configured_ttl() {
+        let index = AvailabilityIndex::with_ttl(8192, std::time::Duration::from_millis(5));
+        let msg_id = MessageId::from_borrowed("<expires@example.com>").unwrap();
+
+        index.record_backend_missing(&msg_id, BackendId::from_index(0));
+        assert!(index.get(&msg_id).is_some());
+
+        std::thread::sleep(std::time::Duration::from_millis(15));
+
+        assert!(
+            index.get(&msg_id).is_none(),
+            "availability-only negatives must expire on the configured cache TTL"
+        );
+    }
+
+    #[test]
     fn record_missing_supports_highest_backend_bit() {
         let index = AvailabilityIndex::new(8192);
         let msg_id = MessageId::from_borrowed("<highest@example.com>").unwrap();
@@ -709,7 +816,7 @@ mod tests {
 
     #[test]
     fn lru_eviction_keeps_newer_entry() {
-        let index = AvailabilityIndex::with_shard_count(256, 1);
+        let index = AvailabilityIndex::with_shard_count(320, 1);
         let older = MessageId::from_borrowed("<older@example.com>").unwrap();
         let newer = MessageId::from_borrowed("<newer@example.com>").unwrap();
         let latest = MessageId::from_borrowed("<latest@example.com>").unwrap();
@@ -756,6 +863,34 @@ mod tests {
                 .get(&second)
                 .expect("restored second entry")
                 .should_try_backend(BackendId::from_index(2))
+        );
+    }
+
+    #[test]
+    fn load_from_path_skips_expired_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("availability.idx");
+        let index = AvailabilityIndex::with_ttl_and_shard_count(
+            1024,
+            std::time::Duration::from_millis(5),
+            1,
+        );
+        let msg_id = MessageId::from_borrowed("<persisted-expired@example.com>").unwrap();
+
+        index.record_backend_missing(&msg_id, BackendId::from_index(0));
+        index.save_to_path(&path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(15));
+
+        let restored = AvailabilityIndex::with_ttl_and_shard_count(
+            1024,
+            std::time::Duration::from_millis(5),
+            1,
+        );
+        assert!(restored.load_from_path(&path).unwrap());
+
+        assert!(
+            restored.get(&msg_id).is_none(),
+            "persisted availability-only negatives must not outlive cache TTL"
         );
     }
 }

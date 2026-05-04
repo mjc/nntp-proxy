@@ -521,7 +521,7 @@ async fn test_430_cache_is_authoritative() -> Result<()> {
     use nntp_proxy::router::BackendCount;
     use nntp_proxy::types::{BackendId, MessageId};
 
-    let cache = UnifiedCache::availability(1024 * 1024);
+    let cache = UnifiedCache::availability(1024 * 1024, std::time::Duration::MAX);
     let msg_id = MessageId::from_borrowed("<auth430@test.com>")?;
 
     // Record backends as 430 using the public API

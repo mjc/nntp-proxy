@@ -191,7 +191,10 @@ impl ClientSessionBuilder {
 impl ClientSession {
     /// Create default cache for availability tracking only (no content caching)
     fn default_cache() -> Arc<crate::cache::UnifiedCache> {
-        Arc::new(crate::cache::UnifiedCache::availability(0))
+        Arc::new(crate::cache::UnifiedCache::availability(
+            0,
+            std::time::Duration::MAX,
+        ))
     }
 
     /// Create a new client session for 1:1 backend mapping
@@ -241,7 +244,10 @@ impl ClientSession {
             auth_state: AuthState::new(),
             metrics,
             connection_stats: None,
-            cache: Arc::new(crate::cache::UnifiedCache::availability(0)),
+            cache: Arc::new(crate::cache::UnifiedCache::availability(
+                0,
+                std::time::Duration::MAX,
+            )),
             cache_articles: true,
             adaptive_precheck: false,
         }
@@ -283,7 +289,10 @@ impl ClientSession {
             auth_handler,
             metrics,
             connection_stats: None,
-            cache: Arc::new(crate::cache::UnifiedCache::availability(0)),
+            cache: Arc::new(crate::cache::UnifiedCache::availability(
+                0,
+                std::time::Duration::MAX,
+            )),
             cache_articles: true,
             adaptive_precheck: false,
         }

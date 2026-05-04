@@ -194,7 +194,10 @@ mod availability_cache {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn make_cache() -> Arc<UnifiedCache> {
-        Arc::new(UnifiedCache::availability(1024 * 1024))
+        Arc::new(UnifiedCache::availability(
+            1024 * 1024,
+            std::time::Duration::MAX,
+        ))
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]

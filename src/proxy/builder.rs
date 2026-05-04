@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use crate::auth::AuthHandler;
@@ -274,7 +274,7 @@ impl NntpProxyBuilder {
             let cache_articles = cache_config.cache_articles;
 
             let cache = if !cache_articles {
-                Arc::new(UnifiedCache::availability(capacity))
+                Arc::new(UnifiedCache::availability(capacity, cache_config.ttl))
             } else if let Some(disk_config) = &cache_config.disk {
                 let hybrid_config = HybridCacheConfig {
                     memory_capacity: capacity,
@@ -305,7 +305,10 @@ impl NntpProxyBuilder {
             (cache, cache_articles)
         } else {
             debug!("Cache not configured, using availability-only mode (capacity=0)");
-            (Arc::new(UnifiedCache::availability(0)), false)
+            (
+                Arc::new(UnifiedCache::availability(0, Duration::MAX)),
+                false,
+            )
         };
 
         Ok(ctx.into_proxy(cache, cache_articles))
@@ -340,14 +343,17 @@ impl NntpProxyBuilder {
             let cache = if cache_articles {
                 Arc::new(UnifiedCache::memory(capacity, cache_config.ttl))
             } else {
-                Arc::new(UnifiedCache::availability(capacity))
+                Arc::new(UnifiedCache::availability(capacity, cache_config.ttl))
             };
 
             Self::log_cache_config(cache_config, cache_articles);
             (cache, cache_articles)
         } else {
             debug!("Cache not configured, using availability-only mode (capacity=0)");
-            (Arc::new(UnifiedCache::availability(0)), false)
+            (
+                Arc::new(UnifiedCache::availability(0, Duration::MAX)),
+                false,
+            )
         };
 
         Ok(ctx.into_proxy(cache, cache_articles))
