@@ -499,7 +499,6 @@ enum ChunkResult {
 #[derive(Clone, Copy)]
 enum TerminatorScan {
     Exact,
-    BoundaryOnly,
 }
 
 struct ChunkProcessOptions {
@@ -545,7 +544,6 @@ where
     // Detect terminator location: within chunk or spanning boundary
     let status = match state.options.terminator_scan {
         TerminatorScan::Exact => tail.detect_terminator(data),
-        TerminatorScan::BoundaryOnly => tail.detect_terminal_boundary(data),
     };
     let write_len = status.write_len(data.len());
 
@@ -654,16 +652,12 @@ where
 }
 
 const fn chunk_terminator_scan(
-    capture: &Option<&mut crate::pool::ChunkedResponse>,
-    leftover_out: &Option<&mut crate::pool::PooledBuffer>,
-    chunk_len: usize,
-    buffer_capacity: usize,
+    _capture: &Option<&mut crate::pool::ChunkedResponse>,
+    _leftover_out: &Option<&mut crate::pool::PooledBuffer>,
+    _chunk_len: usize,
+    _buffer_capacity: usize,
 ) -> TerminatorScan {
-    if capture.is_none() && leftover_out.is_none() && chunk_len == buffer_capacity {
-        TerminatorScan::BoundaryOnly
-    } else {
-        TerminatorScan::Exact
-    }
+    TerminatorScan::Exact
 }
 
 async fn stream_remaining_chunks<R, W>(
@@ -972,6 +966,33 @@ mod tests {
         // Should only write up to and including terminator (position 22)
         assert_eq!(result.unwrap(), 22);
         assert_eq!(&writer[..], b"220 Article\r\nData\r\n.\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_stream_multiline_response_full_buffer_mid_chunk_terminator() {
+        let first_chunk = b"220 Article follows\r\nLong body content here";
+        let expected_body = b" more body\r\n.\r\n";
+        let mut second_chunk = expected_body.to_vec();
+        second_chunk.resize(4096, b'X');
+        let pool =
+            crate::pool::BufferPool::new(crate::types::BufferSize::try_new(4096).unwrap(), 2);
+        let ctx = test_helpers::make_ctx(&pool);
+        let mut reader = Cursor::new(second_chunk.as_slice());
+        let mut writer = Vec::new();
+
+        let result = stream_multiline_response(&mut reader, &mut writer, first_chunk, &ctx).await;
+
+        let expected_total = first_chunk.len() as u64 + expected_body.len() as u64;
+        let mut expected_written = Vec::new();
+        expected_written.extend_from_slice(first_chunk);
+        expected_written.extend_from_slice(expected_body);
+
+        assert!(
+            result.is_ok(),
+            "full-buffer mid-chunk terminator must succeed"
+        );
+        assert_eq!(result.unwrap(), expected_total);
+        assert_eq!(&writer[..], &expected_written[..]);
     }
 
     #[tokio::test]
