@@ -59,7 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - 768 KB cache hit: 76.41 us on this branch vs 78.24 us on `main`
   - 64 KB cache miss: 33.23 us on this branch vs 32.05 us on `main`
   - 768 KB cache miss: 208.9 us on this branch vs 238.1 us on `main`
-- 64 KB backend round trips still trailed `main` in the same reruns (44.35 us here vs 30.71 us on `main`), so the rewrite improved cache-hit throughput much more than uncached backend forwarding.
+- 64 KB backend round trips still trailed `main` in the latest rerun (34.9 us here vs 30.71 us on `main`), so the rewrite improved cache-hit throughput much more than uncached backend forwarding.
 
 ### Technical Details
 
