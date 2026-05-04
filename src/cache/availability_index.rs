@@ -23,7 +23,6 @@ use twox_hash::XxHash64;
 const DEFAULT_GENERATIONS: usize = 2;
 const BLOCK_SLOTS: usize = 2;
 const FIXED_ARTICLE_CAPACITY: usize = 256 * 1024;
-const SLOT_BYTES: usize = size_of::<u64>() + size_of::<u16>() + size_of::<u8>();
 const ALL_BACKEND_BITS: u8 = ((1u16 << MAX_BACKENDS) - 1) as u8;
 const PERSISTENCE_MAGIC: &[u8; 8] = b"ANEGSIM2";
 const LEGACY_PERSISTENCE_MAGIC_V1: &[u8; 8] = b"ANEGIDX1";
@@ -258,12 +257,10 @@ impl FilterState {
         let rotations = (1 + ((now.saturating_sub(self.next_rotation_at)) / interval) as usize)
             .min(self.generations.len());
         let mut evicted = 0usize;
-        for step in 0..rotations {
+        for _ in 0..rotations {
             self.current_generation = (self.current_generation + 1) % self.generations.len();
             let generation = &mut self.generations[self.current_generation];
             evicted += generation.clear();
-            generation.started_at =
-                scheduled_at.saturating_add((step as u64).saturating_mul(interval));
         }
         self.live_generations = (self.live_generations + rotations).min(self.generations.len());
         self.next_rotation_at =
@@ -465,6 +462,11 @@ impl Default for AvailabilityIndex {
 
 impl AvailabilityIndex {
     #[must_use]
+    pub const fn fixed_capacity_bytes() -> u64 {
+        FIXED_CAPACITY_BYTES
+    }
+
+    #[must_use]
     pub fn new() -> Self {
         Self::with_ttl(Duration::MAX)
     }
@@ -472,6 +474,11 @@ impl AvailabilityIndex {
     #[must_use]
     pub fn with_ttl(ttl: Duration) -> Self {
         Self::with_capacity_and_generation_count(FIXED_CAPACITY_BYTES, ttl, DEFAULT_GENERATIONS)
+    }
+
+    #[must_use]
+    pub(crate) fn disabled(ttl: Duration) -> Self {
+        Self::with_capacity_and_generation_count(0, ttl, DEFAULT_GENERATIONS)
     }
 
     #[must_use]
@@ -664,7 +671,7 @@ impl AvailabilityIndex {
 
     #[must_use]
     pub fn used_bytes(&self) -> u64 {
-        self.entry_count().saturating_mul(SLOT_BYTES as u64)
+        self.capacity_bytes
     }
 
     #[must_use]
@@ -989,7 +996,21 @@ mod tests {
         }
 
         assert!(index.used_bytes() <= capacity);
-        assert!(index.entry_count() <= (capacity as usize / SLOT_BYTES) as u64);
+        let slot_bytes = size_of::<u64>() + size_of::<u16>() + size_of::<u8>();
+        assert!(index.entry_count() <= (capacity as usize / slot_bytes) as u64);
+    }
+
+    #[test]
+    fn used_bytes_reports_preallocated_capacity() {
+        let capacity = test_capacity_for(4, 2);
+        let index = AvailabilityIndex::with_test_capacity(capacity);
+        let msg_id = MessageId::from_borrowed("<allocated@example.com>").unwrap();
+
+        assert_eq!(index.used_bytes(), capacity);
+
+        index.record_backend_missing(&msg_id, BackendId::from_index(0));
+
+        assert_eq!(index.used_bytes(), capacity);
     }
 
     #[test]
@@ -1111,6 +1132,38 @@ mod tests {
         assert!(
             restored.get(&msg_id).is_some(),
             "restored older-generation entry should survive the first lookup"
+        );
+    }
+
+    #[test]
+    fn rotated_generation_starts_when_it_receives_a_new_insert() {
+        let index = AvailabilityIndex::with_capacity_and_generation_count(
+            test_capacity_for(8, 2),
+            std::time::Duration::from_millis(40),
+            DEFAULT_GENERATIONS,
+        );
+        let first = MessageId::from_borrowed("<before-rotate@example.com>").unwrap();
+        let second = MessageId::from_borrowed("<after-rotate@example.com>").unwrap();
+
+        index.record_backend_missing(&first, BackendId::from_index(0));
+        let initial_started_at = {
+            let state = index.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.generations[state.current_generation].started_at
+        };
+
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        let before_second_insert = ttl::now_millis();
+        index.record_backend_missing(&second, BackendId::from_index(1));
+
+        let state = index.state.lock().unwrap_or_else(|e| e.into_inner());
+        let current_generation = &state.generations[state.current_generation];
+        assert!(
+            current_generation.started_at >= before_second_insert,
+            "rotated generation should start when the new insert arrives"
+        );
+        assert!(
+            current_generation.started_at > initial_started_at,
+            "rotated generation should not keep the historical rotation timestamp"
         );
     }
 

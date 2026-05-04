@@ -34,7 +34,7 @@ pub struct ClientSession {
     /// Connection statistics aggregator for logging connection creation
     pub(super) connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
 
-    /// Article cache (always present - at minimum a fixed-size availability index)
+    /// Article cache (always present - fixed-size, memory-backed, hybrid, or disabled)
     pub(super) cache: Arc<crate::cache::UnifiedCache>,
 
     /// Whether to cache article bodies (config-driven)

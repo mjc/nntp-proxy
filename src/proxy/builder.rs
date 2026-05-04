@@ -237,22 +237,24 @@ impl NntpProxyBuilder {
     /// Log cache configuration details
     fn log_cache_config(cache_config: &crate::config::Cache, cache_articles: bool) {
         let capacity = cache_config.max_capacity.as_u64();
-        if capacity > 0 {
-            if cache_articles {
-                info!(
-                    "Article cache enabled: max_capacity={}, ttl={}s (full caching)",
-                    cache_config.max_capacity,
-                    cache_config.ttl.as_secs()
-                );
-            } else {
-                info!(
-                    "Article cache enabled: max_capacity={}, ttl={}s (availability-only, bodies not cached)",
-                    cache_config.max_capacity,
-                    cache_config.ttl.as_secs()
-                );
-            }
+        if cache_articles {
+            info!(
+                "Article cache enabled: max_capacity={}, ttl={}s (full caching)",
+                cache_config.max_capacity,
+                cache_config.ttl.as_secs()
+            );
+        } else if capacity < crate::cache::AvailabilityIndex::fixed_capacity_bytes() {
+            info!(
+                "Availability-only cache disabled: configured budget {} is smaller than fixed index size {} bytes",
+                cache_config.max_capacity,
+                crate::cache::AvailabilityIndex::fixed_capacity_bytes()
+            );
         } else {
-            info!("Backend availability tracking enabled (fixed-size availability index)");
+            info!(
+                "Backend availability tracking enabled: max_capacity={}, ttl={}s (fixed-size availability index, bodies not cached)",
+                cache_config.max_capacity,
+                cache_config.ttl.as_secs()
+            );
         }
     }
 
@@ -274,7 +276,13 @@ impl NntpProxyBuilder {
             let cache_articles = cache_config.cache_articles;
 
             let cache = if !cache_articles {
-                Arc::new(UnifiedCache::availability(cache_config.ttl))
+                Arc::new(
+                    if capacity < crate::cache::AvailabilityIndex::fixed_capacity_bytes() {
+                        UnifiedCache::availability_disabled(cache_config.ttl)
+                    } else {
+                        UnifiedCache::availability(cache_config.ttl)
+                    },
+                )
             } else if let Some(disk_config) = &cache_config.disk {
                 let hybrid_config = HybridCacheConfig {
                     memory_capacity: capacity,
@@ -340,7 +348,14 @@ impl NntpProxyBuilder {
                 let capacity = cache_config.max_capacity.as_u64();
                 Arc::new(UnifiedCache::memory(capacity, cache_config.ttl))
             } else {
-                Arc::new(UnifiedCache::availability(cache_config.ttl))
+                let capacity = cache_config.max_capacity.as_u64();
+                Arc::new(
+                    if capacity < crate::cache::AvailabilityIndex::fixed_capacity_bytes() {
+                        UnifiedCache::availability_disabled(cache_config.ttl)
+                    } else {
+                        UnifiedCache::availability(cache_config.ttl)
+                    },
+                )
             };
 
             Self::log_cache_config(cache_config, cache_articles);
@@ -441,9 +456,26 @@ impl BuildContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::AvailabilityIndex;
+    use crate::config::Cache;
+    use crate::types::CacheCapacity;
+    use std::time::Duration;
 
     fn create_test_config() -> Config {
         super::super::tests::create_test_config()
+    }
+
+    fn availability_only_config(capacity: u64) -> Config {
+        let mut config = create_test_config();
+        config.cache = Some(Cache {
+            max_capacity: CacheCapacity::try_new(capacity).unwrap(),
+            ttl: Duration::from_secs(60),
+            cache_articles: false,
+            adaptive_precheck: false,
+            disk: None,
+            availability_file: None,
+        });
+        config
     }
 
     #[test]
@@ -493,6 +525,49 @@ mod tests {
 
         assert_eq!(proxy.servers().len(), 3);
         assert_eq!(proxy.router.backend_count(), 3);
+    }
+
+    #[test]
+    fn test_build_sync_disables_availability_index_when_budget_is_too_small() {
+        let proxy = NntpProxyBuilder::new(availability_only_config(1))
+            .build_sync()
+            .expect("Failed to build proxy");
+
+        assert!(!proxy.cache_articles);
+        assert_eq!(proxy.cache.capacity(), 0);
+        assert_eq!(proxy.cache.weighted_size(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_build_disables_availability_index_when_budget_is_too_small() {
+        let proxy = NntpProxyBuilder::new(availability_only_config(1))
+            .build()
+            .await
+            .expect("Failed to build proxy");
+
+        assert!(!proxy.cache_articles);
+        assert_eq!(proxy.cache.capacity(), 0);
+        assert_eq!(proxy.cache.weighted_size(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_build_enables_fixed_availability_index_when_budget_can_hold_it() {
+        let proxy = NntpProxyBuilder::new(availability_only_config(
+            AvailabilityIndex::fixed_capacity_bytes(),
+        ))
+        .build()
+        .await
+        .expect("Failed to build proxy");
+
+        assert!(!proxy.cache_articles);
+        assert_eq!(
+            proxy.cache.capacity(),
+            AvailabilityIndex::fixed_capacity_bytes()
+        );
+        assert_eq!(
+            proxy.cache.weighted_size(),
+            AvailabilityIndex::fixed_capacity_bytes()
+        );
     }
 
     #[test]
