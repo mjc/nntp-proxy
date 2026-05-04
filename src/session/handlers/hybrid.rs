@@ -14,7 +14,7 @@
 //!                                          │ 3. Hand off loop   │
 //!                                          └─────────┬─────────┘
 //!                                                    │
-//!                                          handle_stateful_proxy_loop()
+//!                                          run_stateful_proxy_loop()
 //! ```
 
 use crate::session::ClientSession;

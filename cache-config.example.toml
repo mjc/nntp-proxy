@@ -1,4 +1,5 @@
-# NNTP Caching Proxy Configuration
+# Cache-focused NNTP Proxy configuration
+# Use this with nntp-proxy or nntp-proxy-tui; caching is built in.
 
 # Backend NNTP servers
 [[servers]]
@@ -59,8 +60,8 @@ store_article_bodies = false
 # Health check configuration
 [health_check]
 # Interval between health checks in seconds
-interval_secs = 30
+interval = 30
 # Timeout for each health check in seconds
-timeout_secs = 5
+timeout = 5
 # Number of consecutive failures before marking unhealthy
 unhealthy_threshold = 3

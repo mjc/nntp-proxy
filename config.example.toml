@@ -52,10 +52,10 @@ article_cache_capacity = "256mb"
 # Time-to-live for the article cache, in seconds
 article_cache_ttl_secs = 3600
 # Default false: track backend availability only, without storing article bodies.
-# Set true to keep hot article bodies in memory.
+# This example sets true to enable full article-body caching (and the optional disk tier below).
 store_article_bodies = true
 # Optional persistence file for availability-only mode
-availability_index_path = "/var/cache/nntp-proxy/availability.idx"
+# availability_index_path = "/var/cache/nntp-proxy/availability.idx"
 
 # Disk Cache Configuration (optional)
 # When configured, evicted articles spill from memory to disk.
@@ -72,7 +72,7 @@ shards = 4
 [health_check]
 # Interval and timeout are in seconds
 interval = 30
-timeout = 10
+timeout = 5
 unhealthy_threshold = 3
 
 # Client Authentication Configuration

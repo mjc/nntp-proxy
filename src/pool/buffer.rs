@@ -144,7 +144,7 @@ impl PooledBuffer {
     ///
     /// # Performance
     ///
-    /// Capture buffers are pre-allocated with sufficient capacity (768KB) and
+    /// Capture buffers are pre-allocated with sufficient capacity (772KB by default) and
     /// pages are pre-faulted. As long as total accumulated data fits within
     /// capacity, this operation performs NO allocations or page faults.
     ///
@@ -540,7 +540,7 @@ impl BufferPool {
     /// Pages are pre-faulted to eliminate soft page faults during streaming.
     ///
     /// # Arguments
-    /// * `capacity` - Size of each capture buffer in bytes (e.g., 768KB)
+    /// * `capacity` - Size of each capture buffer in bytes (e.g., 772KB by default)
     /// * `count` - Number of capture buffers to pre-allocate
     #[must_use]
     pub fn with_capture_pool(mut self, capacity: usize, count: usize) -> Self {

@@ -9,9 +9,9 @@
 //!
 //! ## Cache Implementations
 //!
-//! - [`ArticleCache`] - In-memory only cache using moka (default when no disk config)
+//! - [`ArticleCache`] - In-memory body cache using moka when article bodies stay in memory
 //! - [`HybridArticleCache`] - Memory + disk cache using foyer (when `[cache.disk]` configured)
-//! - [`UnifiedCache`] - Enum that wraps either cache type with a common interface
+//! - [`UnifiedCache`] - Enum that wraps availability-only, memory, or hybrid cache modes
 
 mod article;
 mod availability;
@@ -332,10 +332,11 @@ impl CacheStatsProvider for HybridArticleCache {
     }
 }
 
-/// Unified cache that can be either memory-only (moka) or hybrid (foyer)
+/// Unified cache that can be availability-only, memory-only (moka), or hybrid (foyer)
 ///
-/// This enum provides a common interface for both cache implementations,
-/// allowing the proxy to use either based on configuration.
+/// This enum provides a common interface for all cache implementations,
+/// allowing the proxy to switch between availability-only, memory, and disk-backed
+/// caching based on configuration.
 #[derive(Debug)]
 pub enum UnifiedCache {
     /// Availability-only negative index with exact key matches.

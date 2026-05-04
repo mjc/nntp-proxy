@@ -36,7 +36,7 @@ pub struct NntpProxy {
     pub(super) connection_providers: Vec<DeadpoolConnectionProvider>,
     /// Buffer pool for I/O operations
     pub(super) buffer_pool: BufferPool,
-    /// Routing mode (Standard, `PerCommand`, or Hybrid)
+    /// Routing mode (`Stateful`, `PerCommand`, or `Hybrid`)
     pub(super) routing_mode: RoutingMode,
     /// Authentication handler for client auth interception
     pub(super) auth_handler: Arc<AuthHandler>,

@@ -1,6 +1,6 @@
 //! Integration tests for different routing modes
 //!
-//! Tests the three routing modes: Standard, `PerCommand`, and Hybrid
+//! Tests the three routing modes: `Stateful`, `PerCommand`, and `Hybrid`
 //! These tests exercise the session handler code paths that have low coverage.
 
 use anyhow::Result;

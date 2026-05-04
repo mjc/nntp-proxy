@@ -20,7 +20,8 @@ TLS, cache behavior, and live metrics in one place.
 ## Binaries
 
 - `nntp-proxy` runs the proxy server.
-- `nntp-proxy-tui` runs the proxy with a terminal dashboard.
+- `nntp-proxy-tui` runs the same proxy with a terminal dashboard.
+- Article caching is configured via `[cache]` for either binary; there is no separate cache-only executable.
 
 ## Quick Start
 
@@ -133,8 +134,8 @@ capture_pool_count = 16
 [cache]
 article_cache_capacity = "256mb"
 article_cache_ttl_secs = 3600
-store_article_bodies = false
-availability_index_path = "/var/cache/nntp-proxy/availability.idx"
+store_article_bodies = true
+# availability_index_path = "/var/cache/nntp-proxy/availability.idx"  # Only used when store_article_bodies = false
 
 # Optional article-body disk cache.
 [cache.disk]

@@ -1,286 +1,112 @@
-# NNTP Caching Proxy
+# NNTP Proxy Caching Guide
 
-A high-performance caching layer for NNTP proxy that sits between the regular proxy and real backend servers. This allows you to tune and test the main proxy without bandwidth limits from real-world backends.
+Caching is built into `nntp-proxy` and `nntp-proxy-tui`. There is no separate `nntp-cache-proxy` binary.
 
-## Architecture
+## Cache Modes
 
-```
-Client → Main Proxy (tunable/testable) → Caching Proxy → Real Backend
-```
+### Availability-only mode (default)
 
-The caching proxy:
-- Acts as a backend to the main NNTP proxy
-- Caches article content retrieved by message-ID
-- Reduces bandwidth usage on real backends
-- Enables realistic testing and tuning of the main proxy
+- `store_article_bodies = false`
+- Tracks which backends have or do not have a message-ID
+- Persists routing knowledge with `availability_index_path` if you want it to survive restarts
+- Does **not** store article payloads
 
-## Features
+### Full article-body cache
 
-- 🚀 **LRU Cache with TTL** - Uses Moka for high-performance async caching
-- 📦 **Article Caching** - Caches ARTICLE, BODY, HEAD, STAT responses by message-ID
-- ⏱️ **Configurable TTL** - Set cache expiration time per your needs
-- 📊 **Cache Statistics** - Periodic logging of cache hit rates and size
-- 🔄 **Full Proxy Features** - Inherits all standard proxy capabilities
+- `store_article_bodies = true`
+- Uses `article_cache_capacity` and `article_cache_ttl_secs` for the in-memory cache
+- Can serve cached `ARTICLE`, `BODY`, `HEAD`, and `STAT` responses for message-ID lookups
+- Can optionally spill evicted article bodies to `[cache.disk]`
 
 ## Quick Start
 
-### 1. Build the Caching Proxy
-
-```bash
-cargo build --release --bin nntp-cache-proxy
-```
-
-### 2. Configure the Caching Proxy
-
-Copy the example configuration:
+1. Copy the cache-focused example config:
 
 ```bash
 cp cache-config.example.toml cache-config.toml
 ```
 
-Edit `cache-config.toml` to point to your real backend servers:
+2. Point `[[servers]]` at your real backend servers.
 
-```toml
-[[servers]]
-host = "your-real-news-server.com"
-port = 119
-name = "Real News Server"
-username = "your_username"
-password = "your_password"
-max_connections = 10
-
-[cache]
-max_capacity = 67108864  # Cache size in bytes (64 MB)
-ttl_secs = 3600          # 1 hour cache lifetime
-```
-
-### 3. Start the Caching Proxy
-
-```bash
-./target/release/nntp-cache-proxy --port 8120 --config cache-config.toml
-```
-
-The caching proxy will listen on port 8120 by default.
-
-### 4. Configure Main Proxy to Use Caching Proxy
-
-Edit your main proxy's `config.toml`:
-
-```toml
-[[servers]]
-host = "localhost"
-port = 8120
-name = "Caching Proxy Backend"
-max_connections = 50  # Can be much higher since caching proxy is local
-```
-
-### 5. Start the Main Proxy
-
-```bash
-./target/release/nntp-proxy --port 8119 --config config.toml
-```
-
-Now clients connect to port 8119, which proxies through the caching layer on 8120.
-
-## Configuration Options
-
-### Command-Line Arguments
-
-- `--port <PORT>` - Port to listen on (default: 8120)
-- `--config <PATH>` - Configuration file path (default: cache-config.toml)
-- `--threads <N>` - Number of worker threads (default: number of CPUs)
-- `--cache-capacity <N>` - Cache capacity in articles (default: 10000)
-- `--cache-ttl <SECONDS>` - Cache TTL in seconds (default: 3600)
-
-### Configuration File
-
-The caching proxy uses the same configuration format as the main proxy, with an additional `[cache]` section:
+3. Enable full article-body caching if you want cached payloads:
 
 ```toml
 [cache]
-max_capacity = 67108864  # Cache size in bytes (64 MB)
-ttl_secs = 3600          # Time-to-live in seconds
+article_cache_capacity = "256mb"
+article_cache_ttl_secs = 3600
+store_article_bodies = true
+
+[cache.disk]
+path = "/var/cache/nntp-proxy"
+capacity = "10gb"
+compression = "lz4"
+shards = 4
 ```
 
-## How It Works
+4. Start the proxy:
 
-### Caching Strategy
+```bash
+./target/release/nntp-proxy --config cache-config.toml
+```
 
-The caching proxy intercepts commands and caches responses for:
+Or run the dashboard variant:
 
-- `ARTICLE <message-id>` - Full article with headers and body
-- `BODY <message-id>` - Article body only
-- `HEAD <message-id>` - Article headers only
-- `STAT <message-id>` - Article existence check
+```bash
+cargo run --bin nntp-proxy-tui -- --config cache-config.toml
+```
 
-**Cache Key**: Message-ID (e.g., `<article123@example.com>`)
+## CLI Overrides
 
-**Cache Hit**: Response served directly from cache, no backend query
-**Cache Miss**: Query forwarded to backend, response cached for future requests
+These flags work with either binary:
 
-### Non-Cached Commands
+- `--article-cache-capacity <SIZE>`
+- `--article-cache-ttl <SECONDS>`
+- `--store-article-bodies <true|false>`
 
-All other NNTP commands (LIST, CAPABILITIES, etc.) are forwarded directly to the backend without caching.
+The environment variable equivalents are:
 
-### Cache Eviction
+- `NNTP_PROXY_ARTICLE_CACHE_CAPACITY`
+- `NNTP_PROXY_ARTICLE_CACHE_TTL_SECS`
+- `NNTP_PROXY_STORE_ARTICLE_BODIES`
 
-The cache uses LRU (Least Recently Used) eviction:
-- When cache reaches `max_capacity`, oldest unused entries are evicted
-- Entries automatically expire after `ttl_secs` seconds
-- Both limits work together to manage memory usage
+## What Gets Cached
+
+The cache is for message-ID based article retrievals:
+
+- `ARTICLE <message-id>`
+- `BODY <message-id>`
+- `HEAD <message-id>`
+- `STAT <message-id>`
+
+Other commands are forwarded to the backend normally.
+
+## Disk Cache Notes
+
+`[cache.disk]` is only useful when `store_article_bodies = true`. In availability-only mode, the relevant persistence knob is `availability_index_path`.
+
+Recommended settings:
+
+- Put `path` on SSD/NVMe storage
+- Keep `compression = "lz4"` unless you specifically want better compression ratios
+- Increase `article_cache_capacity` before reaching for a very large disk tier
 
 ## Monitoring
 
-The caching proxy logs cache statistics every 60 seconds:
+- `nntp-proxy-tui` shows cache metrics live
+- The proxy also logs periodic cache statistics
+- `stats.json` persists metrics; `availability.idx` persists availability-only knowledge when enabled
 
-```
-Cache stats: entries=8523, size=156789
-```
+## Choosing a Mode
 
-- `entries`: Number of cached articles
-- `size`: Total cache memory usage (weighted)
+Use availability-only mode when you mainly want smarter backend routing and lower RAM use.
 
-## Use Cases
-
-### 1. Testing and Development
-
-Use the caching proxy to:
-- Test main proxy configurations without hitting real backends
-- Simulate high-volume scenarios with cached data
-- Tune connection pools and buffer sizes
-
-### 2. Bandwidth Optimization
-
-For users with:
-- Limited backend bandwidth
-- Expensive metered connections
-- High client request volumes for same articles
-
-### 3. Performance Testing
-
-- Establish a baseline with cached responses
-- Measure proxy overhead without backend latency
-- Test at scale without backend capacity limits
-
-## Performance Considerations
-
-### Memory Usage
-
-Cache memory usage depends on the mode:
-
-**Availability-only mode** (`cache_articles = false`, default):
-- ~1 KB per article (key + metadata + overhead)
-- 64 MB capacity ≈ 60,000+ articles tracked
-
-**Full caching mode** (`cache_articles = true`):
-- ~700 KB per article (typical Usenet article)
-- 512 MB capacity ≈ ~700 articles cached
-
-Set `max_capacity` to the desired cache size in bytes.
-
-### CPU Usage
-
-The caching proxy adds minimal CPU overhead:
-- Cache lookups are O(1) with Moka
-- No serialization/deserialization
-- Direct byte buffer forwarding
-
-### Network
-
-Place the caching proxy on the same machine as the main proxy for best performance:
-- Eliminates network latency for cache hits
-- Reduces bandwidth between proxy layers
-- Simplifies deployment
+Use full article-body caching when repeated message-ID reads are common and you want cache hits to avoid backend round-trips entirely.
 
 ## Limitations
 
-- **Stateless Only**: Only caches message-ID based retrievals (stateless commands)
-- **Memory Bound**: Cache size limited by available RAM
-- **No Persistence**: Cache is in-memory only, lost on restart
-- **Single Instance**: No distributed caching support
-
-## Example Deployment
-
-### Development Setup
-
-```bash
-# Terminal 1: Start caching proxy
-./target/release/nntp-cache-proxy --port 8120
-
-# Terminal 2: Start main proxy pointing to caching proxy
-./target/release/nntp-proxy --port 8119
-
-# Terminal 3: Test with NNTP client
-telnet localhost 8119
-```
-
-### Production Setup
-
-Use systemd or similar to manage both processes:
-
-```ini
-# /etc/systemd/system/nntp-cache-proxy.service
-[Unit]
-Description=NNTP Caching Proxy
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/nntp-cache-proxy --port 8120 --config /etc/nntp/cache-config.toml
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-## Troubleshooting
-
-### Cache Not Working
-
-Check logs for "Cache HIT" and "Cache MISS" messages:
-
-```
-Cache MISS for message-ID: <article123@example.com>
-Caching response for message-ID: <article123@example.com>
-Cache HIT for message-ID: <article123@example.com>
-```
-
-### High Memory Usage
-
-Reduce `max_capacity` in configuration or via `--cache-capacity` flag.
-
-### Backend Connection Issues
-
-The caching proxy uses standard proxy connection pooling. Check:
-- Backend server is reachable
-- Credentials are correct
-- `max_connections` is appropriate
-
-## Advanced Configuration
-
-### Multiple Backend Servers
-
-The caching proxy supports multiple backends with round-robin load balancing:
-
-```toml
-[[servers]]
-host = "news1.example.com"
-port = 119
-name = "Backend 1"
-
-[[servers]]
-host = "news2.example.com"
-port = 119
-name = "Backend 2"
-```
-
-### Custom Cache TTL
-
-Adjust cache lifetime based on your content:
-
-- News articles (rarely change): `ttl_secs = 86400` (24 hours)
-- Binary downloads (static): `ttl_secs = 604800` (7 days)
-- Frequently updated: `ttl_secs = 1800` (30 minutes)
+- Caching is keyed by message-ID; article-number commands are not cacheable across backends
+- Availability-only mode stores backend knowledge, not article bodies
+- Disk cache stores article bodies, so it is not active in availability-only mode
 
 ## License
 

@@ -40,7 +40,7 @@ pub mod buffer {
     /// Default number of capture buffers in the pool.
     ///
     /// Sized for 16 concurrent caching operations.
-    /// Total memory: 16 × 768KB ≈ 12MB.
+    /// Total memory: 16 × 772KB ≈ 12MB.
     /// This is a conservative default; increase via config for higher caching throughput.
     pub const CAPTURE_COUNT: usize = 16;
 

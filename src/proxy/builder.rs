@@ -68,7 +68,7 @@ pub struct NntpProxyBuilder {
 impl NntpProxyBuilder {
     /// Create a new builder with the given configuration
     ///
-    /// The routing mode defaults to `Stateful` (1:1) mode.
+    /// The routing mode starts from `config.routing.routing_mode` (`Hybrid` by default).
     #[must_use]
     pub const fn new(config: Config) -> Self {
         let routing_mode = config.routing.routing_mode;
@@ -84,7 +84,7 @@ impl NntpProxyBuilder {
     /// Set the routing mode
     ///
     /// Available modes:
-    /// - `Standard`: 1:1 client-to-backend mapping (default)
+    /// - `Stateful`: 1:1 client-to-backend mapping
     /// - `PerCommand`: Each command routes to a different backend
     /// - `Hybrid`: Starts in per-command mode, switches to stateful when needed
     #[must_use]
@@ -93,7 +93,7 @@ impl NntpProxyBuilder {
         self
     }
 
-    /// Override the default buffer pool size (256KB)
+    /// Override the configured main buffer pool size (724KB by default)
     ///
     /// This affects the size of each buffer in the pool. Larger buffers
     /// can improve throughput for large article transfers but use more memory.
@@ -103,7 +103,7 @@ impl NntpProxyBuilder {
         self
     }
 
-    /// Override the default buffer pool count (32)
+    /// Override the configured main buffer pool count (50 by default)
     ///
     /// This affects how many buffers are pre-allocated. Should roughly match
     /// the expected number of concurrent connections.

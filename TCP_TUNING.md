@@ -1,225 +1,203 @@
 # TCP Tuning Guide for High-Performance NNTP Proxy
 
-This document describes TCP optimizations for maximizing throughput and minimizing latency in the NNTP proxy.
+This document separates two things that were previously mixed together:
 
-## Application-Level Optimizations (Built-in)
+1. **Socket options the proxy actually sets today**
+2. **Optional operating-system tuning that may help some deployments**
 
-The proxy automatically applies the following TCP optimizations:
+The first section is meant to track the current implementation. The later OS-level
+sections are general guidance, not project-benchmarked guarantees.
 
-### Cross-Platform (Linux, macOS, Windows)
-- **Large socket buffers**: 16MB send/receive for high-throughput connections, 4MB for pooled connections
-- **SO_LINGER**: 5-second timeout to prevent indefinite blocking on socket close
-- **TCP keepalive**: Probes after 60s idle, retries every 10s
-- **TCP_NODELAY**: Enabled on pooled backend connections for lower latency
-- **SO_REUSEADDR**: Allows quick socket reuse after connection close
+## Socket Options Applied by the Proxy
 
-### Linux-Specific
-- **TCP_USER_TIMEOUT**: 30-second timeout for faster dead connection detection (vs default ~15 minutes)
-- **IP_TOS**: Marks packets for throughput optimization (0x08 = IPTOS_THROUGHPUT)
+The proxy does not apply one uniform set of TCP options to every socket. Client
+connections and pooled backend connections are configured a little differently.
 
-## System-Level Tuning (Optional but Recommended)
+### Client connections
 
-These require root/admin privileges and system configuration changes.
+Accepted client sockets go through the optimizer in `src/network.rs` and get:
+
+- **Configurable receive/send buffer sizes** via `[memory].socket_recv_buffer_size`
+  and `[memory].socket_send_buffer_size` (16 MiB defaults)
+- **`SO_LINGER=5s`**
+- **`TCP_NODELAY`**
+- On **Linux only**, best-effort:
+  - **`TCP_USER_TIMEOUT=30s`**
+  - **`IP_TOS=0x08`** (`IPTOS_THROUGHPUT`)
+
+Linux-specific options are best-effort: the proxy logs a debug message if the OS
+rejects them, but it does not fail startup or the client connection.
+
+### Pooled backend connections
+
+Backend sockets created for the connection pool in `src/pool/deadpool_connection.rs`
+get:
+
+- **Configurable receive/send buffer sizes** before connect
+- **`SO_REUSEADDR`** before connect
+- **Socket-level TCP keepalive** after connect:
+  - idle time: **60s**
+  - interval: **10s**
+- **`TCP_NODELAY`** after connect
+
+This is distinct from the optional NNTP-level `connection_keepalive` setting in
+the config, which controls periodic `DATE` health probes on idle pooled backend
+connections.
+
+## OS-Level Tuning (Optional)
+
+These changes require root or administrator access and are deployment-specific.
+They are not validated by the repository test suite, and the throughput gains
+depend heavily on WAN latency, packet loss, backend behavior, and host limits.
 
 ### Linux
 
-#### 1. TCP Congestion Control - BBR (Highly Recommended for Backend Connections)
+#### 1. Consider BBR for remote backend links
 
-**Note:** This only affects proxy ↔ backend server connections over the internet. Localhost client connections don't use congestion control at all (loopback has no congestion).
-
-BBR (Bottleneck Bandwidth and RTT) achieves significantly higher throughput than the default CUBIC algorithm, especially on high-bandwidth, long-distance connections to NNTP backend servers.
+BBR can help when the proxy talks to **remote** NNTP backends over the internet,
+especially on higher-latency or lossy links. It is unlikely to matter for
+localhost traffic and may not matter much on a fast LAN.
 
 ```bash
 # Check current congestion control algorithm
 sysctl net.ipv4.tcp_congestion_control
 
 # Enable BBR (requires Linux 4.9+)
-# This affects all TCP connections, including proxy → backend
 echo "net.core.default_qdisc=fq" | sudo tee -a /etc/sysctl.conf
 echo "net.ipv4.tcp_congestion_control=bbr" | sudo tee -a /etc/sysctl.conf
 sudo sysctl -p
-
-# Verify
-sysctl net.ipv4.tcp_congestion_control
-# Should show: net.ipv4.tcp_congestion_control = bbr
 ```
 
-**When BBR helps:**
-- ✅ Proxy running on cloud server connecting to remote NNTP servers
-- ✅ High-latency links (>20ms RTT)
-- ✅ Connections with packet loss or variable bandwidth
+Use this only if you are comfortable making a host-wide TCP policy change.
 
-**When BBR doesn't matter:**
-- ❌ Client → Proxy (localhost) - no congestion control used
-- ❌ LAN connections (minimal congestion)
-- ❌ Very low latency links (<5ms RTT)
+#### 2. Raise OS socket-buffer limits if your configured buffers are being clamped
 
-#### 2. Increase Maximum Socket Buffer Sizes
-
-The proxy requests 16MB socket buffers, but if the system maximum is lower, it will be clamped. Raise the system limits:
+The proxy requests the configured socket buffer sizes, but the OS can clamp those
+requests to lower maxima.
 
 ```bash
-# Current maximums (often 4MB or less by default)
+# Inspect current maxima
 sysctl net.core.rmem_max
 sysctl net.core.wmem_max
 
-# Set to 32MB to allow room for 16MB application buffers
+# Example: allow room for 16 MiB application buffers
 echo "net.core.rmem_max=33554432" | sudo tee -a /etc/sysctl.conf
 echo "net.core.wmem_max=33554432" | sudo tee -a /etc/sysctl.conf
 
-# TCP auto-tuning ranges: min, default, max (in bytes)
+# TCP autotuning ranges: min, default, max
 echo "net.ipv4.tcp_rmem=4096 87380 33554432" | sudo tee -a /etc/sysctl.conf
 echo "net.ipv4.tcp_wmem=4096 65536 33554432" | sudo tee -a /etc/sysctl.conf
-
-# Apply
 sudo sysctl -p
 ```
 
-#### 3. Enable TCP Window Scaling (Usually Already Enabled)
+If you do not need 16 MiB buffers, lowering the application config is usually
+safer than raising global sysctl limits.
 
-Required for window sizes >64KB. Verify it's enabled:
+#### 3. Check that window scaling is enabled
+
+Required for buffers larger than 64 KiB.
 
 ```bash
 sysctl net.ipv4.tcp_window_scaling
-# Should be: net.ipv4.tcp_window_scaling = 1
 ```
 
-#### 4. Additional Performance Tweaks
+#### 4. Other sysctl tweaks
 
-```bash
-# Increase max backlog for incoming connections
-echo "net.core.netdev_max_backlog=5000" | sudo tee -a /etc/sysctl.conf
-
-# Increase max orphaned TCP connections
-echo "net.ipv4.tcp_max_orphans=262144" | sudo tee -a /etc/sysctl.conf
-
-# Faster TIME_WAIT socket recycling (be careful with this)
-echo "net.ipv4.tcp_tw_reuse=1" | sudo tee -a /etc/sysctl.conf
-
-# Apply all
-sudo sysctl -p
-```
+Settings like `net.core.netdev_max_backlog`, `tcp_max_orphans`, or
+`tcp_tw_reuse` are generic Linux tuning knobs. They may help some installations,
+but this project does not depend on them and does not benchmark them directly.
+Treat them as host-level tuning, not proxy-specific requirements.
 
 ### Windows
 
-#### 1. Increase TCP Window Size
-
-Windows auto-tuning is usually good, but you can optimize:
+Windows autotuning is usually reasonable already. If you tune it, treat the
+changes as general Windows TCP policy rather than something specific to this
+proxy.
 
 ```powershell
-# Check current auto-tuning level (should be "normal")
 netsh interface tcp show global
-
-# Set to experimental for maximum throughput (use with caution)
-netsh interface tcp set global autotuninglevel=experimental
-
-# Or stick with normal (recommended)
 netsh interface tcp set global autotuninglevel=normal
-
-# Enable window scaling
-netsh interface tcp set global chimney=enabled
-netsh interface tcp set global rss=enabled
-netsh interface tcp set global netdma=enabled
 ```
 
-#### 2. Disable Nagle's Algorithm System-Wide (Optional)
-
-The proxy already sets TCP_NODELAY per-socket, but you can disable Nagle globally:
-
-```powershell
-# Requires admin PowerShell
-reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v TcpAckFrequency /t REG_DWORD /d 1 /f
-reg add "HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters" /v TCPNoDelay /t REG_DWORD /d 1 /f
-
-# Restart required
-```
+Be cautious with older advice around `chimney`, `rss`, `netdma`, registry-wide
+Nagle tweaks, or experimental autotuning modes; those are platform-level changes
+with tradeoffs and are not validated here.
 
 ### macOS
 
-macOS has good defaults for most scenarios. Optional tweaks:
+macOS usually needs less manual tuning. If you change system socket-buffer
+defaults, treat that as host-specific tuning and verify it with normal macOS
+network tools.
 
 ```bash
-# Increase socket buffer sizes
 sudo sysctl -w net.inet.tcp.sendspace=2097152
 sudo sysctl -w net.inet.tcp.recvspace=2097152
-
-# Make permanent by adding to /etc/sysctl.conf:
-echo "net.inet.tcp.sendspace=2097152" | sudo tee -a /etc/sysctl.conf
-echo "net.inet.tcp.recvspace=2097152" | sudo tee -a /etc/sysctl.conf
 ```
 
 ## Verification
 
-### Check Applied Settings
+### Check applied settings on live sockets
+
+On Linux, inspect live sockets rather than assuming the requested values were
+accepted unchanged:
 
 ```bash
-# Linux: View actual socket buffer sizes of a running connection
+# Inspect listening and connected sockets
 ss -tmi | grep -A 10 ":8119"
 
-# Or with netstat
-netstat -tnp | grep nntp-proxy
-
-# Check if BBR is active
-ss -ti | grep bbr
+# Inspect backend flows more directly when possible
+ss -ti
 ```
 
-### Benchmark
+If you are tuning remote backend performance, focus on the **proxy-to-backend**
+connections, not just the local client-to-proxy leg.
 
-Test throughput before and after tuning:
+### Measure realistic workloads
 
-```bash
-# Download a large article and measure speed
-time echo "ARTICLE <message-id>" | nc localhost 8119 > /dev/null
+Do not use a localhost `nc` command as proof that backend-side TCP tuning helped;
+that mostly exercises the local client-to-proxy path.
 
-# Or use a proper NNTP client with speed measurement
-```
+Prefer:
 
-## Expected Performance Impact
+- a real NNTP client workload through the proxy
+- repeated message-ID fetches against representative remote backends
+- before/after measurements of throughput, latency, retransmits, and error rates
 
-**Important:** These optimizations primarily affect **proxy ↔ backend** connections. Client ↔ proxy (localhost) performance is already optimal due to loopback's inherent characteristics (no congestion, memory-speed bandwidth).
+## Expected Impact
 
-| Optimization | Throughput Gain | Latency Improvement | Applies To | Complexity |
-|--------------|----------------|---------------------|------------|------------|
-| BBR congestion control | +20-40% | Moderate | Backend only | Low |
-| 16MB socket buffers | +10-30% | Minimal | Both | None (automatic) |
-| TCP_USER_TIMEOUT | 0% | High (failure detection) | Backend only | None (automatic) |
-| SO_LINGER | 0% | High (clean shutdown) | Both | None (automatic) |
-| Window scaling | Essential for >64KB windows | Minimal | Backend only | Usually enabled |
+The likely payoff depends on where the bottleneck is:
+
+- **Remote backend links:** BBR and larger OS socket maxima may help
+- **Localhost or low-latency LAN:** expect little benefit from host-level TCP tuning
+- **Failure detection:** `TCP_USER_TIMEOUT`, socket keepalive, and NNTP health
+  probes help more with cleanup and reuse safety than raw throughput
+- **Memory pressure:** large socket buffers improve headroom for throughput but
+  increase per-connection memory use
 
 ## Troubleshooting
 
 ### "Cannot allocate memory" errors
 
-Reduce buffer sizes in `src/constants.rs`:
-```rust
-pub const HIGH_THROUGHPUT_RECV_BUFFER: usize = 8 * 1024 * 1024;  // 8MB instead of 16MB
-pub const HIGH_THROUGHPUT_SEND_BUFFER: usize = 8 * 1024 * 1024;
+Reduce configured socket buffers before changing source code:
+
+```toml
+[memory]
+socket_recv_buffer_size = 8388608
+socket_send_buffer_size = 8388608
 ```
+
+If RAM usage is still too high, also lower `buffer_pool_count` and
+`capture_pool_count`.
 
 ### Windows: "An invalid argument was supplied"
 
-Windows has different limits. The proxy will gracefully fall back if buffer allocation fails.
+Windows socket limits differ from Linux. Use smaller configured buffer sizes if
+necessary.
 
-### Verify sysctl changes persist after reboot
+### Make sysctl changes persistent
 
-Add to `/etc/sysctl.conf` or create a file in `/etc/sysctl.d/99-nntp-proxy.conf`
-
-## Platform-Specific Notes
-
-### Linux
-- **Best platform for maximum performance** due to BBR, TCP_USER_TIMEOUT, and extensive tuning options
-- Kernel 4.9+ recommended for BBR support
-- Use `ss -ti` to inspect live connection parameters
-
-### Windows
-- **Good performance with default settings** - auto-tuning works well
-- Per-socket optimizations (buffers, linger) are applied automatically
-- System-wide tuning options are more limited than Linux
-
-### macOS
-- **Good default behavior** for most use cases
-- Limited tuning options compared to Linux
-- Focus on application-level optimizations (already built-in)
+Persist Linux sysctl settings in `/etc/sysctl.conf` or a file under
+`/etc/sysctl.d/`.
 
 ## References
 

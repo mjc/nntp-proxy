@@ -60,7 +60,7 @@ pub const fn cache_ttl() -> Duration {
     Duration::from_hours(1)
 }
 
-/// Default for caching article bodies (true = full caching)
+/// Default for caching article bodies (false = availability-only mode)
 #[inline]
 pub const fn cache_articles() -> bool {
     false

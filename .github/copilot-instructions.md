@@ -2,8 +2,8 @@
 
 This document provides comprehensive guidance for understanding and working with the NNTP Proxy codebase. It is optimized for GitHub Copilot to provide better context-aware suggestions.
 
-**Last Updated:** November 20, 2025  
-**Version:** 0.2.3  
+**Last Updated:** May 4, 2026  
+**Version:** 0.4.0  
 **Rust Edition:** 2024  
 **MSRV:** 1.85+
 
@@ -28,7 +28,7 @@ This document provides comprehensive guidance for understanding and working with
 
 A high-performance NNTP (Network News Transfer Protocol) proxy server written in Rust with:
 - **Hybrid routing mode** - Intelligent per-command routing that auto-switches to stateful when needed (default)
-- **Round-robin load balancing** - Distributes connections across multiple backend servers
+- **Health-aware load balancing** - Uses least-loaded or weighted round-robin backend selection
 - **TLS/SSL support** - Secure backend connections using rustls
 - **Connection pooling** - Pre-authenticated connections with deadpool
 - **Article caching** - Optional LRU cache for frequently accessed articles
@@ -44,8 +44,8 @@ A high-performance NNTP (Network News Transfer Protocol) proxy server written in
 
 ### Binary Targets
 
-1. **`nntp-proxy`** - Main proxy server with three routing modes
-2. **`nntp-cache-proxy`** - Caching variant with article cache layer
+1. **`nntp-proxy`** - Main proxy server with three routing modes and built-in caching
+2. **`nntp-proxy-tui`** - Same proxy with the terminal dashboard enabled
 
 ---
 
@@ -69,14 +69,14 @@ Client → Proxy (Routing Logic) → Backend Pool → Backend Server(s)
 - Seamlessly switches to dedicated backend connection
 - **Best for:** Universal compatibility with optimal performance
 
-#### 2. **Standard Mode** (`--routing-mode standard`)
+#### 2. **Stateful Mode** (`--routing-mode stateful`)
 - Traditional 1:1 client-to-backend mapping
 - Each client gets dedicated backend connection
 - Full NNTP protocol support
 - **Best for:** Maximum compatibility, debugging, legacy deployments
 
 #### 3. **Per-Command Mode** (`--routing-mode per-command`)
-- Each command routes independently (round-robin)
+- Each command routes independently using the configured backend-selection strategy
 - Rejects stateful commands (GROUP, NEXT, LAST, XOVER, etc.)
 - Only supports message-ID based operations
 - **Best for:** Indexing tools, specialized workloads
@@ -87,7 +87,7 @@ Client → Proxy (Routing Logic) → Backend Pool → Backend Server(s)
 1. Client connects → TcpStream
 2. Proxy sends greeting (200 NNTP Proxy Ready)
 3. Client sends command → Command Parser
-4. Router selects backend (round-robin)
+4. Router selects backend (configured strategy)
 5. Get connection from pool
 6. Forward command → Backend
 7. Stream response → Client (zero-copy)
@@ -116,116 +116,39 @@ Client → Proxy (Routing Logic) → Backend Pool → Backend Server(s)
 
 ```
 src/
-├── lib.rs                    # Public API exports, module declarations
-├── main binaries
-│   ├── bin/
-│   │   ├── nntp-proxy.rs            # Main proxy server
-│   │   └── nntp-cache-proxy.rs      # Caching variant
-│
-├── core types
-│   ├── types.rs                     # ClientId, BackendId, core types
-│   ├── types/
-│   │   ├── config.rs               # BufferSize, Port, validated types
-│   │   ├── metrics.rs              # BytesTransferred, TransferMetrics
-│   │   ├── protocol.rs             # MessageId
-│   │   └── validated.rs            # HostName, ServerName validation
-│
-├── configuration
-│   ├── config/
-│   │   ├── mod.rs                  # Public exports
-│   │   ├── types.rs                # Config, ServerConfig, RoutingMode
-│   │   ├── defaults.rs             # Default values for config
-│   │   ├── loading.rs              # TOML parsing and validation
-│   │   └── validation.rs           # Config validation logic
-│
-├── protocol handling
-│   ├── protocol/
-│   │   ├── mod.rs                  # Public exports
-│   │   ├── commands.rs             # Command construction helpers
-│   │   ├── response.rs             # Response parsing (NntpResponse, ResponseCode)
-│   │   └── responses.rs            # Response constants (AUTH_REQUIRED, etc.)
-│
-├── command processing
-│   ├── command/
-│   │   ├── mod.rs                  # Public exports
-│   │   ├── classifier.rs           # ULTRA-FAST command classification (4-6ns hot path)
-│   │   └── handler.rs              # CommandHandler, CommandAction, AuthAction
-│
-├── session management
-│   ├── session/
-│   │   ├── mod.rs                  # ClientSession, SessionMode
-│   │   ├── backend.rs              # Backend command execution
-│   │   ├── connection.rs           # Connection state management
-│   │   ├── error_classification.rs # Error classification utilities
-│   │   ├── handlers/
-│   │   │   ├── standard.rs         # 1:1 mode handler
-│   │   │   ├── per_command.rs      # Per-command routing handler
-│   │   │   └── hybrid.rs           # Hybrid mode switching logic
-│   │   └── streaming/
-│   │       ├── mod.rs              # Streaming utilities
-│   │       ├── client.rs           # Client streaming helpers
-│   │       └── tail_buffer.rs      # Terminator detection across chunks
-│
-├── routing and load balancing
-│   ├── router/
-│   │   ├── mod.rs                  # BackendSelector (round-robin)
-│   │   └── tests/                  # Router tests
-│
-├── connection pooling
-│   ├── pool/
-│   │   ├── mod.rs                  # Public exports
-│   │   ├── buffer.rs               # BufferPool, PooledBuffer (crossbeam-based)
-│   │   ├── connection_pool.rs      # Generic connection pool
-│   │   ├── connection_trait.rs     # ConnectionProvider trait
-│   │   ├── deadpool_connection.rs  # Deadpool-based provider
-│   │   ├── connection_guard.rs     # RAII guard for error handling
-│   │   ├── health_check.rs         # Health checking (TCP + DATE command)
-│   │   └── prewarming.rs           # Connection prewarming
-│
-├── authentication
-│   ├── auth/
-│   │   ├── mod.rs                  # Public exports
-│   │   ├── handler.rs              # AuthHandler (client auth)
-│   │   └── backend.rs              # BackendAuthenticator
-│
-├── caching
-│   ├── cache/
-│   │   ├── mod.rs                  # Public exports
-│   │   ├── article.rs              # ArticleCache (moka-based LRU)
-│   │   └── session.rs              # CachingSession
-│
-├── networking
-│   ├── network.rs                  # SocketOptimizer
-│   ├── network/
-│   │   └── optimizers.rs           # NetworkOptimizer trait, implementations
-│   ├── stream.rs                   # ConnectionStream (Plain/TLS enum)
-│   └── tls.rs                      # TLS configuration and helpers
-│
-├── utilities
-│   ├── constants.rs                # All magic numbers (buffer sizes, timeouts)
-│   ├── formatting.rs               # Display helpers (bytes, IDs)
-│   ├── proxy.rs                    # NntpProxy, NntpProxyBuilder
-│   └── connection_error.rs         # ConnectionError type
-│
-└── health monitoring
-    └── health/
-        ├── mod.rs                  # Public exports
-        └── types.rs                # Health check types
+├── lib.rs                    # Public API exports and module declarations
+├── bin/                      # nntp-proxy and nntp-proxy-tui binaries
+├── args.rs                   # Shared CLI/env argument handling
+├── auth/                     # Client and backend authentication
+├── cache/                    # Memory, disk, and availability caching
+├── command/                  # Command classification and handling
+├── config/                   # Config types, defaults, loading, validation
+├── metrics/                  # Metrics collection and persistence
+├── pool/                     # Connection and buffer pools
+├── protocol/                 # NNTP commands, responses, status parsing
+├── proxy/                    # Builder and proxy lifecycle orchestration
+├── router/                   # Backend selection strategies and queues
+├── runtime.rs                # Shared runtime/bootstrap helpers
+├── session/                  # Session state, handlers, streaming, retries
+├── stream/                   # Plain/TLS/compressed connection stream types
+├── tls.rs                    # TLS configuration and helpers
+├── tui/                      # Terminal dashboard
+└── types/ + types.rs         # Domain types and validated wrappers
 ```
 
 ### Test Organization (`tests/`)
 
 ```
 tests/
-├── test_helpers.rs              # Reusable test utilities, mock servers
-├── config_helpers.rs            # Config creation helpers
-├── integration_tests.rs         # Main integration test suite
-├── test_authentication.rs       # Auth basic tests
-├── test_auth_integration.rs     # Auth integration tests
-├── test_auth_security.rs        # Auth security tests
-├── test_auth_bypass_prevention.rs # Auth bypass prevention
-├── test_duplicate_greeting.rs   # Greeting deduplication tests
-└── test_review_claims.rs        # Performance claims validation
+├── integration_tests.rs      # End-to-end proxy behavior
+├── proxy/                    # Config, routing, and proxy integration suites
+├── rfc3977/                  # RFC 3977 compliance coverage
+├── rfc4643/                  # RFC 4643 auth coverage
+├── cache/                    # Cache-specific integration tests
+├── test_helpers.rs           # Shared test utilities and mock servers
+├── test_metrics.rs           # Metrics coverage
+├── test_properties.rs        # Property-based tests
+└── test_rfc_protocol_bugs.rs # Regression coverage for protocol edge cases
 ```
 
 ---
@@ -736,7 +659,7 @@ async fn stream_multiline_response(
 /// Creates connections in batches to avoid overwhelming backends
 pub async fn prewarm_pools(
     providers: &[DeadpoolConnectionProvider],
-    servers: &[ServerConfig],
+    servers: &[Server],
 ) -> Result<()> {
     let tasks: Vec<_> = providers
         .iter()
@@ -937,11 +860,12 @@ pub async fn get_random_port() -> u16 {
 
 /// Create test configuration
 pub fn create_test_config() -> Config {
-    use crate::config::ServerConfig;
+    use crate::config::Server;
+    use crate::types::Port;
     
     Config {
         servers: vec![
-            ServerConfig::builder("localhost", 119)
+            Server::builder("localhost", Port::try_new(119).unwrap())
                 .name("Test Server")
                 .build()
                 .unwrap()
@@ -1272,11 +1196,12 @@ use_tls = false
 
 **Programmatically:**
 ```rust
-use nntp_proxy::config::ServerConfig;
+use nntp_proxy::config::Server;
+use nntp_proxy::types::{MaxConnections, Port};
 
-let server = ServerConfig::builder("news.example.com", 119)
+let server = Server::builder("news.example.com", Port::try_new(119).unwrap())
     .name("Example Server")
-    .max_connections(15)
+    .max_connections(MaxConnections::try_new(15).unwrap())
     .use_tls(true)
     .tls_verify_cert(true)
     .build()?;
@@ -1361,6 +1286,9 @@ fn test_new_command_classification() {
 **In `config.toml`:**
 ```toml
 [client_auth]
+greeting = "200 NNTP proxy ready"
+
+[[client_auth.users]]
 username = "proxyuser"
 password = "securepassword"
 ```
@@ -1368,10 +1296,12 @@ password = "securepassword"
 **Programmatically:**
 ```rust
 let config = Config {
-    client_auth: ClientAuthConfig {
-        username: Some("proxyuser".to_string()),
-        password: Some("securepassword".to_string()),
+    client_auth: ClientAuth {
         greeting: None,
+        users: vec![UserCredentials {
+            username: "proxyuser".to_string(),
+            password: "securepassword".to_string(),
+        }],
     },
     ..Default::default()
 };
@@ -1379,23 +1309,23 @@ let config = Config {
 
 ### 5. Enabling Article Caching
 
-**Use the caching proxy binary:**
+**Caching is built into the main binaries:**
 
 ```bash
-# Run caching proxy
-./target/release/nntp-cache-proxy \
-    --port 8120 \
+./target/release/nntp-proxy \
     --config cache-config.toml \
-    --cache-capacity 10000 \
-    --cache-ttl 3600
+    --article-cache-capacity 256mb \
+    --article-cache-ttl 3600 \
+    --store-article-bodies true
 ```
 
 **Configuration:**
 ```toml
 # cache-config.toml
 [cache]
-max_capacity = 10000  # Number of articles
-ttl = 3600           # Time-to-live in seconds
+article_cache_capacity = "256mb"
+article_cache_ttl_secs = 3600
+store_article_bodies = true
 ```
 
 ### 6. Debugging Connection Issues
@@ -1529,7 +1459,7 @@ sudo systemctl status nntp-proxy
 
 **3. "Command not supported"**
 - Using stateful command in per-command mode
-- Switch to hybrid or standard mode
+- Switch to hybrid or stateful mode
 - Or use message-ID based commands
 
 **4. "Authentication failed"**
@@ -1577,7 +1507,7 @@ sudo systemctl status nntp-proxy
    ```bash
    cargo fmt
    cargo clippy --all-targets --all-features
-   cargo test
+   cargo nextest run
    ```
 
 ### Pre-1.0 Development
@@ -1622,7 +1552,7 @@ This project uses `direnv` to automatically manage the Nix development environme
 ```bash
 # ✅ CORRECT - Run commands in current directory (direnv already active)
 cargo build
-cargo test
+cargo nextest run
 
 # ❌ WRONG - Don't try to cd in scripts/automation
 cd /home/mjc/projects/nntp-proxy && cargo build  # Bypasses direnv!
