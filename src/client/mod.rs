@@ -217,7 +217,7 @@ impl NntpClient {
     ) -> Result<()> {
         use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
 
-        let first_chunk = &io_buffer.as_mut_slice()[..first_chunk_size];
+        let first_chunk = &io_buffer[..first_chunk_size];
         let mut tail = TailBuffer::default();
 
         match tail.detect_terminator(first_chunk) {
@@ -245,20 +245,20 @@ impl NntpClient {
             }
             // NLL: chunk borrow ends before next read_from call
             let found_at = {
-                let chunk = &io_buffer.as_mut_slice()[..n];
+                let chunk = &io_buffer[..n];
                 tail.detect_terminator(chunk)
             };
             match found_at {
                 TerminatorStatus::FoundAt(pos) => {
                     // pos is after the terminator (terminator included in [..pos])
-                    capture.extend_from_slice(&io_buffer.as_mut_slice()[..pos]);
+                    capture.extend_from_slice(&io_buffer[..pos]);
                     if pos < n {
-                        conn.stash_leftover(&io_buffer.as_mut_slice()[pos..n])?;
+                        conn.stash_leftover(&io_buffer[pos..n])?;
                     }
                     return Ok(());
                 }
                 TerminatorStatus::NotFound => {
-                    let chunk = &io_buffer.as_mut_slice()[..n];
+                    let chunk = &io_buffer[..n];
                     tail.update(chunk);
                     capture.extend_from_slice(chunk);
                 }
