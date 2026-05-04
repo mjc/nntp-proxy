@@ -105,7 +105,6 @@ impl ClientSession {
         &self,
         router: &Arc<BackendSelector>,
         request: &mut RequestContext,
-        msg_id: Option<&crate::types::MessageId<'_>>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         state: &mut ArticleAttemptState<'_>,
     ) -> Result<BackendAttemptResult, SessionError> {
@@ -130,6 +129,7 @@ impl ClientSession {
             return Ok(BackendAttemptResult::ArticleNotFound { backend_id });
         }
 
+        let msg_id = request.message_id_value();
         let response = self
             .stream_successful_backend_response(
                 conn,
@@ -137,7 +137,7 @@ impl ClientSession {
                 backend_id,
                 ResponseStreamParams {
                     request,
-                    msg_id,
+                    msg_id: msg_id.as_ref(),
                     status_code,
                     first_chunk: &state.buffer[..cmd_response.bytes_read],
                 },
@@ -154,6 +154,7 @@ impl ClientSession {
         request: &RequestContext,
         state: &mut ArticleAttemptState<'_>,
     ) -> Result<PreparedBackendAttempt, SessionError> {
+        let request_wire_len = request.request_wire_len().get();
         let (conn, cmd_response, timings) = retry_once!(
             self.execute_backend_attempt(provider, backend_id, request, state.buffer)
                 .await,
@@ -165,9 +166,7 @@ impl ClientSession {
         if let Some((ttfb, send, recv)) = timings {
             self.record_timing_metrics(backend_id, ttfb, send, recv);
         }
-        *state.client_to_backend_bytes = state
-            .client_to_backend_bytes
-            .add(request.request_wire_len().get());
+        *state.client_to_backend_bytes = state.client_to_backend_bytes.add(request_wire_len);
 
         let Some(status_code) = cmd_response.status_code() else {
             self.handle_invalid_backend_response(
