@@ -21,6 +21,10 @@ fn table_has_key(value: &toml::Value, section: &str, key: &str) -> bool {
     table(value, section).is_some_and(|t| t.contains_key(key))
 }
 
+fn table_has_any_key(value: &toml::Value, section: &str, keys: &[&str]) -> bool {
+    keys.iter().any(|key| table_has_key(value, section, key))
+}
+
 fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut path = path.as_os_str().to_os_string();
     path.push(suffix);
@@ -84,17 +88,17 @@ fn migrate_proxy_routing(config: &mut Config, raw: &toml::Value) -> bool {
         return false;
     };
 
-    if raw.get("routing").is_some() {
-        return false;
-    }
-
     let mut migrated = false;
-    migrated |= assign_from_table(&mut config.routing.routing_mode, proxy, "routing_mode");
-    migrated |= assign_from_table(
-        &mut config.routing.backend_selection,
-        proxy,
-        "backend_selection",
-    );
+    if !table_has_any_key(raw, "routing", &["mode", "routing_mode"]) {
+        migrated |= assign_from_table(&mut config.routing.routing_mode, proxy, "routing_mode");
+    }
+    if !table_has_any_key(raw, "routing", &["backend_selection", "strategy"]) {
+        migrated |= assign_from_table(
+            &mut config.routing.backend_selection,
+            proxy,
+            "backend_selection",
+        );
+    }
     migrated
 }
 
@@ -103,21 +107,21 @@ fn migrate_proxy_memory(config: &mut Config, raw: &toml::Value) -> bool {
         return false;
     };
 
-    if raw.get("memory").is_some() {
-        return false;
-    }
-
     let mut migrated = false;
-    migrated |= assign_from_table(
-        &mut config.memory.buffer_pool_count,
-        proxy,
-        "buffer_pool_count",
-    );
-    migrated |= assign_from_table(
-        &mut config.memory.capture_pool_count,
-        proxy,
-        "capture_pool_count",
-    );
+    if !table_has_key(raw, "memory", "buffer_pool_count") {
+        migrated |= assign_from_table(
+            &mut config.memory.buffer_pool_count,
+            proxy,
+            "buffer_pool_count",
+        );
+    }
+    if !table_has_key(raw, "memory", "capture_pool_count") {
+        migrated |= assign_from_table(
+            &mut config.memory.capture_pool_count,
+            proxy,
+            "capture_pool_count",
+        );
+    }
     migrated
 }
 
@@ -970,6 +974,77 @@ capture_pool_count = 32
         assert_eq!(config.servers[0].port.get(), 563);
         assert_eq!(config.servers[0].name.as_str(), "Env Server");
         assert!(config.servers[0].use_tls);
+    }
+
+    #[test]
+    fn test_load_config_merges_legacy_proxy_routing_into_partial_routing_section() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+
+        let config_content = r#"
+[[servers]]
+host = "legacy.example.com"
+port = 119
+name = "Legacy Server"
+
+[proxy]
+routing_mode = "per-command"
+backend_selection = "least-loaded"
+
+[routing]
+adaptive_precheck = true
+"#;
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let path = temp_file.path().to_str().unwrap().to_string();
+        let config = load_config_with_env_provider(&path, &MockEnv::new()).unwrap();
+
+        assert_eq!(config.routing.routing_mode, RoutingMode::PerCommand);
+        assert_eq!(
+            config.routing.backend_selection,
+            BackendSelectionStrategy::LeastLoaded
+        );
+        assert!(config.routing.adaptive_precheck);
+
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(migrated.contains("[routing]"));
+        assert!(migrated.contains("mode = \"per-command\""));
+        assert!(migrated.contains("backend_selection = \"least-loaded\""));
+        assert!(migrated.contains("adaptive_precheck = true"));
+    }
+
+    #[test]
+    fn test_load_config_merges_legacy_proxy_memory_into_partial_memory_section() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+
+        let config_content = r#"
+[[servers]]
+host = "legacy.example.com"
+port = 119
+name = "Legacy Server"
+
+[proxy]
+buffer_pool_count = 64
+capture_pool_count = 32
+
+[memory]
+socket_recv_buffer_size = 8388608
+"#;
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let path = temp_file.path().to_str().unwrap().to_string();
+        let config = load_config_with_env_provider(&path, &MockEnv::new()).unwrap();
+
+        assert_eq!(config.memory.socket_recv_buffer_size, 8 * 1024 * 1024);
+        assert_eq!(config.memory.buffer_pool_count, 64);
+        assert_eq!(config.memory.capture_pool_count, 32);
+
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(migrated.contains("[memory]"));
+        assert!(migrated.contains("socket_recv_buffer_size = 8388608"));
+        assert!(migrated.contains("buffer_pool_count = 64"));
+        assert!(migrated.contains("capture_pool_count = 32"));
     }
 
     #[test]
