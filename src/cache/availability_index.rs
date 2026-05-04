@@ -9,6 +9,7 @@ use super::{ArticleAvailability, CachedArticle, ttl};
 use crate::io_util::atomic_replace_file;
 use crate::types::{BackendId, MessageId};
 use anyhow::{Context, Result};
+use smallvec::SmallVec;
 use std::fs;
 use std::mem::{size_of, take};
 use std::path::Path;
@@ -21,6 +22,8 @@ const DEFAULT_SHARDS: usize = 16;
 const SLOT_BUDGET_DIVISOR: usize = 3;
 const LOAD_FACTOR_NUM: usize = 85;
 const LOAD_FACTOR_DEN: usize = 100;
+const INLINE_SHARD_ENTRIES: usize = 4;
+const INLINE_KEY_BYTES: usize = 64;
 const PERSISTENCE_MAGIC: &[u8; 8] = b"ANEGIDX2";
 const LEGACY_PERSISTENCE_MAGIC: &[u8; 8] = b"ANEGIDX1";
 
@@ -52,21 +55,40 @@ struct PersistedEntry {
     inserted_at: u64,
 }
 
-#[derive(Debug)]
-struct Shard {
-    slots: Box<[Slot]>,
-    len: usize,
-    arena: Box<[u8]>,
-    arena_len: usize,
+#[derive(Clone, Debug)]
+struct TinyEntry {
+    hash: u64,
+    key: SmallVec<[u8; INLINE_KEY_BYTES]>,
+    missing: u8,
+    last_touch: u64,
+    inserted_at: u64,
 }
 
-impl Shard {
+impl TinyEntry {
+    fn new(hash: u64, key: &[u8], missing: u8, last_touch: u64, inserted_at: u64) -> Self {
+        Self {
+            hash,
+            key: SmallVec::from_slice(key),
+            missing,
+            last_touch,
+            inserted_at,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FullShard {
+    slots: Box<[Slot]>,
+    len: usize,
+    arena: Vec<u8>,
+}
+
+impl FullShard {
     fn new(slot_count: usize, arena_bytes: usize) -> Self {
         Self {
             slots: vec![Slot::default(); slot_count].into_boxed_slice(),
             len: 0,
-            arena: vec![0; arena_bytes].into_boxed_slice(),
-            arena_len: 0,
+            arena: Vec::with_capacity(arena_bytes),
         }
     }
 
@@ -116,43 +138,6 @@ impl Shard {
         Some(slot.missing)
     }
 
-    fn insert_missing(
-        &mut self,
-        hash: u64,
-        key: &[u8],
-        missing_bits: u8,
-        touch: u64,
-        inserted_at: u64,
-    ) -> usize {
-        if missing_bits == 0 || key.is_empty() {
-            return 0;
-        }
-
-        if let Some(existing) = self.lookup_slot_index(hash, key) {
-            let slot = &mut self.slots[existing];
-            slot.missing |= missing_bits;
-            slot.last_touch = touch;
-            slot.inserted_at = inserted_at;
-            return 0;
-        }
-
-        let Some(evicted) = self.ensure_space_for(key.len()) else {
-            return usize::MAX;
-        };
-
-        let new_slot = Slot {
-            hash,
-            offset: self.allocate_key_bytes(key),
-            len: key.len() as u16,
-            missing: missing_bits,
-            occupied: true,
-            last_touch: touch,
-            inserted_at,
-        };
-        debug_assert!(self.place_slot(new_slot));
-        evicted
-    }
-
     fn restore_entry(
         &mut self,
         hash: u64,
@@ -190,10 +175,8 @@ impl Shard {
     }
 
     fn allocate_key_bytes(&mut self, key: &[u8]) -> u32 {
-        let offset = self.arena_len;
-        let end = offset + key.len();
-        self.arena[offset..end].copy_from_slice(key);
-        self.arena_len = end;
+        let offset = self.arena.len();
+        self.arena.extend_from_slice(key);
         offset as u32
     }
 
@@ -228,21 +211,21 @@ impl Shard {
     fn ensure_space_for(&mut self, required_key_len: usize) -> Option<usize> {
         if self.slots.is_empty()
             || required_key_len == 0
-            || required_key_len > self.arena.len()
+            || required_key_len > self.arena.capacity()
             || required_key_len > u16::MAX as usize
         {
             return None;
         }
 
         let mut evicted = 0usize;
-        while (!self.can_insert() || self.arena_len + required_key_len > self.arena.len())
+        while (!self.can_insert() || self.arena.len() + required_key_len > self.arena.capacity())
             && self.len > 0
         {
             self.evict_lru()?;
             evicted += 1;
         }
 
-        if self.can_insert() && self.arena_len + required_key_len <= self.arena.len() {
+        if self.can_insert() && self.arena.len() + required_key_len <= self.arena.capacity() {
             Some(evicted)
         } else {
             None
@@ -262,12 +245,10 @@ impl Shard {
     }
 
     fn rebuild_excluding(&mut self, victim_idx: usize) {
-        let slot_count = self.slots.len();
-        let arena_bytes = self.arena.len();
         let old_slots = take(&mut self.slots);
         let old_arena = take(&mut self.arena);
 
-        let mut rebuilt = Shard::new(slot_count, arena_bytes);
+        let mut rebuilt = FullShard::new(old_slots.len(), old_arena.capacity());
         for (idx, slot) in old_slots.iter().copied().enumerate() {
             if idx == victim_idx || slot.is_empty() {
                 continue;
@@ -318,9 +299,267 @@ impl Shard {
             }
         }
     }
+}
+
+// Keep Tiny inline so untouched and low-cardinality shards avoid any heap allocation.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+enum ShardStorage {
+    Tiny(SmallVec<[TinyEntry; INLINE_SHARD_ENTRIES]>),
+    Full(Box<FullShard>),
+}
+
+#[derive(Debug)]
+struct Shard {
+    slot_capacity: usize,
+    arena_capacity: usize,
+    storage: ShardStorage,
+}
+
+impl Shard {
+    fn new(slot_count: usize, arena_bytes: usize) -> Self {
+        Self {
+            slot_capacity: slot_count,
+            arena_capacity: arena_bytes,
+            storage: ShardStorage::Tiny(SmallVec::new()),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match &self.storage {
+            ShardStorage::Tiny(entries) => entries.len(),
+            ShardStorage::Full(full) => full.len,
+        }
+    }
+
+    fn used_bytes(&self) -> usize {
+        match &self.storage {
+            ShardStorage::Tiny(entries) => entries.len() * size_of::<TinyEntry>(),
+            ShardStorage::Full(full) => full.slots.len() * size_of::<Slot>() + full.arena.len(),
+        }
+    }
+
+    fn tiny_key_bytes(entries: &[TinyEntry]) -> usize {
+        entries.iter().map(|entry| entry.key.len()).sum()
+    }
+
+    fn tiny_lookup_index(entries: &[TinyEntry], hash: u64, key: &[u8]) -> Option<usize> {
+        entries
+            .iter()
+            .position(|entry| entry.hash == hash && entry.key.as_slice() == key)
+    }
+
+    fn tiny_can_insert(
+        slot_capacity: usize,
+        arena_capacity: usize,
+        entries: &[TinyEntry],
+        key: &[u8],
+    ) -> bool {
+        key.len() <= INLINE_KEY_BYTES
+            && key.len() <= u16::MAX as usize
+            && entries.len()
+                < if slot_capacity == 0 || arena_capacity == 0 {
+                    0
+                } else {
+                    INLINE_SHARD_ENTRIES
+                        .min((slot_capacity * LOAD_FACTOR_NUM / LOAD_FACTOR_DEN).max(1))
+                }
+            && Self::tiny_key_bytes(entries) + key.len() <= arena_capacity
+    }
+
+    fn promote_to_full(&mut self) {
+        let old_storage = std::mem::replace(&mut self.storage, ShardStorage::Tiny(SmallVec::new()));
+        let ShardStorage::Tiny(entries) = old_storage else {
+            return;
+        };
+
+        let mut full = FullShard::new(self.slot_capacity, self.arena_capacity);
+        for entry in entries {
+            let inserted = full.restore_entry(
+                entry.hash,
+                entry.key.as_slice(),
+                entry.missing,
+                entry.last_touch,
+                entry.inserted_at,
+            );
+            debug_assert!(
+                inserted,
+                "promoting tiny shard entries should preserve exact negatives"
+            );
+        }
+        self.storage = ShardStorage::Full(Box::new(full));
+    }
+
+    fn lookup_missing(
+        &mut self,
+        hash: u64,
+        key: &[u8],
+        touch: u64,
+        base_ttl: ttl::CacheTtlMillis,
+    ) -> Option<u8> {
+        match &mut self.storage {
+            ShardStorage::Tiny(entries) => {
+                let index = Self::tiny_lookup_index(entries, hash, key)?;
+                if ttl::is_expired(
+                    ttl::CacheTimestampMillis::new(entries[index].inserted_at),
+                    base_ttl,
+                    ttl::CacheTier::new(0),
+                ) {
+                    entries.swap_remove(index);
+                    return None;
+                }
+                entries[index].last_touch = touch;
+                Some(entries[index].missing)
+            }
+            ShardStorage::Full(full) => full.lookup_missing(hash, key, touch, base_ttl),
+        }
+    }
+
+    fn insert_missing(
+        &mut self,
+        hash: u64,
+        key: &[u8],
+        missing_bits: u8,
+        touch: u64,
+        inserted_at: u64,
+    ) -> usize {
+        if missing_bits == 0 || key.is_empty() || key.len() > u16::MAX as usize {
+            return 0;
+        }
+
+        loop {
+            match &mut self.storage {
+                ShardStorage::Tiny(entries) => {
+                    if let Some(existing) = Self::tiny_lookup_index(entries, hash, key) {
+                        let entry = &mut entries[existing];
+                        entry.missing |= missing_bits;
+                        entry.last_touch = touch;
+                        entry.inserted_at = inserted_at;
+                        return 0;
+                    }
+
+                    if Self::tiny_can_insert(self.slot_capacity, self.arena_capacity, entries, key)
+                    {
+                        entries.push(TinyEntry::new(hash, key, missing_bits, touch, inserted_at));
+                        return 0;
+                    }
+
+                    self.promote_to_full();
+                }
+                ShardStorage::Full(full) => {
+                    if let Some(existing) = full.lookup_slot_index(hash, key) {
+                        let slot = &mut full.slots[existing];
+                        slot.missing |= missing_bits;
+                        slot.last_touch = touch;
+                        slot.inserted_at = inserted_at;
+                        return 0;
+                    }
+
+                    let Some(evicted) = full.ensure_space_for(key.len()) else {
+                        return usize::MAX;
+                    };
+
+                    let new_slot = Slot {
+                        hash,
+                        offset: full.allocate_key_bytes(key),
+                        len: key.len() as u16,
+                        missing: missing_bits,
+                        occupied: true,
+                        last_touch: touch,
+                        inserted_at,
+                    };
+                    debug_assert!(full.place_slot(new_slot));
+                    return evicted;
+                }
+            }
+        }
+    }
+
+    fn restore_entry(
+        &mut self,
+        hash: u64,
+        key: &[u8],
+        missing_bits: u8,
+        last_touch: u64,
+        inserted_at: u64,
+    ) -> bool {
+        if missing_bits == 0 || key.is_empty() || key.len() > u16::MAX as usize {
+            return true;
+        }
+
+        loop {
+            match &mut self.storage {
+                ShardStorage::Tiny(entries) => {
+                    if let Some(existing) = Self::tiny_lookup_index(entries, hash, key) {
+                        let entry = &mut entries[existing];
+                        entry.missing |= missing_bits;
+                        entry.last_touch = entry.last_touch.max(last_touch);
+                        entry.inserted_at = entry.inserted_at.max(inserted_at);
+                        return true;
+                    }
+
+                    if Self::tiny_can_insert(self.slot_capacity, self.arena_capacity, entries, key)
+                    {
+                        entries.push(TinyEntry::new(
+                            hash,
+                            key,
+                            missing_bits,
+                            last_touch,
+                            inserted_at,
+                        ));
+                        return true;
+                    }
+
+                    self.promote_to_full();
+                }
+                ShardStorage::Full(full) => {
+                    return full.restore_entry(hash, key, missing_bits, last_touch, inserted_at);
+                }
+            }
+        }
+    }
 
     fn clear(&mut self) {
-        *self = Shard::new(self.slots.len(), self.arena.len());
+        self.storage = ShardStorage::Tiny(SmallVec::new());
+    }
+
+    fn snapshot_entries(&self, out: &mut Vec<PersistedEntry>) {
+        match &self.storage {
+            ShardStorage::Tiny(entries) => {
+                out.extend(entries.iter().map(|entry| PersistedEntry {
+                    key: entry.key.to_vec(),
+                    missing: entry.missing,
+                    last_touch: entry.last_touch,
+                    inserted_at: entry.inserted_at,
+                }));
+            }
+            ShardStorage::Full(full) => {
+                out.extend(
+                    full.slots
+                        .iter()
+                        .copied()
+                        .filter(|slot| slot.occupied)
+                        .filter_map(|slot| {
+                            full.entry_bytes(slot).map(|key| PersistedEntry {
+                                key: key.to_vec(),
+                                missing: slot.missing,
+                                last_touch: slot.last_touch,
+                                inserted_at: slot.inserted_at,
+                            })
+                        }),
+                );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn is_tiny(&self) -> bool {
+        matches!(self.storage, ShardStorage::Tiny(_))
+    }
+
+    #[cfg(test)]
+    fn is_full(&self) -> bool {
+        matches!(self.storage, ShardStorage::Full(_))
     }
 }
 
@@ -513,7 +752,7 @@ impl AvailabilityIndex {
     pub fn entry_count(&self) -> u64 {
         self.shards
             .iter()
-            .map(|shard| shard.lock().unwrap_or_else(|e| e.into_inner()).len as u64)
+            .map(|shard| shard.lock().unwrap_or_else(|e| e.into_inner()).len() as u64)
             .sum()
     }
 
@@ -523,7 +762,7 @@ impl AvailabilityIndex {
             .iter()
             .map(|shard| {
                 let shard = shard.lock().unwrap_or_else(|e| e.into_inner());
-                (shard.slots.len() * size_of::<Slot>() + shard.arena_len) as u64
+                shard.used_bytes() as u64
             })
             .sum()
     }
@@ -620,20 +859,9 @@ impl AvailabilityIndex {
         let mut entries = Vec::with_capacity(self.entry_count() as usize);
         for shard in &self.shards {
             let shard = shard.lock().unwrap_or_else(|e| e.into_inner());
-            for slot in shard.slots.iter().copied().filter(|slot| slot.occupied) {
-                if self.is_expired(slot.inserted_at) {
-                    continue;
-                }
-                if let Some(key) = shard.entry_bytes(slot) {
-                    entries.push(PersistedEntry {
-                        key: key.to_vec(),
-                        missing: slot.missing,
-                        last_touch: slot.last_touch,
-                        inserted_at: slot.inserted_at,
-                    });
-                }
-            }
+            shard.snapshot_entries(&mut entries);
         }
+        entries.retain(|entry| !self.is_expired(entry.inserted_at));
         entries
     }
 
@@ -815,6 +1043,74 @@ mod tests {
     }
 
     #[test]
+    fn shards_start_in_tiny_mode() {
+        let index = AvailabilityIndex::with_shard_count(4096, 4);
+        for shard in &index.shards {
+            let shard = shard.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(shard.is_tiny());
+            assert_eq!(shard.len(), 0);
+            assert_eq!(shard.used_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn single_negative_entry_stays_in_tiny_mode() {
+        let index = AvailabilityIndex::with_shard_count(4096, 1);
+        let msg_id = MessageId::from_borrowed("<tiny@example.com>").unwrap();
+
+        index.record_backend_missing(&msg_id, BackendId::from_index(0));
+
+        let shard = index.shards[0].lock().unwrap_or_else(|e| e.into_inner());
+        assert!(shard.is_tiny());
+        assert_eq!(shard.len(), 1);
+    }
+
+    #[test]
+    fn shard_promotes_to_full_after_inline_capacity() {
+        let index = AvailabilityIndex::with_shard_count(4096, 1);
+
+        for idx in 0..=INLINE_SHARD_ENTRIES {
+            let msg_id = MessageId::new(format!("<promote-{idx}@example.com>")).unwrap();
+            index.record_backend_missing(&msg_id, BackendId::from_index(idx % 4));
+        }
+
+        let shard = index.shards[0].lock().unwrap_or_else(|e| e.into_inner());
+        assert!(shard.is_full());
+        assert_eq!(shard.len(), INLINE_SHARD_ENTRIES + 1);
+    }
+
+    #[test]
+    fn promotion_preserves_existing_entries() {
+        let index = AvailabilityIndex::with_shard_count(4096, 1);
+        let first = MessageId::from_borrowed("<first-promote@example.com>").unwrap();
+        let second = MessageId::from_borrowed("<second-promote@example.com>").unwrap();
+
+        index.record_backend_missing(&first, BackendId::from_index(0));
+        index.record_backend_missing(&second, BackendId::from_index(1));
+        for idx in 2..=INLINE_SHARD_ENTRIES {
+            let msg_id = MessageId::new(format!("<fill-{idx}@example.com>")).unwrap();
+            index.record_backend_missing(&msg_id, BackendId::from_index(idx % 4));
+        }
+        let trigger = MessageId::from_borrowed("<promote-trigger@example.com>").unwrap();
+        index.record_backend_missing(&trigger, BackendId::from_index(3));
+
+        assert!(
+            !index
+                .get(&first)
+                .unwrap()
+                .should_try_backend(BackendId::from_index(0))
+        );
+        assert!(
+            !index
+                .get(&second)
+                .unwrap()
+                .should_try_backend(BackendId::from_index(1))
+        );
+        let shard = index.shards[0].lock().unwrap_or_else(|e| e.into_inner());
+        assert!(shard.is_full());
+    }
+
+    #[test]
     fn lru_eviction_keeps_newer_entry() {
         let index = AvailabilityIndex::with_shard_count(320, 1);
         let older = MessageId::from_borrowed("<older@example.com>").unwrap();
@@ -864,6 +1160,32 @@ mod tests {
                 .expect("restored second entry")
                 .should_try_backend(BackendId::from_index(2))
         );
+    }
+
+    #[test]
+    fn save_and_load_roundtrip_restores_promoted_shard_entries() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("availability-promoted.idx");
+        let index = AvailabilityIndex::with_shard_count(4096, 1);
+
+        for idx in 0..=INLINE_SHARD_ENTRIES {
+            let msg_id = MessageId::new(format!("<persist-promote-{idx}@example.com>")).unwrap();
+            index.record_backend_missing(&msg_id, BackendId::from_index(idx % 4));
+        }
+        index.save_to_path(&path).unwrap();
+
+        let restored = AvailabilityIndex::with_shard_count(4096, 1);
+        assert!(restored.load_from_path(&path).unwrap());
+
+        for idx in 0..=INLINE_SHARD_ENTRIES {
+            let msg_id = MessageId::new(format!("<persist-promote-{idx}@example.com>")).unwrap();
+            assert!(
+                restored.get(&msg_id).is_some(),
+                "missing restored entry {idx}"
+            );
+        }
+        let shard = restored.shards[0].lock().unwrap_or_else(|e| e.into_inner());
+        assert!(shard.is_full());
     }
 
     #[test]
