@@ -162,7 +162,7 @@ pub async fn shutdown_signal() {
 }
 
 // ============================================================================
-// Binary Utilities - Shared code across nntp-proxy, nntp-proxy-tui, etc.
+// Binary Utilities - Shared code for the unified nntp-proxy entrypoint.
 // ============================================================================
 
 /// Load configuration and log server information
@@ -289,6 +289,37 @@ pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
     });
 }
 
+/// Persist runtime state that should survive process restarts.
+///
+/// Saves metrics unconditionally and availability state when the proxy uses
+/// the dedicated availability index.
+///
+/// # Errors
+/// Returns an error if metrics or availability persistence fails.
+pub async fn persist_runtime_state(
+    proxy: &std::sync::Arc<crate::NntpProxy>,
+    stats_path: std::path::PathBuf,
+    availability_path: Option<std::path::PathBuf>,
+    server_names: Vec<String>,
+) -> Result<()> {
+    use tracing::{info, warn};
+
+    let metrics = proxy.metrics().clone();
+    save_metrics_to_disk_blocking(metrics, stats_path.clone(), server_names).await?;
+    info!("Metrics saved to {}", stats_path.display());
+
+    if let Some(path) = availability_path {
+        let cache = proxy.cache().clone();
+        match save_availability_to_disk_blocking(cache, path.clone()).await {
+            Ok(true) => info!("Availability index saved to {}", path.display()),
+            Ok(false) => {}
+            Err(e) => warn!("Failed to save availability index on shutdown: {}", e),
+        }
+    }
+
+    Ok(())
+}
+
 /// Spawn graceful shutdown handler
 ///
 /// Waits for shutdown signal, then:
@@ -313,20 +344,10 @@ pub fn spawn_shutdown_handler(
         shutdown_signal().await;
         info!("Shutdown signal received");
 
-        // Save metrics before shutting down
-        let metrics = proxy.metrics().clone();
-        match save_metrics_to_disk_blocking(metrics, stats_path.clone(), server_names).await {
-            Ok(()) => info!("Metrics saved to {}", stats_path.display()),
-            Err(e) => warn!("Failed to save metrics on shutdown: {}", e),
-        }
-
-        if let Some(path) = availability_path.clone() {
-            let cache = proxy.cache().clone();
-            match save_availability_to_disk_blocking(cache, path.clone()).await {
-                Ok(true) => info!("Availability index saved to {}", path.display()),
-                Ok(false) => {}
-                Err(e) => warn!("Failed to save availability index on shutdown: {}", e),
-            }
+        if let Err(e) =
+            persist_runtime_state(&proxy, stats_path, availability_path, server_names).await
+        {
+            warn!("Failed to persist runtime state on shutdown: {}", e);
         }
 
         // Notify listeners

@@ -9,19 +9,21 @@ TLS, cache behavior, and live metrics in one place.
 - Hybrid routing by default: starts efficient and switches to stateful mode when a client needs group context.
 - Health-aware backend selection with weighted round-robin or least-loaded selection.
 - Per-backend TLS, backend authentication, connection limits, keep-alives, and tiering.
+- Plain NNTP listener only for clients; intended for trusted LAN/VPN/segmented-network deployment rather than direct internet exposure.
 - Optional article-body caching plus lightweight availability tracking.
 - Availability-only cache mode by default, so smart routing works without storing article bodies.
 - RAM article-cache hits measured 5.16 GB/s on a Ryzen 9 5950X.
 - A hot-cache path with a 256 MB in-memory article cache and disk cache on SSD measured 2.58 GB/s on the same system.
 - Allocation-conscious hot paths: borrowed request slices, preallocated buffer pools, and allocation-free cache key lookup in the steady state.
-- TUI dashboard with persisted metrics for restarts.
+- Optional terminal dashboard with persisted metrics across restarts.
 - TOML config, environment-based backend configuration, and CLI overrides.
 
-## Binaries
+## Runtime Binary
 
-- `nntp-proxy` runs the proxy server.
-- `nntp-proxy-tui` runs the same proxy with a terminal dashboard.
-- Article caching is configured via `[cache]` for either binary; there is no separate cache-only executable.
+- `nntp-proxy` is the runtime executable.
+- The same binary can run headless or with the terminal dashboard via `--ui headless` or `--ui tui`.
+- Article caching is configured via `[cache]`; there is no separate cache-only executable.
+- Client-facing connections are plain NNTP only. The proxy does not terminate inbound TLS or offer a TLS listening mode.
 
 ## Quick Start
 
@@ -49,11 +51,7 @@ Run the proxy:
 ./target/release/nntp-proxy --config config.toml
 ```
 
-Run with the TUI:
-
-```bash
-cargo run --bin nntp-proxy-tui -- --config config.toml
-```
+To launch the dashboard-enabled UI, use the same `nntp-proxy` binary with `--ui tui`.
 
 Connect a client to `localhost:8119` unless you changed `[proxy].port`.
 
@@ -238,7 +236,9 @@ This keeps primary-server results fresh while avoiding repeated expensive lookup
 
 ### TLS
 
-For NNTPS:
+TLS support is for outbound backend connections only. `nntp-proxy` does not provide a TLS listener for inbound client connections; it is meant to sit behind trusted-network boundaries such as a LAN, VPN, or segmented internal network.
+
+For NNTPS backends:
 
 ```toml
 [[servers]]
@@ -295,30 +295,34 @@ This is not an unconditional "zero allocations everywhere" claim. TLS handshakes
 
 Common flags:
 
-| Flag | Environment | Meaning |
-| --- | --- | --- |
-| `--config <FILE>` | `NNTP_PROXY_CONFIG` | Config file path. |
-| `--host <HOST>` | `NNTP_PROXY_HOST` | Override `[proxy].host`. |
-| `--port <PORT>` | `NNTP_PROXY_PORT` | Override `[proxy].port`. |
-| `--routing-mode <MODE>` | `NNTP_PROXY_ROUTING_MODE` | `hybrid`, `stateful`, or `per-command`. |
-| `--backend-selection <STRATEGY>` | `NNTP_PROXY_BACKEND_SELECTION` | `least-loaded` or `weighted-round-robin`. |
-| `--article-cache-capacity <SIZE>` | `NNTP_PROXY_ARTICLE_CACHE_CAPACITY` | Override hot in-memory article cache capacity. |
-| `--article-cache-ttl <SECONDS>` | `NNTP_PROXY_ARTICLE_CACHE_TTL_SECS` | Override article cache TTL. |
-| `--store-article-bodies <true|false>` | `NNTP_PROXY_STORE_ARTICLE_BODIES` | Enable or disable article-body storage. |
-| `--threads <N>` | `NNTP_PROXY_THREADS` | Worker threads. Use `0` for CPU cores. |
-| `--backend-pipelining <true|false>` | `NNTP_PROXY_BACKEND_PIPELINING` | Override pipelining for all configured servers. |
+| Flag | Environment | Values / default | Meaning |
+| --- | --- | --- | --- |
+| `--config <FILE>` | `NNTP_PROXY_CONFIG` | Default: `config.toml` | Config file path. |
+| `--ui <MODE>` | `NNTP_PROXY_UI` | `headless` or `tui`; default: `headless` | Selects how the single `nntp-proxy` binary runs: plain server logging or the terminal dashboard. |
+| `--host <HOST>` | `NNTP_PROXY_HOST` | Default from config; otherwise `0.0.0.0` | Override `[proxy].host`. |
+| `--port <PORT>` | `NNTP_PROXY_PORT` | Default from config; otherwise `8119` | Override `[proxy].port`. |
+| `--routing-mode <MODE>` | `NNTP_PROXY_ROUTING_MODE` | `hybrid`, `stateful`, or `per-command`; default from config | Override `[routing].mode`. |
+| `--backend-selection <STRATEGY>` | `NNTP_PROXY_BACKEND_SELECTION` | `least-loaded` or `weighted-round-robin`; default from config | Override `[routing].backend_selection`. |
+| `--article-cache-capacity <SIZE>` | `NNTP_PROXY_ARTICLE_CACHE_CAPACITY` | Example: `64mb`, `256mb`, `1gb`; default from config | Override `[cache].article_cache_capacity`. |
+| `--article-cache-ttl <SECONDS>` | `NNTP_PROXY_ARTICLE_CACHE_TTL_SECS` | Integer seconds; default from config | Override `[cache].article_cache_ttl_secs`. |
+| `--store-article-bodies <BOOL>` | `NNTP_PROXY_STORE_ARTICLE_BODIES` | `true` or `false`; default from config | Override `[cache].store_article_bodies`. |
+| `--threads <N>` | `NNTP_PROXY_THREADS` | `0` for CPU cores; otherwise integer; default from config | Override `[proxy].threads`. |
+| `--backend-pipelining <BOOL>` | `NNTP_PROXY_BACKEND_PIPELINING` | `true` or `false`; default from config | Override `backend_pipelining` for all configured servers. |
 
 Examples:
 
 ```bash
 nntp-proxy --config /etc/nntp-proxy/config.toml
+nntp-proxy --ui tui --config config.toml
 nntp-proxy --routing-mode stateful --port 119
 nntp-proxy --store-article-bodies true --article-cache-capacity 256mb
-nntp-proxy-tui --config config.toml
-nntp-proxy-tui --config config.toml --no-tui
 ```
 
 CLI flags override config file values.
+
+UI selection is separate from `--routing-mode`: routing mode controls backend session behavior, while UI options control whether `nntp-proxy` runs headless or with the dashboard.
+
+`--no-tui` remains accepted as a hidden compatibility alias for headless mode, but `--ui headless` / `--ui tui` is the documented interface.
 
 ## Environment-Based Backend Configuration
 

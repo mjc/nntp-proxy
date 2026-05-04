@@ -4,7 +4,7 @@ set -euo pipefail
 # ============================================================================
 # NNTP Proxy Release Build Script
 # ============================================================================
-# Builds cross-platform release binaries for Linux, Windows, and macOS.
+# Builds cross-platform release artifacts for Linux, Windows, and macOS.
 #
 # Usage:
 #   ./scripts/build-release.sh [VERSION]
@@ -75,8 +75,8 @@ build_linux_target() {
     log_info "Building for $target..."
     $BUILD_CMD build --release --target "$target"
     tar -czf "release/v$VERSION/nntp-proxy-v$VERSION-$arch-linux.tar.gz" \
-        -C "target/$target/release" nntp-proxy nntp-cache-proxy
-    log_success "Built $arch Linux binary"
+        -C "target/$target/release" nntp-proxy
+    log_success "Built $arch Linux artifact"
 }
 
 build_windows_target() {
@@ -87,12 +87,12 @@ build_windows_target() {
     $BUILD_CMD build --release --target "$target"
     (cd "target/$target/release" && \
      zip "../../../release/v$VERSION/nntp-proxy-v$VERSION-$arch-windows.zip" \
-         nntp-proxy.exe nntp-cache-proxy.exe)
-    log_success "Built $arch Windows binary"
+         nntp-proxy.exe)
+    log_success "Built $arch Windows artifact"
 }
 
 build_macos_universal() {
-    log_info "Building macOS universal binaries..."
+    log_info "Building macOS universal artifact..."
     
     # Build both architectures
     log_info "Building for x86_64-apple-darwin..."
@@ -101,21 +101,19 @@ build_macos_universal() {
     log_info "Building for aarch64-apple-darwin..."
     cargo build --release --target aarch64-apple-darwin
     
-    # Create universal binaries
-    log_info "Creating universal binaries with lipo..."
+    # Create universal binary
+    log_info "Creating universal binary with lipo..."
     mkdir -p target/universal-apple-darwin/release
     
-    for binary in nntp-proxy nntp-cache-proxy; do
-        lipo -create \
-            "target/x86_64-apple-darwin/release/$binary" \
-            "target/aarch64-apple-darwin/release/$binary" \
-            -output "target/universal-apple-darwin/release/$binary"
-    done
+    lipo -create \
+        "target/x86_64-apple-darwin/release/nntp-proxy" \
+        "target/aarch64-apple-darwin/release/nntp-proxy" \
+        -output "target/universal-apple-darwin/release/nntp-proxy"
     
     tar -czf "release/v$VERSION/nntp-proxy-v$VERSION-universal-darwin.tar.gz" \
-        -C target/universal-apple-darwin/release nntp-proxy nntp-cache-proxy
+        -C target/universal-apple-darwin/release nntp-proxy
     
-    log_success "Built macOS universal binary"
+    log_success "Built macOS universal artifact"
 }
 
 # ============================================================================
@@ -189,4 +187,3 @@ echo "════════════════════════�
 
 # Clean up the cross-env marker
 rm -f /tmp/.in-nix-cross-env
-

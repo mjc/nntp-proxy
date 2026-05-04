@@ -60,7 +60,7 @@ pub mod tls;
 pub mod types;
 
 // Public exports
-pub use args::CommonArgs;
+pub use args::{CommonArgs, UiMode};
 pub use config::{
     Cache, Config, ConfigSource, RoutingMode, Server, create_default_config, has_server_env_vars,
     load_config, load_config_from_env, load_config_with_fallback,

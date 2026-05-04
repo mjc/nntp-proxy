@@ -4,12 +4,15 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use anyhow::Result;
 use clap::Parser;
 use std::sync::Arc;
-use tracing::info;
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
 
-use nntp_proxy::{CommonArgs, NntpProxy, RuntimeConfig, runtime};
+use nntp_proxy::{
+    CommonArgs, NntpProxy, RuntimeConfig, UiMode, metrics::MetricsStore, runtime, tui,
+};
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(author, version, about = "NNTP Proxy server", long_about = None)]
 struct Args {
     #[command(flatten)]
     common: CommonArgs,
@@ -22,20 +25,21 @@ fn main() -> Result<()> {
     // Apply CLI argument overrides to config
     args.common.apply_overrides(&mut config);
 
-    nntp_proxy::logging::init_dual_logging(&config.proxy.log_file_level);
+    let ui_mode = args.common.effective_ui_mode();
+    let log_buffer = nntp_proxy::logging::init_logging(ui_mode, &config.proxy.log_file_level);
 
-    build_runtime(&args, &config)?.block_on(run_proxy(args, config))
-}
-
-fn build_runtime(
-    args: &Args,
-    config: &nntp_proxy::config::Config,
-) -> Result<tokio::runtime::Runtime> {
     let threads = args.common.threads.or(Some(config.proxy.threads));
-    RuntimeConfig::from_args(threads).build_runtime()
+    RuntimeConfig::from_args(threads)
+        .build_runtime()?
+        .block_on(run_proxy(args, config, ui_mode, log_buffer))
 }
 
-async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()> {
+async fn run_proxy(
+    args: Args,
+    config: nntp_proxy::config::Config,
+    ui_mode: UiMode,
+    log_buffer: Option<tui::LogBuffer>,
+) -> Result<()> {
     let routing_mode = args
         .common
         .routing_mode
@@ -43,7 +47,6 @@ async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()>
     let (host, port) =
         runtime::resolve_listen_address(args.common.host.as_deref(), args.common.port, &config);
 
-    // Resolve stats file path and load metrics if available
     let stats_path = runtime::resolve_stats_file_path(
         args.common.config.as_str(),
         config.proxy.stats_file.as_ref(),
@@ -57,12 +60,7 @@ async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()>
         .collect();
     let metrics_store = runtime::load_metrics_from_disk(&stats_path, &server_names);
 
-    // Build proxy with restored metrics
-    let mut builder = NntpProxy::builder(config).with_routing_mode(routing_mode);
-    if let Some(store) = metrics_store {
-        builder = builder.with_metrics_store(store);
-    }
-    let proxy = Arc::new(builder.build().await?);
+    let proxy = build_proxy(config, routing_mode, metrics_store).await?;
     if let Some(path) = availability_path.as_ref() {
         let _ = runtime::load_availability_from_disk(proxy.cache(), path);
     }
@@ -80,8 +78,96 @@ async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()>
     runtime::spawn_availability_saver(&proxy, availability_path.clone());
     runtime::spawn_idle_connection_clearer(&proxy);
 
-    let shutdown_rx =
-        runtime::spawn_shutdown_handler(&proxy, stats_path, availability_path, server_names);
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+    let (tui_handle, tui_shutdown_tx) =
+        launch_tui(ui_mode, &proxy, log_buffer, shutdown_tx.clone())?;
+    spawn_signal_forwarder(shutdown_tx, tui_shutdown_tx);
 
-    runtime::run_accept_loop(proxy, listener, shutdown_rx, routing_mode).await
+    let accept_result =
+        runtime::run_accept_loop(proxy.clone(), listener, shutdown_rx, routing_mode).await;
+
+    if let Some(handle) = tui_handle {
+        handle.await?;
+    }
+
+    if let Err(e) =
+        runtime::persist_runtime_state(&proxy, stats_path, availability_path, server_names).await
+    {
+        warn!("Failed to persist runtime state after shutdown: {}", e);
+    }
+
+    accept_result
+}
+
+async fn build_proxy(
+    config: nntp_proxy::config::Config,
+    routing_mode: nntp_proxy::RoutingMode,
+    metrics_store: Option<MetricsStore>,
+) -> Result<Arc<NntpProxy>> {
+    let mut builder = NntpProxy::builder(config).with_routing_mode(routing_mode);
+    if let Some(store) = metrics_store {
+        builder = builder.with_metrics_store(store);
+    }
+    Ok(Arc::new(builder.build().await?))
+}
+
+type TuiHandle = tokio::task::JoinHandle<()>;
+
+fn launch_tui(
+    ui_mode: UiMode,
+    proxy: &Arc<NntpProxy>,
+    log_buffer: Option<tui::LogBuffer>,
+    shutdown_tx: mpsc::Sender<()>,
+) -> Result<(Option<TuiHandle>, Option<mpsc::Sender<()>>)> {
+    if !ui_mode.uses_tui() {
+        return Ok((None, None));
+    }
+
+    let (tui_shutdown_tx, tui_shutdown_rx) = mpsc::channel::<()>(1);
+
+    info!("Building TUI dashboard...");
+    let mut builder = tui::TuiAppBuilder::new(
+        proxy.metrics().clone(),
+        proxy.router().clone(),
+        Arc::from(proxy.servers()),
+    );
+
+    if let Some(buffer) = log_buffer {
+        builder = builder.with_log_buffer(buffer);
+    }
+
+    let cache = proxy.cache();
+    info!(
+        "Adding cache to TUI: entries={}, size={}",
+        cache.entry_count(),
+        cache.weighted_size()
+    );
+    builder = builder.with_cache(cache.clone());
+    builder = builder.with_buffer_pool(proxy.buffer_pool().clone());
+
+    let tui_app = builder.build();
+    let handle = tokio::spawn(async move {
+        info!("Initializing TUI dashboard...");
+        if let Err(e) = tui::run_tui(tui_app, shutdown_tx, tui_shutdown_rx).await {
+            error!("TUI error: {}", e);
+        }
+        info!("TUI closed");
+    });
+
+    Ok((Some(handle), Some(tui_shutdown_tx)))
+}
+
+fn spawn_signal_forwarder(
+    shutdown_tx: mpsc::Sender<()>,
+    tui_shutdown_tx: Option<mpsc::Sender<()>>,
+) {
+    tokio::spawn(async move {
+        runtime::shutdown_signal().await;
+        info!("Shutdown signal received");
+
+        if let Some(tx) = tui_shutdown_tx {
+            let _ = tx.send(()).await;
+        }
+        let _ = shutdown_tx.send(()).await;
+    });
 }

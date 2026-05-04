@@ -1,5 +1,5 @@
 # Cache-focused NNTP Proxy configuration
-# Use this with nntp-proxy or nntp-proxy-tui; caching is built in.
+# Use this with nntp-proxy; caching is built in and the same binary handles dashboard/headless UI modes.
 
 # Backend NNTP servers
 [[servers]]

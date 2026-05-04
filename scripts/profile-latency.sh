@@ -4,7 +4,8 @@ set -e
 # Latency-focused profiling for nntp-proxy
 #
 # Shows WHERE TIME IS SPENT WAITING — syscall latency, off-CPU time, etc.
-# Press 'q' in the TUI (or Ctrl-C for CLI) to stop and generate reports.
+# The runtime binary is always nntp-proxy; pass any dashboard/headless UI flags
+# as extra arguments when profiling a specific UI mode.
 #
 # Outputs:
 #   strace mode:  strace.log + summary
@@ -15,12 +16,22 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
 MODE="${1:-strace}"
-BIN="${2:-tui}"
-shift 2 2>/dev/null || true
+shift 1 2>/dev/null || true
+
+TARGET="proxy"
+if [ $# -gt 0 ]; then
+    case "$1" in
+        proxy|ui|headless|cli|tui|/*|./*|../*)
+            TARGET="$1"
+            shift
+            ;;
+    esac
+fi
+
 EXTRA_ARGS=("$@")
 
 if [ "$MODE" = "-h" ] || [ "$MODE" = "--help" ]; then
-    echo "Usage: $0 [MODE] [BIN] [ARGS...]"
+    echo "Usage: $0 [MODE] [TARGET] [ARGS...]"
     echo ""
     echo "Profile nntp-proxy latency and waiting patterns"
     echo ""
@@ -29,29 +40,26 @@ if [ "$MODE" = "-h" ] || [ "$MODE" = "--help" ]; then
     echo "  offcpu  - Off-CPU flamegraph (what we're waiting on)"
     echo ""
     echo "Arguments:"
-    echo "  BIN       Which binary: tui, cli, or a path (default: tui)"
+    echo "  TARGET    proxy/ui/headless (all map to nntp-proxy) or a custom path"
     echo "  ARGS...   Extra arguments passed to the binary"
     echo ""
     echo "Examples:"
-    echo "  ./scripts/profile-latency.sh strace tui -c config.toml"
-    echo "  ./scripts/profile-latency.sh offcpu cli -c config.toml"
+    echo "  ./scripts/profile-latency.sh strace proxy --config config.toml"
+    echo "  ./scripts/profile-latency.sh strace ui --config config.toml [ui flags]"
+    echo "  ./scripts/profile-latency.sh offcpu headless --config config.toml"
     echo ""
-    echo "Press 'q' in TUI (or Ctrl-C for CLI) to stop and generate reports."
+    echo "Stop the proxy normally to generate reports."
     exit 0
 fi
 
 # Resolve binary name
-case "$BIN" in
-    tui)
-        BINARY="$PROJECT_DIR/target/profiling/nntp-proxy-tui"
-        BIN_NAME="nntp-proxy-tui"
-        ;;
-    cli)
+case "$TARGET" in
+    proxy|ui|headless|cli|tui)
         BINARY="$PROJECT_DIR/target/profiling/nntp-proxy"
         BIN_NAME="nntp-proxy"
         ;;
     *)
-        BINARY="$BIN"
+        BINARY="$TARGET"
         BIN_NAME=""  # Custom path, skip build
         ;;
 esac

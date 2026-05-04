@@ -16,10 +16,6 @@ readme = "README.md"
 name = "nntp-proxy"
 path = "src/bin/nntp-proxy.rs"
 
-[[bin]]
-name = "nntp-proxy-tui"
-path = "src/bin/nntp-proxy-tui.rs"
-
 [lib]
 name = "nntp_proxy"
 path = "src/lib.rs"

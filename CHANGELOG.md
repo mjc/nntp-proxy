@@ -26,9 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Substantial architecture refactor since 0.4.0**
+  - Reworked the proxy around typed request/context plumbing, explicit cache metadata, backend pipeline queues, persisted metrics and availability state, config migration helpers, and corrected pooled-connection read-ahead handling.
+  - The current tree is a broad redesign of routing, caching, persistence, and operator-facing runtime behavior compared to 0.4.0, not just an incremental feature release.
+
 - **Configuration and CLI naming refresh**
   - Reorganized config around `[routing]`, `[memory]`, `[cache]`, and `[health_check]` with clearer canonical names such as `article_cache_capacity`, `article_cache_ttl_secs`, `store_article_bodies`, and `backend_pipelining`.
   - Config loading now migrates older layouts in place and CLI parsing keeps legacy flag aliases for compatibility.
+
+- **Runtime binary presentation**
+  - Current docs and release packaging describe a single `nntp-proxy` executable with selectable dashboard/headless UI behavior.
+  - Historical entries below still mention older separate binaries where that reflected the release at the time.
 
 - **Disk cache compression configuration** ([#56](https://github.com/mjc/nntp-proxy/pull/56))
   - Disk cache compression is now a selectable codec (`lz4`, `zstd`, or `none`) instead of a boolean toggle.
@@ -57,6 +65,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Routed full-buffer multiline terminator detection through `TailBuffer` and guarded availability bit generation with `BackendId::availability_bit()`.
 
 ### Performance
+
+- **Large drop in steady-state CPU usage since 0.4.0**
+  - In local testing on a Ryzen 9 5950X, current builds stayed below roughly 16% of one core while sustaining about 50 MiB/s, and were usually in the single-digit percentages.
 
 - **Hot-path cache and pipeline work** ([#55](https://github.com/mjc/nntp-proxy/pull/55), [#60](https://github.com/mjc/nntp-proxy/pull/60), [#61](https://github.com/mjc/nntp-proxy/pull/61))
   - Kept steady-state cache-hit and request-routing paths allocation-conscious via typed metadata, borrowed bytes, and pooled buffers.

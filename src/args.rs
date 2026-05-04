@@ -1,10 +1,10 @@
-//! Command-line argument parsing for NNTP proxy binaries
+//! Command-line argument parsing for the unified NNTP proxy binary.
 //!
-//! Provides shared argument structures to avoid duplication across binaries.
+//! Provides shared argument structures and value enums for CLI parsing.
 
 use crate::config::{BackendSelectionStrategy, Config, RoutingMode};
 use crate::types::{CacheCapacity, ConfigPath, Port, ThreadCount};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::time::Duration;
 
 /// Parse port from command line argument
@@ -13,9 +13,29 @@ fn parse_port(s: &str) -> Result<Port, String> {
     Port::try_new(port).map_err(|e| format!("Invalid port: {e}"))
 }
 
-/// Common command-line arguments for NNTP proxy binaries
+/// User interface/runtime mode for the unified `nntp-proxy` binary.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum UiMode {
+    /// Run as a headless server and log to stdout.
+    Headless,
+    /// Run the server with the terminal dashboard enabled.
+    Tui,
+}
+
+impl UiMode {
+    /// Default UI mode for the unified binary.
+    pub const DEFAULT: Self = Self::Headless;
+
+    /// Returns true when the interactive terminal dashboard should be launched.
+    #[must_use]
+    pub const fn uses_tui(self) -> bool {
+        matches!(self, Self::Tui)
+    }
+}
+
+/// Common command-line arguments for the `nntp-proxy` binary.
 ///
-/// Use `#[command(flatten)]` in binary-specific Args to include these fields.
+/// Use `#[command(flatten)]` in the top-level CLI args to include these fields.
 #[derive(Parser, Debug, Clone)]
 pub struct CommonArgs {
     /// Configuration file path
@@ -27,6 +47,20 @@ pub struct CommonArgs {
         help_heading = "General"
     )]
     pub config: ConfigPath,
+
+    /// Runtime UI mode: headless server logs or terminal dashboard.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = UiMode::DEFAULT,
+        env = "NNTP_PROXY_UI",
+        help_heading = "General"
+    )]
+    pub ui: UiMode,
+
+    /// Disable the terminal dashboard and run in headless mode.
+    #[arg(long, hide = true, help_heading = "General")]
+    pub no_tui: bool,
 
     /// Port to listen on (overrides config file)
     #[arg(
@@ -144,6 +178,18 @@ impl CommonArgs {
         self.host.as_deref().unwrap_or(Self::DEFAULT_HOST)
     }
 
+    /// Get the effective UI/runtime mode.
+    ///
+    /// `--no-tui` remains as a hidden compatibility alias for headless mode.
+    #[must_use]
+    pub const fn effective_ui_mode(&self) -> UiMode {
+        if self.no_tui {
+            UiMode::Headless
+        } else {
+            self.ui
+        }
+    }
+
     /// Apply CLI argument overrides to loaded config
     ///
     /// This method modifies the provided config by applying any CLI arguments
@@ -197,6 +243,7 @@ mod tests {
         assert_eq!(args.listen_addr(None), "0.0.0.0:8119");
         assert_eq!(args.effective_host(), "0.0.0.0");
         assert!(args.effective_port(None).is_none());
+        assert_eq!(args.effective_ui_mode(), UiMode::Headless);
     }
 
     #[test]
@@ -316,6 +363,8 @@ mod tests {
     fn test_common_args_parse_primary_and_legacy_flags() {
         let args = CommonArgs::parse_from([
             "nntp-proxy",
+            "--ui",
+            "tui",
             "--article-cache-capacity",
             "128mb",
             "--backend-selection",
@@ -339,9 +388,11 @@ mod tests {
         assert_eq!(args.article_cache_ttl_secs, Some(7200));
         assert_eq!(args.store_article_bodies, Some(true));
         assert_eq!(args.backend_pipelining, Some(false));
+        assert_eq!(args.effective_ui_mode(), UiMode::Tui);
 
         let legacy_args = CommonArgs::parse_from([
             "nntp-proxy",
+            "--no-tui",
             "--cache-capacity",
             "256mb",
             "--backend-strategy",
@@ -365,12 +416,15 @@ mod tests {
         assert_eq!(legacy_args.article_cache_ttl_secs, Some(3600));
         assert_eq!(legacy_args.store_article_bodies, Some(false));
         assert_eq!(legacy_args.backend_pipelining, Some(true));
+        assert_eq!(legacy_args.effective_ui_mode(), UiMode::Headless);
     }
 
     // Helper to create default args for testing
     fn default_args() -> CommonArgs {
         CommonArgs {
             config: ConfigPath::new("config.toml").unwrap(),
+            ui: UiMode::Headless,
+            no_tui: false,
             port: None,
             host: None,
             routing_mode: None,

@@ -29,7 +29,7 @@ This document provides comprehensive guidance for understanding and working with
 A high-performance NNTP (Network News Transfer Protocol) proxy server written in Rust with:
 - **Hybrid routing mode** - Intelligent per-command routing that auto-switches to stateful when needed (default)
 - **Health-aware load balancing** - Uses least-loaded or weighted round-robin backend selection
-- **TLS/SSL support** - Secure backend connections using rustls
+- **TLS/SSL support** - Secure outbound backend connections using rustls; client-side listening remains plain NNTP
 - **Connection pooling** - Pre-authenticated connections with deadpool
 - **Article caching** - Optional LRU cache for frequently accessed articles
 - **Client authentication** - Config-based authentication with credential validation
@@ -42,10 +42,9 @@ A high-performance NNTP (Network News Transfer Protocol) proxy server written in
 4. **Testability** - 82%+ library code coverage, property-based testing, integration tests, mock servers
 5. **Observability** - Structured logging with tracing, detailed metrics, error classification
 
-### Binary Targets
+### Runtime Binary
 
-1. **`nntp-proxy`** - Main proxy server with three routing modes and built-in caching
-2. **`nntp-proxy-tui`** - Same proxy with the terminal dashboard enabled
+1. **`nntp-proxy`** - Main proxy server with three routing modes, built-in caching, and selectable dashboard/headless UI behavior
 
 ---
 
@@ -117,7 +116,7 @@ Client → Proxy (Routing Logic) → Backend Pool → Backend Server(s)
 ```
 src/
 ├── lib.rs                    # Public API exports and module declarations
-├── bin/                      # nntp-proxy and nntp-proxy-tui binaries
+├── bin/                      # Runtime entrypoints; public docs should describe a single nntp-proxy executable with selectable UI modes
 ├── args.rs                   # Shared CLI/env argument handling
 ├── auth/                     # Client and backend authentication
 ├── cache/                    # Memory, disk, and availability caching

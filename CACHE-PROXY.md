@@ -1,6 +1,6 @@
 # NNTP Proxy Caching Guide
 
-Caching is built into `nntp-proxy` and `nntp-proxy-tui`. There is no separate `nntp-cache-proxy` binary.
+Caching is built into the main `nntp-proxy` binary. There is no separate `nntp-cache-proxy` or `nntp-proxy-tui` runtime executable.
 
 ## Cache Modes
 
@@ -49,15 +49,11 @@ shards = 4
 ./target/release/nntp-proxy --config cache-config.toml
 ```
 
-Or run the dashboard variant:
-
-```bash
-cargo run --bin nntp-proxy-tui -- --config cache-config.toml
-```
+To launch the built-in dashboard, use the same `nntp-proxy` binary with `--ui tui`.
 
 ## CLI Overrides
 
-These flags work with either binary:
+These flags work with `nntp-proxy` in either UI mode:
 
 - `--article-cache-capacity <SIZE>`
 - `--article-cache-ttl <SECONDS>`
@@ -92,7 +88,7 @@ Recommended settings:
 
 ## Monitoring
 
-- `nntp-proxy-tui` shows cache metrics live
+- `nntp-proxy` can show cache metrics live when launched with the dashboard enabled
 - The proxy also logs periodic cache statistics
 - `stats.json` persists metrics; `availability.idx` persists availability-only knowledge when enabled
 
