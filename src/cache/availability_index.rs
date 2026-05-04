@@ -3,7 +3,8 @@
 //! Stores negative-only backend availability using a rotating blocked fingerprint
 //! filter. The filter is bounded by `capacity_bytes`, favors throughput, and
 //! accepts occasional false negatives from rotation/overwrites. False positives
-//! are pushed down by storing a 64-bit keyed fingerprint per slot.
+//! are pushed down by storing a keyed 64-bit fingerprint plus a keyed 16-bit
+//! confirmation tag per slot.
 
 use super::{ArticleAvailability, CachedArticle, availability::MAX_BACKENDS, ttl};
 use crate::io_util::atomic_replace_file;
@@ -22,11 +23,12 @@ use twox_hash::XxHash64;
 const DEFAULT_GENERATIONS: usize = 2;
 const BLOCK_SLOTS: usize = 2;
 const FIXED_ARTICLE_CAPACITY: usize = 256 * 1024;
-const SLOT_BYTES: usize = size_of::<u64>() + size_of::<u8>();
+const SLOT_BYTES: usize = size_of::<u64>() + size_of::<u16>() + size_of::<u8>();
 const ALL_BACKEND_BITS: u8 = ((1u16 << MAX_BACKENDS) - 1) as u8;
-const PERSISTENCE_MAGIC: &[u8; 8] = b"ANEGSIM1";
+const PERSISTENCE_MAGIC: &[u8; 8] = b"ANEGSIM2";
 const LEGACY_PERSISTENCE_MAGIC_V1: &[u8; 8] = b"ANEGIDX1";
 const LEGACY_PERSISTENCE_MAGIC_V2: &[u8; 8] = b"ANEGIDX2";
+const LEGACY_PERSISTENCE_MAGIC_V3: &[u8; 8] = b"ANEGSIM1";
 
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -34,6 +36,7 @@ static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy, Debug, Default)]
 struct Block {
     hashes: [u64; BLOCK_SLOTS],
+    tags: [u16; BLOCK_SLOTS],
     missing: [u8; BLOCK_SLOTS],
 }
 
@@ -42,8 +45,8 @@ const FIXED_TOTAL_BLOCKS: usize = FIXED_ARTICLE_CAPACITY / BLOCK_SLOTS;
 const FIXED_CAPACITY_BYTES: u64 = (FIXED_TOTAL_BLOCKS * size_of::<Block>()) as u64;
 
 impl Block {
-    fn missing_bits(&self, hash: u64) -> u8 {
-        let mut matched = matching_slots(&self.hashes, hash);
+    fn missing_bits(&self, hash: u64, tag: u16) -> u8 {
+        let mut matched = matching_slots(&self.hashes, &self.tags, hash, tag);
         let mut missing_bits = 0u8;
 
         while matched != 0 {
@@ -55,10 +58,10 @@ impl Block {
         missing_bits
     }
 
-    fn insert(&mut self, hash: u64, missing_bits: u8, victim: usize) -> InsertOutcome {
+    fn insert(&mut self, hash: u64, tag: u16, missing_bits: u8, victim: usize) -> InsertOutcome {
         debug_assert_ne!(hash, 0, "fingerprint slots use 0 as the empty sentinel");
 
-        let existing = matching_slots(&self.hashes, hash);
+        let existing = matching_slots(&self.hashes, &self.tags, hash, tag);
         if existing != 0 {
             let slot = existing.trailing_zeros() as usize;
             self.missing[slot] |= missing_bits;
@@ -67,11 +70,13 @@ impl Block {
 
         if let Some(empty_slot) = self.hashes.iter().position(|&value| value == 0) {
             self.hashes[empty_slot] = hash;
+            self.tags[empty_slot] = tag;
             self.missing[empty_slot] = missing_bits;
             return InsertOutcome::Inserted;
         }
 
         self.hashes[victim] = hash;
+        self.tags[victim] = tag;
         self.missing[victim] = missing_bits;
         InsertOutcome::Replaced
     }
@@ -79,6 +84,7 @@ impl Block {
     fn clear(&mut self) -> usize {
         let occupied = self.hashes.iter().filter(|&&hash| hash != 0).count();
         self.hashes = [0; BLOCK_SLOTS];
+        self.tags = [0; BLOCK_SLOTS];
         self.missing = [0; BLOCK_SLOTS];
         occupied
     }
@@ -121,6 +127,7 @@ impl Generation {
 #[derive(Clone, Copy, Debug)]
 struct PersistedEntry {
     hash: u64,
+    tag: u16,
     missing: u8,
     inserted_at: u64,
 }
@@ -264,7 +271,13 @@ impl FilterState {
         evicted
     }
 
-    fn lookup_missing_bits(&mut self, hash: u64, block_index: usize, now: u64) -> LookupResult {
+    fn lookup_missing_bits(
+        &mut self,
+        hash: u64,
+        tag: u16,
+        block_index: usize,
+        now: u64,
+    ) -> LookupResult {
         let evicted = self.rotate_if_needed(now);
         if self.blocks_per_generation == 0 || self.generations.is_empty() {
             return LookupResult {
@@ -277,7 +290,7 @@ impl FilterState {
         let mut missing_bits = 0u8;
         for generation_index in self.active_generation_indices() {
             missing_bits |=
-                self.generations[generation_index].blocks[block_index].missing_bits(hash);
+                self.generations[generation_index].blocks[block_index].missing_bits(hash, tag);
             if missing_bits == ALL_BACKEND_BITS {
                 break;
             }
@@ -293,6 +306,7 @@ impl FilterState {
     fn insert_missing_bits(
         &mut self,
         hash: u64,
+        tag: u16,
         missing_bits: u8,
         block_index: usize,
         victim: usize,
@@ -312,7 +326,7 @@ impl FilterState {
         self.ensure_current_generation_started(now);
         let generation = &mut self.generations[self.current_generation];
         let block = &mut generation.blocks[block_index];
-        let outcome = block.insert(hash, missing_bits, victim);
+        let outcome = block.insert(hash, tag, missing_bits, victim);
         if matches!(outcome, InsertOutcome::Inserted) {
             generation.occupied += 1;
         }
@@ -368,7 +382,12 @@ impl FilterState {
         self.live_generations = self.live_generations.max(offset + 1);
 
         let block = &mut generation.blocks[block_index(entry.hash, self.blocks_per_generation)];
-        match block.insert(entry.hash, entry.missing, victim_slot(entry.hash)) {
+        match block.insert(
+            entry.hash,
+            entry.tag,
+            entry.missing,
+            victim_slot(entry.hash),
+        ) {
             InsertOutcome::Inserted => {
                 generation.occupied += 1;
                 0
@@ -394,6 +413,7 @@ impl FilterState {
                     }
                     entries.push(PersistedEntry {
                         hash,
+                        tag: block.tags[slot],
                         missing,
                         inserted_at: generation.started_at,
                     });
@@ -585,12 +605,15 @@ impl AvailabilityIndex {
                 .fetch_add(snapshot.evicted as u64, Ordering::Relaxed);
         }
 
-        let mut bytes =
-            Vec::with_capacity(16 + snapshot.entries.len() * (size_of::<u64>() * 2 + 1));
+        let mut bytes = Vec::with_capacity(
+            16 + snapshot.entries.len()
+                * (size_of::<u64>() + size_of::<u16>() + 1 + size_of::<u64>()),
+        );
         bytes.extend_from_slice(PERSISTENCE_MAGIC);
         bytes.extend_from_slice(&(snapshot.entries.len() as u64).to_le_bytes());
         for entry in snapshot.entries {
             bytes.extend_from_slice(&entry.hash.to_le_bytes());
+            bytes.extend_from_slice(&entry.tag.to_le_bytes());
             bytes.push(entry.missing);
             bytes.extend_from_slice(&entry.inserted_at.to_le_bytes());
         }
@@ -667,7 +690,7 @@ impl AvailabilityIndex {
             return None;
         }
 
-        let hash = hash_key(key.as_bytes());
+        let (hash, tag) = hash_key(key.as_bytes());
         let now = ttl::now_millis();
         let lookup = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -679,7 +702,7 @@ impl AvailabilityIndex {
                 }
             } else {
                 let block_index = block_index(hash, state.blocks_per_generation);
-                let mut lookup = state.lookup_missing_bits(hash, block_index, now);
+                let mut lookup = state.lookup_missing_bits(hash, tag, block_index, now);
                 lookup.empty_after = state.occupied_slots() == 0;
                 lookup
             }
@@ -706,7 +729,7 @@ impl AvailabilityIndex {
             return;
         }
 
-        let hash = hash_key(key.as_bytes());
+        let (hash, tag) = hash_key(key.as_bytes());
         let outcome = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if state.blocks_per_generation == 0 {
@@ -715,7 +738,7 @@ impl AvailabilityIndex {
                 let block_index = block_index(hash, state.blocks_per_generation);
                 let victim = victim_slot(hash);
                 let now = ttl::now_millis();
-                state.insert_missing_bits(hash, missing_bits, block_index, victim, now)
+                state.insert_missing_bits(hash, tag, missing_bits, block_index, victim, now)
             }
         };
 
@@ -738,7 +761,10 @@ fn parse_entries(data: &[u8]) -> Result<Vec<PersistedEntry>> {
     }
 
     let magic = &data[..PERSISTENCE_MAGIC.len()];
-    if magic == LEGACY_PERSISTENCE_MAGIC_V1 || magic == LEGACY_PERSISTENCE_MAGIC_V2 {
+    if magic == LEGACY_PERSISTENCE_MAGIC_V1
+        || magic == LEGACY_PERSISTENCE_MAGIC_V2
+        || magic == LEGACY_PERSISTENCE_MAGIC_V3
+    {
         return Ok(Vec::new());
     }
     if magic != PERSISTENCE_MAGIC {
@@ -751,6 +777,7 @@ fn parse_entries(data: &[u8]) -> Result<Vec<PersistedEntry>> {
 
     for _ in 0..entry_count {
         let hash = read_u64(data, &mut cursor)?;
+        let tag = read_u16(data, &mut cursor)?;
         let missing = *data
             .get(cursor)
             .ok_or_else(|| anyhow::anyhow!("truncated availability missing bits"))?;
@@ -758,6 +785,7 @@ fn parse_entries(data: &[u8]) -> Result<Vec<PersistedEntry>> {
         let inserted_at = read_u64(data, &mut cursor)?;
         entries.push(PersistedEntry {
             hash,
+            tag,
             missing,
             inserted_at,
         });
@@ -774,10 +802,25 @@ fn read_u64(data: &[u8], cursor: &mut usize) -> Result<u64> {
     Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
 }
 
-fn hash_key(bytes: &[u8]) -> u64 {
-    let mut hasher = XxHash64::default();
-    hasher.write(bytes);
-    normalize_hash(hasher.finish())
+fn read_u16(data: &[u8], cursor: &mut usize) -> Result<u16> {
+    let bytes = data
+        .get(*cursor..*cursor + size_of::<u16>())
+        .ok_or_else(|| anyhow::anyhow!("truncated u16 field"))?;
+    *cursor += size_of::<u16>();
+    Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn hash_key(bytes: &[u8]) -> (u64, u16) {
+    let mut primary = XxHash64::default();
+    primary.write(bytes);
+
+    let mut tag = XxHash64::with_seed(0x9E37_79B9_7F4A_7C15);
+    tag.write(bytes);
+
+    (
+        normalize_hash(primary.finish()),
+        (tag.finish() & u16::MAX as u64) as u16,
+    )
 }
 
 fn normalize_hash(hash: u64) -> u64 {
@@ -793,10 +836,15 @@ fn victim_slot(hash: u64) -> usize {
     ((hash >> 48) as usize) & (BLOCK_SLOTS - 1)
 }
 
-fn matching_slots(hashes: &[u64; BLOCK_SLOTS], needle: u64) -> SlotMatchMask {
+fn matching_slots(
+    hashes: &[u64; BLOCK_SLOTS],
+    tags: &[u16; BLOCK_SLOTS],
+    needle_hash: u64,
+    needle_tag: u16,
+) -> SlotMatchMask {
     let mut mask = 0;
     for (index, &value) in hashes.iter().enumerate() {
-        if value == needle {
+        if value == needle_hash && tags[index] == needle_tag {
             mask |= 1u8 << index;
         }
     }
@@ -817,6 +865,17 @@ mod tests {
         let index = AvailabilityIndex::with_test_capacity(test_capacity_for(16, 2));
         let msg_id = MessageId::from_borrowed("<miss@example.com>").unwrap();
         assert!(index.get(&msg_id).is_none());
+    }
+
+    #[test]
+    fn slot_match_requires_confirmation_tag() {
+        let mut block = Block::default();
+        block.hashes[0] = 42;
+        block.tags[0] = 7;
+        block.missing[0] = 0b0000_0001;
+
+        assert_eq!(block.missing_bits(42, 7), 0b0000_0001);
+        assert_eq!(block.missing_bits(42, 8), 0);
     }
 
     #[test]
