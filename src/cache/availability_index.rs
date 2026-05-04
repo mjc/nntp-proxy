@@ -80,6 +80,7 @@ impl TinyEntry {
 struct FullShard {
     slots: Box<[Slot]>,
     len: usize,
+    arena_limit: usize,
     arena: Vec<u8>,
 }
 
@@ -88,6 +89,7 @@ impl FullShard {
         Self {
             slots: vec![Slot::default(); slot_count].into_boxed_slice(),
             len: 0,
+            arena_limit: arena_bytes,
             arena: Vec::with_capacity(arena_bytes),
         }
     }
@@ -211,21 +213,21 @@ impl FullShard {
     fn ensure_space_for(&mut self, required_key_len: usize) -> Option<usize> {
         if self.slots.is_empty()
             || required_key_len == 0
-            || required_key_len > self.arena.capacity()
+            || required_key_len > self.arena_limit
             || required_key_len > u16::MAX as usize
         {
             return None;
         }
 
         let mut evicted = 0usize;
-        while (!self.can_insert() || self.arena.len() + required_key_len > self.arena.capacity())
+        while (!self.can_insert() || self.arena.len() + required_key_len > self.arena_limit)
             && self.len > 0
         {
             self.evict_lru()?;
             evicted += 1;
         }
 
-        if self.can_insert() && self.arena.len() + required_key_len <= self.arena.capacity() {
+        if self.can_insert() && self.arena.len() + required_key_len <= self.arena_limit {
             Some(evicted)
         } else {
             None
@@ -248,7 +250,7 @@ impl FullShard {
         let old_slots = take(&mut self.slots);
         let old_arena = take(&mut self.arena);
 
-        let mut rebuilt = FullShard::new(old_slots.len(), old_arena.capacity());
+        let mut rebuilt = FullShard::new(old_slots.len(), self.arena_limit);
         for (idx, slot) in old_slots.iter().copied().enumerate() {
             if idx == victim_idx || slot.is_empty() {
                 continue;
@@ -1186,6 +1188,21 @@ mod tests {
         }
         let shard = restored.shards[0].lock().unwrap_or_else(|e| e.into_inner());
         assert!(shard.is_full());
+    }
+
+    #[test]
+    fn full_shard_uses_configured_arena_limit_not_vec_capacity() {
+        let mut shard = FullShard::new(8, 8);
+        shard.arena = Vec::with_capacity(64);
+        shard.arena.extend_from_slice(b"12345678");
+
+        assert_eq!(shard.arena_limit, 8);
+        assert_eq!(shard.arena.len(), 8);
+        assert!(shard.arena.capacity() > shard.arena_limit);
+        assert!(
+            shard.ensure_space_for(1).is_none(),
+            "configured arena budget must win over allocator-rounded capacity"
+        );
     }
 
     #[test]
