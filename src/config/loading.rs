@@ -329,9 +329,14 @@ pub fn load_config_from_env() -> Result<Config> {
 /// modifying the config file.
 ///
 /// # Errors
-/// Returns any file I/O, TOML parsing, environment override, or configuration
-/// validation error encountered while loading the config.
+/// Returns read/parsing or validation errors encountered while loading the
+/// config. Legacy schema write-back failures are logged but do not prevent
+/// startup because the migrated in-memory config can still be used.
 pub fn load_config(config_path: &str) -> Result<Config> {
+    load_config_with_env_provider(config_path, &StdEnvProvider)
+}
+
+fn load_config_with_env_provider<E: EnvProvider>(config_path: &str, env: &E) -> Result<Config> {
     use anyhow::Context;
 
     let config_content = std::fs::read_to_string(config_path)
@@ -346,22 +351,29 @@ pub fn load_config(config_path: &str) -> Result<Config> {
     let mut file_config = config.clone();
     let migrated = migrate_legacy_config(&mut file_config, &raw_config);
 
-    // Check for environment variable server overrides
-    if let Some(env_servers) = load_servers_from_env() {
-        tracing::info!(
-            "Using {} backend server(s) from environment variables (overriding config file)",
-            env_servers.len()
-        );
-        config.servers = env_servers;
-    }
-
     if migrated {
         tracing::info!(
             "Migrating legacy configuration schema in '{}' to the new routing/cache/memory layout",
             config_path
         );
-        write_canonical_config(config_path, &file_config)?;
         config = file_config;
+        if let Err(error) = write_canonical_config(config_path, &config) {
+            tracing::warn!(
+                "Failed to write migrated config schema for '{}': {:#}. Continuing with migrated in-memory config.",
+                config_path,
+                error
+            );
+        }
+    }
+
+    // Check for environment variable server overrides after migration so
+    // canonical file rewrites never discard container-provided backends.
+    if let Some(env_servers) = load_servers_from_env_provider(env) {
+        tracing::info!(
+            "Using {} backend server(s) from environment variables (overriding config file)",
+            env_servers.len()
+        );
+        config.servers = env_servers;
     }
 
     // Validate the loaded configuration
@@ -887,5 +899,69 @@ adaptive_precheck = true
 
         let backup_path = format!("{path}.bak");
         assert!(std::path::Path::new(&backup_path).exists());
+    }
+
+    #[test]
+    fn test_load_config_preserves_env_server_overrides_after_migration() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+
+        let config_content = r#"
+[proxy]
+routing_mode = "per-command"
+backend_selection = "least-loaded"
+buffer_pool_count = 64
+capture_pool_count = 32
+"#;
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "env.example.com")
+            .set("NNTP_SERVER_0_PORT", "563")
+            .set("NNTP_SERVER_0_NAME", "Env Server")
+            .set("NNTP_SERVER_0_USE_TLS", "true");
+
+        let path = temp_file.path().to_str().unwrap().to_string();
+        let config = load_config_with_env_provider(&path, &env).unwrap();
+
+        assert_eq!(config.routing.routing_mode, RoutingMode::PerCommand);
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].host.as_str(), "env.example.com");
+        assert_eq!(config.servers[0].port.get(), 563);
+        assert_eq!(config.servers[0].name.as_str(), "Env Server");
+        assert!(config.servers[0].use_tls);
+    }
+
+    #[test]
+    fn test_load_config_uses_migrated_config_when_writeback_fails() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("config.toml");
+
+        let config_content = r#"
+[[servers]]
+host = "legacy.example.com"
+port = 119
+name = "Legacy Server"
+
+[proxy]
+routing_mode = "per-command"
+backend_selection = "least-loaded"
+"#;
+        std::fs::write(&path, config_content).unwrap();
+
+        let backup_path = path_with_suffix(&path, ".bak");
+        std::fs::create_dir(&backup_path).unwrap();
+
+        let result = load_config_with_env_provider(path.to_str().unwrap(), &MockEnv::new());
+
+        let config = result.unwrap();
+        assert_eq!(config.routing.routing_mode, RoutingMode::PerCommand);
+        assert_eq!(
+            config.routing.backend_selection,
+            BackendSelectionStrategy::LeastLoaded
+        );
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(config.servers[0].host.as_str(), "legacy.example.com");
+        assert!(backup_path.is_dir());
     }
 }

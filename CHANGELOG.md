@@ -9,63 +9,71 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Typed request pipeline rewrite**
-  - Added `RequestContext`-based request handling so validated verb and argument bytes can move through routing, batching, cache, and response accounting without rebuilding ad-hoc command buffers.
-  - Added typed request, response, cache, and wire-length metadata slots used throughout per-command, pipeline, and stateful execution paths.
+- **RFC 8054 backend wire compression** ([#53](https://github.com/mjc/nntp-proxy/pull/53))
+  - Added `COMPRESS DEFLATE` negotiation for proxy-to-backend links with configurable compression mode and level.
+  - Backend responses can now be transparently compressed without changing client-side NNTP behavior.
 
-- **Availability-only negative cache index**
-  - Added a compact sharded index for exact per-message-id 430 knowledge without storing payload bytes.
-  - Added bounded arena storage, LRU-style eviction/compaction, and persistence support for availability-only cache state.
+- **TCP command pipelining** ([#55](https://github.com/mjc/nntp-proxy/pull/55))
+  - Added backend pipeline workers and batched `ARTICLE`/`BODY`/`STAT`/`HEAD` execution to reduce round trips for sequential article fetches.
+  - Added queued pipeline routing and leftover-response handling for pipelined backend connections.
 
-- **Benchmark coverage for the rewritten hot paths**
-  - Added benchmark suites for request batch parsing, request serialization, request classifier callgrind runs, cache ingest, cache response generation, end-to-end proxy cache hits, streaming round-trips, and tail-buffer boundaries.
+- **Persistent proxy/TUI metrics** ([#57](https://github.com/mjc/nntp-proxy/pull/57))
+  - Added versioned JSON metrics persistence and restore via `[proxy].stats_file` so cumulative dashboard stats survive restarts.
+
+- **Typed request pipeline and availability-only cache index** ([#60](https://github.com/mjc/nntp-proxy/pull/60))
+  - Added `RequestContext`-based request handling so validated request metadata can flow through routing, batching, cache lookup, and metrics without rebuilding ad-hoc command buffers.
+  - Added a compact persisted availability-only index so exact 430 knowledge can be retained without storing article bodies.
 
 ### Changed
 
-- **Typed cache and routing internals**
-  - Reworked cache lookup, cache upsert, pipeline completion, backend response accounting, and metrics recording to operate on typed request context metadata instead of legacy loosely-coupled helper paths.
-  - Reworked cache response generation and ingestion to use typed cache parts and borrowed bytes, reducing copying and eliminating steady-state cache-hit allocations on the common path.
+- **Configuration and CLI naming refresh**
+  - Reorganized config around `[routing]`, `[memory]`, `[cache]`, and `[health_check]` with clearer canonical names such as `article_cache_capacity`, `article_cache_ttl_secs`, `store_article_bodies`, and `backend_pipelining`.
+  - Config loading now migrates older layouts in place and CLI parsing keeps legacy flag aliases for compatibility.
 
-- **Protocol and classifier cleanup**
-  - Removed the legacy command classifier export and the old message-id extractor in favor of typed request parsing and routing decisions.
-  - Updated request handling so local/reject/stateful/stateless routing decisions derive from parsed request context instead of duplicated command-shape checks.
+- **Disk cache compression configuration** ([#56](https://github.com/mjc/nntp-proxy/pull/56))
+  - Disk cache compression is now a selectable codec (`lz4`, `zstd`, or `none`) instead of a boolean toggle.
 
-- **Typed cache metadata**
-  - Converted cache tier, timestamp, payload kind, article number, response status, and wire-length fields to typed wrappers across memory and hybrid cache implementations.
+- **Typed cache and routing internals** ([#60](https://github.com/mjc/nntp-proxy/pull/60))
+  - Reworked cache lookup, cache upsert, pipeline completion, backend response accounting, and metrics recording around typed request and cache metadata.
+  - Reworked cache response generation and ingestion to use borrowed bytes and typed cache parts, reducing copying on cache hits.
 
 ### Fixed
 
-- **Availability-only cache correctness**
-  - Fixed 430 handling so missing-article knowledge can be retained without a payload and reused on later requests instead of repeatedly probing every backend.
-  - Guarded availability bit generation with `BackendId::availability_bit()` so out-of-range backend indexes fail at a single checked boundary instead of relying on raw shifts.
+- **Backend connection state and multiline response framing** ([#58](https://github.com/mjc/nntp-proxy/pull/58), [#59](https://github.com/mjc/nntp-proxy/pull/59))
+  - Fixed pooled-connection read-ahead handling so bytes past `\r\n.\r\n` are preserved for the next response instead of desynchronizing reused backend connections.
+  - Direct per-command multiline responses are now fully buffered and terminator-validated before being forwarded, preventing partial-response corruption.
 
-- **Streaming response framing**
-  - Fixed full-buffer multiline response handling so terminator detection always flows through `TailBuffer`, preventing pipelined bytes from being consumed past the article terminator.
-  - Removed the unsafe `BoundaryOnly` fast path that could desynchronize backend response framing.
+- **RFC 3977 / RFC 4643 protocol compliance**
+  - Fixed greeting and authentication behavior to return RFC-correct `201`, `482`, `502`, and `501` responses where appropriate.
+  - Added `MODE READER` negotiation support and return `503` for unsupported commands that must be rejected explicitly.
 
-- **Typed request routing regressions**
-  - Tightened message-id detection so commands are only routed as message-id lookups when the argument is a single exact validated message-id token.
-  - Restored multiline-response fallback for unknown extension commands so legacy multiline 1xx/2xx extension responses keep working after the request rewrite.
+- **Retry and recovery behavior** ([#52](https://github.com/mjc/nntp-proxy/pull/52), [#57](https://github.com/mjc/nntp-proxy/pull/57))
+  - Added jittered retry backoff for stale pooled connections to avoid synchronized retry storms after backend disruption.
+  - Improved connection draining, health checks, and graceful-shutdown timeouts so broken or half-read connections are less likely to be reused.
+
+- **Typed request/cache correctness** ([#60](https://github.com/mjc/nntp-proxy/pull/60))
+  - Fixed availability-only 430 retention so missing-article knowledge can be reused without a cached payload.
+  - Tightened message-ID routing to require a single exact validated token and restored multiline fallback for unknown extension commands.
+  - Routed full-buffer multiline terminator detection through `TailBuffer` and guarded availability bit generation with `BackendId::availability_bit()`.
 
 ### Performance
 
-- Steady-state cache-hit and request-routing hot paths remain zero-allocation when buffer pools and `SmallVec` inline capacities are sized for the working set.
-- Microbench and focused benchmark notes from this branch:
-  - `UnifiedCache::get()` miss: ~182 ns
-  - 64 KB cache hit hot path: ~13.1-13.7 us
-  - 768 KB cache hit hot path: ~74.8-76.4 us
-- Matched native end-to-end reruns against `main` showed the rewritten cache path closing most of the gap on hits and reaching rough parity or better on larger payloads:
-  - 64 KB cache hit: 15.15 us on this branch vs 13.76 us on `main`
-  - 768 KB cache hit: 76.41 us on this branch vs 78.24 us on `main`
-  - 64 KB cache miss: 33.23 us on this branch vs 32.05 us on `main`
-  - 768 KB cache miss: 208.9 us on this branch vs 238.1 us on `main`
-- 64 KB backend round trips still trailed `main` in the latest rerun (34.9 us here vs 30.71 us on `main`), so the rewrite improved cache-hit throughput much more than uncached backend forwarding.
+- **Hot-path cache and pipeline work** ([#55](https://github.com/mjc/nntp-proxy/pull/55), [#60](https://github.com/mjc/nntp-proxy/pull/60), [#61](https://github.com/mjc/nntp-proxy/pull/61))
+  - Kept steady-state cache-hit and request-routing paths allocation-conscious via typed metadata, borrowed bytes, and pooled buffers.
+  - Reduced larger cache-miss round-trip costs by handing off owned multiline chunks, removing scratch-buffer zero-fill, and adding adaptive availability sharding.
 
-### Technical Details
+- **Benchmark coverage and measurement cleanup** ([#60](https://github.com/mjc/nntp-proxy/pull/60), [#61](https://github.com/mjc/nntp-proxy/pull/61))
+  - Added or refreshed benchmark suites for request parsing/serialization, cache ingest, cache response generation, end-to-end proxy behavior, streaming round-trips, and tail-buffer boundary handling.
+  - Corrected the cache-miss callgrind harness so instruction-count comparisons reflect normal benchmark setup.
 
-- Branch scope: 162 files changed, 14,344 insertions, 11,166 deletions.
-- The rewrite replaces legacy request/classifier plumbing with typed request contexts end-to-end across protocol parsing, cache operations, pipeline execution, and metrics.
-- Buffer-pool sizing still matters: undersized pools can force fallback allocations and reduce the benefits of the zero-allocation hot path.
+### Testing
+
+- Expanded regression coverage for pipelining, leftover-response handling, terminator detection, config migration, typed request parsing, availability-only caching, and RFC 3977 / RFC 4643 compliance.
+
+### Docs
+
+- Rewrote `README.md` and refreshed example configs to match the current routing, cache, memory, and health-check layout, including canonical config names and availability-only cache behavior.
+- Added updated performance notes documenting the cache hot path and current benchmark methodology.
 
 ## [0.4.0] - 2026-01-27
 
