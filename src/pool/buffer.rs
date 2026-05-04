@@ -283,6 +283,18 @@ impl ChunkedResponse {
         self.len = 0;
     }
 
+    /// Append an initialized owned chunk without copying its bytes.
+    #[inline]
+    pub fn push_chunk(&mut self, chunk: PooledBuffer) {
+        let chunk_len = chunk.initialized();
+        if chunk_len == 0 {
+            return;
+        }
+
+        self.len += chunk_len;
+        self.chunks.push(chunk);
+    }
+
     /// Append bytes using one or more pooled capture buffers.
     ///
     /// # Panics
@@ -982,6 +994,47 @@ mod tests {
         let mut prefix = SmallVec::<[u8; 128]>::new();
         response.copy_prefix_into(64, &mut prefix);
         assert_eq!(&prefix[..], b"430\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_chunked_response_push_chunk_preserves_owned_boundaries() {
+        let pool = BufferPool::new(BufferSize::try_new(16).unwrap(), 4).with_capture_pool(1024, 1);
+        let mut first = pool.acquire().await;
+        let mut second = pool.acquire().await;
+        first.copy_from_slice(b"220 0 <id>\r\n");
+        second.copy_from_slice(b"Body\r\n.\r\n");
+
+        let mut response = ChunkedResponse::default();
+        response.push_chunk(first);
+        response.push_chunk(second);
+
+        let chunks: Vec<&[u8]> = response.iter_chunks().collect();
+        assert_eq!(
+            chunks,
+            vec![b"220 0 <id>\r\n".as_slice(), b"Body\r\n.\r\n".as_slice()]
+        );
+        assert_eq!(response.to_vec(), b"220 0 <id>\r\nBody\r\n.\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_chunked_response_truncate_mid_owned_chunk() {
+        let pool = BufferPool::new(BufferSize::try_new(16).unwrap(), 4).with_capture_pool(1024, 1);
+        let mut first = pool.acquire().await;
+        let mut second = pool.acquire().await;
+        first.copy_from_slice(b"220 0 <id>\r\n");
+        second.copy_from_slice(b"Body\r\n.\r\n");
+
+        let mut response = ChunkedResponse::default();
+        response.push_chunk(first);
+        response.push_chunk(second);
+        response.truncate(b"220 0 <id>\r\nBody\r\n".len());
+
+        let chunks: Vec<&[u8]> = response.iter_chunks().collect();
+        assert_eq!(
+            chunks,
+            vec![b"220 0 <id>\r\n".as_slice(), b"Body\r\n".as_slice()]
+        );
+        assert_eq!(response.to_vec(), b"220 0 <id>\r\nBody\r\n");
     }
 
     #[tokio::test]
