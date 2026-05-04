@@ -1,19 +1,19 @@
 # Minimal NNTP Proxy Configuration
-# This is the simplest possible configuration - just one backend server
-# Client authentication is optional and not required
+# This is the simplest useful configuration: one backend server plus defaults.
+
+# Defaults:
+# - Binds to 0.0.0.0:8119
+# - Hybrid routing mode (automatic per-command to stateful switching)
+# - Availability-only article cache mode
+# - Default transport memory settings
+# - No client authentication
+# - Max 10 connections per backend
+# - No TLS
+#
+# To override the defaults, add [proxy], [routing], [memory], [cache], or
+# [client_auth] sections above the server list.
 
 [[servers]]
 host = "news.example.com"
 port = 119
 name = "News Server"
-
-# That's it! The proxy will run with defaults:
-# - No client authentication
-# - Max 10 connections per backend
-# - Health checks every 30 seconds
-# - No TLS
-# - Hybrid routing mode (automatic per-command to stateful switching)
-# - Availability-only article cache mode
-# - Default transport memory settings
-#
-# To override the defaults, add [routing], [cache], or [memory] sections.

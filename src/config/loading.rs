@@ -3,12 +3,17 @@
 //! This module handles loading configuration from TOML files and environment variables,
 //! with environment variables taking precedence for Docker/container deployments.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use serde::de::DeserializeOwned;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use super::defaults;
-use super::types::{BackendSelectionStrategy, Config, RoutingMode, Server};
+use super::types::{Config, Server};
 
-fn table<'a>(value: &'a toml::Value, key: &str) -> Option<&'a toml::map::Map<String, toml::Value>> {
+type TomlTable = toml::map::Map<String, toml::Value>;
+
+fn table<'a>(value: &'a toml::Value, key: &str) -> Option<&'a TomlTable> {
     value.get(key)?.as_table()
 }
 
@@ -16,24 +21,22 @@ fn table_has_key(value: &toml::Value, section: &str, key: &str) -> bool {
     table(value, section).is_some_and(|t| t.contains_key(key))
 }
 
-fn write_canonical_config(config_path: &str, config: &Config) -> Result<()> {
-    use anyhow::Context;
-    use std::fs;
-    use std::path::Path;
+fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut path = path.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
 
+fn write_canonical_config(config_path: &str, config: &Config) -> Result<()> {
     let canonical =
         toml::to_string_pretty(config).context("Failed to serialize migrated config")?;
     let path = Path::new(config_path);
-    let backup_path = path.with_extension(
-        path.extension()
-            .map(|ext| format!("{}{}.bak", ext.to_string_lossy(), ""))
-            .unwrap_or_else(|| "bak".to_string()),
-    );
+    let backup_path = path_with_suffix(path, ".bak");
 
     fs::copy(path, &backup_path)
         .with_context(|| format!("Failed to create backup config '{}'", backup_path.display()))?;
 
-    let tmp_path = path.with_extension("tmp");
+    let tmp_path = path_with_suffix(path, ".tmp");
     fs::write(&tmp_path, canonical).with_context(|| {
         format!(
             "Failed to write migrated config to temporary file '{}'",
@@ -50,72 +53,82 @@ fn write_canonical_config(config_path: &str, config: &Config) -> Result<()> {
     Ok(())
 }
 
-fn migrate_legacy_config(config: &mut Config, raw: &toml::Value) -> bool {
-    let mut migrated = false;
+fn assign_from_table<T>(target: &mut T, source: &TomlTable, key: &str) -> bool
+where
+    T: DeserializeOwned,
+{
+    let Some(value) = source
+        .get(key)
+        .and_then(|value| value.clone().try_into::<T>().ok())
+    else {
+        return false;
+    };
 
-    // Legacy routing values lived under [proxy].
-    if raw.get("routing").is_none()
-        && let Some(proxy) = table(raw, "proxy")
-    {
-        if let Some(value) = proxy.get("routing_mode")
-            && let Ok(mode) = value.clone().try_into::<RoutingMode>()
-        {
-            config.routing.routing_mode = mode;
-            migrated = true;
-        }
+    *target = value;
+    true
+}
 
-        if let Some(value) = proxy.get("backend_selection")
-            && let Ok(strategy) = value.clone().try_into::<BackendSelectionStrategy>()
-        {
-            config.routing.backend_selection = strategy;
-            migrated = true;
-        }
+fn migrate_proxy_routing(config: &mut Config, raw: &toml::Value) -> bool {
+    let Some(proxy) = table(raw, "proxy") else {
+        return false;
+    };
 
-        if let Some(value) = proxy.get("buffer_pool_count")
-            && let Ok(count) = value.clone().try_into::<usize>()
-        {
-            config.memory.buffer_pool_count = count;
-            migrated = true;
-        }
-
-        if let Some(value) = proxy.get("capture_pool_count")
-            && let Ok(count) = value.clone().try_into::<usize>()
-        {
-            config.memory.capture_pool_count = count;
-            migrated = true;
-        }
+    if raw.get("routing").is_some() {
+        return false;
     }
 
-    // Legacy adaptive precheck lived under [cache].
+    let mut migrated = false;
+    migrated |= assign_from_table(&mut config.routing.routing_mode, proxy, "routing_mode");
+    migrated |= assign_from_table(
+        &mut config.routing.backend_selection,
+        proxy,
+        "backend_selection",
+    );
+    migrated
+}
+
+fn migrate_proxy_memory(config: &mut Config, raw: &toml::Value) -> bool {
+    let Some(proxy) = table(raw, "proxy") else {
+        return false;
+    };
+
+    if raw.get("memory").is_some() {
+        return false;
+    }
+
+    let mut migrated = false;
+    migrated |= assign_from_table(
+        &mut config.memory.buffer_pool_count,
+        proxy,
+        "buffer_pool_count",
+    );
+    migrated |= assign_from_table(
+        &mut config.memory.capture_pool_count,
+        proxy,
+        "capture_pool_count",
+    );
+    migrated
+}
+
+fn migrate_cache_precheck(config: &mut Config, raw: &toml::Value) -> bool {
     if !table_has_key(raw, "routing", "adaptive_precheck")
         && let Some(cache) = table(raw, "cache")
-        && let Some(value) = cache.get("adaptive_precheck")
-        && let Ok(enabled) = value.clone().try_into::<bool>()
+        && assign_from_table(
+            &mut config.routing.adaptive_precheck,
+            cache,
+            "adaptive_precheck",
+        )
     {
-        config.routing.adaptive_precheck = enabled;
-        migrated = true;
+        return true;
     }
 
-    // Legacy memory knobs lived under [proxy].
-    if raw.get("memory").is_none()
-        && let Some(proxy) = table(raw, "proxy")
-    {
-        if let Some(value) = proxy.get("buffer_pool_count")
-            && let Ok(count) = value.clone().try_into::<usize>()
-        {
-            config.memory.buffer_pool_count = count;
-            migrated = true;
-        }
+    false
+}
 
-        if let Some(value) = proxy.get("capture_pool_count")
-            && let Ok(count) = value.clone().try_into::<usize>()
-        {
-            config.memory.capture_pool_count = count;
-            migrated = true;
-        }
-    }
-
-    migrated
+fn migrate_legacy_config(config: &mut Config, raw: &toml::Value) -> bool {
+    migrate_proxy_routing(config, raw)
+        | migrate_proxy_memory(config, raw)
+        | migrate_cache_precheck(config, raw)
 }
 
 /// Environment variable getter trait for dependency injection
@@ -263,9 +276,7 @@ fn load_servers_from_env() -> Option<Vec<Server>> {
 /// Load servers using a custom environment provider (testable version)
 pub fn load_servers_from_env_provider<E: EnvProvider>(env: &E) -> Option<Vec<Server>> {
     let servers: Vec<Server> = (0..)
-        .map(|i| parse_server_from_env(i, env))
-        .take_while(std::option::Option::is_some)
-        .flatten()
+        .map_while(|index| parse_server_from_env(index, env))
         .collect();
 
     if servers.is_empty() {
@@ -498,6 +509,7 @@ pub fn create_default_config() -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{BackendSelectionStrategy, RoutingMode};
     use std::collections::HashMap;
     use std::io::Write;
     use tempfile::NamedTempFile;
@@ -857,6 +869,21 @@ adaptive_precheck = true
         assert!(migrated.contains("article_cache_capacity = 268435456"));
         assert!(migrated.contains("article_cache_ttl_secs = 1800"));
         assert!(migrated.contains("store_article_bodies = true"));
+
+        let proxy_offset = migrated.find("[proxy]").unwrap();
+        let routing_offset = migrated.find("[routing]").unwrap();
+        let memory_offset = migrated.find("[memory]").unwrap();
+        let cache_offset = migrated.find("[cache]").unwrap();
+        let health_check_offset = migrated.find("[health_check]").unwrap();
+        let client_auth_offset = migrated.find("[client_auth]").unwrap();
+        let servers_offset = migrated.find("[[servers]]").unwrap();
+
+        assert!(proxy_offset < routing_offset);
+        assert!(routing_offset < memory_offset);
+        assert!(memory_offset < cache_offset);
+        assert!(cache_offset < health_check_offset);
+        assert!(health_check_offset < client_auth_offset);
+        assert!(client_auth_offset < servers_offset);
 
         let backup_path = format!("{path}.bak");
         assert!(std::path::Path::new(&backup_path).exists());

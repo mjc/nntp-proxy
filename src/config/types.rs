@@ -112,9 +112,6 @@ impl std::fmt::Display for BackendSelectionStrategy {
 /// Main proxy configuration
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// List of backend NNTP servers
-    #[serde(default)]
-    pub servers: Vec<Server>,
     /// Proxy server settings
     #[serde(default)]
     pub proxy: Proxy,
@@ -124,30 +121,33 @@ pub struct Config {
     /// Memory configuration
     #[serde(default)]
     pub memory: Memory,
-    /// Health check configuration
-    #[serde(default)]
-    pub health_check: HealthCheck,
     /// Cache configuration (optional in config - defaults to availability-only mode)
     #[serde(
         default = "super::defaults::default_cache_option",
         skip_serializing_if = "Option::is_none"
     )]
     pub cache: Option<Cache>,
+    /// Health check configuration
+    #[serde(default)]
+    pub health_check: HealthCheck,
     /// Client authentication configuration
     #[serde(default)]
     pub client_auth: ClientAuth,
+    /// List of backend NNTP servers
+    #[serde(default)]
+    pub servers: Vec<Server>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            servers: Vec::new(),
             proxy: Proxy::default(),
             routing: Routing::default(),
             memory: Memory::default(),
-            health_check: HealthCheck::default(),
             cache: super::defaults::default_cache_option(),
+            health_check: HealthCheck::default(),
             client_auth: ClientAuth::default(),
+            servers: Vec::new(),
         }
     }
 }

@@ -51,10 +51,10 @@ Main config sections:
 
 - `[proxy]` for listen address, thread count, logging, and stats file path
 - `[routing]` for routing mode, backend selection, and adaptive precheck
-- `[[servers]]` for backend servers
-- `[cache]` for article-cache capacity, TTL, storage mode, and availability persistence
 - `[memory]` for socket buffers and pooled buffer sizes/counts
-- `[client_auth]` or `[[client_auth.users]]` for client authentication
+- `[cache]` for article-cache capacity, TTL, storage mode, and availability persistence
+- `[client_auth]` and `[[client_auth.users]]` for client authentication
+- `[[servers]]` for backend servers
 
 Common server fields:
 
@@ -82,17 +82,17 @@ Common proxy/cache settings:
 - `routing.mode`
 - `routing.backend_selection`
 - `routing.adaptive_precheck`
-- `cache.article_cache_capacity`
-- `cache.article_cache_ttl_secs`
-- `cache.store_article_bodies`
-- `cache.availability_index_path`
-- `cache.disk`
 - `memory.socket_recv_buffer_size`
 - `memory.socket_send_buffer_size`
 - `memory.buffer_pool_size`
 - `memory.buffer_pool_count`
 - `memory.capture_pool_size`
 - `memory.capture_pool_count`
+- `cache.article_cache_capacity`
+- `cache.article_cache_ttl_secs`
+- `cache.store_article_bodies`
+- `cache.availability_index_path`
+- `cache.disk`
 
 Command-line flags mirror the same ideas:
 
