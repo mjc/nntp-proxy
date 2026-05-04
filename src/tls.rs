@@ -270,6 +270,9 @@ impl TlsManager {
     /// **Performance**: Loads and parses certificates once during initialization
     /// instead of on every connection, eliminating certificate parsing overhead
     /// (DER parsing, X.509 validation, signature verification).
+    ///
+    /// # Errors
+    /// Returns any certificate-loading or rustls configuration error.
     pub fn new(config: TlsConfig) -> Result<Self, anyhow::Error> {
         // Load certificates once during initialization
         let cert_result = Self::load_certificates_sync(&config)?;
@@ -289,6 +292,10 @@ impl TlsManager {
     }
 
     /// Perform TLS handshake
+    ///
+    /// # Errors
+    /// Returns any SNI conversion, connector, or handshake error for the
+    /// backend connection.
     pub async fn handshake(
         &self,
         stream: TcpStream,
@@ -330,7 +337,7 @@ impl TlsManager {
         }
 
         // 2. Try to load system certificates
-        let system_count = Self::load_system_certificates_sync(&mut root_store)?;
+        let system_count = Self::load_system_certificates_sync(&mut root_store);
         if system_count > 0 {
             debug!(
                 "TLS: Loaded {} certificates from system store",
@@ -376,10 +383,7 @@ impl TlsManager {
     }
 
     /// Load system certificates, returning count of successfully loaded certificates
-    #[allow(clippy::unnecessary_wraps)] // Errors logged as warnings; always returns Ok(count)
-    fn load_system_certificates_sync(
-        root_store: &mut RootCertStore,
-    ) -> Result<usize, anyhow::Error> {
+    fn load_system_certificates_sync(root_store: &mut RootCertStore) -> usize {
         let cert_result = rustls_native_certs::load_native_certs();
         let mut added_count = 0;
 
@@ -394,7 +398,7 @@ impl TlsManager {
             warn!("TLS: Certificate loading error: {}", error);
         }
 
-        Ok(added_count)
+        added_count
     }
 
     /// Create optimized client configuration using ring crypto provider

@@ -66,9 +66,7 @@ impl RuntimeConfig {
                 .enable_all()
                 .build()?
         } else {
-            let num_cpus = std::thread::available_parallelism()
-                .map(std::num::NonZero::get)
-                .unwrap_or(1);
+            let num_cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
             tracing::info!(
                 "Starting NNTP proxy with {} worker threads (detected {} CPUs)",
                 self.worker_threads,
@@ -81,7 +79,7 @@ impl RuntimeConfig {
         };
 
         if self.enable_cpu_pinning {
-            pin_to_cpu_cores(self.worker_threads)?;
+            pin_to_cpu_cores(self.worker_threads);
         }
 
         Ok(rt)
@@ -101,8 +99,7 @@ impl Default for RuntimeConfig {
 /// # Arguments
 /// * `num_cores` - Number of CPU cores to pin to (`0..num_cores`)
 #[cfg(target_os = "linux")]
-#[allow(clippy::unnecessary_wraps)] // Non-fatal: errors are logged as warnings, always returns Ok
-fn pin_to_cpu_cores(num_cores: usize) -> Result<()> {
+fn pin_to_cpu_cores(num_cores: usize) {
     use nix::sched::{CpuSet, sched_setaffinity};
     use nix::unistd::Pid;
 
@@ -117,40 +114,42 @@ fn pin_to_cpu_cores(num_cores: usize) -> Result<()> {
                 "Successfully pinned process to {} CPU cores for optimal performance",
                 num_cores
             );
-            Ok(())
         }
         Err(e) => {
             tracing::warn!(
                 "Failed to set CPU affinity: {}, continuing without pinning",
                 e
             );
-            Ok(()) // Non-fatal
         }
     }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pin_to_cpu_cores(_num_cores: usize) -> Result<()> {
+fn pin_to_cpu_cores(_num_cores: usize) {
     tracing::info!("CPU pinning not available on this platform");
-    Ok(())
 }
 
 /// Wait for shutdown signal (Ctrl+C or SIGTERM on Unix)
 ///
-/// This is a common utility for all binary targets.
+/// This is a common utility for all binary targets. Handler installation
+/// failures are logged and treated as an immediate shutdown signal.
 pub async fn shutdown_signal() {
+    use tracing::warn;
+
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to install Ctrl+C handler");
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            warn!("Failed to install Ctrl+C handler: {error}");
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("Failed to install signal handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(error) => warn!("Failed to install SIGTERM handler: {error}"),
+        }
     };
 
     #[cfg(not(unix))]
@@ -272,7 +271,7 @@ pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
     // Cache is always present now
     let cache = Arc::clone(proxy.cache());
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_mins(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
@@ -301,6 +300,7 @@ pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
 pub fn spawn_shutdown_handler(
     proxy: &std::sync::Arc<crate::NntpProxy>,
     stats_path: std::path::PathBuf,
+    availability_path: Option<std::path::PathBuf>,
     server_names: Vec<String>,
 ) -> tokio::sync::mpsc::Receiver<()> {
     use std::sync::Arc;
@@ -320,6 +320,15 @@ pub fn spawn_shutdown_handler(
             Err(e) => warn!("Failed to save metrics on shutdown: {}", e),
         }
 
+        if let Some(path) = availability_path.clone() {
+            let cache = proxy.cache().clone();
+            match save_availability_to_disk_blocking(cache, path.clone()).await {
+                Ok(true) => info!("Availability index saved to {}", path.display()),
+                Ok(false) => {}
+                Err(e) => warn!("Failed to save availability index on shutdown: {}", e),
+            }
+        }
+
         // Notify listeners
         let _ = shutdown_tx.send(()).await;
 
@@ -336,12 +345,24 @@ pub fn spawn_shutdown_handler(
 /// `MetricsCollector::save_to_disk` uses `std::fs`, so callers from async
 /// tasks should delegate here instead of running filesystem work on a runtime
 /// worker.
+///
+/// # Errors
+/// Returns an error if the blocking task panics/cancels or if writing the
+/// metrics JSON fails.
 pub async fn save_metrics_to_disk_blocking(
     metrics: crate::metrics::MetricsCollector,
     stats_path: std::path::PathBuf,
     server_names: Vec<String>,
 ) -> Result<()> {
     tokio::task::spawn_blocking(move || metrics.save_to_disk(&stats_path, &server_names)).await?
+}
+
+/// Save availability state on Tokio's blocking thread pool.
+pub async fn save_availability_to_disk_blocking(
+    cache: std::sync::Arc<crate::cache::UnifiedCache>,
+    availability_path: std::path::PathBuf,
+) -> Result<bool> {
+    tokio::task::spawn_blocking(move || cache.save_to_disk(&availability_path)).await?
 }
 
 /// Run the main accept loop for client connections
@@ -415,15 +436,40 @@ pub fn resolve_stats_file_path(
 ) -> std::path::PathBuf {
     use std::path::Path;
 
-    if let Some(path) = configured_path {
-        path.clone()
-    } else {
-        // Default to stats.json alongside config file
+    configured_path.map_or_else(
+        || {
+            // Default to stats.json alongside config file
+            let config_dir = Path::new(config_path)
+                .parent()
+                .unwrap_or_else(|| Path::new("."));
+            config_dir.join("stats.json")
+        },
+        std::clone::Clone::clone,
+    )
+}
+
+/// Resolve the availability persistence path for availability-only mode.
+///
+/// Returns None unless `cache_articles = false`. If `availability_file` is
+/// configured, use it; otherwise default to "availability.idx" alongside config.
+#[must_use]
+pub fn resolve_availability_file_path(
+    config_path: &str,
+    cache_config: Option<&crate::config::Cache>,
+) -> Option<std::path::PathBuf> {
+    use std::path::Path;
+
+    let cache_config = cache_config?;
+    if cache_config.cache_articles {
+        return None;
+    }
+
+    Some(cache_config.availability_file.clone().unwrap_or_else(|| {
         let config_dir = Path::new(config_path)
             .parent()
             .unwrap_or_else(|| Path::new("."));
-        config_dir.join("stats.json")
-    }
+        config_dir.join("availability.idx")
+    }))
 }
 
 /// Load metrics from disk if the stats file exists
@@ -463,6 +509,41 @@ pub fn load_metrics_from_disk(
     }
 }
 
+/// Load availability state from disk if the file exists.
+///
+/// Returns true when an availability-only cache was restored successfully.
+pub fn load_availability_from_disk(
+    cache: &std::sync::Arc<crate::cache::UnifiedCache>,
+    availability_path: &std::path::Path,
+) -> bool {
+    use tracing::{info, warn};
+
+    match cache.load_from_disk(availability_path) {
+        Ok(true) => {
+            info!(
+                "Restored availability index from {}",
+                availability_path.display()
+            );
+            true
+        }
+        Ok(false) => {
+            info!(
+                "Availability file {} is missing or not needed, starting fresh",
+                availability_path.display()
+            );
+            false
+        }
+        Err(e) => {
+            warn!(
+                "Failed to load availability index from {}: {}, starting fresh",
+                availability_path.display(),
+                e
+            );
+            false
+        }
+    }
+}
+
 /// Spawn background task to periodically save metrics to disk
 ///
 /// Saves every 30 seconds. Logs errors but doesn't fail.
@@ -490,6 +571,39 @@ pub fn spawn_metrics_saver(
     });
 }
 
+/// Spawn background task to periodically save availability state to disk.
+///
+/// Saves every 30 seconds when the proxy uses the dedicated availability index.
+pub fn spawn_availability_saver(
+    proxy: &std::sync::Arc<crate::NntpProxy>,
+    availability_path: Option<std::path::PathBuf>,
+) {
+    use std::sync::Arc;
+    use tracing::warn;
+
+    let Some(availability_path) = availability_path else {
+        return;
+    };
+
+    let proxy = Arc::clone(proxy);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let cache = proxy.cache().clone();
+            let path = availability_path.clone();
+            if let Err(e) = save_availability_to_disk_blocking(cache, path.clone()).await {
+                warn!(
+                    "Failed to save availability index to {}: {}",
+                    path.display(),
+                    e
+                );
+            }
+        }
+    });
+}
+
 /// Spawn background task that periodically checks for and clears idle backend connections.
 ///
 /// Runs every 60 seconds and delegates to [`NntpProxy::check_and_clear_stale_pools`],
@@ -501,10 +615,10 @@ pub fn spawn_idle_connection_clearer(proxy: &std::sync::Arc<crate::NntpProxy>) {
     use std::sync::Arc;
     use std::time::Duration;
 
-    let proxy = Arc::clone(proxy);
-
     /// How often to check for idle backends
-    const CHECK_INTERVAL: Duration = Duration::from_secs(60);
+    const CHECK_INTERVAL: Duration = Duration::from_mins(1);
+
+    let proxy = Arc::clone(proxy);
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(CHECK_INTERVAL);
@@ -579,8 +693,7 @@ mod tests {
     #[test]
     fn test_pin_to_cpu_cores_non_fatal() {
         // Should not panic even if pinning fails
-        let result = pin_to_cpu_cores(1);
-        assert!(result.is_ok());
+        pin_to_cpu_cores(1);
     }
 
     // Edge case tests
@@ -673,39 +786,34 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn test_pin_to_cpu_cores_linux_single_core() {
-        let result = pin_to_cpu_cores(1);
-        assert!(result.is_ok());
+        pin_to_cpu_cores(1);
     }
 
     #[test]
     #[cfg(target_os = "linux")]
     fn test_pin_to_cpu_cores_linux_multi_core() {
-        let result = pin_to_cpu_cores(4);
-        assert!(result.is_ok());
+        pin_to_cpu_cores(4);
     }
 
     #[test]
     #[cfg(target_os = "linux")]
     fn test_pin_to_cpu_cores_linux_zero_cores() {
         // Edge case: 0 cores should still succeed (no-op)
-        let result = pin_to_cpu_cores(0);
-        assert!(result.is_ok());
+        pin_to_cpu_cores(0);
     }
 
     #[test]
     #[cfg(target_os = "linux")]
     fn test_pin_to_cpu_cores_linux_many_cores() {
         // Try to pin to more cores than available - should not panic
-        let result = pin_to_cpu_cores(1024);
-        assert!(result.is_ok()); // Best-effort, won't fail
+        pin_to_cpu_cores(1024);
     }
 
     #[test]
     #[cfg(not(target_os = "linux"))]
     fn test_pin_to_cpu_cores_non_linux() {
         // Non-Linux platforms should gracefully no-op
-        let result = pin_to_cpu_cores(4);
-        assert!(result.is_ok());
+        pin_to_cpu_cores(4);
     }
 
     // Default implementation tests
@@ -808,5 +916,39 @@ mod tests {
         let result = load_metrics_from_disk(nonexistent_path, &[]);
 
         assert!(result.is_none(), "Missing file should return None");
+    }
+
+    #[test]
+    fn test_resolve_availability_file_path_none_for_full_cache() {
+        let cache = crate::config::Cache::default();
+        assert!(resolve_availability_file_path("config.toml", Some(&cache)).is_none());
+    }
+
+    #[test]
+    fn test_resolve_availability_file_path_default_for_availability_only() {
+        let cache = crate::config::Cache {
+            cache_articles: false,
+            ..Default::default()
+        };
+
+        let result = resolve_availability_file_path("/etc/nntp-proxy/config.toml", Some(&cache))
+            .expect("availability-only mode should resolve a path");
+
+        assert_eq!(result.file_name().unwrap(), "availability.idx");
+        assert!(result.to_string_lossy().contains("nntp-proxy"));
+    }
+
+    #[test]
+    fn test_resolve_availability_file_path_with_configured() {
+        let cache = crate::config::Cache {
+            cache_articles: false,
+            availability_file: Some(std::path::PathBuf::from("/custom/path/availability.idx")),
+            ..Default::default()
+        };
+
+        let result = resolve_availability_file_path("config.toml", Some(&cache))
+            .expect("configured path should be used");
+
+        assert_eq!(result, cache.availability_file.unwrap());
     }
 }

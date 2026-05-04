@@ -64,6 +64,10 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
 ///
 /// # Returns
 /// Ok(()) when the TUI exits normally, or an error if terminal operations fail
+///
+/// # Errors
+/// Returns any terminal setup, drawing, input, shutdown-signal, or restore error
+/// encountered while running the interactive UI.
 pub async fn run_tui(
     mut app: TuiApp,
     shutdown_tx: mpsc::Sender<()>,

@@ -44,6 +44,7 @@
 //! - Compression: Reduces disk usage (LZ4: ~60%, Zstd: ~65%+ for typical NNTP articles)
 
 use crate::config::CompressionCodec;
+use crate::protocol::StatusCode;
 use crate::types::{BackendId, MessageId};
 use foyer::{
     BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
@@ -55,8 +56,10 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use super::availability::ArticleAvailability;
-use super::hybrid_codec::HybridArticleEntry;
+use super::hybrid_codec::{CacheableStatusCode, DiskCachedArticle};
 use super::ttl;
+
+const HYBRID_CACHE_NAME: &str = "nntp-article-cache-v3";
 
 /// Check available disk space at the given path using df command
 fn check_available_space(path: &Path) -> Option<u64> {
@@ -89,8 +92,6 @@ pub struct HybridCacheConfig {
     pub disk_path: std::path::PathBuf,
     /// Time-to-live for cached articles (not directly used by foyer, but kept for API consistency)
     pub ttl: Duration,
-    /// Whether to cache full article bodies
-    pub cache_articles: bool,
     /// Compression codec for disk storage (lz4, zstd, or none)
     pub compression: CompressionCodec,
     /// Number of shards for concurrent access
@@ -104,7 +105,6 @@ impl Default for HybridCacheConfig {
             disk_capacity: 10 * 1024 * 1024 * 1024, // 10 GB disk
             disk_path: std::path::PathBuf::from("/var/cache/nntp-proxy"),
             ttl: Duration::from_secs(3600), // 1 hour
-            cache_articles: true,
             compression: CompressionCodec::Lz4,
             shards: 16, // Match indexer shards for consistent lock contention
         }
@@ -122,13 +122,13 @@ impl Default for HybridCacheConfig {
 /// Note: Keys are stored as `String` (message ID without brackets) because
 /// foyer requires keys to implement the `Code` trait for disk serialization.
 pub struct HybridArticleCache {
-    cache: HybridCache<String, HybridArticleEntry>,
+    cache: HybridCache<String, DiskCachedArticle>,
     hits: AtomicU64,
     misses: AtomicU64,
     disk_hits: AtomicU64,
     config: HybridCacheConfig,
     /// Base TTL in milliseconds (used for tier-aware expiration via `effective_ttl`)
-    ttl_millis: u64,
+    ttl_millis: ttl::CacheTtlMillis,
 }
 
 impl std::fmt::Debug for HybridArticleCache {
@@ -231,14 +231,14 @@ impl HybridArticleCache {
             .map_err(|e| anyhow::anyhow!("Failed to create foyer runtime: {e}"))?;
 
         let mut builder = HybridCacheBuilder::new()
-            .with_name("nntp-article-cache-v1") // Bumped for tier-aware TTL format (added tier byte)
+            .with_name(HYBRID_CACHE_NAME)
             .with_policy(HybridCachePolicy::WriteOnInsertion)
             .memory(memory_capacity_usize)
             .with_shards(config.shards)
             .with_eviction_config(LruConfig {
                 high_priority_pool_ratio: 0.1,
             })
-            .with_weighter(|_key: &String, value: &HybridArticleEntry| value.buffer.len())
+            .with_weighter(|_key: &String, value: &DiskCachedArticle| value.payload_len().get())
             .storage()
             .with_io_engine_config(PsyncIoEngineConfig::new())
             .with_engine_config(
@@ -288,7 +288,7 @@ impl HybridArticleCache {
             "Hybrid article cache initialized"
         );
 
-        let ttl_millis = config.ttl.as_millis() as u64;
+        let ttl_millis = ttl::CacheTtlMillis::from_duration(config.ttl);
         Ok(Self {
             cache,
             hits: AtomicU64::new(0),
@@ -303,7 +303,7 @@ impl HybridArticleCache {
     ///
     /// Checks memory first, then disk. Returns None if not found in either tier.
     /// Applies tier-aware TTL expiration - higher tier entries get longer TTLs.
-    pub async fn get(&self, message_id: &MessageId<'_>) -> Option<HybridArticleEntry> {
+    pub(crate) async fn get(&self, message_id: &MessageId<'_>) -> Option<DiskCachedArticle> {
         let key = message_id.without_brackets().to_string();
         let result = self.cache.get(&key).await;
 
@@ -346,88 +346,95 @@ impl HybridArticleCache {
     /// With `WriteOnInsertion` policy, articles are written to disk immediately
     /// in a background task (non-blocking).
     ///
-    /// **UPSERT SEMANTICS**: Never overwrites a larger buffer with a smaller one.
-    /// A cached full article (220/222 response) must not be replaced by a STAT stub.
+    /// **UPSERT SEMANTICS**: Never overwrites a larger semantic payload with a smaller one.
+    /// A cached full article (220/222 response) must not be replaced by STAT availability.
     ///
     /// The tier is stored with the entry for tier-aware TTL calculation.
-    pub async fn upsert<B>(
+    pub async fn upsert_ingest(
         &self,
         message_id: MessageId<'_>,
-        buffer: B,
+        buffer: impl Into<super::CacheIngestResponse>,
         backend_id: BackendId,
-        tier: u8,
-    ) where
-        B: Into<super::CacheBuffer>,
-    {
+        tier: super::ttl::CacheTier,
+    ) {
         let buffer = buffer.into();
         let key = message_id.without_brackets().to_string();
         let buffer_len = buffer.len();
-        let buffer = buffer.into_vec();
+        let Some(mut entry) = DiskCachedArticle::from_ingest_response_with_tier(buffer, tier)
+        else {
+            warn!(msg_id = %key, buffer_len, "Cannot cache: invalid status code");
+            return;
+        };
+        let entry_len = entry.payload_len();
 
-        // Check for existing entry - don't overwrite larger buffers with smaller ones
+        // Check for existing entry - don't overwrite larger semantic payloads with smaller ones.
         if let Ok(Some(existing)) = self.cache.get(&key).await {
-            let existing_len = existing.value().buffer.len();
-            if existing_len > buffer_len {
+            let existing_len = existing.value().payload_len();
+            if existing_len > entry_len {
                 // Existing entry is larger - just update availability info and refresh TTL
                 let mut updated = existing.value().clone();
                 updated.record_backend_has(backend_id);
                 // Refresh timestamp on successful upsert to extend tier-aware TTL
-                updated.timestamp = ttl::now_millis();
+                updated.timestamp = ttl::CacheTimestampMillis::now();
                 self.cache.insert(key.clone(), updated);
                 debug!(
                     msg_id = %key,
-                    existing_bytes = existing_len,
-                    new_bytes = buffer_len,
+                    existing_bytes = existing_len.get(),
+                    new_bytes = entry_len.get(),
                     "Hybrid cache upsert: preserved larger existing entry, updated availability"
                 );
                 return;
             }
         }
 
-        // Split into two paths to avoid clone: one moves buffer, one borrows it
-        if self.config.cache_articles {
-            let Some(mut entry) = HybridArticleEntry::with_tier(buffer, tier) else {
-                warn!(msg_id = %key, buffer_len, "Cannot cache: invalid status code");
-                return;
-            };
-            entry.record_backend_has(backend_id);
-            let entry_len = entry.buffer.len();
-            self.cache.insert(key.clone(), entry);
-            debug!(msg_id = %key, stored_bytes = entry_len, tier, "Hybrid cache upsert");
-        } else {
-            // Availability-only mode: store minimal stub
-            let stub = Self::create_stub(&buffer);
-            let Some(mut entry) = HybridArticleEntry::with_tier(stub, tier) else {
-                warn!(
-                    msg_id = %key,
-                    buffer_len,
-                    first_bytes = ?&buffer[..buffer_len.min(32)],
-                    "Cannot cache: invalid status code"
-                );
-                return;
-            };
-            entry.record_backend_has(backend_id);
-            let entry_len = entry.buffer.len();
-            self.cache.insert(key.clone(), entry);
-            debug!(msg_id = %key, stored_bytes = entry_len, tier, "Hybrid cache upsert (stub)");
-        }
+        entry.record_backend_has(backend_id);
+        self.cache.insert(key.clone(), entry);
+        debug!(msg_id = %key, stored_bytes = entry_len.get(), tier = tier.get(), "Hybrid cache upsert");
     }
 
     /// Record that a backend doesn't have an article (430 response)
     pub async fn record_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
         let key = message_id.without_brackets().to_string();
 
-        // Get existing entry or create a minimal stub
+        // Get existing entry or create a typed missing entry.
         let entry = if let Ok(Some(existing)) = self.cache.get(&key).await {
             let mut updated = existing.value().clone();
             updated.record_backend_missing(backend_id);
             updated
         } else {
-            // Create stub entry for availability tracking
-            // SAFETY: "430\r\n" is a valid NNTP response
-            let mut entry =
-                HybridArticleEntry::new(b"430\r\n".to_vec()).expect("430 is a valid status code");
+            let mut entry = DiskCachedArticle::missing(super::ttl::CacheTier::new(0));
             entry.record_backend_missing(backend_id);
+            entry
+        };
+
+        self.cache.insert(key, entry);
+    }
+
+    /// Record successful backend availability without storing response payload bytes.
+    pub async fn record_has_status(
+        &self,
+        message_id: MessageId<'_>,
+        status_code: StatusCode,
+        backend_id: BackendId,
+        tier: super::ttl::CacheTier,
+    ) {
+        let Ok(cacheable_status) = CacheableStatusCode::try_from(status_code.as_u16()) else {
+            warn!(
+                msg_id = %message_id,
+                status_code = status_code.as_u16(),
+                "Cannot record availability: invalid cache status code"
+            );
+            return;
+        };
+
+        let key = message_id.without_brackets().to_string();
+        let entry = if let Ok(Some(existing)) = self.cache.get(&key).await {
+            let mut updated = existing.value().clone();
+            updated.record_backend_has_status(cacheable_status, backend_id, tier);
+            updated
+        } else {
+            let mut entry = DiskCachedArticle::availability_only(cacheable_status, tier);
+            entry.record_backend_has(backend_id);
             entry
         };
 
@@ -440,7 +447,7 @@ impl HybridArticleCache {
     /// backends that returned 430 during this request. Much more efficient
     /// than calling `record_missing` for each backend individually.
     ///
-    /// IMPORTANT: Only creates a 430 stub entry if ALL checked backends returned 430.
+    /// IMPORTANT: Only creates a missing entry if ALL checked backends returned 430.
     /// If any backend successfully provided the article, we skip creating an entry
     /// (the actual article will be cached via upsert, which may race with this call).
     pub async fn sync_availability(
@@ -455,7 +462,7 @@ impl HybridArticleCache {
 
         let key = message_id.without_brackets().to_string();
 
-        // Get existing entry or conditionally create a stub
+        // Get existing entry or conditionally create a missing entry.
         let updated_entry = match self.cache.get(&key).await {
             Ok(Some(existing)) => {
                 // Merge availability into existing entry
@@ -464,16 +471,14 @@ impl HybridArticleCache {
                 Some(entry)
             }
             _ => {
-                // No existing entry - only create a 430 stub if ALL backends returned 430
+                // No existing entry - only create a missing entry if all checked backends returned 430.
                 if availability.any_backend_has_article() {
                     // A backend successfully provided the article.
-                    // Don't create a 430 stub - let upsert() handle it with the real article data.
+                    // Don't create a missing entry - let upsert() handle it with the real article data.
                     None
                 } else {
-                    // All checked backends returned 430 - create stub to track this
-                    // SAFETY: "430\r\n" is a valid NNTP response
-                    let mut entry = HybridArticleEntry::new(b"430\r\n".to_vec())
-                        .expect("430 is a valid status code");
+                    // All checked backends returned 430 - create typed missing entry.
+                    let mut entry = DiskCachedArticle::missing(super::ttl::CacheTier::new(0));
                     entry.availability = *availability;
                     self.misses.fetch_add(1, Ordering::Relaxed);
                     Some(entry)
@@ -484,11 +489,6 @@ impl HybridArticleCache {
         if let Some(entry) = updated_entry {
             self.cache.insert(key, entry);
         }
-    }
-
-    /// Create a minimal stub from a response buffer (for availability-only mode)
-    fn create_stub(buffer: &[u8]) -> Vec<u8> {
-        super::entry_helpers::extract_status_line(buffer).into_vec()
     }
 
     /// Get cache statistics
@@ -584,7 +584,7 @@ impl HybridArticleCache {
             .with_eviction_config(LruConfig {
                 high_priority_pool_ratio: 0.1,
             })
-            .with_weighter(|_key: &String, value: &HybridArticleEntry| value.buffer.len())
+            .with_weighter(|_key: &String, value: &DiskCachedArticle| value.payload_len().get())
             .storage()
             .with_io_engine_config(Box::new(NoopIoEngineConfig) as Box<dyn foyer::IoEngineConfig>);
 
@@ -595,7 +595,6 @@ impl HybridArticleCache {
             disk_capacity: 0, // No disk in memory-only mode
             disk_path: std::path::PathBuf::new(),
             ttl: Duration::from_secs(3600),
-            cache_articles: true,
             compression: CompressionCodec::None,
             shards: 1,
         };
@@ -606,7 +605,7 @@ impl HybridArticleCache {
             misses: AtomicU64::new(0),
             disk_hits: AtomicU64::new(0),
             config,
-            ttl_millis: 3600 * 1000, // 1 hour in milliseconds
+            ttl_millis: ttl::CacheTtlMillis::new(3600 * 1000), // 1 hour in milliseconds
         })
     }
 }
@@ -616,6 +615,11 @@ mod tests {
     //! Cache-level integration tests for `HybridArticleCache`
     //!
     use super::*;
+
+    #[test]
+    fn hybrid_cache_name_cold_invalidates_old_disk_formats() {
+        assert_eq!(HYBRID_CACHE_NAME, "nntp-article-cache-v3");
+    }
 
     #[tokio::test]
     async fn test_hybrid_cache_basic() {
@@ -627,13 +631,18 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<test123@example.com>").unwrap();
         let buffer = b"220 0 <test123@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         cache
-            .upsert(msg_id, buffer.clone(), BackendId::from_index(0), 0)
+            .upsert_ingest(msg_id, buffer.clone(), BackendId::from_index(0), 0.into())
             .await;
 
         // Retrieve it
         let msg_id = MessageId::from_borrowed("<test123@example.com>").unwrap();
         let entry = cache.get(&msg_id).await.unwrap();
-        assert_eq!(entry.buffer(), buffer.as_slice());
+        let response = entry
+            .cached_response_for(crate::protocol::RequestKind::Article, msg_id.as_str())
+            .unwrap();
+        let mut rendered = Vec::with_capacity(response.wire_len().get());
+        response.write_to(&mut rendered).await.unwrap();
+        assert_eq!(rendered, buffer);
         assert!(entry.should_try_backend(BackendId::from_index(0)));
 
         // Check stats
@@ -657,6 +666,11 @@ mod tests {
         // Check availability
         let msg_id = MessageId::from_borrowed("<missing@example.com>").unwrap();
         let entry = cache.get(&msg_id).await.unwrap();
+        assert_eq!(
+            entry.payload_len().get(),
+            0,
+            "missing hybrid cache entries must not retain response payload bytes"
+        );
         assert!(!entry.should_try_backend(BackendId::from_index(0)));
         assert!(entry.should_try_backend(BackendId::from_index(1)));
 

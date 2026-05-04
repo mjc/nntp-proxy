@@ -26,9 +26,17 @@ const SPARKLINE_WIDTH: usize = 15;
 ///
 /// # Returns
 /// A string of length `SPARKLINE_WIDTH` with filled/empty blocks
+// Sparkline fill count is a bounded UI-only conversion from integer percentages.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 #[must_use]
 pub fn create_sparkline(value: u64, max_value: u64) -> String {
     let filled = if max_value > 0 {
+        // Sparkline width is tiny and purely visual, so approximate float math is
+        // sufficient and keeping the cast local makes the display tradeoff explicit.
         ((value as f64 / max_value as f64) * SPARKLINE_WIDTH as f64) as usize
     } else {
         0
@@ -168,23 +176,23 @@ pub fn format_throughput_label(value: f64) -> String {
 
 /// Format throughput strings for summary display
 #[must_use]
-#[allow(clippy::map_unwrap_or)] // map_or_else reverses closure order, making multi-line form less readable
 pub fn format_summary_throughput(latest_throughput: Option<&ThroughputPoint>) -> (String, String) {
     use super::constants::text;
 
-    latest_throughput
-        .map(|point| {
-            (
-                format!("{}{}", text::ARROW_UP, point.sent_per_sec()),
-                format!("{}{}", text::ARROW_DOWN, point.received_per_sec()),
-            )
-        })
-        .unwrap_or_else(|| {
+    latest_throughput.map_or_else(
+        || {
             (
                 format!("{}{}", text::ARROW_UP, text::DEFAULT_THROUGHPUT),
                 format!("{}{}", text::ARROW_DOWN, text::DEFAULT_THROUGHPUT),
             )
-        })
+        },
+        |point| {
+            (
+                format!("{}{}", text::ARROW_UP, point.sent_per_sec()),
+                format!("{}{}", text::ARROW_DOWN, point.received_per_sec()),
+            )
+        },
+    )
 }
 
 // ============================================================================
@@ -281,6 +289,7 @@ pub fn calculate_chart_bounds(max_throughput: f64) -> f64 {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // These helper tests use exact expected fixture values for chart math.
 mod tests {
     use super::*;
 
@@ -350,7 +359,9 @@ mod tests {
         for i in 0..60 {
             points.push(ChartPoint::new(
                 ChartX::from(i),
-                ChartY::from((i * 1000) as f64),
+                ChartY::from(f64::from(
+                    u32::try_from(i * 1000).expect("test value fits into u32"),
+                )),
             ));
         }
 

@@ -2,30 +2,28 @@
 //!
 //! These tests verify invariants and algebraic properties of core functions
 //! using property-based testing with arbitrary input generation.
-#![allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-#![allow(clippy::items_after_statements)]
-#![allow(clippy::format_push_string)]
-
 use nntp_proxy::cache::ArticleAvailability;
-use nntp_proxy::cache::ttl::effective_ttl;
-use nntp_proxy::command::NntpCommand;
-use nntp_proxy::protocol::StatusCode;
-use nntp_proxy::types::MessageId;
+use nntp_proxy::cache::ttl::{CacheTier, CacheTtlMillis, effective_ttl};
+use nntp_proxy::protocol::{Headers, RequestContext, RequestRouteClass, StatusCode};
+use nntp_proxy::router::BackendCount;
+use nntp_proxy::session::streaming::tail_buffer::TailBuffer;
+use nntp_proxy::types::{BackendId, MessageId};
 use proptest::prelude::*;
+use std::fmt::Write as _;
+
+const fn effective_ttl_ms(base_ttl: u64, tier: CacheTier) -> u64 {
+    effective_ttl(CacheTtlMillis::new(base_ttl), tier).get()
+}
 
 // =============================================================================
-// 1. NntpCommand::parse - Classifier robustness and consistency
+// 1. RequestContext - Classifier robustness and consistency
 // =============================================================================
 
 proptest! {
     #[test]
-    fn prop_parse_never_panics(s in ".*") {
-        // Parse any string without panicking
-        let _ = NntpCommand::parse(&s);
+    fn prop_request_context_never_panics(s in ".*") {
+        // Parse any already-read request line without panicking
+        let _ = RequestContext::parse(s.as_bytes());
     }
 
     #[test]
@@ -36,33 +34,27 @@ proptest! {
         let upper = format!("{cmd} {arg}");
         let lower = format!("{} {}", cmd.to_lowercase(), arg);
 
-        let upper_result = NntpCommand::parse(&upper);
-        let lower_result = NntpCommand::parse(&lower);
+        let upper_result = RequestContext::parse(upper.as_bytes());
+        let lower_result = RequestContext::parse(lower.as_bytes());
+        let upper_result = upper_result.expect("generated uppercase command is valid");
+        let lower_result = lower_result.expect("generated lowercase command is valid");
 
         // Same classification regardless of case
-        prop_assert_eq!(
-            std::mem::discriminant(&upper_result),
-            std::mem::discriminant(&lower_result),
-            "UPPER vs lower case differ: {} vs {}",
-            upper,
-            lower
-        );
+        prop_assert_eq!(upper_result.kind(), lower_result.kind(), "UPPER vs lower kind differs: {} vs {}", upper, lower);
+        prop_assert_eq!(upper_result.route_class(), lower_result.route_class(), "UPPER vs lower route differs: {} vs {}", upper, lower);
     }
 
     #[test]
-    fn prop_trimming_idempotent(s in ".*") {
-        let with_spaces = format!("  {s}  ");
-        let result1 = NntpCommand::parse(&with_spaces);
-        let result2 = NntpCommand::parse(&s);
+    fn prop_trailing_line_ending_idempotent(s in "[A-Za-z0-9]+( [A-Za-z0-9@.<>_-]+)?") {
+        let with_crlf = format!("{s}\r\n");
+        let result1 = RequestContext::parse(with_crlf.as_bytes());
+        let result2 = RequestContext::parse(s.as_bytes());
+        let result1 = result1.expect("generated command with CRLF is valid");
+        let result2 = result2.expect("generated command is valid");
 
-        // Trimming is idempotent
-        prop_assert_eq!(
-            std::mem::discriminant(&result1),
-            std::mem::discriminant(&result2),
-            "Trimming changed classification: '{}' vs '{}'",
-            with_spaces,
-            s
-        );
+        // Request line endings do not affect classification.
+        prop_assert_eq!(result1.kind(), result2.kind(), "Line ending changed kind: '{}' vs '{}'", with_crlf, s);
+        prop_assert_eq!(result1.route_class(), result2.route_class(), "Line ending changed route: '{}' vs '{}'", with_crlf, s);
     }
 
     #[test]
@@ -72,28 +64,22 @@ proptest! {
     ) {
         // With angle brackets, should be ArticleByMessageId
         let with_brackets = format!("{cmd} <{arg}>");
-        match NntpCommand::parse(&with_brackets) {
-            NntpCommand::ArticleByMessageId => {
-                // Expected
-            }
-            other => {
-                prop_assert!(false, "Should be ArticleByMessageId with brackets: {}, got {:?}", with_brackets, other);
-            }
-        }
+        let request = RequestContext::parse(with_brackets.as_bytes())
+            .expect("generated message-id command is valid");
+        prop_assert_eq!(request.route_class(), RequestRouteClass::ArticleByMessageId);
     }
 
     #[test]
-    fn prop_parse_deterministic(s in ".*") {
+    fn prop_request_context_deterministic(s in ".*") {
         // Same input always produces same classification
-        let result1 = NntpCommand::parse(&s);
-        let result2 = NntpCommand::parse(&s);
+        let result1 = RequestContext::parse(s.as_bytes());
+        let result2 = RequestContext::parse(s.as_bytes());
 
-        prop_assert_eq!(
-            std::mem::discriminant(&result1),
-            std::mem::discriminant(&result2),
-            "Parse not deterministic for: {}",
-            s
-        );
+        prop_assert_eq!(result1.is_some(), result2.is_some(), "Validity not deterministic for: {}", s);
+        if let (Some(result1), Some(result2)) = (result1, result2) {
+            prop_assert_eq!(result1.kind(), result2.kind(), "Kind not deterministic for: {}", s);
+            prop_assert_eq!(result1.route_class(), result2.route_class(), "Route not deterministic for: {}", s);
+        }
     }
 }
 
@@ -108,18 +94,18 @@ proptest! {
     ) {
         let mut avail = ArticleAvailability::new();
         for (backend_id, op) in ops {
-            let id = nntp_proxy::types::BackendId::from_index(backend_id as usize);
-            match op {
-                0 => { avail.record_missing(id); }
-                _ => { avail.record_has(id); }
+            let id = BackendId::from_index(usize::from(backend_id));
+            if op == 0 {
+                avail.record_missing(id);
+            } else {
+                avail.record_has(id);
             }
         }
     }
 
     #[test]
     fn prop_record_missing_idempotent(backend_id in 0..8u8) {
-        use nntp_proxy::types::BackendId;
-        let id = BackendId::from_index(backend_id as usize);
+        let id = BackendId::from_index(usize::from(backend_id));
         let mut avail1 = ArticleAvailability::new();
         let mut avail2 = ArticleAvailability::new();
 
@@ -133,8 +119,7 @@ proptest! {
 
     #[test]
     fn prop_record_has_clears_missing(backend_id in 0..8u8) {
-        use nntp_proxy::types::BackendId;
-        let id = BackendId::from_index(backend_id as usize);
+        let id = BackendId::from_index(usize::from(backend_id));
         let mut avail = ArticleAvailability::new();
 
         avail.record_missing(id);
@@ -146,8 +131,7 @@ proptest! {
 
     #[test]
     fn prop_should_try_inverse_of_is_missing(backend_id in 0..8u8) {
-        use nntp_proxy::types::BackendId;
-        let id = BackendId::from_index(backend_id as usize);
+        let id = BackendId::from_index(usize::from(backend_id));
         let mut avail = ArticleAvailability::new();
 
         // Initially should_try is true, is_missing is false
@@ -166,8 +150,6 @@ proptest! {
     fn prop_all_exhausted_consistency(
         num_backends in 1..=8usize
     ) {
-        use nntp_proxy::types::BackendId;
-        use nntp_proxy::router::BackendCount;
         let mut avail = ArticleAvailability::new();
         let count = BackendCount::new(num_backends);
 
@@ -304,7 +286,7 @@ proptest! {
         tier in any::<u8>()
     ) {
         // Should work for all combinations
-        let _ = effective_ttl(base, tier);
+        let _ = effective_ttl_ms(base, CacheTier::new(tier));
     }
 
     #[test]
@@ -314,8 +296,8 @@ proptest! {
         tier in 0u8..=10u8
     ) {
         if b1 <= b2 {
-            let ttl1 = effective_ttl(b1, tier);
-            let ttl2 = effective_ttl(b2, tier);
+            let ttl1 = effective_ttl_ms(b1, CacheTier::new(tier));
+            let ttl2 = effective_ttl_ms(b2, CacheTier::new(tier));
 
             // Higher base should give higher or equal TTL
             prop_assert!(ttl1 <= ttl2,
@@ -331,8 +313,8 @@ proptest! {
         t2 in 0u8..20u8
     ) {
         if t1 <= t2 {
-            let ttl1 = effective_ttl(base, t1);
-            let ttl2 = effective_ttl(base, t2);
+            let ttl1 = effective_ttl_ms(base, CacheTier::new(t1));
+            let ttl2 = effective_ttl_ms(base, CacheTier::new(t2));
 
             // Higher tier should give higher or equal TTL
             prop_assert!(ttl1 <= ttl2,
@@ -343,7 +325,7 @@ proptest! {
 
     #[test]
     fn prop_effective_ttl_zero_base_is_zero(tier in any::<u8>()) {
-        let ttl = effective_ttl(0, tier);
+        let ttl = effective_ttl_ms(0, CacheTier::new(tier));
         prop_assert_eq!(ttl, 0, "Zero base should always give zero TTL");
     }
 }
@@ -464,90 +446,57 @@ proptest! {
 }
 
 // =============================================================================
-// 7. NntpResponse::parse - Consistency properties
+// 7. StatusCode::parse - Consistency properties
 // =============================================================================
-
-use nntp_proxy::protocol::NntpResponse;
 
 proptest! {
     #[test]
-    fn prop_nntp_response_parse_never_panics(data in prop::collection::vec(any::<u8>(), 0..100)) {
-        // NntpResponse::parse should never panic on arbitrary bytes
-        let _ = NntpResponse::parse(&data);
+    fn prop_status_code_parse_never_panics(data in prop::collection::vec(any::<u8>(), 0..100)) {
+        let _ = StatusCode::parse(&data);
     }
 
     #[test]
-    fn prop_nntp_response_invalid_iff_statuscode_fails(data in prop::collection::vec(any::<u8>(), 0..100)) {
-        let response = NntpResponse::parse(&data);
+    fn prop_status_code_parse_matches_ascii_prefix(data in prop::collection::vec(any::<u8>(), 0..100)) {
         let status = StatusCode::parse(&data);
 
-        // If StatusCode::parse fails, NntpResponse must be Invalid
-        if status.is_none() {
-            prop_assert_eq!(response, NntpResponse::Invalid,
-                "NntpResponse should be Invalid when StatusCode::parse fails");
-        }
-        // If StatusCode::parse succeeds, NntpResponse must NOT be Invalid
-        if status.is_some() {
-            prop_assert_ne!(response, NntpResponse::Invalid,
-                "NntpResponse should NOT be Invalid when StatusCode::parse succeeds");
-        }
+        let expected = data.get(0..3).and_then(|digits| {
+            digits.iter().all(u8::is_ascii_digit).then(|| {
+                u16::from(digits[0] - b'0') * 100
+                    + u16::from(digits[1] - b'0') * 10
+                    + u16::from(digits[2] - b'0')
+            })
+        });
+
+        prop_assert_eq!(status.map(|code| code.as_u16()), expected);
     }
 
     #[test]
-    fn prop_nntp_response_non_invalid_has_status_code(code in 100u16..=599u16) {
+    fn prop_status_code_round_trips_formatted_code(code in 100u16..=599u16) {
         let formatted = format!("{code:03} some text\r\n");
-        let response = NntpResponse::parse(formatted.as_bytes());
-
-        // Non-Invalid responses must have a status code
-        if response != NntpResponse::Invalid {
-            let sc = response.status_code();
-            prop_assert!(sc.is_some(),
-                "Non-Invalid response for code {} should have status_code()", code);
-            prop_assert_eq!(sc.unwrap().as_u16(), code,
-                "Status code should match input code {}", code);
-        }
+        let status = StatusCode::parse(formatted.as_bytes());
+        prop_assert_eq!(status.map(|code| code.as_u16()), Some(code));
     }
 
     #[test]
-    fn prop_nntp_response_multiline_consistency(code in 100u16..=599u16) {
-        let formatted = format!("{code:03} text\r\n");
-        let response = NntpResponse::parse(formatted.as_bytes());
-
-        if let Some(sc) = StatusCode::parse(formatted.as_bytes()) {
-            // NntpResponse.is_multiline() should agree with StatusCode.is_multiline()
-            // EXCEPT for special codes that NntpResponse categorizes differently
-            // (200, 201 as Greeting; 205 as Disconnect; 281 as AuthSuccess; 381/480 as AuthRequired)
-            let special = matches!(code, 200 | 201 | 205 | 281 | 381 | 480);
-            if !special {
-                prop_assert_eq!(response.is_multiline(), sc.is_multiline(),
-                    "Multiline consistency for code {}: response={}, statuscode={}",
-                    code, response.is_multiline(), sc.is_multiline());
-            }
-        }
+    fn prop_status_code_setup_helpers_match_literal_codes(code in 100u16..=599u16) {
+        let status = StatusCode::new(code);
+        prop_assert_eq!(status.is_greeting(), matches!(code, 200 | 201));
+        prop_assert_eq!(status.requires_auth_credentials(), matches!(code, 381 | 480));
+        prop_assert_eq!(status.is_auth_accepted(), code == 281);
+        prop_assert_eq!(status.is_article_missing(), code == 430);
     }
 
     #[test]
-    fn prop_nntp_response_success_error_exclusive(code in 100u16..=599u16) {
-        let formatted = format!("{code:03} text\r\n");
-        let response = NntpResponse::parse(formatted.as_bytes());
-
-        if response != NntpResponse::Invalid {
-            let is_success = response.is_success();
-            let sc = response.status_code().unwrap();
-            let is_error = sc.is_error();
-
-            // Success and error must be mutually exclusive
-            prop_assert!(!(is_success && is_error),
-                "Code {} cannot be both success and error", code);
-        }
+    fn prop_status_code_success_error_exclusive(code in 100u16..=599u16) {
+        let status = StatusCode::new(code);
+        prop_assert!(!(status.is_success() && status.is_error()),
+            "Code {} cannot be both success and error", code);
     }
 }
 
 // =============================================================================
 // 8. Headers::parse - RFC parser robustness
 // =============================================================================
-
-use nntp_proxy::protocol::Headers;
 
 proptest! {
     #[test]
@@ -598,7 +547,7 @@ proptest! {
         let count = names.len().min(values.len());
         let mut raw = String::new();
         for i in 0..count {
-            raw.push_str(&format!("{}: {}\r\n", names[i], values[i]));
+            writeln!(&mut raw, "{}: {}", names[i], values[i]).expect("writing to String cannot fail");
         }
 
         if let Ok(headers) = Headers::parse(raw.as_bytes()) {
@@ -607,57 +556,6 @@ proptest! {
                 "Iterator count {} should match header count {} for:\n{}",
                 iter_count, count, raw);
         }
-    }
-}
-
-// =============================================================================
-// 9. CacheableStatusCode - TryFrom exhaustiveness
-// =============================================================================
-
-use nntp_proxy::cache::CacheableStatusCode;
-
-proptest! {
-    #[test]
-    fn prop_cacheable_status_code_roundtrip(
-        variant in prop::sample::select(vec![
-            CacheableStatusCode::Article,
-            CacheableStatusCode::Head,
-            CacheableStatusCode::Body,
-            CacheableStatusCode::Stat,
-            CacheableStatusCode::Missing,
-        ])
-    ) {
-        // Every valid variant roundtrips: as_u16 -> try_from -> same variant
-        let raw = variant.as_u16();
-        let back = CacheableStatusCode::try_from(raw);
-        prop_assert!(back.is_ok(),
-            "Roundtrip failed for variant {:?} (code {})", variant, raw);
-        prop_assert_eq!(back.unwrap(), variant,
-            "Roundtrip produced different variant for code {}", raw);
-    }
-
-    #[test]
-    fn prop_cacheable_status_code_rejects_invalid(code in any::<u16>()) {
-        let valid_codes = [220u16, 221, 222, 223, 430];
-        let result = CacheableStatusCode::try_from(code);
-
-        if valid_codes.contains(&code) {
-            prop_assert!(result.is_ok(),
-                "Valid code {} should succeed", code);
-        } else {
-            prop_assert!(result.is_err(),
-                "Invalid code {} should be rejected", code);
-            prop_assert_eq!(result.unwrap_err(), code,
-                "Error should carry the rejected code {}", code);
-        }
-    }
-
-    #[test]
-    fn prop_cacheable_status_code_all_u16_handled(code in any::<u16>()) {
-        // Every u16 value is handled: either success or error, never panic
-        let result = CacheableStatusCode::try_from(code);
-        prop_assert!(result.is_ok() || result.is_err(),
-            "Code {} must be either Ok or Err", code);
     }
 }
 
@@ -682,7 +580,6 @@ proptest! {
                 nntp_proxy::types::ServerName::try_new(format!("server-{i}")).unwrap(),
                 provider,
                 0,
-            None,
             );
 
             prop_assert_eq!(selector.backend_count().get(), i + 1,
@@ -698,9 +595,9 @@ proptest! {
         let client_id = nntp_proxy::types::ClientId::new();
 
         // Routing with zero backends should return an error
-        let result = selector.route_command(client_id, "LIST");
+        let result = selector.route(client_id);
         prop_assert!(result.is_err(),
-            "route_command with zero backends should return error");
+            "route with zero backends should return error");
     }
 
     #[test]
@@ -723,13 +620,11 @@ proptest! {
             id0,
             nntp_proxy::types::ServerName::try_new("server-0".to_string()).unwrap(),
             provider0, 0,
-            None,
         );
         selector.add_backend(
             id1,
             nntp_proxy::types::ServerName::try_new("server-1".to_string()).unwrap(),
             provider1, 0,
-            None,
         );
 
         // Route many commands and count distribution
@@ -737,7 +632,7 @@ proptest! {
         let mut count1 = 0usize;
         for _ in 0..num_requests {
             let client_id = nntp_proxy::types::ClientId::new();
-            if let Ok(id) = selector.route_command(client_id, "LIST") {
+            if let Ok(id) = selector.route(client_id) {
                 if id == id0 { count0 += 1; }
                 if id == id1 { count1 += 1; }
                 // Complete immediately so pending counts don't accumulate
@@ -751,7 +646,7 @@ proptest! {
 
         // With equal weights, each backend should get roughly 50% of requests
         // Allow 30% tolerance for small sample sizes
-        let min_expected = (num_requests as f64 * 0.20) as usize;
+        let min_expected = num_requests / 5;
         prop_assert!(count0 >= min_expected,
             "Backend 0 got {} out of {} requests, expected at least {}",
             count0, num_requests, min_expected);
@@ -762,40 +657,10 @@ proptest! {
 }
 
 // =============================================================================
-// 11. validate_backend_response - Response validation robustness
+// 11. NNTP status and multiline response robustness
 // =============================================================================
 
-use nntp_proxy::session::backend::validate_backend_response;
-
 proptest! {
-    #[test]
-    fn prop_validate_backend_response_never_panics(
-        data in prop::collection::vec(any::<u8>(), 0..200)
-    ) {
-        // validate_backend_response should never panic on arbitrary bytes
-        let _ = validate_backend_response(&data, data.len(), nntp_proxy::protocol::MIN_RESPONSE_LENGTH);
-    }
-
-    #[test]
-    fn prop_valid_nntp_response_never_classified_invalid(
-        code in 100u16..=599u16,
-        text in r"[A-Za-z0-9 ]{1,30}"
-    ) {
-        // Generate valid NNTP response: "{code} {text}\r\n"
-        let response = format!("{code} {text}\r\n");
-        let data = response.as_bytes();
-        let validated = validate_backend_response(data, data.len(), nntp_proxy::protocol::MIN_RESPONSE_LENGTH);
-
-        prop_assert_ne!(
-            validated.response,
-            nntp_proxy::protocol::NntpResponse::Invalid,
-            "Valid NNTP response '{}' should not be classified as Invalid", response
-        );
-        let status = validated.response.status_code().unwrap();
-        prop_assert_eq!(status.as_u16(), code,
-            "Parsed status code should match generated code");
-    }
-
     #[test]
     fn prop_status_code_parse_roundtrip(code in 100u16..=599u16) {
         // Format as "{code} text\r\n", parse, check roundtrip
@@ -823,14 +688,15 @@ proptest! {
         response.push_str(".\r\n");
 
         let data = response.as_bytes();
-        let validated = validate_backend_response(data, data.len(), nntp_proxy::protocol::MIN_RESPONSE_LENGTH);
 
-        // Should be multiline for 220/221/222
-        prop_assert!(validated.is_multiline,
-            "Code {code} should be detected as multiline");
+        prop_assert_eq!(
+            StatusCode::parse(data).map(|status| status.as_u16()),
+            Some(code),
+            "Code {} should parse as response status",
+            code
+        );
 
         // Terminator detection should find the real terminator, not a false positive
-        use nntp_proxy::session::streaming::tail_buffer::TailBuffer;
         let tail = TailBuffer::default();
         let status = tail.detect_terminator(data);
         prop_assert!(status.is_found(),
@@ -842,8 +708,6 @@ proptest! {
         data in prop::collection::vec(any::<u8>(), 0..500)
     ) {
         // TailBuffer::detect_terminator result should match naive memmem::find
-        use nntp_proxy::session::streaming::tail_buffer::TailBuffer;
-
         let tail = TailBuffer::default();
         let status = tail.detect_terminator(&data);
 

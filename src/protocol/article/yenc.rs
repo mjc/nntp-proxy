@@ -75,8 +75,7 @@ struct YencFooter {
 impl YencFooter {
     /// Parse from line bytes
     #[inline]
-    #[allow(clippy::unnecessary_wraps)] // Result is forward-compatible; consistent with other parse fns
-    fn parse(line: &[u8], is_multipart: bool) -> Result<Self, ParseError> {
+    fn parse(line: &[u8], is_multipart: bool) -> Self {
         let line_str = String::from_utf8_lossy(line);
 
         let size = extract_param(&line_str, "size").and_then(|s| s.parse().ok());
@@ -85,7 +84,7 @@ impl YencFooter {
         let crc32 =
             extract_param(&line_str, crc_param).and_then(|s| u32::from_str_radix(s, 16).ok());
 
-        Ok(Self { size, crc32 })
+        Self { size, crc32 }
     }
 
     /// Validate CRC32 checksum if provided
@@ -168,6 +167,10 @@ impl Iterator for YencLines<'_> {
 /// - Proper line encoding (validates actual yenc data)
 ///
 /// Does NOT write to disk - validates in-memory only.
+///
+/// # Errors
+/// Returns `ParseError` when the body is missing required yEnc framing, has
+/// invalid footer/header metadata, or fails checksum/size validation.
 pub fn validate_yenc_structure(body: &[u8]) -> Result<(), ParseError> {
     let mut reader = BufReader::new(body);
     let mut lines = YencLines::new(&mut reader);
@@ -188,11 +191,11 @@ pub fn validate_yenc_structure(body: &[u8]) -> Result<(), ParseError> {
             match YencLine::classify(&line) {
                 YencLine::Part => Ok((footer, checksum)),
                 YencLine::End => {
-                    let parsed_footer = YencFooter::parse(&line, header.is_multipart)?;
+                    let parsed_footer = YencFooter::parse(&line, header.is_multipart);
                     Ok((Some(parsed_footer), checksum))
                 }
                 YencLine::Data => {
-                    decode_and_checksum(&line, &mut checksum)?;
+                    decode_and_checksum(&line, &mut checksum);
                     Ok((footer, checksum))
                 }
             }
@@ -210,8 +213,7 @@ pub fn validate_yenc_structure(body: &[u8]) -> Result<(), ParseError> {
 
 /// Decode a yenc data line and update checksum
 #[inline]
-#[allow(clippy::unnecessary_wraps)] // Result for consistency; decode_yenc_line may fail in future
-fn decode_and_checksum(line: &[u8], checksum: &mut crc32fast::Hasher) -> Result<(), ParseError> {
+fn decode_and_checksum(line: &[u8], checksum: &mut crc32fast::Hasher) {
     let decoded = line
         .strip_suffix(b"\r\n")
         .or_else(|| line.strip_suffix(b"\n"))
@@ -219,7 +221,6 @@ fn decode_and_checksum(line: &[u8], checksum: &mut crc32fast::Hasher) -> Result<
         .pipe(decode_yenc_line);
 
     checksum.update(&decoded);
-    Ok(())
 }
 
 /// Extract a parameter value from a yenc metadata line

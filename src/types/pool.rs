@@ -3,6 +3,13 @@
 use nutype::nutype;
 use std::fmt;
 
+#[allow(clippy::cast_precision_loss)] // Pool percentages are display values derived from exact usize counters.
+const fn pool_count_as_f64(value: usize) -> f64 {
+    // Pool utilization is a percentage for display/thresholding. The exact
+    // connection counts remain available as usize newtypes.
+    value as f64
+}
+
 /// Macro to reduce boilerplate for pool connection count types.
 /// All pool types have the same `zero()` and `get()` implementations.
 macro_rules! pool_count_type {
@@ -89,7 +96,7 @@ impl PoolUtilization {
         }
 
         let in_use = max_size.saturating_sub(available.get());
-        let utilization = (in_use as f64 / max_size as f64) * 100.0;
+        let utilization = (pool_count_as_f64(in_use) / pool_count_as_f64(max_size)) * 100.0;
         Self(utilization)
     }
 
@@ -125,6 +132,7 @@ impl fmt::Display for PoolUtilization {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // These tests compare exact percentage values from bounded pool math.
 mod tests {
     use super::*;
 

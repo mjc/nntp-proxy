@@ -281,6 +281,9 @@ impl MetricsStore {
     ///
     /// Returns Ok(None) if file doesn't exist or is corrupt (logs warning, starts fresh).
     /// Returns Ok(Some(store)) on successful load.
+    ///
+    /// # Errors
+    /// Returns any filesystem error while reading `path` other than a missing file.
     pub fn load(path: &Path, server_names: &[String]) -> Result<Option<Self>> {
         // File doesn't exist - start fresh
         if !path.exists() {
@@ -370,6 +373,10 @@ impl MetricsStore {
     }
 
     /// Save to file atomically (tmp + rename)
+    ///
+    /// # Errors
+    /// Returns any serialization, filesystem, or atomic-rename error while
+    /// persisting the metrics store to disk.
     pub fn save(&self, path: &Path, server_names: &[String]) -> Result<()> {
         let _save_guard = SAVE_LOCK
             .lock()
@@ -546,7 +553,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::significant_drop_tightening)] // DashMap ref scope is fine for test clarity
     fn test_metrics_store_save_load_roundtrip() {
         let temp_dir = TempDir::new().unwrap();
         let stats_path = temp_dir.path().join("stats.json");
@@ -593,6 +599,7 @@ mod tests {
 
         let bob = loaded.user_metrics.get("bob").unwrap();
         assert_eq!(bob.total_connections, 5);
+        drop(bob);
     }
 
     #[test]

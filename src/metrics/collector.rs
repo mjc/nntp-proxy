@@ -167,6 +167,10 @@ impl MetricsCollector {
     }
 
     /// Save metrics to disk (for persistence)
+    ///
+    /// # Errors
+    /// Returns any serialization or filesystem error from persisting the metrics
+    /// snapshot to `path`.
     pub fn save_to_disk(&self, path: &Path, server_names: &[String]) -> anyhow::Result<()> {
         self.inner.store.save(path, server_names)
     }
@@ -503,7 +507,7 @@ impl MetricsCollector {
             client_to_backend_bytes: ClientToBackendBytes::new(total_sent),
             backend_to_client_bytes: BackendToClientBytes::new(total_received),
             uptime: self.inner.start_time.elapsed(),
-            backend_stats: Arc::new(backend_stats),
+            backend_stats: backend_stats.into(),
             user_stats,
             cache_entries,
             cache_size_bytes,

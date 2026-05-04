@@ -138,6 +138,11 @@ impl From<PasswordError> for ValidationError {
 pub struct ConfigPath(PathBuf);
 
 impl ConfigPath {
+    /// Create a validated configuration path.
+    ///
+    /// # Errors
+    /// Returns `ValidationError::EmptyConfigPath` when the path is empty,
+    /// whitespace-only, or not valid UTF-8.
     pub fn new(path: impl AsRef<Path>) -> Result<Self, ValidationError> {
         let path_ref = path.as_ref();
         let path_str = path_ref.to_str().ok_or(ValidationError::EmptyConfigPath)?;

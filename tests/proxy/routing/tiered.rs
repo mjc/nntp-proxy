@@ -18,7 +18,6 @@ fn test_tier_zero_selected_first() {
         ServerName::try_new("backup".to_string()).unwrap(),
         create_backend("backup", 10),
         1, // tier 1 (backup)
-        None,
     );
 
     // Add tier 0 backend second
@@ -27,7 +26,6 @@ fn test_tier_zero_selected_first() {
         ServerName::try_new("primary".to_string()).unwrap(),
         create_backend("primary", 10),
         0, // tier 0 (primary)
-        None,
     );
 
     // Create availability to trigger tier filtering (tiering only applies to article requests)
@@ -35,7 +33,7 @@ fn test_tier_zero_selected_first() {
 
     // Despite being added second, tier 0 should be selected first
     let backend = selector
-        .route_command_with_availability(ClientId::new(), "ARTICLE", Some(&availability))
+        .route_with_availability(ClientId::new(), Some(&availability))
         .unwrap();
     assert_eq!(
         backend.as_index(),
@@ -54,21 +52,18 @@ fn test_tier_escalation_on_430() {
         ServerName::try_new("primary-1".to_string()).unwrap(),
         create_backend("primary-1", 10),
         0, // tier 0
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("primary-2".to_string()).unwrap(),
         create_backend("primary-2", 10),
         0, // tier 0
-        None,
     );
     selector.add_backend(
         BackendId::from_index(2),
         ServerName::try_new("backup".to_string()).unwrap(),
         create_backend("backup", 10),
         1, // tier 1
-        None,
     );
 
     // Simulate both tier 0 backends returning 430
@@ -78,11 +73,7 @@ fn test_tier_escalation_on_430() {
 
     // Now routing should select tier 1 backend
     let backend = selector
-        .route_command_with_availability(
-            ClientId::new(),
-            "ARTICLE <test@example.com>",
-            Some(&availability),
-        )
+        .route_with_availability(ClientId::new(), Some(&availability))
         .unwrap();
     assert_eq!(
         backend.as_index(),
@@ -101,14 +92,12 @@ fn test_within_tier_load_balancing() {
         ServerName::try_new("tier0-a".to_string()).unwrap(),
         create_backend("tier0-a", 10),
         0,
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("tier0-b".to_string()).unwrap(),
         create_backend("tier0-b", 10),
         0,
-        None,
     );
 
     // Add one backend in tier 1 (should not be used)
@@ -117,7 +106,6 @@ fn test_within_tier_load_balancing() {
         ServerName::try_new("tier1".to_string()).unwrap(),
         create_backend("tier1", 10),
         1,
-        None,
     );
 
     // Route 100 commands - all should go to tier 0 backends
@@ -126,7 +114,7 @@ fn test_within_tier_load_balancing() {
     let mut counts = [0; 3];
     for _ in 0..100 {
         let backend = selector
-            .route_command_with_availability(ClientId::new(), "ARTICLE", Some(&availability))
+            .route_with_availability(ClientId::new(), Some(&availability))
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -159,14 +147,12 @@ fn test_partial_tier_exhaustion() {
         ServerName::try_new("primary-1".to_string()).unwrap(),
         create_backend("primary-1", 10),
         0,
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("primary-2".to_string()).unwrap(),
         create_backend("primary-2", 10),
         0,
-        None,
     );
 
     // Add tier 1 backend
@@ -175,7 +161,6 @@ fn test_partial_tier_exhaustion() {
         ServerName::try_new("backup".to_string()).unwrap(),
         create_backend("backup", 10),
         1,
-        None,
     );
 
     // Mark only one tier 0 backend as missing
@@ -184,11 +169,7 @@ fn test_partial_tier_exhaustion() {
 
     // Should still select from tier 0 (the remaining one)
     let backend = selector
-        .route_command_with_availability(
-            ClientId::new(),
-            "ARTICLE <test@example.com>",
-            Some(&availability),
-        )
+        .route_with_availability(ClientId::new(), Some(&availability))
         .unwrap();
     assert_eq!(
         backend.as_index(),
@@ -207,7 +188,6 @@ fn test_multiple_tiers() {
         ServerName::try_new("primary".to_string()).unwrap(),
         create_backend("primary", 10),
         0,
-        None,
     );
 
     // Tier 1: secondary
@@ -216,7 +196,6 @@ fn test_multiple_tiers() {
         ServerName::try_new("secondary".to_string()).unwrap(),
         create_backend("secondary", 10),
         1,
-        None,
     );
 
     // Tier 2: tertiary
@@ -225,7 +204,6 @@ fn test_multiple_tiers() {
         ServerName::try_new("tertiary".to_string()).unwrap(),
         create_backend("tertiary", 10),
         2,
-        None,
     );
 
     // Mark tier 0 and tier 1 as missing
@@ -235,11 +213,7 @@ fn test_multiple_tiers() {
 
     // Should escalate to tier 2
     let backend = selector
-        .route_command_with_availability(
-            ClientId::new(),
-            "ARTICLE <test@example.com>",
-            Some(&availability),
-        )
+        .route_with_availability(ClientId::new(), Some(&availability))
         .unwrap();
     assert_eq!(
         backend.as_index(),
@@ -271,14 +245,12 @@ fn test_tiered_weighted_round_robin() {
         ServerName::try_new("tier0-small".to_string()).unwrap(),
         create_backend("tier0-small", 10), // weight 10
         0,
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("tier0-large".to_string()).unwrap(),
         create_backend("tier0-large", 30), // weight 30
         0,
-        None,
     );
 
     // Tier 1: should not be used
@@ -287,7 +259,6 @@ fn test_tiered_weighted_round_robin() {
         ServerName::try_new("tier1".to_string()).unwrap(),
         create_backend("tier1", 100),
         1,
-        None,
     );
 
     // Route 400 commands - all should go to tier 0 with weighted distribution
@@ -296,7 +267,7 @@ fn test_tiered_weighted_round_robin() {
     let mut counts = [0; 3];
     for _ in 0..400 {
         let backend = selector
-            .route_command_with_availability(ClientId::new(), "ARTICLE", Some(&availability))
+            .route_with_availability(ClientId::new(), Some(&availability))
             .unwrap();
         counts[backend.as_index()] += 1;
     }

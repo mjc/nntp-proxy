@@ -25,6 +25,10 @@ const TOS_THROUGHPUT: u32 = 0x08;
 /// Trait for network optimization strategies
 pub trait NetworkOptimizer {
     /// Apply optimizations to improve network performance
+    ///
+    /// # Errors
+    /// Returns any socket option error reported by the operating system while
+    /// applying the optimization strategy.
     fn optimize(&self) -> Result<()>;
 
     /// Get a description of the optimization strategy

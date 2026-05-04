@@ -143,8 +143,7 @@ async fn test_mode_reader_sent_to_backend() -> Result<()> {
     assert!(
         mode_reader_seen,
         "RFC 3977 §5.3: proxy must send MODE READER to backend during connection setup, \
-         commands received by backend: {:?}",
-        received
+         commands received by backend: {received:?}"
     );
 
     Ok(())

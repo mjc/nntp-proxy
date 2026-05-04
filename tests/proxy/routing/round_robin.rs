@@ -16,7 +16,6 @@ fn test_round_robin_selection() {
             ServerName::try_new(format!("backend-{i}")).unwrap(),
             provider,
             0, // tier
-            None,
         );
     }
 
@@ -26,7 +25,7 @@ fn test_round_robin_selection() {
     // Route 6 commands (one full cycle through the weight)
     let mut backends = Vec::new();
     for _ in 0..6 {
-        backends.push(router.route_command(client_id, "LIST\r\n").unwrap());
+        backends.push(router.route(client_id).unwrap());
     }
 
     // Count distribution
@@ -55,7 +54,6 @@ fn test_load_balancing_fairness() {
             ServerName::try_new(format!("backend-{i}")).unwrap(),
             create_test_provider(), // 2 connections each
             0,                      // tier
-            None,
         );
     }
 
@@ -63,7 +61,7 @@ fn test_load_balancing_fairness() {
     // Route 12 commands (2 full cycles)
     let mut backend_counts = vec![0, 0, 0];
     for _ in 0..12 {
-        let backend_id = router.route_command(client_id, "LIST\r\n").unwrap();
+        let backend_id = router.route(client_id).unwrap();
         backend_counts[backend_id.as_index()] += 1;
     }
 

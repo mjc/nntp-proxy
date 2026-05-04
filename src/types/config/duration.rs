@@ -10,6 +10,10 @@ use std::time::Duration;
 pub mod duration_serde {
     use super::{Deserialize, Deserializer, Duration, Serializer};
 
+    /// Serialize `Duration` as whole seconds.
+    ///
+    /// # Errors
+    /// Returns any serializer error from the underlying serde sink.
     pub fn serialize<S>(duration: &Duration, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -17,6 +21,10 @@ pub mod duration_serde {
         serializer.serialize_u64(duration.as_secs())
     }
 
+    /// Deserialize `Duration` from whole seconds.
+    ///
+    /// # Errors
+    /// Returns any deserializer error while reading the integer seconds value.
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Duration, D::Error>
     where
         D: Deserializer<'de>,
@@ -30,6 +38,10 @@ pub mod duration_serde {
 pub mod option_duration_serde {
     use super::{Deserialize, Deserializer, Duration, Serializer};
 
+    /// Serialize `Option<Duration>` as optional whole seconds.
+    ///
+    /// # Errors
+    /// Returns any serializer error from the underlying serde sink.
     pub fn serialize<S>(duration: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -40,6 +52,10 @@ pub mod option_duration_serde {
         }
     }
 
+    /// Deserialize `Option<Duration>` from optional whole seconds.
+    ///
+    /// # Errors
+    /// Returns any deserializer error while reading the optional seconds value.
     pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
     where
         D: Deserializer<'de>,

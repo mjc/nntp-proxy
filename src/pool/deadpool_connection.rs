@@ -5,10 +5,12 @@
 
 use deadpool::managed;
 use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::connection_error::ConnectionError;
 use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
 use crate::protocol::{authinfo_pass, authinfo_user};
+use crate::session::backend;
 use crate::stream::ConnectionStream;
 use crate::tls::{TlsConfig, TlsManager};
 
@@ -73,6 +75,9 @@ impl TcpManager {
     /// If `options.tls_config` is `Some` with `use_tls = true`, the TLS manager is
     /// pre-initialized (certificates loaded). If `None` or `use_tls = false`,
     /// plain TCP connections are used.
+    ///
+    /// # Errors
+    /// Returns any TLS initialization error when TLS is enabled for the manager.
     pub fn new(
         host: String,
         port: u16,
@@ -125,8 +130,12 @@ impl TcpManager {
         };
 
         // Pre-connect options (buffer sizes, reuse)
-        socket.set_recv_buffer_size(POOL_RECV_BUFFER as u32)?;
-        socket.set_send_buffer_size(POOL_SEND_BUFFER as u32)?;
+        socket.set_recv_buffer_size(
+            u32::try_from(POOL_RECV_BUFFER).expect("pool receive buffer fits u32"),
+        )?;
+        socket.set_send_buffer_size(
+            u32::try_from(POOL_SEND_BUFFER).expect("pool send buffer fits u32"),
+        )?;
         socket.set_reuseaddr(true)?;
 
         // Async connect — does NOT block the tokio worker thread
@@ -136,7 +145,7 @@ impl TcpManager {
         let sock_ref = socket2::SockRef::from(&tcp_stream);
         sock_ref.set_keepalive(true)?;
         let keepalive = socket2::TcpKeepalive::new()
-            .with_time(std::time::Duration::from_secs(60))
+            .with_time(std::time::Duration::from_mins(1))
             .with_interval(std::time::Duration::from_secs(10));
         sock_ref.set_tcp_keepalive(&keepalive)?;
         sock_ref.set_tcp_nodelay(true)?;
@@ -176,16 +185,11 @@ impl TcpManager {
         stream: &mut ConnectionStream,
         buffer: &mut [u8],
     ) -> Result<(), ConnectionError> {
-        use tokio::io::AsyncReadExt;
-
         let n = stream.read(buffer).await?;
         let greeting = &buffer[..n];
         let greeting_str = String::from_utf8_lossy(greeting);
 
-        if !matches!(
-            crate::protocol::NntpResponse::parse(greeting),
-            crate::protocol::NntpResponse::Greeting(_)
-        ) {
+        if !crate::protocol::StatusCode::parse(greeting).is_some_and(|code| code.is_greeting()) {
             return Err(ConnectionError::InvalidGreeting {
                 backend: self.name.clone(),
                 greeting: greeting_str.trim().to_string(),
@@ -205,8 +209,6 @@ impl TcpManager {
         stream: &mut ConnectionStream,
         buffer: &mut [u8],
     ) -> Result<(), ConnectionError> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         stream.write_all(b"MODE READER\r\n").await?;
         stream.flush().await?;
 
@@ -238,8 +240,6 @@ impl TcpManager {
         stream: &mut ConnectionStream,
         buffer: &mut [u8],
     ) -> Result<bool, ConnectionError> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         if self.compress == Some(false) {
             return Ok(false);
         }
@@ -282,21 +282,18 @@ impl TcpManager {
         stream: &mut ConnectionStream,
         buffer: &mut [u8],
     ) -> Result<(), ConnectionError> {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         let Some(username) = &self.username else {
             return Ok(());
         };
 
-        stream.write_all(authinfo_user(username).as_bytes()).await?;
+        backend::write_request(stream, &authinfo_user(username)).await?;
         let n = stream.read(buffer).await?;
         let response = &buffer[..n];
         let response_str = String::from_utf8_lossy(response);
 
-        if matches!(
-            crate::protocol::NntpResponse::parse(response),
-            crate::protocol::NntpResponse::AuthRequired(_)
-        ) {
+        if crate::protocol::StatusCode::parse(response)
+            .is_some_and(|code| code.requires_auth_credentials())
+        {
             // Password required
             let Some(password) = self.password.as_ref() else {
                 return Err(ConnectionError::PasswordRequired {
@@ -304,15 +301,14 @@ impl TcpManager {
                 });
             };
 
-            stream.write_all(authinfo_pass(password).as_bytes()).await?;
+            backend::write_request(stream, &authinfo_pass(password)).await?;
             let n = stream.read(buffer).await?;
             let response = &buffer[..n];
             let response_str = String::from_utf8_lossy(response);
 
-            if !matches!(
-                crate::protocol::NntpResponse::parse(response),
-                crate::protocol::NntpResponse::AuthSuccess
-            ) {
+            if !crate::protocol::StatusCode::parse(response)
+                .is_some_and(|code| code.is_auth_accepted())
+            {
                 // Check for 482 (connection limit exceeded) before generic auth failure
                 if crate::protocol::StatusCode::parse(response).is_some_and(|c| c.as_u16() == 482) {
                     tracing::error!(
@@ -348,10 +344,9 @@ impl TcpManager {
                 self.port,
                 username
             );
-        } else if !matches!(
-            crate::protocol::NntpResponse::parse(response),
-            crate::protocol::NntpResponse::AuthSuccess
-        ) {
+        } else if !crate::protocol::StatusCode::parse(response)
+            .is_some_and(|code| code.is_auth_accepted())
+        {
             return Err(ConnectionError::UnexpectedAuthResponse {
                 backend: self.name.clone(),
                 response: response_str.trim().to_string(),

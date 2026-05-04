@@ -2,6 +2,7 @@
 
 use crate::auth::AuthHandler;
 use crate::command::AuthAction;
+use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata, StatusCode, codes};
 use crate::types::BackendToClientBytes;
 
 use anyhow::Result;
@@ -12,9 +13,33 @@ use tokio::io::AsyncWriteExt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthResult {
     /// Authentication succeeded
-    Authenticated(BackendToClientBytes),
+    Authenticated {
+        bytes: BackendToClientBytes,
+        response: RequestResponseMetadata,
+    },
     /// Authentication failed or not required yet
-    NotAuthenticated(BackendToClientBytes),
+    NotAuthenticated {
+        bytes: BackendToClientBytes,
+        response: RequestResponseMetadata,
+    },
+}
+
+impl AuthResult {
+    #[must_use]
+    pub const fn bytes_written(self) -> BackendToClientBytes {
+        match self {
+            Self::Authenticated { bytes, .. } | Self::NotAuthenticated { bytes, .. } => bytes,
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn response_metadata(self) -> RequestResponseMetadata {
+        match self {
+            Self::Authenticated { response, .. } | Self::NotAuthenticated { response, .. } => {
+                response
+            }
+        }
+    }
 }
 
 /// Result of checking for QUIT command
@@ -43,9 +68,13 @@ where
         use crate::protocol::AUTH_ALREADY_AUTHENTICATED;
         client_write.write_all(AUTH_ALREADY_AUTHENTICATED).await?;
         let bytes = BackendToClientBytes::new(AUTH_ALREADY_AUTHENTICATED.len() as u64);
-        return Ok(AuthResult::NotAuthenticated(bytes));
+        return Ok(AuthResult::NotAuthenticated {
+            bytes,
+            response: local_response_metadata(codes::ACCESS_DENIED, AUTH_ALREADY_AUTHENTICATED),
+        });
     }
 
+    let had_username = auth_username.is_some();
     if let AuthAction::RequestPassword(username) = auth_action {
         *auth_username = Some(username.to_string());
     }
@@ -59,20 +88,60 @@ where
     }
 
     let bytes_written = BackendToClientBytes::new(bytes as u64);
+    let response = auth_response_metadata(auth_action, had_username, auth_success);
 
     Ok(if auth_success {
-        AuthResult::Authenticated(bytes_written)
+        AuthResult::Authenticated {
+            bytes: bytes_written,
+            response,
+        }
     } else {
-        AuthResult::NotAuthenticated(bytes_written)
+        AuthResult::NotAuthenticated {
+            bytes: bytes_written,
+            response,
+        }
     })
 }
 
+fn local_response_metadata(status: u16, response: &[u8]) -> RequestResponseMetadata {
+    RequestResponseMetadata::new(StatusCode::new(status), response.len().into())
+}
+
+fn auth_response_metadata(
+    auth_action: AuthAction<'_>,
+    had_username: bool,
+    auth_success: bool,
+) -> RequestResponseMetadata {
+    match auth_action {
+        AuthAction::RequestPassword(_) => {
+            local_response_metadata(codes::PASSWORD_REQUIRED, crate::protocol::AUTH_REQUIRED)
+        }
+        AuthAction::ValidateAndRespond { .. } if !had_username => local_response_metadata(
+            codes::AUTH_OUT_OF_SEQUENCE,
+            crate::protocol::AUTH_OUT_OF_SEQUENCE,
+        ),
+        AuthAction::ValidateAndRespond { .. } if auth_success => {
+            local_response_metadata(codes::AUTH_ACCEPTED, crate::protocol::AUTH_ACCEPTED)
+        }
+        AuthAction::ValidateAndRespond { .. } => {
+            local_response_metadata(codes::AUTH_REJECTED, crate::protocol::AUTH_FAILED)
+        }
+        AuthAction::UnknownSubcommand => local_response_metadata(
+            codes::COMMAND_SYNTAX_ERROR,
+            crate::protocol::AUTH_UNKNOWN_SUBCOMMAND,
+        ),
+    }
+}
+
 /// Check if command is QUIT and send closing response
-pub async fn handle_quit_command<W>(command: &str, client_write: &mut W) -> Result<QuitStatus>
+pub async fn handle_quit_command<W>(
+    request: &RequestContext,
+    client_write: &mut W,
+) -> Result<QuitStatus>
 where
     W: tokio::io::AsyncWrite + Unpin,
 {
-    if command.trim().eq_ignore_ascii_case("QUIT") {
+    if request.kind() == RequestKind::Quit {
         use crate::protocol::CONNECTION_CLOSING;
 
         client_write
@@ -92,7 +161,7 @@ where
 /// Handle successful authentication with all side effects
 ///
 /// Sets username, records connection stats, updates metrics
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value)] // The owned username is consumed as part of session state updates.
 pub fn on_authentication_success(
     client_addr: impl std::fmt::Display,
     username: Option<String>,
@@ -103,6 +172,9 @@ pub fn on_authentication_success(
 ) {
     use tracing::debug;
 
+    // The auth path already owns the username here. Keeping ownership lets us
+    // hand the same value to session state while also reusing it for metrics and
+    // logging without threading extra lifetimes through the handler chain.
     debug!("Client {} authenticated as: {:?}", client_addr, username);
 
     // Store username in session
@@ -127,12 +199,27 @@ mod tests {
 
     #[test]
     fn test_auth_result_equality() {
-        let auth1 = AuthResult::Authenticated(BackendToClientBytes::new(100));
-        let auth2 = AuthResult::Authenticated(BackendToClientBytes::new(100));
-        let not_auth = AuthResult::NotAuthenticated(BackendToClientBytes::new(100));
+        let response = crate::protocol::RequestResponseMetadata::new(
+            crate::protocol::StatusCode::new(281),
+            27_usize.into(),
+        );
+        let auth1 = AuthResult::Authenticated {
+            bytes: BackendToClientBytes::new(100),
+            response,
+        };
+        let auth2 = AuthResult::Authenticated {
+            bytes: BackendToClientBytes::new(100),
+            response,
+        };
+        let not_auth = AuthResult::NotAuthenticated {
+            bytes: BackendToClientBytes::new(100),
+            response,
+        };
 
         assert_eq!(auth1, auth2);
         assert_ne!(auth1, not_auth);
+        assert_eq!(auth1.bytes_written(), BackendToClientBytes::new(100));
+        assert_eq!(auth1.response_metadata(), response);
     }
 
     #[test]
@@ -143,6 +230,33 @@ mod tests {
 
         assert_eq!(quit1, quit2);
         assert_ne!(quit1, cont);
+    }
+
+    #[tokio::test]
+    async fn handle_quit_command_uses_typed_request_kind() {
+        let request = RequestContext::parse(b"quit\r\n").expect("valid request line");
+        let mut written = Vec::new();
+
+        let status = handle_quit_command(&request, &mut written).await.unwrap();
+
+        assert_eq!(
+            status,
+            QuitStatus::Quit(BackendToClientBytes::new(
+                crate::protocol::CONNECTION_CLOSING.len() as u64
+            ))
+        );
+        assert_eq!(written, crate::protocol::CONNECTION_CLOSING);
+    }
+
+    #[tokio::test]
+    async fn handle_quit_command_ignores_non_quit_request_contexts() {
+        let request = RequestContext::parse(b"HELP\r\n").expect("valid request line");
+        let mut written = Vec::new();
+
+        let status = handle_quit_command(&request, &mut written).await.unwrap();
+
+        assert_eq!(status, QuitStatus::Continue);
+        assert!(written.is_empty());
     }
 
     // =========================================================================
@@ -247,7 +361,7 @@ pub struct AuthCheckContext<'a> {
 /// 2. Handling auth commands
 /// 3. Rejecting non-auth commands when not authenticated
 pub async fn handle_stateful_auth_check<W>(
-    command: &str,
+    request: &crate::protocol::RequestContext,
     client_write: &mut W,
     auth_username: &mut Option<String>,
     ctx: &AuthCheckContext<'_>,
@@ -259,7 +373,7 @@ where
 {
     use crate::command::{CommandAction, CommandHandler};
 
-    let action = CommandHandler::classify(command);
+    let action = CommandHandler::classify_request(request);
     match action {
         CommandAction::ForwardStateless => {
             // Reject all non-auth commands before authentication
@@ -289,7 +403,7 @@ where
             .await?;
 
             match result {
-                AuthResult::Authenticated(bytes) => {
+                AuthResult::Authenticated { bytes, .. } => {
                     on_authentication_success(
                         client_addr,
                         auth_username.clone(),
@@ -304,9 +418,11 @@ where
                         skip_further_checks: true,
                     })
                 }
-                AuthResult::NotAuthenticated(bytes) => Ok(AuthHandlerResult::NotAuthenticated {
-                    bytes_written: bytes.as_u64(),
-                }),
+                AuthResult::NotAuthenticated { bytes, .. } => {
+                    Ok(AuthHandlerResult::NotAuthenticated {
+                        bytes_written: bytes.as_u64(),
+                    })
+                }
             }
         }
         CommandAction::Reject(response) => {

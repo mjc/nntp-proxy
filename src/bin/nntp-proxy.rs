@@ -48,6 +48,8 @@ async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()>
         args.common.config.as_str(),
         config.proxy.stats_file.as_ref(),
     );
+    let availability_path =
+        runtime::resolve_availability_file_path(args.common.config.as_str(), config.cache.as_ref());
     let server_names: Vec<String> = config
         .servers
         .iter()
@@ -61,6 +63,9 @@ async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()>
         builder = builder.with_metrics_store(store);
     }
     let proxy = Arc::new(builder.build().await?);
+    if let Some(path) = availability_path.as_ref() {
+        let _ = runtime::load_availability_from_disk(proxy.cache(), path);
+    }
 
     let listener = runtime::bind_listener(&host, port, routing_mode).await?;
 
@@ -72,9 +77,11 @@ async fn run_proxy(args: Args, config: nntp_proxy::config::Config) -> Result<()>
     runtime::spawn_stats_flusher(proxy.connection_stats());
     runtime::spawn_cache_stats_logger(&proxy);
     runtime::spawn_metrics_saver(&proxy, stats_path.clone(), server_names.clone());
+    runtime::spawn_availability_saver(&proxy, availability_path.clone());
     runtime::spawn_idle_connection_clearer(&proxy);
 
-    let shutdown_rx = runtime::spawn_shutdown_handler(&proxy, stats_path, server_names);
+    let shutdown_rx =
+        runtime::spawn_shutdown_handler(&proxy, stats_path, availability_path, server_names);
 
     runtime::run_accept_loop(proxy, listener, shutdown_rx, routing_mode).await
 }

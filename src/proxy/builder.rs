@@ -173,7 +173,7 @@ impl NntpProxyBuilder {
 
         let backend_strategy = self.config.proxy.backend_selection;
         let cache_config = self.config.cache;
-        let servers = Arc::new(self.config.servers);
+        let servers: Arc<[Server]> = self.config.servers.into();
 
         let router = Arc::new({
             use types::BackendId;
@@ -188,7 +188,7 @@ impl NntpProxyBuilder {
                     } else {
                         None
                     };
-                    r.add_backend(
+                    r.add_backend_with_queue(
                         backend_id,
                         servers[idx].name.clone(),
                         provider.clone(),
@@ -273,8 +273,9 @@ impl NntpProxyBuilder {
             let capacity = cache_config.max_capacity.as_u64();
             let cache_articles = cache_config.cache_articles;
 
-            // Check if disk cache is configured
-            let cache = if let Some(disk_config) = &cache_config.disk {
+            let cache = if !cache_articles {
+                Arc::new(UnifiedCache::availability(capacity, cache_config.ttl))
+            } else if let Some(disk_config) = &cache_config.disk {
                 let hybrid_config = HybridCacheConfig {
                     memory_capacity: capacity,
                     disk_path: disk_config.path.clone(),
@@ -282,7 +283,6 @@ impl NntpProxyBuilder {
                     shards: disk_config.shards,
                     compression: disk_config.compression,
                     ttl: cache_config.ttl,
-                    cache_articles,
                 };
 
                 info!(
@@ -298,11 +298,7 @@ impl NntpProxyBuilder {
                         .context("Failed to initialize hybrid disk cache")?,
                 )
             } else {
-                Arc::new(UnifiedCache::memory(
-                    capacity,
-                    cache_config.ttl,
-                    cache_articles,
-                ))
+                Arc::new(UnifiedCache::memory(capacity, cache_config.ttl))
             };
 
             Self::log_cache_config(cache_config, cache_articles);
@@ -310,8 +306,8 @@ impl NntpProxyBuilder {
         } else {
             debug!("Cache not configured, using availability-only mode (capacity=0)");
             (
-                Arc::new(UnifiedCache::memory(0, Duration::from_secs(3600), false)),
-                true,
+                Arc::new(UnifiedCache::availability(0, Duration::MAX)),
+                false,
             )
         };
 
@@ -338,25 +334,25 @@ impl NntpProxyBuilder {
             let capacity = cache_config.max_capacity.as_u64();
             let cache_articles = cache_config.cache_articles;
 
-            if cache_config.disk.is_some() {
+            if cache_config.disk.is_some() && cache_articles {
                 warn!(
                     "Disk cache configured but build_sync() called - using memory-only cache. Use build() for disk cache support."
                 );
             }
 
-            let cache = Arc::new(UnifiedCache::memory(
-                capacity,
-                cache_config.ttl,
-                cache_articles,
-            ));
+            let cache = if cache_articles {
+                Arc::new(UnifiedCache::memory(capacity, cache_config.ttl))
+            } else {
+                Arc::new(UnifiedCache::availability(capacity, cache_config.ttl))
+            };
 
             Self::log_cache_config(cache_config, cache_articles);
             (cache, cache_articles)
         } else {
             debug!("Cache not configured, using availability-only mode (capacity=0)");
             (
-                Arc::new(UnifiedCache::memory(0, Duration::from_secs(3600), false)),
-                true,
+                Arc::new(UnifiedCache::availability(0, Duration::MAX)),
+                false,
             )
         };
 
@@ -372,7 +368,7 @@ pub(super) struct BuildContext {
     connection_providers: Vec<DeadpoolConnectionProvider>,
     buffer_pool: BufferPool,
     metrics: MetricsCollector,
-    servers: Arc<Vec<Server>>,
+    servers: Arc<[Server]>,
     router: Arc<router::BackendSelector>,
     auth_handler: Arc<AuthHandler>,
     adaptive_precheck: bool,

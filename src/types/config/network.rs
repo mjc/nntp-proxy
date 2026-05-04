@@ -45,12 +45,20 @@ impl Port {
 
     /// Create NNTP port instance
     #[must_use]
+    ///
+    /// # Panics
+    /// Panics only if the built-in NNTP port constant stops satisfying the
+    /// validated `Port` invariants.
     pub fn nntp() -> Self {
         Self::try_new(Self::NNTP).unwrap()
     }
 
     /// Create NNTPS port instance
     #[must_use]
+    ///
+    /// # Panics
+    /// Panics only if the built-in NNTPS port constant stops satisfying the
+    /// validated `Port` invariants.
     pub fn nntps() -> Self {
         Self::try_new(Self::NNTPS).unwrap()
     }

@@ -157,7 +157,7 @@ impl ThroughputHistory {
 pub struct TuiAppBuilder {
     metrics: MetricsCollector,
     router: Arc<BackendSelector>,
-    servers: Arc<Vec<Server>>,
+    servers: Arc<[Server]>,
     cache: Option<Arc<crate::cache::UnifiedCache>>,
     buffer_pool: Option<crate::pool::BufferPool>,
     log_buffer: Option<LogBuffer>,
@@ -170,7 +170,7 @@ impl TuiAppBuilder {
     pub const fn new(
         metrics: MetricsCollector,
         router: Arc<BackendSelector>,
-        servers: Arc<Vec<Server>>,
+        servers: Arc<[Server]>,
     ) -> Self {
         Self {
             metrics,
@@ -251,7 +251,7 @@ pub struct TuiApp {
     /// Router for getting pending command counts
     router: Arc<BackendSelector>,
     /// Server configurations for display names
-    servers: Arc<Vec<Server>>,
+    servers: Arc<[Server]>,
     /// Current metrics snapshot (Arc for zero-cost sharing)
     snapshot: Arc<MetricsSnapshot>,
     /// Historical throughput data per backend
@@ -279,6 +279,20 @@ pub struct TuiApp {
 }
 
 impl TuiApp {
+    #[allow(clippy::cast_precision_loss)] // TUI rates are derived display values, not exact persisted counters.
+    const fn counter_as_f64(value: u64) -> f64 {
+        // TUI throughput and rate calculations are display-only aggregates.
+        // The exact counters remain stored as integers in the metrics snapshot.
+        value as f64
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // UI throughput truncates fractional, non-negative bytes/sec for display.
+    const fn throughput_as_u64(rate: Throughput) -> u64 {
+        // Displayed per-user byte rates are derived from non-negative throughput
+        // samples; truncating fractional bytes/sec matches the existing UI.
+        rate.get() as u64
+    }
+
     /// Create a new TUI application
     ///
     /// **Note:** Prefer using `TuiAppBuilder` for more flexibility.
@@ -287,7 +301,7 @@ impl TuiApp {
     pub fn new(
         metrics: MetricsCollector,
         router: Arc<BackendSelector>,
-        servers: Arc<Vec<Server>>,
+        servers: Arc<[Server]>,
     ) -> Self {
         TuiAppBuilder::new(metrics, router, servers).build()
     }
@@ -296,7 +310,7 @@ impl TuiApp {
     #[inline]
     fn calculate_rate(byte_delta: u64, time_delta_secs: f64) -> Throughput {
         if time_delta_secs > 0.0 {
-            Throughput::new((byte_delta as f64) / time_delta_secs)
+            Throughput::new(Self::counter_as_f64(byte_delta) / time_delta_secs)
         } else {
             Throughput::zero()
         }
@@ -306,7 +320,7 @@ impl TuiApp {
     #[inline]
     fn calculate_command_rate(cmd_delta: u64, time_delta_secs: f64) -> CommandsPerSecond {
         if time_delta_secs > 0.0 {
-            CommandsPerSecond::new((cmd_delta as f64) / time_delta_secs)
+            CommandsPerSecond::new(Self::counter_as_f64(cmd_delta) / time_delta_secs)
         } else {
             CommandsPerSecond::zero()
         }
@@ -331,12 +345,14 @@ impl TuiApp {
                     let sent_delta = current.bytes_sent.saturating_sub(prev.bytes_sent);
                     let recv_delta = current.bytes_received.saturating_sub(prev.bytes_received);
                     (
-                        BytesPerSecondRate::new(
-                            Self::calculate_rate(sent_delta.into(), time_delta).get() as u64,
-                        ),
-                        BytesPerSecondRate::new(
-                            Self::calculate_rate(recv_delta.into(), time_delta).get() as u64,
-                        ),
+                        BytesPerSecondRate::new(Self::throughput_as_u64(Self::calculate_rate(
+                            sent_delta.into(),
+                            time_delta,
+                        ))),
+                        BytesPerSecondRate::new(Self::throughput_as_u64(Self::calculate_rate(
+                            recv_delta.into(),
+                            time_delta,
+                        ))),
                     )
                 },
             );
@@ -559,20 +575,19 @@ mod tests {
     use std::time::Duration;
 
     /// Helper to create test servers
-    fn create_test_servers(count: usize) -> Arc<Vec<Server>> {
-        Arc::new(
-            (0..count)
-                .map(|i| {
-                    Server::builder(
-                        format!("backend{i}.example.com"),
-                        Port::try_new(119).unwrap(),
-                    )
-                    .name(format!("Backend {i}"))
-                    .build()
-                    .unwrap()
-                })
-                .collect(),
-        )
+    fn create_test_servers(count: usize) -> Arc<[Server]> {
+        (0..count)
+            .map(|i| {
+                Server::builder(
+                    format!("backend{i}.example.com"),
+                    Port::try_new(119).unwrap(),
+                )
+                .name(format!("Backend {i}"))
+                .build()
+                .unwrap()
+            })
+            .collect::<Vec<_>>()
+            .into()
     }
 
     /// Helper to create test `TuiApp`
@@ -581,6 +596,10 @@ mod tests {
         let router = Arc::new(BackendSelector::new());
         let servers = create_test_servers(backend_count);
         TuiApp::new(metrics, router, servers)
+    }
+
+    fn assert_f64_eq(actual: f64, expected: f64) {
+        assert_eq!(actual.to_bits(), expected.to_bits());
     }
 
     /// Test for the bug where `previous_snapshot` was set to self.snapshot instead of `new_snapshot`.
@@ -593,12 +612,13 @@ mod tests {
     fn test_previous_snapshot_uses_new_snapshot_not_old() {
         let metrics = MetricsCollector::new(1);
         let router = Arc::new(BackendSelector::new());
-        let servers = Arc::new(vec![
+        let servers: Arc<[Server]> = vec![
             Server::builder("test.example.com", Port::try_new(119).unwrap())
                 .name("Test Server".to_string())
                 .build()
                 .unwrap(),
-        ]);
+        ]
+        .into();
 
         let mut app = TuiApp::new(metrics.clone(), router, servers);
 
@@ -800,30 +820,30 @@ mod tests {
     fn test_calculate_rate() {
         // Zero time should give zero rate
         let rate = TuiApp::calculate_rate(1000, 0.0);
-        assert_eq!(rate.get(), 0.0);
+        assert_f64_eq(rate.get(), 0.0);
 
         // 1000 bytes in 1 second = 1000 B/s
         let rate = TuiApp::calculate_rate(1000, 1.0);
-        assert_eq!(rate.get(), 1000.0);
+        assert_f64_eq(rate.get(), 1000.0);
 
         // 1000 bytes in 0.5 seconds = 2000 B/s
         let rate = TuiApp::calculate_rate(1000, 0.5);
-        assert_eq!(rate.get(), 2000.0);
+        assert_f64_eq(rate.get(), 2000.0);
     }
 
     #[test]
     fn test_calculate_command_rate() {
         // Zero time should give zero rate
         let rate = TuiApp::calculate_command_rate(100, 0.0);
-        assert_eq!(rate.get(), 0.0);
+        assert_f64_eq(rate.get(), 0.0);
 
         // 100 commands in 1 second = 100 cmd/s
         let rate = TuiApp::calculate_command_rate(100, 1.0);
-        assert_eq!(rate.get(), 100.0);
+        assert_f64_eq(rate.get(), 100.0);
 
         // 50 commands in 0.5 seconds = 100 cmd/s
         let rate = TuiApp::calculate_command_rate(50, 0.5);
-        assert_eq!(rate.get(), 100.0);
+        assert_f64_eq(rate.get(), 100.0);
     }
 
     #[test]
@@ -858,9 +878,9 @@ mod tests {
             CommandsPerSecond::new(50.0),
         );
 
-        assert_eq!(point.sent_per_sec().get(), 1000.0);
-        assert_eq!(point.received_per_sec().get(), 2000.0);
-        assert_eq!(point.commands_per_sec().unwrap().get(), 50.0);
+        assert_f64_eq(point.sent_per_sec().get(), 1000.0);
+        assert_f64_eq(point.received_per_sec().get(), 2000.0);
+        assert_f64_eq(point.commands_per_sec().unwrap().get(), 50.0);
 
         let client_point = ThroughputPoint::new_client(
             Timestamp::now(),
@@ -868,8 +888,8 @@ mod tests {
             Throughput::new(1500.0),
         );
 
-        assert_eq!(client_point.sent_per_sec().get(), 500.0);
-        assert_eq!(client_point.received_per_sec().get(), 1500.0);
+        assert_f64_eq(client_point.sent_per_sec().get(), 500.0);
+        assert_f64_eq(client_point.received_per_sec().get(), 1500.0);
         assert!(client_point.commands_per_sec().is_none());
     }
 
@@ -887,7 +907,7 @@ mod tests {
         history.push(point1);
 
         assert!(history.latest().is_some());
-        assert_eq!(history.latest().unwrap().sent_per_sec().get(), 100.0);
+        assert_f64_eq(history.latest().unwrap().sent_per_sec().get(), 100.0);
 
         let point2 = ThroughputPoint::new_client(
             Timestamp::now(),
@@ -897,7 +917,7 @@ mod tests {
         history.push(point2);
 
         // Latest should be point2
-        assert_eq!(history.latest().unwrap().sent_per_sec().get(), 300.0);
+        assert_f64_eq(history.latest().unwrap().sent_per_sec().get(), 300.0);
     }
 
     // Tests for TuiAppBuilder

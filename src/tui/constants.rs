@@ -112,6 +112,7 @@ pub mod throughput {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // Constant tests intentionally compare exact float literals defined in the UI module.
 mod tests {
     use super::*;
 

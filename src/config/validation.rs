@@ -20,6 +20,9 @@ impl Config {
     /// - At least one server configured
     /// - Maximum 8 servers (bitset limitation for article availability tracking)
     /// - Keep-alive intervals are in recommended ranges
+    ///
+    /// # Errors
+    /// Returns an error if semantic validation fails after deserialization.
     pub fn validate(&self) -> Result<()> {
         if self.servers.is_empty() {
             return Err(anyhow::anyhow!(
@@ -150,7 +153,7 @@ mod tests {
 
     #[test]
     fn test_validate_server_with_recommended_keepalive() {
-        let server = create_test_server("test", Some(Duration::from_secs(60)));
+        let server = create_test_server("test", Some(Duration::from_mins(1)));
         validate_server(&server);
     }
 
@@ -164,7 +167,7 @@ mod tests {
     #[test]
     fn test_validate_server_with_high_keepalive_warns() {
         // This should warn but not fail
-        let server = create_test_server("test", Some(Duration::from_secs(600)));
+        let server = create_test_server("test", Some(Duration::from_mins(10)));
         validate_server(&server);
     }
 

@@ -7,8 +7,16 @@
 
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
+use nntp_proxy::protocol::RequestContext;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
+
+fn classify(command: &str) -> CommandAction<'static> {
+    let request = Box::leak(Box::new(
+        RequestContext::parse(command.as_bytes()).expect("valid request line"),
+    ));
+    CommandHandler::classify_request(request)
+}
 
 /// Test that Reject commands (stateful commands) don't bypass authentication.
 ///
@@ -28,7 +36,7 @@ async fn test_reject_commands_dont_bypass_authentication() {
     let mut authenticated = false;
 
     // First command: GROUP (stateful, will be rejected)
-    let action = CommandHandler::classify("GROUP misc.test\r\n");
+    let action = classify("GROUP misc.test\r\n");
     match action {
         CommandAction::Reject(response) => {
             // Session sends rejection response
@@ -41,7 +49,7 @@ async fn test_reject_commands_dont_bypass_authentication() {
 
     // Second command: LIST (stateless)
     // This should ALSO require authentication, proving no bypass
-    let action = CommandHandler::classify("LIST\r\n");
+    let action = classify("LIST\r\n");
     match action {
         CommandAction::ForwardStateless => {
             // In the actual handler, this branch checks if auth is enabled
@@ -236,7 +244,7 @@ async fn test_uninit_buffer_pattern_is_safe() {
     /// The returned buffer contains uninitialized memory and must only be used with
     /// `AsyncRead`/`AsyncWrite` operations that initialize bytes before reading them.
     /// Only access `&buf[..n]` where `n` is the number of bytes actually written.
-    #[allow(clippy::uninit_vec)]
+    #[allow(clippy::uninit_vec)] // This benchmark intentionally mirrors the production buffer-allocation pattern.
     fn create_buffer(size: usize) -> Vec<u8> {
         let mut buffer = Vec::with_capacity(size);
         unsafe {
@@ -327,6 +335,7 @@ fn test_uninit_vs_zeroed_performance_difference() {
     let start = Instant::now();
     for _ in 0..ITERATIONS {
         #[allow(clippy::slow_vector_initialization)]
+        // This branch intentionally benchmarks zeroed allocation.
         let mut buffer: Vec<u8> = Vec::with_capacity(SIZE);
         buffer.resize(SIZE, 0); // Zeros all 64KB
         std::hint::black_box(&buffer);
@@ -338,6 +347,7 @@ fn test_uninit_vs_zeroed_performance_difference() {
     for _ in 0..ITERATIONS {
         let mut buffer: Vec<u8> = Vec::with_capacity(SIZE);
         #[allow(clippy::uninit_vec)]
+        // This branch intentionally benchmarks uninitialized allocation.
         unsafe {
             buffer.set_len(SIZE); // No zeroing
         }

@@ -1,10 +1,9 @@
 //! Benchmarks for backend selection and routing
-#![allow(clippy::cast_possible_truncation)]
 //!
 //! Measures hot-path router operations:
-//! - `route_command` with weighted round-robin strategy
-//! - `route_command` with least-loaded strategy
-//! - `route_command_with_availability` (partially exhausted)
+//! - `route` with weighted round-robin strategy
+//! - `route` with least-loaded strategy
+//! - `route_with_availability` (partially exhausted)
 //! - `complete_command` throughput
 //!
 //! Run with: cargo bench --bench `router_selection`
@@ -39,8 +38,7 @@ fn make_router(strategy: BackendSelectionStrategy, num_backends: usize) -> Arc<B
             BackendId::from_index(i),
             ServerName::try_new(name).unwrap(),
             make_provider(10),
-            (i / 2) as u8, // Tier 0 for first 2, tier 1 for next 2, etc.
-            None,
+            u8::try_from(i / 2).expect("benchmark tier fits in u8"), // Tier 0 for first 2, tier 1 for next 2, etc.
         );
     }
     Arc::new(selector)
@@ -58,9 +56,7 @@ mod weighted_round_robin {
         let router = make_router(BackendSelectionStrategy::WeightedRoundRobin, 2);
         let client_id = ClientId::new();
         bencher.bench(|| {
-            let id = router
-                .route_command(black_box(client_id), black_box("ARTICLE"))
-                .unwrap();
+            let id = router.route(black_box(client_id)).unwrap();
             router.complete_command(id);
             black_box(id)
         });
@@ -71,9 +67,7 @@ mod weighted_round_robin {
         let router = make_router(BackendSelectionStrategy::WeightedRoundRobin, 4);
         let client_id = ClientId::new();
         bencher.bench(|| {
-            let id = router
-                .route_command(black_box(client_id), black_box("ARTICLE"))
-                .unwrap();
+            let id = router.route(black_box(client_id)).unwrap();
             router.complete_command(id);
             black_box(id)
         });
@@ -84,9 +78,7 @@ mod weighted_round_robin {
         let router = make_router(BackendSelectionStrategy::WeightedRoundRobin, 8);
         let client_id = ClientId::new();
         bencher.bench(|| {
-            let id = router
-                .route_command(black_box(client_id), black_box("ARTICLE"))
-                .unwrap();
+            let id = router.route(black_box(client_id)).unwrap();
             router.complete_command(id);
             black_box(id)
         });
@@ -105,9 +97,7 @@ mod least_loaded {
         let router = make_router(BackendSelectionStrategy::LeastLoaded, 2);
         let client_id = ClientId::new();
         bencher.bench(|| {
-            let id = router
-                .route_command(black_box(client_id), black_box("ARTICLE"))
-                .unwrap();
+            let id = router.route(black_box(client_id)).unwrap();
             router.complete_command(id);
             black_box(id)
         });
@@ -118,9 +108,7 @@ mod least_loaded {
         let router = make_router(BackendSelectionStrategy::LeastLoaded, 4);
         let client_id = ClientId::new();
         bencher.bench(|| {
-            let id = router
-                .route_command(black_box(client_id), black_box("ARTICLE"))
-                .unwrap();
+            let id = router.route(black_box(client_id)).unwrap();
             router.complete_command(id);
             black_box(id)
         });
@@ -142,11 +130,7 @@ mod availability_routing {
         let avail = ArticleAvailability::new(); // Fresh, nothing exhausted
         bencher.bench(|| {
             let id = router
-                .route_command_with_availability(
-                    black_box(client_id),
-                    black_box("ARTICLE"),
-                    Some(black_box(&avail)),
-                )
+                .route_with_availability(black_box(client_id), Some(black_box(&avail)))
                 .unwrap();
             router.complete_command(id);
             black_box(id)
@@ -163,11 +147,7 @@ mod availability_routing {
         avail.record_missing(BackendId::from_index(1));
         bencher.bench(|| {
             let id = router
-                .route_command_with_availability(
-                    black_box(client_id),
-                    black_box("ARTICLE"),
-                    Some(black_box(&avail)),
-                )
+                .route_with_availability(black_box(client_id), Some(black_box(&avail)))
                 .unwrap();
             router.complete_command(id);
             black_box(id)
@@ -207,9 +187,7 @@ mod contention {
         let router = make_router(BackendSelectionStrategy::WeightedRoundRobin, 4);
         let client_id = ClientId::new();
         bencher.bench(|| {
-            let id = router
-                .route_command(black_box(client_id), black_box("ARTICLE"))
-                .unwrap();
+            let id = router.route(black_box(client_id)).unwrap();
             router.complete_command(id);
             black_box(id)
         });

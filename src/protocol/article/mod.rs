@@ -44,6 +44,10 @@ impl<'a> Article<'a> {
     /// # Arguments
     /// * `buf` - Raw response bytes
     /// * `validate_yenc` - Whether to validate yEnc structure/checksums
+    ///
+    /// # Errors
+    /// Returns `ParseError` when the NNTP response status line, message metadata,
+    /// headers, body framing, or optional yEnc validation fails.
     pub fn parse(buf: &'a [u8], validate_yenc: bool) -> Result<Self, ParseError> {
         // Parse status code from first line
         let status_code = parse_status_code(buf)?;

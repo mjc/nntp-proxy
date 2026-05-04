@@ -110,7 +110,6 @@ mod unified_cache {
         Arc::new(UnifiedCache::memory(
             1024 * 1024, // 1MB capacity
             Duration::from_secs(300),
-            true,
         ))
     }
 
@@ -134,11 +133,11 @@ mod unified_cache {
         rt.block_on(async {
             let msg_id = MessageId::from_borrowed("<hit@example.com>").unwrap();
             cache
-                .upsert(
+                .upsert_ingest(
                     msg_id.to_owned(),
                     b"220 0 <hit@example.com>\r\nSubject: test\r\n\r\nbody\r\n.\r\n".to_vec(),
                     BackendId::from_index(0),
-                    0,
+                    0.into(),
                 )
                 .await;
         });
@@ -162,7 +161,12 @@ mod unified_cache {
                 rt.block_on(async {
                     let msg_id = MessageId::from_borrowed("<bench@test.com>").unwrap();
                     cache
-                        .upsert(msg_id.to_owned(), data.clone(), BackendId::from_index(0), 0)
+                        .upsert_ingest(
+                            msg_id.to_owned(),
+                            data.clone(),
+                            BackendId::from_index(0),
+                            0.into(),
+                        )
                         .await;
                 });
             });
@@ -181,6 +185,81 @@ mod unified_cache {
                 let msg_id = MessageId::from_borrowed("<sync@test.com>").unwrap();
                 cache.sync_availability(msg_id.to_owned(), &avail).await;
             });
+        });
+    }
+}
+
+mod availability_cache {
+    use super::{Arc, ArticleAvailability, BackendId, Bencher, MessageId, UnifiedCache, black_box};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn make_cache() -> Arc<UnifiedCache> {
+        Arc::new(UnifiedCache::availability(
+            1024 * 1024,
+            std::time::Duration::MAX,
+        ))
+    }
+
+    #[divan::bench(sample_count = 1000, sample_size = 1000)]
+    fn get_miss(bencher: Bencher) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cache = make_cache();
+        bencher.bench(|| {
+            rt.block_on(async {
+                let msg_id = MessageId::from_borrowed("<miss@example.com>").unwrap();
+                black_box(cache.get(&msg_id).await)
+            })
+        });
+    }
+
+    #[divan::bench(sample_count = 1000, sample_size = 1000)]
+    fn get_hit(bencher: Bencher) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cache = make_cache();
+        let msg_id = MessageId::from_borrowed("<hit@example.com>").unwrap();
+        rt.block_on(async {
+            cache
+                .record_backend_missing(msg_id.clone(), BackendId::from_index(0))
+                .await;
+        });
+
+        bencher.bench(|| rt.block_on(async { black_box(cache.get(&msg_id).await) }));
+    }
+
+    #[divan::bench(sample_count = 1000, sample_size = 1000)]
+    fn record_missing(bencher: Bencher) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cache = make_cache();
+        let next_id = AtomicU64::new(0);
+
+        bencher.bench(|| {
+            let id = next_id.fetch_add(1, Ordering::Relaxed);
+            let msg_id = MessageId::new(format!("<bench-{id}@example.com>")).unwrap();
+            rt.block_on(async {
+                cache
+                    .record_backend_missing(msg_id, BackendId::from_index(0))
+                    .await;
+                black_box(());
+            });
+        });
+    }
+
+    #[divan::bench(sample_count = 1000, sample_size = 1000)]
+    fn sync_availability(bencher: Bencher) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cache = make_cache();
+        let next_id = AtomicU64::new(0);
+        let mut availability = ArticleAvailability::new();
+        availability.record_missing(BackendId::from_index(0));
+        availability.record_has(BackendId::from_index(1));
+
+        bencher.bench(|| {
+            let id = next_id.fetch_add(1, Ordering::Relaxed);
+            let msg_id = MessageId::new(format!("<sync-{id}@example.com>")).unwrap();
+            rt.block_on(async {
+                cache.sync_availability(msg_id, &availability).await;
+                black_box(())
+            })
         });
     }
 }

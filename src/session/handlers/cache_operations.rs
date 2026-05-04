@@ -4,26 +4,29 @@
 //! and tier-aware cache operations.
 
 use crate::cache::ArticleAvailability;
-use crate::command::classifier::is_stat_command;
-use crate::router::{BackendSelector, CommandGuard};
+use crate::cache::ttl::CacheTier;
+use crate::protocol::{
+    RequestCacheEntryMetadata, RequestCacheStatus, RequestContext, RequestKind,
+    RequestResponseMetadata, ResponseWireLen, StatusCode,
+};
+use crate::router::BackendSelector;
 use crate::session::{ClientSession, precheck};
-use crate::types::{BackendId, BackendToClientBytes};
+use crate::types::{BackendId, BackendToClientBytes, MessageId};
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::AsyncWrite;
 use tracing::debug;
 
 /// Result of a cache lookup attempt in `try_serve_from_cache`.
 ///
 /// Distinguishes between a full cache hit (response served), a partial hit
-/// (entry existed but wasn't servable — availability info is available),
-/// and a complete miss (no entry in cache at all).
+/// (entry existed but wasn't servable), and a complete miss (no entry in cache
+/// at all). Cache metadata is recorded on the request context.
 pub(super) enum CacheLookupResult {
     /// Response was served directly from cache.
-    Hit(BackendId),
-    /// Entry existed but wasn't servable. Carries the availability info
-    /// so callers can skip a redundant `cache.get()`.
-    PartialHit(ArticleAvailability),
+    Hit,
+    /// Entry existed but wasn't servable; availability metadata is recorded on the request.
+    PartialHit,
     /// No entry in cache at all.
     Miss,
 }
@@ -32,155 +35,152 @@ impl ClientSession {
     /// Try to serve from cache
     ///
     /// Returns `CacheLookupResult::Hit` if served, `PartialHit` if entry existed but
-    /// wasn't servable (carries availability to avoid a redundant lookup), or `Miss`.
+    /// wasn't servable, or `Miss`.
     pub(super) async fn try_serve_from_cache(
         &self,
-        msg_id: Option<&crate::types::MessageId<'_>>,
-        command: &str,
+        request: &mut RequestContext,
         router: &Arc<BackendSelector>,
         client_write: &mut tokio::net::tcp::WriteHalf<'_>,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<CacheLookupResult> {
-        let Some(msg_id_ref) = msg_id else {
+        let Some(msg_id_for_lookup) = request.message_id() else {
+            request.record_cache_status(RequestCacheStatus::Miss);
             return Ok(CacheLookupResult::Miss);
         };
 
         debug!(
             "Client {} checking cache for {}",
-            self.client_addr, msg_id_ref
+            self.client_addr, msg_id_for_lookup
         );
 
-        let Some(cached) = self.cache.get(msg_id_ref).await else {
-            debug!("Cache MISS for message-ID: {}", msg_id_ref);
+        let Some(cached) = self.cache.get_request_message_id(msg_id_for_lookup).await else {
+            debug!("Cache MISS for message-ID: {}", msg_id_for_lookup);
+            request.record_cache_status(RequestCacheStatus::Miss);
             return Ok(CacheLookupResult::Miss);
         };
 
-        // Extract availability before any early returns so we can pass it back
-        let availability = cached.to_availability(router.backend_count());
+        // Extract stored availability before any early returns so we can pass it back.
+        // Cache-hit metadata should preserve both checked and missing bits; retry routing
+        // can derive backend attempts later when it actually needs router.backend_count().
+        let availability = cached.availability();
+        request.record_cache_entry_metadata(cache_entry_metadata(&cached, &availability));
 
         if !cached.has_availability_info() {
             debug!(
                 "Cache entry exists for {} but no availability info (missing=0) - running precheck",
-                msg_id_ref
+                request.message_id().unwrap_or("<invalid>")
             );
-            return Ok(CacheLookupResult::PartialHit(availability));
+            request.record_cache_status(RequestCacheStatus::PartialHit);
+            return Ok(CacheLookupResult::PartialHit);
         }
 
         debug!(
             "Client {} cache HIT for {} (cache_articles={})",
-            self.client_addr, msg_id_ref, self.cache_articles
+            self.client_addr,
+            request.message_id().unwrap_or("<invalid>"),
+            self.cache_articles
         );
 
         // If full article caching enabled, try to serve from cache
         if !self.cache_articles {
             // Availability-only mode - spawn background precheck to update availability
             // then fall through to use availability info for routing
-            if self.adaptive_precheck {
-                let bytes = command.as_bytes();
-                if is_stat_command(bytes) {
-                    precheck::spawn_background_precheck(
-                        self.precheck_deps(router),
-                        command.to_string(),
-                        msg_id_ref.to_owned(),
-                    );
-                }
+            if self.adaptive_precheck && request.is_stat() {
+                precheck::spawn_background_precheck(
+                    self.precheck_deps(router),
+                    request.clone(),
+                    MessageId::from_borrowed(
+                        request
+                            .message_id()
+                            .expect("cached request still has message id"),
+                    )
+                    .expect("cached request has validated message id")
+                    .to_owned(),
+                );
             }
-            return Ok(CacheLookupResult::PartialHit(availability));
+            request.record_cache_status(RequestCacheStatus::PartialHit);
+            return Ok(CacheLookupResult::PartialHit);
         }
 
-        // Check if this is a complete article we can serve
-        // Stubs from STAT/HEAD precheck or availability tracking should not be served
+        // Check if this is a complete article we can serve.
+        // Availability-only or missing entries should not be served as article payloads.
         // Exception: STAT can be answered from any cache entry (we just need to know it exists)
-        let cmd_verb = command.split_whitespace().next().unwrap_or("");
-
-        if !cmd_verb.eq_ignore_ascii_case("STAT") && !cached.is_complete_article() {
+        if !request.is_stat() && !cached.is_complete_article() {
             debug!(
-                "Client {} cache entry for {} is a stub (len={}), fetching full article",
+                "Client {} cache entry for {} has no complete payload (payload_len={}), fetching full article",
                 self.client_addr,
-                msg_id_ref,
-                cached.buffer().len()
+                request.message_id().unwrap_or("<invalid>"),
+                cached.payload_len().get()
             );
-            return Ok(CacheLookupResult::PartialHit(availability));
+            request.record_cache_status(RequestCacheStatus::PartialHit);
+            return Ok(CacheLookupResult::PartialHit);
         }
 
         // Serve from cache, avoiding buffer copies for the common path.
-        // STAT is synthesized (tiny response), everything else writes directly from the Arc buffer.
-        if !cached.matches_command_type_verb(cmd_verb) {
-            let status_code = cached.status_code().map_or(0, |c| c.as_u16());
+        // STAT is synthesized (tiny response), everything else writes directly from typed payload sections.
+        let request_kind = request.kind();
+        let msg_id_for_write = request
+            .message_id()
+            .expect("cached request still has message id");
+        let Some(write) =
+            write_cached_article_response(client_write, &cached, request_kind, msg_id_for_write)
+                .await?
+        else {
+            let status_code = cached.status_code().as_u16();
             debug!(
-                "Client {} cached response (code={}) can't serve '{}' command",
-                self.client_addr, status_code, cmd_verb
+                "Client {} cached response (code={}) can't serve request kind {:?}",
+                self.client_addr, status_code, request_kind
             );
-            return Ok(CacheLookupResult::PartialHit(availability));
-        }
-
-        // STAT: synthesize a small response (no buffer copy needed)
-        // Direct serve: write directly from the Arc-backed buffer (zero-copy)
-        let bytes_written = if cmd_verb.eq_ignore_ascii_case("STAT") {
-            let stat_response = crate::cache::build_stat_response(msg_id_ref.as_str());
-            client_write.write_all(&stat_response).await?;
-            stat_response.len()
-        } else {
-            // Validate before serving
-            if !cached.is_valid_response() {
-                let status_code = cached.status_code().map_or(0, |c| c.as_u16());
-                tracing::warn!(
-                    code = status_code,
-                    len = cached.buffer().len(),
-                    "Cached buffer failed validation, discarding"
-                );
-                return Ok(CacheLookupResult::PartialHit(availability));
-            }
-            let buf = cached.buffer();
-            client_write.write_all(buf).await?;
-            buf.len()
+            request.record_cache_status(RequestCacheStatus::PartialHit);
+            return Ok(CacheLookupResult::PartialHit);
         };
-        *backend_to_client_bytes = backend_to_client_bytes.add(bytes_written);
+        *backend_to_client_bytes = backend_to_client_bytes.add(write.wire_len.get());
 
-        let backend_id = router.route_command(self.client_id, command)?;
-        let guard = CommandGuard::new(router.clone(), backend_id);
-        guard.complete();
-        Ok(CacheLookupResult::Hit(backend_id))
-    }
-
-    /// Spawn async cache upsert task
-    ///
-    /// This is fire-and-forget - we don't wait for the cache to update.
-    /// Used after successfully streaming a response to update availability tracking.
-    ///
-    /// The tier is used for tier-aware TTL (higher tier = longer TTL).
-    pub(super) fn spawn_cache_upsert(
-        &self,
-        msg_id: &crate::types::MessageId<'_>,
-        buffer: &[u8],
-        backend_id: crate::types::BackendId,
-        tier: u8,
-    ) {
-        self.spawn_cache_upsert_buffer(msg_id, buffer.to_vec().into(), backend_id, tier);
+        request.record_cache_response(write.metadata());
+        Ok(CacheLookupResult::Hit)
     }
 
     /// Spawn async cache upsert task with owned hot-path storage.
     pub(super) fn spawn_cache_upsert_buffer(
         &self,
         msg_id: &crate::types::MessageId<'_>,
-        buffer: crate::cache::CacheBuffer,
+        buffer: crate::cache::CacheIngestResponse,
         backend_id: crate::types::BackendId,
-        tier: u8,
+        tier: CacheTier,
     ) {
         let cache_clone = self.cache.clone();
         let msg_id_owned = msg_id.to_owned();
         tokio::spawn(async move {
             cache_clone
-                .upsert(msg_id_owned, buffer, backend_id, tier)
+                .upsert_ingest(msg_id_owned, buffer, backend_id, tier)
                 .await;
         });
     }
+
+    /// Spawn async availability-only cache update without response payload storage.
+    pub(super) fn spawn_cache_upsert_availability(
+        &self,
+        msg_id: &crate::types::MessageId<'_>,
+        status_code: StatusCode,
+        backend_id: crate::types::BackendId,
+        tier: CacheTier,
+    ) {
+        let cache_clone = self.cache.clone();
+        let msg_id_owned = msg_id.to_owned();
+        tokio::spawn(async move {
+            cache_clone
+                .record_backend_has_status(msg_id_owned, status_code, backend_id, tier)
+                .await;
+        });
+    }
+
     /// Get the tier for a backend, defaulting to 0 if router or backend not found.
-    pub(super) fn tier_for_backend(&self, backend_id: BackendId) -> u8 {
+    pub(super) fn tier_for_backend(&self, backend_id: BackendId) -> CacheTier {
         self.router
             .as_ref()
             .and_then(|r| r.get_tier(backend_id))
             .unwrap_or(0)
+            .into()
     }
 
     /// Create precheck dependencies
@@ -195,5 +195,263 @@ impl ClientSession {
             metrics: &self.metrics,
             cache_articles: self.cache_articles,
         }
+    }
+}
+
+fn cache_entry_metadata(
+    cached: &crate::cache::CachedArticle,
+    availability: &ArticleAvailability,
+) -> RequestCacheEntryMetadata {
+    cached.request_cache_metadata(availability)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CachedResponseWrite {
+    pub status: StatusCode,
+    pub wire_len: ResponseWireLen,
+}
+
+impl CachedResponseWrite {
+    #[must_use]
+    pub const fn metadata(self) -> RequestResponseMetadata {
+        RequestResponseMetadata::new(self.status, self.wire_len)
+    }
+}
+
+pub(super) async fn write_cached_article_response<W>(
+    client_write: &mut W,
+    cached: &crate::cache::CachedArticle,
+    request_kind: RequestKind,
+    message_id: &str,
+) -> std::io::Result<Option<CachedResponseWrite>>
+where
+    W: AsyncWrite + Unpin,
+{
+    let Some(response) = cached.cached_response_for(request_kind, message_id) else {
+        return Ok(None);
+    };
+    let wire_len = response.wire_len();
+    response.write_to(client_write).await?;
+    Ok(Some(CachedResponseWrite {
+        status: response.status(),
+        wire_len,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::AuthHandler;
+    use crate::cache::UnifiedCache;
+    use crate::metrics::MetricsCollector;
+    use crate::pool::{BufferPool, DeadpoolConnectionProvider};
+    use crate::protocol::{
+        RequestCacheArticleNumber, RequestCachePayloadKind, RequestCacheTimestampMillis,
+    };
+    use crate::types::{BufferSize, ClientAddress, ServerName};
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    fn test_session() -> ClientSession {
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid address");
+        ClientSession::builder(
+            ClientAddress::from(addr),
+            BufferPool::new(BufferSize::try_new(1024).expect("valid buffer size"), 1),
+            Arc::new(AuthHandler::new(None, None).expect("auth disabled")),
+            MetricsCollector::new(1),
+        )
+        .with_cache(Arc::new(UnifiedCache::memory(
+            1024,
+            Duration::from_secs(60),
+        )))
+        .build()
+    }
+
+    async fn tcp_write_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener address");
+        let connect = TcpStream::connect(addr);
+        let accept = listener.accept();
+        let (client, server) = tokio::join!(connect, accept);
+        (
+            client.expect("connect client"),
+            server.expect("accept client").0,
+        )
+    }
+
+    fn request_context(line: &[u8]) -> RequestContext {
+        RequestContext::parse(line).expect("valid request line")
+    }
+
+    #[tokio::test]
+    async fn cache_miss_is_recorded_on_request_context() {
+        let session = test_session();
+        let router = Arc::new(BackendSelector::new());
+        let mut metrics = BackendToClientBytes::zero();
+        let (mut client, _server) = tcp_write_pair().await;
+        let (_read, mut write) = client.split();
+        let mut request = request_context(b"ARTICLE <missing@example>\r\n");
+
+        let result = session
+            .try_serve_from_cache(&mut request, &router, &mut write, &mut metrics)
+            .await
+            .expect("lookup succeeds");
+
+        assert!(matches!(result, CacheLookupResult::Miss));
+        assert_eq!(request.cache_status(), Some(RequestCacheStatus::Miss));
+        assert_eq!(metrics, BackendToClientBytes::zero());
+    }
+
+    #[tokio::test]
+    async fn request_without_message_id_records_cache_miss() {
+        let session = test_session();
+        let router = Arc::new(BackendSelector::new());
+        let mut metrics = BackendToClientBytes::zero();
+        let (mut client, _server) = tcp_write_pair().await;
+        let (_read, mut write) = client.split();
+        let mut request = request_context(b"DATE\r\n");
+
+        let result = session
+            .try_serve_from_cache(&mut request, &router, &mut write, &mut metrics)
+            .await
+            .expect("lookup succeeds");
+
+        assert!(matches!(result, CacheLookupResult::Miss));
+        assert_eq!(request.cache_status(), Some(RequestCacheStatus::Miss));
+        assert_eq!(metrics, BackendToClientBytes::zero());
+    }
+
+    #[tokio::test]
+    async fn cache_hit_records_response_metadata_on_request_context() {
+        let session = test_session();
+        let msg_id = MessageId::new("<hit@example>".to_string()).expect("valid message id");
+        let expected = b"220 0 <hit@example>\r\nHeader: v\r\n\r\nBody\r\n.\r\n";
+        session
+            .cache
+            .upsert_ingest(
+                msg_id.clone(),
+                expected.to_vec(),
+                BackendId::from_index(0),
+                0.into(),
+            )
+            .await;
+
+        let router = Arc::new(BackendSelector::new());
+
+        let mut metrics = BackendToClientBytes::zero();
+        let (mut client, mut server) = tcp_write_pair().await;
+        let (_read, mut write) = client.split();
+        let mut request = request_context(b"ARTICLE <hit@example>\r\n");
+
+        let result = session
+            .try_serve_from_cache(&mut request, &router, &mut write, &mut metrics)
+            .await
+            .expect("lookup succeeds");
+
+        let mut written = vec![0; expected.len()];
+        server
+            .read_exact(&mut written)
+            .await
+            .expect("cached response written");
+
+        assert!(matches!(result, CacheLookupResult::Hit));
+        assert_eq!(written, expected);
+        assert_eq!(request.cache_status(), Some(RequestCacheStatus::Hit));
+        assert_eq!(request.backend_id(), None);
+        assert_eq!(request.response_status(), Some(StatusCode::new(220)));
+        assert_eq!(
+            request
+                .cache_availability()
+                .expect("cache hit records availability")
+                .checked_bits(),
+            0b0000_0001
+        );
+        assert_eq!(
+            request
+                .cache_availability()
+                .expect("cache hit records availability")
+                .missing_bits(),
+            0
+        );
+        assert_eq!(
+            request.cache_article_number(),
+            Some(RequestCacheArticleNumber::new(0))
+        );
+        assert_eq!(
+            request.response_wire_len(),
+            Some(ResponseWireLen::new(expected.len()))
+        );
+        assert_eq!(metrics, BackendToClientBytes::zero().add(expected.len()));
+    }
+
+    #[tokio::test]
+    async fn partial_cache_hit_records_availability_on_request_context() {
+        let session = test_session();
+        let msg_id = MessageId::new("<partial@example>".to_string()).expect("valid message id");
+        let mut availability = ArticleAvailability::new();
+        availability.record_missing(BackendId::from_index(0));
+        session
+            .cache
+            .sync_availability(msg_id.clone(), &availability)
+            .await;
+        let expected_timestamp = session
+            .cache
+            .get(&msg_id)
+            .await
+            .expect("cached availability entry")
+            .inserted_at();
+
+        let mut router = BackendSelector::new();
+        router.add_backend(
+            BackendId::from_index(0),
+            ServerName::try_new("partial-backend".to_string()).expect("server name"),
+            DeadpoolConnectionProvider::new(
+                "127.0.0.1".to_string(),
+                119,
+                "partial-backend".to_string(),
+                1,
+                None,
+                None,
+            ),
+            0,
+        );
+        let router = Arc::new(router);
+        let mut metrics = BackendToClientBytes::zero();
+        let (mut client, _server) = tcp_write_pair().await;
+        let (_read, mut write) = client.split();
+        let mut request = request_context(b"ARTICLE <partial@example>\r\n");
+
+        let result = session
+            .try_serve_from_cache(&mut request, &router, &mut write, &mut metrics)
+            .await
+            .expect("lookup succeeds");
+
+        assert!(matches!(result, CacheLookupResult::PartialHit));
+        assert_eq!(request.cache_status(), Some(RequestCacheStatus::PartialHit));
+        assert_eq!(request.cache_entry_status(), Some(StatusCode::new(430)));
+        assert_eq!(
+            request.cache_entry_tier(),
+            Some(crate::protocol::RequestCacheTier::new(0))
+        );
+        assert_eq!(
+            request.cache_entry_timestamp(),
+            Some(RequestCacheTimestampMillis::new(expected_timestamp.get()))
+        );
+        assert_eq!(
+            request.cache_payload_kind(),
+            Some(RequestCachePayloadKind::Missing)
+        );
+        assert_eq!(request.cache_article_number(), None);
+        assert_eq!(
+            request
+                .cache_availability()
+                .map(|availability| { (availability.checked_bits(), availability.missing_bits()) }),
+            Some((0b0000_0001, 0b0000_0001))
+        );
+        assert_eq!(metrics, BackendToClientBytes::zero());
     }
 }

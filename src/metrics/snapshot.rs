@@ -3,8 +3,12 @@
 //! Contains the immutable `MetricsSnapshot` struct with functional methods
 //! for querying and aggregating metrics across backends.
 
-#[allow(clippy::wildcard_imports)] // imports many metric types from types module
-use super::types::*;
+#![allow(clippy::cast_precision_loss, clippy::float_cmp)] // Snapshot rates are presentation values; tests use exact deterministic fixtures.
+
+// Snapshot rates are presentation/monitoring values, and the tests exercise
+// exact deterministic fixtures rather than fuzzy comparisons.
+
+use super::types::{ActiveConnections, BackendHealthStatus, ErrorRatePercent};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use std::sync::Arc;
 use std::time::Duration;
@@ -22,7 +26,7 @@ use super::UserStats;
 /// by taking deltas between snapshots over time.
 ///
 /// # Arc Sharing
-/// `backend_stats` is Arc-wrapped to avoid cloning the entire Vec when
+/// `backend_stats` is Arc-wrapped to avoid cloning the entire slice when
 /// calculating user rates every TUI frame (4 Hz). This reduces allocations
 /// from O(backends) to O(1) per update.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -36,7 +40,7 @@ pub struct MetricsSnapshot {
     pub backend_to_client_bytes: BackendToClientBytes,
     #[serde(skip, default)]
     pub uptime: Duration,
-    pub backend_stats: Arc<Vec<BackendStats>>,
+    pub backend_stats: Arc<[BackendStats]>,
     pub user_stats: Vec<UserStats>,
     #[serde(skip, default)]
     pub cache_entries: u64,
@@ -228,10 +232,12 @@ impl MetricsSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::{
+        ArticleCount, CommandCount, ErrorCount, FailureCount, RecvMicros, SendMicros, TtfbMicros,
+    };
     use crate::types::BackendId;
 
     fn create_test_snapshot() -> MetricsSnapshot {
-        use crate::types::metrics::*;
         use crate::types::{ArticleBytesTotal, BytesReceived, BytesSent, TimingMeasurementCount};
 
         let backend1 = BackendStats {
@@ -278,8 +284,8 @@ mod tests {
             stateful_sessions: 2,
             client_to_backend_bytes: ClientToBackendBytes::new(1500),
             backend_to_client_bytes: BackendToClientBytes::new(3500),
-            uptime: Duration::from_secs(3600),
-            backend_stats: Arc::new(vec![backend1, backend2]),
+            uptime: Duration::from_hours(1),
+            backend_stats: vec![backend1, backend2].into(),
             user_stats: vec![],
             cache_entries: 0,
             cache_size_bytes: 0,
@@ -427,7 +433,7 @@ mod tests {
         };
 
         let snapshot = MetricsSnapshot {
-            backend_stats: Arc::new(vec![backend]),
+            backend_stats: vec![backend].into(),
             ..Default::default()
         };
 
@@ -486,7 +492,7 @@ mod tests {
         ];
 
         let snapshot = MetricsSnapshot {
-            backend_stats: Arc::new(backends),
+            backend_stats: backends.into(),
             ..Default::default()
         };
 

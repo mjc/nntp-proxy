@@ -5,30 +5,26 @@
 //!
 //! # Structure
 //!
-//! - Response validation functions (pure, easily testable)
+//! - Response status parsing functions (pure, easily testable)
 //! - Command execution helpers - Send command, read response
 //!
-//! # Usage
-//!
-//! ```ignore
-//! use crate::session::backend::{send_command, CommandResponse};
-//!
-//! let response = send_command(&mut conn, command, &mut buffer).await?;
-//! if response.is_430() {
-//!     // Article not found
-//! }
-//! ```
+//! Backend requests and response parsing are driven by `RequestContext`; callers
+//! should not rebuild command strings after request validation.
 
 use anyhow::Result;
 use smallvec::SmallVec;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::pool::PooledBuffer;
-use crate::protocol::NntpResponse;
+use crate::protocol::{RequestContext, StatusCode};
 
-// ─── Response validation ────────────────────────────────────────────────────
+fn duration_micros_u64(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
 
-/// Response validation warnings (pure data)
+// ─── Response status parsing ────────────────────────────────────────────────
+
+/// Response status parse warnings (pure data)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResponseWarning {
     /// Response too short to be valid
@@ -39,15 +35,14 @@ pub enum ResponseWarning {
     UnusualStatusCode(u16),
 }
 
-/// Validated backend response (pure data)
+/// Parsed backend response status (pure data)
 #[derive(Debug)]
-pub struct ValidatedResponse {
-    pub response: NntpResponse,
-    pub is_multiline: bool,
-    pub warnings: SmallVec<[ResponseWarning; 0]>,
+pub struct BackendStatusParse {
+    pub(crate) status_code: Option<StatusCode>,
+    pub(crate) warnings: SmallVec<[ResponseWarning; 0]>,
 }
 
-/// Validate backend response data (pure function - easily testable)
+/// Parse backend response status (pure function - easily testable)
 ///
 /// Checks response for:
 /// - Minimum length requirement
@@ -60,13 +55,13 @@ pub struct ValidatedResponse {
 /// * `min_length` - Minimum expected length
 ///
 /// # Returns
-/// `ValidatedResponse` with parsed response and any warnings
+/// `BackendStatusParse` with parsed status and any warnings
 #[must_use]
-pub fn validate_backend_response(
+pub fn parse_backend_status(
     chunk: &[u8],
     bytes_read: usize,
     min_length: usize,
-) -> ValidatedResponse {
+) -> BackendStatusParse {
     let mut warnings = SmallVec::new();
 
     // Check minimum length
@@ -77,26 +72,47 @@ pub fn validate_backend_response(
         });
     }
 
-    // Parse response code
-    let response = NntpResponse::parse(&chunk[..bytes_read]);
-    let is_multiline = response.is_multiline();
-
+    let status_code = StatusCode::parse(&chunk[..bytes_read]);
     // Check for invalid response
-    if response == NntpResponse::Invalid {
-        warnings.push(ResponseWarning::InvalidResponse);
-    } else if let Some(code) = response.status_code() {
+    if let Some(code) = status_code {
         // Check for unusual status codes
         let raw_code = code.as_u16();
         if raw_code == 0 || raw_code >= 600 {
             warnings.push(ResponseWarning::UnusualStatusCode(raw_code));
         }
+    } else {
+        warnings.push(ResponseWarning::InvalidResponse);
     }
 
-    ValidatedResponse {
-        response,
-        is_multiline,
+    BackendStatusParse {
+        status_code,
         warnings,
     }
+}
+
+/// Return the byte offset immediately after the response status line.
+///
+/// NNTP status lines are CRLF-terminated. We also treat a bare LF as a line
+/// boundary here so callers do not classify a partial status line as complete.
+#[must_use]
+pub fn status_line_end(data: &[u8]) -> Option<usize> {
+    memchr::memchr(b'\n', data).map(|pos| pos + 1)
+}
+
+async fn read_until_status_line<C>(conn: &mut C, buffer: &mut PooledBuffer) -> Result<()>
+where
+    C: AsyncReadExt + Unpin,
+{
+    while status_line_end(buffer).is_none() {
+        let more = buffer.read_more(conn).await?;
+        if more == 0 {
+            anyhow::bail!(
+                "Backend EOF before complete status line ({} bytes)",
+                buffer.initialized()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Format a hex preview of response bytes for debugging Invalid responses
@@ -127,29 +143,27 @@ pub fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
 
 // ─── Command execution ──────────────────────────────────────────────────────
 
-/// Result of sending a command to a backend
+/// Metadata for the first backend response chunk.
 #[derive(Debug)]
-pub struct CommandResponse {
+pub struct BackendFirstResponse {
     /// Number of bytes read into buffer
-    pub bytes_read: usize,
-    /// Parsed NNTP response
-    pub response: NntpResponse,
-    /// Whether this is a multiline response
-    pub is_multiline: bool,
+    pub(crate) bytes_read: usize,
+    /// Parsed status code, if present
+    pub(crate) status_code: Option<StatusCode>,
     /// Any validation warnings
-    pub warnings: SmallVec<[ResponseWarning; 0]>,
+    pub(crate) warnings: SmallVec<[ResponseWarning; 0]>,
 }
 
-impl CommandResponse {
+impl BackendFirstResponse {
     /// Get status code if valid
     #[inline]
     #[must_use]
-    pub fn status_code(&self) -> Option<crate::protocol::StatusCode> {
-        self.response.status_code()
+    pub(crate) const fn status_code(&self) -> Option<StatusCode> {
+        self.status_code
     }
 
     /// Log validation warnings with context
-    pub fn log_warnings(
+    pub(crate) fn log_warnings(
         &self,
         buffer: &[u8],
         client_addr: impl std::fmt::Display,
@@ -198,104 +212,88 @@ impl CommandResponse {
     }
 }
 
-/// Send command to backend and read first response chunk
-///
-/// This is the core NNTP client operation: send a command, get a response.
-/// For multiline responses, only the first chunk is read - caller must
-/// stream the rest.
-///
-/// # Arguments
-/// * `conn` - Backend connection (anything implementing `AsyncRead` + `AsyncWrite`)
-/// * `command` - NNTP command to send (should include \r\n)
-/// * `buffer` - Buffer to read response into
-///
-/// # Returns
-/// `CommandResponse` with parsed response and buffer position
-///
-/// # Errors
-/// Returns error if write fails, read fails, or connection closes unexpectedly
-pub async fn send_command<C>(
+/// Write a typed request to a backend without building a temporary command buffer.
+pub async fn write_request<C>(conn: &mut C, request: &RequestContext) -> std::io::Result<()>
+where
+    C: tokio::io::AsyncWrite + Unpin,
+{
+    request.write_wire_to(conn).await
+}
+
+/// Send a typed request and read the first response chunk.
+pub async fn send_request<C>(
     conn: &mut C,
-    command: &str,
+    request: &RequestContext,
     buffer: &mut PooledBuffer,
-) -> Result<CommandResponse>
+) -> Result<BackendFirstResponse>
 where
     C: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    // Delegate to timed version, discard timing
-    let (response, _, _, _) = send_command_timed(conn, command, buffer).await?;
-    Ok(response)
+    write_request(conn, request).await?;
+
+    let n = buffer.read_from(conn).await?;
+    if n == 0 {
+        anyhow::bail!("Backend connection closed unexpectedly");
+    }
+
+    read_until_status_line(conn, buffer).await?;
+    let min_len = crate::protocol::MIN_RESPONSE_LENGTH;
+    let total = buffer.initialized();
+    let validated = parse_backend_status(&buffer[..total], total, min_len);
+
+    Ok(BackendFirstResponse {
+        bytes_read: total,
+        status_code: validated.status_code,
+        warnings: validated.warnings,
+    })
 }
 
-/// Send command with timing measurements
-///
-/// Like `send_command` but also returns timing information for metrics.
-///
-/// # Returns
-/// Tuple of (`CommandResponse`, `ttfb_micros`, `send_micros`, `recv_micros`)
-pub async fn send_command_timed<C>(
+/// Send a typed request with timing measurements.
+pub async fn send_request_timed<C>(
     conn: &mut C,
-    command: &str,
+    request: &RequestContext,
     buffer: &mut PooledBuffer,
-) -> Result<(CommandResponse, u64, u64, u64)>
+) -> Result<(BackendFirstResponse, u64, u64, u64)>
 where
     C: AsyncReadExt + AsyncWriteExt + Unpin,
 {
     use std::time::Instant;
 
     let start = Instant::now();
+    write_request(conn, request).await?;
+    let after_send = Instant::now();
 
-    // Send command
-    let send_start = Instant::now();
-    conn.write_all(command.as_bytes()).await?;
-    let send_elapsed = send_start.elapsed();
-
-    // Read first chunk
-    let recv_start = Instant::now();
     let n = buffer.read_from(conn).await?;
     if n == 0 {
         anyhow::bail!("Backend connection closed unexpectedly");
     }
 
-    // H5: If first read returned fewer bytes than needed to parse a status code,
-    // accumulate more data. This handles the rare case where a TCP segment
-    // boundary splits the 3-digit status code across reads.
+    read_until_status_line(conn, buffer).await?;
     let min_len = crate::protocol::MIN_RESPONSE_LENGTH;
-    if n < min_len {
-        loop {
-            let more = buffer.read_more(conn).await?;
-            if more == 0 {
-                break; // EOF — validate what we have
-            }
-            if buffer.initialized() >= min_len {
-                break; // Enough data to validate
-            }
-        }
-    }
     let total = buffer.initialized();
-    let recv_elapsed = recv_start.elapsed();
+    let after_recv = Instant::now();
+    let send_elapsed = after_send.duration_since(start);
+    let recv_elapsed = after_recv.duration_since(after_send);
+    let elapsed = after_recv.duration_since(start);
 
-    // Validate response
-    let validated = validate_backend_response(&buffer[..total], total, min_len);
-
-    let elapsed = start.elapsed();
+    let validated = parse_backend_status(&buffer[..total], total, min_len);
 
     Ok((
-        CommandResponse {
+        BackendFirstResponse {
             bytes_read: total,
-            response: validated.response,
-            is_multiline: validated.is_multiline,
+            status_code: validated.status_code,
             warnings: validated.warnings,
         },
-        elapsed.as_micros() as u64,
-        send_elapsed.as_micros() as u64,
-        recv_elapsed.as_micros() as u64,
+        duration_micros_u64(elapsed),
+        duration_micros_u64(send_elapsed),
+        duration_micros_u64(recv_elapsed),
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::collections::VecDeque;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -353,7 +351,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_send_command_partial_read_accumulates() {
+    async fn test_send_request_partial_read_accumulates() {
         // Simulate a backend that sends "200 OK\r\n" in two chunks:
         // first read returns "20", second returns "0 OK\r\n"
         let mut stream = ChunkedStream::new(vec![b"20".to_vec(), b"0 OK\r\n".to_vec()]);
@@ -361,18 +359,39 @@ mod tests {
         let pool = crate::pool::BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
 
-        let result = send_command(&mut stream, "DATE\r\n", &mut buffer).await;
-        assert!(result.is_ok(), "send_command should handle partial reads");
+        let request = RequestContext::from_verb_args(b"DATE", b"");
+        let result = send_request(&mut stream, &request, &mut buffer).await;
+        assert!(result.is_ok(), "send_request should handle partial reads");
         let resp = result.unwrap();
-        assert!(
-            matches!(resp.response, NntpResponse::Greeting(_)),
-            "Expected 200 greeting, got {:?}",
-            resp.response
-        );
+        assert_eq!(resp.status_code(), Some(StatusCode::new(200)));
+        assert!(!request.expects_multiline_response(resp.status_code().unwrap()));
     }
 
     #[tokio::test]
-    async fn test_send_command_single_byte_reads() {
+    async fn test_send_request_reads_complete_status_line_when_code_arrives_first() {
+        // RFC-compliant servers can split a single-line response across TCP reads.
+        // Reading only the 3-byte status code would leave the rest of the line
+        // in the socket for the next command and desynchronize the connection.
+        let mut stream = ChunkedStream::new(vec![b"111".to_vec(), b" 20260501173336\r\n".to_vec()]);
+
+        let pool = crate::pool::BufferPool::for_tests();
+        let mut buffer = pool.acquire().await;
+
+        let request = RequestContext::from_verb_args(b"DATE", b"");
+        let result = send_request(&mut stream, &request, &mut buffer).await;
+        assert!(
+            result.is_ok(),
+            "send_request should read through status-line CRLF"
+        );
+        let resp = result.unwrap();
+        assert_eq!(resp.bytes_read, b"111 20260501173336\r\n".len());
+        assert_eq!(resp.status_code(), Some(StatusCode::new(111)));
+        assert!(!request.expects_multiline_response(resp.status_code().unwrap()));
+        assert_eq!(&buffer[..resp.bytes_read], b"111 20260501173336\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_send_request_single_byte_reads() {
         // Extreme case: each byte comes separately
         let data = b"211 Group\r\n";
         let chunks: Vec<Vec<u8>> = data.iter().map(|&b| vec![b]).collect();
@@ -381,48 +400,43 @@ mod tests {
         let pool = crate::pool::BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
 
-        let result = send_command(&mut stream, "GROUP alt.test\r\n", &mut buffer).await;
+        let request = RequestContext::from_verb_args(b"GROUP", b"alt.test");
+        let result = send_request(&mut stream, &request, &mut buffer).await;
         assert!(
             result.is_ok(),
-            "send_command should handle single-byte reads"
+            "send_request should handle single-byte reads"
         );
         let resp = result.unwrap();
-        assert!(
-            matches!(resp.response, NntpResponse::SingleLine(_)),
-            "Expected 211 single-line, got {:?}",
-            resp.response
-        );
+        assert_eq!(resp.status_code(), Some(StatusCode::new(211)));
+        assert!(!request.expects_multiline_response(resp.status_code().unwrap()));
     }
 
     // ─── Command response tests ─────────────────────────────────────────────
 
     #[test]
-    fn test_command_response_is_430() {
+    fn test_backend_first_response_is_430() {
         // Create a 430 response
-        let response = CommandResponse {
+        let response = BackendFirstResponse {
             bytes_read: 20,
-            response: NntpResponse::parse(b"430 No such article\r\n"),
-            is_multiline: false,
+            status_code: Some(StatusCode::new(430)),
             warnings: SmallVec::new(),
         };
-        assert!(response.response.is_430());
+        assert_eq!(response.status_code(), Some(StatusCode::new(430)));
 
         // Create a 220 response
-        let response = CommandResponse {
+        let response = BackendFirstResponse {
             bytes_read: 30,
-            response: NntpResponse::parse(b"220 0 <msg@example.com>\r\n"),
-            is_multiline: true,
+            status_code: Some(StatusCode::new(220)),
             warnings: SmallVec::new(),
         };
-        assert!(!response.response.is_430());
+        assert_ne!(response.status_code(), Some(StatusCode::new(430)));
     }
 
     #[test]
-    fn test_command_response_status_code() {
-        let response = CommandResponse {
+    fn test_backend_first_response_status_code() {
+        let response = BackendFirstResponse {
             bytes_read: 10,
-            response: NntpResponse::parse(b"211 Group\r\n"),
-            is_multiline: false,
+            status_code: Some(StatusCode::new(211)),
             warnings: SmallVec::new(),
         };
         assert_eq!(response.status_code().map(|c| c.as_u16()), Some(211));
@@ -431,19 +445,21 @@ mod tests {
     // ─── Validation tests ───────────────────────────────────────────────────
 
     #[test]
-    fn test_validate_backend_response_valid() {
+    fn test_parse_backend_status_valid() {
         let data = b"200 OK\r\n";
-        let validated = validate_backend_response(data, data.len(), 7);
+        let validated = parse_backend_status(data, data.len(), 7);
 
-        assert!(matches!(validated.response, NntpResponse::Greeting(_)));
-        assert!(!validated.is_multiline);
+        assert_eq!(
+            validated.status_code,
+            Some(crate::protocol::StatusCode::new(200))
+        );
         assert!(validated.warnings.is_empty());
     }
 
     #[test]
-    fn test_validate_backend_response_short() {
+    fn test_parse_backend_status_short() {
         let data = b"200";
-        let validated = validate_backend_response(data, data.len(), 7);
+        let validated = parse_backend_status(data, data.len(), 7);
 
         assert_eq!(validated.warnings.len(), 1);
         assert_eq!(
@@ -453,11 +469,11 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_backend_response_invalid() {
+    fn test_parse_backend_status_invalid() {
         let data = b"garbage response";
-        let validated = validate_backend_response(data, data.len(), 7);
+        let validated = parse_backend_status(data, data.len(), 7);
 
-        assert_eq!(validated.response, NntpResponse::Invalid);
+        assert_eq!(validated.status_code, None);
         assert!(
             validated
                 .warnings
@@ -466,9 +482,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_backend_response_unusual_status_zero() {
+    fn test_parse_backend_status_unusual_status_zero() {
         let data = b"000 Weird\r\n";
-        let validated = validate_backend_response(data, data.len(), 7);
+        let validated = parse_backend_status(data, data.len(), 7);
 
         assert!(
             validated
@@ -478,9 +494,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_backend_response_unusual_status_high() {
+    fn test_parse_backend_status_unusual_status_high() {
         let data = b"700 Too High\r\n";
-        let validated = validate_backend_response(data, data.len(), 7);
+        let validated = parse_backend_status(data, data.len(), 7);
 
         assert!(
             validated
@@ -490,18 +506,9 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_backend_response_multiline() {
-        let data = b"220 0 <article@example.com>\r\n";
-        let validated = validate_backend_response(data, data.len(), 7);
-
-        assert!(validated.is_multiline);
-        assert!(validated.warnings.is_empty());
-    }
-
-    #[test]
-    fn test_validate_backend_response_multiple_warnings() {
+    fn test_parse_backend_status_multiple_warnings() {
         let data = b"000";
-        let validated = validate_backend_response(data, data.len(), 7);
+        let validated = parse_backend_status(data, data.len(), 7);
 
         // Should have both short response AND unusual status
         assert!(!validated.warnings.is_empty());
@@ -514,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_backend_response_normal_codes() {
+    fn test_parse_backend_status_normal_codes() {
         // Test various normal response codes don't generate warnings
         let test_cases = vec![
             b"200 OK\r\n".as_ref(),
@@ -523,14 +530,39 @@ mod tests {
         ];
 
         for data in test_cases {
-            let validated = validate_backend_response(data, data.len(), 7);
-            assert!(!matches!(validated.response, NntpResponse::Invalid));
+            let validated = parse_backend_status(data, data.len(), 7);
+            assert!(validated.status_code.is_some());
             assert!(
                 validated
                     .warnings
                     .iter()
                     .all(|w| !matches!(w, ResponseWarning::UnusualStatusCode(_))),
                 "Normal status codes should not generate unusual code warnings"
+            );
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_parse_backend_status_never_panics(
+            data in prop::collection::vec(any::<u8>(), 0..200)
+        ) {
+            let _ = parse_backend_status(&data, data.len(), crate::protocol::MIN_RESPONSE_LENGTH);
+        }
+
+        #[test]
+        fn prop_valid_nntp_response_never_classified_invalid(
+            code in 100u16..=599u16,
+            text in r"[A-Za-z0-9 ]{1,30}"
+        ) {
+            let response = format!("{code} {text}\r\n");
+            let data = response.as_bytes();
+            let parsed = parse_backend_status(data, data.len(), crate::protocol::MIN_RESPONSE_LENGTH);
+
+            prop_assert_eq!(
+                parsed.status_code.map(|status| status.as_u16()),
+                Some(code),
+                "parsed status code should match generated code"
             );
         }
     }
@@ -578,10 +610,10 @@ mod tests {
     }
 
     #[test]
-    fn test_format_hex_preview_full_response() {
+    fn test_format_hex_preview_response_bytes() {
         let data = b"430 No such article\r\n";
         let result = format_hex_preview(data, 256);
-        // Should show full response in hex
+        // Should show every byte in the preview
         assert!(result.starts_with("34 33 30 20")); // "430 "
         assert!(result.ends_with("0d 0a")); // \r\n
         assert_eq!(result.split_whitespace().count(), data.len());

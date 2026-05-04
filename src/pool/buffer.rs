@@ -65,6 +65,9 @@ impl PooledBuffer {
     }
 
     /// Read from an `AsyncRead` source, automatically tracking initialized bytes
+    ///
+    /// # Errors
+    /// Returns any read error produced by the underlying async reader.
     pub async fn read_from<R>(&mut self, reader: &mut R) -> std::io::Result<usize>
     where
         R: AsyncRead + Unpin,
@@ -82,6 +85,9 @@ impl PooledBuffer {
     /// across TCP segments).
     ///
     /// Returns the number of NEW bytes read (not total).
+    ///
+    /// # Errors
+    /// Returns any read error produced by the underlying async reader.
     pub async fn read_more<R>(&mut self, reader: &mut R) -> std::io::Result<usize>
     where
         R: AsyncRead + Unpin,
@@ -119,6 +125,9 @@ impl PooledBuffer {
     ///
     /// Used by response framing helpers when a read contains bytes beyond the current
     /// response boundary and the remainder is stashed as leftover for the next response.
+    ///
+    /// # Panics
+    /// Panics if `len` exceeds the current initialized byte count.
     #[inline]
     pub fn truncate(&mut self, len: usize) {
         assert!(
@@ -130,9 +139,9 @@ impl PooledBuffer {
 
     /// Get mutable access to the fixed I/O writable region.
     ///
-    /// This compatibility API is for callers that still perform manual reads
-    /// into a borrowed slice. It does not update the logical initialized length;
-    /// callers must use the read byte count directly.
+    /// This is for scratch-buffer paths that need to inspect bytes returned by
+    /// a read that already reported its byte count. It does not update the
+    /// logical initialized length; callers must use the read byte count directly.
     ///
     /// # Safety Note
     /// Only bytes written by the caller's I/O operation should be read. Prefer
@@ -275,6 +284,10 @@ impl ChunkedResponse {
     }
 
     /// Append bytes using one or more pooled capture buffers.
+    ///
+    /// # Panics
+    /// Panics if the internal chunk list becomes unexpectedly empty after a
+    /// new capture buffer is acquired.
     pub fn extend_from_slice(&mut self, pool: &BufferPool, mut data: &[u8]) {
         while !data.is_empty() {
             let need_new_chunk = self
@@ -301,6 +314,9 @@ impl ChunkedResponse {
     }
 
     /// Truncate the buffered response to the given absolute length.
+    ///
+    /// # Panics
+    /// Panics if `len` exceeds the total buffered byte count.
     pub fn truncate(&mut self, len: usize) {
         assert!(len <= self.len, "truncate length exceeds buffered bytes");
         if len == self.len {
@@ -412,6 +428,9 @@ impl ChunkedResponse {
     }
 
     /// Write all buffered chunks to a sink in order.
+    ///
+    /// # Errors
+    /// Returns any write error produced by the underlying async sink.
     pub async fn write_all_to<W>(&self, writer: &mut W) -> std::io::Result<()>
     where
         W: AsyncWriteExt + Unpin,
@@ -584,6 +603,10 @@ impl BufferPool {
     ///
     /// Uses sensible defaults (8KB buffers, pool of 4) that work for most tests.
     /// Prefer this over manually constructing `BufferPool` in tests.
+    ///
+    /// # Panics
+    /// Panics only if the built-in test buffer size stops satisfying
+    /// `BufferSize` validation.
     #[cfg(test)]
     #[must_use]
     pub fn for_tests() -> Self {
@@ -628,21 +651,24 @@ impl BufferPool {
     /// The buffer may contain old bytes outside its logical length, but immutable
     /// access only exposes `BytesMut::len()` initialized bytes.
     fn acquire_now(&self) -> PooledBuffer {
-        let buffer = if let Some(buffer) = self.pool.pop() {
-            self.pool_size.fetch_sub(1, Ordering::Relaxed);
-            // Buffer from pool is logically empty and has the expected allocation
-            // capacity (enforced on return).
-            debug_assert_eq!(buffer.len(), 0);
-            buffer
-        } else {
-            // Create new page-aligned buffer for better DMA performance
-            let in_use = self.buffers_in_use();
-            debug!(
-                "Buffer pool exhausted (allocating beyond pool size). In use: {}/{}",
-                in_use, self.max_pool_size
-            );
-            Self::create_aligned_buffer(self.buffer_size.get())
-        };
+        let buffer = self.pool.pop().map_or_else(
+            || {
+                // Create new page-aligned buffer for better DMA performance
+                let in_use = self.buffers_in_use();
+                debug!(
+                    "Buffer pool exhausted (allocating beyond pool size). In use: {}/{}",
+                    in_use, self.max_pool_size
+                );
+                Self::create_aligned_buffer(self.buffer_size.get())
+            },
+            |buffer| {
+                self.pool_size.fetch_sub(1, Ordering::Relaxed);
+                // Buffer from pool is logically empty and has the expected allocation
+                // capacity (enforced on return).
+                debug_assert_eq!(buffer.len(), 0);
+                buffer
+            },
+        );
 
         PooledBuffer {
             expected_capacity: buffer.capacity(),
@@ -654,9 +680,8 @@ impl BufferPool {
         }
     }
 
-    #[allow(clippy::unused_async)] // async for API consistency with acquire_capture and future pool implementations
     pub async fn acquire(&self) -> PooledBuffer {
-        self.acquire_now()
+        std::future::ready(self.acquire_now()).await
     }
 
     /// Get a capture buffer from the capture pool
@@ -667,29 +692,32 @@ impl BufferPool {
     /// Pages are pre-faulted to eliminate soft page faults during streaming,
     /// which profiling showed accounted for 96.75% of memmove time.
     pub(crate) fn acquire_capture_now(&self) -> PooledBuffer {
-        let buffer = if let Some(mut buffer) = self.capture_pool.pop() {
-            self.capture_pool_size.fetch_sub(1, Ordering::Relaxed);
-            // Clear but keep capacity (pages stay mapped)
-            buffer.clear();
-            buffer
-        } else {
-            // Pool exhausted - allocate and pre-fault new buffer
-            let in_use = self
-                .max_capture_pool_size
-                .saturating_sub(self.capture_pool_size.load(Ordering::Relaxed));
-            debug!(
-                "Capture pool exhausted (allocating beyond pool size). In use: {}/{}",
-                in_use, self.max_capture_pool_size
-            );
-            let capacity = if self.capture_capacity > 0 {
-                self.capture_capacity
-            } else {
-                self.buffer_size.get()
-            };
-            let mut buffer = BytesMut::with_capacity(capacity);
-            Self::prefault_pages(&mut buffer);
-            buffer
-        };
+        let buffer = self.capture_pool.pop().map_or_else(
+            || {
+                // Pool exhausted - allocate and pre-fault new buffer
+                let in_use = self
+                    .max_capture_pool_size
+                    .saturating_sub(self.capture_pool_size.load(Ordering::Relaxed));
+                debug!(
+                    "Capture pool exhausted (allocating beyond pool size). In use: {}/{}",
+                    in_use, self.max_capture_pool_size
+                );
+                let capacity = if self.capture_capacity > 0 {
+                    self.capture_capacity
+                } else {
+                    self.buffer_size.get()
+                };
+                let mut buffer = BytesMut::with_capacity(capacity);
+                Self::prefault_pages(&mut buffer);
+                buffer
+            },
+            |mut buffer| {
+                self.capture_pool_size.fetch_sub(1, Ordering::Relaxed);
+                // Clear but keep capacity (pages stay mapped)
+                buffer.clear();
+                buffer
+            },
+        );
 
         PooledBuffer {
             expected_capacity: buffer.capacity(),
@@ -701,9 +729,8 @@ impl BufferPool {
         }
     }
 
-    #[allow(clippy::unused_async)] // async for API consistency with acquire and future pool implementations
     pub async fn acquire_capture(&self) -> PooledBuffer {
-        self.acquire_capture_now()
+        std::future::ready(self.acquire_capture_now()).await
     }
 }
 
@@ -1050,12 +1077,12 @@ mod tests {
         let pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 5);
 
         // Do multiple get/return cycles
-        for i in 0..20 {
+        for i in 0u8..20 {
             let mut buffer = pool.acquire().await;
             assert_eq!(buffer.capacity(), 4096);
 
             // Write some data using copy_from_slice
-            let data = vec![i as u8; 1];
+            let data = vec![i; 1];
             buffer.copy_from_slice(&data);
             assert_eq!(buffer.initialized(), 1);
         }
@@ -1103,7 +1130,7 @@ mod tests {
 
         // Can write to the fixed I/O writable region
         for (i, byte) in slice.iter_mut().enumerate() {
-            *byte = (i % 256) as u8;
+            *byte = u8::try_from(i % 256).expect("modulo 256 always fits in u8");
         }
 
         // Note: initialized() doesn't track manual writes via as_mut_slice

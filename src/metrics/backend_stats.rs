@@ -152,6 +152,7 @@ impl BackendStats {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // These tests assert exact zero/default values from deterministic fixtures.
 mod tests {
     use super::*;
     use crate::types::BackendId;

@@ -94,20 +94,35 @@ impl TailBuffer {
         }
         find_spanning_terminator(self.as_slice(), self.len(), chunk, chunk.len())
     }
-    /// Detect terminator in chunk, considering possible boundary spanning
+    /// Detect only terminators at the chunk suffix or spanning the prior boundary.
     ///
-    /// **Performance**: `find_terminator_end()` checks end first (O(1)),
-    /// only scans with memchr if terminator is mid-chunk (rare).
-    /// This optimizes the 99% case where terminator is at chunk end.
+    /// Direct, non-pipelined streaming can use this for full read buffers: with no
+    /// queued backend response after the current article, a terminator cannot be
+    /// followed by valid leftover bytes in the same full-size read.
     #[must_use]
-    pub fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
-        if let Some(pos) = find_terminator_end(chunk) {
-            TerminatorStatus::FoundAt(pos)
+    pub fn detect_terminal_boundary(&self, chunk: &[u8]) -> TerminatorStatus {
+        if is_terminator_suffix(chunk) {
+            TerminatorStatus::FoundAt(chunk.len())
         } else if let Some(end) = self.find_spanning_terminator(chunk) {
             TerminatorStatus::FoundAt(end)
         } else {
             TerminatorStatus::NotFound
         }
+    }
+    /// Detect terminator in chunk, considering possible boundary spanning
+    ///
+    /// **Performance**: `find_terminator_end()` checks end first (O(1)),
+    /// then scans candidate dot bytes if terminator is mid-chunk (rare).
+    /// This optimizes the 99% case where terminator is at chunk end.
+    #[must_use]
+    pub fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
+        find_terminator_end(chunk).map_or_else(
+            || {
+                self.find_spanning_terminator(chunk)
+                    .map_or(TerminatorStatus::NotFound, TerminatorStatus::FoundAt)
+            },
+            TerminatorStatus::FoundAt,
+        )
     }
 }
 
@@ -119,31 +134,32 @@ impl TailBuffer {
 /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1),
 /// the terminator is exactly "\r\n.\r\n" (CRLF, dot, CRLF).
 ///
-/// **Optimization**: Uses `memchr::memchr_iter()` to find '\r' bytes (SIMD-accelerated),
-/// then validates the full 5-byte pattern. This eliminates the need to create new slices
-/// on each iteration (which the manual loop approach requires with `&data[pos..]`).
-///
-/// Benchmarks show this is **72% faster for small responses** (37ns → 13ns) and
-/// **64% faster for medium responses** (109ns → 40ns) compared to the manual loop
-/// that creates a new slice on each iteration.
-///
 /// **Hot path optimization**: Check end first (99% case for streaming chunks),
-/// then scan forward if needed. Compiler optimizes slice comparison to memcmp.
+/// then scan for the terminator's distinguishing dot byte for mid-chunk leftovers.
 #[inline]
 fn find_terminator_end(data: &[u8]) -> Option<usize> {
-    const TERMINATOR: [u8; 5] = *b"\r\n.\r\n";
+    const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
 
-    // Fast path: check suffix, or slow path: scan for terminator mid-chunk
+    data.len().checked_sub(TERMINATOR.len()).and_then(|_| {
+        if is_terminator_suffix(data) {
+            Some(data.len())
+        } else {
+            memchr::memchr_iter(b'.', data)
+                .skip_while(|&pos| pos < 2)
+                .take_while(|&pos| pos + 3 <= data.len())
+                .find(|&pos| data[pos - 2..pos + 3] == *TERMINATOR)
+                .map(|pos| pos + 3)
+        }
+    })
+}
+
+#[inline]
+fn is_terminator_suffix(data: &[u8]) -> bool {
+    const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
+
     data.len()
-        .checked_sub(5)
-        .filter(|&start| data[start..] == TERMINATOR)
-        .map(|_| data.len())
-        .or_else(|| {
-            memchr::memchr_iter(b'\r', data)
-                .take_while(|&pos| pos + 5 <= data.len())
-                .find(|&pos| data[pos..pos + 5] == TERMINATOR)
-                .map(|pos| pos + 5)
-        })
+        .checked_sub(TERMINATOR.len())
+        .is_some_and(|start| data[start..] == *TERMINATOR)
 }
 
 /// Find spanning terminator across boundary between tail and current chunk
@@ -260,7 +276,7 @@ mod tests {
         assert_eq!(tail.as_slice(), b".\r\n");
     }
 
-    /// Regression test: update() with successive small chunks must maintain the
+    /// Regression test: `update()` with successive small chunks must maintain the
     /// rolling window — not overwrite it — so terminators split across 3+ reads work.
     #[test]
     fn test_tail_buffer_update_successive_small_chunks() {
@@ -402,6 +418,38 @@ mod tests {
             }
             TerminatorStatus::NotFound => panic!("Expected FoundAt, got {status:?}"),
         }
+    }
+
+    #[test]
+    fn test_detect_terminal_boundary_ignores_mid_chunk_terminator() {
+        let tail = TailBuffer::default();
+        let chunk = b"Line 1\r\n.\r\nExtra data";
+
+        assert!(!tail.detect_terminal_boundary(chunk).is_found());
+    }
+
+    #[test]
+    fn test_detect_terminal_boundary_detects_suffix() {
+        let tail = TailBuffer::default();
+        let chunk = b"Line 1\r\n.\r\n";
+
+        assert_eq!(
+            tail.detect_terminal_boundary(chunk).write_len(chunk.len()),
+            chunk.len()
+        );
+    }
+
+    #[test]
+    fn test_detect_terminal_boundary_detects_spanning() {
+        let mut tail = TailBuffer::default();
+        tail.update(b"article content\r\n");
+
+        let chunk = b".\r\n";
+
+        assert_eq!(
+            tail.detect_terminal_boundary(chunk).write_len(chunk.len()),
+            3
+        );
     }
 
     #[test]

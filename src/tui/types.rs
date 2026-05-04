@@ -28,7 +28,10 @@ impl ChartX {
 }
 
 impl From<usize> for ChartX {
+    #[allow(clippy::cast_precision_loss)] // Chart indices are tiny bounded UI coordinates.
     fn from(index: usize) -> Self {
+        // Chart indices are tiny UI positions (history length is bounded), so
+        // converting them to f64 for plotting does not affect correctness.
         Self::new(index as f64)
     }
 }
@@ -171,13 +174,22 @@ impl BackendChartData {
 mod tests {
     use super::*;
 
+    fn assert_f64_eq(actual: f64, expected: f64) {
+        assert_eq!(actual.to_bits(), expected.to_bits());
+    }
+
+    fn assert_point_eq(actual: (f64, f64), expected: (f64, f64)) {
+        assert_f64_eq(actual.0, expected.0);
+        assert_f64_eq(actual.1, expected.1);
+    }
+
     #[test]
     fn test_chart_x() {
         let x = ChartX::new(10.5);
-        assert_eq!(x.get(), 10.5);
+        assert_f64_eq(x.get(), 10.5);
 
         let x2: ChartX = 5usize.into();
-        assert_eq!(x2.get(), 5.0);
+        assert_f64_eq(x2.get(), 5.0);
     }
 
     #[test]
@@ -185,18 +197,18 @@ mod tests {
         let y1 = ChartY::new(100.0);
         let y2 = ChartY::new(200.0);
 
-        assert_eq!(y1.max(y2).get(), 200.0);
-        assert_eq!(y2.max(y1).get(), 200.0);
+        assert_f64_eq(y1.max(y2).get(), 200.0);
+        assert_f64_eq(y2.max(y1).get(), 200.0);
     }
 
     #[test]
     fn test_chart_point() {
         let point = ChartPoint::new(ChartX::new(1.0), ChartY::new(2.0));
-        assert_eq!(point.as_tuple(), (1.0, 2.0));
+        assert_point_eq(point.as_tuple(), (1.0, 2.0));
 
         let point2: ChartPoint = (3.0, 4.0).into();
-        assert_eq!(point2.x.get(), 3.0);
-        assert_eq!(point2.y.get(), 4.0);
+        assert_f64_eq(point2.x.get(), 3.0);
+        assert_f64_eq(point2.y.get(), 4.0);
     }
 
     #[test]
@@ -205,13 +217,15 @@ mod tests {
         for i in 0..60 {
             points.push(ChartPoint::new(
                 ChartX::from(i),
-                ChartY::new(i as f64 * 1000.0),
+                ChartY::new(
+                    f64::from(u32::try_from(i).expect("test index fits into u32")) * 1000.0,
+                ),
             ));
         }
 
         assert_eq!(points.len(), 60);
-        assert_eq!(points[0].x.get(), 0.0);
-        assert_eq!(points[59].x.get(), 59.0);
+        assert_f64_eq(points[0].x.get(), 0.0);
+        assert_f64_eq(points[59].x.get(), 59.0);
     }
 
     #[test]
@@ -229,7 +243,7 @@ mod tests {
 
         let tuples = data.sent_points_as_tuples();
         assert_eq!(tuples.len(), 2);
-        assert_eq!(tuples[0], (0.0, 100.0));
-        assert_eq!(tuples[1], (1.0, 200.0));
+        assert_point_eq(tuples[0], (0.0, 100.0));
+        assert_point_eq(tuples[1], (1.0, 200.0));
     }
 }

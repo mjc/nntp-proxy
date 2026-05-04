@@ -20,7 +20,7 @@
 use crate::session::ClientSession;
 use crate::types::TransferMetrics;
 use anyhow::{Context, Result};
-use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::io::BufReader;
 use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tracing::info;
 
@@ -58,6 +58,13 @@ impl Drop for StatefulSessionGuard<'_> {
     }
 }
 
+fn stateful_initial_client_bytes(
+    carried_client_to_backend_bytes: u64,
+    initial_request: &crate::protocol::RequestContext,
+) -> u64 {
+    carried_client_to_backend_bytes + initial_request.request_wire_len().as_u64()
+}
+
 impl ClientSession {
     /// Switch from per-command routing to stateful mode
     ///
@@ -69,7 +76,7 @@ impl ClientSession {
     /// # Arguments
     /// * `client_reader` - Buffered reader for client commands
     /// * `client_write` - Write half for sending responses to client
-    /// * `initial_command` - The stateful command that triggered the switch
+    /// * `initial_request` - The typed stateful request that triggered the switch
     /// * `client_to_backend_bytes` - Bytes already transferred client→backend
     /// * `backend_to_client_bytes` - Bytes already transferred backend→client
     ///
@@ -79,7 +86,7 @@ impl ClientSession {
         &self,
         client_reader: BufReader<ReadHalf<'_>>,
         client_write: WriteHalf<'_>,
-        initial_command: &str,
+        initial_request: &crate::protocol::RequestContext,
         client_to_backend_bytes: u64,
         backend_to_client_bytes: u64,
     ) -> Result<TransferMetrics, crate::session::SessionError> {
@@ -88,7 +95,7 @@ impl ClientSession {
 
         // Acquire backend connection (returns CommandGuard to track pending_count)
         let (pooled_conn, backend_id, _pending_guard, provider) = self
-            .acquire_stateful_backend(initial_command)
+            .acquire_stateful_backend()
             .await
             .context("Failed to acquire backend for stateful mode")?;
 
@@ -104,14 +111,13 @@ impl ClientSession {
             "Switched to stateful mode"
         );
 
-        // Forward the triggering command (response handled by proxy loop)
-        conn_guard
-            .write_all(initial_command.as_bytes())
+        // Forward the triggering request (response handled by proxy loop)
+        crate::session::backend::write_request(&mut **conn_guard, initial_request)
             .await
-            .context("Failed to send initial command to backend")?;
+            .context("Failed to send initial request to backend")?;
 
         // Build initial state with carried-over byte counts
-        let initial_bytes = client_to_backend_bytes + initial_command.len() as u64;
+        let initial_bytes = stateful_initial_client_bytes(client_to_backend_bytes, initial_request);
         let state = crate::session::state::SessionLoopState::from_initial_bytes(
             initial_bytes,
             backend_to_client_bytes,
@@ -146,14 +152,13 @@ impl ClientSession {
 
     /// Acquire a dedicated backend connection for stateful mode
     ///
-    /// Routes the command to select a backend, then gets a pooled connection.
+    /// Routes the client to a backend, then gets a pooled connection.
     /// Returns the connection, backend ID, and a `CommandGuard` that decrements
-    /// `pending_count` on drop. Creating the guard here (immediately after
-    /// `route_command`) ensures the count is decremented even if
-    /// `get_pooled_connection` fails.
+    /// `pending_count` on drop. Creating the guard here immediately after
+    /// routing ensures the count is decremented even if `get_pooled_connection`
+    /// fails.
     async fn acquire_stateful_backend(
         &self,
-        command: &str,
     ) -> Result<(
         deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
         crate::types::BackendId,
@@ -165,7 +170,7 @@ impl ClientSession {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!(error::ROUTER_REQUIRED))?;
 
-        let backend_id = router.route_command(self.client_id, command)?;
+        let backend_id = router.route(self.client_id)?;
 
         // Guard pending_count immediately — if get_pooled_connection fails,
         // the guard drops and decrements automatically
@@ -184,13 +189,22 @@ impl ClientSession {
 
 #[cfg(test)]
 mod tests {
-    // Unit tests for pure functions would go here
-    // The async methods require integration tests with mock servers
+    use crate::protocol::RequestContext;
 
     #[test]
     fn test_error_messages_are_descriptive() {
         use super::error::*;
         assert!(ROUTER_REQUIRED.contains("router"));
         assert!(BACKEND_NOT_FOUND.contains("Backend"));
+    }
+
+    #[test]
+    fn stateful_initial_client_bytes_uses_typed_wire_len() {
+        let request = RequestContext::parse(b"group alt.test\r\n").expect("valid request line");
+
+        assert_eq!(
+            super::stateful_initial_client_bytes(10, &request),
+            10 + "group alt.test\r\n".len() as u64
+        );
     }
 }

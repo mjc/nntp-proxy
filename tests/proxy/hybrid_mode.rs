@@ -87,7 +87,7 @@ async fn test_hybrid_mode_long_session_metrics_flush() -> Result<()> {
 
         // Read response - reuse the 1024 buffer
         buffer = [0; 1024];
-        let n = timeout(Duration::from_millis(1000), client.read(&mut buffer))
+        let n = timeout(Duration::from_secs(1), client.read(&mut buffer))
             .await
             .map_err(|_| anyhow::anyhow!("Timeout on command {i}"))?
             .map_err(|e| anyhow::anyhow!("Read error on command {i}: {e}"))?;

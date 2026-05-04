@@ -116,7 +116,7 @@
 //! let router = Arc::new(BackendSelector::new());
 //! let auth = Arc::new(AuthHandler::new(None, None)?);
 //! let metrics = MetricsCollector::new(2); // 2 backends
-//! let cache = Arc::new(UnifiedCache::memory(1000, Duration::from_secs(3600), true));
+//! let cache = Arc::new(UnifiedCache::memory(1000, Duration::from_secs(3600)));
 //!
 //! // Full-featured session with caching
 //! let session = ClientSession::builder(addr.into(), buffer_pool, auth, metrics)
@@ -159,15 +159,15 @@
 //!   - Acquires dedicated backend connection
 //!   - Hands off to stateful proxy loop
 //!
-//! - `route_and_execute_command()` - Per-command orchestration
+//! - `route_and_execute_request()` - Per-command orchestration
 //!   - Routes command to backend
 //!   - Handles connection pool management
 //!   - Distinguishes backend errors from client disconnects
 
 pub mod auth_state;
-pub mod backend;
+pub(crate) mod backend;
 pub(crate) mod common;
-pub mod connection;
+pub(crate) mod connection;
 pub mod core;
 pub mod handlers;
 pub mod metrics_ext;

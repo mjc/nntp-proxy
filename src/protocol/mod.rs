@@ -10,6 +10,7 @@ use tracing::debug;
 mod article;
 pub mod codes;
 mod commands;
+mod request;
 mod response;
 mod responses;
 
@@ -17,21 +18,30 @@ mod responses;
 pub use article::{Article, HeaderIter, Headers, ParseError, yenc};
 
 // Re-export response types and utilities
-pub use response::{NntpResponse, StatusCode};
+pub(crate) use request::{
+    MAX_COMMAND_LINE_OCTETS, RequestCacheArticleNumber, RequestCacheAvailability,
+    RequestCacheEntryMetadata, RequestCachePayloadKind, RequestCacheStatus, RequestCacheTier,
+    RequestCacheTimestampMillis, RequestResponseMetadata, ResponsePayloadLen,
+};
+pub use request::{
+    RequestContext, RequestKind, RequestRouteClass, RequestWireLen, ResponseWireLen,
+};
+pub use response::StatusCode;
 
 // Re-export command construction helpers
 pub use commands::{
-    COMPRESS_DEFLATE, DATE, QUIT, article_by_msgid, authinfo_pass, authinfo_user, body_by_msgid,
-    head_by_msgid, stat_by_msgid,
+    COMPRESS_DEFLATE, QUIT, article_request, authinfo_pass, authinfo_user, body_request,
+    date_request, head_request, stat_request,
 };
 
 // Re-export response constants and helpers
 pub use responses::{
     AUTH_ACCEPTED, AUTH_ALREADY_AUTHENTICATED, AUTH_FAILED, AUTH_OUT_OF_SEQUENCE, AUTH_REQUIRED,
     AUTH_REQUIRED_FOR_COMMAND, AUTH_UNKNOWN_SUBCOMMAND, BACKEND_ERROR, BACKEND_UNAVAILABLE,
-    CAPABILITIES_WITH_AUTHINFO, CAPABILITIES_WITHOUT_AUTHINFO, CONNECTION_CLOSING, CRLF, GOODBYE,
-    MIN_RESPONSE_LENGTH, NO_SUCH_ARTICLE, POSTING_NOT_PERMITTED, PROXY_GREETING_PCR,
-    TERMINATOR_TAIL_SIZE, error_response, greeting, greeting_readonly, ok_response, response,
+    CAPABILITIES_WITH_AUTHINFO, CAPABILITIES_WITHOUT_AUTHINFO, COMMAND_SYNTAX_ERROR_RESPONSE,
+    COMMAND_TOO_LONG, CONNECTION_CLOSING, CRLF, GOODBYE, MIN_RESPONSE_LENGTH, NO_SUCH_ARTICLE,
+    POSTING_NOT_PERMITTED, PROXY_GREETING_PCR, TERMINATOR_TAIL_SIZE, error_response, greeting,
+    greeting_readonly, ok_response, response,
 };
 
 /// Send NNTP proxy greeting to a client
@@ -39,6 +49,9 @@ pub use responses::{
 /// Sends the "201 NNTP Proxy Ready" greeting message.
 /// The greeting is flushed immediately to ensure the client receives it
 /// before we start processing commands.
+///
+/// # Errors
+/// Returns any socket write or flush error while sending the proxy greeting.
 pub async fn send_proxy_greeting(
     client_stream: &mut TcpStream,
     client_addr: impl std::fmt::Display,

@@ -5,6 +5,10 @@
 
 use super::*;
 
+fn usize_to_f64(value: usize) -> f64 {
+    f64::from(u32::try_from(value).expect("test values fit in u32"))
+}
+
 #[test]
 fn test_total_weight_accumulation() {
     let mut selector = BackendSelector::new();
@@ -15,7 +19,6 @@ fn test_total_weight_accumulation() {
         ServerName::try_new("backend1".to_string()).unwrap(),
         create_backend("backend1", 20),
         0, // tier
-        None,
     );
     assert_eq!(selector.total_weight(), 20);
 
@@ -24,7 +27,6 @@ fn test_total_weight_accumulation() {
         ServerName::try_new("backend2".to_string()).unwrap(),
         create_backend("backend2", 30),
         0, // tier
-        None,
     );
     assert_eq!(selector.total_weight(), 50);
 
@@ -33,7 +35,6 @@ fn test_total_weight_accumulation() {
         ServerName::try_new("backend3".to_string()).unwrap(),
         create_backend("backend3", 50),
         0, // tier
-        None,
     );
     assert_eq!(selector.total_weight(), 100);
 }
@@ -48,14 +49,12 @@ fn test_weighted_distribution_equal_weights() {
         ServerName::try_new("backend0".to_string()).unwrap(),
         create_backend("backend0", 10),
         0, // tier
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("backend1".to_string()).unwrap(),
         create_backend("backend1", 10),
         0, // tier
-        None,
     );
 
     // Total weight = 20
@@ -64,7 +63,7 @@ fn test_weighted_distribution_equal_weights() {
     // Issue 100 requests and count distribution
     let mut counts = [0; 2];
     for _ in 0..100 {
-        let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         counts[backend.as_index()] += 1;
     }
 
@@ -94,14 +93,12 @@ fn test_weighted_distribution_unequal_weights() {
         ServerName::try_new("small".to_string()).unwrap(),
         create_backend("small", 40),
         0, // tier
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("large".to_string()).unwrap(),
         create_backend("large", 50),
         0, // tier
-        None,
     );
 
     assert_eq!(selector.total_weight(), 90);
@@ -109,7 +106,7 @@ fn test_weighted_distribution_unequal_weights() {
     // Issue 900 requests (10x the total weight for good statistical sample)
     let mut counts = [0; 2];
     for _ in 0..900 {
-        let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         counts[backend.as_index()] += 1;
     }
 
@@ -141,21 +138,18 @@ fn test_weighted_distribution_three_backends() {
         ServerName::try_new("small".to_string()).unwrap(),
         create_backend("small", 10),
         0, // tier
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("medium".to_string()).unwrap(),
         create_backend("medium", 20),
         0, // tier
-        None,
     );
     selector.add_backend(
         BackendId::from_index(2),
         ServerName::try_new("large".to_string()).unwrap(),
         create_backend("large", 30),
         0, // tier
-        None,
     );
 
     assert_eq!(selector.total_weight(), 60);
@@ -163,7 +157,7 @@ fn test_weighted_distribution_three_backends() {
     // Issue 600 requests (10x total weight)
     let mut counts = [0; 3];
     for _ in 0..600 {
-        let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         counts[backend.as_index()] += 1;
     }
 
@@ -198,14 +192,12 @@ fn test_weighted_real_world_scenario() {
         ServerName::try_new("usenet.farm".to_string()).unwrap(),
         create_backend("usenet.farm", 40),
         0, // tier
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("NewsDemon".to_string()).unwrap(),
         create_backend("NewsDemon", 50),
         0, // tier
-        None,
     );
 
     assert_eq!(selector.total_weight(), 90);
@@ -215,9 +207,7 @@ fn test_weighted_real_world_scenario() {
     let mut counts = [0; 2];
 
     for _ in 0..total_requests {
-        let backend = selector
-            .route_command(ClientId::new(), "ARTICLE <test@example.com>")
-            .unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         counts[backend.as_index()] += 1;
     }
 
@@ -251,14 +241,12 @@ fn test_weighted_extreme_imbalance() {
         ServerName::try_new("tiny".to_string()).unwrap(),
         create_backend("tiny", 1),
         0, // tier
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("huge".to_string()).unwrap(),
         create_backend("huge", 99),
         0, // tier
-        None,
     );
 
     assert_eq!(selector.total_weight(), 100);
@@ -266,7 +254,7 @@ fn test_weighted_extreme_imbalance() {
     // Issue 1000 requests
     let mut counts = [0; 2];
     for _ in 0..1000 {
-        let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         counts[backend.as_index()] += 1;
     }
 
@@ -294,21 +282,19 @@ fn test_weighted_consistency_across_runs() {
         ServerName::try_new("b0".to_string()).unwrap(),
         create_backend("b0", 30),
         0, // tier
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("b1".to_string()).unwrap(),
         create_backend("b1", 70),
         0, // tier
-        None,
     );
 
     // Run the test multiple times to ensure consistency
     for run in 0..5 {
         let mut counts = [0; 2];
         for _ in 0..1000 {
-            let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+            let backend = selector.route(ClientId::new()).unwrap();
             counts[backend.as_index()] += 1;
         }
 
@@ -337,13 +323,12 @@ fn test_zero_weight_backend_handled() {
         ServerName::try_new("zero".to_string()).unwrap(),
         create_backend("zero", 0),
         0, // tier
-        None,
     );
 
     assert_eq!(selector.total_weight(), 0);
 
     // Should fail gracefully when routing
-    let result = selector.route_command(ClientId::new(), "LIST");
+    let result = selector.route(ClientId::new());
     assert!(result.is_err());
 }
 
@@ -356,21 +341,19 @@ fn test_mixed_zero_and_nonzero_weights() {
         ServerName::try_new("zero".to_string()).unwrap(),
         create_backend("zero", 0),
         0, // tier
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("normal".to_string()).unwrap(),
         create_backend("normal", 10),
         0, // tier
-        None,
     );
 
     assert_eq!(selector.total_weight(), 10);
 
     // All requests should go to the non-zero backend
     for _ in 0..100 {
-        let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         assert_eq!(backend.as_index(), 1);
     }
 }
@@ -389,7 +372,6 @@ fn test_weighted_with_varying_pool_sizes() {
             ServerName::try_new(format!("backend-{i}")).unwrap(),
             create_backend(&format!("backend-{i}"), size),
             0, // tier
-            None,
         );
     }
 
@@ -400,23 +382,23 @@ fn test_weighted_with_varying_pool_sizes() {
     let mut counts = vec![0; pool_sizes.len()];
 
     for _ in 0..num_requests {
-        let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         counts[backend.as_index()] += 1;
     }
 
     // Verify each backend gets approximately its weighted share
     for (i, &size) in pool_sizes.iter().enumerate() {
-        let expected = (size as f64 / total as f64) * num_requests as f64;
+        let expected = (usize_to_f64(size) / usize_to_f64(total)) * usize_to_f64(num_requests);
         let tolerance = expected * 0.10; // 10% tolerance
 
         assert!(
-            (f64::from(counts[i]) - expected).abs() < tolerance,
+            (usize_to_f64(counts[i]) - expected).abs() < tolerance,
             "Backend {} (size {}) expected ~{:.0}, got {} (diff: {:.0})",
             i,
             size,
             expected,
             counts[i],
-            (f64::from(counts[i]) - expected).abs()
+            (usize_to_f64(counts[i]) - expected).abs()
         );
     }
 }
@@ -430,14 +412,13 @@ fn test_weighted_single_backend() {
         ServerName::try_new("only".to_string()).unwrap(),
         create_backend("only", 42),
         0, // tier
-        None,
     );
 
     assert_eq!(selector.total_weight(), 42);
 
     // All requests should go to the only backend
     for _ in 0..100 {
-        let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         assert_eq!(backend.as_index(), 0);
     }
 }
@@ -452,14 +433,12 @@ fn test_weighted_distribution_precision() {
         ServerName::try_new("b0".to_string()).unwrap(),
         create_backend("b0", 13),
         0, // tier
-        None,
     );
     selector.add_backend(
         BackendId::from_index(1),
         ServerName::try_new("b1".to_string()).unwrap(),
         create_backend("b1", 17),
         0, // tier
-        None,
     );
 
     assert_eq!(selector.total_weight(), 30);
@@ -470,7 +449,7 @@ fn test_weighted_distribution_precision() {
     let mut counts = [0; 2];
 
     for _ in 0..num_requests {
-        let backend = selector.route_command(ClientId::new(), "LIST").unwrap();
+        let backend = selector.route(ClientId::new()).unwrap();
         counts[backend.as_index()] += 1;
     }
 

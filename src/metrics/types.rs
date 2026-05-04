@@ -10,6 +10,26 @@
 
 use std::num::NonZeroU64;
 
+#[allow(clippy::cast_precision_loss)] // Metrics rates and percentages are derived display/monitoring values.
+const fn count_as_f64_for_rate(value: u64) -> f64 {
+    // Metrics rates and percentages are display/monitoring values. The source
+    // counters remain exact u64s; this conversion is only for derived ratios.
+    value as f64
+}
+
+// Bytes/sec is intentionally exposed as an integer metric derived from non-negative samples.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss,
+    clippy::cast_sign_loss
+)]
+fn bytes_per_second_to_u64(bytes_delta: u64, seconds: f64) -> u64 {
+    // Bytes/sec is exposed as an integer metric. Truncating the fractional
+    // byte/sec component matches the previous API and avoids overstating rate.
+    // Callers pass positive elapsed durations, so the computed rate is non-negative.
+    (count_as_f64_for_rate(bytes_delta) / seconds) as u64
+}
+
 // ============================================================================
 // Macros to reduce boilerplate
 // ============================================================================
@@ -100,7 +120,8 @@ macro_rules! timing_type {
 
             #[must_use]
             pub fn average(total: Self, count: NonZeroU64) -> Milliseconds {
-                let avg_micros = total.0 as f64 / count.get() as f64;
+                let avg_micros =
+                    count_as_f64_for_rate(total.0) / count_as_f64_for_rate(count.get());
                 Milliseconds::from_micros(avg_micros)
             }
         }
@@ -355,7 +376,7 @@ impl Microseconds {
     #[inline]
     #[must_use]
     pub fn as_millis_f64(self) -> f64 {
-        self.0 as f64 / 1000.0
+        count_as_f64_for_rate(self.0) / 1000.0
     }
 }
 
@@ -405,7 +426,7 @@ impl BytesPerSecond {
     #[must_use]
     pub fn from_delta(bytes_delta: u64, seconds: f64) -> Self {
         if seconds > 0.0 {
-            Self((bytes_delta as f64 / seconds) as u64)
+            Self(bytes_per_second_to_u64(bytes_delta, seconds))
         } else {
             Self(0)
         }
@@ -418,7 +439,7 @@ impl CommandsPerSecond {
     #[must_use]
     pub fn from_delta(commands_delta: u64, seconds: f64) -> Self {
         if seconds > 0.0 {
-            Self(commands_delta as f64 / seconds)
+            Self(count_as_f64_for_rate(commands_delta) / seconds)
         } else {
             Self(0.0)
         }
@@ -431,7 +452,10 @@ impl ErrorRatePercent {
     #[must_use]
     pub fn from_counts(errors: ErrorCount, commands: CommandCount) -> Self {
         if commands.get() > 0 {
-            Self((errors.get() as f64 / commands.get() as f64) * 100.0)
+            Self(
+                (count_as_f64_for_rate(errors.get()) / count_as_f64_for_rate(commands.get()))
+                    * 100.0,
+            )
         } else {
             Self(0.0)
         }
@@ -440,7 +464,7 @@ impl ErrorRatePercent {
     #[must_use]
     pub fn from_raw_counts(errors: u64, commands: u64) -> Self {
         if commands > 0 {
-            Self((errors as f64 / commands as f64) * 100.0)
+            Self((count_as_f64_for_rate(errors) / count_as_f64_for_rate(commands)) * 100.0)
         } else {
             Self(0.0)
         }
@@ -453,6 +477,7 @@ impl ErrorRatePercent {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // These tests intentionally compare exact fixed outputs and zero cases.
 mod tests {
     use super::*;
 

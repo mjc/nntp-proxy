@@ -1,5 +1,12 @@
 //! Log formatting utilities
 
+#[allow(clippy::cast_precision_loss)] // Human-readable byte formatting is approximate by design.
+const fn bytes_as_f64_for_display(bytes: u64) -> f64 {
+    // Human-readable log output is approximate by design; exact byte counts are
+    // preserved in the integer path below and in metrics storage.
+    bytes as f64
+}
+
 /// Format bytes in human-readable format (KB, MB, GB)
 #[inline]
 #[must_use]
@@ -7,13 +14,16 @@ pub fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     const GB: u64 = MB * 1024;
+    const KB_F64: f64 = 1024.0;
+    const MB_F64: f64 = KB_F64 * 1024.0;
+    const GB_F64: f64 = MB_F64 * 1024.0;
 
     if bytes >= GB {
-        format!("{:.2} GB", bytes as f64 / GB as f64)
+        format!("{:.2} GB", bytes_as_f64_for_display(bytes) / GB_F64)
     } else if bytes >= MB {
-        format!("{:.2} MB", bytes as f64 / MB as f64)
+        format!("{:.2} MB", bytes_as_f64_for_display(bytes) / MB_F64)
     } else if bytes >= KB {
-        format!("{:.2} KB", bytes as f64 / KB as f64)
+        format!("{:.2} KB", bytes_as_f64_for_display(bytes) / KB_F64)
     } else {
         format!("{bytes} B")
     }

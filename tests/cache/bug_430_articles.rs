@@ -3,25 +3,29 @@
 //! BUG: When `cache_articles=true`, the proxy returns 430 for articles that backends
 //! actually have. This is caused by a race condition:
 //!
-//! 1. `spawn_cache_upsert()` is fire-and-forget (async)
+//! 1. Cache article upserts are fire-and-forget (async)
 //! 2. `sync_availability()` runs immediately after success
-//! 3. If upsert hasn't completed, `sync_availability` creates a 430 stub
-//! 4. The 430 stub overwrites the real article when upsert finally runs
-//!    OR the 430 stub is served on the next request before upsert completes
+//! 3. If upsert hasn't completed, `sync_availability` creates a missing entry
+//! 4. The missing entry overwrites the real article when upsert finally runs
+//!    OR the missing entry is served on the next request before upsert completes
 //!
-//! This test verifies the fix: `sync_availability` should not create 430 stubs
+//! This test verifies the fix: `sync_availability` should not create missing entries
 //! when the availability shows a backend HAS the article.
 
 use anyhow::Result;
 use nntp_proxy::cache::{ArticleAvailability, ArticleCache};
+use nntp_proxy::protocol::RequestKind;
 use nntp_proxy::router::BackendCount;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
 
-/// Test that `sync_availability` does NOT create a 430 stub when a backend has the article
+use super::article_response_bytes;
+
+/// Test that `sync_availability` does NOT create a missing entry when a backend has the article
 #[tokio::test]
-async fn test_sync_availability_does_not_create_430_stub_when_backend_has_article() -> Result<()> {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
+async fn test_sync_availability_does_not_create_430_metadata_only_when_backend_has_article()
+-> Result<()> {
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
     let msg_id = MessageId::new("<test@example.com>".to_string())?;
 
     // Simulate the scenario: backend 0 has the article
@@ -35,7 +39,7 @@ async fn test_sync_availability_does_not_create_430_stub_when_backend_has_articl
     // Check what got cached
     let cached = cache.get(&msg_id).await;
 
-    // BUG: sync_availability creates a "430\r\n" stub even when availability shows
+    // BUG: sync_availability creates a "430\r\n" metadata-only response even when availability shows
     // backend 0 HAS the article. This is wrong - if a backend has it, we should
     // either not create an entry at all, or create a proper placeholder.
 
@@ -43,11 +47,10 @@ async fn test_sync_availability_does_not_create_430_stub_when_backend_has_articl
     if let Some(entry) = cached {
         let status = entry.status_code();
         assert!(
-            status.map(|s| s.as_u16()) != Some(430),
-            "sync_availability should NOT create 430 stub when backend has article! \
-             Got status code: {:?}, buffer: {:?}",
-            status,
-            String::from_utf8_lossy(entry.buffer())
+            status.as_u16() != 430,
+            "sync_availability should NOT create missing entry when backend has article! \
+             Got status code: {:?}",
+            status
         );
     }
     // If no entry was created, that's also acceptable
@@ -58,7 +61,7 @@ async fn test_sync_availability_does_not_create_430_stub_when_backend_has_articl
 /// Test the full race condition scenario
 #[tokio::test]
 async fn test_race_condition_upsert_vs_sync_availability() -> Result<()> {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
     let msg_id = MessageId::new("<race@example.com>".to_string())?;
 
     // Simulate the race: sync_availability runs BEFORE upsert
@@ -71,22 +74,22 @@ async fn test_race_condition_upsert_vs_sync_availability() -> Result<()> {
     // Now upsert runs with the actual article
     let article_data = b"220 0 <race@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
     cache
-        .upsert(
+        .upsert_ingest(
             msg_id.clone(),
             article_data.clone(),
             BackendId::from_index(0),
-            0,
+            0.into(),
         )
         .await;
 
-    // The cached entry should be the article, not a 430 stub
+    // The cached entry should be the article, not a missing entry
     let cached = cache.get(&msg_id).await.expect("Should have cache entry");
-    let status = cached.status_code().expect("Should have status code");
+    let status = cached.status_code();
 
     assert_eq!(
         status.as_u16(),
         220,
-        "After upsert, cache should have article (220), not 430 stub. Got: {}",
+        "After upsert, cache should have article (220), not missing entry. Got: {}",
         status.as_u16()
     );
 
@@ -96,17 +99,17 @@ async fn test_race_condition_upsert_vs_sync_availability() -> Result<()> {
 /// Test that repeated requests don't get 430 due to corrupted cache
 #[tokio::test]
 async fn test_second_request_gets_article_not_430() -> Result<()> {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
     let msg_id = MessageId::new("<second@example.com>".to_string())?;
 
     // First request: upsert the article
     let article_data = b"220 0 <second@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
     cache
-        .upsert(
+        .upsert_ingest(
             msg_id.clone(),
             article_data.clone(),
             BackendId::from_index(0),
-            0,
+            0.into(),
         )
         .await;
 
@@ -117,7 +120,7 @@ async fn test_second_request_gets_article_not_430() -> Result<()> {
 
     // Second request: should get the article
     let cached = cache.get(&msg_id).await.expect("Should have cache entry");
-    let status = cached.status_code().expect("Should have status code");
+    let status = cached.status_code();
 
     assert_eq!(
         status.as_u16(),
@@ -126,12 +129,8 @@ async fn test_second_request_gets_article_not_430() -> Result<()> {
         status.as_u16()
     );
 
-    // Verify we can serve the actual article
-    assert!(
-        cached.buffer().starts_with(b"220"),
-        "Buffer should start with 220, got: {:?}",
-        String::from_utf8_lossy(&cached.buffer()[..20.min(cached.buffer().len())])
-    );
+    let rendered = article_response_bytes(&cached, RequestKind::Article, &msg_id).unwrap();
+    assert!(rendered.starts_with(b"220"));
 
     Ok(())
 }
@@ -208,7 +207,7 @@ fn test_record_has_clears_missing() {
 /// Test `sync_availability` with mixed availability (some have, some missing)
 #[tokio::test]
 async fn test_sync_availability_mixed_results() -> Result<()> {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
     let msg_id = MessageId::new("<mixed@example.com>".to_string())?;
 
     // Simulate: backend 0 returned 430, backend 1 has it
@@ -216,14 +215,14 @@ async fn test_sync_availability_mixed_results() -> Result<()> {
     availability.record_missing(BackendId::from_index(0));
     availability.record_has(BackendId::from_index(1));
 
-    // sync_availability should NOT create 430 stub because backend 1 has it
+    // sync_availability should NOT create missing entry because backend 1 has it
     cache.sync_availability(msg_id.clone(), &availability).await;
 
     let cached = cache.get(&msg_id).await;
     if let Some(entry) = cached {
         assert!(
-            entry.status_code().map(|s| s.as_u16()) != Some(430),
-            "Should not create 430 stub when one backend has article"
+            entry.status_code().as_u16() != 430,
+            "Should not create missing entry when one backend has article"
         );
     }
     // No entry is also acceptable
@@ -231,10 +230,10 @@ async fn test_sync_availability_mixed_results() -> Result<()> {
     Ok(())
 }
 
-/// Test `sync_availability` creates 430 stub only when ALL backends are missing
+/// Test `sync_availability` creates missing entry only when ALL backends are missing
 #[tokio::test]
 async fn test_sync_availability_creates_430_when_all_missing() -> Result<()> {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
     let msg_id = MessageId::new("<allmissing@example.com>".to_string())?;
 
     // All backends returned 430
@@ -242,14 +241,14 @@ async fn test_sync_availability_creates_430_when_all_missing() -> Result<()> {
     availability.record_missing(BackendId::from_index(0));
     availability.record_missing(BackendId::from_index(1));
 
-    // Should create 430 stub
+    // Should create missing entry
     cache.sync_availability(msg_id.clone(), &availability).await;
 
     let cached = cache.get(&msg_id).await.expect("Should have cache entry");
     assert_eq!(
-        cached.status_code().map(|s| s.as_u16()),
-        Some(430),
-        "Should create 430 stub when all backends are missing"
+        cached.status_code().as_u16(),
+        430,
+        "Should create missing entry when all backends are missing"
     );
 
     // Verify availability is preserved
@@ -285,26 +284,26 @@ fn test_all_exhausted_with_backend_count() {
     assert!(!availability.all_exhausted(BackendCount::new(3)));
 }
 
-/// Test that `try_serve_from_cache` doesn't serve 430 stubs when `cache_articles=true`
+/// Test that `try_serve_from_cache` doesn't serve missing entries when `cache_articles=true`
 ///
-/// This is a critical edge case: if a 430 stub is in the cache, we should NOT
+/// This is a critical edge case: if a missing entry is in the cache, we should NOT
 /// serve it directly - we should fall through to backend routing.
 #[tokio::test]
-async fn test_430_stub_not_served_directly() -> Result<()> {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
-    let msg_id = MessageId::new("<stub@example.com>".to_string())?;
+async fn test_430_metadata_only_not_served_directly() -> Result<()> {
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
+    let msg_id = MessageId::new("<metadata_only@example.com>".to_string())?;
 
-    // Create a 430 stub in the cache (simulating all backends returned 430 previously)
+    // Create a missing entry in the cache (simulating all backends returned 430 previously)
     let mut availability = ArticleAvailability::new();
     availability.record_missing(BackendId::from_index(0));
     availability.record_missing(BackendId::from_index(1));
     cache.sync_availability(msg_id.clone(), &availability).await;
 
-    // Verify stub is in cache
-    let cached = cache.get(&msg_id).await.expect("Should have stub");
-    assert_eq!(cached.status_code().map(|s| s.as_u16()), Some(430));
+    // Verify a missing entry is in cache
+    let cached = cache.get(&msg_id).await.expect("Should have missing entry");
+    assert_eq!(cached.status_code().as_u16(), 430);
 
-    // When we have a 430 stub, the availability info shows all backends exhausted
+    // When we have a missing entry, the availability info shows all backends exhausted
     // The session handler should check all_exhausted and send 430 only if true
     // (This test documents the expected behavior - actual implementation is in session handler)
     assert!(cached.all_backends_exhausted(BackendCount::new(2)));
@@ -318,7 +317,7 @@ async fn test_concurrent_upsert_and_sync() -> Result<()> {
     use std::sync::Arc;
     use tokio::sync::Barrier;
 
-    let cache = Arc::new(ArticleCache::new(1_000_000, Duration::from_secs(300), true));
+    let cache = Arc::new(ArticleCache::new(1_000_000, Duration::from_secs(300)));
     let msg_id = MessageId::new("<concurrent@example.com>".to_string())?;
 
     // Use a barrier to synchronize the two operations
@@ -334,7 +333,7 @@ async fn test_concurrent_upsert_and_sync() -> Result<()> {
         let article_data =
             b"220 0 <concurrent@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         cache1
-            .upsert(msg_id1, article_data, BackendId::from_index(0), 0)
+            .upsert_ingest(msg_id1, article_data, BackendId::from_index(0), 0.into())
             .await;
     });
 
@@ -354,137 +353,36 @@ async fn test_concurrent_upsert_and_sync() -> Result<()> {
     upsert_task.await?;
     sync_task.await?;
 
-    // Regardless of order, we should NOT have a 430 stub
+    // Regardless of order, we should NOT have a missing entry
     let article = cache.get(&msg_id).await;
     if let Some(entry) = article {
         assert!(
-            entry.status_code().map(|s| s.as_u16()) != Some(430),
-            "Concurrent operations should not result in 430 stub when backend has article"
+            entry.status_code().as_u16() != 430,
+            "Concurrent operations should not result in missing entry when backend has article"
         );
     }
 
     Ok(())
 }
 
-// ============================================================================
-// Tests for is_complete_article() - preventing stub serving
-// ============================================================================
-
-/// Test that `is_complete_article` returns false for stubs
-#[test]
-fn test_is_complete_article_rejects_stubs() {
-    use nntp_proxy::cache::ArticleEntry;
-
-    // 430 stub
-    let stub_430 = ArticleEntry::new(b"430\r\n".to_vec());
-    assert!(
-        !stub_430.is_complete_article(),
-        "430 stub should not be complete article"
-    );
-
-    // 220 stub (from availability tracking)
-    let stub_220 = ArticleEntry::new(b"220\r\n".to_vec());
-    assert!(
-        !stub_220.is_complete_article(),
-        "220 stub should not be complete article"
-    );
-
-    // 223 stub (from STAT precheck)
-    let stub_223 = ArticleEntry::new(b"223\r\n".to_vec());
-    assert!(
-        !stub_223.is_complete_article(),
-        "223 stub should not be complete article"
-    );
-
-    // 221 stub (from HEAD precheck)
-    let stub_221 = ArticleEntry::new(b"221\r\n".to_vec());
-    assert!(
-        !stub_221.is_complete_article(),
-        "221 stub should not be complete article"
-    );
-}
-
-/// Test that `is_complete_article` returns true for real articles
-#[test]
-fn test_is_complete_article_accepts_real_articles() {
-    use nntp_proxy::cache::ArticleEntry;
-
-    // Full article response
-    let full_article = ArticleEntry::new(
-        b"220 0 <test@example.com>\r\nSubject: Test\r\nFrom: test@example.com\r\n\r\nThis is the body.\r\n.\r\n"
-            .to_vec(),
-    );
-    assert!(
-        full_article.is_complete_article(),
-        "Full article should be complete"
-    );
-
-    // Minimal but valid article
-    let minimal_article =
-        ArticleEntry::new(b"220 0 <x@y>\r\nSubject: X\r\n\r\nBody text here\r\n.\r\n".to_vec());
-    assert!(
-        minimal_article.is_complete_article(),
-        "Minimal article should be complete"
-    );
-}
-
-/// Test that `is_complete_article` requires 220 status code
-#[test]
-fn test_is_complete_article_accepts_220_and_222() {
-    use nntp_proxy::cache::ArticleEntry;
-
-    // ARTICLE response (220) should be considered complete
-    let article_response = ArticleEntry::new(
-        b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec(),
-    );
-    assert!(
-        article_response.is_complete_article(),
-        "ARTICLE response (220) should be complete article"
-    );
-
-    // BODY response (222) with content should be considered complete
-    let body_response =
-        ArticleEntry::new(b"222 0 <test@example.com>\r\nThis is body text.\r\n.\r\n".to_vec());
-    assert!(
-        body_response.is_complete_article(),
-        "BODY response (222) with content should be complete article"
-    );
-
-    // HEAD response (221) should NOT be considered complete article
-    let head_response = ArticleEntry::new(
-        b"221 0 <test@example.com>\r\nSubject: Test\r\nFrom: test@example.com\r\n.\r\n".to_vec(),
-    );
-    assert!(
-        !head_response.is_complete_article(),
-        "HEAD response (221) should not be complete article"
-    );
-
-    // STAT response (223) should NOT be complete article
-    let stat_response = ArticleEntry::new(b"223 0 <test@example.com>\r\n".to_vec());
-    assert!(
-        !stat_response.is_complete_article(),
-        "STAT response (223) should not be complete article"
-    );
-}
-
-/// Test that stubs don't get served when `cache_articles=true`
+/// Test that metadata-only responses don't get served when `cache_articles=true`
 #[tokio::test]
-async fn test_stub_not_served_as_article() -> Result<()> {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
-    let msg_id = MessageId::new("<stub-test@example.com>".to_string())?;
+async fn test_metadata_only_not_served_as_article() -> Result<()> {
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
+    let msg_id = MessageId::new("<metadata_only-test@example.com>".to_string())?;
 
-    // Simulate STAT precheck creating a stub
+    // Simulate STAT precheck creating a metadata-only response
     let mut availability = ArticleAvailability::new();
     availability.record_has(BackendId::from_index(0));
 
-    // First, put a 223 stub in the cache (as if from STAT precheck)
-    // We'll use upsert with a stub-like buffer to simulate this
+    // First, put a 223 metadata-only response in the cache (as if from STAT precheck)
+    // We'll use upsert with a metadata-only response-like buffer to simulate this
     cache
-        .upsert(
+        .upsert_ingest(
             msg_id.clone(),
             b"223\r\n".to_vec(),
             BackendId::from_index(0),
-            0,
+            0.into(),
         )
         .await;
 
@@ -494,37 +392,40 @@ async fn test_stub_not_served_as_article() -> Result<()> {
     // Verify it's NOT a complete article (what is_complete_article should return)
     assert!(
         !cached.is_complete_article(),
-        "STAT stub should not be identified as complete article"
+        "STAT metadata-only response should not be identified as complete article"
     );
 
-    // The session handler would check is_complete_article() and NOT serve this stub
+    // The session handler would check is_complete_article() and NOT serve this metadata-only response
     // Instead, it would fall through to fetch the real article from backend
 
     Ok(())
 }
 
-/// Test the full scenario: precheck creates stub, then ARTICLE command needs real body
+/// Test the full scenario: precheck creates a metadata-only response, then ARTICLE command needs real body
 #[tokio::test]
-async fn test_precheck_stub_then_article_request() -> Result<()> {
-    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300), true);
+async fn test_precheck_metadata_only_then_article_request() -> Result<()> {
+    let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
     let msg_id = MessageId::new("<precheck-then-article@example.com>".to_string())?;
 
-    // Step 1: STAT precheck creates a stub
+    // Step 1: STAT precheck creates a metadata-only response
     cache
-        .upsert(
+        .upsert_ingest(
             msg_id.clone(),
             b"223\r\n".to_vec(),
             BackendId::from_index(0),
-            0,
+            0.into(),
         )
         .await;
 
-    // Verify stub exists but is not a complete article
-    let cached = cache.get(&msg_id).await.expect("Should have stub");
+    // Verify a metadata-only response exists but is not a complete article
+    let cached = cache
+        .get(&msg_id)
+        .await
+        .expect("Should have metadata-only response");
     assert!(!cached.is_complete_article());
     assert!(cached.has_availability_info()); // Availability IS tracked
 
-    // Step 2: ARTICLE command comes in - should NOT serve stub
+    // Step 2: ARTICLE command comes in - should NOT serve the metadata-only response
     // (In real code, is_complete_article() check causes fallthrough to backend fetch)
 
     // Step 3: Simulate backend fetch and upsert of real article
@@ -532,19 +433,23 @@ async fn test_precheck_stub_then_article_request() -> Result<()> {
         b"220 0 <precheck-then-article@example.com>\r\nSubject: Test\r\n\r\nReal body.\r\n.\r\n"
             .to_vec();
     cache
-        .upsert(
+        .upsert_ingest(
             msg_id.clone(),
             real_article.clone(),
             BackendId::from_index(0),
-            0,
+            0.into(),
         )
         .await;
 
-    // Verify real article replaced stub
+    // Verify real article replaced metadata-only response
     let cached = cache.get(&msg_id).await.expect("Should have article");
     assert!(cached.is_complete_article());
-    assert_eq!(cached.status_code().map(|s| s.as_u16()), Some(220));
-    assert!(cached.buffer().ends_with(b".\r\n"));
+    assert_eq!(cached.status_code().as_u16(), 220);
+    assert!(
+        article_response_bytes(&cached, RequestKind::Article, &msg_id)
+            .unwrap()
+            .ends_with(b".\r\n")
+    );
 
     Ok(())
 }

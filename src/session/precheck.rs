@@ -5,22 +5,33 @@
 
 use std::sync::Arc;
 
-use crate::cache::{ArticleAvailability, ArticleEntry, UnifiedCache};
+use crate::cache::{ArticleAvailability, CachedArticle, UnifiedCache};
 use crate::metrics::MetricsCollector;
 use crate::pool::BufferPool;
+use crate::protocol::{RequestContext, StatusCode};
 use crate::router::BackendSelector;
 use crate::session::backend;
+use crate::session::handlers::should_sample_backend_timing;
 use crate::types::{BackendId, MessageId};
 
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+pub(crate) enum PrecheckHit {
+    Payload(crate::cache::CacheIngestResponse),
+    Availability(StatusCode),
+}
+
 /// Result of querying a backend for an article.
-#[derive(Debug, PartialEq, Eq)]
-pub enum QueryResult {
-    Found(BackendId, crate::cache::CacheBuffer),
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+pub(crate) enum QueryResult {
+    Found(BackendId, PrecheckHit),
     Missing(BackendId),
-    Error(BackendId),
+    Error,
 }
 
 /// Shared dependencies for precheck operations.
+#[derive(Clone, Copy)]
 pub struct PrecheckDeps<'a> {
     pub router: &'a Arc<BackendSelector>,
     pub cache: &'a Arc<UnifiedCache>,
@@ -39,7 +50,7 @@ struct OwnedDeps {
 }
 
 impl PrecheckDeps<'_> {
-    fn to_owned(&self) -> OwnedDeps {
+    fn clone_deps(&self) -> OwnedDeps {
         OwnedDeps {
             router: Arc::clone(self.router),
             cache: Arc::clone(self.cache),
@@ -50,14 +61,32 @@ impl PrecheckDeps<'_> {
     }
 }
 
+async fn cache_precheck_hit(
+    cache: &UnifiedCache,
+    msg_id: MessageId<'static>,
+    backend_id: BackendId,
+    hit: PrecheckHit,
+    tier: crate::cache::ttl::CacheTier,
+) {
+    match hit {
+        PrecheckHit::Payload(data) => {
+            cache.upsert_ingest(msg_id, data, backend_id, tier).await;
+        }
+        PrecheckHit::Availability(status_code) => {
+            cache
+                .record_backend_has_status(msg_id, status_code, backend_id, tier)
+                .await;
+        }
+    }
+}
+
 async fn query_backend(
     deps: &OwnedDeps,
     backend_id: BackendId,
-    command: &str,
-    multiline: bool,
+    request: &RequestContext,
 ) -> QueryResult {
     let Some(provider) = deps.router.backend_provider(backend_id) else {
-        return QueryResult::Error(backend_id);
+        return QueryResult::Error;
     };
 
     // Track pending count for load balancing
@@ -65,10 +94,10 @@ async fn query_backend(
 
     // Retry once on backend error (fresh connection on second attempt)
     let query_result: QueryResult = crate::session::retry::retry_once!(
-        execute_backend_query(deps, provider, backend_id, command, multiline).await,
+        execute_backend_query(deps, provider, backend_id, request).await,
         backend = backend_id.as_index()
     )
-    .unwrap_or(QueryResult::Error(backend_id));
+    .unwrap_or(QueryResult::Error);
 
     // Always decrement pending count when done
     deps.router.complete_command(backend_id);
@@ -84,28 +113,42 @@ async fn execute_backend_query(
     deps: &OwnedDeps,
     provider: &crate::pool::DeadpoolConnectionProvider,
     backend_id: BackendId,
-    command: &str,
-    multiline: bool,
+    request: &RequestContext,
 ) -> Result<QueryResult, ()> {
     let Ok(conn_raw) = provider.get_pooled_connection().await else {
-        return Ok(QueryResult::Error(backend_id));
+        return Ok(QueryResult::Error);
     };
     let mut conn = crate::pool::ConnectionGuard::new(conn_raw, provider.clone());
 
     let mut buffer = deps.buffer_pool.acquire().await;
 
-    // Use shared backend command execution with timing
-    match backend::send_command_timed(&mut **conn, command, &mut buffer).await {
-        Ok((cmd_response, ttfb, send, recv)) => {
+    let response = if should_sample_backend_timing() {
+        backend::send_request_timed(&mut **conn, request, &mut buffer)
+            .await
+            .map(|(response, ttfb, send, recv)| (response, Some((ttfb, send, recv))))
+    } else {
+        backend::send_request(&mut **conn, request, &mut buffer)
+            .await
+            .map(|response| (response, None))
+    };
+
+    // Use shared backend request execution with sampled timing
+    match response {
+        Ok((cmd_response, timings)) => {
             let Some(status_code) = cmd_response.status_code() else {
                 // Invalid response - conn drops → remove_with_cooldown
                 return Err(());
             };
 
-            let response = if multiline && cmd_response.is_multiline {
+            let response = if request.expects_multiline_response(status_code) {
                 use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
-                let mut response = crate::pool::ChunkedResponse::default();
-                response.extend_from_slice(&deps.buffer_pool, &buffer[..cmd_response.bytes_read]);
+                let mut response = deps
+                    .cache_articles
+                    .then(crate::pool::ChunkedResponse::default);
+                if let Some(response) = &mut response {
+                    response
+                        .extend_from_slice(&deps.buffer_pool, &buffer[..cmd_response.bytes_read]);
+                }
                 let mut tail = TailBuffer::default();
                 match tail.detect_terminator(buffer.as_ref()) {
                     TerminatorStatus::FoundAt(pos) => {
@@ -117,7 +160,9 @@ async fn execute_backend_query(
                         {
                             return Err(());
                         }
-                        response.truncate(pos);
+                        if let Some(response) = &mut response {
+                            response.truncate(pos);
+                        }
                     }
                     TerminatorStatus::NotFound => {
                         tail.update(buffer.as_ref());
@@ -130,53 +175,62 @@ async fn execute_backend_query(
                                         {
                                             return Err(());
                                         }
-                                        response
-                                            .extend_from_slice(&deps.buffer_pool, &buffer[..pos]);
+                                        if let Some(response) = &mut response {
+                                            response.extend_from_slice(
+                                                &deps.buffer_pool,
+                                                &buffer[..pos],
+                                            );
+                                        }
                                         break;
                                     }
                                     TerminatorStatus::NotFound => {
                                         tail.update(&buffer[..n]);
-                                        response.extend_from_slice(&deps.buffer_pool, &buffer[..n]);
+                                        if let Some(response) = &mut response {
+                                            response
+                                                .extend_from_slice(&deps.buffer_pool, &buffer[..n]);
+                                        }
                                     }
                                 },
                             }
                         }
                     }
                 }
-                if deps.cache_articles {
-                    crate::cache::CacheBuffer::Chunked(response)
+                if let Some(response) = response {
+                    PrecheckHit::Payload(crate::cache::CacheIngestResponse::Chunked(response))
                 } else {
-                    crate::cache::CacheBuffer::Small(crate::cache::extract_chunked_status_line(
-                        &response,
-                    ))
+                    PrecheckHit::Availability(status_code)
                 }
+            } else if deps.cache_articles {
+                PrecheckHit::Payload(crate::cache::CacheIngestResponse::from(
+                    &buffer[..cmd_response.bytes_read],
+                ))
             } else {
-                let mut response = Vec::with_capacity(cmd_response.bytes_read);
-                response.extend_from_slice(&buffer[..cmd_response.bytes_read]);
-                crate::cache::CacheBuffer::Vec(response)
+                PrecheckHit::Availability(status_code)
             };
 
             let result = match status_code.as_u16() {
                 220..=223 => {
-                    // Record successful command and timing
                     tracing::debug!(
                         backend = backend_id.as_index(),
-                        ttfb_us = ttfb,
                         "precheck recording command to metrics"
                     );
                     deps.metrics.record_command(backend_id);
-                    deps.metrics.record_ttfb_micros(backend_id, ttfb);
-                    deps.metrics.record_send_recv_micros(backend_id, send, recv);
+                    if let Some((ttfb, send, recv)) = timings {
+                        deps.metrics.record_ttfb_micros(backend_id, ttfb);
+                        deps.metrics.record_send_recv_micros(backend_id, send, recv);
+                    }
                     QueryResult::Found(backend_id, response)
                 }
                 430 => {
                     deps.metrics.record_command(backend_id);
-                    deps.metrics.record_ttfb_micros(backend_id, ttfb);
-                    deps.metrics.record_send_recv_micros(backend_id, send, recv);
+                    if let Some((ttfb, send, recv)) = timings {
+                        deps.metrics.record_ttfb_micros(backend_id, ttfb);
+                        deps.metrics.record_send_recv_micros(backend_id, send, recv);
+                    }
                     deps.metrics.record_error_4xx(backend_id);
                     QueryResult::Missing(backend_id)
                 }
-                _ => QueryResult::Error(backend_id),
+                _ => QueryResult::Error,
             };
 
             let _ = conn.release(); // response received; connection healthy, return to pool
@@ -190,15 +244,15 @@ async fn execute_backend_query(
 }
 
 /// Query all backends, collecting results as they arrive
-async fn query_all_backends(deps: &OwnedDeps, command: &str, multiline: bool) -> Vec<QueryResult> {
+async fn query_all_backends(deps: &OwnedDeps, request: &RequestContext) -> Vec<QueryResult> {
     use futures::StreamExt;
 
     let tasks: Vec<_> = (0..deps.router.backend_count().get())
         .map(BackendId::from_index)
         .map(|id| {
             let deps = deps.clone();
-            let cmd = command.to_string();
-            tokio::spawn(async move { query_backend(&deps, id, &cmd, multiline).await })
+            let request = request.clone();
+            tokio::spawn(async move { query_backend(&deps, id, &request).await })
         })
         .collect();
 
@@ -215,18 +269,17 @@ async fn query_all_backends(deps: &OwnedDeps, command: &str, multiline: bool) ->
 /// Background task updates cache with full availability once all backends complete.
 async fn query_all_backends_racing(
     deps: &OwnedDeps,
-    command: &str,
+    request: &RequestContext,
     msg_id: &MessageId<'_>,
-    multiline: bool,
-) -> Option<(BackendId, crate::cache::CacheBuffer)> {
+) -> Option<(BackendId, PrecheckHit)> {
     use futures::StreamExt;
 
     let tasks: Vec<_> = (0..deps.router.backend_count().get())
         .map(BackendId::from_index)
         .map(|id| {
             let deps = deps.clone();
-            let cmd = command.to_string();
-            tokio::spawn(async move { query_backend(&deps, id, &cmd, multiline).await })
+            let request = request.clone();
+            tokio::spawn(async move { query_backend(&deps, id, &request).await })
         })
         .collect();
 
@@ -289,12 +342,7 @@ async fn query_all_backends_racing(
 /// # NNTP Semantics
 /// 430 responses are authoritative (never false negatives), 2xx are not.
 /// See `crate::cache::article` module docs for full explanation.
-fn summarize(
-    results: Vec<QueryResult>,
-) -> (
-    Option<(BackendId, crate::cache::CacheBuffer)>,
-    ArticleAvailability,
-) {
+fn summarize(results: Vec<QueryResult>) -> (Option<(BackendId, PrecheckHit)>, ArticleAvailability) {
     let mut availability = ArticleAvailability::new();
     let mut found = None;
 
@@ -309,7 +357,7 @@ fn summarize(
             QueryResult::Missing(id) => {
                 availability.record_missing(id);
             }
-            QueryResult::Error(_) => {}
+            QueryResult::Error => {}
         }
     }
 
@@ -328,10 +376,9 @@ fn summarize(
 /// Skips backend queries entirely if we already have a complete article cached.
 pub async fn precheck(
     deps: &PrecheckDeps<'_>,
-    command: &str,
+    request: &RequestContext,
     msg_id: &MessageId<'_>,
-    multiline: bool,
-) -> Option<ArticleEntry> {
+) -> Option<CachedArticle> {
     // Check cache first - if we have a complete article, return it immediately
     if let Some(cached) = deps.cache.get(msg_id).await
         && cached.is_complete_article()
@@ -339,8 +386,8 @@ pub async fn precheck(
         return Some(cached);
     }
 
-    let owned = deps.to_owned();
-    let found = query_all_backends_racing(&owned, command, msg_id, multiline).await;
+    let owned = deps.clone_deps();
+    let found = query_all_backends_racing(&owned, request, msg_id).await;
 
     // Cache the found result and return it
     if let Some((backend_id, data)) = found {
@@ -349,13 +396,10 @@ pub async fn precheck(
         // incorrectly caching an article as "higher tier" (longer TTL) even if a lower-tier
         // backend also has it but responded slower. Using tier 0 conservatively ensures
         // we don't overestimate TTL. Regular routing will discover higher-tier availability.
-        let tier = 0;
+        let tier = crate::cache::ttl::CacheTier::new(0);
         // Move data into upsert, then retrieve the entry via cache.get().
         // The lookup is sub-microsecond vs 750KB memcpy from cloning.
-        owned
-            .cache
-            .upsert(msg_id.to_owned(), data, backend_id, tier)
-            .await;
+        cache_precheck_hit(&owned.cache, msg_id.to_owned(), backend_id, data, tier).await;
         owned.cache.get(msg_id).await
     } else {
         // No article found - availability is synced by background task
@@ -366,13 +410,12 @@ pub async fn precheck(
 /// Spawn background precheck. Results go to cache only.
 ///
 /// Skips backend queries entirely if we already have a complete article cached.
-#[allow(clippy::needless_pass_by_value)]
 pub fn spawn_background_precheck(
     deps: PrecheckDeps<'_>,
-    command: String,
+    request: RequestContext,
     msg_id: MessageId<'static>,
 ) {
-    let owned = deps.to_owned();
+    let owned = deps.clone_deps();
     tokio::spawn(async move {
         // Check cache first - if we have a complete article, no need to query backends
         if let Some(cached) = owned.cache.get(&msg_id).await
@@ -382,18 +425,15 @@ pub fn spawn_background_precheck(
             return;
         }
 
-        let results = query_all_backends(&owned, &command, false).await;
+        let results = query_all_backends(&owned, &request).await;
         let (found, availability) = summarize(results);
 
         if let Some((backend_id, data)) = found {
             // NOTE: We intentionally use tier 0 for articles found via background precheck.
             // When racing backends, we don't have visibility into which tier actually has
             // the article. Using tier 0 conservatively avoids overestimating TTL.
-            let tier = 0;
-            owned
-                .cache
-                .upsert(msg_id.to_owned(), data, backend_id, tier)
-                .await;
+            let tier = crate::cache::ttl::CacheTier::new(0);
+            cache_precheck_hit(&owned.cache, msg_id.to_owned(), backend_id, data, tier).await;
         }
         owned.cache.sync_availability(msg_id, &availability).await;
     });
@@ -409,15 +449,21 @@ mod tests {
     fn summarize_finds_first() {
         let results = vec![
             QueryResult::Missing(BackendId::from_index(0)),
-            QueryResult::Found(BackendId::from_index(1), b"first".to_vec().into()),
-            QueryResult::Found(BackendId::from_index(2), b"second".to_vec().into()),
+            QueryResult::Found(
+                BackendId::from_index(1),
+                PrecheckHit::Payload(b"first".to_vec().into()),
+            ),
+            QueryResult::Found(
+                BackendId::from_index(2),
+                PrecheckHit::Payload(b"second".to_vec().into()),
+            ),
         ];
         let (found, avail) = summarize(results);
         assert_eq!(
             found,
             Some((
                 BackendId::from_index(1),
-                crate::cache::CacheBuffer::Vec(b"first".to_vec())
+                PrecheckHit::Payload(crate::cache::CacheIngestResponse::from(b"first".to_vec()))
             ))
         );
         assert!(avail.is_missing(BackendId::from_index(0)));
@@ -495,18 +541,43 @@ mod tests {
             ServerName::try_new("test-server".to_string()).unwrap(),
             provider,
             0,
-            None,
         );
 
         let deps = OwnedDeps {
             router: Arc::new(selector),
-            cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60), true)),
+            cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
             buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 2),
             metrics: MetricsCollector::new(1),
             cache_articles: true,
         };
 
-        let result = query_backend(&deps, backend_id, "ARTICLE <test@example.com>\r\n", true).await;
-        assert_eq!(result, QueryResult::Error(backend_id));
+        let request =
+            RequestContext::parse(b"ARTICLE <test@example.com>\r\n").expect("valid request line");
+        let result = query_backend(&deps, backend_id, &request).await;
+        assert_eq!(result, QueryResult::Error);
+    }
+
+    #[tokio::test]
+    async fn cache_precheck_availability_hit_does_not_persist_positive_entry() {
+        use crate::cache::UnifiedCache;
+        use crate::types::BackendId;
+
+        let backend_id = BackendId::from_index(0);
+        let cache = UnifiedCache::availability(100, std::time::Duration::MAX);
+        let msg_id = MessageId::new("<test@example.com>".to_string()).unwrap();
+
+        cache_precheck_hit(
+            &cache,
+            msg_id.to_owned(),
+            backend_id,
+            PrecheckHit::Availability(StatusCode::new(223)),
+            crate::cache::ttl::CacheTier::new(0),
+        )
+        .await;
+
+        assert!(
+            cache.get(&msg_id).await.is_none(),
+            "availability-only index should persist negatives, not optimistic positive hits"
+        );
     }
 }

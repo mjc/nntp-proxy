@@ -22,6 +22,14 @@ use crate::session::SessionError;
 
 use super::NntpProxy;
 
+#[allow(clippy::cast_possible_truncation)]
+fn elapsed_nanos_u64(start: std::time::Instant) -> u64 {
+    // This is a monotonic diagnostic timestamp. Saturating on overflow keeps
+    // the last-activity marker valid without threading error handling through
+    // the shutdown path.
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
 impl NntpProxy {
     // Helper methods for session management
 
@@ -52,7 +60,7 @@ impl NntpProxy {
 
         // When last client disconnects, record the timestamp
         if prev == 1 {
-            let nanos = self.start_instant.elapsed().as_nanos() as u64;
+            let nanos = elapsed_nanos_u64(self.start_instant);
             self.last_activity_nanos.store(nanos, Ordering::Relaxed);
         }
     }
@@ -153,7 +161,6 @@ impl NntpProxy {
 
     /// Log backend routing selection
     #[inline]
-    #[allow(clippy::unused_self)]
     pub(super) fn log_routing_selection(
         &self,
         client_addr: ClientAddress,
@@ -188,7 +195,7 @@ impl NntpProxy {
         self.record_connection_opened();
 
         let client_id = types::ClientId::new();
-        let backend_id = self.router.route_command(client_id, "")?;
+        let backend_id = self.router.route(client_id)?;
         let server_idx = backend_id.as_index();
 
         self.log_routing_selection(client_addr, backend_id, &self.servers[server_idx]);
@@ -223,7 +230,6 @@ impl NntpProxy {
 
     /// Generate short session ID for logging
     #[inline]
-    #[allow(clippy::unused_self)]
     pub(super) fn generate_session_id(&self, session: &ClientSession) -> String {
         crate::formatting::short_id(session.client_id().as_uuid())
     }
@@ -240,7 +246,6 @@ impl NntpProxy {
 
     /// Apply TCP optimizations to client socket
     #[inline]
-    #[allow(clippy::unused_self)]
     pub(super) fn apply_tcp_optimizations(&self, client_stream: &TcpStream) {
         use crate::network::TcpOptimizer;
         TcpOptimizer::new(client_stream)
@@ -407,9 +412,7 @@ impl NntpProxy {
         self.check_and_clear_stale_pools();
         self.increment_active_clients();
 
-        let result = self
-            .handle_per_command_client(client_stream, client_addr)
-            .await;
+        let result = Box::pin(self.handle_per_command_client(client_stream, client_addr)).await;
 
         self.decrement_active_clients();
         result
@@ -434,7 +437,7 @@ impl NntpProxy {
         let session = self.create_session(client_addr, Some(self.router.clone()));
         let session_id = self.generate_session_id(&session);
 
-        let metrics = session.handle_per_command_routing(client_stream).await;
+        let metrics = Box::pin(session.handle_per_command_routing(client_stream)).await;
 
         self.finalize_per_command_session(metrics, client_addr, &session_id, &session)
     }
@@ -631,10 +634,9 @@ mod tests {
         let config = create_test_config();
         let proxy = NntpProxy::new_sync(config, RoutingMode::Hybrid).unwrap();
 
-        let _empty_cache = Arc::new(crate::cache::UnifiedCache::memory(
+        let _empty_cache = Arc::new(crate::cache::UnifiedCache::availability(
             100,
-            std::time::Duration::from_secs(3600),
-            false,
+            std::time::Duration::MAX,
         ));
         assert_eq!(proxy.routing_mode_display_name(), "per-command");
     }

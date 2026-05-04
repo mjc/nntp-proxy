@@ -103,12 +103,11 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         );
 
     let tier_key = format!("NNTP_SERVER_{index}_TIER");
-    let tier = match env.get(&tier_key) {
-        Some(tier_str) => tier_str
+    let tier = env.get(&tier_key).map_or(0, |tier_str| {
+        tier_str
             .parse::<u8>()
-            .unwrap_or_else(|_| panic!("Invalid tier in {tier_key}: '{tier_str}' (must be 0-255)")),
-        None => 0,
-    };
+            .unwrap_or_else(|_| panic!("Invalid tier in {tier_key}: '{tier_str}' (must be 0-255)"))
+    });
 
     Some(Server {
         host: crate::types::HostName::try_new(host.clone())
@@ -207,6 +206,10 @@ pub fn load_config_from_env() -> Result<Config> {
 ///
 /// This allows Docker/container deployments to override servers without
 /// modifying the config file.
+///
+/// # Errors
+/// Returns any file I/O, TOML parsing, environment override, or configuration
+/// validation error encountered while loading the config.
 pub fn load_config(config_path: &str) -> Result<Config> {
     use anyhow::Context;
 
@@ -333,6 +336,10 @@ pub fn load_config_with_fallback(config_path: &str) -> Result<(Config, ConfigSou
 
 /// Create a default configuration for examples/testing
 #[must_use]
+///
+/// # Panics
+/// Panics only if the hard-coded example hostname, port, or server name stop
+/// satisfying their validated newtype constructors.
 pub fn create_default_config() -> Config {
     Config {
         servers: vec![Server {
@@ -477,7 +484,7 @@ mod tests {
         let server = parse_server_from_env(0, &env).unwrap();
         assert_eq!(
             server.connection_keepalive,
-            Some(std::time::Duration::from_secs(300))
+            Some(std::time::Duration::from_mins(5))
         );
     }
 

@@ -32,6 +32,9 @@ pub struct SystemMonitor {
 
 impl SystemMonitor {
     /// Create a new system monitor for the current process
+    ///
+    /// # Panics
+    /// Panics if `sysinfo` cannot determine the current process ID.
     #[must_use]
     pub fn new() -> Self {
         let mut system = System::new_with_specifics(
@@ -92,17 +95,15 @@ impl SystemMonitor {
     /// Returns the last refreshed stats. Useful if you just called `update()`.
     #[must_use]
     pub fn current(&self) -> SystemStats {
-        if let Some(process) = self.system.process(self.pid) {
-            SystemStats {
+        self.system
+            .process(self.pid)
+            .map_or_else(SystemStats::default, |process| SystemStats {
                 cpu_usage: process.cpu_usage(),
                 peak_cpu_usage: self.peak_cpu,
                 memory_bytes: process.memory(),
                 peak_memory_bytes: self.peak_memory,
                 thread_count: process.tasks().map_or(1, std::collections::HashSet::len),
-            }
-        } else {
-            SystemStats::default()
-        }
+            })
     }
 }
 
@@ -113,6 +114,7 @@ impl Default for SystemMonitor {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // These tests assert exact default/current CPU values from deterministic fixtures.
 mod tests {
     use super::*;
 

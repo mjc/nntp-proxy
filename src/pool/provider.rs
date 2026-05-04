@@ -196,6 +196,9 @@ impl DeadpoolConnectionProvider {
     /// let provider = DeadpoolConnectionProvider::simple("news.example.com", 119)?;
     /// # Ok::<(), anyhow::Error>(())
     /// ```
+    ///
+    /// # Errors
+    /// Returns any validation or pool-construction error from the builder.
     pub fn simple(host: impl Into<String>, port: u16) -> Result<Self> {
         Self::builder(host, port).build()
     }
@@ -217,6 +220,9 @@ impl DeadpoolConnectionProvider {
     /// )?;
     /// # Ok::<(), anyhow::Error>(())
     /// ```
+    ///
+    /// # Errors
+    /// Returns any validation or pool-construction error from the builder.
     pub fn with_auth(
         host: impl Into<String>,
         port: u16,
@@ -242,6 +248,9 @@ impl DeadpoolConnectionProvider {
     /// let provider = DeadpoolConnectionProvider::with_tls("news.example.com", 563)?;
     /// # Ok::<(), anyhow::Error>(())
     /// ```
+    ///
+    /// # Errors
+    /// Returns any TLS initialization, validation, or pool-construction error.
     pub fn with_tls(host: impl Into<String>, port: u16) -> Result<Self> {
         Self::builder(host, port)
             .tls_config(TlsConfig::default())
@@ -266,6 +275,9 @@ impl DeadpoolConnectionProvider {
     /// )?;
     /// # Ok::<(), anyhow::Error>(())
     /// ```
+    ///
+    /// # Errors
+    /// Returns any TLS initialization, validation, or pool-construction error.
     pub fn with_tls_auth(
         host: impl Into<String>,
         port: u16,
@@ -283,6 +295,10 @@ impl DeadpoolConnectionProvider {
     ///
     /// For TLS support, use `new_with_tls()` or the builder API.
     #[must_use]
+    ///
+    /// # Panics
+    /// Panics only if plain `TcpManager` construction unexpectedly becomes
+    /// fallible or deadpool rejects the requested pool size.
     pub fn new(
         host: String,
         port: u16,
@@ -310,6 +326,9 @@ impl DeadpoolConnectionProvider {
     }
 
     /// Create a new connection provider with TLS support
+    ///
+    /// # Errors
+    /// Returns any TLS initialization or provider-construction error.
     pub fn new_with_tls(
         host: String,
         port: u16,
@@ -354,6 +373,13 @@ impl DeadpoolConnectionProvider {
     /// Create a connection provider from a server configuration
     ///
     /// This avoids unnecessary cloning of individual fields.
+    ///
+    /// # Errors
+    /// Returns any TLS initialization or manager-construction error implied by
+    /// the server configuration.
+    ///
+    /// # Panics
+    /// Panics only if deadpool rejects the validated pool size.
     pub fn from_server_config(server: &crate::config::Server) -> Result<Self> {
         let tls_builder = TlsConfig::builder()
             .enabled(server.use_tls)
@@ -391,28 +417,29 @@ impl DeadpoolConnectionProvider {
 
         // Create metrics and shutdown channel if keepalive is enabled
         let metrics = Arc::new(HealthCheckMetrics::new());
-        let shutdown_tx = if let Some(interval) = keepalive_interval {
-            let (tx, rx) = broadcast::channel(1);
+        let shutdown_tx = keepalive_interval.map_or_else(
+            || None,
+            |interval| {
+                let (tx, rx) = broadcast::channel(1);
 
-            // Spawn background health check task
-            let pool_clone = pool.clone();
-            let name_clone = server.name.to_string();
-            let metrics_clone = metrics.clone();
-            tokio::spawn(async move {
-                Self::run_periodic_health_checks(
-                    pool_clone,
-                    name_clone,
-                    interval,
-                    rx,
-                    metrics_clone,
-                )
-                .await;
-            });
+                // Spawn background health check task
+                let pool_clone = pool.clone();
+                let name_clone = server.name.to_string();
+                let metrics_clone = metrics.clone();
+                tokio::spawn(async move {
+                    Self::run_periodic_health_checks(
+                        pool_clone,
+                        name_clone,
+                        interval,
+                        rx,
+                        metrics_clone,
+                    )
+                    .await;
+                });
 
-            Some(tx)
-        } else {
-            None
-        };
+                Some(tx)
+            },
+        );
 
         Ok(Self {
             pool,
@@ -426,6 +453,10 @@ impl DeadpoolConnectionProvider {
     }
 
     /// Get a connection from the pool (automatically returned when dropped)
+    ///
+    /// # Errors
+    /// Returns [`crate::connection_error::ConnectionError`] if deadpool cannot
+    /// provide a healthy backend connection.
     pub async fn get_pooled_connection(
         &self,
     ) -> Result<managed::Object<TcpManager>, crate::connection_error::ConnectionError> {
@@ -773,6 +804,7 @@ impl ConnectionProvider for DeadpoolConnectionProvider {
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // These tests compare exact derived failure-rate fixtures.
 mod tests {
     use super::*;
 

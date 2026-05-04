@@ -30,7 +30,8 @@ pub mod buffer {
     /// This is a conservative default; increase via config for higher concurrency
     pub const POOL_COUNT: usize = 50;
 
-    /// Size of each capture buffer (772KB, page-aligned)
+    /// Size of each capture buffer (772KB, page-aligned).
+    ///
     /// Sized to capture typical yEnc articles plus NNTP framing without
     /// reallocation. The extra 4KB avoids needless growth when payloads are
     /// near 768KB and only exceed it by status-line/terminator overhead.
@@ -126,7 +127,7 @@ pub mod timeout {
     pub const BACKEND_READ: Duration = Duration::from_secs(30);
 
     /// Timeout for executing a command on backend
-    pub const COMMAND_EXECUTION: Duration = Duration::from_secs(60);
+    pub const COMMAND_EXECUTION: Duration = Duration::from_mins(1);
 
     /// Connection timeout for backend connections
     pub const CONNECTION: Duration = Duration::from_secs(10);
@@ -137,11 +138,11 @@ pub mod timeout {
     pub const PRECHECK_QUERY: Duration = Duration::from_secs(2);
 
     /// Timeout for closing the cache during graceful shutdown
-    /// foyer's close() can hang indefinitely if the runtime is winding down
+    /// foyer's `close()` can hang indefinitely if the runtime is winding down
     pub const CACHE_CLOSE: Duration = Duration::from_secs(3);
 
     /// Timeout for sending QUIT to an idle backend connection during shutdown
-    /// Half-closed connections can block write_all indefinitely without this
+    /// Half-closed connections can block `write_all` indefinitely without this
     pub const SHUTDOWN_QUIT_WRITE: Duration = Duration::from_millis(500);
 
     /// Timeout for acquiring an idle connection from the pool during shutdown

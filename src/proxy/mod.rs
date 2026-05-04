@@ -29,7 +29,7 @@ use crate::router;
 
 #[derive(Debug, Clone)]
 pub struct NntpProxy {
-    pub(super) servers: Arc<Vec<Server>>,
+    pub(super) servers: Arc<[Server]>,
     /// Backend selector for round-robin load balancing
     pub(super) router: Arc<router::BackendSelector>,
     /// Connection providers per server - easily swappable implementation
@@ -77,6 +77,10 @@ impl NntpProxy {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// # Errors
+    /// Returns any configuration, pool-construction, cache-initialization, or
+    /// backend preflight error encountered while building the proxy.
     pub async fn new(config: crate::config::Config, routing_mode: RoutingMode) -> Result<Self> {
         NntpProxyBuilder::new(config)
             .with_routing_mode(routing_mode)
@@ -100,6 +104,10 @@ impl NntpProxy {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// # Errors
+    /// Returns any configuration or pool-construction error encountered while
+    /// building the memory-only proxy.
     pub fn new_sync(config: crate::config::Config, routing_mode: RoutingMode) -> Result<Self> {
         NntpProxyBuilder::new(config)
             .with_routing_mode(routing_mode)
@@ -131,6 +139,10 @@ impl NntpProxy {
 
     /// Prewarm all connection pools before accepting clients
     /// Creates all connections concurrently and returns when ready
+    ///
+    /// # Errors
+    /// Returns any connection-establishment or backend-authentication error
+    /// encountered while prewarming the backend pools.
     pub async fn prewarm_connections(&self) -> Result<()> {
         prewarm_pools(&self.connection_providers, &self.servers).await
     }
@@ -280,8 +292,8 @@ pub mod tests {
     }
 
     #[test]
-    fn test_backward_compatibility_new() {
-        // Ensure NntpProxy::new_sync() still works (it uses builder internally)
+    fn test_new_sync_constructs_proxy() {
+        // Ensure NntpProxy::new_sync() constructs through the builder path.
         let config = create_test_config();
         let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful)
             .expect("Failed to create proxy with new_sync()");

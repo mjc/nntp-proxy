@@ -42,7 +42,7 @@ pub const MAX_CONNECTION_SALVAGE_MS: u64 = 1000;
 /// const DRAIN_TIMEOUT_MS: u64 = 200;
 /// const _: () = assert_no_timeout_loop(MAX_DRAIN_ITERATIONS, DRAIN_TIMEOUT_MS);
 /// ```
-#[allow(dead_code)]
+#[allow(dead_code)] // Called from a const assertion; rustc still reports the helper as unused.
 const fn assert_no_timeout_loop(max_iterations: usize, timeout_per_iteration_ms: u64) {
     // If you see this compile error, you're trying to add a timeout loop
     // that could hold connections for too long. Use DATE health check instead.

@@ -53,8 +53,8 @@ mod tests {
     fn test_timeout_types_available() {
         use std::time::Duration;
         let _ = ConnectionTimeout::new(Duration::from_secs(30));
-        let _ = BackendReadTimeout::new(Duration::from_secs(60));
-        let _ = CommandExecutionTimeout::new(Duration::from_secs(120));
+        let _ = BackendReadTimeout::new(Duration::from_mins(1));
+        let _ = CommandExecutionTimeout::new(Duration::from_mins(2));
         let _ = HealthCheckTimeout::new(Duration::from_secs(10));
     }
 

@@ -2,7 +2,6 @@
 //!
 //! Now that we use the yenc crate, these benchmarks just verify
 //! we're getting expected performance from it.
-#![allow(clippy::cast_possible_truncation)]
 
 use divan::{Bencher, black_box};
 
@@ -15,7 +14,7 @@ fn main() {
 fn generate_yenc_data(length: usize) -> Vec<u8> {
     (0..length)
         .map(|i| {
-            let byte = (i % 256) as u8;
+            let byte = u8::try_from(i % 256).expect("modulo 256 always fits in u8");
             // yenc encoding: (original + 42) % 256
             byte.wrapping_add(42)
         })
@@ -29,10 +28,10 @@ fn generate_yenc_with_escapes(length: usize, escape_freq: usize) -> Vec<u8> {
         if i % escape_freq == 0 {
             // Escaped character
             data.push(b'=');
-            let byte = (i % 256) as u8;
+            let byte = u8::try_from(i % 256).expect("modulo 256 always fits in u8");
             data.push(byte.wrapping_add(64));
         } else {
-            let byte = (i % 256) as u8;
+            let byte = u8::try_from(i % 256).expect("modulo 256 always fits in u8");
             data.push(byte.wrapping_add(42));
         }
     }

@@ -25,19 +25,18 @@
 //!     ServerName::try_new("server1".to_string()).unwrap(),
 //!     provider,
 //!     0, // tier (lower = higher priority)
-//!     None, // pipeline_queue
 //! );
 //!
 //! // Route a command
 //! let client_id = ClientId::new();
-//! let backend_id = selector.route_command(client_id, "LIST").unwrap();
+//! let backend_id = selector.route(client_id).unwrap();
 //!
 //! // After command completes
 //! selector.complete_command(backend_id);
 //! ```
 
 mod backend_info;
-pub mod backend_queue;
+pub(crate) mod backend_queue;
 mod strategies;
 
 use anyhow::Result;
@@ -46,7 +45,7 @@ use std::cmp::Ordering as CmpOrdering;
 use std::sync::Arc;
 use tracing::{debug, info};
 
-pub use backend_queue::BackendQueue;
+pub(crate) use backend_queue::BackendQueue;
 
 use crate::config::BackendSelectionStrategy;
 use crate::pool::DeadpoolConnectionProvider;
@@ -146,6 +145,10 @@ impl TrafficShare {
     #[must_use]
     pub fn from_weight(max_connections: usize, total_weight: TotalWeight) -> Self {
         if total_weight.get() > 0 {
+            // Traffic share is a display percentage; routing uses the original
+            // integer weights, so precision loss here cannot affect selection.
+            #[allow(clippy::cast_precision_loss)] // This is a display-only capacity percentage.
+            // Display-only percentage; backend weights stay in integer form.
             Self::new((max_connections as f64 / total_weight.get() as f64) * 100.0)
         } else {
             Self::new(0.0)
@@ -230,7 +233,7 @@ impl Drop for CommandGuard {
 /// );
 ///
 /// // Route commands
-/// let backend = selector.route_command(ClientId::new(), "LIST")?;
+/// let backend = selector.route(ClientId::new())?;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 #[derive(Debug)]
@@ -301,8 +304,18 @@ impl BackendSelector {
     /// * `name` - Human-readable name for logging
     /// * `provider` - Connection pool provider
     /// * `tier` - Server tier (lower = higher priority, 0 is highest)
-    /// * `pipeline_queue` - Optional pipeline queue for request multiplexing
     pub fn add_backend(
+        &mut self,
+        backend_id: BackendId,
+        name: ServerName,
+        provider: DeadpoolConnectionProvider,
+        tier: u8,
+    ) {
+        self.add_backend_with_queue(backend_id, name, provider, tier, None);
+    }
+
+    /// Add a backend server with an optional internal pipeline queue.
+    pub(crate) fn add_backend_with_queue(
         &mut self,
         backend_id: BackendId,
         name: ServerName,
@@ -476,17 +489,22 @@ impl BackendSelector {
         }
     }
 
-    /// Select a backend for the given command using round-robin
-    /// Returns the backend ID to use for this command
-    pub fn route_command(&self, client_id: ClientId, command: &str) -> Result<BackendId> {
-        self.route_command_with_availability(client_id, command, None)
+    /// Select a backend for a client request.
+    ///
+    /// # Errors
+    /// Returns an error when no backend is currently eligible for routing.
+    pub fn route(&self, client_id: ClientId) -> Result<BackendId> {
+        self.route_with_availability(client_id, None)
     }
 
-    /// Select a backend for the given command, optionally filtering by availability
-    pub fn route_command_with_availability(
+    /// Select a backend for a client request, optionally filtering by availability.
+    ///
+    /// # Errors
+    /// Returns an error when no backend remains eligible after applying the
+    /// optional availability filter.
+    pub fn route_with_availability(
         &self,
         _client_id: ClientId,
-        _command: &str,
         availability: Option<&crate::cache::ArticleAvailability>,
     ) -> Result<BackendId> {
         let backend = self.select_backend(availability).ok_or_else(|| {
@@ -515,7 +533,7 @@ impl BackendSelector {
     }
 
     /// Manually increment pending count for a specific backend
-    /// Used when directly selecting a backend instead of using `route_command`
+    /// Used when directly selecting a backend instead of using `route`.
     pub fn mark_backend_pending(&self, backend_id: BackendId) {
         if let Some(backend) = self.find_backend(backend_id) {
             backend.pending_count.increment();
@@ -530,7 +548,7 @@ impl BackendSelector {
 
     /// Get the pipeline queue for a backend (if pipelining is enabled)
     #[must_use]
-    pub fn get_backend_queue(&self, backend_id: BackendId) -> Option<&Arc<BackendQueue>> {
+    pub(crate) fn get_backend_queue(&self, backend_id: BackendId) -> Option<&Arc<BackendQueue>> {
         self.find_backend(backend_id)
             .and_then(|b| b.pipeline_queue.as_ref())
     }
@@ -550,7 +568,7 @@ impl BackendSelector {
         match &self.strategy {
             SelectionStrategy::WeightedRoundRobin(wrr) => TotalWeight::new(wrr.total_weight()),
             SelectionStrategy::LeastLoaded(_) => {
-                // For least-loaded, return sum of all max_connections for compatibility
+                // Least-loaded does not use weights; expose aggregate capacity.
                 TotalWeight::new(self.backends.iter().map(|b| b.provider.max_size()).sum())
             }
         }
@@ -570,7 +588,7 @@ impl BackendSelector {
     /// Returns true if acquisition succeeded (within max_connections-1 limit)
     /// Returns false if all stateful slots are taken (need to keep 1 for PCR)
     pub fn try_acquire_stateful(&self, backend_id: BackendId) -> bool {
-        if let Some(backend) = self.find_backend(backend_id) {
+        self.find_backend(backend_id).is_some_and(|backend| {
             // Get max connections from the provider's pool
             let max_connections = backend.provider.max_size();
 
@@ -599,9 +617,7 @@ impl BackendSelector {
             }
 
             acquired
-        } else {
-            false
-        }
+        })
     }
 
     /// Release a stateful connection slot
@@ -683,7 +699,6 @@ mod tests {
             ServerName::try_new("test-server".to_string()).unwrap(),
             provider,
             0,
-            None,
         );
         (Arc::new(selector), backend_id)
     }
@@ -692,7 +707,7 @@ mod tests {
     fn command_guard_decrements_on_drop() {
         let (router, backend_id) = make_router_with_backend();
 
-        // Simulate route_command incrementing the pending count
+        // Simulate route incrementing the pending count.
         router.mark_backend_pending(backend_id);
         assert_eq!(router.backend_load(backend_id).unwrap().get(), 1);
 

@@ -1,14 +1,15 @@
 //! Comprehensive tests for metrics module
-// assert_eq! on f64 rate values is correct here — comparing computed rates that should be exact.
-#![allow(clippy::float_cmp)]
 
 use nntp_proxy::metrics::*;
 use nntp_proxy::types::{
     ArticleBytesTotal, BackendId, BackendToClientBytes, BytesPerSecondRate, BytesReceived,
     BytesSent, ClientToBackendBytes, TimingMeasurementCount, TotalConnections,
 };
-use std::sync::Arc;
 use std::time::Duration;
+
+fn assert_f64_eq(actual: f64, expected: f64) {
+    assert_eq!(actual.to_bits(), expected.to_bits());
+}
 
 #[test]
 fn test_backend_stats_default() {
@@ -46,7 +47,10 @@ fn test_backend_stats_timing_averages() {
     };
 
     // 10000 / 5 / 1000 = 2.0ms
-    assert_eq!(stats.average_ttfb_ms(), Some(2.0));
+    assert_eq!(
+        stats.average_ttfb_ms().map(f64::to_bits),
+        Some(2.0f64.to_bits())
+    );
 
     // 500 / 5 / 1000 = 0.1ms
     assert!((stats.average_send_ms().unwrap() - 0.1).abs() < 1e-10);
@@ -76,17 +80,17 @@ fn test_backend_stats_error_rate() {
         ..Default::default()
     };
 
-    assert_eq!(stats.error_rate_percent(), 6.0);
+    assert_f64_eq(stats.error_rate_percent(), 6.0);
     assert!(stats.has_high_error_rate());
 
     // Low error rate
     stats.errors = ErrorCount::new(2);
-    assert_eq!(stats.error_rate_percent(), 2.0);
+    assert_f64_eq(stats.error_rate_percent(), 2.0);
     assert!(!stats.has_high_error_rate());
 
     // Zero commands
     stats.total_commands = CommandCount::new(0);
-    assert_eq!(stats.error_rate_percent(), 0.0);
+    assert_f64_eq(stats.error_rate_percent(), 0.0);
 }
 
 #[test]
@@ -97,7 +101,7 @@ fn test_metrics_snapshot_total_bytes() {
         stateful_sessions: 2,
         client_to_backend_bytes: ClientToBackendBytes::new(1000),
         backend_to_client_bytes: BackendToClientBytes::new(5000),
-        uptime: Duration::from_secs(60),
+        uptime: Duration::from_mins(1),
         ..Default::default()
     };
 
@@ -117,14 +121,14 @@ fn test_metrics_snapshot_throughput() {
     };
 
     // 10000 bytes / 10 seconds = 1000 bytes/sec
-    assert_eq!(snapshot.throughput_bps(), 1000.0);
+    assert_f64_eq(snapshot.throughput_bps(), 1000.0);
 
     // Zero uptime
     let snapshot_zero = MetricsSnapshot {
         uptime: Duration::from_secs(0),
         ..snapshot
     };
-    assert_eq!(snapshot_zero.throughput_bps(), 0.0);
+    assert_f64_eq(snapshot_zero.throughput_bps(), 0.0);
 }
 
 #[test]
@@ -182,7 +186,7 @@ fn test_backend_stats_with_realistic_values() {
     stats.health_status = BackendHealthStatus::Healthy;
 
     // Verify calculations
-    assert_eq!(stats.error_rate_percent(), 1.0);
+    assert_f64_eq(stats.error_rate_percent(), 1.0);
     assert!(!stats.has_high_error_rate());
     assert_eq!(stats.average_article_size(), Some(20000)); // 1MB / 50
     assert!((stats.average_ttfb_ms().unwrap() - 0.5).abs() < 1e-10); // 500000 / 1000 / 1000
@@ -235,7 +239,7 @@ fn test_metrics_snapshot_with_multiple_backends() {
         client_to_backend_bytes: ClientToBackendBytes::new(1500),
         backend_to_client_bytes: BackendToClientBytes::new(15000),
         uptime: Duration::from_secs(100),
-        backend_stats: Arc::new(vec![stats1, stats2]),
+        backend_stats: vec![stats1, stats2].into(),
         ..Default::default()
     };
 
@@ -243,5 +247,5 @@ fn test_metrics_snapshot_with_multiple_backends() {
     assert_eq!(snapshot.backend_stats[0].backend_id, BackendId::from(0));
     assert_eq!(snapshot.backend_stats[1].backend_id, BackendId::from(1));
     assert_eq!(snapshot.total_bytes(), 16500);
-    assert_eq!(snapshot.throughput_bps(), 165.0);
+    assert_f64_eq(snapshot.throughput_bps(), 165.0);
 }

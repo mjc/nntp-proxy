@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 /// Default maximum connections per server
+///
+/// # Panics
+/// Panics only if the hard-coded non-zero default becomes invalid.
 #[inline]
 #[must_use]
 pub fn max_connections() -> MaxConnections {
@@ -29,6 +32,9 @@ pub const fn health_check_timeout() -> Duration {
 }
 
 /// Default unhealthy threshold
+///
+/// # Panics
+/// Panics only if the hard-coded non-zero default becomes invalid.
 #[inline]
 #[must_use]
 pub fn unhealthy_threshold() -> MaxErrors {
@@ -36,6 +42,9 @@ pub fn unhealthy_threshold() -> MaxErrors {
 }
 
 /// Default cache max capacity in bytes (memory tier)
+///
+/// # Panics
+/// Panics only if the hard-coded non-zero default becomes invalid.
 #[inline]
 #[must_use]
 pub fn cache_max_capacity() -> CacheCapacity {
@@ -47,7 +56,7 @@ pub fn cache_max_capacity() -> CacheCapacity {
 #[inline]
 #[must_use]
 pub const fn cache_ttl() -> Duration {
-    Duration::from_secs(3600)
+    Duration::from_hours(1)
 }
 
 /// Default for caching article bodies (true = full caching)
@@ -95,6 +104,9 @@ pub fn disk_cache_path() -> PathBuf {
 }
 
 /// Default disk cache capacity (10 GB)
+///
+/// # Panics
+/// Panics only if the hard-coded non-zero default becomes invalid.
 #[inline]
 #[must_use]
 pub fn disk_cache_capacity() -> CacheCapacity {
@@ -121,7 +133,7 @@ pub const fn disk_cache_shards() -> usize {
 /// Prevents stale connections from accumulating during overnight idle periods.
 #[inline]
 pub const fn backend_idle_timeout() -> Duration {
-    Duration::from_secs(10 * 60)
+    Duration::from_mins(10)
 }
 
 /// Default for backend pipelining (enabled)
@@ -150,8 +162,10 @@ pub const fn replacement_cooldown() -> Duration {
 
 /// Default connection replacement cooldown option (Some(30 seconds))
 #[inline]
-#[allow(clippy::unnecessary_wraps)] // Option required for use with .or_else(defaults::replacement_cooldown_option)
+#[allow(clippy::unnecessary_wraps)] // Config defaults model an optional field even when the default is always present.
 pub const fn replacement_cooldown_option() -> Option<Duration> {
+    // This mirrors optional config fields and keeps the default plumbing
+    // uniform even though the default itself is always present.
     Some(replacement_cooldown())
 }
 

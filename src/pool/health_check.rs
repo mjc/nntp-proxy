@@ -17,6 +17,13 @@ use crate::constants::pool::{
 };
 use crate::stream::ConnectionStream;
 
+#[allow(clippy::cast_precision_loss)] // Failure rates are approximate monitoring values derived from exact counters.
+const fn count_as_f64_for_rate(value: u64) -> f64 {
+    // Health-check failure rate is an approximate monitoring value. The exact
+    // checked/failed counters remain stored as u64.
+    value as f64
+}
+
 /// Errors that can occur during connection health checks
 #[derive(Debug, Error)]
 pub enum HealthCheckError {
@@ -92,7 +99,7 @@ impl HealthCheckMetrics {
             0.0
         } else {
             let failed = self.connections_failed.load(Ordering::Relaxed);
-            failed as f64 / checked as f64
+            count_as_f64_for_rate(failed) / count_as_f64_for_rate(checked)
         }
     }
 
@@ -124,6 +131,10 @@ impl HealthCheckMetrics {
 /// - `Err(WouldBlock)` means no data available - this is **expected** for an idle,
 ///   healthy connection, as there should be no data to read between commands
 /// - Other errors indicate TCP-level problems
+///
+/// # Errors
+/// Returns a recycle error when the connection is closed, contains leftover data,
+/// or the underlying TCP socket reports a health-check failure.
 pub fn check_tcp_alive(
     conn: &mut ConnectionStream,
 ) -> managed::RecycleResult<crate::connection_error::ConnectionError> {
@@ -173,6 +184,10 @@ pub(crate) fn validate_date_response(response: &str) -> Result<(), HealthCheckEr
 /// Sends DATE command and verifies response to ensure the NNTP connection
 /// is still functional. This detects server-side timeouts that TCP keepalive
 /// might miss.
+///
+/// # Errors
+/// Returns `HealthCheckError` when writing `DATE` fails, the response times out,
+/// the backend closes the connection, or the reply is not a valid `111` response.
 pub async fn check_date_response(conn: &mut ConnectionStream) -> Result<(), HealthCheckError> {
     // Wrap entire health check in single timeout
     let health_check = async {
@@ -204,6 +219,7 @@ pub async fn check_date_response(conn: &mut ConnectionStream) -> Result<(), Heal
 }
 
 #[cfg(test)]
+#[allow(clippy::float_cmp)] // These tests assert exact health-check failure rates from fixed counters.
 mod tests {
     use super::*;
 

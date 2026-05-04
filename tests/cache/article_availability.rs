@@ -1,310 +1,178 @@
-//! Comprehensive tests for `ArticleAvailability` bitset semantics and retry logic
-//!
-//! Tests cover:
-//! - Bitset semantics (track missing backends, assume all have article by default)
-//! - `should_try()` behavior
-//! - `all_missing()` edge cases
-//! - Integration with 430 retry loop
-//! - Multi-backend exhaustion scenarios
+//! Tests for `ArticleAvailability` bitset semantics and retry logic.
 
 use nntp_proxy::cache::ArticleAvailability;
 use nntp_proxy::router::BackendCount;
 use nntp_proxy::types::BackendId;
 
-#[test]
-fn test_fresh_availability_assumes_all_backends_have_article() {
-    let avail = ArticleAvailability::new();
+fn backend(index: usize) -> BackendId {
+    BackendId::from_index(index)
+}
 
-    // Fresh availability should allow trying all backends
-    for i in 0..8 {
-        assert!(
-            avail.should_try(BackendId::from_index(i)),
-            "Fresh availability should allow trying backend {i}"
+fn count(count: usize) -> BackendCount {
+    BackendCount::new(count)
+}
+
+fn availability_with_missing(backends: &[usize]) -> ArticleAvailability {
+    let mut avail = ArticleAvailability::new();
+    for backend_index in backends {
+        avail.record_missing(backend(*backend_index));
+    }
+    avail
+}
+
+fn assert_should_try(avail: ArticleAvailability, cases: &[(usize, bool)]) {
+    for (backend_index, should_try) in cases {
+        assert_eq!(
+            avail.should_try(backend(*backend_index)),
+            *should_try,
+            "backend {backend_index}"
         );
     }
 }
 
 #[test]
-fn test_record_missing_prevents_retry() {
-    let mut avail = ArticleAvailability::new();
-    let backend = BackendId::from_index(2);
-
-    // Initially should try
-    assert!(avail.should_try(backend));
-
-    // Record as missing (430 response)
-    avail.record_missing(backend);
-
-    // Should not try again
-    assert!(!avail.should_try(backend));
-}
-
-#[test]
-fn test_all_exhausted_with_single_backend() {
-    let mut avail = ArticleAvailability::new();
-
-    // Not all exhausted initially
-    assert!(!avail.all_exhausted(BackendCount::new(1)));
-
-    // Record the only backend as missing
-    avail.record_missing(BackendId::from_index(0));
-
-    // Now all backends are exhausted
-    assert!(avail.all_exhausted(BackendCount::new(1)));
-}
-
-#[test]
-fn test_all_exhausted_with_two_backends() {
-    let mut avail = ArticleAvailability::new();
-
-    assert!(!avail.all_exhausted(BackendCount::new(2)));
-
-    // Record first backend as missing
-    avail.record_missing(BackendId::from_index(0));
-    assert!(!avail.all_exhausted(BackendCount::new(2))); // Still have backend 1
-
-    // Record second backend as missing
-    avail.record_missing(BackendId::from_index(1));
-    assert!(avail.all_exhausted(BackendCount::new(2))); // Now all exhausted
-}
-
-#[test]
-fn test_all_exhausted_with_eight_backends() {
-    let mut avail = ArticleAvailability::new();
-
-    // Record 7 backends as missing
-    for i in 0..7 {
-        avail.record_missing(BackendId::from_index(i));
-        assert!(
-            !avail.all_exhausted(BackendCount::new(8)),
-            "Should not be all exhausted with backend 7 untried"
-        );
-    }
-
-    // Record the last backend
-    avail.record_missing(BackendId::from_index(7));
-    assert!(
-        avail.all_exhausted(BackendCount::new(8)),
-        "All 8 backends should be exhausted now"
+fn test_should_try_tracks_missing_backends() {
+    let fresh = ArticleAvailability::new();
+    assert_should_try(
+        fresh,
+        &[
+            (0, true),
+            (1, true),
+            (2, true),
+            (3, true),
+            (4, true),
+            (5, true),
+            (6, true),
+            (7, true),
+        ],
     );
+
+    let avail = availability_with_missing(&[0, 2, 4]);
+    assert_should_try(
+        avail,
+        &[
+            (0, false),
+            (1, true),
+            (2, false),
+            (3, true),
+            (4, false),
+            (5, true),
+        ],
+    );
+    assert!(!avail.all_exhausted(count(6)));
 }
 
 #[test]
-fn test_partial_backend_subset() {
+fn test_record_missing_is_idempotent_and_encoded_as_bitset() {
     let mut avail = ArticleAvailability::new();
-
-    // Record backends 0, 2, 4 as missing
-    avail.record_missing(BackendId::from_index(0));
-    avail.record_missing(BackendId::from_index(2));
-    avail.record_missing(BackendId::from_index(4));
-
-    // Check should_try for each backend
-    assert!(!avail.should_try(BackendId::from_index(0))); // missing
-    assert!(avail.should_try(BackendId::from_index(1))); // untried
-    assert!(!avail.should_try(BackendId::from_index(2))); // missing
-    assert!(avail.should_try(BackendId::from_index(3))); // untried
-    assert!(!avail.should_try(BackendId::from_index(4))); // missing
-    assert!(avail.should_try(BackendId::from_index(5))); // untried
-
-    // Not all exhausted (only tested 3 of 6 backends)
-    assert!(!avail.all_exhausted(BackendCount::new(6)));
-}
-
-#[test]
-fn test_idempotent_record_missing() {
-    let mut avail = ArticleAvailability::new();
-    let backend = BackendId::from_index(3);
-
-    // Record as missing multiple times
-    avail.record_missing(backend);
-    avail.record_missing(backend);
-    avail.record_missing(backend);
-
-    // Should still just be recorded once
-    assert!(!avail.should_try(backend));
-
-    // Bitset should still be correct
-    assert_eq!(avail.as_u8(), 0b0000_1000);
-}
-
-#[test]
-fn test_as_u8_bitset_encoding() {
-    let mut avail = ArticleAvailability::new();
-
-    // Initially all zeros (no backends missing)
     assert_eq!(avail.as_u8(), 0b0000_0000);
 
-    // Record backend 0 as missing
-    avail.record_missing(BackendId::from_index(0));
+    avail.record_missing(backend(0));
     assert_eq!(avail.as_u8(), 0b0000_0001);
 
-    // Record backend 1 as missing
-    avail.record_missing(BackendId::from_index(1));
+    avail.record_missing(backend(1));
     assert_eq!(avail.as_u8(), 0b0000_0011);
 
-    // Record backend 7 as missing
-    avail.record_missing(BackendId::from_index(7));
-    assert_eq!(avail.as_u8(), 0b1000_0011);
+    avail.record_missing(backend(3));
+    avail.record_missing(backend(3));
+    assert_eq!(avail.as_u8(), 0b0000_1011);
+    assert!(!avail.should_try(backend(3)));
+
+    avail.record_missing(backend(7));
+    assert_eq!(avail.as_u8(), 0b1000_1011);
 }
 
 #[test]
-fn test_retry_loop_simulation_two_backends() {
-    let mut avail = ArticleAvailability::new();
-    let backend_count = 2;
+fn test_all_exhausted_for_backend_counts() {
+    assert!(ArticleAvailability::new().all_exhausted(count(0)));
 
-    // Simulate retry loop
-    let mut attempts = Vec::new();
+    let mut one = ArticleAvailability::new();
+    assert!(!one.all_exhausted(count(1)));
+    one.record_missing(backend(0));
+    assert!(one.all_exhausted(count(1)));
 
-    // Attempt 1: Try backend 0, gets 430
-    let b0 = BackendId::from_index(0);
-    assert!(avail.should_try(b0));
-    attempts.push(b0);
-    avail.record_missing(b0);
-    assert!(!avail.all_exhausted(BackendCount::new(backend_count)));
+    let mut two = ArticleAvailability::new();
+    assert!(!two.all_exhausted(count(2)));
+    two.record_missing(backend(0));
+    assert!(!two.all_exhausted(count(2)));
+    two.record_missing(backend(1));
+    assert!(two.all_exhausted(count(2)));
 
-    // Attempt 2: Try backend 1, gets 430
-    let b1 = BackendId::from_index(1);
-    assert!(avail.should_try(b1));
-    attempts.push(b1);
-    avail.record_missing(b1);
-
-    // Now all backends exhausted
-    assert!(avail.all_exhausted(BackendCount::new(backend_count)));
-
-    // Verify we tried both backends
-    assert_eq!(attempts.len(), 2);
-    assert_eq!(attempts[0], BackendId::from_index(0));
-    assert_eq!(attempts[1], BackendId::from_index(1));
-}
-
-#[test]
-fn test_retry_loop_simulation_finds_on_third() {
-    let mut avail = ArticleAvailability::new();
-    let mut attempts = Vec::new();
-
-    // Backend 0: 430
-    let b0 = BackendId::from_index(0);
-    assert!(avail.should_try(b0));
-    attempts.push(b0);
-    avail.record_missing(b0);
-
-    // Backend 1: 430
-    let b1 = BackendId::from_index(1);
-    assert!(avail.should_try(b1));
-    attempts.push(b1);
-    avail.record_missing(b1);
-
-    // Backend 2: SUCCESS (220)
-    let b2 = BackendId::from_index(2);
-    assert!(avail.should_try(b2));
-    attempts.push(b2);
-    // Don't record missing - we got the article
-
-    // Verify state
-    assert!(!avail.all_exhausted(BackendCount::new(4)));
-    assert_eq!(attempts.len(), 3);
-
-    // Verify backends 0 and 1 won't be tried again
-    assert!(!avail.should_try(BackendId::from_index(0)));
-    assert!(!avail.should_try(BackendId::from_index(1)));
-    assert!(avail.should_try(BackendId::from_index(2)));
-    assert!(avail.should_try(BackendId::from_index(3)));
-}
-
-#[test]
-fn test_round_robin_skip_pattern() {
-    let mut avail = ArticleAvailability::new();
-
-    // Record backends 1 and 3 as missing
-    avail.record_missing(BackendId::from_index(1));
-    avail.record_missing(BackendId::from_index(3));
-
-    // Simulate round-robin routing that needs to skip
-    let sequence = vec![
-        BackendId::from_index(0), // router gives 0 - should try
-        BackendId::from_index(1), // router gives 1 - skip (missing)
-        BackendId::from_index(2), // router gives 2 - should try
-        BackendId::from_index(3), // router gives 3 - skip (missing)
-        BackendId::from_index(0), // router gives 0 again - should try
-    ];
-
-    let mut tried = Vec::new();
-    for backend in sequence {
-        if avail.should_try(backend) {
-            tried.push(backend);
-        }
+    let mut eight = ArticleAvailability::new();
+    for backend_index in 0..7 {
+        eight.record_missing(backend(backend_index));
+        assert!(!eight.all_exhausted(count(8)));
     }
-
-    // Should have only tried backends 0 and 2 (skipped 1 and 3)
-    assert_eq!(tried.len(), 3); // 0, 2, 0
-    assert_eq!(tried[0], BackendId::from_index(0));
-    assert_eq!(tried[1], BackendId::from_index(2));
-    assert_eq!(tried[2], BackendId::from_index(0));
+    eight.record_missing(backend(7));
+    assert!(eight.all_exhausted(count(8)));
 }
 
 #[test]
-fn test_all_exhausted_edge_case_zero_backends() {
-    let avail = ArticleAvailability::new();
+fn test_retry_loop_simulations() {
+    let mut exhausted = ArticleAvailability::new();
+    let mut attempts = Vec::new();
+    for backend_index in [0, 1] {
+        let backend = backend(backend_index);
+        assert!(exhausted.should_try(backend));
+        attempts.push(backend);
+        exhausted.record_missing(backend);
+    }
+    assert!(exhausted.all_exhausted(count(2)));
+    assert_eq!(attempts, vec![backend(0), backend(1)]);
 
-    // Edge case: zero backends means all are exhausted
-    assert!(avail.all_exhausted(BackendCount::new(0)));
+    let mut found = ArticleAvailability::new();
+    for backend_index in [0, 1] {
+        let backend = backend(backend_index);
+        assert!(found.should_try(backend));
+        found.record_missing(backend);
+    }
+    assert!(found.should_try(backend(2)));
+    assert!(!found.all_exhausted(count(4)));
+    assert_should_try(found, &[(0, false), (1, false), (2, true), (3, true)]);
+}
+
+#[test]
+fn test_round_robin_and_cached_availability_skip_missing_backends() {
+    let avail = availability_with_missing(&[1, 3, 5]);
+
+    let tried = [0, 1, 2, 3, 0]
+        .into_iter()
+        .map(backend)
+        .filter(|&backend| avail.should_try(backend))
+        .collect::<Vec<_>>();
+    assert_eq!(tried, vec![backend(0), backend(2), backend(0)]);
+
+    assert_should_try(
+        avail,
+        &[
+            (0, true),
+            (1, false),
+            (2, true),
+            (3, false),
+            (4, true),
+            (5, false),
+        ],
+    );
+    assert_eq!(
+        (0..6)
+            .map(backend)
+            .filter(|&backend| avail.should_try(backend))
+            .collect::<Vec<_>>(),
+        vec![backend(0), backend(2), backend(4)]
+    );
 }
 
 #[test]
 #[cfg(debug_assertions)]
 #[should_panic(expected = "Backend count 9 exceeds MAX_BACKENDS")]
 fn test_all_exhausted_panics_with_nine_backends() {
-    let mut avail = ArticleAvailability::new();
-
-    // Record all 8 backends as missing
-    for i in 0..8 {
-        avail.record_missing(BackendId::from_index(i));
-    }
-
-    // This should panic in debug builds (config validation prevents this)
-    let _ = avail.all_exhausted(BackendCount::new(9));
+    let avail = availability_with_missing(&(0..8).collect::<Vec<_>>());
+    let _ = avail.all_exhausted(count(9));
 }
 
 #[test]
 #[cfg(debug_assertions)]
 #[should_panic(expected = "Backend index 8 exceeds MAX_BACKENDS")]
 fn test_backend_id_out_of_range_panics() {
-    let mut avail = ArticleAvailability::new();
-
-    // Backend 8 is out of range - should panic in debug builds (config validation prevents this)
-    avail.record_missing(BackendId::from_index(8));
-}
-
-#[test]
-fn test_cache_persistence_scenario() {
-    // Simulate: Article cached with availability info from previous request
-    let mut avail = ArticleAvailability::new();
-
-    // Previous request found that backends 1, 3, 5 don't have this article
-    avail.record_missing(BackendId::from_index(1));
-    avail.record_missing(BackendId::from_index(3));
-    avail.record_missing(BackendId::from_index(5));
-
-    // New request comes in - should skip backends 1, 3, 5
-    assert!(avail.should_try(BackendId::from_index(0)));
-    assert!(!avail.should_try(BackendId::from_index(1)));
-    assert!(avail.should_try(BackendId::from_index(2)));
-    assert!(!avail.should_try(BackendId::from_index(3)));
-    assert!(avail.should_try(BackendId::from_index(4)));
-    assert!(!avail.should_try(BackendId::from_index(5)));
-
-    // Optimization: Skip directly to backends that might have it
-    let potentially_available = (0..6)
-        .map(BackendId::from_index)
-        .filter(|&b| avail.should_try(b))
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        potentially_available,
-        vec![
-            BackendId::from_index(0),
-            BackendId::from_index(2),
-            BackendId::from_index(4),
-        ]
-    );
+    let _ = availability_with_missing(&[8]);
 }
