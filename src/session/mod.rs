@@ -180,6 +180,7 @@ pub mod state;
 pub mod streaming;
 
 pub use auth_state::AuthState;
+pub use backend::format_hex_preview;
 pub use core::{ClientSession, ClientSessionBuilder};
 pub use metrics_ext::MetricsRecorder;
 pub use mode_state::{ModeState, SessionMode};

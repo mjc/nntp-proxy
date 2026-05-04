@@ -11,7 +11,7 @@ services:
     environment:
       # Proxy configuration (these match the CLI env vars in src/bin/nntp-proxy.rs)
       NNTP_PROXY_PORT: 8119
-      NNTP_PROXY_ROUTING_MODE: hybrid  # Options: standard, per-command, hybrid
+      NNTP_PROXY_ROUTING_MODE: hybrid  # Options: stateful, per-command, hybrid
       # NNTP_PROXY_THREADS: 4  # Optional: number of worker threads (default: number of CPUs)
       RUST_LOG: info  # Log level: trace, debug, info, warn, error
       

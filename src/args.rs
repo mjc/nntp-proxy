@@ -23,17 +23,23 @@ pub struct CommonArgs {
         short,
         long,
         default_value = "config.toml",
-        env,
+        env = "NNTP_PROXY_CONFIG",
         help_heading = "General"
     )]
     pub config: ConfigPath,
 
     /// Port to listen on (overrides config file)
-    #[arg(short, long, env, value_parser = parse_port, help_heading = "Network")]
+    #[arg(
+        short,
+        long,
+        env = "NNTP_PROXY_PORT",
+        value_parser = parse_port,
+        help_heading = "Network"
+    )]
     pub port: Option<Port>,
 
     /// Host to bind to (overrides config file)
-    #[arg(long, env, help_heading = "Network")]
+    #[arg(long, env = "NNTP_PROXY_HOST", help_heading = "Network")]
     pub host: Option<String>,
 
     /// Routing mode: stateful, per-command, or hybrid
@@ -45,7 +51,7 @@ pub struct CommonArgs {
         short = 'm',
         long = "routing-mode",
         value_enum,
-        env,
+        env = "NNTP_PROXY_ROUTING_MODE",
         help_heading = "Routing"
     )]
     pub routing_mode: Option<RoutingMode>,
@@ -55,7 +61,7 @@ pub struct CommonArgs {
         long = "backend-selection",
         alias = "backend-strategy",
         value_enum,
-        env,
+        env = "NNTP_PROXY_BACKEND_SELECTION",
         help_heading = "Routing"
     )]
     pub backend_selection: Option<BackendSelectionStrategy>,
@@ -64,7 +70,7 @@ pub struct CommonArgs {
     #[arg(
         long = "article-cache-capacity",
         alias = "cache-capacity",
-        env,
+        env = "NNTP_PROXY_ARTICLE_CACHE_CAPACITY",
         help_heading = "Cache"
     )]
     pub article_cache_capacity: Option<CacheCapacity>,
@@ -74,7 +80,7 @@ pub struct CommonArgs {
         long = "article-cache-ttl",
         alias = "cache-ttl",
         alias = "ttl-secs",
-        env,
+        env = "NNTP_PROXY_ARTICLE_CACHE_TTL_SECS",
         help_heading = "Cache"
     )]
     pub article_cache_ttl_secs: Option<u64>,
@@ -84,20 +90,20 @@ pub struct CommonArgs {
         long = "store-article-bodies",
         alias = "cache-articles",
         alias = "store-articles",
-        env,
+        env = "NNTP_PROXY_STORE_ARTICLE_BODIES",
         help_heading = "Cache"
     )]
     pub store_article_bodies: Option<bool>,
 
     /// Number of worker threads (default: 1, use 0 for CPU cores)
-    #[arg(short, long, env, help_heading = "Performance")]
+    #[arg(short, long, env = "NNTP_PROXY_THREADS", help_heading = "Performance")]
     pub threads: Option<ThreadCount>,
 
     /// Enable TCP command pipelining for all backends
     #[arg(
         long = "backend-pipelining",
         alias = "enable-pipelining",
-        env,
+        env = "NNTP_PROXY_BACKEND_PIPELINING",
         help_heading = "Performance"
     )]
     pub backend_pipelining: Option<bool>,
