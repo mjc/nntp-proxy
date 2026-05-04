@@ -51,28 +51,56 @@ pub struct CommonArgs {
     pub routing_mode: Option<RoutingMode>,
 
     /// Backend selection strategy
-    #[arg(long = "backend-selection", value_enum, env, help_heading = "Routing")]
+    #[arg(
+        long = "backend-selection",
+        alias = "backend-strategy",
+        value_enum,
+        env,
+        help_heading = "Routing"
+    )]
     pub backend_selection: Option<BackendSelectionStrategy>,
 
-    /// Memory cache capacity (e.g., "64mb", "1gb")
-    #[arg(long = "cache-capacity", env, help_heading = "Cache")]
-    pub cache_capacity: Option<CacheCapacity>,
+    /// Article cache capacity in memory (e.g., "64mb", "1gb")
+    #[arg(
+        long = "article-cache-capacity",
+        alias = "cache-capacity",
+        env,
+        help_heading = "Cache"
+    )]
+    pub article_cache_capacity: Option<CacheCapacity>,
 
-    /// Cache TTL in seconds
-    #[arg(long = "cache-ttl", env, help_heading = "Cache")]
-    pub cache_ttl: Option<u64>,
+    /// Article cache TTL in seconds
+    #[arg(
+        long = "article-cache-ttl",
+        alias = "cache-ttl",
+        alias = "ttl-secs",
+        env,
+        help_heading = "Cache"
+    )]
+    pub article_cache_ttl_secs: Option<u64>,
 
-    /// Cache full article bodies (true) or availability-only (false)
-    #[arg(long = "cache-articles", env, help_heading = "Cache")]
-    pub cache_articles: Option<bool>,
+    /// Store full article bodies in the article cache (true) or track availability only (false)
+    #[arg(
+        long = "store-article-bodies",
+        alias = "cache-articles",
+        alias = "store-articles",
+        env,
+        help_heading = "Cache"
+    )]
+    pub store_article_bodies: Option<bool>,
 
     /// Number of worker threads (default: 1, use 0 for CPU cores)
     #[arg(short, long, env, help_heading = "Performance")]
     pub threads: Option<ThreadCount>,
 
     /// Enable TCP command pipelining for all backends
-    #[arg(long = "enable-pipelining", env, help_heading = "Performance")]
-    pub enable_pipelining: Option<bool>,
+    #[arg(
+        long = "backend-pipelining",
+        alias = "enable-pipelining",
+        env,
+        help_heading = "Performance"
+    )]
+    pub backend_pipelining: Option<bool>,
 }
 
 impl CommonArgs {
@@ -118,35 +146,35 @@ impl CommonArgs {
     pub fn apply_overrides(&self, config: &mut Config) {
         // Routing overrides
         if let Some(strategy) = self.backend_selection {
-            config.proxy.backend_selection = strategy;
+            config.routing.backend_selection = strategy;
         }
         if let Some(rm) = self.routing_mode {
-            config.proxy.routing_mode = rm;
+            config.routing.routing_mode = rm;
         }
 
         // Cache overrides — create cache section if needed
-        if self.cache_capacity.is_some()
-            || self.cache_ttl.is_some()
-            || self.cache_articles.is_some()
+        if self.article_cache_capacity.is_some()
+            || self.article_cache_ttl_secs.is_some()
+            || self.store_article_bodies.is_some()
         {
             let cache = config
                 .cache
                 .get_or_insert_with(crate::config::Cache::default);
-            if let Some(cap) = self.cache_capacity {
-                cache.max_capacity = cap;
+            if let Some(cap) = self.article_cache_capacity {
+                cache.article_cache_capacity = cap;
             }
-            if let Some(ttl) = self.cache_ttl {
-                cache.ttl = Duration::from_secs(ttl);
+            if let Some(ttl) = self.article_cache_ttl_secs {
+                cache.article_cache_ttl_secs = Duration::from_secs(ttl);
             }
-            if let Some(articles) = self.cache_articles {
-                cache.cache_articles = articles;
+            if let Some(articles) = self.store_article_bodies {
+                cache.store_article_bodies = articles;
             }
         }
 
         // Pipelining global override — applies to all servers
-        if let Some(enable) = self.enable_pipelining {
+        if let Some(enable) = self.backend_pipelining {
             for server in &mut config.servers {
-                server.enable_pipelining = enable;
+                server.backend_pipelining = enable;
             }
         }
     }
@@ -278,6 +306,61 @@ mod tests {
         assert_eq!(multi_thread.threads, Some(ThreadCount::new(4).unwrap()));
     }
 
+    #[test]
+    fn test_common_args_parse_primary_and_legacy_flags() {
+        let args = CommonArgs::parse_from([
+            "nntp-proxy",
+            "--article-cache-capacity",
+            "128mb",
+            "--backend-selection",
+            "least-loaded",
+            "--article-cache-ttl",
+            "7200",
+            "--store-article-bodies",
+            "true",
+            "--backend-pipelining",
+            "false",
+        ]);
+
+        assert_eq!(
+            args.backend_selection,
+            Some(BackendSelectionStrategy::LeastLoaded)
+        );
+        assert_eq!(
+            args.article_cache_capacity,
+            Some(CacheCapacity::try_new(128_000_000).unwrap())
+        );
+        assert_eq!(args.article_cache_ttl_secs, Some(7200));
+        assert_eq!(args.store_article_bodies, Some(true));
+        assert_eq!(args.backend_pipelining, Some(false));
+
+        let legacy_args = CommonArgs::parse_from([
+            "nntp-proxy",
+            "--cache-capacity",
+            "256mb",
+            "--backend-strategy",
+            "weighted-round-robin",
+            "--cache-ttl",
+            "3600",
+            "--store-articles",
+            "false",
+            "--enable-pipelining",
+            "true",
+        ]);
+
+        assert_eq!(
+            legacy_args.backend_selection,
+            Some(BackendSelectionStrategy::WeightedRoundRobin)
+        );
+        assert_eq!(
+            legacy_args.article_cache_capacity,
+            Some(CacheCapacity::try_new(256_000_000).unwrap())
+        );
+        assert_eq!(legacy_args.article_cache_ttl_secs, Some(3600));
+        assert_eq!(legacy_args.store_article_bodies, Some(false));
+        assert_eq!(legacy_args.backend_pipelining, Some(true));
+    }
+
     // Helper to create default args for testing
     fn default_args() -> CommonArgs {
         CommonArgs {
@@ -286,11 +369,11 @@ mod tests {
             host: None,
             routing_mode: None,
             backend_selection: None,
-            cache_capacity: None,
-            cache_ttl: None,
-            cache_articles: None,
+            article_cache_capacity: None,
+            article_cache_ttl_secs: None,
+            store_article_bodies: None,
             threads: None,
-            enable_pipelining: None,
+            backend_pipelining: None,
         }
     }
 
@@ -322,9 +405,9 @@ mod tests {
 
         args.apply_overrides(&mut config);
 
-        assert_eq!(config.proxy.routing_mode, RoutingMode::PerCommand);
+        assert_eq!(config.routing.routing_mode, RoutingMode::PerCommand);
         assert_eq!(
-            config.proxy.backend_selection,
+            config.routing.backend_selection,
             BackendSelectionStrategy::LeastLoaded
         );
     }
@@ -332,9 +415,9 @@ mod tests {
     #[test]
     fn test_apply_overrides_cache() {
         let args = CommonArgs {
-            cache_capacity: Some(CacheCapacity::try_new(128 * 1024 * 1024).unwrap()),
-            cache_ttl: Some(7200),
-            cache_articles: Some(false),
+            article_cache_capacity: Some(CacheCapacity::try_new(128 * 1024 * 1024).unwrap()),
+            article_cache_ttl_secs: Some(7200),
+            store_article_bodies: Some(false),
             ..default_args()
         };
         let mut config = Config {
@@ -345,9 +428,9 @@ mod tests {
         args.apply_overrides(&mut config);
 
         let cache = config.cache.as_ref().unwrap();
-        assert_eq!(cache.max_capacity.get(), 128 * 1024 * 1024);
-        assert_eq!(cache.ttl, Duration::from_hours(2));
-        assert!(!cache.cache_articles);
+        assert_eq!(cache.article_cache_capacity.get(), 128 * 1024 * 1024);
+        assert_eq!(cache.article_cache_ttl_secs, Duration::from_hours(2));
+        assert!(!cache.store_article_bodies);
     }
 
     #[test]
@@ -355,17 +438,17 @@ mod tests {
         use crate::types::Port;
 
         let args = CommonArgs {
-            enable_pipelining: Some(false),
+            backend_pipelining: Some(false),
             ..default_args()
         };
         let mut config = Config::default();
         config.servers = vec![
             crate::config::Server::builder("server1.example.com", Port::try_new(119).unwrap())
-                .enable_pipelining(true)
+                .backend_pipelining(true)
                 .build()
                 .unwrap(),
             crate::config::Server::builder("server2.example.com", Port::try_new(119).unwrap())
-                .enable_pipelining(true)
+                .backend_pipelining(true)
                 .build()
                 .unwrap(),
         ];
@@ -374,7 +457,7 @@ mod tests {
 
         // All servers should have pipelining disabled
         for server in &config.servers {
-            assert!(!server.enable_pipelining);
+            assert!(!server.backend_pipelining);
         }
     }
 }

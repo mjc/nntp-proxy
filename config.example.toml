@@ -1,7 +1,7 @@
 # NNTP Proxy Configuration
 #
-# This file configures the proxy server, including listen address, backend servers,
-# authentication, and health checking.
+# This file configures the proxy server, including listen address, routing,
+# backend servers, cache behavior, memory tuning, authentication, and health checking.
 
 # Proxy Server Settings
 [proxy]
@@ -167,40 +167,54 @@ tls_verify_cert = true
 # Each server can have different limits based on your provider's restrictions
 # Common NNTP ports: 119 (plain), 563 (NNTPS/SSL), 8119 (custom)
 
-# Cache Configuration (optional)
-# Uncomment to enable article caching
-#
-# [cache]
-# # Maximum memory cache size (default: 64mb)
-# # Supports: "1gb", "500mb", "64mb", or raw bytes
-# max_capacity = "64mb"
-# # Time-to-live for cached articles (default: 1 hour)
-# ttl_secs = 3600
-# # Cache article bodies (default: true)
-# # Set to false for availability-only mode (dedicated exact negative index with LRU eviction)
-# cache_articles = true
-# # Optional persistence file for availability-only mode
-# # Saves every 30 seconds and on shutdown; defaults to "availability.idx" next to the config
-# # availability_file = "/var/cache/nntp-proxy/availability.idx"
-# # Enable adaptive prechecking for STAT/HEAD commands (default: false)
-# # Queries all backends simultaneously to build availability data
-# adaptive_precheck = false
-#
-# # Disk Cache Configuration (optional)
-# # When configured, creates two-tier cache: memory -> disk -> backend
-# # Articles evicted from memory are written to disk for later retrieval
-# [cache.disk]
-# # Path to disk cache directory (will be created if needed)
-# path = "/var/cache/nntp-proxy"
-# # Maximum disk cache size (default: 10gb)
-# # Supports: "100gb", "10gb", "1tb", or raw bytes
-# capacity = "10gb"
-# # Compression codec for disk storage (default: "lz4")
-# # Options:
-# #   "lz4"  - Fast compression (~60% reduction), minimal CPU, SIMD-accelerated
-# #   "zstd" - Better compression ratio, moderate CPU overhead, SIMD-accelerated
-# #   "none" - No compression, fastest but largest disk usage
-# # SIMD optimizations (SSE2/AVX2/AVX512) for "lz4"/"zstd" are auto-detected and enabled by default
-# compression = "lz4"
-# # Number of shards for concurrent access (default: 4)
-# shards = 4
+# Routing Configuration
+[routing]
+# Routing mode: "hybrid" (default), "per-command", or "stateful"
+mode = "hybrid"
+# Backend selection strategy: "least-loaded" (default) or "weighted-round-robin"
+backend_selection = "least-loaded"
+# Enable adaptive prechecking for STAT/HEAD commands
+adaptive_precheck = false
+
+# Article Cache Configuration
+[cache]
+# Article cache capacity in memory
+# Supports: "1gb", "500mb", "64mb", or raw bytes
+article_cache_capacity = "64mb"
+# Time-to-live for the article cache, in seconds
+article_cache_ttl_secs = 3600
+# Store full article bodies in the article cache. When false, the cache tracks availability only.
+store_article_bodies = false
+# Optional persistence file for availability-only mode
+availability_index_path = "/var/cache/nntp-proxy/availability.idx"
+
+# Disk Cache Configuration (optional)
+# When configured, creates two-tier cache: memory -> disk -> backend
+# Articles evicted from memory are written to disk for later retrieval
+[cache.disk]
+# Path to disk cache directory (will be created if needed)
+path = "/var/cache/nntp-proxy"
+# Maximum disk cache size (default: 10gb)
+# Supports: "100gb", "10gb", "1tb", or raw bytes
+capacity = "10gb"
+# Compression codec for disk storage (default: "lz4")
+# Options:
+#   "lz4"  - Fast compression (~60% reduction), minimal CPU, SIMD-accelerated
+#   "zstd" - Better compression ratio, moderate CPU overhead, SIMD-accelerated
+#   "none" - No compression, fastest but largest disk usage
+# SIMD optimizations (SSE2/AVX2/AVX512) for "lz4"/"zstd" are auto-detected and enabled by default
+compression = "lz4"
+# Number of shards for concurrent access (default: 4)
+shards = 4
+
+# Memory Configuration
+[memory]
+# TCP socket buffers for client and backend connections
+socket_recv_buffer_size = 16777216
+socket_send_buffer_size = 16777216
+# Pooled streaming buffers
+buffer_pool_size = 741376
+buffer_pool_count = 50
+# Capture buffers used by cache ingest/response assembly
+capture_pool_size = 790528
+capture_pool_count = 16

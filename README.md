@@ -2,15 +2,15 @@
 
 NNTP proxy written in Rust.
 
-It supports:
+What it gives you:
 
-- multiple backend servers
-- three routing modes: `stateful`, `per-command`, and `hybrid`
-- per-backend TLS
-- client authentication
-- optional article caching
-- metrics persistence
-- a terminal dashboard binary
+- lets many NNTP clients use many backends without you managing connection limits yourself
+- `hybrid` mode by default, so stateless commands can stay efficient while stateful commands still work
+- per-backend TLS and backend authentication
+- optional article caching plus availability tracking
+- a hot-cache path that can hit 2.58 GB/s with a 256 MB in-memory article cache and the disk tier on SSD
+- metrics persistence for restarts
+- a TUI binary for live inspection
 
 ## Binaries
 
@@ -49,9 +49,11 @@ The repo includes two config examples:
 
 Main config sections:
 
-- `[proxy]` for listen address, routing mode, backend selection, thread count, logging, and stats file path
+- `[proxy]` for listen address, thread count, logging, and stats file path
+- `[routing]` for routing mode, backend selection, and adaptive precheck
 - `[[servers]]` for backend servers
-- `[cache]` for article caching and availability tracking
+- `[cache]` for article-cache capacity, TTL, storage mode, and availability persistence
+- `[memory]` for socket buffers and pooled buffer sizes/counts
 - `[client_auth]` or `[[client_auth.users]]` for client authentication
 
 Common server fields:
@@ -74,19 +76,32 @@ Common proxy/cache settings:
 - `host`
 - `port`
 - `threads`
-- `routing_mode`
-- `backend_selection`
 - `validate_yenc`
-- `buffer_pool_count`
-- `capture_pool_count`
 - `log_file_level`
 - `stats_file`
-- `max_capacity`
-- `ttl`
-- `cache_articles`
-- `adaptive_precheck`
-- `availability_file`
-- `disk`
+- `routing.mode`
+- `routing.backend_selection`
+- `routing.adaptive_precheck`
+- `cache.article_cache_capacity`
+- `cache.article_cache_ttl_secs`
+- `cache.store_article_bodies`
+- `cache.availability_index_path`
+- `cache.disk`
+- `memory.socket_recv_buffer_size`
+- `memory.socket_send_buffer_size`
+- `memory.buffer_pool_size`
+- `memory.buffer_pool_count`
+- `memory.capture_pool_size`
+- `memory.capture_pool_count`
+
+Command-line flags mirror the same ideas:
+
+- `--routing-mode`
+- `--backend-selection`
+- `--article-cache-capacity`
+- `--article-cache-ttl`
+- `--store-article-bodies`
+- `--backend-pipelining`
 
 Command-line flags override config file values.
 
@@ -139,15 +154,6 @@ Useful checks:
 cargo fmt --check
 cargo clippy --all-targets --all-features
 ```
-
-## Repository layout
-
-- [src/bin/nntp-proxy.rs](src/bin/nntp-proxy.rs)
-- [src/bin/nntp-proxy-tui.rs](src/bin/nntp-proxy-tui.rs)
-- [src/config/mod.rs](src/config/mod.rs)
-- [src/session/mod.rs](src/session/mod.rs)
-- [src/router/mod.rs](src/router/mod.rs)
-- [src/cache/mod.rs](src/cache/mod.rs)
 
 ## License
 

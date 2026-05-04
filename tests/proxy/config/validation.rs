@@ -315,8 +315,8 @@ ttl = 3600
     let config: Config = toml::from_str(toml)?;
 
     let cache = config.cache.expect("Cache config should be present");
-    assert_eq!(cache.max_capacity.get(), 10000);
-    assert_eq!(cache.ttl.as_secs(), 3600);
+    assert_eq!(cache.article_cache_capacity.get(), 10000);
+    assert_eq!(cache.article_cache_ttl_secs.as_secs(), 3600);
 
     Ok(())
 }

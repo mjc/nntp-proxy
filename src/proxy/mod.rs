@@ -22,7 +22,7 @@ use tracing::info;
 
 use crate::auth::AuthHandler;
 use crate::cache::UnifiedCache;
-use crate::config::{RoutingMode, Server};
+use crate::config::{Memory, RoutingMode, Server};
 use crate::metrics::{ConnectionStatsAggregator, MetricsCollector};
 use crate::pool::{BufferPool, DeadpoolConnectionProvider, prewarm_pools};
 use crate::router;
@@ -46,8 +46,10 @@ pub struct NntpProxy {
     pub(super) connection_stats: ConnectionStatsAggregator,
     /// Article cache (always present - fixed-size, memory-backed, hybrid, or disabled)
     pub(super) cache: Arc<UnifiedCache>,
+    /// Memory configuration for transport and pooling
+    pub(super) memory: Memory,
     /// Whether to cache article bodies (config-driven)
-    pub(super) cache_articles: bool,
+    pub(super) store_article_bodies: bool,
     /// Whether to use adaptive availability prechecking for STAT/HEAD
     pub(super) adaptive_precheck: bool,
     /// Timestamp (as epoch nanos) when last client disconnected (for idle detection)

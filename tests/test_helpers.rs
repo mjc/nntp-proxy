@@ -322,6 +322,8 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
             })
             .collect(),
         proxy: Proxy::default(),
+        routing: Default::default(),
+        memory: Default::default(),
         health_check: HealthCheck::default(),
         cache: None,
         client_auth: ClientAuth::default(),
@@ -696,6 +698,8 @@ pub fn create_test_config_with_auth(
             .map(|port| create_test_server_config("127.0.0.1", port, &format!("backend-{port}")))
             .collect(),
         proxy: Proxy::default(),
+        routing: Default::default(),
+        memory: Default::default(),
         health_check: HealthCheck::default(),
         cache: None,
         client_auth: ClientAuth {

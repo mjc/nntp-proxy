@@ -11,8 +11,7 @@ use tracing::{debug, info, warn};
 
 use crate::auth::AuthHandler;
 use crate::cache::{HybridCacheConfig, UnifiedCache};
-use crate::config::{Config, RoutingMode, Server};
-use crate::constants::buffer::{CAPTURE, POOL};
+use crate::config::{Config, Memory, RoutingMode, Server};
 use crate::metrics::{ConnectionStatsAggregator, MetricsCollector};
 use crate::pool::{BufferPool, DeadpoolConnectionProvider};
 use crate::router;
@@ -72,9 +71,10 @@ impl NntpProxyBuilder {
     /// The routing mode defaults to `Stateful` (1:1) mode.
     #[must_use]
     pub const fn new(config: Config) -> Self {
+        let routing_mode = config.routing.routing_mode;
         Self {
             config,
-            routing_mode: RoutingMode::Stateful,
+            routing_mode,
             buffer_size: None,
             buffer_count: None,
             metrics_store: None,
@@ -132,10 +132,8 @@ impl NntpProxyBuilder {
             anyhow::bail!("No servers configured in configuration");
         }
 
-        let buffer_size = self.buffer_size.unwrap_or(POOL);
-        let buffer_count = self
-            .buffer_count
-            .unwrap_or(self.config.proxy.buffer_pool_count);
+        let memory = self.config.memory.clone();
+        let buffer_count = self.buffer_count.unwrap_or(memory.buffer_pool_count);
 
         // Create deadpool connection providers for each server
         let connection_providers: Result<Vec<DeadpoolConnectionProvider>> = self
@@ -147,31 +145,31 @@ impl NntpProxyBuilder {
                     "Configuring deadpool connection provider for '{}'",
                     server.name
                 );
-                DeadpoolConnectionProvider::from_server_config(server)
+                DeadpoolConnectionProvider::from_server_config(
+                    server,
+                    memory.socket_recv_buffer_size,
+                    memory.socket_send_buffer_size,
+                )
             })
             .collect();
 
         let connection_providers = connection_providers?;
 
         let buffer_pool = BufferPool::new(
-            BufferSize::try_new(buffer_size)
+            BufferSize::try_new(self.buffer_size.unwrap_or(memory.buffer_pool_size))
                 .map_err(|_| anyhow::anyhow!("Buffer size must be non-zero"))?,
             buffer_count,
         )
-        .with_capture_pool(CAPTURE, self.config.proxy.capture_pool_count);
+        .with_capture_pool(memory.capture_pool_size, memory.capture_pool_count);
 
         let metrics = match self.metrics_store {
             Some(store) => MetricsCollector::with_store(store),
             None => MetricsCollector::new(self.config.servers.len()),
         };
 
-        let adaptive_precheck = self
-            .config
-            .cache
-            .as_ref()
-            .is_some_and(|c| c.adaptive_precheck);
+        let adaptive_precheck = self.config.routing.adaptive_precheck;
 
-        let backend_strategy = self.config.proxy.backend_selection;
+        let backend_strategy = self.config.routing.backend_selection;
         let cache_config = self.config.cache;
         let servers: Arc<[Server]> = self.config.servers.into();
 
@@ -181,7 +179,7 @@ impl NntpProxyBuilder {
                 router::BackendSelector::with_strategy(backend_strategy),
                 |mut r, (idx, provider)| {
                     let backend_id = BackendId::from_index(idx);
-                    let pipeline_queue = if servers[idx].enable_pipelining {
+                    let pipeline_queue = if servers[idx].backend_pipelining {
                         Some(Arc::new(router::BackendQueue::new(
                             servers[idx].pipeline_queue_depth,
                         )))
@@ -229,31 +227,32 @@ impl NntpProxyBuilder {
             auth_handler,
             adaptive_precheck,
             routing_mode: self.routing_mode,
+            memory,
         };
 
         Ok((ctx, cache_config))
     }
 
     /// Log cache configuration details
-    fn log_cache_config(cache_config: &crate::config::Cache, cache_articles: bool) {
-        let capacity = cache_config.max_capacity.as_u64();
-        if cache_articles {
+    fn log_cache_config(cache_config: &crate::config::Cache, store_article_bodies: bool) {
+        let capacity = cache_config.article_cache_capacity.as_u64();
+        if store_article_bodies {
             info!(
                 "Article cache enabled: max_capacity={}, ttl={}s (full caching)",
-                cache_config.max_capacity,
-                cache_config.ttl.as_secs()
+                cache_config.article_cache_capacity,
+                cache_config.article_cache_ttl_secs.as_secs()
             );
         } else if capacity < crate::cache::AvailabilityIndex::fixed_capacity_bytes() {
             info!(
                 "Availability-only cache disabled: configured budget {} is smaller than fixed index size {} bytes",
-                cache_config.max_capacity,
+                cache_config.article_cache_capacity,
                 crate::cache::AvailabilityIndex::fixed_capacity_bytes()
             );
         } else {
             info!(
                 "Backend availability tracking enabled: max_capacity={}, ttl={}s (fixed-size availability index, bodies not cached)",
-                cache_config.max_capacity,
-                cache_config.ttl.as_secs()
+                cache_config.article_cache_capacity,
+                cache_config.article_cache_ttl_secs.as_secs()
             );
         }
     }
@@ -271,16 +270,16 @@ impl NntpProxyBuilder {
         let (ctx, cache_config) = self.build_infrastructure()?;
 
         // Create article cache (always enabled for availability tracking)
-        let (cache, cache_articles) = if let Some(cache_config) = &cache_config {
-            let capacity = cache_config.max_capacity.as_u64();
-            let cache_articles = cache_config.cache_articles;
+        let (cache, store_article_bodies) = if let Some(cache_config) = &cache_config {
+            let capacity = cache_config.article_cache_capacity.as_u64();
+            let store_article_bodies = cache_config.store_article_bodies;
 
-            let cache = if !cache_articles {
+            let cache = if !store_article_bodies {
                 Arc::new(
                     if capacity < crate::cache::AvailabilityIndex::fixed_capacity_bytes() {
-                        UnifiedCache::availability_disabled(cache_config.ttl)
+                        UnifiedCache::availability_disabled(cache_config.article_cache_ttl_secs)
                     } else {
-                        UnifiedCache::availability(cache_config.ttl)
+                        UnifiedCache::availability(cache_config.article_cache_ttl_secs)
                     },
                 )
             } else if let Some(disk_config) = &cache_config.disk {
@@ -290,7 +289,7 @@ impl NntpProxyBuilder {
                     disk_capacity: disk_config.capacity.as_u64(),
                     shards: disk_config.shards,
                     compression: disk_config.compression,
-                    ttl: cache_config.ttl,
+                    ttl: cache_config.article_cache_ttl_secs,
                 };
 
                 info!(
@@ -306,17 +305,20 @@ impl NntpProxyBuilder {
                         .context("Failed to initialize hybrid disk cache")?,
                 )
             } else {
-                Arc::new(UnifiedCache::memory(capacity, cache_config.ttl))
+                Arc::new(UnifiedCache::memory(
+                    capacity,
+                    cache_config.article_cache_ttl_secs,
+                ))
             };
 
-            Self::log_cache_config(cache_config, cache_articles);
-            (cache, cache_articles)
+            Self::log_cache_config(cache_config, store_article_bodies);
+            (cache, store_article_bodies)
         } else {
             debug!("Cache not configured, using fixed-size availability-only mode");
             (Arc::new(UnifiedCache::availability(Duration::MAX)), false)
         };
 
-        Ok(ctx.into_proxy(cache, cache_articles))
+        Ok(ctx.into_proxy(cache, store_article_bodies))
     }
 
     /// Build the `NntpProxy` instance (synchronous version)
@@ -335,37 +337,40 @@ impl NntpProxyBuilder {
         let (ctx, cache_config) = self.build_infrastructure()?;
 
         // Create article cache (memory-only in sync version)
-        let (cache, cache_articles) = if let Some(cache_config) = &cache_config {
-            let cache_articles = cache_config.cache_articles;
+        let (cache, store_article_bodies) = if let Some(cache_config) = &cache_config {
+            let store_article_bodies = cache_config.store_article_bodies;
 
-            if cache_config.disk.is_some() && cache_articles {
+            if cache_config.disk.is_some() && store_article_bodies {
                 warn!(
                     "Disk cache configured but build_sync() called - using memory-only cache. Use build() for disk cache support."
                 );
             }
 
-            let cache = if cache_articles {
-                let capacity = cache_config.max_capacity.as_u64();
-                Arc::new(UnifiedCache::memory(capacity, cache_config.ttl))
+            let cache = if store_article_bodies {
+                let capacity = cache_config.article_cache_capacity.as_u64();
+                Arc::new(UnifiedCache::memory(
+                    capacity,
+                    cache_config.article_cache_ttl_secs,
+                ))
             } else {
-                let capacity = cache_config.max_capacity.as_u64();
+                let capacity = cache_config.article_cache_capacity.as_u64();
                 Arc::new(
                     if capacity < crate::cache::AvailabilityIndex::fixed_capacity_bytes() {
-                        UnifiedCache::availability_disabled(cache_config.ttl)
+                        UnifiedCache::availability_disabled(cache_config.article_cache_ttl_secs)
                     } else {
-                        UnifiedCache::availability(cache_config.ttl)
+                        UnifiedCache::availability(cache_config.article_cache_ttl_secs)
                     },
                 )
             };
 
-            Self::log_cache_config(cache_config, cache_articles);
-            (cache, cache_articles)
+            Self::log_cache_config(cache_config, store_article_bodies);
+            (cache, store_article_bodies)
         } else {
             debug!("Cache not configured, using fixed-size availability-only mode");
             (Arc::new(UnifiedCache::availability(Duration::MAX)), false)
         };
 
-        Ok(ctx.into_proxy(cache, cache_articles))
+        Ok(ctx.into_proxy(cache, store_article_bodies))
     }
 }
 
@@ -382,11 +387,16 @@ pub(super) struct BuildContext {
     auth_handler: Arc<AuthHandler>,
     adaptive_precheck: bool,
     routing_mode: RoutingMode,
+    memory: Memory,
 }
 
 impl BuildContext {
     /// Construct the final `NntpProxy` from this context and a cache
-    pub(super) fn into_proxy(self, cache: Arc<UnifiedCache>, cache_articles: bool) -> NntpProxy {
+    pub(super) fn into_proxy(
+        self,
+        cache: Arc<UnifiedCache>,
+        store_article_bodies: bool,
+    ) -> NntpProxy {
         // Spawn pipeline workers for backends that have pipelining enabled
         self.spawn_pipeline_workers();
 
@@ -400,7 +410,8 @@ impl BuildContext {
             metrics: self.metrics,
             connection_stats: ConnectionStatsAggregator::new(),
             cache,
-            cache_articles,
+            memory: self.memory,
+            store_article_bodies,
             adaptive_precheck: self.adaptive_precheck,
             last_activity_nanos: Arc::new(AtomicU64::new(0)),
             active_clients: Arc::new(AtomicUsize::new(0)),
@@ -412,16 +423,16 @@ impl BuildContext {
     ///
     /// Only spawns if a Tokio runtime is available (skipped in sync test contexts).
     fn spawn_pipeline_workers(&self) {
+        use crate::session::handlers::pipeline_worker::{
+            PipelineWorkerConfig, backend_pipeline_worker,
+        };
+        use crate::types::BackendId;
+
         // Check if a Tokio runtime is available before spawning
         let Ok(_handle) = tokio::runtime::Handle::try_current() else {
             debug!("No Tokio runtime available, skipping pipeline worker spawning");
             return;
         };
-
-        use crate::session::handlers::pipeline_worker::{
-            PipelineWorkerConfig, backend_pipeline_worker,
-        };
-        use crate::types::BackendId;
 
         for (idx, server) in self.servers.iter().enumerate() {
             let backend_id = BackendId::from_index(idx);
@@ -468,12 +479,12 @@ mod tests {
     fn availability_only_config(capacity: u64) -> Config {
         let mut config = create_test_config();
         config.cache = Some(Cache {
-            max_capacity: CacheCapacity::try_new(capacity).unwrap(),
-            ttl: Duration::from_secs(60),
-            cache_articles: false,
+            article_cache_capacity: CacheCapacity::try_new(capacity).unwrap(),
+            article_cache_ttl_secs: Duration::from_mins(1),
+            store_article_bodies: false,
             adaptive_precheck: false,
             disk: None,
-            availability_file: None,
+            availability_index_path: None,
         });
         config
     }
@@ -533,7 +544,7 @@ mod tests {
             .build_sync()
             .expect("Failed to build proxy");
 
-        assert!(!proxy.cache_articles);
+        assert!(!proxy.store_article_bodies);
         assert_eq!(proxy.cache.capacity(), 0);
         assert_eq!(proxy.cache.weighted_size(), 0);
     }
@@ -545,7 +556,7 @@ mod tests {
             .await
             .expect("Failed to build proxy");
 
-        assert!(!proxy.cache_articles);
+        assert!(!proxy.store_article_bodies);
         assert_eq!(proxy.cache.capacity(), 0);
         assert_eq!(proxy.cache.weighted_size(), 0);
     }
@@ -559,7 +570,7 @@ mod tests {
         .await
         .expect("Failed to build proxy");
 
-        assert!(!proxy.cache_articles);
+        assert!(!proxy.store_article_bodies);
         assert_eq!(
             proxy.cache.capacity(),
             AvailabilityIndex::fixed_capacity_bytes()

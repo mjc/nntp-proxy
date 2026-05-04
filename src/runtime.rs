@@ -450,7 +450,7 @@ pub fn resolve_stats_file_path(
 
 /// Resolve the availability persistence path for availability-only mode.
 ///
-/// Returns None unless `cache_articles = false`. If `availability_file` is
+/// Returns None unless `store_article_bodies = false`. If `availability_index_path` is
 /// configured, use it; otherwise default to "availability.idx" alongside config.
 #[must_use]
 pub fn resolve_availability_file_path(
@@ -460,16 +460,21 @@ pub fn resolve_availability_file_path(
     use std::path::Path;
 
     let cache_config = cache_config?;
-    if cache_config.cache_articles {
+    if cache_config.store_article_bodies {
         return None;
     }
 
-    Some(cache_config.availability_file.clone().unwrap_or_else(|| {
-        let config_dir = Path::new(config_path)
-            .parent()
-            .unwrap_or_else(|| Path::new("."));
-        config_dir.join("availability.idx")
-    }))
+    Some(
+        cache_config
+            .availability_index_path
+            .clone()
+            .unwrap_or_else(|| {
+                let config_dir = Path::new(config_path)
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."));
+                config_dir.join("availability.idx")
+            }),
+    )
 }
 
 /// Load metrics from disk if the stats file exists
@@ -920,14 +925,17 @@ mod tests {
 
     #[test]
     fn test_resolve_availability_file_path_none_for_full_cache() {
-        let cache = crate::config::Cache::default();
+        let cache = crate::config::Cache {
+            store_article_bodies: true,
+            ..Default::default()
+        };
         assert!(resolve_availability_file_path("config.toml", Some(&cache)).is_none());
     }
 
     #[test]
     fn test_resolve_availability_file_path_default_for_availability_only() {
         let cache = crate::config::Cache {
-            cache_articles: false,
+            store_article_bodies: false,
             ..Default::default()
         };
 
@@ -941,14 +949,16 @@ mod tests {
     #[test]
     fn test_resolve_availability_file_path_with_configured() {
         let cache = crate::config::Cache {
-            cache_articles: false,
-            availability_file: Some(std::path::PathBuf::from("/custom/path/availability.idx")),
+            store_article_bodies: false,
+            availability_index_path: Some(std::path::PathBuf::from(
+                "/custom/path/availability.idx",
+            )),
             ..Default::default()
         };
 
         let result = resolve_availability_file_path("config.toml", Some(&cache))
             .expect("configured path should be used");
 
-        assert_eq!(result, cache.availability_file.unwrap());
+        assert_eq!(result, cache.availability_index_path.unwrap());
     }
 }

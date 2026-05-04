@@ -6,7 +6,117 @@
 use anyhow::Result;
 
 use super::defaults;
-use super::types::{Config, Server};
+use super::types::{BackendSelectionStrategy, Config, RoutingMode, Server};
+
+fn table<'a>(value: &'a toml::Value, key: &str) -> Option<&'a toml::map::Map<String, toml::Value>> {
+    value.get(key)?.as_table()
+}
+
+fn table_has_key(value: &toml::Value, section: &str, key: &str) -> bool {
+    table(value, section).is_some_and(|t| t.contains_key(key))
+}
+
+fn write_canonical_config(config_path: &str, config: &Config) -> Result<()> {
+    use anyhow::Context;
+    use std::fs;
+    use std::path::Path;
+
+    let canonical =
+        toml::to_string_pretty(config).context("Failed to serialize migrated config")?;
+    let path = Path::new(config_path);
+    let backup_path = path.with_extension(
+        path.extension()
+            .map(|ext| format!("{}{}.bak", ext.to_string_lossy(), ""))
+            .unwrap_or_else(|| "bak".to_string()),
+    );
+
+    fs::copy(path, &backup_path)
+        .with_context(|| format!("Failed to create backup config '{}'", backup_path.display()))?;
+
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, canonical).with_context(|| {
+        format!(
+            "Failed to write migrated config to temporary file '{}'",
+            tmp_path.display()
+        )
+    })?;
+    fs::rename(&tmp_path, path).with_context(|| {
+        format!(
+            "Failed to atomically replace config '{}' with migrated schema",
+            path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn migrate_legacy_config(config: &mut Config, raw: &toml::Value) -> bool {
+    let mut migrated = false;
+
+    // Legacy routing values lived under [proxy].
+    if raw.get("routing").is_none()
+        && let Some(proxy) = table(raw, "proxy")
+    {
+        if let Some(value) = proxy.get("routing_mode")
+            && let Ok(mode) = value.clone().try_into::<RoutingMode>()
+        {
+            config.routing.routing_mode = mode;
+            migrated = true;
+        }
+
+        if let Some(value) = proxy.get("backend_selection")
+            && let Ok(strategy) = value.clone().try_into::<BackendSelectionStrategy>()
+        {
+            config.routing.backend_selection = strategy;
+            migrated = true;
+        }
+
+        if let Some(value) = proxy.get("buffer_pool_count")
+            && let Ok(count) = value.clone().try_into::<usize>()
+        {
+            config.memory.buffer_pool_count = count;
+            migrated = true;
+        }
+
+        if let Some(value) = proxy.get("capture_pool_count")
+            && let Ok(count) = value.clone().try_into::<usize>()
+        {
+            config.memory.capture_pool_count = count;
+            migrated = true;
+        }
+    }
+
+    // Legacy adaptive precheck lived under [cache].
+    if !table_has_key(raw, "routing", "adaptive_precheck")
+        && let Some(cache) = table(raw, "cache")
+        && let Some(value) = cache.get("adaptive_precheck")
+        && let Ok(enabled) = value.clone().try_into::<bool>()
+    {
+        config.routing.adaptive_precheck = enabled;
+        migrated = true;
+    }
+
+    // Legacy memory knobs lived under [proxy].
+    if raw.get("memory").is_none()
+        && let Some(proxy) = table(raw, "proxy")
+    {
+        if let Some(value) = proxy.get("buffer_pool_count")
+            && let Ok(count) = value.clone().try_into::<usize>()
+        {
+            config.memory.buffer_pool_count = count;
+            migrated = true;
+        }
+
+        if let Some(value) = proxy.get("capture_pool_count")
+            && let Ok(count) = value.clone().try_into::<usize>()
+        {
+            config.memory.capture_pool_count = count;
+            migrated = true;
+        }
+    }
+
+    migrated
+}
 
 /// Environment variable getter trait for dependency injection
 pub trait EnvProvider {
@@ -130,7 +240,7 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         compress: None,
         compress_level: None,
         backend_idle_timeout: crate::config::defaults::backend_idle_timeout(),
-        enable_pipelining: crate::config::defaults::enable_pipelining(),
+        backend_pipelining: crate::config::defaults::enable_pipelining(),
         pipeline_queue_depth: crate::config::defaults::pipeline_queue_depth(),
         pipeline_batch_size: crate::config::defaults::pipeline_batch_size(),
     })
@@ -216,8 +326,14 @@ pub fn load_config(config_path: &str) -> Result<Config> {
     let config_content = std::fs::read_to_string(config_path)
         .with_context(|| format!("Failed to read config file '{config_path}'"))?;
 
+    let raw_config: toml::Value = toml::from_str(&config_content)
+        .with_context(|| format!("Failed to parse config file '{config_path}'"))?;
+
     let mut config: Config = toml::from_str(&config_content)
         .with_context(|| format!("Failed to parse config file '{config_path}'"))?;
+
+    let mut file_config = config.clone();
+    let migrated = migrate_legacy_config(&mut file_config, &raw_config);
 
     // Check for environment variable server overrides
     if let Some(env_servers) = load_servers_from_env() {
@@ -226,6 +342,15 @@ pub fn load_config(config_path: &str) -> Result<Config> {
             env_servers.len()
         );
         config.servers = env_servers;
+    }
+
+    if migrated {
+        tracing::info!(
+            "Migrating legacy configuration schema in '{}' to the new routing/cache/memory layout",
+            config_path
+        );
+        write_canonical_config(config_path, &file_config)?;
+        config = file_config;
     }
 
     // Validate the loaded configuration
@@ -362,7 +487,7 @@ pub fn create_default_config() -> Config {
             compress: None,
             compress_level: None,
             backend_idle_timeout: defaults::backend_idle_timeout(),
-            enable_pipelining: defaults::enable_pipelining(),
+            backend_pipelining: defaults::enable_pipelining(),
             pipeline_queue_depth: defaults::pipeline_queue_depth(),
             pipeline_batch_size: defaults::pipeline_batch_size(),
         }],
@@ -374,6 +499,8 @@ pub fn create_default_config() -> Config {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
 
     // Mock environment provider for testing
     struct MockEnv {
@@ -678,5 +805,60 @@ name = "Test Server"
         assert_eq!(config.servers[0].host.as_str(), "news.example.com");
         assert_eq!(config.servers[0].port.get(), 119);
         assert!(!config.servers[0].use_tls);
+    }
+
+    #[test]
+    fn test_load_config_migrates_legacy_schema() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+
+        let config_content = r#"
+[[servers]]
+host = "legacy.example.com"
+port = 119
+name = "Legacy Server"
+
+[proxy]
+routing_mode = "per-command"
+backend_selection = "least-loaded"
+buffer_pool_count = 64
+capture_pool_count = 32
+
+[cache]
+max_capacity = "256mib"
+ttl = 1800
+cache_articles = true
+adaptive_precheck = true
+"#;
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let path = temp_file.path().to_str().unwrap().to_string();
+        let config = load_config(&path).unwrap();
+
+        assert_eq!(config.routing.routing_mode, RoutingMode::PerCommand);
+        assert_eq!(
+            config.routing.backend_selection,
+            BackendSelectionStrategy::LeastLoaded
+        );
+        assert_eq!(config.memory.buffer_pool_count, 64);
+        assert_eq!(config.memory.capture_pool_count, 32);
+        assert!(config.routing.adaptive_precheck);
+        let cache = config.cache.as_ref().unwrap();
+        assert_eq!(cache.article_cache_capacity.get(), 256 * 1024 * 1024);
+        assert_eq!(cache.article_cache_ttl_secs.as_secs(), 1800);
+        assert!(cache.store_article_bodies);
+
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(migrated.contains("[routing]"));
+        assert!(migrated.contains("[memory]"));
+        assert!(migrated.contains("mode = \"per-command\""));
+        assert!(migrated.contains("buffer_pool_count = 64"));
+        assert!(migrated.contains("capture_pool_count = 32"));
+        assert!(migrated.contains("article_cache_capacity = 268435456"));
+        assert!(migrated.contains("article_cache_ttl_secs = 1800"));
+        assert!(migrated.contains("store_article_bodies = true"));
+
+        let backup_path = format!("{path}.bak");
+        assert!(std::path::Path::new(&backup_path).exists());
     }
 }

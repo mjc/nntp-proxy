@@ -19,7 +19,8 @@
 //! Configure disk cache in your config.toml:
 //! ```toml
 //! [cache]
-//! max_capacity = "256mb"
+//! article_cache_capacity = "256mb"
+//! store_article_bodies = true
 //!
 //! [cache.disk]
 //! path = "/var/cache/nntp-proxy"

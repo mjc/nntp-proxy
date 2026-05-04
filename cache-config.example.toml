@@ -16,24 +16,23 @@ use_tls = false
 tls_verify_cert = true
 # tls_cert_path = "/path/to/ca-cert.pem"
 
-# Cache configuration
-[cache]
-# Maximum memory cache size (default: 64mb)
-# Supports human-readable formats: "1gb", "500mb", "64mb"
-# For availability-only mode: ~1000 bytes per article
-# For full caching: depends on article sizes (avg ~700 KB)
-max_capacity = "64mb"
-# Time-to-live for cached articles (default: 1 hour)
-ttl_secs = 3600
-# Cache article bodies (default: true)
-# Set to false for availability-only mode (dedicated exact negative index with LRU eviction)
-cache_articles = true
-# Optional persistence file for availability-only mode
-# Saves every 30 seconds and on shutdown; defaults to "availability.idx" next to the config
-# availability_file = "/var/cache/nntp-proxy/availability.idx"
-# Enable adaptive prechecking for STAT/HEAD commands (default: false)
-# Queries all backends simultaneously to build availability data
+# Routing configuration
+[routing]
+mode = "hybrid"
+backend_selection = "least-loaded"
 adaptive_precheck = false
+
+# Article cache configuration
+[cache]
+# Maximum article-cache size in memory (default: 64mb)
+# Supports human-readable formats: "1gb", "500mb", "64mb"
+article_cache_capacity = "64mb"
+# Time-to-live for the article cache (default: 1 hour)
+article_cache_ttl_secs = 3600
+# Store full article bodies in the article cache (default: false for availability-only mode)
+store_article_bodies = false
+# Optional persistence file for availability-only mode
+# availability_index_path = "/var/cache/nntp-proxy/availability.idx"
 
 # Disk Cache Configuration (optional)
 # When configured, creates two-tier cache: memory -> disk -> backend

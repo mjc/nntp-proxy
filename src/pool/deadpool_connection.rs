@@ -8,7 +8,6 @@ use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::connection_error::ConnectionError;
-use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
 use crate::protocol::{authinfo_pass, authinfo_user};
 use crate::session::backend;
 use crate::stream::ConnectionStream;
@@ -26,6 +25,10 @@ pub struct TcpManagerOptions {
     pub username: Option<String>,
     pub password: Option<String>,
     pub tls_config: Option<TlsConfig>,
+    /// TCP receive buffer size for this connection.
+    pub recv_buffer_size: usize,
+    /// TCP send buffer size for this connection.
+    pub send_buffer_size: usize,
     /// Wire compression mode: None = auto-detect, Some(true) = require, Some(false) = disable
     pub compress: Option<bool>,
     /// Compression level (0-9). None = fast (level 1).
@@ -43,6 +46,8 @@ impl Default for TcpManagerOptions {
             username: None,
             password: None,
             tls_config: None,
+            recv_buffer_size: crate::constants::socket::HIGH_THROUGHPUT_RECV_BUFFER,
+            send_buffer_size: crate::constants::socket::HIGH_THROUGHPUT_SEND_BUFFER,
             compress: None,
             compress_level: None,
             send_mode_reader: true,
@@ -61,6 +66,8 @@ pub struct TcpManager {
     pub(crate) tls_config: TlsConfig,
     /// Cached TLS manager with pre-loaded certificates (avoids base64 decode overhead)
     pub(crate) tls_manager: Option<Arc<TlsManager>>,
+    pub(crate) recv_buffer_size: usize,
+    pub(crate) send_buffer_size: usize,
     /// Wire compression mode: None = auto-detect, Some(true) = require, Some(false) = disable
     pub(crate) compress: Option<bool>,
     /// Compression level (0-9). None = fast (level 1).
@@ -106,6 +113,8 @@ impl TcpManager {
             password: options.password,
             tls_config,
             tls_manager,
+            recv_buffer_size: options.recv_buffer_size,
+            send_buffer_size: options.send_buffer_size,
             compress: options.compress,
             compress_level: options.compress_level,
             send_mode_reader: options.send_mode_reader,
@@ -131,10 +140,10 @@ impl TcpManager {
 
         // Pre-connect options (buffer sizes, reuse)
         socket.set_recv_buffer_size(
-            u32::try_from(POOL_RECV_BUFFER).expect("pool receive buffer fits u32"),
+            u32::try_from(self.recv_buffer_size).expect("receive buffer fits u32"),
         )?;
         socket.set_send_buffer_size(
-            u32::try_from(POOL_SEND_BUFFER).expect("pool send buffer fits u32"),
+            u32::try_from(self.send_buffer_size).expect("send buffer fits u32"),
         )?;
         socket.set_reuseaddr(true)?;
 

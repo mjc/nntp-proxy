@@ -47,7 +47,7 @@ async fn run_proxy(
     let routing_mode = args
         .common
         .routing_mode
-        .unwrap_or(config.proxy.routing_mode);
+        .unwrap_or(config.routing.routing_mode);
     let (host, port) =
         runtime::resolve_listen_address(args.common.host.as_deref(), args.common.port, &config);
 

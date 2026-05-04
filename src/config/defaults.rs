@@ -2,6 +2,7 @@
 //!
 //! This module centralizes all default value functions used in serde deserialization.
 
+use super::types::Cache;
 use super::types::CompressionCodec;
 use crate::types::{CacheCapacity, MaxConnections, MaxErrors};
 use std::path::PathBuf;
@@ -62,13 +63,66 @@ pub const fn cache_ttl() -> Duration {
 /// Default for caching article bodies (true = full caching)
 #[inline]
 pub const fn cache_articles() -> bool {
-    true
+    false
 }
 
 /// Default for adaptive availability prechecking (false = disabled)
 #[inline]
 pub const fn adaptive_precheck() -> bool {
     false
+}
+
+/// Default cache configuration option
+#[inline]
+#[must_use]
+pub fn default_cache_option() -> Option<Cache> {
+    Some(Cache::default())
+}
+
+/// Default socket receive buffer size
+#[inline]
+#[must_use]
+pub const fn socket_recv_buffer_size() -> usize {
+    crate::constants::socket::HIGH_THROUGHPUT_RECV_BUFFER
+}
+
+/// Default socket send buffer size
+#[inline]
+#[must_use]
+pub const fn socket_send_buffer_size() -> usize {
+    crate::constants::socket::HIGH_THROUGHPUT_SEND_BUFFER
+}
+
+/// Default size of each pooled I/O buffer
+#[inline]
+#[must_use]
+pub const fn buffer_pool_size() -> usize {
+    crate::constants::buffer::POOL
+}
+
+/// Default number of buffers in the main buffer pool
+/// Sized for ~50 concurrent connections with single buffer per connection
+/// Total memory: 50 × 724KB ≈ 35MB
+#[inline]
+#[must_use]
+pub const fn buffer_pool_count() -> usize {
+    crate::constants::buffer::POOL_COUNT
+}
+
+/// Default size of each capture buffer
+#[inline]
+#[must_use]
+pub const fn capture_pool_size() -> usize {
+    crate::constants::buffer::CAPTURE
+}
+
+/// Default number of buffers in the capture pool for caching
+/// Sized for 16 concurrent caching operations
+/// Total memory: 16 × 772KB ≈ 12MB
+#[inline]
+#[must_use]
+pub const fn capture_pool_count() -> usize {
+    crate::constants::buffer::CAPTURE_COUNT
 }
 
 /// Default for TLS certificate verification (true for security)
@@ -167,22 +221,6 @@ pub const fn replacement_cooldown_option() -> Option<Duration> {
     // This mirrors optional config fields and keeps the default plumbing
     // uniform even though the default itself is always present.
     Some(replacement_cooldown())
-}
-
-/// Default number of buffers in the main buffer pool
-/// Sized for ~50 concurrent connections with single buffer per connection
-/// Total memory: 50 × 724KB ≈ 35MB
-#[inline]
-pub const fn buffer_pool_count() -> usize {
-    50
-}
-
-/// Default number of buffers in the capture pool for caching
-/// Sized for 16 concurrent caching operations
-/// Total memory: 16 × 768KB ≈ 12MB
-#[inline]
-pub const fn capture_pool_count() -> usize {
-    16
 }
 
 /// Default log file level (warn)

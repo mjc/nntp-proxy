@@ -13,3 +13,7 @@ name = "News Server"
 # - Health checks every 30 seconds
 # - No TLS
 # - Hybrid routing mode (automatic per-command to stateful switching)
+# - Availability-only article cache mode
+# - Default transport memory settings
+#
+# To override the defaults, add [routing], [cache], or [memory] sections.

@@ -380,7 +380,11 @@ impl DeadpoolConnectionProvider {
     ///
     /// # Panics
     /// Panics only if deadpool rejects the validated pool size.
-    pub fn from_server_config(server: &crate::config::Server) -> Result<Self> {
+    pub fn from_server_config(
+        server: &crate::config::Server,
+        recv_buffer_size: usize,
+        send_buffer_size: usize,
+    ) -> Result<Self> {
         let tls_builder = TlsConfig::builder()
             .enabled(server.use_tls)
             .verify_cert(server.tls_verify_cert);
@@ -402,6 +406,8 @@ impl DeadpoolConnectionProvider {
                 username: server.username.clone(),
                 password: server.password.clone(),
                 tls_config: Some(tls_config),
+                recv_buffer_size,
+                send_buffer_size,
                 compress: server.compress,
                 compress_level: server.compress_level,
                 ..TcpManagerOptions::default()
