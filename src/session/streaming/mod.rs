@@ -496,20 +496,10 @@ enum ChunkResult {
     Continue,
 }
 
-#[derive(Clone, Copy)]
-enum TerminatorScan {
-    Exact,
-}
-
-struct ChunkProcessOptions {
-    terminator_scan: TerminatorScan,
-}
-
 struct ChunkProcessState<'a, R> {
     backend_read: &'a mut R,
     total_bytes: &'a mut u64,
     ctx: &'a StreamContext<'a>,
-    options: ChunkProcessOptions,
 }
 
 struct StreamBuffers<'a, 'b> {
@@ -542,9 +532,7 @@ where
     W: AsyncWriteExt + Unpin,
 {
     // Detect terminator location: within chunk or spanning boundary
-    let status = match state.options.terminator_scan {
-        TerminatorScan::Exact => tail.detect_terminator(data),
-    };
+    let status = tail.detect_terminator(data);
     let write_len = status.write_len(data.len());
 
     // Capture data if requested (for caching)
@@ -635,9 +623,6 @@ where
             backend_read,
             total_bytes,
             ctx,
-            options: ChunkProcessOptions {
-                terminator_scan: TerminatorScan::Exact,
-            },
         },
     )
     .await?
@@ -649,15 +634,6 @@ where
         }
         ChunkResult::Continue => Ok(None),
     }
-}
-
-const fn chunk_terminator_scan(
-    _capture: &Option<&mut crate::pool::ChunkedResponse>,
-    _leftover_out: &Option<&mut crate::pool::PooledBuffer>,
-    _chunk_len: usize,
-    _buffer_capacity: usize,
-) -> TerminatorScan {
-    TerminatorScan::Exact
 }
 
 async fn stream_remaining_chunks<R, W>(
@@ -715,14 +691,6 @@ where
         }
 
         let data = &buffers[idx][..n];
-        let options = ChunkProcessOptions {
-            terminator_scan: chunk_terminator_scan(
-                capture,
-                leftover_out,
-                n,
-                buffers[idx].capacity(),
-            ),
-        };
         match process_chunk(
             data,
             tail,
@@ -732,7 +700,6 @@ where
                 backend_read,
                 total_bytes,
                 ctx,
-                options,
             },
         )
         .await?
