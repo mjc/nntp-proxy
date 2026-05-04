@@ -113,6 +113,10 @@ name = "request_classifier_callgrind"
 harness = false
 
 [[bench]]
+name = "cache_miss_roundtrip_callgrind"
+harness = false
+
+[[bench]]
 name = "request_serialization"
 harness = false
 
