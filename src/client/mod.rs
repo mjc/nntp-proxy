@@ -507,4 +507,39 @@ mod tests {
             "unexpected error: {err:#}"
         );
     }
+
+    #[tokio::test]
+    async fn test_drain_multiline_into_stashes_packed_leftover_response() {
+        use crate::pool::BufferPool;
+        use crate::types::BufferSize;
+
+        let article = b"220 body follows\r\nHello world\r\n.\r\n";
+        let packed = [article.as_slice(), b"430 No such article\r\n"].concat();
+        let packed: &'static [u8] = Box::leak(packed.into_boxed_slice());
+        let (addr, notify) = spawn_test_server(packed).await;
+        let pool = make_test_pool(addr);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 2);
+
+        let mut conn = pool.get().await.unwrap();
+        notify.notify_one();
+
+        let mut io_buffer = buffer_pool.acquire().await;
+        let mut capture = buffer_pool.acquire_capture().await;
+        let first_chunk_size = io_buffer.read_from(&mut *conn).await.unwrap();
+
+        NntpClient::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, first_chunk_size)
+            .await
+            .unwrap();
+
+        assert_eq!(&capture[..], article as &[u8]);
+        assert!(conn.has_leftover(), "next response should be stashed");
+        assert_eq!(conn.leftover_len(), b"430 No such article\r\n".len());
+
+        let next = io_buffer.read_from(&mut *conn).await.unwrap();
+        assert_eq!(&io_buffer[..next], b"430 No such article\r\n");
+        assert!(
+            !conn.has_leftover(),
+            "stashed bytes should be consumed first"
+        );
+    }
 }
