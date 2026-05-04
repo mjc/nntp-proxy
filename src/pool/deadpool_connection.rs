@@ -4,6 +4,7 @@
 //! creation of optimized TCP/TLS connections to NNTP servers.
 
 use deadpool::managed;
+use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -77,6 +78,15 @@ pub struct TcpManager {
 }
 
 impl TcpManager {
+    fn socket_buffer_size_u32(size: usize, label: &str) -> Result<u32, ConnectionError> {
+        u32::try_from(size).map_err(|_| {
+            ConnectionError::IoError(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{label} socket buffer size {size} exceeds u32::MAX"),
+            ))
+        })
+    }
+
     /// Create a new `TcpManager` with optional TLS configuration
     ///
     /// If `options.tls_config` is `Some` with `use_tls = true`, the TLS manager is
@@ -139,12 +149,12 @@ impl TcpManager {
         };
 
         // Pre-connect options (buffer sizes, reuse)
-        socket.set_recv_buffer_size(
-            u32::try_from(self.recv_buffer_size).expect("receive buffer fits u32"),
-        )?;
-        socket.set_send_buffer_size(
-            u32::try_from(self.send_buffer_size).expect("send buffer fits u32"),
-        )?;
+        socket.set_recv_buffer_size(Self::socket_buffer_size_u32(
+            self.recv_buffer_size,
+            "receive",
+        )?)?;
+        socket
+            .set_send_buffer_size(Self::socket_buffer_size_u32(self.send_buffer_size, "send")?)?;
         socket.set_reuseaddr(true)?;
 
         // Async connect — does NOT block the tokio worker thread
@@ -417,6 +427,18 @@ impl managed::Manager for TcpManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_socket_buffer_size_u32_rejects_oversized_values() {
+        let result = TcpManager::socket_buffer_size_u32(u32::MAX as usize + 1, "receive");
+
+        assert!(matches!(
+            result,
+            Err(ConnectionError::IoError(ref error))
+                if error.kind() == io::ErrorKind::InvalidInput
+                    && error.to_string().contains("receive socket buffer size")
+        ));
+    }
 
     #[test]
     fn test_tcp_manager_new_plain() {

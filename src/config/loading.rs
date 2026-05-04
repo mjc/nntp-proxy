@@ -43,6 +43,17 @@ fn write_canonical_config(config_path: &str, config: &Config) -> Result<()> {
             tmp_path.display()
         )
     })?;
+
+    let original_permissions = fs::metadata(path)
+        .with_context(|| format!("Failed to read config metadata '{}'", path.display()))?
+        .permissions();
+    fs::set_permissions(&tmp_path, original_permissions).with_context(|| {
+        format!(
+            "Failed to preserve config permissions on temporary file '{}'",
+            tmp_path.display()
+        )
+    })?;
+
     fs::rename(&tmp_path, path).with_context(|| {
         format!(
             "Failed to atomically replace config '{}' with migrated schema",
@@ -899,6 +910,35 @@ adaptive_precheck = true
 
         let backup_path = format!("{path}.bak");
         assert!(std::path::Path::new(&backup_path).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_config_preserves_file_mode_when_migrating() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let mut temp_file = NamedTempFile::new().unwrap();
+
+        let config_content = r#"
+[[servers]]
+host = "legacy.example.com"
+port = 119
+name = "Legacy Server"
+
+[proxy]
+routing_mode = "per-command"
+backend_selection = "least-loaded"
+"#;
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let path = temp_file.path().to_path_buf();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        load_config_with_env_provider(path.to_str().unwrap(), &MockEnv::new()).unwrap();
+
+        let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]
