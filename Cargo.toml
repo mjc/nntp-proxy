@@ -168,3 +168,4 @@ strip = false
 [profile.bench]
 inherits = "release"
 debug = 2              # Full debuginfo so benchmark flamegraphs resolve symbols
+strip = false          # Keep symbols for addr2line/callgrind hotspot attribution

@@ -296,9 +296,7 @@ async fn fill_multiline_response(
         }
         TerminatorStatus::NotFound => {
             tail.update(&io_buffer[..initial_chunk_len]);
-            let mut owned_chunk = pool.acquire().await;
-            std::mem::swap(io_buffer, &mut owned_chunk);
-            response.push_chunk(owned_chunk);
+            response.extend_from_slice(pool, &io_buffer[..initial_chunk_len]);
         }
     }
 
@@ -331,9 +329,7 @@ async fn fill_multiline_response(
             "non-terminal multiline chunk should consume full read"
         );
         tail.update(&io_buffer[..write_len]);
-        let mut owned_chunk = pool.acquire().await;
-        std::mem::swap(io_buffer, &mut owned_chunk);
-        response.push_chunk(owned_chunk);
+        response.extend_from_slice(pool, &io_buffer[..write_len]);
     }
 }
 
@@ -465,9 +461,7 @@ pub(crate) async fn buffer_multiline_response(
                     "non-terminal multiline chunk should consume full read"
                 );
                 tail.update(&io_buffer[..write_len]);
-                let mut owned_chunk = ctx.buffer_pool.acquire().await;
-                std::mem::swap(&mut io_buffer, &mut owned_chunk);
-                captured.push_chunk(owned_chunk);
+                captured.extend_from_slice(ctx.buffer_pool, &io_buffer[..write_len]);
             }
         }
     }

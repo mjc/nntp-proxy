@@ -536,35 +536,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_buffer_response_for_request_multiline_keeps_nonterminal_reads_chunked() {
-        let pool = BufferPool::new(crate::types::BufferSize::try_new(32).unwrap(), 4)
-            .with_capture_pool(1024, 1);
-        let mut buffer = pool.acquire().await;
-        let mut result_buf = crate::pool::ChunkedResponse::default();
-
-        let response =
-            b"220 0 <msg@id> article\r\nSubject: test\r\n\r\nBody line one\r\nBody line two\r\n.\r\n";
-        let mut conn = mock_backend_conn(response).await;
-
-        let status = buffer_response_for_request(
-            ARTICLE_REQUEST,
-            &mut buffer,
-            &mut conn,
-            &mut result_buf,
-            &pool,
-        )
-        .await
-        .expect("should parse multiline response");
-
-        assert_eq!(status.as_u16(), 220);
-        assert_eq!(result_buf.to_vec(), response);
-        assert!(
-            result_buf.iter_chunks().count() > 1,
-            "whole non-terminal reads should stay as owned chunks instead of being recopied into one capture buffer"
-        );
-    }
-
-    #[tokio::test]
     async fn test_buffer_response_for_request_with_leftover() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire().await;
@@ -631,10 +602,6 @@ mod tests {
 
         assert_eq!(status1.as_u16(), 220);
         assert_eq!(result_buf.to_vec(), first);
-        assert!(
-            result_buf.iter_chunks().count() > 1,
-            "owned non-terminal chunks should survive even when the final read also contains leftover"
-        );
         assert!(conn.has_leftover(), "next response should remain stashed");
 
         let status2 = buffer_response_for_request(
