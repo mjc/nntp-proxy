@@ -284,20 +284,19 @@ async fn fill_multiline_response(
 ) -> Result<(), StreamingError> {
     use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
 
-    let initial_chunk = &io_buffer[..initial_chunk_len];
     let mut tail = TailBuffer::default();
 
-    match tail.detect_terminator(initial_chunk) {
+    match tail.detect_terminator(&io_buffer[..initial_chunk_len]) {
         TerminatorStatus::FoundAt(pos) => {
-            response.extend_from_slice(pool, &initial_chunk[..pos]);
-            if pos < initial_chunk.len() {
-                stash_leftover(conn, &initial_chunk[pos..])?;
+            response.extend_from_slice(pool, &io_buffer[..pos]);
+            if pos < initial_chunk_len {
+                stash_leftover(conn, &io_buffer[pos..initial_chunk_len])?;
             }
             return Ok(());
         }
         TerminatorStatus::NotFound => {
-            response.extend_from_slice(pool, initial_chunk);
-            tail.update(initial_chunk);
+            tail.update(&io_buffer[..initial_chunk_len]);
+            response.extend_from_slice(pool, &io_buffer[..initial_chunk_len]);
         }
     }
 
@@ -314,19 +313,23 @@ async fn fill_multiline_response(
             });
         }
 
-        let chunk = &io_buffer[..n];
-        let status = tail.detect_terminator(chunk);
+        let status = tail.detect_terminator(&io_buffer[..n]);
         let write_len = status.write_len(n);
-        response.extend_from_slice(pool, &chunk[..write_len]);
 
         if status.is_found() {
+            response.extend_from_slice(pool, &io_buffer[..write_len]);
             if write_len < n {
-                stash_leftover(conn, &chunk[write_len..n])?;
+                stash_leftover(conn, &io_buffer[write_len..n])?;
             }
             return Ok(());
         }
 
-        tail.update(&chunk[..write_len]);
+        debug_assert_eq!(
+            write_len, n,
+            "non-terminal multiline chunk should consume full read"
+        );
+        tail.update(&io_buffer[..write_len]);
+        response.extend_from_slice(pool, &io_buffer[..write_len]);
     }
 }
 
@@ -442,19 +445,23 @@ pub(crate) async fn buffer_multiline_response(
                     });
                 }
 
-                let chunk = &io_buffer[..n];
-                let status = tail.detect_terminator(chunk);
+                let status = tail.detect_terminator(&io_buffer[..n]);
                 let write_len = status.write_len(n);
-                captured.extend_from_slice(ctx.buffer_pool, &chunk[..write_len]);
 
                 if status.is_found() {
+                    captured.extend_from_slice(ctx.buffer_pool, &io_buffer[..write_len]);
                     if write_len < n {
-                        stash_leftover(conn, &chunk[write_len..n])?;
+                        stash_leftover(conn, &io_buffer[write_len..n])?;
                     }
                     break;
                 }
 
-                tail.update(&chunk[..write_len]);
+                debug_assert_eq!(
+                    write_len, n,
+                    "non-terminal multiline chunk should consume full read"
+                );
+                tail.update(&io_buffer[..write_len]);
+                captured.extend_from_slice(ctx.buffer_pool, &io_buffer[..write_len]);
             }
         }
     }

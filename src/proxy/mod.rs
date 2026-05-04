@@ -44,7 +44,7 @@ pub struct NntpProxy {
     pub(super) metrics: MetricsCollector,
     /// Connection statistics aggregator (reduces log spam)
     pub(super) connection_stats: ConnectionStatsAggregator,
-    /// Article cache (always present - tracks backend availability even with capacity=0)
+    /// Article cache (always present - fixed-size, memory-backed, hybrid, or disabled)
     pub(super) cache: Arc<UnifiedCache>,
     /// Whether to cache article bodies (config-driven)
     pub(super) cache_articles: bool,
@@ -201,7 +201,7 @@ impl NntpProxy {
         &self.buffer_pool
     }
 
-    /// Get the article cache (always present - capacity 0 if not configured)
+    /// Get the article cache (always present, though availability-only mode may be disabled)
     #[must_use]
     #[inline]
     pub const fn cache(&self) -> &Arc<UnifiedCache> {

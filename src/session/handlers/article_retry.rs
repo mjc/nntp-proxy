@@ -71,9 +71,8 @@ struct RequestExecutionIo<'a, 'b> {
 enum PreparedRequest {
     /// The response was already written to the client.
     Served,
-    /// Continue with backend routing using the resolved message ID and availability.
+    /// Continue with backend routing using resolved availability state.
     Continue {
-        msg_id: Option<crate::types::MessageId<'static>>,
         availability: Option<ArticleAvailability>,
     },
 }
@@ -570,15 +569,12 @@ impl ClientSession {
             client_to_backend_bytes,
             backend_to_client_bytes,
         };
-        let (msg_id, mut availability) = match self
+        let mut availability = match self
             .prepare_request_execution(&router, request, &mut io)
             .await?
         {
             PreparedRequest::Served => return Ok(()),
-            PreparedRequest::Continue {
-                msg_id,
-                availability,
-            } => (msg_id, availability),
+            PreparedRequest::Continue { availability } => availability,
         };
 
         if !request.is_large_transfer()
@@ -589,7 +585,7 @@ impl ClientSession {
             return Ok(());
         }
 
-        self.execute_article_retry_loop(&router, request, msg_id, availability, &mut io)
+        self.execute_article_retry_loop(&router, request, availability, &mut io)
             .await
     }
 
@@ -624,19 +620,11 @@ impl ClientSession {
                 .map(Self::request_cache_availability),
             CacheLookupResult::Miss => None,
         };
-        let msg_id = request.message_id_value().map(|msg_id| msg_id.to_owned());
-
-        if self
-            .try_adaptive_precheck(router, request, io, msg_id.as_ref())
-            .await?
-        {
+        if self.try_adaptive_precheck(router, request, io).await? {
             return Ok(PreparedRequest::Served);
         }
 
-        Ok(PreparedRequest::Continue {
-            msg_id,
-            availability,
-        })
+        Ok(PreparedRequest::Continue { availability })
     }
 
     const fn request_cache_availability(
@@ -650,17 +638,16 @@ impl ClientSession {
         router: &Arc<BackendSelector>,
         request: &RequestContext,
         io: &mut RequestExecutionIo<'_, '_>,
-        msg_id: Option<&crate::types::MessageId<'static>>,
     ) -> Result<bool, SessionError> {
         if !self.adaptive_precheck || !(request.is_stat() || request.is_head()) {
             return Ok(false);
         }
-        let Some(msg_id) = msg_id else {
+        let Some(msg_id) = request.message_id_value() else {
             return Ok(false);
         };
 
         let deps = self.precheck_deps(router);
-        let bytes_written = if let Some(entry) = precheck::precheck(&deps, request, msg_id).await {
+        let bytes_written = if let Some(entry) = precheck::precheck(&deps, request, &msg_id).await {
             if let Some(write) = write_cached_article_response(
                 io.client_write,
                 &entry,
@@ -788,7 +775,6 @@ impl ClientSession {
         &self,
         router: &Arc<BackendSelector>,
         request: &mut RequestContext,
-        msg_id: Option<crate::types::MessageId<'static>>,
         availability: Option<ArticleAvailability>,
         io: &mut RequestExecutionIo<'_, '_>,
     ) -> Result<(), SessionError> {
@@ -813,7 +799,6 @@ impl ClientSession {
                 .try_backend_for_article(
                     router,
                     request,
-                    msg_id.as_ref(),
                     io.client_write,
                     &mut ArticleAttemptState {
                         availability: &mut availability,
@@ -829,6 +814,7 @@ impl ClientSession {
                         .expect("successful direct attempt records response metadata");
                     *io.backend_to_client_bytes =
                         io.backend_to_client_bytes.add(response.wire_len().get());
+                    let msg_id = request.message_id_value();
                     self.sync_availability_if_needed(msg_id.as_ref(), &availability)
                         .await;
                     return Ok(());
@@ -859,8 +845,10 @@ impl ClientSession {
 
         debug!(
             "Client {} all backends exhausted for {:?}, sending 430",
-            self.client_addr, msg_id
+            self.client_addr,
+            request.message_id_value()
         );
+        let msg_id = request.message_id_value();
         self.sync_availability_if_needed(msg_id.as_ref(), &availability)
             .await;
         self.send_430_to_client(io.client_write, io.backend_to_client_bytes)

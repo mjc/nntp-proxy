@@ -137,32 +137,6 @@ impl PooledBuffer {
         self.buffer.truncate(len);
     }
 
-    /// Get mutable access to the fixed I/O writable region.
-    ///
-    /// This is for scratch-buffer paths that need to inspect bytes returned by
-    /// a read that already reported its byte count. It does not update the
-    /// logical initialized length; callers must use the read byte count directly.
-    ///
-    /// # Safety Note
-    /// Only bytes written by the caller's I/O operation should be read. Prefer
-    /// `read_from()` or `read_more()` when possible because those update the
-    /// initialized length automatically.
-    ///
-    /// # Examples
-    /// ```ignore
-    /// let mut buffer = pool.acquire().await;
-    /// let n = stream.read(buffer.as_mut_slice()).await?;
-    /// let initialized_data = &buffer.as_mut_slice()[..n];
-    /// ```
-    #[must_use]
-    #[inline]
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        // `create_aligned_buffer` initializes the full writable region before
-        // clearing the logical length, so this preserves the old fixed-I/O API
-        // without making those bytes part of the initialized slice.
-        unsafe { std::slice::from_raw_parts_mut(self.buffer.as_mut_ptr(), self.writable_len) }
-    }
-
     /// Append data to the buffer (accumulator mode)
     ///
     /// Used when `PooledBuffer` is acquired from capture pool for accumulating
@@ -206,7 +180,7 @@ impl Deref for PooledBuffer {
     }
 }
 
-// Intentionally NO DerefMut or AsMut - forces explicit use of read_from() or as_mut_slice()
+// Intentionally NO DerefMut or AsMut - forces explicit use of read_from()/read_more()
 
 impl AsRef<[u8]> for PooledBuffer {
     #[inline]
@@ -468,12 +442,8 @@ impl BufferPool {
     /// **INTERNAL USE ONLY.** This function is not exposed publicly and is only used
     /// within the buffer pool implementation where the safety contract is guaranteed.
     ///
-    /// The returned buffer has initialized spare storage for the fixed I/O view, but a logical
-    /// length of zero. Only bytes added to the `BytesMut` logical length are exposed through the
-    /// public initialized slice APIs.
-    ///
-    /// The public API (`acquire()`) returns a `PooledBuffer` which is a safe wrapper that
-    /// enforces this contract through the type system and usage patterns.
+    /// The returned buffer has a logical length of zero. Only bytes added to the
+    /// `BytesMut` logical length are exposed through the public initialized slice APIs.
     fn create_aligned_buffer(size: usize) -> BytesMut {
         // Align to page boundaries (4KB) for better memory performance
         let page_size = 4096;
@@ -484,7 +454,7 @@ impl BufferPool {
         buffer
     }
 
-    /// Pre-fault pages by writing to each 4KB stride to map physical memory
+    /// Pre-fault pages by touching one byte per 4KB stride to map physical memory.
     ///
     /// This eliminates page faults during streaming by ensuring all pages are
     /// resident in physical memory. Without this, the first write to each page
@@ -492,23 +462,21 @@ impl BufferPool {
     ///
     /// # Safety
     ///
-    /// M2: We write within the buffer's allocated capacity (not beyond it).
+    /// We write within the buffer's allocated capacity (not beyond it).
     /// `write_volatile` touches one byte per 4KB page to trigger the OS page fault
-    /// at init time rather than during streaming I/O. Values are overwritten by
-    /// actual I/O before being read.
+    /// at init time rather than during streaming I/O. We deliberately do NOT zero
+    /// the full allocation first; scratch buffers are filled via `read_buf` before
+    /// their bytes become part of the initialized slice.
     fn prefault_pages(buf: &mut BytesMut) {
         let cap = buf.capacity();
-        buf.resize(cap, 0);
-        // SAFETY: We write within the buffer's allocated capacity.
-        // Each write_volatile touches one byte per 4KB page to trigger page faults.
-        // These sentinel values (1) are overwritten by real I/O data before being read.
+        // SAFETY: We write within the buffer's allocated capacity. `BytesMut::with_capacity`
+        // reserves that storage even though the logical length remains zero.
         unsafe {
             let ptr = buf.as_mut_ptr();
             for offset in (0..cap).step_by(4096) {
                 std::ptr::write_volatile(ptr.add(offset), 1);
             }
         }
-        buf.clear();
     }
 
     /// Create a new buffer pool with pre-allocated buffers
@@ -788,7 +756,7 @@ mod tests {
     async fn test_read_from_is_limited_to_fixed_writable_region() {
         let pool = BufferPool::new(BufferSize::try_new(8).unwrap(), 1);
         let mut buffer = pool.acquire().await;
-        assert!(buffer.capacity() > buffer.as_mut_slice().len());
+        assert_eq!(buffer.capacity(), 4096);
 
         let (mut writer, mut reader) = tokio::io::duplex(64);
         writer
@@ -800,7 +768,7 @@ mod tests {
         let read = buffer.read_from(&mut reader).await.unwrap();
         assert_eq!(read, 8);
         assert_eq!(buffer.initialized(), 8);
-        assert_eq!(buffer.as_mut_slice()[..read].len(), read);
+        assert_eq!(buffer[..read].len(), read);
     }
 
     #[tokio::test]
@@ -1115,30 +1083,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_as_mut_slice() {
-        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 5);
-        let mut buffer = pool.acquire().await;
-
-        // Get mutable slice and write to it
-        let slice = buffer.as_mut_slice();
-        assert_eq!(slice.len(), 1024);
-
-        // Write some data manually
-        slice[0] = b'H';
-        slice[1] = b'i';
-        slice[2] = b'!';
-
-        // Can write to the fixed I/O writable region
-        for (i, byte) in slice.iter_mut().enumerate() {
-            *byte = u8::try_from(i % 256).expect("modulo 256 always fits in u8");
-        }
-
-        // Note: initialized() doesn't track manual writes via as_mut_slice
-        // This is intentional - as_mut_slice is for low-level I/O
-        assert_eq!(buffer.initialized(), 0);
-    }
-
-    #[tokio::test]
     async fn test_buffer_pool_stress() {
         let pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 10);
 
@@ -1250,16 +1194,6 @@ mod tests {
         buffer.copy_from_slice(b"Small");
         assert_eq!(buffer.capacity(), 8192);
         assert_eq!(buffer.initialized(), 5);
-    }
-
-    #[tokio::test]
-    async fn test_as_mut_slice_capacity() {
-        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 5);
-        let mut buffer = pool.acquire().await;
-
-        // as_mut_slice should return the fixed I/O writable region
-        let slice = buffer.as_mut_slice();
-        assert_eq!(slice.len(), 1024);
     }
 
     #[tokio::test]

@@ -7,7 +7,9 @@
 //! - `ArticleAvailability::from_bits()`
 //! - `DiskCache` configuration defaults and validation
 
-use nntp_proxy::cache::{ArticleAvailability, ArticleCache, BackendStatus, UnifiedCache};
+use nntp_proxy::cache::{
+    ArticleAvailability, ArticleCache, AvailabilityIndex, BackendStatus, UnifiedCache,
+};
 use nntp_proxy::protocol::RequestKind;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
@@ -26,9 +28,9 @@ async fn test_unified_cache_memory_construction() {
 
 #[tokio::test]
 async fn test_unified_cache_availability_construction() {
-    let cache = UnifiedCache::availability(4096, std::time::Duration::MAX);
+    let cache = UnifiedCache::availability(std::time::Duration::MAX);
     assert!(!cache.is_hybrid());
-    assert_eq!(cache.capacity(), 4096);
+    assert_eq!(cache.capacity(), AvailabilityIndex::new().capacity_bytes());
     assert_eq!(cache.entry_count(), 0);
 }
 
@@ -43,7 +45,7 @@ async fn test_unified_cache_memory_get_miss() {
 
 #[tokio::test]
 async fn test_unified_cache_availability_get_miss() {
-    let cache = UnifiedCache::availability(4096, std::time::Duration::MAX);
+    let cache = UnifiedCache::availability(std::time::Duration::MAX);
     let msg_id = MessageId::from_str_or_wrap("test@example.com").unwrap();
 
     let result = cache.get(&msg_id).await;
@@ -88,7 +90,7 @@ async fn test_unified_cache_memory_record_missing() {
 
 #[tokio::test]
 async fn test_unified_cache_availability_record_missing() {
-    let cache = UnifiedCache::availability(8192, std::time::Duration::MAX);
+    let cache = UnifiedCache::availability(std::time::Duration::MAX);
     let msg_id = MessageId::from_str_or_wrap("missing@example.com").unwrap();
     let backend_id = BackendId::from_index(0);
 
@@ -129,7 +131,7 @@ async fn test_unified_cache_sync_availability() {
 
 #[tokio::test]
 async fn test_unified_cache_availability_sync_persists_only_missing_bits() {
-    let cache = UnifiedCache::availability(8192, std::time::Duration::MAX);
+    let cache = UnifiedCache::availability(std::time::Duration::MAX);
     let msg_id = MessageId::from_str_or_wrap("test@example.com").unwrap();
     let mut availability = ArticleAvailability::new();
     availability.record_missing(BackendId::from_index(1));
