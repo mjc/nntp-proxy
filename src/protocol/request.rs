@@ -6,7 +6,7 @@
 
 use smallvec::SmallVec;
 
-use super::StatusCode;
+use super::{StatusCode, codes};
 use crate::types::{BackendId, MessageId};
 
 pub const MAX_COMMAND_LINE_OCTETS: usize = 512;
@@ -786,7 +786,7 @@ impl RequestContext {
                 | (RequestKind::Hdr | RequestKind::Xhdr, 225)
                 | (RequestKind::NewNews, 230)
                 | (RequestKind::NewGroups, 231)
-        )
+        ) || matches!(self.kind, RequestKind::Unknown) && status_implies_multiline(code)
     }
 }
 
@@ -903,9 +903,39 @@ const fn classify_verb(verb: &[u8]) -> RequestKind {
 }
 
 fn find_message_id(args: &[u8]) -> Option<(usize, usize)> {
-    let start = args.iter().position(|b| *b == b'<')?;
-    let end = args[start..].iter().position(|b| *b == b'>')? + start + 1;
+    let start = args.iter().position(|byte| !byte.is_ascii_whitespace())?;
+    let end = args.iter().rposition(|byte| !byte.is_ascii_whitespace())? + 1;
+    let trimmed = &args[start..end];
+
+    if !trimmed.starts_with(b"<")
+        || !trimmed.ends_with(b">")
+        || trimmed[1..trimmed.len() - 1]
+            .iter()
+            .any(|byte| byte.is_ascii_whitespace())
+    {
+        return None;
+    }
+
+    MessageId::from_borrowed(std::str::from_utf8(trimmed).ok()?).ok()?;
     Some((start, end))
+}
+
+const fn status_implies_multiline(code: u16) -> bool {
+    matches!(
+        code,
+        codes::HELP_TEXT
+            | codes::CAPABILITY_LIST
+            | codes::INFORMATION_FOLLOWS
+            | codes::ARTICLE_FOLLOWS
+            | codes::HEAD_FOLLOWS
+            | codes::BODY_FOLLOWS
+            | codes::OVERVIEW_FOLLOWS
+            | codes::HEADERS_FOLLOW
+            | codes::NEW_ARTICLES_FOLLOW
+            | codes::NEW_GROUPS_FOLLOW
+            | 282
+            | 288
+    )
 }
 
 #[cfg(test)]
@@ -1017,6 +1047,18 @@ mod tests {
             Some(MessageId::from_borrowed("<a@b>").unwrap())
         );
         assert_eq!(parsed.route_class(), RequestRouteClass::ArticleByMessageId);
+    }
+
+    #[test]
+    fn borrowed_request_line_requires_exact_message_id_argument() {
+        let extra_token = RequestLine::parse(b"ARTICLE 123 <a@b>\r\n");
+        let spaced = RequestLine::parse(b"ARTICLE   <a@b>  \r\n");
+
+        assert_eq!(extra_token.message_id(), None);
+        assert_eq!(extra_token.route_class(), RequestRouteClass::Stateful);
+
+        assert_eq!(spaced.message_id(), Some("<a@b>"));
+        assert_eq!(spaced.route_class(), RequestRouteClass::ArticleByMessageId);
     }
 
     #[test]
@@ -1323,10 +1365,14 @@ mod tests {
     fn request_context_derives_multiline_response_expectation() {
         let group = request_context(b"GROUP alt.test\r\n");
         let listgroup = request_context(b"LISTGROUP alt.test\r\n");
+        let unknown = request_context(b"XFEATURE TEST\r\n");
         assert!(!group.expects_multiline_response(StatusCode::new(211)));
         assert!(listgroup.expects_multiline_response(StatusCode::new(211)));
         assert!(
             !request_context(b"ARTICLE <x@y>\r\n").expects_multiline_response(StatusCode::new(430))
         );
+        assert!(unknown.expects_multiline_response(StatusCode::new(282)));
+        assert!(unknown.expects_multiline_response(StatusCode::new(288)));
+        assert!(!unknown.expects_multiline_response(StatusCode::new(281)));
     }
 }
