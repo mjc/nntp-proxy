@@ -44,7 +44,7 @@ pub struct NntpProxy {
     pub(super) metrics: MetricsCollector,
     /// Connection statistics aggregator (reduces log spam)
     pub(super) connection_stats: ConnectionStatsAggregator,
-    /// Article cache (always present - tracks backend availability even with capacity=0)
+    /// Article cache (always present - at minimum a fixed-size availability index)
     pub(super) cache: Arc<UnifiedCache>,
     /// Whether to cache article bodies (config-driven)
     pub(super) cache_articles: bool,

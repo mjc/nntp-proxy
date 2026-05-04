@@ -349,7 +349,7 @@ pub enum UnifiedCache {
 impl UnifiedCache {
     /// Create an availability-only negative index.
     #[must_use]
-    pub fn availability(_capacity: u64, ttl: std::time::Duration) -> Self {
+    pub fn availability(ttl: std::time::Duration) -> Self {
         Self::Availability(AvailabilityIndex::with_ttl(ttl))
     }
 

@@ -252,7 +252,7 @@ impl NntpProxyBuilder {
                 );
             }
         } else {
-            info!("Backend availability tracking enabled (cache disabled, capacity=0)");
+            info!("Backend availability tracking enabled (fixed-size availability index)");
         }
     }
 
@@ -274,7 +274,7 @@ impl NntpProxyBuilder {
             let cache_articles = cache_config.cache_articles;
 
             let cache = if !cache_articles {
-                Arc::new(UnifiedCache::availability(capacity, cache_config.ttl))
+                Arc::new(UnifiedCache::availability(cache_config.ttl))
             } else if let Some(disk_config) = &cache_config.disk {
                 let hybrid_config = HybridCacheConfig {
                     memory_capacity: capacity,
@@ -304,11 +304,8 @@ impl NntpProxyBuilder {
             Self::log_cache_config(cache_config, cache_articles);
             (cache, cache_articles)
         } else {
-            debug!("Cache not configured, using availability-only mode (capacity=0)");
-            (
-                Arc::new(UnifiedCache::availability(0, Duration::MAX)),
-                false,
-            )
+            debug!("Cache not configured, using fixed-size availability-only mode");
+            (Arc::new(UnifiedCache::availability(Duration::MAX)), false)
         };
 
         Ok(ctx.into_proxy(cache, cache_articles))
@@ -331,7 +328,6 @@ impl NntpProxyBuilder {
 
         // Create article cache (memory-only in sync version)
         let (cache, cache_articles) = if let Some(cache_config) = &cache_config {
-            let capacity = cache_config.max_capacity.as_u64();
             let cache_articles = cache_config.cache_articles;
 
             if cache_config.disk.is_some() && cache_articles {
@@ -341,19 +337,17 @@ impl NntpProxyBuilder {
             }
 
             let cache = if cache_articles {
+                let capacity = cache_config.max_capacity.as_u64();
                 Arc::new(UnifiedCache::memory(capacity, cache_config.ttl))
             } else {
-                Arc::new(UnifiedCache::availability(capacity, cache_config.ttl))
+                Arc::new(UnifiedCache::availability(cache_config.ttl))
             };
 
             Self::log_cache_config(cache_config, cache_articles);
             (cache, cache_articles)
         } else {
-            debug!("Cache not configured, using availability-only mode (capacity=0)");
-            (
-                Arc::new(UnifiedCache::availability(0, Duration::MAX)),
-                false,
-            )
+            debug!("Cache not configured, using fixed-size availability-only mode");
+            (Arc::new(UnifiedCache::availability(Duration::MAX)), false)
         };
 
         Ok(ctx.into_proxy(cache, cache_articles))

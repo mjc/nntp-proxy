@@ -34,7 +34,7 @@ pub struct ClientSession {
     /// Connection statistics aggregator for logging connection creation
     pub(super) connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
 
-    /// Article cache (always present - tracks backend availability even with capacity=0)
+    /// Article cache (always present - at minimum a fixed-size availability index)
     pub(super) cache: Arc<crate::cache::UnifiedCache>,
 
     /// Whether to cache article bodies (config-driven)
@@ -192,7 +192,6 @@ impl ClientSession {
     /// Create default cache for availability tracking only (no content caching)
     fn default_cache() -> Arc<crate::cache::UnifiedCache> {
         Arc::new(crate::cache::UnifiedCache::availability(
-            0,
             std::time::Duration::MAX,
         ))
     }
@@ -245,7 +244,6 @@ impl ClientSession {
             metrics,
             connection_stats: None,
             cache: Arc::new(crate::cache::UnifiedCache::availability(
-                0,
                 std::time::Duration::MAX,
             )),
             cache_articles: true,
@@ -290,7 +288,6 @@ impl ClientSession {
             metrics,
             connection_stats: None,
             cache: Arc::new(crate::cache::UnifiedCache::availability(
-                0,
                 std::time::Duration::MAX,
             )),
             cache_articles: true,

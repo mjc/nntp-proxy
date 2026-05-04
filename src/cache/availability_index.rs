@@ -209,6 +209,21 @@ impl FilterState {
         };
     }
 
+    fn reanchor_current_generation(&mut self) {
+        let Some((index, _)) = self
+            .generations
+            .iter()
+            .enumerate()
+            .filter(|(_, generation)| generation.started_at != 0)
+            .max_by_key(|(_, generation)| generation.started_at)
+        else {
+            return;
+        };
+
+        self.current_generation = index;
+        self.refresh_next_rotation_at();
+    }
+
     fn rotate_if_needed(&mut self, now: u64) -> usize {
         if self.blocks_per_generation == 0 || self.generations.is_empty() {
             return 0;
@@ -530,7 +545,7 @@ impl AvailabilityIndex {
             evicted += state.restore_entry(entry, now, self.ttl);
         }
         if state.live_generations != 0 {
-            state.refresh_next_rotation_at();
+            state.reanchor_current_generation();
         }
         let has_entries = state.occupied_slots() != 0;
         drop(state);
@@ -1011,6 +1026,33 @@ mod tests {
         );
         assert!(restored.load_from_path(&path).unwrap());
         assert!(restored.get(&msg_id).is_none());
+    }
+
+    #[test]
+    fn load_from_path_keeps_older_generation_as_rotation_anchor() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("availability-older-generation.idx");
+        let index = AvailabilityIndex::with_capacity_and_generation_count(
+            test_capacity_for(8, 2),
+            std::time::Duration::from_millis(40),
+            DEFAULT_GENERATIONS,
+        );
+        let msg_id = MessageId::from_borrowed("<persisted-older@example.com>").unwrap();
+
+        index.record_backend_missing(&msg_id, BackendId::from_index(0));
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        index.save_to_path(&path).unwrap();
+
+        let restored = AvailabilityIndex::with_capacity_and_generation_count(
+            test_capacity_for(8, 2),
+            std::time::Duration::from_millis(40),
+            DEFAULT_GENERATIONS,
+        );
+        assert!(restored.load_from_path(&path).unwrap());
+        assert!(
+            restored.get(&msg_id).is_some(),
+            "restored older-generation entry should survive the first lookup"
+        );
     }
 
     #[test]

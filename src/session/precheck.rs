@@ -563,7 +563,7 @@ mod tests {
         use crate::types::BackendId;
 
         let backend_id = BackendId::from_index(0);
-        let cache = UnifiedCache::availability(100, std::time::Duration::MAX);
+        let cache = UnifiedCache::availability(std::time::Duration::MAX);
         let msg_id = MessageId::new("<test@example.com>".to_string()).unwrap();
 
         cache_precheck_hit(
