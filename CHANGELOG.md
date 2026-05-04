@@ -1,11 +1,3 @@
-## Unreleased
-
-- Fix: guard availability bit shifts to avoid UB/panic (BackendId::availability_bit).
-- Fix: correct full-buffer terminator handling in streaming; remove unsafe BoundaryOnly fast-path.
-- Fix: tighten message-id routing; restore multiline fallback for unknown commands.
-- Perf: UnifiedCache.get_miss ≈ 182 ns; cache hit 64KB ≈ 13.2 µs (backend ≈ 39.9 µs); cache hit 768KB ≈ 75 µs (backend ≈ 269 µs).
-- Docs: recommend buffer-pool sizing to avoid fallback allocations and maintain zero-allocation hot path.
-
 # Changelog
 
 All notable changes to this project will be documented in this file.
@@ -14,6 +6,66 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+### Added
+
+- **Typed request pipeline rewrite**
+  - Added `RequestContext`-based request handling so validated verb and argument bytes can move through routing, batching, cache, and response accounting without rebuilding ad-hoc command buffers.
+  - Added typed request, response, cache, and wire-length metadata slots used throughout per-command, pipeline, and stateful execution paths.
+
+- **Availability-only negative cache index**
+  - Added a compact sharded index for exact per-message-id 430 knowledge without storing payload bytes.
+  - Added bounded arena storage, LRU-style eviction/compaction, and persistence support for availability-only cache state.
+
+- **Benchmark coverage for the rewritten hot paths**
+  - Added benchmark suites for request batch parsing, request serialization, request classifier callgrind runs, cache ingest, cache response generation, end-to-end proxy cache hits, streaming round-trips, and tail-buffer boundaries.
+
+### Changed
+
+- **Typed cache and routing internals**
+  - Reworked cache lookup, cache upsert, pipeline completion, backend response accounting, and metrics recording to operate on typed request context metadata instead of legacy loosely-coupled helper paths.
+  - Reworked cache response generation and ingestion to use typed cache parts and borrowed bytes, reducing copying and eliminating steady-state cache-hit allocations on the common path.
+
+- **Protocol and classifier cleanup**
+  - Removed the legacy command classifier export and the old message-id extractor in favor of typed request parsing and routing decisions.
+  - Updated request handling so local/reject/stateful/stateless routing decisions derive from parsed request context instead of duplicated command-shape checks.
+
+- **Typed cache metadata**
+  - Converted cache tier, timestamp, payload kind, article number, response status, and wire-length fields to typed wrappers across memory and hybrid cache implementations.
+
+### Fixed
+
+- **Availability-only cache correctness**
+  - Fixed 430 handling so missing-article knowledge can be retained without a payload and reused on later requests instead of repeatedly probing every backend.
+  - Guarded availability bit generation with `BackendId::availability_bit()` so out-of-range backend indexes fail at a single checked boundary instead of relying on raw shifts.
+
+- **Streaming response framing**
+  - Fixed full-buffer multiline response handling so terminator detection always flows through `TailBuffer`, preventing pipelined bytes from being consumed past the article terminator.
+  - Removed the unsafe `BoundaryOnly` fast path that could desynchronize backend response framing.
+
+- **Typed request routing regressions**
+  - Tightened message-id detection so commands are only routed as message-id lookups when the argument is a single exact validated message-id token.
+  - Restored multiline-response fallback for unknown extension commands so legacy multiline 1xx/2xx extension responses keep working after the request rewrite.
+
+### Performance
+
+- Steady-state cache-hit and request-routing hot paths remain zero-allocation when buffer pools and `SmallVec` inline capacities are sized for the working set.
+- Microbench and focused benchmark notes from this branch:
+  - `UnifiedCache::get()` miss: ~182 ns
+  - 64 KB cache hit hot path: ~13.1-13.7 us
+  - 768 KB cache hit hot path: ~74.8-76.4 us
+- Matched native end-to-end reruns against `main` showed the rewritten cache path closing most of the gap on hits and reaching rough parity or better on larger payloads:
+  - 64 KB cache hit: 15.15 us on this branch vs 13.76 us on `main`
+  - 768 KB cache hit: 76.41 us on this branch vs 78.24 us on `main`
+  - 64 KB cache miss: 33.23 us on this branch vs 32.05 us on `main`
+  - 768 KB cache miss: 208.9 us on this branch vs 238.1 us on `main`
+- 64 KB backend round trips still trailed `main` in the same reruns (44.35 us here vs 30.71 us on `main`), so the rewrite improved cache-hit throughput much more than uncached backend forwarding.
+
+### Technical Details
+
+- Branch scope: 162 files changed, 14,344 insertions, 11,166 deletions.
+- The rewrite replaces legacy request/classifier plumbing with typed request contexts end-to-end across protocol parsing, cache operations, pipeline execution, and metrics.
+- Buffer-pool sizing still matters: undersized pools can force fallback allocations and reduce the benefits of the zero-allocation hot path.
 
 ## [0.4.0] - 2026-01-27
 
