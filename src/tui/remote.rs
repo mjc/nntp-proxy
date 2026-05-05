@@ -2,6 +2,7 @@
 
 use crate::tui::TuiApp;
 use crate::tui::dashboard::DashboardState;
+use anyhow::Context;
 use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt, future, stream};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -98,7 +99,9 @@ pub async fn run_dashboard_publisher(
     listen_addr: SocketAddr,
     mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
 ) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(listen_addr).await?;
+    let listener = TcpListener::bind(listen_addr)
+        .await
+        .with_context(|| format!("Failed to bind dashboard websocket listener at {listen_addr}"))?;
     let (state_tx, _state_rx) = watch::channel(Arc::new(app.snapshot_state()));
     let mut update_interval = tokio::time::interval(Duration::from_millis(250));
     update_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -249,6 +252,22 @@ mod tests {
             .is_none()
         );
         assert!(dashboard_state_from_message(Ok(Message::Text("{not-json}".into()))).is_none());
+    }
+
+    #[tokio::test]
+    async fn dashboard_publisher_bind_error_mentions_dashboard_listener() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test port");
+        let addr = listener.local_addr().expect("local addr");
+        let (_shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+
+        let err = run_dashboard_publisher(build_test_app(), addr, shutdown_rx)
+            .await
+            .expect_err("bind should fail");
+
+        let err = format!("{err:#}");
+        assert!(err.contains("Failed to bind dashboard websocket listener"));
     }
 
     #[tokio::test]
