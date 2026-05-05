@@ -248,33 +248,18 @@ pub const fn load_percentage_color(percent: f64) -> Color {
     }
 }
 
-/// Color for pending count
+/// Color for byte sizes and large counters based on magnitude.
 #[must_use]
-pub const fn pending_count_color(pending: usize) -> Color {
-    if pending > 0 {
-        Color::Yellow
-    } else {
-        super::constants::styles::VALUE_NEUTRAL
-    }
-}
-
-/// Color for error count
-#[must_use]
-pub const fn error_count_color(has_errors: bool) -> Color {
+pub const fn magnitude_color(value: u64) -> Color {
     use super::constants::styles;
-    if has_errors {
-        Color::Yellow
-    } else {
-        styles::VALUE_NEUTRAL
-    }
-}
-
-/// Color for connection failures
-#[must_use]
-pub const fn connection_failure_color(failures: u64) -> Color {
-    use super::constants::styles;
-    if failures > 0 {
+    if value >= 1_000_000_000_000 {
         Color::Red
+    } else if value >= 1_000_000_000 {
+        Color::Yellow
+    } else if value >= 1_000_000 {
+        styles::VALUE_PRIMARY
+    } else if value >= 1_000 {
+        styles::VALUE_INFO
     } else {
         styles::VALUE_NEUTRAL
     }
@@ -353,6 +338,18 @@ mod tests {
         assert_eq!(format_throughput_label(1_048_576.0), "1 MiB/s");
         assert_eq!(format_throughput_label(1_024.0), "1 KiB/s");
         assert_eq!(format_throughput_label(0.0), "0 B/s");
+    }
+
+    #[test]
+    fn test_magnitude_color_boundaries() {
+        use super::super::constants::styles;
+
+        assert_eq!(magnitude_color(0), styles::VALUE_NEUTRAL);
+        assert_eq!(magnitude_color(999), styles::VALUE_NEUTRAL);
+        assert_eq!(magnitude_color(1_000), styles::VALUE_INFO);
+        assert_eq!(magnitude_color(1_000_000), styles::VALUE_PRIMARY);
+        assert_eq!(magnitude_color(1_000_000_000), Color::Yellow);
+        assert_eq!(magnitude_color(1_000_000_000_000), Color::Red);
     }
 
     #[test]

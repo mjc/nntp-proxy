@@ -37,6 +37,37 @@ pub fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Format large counts with compact human suffixes for readable TUI output.
+#[inline]
+#[must_use]
+pub fn format_count(count: u64) -> String {
+    const UNITS: &[(u64, &str)] = &[
+        (1_000_000_000_000, "T"),
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "K"),
+    ];
+
+    #[allow(clippy::cast_precision_loss)] // Presentation-only rounding for compact labels.
+    fn compact(value: u64, divisor: u64, suffix: &str) -> String {
+        let scaled = value as f64 / divisor as f64;
+        format!("{scaled:.1}{suffix}")
+    }
+
+    for (idx, (divisor, suffix)) in UNITS.iter().enumerate() {
+        if count >= *divisor {
+            let formatted = compact(count, *divisor, suffix);
+            if formatted.starts_with("1000.0") && idx > 0 {
+                let (next_divisor, next_suffix) = UNITS[idx - 1];
+                return compact(count, next_divisor, next_suffix);
+            }
+            return formatted;
+        }
+    }
+
+    count.to_string()
+}
+
 /// Shorten UUID to first 8 characters for log readability
 #[inline]
 #[must_use]
@@ -57,6 +88,18 @@ mod tests {
         assert_eq!(format_bytes(1_048_576), "1.00 MiB");
         assert_eq!(format_bytes(29_312_178), "27.95 MiB");
         assert_eq!(format_bytes(1_073_741_824), "1.00 GiB");
+    }
+
+    #[test]
+    fn test_format_count() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1_000), "1.0K");
+        assert_eq!(format_count(999_999), "1.0M");
+        assert_eq!(format_count(12_345), "12.3K");
+        assert_eq!(format_count(1_234_567), "1.2M");
+        assert_eq!(format_count(1_234_567_890), "1.2B");
+        assert_eq!(format_count(9_876_543_210_987), "9.9T");
     }
 
     #[test]
