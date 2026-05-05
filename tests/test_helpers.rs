@@ -608,20 +608,52 @@ pub async fn spawn_proxy_with_config(
 /// # Errors
 /// Returns any connection or read error, or an error if the greeting is unexpected.
 pub async fn connect_and_read_greeting(proxy_port: u16) -> Result<tokio::net::TcpStream> {
-    use tokio::io::AsyncBufReadExt;
-
     let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
-    let mut reader = tokio::io::BufReader::new(&mut stream);
-    let mut line = String::new();
-
-    reader.read_line(&mut line).await?;
+    let line = read_line_from_stream(&mut stream, "proxy greeting").await?;
     if !line.starts_with("201") {
         anyhow::bail!("Expected 200 greeting, got: {line}");
     }
 
-    // Return the raw stream (reader consumed it, need to recreate)
-    drop(reader);
     Ok(stream)
+}
+
+async fn write_command_line(stream: &mut tokio::net::TcpStream, command: &str) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    if command.ends_with("\r\n") {
+        stream.write_all(command.as_bytes()).await?;
+    } else {
+        stream
+            .write_all(format!("{command}\r\n").as_bytes())
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn read_line_from_stream(
+    stream: &mut tokio::net::TcpStream,
+    context: &str,
+) -> Result<String> {
+    use tokio::io::AsyncReadExt;
+
+    let mut bytes = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
+
+    loop {
+        let n = stream.read(&mut byte).await?;
+        if n == 0 {
+            if bytes.is_empty() {
+                anyhow::bail!("Connection closed while reading {context}");
+            }
+            anyhow::bail!("Connection closed before line terminator while reading {context}");
+        }
+
+        bytes.push(byte[0]);
+        if byte[0] == b'\n' {
+            return String::from_utf8(bytes).map_err(Into::into);
+        }
+    }
 }
 
 /// Send a command and read its single-line response.
@@ -634,23 +666,8 @@ pub async fn send_command_read_line(
     stream: &mut tokio::net::TcpStream,
     command: &str,
 ) -> Result<String> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-
-    if command.ends_with("\r\n") {
-        stream.write_all(command.as_bytes()).await?;
-    } else {
-        stream
-            .write_all(format!("{command}\r\n").as_bytes())
-            .await?;
-    }
-
-    let mut reader = tokio::io::BufReader::new(&mut *stream);
-    let mut line = String::new();
-    let n = reader.read_line(&mut line).await?;
-    if n == 0 {
-        anyhow::bail!("Connection closed while reading response line");
-    }
-    Ok(line)
+    write_command_line(stream, command).await?;
+    read_line_from_stream(stream, "response line").await
 }
 
 /// Send ARTICLE command and read its multiline response.
@@ -661,19 +678,10 @@ pub async fn send_article_read_multiline_response(
     stream: &mut tokio::net::TcpStream,
     message_id: &str,
 ) -> Result<(String, Vec<String>)> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-
     eprintln!("Sending: ARTICLE {message_id}");
-    stream
-        .write_all(format!("ARTICLE {message_id}\r\n").as_bytes())
-        .await?;
+    write_command_line(stream, &format!("ARTICLE {message_id}")).await?;
 
-    let mut reader = tokio::io::BufReader::new(&mut *stream);
-    let mut status_line = String::new();
-    let n = reader.read_line(&mut status_line).await?;
-    if n == 0 {
-        anyhow::bail!("Connection closed while reading ARTICLE status line");
-    }
+    let status_line = read_line_from_stream(stream, "ARTICLE status line").await?;
 
     eprintln!("Received status: {}", status_line.trim());
 
@@ -682,11 +690,7 @@ pub async fn send_article_read_multiline_response(
     // If 220, read multiline body
     if status_line.starts_with("220") {
         loop {
-            let mut line = String::new();
-            let n = reader.read_line(&mut line).await?;
-            if n == 0 {
-                anyhow::bail!("Connection closed while reading ARTICLE body");
-            }
+            let line = read_line_from_stream(stream, "ARTICLE body").await?;
             if line == ".\r\n" {
                 break;
             }
@@ -708,22 +712,8 @@ pub async fn send_command_read_multiline_response(
     stream: &mut tokio::net::TcpStream,
     command: &str,
 ) -> Result<(String, Vec<String>)> {
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-
-    if command.ends_with("\r\n") {
-        stream.write_all(command.as_bytes()).await?;
-    } else {
-        stream
-            .write_all(format!("{command}\r\n").as_bytes())
-            .await?;
-    }
-
-    let mut reader = tokio::io::BufReader::new(&mut *stream);
-    let mut status_line = String::new();
-    let n = reader.read_line(&mut status_line).await?;
-    if n == 0 {
-        anyhow::bail!("Connection closed while reading response status line");
-    }
+    write_command_line(stream, command).await?;
+    let status_line = read_line_from_stream(stream, "response status line").await?;
 
     // Only attempt multiline reads for responses that are defined as multiline by
     // the NNTP/RFC semantics. This avoids hanging when the server returns a
@@ -738,11 +728,7 @@ pub async fn send_command_read_multiline_response(
     let mut lines = Vec::new();
     if is_multiline {
         loop {
-            let mut line = String::new();
-            let n = reader.read_line(&mut line).await?;
-            if n == 0 {
-                anyhow::bail!("Connection closed while reading multiline response");
-            }
+            let line = read_line_from_stream(stream, "multiline response").await?;
             if line == ".\r\n" {
                 break;
             }

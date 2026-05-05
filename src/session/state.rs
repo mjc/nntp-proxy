@@ -14,6 +14,11 @@ struct PendingBackendResponse {
     state: PendingBackendResponseState,
 }
 
+pub enum DeferredStatefulAction {
+    LocalReply(Vec<u8>),
+    BackendRequest { kind: RequestKind, wire: Vec<u8> },
+}
+
 enum PendingBackendResponseState {
     AwaitingStatusLine(Vec<u8>),
     ReadingMultiline { tail: TailBuffer },
@@ -121,8 +126,8 @@ pub struct SessionLoopState {
     pub skip_auth_check: bool,
     /// Forwarded backend replies that must complete before deferred local replies can flush.
     pending_backend_replies: VecDeque<PendingBackendResponse>,
-    /// Local replies deferred until earlier backend output has been sent first.
-    deferred_replies: Vec<Vec<u8>>,
+    /// Ordered local/backend actions deferred until earlier backend output has been sent first.
+    deferred_actions: VecDeque<DeferredStatefulAction>,
 }
 
 impl Default for SessionLoopState {
@@ -147,7 +152,7 @@ impl SessionLoopState {
             auth_username: None,
             skip_auth_check: !auth_enabled,
             pending_backend_replies: VecDeque::new(),
-            deferred_replies: Vec::new(),
+            deferred_actions: VecDeque::new(),
         }
     }
 
@@ -298,13 +303,27 @@ impl SessionLoopState {
 
     /// Queue a local reply until earlier backend output has been sent.
     pub fn push_deferred_reply(&mut self, reply: impl Into<Vec<u8>>) {
-        self.deferred_replies.push(reply.into());
+        self.deferred_actions
+            .push_back(DeferredStatefulAction::LocalReply(reply.into()));
     }
 
-    /// Drain deferred local replies in order.
+    /// Queue a backend request behind earlier deferred actions.
+    pub fn push_deferred_backend_request(&mut self, kind: RequestKind, wire: Vec<u8>) {
+        self.deferred_actions
+            .push_back(DeferredStatefulAction::BackendRequest { kind, wire });
+    }
+
+    /// Whether ordered deferred actions remain queued.
+    #[inline]
     #[must_use]
-    pub fn take_deferred_replies(&mut self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut self.deferred_replies)
+    pub fn has_deferred_actions(&self) -> bool {
+        !self.deferred_actions.is_empty()
+    }
+
+    /// Pop the next deferred action in FIFO order.
+    #[must_use]
+    pub fn pop_deferred_action(&mut self) -> Option<DeferredStatefulAction> {
+        self.deferred_actions.pop_front()
     }
 }
 
@@ -385,13 +404,34 @@ mod tests {
         assert!(state.has_pending_backend_replies());
 
         state.push_deferred_reply(b"205 Goodbye\r\n".to_vec());
-        assert_eq!(
-            state.take_deferred_replies(),
-            vec![b"205 Goodbye\r\n".to_vec()]
-        );
+        assert!(state.has_deferred_actions());
+        match state.pop_deferred_action() {
+            Some(DeferredStatefulAction::LocalReply(reply)) => {
+                assert_eq!(reply, b"205 Goodbye\r\n".to_vec());
+            }
+            Some(DeferredStatefulAction::BackendRequest { .. }) | None => {
+                panic!("expected deferred local reply")
+            }
+        }
 
         state.observe_backend_bytes(b"111 20260505120000\r\n");
         assert!(!state.has_pending_backend_replies());
+    }
+
+    #[test]
+    fn test_session_loop_state_deferred_backend_requests_preserve_kind_and_wire() {
+        let mut state = SessionLoopState::new(false);
+
+        state.push_deferred_backend_request(RequestKind::Date, b"DATE\r\n".to_vec());
+        match state.pop_deferred_action() {
+            Some(DeferredStatefulAction::BackendRequest { kind, wire }) => {
+                assert_eq!(kind, RequestKind::Date);
+                assert_eq!(wire, b"DATE\r\n".to_vec());
+            }
+            Some(DeferredStatefulAction::LocalReply(_)) | None => {
+                panic!("expected deferred backend request")
+            }
+        }
     }
 
     #[test]
