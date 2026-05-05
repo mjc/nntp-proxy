@@ -13,7 +13,6 @@ use super::health_check::{HealthCheckMetrics, check_date_response};
 use crate::pool::PoolStatus;
 use crate::tls::TlsConfig;
 use anyhow::Result;
-use async_trait::async_trait;
 use deadpool::managed;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -810,7 +809,6 @@ fn resize_then_drop(pool: &Pool, conn: managed::Object<TcpManager>, new_max: usi
     drop(conn);
 }
 
-#[async_trait]
 impl ConnectionProvider for DeadpoolConnectionProvider {
     fn status(&self) -> PoolStatus {
         use crate::types::{AvailableConnections, CreatedConnections, MaxPoolSize};

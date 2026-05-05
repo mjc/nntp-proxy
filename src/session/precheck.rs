@@ -13,6 +13,7 @@ use crate::router::BackendSelector;
 use crate::session::backend;
 use crate::session::handlers::should_sample_backend_timing;
 use crate::types::{BackendId, MessageId};
+use futures::{StreamExt, stream::FuturesUnordered};
 
 #[derive(Debug)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
@@ -245,24 +246,16 @@ async fn execute_backend_query(
 
 /// Query all backends, collecting results as they arrive
 async fn query_all_backends(deps: &OwnedDeps, request: &RequestContext) -> Vec<QueryResult> {
-    use futures::StreamExt;
+    let mut pending = spawn_backend_queries(deps, request);
+    let mut results = Vec::with_capacity(deps.router.backend_count().get());
 
-    let tasks: Vec<_> = (0..deps.router.backend_count().get())
-        .map(BackendId::from_index)
-        .map(|id| {
-            let deps = deps.clone();
-            let request = request.clone();
-            tokio::spawn(async move { query_backend(&deps, id, &request).await })
-        })
-        .collect();
+    while let Some(result) = pending.next().await {
+        if let Ok(result) = result {
+            results.push(result);
+        }
+    }
 
-    // Race all backends - collect results as they complete (fastest first)
-    let task_count = tasks.len();
-    futures::stream::iter(tasks)
-        .buffer_unordered(task_count)
-        .filter_map(|result| async move { result.ok() })
-        .collect()
-        .await
+    results
 }
 
 /// Query all backends racing, return first success immediately.
@@ -272,34 +265,18 @@ async fn query_all_backends_racing(
     request: &RequestContext,
     msg_id: &MessageId<'_>,
 ) -> Option<(BackendId, PrecheckHit)> {
-    use futures::StreamExt;
-
-    let tasks: Vec<_> = (0..deps.router.backend_count().get())
-        .map(BackendId::from_index)
-        .map(|id| {
-            let deps = deps.clone();
-            let request = request.clone();
-            tokio::spawn(async move { query_backend(&deps, id, &request).await })
-        })
-        .collect();
-
     let backend_count = deps.router.backend_count();
-
-    // Process results as they complete, return first success immediately
-    let mut pending = futures::stream::iter(tasks)
-        .buffer_unordered(backend_count.get())
-        .filter_map(|result| async move { result.ok() })
-        .boxed();
+    let mut pending = spawn_backend_queries(deps, request);
 
     let mut results = Vec::with_capacity(backend_count.get());
-    let mut first_found = None;
 
     // Collect results until we find a success
     while let Some(result) = pending.next().await {
+        let Ok(result) = result else {
+            continue;
+        };
         match result {
-            QueryResult::Found(id, response) if first_found.is_none() => {
-                first_found = Some((id, response));
-
+            QueryResult::Found(id, response) => {
                 // Spawn background task to complete remaining backends and update cache
                 let cache = deps.cache.clone();
                 let msg_id_owned = msg_id.to_owned();
@@ -307,7 +284,9 @@ async fn query_all_backends_racing(
                 let handle = tokio::spawn(async move {
                     // Collect remaining results
                     while let Some(result) = pending.next().await {
-                        results.push(result);
+                        if let Ok(result) = result {
+                            results.push(result);
+                        }
                     }
                     // Build availability from all results and sync to cache
                     let (_, mut availability) = summarize(results);
@@ -325,7 +304,7 @@ async fn query_all_backends_racing(
                         );
                     }
                 });
-                return first_found;
+                return Some((id, response));
             }
             _ => {
                 results.push(result);
@@ -335,6 +314,20 @@ async fn query_all_backends_racing(
 
     // No success found - all backends returned 430
     None
+}
+
+fn spawn_backend_queries(
+    deps: &OwnedDeps,
+    request: &RequestContext,
+) -> FuturesUnordered<tokio::task::JoinHandle<QueryResult>> {
+    (0..deps.router.backend_count().get())
+        .map(BackendId::from_index)
+        .map(|id| {
+            let deps = deps.clone();
+            let request = request.clone();
+            tokio::spawn(async move { query_backend(&deps, id, &request).await })
+        })
+        .collect()
 }
 
 /// Extract first found response and build availability from results.
