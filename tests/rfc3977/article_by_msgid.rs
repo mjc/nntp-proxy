@@ -25,11 +25,22 @@ async fn spawn_client_with_backend(
 }
 
 fn article_backend(port: u16, message_id: &str) -> MockNntpServer {
+    // Avoid double-wrapping angle brackets if the caller already provided them.
+    let display = message_id.trim_matches(|c| c == '<' || c == '>');
+    let resp_id = if message_id.starts_with('<') {
+        message_id.to_string()
+    } else {
+        format!("<{display}>")
+    };
+
     MockNntpServer::new(port)
         .with_name("ArticleBackend")
         .on_command(
             &format!("ARTICLE {message_id}"),
-            &format!("220 0 <{message_id}>\r\nSubject: Test\r\n\r\nBody for {message_id}\r\n.\r\n"),
+            &format!(
+                "220 0 {}\r\nSubject: Test\r\n\r\nBody for {}\r\n.\r\n",
+                resp_id, display
+            ),
         )
 }
 

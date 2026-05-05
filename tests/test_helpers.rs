@@ -12,6 +12,7 @@ use nntp_proxy::NntpProxy;
 use nntp_proxy::config::{ClientAuth, Config, HealthCheck, Proxy, Server};
 use nntp_proxy::types::{MaxConnections, Port};
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -270,7 +271,8 @@ pub fn spawn_mock_server(port: u16, server_name: &str) -> AbortHandle {
 pub async fn spawn_test_proxy(proxy: NntpProxy, port: u16, per_command_routing: bool) {
     let proxy_addr = format!("127.0.0.1:{port}");
 
-    // Try binding a few times to avoid transient race with port allocation
+    // Try binding a few times to avoid transient race with port allocation.
+    // Only retry on `AddrInUse` to avoid masking non-transient errors like invalid addresses.
     let mut proxy_listener = None;
     for attempt in 0..5 {
         match TcpListener::bind(&proxy_addr).await {
@@ -279,6 +281,9 @@ pub async fn spawn_test_proxy(proxy: NntpProxy, port: u16, per_command_routing: 
                 break;
             }
             Err(e) => {
+                if e.kind() != ErrorKind::AddrInUse {
+                    panic!("Failed to bind proxy listener on {proxy_addr}: {e}");
+                }
                 if attempt == 4 {
                     panic!("Failed to bind proxy listener on {proxy_addr}: {e}");
                 }
@@ -671,7 +676,10 @@ pub async fn send_article_read_multiline_response(
     if status_line.starts_with("220") {
         loop {
             let mut line = String::new();
-            reader.read_line(&mut line).await?;
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                anyhow::bail!("Connection closed while reading ARTICLE body");
+            }
             if line == ".\r\n" {
                 break;
             }
@@ -707,14 +715,29 @@ pub async fn send_command_read_multiline_response(
     let mut status_line = String::new();
     reader.read_line(&mut status_line).await?;
 
+    // Only attempt multiline reads for responses that are defined as multiline by
+    // the NNTP/RFC semantics. This avoids hanging when the server returns a
+    // single-line error or closes the connection mid-response.
+    let multiline_prefixes = [
+        "100", "101", "215", "220", "221", "222", "224", "225", "230", "231", "235",
+    ];
+    let is_multiline = multiline_prefixes
+        .iter()
+        .any(|p| status_line.starts_with(p));
+
     let mut lines = Vec::new();
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
-        if line == ".\r\n" {
-            break;
+    if is_multiline {
+        loop {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await?;
+            if n == 0 {
+                anyhow::bail!("Connection closed while reading multiline response");
+            }
+            if line == ".\r\n" {
+                break;
+            }
+            lines.push(line);
         }
-        lines.push(line);
     }
 
     Ok((status_line, lines))
