@@ -27,6 +27,7 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use futures::future::BoxFuture;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout},
@@ -39,6 +40,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TuiInputAction {
     None,
@@ -48,7 +51,7 @@ enum TuiInputAction {
 }
 
 /// Setup the terminal for TUI rendering
-fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
+fn setup_terminal() -> Result<TuiTerminal> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -59,7 +62,7 @@ fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
 }
 
 /// Restore the terminal to its original state
-fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+fn restore_terminal(terminal: &mut TuiTerminal) -> Result<()> {
     // Clear the terminal first to prevent escape sequences leaking to shell
     terminal.clear()?;
 
@@ -68,6 +71,24 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Re
     terminal.show_cursor()?;
 
     Ok(())
+}
+
+async fn with_terminal_session<T>(
+    run: impl for<'a> FnOnce(&'a mut TuiTerminal) -> BoxFuture<'a, Result<T>>,
+) -> Result<T> {
+    let mut terminal = setup_terminal()?;
+
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        original_hook(panic_info);
+    }));
+
+    let result = run(&mut terminal).await;
+
+    restore_terminal(&mut terminal)?;
+    result
 }
 
 /// Run the TUI event loop
@@ -92,22 +113,10 @@ pub async fn run_tui(
     shutdown_tx: mpsc::Sender<()>,
     mut shutdown_rx: mpsc::Receiver<()>,
 ) -> Result<()> {
-    // Setup terminal
-    let mut terminal = setup_terminal()?;
-
-    // Setup panic hook to ensure terminal cleanup
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        original_hook(panic_info);
-    }));
-
-    // Run the app
-    let result = run_app(&mut terminal, &mut app, &mut shutdown_rx).await;
-
-    // Restore terminal
-    restore_terminal(&mut terminal)?;
+    let result = with_terminal_session(move |terminal| {
+        Box::pin(async move { run_app(terminal, &mut app, &mut shutdown_rx).await })
+    })
+    .await;
 
     // Signal shutdown when TUI exits
     let _ = shutdown_tx.send(()).await;
@@ -117,22 +126,13 @@ pub async fn run_tui(
 
 /// Run the TUI as a remote dashboard client connected to a headless publisher.
 pub async fn run_attached_tui(connect_addr: SocketAddr) -> Result<()> {
-    let mut terminal = setup_terminal()?;
-
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |panic_info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
-        original_hook(panic_info);
-    }));
-
     let (state_tx, mut state_rx) = tokio::sync::watch::channel(None::<DashboardState>);
     let _reader = spawn_dashboard_reader(connect_addr, state_tx);
 
-    let result = run_attached_app(&mut terminal, &mut state_rx).await;
-
-    restore_terminal(&mut terminal)?;
-    result
+    with_terminal_session(move |terminal| {
+        Box::pin(async move { run_attached_app(terminal, &mut state_rx).await })
+    })
+    .await
 }
 
 /// Main TUI event loop
