@@ -43,6 +43,62 @@ async fn test_list_newsgroups_multiline() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_list_active_multiline() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+
+    let backend = MockNntpServer::new(port)
+        .with_name("ListActiveBackend")
+        .on_command("LIST ACTIVE", "215 list follows\r\nalt.test 2 1 y\r\n.\r\n")
+        .spawn_on_listener(listener);
+
+    let config = create_test_config(vec![(port, "list-active-backend")]);
+    let proxy_port = spawn_proxy_with_config(config, RoutingMode::PerCommand).await?;
+
+    let mut client = connect_and_read_greeting(proxy_port).await?;
+
+    let (status, lines) = send_command_read_multiline_response(&mut client, "LIST ACTIVE").await?;
+    assert!(
+        status.starts_with("215"),
+        "Expected 215 LIST ACTIVE response, got: {status:?}"
+    );
+    assert_eq!(lines, vec!["alt.test 2 1 y\r\n".to_string()]);
+
+    backend.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_list_distributions_multiline() -> Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+
+    let backend = MockNntpServer::new(port)
+        .with_name("ListDistributionsBackend")
+        .on_command(
+            "LIST DISTRIBUTIONS",
+            "215 list follows\r\nworld Global distribution\r\n.\r\n",
+        )
+        .spawn_on_listener(listener);
+
+    let config = create_test_config(vec![(port, "list-distributions-backend")]);
+    let proxy_port = spawn_proxy_with_config(config, RoutingMode::PerCommand).await?;
+
+    let mut client = connect_and_read_greeting(proxy_port).await?;
+
+    let (status, lines) =
+        send_command_read_multiline_response(&mut client, "LIST DISTRIBUTIONS").await?;
+    assert!(
+        status.starts_with("215"),
+        "Expected 215 LIST DISTRIBUTIONS response, got: {status:?}"
+    );
+    assert_eq!(lines, vec!["world Global distribution\r\n".to_string()]);
+
+    backend.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_listgroup_multiline_uses_211_and_preserves_body() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
