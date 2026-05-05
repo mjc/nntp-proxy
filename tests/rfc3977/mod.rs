@@ -5,6 +5,7 @@
 //! protocol specification.
 
 pub mod article;
+pub mod article_by_msgid;
 pub mod commands;
 pub mod errors;
 pub mod multiline;
