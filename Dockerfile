@@ -1,10 +1,11 @@
-# Build stage - use nightly for let-chains support
-FROM rustlang/rust:nightly-slim AS builder
+# Build stage - match the Bookworm runtime to avoid glibc mismatches
+FROM rust:slim-bookworm AS builder
 
 WORKDIR /usr/src/app
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
+    make \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -30,14 +31,17 @@ RUN apt-get update && apt-get install -y \
 RUN useradd --create-home --shell /bin/bash --uid 1000 nntp-proxy
 
 # Create directories
-RUN mkdir -p /etc/nntp-proxy /var/log/nntp-proxy && \
-    chown -R nntp-proxy:nntp-proxy /var/log/nntp-proxy /etc/nntp-proxy
+RUN mkdir -p /etc/nntp-proxy /var/log/nntp-proxy /var/cache/nntp-proxy && \
+    chown -R nntp-proxy:nntp-proxy /var/log/nntp-proxy /etc/nntp-proxy /var/cache/nntp-proxy
 
 # Copy the binary from builder stage
 COPY --from=builder /usr/src/app/target/release/nntp-proxy /usr/local/bin/nntp-proxy
 
 # Switch to non-root user
 USER nntp-proxy
+
+# Use the non-root home directory so debug.log is writable
+WORKDIR /home/nntp-proxy
 
 # Expose default proxy port
 EXPOSE 8119
@@ -71,4 +75,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD ["/bin/sh", "-c", "nc -z localhost ${NNTP_PROXY_PORT} || exit 1"]
 
 # Run the application
-CMD ["/usr/local/bin/nntp-proxy"]
+ENTRYPOINT ["/usr/local/bin/nntp-proxy"]

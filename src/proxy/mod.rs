@@ -153,6 +153,10 @@ impl NntpProxy {
     pub async fn graceful_shutdown(&self) {
         info!("Initiating graceful shutdown...");
 
+        for provider in &self.connection_providers {
+            provider.shutdown();
+        }
+
         // Flush cache writes to disk before shutting down
         // With WriteOnInsertion, writes are enqueued async - close() waits for completion
         // Use a timeout: foyer's close() can hang if the runtime is winding down
