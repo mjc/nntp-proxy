@@ -374,10 +374,7 @@ fn proxy_listener_conflicts(
 }
 
 fn listener_ips_conflict(proxy_ip: IpAddr, dashboard_ip: IpAddr) -> bool {
-    proxy_ip.is_unspecified()
-        || dashboard_ip.is_unspecified()
-        || proxy_ip == dashboard_ip
-        || (proxy_ip.is_loopback() && dashboard_ip.is_loopback())
+    proxy_ip.is_unspecified() || dashboard_ip.is_unspecified() || proxy_ip == dashboard_ip
 }
 
 #[cfg(test)]
@@ -650,16 +647,14 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_dashboard_listen_rejects_loopback_alias_collision() {
+    fn test_validate_dashboard_listen_allows_distinct_loopback_ips() {
         let args = CommonArgs {
             tui_listen: Some("[::1]:8119".parse().unwrap()),
             ..default_args()
         };
 
-        assert!(
-            args.validate_dashboard_listen("127.0.0.1", Port::try_new(8119).unwrap())
-                .is_err()
-        );
+        args.validate_dashboard_listen("127.0.0.1", Port::try_new(8119).unwrap())
+            .unwrap();
     }
 
     #[test]
