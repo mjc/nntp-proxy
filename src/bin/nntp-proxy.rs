@@ -91,13 +91,11 @@ async fn run_proxy(
     let accept_result =
         runtime::run_accept_loop(proxy.clone(), listener, shutdown_rx, launch.routing_mode).await;
 
-    if accept_result.is_err() {
-        if let Some(tx) = error_tui_shutdown_tx {
-            let _ = tx.send(()).await;
-        }
-        if let Some(tx) = error_dashboard_shutdown_tx {
-            let _ = tx.send(()).await;
-        }
+    if let Some(tx) = error_tui_shutdown_tx {
+        let _ = tx.send(()).await;
+    }
+    if let Some(tx) = error_dashboard_shutdown_tx {
+        let _ = tx.send(()).await;
     }
 
     if let Some(handle) = tui_handle {

@@ -1,9 +1,9 @@
 //! Serializable dashboard state shared between local and attached TUI modes.
 
-use crate::config::Server;
 use crate::metrics::{BackendHealthStatus, BackendStats, MetricsSnapshot};
 use crate::tui::app::{ThroughputPoint, ViewMode};
 use crate::tui::system_stats::SystemStats;
+use crate::types::{HostName, MaxConnections, Port, ServerName};
 
 /// Snapshot of the I/O buffer pool used by the summary panel.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
@@ -15,8 +15,17 @@ pub struct BufferPoolStats {
 
 /// A backend entry rendered in the backend list and chart panels.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct BackendDisplay {
+    pub host: HostName,
+    pub port: Port,
+    pub name: ServerName,
+    pub max_connections: MaxConnections,
+}
+
+/// A backend entry rendered in the backend list and chart panels.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct BackendView {
-    pub server: Server,
+    pub server: BackendDisplay,
     pub stats: BackendStats,
     pub active_connections: usize,
     pub health_status: BackendHealthStatus,
@@ -110,10 +119,12 @@ mod tests {
 
     fn sample_backend_view() -> BackendView {
         BackendView {
-            server: Server::builder("backend.example.com", Port::try_new(119).unwrap())
-                .name("Backend")
-                .build()
-                .unwrap(),
+            server: BackendDisplay {
+                host: HostName::try_new("backend.example.com".to_string()).unwrap(),
+                port: Port::try_new(119).unwrap(),
+                name: ServerName::try_new("Backend".to_string()).unwrap(),
+                max_connections: MaxConnections::try_new(10).unwrap(),
+            },
             stats: BackendStats::default(),
             active_connections: 1,
             health_status: BackendHealthStatus::Healthy,

@@ -3,7 +3,7 @@
 use crate::config::Server;
 use crate::metrics::{MetricsCollector, MetricsSnapshot};
 use crate::router::BackendSelector;
-use crate::tui::dashboard::{BackendView, BufferPoolStats, DashboardState};
+use crate::tui::dashboard::{BackendDisplay, BackendView, BufferPoolStats, DashboardState};
 use crate::tui::log_capture::LogBuffer;
 use crate::types::tui::{CommandsPerSecond, HistorySize, Throughput, Timestamp};
 use std::collections::VecDeque;
@@ -620,7 +620,12 @@ impl TuiApp {
         stats: &crate::metrics::BackendStats,
     ) -> BackendView {
         BackendView {
-            server: server.clone(),
+            server: BackendDisplay {
+                host: server.host.clone(),
+                port: server.port,
+                name: server.name.clone(),
+                max_connections: server.max_connections,
+            },
             stats: stats.clone(),
             active_connections: stats.active_connections.get(),
             health_status: stats.health_status,
@@ -1089,7 +1094,14 @@ mod tests {
 
         let metrics = MetricsCollector::new(1);
         let router = Arc::new(BackendSelector::new());
-        let servers = create_test_servers(1);
+        let servers = Arc::from(vec![
+            Server::builder("backend.example.com", Port::try_new(119).unwrap())
+                .name("Backend")
+                .username("backend-user")
+                .password("backend-pass")
+                .build()
+                .unwrap(),
+        ]);
 
         let app = TuiAppBuilder::new(metrics, router, servers)
             .with_log_buffer(log_buffer)
@@ -1103,6 +1115,8 @@ mod tests {
         assert!(!snapshot.show_details);
 
         let json = serde_json::to_string(&snapshot).expect("snapshot should serialize");
+        assert!(!json.contains("backend-user"));
+        assert!(!json.contains("backend-pass"));
         let decoded: DashboardState =
             serde_json::from_str(&json).expect("snapshot should deserialize");
 
@@ -1111,6 +1125,7 @@ mod tests {
         assert_eq!(decoded.view_mode, ViewMode::Normal);
         assert!(!decoded.show_details);
         assert!(decoded.buffer_pool.is_none());
+        assert_eq!(decoded.backend_views[0].server.name.as_str(), "Backend");
     }
 
     #[test]

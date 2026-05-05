@@ -65,7 +65,7 @@ pub struct CommonArgs {
     #[arg(long, hide = true, help_heading = "General")]
     pub no_tui: bool,
 
-    /// Bind the dashboard websocket publisher to a free HOST:PORT distinct from the proxy listener.
+    /// Bind the dashboard websocket publisher to a free loopback HOST:PORT distinct from the proxy listener.
     #[arg(
         long = "tui-listen",
         value_name = "HOST:PORT",
@@ -231,6 +231,13 @@ impl CommonArgs {
         let Some(dashboard_listen) = self.tui_listen else {
             return Ok(());
         };
+
+        if !dashboard_listen.ip().is_loopback() {
+            bail!(
+                "--tui-listen {} must bind to a loopback address; use 127.0.0.1 or ::1",
+                dashboard_listen
+            );
+        }
 
         if dashboard_listen.port() != proxy_port.get() {
             return Ok(());
@@ -631,6 +638,19 @@ mod tests {
 
         assert!(
             args.validate_dashboard_listen("127.0.0.1", Port::try_new(8119).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_validate_dashboard_listen_rejects_non_loopback_bind() {
+        let args = CommonArgs {
+            tui_listen: Some("0.0.0.0:8119".parse().unwrap()),
+            ..default_args()
+        };
+
+        assert!(
+            args.validate_dashboard_listen("127.0.0.1", Port::try_new(9120).unwrap())
                 .is_err()
         );
     }

@@ -129,6 +129,10 @@ fn publish_dashboard_snapshot(app: &mut TuiApp, state_tx: &watch::Sender<Arc<Das
 }
 
 pub async fn bind_dashboard_listener(listen_addr: SocketAddr) -> anyhow::Result<TcpListener> {
+    anyhow::ensure!(
+        listen_addr.ip().is_loopback(),
+        "Dashboard websocket listener must bind to a loopback address; got {listen_addr}"
+    );
     TcpListener::bind(listen_addr).await.with_context(|| {
         format!(
             "Failed to bind dashboard websocket listener at {listen_addr}; ensure that socket is free and distinct from the proxy listener"
@@ -421,6 +425,15 @@ mod tests {
         let err = format!("{err:#}");
         assert!(err.contains("Failed to bind dashboard websocket listener"));
         assert!(err.contains("ensure that socket is free"));
+    }
+
+    #[tokio::test]
+    async fn dashboard_publisher_rejects_non_loopback_listener() {
+        let err = bind_dashboard_listener("0.0.0.0:8120".parse().unwrap())
+            .await
+            .expect_err("non-loopback bind should fail");
+
+        assert!(format!("{err:#}").contains("must bind to a loopback address"));
     }
 
     #[tokio::test]
