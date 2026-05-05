@@ -1,6 +1,7 @@
 //! TUI rendering and layout
 
 use crate::formatting::format_bytes;
+use crate::tui::RemoteDashboardStatus;
 use crate::tui::constants::{chart, layout, styles, text};
 use crate::tui::dashboard::{BufferPoolStats, DashboardState};
 use crate::tui::helpers::{
@@ -47,13 +48,14 @@ fn bordered_block(title: &'static str, border_color: Color) -> Block<'static> {
 // ============================================================================
 
 /// Render the main UI
-pub fn render_ui(
+pub(crate) fn render_ui(
     f: &mut Frame,
     state: &DashboardState,
     attached_ui_stats: Option<&crate::tui::SystemStats>,
+    remote_status: Option<&RemoteDashboardStatus>,
 ) {
     if let Some(chunks) = dashboard_fullscreen_chunks(state.view_mode, f.area()) {
-        render_title(f, chunks[0], &state.snapshot);
+        render_title(f, chunks[0], &state.snapshot, remote_status);
         render_logs(f, chunks[1], state);
         render_footer(f, chunks[2]);
         return;
@@ -63,7 +65,7 @@ pub fn render_ui(
     let chunks = dashboard_main_chunks(f.area(), show_logs);
 
     // Render each section
-    render_title(f, chunks[0], &state.snapshot);
+    render_title(f, chunks[0], &state.snapshot, remote_status);
     render_summary(f, chunks[1], state, attached_ui_stats);
 
     // Backends area now contains 3 columns: backends, chart, and user stats
@@ -126,26 +128,89 @@ fn dashboard_main_chunks(area: Rect, show_logs: bool) -> Vec<Rect> {
 }
 
 /// Render the title bar
-fn render_title(f: &mut Frame, area: Rect, snapshot: &crate::metrics::MetricsSnapshot) {
-    let title_line = Line::from(vec![
-        "NNTP Proxy ".fg(styles::BORDER_ACTIVE).bold(),
-        "- Real-Time Metrics Dashboard".fg(Color::White),
-    ]);
-
-    let info_line = Line::from(vec![
-        "Uptime: ".fg(styles::LABEL),
-        snapshot.format_uptime().fg(styles::VALUE_PRIMARY).bold(),
-        "  |  Active: ".fg(styles::LABEL),
-        format!("{} connections", snapshot.active_connections).fg(styles::VALUE_SECONDARY),
-        "  |  Total: ".fg(styles::LABEL),
-        format!("{} connections", snapshot.total_connections).fg(styles::VALUE_NEUTRAL),
-    ]);
-
-    let title = Paragraph::new(vec![title_line, info_line])
+fn render_title(
+    f: &mut Frame,
+    area: Rect,
+    snapshot: &crate::metrics::MetricsSnapshot,
+    remote_status: Option<&RemoteDashboardStatus>,
+) {
+    let title = Paragraph::new(build_title_lines(snapshot, remote_status))
         .block(bordered_block("", styles::BORDER_ACTIVE))
         .alignment(Alignment::Center);
 
     f.render_widget(title, area);
+}
+
+fn build_title_lines(
+    snapshot: &crate::metrics::MetricsSnapshot,
+    remote_status: Option<&RemoteDashboardStatus>,
+) -> Vec<Line<'static>> {
+    let title_suffix = remote_status.map_or_else(
+        || Span::from("- Real-Time Metrics Dashboard").fg(Color::White),
+        |status| match status {
+            RemoteDashboardStatus::Connecting { .. } => {
+                Span::from("- Attached Dashboard (connecting)").fg(Color::Yellow)
+            }
+            RemoteDashboardStatus::Connected { .. } => {
+                Span::from("- Attached Dashboard (live)").fg(styles::VALUE_PRIMARY)
+            }
+            RemoteDashboardStatus::Reconnecting { .. } => {
+                Span::from("- Attached Dashboard (reconnecting)").fg(Color::Yellow)
+            }
+        },
+    );
+
+    let info_line = remote_status.map_or_else(
+        || {
+            Line::from(vec![
+                "Uptime: ".fg(styles::LABEL),
+                snapshot.format_uptime().fg(styles::VALUE_PRIMARY).bold(),
+                "  |  Active: ".fg(styles::LABEL),
+                format!("{} connections", snapshot.active_connections).fg(styles::VALUE_SECONDARY),
+                "  |  Total: ".fg(styles::LABEL),
+                format!("{} connections", snapshot.total_connections).fg(styles::VALUE_NEUTRAL),
+            ])
+        },
+        build_remote_title_status_line,
+    );
+
+    vec![
+        Line::from(vec![
+            "NNTP Proxy ".fg(styles::BORDER_ACTIVE).bold(),
+            title_suffix,
+        ]),
+        info_line,
+    ]
+}
+
+fn build_remote_title_status_line(status: &RemoteDashboardStatus) -> Line<'static> {
+    match status {
+        RemoteDashboardStatus::Connecting { target } => Line::from(vec![
+            "Remote: ".fg(styles::LABEL),
+            "connecting".fg(Color::Yellow).bold(),
+            "  |  Target: ".fg(styles::LABEL),
+            target.to_string().fg(styles::VALUE_INFO),
+        ]),
+        RemoteDashboardStatus::Connected { target } => Line::from(vec![
+            "Remote: ".fg(styles::LABEL),
+            "live".fg(styles::VALUE_PRIMARY).bold(),
+            "  |  Target: ".fg(styles::LABEL),
+            target.to_string().fg(styles::VALUE_INFO),
+        ]),
+        RemoteDashboardStatus::Reconnecting {
+            target,
+            retry_delay,
+            ..
+        } => Line::from(vec![
+            "Remote: ".fg(styles::LABEL),
+            "reconnecting".fg(Color::Yellow).bold(),
+            format!(" in {:.1}s", retry_delay.as_secs_f32()).fg(styles::LABEL),
+            "  |  Target: ".fg(styles::LABEL),
+            target.to_string().fg(styles::VALUE_INFO),
+            "  |  Snapshot: ".fg(styles::LABEL),
+            "last known".fg(Color::Yellow),
+        ]),
+    }
 }
 
 /// Render summary statistics
@@ -978,6 +1043,48 @@ mod tests {
         assert_eq!(
             dashboard_main_chunks(Rect::new(0, 0, 80, 24), false).len(),
             4
+        );
+    }
+
+    #[test]
+    fn title_lines_switch_between_local_and_remote_status() {
+        let snapshot = MetricsSnapshot::default();
+        let local_lines = build_title_lines(&snapshot, None)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        let remote_lines = build_title_lines(
+            &snapshot,
+            Some(&RemoteDashboardStatus::Reconnecting {
+                target: "127.0.0.1:8120".parse().unwrap(),
+                retry_delay: std::time::Duration::from_secs(1),
+                last_error: "connection dropped".to_string(),
+            }),
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+
+        assert!(
+            local_lines
+                .iter()
+                .any(|line| line.contains("Real-Time Metrics Dashboard"))
+        );
+        assert!(local_lines.iter().any(|line| line.contains("Uptime:")));
+        assert!(
+            remote_lines
+                .iter()
+                .any(|line| line.contains("Attached Dashboard (reconnecting)"))
+        );
+        assert!(
+            remote_lines
+                .iter()
+                .any(|line| line.contains("Remote: reconnecting"))
+        );
+        assert!(
+            remote_lines
+                .iter()
+                .any(|line| line.contains("Snapshot: last known"))
         );
     }
 }

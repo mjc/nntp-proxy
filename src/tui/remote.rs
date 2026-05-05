@@ -2,6 +2,7 @@
 
 use crate::tui::TuiApp;
 use crate::tui::dashboard::DashboardState;
+use crate::tui::{AttachedDashboard, RemoteDashboardStatus};
 use anyhow::Context;
 use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt, future, stream};
 use std::net::SocketAddr;
@@ -131,9 +132,11 @@ pub async fn run_dashboard_publisher(
     listen_addr: SocketAddr,
     mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
 ) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(listen_addr)
-        .await
-        .with_context(|| format!("Failed to bind dashboard websocket listener at {listen_addr}"))?;
+    let listener = TcpListener::bind(listen_addr).await.with_context(|| {
+        format!(
+            "Failed to bind dashboard websocket listener at {listen_addr}; ensure that socket is free and distinct from the proxy listener"
+        )
+    })?;
     let (state_tx, _state_rx) = watch::channel(Arc::new(app.snapshot_state()));
     let mut update_interval = tokio::time::interval(Duration::from_millis(250));
     update_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -158,16 +161,16 @@ pub async fn run_dashboard_publisher(
 }
 
 /// Spawn a background task that keeps the attached TUI synced to a websocket dashboard.
-pub fn spawn_dashboard_reader(
+pub(crate) fn spawn_dashboard_reader(
     connect_addr: SocketAddr,
-    state_tx: watch::Sender<Option<DashboardState>>,
+    state_tx: watch::Sender<AttachedDashboard>,
 ) -> tokio::task::JoinHandle<()> {
     spawn_dashboard_reader_with_retry_delay(connect_addr, state_tx, Duration::from_secs(1))
 }
 
 fn spawn_dashboard_reader_with_retry_delay(
     connect_addr: SocketAddr,
-    state_tx: watch::Sender<Option<DashboardState>>,
+    state_tx: watch::Sender<AttachedDashboard>,
     retry_delay: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -184,8 +187,16 @@ fn spawn_dashboard_reader_with_retry_delay(
                 break;
             }
 
+            let last_error = retry_reason(&session_result);
+            let last_snapshot = state_tx.borrow().latest_state.clone();
+            let _ = state_tx.send(AttachedDashboard::reconnecting(
+                connect_addr,
+                retry_delay,
+                last_snapshot,
+                last_error.clone(),
+            ));
             warn!(
-                "Attached dashboard websocket disconnected or unavailable; retrying in {retry_delay:?}"
+                "Attached dashboard websocket disconnected or unavailable; retrying in {retry_delay:?}: {last_error}"
             );
             tokio::time::sleep(retry_delay).await;
             info!("Reconnecting attached dashboard client to {ws_url}");
@@ -199,14 +210,20 @@ fn dashboard_reader_should_retry(outcome: &anyhow::Result<ReaderSessionOutcome>)
 
 async fn dashboard_reader_session(
     ws_url: &str,
-    state_tx: watch::Sender<Option<DashboardState>>,
+    state_tx: watch::Sender<AttachedDashboard>,
 ) -> anyhow::Result<ReaderSessionOutcome> {
-    let Ok((ws_stream, _)) = connect_async(ws_url).await else {
-        warn!("Failed to connect attached dashboard client to {ws_url}");
-        return Ok(ReaderSessionOutcome::RetryAfterDelay);
+    let connect_addr = dashboard_target_from_ws_url(ws_url)?;
+    let (ws_stream, _) = match connect_async(ws_url).await {
+        Ok(connection) => connection,
+        Err(err) => {
+            warn!("Failed to connect attached dashboard client to {ws_url}: {err}");
+            return Ok(ReaderSessionOutcome::RetryAfterDelay);
+        }
     };
 
     info!("Attached dashboard websocket connected to {ws_url}");
+    let last_snapshot = state_tx.borrow().latest_state.clone();
+    let _ = state_tx.send(AttachedDashboard::connected(connect_addr, last_snapshot));
     let (_, source) = ws_stream.split();
     forward_dashboard_states(source, state_tx).await.map(|_| {
         warn!("Attached dashboard websocket stream ended for {ws_url}");
@@ -216,7 +233,7 @@ async fn dashboard_reader_session(
 
 async fn forward_dashboard_states<S>(
     source: S,
-    state_tx: watch::Sender<Option<DashboardState>>,
+    state_tx: watch::Sender<AttachedDashboard>,
 ) -> anyhow::Result<()>
 where
     S: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
@@ -224,13 +241,35 @@ where
     dashboard_source_stream(source)
         .map(Ok::<DashboardState, anyhow::Error>)
         .try_fold(state_tx, |state_tx, state| async move {
+            let connect_addr = match &state_tx.borrow().status {
+                RemoteDashboardStatus::Connecting { target }
+                | RemoteDashboardStatus::Connected { target }
+                | RemoteDashboardStatus::Reconnecting { target, .. } => *target,
+            };
             state_tx
-                .send(Some(state))
+                .send(AttachedDashboard::connected(connect_addr, Some(state)))
                 .map_err(|_| anyhow::anyhow!("attached dashboard state receiver dropped"))?;
             Ok::<_, anyhow::Error>(state_tx)
         })
         .await
         .map(|_| ())
+}
+
+fn retry_reason(outcome: &anyhow::Result<ReaderSessionOutcome>) -> String {
+    outcome
+        .as_ref()
+        .map(|_| "connection dropped".to_string())
+        .unwrap_or_else(|err| err.to_string())
+}
+
+fn dashboard_target_from_ws_url(ws_url: &str) -> anyhow::Result<SocketAddr> {
+    ws_url
+        .strip_prefix("ws://")
+        .context("dashboard websocket URL must start with ws://")?
+        .parse()
+        .with_context(|| {
+            format!("dashboard websocket URL contains an invalid socket address: {ws_url}")
+        })
 }
 
 #[cfg(test)]
@@ -319,6 +358,25 @@ mod tests {
         ))));
     }
 
+    #[test]
+    fn retry_reason_prefers_source_error_text() {
+        assert_eq!(
+            retry_reason(&Ok(ReaderSessionOutcome::RetryAfterDelay)),
+            "connection dropped"
+        );
+        assert_eq!(
+            retry_reason(&Err(anyhow::anyhow!("connection refused"))),
+            "connection refused"
+        );
+    }
+
+    #[test]
+    fn dashboard_target_from_ws_url_parses_socket_addresses() {
+        let addr = dashboard_target_from_ws_url("ws://127.0.0.1:8120").expect("target addr");
+        assert_eq!(addr, "127.0.0.1:8120".parse().unwrap());
+        assert!(dashboard_target_from_ws_url("http://127.0.0.1:8120").is_err());
+    }
+
     #[tokio::test]
     async fn publish_dashboard_snapshot_updates_watch_channel() {
         let mut app = build_test_app();
@@ -346,6 +404,7 @@ mod tests {
 
         let err = format!("{err:#}");
         assert!(err.contains("Failed to bind dashboard websocket listener"));
+        assert!(err.contains("ensure that socket is free"));
     }
 
     #[tokio::test]
@@ -356,7 +415,7 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
         drop(listener);
 
-        let (state_tx, _state_rx) = watch::channel(None::<DashboardState>);
+        let (state_tx, _state_rx) = watch::channel(AttachedDashboard::connecting(addr));
         let outcome = dashboard_reader_session(&format!("ws://{addr}"), state_tx)
             .await
             .expect("reader session");
@@ -365,13 +424,13 @@ mod tests {
     }
 
     async fn wait_for_log_lines(
-        state_rx: &mut watch::Receiver<Option<DashboardState>>,
+        state_rx: &mut watch::Receiver<AttachedDashboard>,
         expected: &[&str],
         timeout: Duration,
     ) -> DashboardState {
         tokio::time::timeout(timeout, async {
             loop {
-                if let Some(state) = state_rx.borrow().clone()
+                if let Some(state) = state_rx.borrow().latest_state.clone()
                     && state
                         .log_lines
                         .iter()
@@ -438,7 +497,8 @@ mod tests {
 
     #[tokio::test]
     async fn reader_applies_latest_state() {
-        let (state_tx, mut state_rx) = watch::channel(None::<DashboardState>);
+        let connect_addr: SocketAddr = "127.0.0.1:8120".parse().unwrap();
+        let (state_tx, mut state_rx) = watch::channel(AttachedDashboard::connecting(connect_addr));
 
         let first = DashboardState {
             snapshot: MetricsSnapshot::default(),
@@ -483,6 +543,12 @@ mod tests {
 
         assert_eq!(observed.log_lines, vec!["second".to_string()]);
         assert!(observed.show_details);
+        assert_eq!(
+            state_rx.borrow().status,
+            RemoteDashboardStatus::Connected {
+                target: connect_addr
+            }
+        );
     }
 
     #[tokio::test]
@@ -492,7 +558,7 @@ mod tests {
             .expect("bind test port");
         let addr = listener.local_addr().expect("local addr");
 
-        let (state_tx, mut state_rx) = watch::channel(None::<DashboardState>);
+        let (state_tx, mut state_rx) = watch::channel(AttachedDashboard::connecting(addr));
         let reader =
             spawn_dashboard_reader_with_retry_delay(addr, state_tx, Duration::from_millis(25));
 
@@ -532,6 +598,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let latest = state_rx
             .borrow()
+            .latest_state
             .clone()
             .expect("state should remain present");
         assert_eq!(latest.log_lines, vec!["good".to_string()]);
@@ -548,7 +615,7 @@ mod tests {
             .expect("bind test port");
         let addr = listener.local_addr().expect("local addr");
 
-        let (state_tx, mut state_rx) = watch::channel(None::<DashboardState>);
+        let (state_tx, mut state_rx) = watch::channel(AttachedDashboard::connecting(addr));
         let reader =
             spawn_dashboard_reader_with_retry_delay(addr, state_tx, Duration::from_millis(25));
 
@@ -582,8 +649,26 @@ mod tests {
         let first_observed =
             wait_for_log_lines(&mut state_rx, &["first"], Duration::from_secs(3)).await;
         assert_eq!(first_observed.log_lines, vec!["first".to_string()]);
+        assert_eq!(
+            state_rx.borrow().status,
+            RemoteDashboardStatus::Connected { target: addr }
+        );
 
         drop(first_ws);
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if matches!(
+                    &state_rx.borrow().status,
+                    RemoteDashboardStatus::Reconnecting { target, .. } if *target == addr
+                ) {
+                    break;
+                }
+                state_rx.changed().await.expect("reader still alive");
+            }
+        })
+        .await
+        .expect("reader should enter reconnecting state");
 
         let second_conn = tokio::time::timeout(Duration::from_secs(5), listener.accept())
             .await
@@ -625,6 +710,10 @@ mod tests {
         assert_eq!(
             second_observed.buffer_pool.as_ref().map(|pool| pool.total),
             Some(3)
+        );
+        assert_eq!(
+            state_rx.borrow().status,
+            RemoteDashboardStatus::Connected { target: addr }
         );
 
         drop(second_ws);

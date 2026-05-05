@@ -23,8 +23,6 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::test_helpers::get_available_port;
-
 /// Count how many times backends are queried
 #[derive(Clone)]
 struct BackendQueryCounter {
@@ -53,17 +51,13 @@ impl BackendQueryCounter {
 
 /// Spawn mock server that counts queries
 fn spawn_counting_mock_server(
-    port: u16,
+    listener: TcpListener,
     name: &str,
     counter: BackendQueryCounter,
     has_article: bool,
 ) -> tokio::task::AbortHandle {
     let name = name.to_string();
     let task = tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
-            .await
-            .unwrap();
-
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
             let counter = counter.clone();
@@ -161,6 +155,25 @@ fn spawn_counting_mock_server(
     task.abort_handle()
 }
 
+async fn spawn_test_proxy(proxy: NntpProxy) -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        while let Ok((stream, addr)) = listener.accept().await {
+            let proxy = proxy.clone();
+            tokio::spawn(async move {
+                proxy
+                    .handle_client_per_command_routing(stream, addr.into())
+                    .await
+                    .ok();
+            });
+        }
+    });
+
+    port
+}
+
 /// CRITICAL TEST: Cache check must happen BEFORE adaptive prechecking for STAT
 ///
 /// Bug history:
@@ -174,14 +187,14 @@ fn spawn_counting_mock_server(
 /// - Second STAT: Cache hit, ZERO backend queries (instant response)
 #[tokio::test]
 async fn test_stat_cache_hit_zero_backend_queries() {
-    let proxy_port = get_available_port().await.unwrap();
-    let backend_port = get_available_port().await.unwrap();
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
 
     // Create counter to track backend queries
     let counter = BackendQueryCounter::new();
 
     // Spawn counting mock server (has article)
-    let _mock = spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), true);
+    let _mock = spawn_counting_mock_server(backend_listener, "TestBackend", counter.clone(), true);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Create proxy config with caching and adaptive precheck
@@ -204,20 +217,7 @@ async fn test_stat_cache_hit_zero_backend_queries() {
     let proxy = nntp_proxy::NntpProxy::new(config.clone(), RoutingMode::PerCommand)
         .await
         .unwrap();
-    let listener = TcpListener::bind(format!("127.0.0.1:{proxy_port}"))
-        .await
-        .unwrap();
-    let _proxy_handle = tokio::spawn(async move {
-        while let Ok((stream, addr)) = listener.accept().await {
-            let proxy = proxy.clone();
-            tokio::spawn(async move {
-                proxy
-                    .handle_client_per_command_routing(stream, addr.into())
-                    .await
-                    .ok();
-            });
-        }
-    });
+    let proxy_port = spawn_test_proxy(proxy).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     // Connect client
@@ -284,11 +284,11 @@ async fn test_stat_cache_hit_zero_backend_queries() {
 /// CRITICAL TEST: HEAD command cache hits must not query backends
 #[tokio::test]
 async fn test_head_cache_hit_zero_backend_queries() {
-    let proxy_port = get_available_port().await.unwrap();
-    let backend_port = get_available_port().await.unwrap();
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
 
     let counter = BackendQueryCounter::new();
-    let _mock = spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), true);
+    let _mock = spawn_counting_mock_server(backend_listener, "TestBackend", counter.clone(), true);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
@@ -309,20 +309,7 @@ async fn test_head_cache_hit_zero_backend_queries() {
     let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand)
         .await
         .unwrap();
-    let listener = TcpListener::bind(format!("127.0.0.1:{proxy_port}"))
-        .await
-        .unwrap();
-    let _proxy_handle = tokio::spawn(async move {
-        while let Ok((stream, addr)) = listener.accept().await {
-            let proxy = proxy.clone();
-            tokio::spawn(async move {
-                proxy
-                    .handle_client_per_command_routing(stream, addr.into())
-                    .await
-                    .ok();
-            });
-        }
-    });
+    let proxy_port = spawn_test_proxy(proxy).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
@@ -392,11 +379,11 @@ async fn test_head_cache_hit_zero_backend_queries() {
 /// CRITICAL TEST: ARTICLE command cache hits must not query backends
 #[tokio::test]
 async fn test_article_cache_hit_zero_backend_queries() {
-    let proxy_port = get_available_port().await.unwrap();
-    let backend_port = get_available_port().await.unwrap();
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
 
     let counter = BackendQueryCounter::new();
-    let _mock = spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), true);
+    let _mock = spawn_counting_mock_server(backend_listener, "TestBackend", counter.clone(), true);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
@@ -417,20 +404,7 @@ async fn test_article_cache_hit_zero_backend_queries() {
     let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand)
         .await
         .unwrap();
-    let listener = TcpListener::bind(format!("127.0.0.1:{proxy_port}"))
-        .await
-        .unwrap();
-    let _proxy_handle = tokio::spawn(async move {
-        while let Ok((stream, addr)) = listener.accept().await {
-            let proxy = proxy.clone();
-            tokio::spawn(async move {
-                proxy
-                    .handle_client_per_command_routing(stream, addr.into())
-                    .await
-                    .ok();
-            });
-        }
-    });
+    let proxy_port = spawn_test_proxy(proxy).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
@@ -500,11 +474,11 @@ async fn test_article_cache_hit_zero_backend_queries() {
 /// Fake-backend test: without article payload caching, ARTICLE requests still go upstream.
 #[tokio::test]
 async fn test_article_without_payload_cache_queries_backend_each_time() {
-    let proxy_port = get_available_port().await.unwrap();
-    let backend_port = get_available_port().await.unwrap();
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
 
     let counter = BackendQueryCounter::new();
-    let _mock = spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), true);
+    let _mock = spawn_counting_mock_server(backend_listener, "TestBackend", counter.clone(), true);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
@@ -525,20 +499,7 @@ async fn test_article_without_payload_cache_queries_backend_each_time() {
     let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand)
         .await
         .unwrap();
-    let listener = TcpListener::bind(format!("127.0.0.1:{proxy_port}"))
-        .await
-        .unwrap();
-    let _proxy_handle = tokio::spawn(async move {
-        while let Ok((stream, addr)) = listener.accept().await {
-            let proxy = proxy.clone();
-            tokio::spawn(async move {
-                proxy
-                    .handle_client_per_command_routing(stream, addr.into())
-                    .await
-                    .ok();
-            });
-        }
-    });
+    let proxy_port = spawn_test_proxy(proxy).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
@@ -579,12 +540,12 @@ async fn test_article_without_payload_cache_queries_backend_each_time() {
 /// CRITICAL TEST: Cached 430s must not trigger backend queries
 #[tokio::test]
 async fn test_cached_430_zero_backend_queries() {
-    let proxy_port = get_available_port().await.unwrap();
-    let backend_port = get_available_port().await.unwrap();
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
 
     let counter = BackendQueryCounter::new();
     // Server doesn't have article (returns 430)
-    let _mock = spawn_counting_mock_server(backend_port, "TestBackend", counter.clone(), false);
+    let _mock = spawn_counting_mock_server(backend_listener, "TestBackend", counter.clone(), false);
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
@@ -605,20 +566,7 @@ async fn test_cached_430_zero_backend_queries() {
     let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand)
         .await
         .unwrap();
-    let listener = TcpListener::bind(format!("127.0.0.1:{proxy_port}"))
-        .await
-        .unwrap();
-    let _proxy_handle = tokio::spawn(async move {
-        while let Ok((stream, addr)) = listener.accept().await {
-            let proxy = proxy.clone();
-            tokio::spawn(async move {
-                proxy
-                    .handle_client_per_command_routing(stream, addr.into())
-                    .await
-                    .ok();
-            });
-        }
-    });
+    let proxy_port = spawn_test_proxy(proxy).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
 
     let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))

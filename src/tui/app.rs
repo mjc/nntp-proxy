@@ -922,15 +922,19 @@ mod tests {
         use crate::metrics::{BackendStats, CommandCount};
         use crate::types::{BytesReceived, BytesSent};
 
-        let mut prev = BackendStats::default();
-        prev.bytes_sent = BytesSent::new(100);
-        prev.bytes_received = BytesReceived::new(200);
-        prev.total_commands = CommandCount::new(10);
+        let prev = BackendStats {
+            bytes_sent: BytesSent::new(100),
+            bytes_received: BytesReceived::new(200),
+            total_commands: CommandCount::new(10),
+            ..Default::default()
+        };
 
-        let mut next = prev.clone();
-        next.bytes_sent = BytesSent::new(250);
-        next.bytes_received = BytesReceived::new(500);
-        next.total_commands = CommandCount::new(40);
+        let next = BackendStats {
+            bytes_sent: BytesSent::new(250),
+            bytes_received: BytesReceived::new(500),
+            total_commands: CommandCount::new(40),
+            ..prev.clone()
+        };
 
         let point = TuiApp::build_backend_throughput_point(Timestamp::now(), 0.5, &next, &prev);
 

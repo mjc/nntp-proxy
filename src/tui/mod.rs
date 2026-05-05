@@ -14,12 +14,13 @@ mod ui;
 #[cfg(test)]
 mod ui_tests;
 
+use crate::tui::constants::styles;
 pub use app::{TuiApp, TuiAppBuilder, ViewMode};
 pub use dashboard::{BackendView, BufferPoolStats, DashboardState};
 pub use log_capture::{LogBuffer, LogMakeWriter};
-pub use remote::{run_dashboard_publisher, spawn_dashboard_reader};
+pub use remote::run_dashboard_publisher;
+pub(crate) use remote::spawn_dashboard_reader;
 pub use system_stats::{SystemMonitor, SystemStats};
-pub use ui::render_ui;
 
 use anyhow::Result;
 use crossterm::{
@@ -41,6 +42,59 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RemoteDashboardStatus {
+    Connecting {
+        target: SocketAddr,
+    },
+    Connected {
+        target: SocketAddr,
+    },
+    Reconnecting {
+        target: SocketAddr,
+        retry_delay: Duration,
+        last_error: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AttachedDashboard {
+    pub latest_state: Option<DashboardState>,
+    pub status: RemoteDashboardStatus,
+}
+
+impl AttachedDashboard {
+    fn connecting(target: SocketAddr) -> Self {
+        Self {
+            latest_state: None,
+            status: RemoteDashboardStatus::Connecting { target },
+        }
+    }
+
+    fn connected(target: SocketAddr, latest_state: Option<DashboardState>) -> Self {
+        Self {
+            latest_state,
+            status: RemoteDashboardStatus::Connected { target },
+        }
+    }
+
+    fn reconnecting(
+        target: SocketAddr,
+        retry_delay: Duration,
+        latest_state: Option<DashboardState>,
+        last_error: impl Into<String>,
+    ) -> Self {
+        Self {
+            latest_state,
+            status: RemoteDashboardStatus::Reconnecting {
+                target,
+                retry_delay,
+                last_error: last_error.into(),
+            },
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TuiInputAction {
@@ -126,7 +180,8 @@ pub async fn run_tui(
 
 /// Run the TUI as a remote dashboard client connected to a headless publisher.
 pub async fn run_attached_tui(connect_addr: SocketAddr) -> Result<()> {
-    let (state_tx, mut state_rx) = tokio::sync::watch::channel(None::<DashboardState>);
+    let (state_tx, mut state_rx) =
+        tokio::sync::watch::channel(AttachedDashboard::connecting(connect_addr));
     let _reader = spawn_dashboard_reader(connect_addr, state_tx);
     let mut local_system_monitor = SystemMonitor::new();
 
@@ -151,7 +206,7 @@ where
     let mut update_interval = tokio::time::interval(Duration::from_millis(250));
 
     // Initial render
-    terminal.draw(|f| ui::render_ui(f, &app.snapshot_state(), None))?;
+    terminal.draw(|f| ui::render_ui(f, &app.snapshot_state(), None, None))?;
 
     let mut should_quit = false;
 
@@ -173,7 +228,7 @@ where
                     break;
                 }
 
-                terminal.draw(|f| ui::render_ui(f, &app.snapshot_state(), None))?;
+                terminal.draw(|f| ui::render_ui(f, &app.snapshot_state(), None, None))?;
             }
         }
     }
@@ -183,7 +238,7 @@ where
 
 async fn run_attached_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
-    state_rx: &mut tokio::sync::watch::Receiver<Option<DashboardState>>,
+    state_rx: &mut tokio::sync::watch::Receiver<AttachedDashboard>,
     local_system_monitor: &mut SystemMonitor,
 ) -> Result<()>
 where
@@ -194,7 +249,7 @@ where
 
     let state = state_rx.borrow().clone();
     let local_system_stats = local_system_monitor.update();
-    terminal.draw(|f| draw_attached_dashboard(f, state.as_ref(), &local_system_stats))?;
+    terminal.draw(|f| draw_attached_dashboard(f, &state, &local_system_stats))?;
 
     loop {
         tokio::select! {
@@ -209,7 +264,7 @@ where
 
                 let state = state_rx.borrow().clone();
                 let local_system_stats = local_system_monitor.update();
-                terminal.draw(|f| draw_attached_dashboard(f, state.as_ref(), &local_system_stats))?;
+                terminal.draw(|f| draw_attached_dashboard(f, &state, &local_system_stats))?;
             }
         }
     }
@@ -219,11 +274,11 @@ where
 
 fn draw_attached_dashboard(
     f: &mut ratatui::Frame,
-    state: Option<&DashboardState>,
+    attached: &AttachedDashboard,
     local_system_stats: &SystemStats,
 ) {
-    if let Some(state) = state {
-        ui::render_ui(f, state, Some(local_system_stats));
+    if let Some(state) = attached.latest_state.as_ref() {
+        ui::render_ui(f, state, Some(local_system_stats), Some(&attached.status));
         return;
     }
 
@@ -241,12 +296,12 @@ fn draw_attached_dashboard(
         "NNTP Proxy "
             .fg(crate::tui::constants::styles::BORDER_ACTIVE)
             .bold(),
-        "- Remote Dashboard".fg(Color::White),
+        "- Attached Dashboard".fg(Color::White),
     ]))
     .alignment(Alignment::Center);
 
-    let body =
-        Paragraph::new(Line::from("Connecting to dashboard...")).alignment(Alignment::Center);
+    let body = Paragraph::new(build_attached_placeholder_lines(&attached.status))
+        .alignment(Alignment::Center);
 
     let footer = Paragraph::new(Line::from(vec![
         "Press ".fg(crate::tui::constants::styles::LABEL),
@@ -260,6 +315,41 @@ fn draw_attached_dashboard(
     f.render_widget(title, chunks[0]);
     f.render_widget(body, chunks[1]);
     f.render_widget(footer, chunks[2]);
+}
+
+fn build_attached_placeholder_lines(status: &RemoteDashboardStatus) -> Vec<Line<'static>> {
+    match status {
+        RemoteDashboardStatus::Connecting { target } => vec![
+            Line::from(vec![
+                "Connecting to ".fg(styles::LABEL),
+                target.to_string().fg(styles::VALUE_INFO).bold(),
+                "...".fg(styles::LABEL),
+            ]),
+            Line::from("Waiting for the first dashboard snapshot."),
+        ],
+        RemoteDashboardStatus::Connected { target } => vec![
+            Line::from(vec![
+                "Connected to ".fg(styles::LABEL),
+                target.to_string().fg(styles::VALUE_PRIMARY).bold(),
+            ]),
+            Line::from("Waiting for the first dashboard snapshot."),
+        ],
+        RemoteDashboardStatus::Reconnecting {
+            target,
+            retry_delay,
+            last_error,
+        } => vec![
+            Line::from(vec![
+                "Reconnecting to ".fg(styles::LABEL),
+                target.to_string().fg(Color::Yellow).bold(),
+                format!(" in {:.1}s", retry_delay.as_secs_f32()).fg(styles::LABEL),
+            ]),
+            Line::from(vec![
+                "Last error: ".fg(styles::LABEL),
+                last_error.clone().fg(Color::Yellow),
+            ]),
+        ],
+    }
 }
 
 fn key_event_action(
@@ -362,5 +452,39 @@ mod tests {
 
         assert_eq!(key_event_action(released, true), TuiInputAction::None);
         assert_eq!(key_event_action(other, true), TuiInputAction::None);
+    }
+
+    #[test]
+    fn attached_placeholder_lines_reflect_connection_state() {
+        let connecting = build_attached_placeholder_lines(&RemoteDashboardStatus::Connecting {
+            target: "127.0.0.1:8120".parse().unwrap(),
+        })
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+        let reconnecting = build_attached_placeholder_lines(&RemoteDashboardStatus::Reconnecting {
+            target: "127.0.0.1:8120".parse().unwrap(),
+            retry_delay: Duration::from_secs(1),
+            last_error: "connection refused".to_string(),
+        })
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+
+        assert!(
+            connecting
+                .iter()
+                .any(|line| line.contains("Connecting to 127.0.0.1:8120"))
+        );
+        assert!(
+            reconnecting
+                .iter()
+                .any(|line| line.contains("Reconnecting to 127.0.0.1:8120 in 1.0s"))
+        );
+        assert!(
+            reconnecting
+                .iter()
+                .any(|line| line.contains("Last error: connection refused"))
+        );
     }
 }
