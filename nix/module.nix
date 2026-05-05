@@ -7,6 +7,18 @@
   cfg = config.services.nntp-proxy;
   tomlFormat = pkgs.formats.toml {};
   defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+  managedStateDir = "/var/lib/nntp-proxy";
+  managedCacheDir = "/var/cache/nntp-proxy";
+  managedStatsPath = "${managedStateDir}/stats.json";
+  managedAvailabilityPath = "${managedCacheDir}/availability.idx";
+  managedDiskCachePath = "${managedCacheDir}/disk-cache";
+  managedExternalConfigPath = "${managedStateDir}/external-config.toml";
+  asAbsoluteString = value: let
+    rendered = toString value;
+  in
+    if lib.hasPrefix "/" rendered
+    then rendered
+    else null;
   serviceEnvironment =
     cfg.environment
     // lib.optionalAttrs (cfg.credentialsFile != null) {
@@ -16,20 +28,41 @@
   hasCache = lib.hasAttrByPath ["cache"] cfg.settings;
   storesArticleBodies = lib.attrByPath ["cache" "store_article_bodies"] false cfg.settings;
   hasDiskCache = lib.hasAttrByPath ["cache" "disk"] cfg.settings;
+  generatedStatsPath = lib.attrByPath ["proxy" "stats_file"] managedStatsPath cfg.settings;
+  generatedAvailabilityPath =
+    if hasCache && !storesArticleBodies
+    then lib.attrByPath ["cache" "availability_index_path"] managedAvailabilityPath cfg.settings
+    else null;
+  generatedDiskCachePath =
+    if hasDiskCache
+    then lib.attrByPath ["cache" "disk" "path"] managedDiskCachePath cfg.settings
+    else null;
+  customGeneratedStatsPath =
+    if cfg.configFile == null && asAbsoluteString generatedStatsPath != null && asAbsoluteString generatedStatsPath != managedStatsPath
+    then asAbsoluteString generatedStatsPath
+    else null;
+  customGeneratedAvailabilityPath =
+    if cfg.configFile == null && generatedAvailabilityPath != null && asAbsoluteString generatedAvailabilityPath != null && asAbsoluteString generatedAvailabilityPath != managedAvailabilityPath
+    then asAbsoluteString generatedAvailabilityPath
+    else null;
+  customGeneratedDiskCachePath =
+    if cfg.configFile == null && generatedDiskCachePath != null && asAbsoluteString generatedDiskCachePath != null && asAbsoluteString generatedDiskCachePath != managedDiskCachePath
+    then asAbsoluteString generatedDiskCachePath
+    else null;
   configPath =
     if cfg.configFile != null
-    then cfg.configFile
+    then managedExternalConfigPath
     else
       tomlFormat.generate "nntp-proxy.toml" (
         lib.foldl' lib.recursiveUpdate {} [
           {
-            proxy.stats_file = "/var/lib/nntp-proxy/stats.json";
+            proxy.stats_file = managedStatsPath;
           }
           (lib.optionalAttrs (hasCache && !storesArticleBodies) {
-            cache.availability_index_path = "/var/cache/nntp-proxy/availability.idx";
+            cache.availability_index_path = managedAvailabilityPath;
           })
           (lib.optionalAttrs hasDiskCache {
-            cache.disk.path = "/var/cache/nntp-proxy/disk-cache";
+            cache.disk.path = managedDiskCachePath;
           })
           cfg.settings
         ]
@@ -140,8 +173,8 @@ in {
       wants = ["network-online.target"];
       after = ["network-online.target"];
       environment = serviceEnvironment;
-      preStart = lib.optionalString (cfg.configFile == null && hasDiskCache) ''
-        ${pkgs.coreutils}/bin/mkdir -p /var/cache/nntp-proxy/disk-cache
+      preStart = lib.optionalString hasDiskCache ''
+        ${pkgs.coreutils}/bin/mkdir -p ${lib.escapeShellArg managedDiskCachePath}
       '';
 
       serviceConfig = {
@@ -153,7 +186,7 @@ in {
         DynamicUser = true;
         StateDirectory = "nntp-proxy";
         CacheDirectory = "nntp-proxy";
-        WorkingDirectory = "/var/lib/nntp-proxy";
+        WorkingDirectory = managedStateDir;
         Restart = "on-failure";
         RestartSec = "5s";
         NoNewPrivileges = true;
@@ -166,11 +199,17 @@ in {
         LockPersonality = true;
         MemoryDenyWriteExecute = true;
         RestrictSUIDSGID = true;
+        BindReadOnlyPaths = lib.optional (cfg.configFile != null) "${toString cfg.configFile}:${managedExternalConfigPath}";
         ReadWritePaths = [
-          "/var/lib/nntp-proxy"
-          "/var/cache/nntp-proxy"
+          managedStateDir
+          managedCacheDir
         ];
       };
     };
+
+    systemd.tmpfiles.rules =
+      (lib.optional (customGeneratedStatsPath != null) "L+ ${customGeneratedStatsPath} - - - - ${managedStatsPath}")
+      ++ (lib.optional (customGeneratedAvailabilityPath != null) "L+ ${customGeneratedAvailabilityPath} - - - - ${managedAvailabilityPath}")
+      ++ (lib.optional (customGeneratedDiskCachePath != null) "L+ ${customGeneratedDiskCachePath} - - - - ${managedDiskCachePath}");
   };
 }

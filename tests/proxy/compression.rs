@@ -15,20 +15,18 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::Duration;
 
-use crate::test_helpers::{get_available_port, wait_for_server};
+use crate::test_helpers::wait_for_server;
 
 /// Mock NNTP server that tracks whether COMPRESS DEFLATE was received
 struct CompressionMockServer {
-    port: u16,
     compress_received: Arc<AtomicBool>,
     /// Response to send when COMPRESS DEFLATE is received
     compress_response: String,
 }
 
 impl CompressionMockServer {
-    fn new(port: u16, compress_response: &str) -> Self {
+    fn new(compress_response: &str) -> Self {
         Self {
-            port,
             compress_received: Arc::new(AtomicBool::new(false)),
             compress_response: compress_response.to_string(),
         }
@@ -38,57 +36,62 @@ impl CompressionMockServer {
         Arc::clone(&self.compress_received)
     }
 
-    fn spawn(self) -> tokio::task::AbortHandle {
-        let port = self.port;
+    async fn run_on_listener(
+        listener: TcpListener,
+        compress_received: Arc<AtomicBool>,
+        compress_response: String,
+    ) {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let compress_received = compress_received.clone();
+            let compress_response = compress_response.clone();
+
+            tokio::spawn(async move {
+                if stream
+                    .write_all(b"200 CompressionTest Ready\r\n")
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+
+                let mut buffer = [0u8; 4096];
+
+                loop {
+                    let n = match stream.read(&mut buffer).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+
+                    let cmd = String::from_utf8_lossy(&buffer[..n]);
+                    let cmd_upper = cmd.trim().to_uppercase();
+
+                    if cmd_upper.starts_with("COMPRESS") {
+                        compress_received.store(true, Ordering::SeqCst);
+                        let _ = stream.write_all(compress_response.as_bytes()).await;
+                    } else if cmd_upper.starts_with("QUIT") {
+                        let _ = stream.write_all(b"205 Goodbye\r\n").await;
+                        break;
+                    } else if cmd_upper.starts_with("STAT") {
+                        let _ = stream
+                            .write_all(b"223 0 <test@example.com> exists\r\n")
+                            .await;
+                    } else {
+                        let _ = stream.write_all(b"200 OK\r\n").await;
+                    }
+                }
+            });
+        }
+    }
+
+    fn spawn_on_listener(self, listener: TcpListener) -> tokio::task::AbortHandle {
         let compress_received = self.compress_received;
         let compress_response = self.compress_response;
 
-        tokio::spawn(async move {
-            let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
-                .await
-                .expect("Failed to bind");
-
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let compress_received = compress_received.clone();
-                let compress_response = compress_response.clone();
-
-                tokio::spawn(async move {
-                    if stream
-                        .write_all(b"200 CompressionTest Ready\r\n")
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-
-                    let mut buffer = [0u8; 4096];
-
-                    loop {
-                        let n = match stream.read(&mut buffer).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => n,
-                        };
-
-                        let cmd = String::from_utf8_lossy(&buffer[..n]);
-                        let cmd_upper = cmd.trim().to_uppercase();
-
-                        if cmd_upper.starts_with("COMPRESS") {
-                            compress_received.store(true, Ordering::SeqCst);
-                            let _ = stream.write_all(compress_response.as_bytes()).await;
-                        } else if cmd_upper.starts_with("QUIT") {
-                            let _ = stream.write_all(b"205 Goodbye\r\n").await;
-                            break;
-                        } else if cmd_upper.starts_with("STAT") {
-                            let _ = stream
-                                .write_all(b"223 0 <test@example.com> exists\r\n")
-                                .await;
-                        } else {
-                            let _ = stream.write_all(b"200 OK\r\n").await;
-                        }
-                    }
-                });
-            }
-        })
+        tokio::spawn(Self::run_on_listener(
+            listener,
+            compress_received,
+            compress_response,
+        ))
         .abort_handle()
     }
 }
@@ -105,12 +108,14 @@ fn build_server_config(port: u16, compress: Option<bool>) -> Server {
 /// When compress is disabled, the proxy should never send COMPRESS DEFLATE
 #[tokio::test]
 async fn test_compression_disabled_skips_negotiation() -> Result<()> {
-    let mock_port = get_available_port().await?;
-    let proxy_port = get_available_port().await?;
+    let mock_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let mock_port = mock_listener.local_addr()?.port();
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_port = proxy_listener.local_addr()?.port();
 
-    let mock = CompressionMockServer::new(mock_port, "206 Compression active\r\n");
+    let mock = CompressionMockServer::new("206 Compression active\r\n");
     let compress_received = mock.compress_was_received();
-    let _handle = mock.spawn();
+    let _handle = mock.spawn_on_listener(mock_listener);
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -121,12 +126,11 @@ async fn test_compression_disabled_skips_negotiation() -> Result<()> {
 
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
-    let listener = TcpListener::bind(&proxy_addr).await?;
 
     tokio::spawn({
         let proxy = proxy.clone();
         async move {
-            while let Ok((stream, addr)) = listener.accept().await {
+            while let Ok((stream, addr)) = proxy_listener.accept().await {
                 let p = proxy.clone();
                 tokio::spawn(async move {
                     let _ = p
@@ -166,13 +170,15 @@ async fn test_compression_disabled_skips_negotiation() -> Result<()> {
 /// When compress is auto (None) and server doesn't support it, proxy falls back gracefully
 #[tokio::test]
 async fn test_compression_auto_fallback_on_unsupported() -> Result<()> {
-    let mock_port = get_available_port().await?;
-    let proxy_port = get_available_port().await?;
+    let mock_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let mock_port = mock_listener.local_addr()?.port();
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_port = proxy_listener.local_addr()?.port();
 
     // Server responds 500 to COMPRESS DEFLATE
-    let mock = CompressionMockServer::new(mock_port, "500 Command not recognized\r\n");
+    let mock = CompressionMockServer::new("500 Command not recognized\r\n");
     let compress_received = mock.compress_was_received();
-    let _handle = mock.spawn();
+    let _handle = mock.spawn_on_listener(mock_listener);
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -183,12 +189,11 @@ async fn test_compression_auto_fallback_on_unsupported() -> Result<()> {
 
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
-    let listener = TcpListener::bind(&proxy_addr).await?;
 
     tokio::spawn({
         let proxy = proxy.clone();
         async move {
-            while let Ok((stream, addr)) = listener.accept().await {
+            while let Ok((stream, addr)) = proxy_listener.accept().await {
                 let p = proxy.clone();
                 tokio::spawn(async move {
                     let _ = p
@@ -227,12 +232,14 @@ async fn test_compression_auto_fallback_on_unsupported() -> Result<()> {
 /// When compress is required and server doesn't support it, proxy should fail the connection
 #[tokio::test]
 async fn test_compression_required_fails_on_unsupported() -> Result<()> {
-    let mock_port = get_available_port().await?;
-    let proxy_port = get_available_port().await?;
+    let mock_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let mock_port = mock_listener.local_addr()?.port();
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_port = proxy_listener.local_addr()?.port();
 
     // Server rejects COMPRESS DEFLATE
-    let mock = CompressionMockServer::new(mock_port, "500 Command not recognized\r\n");
-    let _handle = mock.spawn();
+    let mock = CompressionMockServer::new("500 Command not recognized\r\n");
+    let _handle = mock.spawn_on_listener(mock_listener);
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -243,12 +250,11 @@ async fn test_compression_required_fails_on_unsupported() -> Result<()> {
 
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
-    let listener = TcpListener::bind(&proxy_addr).await?;
 
     tokio::spawn({
         let proxy = proxy.clone();
         async move {
-            while let Ok((stream, addr)) = listener.accept().await {
+            while let Ok((stream, addr)) = proxy_listener.accept().await {
                 let p = proxy.clone();
                 tokio::spawn(async move {
                     let _ = p
