@@ -269,11 +269,30 @@ pub fn spawn_mock_server(port: u16, server_name: &str) -> AbortHandle {
 /// Panics if the test proxy cannot bind to the requested loopback port.
 pub async fn spawn_test_proxy(proxy: NntpProxy, port: u16, per_command_routing: bool) {
     let proxy_addr = format!("127.0.0.1:{port}");
-    let listener = TcpListener::bind(&proxy_addr).await.unwrap();
+
+    // Try binding a few times to avoid transient race with port allocation
+    let mut proxy_listener = None;
+    for attempt in 0..5 {
+        match TcpListener::bind(&proxy_addr).await {
+            Ok(l) => {
+                proxy_listener = Some(l);
+                break;
+            }
+            Err(e) => {
+                if attempt == 4 {
+                    panic!("Failed to bind proxy listener on {proxy_addr}: {e}");
+                }
+                // Small sleep before retry
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        }
+    }
+
+    let proxy_listener = proxy_listener.unwrap();
 
     tokio::spawn(async move {
         loop {
-            if let Ok((stream, addr)) = listener.accept().await {
+            if let Ok((stream, addr)) = proxy_listener.accept().await {
                 let proxy_clone = proxy.clone();
                 tokio::spawn(async move {
                     if per_command_routing {
