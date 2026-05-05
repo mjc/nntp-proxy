@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
+use tracing::{info, warn};
 
 #[allow(clippy::cast_precision_loss)]
 fn dashboard_message(state: &DashboardState) -> anyhow::Result<Message> {
@@ -83,6 +84,13 @@ async fn handle_dashboard_client(
     stream: TcpStream,
     state_rx: watch::Receiver<Arc<DashboardState>>,
 ) -> anyhow::Result<()> {
+    let peer_addr = stream.peer_addr().ok();
+    if let Some(peer_addr) = peer_addr {
+        info!("Dashboard websocket client connected from {peer_addr}");
+    } else {
+        info!("Dashboard websocket client connected");
+    }
+
     let ws_stream = accept_async(stream).await?;
     let (sink, source) = ws_stream.split();
 
@@ -90,6 +98,12 @@ async fn handle_dashboard_client(
         send_dashboard_state_stream(sink, state_rx),
         drain_dashboard_source(source)
     )?;
+
+    if let Some(peer_addr) = peer_addr {
+        info!("Dashboard websocket client disconnected from {peer_addr}");
+    } else {
+        info!("Dashboard websocket client disconnected");
+    }
     Ok(())
 }
 
@@ -120,7 +134,9 @@ pub async fn run_dashboard_publisher(
                 let (stream, _) = accept_result?;
                 let rx = state_tx.subscribe();
                 tokio::spawn(async move {
-                    let _ = handle_dashboard_client(stream, rx).await;
+                    if let Err(err) = handle_dashboard_client(stream, rx).await {
+                        warn!("Dashboard websocket client error: {err}");
+                    }
                 });
             }
         }
@@ -145,11 +161,17 @@ fn spawn_dashboard_reader_with_retry_delay(
     tokio::spawn(async move {
         let ws_url = format!("ws://{connect_addr}");
 
+        info!("Connecting attached dashboard client to {ws_url}");
+
         while matches!(
             dashboard_reader_session(&ws_url, state_tx.clone()).await,
             Ok(ReaderSessionOutcome::RetryAfterDelay)
         ) {
+            warn!(
+                "Attached dashboard websocket disconnected or unavailable; retrying in {retry_delay:?}"
+            );
             tokio::time::sleep(retry_delay).await;
+            info!("Reconnecting attached dashboard client to {ws_url}");
         }
     })
 }
@@ -159,13 +181,16 @@ async fn dashboard_reader_session(
     state_tx: watch::Sender<Option<DashboardState>>,
 ) -> anyhow::Result<ReaderSessionOutcome> {
     let Ok((ws_stream, _)) = connect_async(ws_url).await else {
+        warn!("Failed to connect attached dashboard client to {ws_url}");
         return Ok(ReaderSessionOutcome::RetryAfterDelay);
     };
 
+    info!("Attached dashboard websocket connected to {ws_url}");
     let (_, source) = ws_stream.split();
-    forward_dashboard_states(source, state_tx)
-        .await
-        .map(|_| ReaderSessionOutcome::RetryAfterDelay)
+    forward_dashboard_states(source, state_tx).await.map(|_| {
+        warn!("Attached dashboard websocket stream ended for {ws_url}");
+        ReaderSessionOutcome::RetryAfterDelay
+    })
 }
 
 async fn forward_dashboard_states<S>(

@@ -194,8 +194,7 @@ where
 
     let state = state_rx.borrow().clone();
     let local_system_stats = local_system_monitor.update();
-    terminal
-        .draw(|f| draw_attached_dashboard(f, state.as_ref(), local_system_stats.memory_bytes))?;
+    terminal.draw(|f| draw_attached_dashboard(f, state.as_ref(), &local_system_stats))?;
 
     loop {
         tokio::select! {
@@ -210,9 +209,7 @@ where
 
                 let state = state_rx.borrow().clone();
                 let local_system_stats = local_system_monitor.update();
-                terminal.draw(|f| {
-                    draw_attached_dashboard(f, state.as_ref(), local_system_stats.memory_bytes)
-                })?;
+                terminal.draw(|f| draw_attached_dashboard(f, state.as_ref(), &local_system_stats))?;
             }
         }
     }
@@ -223,10 +220,10 @@ where
 fn draw_attached_dashboard(
     f: &mut ratatui::Frame,
     state: Option<&DashboardState>,
-    local_memory_bytes: u64,
+    local_system_stats: &SystemStats,
 ) {
     if let Some(state) = state {
-        ui::render_ui(f, state, Some(local_memory_bytes));
+        ui::render_ui(f, state, Some(local_system_stats));
         return;
     }
 
