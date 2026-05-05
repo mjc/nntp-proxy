@@ -49,6 +49,39 @@
     if cfg.configFile == null && generatedDiskCachePath != null && asAbsoluteString generatedDiskCachePath != null && asAbsoluteString generatedDiskCachePath != managedDiskCachePath
     then asAbsoluteString generatedDiskCachePath
     else null;
+  customGeneratedStatsDir =
+    if customGeneratedStatsPath != null
+    then builtins.dirOf customGeneratedStatsPath
+    else null;
+  customGeneratedAvailabilityDir =
+    if customGeneratedAvailabilityPath != null
+    then builtins.dirOf customGeneratedAvailabilityPath
+    else null;
+  customGeneratedDiskCacheParentDir =
+    if customGeneratedDiskCachePath != null
+    then builtins.dirOf customGeneratedDiskCachePath
+    else null;
+  extraWritablePaths =
+    lib.filter (path: path != null) [
+      customGeneratedStatsDir
+      customGeneratedAvailabilityDir
+      customGeneratedDiskCachePath
+      customGeneratedDiskCacheParentDir
+    ];
+  extraPreStartCommands =
+    lib.concatStringsSep "\n" (
+      lib.filter (cmd: cmd != "") [
+        (lib.optionalString (customGeneratedStatsDir != null) ''
+          ${pkgs.coreutils}/bin/mkdir -p ${lib.escapeShellArg customGeneratedStatsDir}
+        '')
+        (lib.optionalString (customGeneratedAvailabilityDir != null) ''
+          ${pkgs.coreutils}/bin/mkdir -p ${lib.escapeShellArg customGeneratedAvailabilityDir}
+        '')
+        (lib.optionalString (customGeneratedDiskCachePath != null) ''
+          ${pkgs.coreutils}/bin/mkdir -p ${lib.escapeShellArg customGeneratedDiskCachePath}
+        '')
+      ]
+    );
   configPath =
     if cfg.configFile != null
     then managedExternalConfigPath
@@ -173,9 +206,14 @@ in {
       wants = ["network-online.target"];
       after = ["network-online.target"];
       environment = serviceEnvironment;
-      preStart = lib.optionalString hasDiskCache ''
-        ${pkgs.coreutils}/bin/mkdir -p ${lib.escapeShellArg managedDiskCachePath}
-      '';
+      preStart = lib.concatStringsSep "\n" (
+        lib.filter (cmd: cmd != "") [
+          (lib.optionalString hasDiskCache ''
+            ${pkgs.coreutils}/bin/mkdir -p ${lib.escapeShellArg managedDiskCachePath}
+          '')
+          extraPreStartCommands
+        ]
+      );
 
       serviceConfig = {
         Type = "simple";
@@ -203,13 +241,8 @@ in {
         ReadWritePaths = [
           managedStateDir
           managedCacheDir
-        ];
+        ] ++ extraWritablePaths;
       };
     };
-
-    systemd.tmpfiles.rules =
-      (lib.optional (customGeneratedStatsPath != null) "L+ ${customGeneratedStatsPath} - - - - ${managedStatsPath}")
-      ++ (lib.optional (customGeneratedAvailabilityPath != null) "L+ ${customGeneratedAvailabilityPath} - - - - ${managedAvailabilityPath}")
-      ++ (lib.optional (customGeneratedDiskCachePath != null) "L+ ${customGeneratedDiskCachePath} - - - - ${managedDiskCachePath}");
   };
 }
