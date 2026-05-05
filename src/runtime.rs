@@ -312,25 +312,35 @@ pub async fn persist_runtime_state(
     let metrics = proxy.metrics().clone();
     let metrics_path = stats_path.clone();
     match tokio::task::spawn_blocking(move || metrics.save_to_disk(&metrics_path, &server_names))
-        .await?
+        .await
     {
-        Ok(()) => info!("Metrics saved to {}", stats_path.display()),
-        Err(e) => {
+        Ok(Ok(())) => info!("Metrics saved to {}", stats_path.display()),
+        Ok(Err(e)) => {
             warn!("Failed to save metrics on shutdown: {}", e);
             first_error = Some(e);
+        }
+        Err(e) => {
+            warn!("Failed to join metrics save task on shutdown: {}", e);
+            first_error = Some(e.into());
         }
     }
 
     if let Some(path) = availability_path {
         let cache = proxy.cache().clone();
         let save_path = path.clone();
-        match tokio::task::spawn_blocking(move || cache.save_to_disk(&save_path)).await? {
-            Ok(true) => info!("Availability index saved to {}", path.display()),
-            Ok(false) => {}
-            Err(e) => {
+        match tokio::task::spawn_blocking(move || cache.save_to_disk(&save_path)).await {
+            Ok(Ok(true)) => info!("Availability index saved to {}", path.display()),
+            Ok(Ok(false)) => {}
+            Ok(Err(e)) => {
                 warn!("Failed to save availability index on shutdown: {}", e);
                 if first_error.is_none() {
                     first_error = Some(e);
+                }
+            }
+            Err(e) => {
+                warn!("Failed to join availability save task on shutdown: {}", e);
+                if first_error.is_none() {
+                    first_error = Some(e.into());
                 }
             }
         }
