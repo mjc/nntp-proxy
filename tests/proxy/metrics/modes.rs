@@ -8,11 +8,11 @@ use nntp_proxy::types::{BackendId, BytesReceived, BytesSent, ServerName};
 
 #[test]
 fn test_metrics_with_pool_status_standard_mode() {
-    // Standard mode: 1:1 client-to-backend mapping
+    // Stateful routing (logged as "standard"): 1:1 client-to-backend mapping
     // Metrics should show:
     // - bytes_sent/received (recorded at session end)
     // - active_connections (from pool utilization)
-    // - total_commands = 0 (not parsed in standard mode)
+    // - total_commands = 0 (not parsed in stateful routing)
 
     let metrics = MetricsCollector::new(1);
     let mut router = BackendSelector::new();
@@ -33,7 +33,7 @@ fn test_metrics_with_pool_status_standard_mode() {
         0, // tier
     );
 
-    // Simulate standard mode behavior: record bytes only
+    // Simulate stateful routing behavior: record bytes only
     metrics.record_client_to_backend_bytes_for(BackendId::from(0), 1000);
     metrics.record_backend_to_client_bytes_for(BackendId::from(0), 5000);
 
@@ -292,7 +292,7 @@ fn test_all_modes_show_meaningful_metrics() {
         // 3. Commands (per-command and hybrid only)
         match mode {
             RoutingMode::Stateful => {
-                // Standard mode doesn't parse commands
+                // Stateful routing doesn't parse commands
                 assert_eq!(
                     snapshot.backend_stats[0].total_commands,
                     nntp_proxy::metrics::CommandCount::new(0)

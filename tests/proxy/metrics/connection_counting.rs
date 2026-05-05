@@ -1,8 +1,8 @@
 //! Tests for connection counting to prevent double-counting bug regression
 //!
-//! Bug: Standard mode was double-counting authenticated connections:
+//! Bug: stateful routing (logged as "standard") was double-counting authenticated connections:
 //! 1. Once in `on_authentication_success()` after AUTHINFO PASS succeeds
-//! 2. Again in proxy.rs after the session completes
+//! 2. Again in `NntpProxy::handle_client()` after the session completes
 //!
 //! Fix: Only count during authentication, skip if already authenticated.
 
@@ -24,7 +24,7 @@ fn test_authenticated_connection_counted_once() {
         "Connection should be counted during authentication"
     );
 
-    // The bug was: proxy.rs handle_client() would call record_connection() AGAIN
+    // The bug was: `NntpProxy::handle_client()` would call record_connection() AGAIN
     // after session completes, causing double-counting.
     //
     // With the fix, handle_client() checks:
@@ -42,7 +42,7 @@ fn test_anonymous_connection_counted_after_session() {
     let aggregator = ConnectionStatsAggregator::new();
 
     // With no auth, connection is counted AFTER session completes
-    // (in proxy.rs handle_client(), not during auth since there's no auth)
+    // (in `NntpProxy::handle_client()`, not during auth since there's no auth)
     aggregator.record_connection(None, "standard");
 
     assert_eq!(
@@ -74,7 +74,7 @@ fn test_multiple_authenticated_sessions_no_double_count() {
 fn test_conditional_recording_prevents_double_count() {
     let aggregator = ConnectionStatsAggregator::new();
 
-    // Simulate the fixed logic in proxy.rs handle_client():
+    // Simulate the fixed logic in `NntpProxy::handle_client()`:
     //
     // if !auth_handler.is_enabled() || session.username().is_none() {
     //     record_connection(...);

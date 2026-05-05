@@ -961,6 +961,8 @@ async fn start_tiered_proxy(servers: Vec<Server>, proxy_port: u16) -> Result<()>
     let config = Config {
         servers,
         proxy: Proxy::default(),
+        routing: Default::default(),
+        memory: Default::default(),
         health_check: HealthCheck::default(),
         cache: None,
         client_auth: ClientAuth::default(),

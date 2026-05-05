@@ -22,7 +22,7 @@ fn create_config_with_precheck(backend_port: u16, adaptive_precheck: bool) -> Co
             "test-backend",
         )],
         cache: Some(Cache {
-            cache_articles: false,
+            store_article_bodies: false,
             adaptive_precheck,
             ..Default::default()
         }),
@@ -221,7 +221,7 @@ async fn test_head_precheck_first_response_wins() -> Result<()> {
             create_test_server_config("127.0.0.1", backend2_port, "slow-backend"),
         ],
         cache: Some(Cache {
-            cache_articles: false,
+            store_article_bodies: false,
             adaptive_precheck: true,
             ..Default::default()
         }),

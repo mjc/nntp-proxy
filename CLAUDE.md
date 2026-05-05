@@ -266,7 +266,7 @@ if is_large_transfer_command(cmd) { /* ARTICLE/BODY — route to batch pipeline 
 ## Caching
 
 **Two-tier cache:**
-- Memory: moka (LRU) or foyer-memory, configured via `memory_cache_capacity`
+- Memory: moka (LRU) or foyer-memory, configured via `article_cache_capacity`
 - Disk: foyer hybrid with **psync I/O engine** — ❌ **DO NOT use io_uring** (53% idle CPU bug from tight `try_recv` loop)
 
 **Cache key:** Message-ID; STAT/HEAD/ARTICLE/BODY variants cached separately.

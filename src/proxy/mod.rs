@@ -22,7 +22,7 @@ use tracing::info;
 
 use crate::auth::AuthHandler;
 use crate::cache::UnifiedCache;
-use crate::config::{RoutingMode, Server};
+use crate::config::{Memory, RoutingMode, Server};
 use crate::metrics::{ConnectionStatsAggregator, MetricsCollector};
 use crate::pool::{BufferPool, DeadpoolConnectionProvider, prewarm_pools};
 use crate::router;
@@ -36,7 +36,7 @@ pub struct NntpProxy {
     pub(super) connection_providers: Vec<DeadpoolConnectionProvider>,
     /// Buffer pool for I/O operations
     pub(super) buffer_pool: BufferPool,
-    /// Routing mode (Standard, `PerCommand`, or Hybrid)
+    /// Routing mode (`Stateful`, `PerCommand`, or `Hybrid`)
     pub(super) routing_mode: RoutingMode,
     /// Authentication handler for client auth interception
     pub(super) auth_handler: Arc<AuthHandler>,
@@ -46,8 +46,10 @@ pub struct NntpProxy {
     pub(super) connection_stats: ConnectionStatsAggregator,
     /// Article cache (always present - fixed-size, memory-backed, hybrid, or disabled)
     pub(super) cache: Arc<UnifiedCache>,
+    /// Memory configuration for transport and pooling
+    pub(super) memory: Memory,
     /// Whether to cache article bodies (config-driven)
-    pub(super) cache_articles: bool,
+    pub(super) store_article_bodies: bool,
     /// Whether to use adaptive availability prechecking for STAT/HEAD
     pub(super) adaptive_precheck: bool,
     /// Timestamp (as epoch nanos) when last client disconnected (for idle detection)
@@ -151,6 +153,10 @@ impl NntpProxy {
     pub async fn graceful_shutdown(&self) {
         info!("Initiating graceful shutdown...");
 
+        for provider in &self.connection_providers {
+            provider.shutdown();
+        }
+
         // Flush cache writes to disk before shutting down
         // With WriteOnInsertion, writes are enqueued async - close() waits for completion
         // Use a timeout: foyer's close() can hang if the runtime is winding down
@@ -201,7 +207,7 @@ impl NntpProxy {
         &self.buffer_pool
     }
 
-    /// Get the article cache (always present, though availability-only mode may be disabled)
+    /// Get the article cache (always present, including availability-only mode)
     #[must_use]
     #[inline]
     pub const fn cache(&self) -> &Arc<UnifiedCache> {

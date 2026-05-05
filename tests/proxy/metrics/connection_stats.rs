@@ -47,9 +47,9 @@ fn test_anonymous_connections() {
 
 /// Test that authenticated connections are counted exactly once, not double-counted
 ///
-/// This test verifies the fix for a bug where standard mode would count connections twice:
+/// This test verifies the fix for a bug where stateful routing would count connections twice:
 /// 1. Once in `on_authentication_success()` after AUTHINFO PASS succeeds
-/// 2. Again in proxy.rs after the session completes
+/// 2. Again in `NntpProxy::handle_client()` after the session completes
 ///
 /// The correct behavior is to count only once, during authentication.
 #[test]
@@ -64,7 +64,8 @@ fn test_no_double_counting_authenticated_connections() {
     assert_eq!(aggregator.connection_count("testuser"), Some(1));
     assert_eq!(aggregator.user_count(), 1);
 
-    // The bug was that proxy.rs would call record_connection() again after session completion
+    // The bug was that `NntpProxy::handle_client()` would call record_connection() again
+    // after session completion
     // This should NOT happen for authenticated sessions (only for anonymous)
 
     // For anonymous sessions (no auth), recording happens after session completion
@@ -88,7 +89,7 @@ fn test_per_command_hybrid_connection_counting() {
     aggregator.record_connection(Some("user_hybrid"), "hybrid");
     assert_eq!(aggregator.connection_count("user_hybrid"), Some(1));
 
-    // Standard mode: same behavior (fixed)
+    // Stateful routing: same behavior (fixed)
     aggregator.record_connection(Some("user_standard"), "standard");
     assert_eq!(aggregator.connection_count("user_standard"), Some(1));
 

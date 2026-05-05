@@ -37,6 +37,8 @@ pub struct DeadpoolConnectionProvider {
     active_cooldowns: Arc<std::sync::atomic::AtomicUsize>,
     /// Connection replacement cooldown duration (None = disabled)
     replacement_cooldown: Option<std::time::Duration>,
+    /// Set once process shutdown begins so teardown doesn't look like backend damage.
+    is_shutting_down: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Builder for constructing `DeadpoolConnectionProvider` instances
@@ -367,6 +369,7 @@ impl DeadpoolConnectionProvider {
             original_max_size: max_size,
             active_cooldowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             replacement_cooldown: None, // Default: no cooldown
+            is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -380,7 +383,11 @@ impl DeadpoolConnectionProvider {
     ///
     /// # Panics
     /// Panics only if deadpool rejects the validated pool size.
-    pub fn from_server_config(server: &crate::config::Server) -> Result<Self> {
+    pub fn from_server_config(
+        server: &crate::config::Server,
+        recv_buffer_size: usize,
+        send_buffer_size: usize,
+    ) -> Result<Self> {
         let tls_builder = TlsConfig::builder()
             .enabled(server.use_tls)
             .verify_cert(server.tls_verify_cert);
@@ -402,6 +409,8 @@ impl DeadpoolConnectionProvider {
                 username: server.username.clone(),
                 password: server.password.clone(),
                 tls_config: Some(tls_config),
+                recv_buffer_size,
+                send_buffer_size,
                 compress: server.compress,
                 compress_level: server.compress_level,
                 ..TcpManagerOptions::default()
@@ -449,6 +458,7 @@ impl DeadpoolConnectionProvider {
             original_max_size: max_size,
             active_cooldowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             replacement_cooldown: server.replacement_cooldown,
+            is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         })
     }
 
@@ -530,6 +540,13 @@ impl DeadpoolConnectionProvider {
     /// accidentally `drop(conn)` before `pool.resize()`. Any attempt to reorder
     /// would be a use-after-move error.
     pub fn remove_with_cooldown(&self, conn: managed::Object<TcpManager>) {
+        if self.is_shutting_down.load(Ordering::Acquire) {
+            let _ = socket2::SockRef::from(conn.underlying_tcp_stream())
+                .shutdown(std::net::Shutdown::Both);
+            drop(conn);
+            return;
+        }
+
         // If cooldown is disabled (None or zero duration), just shut down and drop
         let Some(cooldown) = self.replacement_cooldown.filter(|d| !d.is_zero()) else {
             let _ = socket2::SockRef::from(conn.underlying_tcp_stream())
@@ -643,6 +660,7 @@ impl DeadpoolConnectionProvider {
     /// This sends a shutdown signal to the background health check task.
     /// The task will complete its current cycle and then terminate.
     pub fn shutdown(&self) {
+        self.is_shutting_down.store(true, Ordering::Release);
         if let Some(tx) = &self.shutdown_tx {
             let _ = tx.send(());
         }
@@ -746,6 +764,8 @@ impl DeadpoolConnectionProvider {
     pub async fn graceful_shutdown(&self) {
         use deadpool::managed::Object;
         use tokio::io::AsyncWriteExt;
+
+        self.shutdown();
 
         let status = self.pool.status();
         info!(
@@ -1103,6 +1123,7 @@ mod tests {
             original_max_size: max_size,
             active_cooldowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             replacement_cooldown: cooldown,
+            is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1205,5 +1226,22 @@ mod tests {
             "Pool max_size should be restored after cooldown expires"
         );
         assert_eq!(provider.active_cooldowns.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn test_remove_with_cooldown_skips_reduction_during_shutdown() {
+        let addr = spawn_mock_nntp_server().await;
+        let cooldown = std::time::Duration::from_secs(10);
+        let max_size = 4;
+        let provider = provider_with_cooldown(addr, max_size, Some(cooldown));
+
+        provider.shutdown();
+
+        let conn = provider.get_pooled_connection().await.unwrap();
+        provider.remove_with_cooldown(conn);
+
+        assert_eq!(provider.pool.status().max_size, max_size);
+        assert_eq!(provider.active_cooldowns.load(Ordering::Acquire), 0);
+        assert!(provider.is_shutting_down.load(Ordering::Acquire));
     }
 }

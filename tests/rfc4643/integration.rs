@@ -339,6 +339,8 @@ async fn test_config_auth_round_trip() {
     let config = Config {
         servers: vec![],
         proxy: Proxy::default(),
+        routing: Default::default(),
+        memory: Default::default(),
         health_check: HealthCheck::default(),
         cache: None,
         client_auth: ClientAuth {

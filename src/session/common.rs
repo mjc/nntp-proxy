@@ -163,6 +163,7 @@ where
 /// Sets username, records connection stats, updates metrics
 #[allow(clippy::needless_pass_by_value)] // The owned username is consumed as part of session state updates.
 pub fn on_authentication_success(
+    client_id: crate::types::ClientId,
     client_addr: impl std::fmt::Display,
     username: Option<String>,
     routing_mode: crate::config::RoutingMode,
@@ -182,7 +183,7 @@ pub fn on_authentication_success(
 
     // Record connection for aggregation (after auth so we have username)
     if let Some(stats) = connection_stats {
-        stats.record_connection(username.as_deref(), routing_mode.short_name());
+        stats.record_session_connection(client_id, username.as_deref(), routing_mode.short_name());
     }
 
     // Track user connection in metrics
@@ -347,6 +348,7 @@ impl AuthHandlerResult {
 /// Groups the session-level references needed by [`handle_stateful_auth_check`]
 /// to keep its parameter list concise.
 pub struct AuthCheckContext<'a> {
+    pub client_id: crate::types::ClientId,
     pub auth_handler: &'a std::sync::Arc<crate::auth::AuthHandler>,
     pub auth_state: &'a crate::session::AuthState,
     pub routing_mode: &'a crate::config::RoutingMode,
@@ -405,6 +407,7 @@ where
             match result {
                 AuthResult::Authenticated { bytes, .. } => {
                     on_authentication_success(
+                        ctx.client_id,
                         client_addr,
                         auth_username.clone(),
                         *ctx.routing_mode,

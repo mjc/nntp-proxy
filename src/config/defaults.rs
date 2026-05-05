@@ -59,7 +59,10 @@ pub const fn cache_ttl() -> Duration {
     Duration::from_hours(1)
 }
 
-/// Default for caching article bodies (true = full caching)
+/// Default for caching article bodies in explicit `[cache]` sections.
+///
+/// Legacy cache configs omitted this field and expected full article caching,
+/// so the serde default stays `true` for backward compatibility.
 #[inline]
 pub const fn cache_articles() -> bool {
     true
@@ -69,6 +72,52 @@ pub const fn cache_articles() -> bool {
 #[inline]
 pub const fn adaptive_precheck() -> bool {
     false
+}
+
+/// Default socket receive buffer size
+#[inline]
+#[must_use]
+pub const fn socket_recv_buffer_size() -> usize {
+    crate::constants::socket::HIGH_THROUGHPUT_RECV_BUFFER
+}
+
+/// Default socket send buffer size
+#[inline]
+#[must_use]
+pub const fn socket_send_buffer_size() -> usize {
+    crate::constants::socket::HIGH_THROUGHPUT_SEND_BUFFER
+}
+
+/// Default size of each pooled I/O buffer
+#[inline]
+#[must_use]
+pub const fn buffer_pool_size() -> usize {
+    crate::constants::buffer::POOL
+}
+
+/// Default number of buffers in the main buffer pool
+/// Sized for ~50 concurrent connections with single buffer per connection
+/// Total memory: 50 × 724KB ≈ 35MB
+#[inline]
+#[must_use]
+pub const fn buffer_pool_count() -> usize {
+    crate::constants::buffer::POOL_COUNT
+}
+
+/// Default size of each capture buffer
+#[inline]
+#[must_use]
+pub const fn capture_pool_size() -> usize {
+    crate::constants::buffer::CAPTURE
+}
+
+/// Default number of buffers in the capture pool for caching
+/// Sized for 16 concurrent caching operations
+/// Total memory: 16 × 772KB ≈ 12MB
+#[inline]
+#[must_use]
+pub const fn capture_pool_count() -> usize {
+    crate::constants::buffer::CAPTURE_COUNT
 }
 
 /// Default for TLS certificate verification (true for security)
@@ -167,22 +216,6 @@ pub const fn replacement_cooldown_option() -> Option<Duration> {
     // This mirrors optional config fields and keeps the default plumbing
     // uniform even though the default itself is always present.
     Some(replacement_cooldown())
-}
-
-/// Default number of buffers in the main buffer pool
-/// Sized for ~50 concurrent connections with single buffer per connection
-/// Total memory: 50 × 724KB ≈ 35MB
-#[inline]
-pub const fn buffer_pool_count() -> usize {
-    50
-}
-
-/// Default number of buffers in the capture pool for caching
-/// Sized for 16 concurrent caching operations
-/// Total memory: 16 × 768KB ≈ 12MB
-#[inline]
-pub const fn capture_pool_count() -> usize {
-    16
 }
 
 /// Default log file level (warn)

@@ -193,7 +193,7 @@ async fn test_stat_cache_hit_zero_backend_queries() {
                 .unwrap(),
         ],
         cache: Some(Cache {
-            cache_articles: true,
+            store_article_bodies: true,
             adaptive_precheck: true,
             ..Default::default()
         }),
@@ -299,7 +299,7 @@ async fn test_head_cache_hit_zero_backend_queries() {
                 .unwrap(),
         ],
         cache: Some(Cache {
-            cache_articles: true,
+            store_article_bodies: true,
             adaptive_precheck: true,
             ..Default::default()
         }),
@@ -407,7 +407,7 @@ async fn test_article_cache_hit_zero_backend_queries() {
                 .unwrap(),
         ],
         cache: Some(Cache {
-            cache_articles: true,
+            store_article_bodies: true,
             adaptive_precheck: true,
             ..Default::default()
         }),
@@ -515,7 +515,7 @@ async fn test_article_without_payload_cache_queries_backend_each_time() {
                 .unwrap(),
         ],
         cache: Some(Cache {
-            cache_articles: false,
+            store_article_bodies: false,
             adaptive_precheck: false,
             ..Default::default()
         }),
@@ -595,7 +595,7 @@ async fn test_cached_430_zero_backend_queries() {
                 .unwrap(),
         ],
         cache: Some(Cache {
-            cache_articles: true,
+            store_article_bodies: true,
             adaptive_precheck: true,
             ..Default::default()
         }),

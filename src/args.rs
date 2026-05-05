@@ -1,10 +1,10 @@
-//! Command-line argument parsing for NNTP proxy binaries
+//! Command-line argument parsing for the unified NNTP proxy binary.
 //!
-//! Provides shared argument structures to avoid duplication across binaries.
+//! Provides shared argument structures and value enums for CLI parsing.
 
 use crate::config::{BackendSelectionStrategy, Config, RoutingMode};
 use crate::types::{CacheCapacity, ConfigPath, Port, ThreadCount};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::time::Duration;
 
 /// Parse port from command line argument
@@ -13,9 +13,29 @@ fn parse_port(s: &str) -> Result<Port, String> {
     Port::try_new(port).map_err(|e| format!("Invalid port: {e}"))
 }
 
-/// Common command-line arguments for NNTP proxy binaries
+/// User interface/runtime mode for the unified `nntp-proxy` binary.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum UiMode {
+    /// Run as a headless server and log to stdout.
+    Headless,
+    /// Run the server with the terminal dashboard enabled.
+    Tui,
+}
+
+impl UiMode {
+    /// Default UI mode for the unified binary.
+    pub const DEFAULT: Self = Self::Headless;
+
+    /// Returns true when the interactive terminal dashboard should be launched.
+    #[must_use]
+    pub const fn uses_tui(self) -> bool {
+        matches!(self, Self::Tui)
+    }
+}
+
+/// Common command-line arguments for the `nntp-proxy` binary.
 ///
-/// Use `#[command(flatten)]` in binary-specific Args to include these fields.
+/// Use `#[command(flatten)]` in the top-level CLI args to include these fields.
 #[derive(Parser, Debug, Clone)]
 pub struct CommonArgs {
     /// Configuration file path
@@ -23,17 +43,37 @@ pub struct CommonArgs {
         short,
         long,
         default_value = "config.toml",
-        env,
+        env = "NNTP_PROXY_CONFIG",
         help_heading = "General"
     )]
     pub config: ConfigPath,
 
+    /// Runtime UI mode: headless server logs or terminal dashboard.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = UiMode::DEFAULT,
+        env = "NNTP_PROXY_UI",
+        help_heading = "General"
+    )]
+    pub ui: UiMode,
+
+    /// Disable the terminal dashboard and run in headless mode.
+    #[arg(long, hide = true, help_heading = "General")]
+    pub no_tui: bool,
+
     /// Port to listen on (overrides config file)
-    #[arg(short, long, env, value_parser = parse_port, help_heading = "Network")]
+    #[arg(
+        short,
+        long,
+        env = "NNTP_PROXY_PORT",
+        value_parser = parse_port,
+        help_heading = "Network"
+    )]
     pub port: Option<Port>,
 
     /// Host to bind to (overrides config file)
-    #[arg(long, env, help_heading = "Network")]
+    #[arg(long, env = "NNTP_PROXY_HOST", help_heading = "Network")]
     pub host: Option<String>,
 
     /// Routing mode: stateful, per-command, or hybrid
@@ -45,34 +85,62 @@ pub struct CommonArgs {
         short = 'm',
         long = "routing-mode",
         value_enum,
-        env,
+        env = "NNTP_PROXY_ROUTING_MODE",
         help_heading = "Routing"
     )]
     pub routing_mode: Option<RoutingMode>,
 
     /// Backend selection strategy
-    #[arg(long = "backend-selection", value_enum, env, help_heading = "Routing")]
+    #[arg(
+        long = "backend-selection",
+        alias = "backend-strategy",
+        value_enum,
+        env = "NNTP_PROXY_BACKEND_SELECTION",
+        help_heading = "Routing"
+    )]
     pub backend_selection: Option<BackendSelectionStrategy>,
 
-    /// Memory cache capacity (e.g., "64mb", "1gb")
-    #[arg(long = "cache-capacity", env, help_heading = "Cache")]
-    pub cache_capacity: Option<CacheCapacity>,
+    /// Article cache capacity in memory (e.g., "64mb", "1gb")
+    #[arg(
+        long = "article-cache-capacity",
+        alias = "cache-capacity",
+        env = "NNTP_PROXY_ARTICLE_CACHE_CAPACITY",
+        help_heading = "Cache"
+    )]
+    pub article_cache_capacity: Option<CacheCapacity>,
 
-    /// Cache TTL in seconds
-    #[arg(long = "cache-ttl", env, help_heading = "Cache")]
-    pub cache_ttl: Option<u64>,
+    /// Article cache TTL in seconds
+    #[arg(
+        long = "article-cache-ttl",
+        alias = "cache-ttl",
+        alias = "ttl-secs",
+        env = "NNTP_PROXY_ARTICLE_CACHE_TTL_SECS",
+        help_heading = "Cache"
+    )]
+    pub article_cache_ttl_secs: Option<u64>,
 
-    /// Cache full article bodies (true) or availability-only (false)
-    #[arg(long = "cache-articles", env, help_heading = "Cache")]
-    pub cache_articles: Option<bool>,
+    /// Store full article bodies in the article cache (true) or track availability only (false)
+    #[arg(
+        long = "store-article-bodies",
+        alias = "cache-articles",
+        alias = "store-articles",
+        env = "NNTP_PROXY_STORE_ARTICLE_BODIES",
+        help_heading = "Cache"
+    )]
+    pub store_article_bodies: Option<bool>,
 
     /// Number of worker threads (default: 1, use 0 for CPU cores)
-    #[arg(short, long, env, help_heading = "Performance")]
+    #[arg(short, long, env = "NNTP_PROXY_THREADS", help_heading = "Performance")]
     pub threads: Option<ThreadCount>,
 
     /// Enable TCP command pipelining for all backends
-    #[arg(long = "enable-pipelining", env, help_heading = "Performance")]
-    pub enable_pipelining: Option<bool>,
+    #[arg(
+        long = "backend-pipelining",
+        alias = "enable-pipelining",
+        env = "NNTP_PROXY_BACKEND_PIPELINING",
+        help_heading = "Performance"
+    )]
+    pub backend_pipelining: Option<bool>,
 }
 
 impl CommonArgs {
@@ -110,45 +178,105 @@ impl CommonArgs {
         self.host.as_deref().unwrap_or(Self::DEFAULT_HOST)
     }
 
+    /// Get the effective UI/runtime mode.
+    ///
+    /// `--no-tui` remains as a hidden compatibility alias for headless mode.
+    #[must_use]
+    pub const fn effective_ui_mode(&self) -> UiMode {
+        if self.no_tui {
+            UiMode::Headless
+        } else {
+            self.ui
+        }
+    }
+
+    fn legacy_env_var<E>(env_get: &E, keys: &[&str]) -> Option<String>
+    where
+        E: Fn(&str) -> Option<String>,
+    {
+        keys.iter().find_map(|key| env_get(key))
+    }
+
+    fn env_bool<E>(env_get: &E, keys: &[&str]) -> Option<bool>
+    where
+        E: Fn(&str) -> Option<String>,
+    {
+        Self::legacy_env_var(env_get, keys)?.parse().ok()
+    }
+
+    fn env_u64<E>(env_get: &E, keys: &[&str]) -> Option<u64>
+    where
+        E: Fn(&str) -> Option<String>,
+    {
+        Self::legacy_env_var(env_get, keys)?.parse().ok()
+    }
+
+    fn env_cache_capacity<E>(env_get: &E, keys: &[&str]) -> Option<CacheCapacity>
+    where
+        E: Fn(&str) -> Option<String>,
+    {
+        Self::legacy_env_var(env_get, keys)?.parse().ok()
+    }
+
+    fn apply_overrides_with_env<E>(&self, config: &mut Config, env_get: E)
+    where
+        E: Fn(&str) -> Option<String>,
+    {
+        // Routing overrides
+        if let Some(strategy) = self.backend_selection {
+            config.routing.backend_selection = strategy;
+        }
+        if let Some(rm) = self.routing_mode {
+            config.routing.routing_mode = rm;
+        }
+
+        let article_cache_capacity = self
+            .article_cache_capacity
+            .or_else(|| Self::env_cache_capacity(&env_get, &["NNTP_PROXY_CACHE_CAPACITY"]));
+        let article_cache_ttl_secs = self
+            .article_cache_ttl_secs
+            .or_else(|| Self::env_u64(&env_get, &["NNTP_PROXY_CACHE_TTL"]));
+        let store_article_bodies = self
+            .store_article_bodies
+            .or_else(|| Self::env_bool(&env_get, &["NNTP_PROXY_CACHE_ARTICLES"]));
+
+        // Cache overrides — create cache section if needed
+        if article_cache_capacity.is_some()
+            || article_cache_ttl_secs.is_some()
+            || store_article_bodies.is_some()
+        {
+            let cache = config
+                .cache
+                .get_or_insert_with(crate::config::Cache::default);
+            if let Some(cap) = article_cache_capacity {
+                cache.article_cache_capacity = cap;
+            }
+            if let Some(ttl) = article_cache_ttl_secs {
+                cache.article_cache_ttl_secs = Duration::from_secs(ttl);
+            }
+            if let Some(articles) = store_article_bodies {
+                cache.store_article_bodies = articles;
+            }
+        }
+
+        // Pipelining global override — applies to all servers
+        if let Some(enable) = self
+            .backend_pipelining
+            .or_else(|| Self::env_bool(&env_get, &["NNTP_PROXY_ENABLE_PIPELINING"]))
+        {
+            for server in &mut config.servers {
+                server.backend_pipelining = enable;
+            }
+        }
+    }
+
     /// Apply CLI argument overrides to loaded config
     ///
     /// This method modifies the provided config by applying any CLI arguments
     /// that were explicitly set by the user. Arguments left at their default
     /// (None) values do not modify the config.
     pub fn apply_overrides(&self, config: &mut Config) {
-        // Routing overrides
-        if let Some(strategy) = self.backend_selection {
-            config.proxy.backend_selection = strategy;
-        }
-        if let Some(rm) = self.routing_mode {
-            config.proxy.routing_mode = rm;
-        }
-
-        // Cache overrides — create cache section if needed
-        if self.cache_capacity.is_some()
-            || self.cache_ttl.is_some()
-            || self.cache_articles.is_some()
-        {
-            let cache = config
-                .cache
-                .get_or_insert_with(crate::config::Cache::default);
-            if let Some(cap) = self.cache_capacity {
-                cache.max_capacity = cap;
-            }
-            if let Some(ttl) = self.cache_ttl {
-                cache.ttl = Duration::from_secs(ttl);
-            }
-            if let Some(articles) = self.cache_articles {
-                cache.cache_articles = articles;
-            }
-        }
-
-        // Pipelining global override — applies to all servers
-        if let Some(enable) = self.enable_pipelining {
-            for server in &mut config.servers {
-                server.enable_pipelining = enable;
-            }
-        }
+        self.apply_overrides_with_env(config, |key| std::env::var(key).ok());
     }
 }
 
@@ -163,6 +291,7 @@ mod tests {
         assert_eq!(args.listen_addr(None), "0.0.0.0:8119");
         assert_eq!(args.effective_host(), "0.0.0.0");
         assert!(args.effective_port(None).is_none());
+        assert_eq!(args.effective_ui_mode(), UiMode::Headless);
     }
 
     #[test]
@@ -278,19 +407,81 @@ mod tests {
         assert_eq!(multi_thread.threads, Some(ThreadCount::new(4).unwrap()));
     }
 
+    #[test]
+    fn test_common_args_parse_primary_and_legacy_flags() {
+        let args = CommonArgs::parse_from([
+            "nntp-proxy",
+            "--ui",
+            "tui",
+            "--article-cache-capacity",
+            "128mb",
+            "--backend-selection",
+            "least-loaded",
+            "--article-cache-ttl",
+            "7200",
+            "--store-article-bodies",
+            "true",
+            "--backend-pipelining",
+            "false",
+        ]);
+
+        assert_eq!(
+            args.backend_selection,
+            Some(BackendSelectionStrategy::LeastLoaded)
+        );
+        assert_eq!(
+            args.article_cache_capacity,
+            Some(CacheCapacity::try_new(128_000_000).unwrap())
+        );
+        assert_eq!(args.article_cache_ttl_secs, Some(7200));
+        assert_eq!(args.store_article_bodies, Some(true));
+        assert_eq!(args.backend_pipelining, Some(false));
+        assert_eq!(args.effective_ui_mode(), UiMode::Tui);
+
+        let legacy_args = CommonArgs::parse_from([
+            "nntp-proxy",
+            "--no-tui",
+            "--cache-capacity",
+            "256mb",
+            "--backend-strategy",
+            "weighted-round-robin",
+            "--cache-ttl",
+            "3600",
+            "--store-articles",
+            "false",
+            "--enable-pipelining",
+            "true",
+        ]);
+
+        assert_eq!(
+            legacy_args.backend_selection,
+            Some(BackendSelectionStrategy::WeightedRoundRobin)
+        );
+        assert_eq!(
+            legacy_args.article_cache_capacity,
+            Some(CacheCapacity::try_new(256_000_000).unwrap())
+        );
+        assert_eq!(legacy_args.article_cache_ttl_secs, Some(3600));
+        assert_eq!(legacy_args.store_article_bodies, Some(false));
+        assert_eq!(legacy_args.backend_pipelining, Some(true));
+        assert_eq!(legacy_args.effective_ui_mode(), UiMode::Headless);
+    }
+
     // Helper to create default args for testing
     fn default_args() -> CommonArgs {
         CommonArgs {
             config: ConfigPath::new("config.toml").unwrap(),
+            ui: UiMode::Headless,
+            no_tui: false,
             port: None,
             host: None,
             routing_mode: None,
             backend_selection: None,
-            cache_capacity: None,
-            cache_ttl: None,
-            cache_articles: None,
+            article_cache_capacity: None,
+            article_cache_ttl_secs: None,
+            store_article_bodies: None,
             threads: None,
-            enable_pipelining: None,
+            backend_pipelining: None,
         }
     }
 
@@ -322,9 +513,9 @@ mod tests {
 
         args.apply_overrides(&mut config);
 
-        assert_eq!(config.proxy.routing_mode, RoutingMode::PerCommand);
+        assert_eq!(config.routing.routing_mode, RoutingMode::PerCommand);
         assert_eq!(
-            config.proxy.backend_selection,
+            config.routing.backend_selection,
             BackendSelectionStrategy::LeastLoaded
         );
     }
@@ -332,9 +523,9 @@ mod tests {
     #[test]
     fn test_apply_overrides_cache() {
         let args = CommonArgs {
-            cache_capacity: Some(CacheCapacity::try_new(128 * 1024 * 1024).unwrap()),
-            cache_ttl: Some(7200),
-            cache_articles: Some(false),
+            article_cache_capacity: Some(CacheCapacity::try_new(128 * 1024 * 1024).unwrap()),
+            article_cache_ttl_secs: Some(7200),
+            store_article_bodies: Some(false),
             ..default_args()
         };
         let mut config = Config {
@@ -345,9 +536,38 @@ mod tests {
         args.apply_overrides(&mut config);
 
         let cache = config.cache.as_ref().unwrap();
-        assert_eq!(cache.max_capacity.get(), 128 * 1024 * 1024);
-        assert_eq!(cache.ttl, Duration::from_hours(2));
-        assert!(!cache.cache_articles);
+        assert_eq!(cache.article_cache_capacity.get(), 128 * 1024 * 1024);
+        assert_eq!(cache.article_cache_ttl_secs, Duration::from_hours(2));
+        assert!(!cache.store_article_bodies);
+    }
+
+    #[test]
+    fn test_apply_overrides_legacy_env_compat() {
+        let args = default_args();
+        let mut config = Config {
+            cache: None,
+            servers: vec![
+                crate::config::Server::builder("server1.example.com", Port::try_new(119).unwrap())
+                    .backend_pipelining(false)
+                    .build()
+                    .unwrap(),
+            ],
+            ..Config::default()
+        };
+
+        args.apply_overrides_with_env(&mut config, |key| match key {
+            "NNTP_PROXY_CACHE_CAPACITY" => Some("128mb".to_string()),
+            "NNTP_PROXY_CACHE_TTL" => Some("7200".to_string()),
+            "NNTP_PROXY_CACHE_ARTICLES" => Some("false".to_string()),
+            "NNTP_PROXY_ENABLE_PIPELINING" => Some("true".to_string()),
+            _ => None,
+        });
+
+        let cache = config.cache.as_ref().unwrap();
+        assert_eq!(cache.article_cache_capacity.get(), 128_000_000);
+        assert_eq!(cache.article_cache_ttl_secs, Duration::from_hours(2));
+        assert!(!cache.store_article_bodies);
+        assert!(config.servers[0].backend_pipelining);
     }
 
     #[test]
@@ -355,17 +575,17 @@ mod tests {
         use crate::types::Port;
 
         let args = CommonArgs {
-            enable_pipelining: Some(false),
+            backend_pipelining: Some(false),
             ..default_args()
         };
         let mut config = Config::default();
         config.servers = vec![
             crate::config::Server::builder("server1.example.com", Port::try_new(119).unwrap())
-                .enable_pipelining(true)
+                .backend_pipelining(true)
                 .build()
                 .unwrap(),
             crate::config::Server::builder("server2.example.com", Port::try_new(119).unwrap())
-                .enable_pipelining(true)
+                .backend_pipelining(true)
                 .build()
                 .unwrap(),
         ];
@@ -374,7 +594,7 @@ mod tests {
 
         // All servers should have pipelining disabled
         for server in &config.servers {
-            assert!(!server.enable_pipelining);
+            assert!(!server.backend_pipelining);
         }
     }
 }

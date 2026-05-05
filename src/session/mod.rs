@@ -132,7 +132,7 @@
 //!
 //! ## Three Operating Modes
 //!
-//! 1. **Stateful (1:1) Mode** - `handle_with_pooled_backend()`
+//! 1. **Stateful (1:1) Mode** - `run_stateful_proxy_loop()`
 //!    - One client maps to one backend connection for entire session
 //!    - Lowest latency, simplest model
 //!    - Used when `routing_mode` = Stateful
@@ -151,7 +151,7 @@
 //!
 //! ## Key Functions
 //!
-//! - `handle_stateful_proxy_loop()` - **PERFORMANCE CRITICAL HOT PATH**
+//! - `run_stateful_proxy_loop()` - **PERFORMANCE CRITICAL HOT PATH**
 //!   - Bidirectional streaming with `tokio::select`! for concurrent I/O
 //!   - Used by both stateful mode and hybrid mode after switching
 //!
@@ -180,6 +180,7 @@ pub mod state;
 pub mod streaming;
 
 pub use auth_state::AuthState;
+pub use backend::format_hex_preview;
 pub use core::{ClientSession, ClientSessionBuilder};
 pub use metrics_ext::MetricsRecorder;
 pub use mode_state::{ModeState, SessionMode};

@@ -4,21 +4,22 @@ set -e
 # CPU profiling for nntp-proxy
 #
 # Builds with frame pointers, runs under perf, generates flamegraph.
-# Press 'q' in the TUI to stop recording and generate the flamegraph.
+# The runtime binary is always nntp-proxy; pass any dashboard/headless UI flags
+# as extra arguments when profiling a specific UI mode.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_DIR"
 
 ATTACH_PID=""
-BIN="tui"
+TARGET="proxy"
 EXTRA_ARGS=()
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -h|--help)
-            echo "Usage: $0 [--pid PID] [BIN] [ARGS...]"
+            echo "Usage: $0 [--pid PID] [TARGET] [ARGS...]"
             echo ""
             echo "Profile nntp-proxy CPU usage"
             echo ""
@@ -26,16 +27,17 @@ while [[ $# -gt 0 ]]; do
             echo "  --pid PID   Attach to an already-running process instead of launching one"
             echo ""
             echo "Arguments:"
-            echo "  BIN       Which binary to profile: tui, cli, or a path (default: tui)"
+            echo "  TARGET    proxy/ui/headless (all map to nntp-proxy) or a custom path"
             echo "  ARGS...   Extra arguments passed to the binary"
             echo ""
             echo "Examples:"
-            echo "  ./scripts/profile.sh tui"
-            echo "  ./scripts/profile.sh tui -c config.toml"
-            echo "  ./scripts/profile.sh cli -c config.toml"
+            echo "  ./scripts/profile.sh"
+            echo "  ./scripts/profile.sh proxy --config config.toml"
+            echo "  ./scripts/profile.sh ui --config config.toml [ui flags]"
+            echo "  ./scripts/profile.sh headless --config config.toml"
             echo "  ./scripts/profile.sh --pid 12345"
             echo ""
-            echo "Press 'q' in the TUI (or Ctrl-C for CLI) to stop and generate flamegraph.svg"
+            echo "Stop the proxy normally (dashboard quit key or Ctrl-C) to generate flamegraph.svg"
             exit 0
             ;;
         --pid)
@@ -44,9 +46,17 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             if [ -z "${BIN_SET:-}" ]; then
-                BIN="$1"
-                BIN_SET=1
-                shift
+                case "$1" in
+                    proxy|ui|headless|cli|tui|/*|./*|../*)
+                        TARGET="$1"
+                        BIN_SET=1
+                        shift
+                        ;;
+                    *)
+                        EXTRA_ARGS+=("$1")
+                        shift
+                        ;;
+                esac
             else
                 EXTRA_ARGS+=("$1")
                 shift
@@ -56,17 +66,13 @@ while [[ $# -gt 0 ]]; do
 done
 
 # Resolve binary name
-case "$BIN" in
-    tui)
-        BINARY="$PROJECT_DIR/target/profiling/nntp-proxy-tui"
-        BIN_NAME="nntp-proxy-tui"
-        ;;
-    cli)
+case "$TARGET" in
+    proxy|ui|headless|cli|tui)
         BINARY="$PROJECT_DIR/target/profiling/nntp-proxy"
         BIN_NAME="nntp-proxy"
         ;;
     *)
-        BINARY="$BIN"
+        BINARY="$TARGET"
         BIN_NAME=""  # Custom path, skip build
         ;;
 esac
@@ -99,7 +105,7 @@ if [ -n "$ATTACH_PID" ]; then
     perf record -g --call-graph fp -F 997 -p "$ATTACH_PID"
 else
     echo "Profiling: $BINARY ${EXTRA_ARGS[*]}"
-    echo "Stop the proxy (q in TUI, Ctrl-C for CLI) to generate flamegraph."
+    echo "Stop the proxy normally to generate flamegraph."
     echo ""
     perf record -g --call-graph fp -F 997 "$BINARY" "${EXTRA_ARGS[@]}"
 fi

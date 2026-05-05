@@ -152,6 +152,7 @@ impl ClientSession {
                                     &mut client_write,
                                     &mut state.auth_username,
                                     &common::AuthCheckContext {
+                                        client_id: self.client_id(),
                                         auth_handler: &self.auth_handler,
                                         auth_state: &self.auth_state,
                                         routing_mode: &crate::config::RoutingMode::Stateful,

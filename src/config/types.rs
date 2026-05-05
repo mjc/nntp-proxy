@@ -12,11 +12,13 @@ use std::time::Duration;
 
 /// Routing mode for the proxy
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "kebab-case")]
+#[value(rename_all = "kebab-case")]
 pub enum RoutingMode {
     /// Stateful 1:1 mode - each client gets a dedicated backend connection
     Stateful,
     /// Per-command routing - each command can use a different backend (stateless only)
+    #[serde(alias = "percommand")]
     PerCommand,
     /// Hybrid mode - starts in per-command routing, auto-switches to stateful on first stateful command
     Hybrid,
@@ -76,8 +78,10 @@ impl std::fmt::Display for RoutingMode {
 #[serde(rename_all = "kebab-case")]
 pub enum BackendSelectionStrategy {
     /// Weighted round-robin - distributes requests proportionally to `max_connections`
+    #[serde(alias = "round-robin")]
     WeightedRoundRobin,
     /// Least-loaded - routes to backend with fewest pending requests
+    #[serde(alias = "adaptive-weighted")]
     LeastLoaded,
 }
 
@@ -108,21 +112,31 @@ impl std::fmt::Display for BackendSelectionStrategy {
 /// Main proxy configuration
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct Config {
-    /// List of backend NNTP servers
-    #[serde(default)]
-    pub servers: Vec<Server>,
     /// Proxy server settings
     #[serde(default)]
     pub proxy: Proxy,
+    /// Routing configuration
+    #[serde(default)]
+    pub routing: Routing,
+    /// Memory configuration
+    #[serde(default)]
+    pub memory: Memory,
+    /// Cache configuration.
+    ///
+    /// When omitted, the proxy still keeps the in-memory availability index for
+    /// routing/retry decisions, but skips explicit cache configuration and
+    /// availability-index persistence unless the CLI or config enables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<Cache>,
     /// Health check configuration
     #[serde(default)]
     pub health_check: HealthCheck,
-    /// Cache configuration (optional in config - defaults to 0 capacity for availability tracking only)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub cache: Option<Cache>,
     /// Client authentication configuration
     #[serde(default)]
     pub client_auth: ClientAuth,
+    /// List of backend NNTP servers
+    #[serde(default)]
+    pub servers: Vec<Server>,
 }
 
 /// Proxy server settings
@@ -136,21 +150,13 @@ pub struct Proxy {
     /// Number of worker threads (default: 1, use 0 for CPU cores)
     pub threads: ThreadCount,
     /// Routing mode for the proxy
+    #[serde(skip_serializing)]
     pub routing_mode: RoutingMode,
     /// Backend selection strategy for load balancing
+    #[serde(skip_serializing)]
     pub backend_selection: BackendSelectionStrategy,
     /// Validate yEnc structure and checksums (default: true)
     pub validate_yenc: bool,
-    /// Number of buffers in the main buffer pool (default: 50)
-    /// Controls memory usage for I/O operations: count × 724KB
-    /// Higher values support more concurrent connections but use more memory
-    #[serde(default = "super::defaults::buffer_pool_count")]
-    pub buffer_pool_count: usize,
-    /// Number of buffers in the capture pool for caching (default: 16)
-    /// Controls memory usage for cache operations: count × 768KB
-    /// Only used when caching is enabled
-    #[serde(default = "super::defaults::capture_pool_count")]
-    pub capture_pool_count: usize,
     /// Minimum log level for the debug.log file appender (default: "warn")
     /// Accepts tracing filter directives: "error", "warn", "info", "debug", "trace"
     #[serde(default = "super::defaults::log_file_level")]
@@ -160,6 +166,12 @@ pub struct Proxy {
     /// Defaults to "stats.json" alongside the config file if not specified
     #[serde(default)]
     pub stats_file: Option<std::path::PathBuf>,
+    /// Legacy buffer pool count retained for config migration compatibility.
+    #[serde(default, skip_serializing)]
+    pub buffer_pool_count: usize,
+    /// Legacy capture pool count retained for config migration compatibility.
+    #[serde(default, skip_serializing)]
+    pub capture_pool_count: usize,
 }
 
 impl Proxy {
@@ -173,33 +185,108 @@ impl Default for Proxy {
             host: Self::DEFAULT_HOST.to_string(),
             port: Port::default(),
             threads: ThreadCount::default(),
-            routing_mode: RoutingMode::default(),
-            backend_selection: BackendSelectionStrategy::default(),
             validate_yenc: true,
-            buffer_pool_count: defaults::buffer_pool_count(),
-            capture_pool_count: defaults::capture_pool_count(),
             log_file_level: defaults::log_file_level(),
             stats_file: None,
+            routing_mode: RoutingMode::default(),
+            backend_selection: BackendSelectionStrategy::default(),
+            buffer_pool_count: defaults::buffer_pool_count(),
+            capture_pool_count: defaults::capture_pool_count(),
         }
     }
 }
 
-/// Cache configuration for article caching
+/// Routing configuration
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Routing {
+    /// Routing mode for the proxy
+    #[serde(rename = "mode", alias = "routing_mode")]
+    pub routing_mode: RoutingMode,
+    /// Backend selection strategy for load balancing
+    #[serde(alias = "strategy")]
+    pub backend_selection: BackendSelectionStrategy,
+    /// Enable adaptive availability prechecking for STAT/HEAD commands (default: false)
+    #[serde(default = "super::defaults::adaptive_precheck")]
+    pub adaptive_precheck: bool,
+}
+
+impl Default for Routing {
+    fn default() -> Self {
+        Self {
+            routing_mode: RoutingMode::default(),
+            backend_selection: BackendSelectionStrategy::default(),
+            adaptive_precheck: defaults::adaptive_precheck(),
+        }
+    }
+}
+
+/// Memory configuration for transport and buffer pools
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Memory {
+    /// TCP socket receive buffer size for backend and client connections
+    #[serde(default = "super::defaults::socket_recv_buffer_size")]
+    pub socket_recv_buffer_size: usize,
+    /// TCP socket send buffer size for backend and client connections
+    #[serde(default = "super::defaults::socket_send_buffer_size")]
+    pub socket_send_buffer_size: usize,
+    /// Size of each pooled I/O buffer used for streaming
+    #[serde(default = "super::defaults::buffer_pool_size")]
+    pub buffer_pool_size: usize,
+    /// Number of buffers in the main buffer pool
+    #[serde(default = "super::defaults::buffer_pool_count")]
+    pub buffer_pool_count: usize,
+    /// Size of each capture buffer for caching and response assembly
+    #[serde(default = "super::defaults::capture_pool_size")]
+    pub capture_pool_size: usize,
+    /// Number of buffers in the capture pool
+    #[serde(default = "super::defaults::capture_pool_count")]
+    pub capture_pool_count: usize,
+}
+
+impl Default for Memory {
+    fn default() -> Self {
+        Self {
+            socket_recv_buffer_size: defaults::socket_recv_buffer_size(),
+            socket_send_buffer_size: defaults::socket_send_buffer_size(),
+            buffer_pool_size: defaults::buffer_pool_size(),
+            buffer_pool_count: defaults::buffer_pool_count(),
+            capture_pool_size: defaults::capture_pool_size(),
+            capture_pool_count: defaults::capture_pool_count(),
+        }
+    }
+}
+
+/// Article cache configuration
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct Cache {
-    /// Maximum cache size in bytes (memory tier for hybrid cache)
+    /// Maximum article-cache size in bytes (memory tier for hybrid cache)
     ///
     /// Supports human-readable formats:
     /// - \"1gb\" = 1 GB
     /// - \"500mb\" = 500 MB
     /// - \"64mb\" = 64 MB (default)
     /// - 10000 = 10,000 bytes
-    #[serde(default = "super::defaults::cache_max_capacity")]
-    pub max_capacity: CacheCapacity,
-    /// Time-to-live for cached articles
-    #[serde(with = "duration_serde", default = "super::defaults::cache_ttl")]
-    pub ttl: Duration,
-    /// Whether to cache article bodies (default: true)
+    #[serde(
+        default = "super::defaults::cache_max_capacity",
+        rename = "article_cache_capacity",
+        alias = "cache_capacity",
+        alias = "max_capacity"
+    )]
+    pub article_cache_capacity: CacheCapacity,
+    /// Time-to-live for the article cache
+    #[serde(
+        with = "duration_serde",
+        default = "super::defaults::cache_ttl",
+        rename = "article_cache_ttl_secs",
+        alias = "cache_ttl",
+        alias = "ttl_secs",
+        alias = "ttl"
+    )]
+    pub article_cache_ttl_secs: Duration,
+    /// Whether to store full article bodies in the article cache (default: true)
     ///
     /// When false:
     /// - Cache still tracks backend availability (smart routing, 430 retry)
@@ -210,23 +297,13 @@ pub struct Cache {
     /// When true:
     /// - Full caching mode (bodies + availability tracking)
     /// - Can serve articles from cache without backend query
-    #[serde(default = "super::defaults::cache_articles")]
-    pub cache_articles: bool,
-    /// Enable adaptive availability prechecking for STAT/HEAD commands (default: false)
-    ///
-    /// When true:
-    /// - STAT/HEAD commands with message-ID check all backends simultaneously
-    /// - Returns optimistic response to client immediately (assumes article exists)
-    /// - Updates availability cache in background based on actual backend responses
-    /// - Improves future routing decisions by learning which backends have articles
-    /// - For HEAD with `cache_articles=true`, also caches the headers
-    ///
-    /// When false:
-    /// - STAT/HEAD commands use normal routing (single backend check)
-    ///
-    /// Trade-off: Uses more backend connections but builds accurate availability data
-    #[serde(default = "super::defaults::adaptive_precheck")]
-    pub adaptive_precheck: bool,
+    #[serde(
+        default = "super::defaults::cache_articles",
+        rename = "store_article_bodies",
+        alias = "store_articles",
+        alias = "cache_articles"
+    )]
+    pub store_article_bodies: bool,
 
     /// Disk cache configuration (requires `hybrid-cache` feature)
     ///
@@ -235,12 +312,21 @@ pub struct Cache {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disk: Option<DiskCache>,
 
-    /// Path to the availability persistence file (optional).
+    /// Path to the availability index persistence file (optional).
     ///
-    /// Only used when `cache_articles = false`. When omitted, the proxy uses
+    /// Only used when `store_article_bodies = false`. When omitted, the proxy uses
     /// "availability.idx" alongside the config file.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub availability_file: Option<std::path::PathBuf>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        rename = "availability_index_path",
+        alias = "availability_path",
+        alias = "availability_file"
+    )]
+    pub availability_index_path: Option<std::path::PathBuf>,
+    /// Legacy adaptive precheck retained for config migration compatibility.
+    #[serde(default, skip_serializing)]
+    pub adaptive_precheck: bool,
 }
 
 /// Compression codec for disk cache storage
@@ -331,12 +417,12 @@ impl Default for DiskCache {
 impl Default for Cache {
     fn default() -> Self {
         Self {
-            max_capacity: defaults::cache_max_capacity(),
-            ttl: defaults::cache_ttl(),
-            cache_articles: defaults::cache_articles(),
-            adaptive_precheck: defaults::adaptive_precheck(),
+            article_cache_capacity: defaults::cache_max_capacity(),
+            article_cache_ttl_secs: defaults::cache_ttl(),
+            store_article_bodies: defaults::cache_articles(),
             disk: None,
-            availability_file: None,
+            availability_index_path: None,
+            adaptive_precheck: defaults::adaptive_precheck(),
         }
     }
 }
@@ -481,8 +567,12 @@ pub struct Server {
     /// Enable backend pipelining (request multiplexing) for this server
     /// When enabled, client requests are queued and batched onto shared connections
     /// Default: true
-    #[serde(default = "super::defaults::enable_pipelining")]
-    pub enable_pipelining: bool,
+    #[serde(
+        default = "super::defaults::enable_pipelining",
+        rename = "backend_pipelining",
+        alias = "enable_pipelining"
+    )]
+    pub backend_pipelining: bool,
     /// Maximum queue depth for pipelined requests (backpressure threshold)
     /// Default: 1000
     #[serde(default = "super::defaults::pipeline_queue_depth")]
@@ -537,7 +627,7 @@ pub struct ServerBuilder {
     compress: Option<bool>,
     compress_level: Option<u32>,
     backend_idle_timeout: Option<Duration>,
-    enable_pipelining: bool,
+    backend_pipelining: bool,
     pipeline_queue_depth: Option<usize>,
     pipeline_batch_size: Option<usize>,
 }
@@ -568,7 +658,7 @@ impl ServerBuilder {
             compress: None,
             compress_level: None,
             backend_idle_timeout: None,
-            enable_pipelining: true,
+            backend_pipelining: true,
             pipeline_queue_depth: None,
             pipeline_batch_size: None,
         }
@@ -689,8 +779,15 @@ impl ServerBuilder {
 
     /// Enable or disable backend pipelining (request multiplexing)
     #[must_use]
+    pub const fn backend_pipelining(mut self, enabled: bool) -> Self {
+        self.backend_pipelining = enabled;
+        self
+    }
+
+    /// Backward-compatible alias for `backend_pipelining`.
+    #[must_use]
     pub const fn enable_pipelining(mut self, enabled: bool) -> Self {
-        self.enable_pipelining = enabled;
+        self.backend_pipelining = enabled;
         self
     }
 
@@ -769,7 +866,7 @@ impl ServerBuilder {
             backend_idle_timeout: self
                 .backend_idle_timeout
                 .unwrap_or_else(super::defaults::backend_idle_timeout),
-            enable_pipelining: self.enable_pipelining,
+            backend_pipelining: self.backend_pipelining,
             pipeline_queue_depth,
             pipeline_batch_size,
         })
@@ -854,8 +951,9 @@ mod tests {
     #[test]
     fn test_cache_default() {
         let cache = Cache::default();
-        assert_eq!(cache.max_capacity.get(), 64 * 1024 * 1024); // 64 MB
-        assert_eq!(cache.ttl, Duration::from_hours(1));
+        assert_eq!(cache.article_cache_capacity.get(), 64 * 1024 * 1024); // 64 MB
+        assert_eq!(cache.article_cache_ttl_secs, Duration::from_hours(1));
+        assert!(cache.store_article_bodies);
     }
 
     // HealthCheck tests

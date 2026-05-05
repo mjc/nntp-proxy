@@ -43,7 +43,7 @@ fn bench_config(backend_port: u16, cache: Option<Cache>) -> Config {
             Server::builder("127.0.0.1", Port::try_new(backend_port).unwrap())
                 .name("bench-backend")
                 .max_connections(MaxConnections::try_new(4).unwrap())
-                .enable_pipelining(true)
+                .backend_pipelining(true)
                 .build()
                 .unwrap(),
         ],
@@ -54,18 +54,18 @@ fn bench_config(backend_port: u16, cache: Option<Cache>) -> Config {
 
 fn memory_cache() -> Cache {
     Cache {
-        max_capacity: CacheCapacity::try_new(32 * 1024 * 1024).unwrap(),
-        ttl: Duration::from_mins(5),
-        cache_articles: true,
+        article_cache_capacity: CacheCapacity::try_new(32 * 1024 * 1024).unwrap(),
+        article_cache_ttl_secs: Duration::from_mins(5),
+        store_article_bodies: true,
         adaptive_precheck: false,
-        availability_file: None,
+        availability_index_path: None,
         disk: None,
     }
 }
 
 fn metadata_only_cache() -> Cache {
     Cache {
-        cache_articles: false,
+        store_article_bodies: false,
         ..memory_cache()
     }
 }

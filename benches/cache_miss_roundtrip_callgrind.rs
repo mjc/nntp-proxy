@@ -50,11 +50,11 @@ supported! {
         Config {
             servers: vec![
                 Server::builder("127.0.0.1", Port::try_new(backend_port).unwrap())
-                    .name("bench-backend")
-                    .max_connections(MaxConnections::try_new(4).unwrap())
-                    .enable_pipelining(true)
-                    .build()
-                    .unwrap(),
+                .name("bench-backend")
+                .max_connections(MaxConnections::try_new(4).unwrap())
+                .backend_pipelining(true)
+                .build()
+                .unwrap(),
             ],
             cache: Some(metadata_only_cache()),
             ..Default::default()
@@ -63,11 +63,11 @@ supported! {
 
     fn metadata_only_cache() -> Cache {
         Cache {
-            max_capacity: CacheCapacity::try_new(32 * 1024 * 1024).unwrap(),
-            ttl: Duration::from_mins(5),
-            cache_articles: false,
+            article_cache_capacity: CacheCapacity::try_new(32 * 1024 * 1024).unwrap(),
+            article_cache_ttl_secs: Duration::from_mins(5),
+            store_article_bodies: false,
             adaptive_precheck: false,
-            availability_file: None,
+            availability_index_path: None,
             disk: None,
         }
     }

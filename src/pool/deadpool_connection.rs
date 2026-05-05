@@ -4,11 +4,11 @@
 //! creation of optimized TCP/TLS connections to NNTP servers.
 
 use deadpool::managed;
+use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::connection_error::ConnectionError;
-use crate::constants::socket::{POOL_RECV_BUFFER, POOL_SEND_BUFFER};
 use crate::protocol::{authinfo_pass, authinfo_user};
 use crate::session::backend;
 use crate::stream::ConnectionStream;
@@ -26,6 +26,10 @@ pub struct TcpManagerOptions {
     pub username: Option<String>,
     pub password: Option<String>,
     pub tls_config: Option<TlsConfig>,
+    /// TCP receive buffer size for this connection.
+    pub recv_buffer_size: usize,
+    /// TCP send buffer size for this connection.
+    pub send_buffer_size: usize,
     /// Wire compression mode: None = auto-detect, Some(true) = require, Some(false) = disable
     pub compress: Option<bool>,
     /// Compression level (0-9). None = fast (level 1).
@@ -43,6 +47,8 @@ impl Default for TcpManagerOptions {
             username: None,
             password: None,
             tls_config: None,
+            recv_buffer_size: crate::constants::socket::HIGH_THROUGHPUT_RECV_BUFFER,
+            send_buffer_size: crate::constants::socket::HIGH_THROUGHPUT_SEND_BUFFER,
             compress: None,
             compress_level: None,
             send_mode_reader: true,
@@ -61,6 +67,8 @@ pub struct TcpManager {
     pub(crate) tls_config: TlsConfig,
     /// Cached TLS manager with pre-loaded certificates (avoids base64 decode overhead)
     pub(crate) tls_manager: Option<Arc<TlsManager>>,
+    pub(crate) recv_buffer_size: usize,
+    pub(crate) send_buffer_size: usize,
     /// Wire compression mode: None = auto-detect, Some(true) = require, Some(false) = disable
     pub(crate) compress: Option<bool>,
     /// Compression level (0-9). None = fast (level 1).
@@ -70,6 +78,15 @@ pub struct TcpManager {
 }
 
 impl TcpManager {
+    fn socket_buffer_size_u32(size: usize, label: &str) -> Result<u32, ConnectionError> {
+        u32::try_from(size).map_err(|_| {
+            ConnectionError::IoError(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{label} socket buffer size {size} exceeds u32::MAX"),
+            ))
+        })
+    }
+
     /// Create a new `TcpManager` with optional TLS configuration
     ///
     /// If `options.tls_config` is `Some` with `use_tls = true`, the TLS manager is
@@ -106,6 +123,8 @@ impl TcpManager {
             password: options.password,
             tls_config,
             tls_manager,
+            recv_buffer_size: options.recv_buffer_size,
+            send_buffer_size: options.send_buffer_size,
             compress: options.compress,
             compress_level: options.compress_level,
             send_mode_reader: options.send_mode_reader,
@@ -130,12 +149,12 @@ impl TcpManager {
         };
 
         // Pre-connect options (buffer sizes, reuse)
-        socket.set_recv_buffer_size(
-            u32::try_from(POOL_RECV_BUFFER).expect("pool receive buffer fits u32"),
-        )?;
-        socket.set_send_buffer_size(
-            u32::try_from(POOL_SEND_BUFFER).expect("pool send buffer fits u32"),
-        )?;
+        socket.set_recv_buffer_size(Self::socket_buffer_size_u32(
+            self.recv_buffer_size,
+            "receive",
+        )?)?;
+        socket
+            .set_send_buffer_size(Self::socket_buffer_size_u32(self.send_buffer_size, "send")?)?;
         socket.set_reuseaddr(true)?;
 
         // Async connect — does NOT block the tokio worker thread
@@ -408,6 +427,18 @@ impl managed::Manager for TcpManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_socket_buffer_size_u32_rejects_oversized_values() {
+        let result = TcpManager::socket_buffer_size_u32(u32::MAX as usize + 1, "receive");
+
+        assert!(matches!(
+            result,
+            Err(ConnectionError::IoError(ref error))
+                if error.kind() == io::ErrorKind::InvalidInput
+                    && error.to_string().contains("receive socket buffer size")
+        ));
+    }
 
     #[test]
     fn test_tcp_manager_new_plain() {

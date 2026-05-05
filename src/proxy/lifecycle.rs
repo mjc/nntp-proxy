@@ -126,7 +126,7 @@ impl NntpProxy {
         .with_routing_mode(routing_mode)
         .with_connection_stats(self.connection_stats.clone())
         .with_cache(cache)
-        .with_cache_articles(self.cache_articles)
+        .with_cache_articles(self.store_article_bodies)
         .with_adaptive_precheck(self.adaptive_precheck);
 
         // Apply optional router
@@ -147,8 +147,11 @@ impl NntpProxy {
         routing_mode: crate::config::RoutingMode,
         metrics: &types::TransferMetrics,
     ) {
-        self.connection_stats
-            .record_disconnection(session.username(), routing_mode.short_name());
+        self.connection_stats.record_session_disconnection(
+            session.client_id(),
+            session.username(),
+            routing_mode.short_name(),
+        );
 
         debug!(
             "Session {} [{}] ↑{} ↓{}",
@@ -230,7 +233,7 @@ impl NntpProxy {
 
     /// Generate short session ID for logging
     #[inline]
-    pub(super) fn generate_session_id(&self, session: &ClientSession) -> String {
+    pub(super) fn generate_session_id(session: &ClientSession) -> String {
         crate::formatting::short_id(session.client_id().as_uuid())
     }
 
@@ -248,10 +251,14 @@ impl NntpProxy {
     #[inline]
     pub(super) fn apply_tcp_optimizations(&self, client_stream: &TcpStream) {
         use crate::network::TcpOptimizer;
-        TcpOptimizer::new(client_stream)
-            .optimize()
-            .map_err(|e| debug!("Failed to optimize client socket: {}", e))
-            .ok();
+        TcpOptimizer::with_buffer_sizes(
+            client_stream,
+            self.memory.socket_recv_buffer_size,
+            self.memory.socket_send_buffer_size,
+        )
+        .optimize()
+        .map_err(|e| debug!("Failed to optimize client socket: {}", e))
+        .ok();
     }
 
     /// Get display name for current routing mode
@@ -298,8 +305,11 @@ impl NntpProxy {
     pub(super) fn record_connection_if_unauthenticated(&self, session: &ClientSession) {
         if !self.auth_handler.is_enabled() || session.username().is_none() {
             let mode = self.session_mode_label(session.mode());
-            self.connection_stats
-                .record_connection(session.username(), mode);
+            self.connection_stats.record_session_connection(
+                session.client_id(),
+                session.username(),
+                mode,
+            );
         }
     }
 
@@ -378,7 +388,7 @@ impl NntpProxy {
             let server_idx = backend_id.as_index();
 
             let session = self.create_session(client_addr, None);
-            let session_id = self.generate_session_id(&session);
+            let session_id = Self::generate_session_id(&session);
 
             debug!("Starting stateful session for client {}", client_addr);
 
@@ -435,7 +445,7 @@ impl NntpProxy {
             .map_err(SessionError::Backend)?;
 
         let session = self.create_session(client_addr, Some(self.router.clone()));
-        let session_id = self.generate_session_id(&session);
+        let session_id = Self::generate_session_id(&session);
 
         let metrics = Box::pin(session.handle_per_command_routing(client_stream)).await;
 
@@ -500,7 +510,7 @@ mod tests {
             None,
         );
 
-        let session_id = proxy.generate_session_id(&session);
+        let session_id = NntpProxy::generate_session_id(&session);
 
         // Should be a short UUID (8 characters)
         assert_eq!(session_id.len(), 8);
@@ -560,7 +570,7 @@ mod tests {
             ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap()),
             None,
         );
-        let session_id = proxy.generate_session_id(&session);
+        let session_id = NntpProxy::generate_session_id(&session);
 
         let metrics = TransferMetrics {
             client_to_backend: crate::types::ClientToBackendBytes::new(1024),
@@ -587,7 +597,7 @@ mod tests {
             ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap()),
             None,
         );
-        let session_id = proxy.generate_session_id(&session);
+        let session_id = NntpProxy::generate_session_id(&session);
 
         let result = proxy.record_session_metrics(
             Err(SessionError::Backend(anyhow::anyhow!("test error"))),
@@ -709,7 +719,7 @@ mod tests {
         let client_addr =
             ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
         let session = proxy.create_session(client_addr, None);
-        let session_id = proxy.generate_session_id(&session);
+        let session_id = NntpProxy::generate_session_id(&session);
         let backend_id = crate::types::BackendId::from_index(0);
 
         let metrics = TransferMetrics {
@@ -736,7 +746,7 @@ mod tests {
         let client_addr =
             ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
         let session = proxy.create_session(client_addr, None);
-        let session_id = proxy.generate_session_id(&session);
+        let session_id = NntpProxy::generate_session_id(&session);
         let backend_id = crate::types::BackendId::from_index(0);
 
         let result = proxy.finalize_stateful_session(
@@ -758,7 +768,7 @@ mod tests {
         let client_addr =
             ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
         let session = proxy.create_session(client_addr, Some(proxy.router.clone()));
-        let session_id = proxy.generate_session_id(&session);
+        let session_id = NntpProxy::generate_session_id(&session);
 
         let metrics = TransferMetrics {
             client_to_backend: crate::types::ClientToBackendBytes::new(256),
@@ -779,7 +789,7 @@ mod tests {
         let client_addr =
             ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
         let session = proxy.create_session(client_addr, Some(proxy.router.clone()));
-        let session_id = proxy.generate_session_id(&session);
+        let session_id = NntpProxy::generate_session_id(&session);
 
         let result = proxy.finalize_per_command_session(
             Err(SessionError::Backend(anyhow::anyhow!("session failed"))),
@@ -799,7 +809,7 @@ mod tests {
         let client_addr =
             ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
         let session = proxy.create_session(client_addr, Some(proxy.router.clone()));
-        let session_id = proxy.generate_session_id(&session);
+        let session_id = NntpProxy::generate_session_id(&session);
 
         let metrics = TransferMetrics {
             client_to_backend: crate::types::ClientToBackendBytes::new(128),
@@ -824,8 +834,8 @@ mod tests {
         let session1 = proxy.create_session(client_addr, None);
         let session2 = proxy.create_session(client_addr, None);
 
-        let id1 = proxy.generate_session_id(&session1);
-        let id2 = proxy.generate_session_id(&session2);
+        let id1 = NntpProxy::generate_session_id(&session1);
+        let id2 = NntpProxy::generate_session_id(&session2);
 
         // Should generate different IDs for different sessions
         assert_ne!(id1, id2);
@@ -842,7 +852,7 @@ mod tests {
         for server in proxy.servers() {
             assert_eq!(
                 server.backend_idle_timeout,
-                Duration::from_secs(10 * 60),
+                Duration::from_mins(10),
                 "Server '{}' should have default 10-minute backend_idle_timeout",
                 server.name.as_ref(),
             );
@@ -991,7 +1001,7 @@ mod tests {
                 Server::builder("server2.example.com", Port::try_new(119).unwrap())
                     .name("Long Timeout")
                     .max_connections(MaxConnections::try_new(2).unwrap())
-                    .backend_idle_timeout(Duration::from_secs(24 * 60 * 60)) // 24h
+                    .backend_idle_timeout(Duration::from_hours(24)) // 24h
                     .build()
                     .unwrap(),
             ],
@@ -1025,7 +1035,7 @@ mod tests {
                 Server::builder("server2.example.com", Port::try_new(119).unwrap())
                     .name("Long Timeout")
                     .max_connections(MaxConnections::try_new(2).unwrap())
-                    .backend_idle_timeout(Duration::from_secs(24 * 60 * 60))
+                    .backend_idle_timeout(Duration::from_hours(24))
                     .build()
                     .unwrap(),
             ],

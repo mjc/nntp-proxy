@@ -32,7 +32,7 @@ fn main() {
 
         if !line.starts_with('\t') && !line.starts_with(' ') {
             // Header line: "comm tid [cpu] time: event:"
-            // e.g. "nntp-proxy-tui 12345 [003] 12345.678901: cpu-clock:"
+            // e.g. "nntp-proxy 12345 [003] 12345.678901: cpu-clock:"
             if let Some(parsed) = parse_header(&line) {
                 current_comm = parsed.0;
                 current_tid = parsed.1;

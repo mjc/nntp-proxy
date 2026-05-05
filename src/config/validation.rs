@@ -11,6 +11,7 @@ use crate::constants::pool::{MAX_RECOMMENDED_KEEPALIVE_SECS, MIN_RECOMMENDED_KEE
 
 const MIN_RECOMMENDED_KEEPALIVE: Duration = Duration::from_secs(MIN_RECOMMENDED_KEEPALIVE_SECS);
 const MAX_RECOMMENDED_KEEPALIVE: Duration = Duration::from_secs(MAX_RECOMMENDED_KEEPALIVE_SECS);
+const MAX_SOCKET_BUFFER_SIZE: usize = u32::MAX as usize;
 
 impl Config {
     /// Validate configuration for correctness
@@ -38,12 +39,31 @@ impl Config {
             ));
         }
 
+        validate_socket_buffer_size(
+            "memory.socket_recv_buffer_size",
+            self.memory.socket_recv_buffer_size,
+        )?;
+        validate_socket_buffer_size(
+            "memory.socket_send_buffer_size",
+            self.memory.socket_send_buffer_size,
+        )?;
+
         for server in &self.servers {
             validate_server(server);
         }
 
         Ok(())
     }
+}
+
+fn validate_socket_buffer_size(field: &str, size: usize) -> Result<()> {
+    if size > MAX_SOCKET_BUFFER_SIZE {
+        return Err(anyhow::anyhow!(
+            "{field} must be <= {MAX_SOCKET_BUFFER_SIZE} bytes because OS socket APIs accept u32 buffer sizes; found {size}"
+        ));
+    }
+
+    Ok(())
 }
 
 /// Validate a single server configuration
@@ -149,6 +169,42 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_oversized_socket_recv_buffer_fails() {
+        let mut config = Config {
+            servers: vec![create_test_server("test", None)],
+            ..Default::default()
+        };
+        config.memory.socket_recv_buffer_size = MAX_SOCKET_BUFFER_SIZE + 1;
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("memory.socket_recv_buffer_size")
+        );
+    }
+
+    #[test]
+    fn test_validate_oversized_socket_send_buffer_fails() {
+        let mut config = Config {
+            servers: vec![create_test_server("test", None)],
+            ..Default::default()
+        };
+        config.memory.socket_send_buffer_size = MAX_SOCKET_BUFFER_SIZE + 1;
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("memory.socket_send_buffer_size")
+        );
     }
 
     #[test]

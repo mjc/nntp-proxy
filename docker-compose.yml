@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   nntp-proxy:
     build:
@@ -9,10 +7,10 @@ services:
     ports:
       - "8119:8119"
     environment:
-      # Proxy configuration (these match the CLI env vars in src/bin/nntp-proxy.rs)
+      # Proxy configuration (these match the CLI/env args in src/args.rs)
       NNTP_PROXY_PORT: 8119
-      NNTP_PROXY_ROUTING_MODE: hybrid  # Options: standard, per-command, hybrid
-      # NNTP_PROXY_THREADS: 4  # Optional: number of worker threads (default: number of CPUs)
+      NNTP_PROXY_ROUTING_MODE: hybrid  # Options: stateful, per-command, hybrid
+      # NNTP_PROXY_THREADS: 4  # Optional: worker threads (default: 1, use 0 for CPU cores)
       RUST_LOG: info  # Log level: trace, debug, info, warn, error
       
       # Backend server 0 (required - at least one server must be configured)
@@ -87,24 +85,24 @@ services:
       # Then use: ${BACKEND_USER_0} and ${BACKEND_PASS_0} below.
       # -----------------------------------------------------------------------------
       
-      # Three backend servers for round-robin load balancing
+      # Three backend servers for load balancing
       NNTP_SERVER_0_HOST: news1.example.com
       NNTP_SERVER_0_PORT: 119
       NNTP_SERVER_0_NAME: "News Server 1"
-      NNTP_SERVER_0_USERNAME: ${BACKEND_USER_0}
-      NNTP_SERVER_0_PASSWORD: ${BACKEND_PASS_0}
+      NNTP_SERVER_0_USERNAME: ${BACKEND_USER_0:-}
+      NNTP_SERVER_0_PASSWORD: ${BACKEND_PASS_0:-}
       
       NNTP_SERVER_1_HOST: news2.example.com
       NNTP_SERVER_1_PORT: 119
       NNTP_SERVER_1_NAME: "News Server 2"
-      NNTP_SERVER_1_USERNAME: ${BACKEND_USER_1}
-      NNTP_SERVER_1_PASSWORD: ${BACKEND_PASS_1}
+      NNTP_SERVER_1_USERNAME: ${BACKEND_USER_1:-}
+      NNTP_SERVER_1_PASSWORD: ${BACKEND_PASS_1:-}
       
       NNTP_SERVER_2_HOST: news3.example.com
       NNTP_SERVER_2_PORT: 119
       NNTP_SERVER_2_NAME: "News Server 3"
-      NNTP_SERVER_2_USERNAME: ${BACKEND_USER_2}
-      NNTP_SERVER_2_PASSWORD: ${BACKEND_PASS_2}
+      NNTP_SERVER_2_USERNAME: ${BACKEND_USER_2:-}
+      NNTP_SERVER_2_PASSWORD: ${BACKEND_PASS_2:-}
     
     # Health check
     healthcheck:

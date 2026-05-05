@@ -1,7 +1,8 @@
 # NNTP Proxy Configuration
 #
-# This file configures the proxy server, including listen address, backend servers,
-# authentication, and health checking.
+# Sections are ordered from general proxy behavior to concrete identities and
+# backend endpoints. Keep authentication and [[servers]] at the bottom so the
+# operational knobs are easy to scan first.
 
 # Proxy Server Settings
 [proxy]
@@ -10,78 +11,98 @@ host = "0.0.0.0"
 # Port to listen on (default: 8119)
 # Can be overridden with --port or NNTP_PROXY_PORT
 port = 8119
+# Worker threads (default: 1, use 0 for CPU cores)
+threads = 1
 # Validate yEnc structure and checksums (default: true)
 # Disable for better performance if you trust your backends
 validate_yenc = true
 # Minimum log level for debug.log file (default: "warn")
 # Options: "error", "warn", "info", "debug", "trace"
-# log_file_level = "warn"
-# Path to stats file for metric persistence (optional)
-# When set, metrics are persisted to this file every 30 seconds and on shutdown
-# Defaults to "stats.json" alongside the config file if not specified
-# This allows the TUI dashboard metrics to persist across proxy restarts
+log_file_level = "warn"
+# Optional stats persistence path used by the TUI dashboard
 # stats_file = "/var/lib/nntp-proxy/stats.json"
 
+# Routing Configuration
+[routing]
+# Routing mode: "hybrid" (default), "per-command", or "stateful"
+mode = "hybrid"
+# Backend selection strategy: "least-loaded" (default) or "weighted-round-robin"
+backend_selection = "least-loaded"
+# Enable adaptive availability prechecking for STAT/HEAD commands
+adaptive_precheck = false
+
+# Memory Configuration
+# These settings affect transport buffers and buffer pools, not article storage.
+[memory]
+# TCP socket buffers for client and backend connections
+socket_recv_buffer_size = 16777216
+socket_send_buffer_size = 16777216
+# Pooled streaming buffers
+buffer_pool_size = 741376
+buffer_pool_count = 50
+# Capture buffers used by cache ingest/response assembly
+capture_pool_size = 790528
+capture_pool_count = 16
+
+# Article Cache Configuration
+[cache]
+# Hot in-memory article cache capacity
+# Supports: "1gb", "500mb", "64mb", or raw bytes
+article_cache_capacity = "256mb"
+# Time-to-live for the article cache, in seconds
+article_cache_ttl_secs = 3600
+# Default false: track backend availability only, without storing article bodies.
+# This example sets true to enable full article-body caching (and the optional disk tier below).
+store_article_bodies = true
+# Optional persistence file for availability-only mode
+# availability_index_path = "/var/cache/nntp-proxy/availability.idx"
+
+# Disk Cache Configuration (optional)
+# When configured, evicted articles spill from memory to disk.
+# Use an SSD/NVMe device for the disk tier.
+[cache.disk]
+path = "/var/cache/nntp-proxy/articles"
+capacity = "10gb"
+# Options: "lz4" (default), "zstd", or "none"
+compression = "lz4"
+# Number of shards for concurrent disk access
+shards = 4
+
+# Health Check Configuration
+[health_check]
+# Interval and timeout are in seconds
+interval = 30
+timeout = 5
+unhealthy_threshold = 3
+
 # Client Authentication Configuration
-# Two formats supported:
+# Place auth near the concrete server entries. It is optional.
 #
-# 1. Single user (legacy format - still supported):
+# Custom greeting:
 [client_auth]
-username = "clientusername"
-password = "client password"
-# Optional custom greeting message
 greeting = "200 Hold On To Your Butts"
 
-# 2. Multiple users (NEW - recommended for grouping clients):
-# [[client_auth.users]]
-# username = "alice"
-# password = "secret123"
+# Users:
+[[client_auth.users]]
+username = "clientusername"
+password = "client password"
 #
 # [[client_auth.users]]
-# username = "bob"  
+# username = "bob"
 # password = "password456"
-#
-# [[client_auth.users]]
-# username = "charlie"
-# password = "hunter2"
-#
-# Benefits of multiple users:
-# - Group parallel connections by username in TUI
-# - Track per-user bandwidth and activity
-# - Different credentials for different client machines
-#
-# Note: You can use either format, but not both. Multi-user is recommended
-# for production deployments where you want to differentiate clients.
 
 [[servers]]
 host = "news.example.com"
 port = 119
 name = "Example News Server 1"
-# Optional authentication - uncomment if needed
+# Optional backend authentication
 # username = "your_username"
 # password = "your_password"
-# High-capacity server allows many connections
 max_connections = 20
-# Server tier for prioritization (lower = higher priority, default: 0)
-#
-# Tier determines:
-# 1. Selection priority: tier 0 tried first, tier 1 only if tier 0 exhausted, etc.
-# 2. Cache TTL: effective_ttl = base_ttl * (2 ^ tier)
-#    - Tier 0: 1x TTL (fresh articles from primary)
-#    - Tier 1: 2x TTL (backup servers)
-#    - Tier 5: 32x TTL (~32 hours with 1h base)
-#    - Tier 10: 1024x TTL (~43 days with 1h base)
-#    - Tier 63: 2^63x TTL (effectively infinite for rare articles)
-#
-# Example strategy:
-#   tier 0: primary/fast servers (1h cache)
-#   tier 5: backup/medium servers (32h cache)
-#   tier 10: archive/slow servers (43 days cache)
+# Lower tier numbers are tried first. Higher tiers are fallback/archive servers.
 tier = 0
-# Connection health check interval (omit or comment out to disable, recommended: 60-120 seconds)
-# Sends DATE command to detect stale connections before reuse
+# Optional keep-alive interval in seconds
 # connection_keepalive = 60
-# TLS/SSL configuration
 use_tls = false
 tls_verify_cert = true
 
@@ -89,16 +110,11 @@ tls_verify_cert = true
 host = "nntp.example.org"
 port = 119
 name = "Example News Server 2"
-# This server requires authentication
 username = "testuser"
 password = "testpass"
-# Standard connection limit
 max_connections = 10
-# Tier 1 = backup server, only used when tier 0 servers don't have the article
 tier = 1
-# Enable health checks every 60 seconds for this server
 connection_keepalive = 60
-# Plain TCP connection (default)
 use_tls = false
 tls_verify_cert = true
 
@@ -106,30 +122,20 @@ tls_verify_cert = true
 host = "secure-news.example.com"
 port = 563
 name = "Secure News Server"
-# Example with SSL/TLS port and authentication
 username = "premium_user"
 password = "secure_password"
-# Premium server allows more connections
 max_connections = 15
-# Tier 5 = backup server (32x longer cache)
-# With 1h base TTL, articles cached for 32 hours
 tier = 5
-# Health checks recommended for production servers
 connection_keepalive = 120
-# Enable TLS for secure connection (NNTPS)
 use_tls = true
-# Verify server certificates (recommended for production)
 tls_verify_cert = true
-# Optional: custom CA certificate
+# Optional custom CA certificate
 # tls_cert_path = "/path/to/ca-cert.pem"
 
 [[servers]]
 host = "archive.example.com"
 port = 563
-name = "Archive Server (Tier 10)"
-# Example: Archive server for rare/hard-to-find articles
-# Tier 10 = 1024x longer cache (with 1h base: ~43 days)
-# Articles found here are cached much longer to avoid repeated lookups
+name = "Archive Server"
 username = "archive_user"
 password = "archive_pass"
 max_connections = 2
@@ -137,70 +143,3 @@ tier = 10
 connection_keepalive = 120
 use_tls = true
 tls_verify_cert = true
-
-[[servers]]
-host = "localhost"
-port = 1119
-name = "Local Test Server"
-# No authentication needed for local server
-# Limited connections for test server
-max_connections = 5
-# No health checks needed for local testing
-# connection_keepalive = 0  # Not needed - disabled by default
-use_tls = false
-tls_verify_cert = true
-
-# TLS/SSL Configuration Guide:
-# - use_tls: Enable TLS/SSL encryption for this server (default: false)
-# - tls_verify_cert: Verify server certificates using system certificate store (default: true, STRONGLY recommended)
-# - tls_cert_path: Optional path to additional CA certificate file (PEM format)
-#                  Note: This ADDS to system certs, does not replace them
-#
-# System Certificate Stores by OS:
-# - Linux: Uses system CA bundle (usually /etc/ssl/certs)
-# - macOS: Uses Security.framework (Keychain)
-# - Windows: Uses SChannel (Windows Certificate Store)
-#
-# Only disable tls_verify_cert for testing/development - it's a security risk!
-#
-# Note: max_connections defaults to 10 if not specified
-# Each server can have different limits based on your provider's restrictions
-# Common NNTP ports: 119 (plain), 563 (NNTPS/SSL), 8119 (custom)
-
-# Cache Configuration (optional)
-# Uncomment to enable article caching
-#
-# [cache]
-# # Maximum memory cache size (default: 64mb)
-# # Supports: "1gb", "500mb", "64mb", or raw bytes
-# max_capacity = "64mb"
-# # Time-to-live for cached articles (default: 1 hour)
-# ttl_secs = 3600
-# # Cache article bodies (default: true)
-# # Set to false for availability-only mode (dedicated exact negative index with LRU eviction)
-# cache_articles = true
-# # Optional persistence file for availability-only mode
-# # Saves every 30 seconds and on shutdown; defaults to "availability.idx" next to the config
-# # availability_file = "/var/cache/nntp-proxy/availability.idx"
-# # Enable adaptive prechecking for STAT/HEAD commands (default: false)
-# # Queries all backends simultaneously to build availability data
-# adaptive_precheck = false
-#
-# # Disk Cache Configuration (optional)
-# # When configured, creates two-tier cache: memory -> disk -> backend
-# # Articles evicted from memory are written to disk for later retrieval
-# [cache.disk]
-# # Path to disk cache directory (will be created if needed)
-# path = "/var/cache/nntp-proxy"
-# # Maximum disk cache size (default: 10gb)
-# # Supports: "100gb", "10gb", "1tb", or raw bytes
-# capacity = "10gb"
-# # Compression codec for disk storage (default: "lz4")
-# # Options:
-# #   "lz4"  - Fast compression (~60% reduction), minimal CPU, SIMD-accelerated
-# #   "zstd" - Better compression ratio, moderate CPU overhead, SIMD-accelerated
-# #   "none" - No compression, fastest but largest disk usage
-# # SIMD optimizations (SSE2/AVX2/AVX512) for "lz4"/"zstd" are auto-detected and enabled by default
-# compression = "lz4"
-# # Number of shards for concurrent access (default: 4)
-# shards = 4

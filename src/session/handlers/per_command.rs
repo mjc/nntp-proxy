@@ -202,6 +202,7 @@ impl ClientSession {
         let auth_succeeded = matches!(result, common::AuthResult::Authenticated { .. });
         if auth_succeeded {
             common::on_authentication_success(
+                self.client_id(),
                 self.client_addr,
                 auth_username.clone(),
                 self.mode_state.routing_mode(),
