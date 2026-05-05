@@ -147,8 +147,11 @@ impl NntpProxy {
         routing_mode: crate::config::RoutingMode,
         metrics: &types::TransferMetrics,
     ) {
-        self.connection_stats
-            .record_disconnection(session.username(), routing_mode.short_name());
+        self.connection_stats.record_session_disconnection(
+            session.client_id(),
+            session.username(),
+            routing_mode.short_name(),
+        );
 
         debug!(
             "Session {} [{}] ↑{} ↓{}",
@@ -302,8 +305,11 @@ impl NntpProxy {
     pub(super) fn record_connection_if_unauthenticated(&self, session: &ClientSession) {
         if !self.auth_handler.is_enabled() || session.username().is_none() {
             let mode = self.session_mode_label(session.mode());
-            self.connection_stats
-                .record_connection(session.username(), mode);
+            self.connection_stats.record_session_connection(
+                session.client_id(),
+                session.username(),
+                mode,
+            );
         }
     }
 

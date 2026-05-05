@@ -4,7 +4,7 @@
 //! Instead of logging every connection individually, we batch them and log:
 //! "User abc created 90 connections in per-command routing mode in 5.2s"
 
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -15,6 +15,7 @@ const AGGREGATION_WINDOW: Duration = Duration::from_secs(30);
 
 // Use centralized constant from constants::user module
 use crate::constants::user::ANONYMOUS;
+use crate::types::ClientId;
 
 /// Statistics for a single user's connections
 #[derive(Debug)]
@@ -104,6 +105,8 @@ impl UserConnectionStats {
 pub struct ConnectionStatsAggregator {
     connection_stats: Arc<DashMap<String, UserConnectionStats>>,
     disconnection_stats: Arc<DashMap<String, UserConnectionStats>>,
+    seen_connections: Arc<DashSet<ClientId>>,
+    seen_disconnections: Arc<DashSet<ClientId>>,
     last_flush: Arc<Mutex<Instant>>,
 }
 
@@ -114,6 +117,8 @@ impl ConnectionStatsAggregator {
         Self {
             connection_stats: Arc::new(DashMap::new()),
             disconnection_stats: Arc::new(DashMap::new()),
+            seen_connections: Arc::new(DashSet::new()),
+            seen_disconnections: Arc::new(DashSet::new()),
             last_flush: Arc::new(Mutex::new(Instant::now())),
         }
     }
@@ -139,6 +144,7 @@ impl ConnectionStatsAggregator {
                     &self.disconnection_stats,
                     UserConnectionStats::log_disconnection,
                 );
+                self.seen_disconnections.clear();
                 *last_flush = now;
             }
         }
@@ -177,8 +183,35 @@ impl ConnectionStatsAggregator {
         self.record_event(username, routing_mode, true);
     }
 
+    /// Record a new client session connection once per `ClientId`.
+    pub fn record_session_connection(
+        &self,
+        client_id: ClientId,
+        username: Option<&str>,
+        routing_mode: &'static str,
+    ) {
+        if !self.seen_connections.insert(client_id) {
+            return;
+        }
+        self.record_event(username, routing_mode, true);
+    }
+
     /// Record a disconnection
     pub fn record_disconnection(&self, username: Option<&str>, routing_mode: &'static str) {
+        self.record_event(username, routing_mode, false);
+    }
+
+    /// Record a client session disconnection once per `ClientId`.
+    pub fn record_session_disconnection(
+        &self,
+        client_id: ClientId,
+        username: Option<&str>,
+        routing_mode: &'static str,
+    ) {
+        if !self.seen_disconnections.insert(client_id) {
+            return;
+        }
+        self.seen_connections.remove(&client_id);
         self.record_event(username, routing_mode, false);
     }
 
@@ -512,5 +545,27 @@ mod tests {
         // Both should be cleared
         assert_eq!(aggregator.user_count(), 0);
         assert_eq!(aggregator.connection_count("alice"), None);
+    }
+
+    #[test]
+    fn test_record_session_connection_deduplicates_same_client() {
+        let aggregator = ConnectionStatsAggregator::new();
+        let client_id = ClientId::new();
+
+        aggregator.record_session_connection(client_id, Some("alice"), "hybrid");
+        aggregator.record_session_connection(client_id, Some("alice"), "hybrid");
+
+        assert_eq!(aggregator.connection_count("alice"), Some(1));
+    }
+
+    #[test]
+    fn test_record_session_disconnection_deduplicates_same_client() {
+        let aggregator = ConnectionStatsAggregator::new();
+        let client_id = ClientId::new();
+
+        aggregator.record_session_disconnection(client_id, Some("alice"), "hybrid");
+        aggregator.record_session_disconnection(client_id, Some("alice"), "hybrid");
+
+        assert_eq!(aggregator.user_count(), 0);
     }
 }
