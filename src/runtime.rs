@@ -6,7 +6,7 @@
 //! - Shutdown signal handling
 
 use crate::types::ThreadCount;
-use anyhow::{Context, Result};
+use anyhow::Result;
 
 /// Runtime configuration
 #[derive(Debug, Clone)]
@@ -214,9 +214,7 @@ pub async fn bind_listener(
     use tracing::info;
 
     let listen_addr = format!("{}:{}", host, port.get());
-    let listener = tokio::net::TcpListener::bind(&listen_addr)
-        .await
-        .with_context(|| format!("Failed to bind NNTP proxy listener at {listen_addr}"))?;
+    let listener = tokio::net::TcpListener::bind(&listen_addr).await?;
 
     info!("NNTP proxy listening on {} ({})", listen_addr, routing_mode);
 
@@ -730,7 +728,6 @@ pub fn spawn_idle_connection_clearer(proxy: &std::sync::Arc<crate::NntpProxy>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::Port;
 
     #[test]
     fn test_runtime_config_from_args_default() {
@@ -830,23 +827,6 @@ mod tests {
         assert!(debug_str.contains("RuntimeConfig"));
         assert!(debug_str.contains("worker_threads"));
         assert!(debug_str.contains("enable_cpu_pinning"));
-    }
-
-    #[tokio::test]
-    async fn test_bind_listener_context_mentions_proxy_listener() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let err = bind_listener(
-            "127.0.0.1",
-            Port::try_new(addr.port()).unwrap(),
-            crate::RoutingMode::PerCommand,
-        )
-        .await
-        .unwrap_err();
-
-        let err = format!("{err:#}");
-        assert!(err.contains("Failed to bind NNTP proxy listener"));
     }
 
     // Builder pattern tests

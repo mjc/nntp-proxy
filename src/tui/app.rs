@@ -3,14 +3,13 @@
 use crate::config::Server;
 use crate::metrics::{MetricsCollector, MetricsSnapshot};
 use crate::router::BackendSelector;
-use crate::tui::dashboard::{BackendView, BufferPoolStats, DashboardState};
 use crate::tui::log_capture::LogBuffer;
 use crate::types::tui::{CommandsPerSecond, HistorySize, Throughput, Timestamp};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// TUI view mode - controls what is displayed
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ViewMode {
     /// Normal view - shows all panels
     #[default]
@@ -20,8 +19,10 @@ pub enum ViewMode {
 }
 
 /// Historical throughput data point (generic over traffic direction)
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ThroughputPoint {
+    /// Timestamp of this measurement
+    timestamp: Timestamp,
     /// Bytes sent per second
     sent_per_sec: Throughput,
     /// Bytes received per second
@@ -34,12 +35,13 @@ impl ThroughputPoint {
     /// Create a new backend throughput point
     #[must_use]
     pub const fn new_backend(
-        _timestamp: Timestamp,
+        timestamp: Timestamp,
         sent_per_sec: Throughput,
         received_per_sec: Throughput,
         commands_per_sec: CommandsPerSecond,
     ) -> Self {
         Self {
+            timestamp,
             sent_per_sec,
             received_per_sec,
             commands_per_sec: Some(commands_per_sec),
@@ -49,15 +51,23 @@ impl ThroughputPoint {
     /// Create a new client throughput point
     #[must_use]
     pub const fn new_client(
-        _timestamp: Timestamp,
+        timestamp: Timestamp,
         sent_per_sec: Throughput,
         received_per_sec: Throughput,
     ) -> Self {
         Self {
+            timestamp,
             sent_per_sec,
             received_per_sec,
             commands_per_sec: None,
         }
+    }
+
+    /// Get timestamp
+    #[must_use]
+    #[inline]
+    pub const fn timestamp(&self) -> Timestamp {
+        self.timestamp
     }
 
     /// Get sent bytes per second
@@ -316,29 +326,6 @@ impl TuiApp {
         }
     }
 
-    #[must_use]
-    fn build_backend_throughput_point(
-        now: Timestamp,
-        time_delta: f64,
-        new_stats: &crate::metrics::BackendStats,
-        prev_stats: &crate::metrics::BackendStats,
-    ) -> ThroughputPoint {
-        let sent_delta = new_stats.bytes_sent.saturating_sub(prev_stats.bytes_sent);
-        let recv_delta = new_stats
-            .bytes_received
-            .saturating_sub(prev_stats.bytes_received);
-        let cmd_delta = new_stats
-            .total_commands
-            .saturating_sub(prev_stats.total_commands);
-
-        ThroughputPoint::new_backend(
-            now,
-            Self::calculate_rate(sent_delta.into(), time_delta),
-            Self::calculate_rate(recv_delta.into(), time_delta),
-            Self::calculate_command_rate(cmd_delta.get(), time_delta),
-        )
-    }
-
     /// Calculate per-user rates from deltas
     #[inline]
     fn calculate_user_rates(
@@ -413,19 +400,28 @@ impl TuiApp {
             let client_point = ThroughputPoint::new_client(now, client_sent_rate, client_recv_rate);
             self.client_history.push(client_point);
 
-            self.backend_history
-                .iter_mut()
-                .zip(
-                    new_snapshot
-                        .backend_stats
-                        .iter()
-                        .zip(prev.backend_stats.iter()),
-                )
-                .for_each(|(history, (new_stats, prev_stats))| {
-                    history.push(Self::build_backend_throughput_point(
-                        now, time_delta, new_stats, prev_stats,
-                    ));
-                });
+            // Calculate per-backend throughput
+            for (i, (new_stats, prev_stats)) in new_snapshot
+                .backend_stats
+                .iter()
+                .zip(prev.backend_stats.iter())
+                .enumerate()
+            {
+                let sent_delta = new_stats.bytes_sent.saturating_sub(prev_stats.bytes_sent);
+                let recv_delta = new_stats
+                    .bytes_received
+                    .saturating_sub(prev_stats.bytes_received);
+                let cmd_delta = new_stats
+                    .total_commands
+                    .saturating_sub(prev_stats.total_commands);
+
+                let sent_rate = Self::calculate_rate(sent_delta.into(), time_delta);
+                let recv_rate = Self::calculate_rate(recv_delta.into(), time_delta);
+                let cmd_rate = Self::calculate_command_rate(cmd_delta.get(), time_delta);
+
+                let point = ThroughputPoint::new_backend(now, sent_rate, recv_rate, cmd_rate);
+                self.backend_history[i].push(point);
+            }
 
             // Enrich user stats with calculated rates
             let user_stats = new_snapshot
@@ -565,62 +561,6 @@ impl TuiApp {
     #[must_use]
     pub const fn buffer_pool(&self) -> Option<&crate::pool::BufferPool> {
         self.buffer_pool.as_ref()
-    }
-
-    /// Build a serializable snapshot of the current dashboard state.
-    #[must_use]
-    pub fn snapshot_state(&self) -> DashboardState {
-        let backend_views = self
-            .snapshot
-            .backend_stats
-            .iter()
-            .zip(self.servers.iter())
-            .enumerate()
-            .map(|(i, (stats, server))| {
-                let pending_count = self.backend_pending_count(i);
-                let load_ratio = self.backend_load_ratio(i);
-                let stateful_count = self.backend_stateful_count(i);
-                let traffic_share = self.backend_traffic_share(i);
-                let history = self
-                    .backend_history
-                    .get(i)
-                    .map_or_else(Vec::new, |history| {
-                        history.points().iter().cloned().collect()
-                    });
-
-                BackendView {
-                    server: server.clone(),
-                    stats: stats.clone(),
-                    active_connections: stats.active_connections.get(),
-                    health_status: stats.health_status,
-                    pending_count,
-                    load_ratio,
-                    stateful_count,
-                    traffic_share,
-                    history,
-                }
-            })
-            .collect();
-
-        let buffer_pool = self.buffer_pool.as_ref().map(|pool| {
-            let (available, in_use, total) = pool.stats();
-            BufferPoolStats {
-                available,
-                in_use,
-                total,
-            }
-        });
-
-        DashboardState {
-            snapshot: self.snapshot.as_ref().clone(),
-            backend_views,
-            client_history: self.client_history.points().iter().cloned().collect(),
-            system_stats: self.system_stats.clone(),
-            view_mode: self.view_mode,
-            show_details: self.show_details,
-            log_lines: self.log_buffer.all_lines(),
-            buffer_pool,
-        }
     }
 }
 
@@ -907,28 +847,6 @@ mod tests {
     }
 
     #[test]
-    fn test_build_backend_throughput_point() {
-        use crate::metrics::{BackendStats, CommandCount};
-        use crate::types::{BytesReceived, BytesSent};
-
-        let mut prev = BackendStats::default();
-        prev.bytes_sent = BytesSent::new(100);
-        prev.bytes_received = BytesReceived::new(200);
-        prev.total_commands = CommandCount::new(10);
-
-        let mut next = prev.clone();
-        next.bytes_sent = BytesSent::new(250);
-        next.bytes_received = BytesReceived::new(500);
-        next.total_commands = CommandCount::new(40);
-
-        let point = TuiApp::build_backend_throughput_point(Timestamp::now(), 0.5, &next, &prev);
-
-        assert_f64_eq(point.sent_per_sec().get(), 300.0);
-        assert_f64_eq(point.received_per_sec().get(), 600.0);
-        assert_f64_eq(point.commands_per_sec().unwrap().get(), 60.0);
-    }
-
-    #[test]
     fn test_with_log_buffer() {
         use crate::tui::log_capture::LogBuffer;
 
@@ -1050,38 +968,5 @@ mod tests {
             .build();
 
         assert_eq!(app.backend_history.len(), 3);
-    }
-
-    #[test]
-    fn test_snapshot_state_serialization_round_trip() {
-        use crate::tui::log_capture::LogBuffer;
-
-        let log_buffer = LogBuffer::new();
-        log_buffer.push("Dashboard log line".to_string());
-
-        let metrics = MetricsCollector::new(1);
-        let router = Arc::new(BackendSelector::new());
-        let servers = create_test_servers(1);
-
-        let app = TuiAppBuilder::new(metrics, router, servers)
-            .with_log_buffer(log_buffer)
-            .build();
-
-        let snapshot = app.snapshot_state();
-        assert_eq!(snapshot.backend_views.len(), 1);
-        assert_eq!(snapshot.client_history.len(), 0);
-        assert_eq!(snapshot.log_lines, vec!["Dashboard log line".to_string()]);
-        assert_eq!(snapshot.view_mode, ViewMode::Normal);
-        assert!(!snapshot.show_details);
-
-        let json = serde_json::to_string(&snapshot).expect("snapshot should serialize");
-        let decoded: DashboardState =
-            serde_json::from_str(&json).expect("snapshot should deserialize");
-
-        assert_eq!(decoded.backend_views.len(), 1);
-        assert_eq!(decoded.log_lines, vec!["Dashboard log line".to_string()]);
-        assert_eq!(decoded.view_mode, ViewMode::Normal);
-        assert!(!decoded.show_details);
-        assert!(decoded.buffer_pool.is_none());
     }
 }

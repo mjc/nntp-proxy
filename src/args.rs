@@ -4,9 +4,7 @@
 
 use crate::config::{BackendSelectionStrategy, Config, RoutingMode};
 use crate::types::{CacheCapacity, ConfigPath, Port, ThreadCount};
-use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
-use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 /// Parse port from command line argument
@@ -54,7 +52,6 @@ pub struct CommonArgs {
     #[arg(
         long,
         value_enum,
-        value_name = "MODE",
         default_value_t = UiMode::DEFAULT,
         env = "NNTP_PROXY_UI",
         help_heading = "General"
@@ -64,24 +61,6 @@ pub struct CommonArgs {
     /// Disable the terminal dashboard and run in headless mode.
     #[arg(long, hide = true, help_heading = "General")]
     pub no_tui: bool,
-
-    /// Bind the dashboard websocket publisher to a free HOST:PORT distinct from the proxy listener.
-    #[arg(
-        long = "tui-listen",
-        value_name = "HOST:PORT",
-        env = "NNTP_PROXY_TUI_LISTEN",
-        help_heading = "General"
-    )]
-    pub tui_listen: Option<SocketAddr>,
-
-    /// Connect the read-only TUI client to a dashboard websocket at HOST:PORT.
-    #[arg(
-        long = "tui-attach",
-        value_name = "HOST:PORT",
-        env = "NNTP_PROXY_TUI_ATTACH",
-        help_heading = "General"
-    )]
-    pub tui_attach: Option<SocketAddr>,
 
     /// Port to listen on (overrides config file)
     #[arg(
@@ -211,50 +190,6 @@ impl CommonArgs {
         }
     }
 
-    /// Validate dashboard-related flag combinations.
-    pub fn validate_runtime_mode(&self) -> Result<()> {
-        let ui_mode = self.effective_ui_mode();
-
-        if self.tui_attach.is_some() && ui_mode != UiMode::Tui {
-            bail!("--tui-attach requires --ui tui");
-        }
-
-        if self.tui_attach.is_some() && self.tui_listen.is_some() {
-            bail!("--tui-attach cannot be combined with --tui-listen");
-        }
-
-        Ok(())
-    }
-
-    /// Validate that the dashboard websocket listener does not reuse the proxy listen socket.
-    pub fn validate_dashboard_listen(&self, proxy_host: &str, proxy_port: Port) -> Result<()> {
-        let Some(dashboard_listen) = self.tui_listen else {
-            return Ok(());
-        };
-
-        if dashboard_listen.port() != proxy_port.get() {
-            return Ok(());
-        }
-
-        let Ok(proxy_ip) = proxy_host.parse::<IpAddr>() else {
-            return Ok(());
-        };
-
-        if proxy_ip.is_unspecified()
-            || dashboard_listen.ip().is_unspecified()
-            || proxy_ip == dashboard_listen.ip()
-        {
-            bail!(
-                "--tui-listen {} conflicts with the proxy listener {}:{}; use a different port",
-                dashboard_listen,
-                proxy_host,
-                proxy_port.get()
-            );
-        }
-
-        Ok(())
-    }
-
     fn legacy_env_var<E>(env_get: &E, keys: &[&str]) -> Option<String>
     where
         E: Fn(&str) -> Option<String>,
@@ -348,7 +283,6 @@ impl CommonArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::CommandFactory;
 
     #[test]
     fn test_common_args_defaults() {
@@ -533,82 +467,12 @@ mod tests {
         assert_eq!(legacy_args.effective_ui_mode(), UiMode::Headless);
     }
 
-    #[test]
-    fn test_validate_runtime_mode_accepts_attach_client() {
-        let args = CommonArgs {
-            ui: UiMode::Tui,
-            tui_attach: Some("127.0.0.1:8119".parse().unwrap()),
-            ..default_args()
-        };
-
-        args.validate_runtime_mode().unwrap();
-    }
-
-    #[test]
-    fn test_validate_runtime_mode_rejects_attach_without_tui() {
-        let args = CommonArgs {
-            tui_attach: Some("127.0.0.1:8119".parse().unwrap()),
-            ..default_args()
-        };
-
-        assert!(args.validate_runtime_mode().is_err());
-    }
-
-    #[test]
-    fn test_validate_runtime_mode_rejects_attach_and_listen() {
-        let args = CommonArgs {
-            ui: UiMode::Tui,
-            tui_attach: Some("127.0.0.1:8119".parse().unwrap()),
-            tui_listen: Some("127.0.0.1:8120".parse().unwrap()),
-            ..default_args()
-        };
-
-        assert!(args.validate_runtime_mode().is_err());
-    }
-
-    #[test]
-    fn test_validate_dashboard_listen_rejects_same_socket() {
-        let args = CommonArgs {
-            tui_listen: Some("127.0.0.1:8119".parse().unwrap()),
-            ..default_args()
-        };
-
-        assert!(
-            args.validate_dashboard_listen("127.0.0.1", Port::try_new(8119).unwrap())
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn test_validate_dashboard_listen_allows_distinct_socket() {
-        let args = CommonArgs {
-            tui_listen: Some("127.0.0.1:8120".parse().unwrap()),
-            ..default_args()
-        };
-
-        args.validate_dashboard_listen("127.0.0.1", Port::try_new(8119).unwrap())
-            .unwrap();
-    }
-
-    #[test]
-    fn test_help_shows_tui_socket_format() {
-        let mut command = CommonArgs::command();
-        let mut help = Vec::new();
-        command.write_long_help(&mut help).unwrap();
-        let help = String::from_utf8(help).unwrap();
-
-        assert!(help.contains("--tui-listen <HOST:PORT>"));
-        assert!(help.contains("--tui-attach <HOST:PORT>"));
-    }
-
     // Helper to create default args for testing
     fn default_args() -> CommonArgs {
         CommonArgs {
             config: ConfigPath::new("config.toml").unwrap(),
             ui: UiMode::Headless,
             no_tui: false,
-            tui_listen: None,
-            tui_attach: None,
             port: None,
             host: None,
             routing_mode: None,

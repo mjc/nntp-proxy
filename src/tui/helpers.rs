@@ -3,8 +3,9 @@
 use ratatui::style::Color;
 
 use super::constants::{BACKEND_COLORS, throughput};
-use super::dashboard::BackendView;
 use super::types::{BackendChartData, ChartDataVec, ChartPoint, ChartX, ChartY, PointVec};
+use crate::config::Server;
+use crate::tui::TuiApp;
 use crate::tui::app::ThroughputPoint;
 
 // ============================================================================
@@ -56,7 +57,7 @@ pub fn create_sparkline(value: u64, max_value: u64) -> String {
 /// 3. Accumulates results with global max tracking
 ///
 /// Returns (`chart_data`, `global_max_throughput`)
-pub fn build_chart_data(backend_views: &[BackendView]) -> (ChartDataVec, f64) {
+pub fn build_chart_data(servers: &[Server], app: &TuiApp) -> (ChartDataVec, f64) {
     /// Extract data from a single throughput point
     #[inline]
     fn extract_point_data(idx: usize, point: &ThroughputPoint) -> (ChartPoint, ChartPoint, ChartY) {
@@ -81,30 +82,39 @@ pub fn build_chart_data(backend_views: &[BackendView]) -> (ChartDataVec, f64) {
         ((sent_vec, recv_vec), max.max(point_max))
     }
 
+    /// Build chart data for a single backend (pure function)
+    fn build_backend_data(
+        index: usize,
+        server: &Server,
+        history: &std::collections::VecDeque<ThroughputPoint>,
+    ) -> (BackendChartData, f64) {
+        let ((sent_points, recv_points), backend_max) = history
+            .iter()
+            .enumerate()
+            .map(|(idx, point)| extract_point_data(idx, point))
+            .fold(
+                ((PointVec::new(), PointVec::new()), ChartY::from(0.0)),
+                accumulate_points,
+            );
+
+        (
+            BackendChartData::new(
+                server.name.as_str().to_string(),
+                backend_color(index),
+                &sent_points,
+                &recv_points,
+            ),
+            backend_max.get(),
+        )
+    }
+
     // Functional pipeline: enumerate → map → fold
-    backend_views
+    servers
         .iter()
         .enumerate()
-        .map(|(index, backend)| {
-            let ((sent_points, recv_points), backend_max) = backend
-                .history
-                .iter()
-                .enumerate()
-                .map(|(idx, point)| extract_point_data(idx, point))
-                .fold(
-                    ((PointVec::new(), PointVec::new()), ChartY::from(0.0)),
-                    accumulate_points,
-                );
-
-            (
-                BackendChartData::new(
-                    backend.server.name.as_str().to_string(),
-                    backend_color(index),
-                    &sent_points,
-                    &recv_points,
-                ),
-                backend_max.get(),
-            )
+        .map(|(index, server)| {
+            let history = app.throughput_history(index);
+            build_backend_data(index, server, history)
         })
         .fold(
             (ChartDataVec::new(), 0.0_f64),
@@ -238,33 +248,18 @@ pub const fn load_percentage_color(percent: f64) -> Color {
     }
 }
 
-/// Color for pending count
+/// Color for byte sizes and large counters based on magnitude.
 #[must_use]
-pub const fn pending_count_color(pending: usize) -> Color {
-    if pending > 0 {
-        Color::Yellow
-    } else {
-        super::constants::styles::VALUE_NEUTRAL
-    }
-}
-
-/// Color for error count
-#[must_use]
-pub const fn error_count_color(has_errors: bool) -> Color {
+pub const fn magnitude_color(value: u64) -> Color {
     use super::constants::styles;
-    if has_errors {
-        Color::Yellow
-    } else {
-        styles::VALUE_NEUTRAL
-    }
-}
-
-/// Color for connection failures
-#[must_use]
-pub const fn connection_failure_color(failures: u64) -> Color {
-    use super::constants::styles;
-    if failures > 0 {
+    if value >= 1_000_000_000_000 {
         Color::Red
+    } else if value >= 1_000_000_000 {
+        Color::Yellow
+    } else if value >= 1_000_000 {
+        styles::VALUE_PRIMARY
+    } else if value >= 1_000 {
+        styles::VALUE_INFO
     } else {
         styles::VALUE_NEUTRAL
     }
@@ -343,6 +338,18 @@ mod tests {
         assert_eq!(format_throughput_label(1_048_576.0), "1 MiB/s");
         assert_eq!(format_throughput_label(1_024.0), "1 KiB/s");
         assert_eq!(format_throughput_label(0.0), "0 B/s");
+    }
+
+    #[test]
+    fn test_magnitude_color_boundaries() {
+        use super::super::constants::styles;
+
+        assert_eq!(magnitude_color(0), styles::VALUE_NEUTRAL);
+        assert_eq!(magnitude_color(999), styles::VALUE_NEUTRAL);
+        assert_eq!(magnitude_color(1_000), styles::VALUE_INFO);
+        assert_eq!(magnitude_color(1_000_000), styles::VALUE_PRIMARY);
+        assert_eq!(magnitude_color(1_000_000_000), Color::Yellow);
+        assert_eq!(magnitude_color(1_000_000_000_000), Color::Red);
     }
 
     #[test]
