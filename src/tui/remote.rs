@@ -175,10 +175,15 @@ fn spawn_dashboard_reader_with_retry_delay(
 
         info!("Connecting attached dashboard client to {ws_url}");
 
-        while matches!(
-            dashboard_reader_session(&ws_url, state_tx.clone()).await,
-            Ok(ReaderSessionOutcome::RetryAfterDelay)
-        ) {
+        loop {
+            let session_result = dashboard_reader_session(&ws_url, state_tx.clone()).await;
+            if !dashboard_reader_should_retry(&session_result) {
+                if let Err(err) = session_result {
+                    warn!("Attached dashboard websocket reader stopped for {ws_url}: {err}");
+                }
+                break;
+            }
+
             warn!(
                 "Attached dashboard websocket disconnected or unavailable; retrying in {retry_delay:?}"
             );
@@ -186,6 +191,10 @@ fn spawn_dashboard_reader_with_retry_delay(
             info!("Reconnecting attached dashboard client to {ws_url}");
         }
     })
+}
+
+fn dashboard_reader_should_retry(outcome: &anyhow::Result<ReaderSessionOutcome>) -> bool {
+    matches!(outcome, Ok(ReaderSessionOutcome::RetryAfterDelay))
 }
 
 async fn dashboard_reader_session(
@@ -298,6 +307,16 @@ mod tests {
             dashboard_peer_label(Some("127.0.0.1:1234".parse().unwrap())),
             " from 127.0.0.1:1234"
         );
+    }
+
+    #[test]
+    fn dashboard_reader_should_retry_only_for_retry_outcomes() {
+        assert!(dashboard_reader_should_retry(&Ok(
+            ReaderSessionOutcome::RetryAfterDelay
+        )));
+        assert!(!dashboard_reader_should_retry(&Err(anyhow::anyhow!(
+            "boom"
+        ))));
     }
 
     #[tokio::test]
