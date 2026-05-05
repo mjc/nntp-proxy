@@ -121,6 +121,10 @@
       packageNativeBuildInputs = with pkgs; [
         pkg-config
         cmake
+      ]
+      ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+        clang
+        mold
       ];
 
       packageBuildInputs = with pkgs; [
@@ -136,7 +140,7 @@
         else if system == "aarch64-darwin" then "CARGO_TARGET_AARCH64_APPLE_DARWIN"
         else throw "Unsupported system: ${system}";
 
-      package = pkgs.rustPlatform.buildRustPackage {
+      package = pkgs.rustPlatform.buildRustPackage ({
         pname = cargoToml.package.name;
         version = cargoToml.package.version;
         src = ./.;
@@ -160,7 +164,13 @@
           mainProgram = cargoToml.package.name;
           platforms = platforms.all;
         };
-      };
+      }
+      // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+        # Match the dev-shell linker setup for packaged builds without forcing
+        # non-portable CPU tuning into release artifacts.
+        "${cargoTargetEnvPrefix}_LINKER" = "clang";
+        "${cargoTargetEnvPrefix}_RUSTFLAGS" = "-C link-arg=-fuse-ld=mold";
+      });
     in {
       apps.default = flake-utils.lib.mkApp {
         drv = package;
