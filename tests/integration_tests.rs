@@ -708,14 +708,13 @@ async fn test_hybrid_mode_stateful_switching() -> Result<()> {
 #[tokio::test]
 async fn test_hybrid_mode_multiple_clients() -> Result<()> {
     // Test multiple concurrent clients in hybrid mode
-    let mock_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-    let proxy_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
+    let mock_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let mock_port = mock_listener.local_addr()?.port();
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_port = proxy_listener.local_addr()?.port();
 
-    let _mock = create_smart_mock_builder(mock_port, "MultiServer").spawn();
+    let _mock =
+        create_smart_mock_builder(mock_port, "MultiServer").spawn_on_listener(mock_listener);
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -731,11 +730,10 @@ async fn test_hybrid_mode_multiple_clients() -> Result<()> {
 
     let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
-    let listener = TcpListener::bind(&proxy_addr).await?;
 
     tokio::spawn(async move {
         loop {
-            if let Ok((stream, addr)) = listener.accept().await {
+            if let Ok((stream, addr)) = proxy_listener.accept().await {
                 let proxy_clone = proxy.clone();
                 tokio::spawn(async move {
                     let _ = proxy_clone.handle_client(stream, addr.into()).await;
