@@ -421,49 +421,17 @@ impl ClientSession {
 
         match (is_multiline_body, cache_action) {
             (true, CacheAction::CaptureArticle) => {
-                let captured =
-                    streaming::buffer_multiline_response(pooled_conn, params.first_chunk, ctx)
-                        .await?;
-                captured
-                    .write_all_to(client_write)
+                self.buffer_and_cache_multiline_response(pooled_conn, client_write, ctx, params)
                     .await
-                    .map_err(classify_buffered_response_write_err)?;
-                if let Some(msg_id_ref) = params.msg_id {
-                    debug!(
-                        "Client {} caching full article for {} ({} bytes captured)",
-                        self.client_addr,
-                        msg_id_ref,
-                        captured.len()
-                    );
-                }
-                let captured_len = captured.len();
-                self.maybe_cache_upsert_buffer(params.msg_id, captured.into(), ctx.backend_id);
-                Ok(captured_len as u64)
             }
             (true, CacheAction::TrackAvailability) => {
-                // Availability-only mode should not buffer the article body.
-                // Keep first-byte latency and memory bounded by streaming directly,
-                // then cache only typed availability metadata after the terminator is seen.
-                let bytes = streaming::stream_multiline_response(
-                    &mut **pooled_conn,
+                self.stream_multiline_with_availability_tracking(
+                    pooled_conn,
                     client_write,
-                    params.first_chunk,
                     ctx,
+                    params,
                 )
-                .await?;
-                if let Some(msg_id) = params.msg_id
-                    && !params
-                        .request
-                        .cache_records_backend_has_article(ctx.backend_id)
-                {
-                    self.spawn_cache_upsert_availability(
-                        msg_id,
-                        params.status_code,
-                        ctx.backend_id,
-                        self.tier_for_backend(ctx.backend_id),
-                    );
-                }
-                Ok(bytes)
+                .await
             }
             (true, _) => {
                 streaming::stream_multiline_response(
@@ -475,12 +443,8 @@ impl ClientSession {
                 .await
             }
             (false, CacheAction::TrackStat) => {
-                // Single-line: backend already has complete response in first_chunk,
-                // so any write failure is a client-side error (backend is always clean here).
-                client_write
-                    .write_all(params.first_chunk)
-                    .await
-                    .map_err(classify_buffered_response_write_err)?;
+                self.write_single_line_response(client_write, params.first_chunk)
+                    .await?;
                 self.maybe_cache_upsert_buffer(
                     params.msg_id,
                     crate::cache::CacheIngestResponse::from(b"223\r\n".as_slice()),
@@ -489,15 +453,81 @@ impl ClientSession {
                 Ok(params.first_chunk.len() as u64)
             }
             (false, _) => {
-                // Single-line, no caching.
-                // Backend is clean regardless of outcome — response was fully read.
-                client_write
-                    .write_all(params.first_chunk)
+                self.write_single_line_response(client_write, params.first_chunk)
                     .await
-                    .map_err(classify_buffered_response_write_err)?;
-                Ok(params.first_chunk.len() as u64)
             }
         }
+    }
+
+    async fn buffer_and_cache_multiline_response(
+        &self,
+        pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        ctx: &streaming::StreamContext<'_>,
+        params: ResponseStreamParams<'_>,
+    ) -> Result<u64, StreamingError> {
+        let captured =
+            streaming::buffer_multiline_response(pooled_conn, params.first_chunk, ctx).await?;
+        captured
+            .write_all_to(client_write)
+            .await
+            .map_err(classify_buffered_response_write_err)?;
+        if let Some(msg_id_ref) = params.msg_id {
+            debug!(
+                "Client {} caching full article for {} ({} bytes captured)",
+                self.client_addr,
+                msg_id_ref,
+                captured.len()
+            );
+        }
+        let captured_len = captured.len();
+        self.maybe_cache_upsert_buffer(params.msg_id, captured.into(), ctx.backend_id);
+        Ok(captured_len as u64)
+    }
+
+    async fn stream_multiline_with_availability_tracking(
+        &self,
+        pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        ctx: &streaming::StreamContext<'_>,
+        params: ResponseStreamParams<'_>,
+    ) -> Result<u64, StreamingError> {
+        // Availability-only mode should not buffer the article body.
+        // Keep first-byte latency and memory bounded by streaming directly,
+        // then cache only typed availability metadata after the terminator is seen.
+        let bytes = streaming::stream_multiline_response(
+            &mut **pooled_conn,
+            client_write,
+            params.first_chunk,
+            ctx,
+        )
+        .await?;
+        if let Some(msg_id) = params.msg_id
+            && !params
+                .request
+                .cache_records_backend_has_article(ctx.backend_id)
+        {
+            self.spawn_cache_upsert_availability(
+                msg_id,
+                params.status_code,
+                ctx.backend_id,
+                self.tier_for_backend(ctx.backend_id),
+            );
+        }
+        Ok(bytes)
+    }
+
+    async fn write_single_line_response(
+        &self,
+        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        response: &[u8],
+    ) -> Result<u64, StreamingError> {
+        // Backend is already clean here because the full single-line response was read up front.
+        client_write
+            .write_all(response)
+            .await
+            .map_err(classify_buffered_response_write_err)?;
+        Ok(response.len() as u64)
     }
 
     /// Handle backend error (metrics and cleanup)

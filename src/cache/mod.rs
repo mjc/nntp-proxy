@@ -147,7 +147,7 @@ mod tests {
             crate::pool::BufferPool::new(crate::types::BufferSize::try_new(1024).unwrap(), 1)
                 .with_capture_pool(8, 4);
 
-        let mut pooled = pool.acquire().await;
+        let mut pooled = pool.acquire();
         pooled.copy_from_slice(bytes);
 
         let mut chunked = crate::pool::ChunkedResponse::default();
@@ -172,7 +172,7 @@ mod tests {
             crate::pool::BufferPool::new(crate::types::BufferSize::try_new(1024).unwrap(), 1)
                 .with_capture_pool(8, 4);
 
-        let mut pooled = pool.acquire().await;
+        let mut pooled = pool.acquire();
         pooled.copy_from_slice(bytes);
 
         let mut chunked = crate::pool::ChunkedResponse::default();
@@ -548,9 +548,8 @@ impl UnifiedCache {
     /// Ensures all async maintenance tasks complete for deterministic testing.
     pub async fn sync(&self) {
         match self {
-            Self::Availability(_) => {}
+            Self::Availability(_) | Self::Hybrid(_) => {}
             Self::Memory(cache) => cache.sync().await,
-            Self::Hybrid(_) => {} // foyer handles this differently
         }
     }
 

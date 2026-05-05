@@ -120,9 +120,7 @@ impl ClientSession {
 
         // Phase 1: Write all commands, then flush
         for i in 0..batch.len() {
-            if let Err(e) =
-                crate::session::backend::write_request(&mut **conn, batch.context(i)).await
-            {
+            if let Err(e) = batch.context(i).write_wire_to(&mut **conn).await {
                 warn!(
                     client = %self.client_addr,
                     backend = ?backend_id,
@@ -153,9 +151,9 @@ impl ClientSession {
         // Phase 2: Read and stream responses in order.
         // Buffer acquired once, reused across all responses.
         // Scratch buffers are needed only while backend responses are being read.
-        let mut buffer = self.buffer_pool.acquire().await;
-        let mut leftover = self.buffer_pool.acquire().await;
-        let mut chunk_data = self.buffer_pool.acquire().await;
+        let mut buffer = self.buffer_pool.acquire();
+        let mut leftover = self.buffer_pool.acquire();
+        let mut chunk_data = self.buffer_pool.acquire();
         debug!(
             client = %self.client_addr,
             backend = ?backend_id,
@@ -714,7 +712,9 @@ impl ClientSession {
                         {
                             completed
                                 .context
-                                .write_response_payload_to(io.client_write)
+                                .response_payload()
+                                .expect("completed request context carries response payload")
+                                .write_all_to(io.client_write)
                                 .await
                                 .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                             let response = completed
@@ -739,11 +739,11 @@ impl ClientSession {
                                 "Client {} pipeline got 430 from backend {:?}, falling through to retry loop",
                                 self.client_addr, completed_backend_id
                             );
-                            availability
-                                .get_or_insert_default()
-                                .record_missing(completed_backend_id);
+                            self.handle_430_availability(
+                                completed_backend_id,
+                                availability.get_or_insert_default(),
+                            );
                             self.metrics.record_pipeline_complete();
-                            self.metrics.record_error_4xx(completed_backend_id);
                         }
                         Ok(Err(e)) => {
                             debug!(
@@ -785,7 +785,7 @@ impl ClientSession {
             request.verb()
         );
 
-        let mut buffer = self.buffer_pool.acquire().await;
+        let mut buffer = self.buffer_pool.acquire();
         let mut availability = availability.unwrap_or_default();
         debug!(
             "Client {} availability routing: missing_bits={:08b}, backend_count={}",

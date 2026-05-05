@@ -129,7 +129,7 @@ async fn execute_pipeline_batch(
 
     // Phase 1: Write all commands
     for (i, req) in batch.iter().enumerate() {
-        if let Err(e) = crate::session::backend::write_request(conn, &req.context).await {
+        if let Err(e) = req.context.write_wire_to(conn).await {
             warn!(
                 "Pipeline worker backend {:?}: write failed at command {}/{}: {}",
                 backend_id,
@@ -162,7 +162,7 @@ async fn execute_pipeline_batch(
     }
 
     // Phase 2: Read responses in order (with shared buffer + connection-stashed leftovers)
-    let mut buffer = buffer_pool.acquire().await;
+    let mut buffer = buffer_pool.acquire();
     // result_buf is passed in as a parameter (hoisted to worker loop)
 
     batch.reverse();
@@ -437,7 +437,7 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_response_for_request_single_line() {
         let pool = BufferPool::for_tests();
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
         let mut conn = mock_backend_conn(b"430 No such article\r\n").await;
@@ -460,7 +460,7 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_response_for_request_single_line_split_after_status_code() {
         let pool = BufferPool::for_tests();
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
         let mut conn =
@@ -484,7 +484,7 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_response_for_request_multiline() {
         let pool = BufferPool::for_tests();
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
         let response = b"220 0 <msg@id> article\r\nSubject: test\r\n\r\nBody line\r\n.\r\n";
@@ -508,7 +508,7 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_response_for_request_multiline_across_chunks() {
         let pool = BufferPool::for_tests();
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
         // Split the terminator \r\n.\r\n across two chunks
@@ -538,7 +538,7 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_response_for_request_with_leftover() {
         let pool = BufferPool::for_tests();
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
         // Two responses packed together
@@ -582,7 +582,7 @@ mod tests {
     async fn test_buffer_response_for_request_multiline_terminal_chunk_stashes_leftover() {
         let pool = BufferPool::new(crate::types::BufferSize::try_new(32).unwrap(), 4)
             .with_capture_pool(1024, 1);
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
         let first =
@@ -621,7 +621,7 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_response_for_request_uses_request_context_for_same_status_framing() {
         let pool = BufferPool::for_tests();
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
         let packed = b"211 3 10 12 group.name\r\n211 3 10 12 group.name\r\n10\r\n11\r\n12\r\n.\r\n";
@@ -659,7 +659,7 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_response_for_request_eof_mid_stream() {
         let pool = BufferPool::for_tests();
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
         // Multiline response without terminator — server disconnects
@@ -684,7 +684,7 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_response_for_request_invalid_status() {
         let pool = BufferPool::for_tests();
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
         let mut conn = mock_backend_conn(b"garbage data here\r\n").await;
@@ -703,7 +703,7 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_response_for_request_short_leftover_triggers_h5() {
         let pool = BufferPool::for_tests();
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
         // Backend will provide the rest of the response
@@ -728,7 +728,7 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_response_for_request_empty_connection() {
         let pool = BufferPool::for_tests();
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
         // Server immediately closes
@@ -1208,7 +1208,7 @@ mod tests {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async {
                 let pool = BufferPool::for_tests();
-                let mut buffer = pool.acquire().await;
+                let mut buffer = pool.acquire();
                 let mut result_buf = crate::pool::ChunkedResponse::default();
 
                 let responses: Vec<Vec<u8>> = codes
@@ -1311,7 +1311,7 @@ mod tests {
         use crate::constants::buffer::MAX_LEFTOVER_BYTES;
 
         let pool = BufferPool::for_tests();
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
         // Create a multiline response that accumulates in result_buf across chunks,
@@ -1369,7 +1369,7 @@ mod tests {
         use crate::constants::buffer::MAX_LEFTOVER_BYTES;
 
         let pool = BufferPool::for_tests();
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
         // Create a response where leftover is within bounds (< MAX_LEFTOVER_BYTES)

@@ -80,11 +80,11 @@ impl NntpClient {
     /// Returns any connection, write, or backend-response error encountered while
     /// fetching the BODY response.
     #[inline]
-    pub async fn fetch_body(
+    pub fn fetch_body(
         &self,
         message_id: &crate::types::MessageId<'_>,
-    ) -> Result<PooledBuffer> {
-        self.fetch_response(&body_request(message_id)).await
+    ) -> impl std::future::Future<Output = Result<PooledBuffer>> + '_ {
+        self.fetch_response(body_request(message_id))
     }
 
     /// Fetch article headers (HEAD command)
@@ -99,11 +99,11 @@ impl NntpClient {
     /// Returns any connection, write, or backend-response error encountered while
     /// fetching the HEAD response.
     #[inline]
-    pub async fn fetch_head(
+    pub fn fetch_head(
         &self,
         message_id: &crate::types::MessageId<'_>,
-    ) -> Result<PooledBuffer> {
-        self.fetch_response(&head_request(message_id)).await
+    ) -> impl std::future::Future<Output = Result<PooledBuffer>> + '_ {
+        self.fetch_response(head_request(message_id))
     }
 
     /// Fetch full article (ARTICLE command)
@@ -118,11 +118,11 @@ impl NntpClient {
     /// Returns any connection, write, or backend-response error encountered while
     /// fetching the ARTICLE response.
     #[inline]
-    pub async fn fetch_article(
+    pub fn fetch_article(
         &self,
         message_id: &crate::types::MessageId<'_>,
-    ) -> Result<PooledBuffer> {
-        self.fetch_response(&article_request(message_id)).await
+    ) -> impl std::future::Future<Output = Result<PooledBuffer>> + '_ {
+        self.fetch_response(article_request(message_id))
     }
 
     /// Check if article exists (STAT command)
@@ -138,8 +138,12 @@ impl NntpClient {
     /// malformed or unexpected backend status codes.
     pub async fn stat(&self, message_id: &crate::types::MessageId<'_>) -> Result<bool> {
         let request = stat_request(message_id);
-        let mut conn = self.get_connection().await?;
-        let mut buffer = self.buffer_pool.acquire().await;
+        let mut conn = self
+            .conn_pool
+            .get_pooled_connection()
+            .await
+            .context("Failed to get connection from pool")?;
+        let mut buffer = self.buffer_pool.acquire();
 
         let response = send_request(&mut *conn, &request, &mut buffer).await?;
 
@@ -158,25 +162,20 @@ impl NntpClient {
             })
     }
 
-    /// Get a connection from the pool
-    #[inline]
-    async fn get_connection(&self) -> Result<Object<TcpManager>> {
-        self.conn_pool
-            .get_pooled_connection()
-            .await
-            .context("Failed to get connection from pool")
-    }
-
     /// Internal: fetch response into `PooledBuffer`
     ///
     /// # Errors
     /// Returns any connection, write, read, or backend-status validation error
     /// encountered while fetching the NNTP response.
-    async fn fetch_response(&self, request: &RequestContext) -> Result<PooledBuffer> {
-        let mut conn = self.get_connection().await?;
-        let mut io_buffer = self.buffer_pool.acquire().await;
+    async fn fetch_response(&self, request: RequestContext) -> Result<PooledBuffer> {
+        let mut conn = self
+            .conn_pool
+            .get_pooled_connection()
+            .await
+            .context("Failed to get connection from pool")?;
+        let mut io_buffer = self.buffer_pool.acquire();
 
-        let response = send_request(&mut *conn, request, &mut io_buffer).await?;
+        let response = send_request(&mut *conn, &request, &mut io_buffer).await?;
 
         // Validate response - early return on errors
         Self::validate_response(&response)?;
@@ -185,24 +184,31 @@ impl NntpClient {
             .status_code()
             .expect("validate_response returned Ok with parsed status");
         if request.expects_multiline_response(status_code) {
-            // Use a capture buffer as the accumulator: pooled, can grow beyond io_buffer
-            // capacity without panicking, returned to pool on drop.
-            let mut capture = self.buffer_pool.acquire_capture().await;
-            if let Err(err) = Self::drain_multiline_into(
-                &mut conn,
-                &mut io_buffer,
-                &mut capture,
-                response.bytes_read,
-            )
-            .await
-            {
-                self.conn_pool.remove_with_cooldown(conn);
-                return Err(err);
-            }
-            Ok(capture)
-        } else {
-            Ok(io_buffer)
+            return self
+                .fetch_multiline_response(conn, io_buffer, response.bytes_read)
+                .await;
         }
+
+        Ok(io_buffer)
+    }
+
+    async fn fetch_multiline_response(
+        &self,
+        mut conn: Object<TcpManager>,
+        mut io_buffer: PooledBuffer,
+        first_chunk_size: usize,
+    ) -> Result<PooledBuffer> {
+        // Use a capture buffer as the accumulator: pooled, can grow beyond io_buffer
+        // capacity without panicking, returned to pool on drop.
+        let mut capture = self.buffer_pool.acquire_capture();
+        if let Err(err) =
+            Self::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, first_chunk_size)
+                .await
+        {
+            self.conn_pool.remove_with_cooldown(conn);
+            return Err(err);
+        }
+        Ok(capture)
     }
 
     /// Stream remaining multiline response data into `capture`.
@@ -304,6 +310,47 @@ mod tests {
         assert!(NntpClient::parse_stat_response(StatusCode::parse(b"500")).is_err());
         assert!(NntpClient::parse_stat_response(StatusCode::parse(b"200")).is_err());
         assert!(NntpClient::parse_stat_response(StatusCode::parse(b"400")).is_err());
+    }
+
+    async fn spawn_fetch_test_server(
+        expected_command: &'static str,
+        response: &'static [u8],
+    ) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let _ = stream.write_all(b"200 mock\r\n").await;
+                        let mut cmd_buf = [0u8; 1024];
+                        loop {
+                            let Ok(n) = stream.read(&mut cmd_buf).await else {
+                                return;
+                            };
+                            if n == 0 {
+                                return;
+                            }
+
+                            let command = std::str::from_utf8(&cmd_buf[..n]).unwrap();
+                            if command.starts_with(expected_command) {
+                                let _ = stream.write_all(response).await;
+                                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                                return;
+                            }
+
+                            let _ = stream.write_all(b"200 OK\r\n").await;
+                        }
+                    });
+                }
+            }
+        });
+
+        addr
     }
 
     /// Spawn a minimal NNTP server that sends a greeting, then waits for
@@ -419,6 +466,19 @@ mod tests {
             .unwrap()
     }
 
+    fn make_test_client(addr: std::net::SocketAddr) -> NntpClient {
+        use crate::pool::BufferPool;
+        use crate::types::BufferSize;
+
+        let provider = DeadpoolConnectionProvider::builder(addr.ip().to_string(), addr.port())
+            .name("test")
+            .max_connections(2)
+            .build()
+            .unwrap();
+        let buffer_pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 2);
+        NntpClient::new(provider, buffer_pool)
+    }
+
     /// Verify `drain_multiline_into` captures the complete response when it all
     /// arrives in the first pre-read chunk (`first_chunk_size` == article length).
     #[tokio::test]
@@ -435,8 +495,8 @@ mod tests {
         // Signal server to send article data now that the greeting is consumed
         notify.notify_one();
 
-        let mut io_buffer = buffer_pool.acquire().await;
-        let mut capture = buffer_pool.acquire_capture().await;
+        let mut io_buffer = buffer_pool.acquire();
+        let mut capture = buffer_pool.acquire_capture();
 
         // Simulate send_request pre-reading the full first response chunk
         let first_chunk_size = io_buffer.read_from(&mut *conn).await.unwrap();
@@ -470,8 +530,8 @@ mod tests {
         let mut conn = pool.get().await.unwrap();
         notify.notify_one();
 
-        let mut io_buffer = buffer_pool.acquire().await;
-        let mut capture = buffer_pool.acquire_capture().await;
+        let mut io_buffer = buffer_pool.acquire();
+        let mut capture = buffer_pool.acquire_capture();
 
         // first_chunk_size = 0: no pre-loaded data, all bytes arrive via the loop
         NntpClient::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, 0)
@@ -494,8 +554,8 @@ mod tests {
         let mut conn = pool.get().await.unwrap();
         notify.notify_one();
 
-        let mut io_buffer = buffer_pool.acquire().await;
-        let mut capture = buffer_pool.acquire_capture().await;
+        let mut io_buffer = buffer_pool.acquire();
+        let mut capture = buffer_pool.acquire_capture();
 
         let err = NntpClient::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, 0)
             .await
@@ -523,8 +583,8 @@ mod tests {
         let mut conn = pool.get().await.unwrap();
         notify.notify_one();
 
-        let mut io_buffer = buffer_pool.acquire().await;
-        let mut capture = buffer_pool.acquire_capture().await;
+        let mut io_buffer = buffer_pool.acquire();
+        let mut capture = buffer_pool.acquire_capture();
         let first_chunk_size = io_buffer.read_from(&mut *conn).await.unwrap();
 
         NntpClient::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, first_chunk_size)
@@ -541,5 +601,29 @@ mod tests {
             !conn.has_leftover(),
             "stashed bytes should be consumed first"
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_head_reads_complete_multiline_response() {
+        let response = b"221 0 <test@example.com>\r\nSubject: test\r\nFrom: tester\r\n\r\n.\r\n";
+        let addr = spawn_fetch_test_server("HEAD <test@example.com>", response).await;
+        let client = make_test_client(addr);
+        let msg_id = crate::types::MessageId::new("<test@example.com>".to_string()).unwrap();
+
+        let buffer = client.fetch_head(&msg_id).await.unwrap();
+
+        assert_eq!(&buffer[..], response);
+    }
+
+    #[tokio::test]
+    async fn fetch_body_reads_complete_multiline_response() {
+        let response = b"222 0 <test@example.com>\r\nhello world\r\n.\r\n";
+        let addr = spawn_fetch_test_server("BODY <test@example.com>", response).await;
+        let client = make_test_client(addr);
+        let msg_id = crate::types::MessageId::new("<test@example.com>".to_string()).unwrap();
+
+        let buffer = client.fetch_body(&msg_id).await.unwrap();
+
+        assert_eq!(&buffer[..], response);
     }
 }

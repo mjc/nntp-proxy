@@ -95,7 +95,7 @@ impl ClientSession {
 
         loop {
             line.clear();
-            let mut buffer = self.buffer_pool.acquire().await;
+            let mut buffer = self.buffer_pool.acquire();
 
             // Periodic metrics flush
             if state.check_and_maybe_flush_metrics() {

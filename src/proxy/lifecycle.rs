@@ -202,7 +202,7 @@ impl NntpProxy {
         let server_idx = backend_id.as_index();
 
         self.log_routing_selection(client_addr, backend_id, &self.servers[server_idx]);
-        self.send_greeting(client_stream, client_addr).await?;
+        crate::protocol::send_proxy_greeting(client_stream, client_addr).await?;
         self.log_pool_status(server_idx);
         self.apply_tcp_optimizations(client_stream);
 
@@ -216,7 +216,7 @@ impl NntpProxy {
         client_addr: ClientAddress,
     ) -> Result<()> {
         self.record_connection_opened();
-        self.send_greeting(client_stream, client_addr).await?;
+        crate::protocol::send_proxy_greeting(client_stream, client_addr).await?;
         self.apply_tcp_optimizations(client_stream);
         Ok(())
     }
@@ -235,16 +235,6 @@ impl NntpProxy {
     #[inline]
     pub(super) fn generate_session_id(session: &ClientSession) -> String {
         crate::formatting::short_id(session.client_id().as_uuid())
-    }
-
-    /// Send greeting to client
-    #[inline]
-    pub(super) async fn send_greeting(
-        &self,
-        client_stream: &mut TcpStream,
-        client_addr: ClientAddress,
-    ) -> Result<()> {
-        crate::protocol::send_proxy_greeting(client_stream, client_addr).await
     }
 
     /// Apply TCP optimizations to client socket

@@ -24,7 +24,7 @@ use crate::auth::AuthHandler;
 use crate::cache::UnifiedCache;
 use crate::config::{Memory, RoutingMode, Server};
 use crate::metrics::{ConnectionStatsAggregator, MetricsCollector};
-use crate::pool::{BufferPool, DeadpoolConnectionProvider, prewarm_pools};
+use crate::pool::{BufferPool, DeadpoolConnectionProvider};
 use crate::router;
 
 #[derive(Debug, Clone)]
@@ -139,16 +139,6 @@ impl NntpProxy {
         NntpProxyBuilder::new(config)
     }
 
-    /// Prewarm all connection pools before accepting clients
-    /// Creates all connections concurrently and returns when ready
-    ///
-    /// # Errors
-    /// Returns any connection-establishment or backend-authentication error
-    /// encountered while prewarming the backend pools.
-    pub async fn prewarm_connections(&self) -> Result<()> {
-        prewarm_pools(&self.connection_providers, &self.servers).await
-    }
-
     /// Gracefully shutdown all connection pools
     pub async fn graceful_shutdown(&self) {
         info!("Initiating graceful shutdown...");
@@ -177,6 +167,17 @@ impl NntpProxy {
         }
 
         info!("All connection pools have been shut down gracefully");
+    }
+
+    /// Establish the configured pooled backend connections up front.
+    ///
+    /// This keeps the provider/server index alignment invariant inside
+    /// `NntpProxy` instead of spreading it to callers.
+    ///
+    /// # Errors
+    /// Returns any backend connection or handshake error from pool prewarming.
+    pub async fn prewarm_connections(&self) -> Result<()> {
+        crate::pool::prewarm_pools(&self.connection_providers, &self.servers).await
     }
 
     /// Get the list of servers

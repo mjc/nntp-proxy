@@ -18,7 +18,7 @@ use tracing::{debug, info};
 ///
 /// ## Usage
 /// ```ignore
-/// let mut buffer = pool.acquire().await;
+/// let mut buffer = pool.acquire();
 /// let n = buffer.read_from(&mut stream).await?;  // Automatic tracking
 /// process(&*buffer);  // Deref returns only &buffer[..n]
 /// ```
@@ -648,8 +648,8 @@ impl BufferPool {
         }
     }
 
-    pub async fn acquire(&self) -> PooledBuffer {
-        std::future::ready(self.acquire_now()).await
+    pub fn acquire(&self) -> PooledBuffer {
+        self.acquire_now()
     }
 
     /// Get a capture buffer from the capture pool
@@ -697,8 +697,8 @@ impl BufferPool {
         }
     }
 
-    pub async fn acquire_capture(&self) -> PooledBuffer {
-        std::future::ready(self.acquire_capture_now()).await
+    pub fn acquire_capture(&self) -> PooledBuffer {
+        self.acquire_capture_now()
     }
 }
 
@@ -712,7 +712,7 @@ mod tests {
         let pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 10);
 
         // Pool should pre-allocate buffers
-        let buffer1 = pool.acquire().await;
+        let buffer1 = pool.acquire();
         assert_eq!(buffer1.capacity(), 8192);
         assert_eq!(buffer1.initialized(), 0); // No bytes initialized yet
         // Buffer automatically returned on drop
@@ -723,13 +723,13 @@ mod tests {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
 
         let capacity = {
-            let buffer = pool.acquire().await;
+            let buffer = pool.acquire();
             assert_eq!(buffer.initialized(), 0);
             assert_eq!(buffer.len(), 0);
             buffer.capacity()
         };
 
-        let buffer = pool.acquire().await;
+        let buffer = pool.acquire();
         assert_eq!(buffer.initialized(), 0);
         assert_eq!(buffer.len(), 0);
         assert_eq!(buffer.capacity(), capacity);
@@ -738,7 +738,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_from_sets_initialized_without_reducing_capacity() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         let capacity = buffer.capacity();
         let (mut writer, mut reader) = tokio::io::duplex(64);
 
@@ -755,7 +755,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_from_is_limited_to_fixed_writable_region() {
         let pool = BufferPool::new(BufferSize::try_new(8).unwrap(), 1);
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         assert_eq!(buffer.capacity(), 4096);
 
         let (mut writer, mut reader) = tokio::io::duplex(64);
@@ -774,7 +774,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_more_appends_after_initialized_bytes() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         buffer.copy_from_slice(b"22");
 
         let (mut writer, mut reader) = tokio::io::duplex(64);
@@ -790,7 +790,7 @@ mod tests {
     #[tokio::test]
     async fn test_read_more_is_limited_to_remaining_fixed_writable_region() {
         let pool = BufferPool::new(BufferSize::try_new(8).unwrap(), 1);
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         buffer.copy_from_slice(b"22");
 
         let (mut writer, mut reader) = tokio::io::duplex(64);
@@ -806,7 +806,7 @@ mod tests {
     #[tokio::test]
     async fn test_copy_from_slice_overwrites_and_allows_up_to_capacity() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         let capacity = buffer.capacity();
 
         buffer.copy_from_slice(b"previous bytes");
@@ -823,7 +823,7 @@ mod tests {
     #[should_panic(expected = "data exceeds buffer capacity")]
     async fn test_copy_from_slice_rejects_larger_than_capacity() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         let too_large = vec![b'X'; buffer.capacity() + 1];
 
         buffer.copy_from_slice(&too_large);
@@ -832,7 +832,7 @@ mod tests {
     #[tokio::test]
     async fn test_clear_and_truncate_only_change_initialized_length() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
         let capacity = buffer.capacity();
 
         buffer.copy_from_slice(b"abcdef");
@@ -852,24 +852,24 @@ mod tests {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 1);
 
         let normal_capacity = {
-            let mut buffer = pool.acquire().await;
+            let mut buffer = pool.acquire();
             let capacity = buffer.capacity();
             buffer.extend_from_slice(&vec![b'N'; capacity + 1]);
             assert!(buffer.capacity() > capacity);
             capacity
         };
 
-        let buffer = pool.acquire().await;
+        let buffer = pool.acquire();
         assert_eq!(buffer.capacity(), normal_capacity);
         drop(buffer);
 
         {
-            let mut capture = pool.acquire_capture().await;
+            let mut capture = pool.acquire_capture();
             capture.extend_from_slice(&[b'C'; 9]);
             assert!(capture.capacity() > 8);
         }
 
-        let capture = pool.acquire_capture().await;
+        let capture = pool.acquire_capture();
         assert_eq!(capture.capacity(), 8);
     }
 
@@ -878,7 +878,7 @@ mod tests {
         let pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 5);
 
         // Get a buffer
-        let buffer = pool.acquire().await;
+        let buffer = pool.acquire();
         assert_eq!(buffer.capacity(), 4096);
         assert_eq!(buffer.initialized(), 0);
 
@@ -888,7 +888,7 @@ mod tests {
         drop(buffer);
 
         // Get it again - should be from pool
-        let buffer2 = pool.acquire().await;
+        let buffer2 = pool.acquire();
         assert_eq!(buffer2.capacity(), 4096);
     }
 
@@ -897,11 +897,11 @@ mod tests {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 2);
 
         // Get all pre-allocated buffers
-        let buf1 = pool.acquire().await;
-        let buf2 = pool.acquire().await;
+        let buf1 = pool.acquire();
+        let buf2 = pool.acquire();
 
         // Pool is exhausted, should create new buffer
-        let buf3 = pool.acquire().await;
+        let buf3 = pool.acquire();
         assert_eq!(buf3.capacity(), 4096);
 
         // Drop buffers (automatically returned)
@@ -915,12 +915,12 @@ mod tests {
         let pool =
             BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8192, 1);
 
-        let mut capture = pool.acquire_capture().await;
+        let mut capture = pool.acquire_capture();
         capture.extend_from_slice(&vec![b'X'; 8193]);
         assert!(capture.capacity() > 8192);
         drop(capture);
 
-        let capture2 = pool.acquire_capture().await;
+        let capture2 = pool.acquire_capture();
         assert_eq!(capture2.capacity(), 8192);
     }
 
@@ -962,7 +962,7 @@ mod tests {
         for _ in 0..20 {
             let pool_clone = pool.clone();
             let handle = tokio::spawn(async move {
-                let buffer = pool_clone.acquire().await;
+                let buffer = pool_clone.acquire();
                 assert_eq!(buffer.capacity(), 4096);
                 // Simulate some work
                 tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
@@ -979,7 +979,7 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_alignment() {
         let pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 1);
-        let buffer = pool.acquire().await;
+        let buffer = pool.acquire();
 
         // Buffer capacity should be aligned to page boundaries (4KB)
         assert!(buffer.capacity() >= 8192);
@@ -991,7 +991,7 @@ mod tests {
     async fn test_buffer_clear_and_resize() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 2);
 
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
 
         // Write data using copy_from_slice
         let data = vec![42u8; 101];
@@ -1002,7 +1002,7 @@ mod tests {
         drop(buffer);
 
         // Get it again - may contain old data (performance optimization)
-        let buffer2 = pool.acquire().await;
+        let buffer2 = pool.acquire();
         assert_eq!(buffer2.capacity(), 4096);
         // Note: buffer may contain previous bytes outside the initialized range.
     }
@@ -1012,12 +1012,12 @@ mod tests {
         let pool = BufferPool::new(BufferSize::try_new(512).unwrap(), 3);
 
         // Get all buffers
-        let buf1 = pool.acquire().await;
-        let buf2 = pool.acquire().await;
-        let buf3 = pool.acquire().await;
+        let buf1 = pool.acquire();
+        let buf2 = pool.acquire();
+        let buf3 = pool.acquire();
 
         // Get one more (should create new)
-        let buf4 = pool.acquire().await;
+        let buf4 = pool.acquire();
 
         // Drop all buffers (automatically returned)
         drop(buf1);
@@ -1033,7 +1033,7 @@ mod tests {
     async fn test_buffer_wrong_size_not_returned() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 2);
 
-        let buffer = pool.acquire().await;
+        let buffer = pool.acquire();
         assert_eq!(buffer.capacity(), 4096);
 
         // PooledBuffer auto-returns on drop with correct size enforcement in Drop impl
@@ -1046,7 +1046,7 @@ mod tests {
 
         // Do multiple get/return cycles
         for i in 0u8..20 {
-            let mut buffer = pool.acquire().await;
+            let mut buffer = pool.acquire();
             assert_eq!(buffer.capacity(), 4096);
 
             // Write some data using copy_from_slice
@@ -1071,9 +1071,9 @@ mod tests {
         let medium_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 5);
         let large_pool = BufferPool::new(BufferSize::try_new(65536).unwrap(), 5);
 
-        let small_buf = small_pool.acquire().await;
-        let medium_buf = medium_pool.acquire().await;
-        let large_buf = large_pool.acquire().await;
+        let small_buf = small_pool.acquire();
+        let medium_buf = medium_pool.acquire();
+        let large_buf = large_pool.acquire();
 
         assert_eq!(small_buf.capacity(), 4096);
         assert_eq!(medium_buf.capacity(), 8192);
@@ -1093,7 +1093,7 @@ mod tests {
             let pool_clone = pool.clone();
             let handle = tokio::spawn(async move {
                 for _ in 0..10 {
-                    let buffer = pool_clone.acquire().await;
+                    let buffer = pool_clone.acquire();
                     assert_eq!(buffer.capacity(), 4096);
                 }
             });
@@ -1108,7 +1108,7 @@ mod tests {
     #[tokio::test]
     async fn test_pooled_buffer_deref() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 5);
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
 
         // Initially no initialized bytes
         assert_eq!(buffer.len(), 0);
@@ -1124,7 +1124,7 @@ mod tests {
     #[tokio::test]
     async fn test_pooled_buffer_as_ref() {
         let pool = BufferPool::new(BufferSize::try_new(512).unwrap(), 5);
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
 
         buffer.copy_from_slice(b"Test data");
 
@@ -1137,7 +1137,7 @@ mod tests {
     #[tokio::test]
     async fn test_copy_from_slice_updates_initialized() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 5);
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
 
         assert_eq!(buffer.initialized(), 0);
 
@@ -1152,7 +1152,7 @@ mod tests {
     #[should_panic(expected = "data exceeds buffer capacity")]
     async fn test_copy_from_slice_panic_on_overflow() {
         let pool = BufferPool::new(BufferSize::try_new(10).unwrap(), 5);
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
 
         let too_large = vec![0u8; buffer.capacity() + 1];
         buffer.copy_from_slice(&too_large); // Should panic
@@ -1168,7 +1168,7 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_initialized_tracking() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 5);
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
 
         // Test multiple writes update initialized correctly
         buffer.copy_from_slice(b"First");
@@ -1183,7 +1183,7 @@ mod tests {
     #[tokio::test]
     async fn test_buffer_capacity_vs_initialized() {
         let pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 5);
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
 
         // Capacity is full buffer size
         assert_eq!(buffer.capacity(), 8192);
@@ -1199,7 +1199,7 @@ mod tests {
     #[tokio::test]
     async fn test_empty_slice_copy() {
         let pool = BufferPool::new(BufferSize::try_new(512).unwrap(), 5);
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
 
         // Copying empty slice should work
         buffer.copy_from_slice(&[]);
@@ -1212,12 +1212,12 @@ mod tests {
         let pool = BufferPool::new(BufferSize::try_new(2048).unwrap(), 5);
 
         {
-            let mut buffer = pool.acquire().await;
+            let mut buffer = pool.acquire();
             buffer.copy_from_slice(b"test");
             assert_eq!(buffer.capacity(), 4096);
         } // Drop returns to pool
 
-        let buffer2 = pool.acquire().await;
+        let buffer2 = pool.acquire();
         // Should have same capacity when reused
         assert_eq!(buffer2.capacity(), 4096);
     }

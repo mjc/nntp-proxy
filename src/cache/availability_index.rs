@@ -565,7 +565,10 @@ impl AvailabilityIndex {
         entries.sort_by_key(|entry| entry.inserted_at);
 
         let now = ttl::now_millis();
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.reset();
         let mut evicted = 0usize;
         for entry in entries {
@@ -604,7 +607,10 @@ impl AvailabilityIndex {
 
         let now = ttl::now_millis();
         let snapshot = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.snapshot_entries(now)
         };
         if snapshot.evicted != 0 {
@@ -658,7 +664,10 @@ impl AvailabilityIndex {
             return 0;
         }
         let result = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let evicted = state.rotate_if_needed(ttl::now_millis());
             (state.occupied_slots() as u64, evicted)
         };
@@ -700,7 +709,10 @@ impl AvailabilityIndex {
         let (hash, tag) = hash_key(key.as_bytes());
         let now = ttl::now_millis();
         let lookup = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.blocks_per_generation == 0 {
                 LookupResult {
                     missing_bits: 0,
@@ -738,7 +750,10 @@ impl AvailabilityIndex {
 
         let (hash, tag) = hash_key(key.as_bytes());
         let outcome = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if state.blocks_per_generation == 0 {
                 StateInsertOutcome::default()
             } else {

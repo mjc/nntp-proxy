@@ -193,7 +193,7 @@ async fn drain_until_terminator<R>(
 where
     R: AsyncReadExt + Unpin,
 {
-    let mut chunk = ctx.buffer_pool.acquire().await;
+    let mut chunk = ctx.buffer_pool.acquire();
     let mut tail = TailBuffer::default();
     tail.update(initial_tail);
     loop {
@@ -416,7 +416,7 @@ pub(crate) async fn buffer_multiline_response(
 ) -> Result<crate::pool::ChunkedResponse, StreamingError> {
     use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
 
-    let mut io_buffer = ctx.buffer_pool.acquire().await;
+    let mut io_buffer = ctx.buffer_pool.acquire();
     let mut captured = crate::pool::ChunkedResponse::default();
     validate_response_prefix(first_chunk, "prefetched")?;
 
@@ -670,10 +670,7 @@ where
         pipelined = leftover_out.is_some(),
         "Multiline Phase 2: first chunk incomplete, streaming remaining chunks"
     );
-    let mut buffers = [
-        ctx.buffer_pool.acquire().await,
-        ctx.buffer_pool.acquire().await,
-    ];
+    let mut buffers = [ctx.buffer_pool.acquire(), ctx.buffer_pool.acquire()];
     let mut idx = 0usize;
 
     loop {
@@ -1030,7 +1027,7 @@ mod tests {
     async fn test_read_response_into_context_completes_request() {
         let response = b"223 0 <test@example>\r\n";
         let pool = test_helpers::make_pool();
-        let mut io_buffer = pool.acquire().await;
+        let mut io_buffer = pool.acquire();
         let mut captured = crate::pool::ChunkedResponse::default();
         let mut conn = test_helpers::mock_backend_conn(vec![response.to_vec()]).await;
         let backend_id = crate::types::BackendId::from_index(1);
@@ -1167,7 +1164,7 @@ mod tests {
         let mut reader = Cursor::new(b"" as &[u8]);
         let mut writer = Vec::new();
         let pool = test_helpers::make_pool();
-        let mut leftover = pool.acquire().await;
+        let mut leftover = pool.acquire();
         let ctx = test_helpers::make_ctx(&pool);
 
         let result = stream_multiline_response_pipelined(
@@ -1197,7 +1194,7 @@ mod tests {
         let mut reader = Cursor::new(second_read.as_slice());
         let mut writer = Vec::new();
         let pool = test_helpers::make_pool();
-        let mut leftover = pool.acquire().await;
+        let mut leftover = pool.acquire();
         let ctx = test_helpers::make_ctx(&pool);
 
         let result = stream_multiline_response_pipelined(
@@ -1230,7 +1227,7 @@ mod tests {
         let mut reader = Cursor::new(b"" as &[u8]);
         let mut writer = Vec::new();
         let pool = test_helpers::make_pool();
-        let mut leftover = pool.acquire().await;
+        let mut leftover = pool.acquire();
         let ctx = test_helpers::make_ctx(&pool);
 
         let result = stream_multiline_response_pipelined(
@@ -1263,7 +1260,7 @@ mod tests {
         let mut reader = Cursor::new(b"" as &[u8]);
         let mut writer = Vec::new();
         let pool = test_helpers::make_pool();
-        let mut leftover = pool.acquire().await;
+        let mut leftover = pool.acquire();
         let ctx = test_helpers::make_ctx(&pool);
 
         let result = stream_multiline_response_pipelined(

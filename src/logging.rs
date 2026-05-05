@@ -84,6 +84,7 @@ pub fn init_dual_logging(file_level: &str) {
 ///
 /// Headless mode logs to line-buffered stdout and `debug.log`.
 /// TUI mode logs to the in-memory TUI buffer and `debug.log`.
+#[must_use]
 pub fn init_logging(ui_mode: UiMode, file_level: &str) -> Option<crate::tui::LogBuffer> {
     match ui_mode {
         UiMode::Headless => {

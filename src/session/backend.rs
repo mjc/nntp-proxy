@@ -212,14 +212,6 @@ impl BackendFirstResponse {
     }
 }
 
-/// Write a typed request to a backend without building a temporary command buffer.
-pub async fn write_request<C>(conn: &mut C, request: &RequestContext) -> std::io::Result<()>
-where
-    C: tokio::io::AsyncWrite + Unpin,
-{
-    request.write_wire_to(conn).await
-}
-
 /// Send a typed request and read the first response chunk.
 pub async fn send_request<C>(
     conn: &mut C,
@@ -229,7 +221,7 @@ pub async fn send_request<C>(
 where
     C: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    write_request(conn, request).await?;
+    request.write_wire_to(conn).await?;
 
     let n = buffer.read_from(conn).await?;
     if n == 0 {
@@ -260,7 +252,7 @@ where
     use std::time::Instant;
 
     let start = Instant::now();
-    write_request(conn, request).await?;
+    request.write_wire_to(conn).await?;
     let after_send = Instant::now();
 
     let n = buffer.read_from(conn).await?;
@@ -357,7 +349,7 @@ mod tests {
         let mut stream = ChunkedStream::new(vec![b"20".to_vec(), b"0 OK\r\n".to_vec()]);
 
         let pool = crate::pool::BufferPool::for_tests();
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
 
         let request = RequestContext::from_verb_args(b"DATE", b"");
         let result = send_request(&mut stream, &request, &mut buffer).await;
@@ -375,7 +367,7 @@ mod tests {
         let mut stream = ChunkedStream::new(vec![b"111".to_vec(), b" 20260501173336\r\n".to_vec()]);
 
         let pool = crate::pool::BufferPool::for_tests();
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
 
         let request = RequestContext::from_verb_args(b"DATE", b"");
         let result = send_request(&mut stream, &request, &mut buffer).await;
@@ -398,7 +390,7 @@ mod tests {
         let mut stream = ChunkedStream::new(chunks);
 
         let pool = crate::pool::BufferPool::for_tests();
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
 
         let request = RequestContext::from_verb_args(b"GROUP", b"alt.test");
         let result = send_request(&mut stream, &request, &mut buffer).await;

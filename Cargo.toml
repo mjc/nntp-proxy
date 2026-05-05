@@ -36,7 +36,6 @@ crossbeam = { version = "0.8", features = ["alloc", "std"] }  # Lock-free data s
 tikv-jemallocator = "0.6"  # jemalloc allocator for reduced page allocation overhead
 nix = { version = "0.31", features = ["sched", "process"] }  # Low-level system calls for CPU pinning
 deadpool = "0.13"
-async-trait = "0.1.89"
 memchr = { version = "2.7", features = ["libc"] }  # Fast byte searching with system optimizations
 uuid = { version = "1.0", features = ["v4"] }  # Unique IDs for request tracking
 moka = { version = "0.12", features = ["future"], default-features = false }  # Async LRU cache, minimal features
