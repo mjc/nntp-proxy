@@ -4,7 +4,7 @@
 
 use crate::command::{CommandAction, CommandHandler, RejectResponse};
 use crate::protocol::{RequestContext, RequestKind, RequestRouteClass};
-use crate::session::state::DeferredStatefulAction;
+use crate::session::state::StatefulReadMode;
 use crate::session::{ClientSession, common};
 use crate::types::TransferMetrics;
 use anyhow::Result;
@@ -54,19 +54,13 @@ impl ClientSession {
     {
         match classify_authenticated_stateful_action(request, self.auth_handler.is_enabled()) {
             AuthenticatedStatefulAction::Forward => {
-                if state.has_deferred_actions() {
-                    let mut wire = Vec::with_capacity(request.request_wire_len().get());
-                    request.write_wire_to(&mut wire).await?;
-                    state.push_deferred_backend_request(request.kind(), wire);
-                } else {
-                    request.write_wire_to(backend_write).await?;
-                    state.add_client_to_backend(request.request_wire_len().get());
-                    state.mark_backend_request_sent(request.kind());
-                }
+                request.write_wire_to(backend_write).await?;
+                state.add_client_to_backend(request.request_wire_len().get());
+                state.mark_backend_request_sent(request.kind());
             }
             AuthenticatedStatefulAction::RejectAuthAlreadyAuthenticated => {
                 use crate::protocol::AUTH_ALREADY_AUTHENTICATED;
-                if state.has_pending_backend_replies() || state.has_deferred_actions() {
+                if state.has_pending_backend_replies() {
                     state.push_deferred_reply(AUTH_ALREADY_AUTHENTICATED.to_vec());
                 } else {
                     client_write.write_all(AUTH_ALREADY_AUTHENTICATED).await?;
@@ -76,7 +70,7 @@ impl ClientSession {
             }
             AuthenticatedStatefulAction::InterceptCapabilities => {
                 use crate::protocol::CAPABILITIES_WITHOUT_AUTHINFO;
-                if state.has_pending_backend_replies() || state.has_deferred_actions() {
+                if state.has_pending_backend_replies() {
                     state.push_deferred_reply(CAPABILITIES_WITHOUT_AUTHINFO.to_vec());
                 } else {
                     client_write
@@ -87,7 +81,7 @@ impl ClientSession {
                 }
             }
             AuthenticatedStatefulAction::Reject(response) => {
-                if state.has_pending_backend_replies() || state.has_deferred_actions() {
+                if state.has_pending_backend_replies() {
                     state.push_deferred_reply(response.as_bytes().to_vec());
                 } else {
                     client_write.write_all(response.as_bytes()).await?;
@@ -98,6 +92,41 @@ impl ClientSession {
         }
 
         Ok(())
+    }
+
+    async fn forward_stateful_backend_bytes<W, BR>(
+        &self,
+        client_write: &mut W,
+        backend_read: &mut BR,
+        state: &mut crate::session::state::SessionLoopState,
+    ) -> Result<bool>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        BR: tokio::io::AsyncRead + Unpin,
+    {
+        let mut buffer = self.buffer_pool.acquire();
+        match buffer.read_from(backend_read).await {
+            Ok(0) => Ok(false),
+            Ok(n) => {
+                client_write.write_all(&buffer[..n]).await?;
+                state.add_backend_to_client(n as u64);
+                state.observe_backend_bytes(&buffer[..n]);
+
+                if !state.has_pending_backend_replies() {
+                    let replies = state.take_deferred_replies();
+                    if !replies.is_empty() {
+                        for reply in replies {
+                            client_write.write_all(&reply).await?;
+                            state.add_backend_to_client(reply.len() as u64);
+                        }
+                        client_write.flush().await?;
+                    }
+                }
+
+                Ok(true)
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// Handle stateful session - acquire backend and proxy bidirectionally
@@ -182,11 +211,28 @@ impl ClientSession {
 
         loop {
             line.clear();
-            let mut buffer = self.buffer_pool.acquire();
 
             // Periodic metrics flush
             if state.check_and_maybe_flush_metrics() {
                 state.flush_byte_deltas(&self.metrics, backend_id, self.username());
+            }
+
+            if matches!(state.read_mode(), StatefulReadMode::DrainBackendReplies) {
+                match self
+                    .forward_stateful_backend_bytes(
+                        &mut client_write,
+                        &mut backend_read,
+                        &mut state,
+                    )
+                    .await
+                {
+                    Ok(true) => continue,
+                    Ok(false) => break,
+                    Err(e) => {
+                        warn!(client = %self.client_addr, error = %e, "Backend read error");
+                        break;
+                    }
+                }
             }
 
             tokio::select! {
@@ -250,41 +296,10 @@ impl ClientSession {
                 }
 
                 // Backend → Client
-                result = buffer.read_from(&mut backend_read) => {
+                result = self.forward_stateful_backend_bytes(&mut client_write, &mut backend_read, &mut state) => {
                     match result {
-                        Ok(0) => break, // Backend disconnected
-                        Ok(n) => {
-                            client_write.write_all(&buffer[..n]).await?;
-                            state.add_backend_to_client(n as u64);
-                            state.observe_backend_bytes(&buffer[..n]);
-
-                            if !state.has_pending_backend_replies() {
-                                let mut wrote_local_reply = false;
-                                while !state.has_pending_backend_replies() {
-                                    let Some(action) = state.pop_deferred_action() else {
-                                        break;
-                                    };
-
-                                    match action {
-                                        DeferredStatefulAction::LocalReply(reply) => {
-                                            client_write.write_all(&reply).await?;
-                                            state.add_backend_to_client(reply.len() as u64);
-                                            wrote_local_reply = true;
-                                        }
-                                        DeferredStatefulAction::BackendRequest { kind, wire } => {
-                                            backend_write.write_all(&wire).await?;
-                                            state.add_client_to_backend(wire.len());
-                                            state.mark_backend_request_sent(kind);
-                                            break;
-                                        }
-                                    }
-                                }
-
-                                if wrote_local_reply {
-                                    client_write.flush().await?;
-                                }
-                            }
-                        }
+                        Ok(true) => {}
+                        Ok(false) => break, // Backend disconnected
                         Err(e) => {
                             warn!(client = %self.client_addr, error = %e, "Backend read error");
                             break;

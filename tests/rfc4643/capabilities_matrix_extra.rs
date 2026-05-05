@@ -5,7 +5,7 @@
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
-use tokio::time::{Duration, sleep, timeout};
+use tokio::time::{Duration, timeout};
 
 use crate::test_helpers::{
     MockNntpServer, connect_and_read_greeting, create_test_config, create_test_config_with_auth,
@@ -77,14 +77,10 @@ async fn spawn_authenticated_stateful_caps_client() -> Result<tokio::net::TcpStr
                             b"111 20260505155900\r\n"
                         } else if cmd.starts_with("HELP") {
                             if stream
-                                .write_all(b"100 Help follows\r\nThis is help text\r\n")
+                                .write_all(b"100 Help follows\r\nThis is help text\r\n.\r\n")
                                 .await
                                 .is_err()
                             {
-                                return;
-                            }
-                            sleep(Duration::from_millis(25)).await;
-                            if stream.write_all(b".\r\n").await.is_err() {
                                 return;
                             }
                             continue;
