@@ -1,12 +1,12 @@
 //! TUI rendering and layout
 
-use crate::formatting::format_bytes;
+use crate::formatting::{format_bytes, format_count};
 use crate::tui::app::TuiApp;
 use crate::tui::constants::{chart, layout, styles, text};
 use crate::tui::helpers::{
-    build_chart_data, calculate_chart_bounds, connection_failure_color, create_sparkline,
-    error_count_color, error_rate_color, format_error_rate, format_summary_throughput,
-    format_throughput_label, health_indicator, load_percentage_color, pending_count_color,
+    build_chart_data, calculate_chart_bounds, create_sparkline, error_rate_color,
+    format_error_rate, format_summary_throughput, format_throughput_label, health_indicator,
+    load_percentage_color, magnitude_color,
 };
 use ratatui::{
     Frame,
@@ -28,6 +28,33 @@ const fn counter_as_f64(value: u64) -> f64 {
 const fn size_as_f64(value: usize) -> f64 {
     // Pool utilization is presented as a percentage in the UI, not used for control flow.
     value as f64
+}
+
+#[allow(clippy::cast_precision_loss)] // Utilization percentages are display-only values.
+fn buffer_utilization_percent(in_use: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        size_as_f64(in_use * 100) / size_as_f64(total)
+    }
+}
+
+const fn backend_error_count_color(errors_4xx: u64, errors_5xx: u64) -> Color {
+    if errors_5xx > 0 {
+        Color::Red
+    } else if errors_4xx > 0 {
+        Color::Yellow
+    } else {
+        styles::VALUE_NEUTRAL
+    }
+}
+
+const fn connection_failures_color(failures: u64) -> Color {
+    if failures > 0 {
+        Color::Red
+    } else {
+        styles::VALUE_NEUTRAL
+    }
 }
 
 // ============================================================================
@@ -123,9 +150,14 @@ fn render_title(f: &mut Frame, area: Rect, snapshot: &crate::metrics::MetricsSna
         "Uptime: ".fg(styles::LABEL),
         snapshot.format_uptime().fg(styles::VALUE_PRIMARY).bold(),
         "  |  Active: ".fg(styles::LABEL),
-        format!("{} connections", snapshot.active_connections).fg(styles::VALUE_SECONDARY),
+        format!(
+            "{} connections",
+            format_count(snapshot.active_connections as u64)
+        )
+        .fg(magnitude_color(snapshot.active_connections as u64)),
         "  |  Total: ".fg(styles::LABEL),
-        format!("{} connections", snapshot.total_connections).fg(styles::VALUE_NEUTRAL),
+        format!("{} connections", format_count(snapshot.total_connections))
+            .fg(magnitude_color(snapshot.total_connections)),
     ]);
 
     let title = Paragraph::new(vec![title_line, info_line])
@@ -215,30 +247,6 @@ fn create_app_summary(
         }
     }
 
-    /// Color for session count (highlight if active)
-    const fn session_color(count: usize) -> Color {
-        if count > 0 {
-            styles::VALUE_PRIMARY
-        } else {
-            styles::VALUE_NEUTRAL
-        }
-    }
-
-    /// Color for buffer pool utilization
-    const fn buffer_color(in_use: usize, total: usize) -> Color {
-        let percent = match (in_use * 100).checked_div(total) {
-            Some(v) => v,
-            None => 0,
-        };
-        if percent > 80 {
-            Color::Red
-        } else if percent > 60 {
-            Color::Yellow
-        } else {
-            styles::VALUE_INFO
-        }
-    }
-
     let mut lines = vec![
         Line::from(vec![
             "Uptime: ".fg(styles::LABEL),
@@ -246,7 +254,8 @@ fn create_app_summary(
         ]),
         Line::from(vec![
             "Stateful Sessions: ".fg(styles::LABEL),
-            format!("{}", snapshot.stateful_sessions).fg(session_color(snapshot.stateful_sessions)),
+            format_count(snapshot.stateful_sessions as u64)
+                .fg(magnitude_color(snapshot.stateful_sessions as u64)),
         ]),
         Line::from(vec![
             "CPU: ".fg(styles::LABEL),
@@ -266,7 +275,8 @@ fn create_app_summary(
             "Pipeline: ".fg(styles::LABEL),
             format!(
                 "{} batches (avg {:.1} cmds)",
-                snapshot.pipeline_batches, avg_batch
+                format_count(snapshot.pipeline_batches),
+                avg_batch
             )
             .fg(styles::VALUE_INFO),
         ]));
@@ -278,7 +288,8 @@ fn create_app_summary(
             "Mux Queue: ".fg(styles::LABEL),
             format!(
                 "{} queued, {} completed",
-                snapshot.pipeline_requests_queued, snapshot.pipeline_requests_completed
+                format_count(snapshot.pipeline_requests_queued),
+                format_count(snapshot.pipeline_requests_completed)
             )
             .fg(styles::VALUE_INFO),
         ]));
@@ -287,15 +298,16 @@ fn create_app_summary(
     // Add buffer stats in details mode if available
     if show_details && let Some(pool) = buffer_pool {
         let (_available, in_use, total) = pool.stats();
+        let utilization_percent = buffer_utilization_percent(in_use, total);
         lines.push(Line::from(vec![
             "Buffers: ".fg(styles::LABEL),
             format!(
                 "{}/{} ({:.0}%)",
-                in_use,
-                total,
-                size_as_f64(in_use * 100) / size_as_f64(total)
+                format_count(in_use as u64),
+                format_count(total as u64),
+                utilization_percent
             )
-            .fg(buffer_color(in_use, total)),
+            .fg(load_percentage_color(utilization_percent)),
         ]));
     }
 
@@ -306,28 +318,11 @@ fn create_app_summary(
 
 /// Create cache summary panel
 fn create_cache_summary(snapshot: &crate::metrics::MetricsSnapshot) -> Paragraph<'static> {
-    /// Color for cache entries (highlight if non-empty)
-    const fn entries_color(count: u64) -> Color {
-        if count > 0 {
-            styles::VALUE_INFO
-        } else {
-            styles::VALUE_NEUTRAL
-        }
-    }
-
     /// Color for hit rate (green if >50%, blue if >0%, gray otherwise)
     const fn hit_rate_color(rate: f64) -> Color {
         if rate > 50.0 {
             styles::VALUE_PRIMARY
         } else if rate > 0.0 {
-            styles::VALUE_INFO
-        } else {
-            styles::VALUE_NEUTRAL
-        }
-    }
-
-    const fn non_zero_color(value: u64) -> Color {
-        if value > 0 {
             styles::VALUE_INFO
         } else {
             styles::VALUE_NEUTRAL
@@ -349,20 +344,24 @@ fn create_cache_summary(snapshot: &crate::metrics::MetricsSnapshot) -> Paragraph
             ]),
             Line::from(vec![
                 "Disk Written: ".fg(styles::LABEL),
-                format_bytes(disk.bytes_written).fg(non_zero_color(disk.bytes_written)),
+                format_bytes(disk.bytes_written).fg(magnitude_color(disk.bytes_written)),
             ]),
             Line::from(vec![
                 "Disk Read: ".fg(styles::LABEL),
-                format_bytes(disk.bytes_read).fg(non_zero_color(disk.bytes_read)),
+                format_bytes(disk.bytes_read).fg(magnitude_color(disk.bytes_read)),
             ]),
             Line::from(vec![
                 "Disk Hits: ".fg(styles::LABEL),
-                format!("{} ({:.1}%)", disk.disk_hits, disk.disk_hit_rate)
-                    .fg(non_zero_color(disk.disk_hits)),
+                format!(
+                    "{} ({:.1}%)",
+                    format_count(disk.disk_hits),
+                    disk.disk_hit_rate
+                )
+                .fg(magnitude_color(disk.disk_hits)),
             ]),
             Line::from(vec![
                 "Write I/Os: ".fg(styles::LABEL),
-                format!("{}", disk.write_ios).fg(styles::VALUE_NEUTRAL),
+                format_count(disk.write_ios).fg(magnitude_color(disk.write_ios)),
             ]),
         ]
     } else {
@@ -370,7 +369,7 @@ fn create_cache_summary(snapshot: &crate::metrics::MetricsSnapshot) -> Paragraph
         vec![
             Line::from(vec![
                 "Entries: ".fg(styles::LABEL),
-                format!("{}", snapshot.cache_entries).fg(entries_color(snapshot.cache_entries)),
+                format_count(snapshot.cache_entries).fg(magnitude_color(snapshot.cache_entries)),
             ]),
             Line::from(vec![
                 "Size: ".fg(styles::LABEL),
@@ -455,7 +454,12 @@ fn backend_metrics_line(
 ) -> Line<'static> {
     Line::from(vec![
         "  Used/Max: ".fg(styles::LABEL),
-        format!("{active}/{max}").fg(styles::VALUE_SECONDARY),
+        format!(
+            "{}/{}",
+            format_count(active as u64),
+            format_count(max as u64)
+        )
+        .fg(magnitude_color(max as u64)),
         " | Cmd/s: ".fg(styles::LABEL),
         cmd_per_sec.fg(styles::VALUE_INFO),
         " | TTFB: ".fg(styles::LABEL),
@@ -479,7 +483,7 @@ fn backend_article_line(avg_size: String, count: u64) -> Line<'static> {
         "  Avg Article: ".fg(styles::LABEL),
         avg_size.fg(styles::VALUE_INFO),
         " | Articles: ".fg(styles::LABEL),
-        format!("{count}").fg(styles::VALUE_NEUTRAL),
+        format_count(count).fg(magnitude_color(count)),
     ])
 }
 
@@ -487,14 +491,19 @@ fn backend_article_line(avg_size: String, count: u64) -> Line<'static> {
 fn backend_error_line(
     errors_4xx: u64,
     errors_5xx: u64,
-    has_errors: bool,
+    _has_errors: bool,
     failures: u64,
 ) -> Line<'static> {
     Line::from(vec![
         "  Errors: ".fg(styles::LABEL),
-        format!("4xx:{errors_4xx} 5xx:{errors_5xx}").fg(error_count_color(has_errors)),
+        format!(
+            "4xx:{} 5xx:{}",
+            format_count(errors_4xx),
+            format_count(errors_5xx)
+        )
+        .fg(backend_error_count_color(errors_4xx, errors_5xx)),
         " | Conn Fails: ".fg(styles::LABEL),
-        format!("{failures}").fg(connection_failure_color(failures)),
+        format_count(failures).fg(connection_failures_color(failures)),
     ])
 }
 
@@ -502,7 +511,7 @@ fn backend_error_line(
 fn backend_details_line(pending: usize, load_ratio: Option<f64>, stateful: usize) -> Line<'static> {
     let mut spans: Vec<Span> = vec![
         "  Load: ".fg(styles::LABEL),
-        format!("{pending} in-flight").fg(pending_count_color(pending)),
+        format!("{} in-flight", format_count(pending as u64)).fg(magnitude_color(pending as u64)),
     ];
 
     if let Some(ratio) = load_ratio {
@@ -511,7 +520,10 @@ fn backend_details_line(pending: usize, load_ratio: Option<f64>, stateful: usize
     }
 
     if stateful > 0 {
-        spans.push(format!(" | Stateful: {stateful}").fg(Color::Cyan));
+        spans.push(
+            format!(" | Stateful: {}", format_count(stateful as u64))
+                .fg(magnitude_color(stateful as u64)),
+        );
     }
 
     Line::from(spans)
@@ -597,6 +609,30 @@ fn render_backend_list(
     let list = List::new(items).block(bordered_block("Backend Servers", styles::BORDER_NORMAL));
 
     f.render_widget(list, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_backend_error_count_color_highlights_any_error() {
+        assert_eq!(backend_error_count_color(0, 0), styles::VALUE_NEUTRAL);
+        assert_eq!(backend_error_count_color(1, 0), Color::Yellow);
+        assert_eq!(backend_error_count_color(0, 1), Color::Red);
+    }
+
+    #[test]
+    fn test_connection_failures_color_highlights_nonzero_failures() {
+        assert_eq!(connection_failures_color(0), styles::VALUE_NEUTRAL);
+        assert_eq!(connection_failures_color(1), Color::Red);
+    }
+
+    #[test]
+    fn test_buffer_utilization_percent_handles_zero_total() {
+        assert_eq!(buffer_utilization_percent(0, 0), 0.0);
+        assert_eq!(buffer_utilization_percent(9, 10), 90.0);
+    }
 }
 
 /// Render data flow visualization as line graphs
@@ -744,13 +780,16 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
                 " ".into(),
                 sparkline.fg(Color::Blue),
                 " ".into(),
-                format!("{:>5}", user.active_connections).fg(Color::Green),
+                format!("{:>5}", format_count(user.active_connections as u64))
+                    .fg(magnitude_color(user.active_connections as u64)),
             ]),
             Line::from(vec![
                 "  ↑".into(),
-                format!("{:>8}", format_bytes(user.bytes_sent.as_u64())).fg(Color::Blue),
+                format!("{:>8}", format_bytes(user.bytes_sent.as_u64()))
+                    .fg(magnitude_color(user.bytes_sent.as_u64())),
                 "  ↓".into(),
-                format!("{:>8}", format_bytes(user.bytes_received.as_u64())).fg(Color::Magenta),
+                format!("{:>8}", format_bytes(user.bytes_received.as_u64()))
+                    .fg(magnitude_color(user.bytes_received.as_u64())),
             ]),
             Line::from(vec![
                 "  Rate: ".into(),

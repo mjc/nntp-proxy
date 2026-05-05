@@ -882,6 +882,29 @@ mod tests {
         (blocks * generations * size_of::<Block>()) as u64
     }
 
+    fn rewrite_persisted_inserted_at(path: &std::path::Path, inserted_at: u64) {
+        let data = std::fs::read(path).unwrap();
+        let mut entries = parse_entries(&data).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "test helper expects exactly one persisted entry"
+        );
+        entries[0].inserted_at = inserted_at;
+
+        let mut bytes = Vec::with_capacity(data.len());
+        bytes.extend_from_slice(PERSISTENCE_MAGIC);
+        bytes.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for entry in entries {
+            bytes.extend_from_slice(&entry.hash.to_le_bytes());
+            bytes.extend_from_slice(&entry.tag.to_le_bytes());
+            bytes.push(entry.missing);
+            bytes.extend_from_slice(&entry.inserted_at.to_le_bytes());
+        }
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn lookup_miss_returns_none() {
         let index = AvailabilityIndex::with_test_capacity(test_capacity_for(16, 2));
@@ -1127,20 +1150,24 @@ mod tests {
     fn load_from_path_keeps_older_generation_as_rotation_anchor() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("availability-older-generation.idx");
+        let ttl = std::time::Duration::from_millis(200);
         let index = AvailabilityIndex::with_capacity_and_generation_count(
             test_capacity_for(8, 2),
-            std::time::Duration::from_millis(40),
+            ttl,
             DEFAULT_GENERATIONS,
         );
         let msg_id = MessageId::from_borrowed("<persisted-older@example.com>").unwrap();
 
         index.record_backend_missing(&msg_id, BackendId::from_index(0));
-        std::thread::sleep(std::time::Duration::from_millis(25));
         index.save_to_path(&path).unwrap();
+        rewrite_persisted_inserted_at(
+            &path,
+            ttl::now_millis().saturating_sub((ttl.as_millis() as u64 / 2) + 20),
+        );
 
         let restored = AvailabilityIndex::with_capacity_and_generation_count(
             test_capacity_for(8, 2),
-            std::time::Duration::from_millis(40),
+            ttl,
             DEFAULT_GENERATIONS,
         );
         assert!(restored.load_from_path(&path).unwrap());
@@ -1152,21 +1179,23 @@ mod tests {
 
     #[test]
     fn rotated_generation_starts_when_it_receives_a_new_insert() {
+        let ttl = std::time::Duration::from_millis(200);
         let index = AvailabilityIndex::with_capacity_and_generation_count(
             test_capacity_for(8, 2),
-            std::time::Duration::from_millis(40),
+            ttl,
             DEFAULT_GENERATIONS,
         );
         let first = MessageId::from_borrowed("<before-rotate@example.com>").unwrap();
         let second = MessageId::from_borrowed("<after-rotate@example.com>").unwrap();
+        let forced_old_started_at = ttl::now_millis().saturating_sub(50);
 
         index.record_backend_missing(&first, BackendId::from_index(0));
-        let initial_started_at = {
-            let state = index.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.generations[state.current_generation].started_at
-        };
-
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        {
+            let mut state = index.state.lock().unwrap_or_else(|e| e.into_inner());
+            let current_generation = state.current_generation;
+            state.generations[current_generation].started_at = forced_old_started_at;
+            state.next_rotation_at = ttl::now_millis().saturating_sub(1);
+        }
         let before_second_insert = ttl::now_millis();
         index.record_backend_missing(&second, BackendId::from_index(1));
 
@@ -1177,7 +1206,7 @@ mod tests {
             "rotated generation should start when the new insert arrives"
         );
         assert!(
-            current_generation.started_at > initial_started_at,
+            current_generation.started_at > forced_old_started_at,
             "rotated generation should not keep the historical rotation timestamp"
         );
     }

@@ -2,7 +2,9 @@
 //!
 //! Bidirectional proxy: each client gets a dedicated backend connection.
 
-use crate::protocol::RequestContext;
+use crate::command::{CommandAction, CommandHandler, RejectResponse};
+use crate::protocol::{RequestContext, RequestKind, RequestRouteClass};
+use crate::session::state::{OrderedOutputSegment, StatefulReadMode};
 use crate::session::{ClientSession, common};
 use crate::types::TransferMetrics;
 use anyhow::Result;
@@ -12,7 +14,120 @@ use tracing::{debug, error, warn};
 
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
 
+enum AuthenticatedStatefulAction {
+    Forward,
+    RejectAuthAlreadyAuthenticated,
+    InterceptCapabilities,
+    Reject(RejectResponse),
+}
+
+fn classify_authenticated_stateful_action(
+    request: &RequestContext,
+    auth_enabled: bool,
+) -> AuthenticatedStatefulAction {
+    match CommandHandler::classify_request(request) {
+        CommandAction::InterceptAuth(_) if auth_enabled => {
+            AuthenticatedStatefulAction::RejectAuthAlreadyAuthenticated
+        }
+        CommandAction::InterceptCapabilities => AuthenticatedStatefulAction::InterceptCapabilities,
+        CommandAction::Reject(response)
+            if matches!(request.kind(), RequestKind::Post | RequestKind::Ihave)
+                || request.route_class() == RequestRouteClass::Reject =>
+        {
+            AuthenticatedStatefulAction::Reject(response)
+        }
+        _ => AuthenticatedStatefulAction::Forward,
+    }
+}
+
 impl ClientSession {
+    async fn handle_authenticated_stateful_request<W, BW>(
+        &self,
+        request: &RequestContext,
+        client_write: &mut W,
+        backend_write: &mut BW,
+        state: &mut crate::session::state::SessionLoopState,
+    ) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        BW: tokio::io::AsyncWrite + Unpin,
+    {
+        match classify_authenticated_stateful_action(request, self.auth_handler.is_enabled()) {
+            AuthenticatedStatefulAction::Forward => {
+                request.write_wire_to(backend_write).await?;
+                state.add_client_to_backend(request.request_wire_len().get());
+                state.mark_backend_request_sent(request.kind());
+            }
+            AuthenticatedStatefulAction::RejectAuthAlreadyAuthenticated => {
+                use crate::protocol::AUTH_ALREADY_AUTHENTICATED;
+                if state.has_pending_backend_replies() {
+                    state.push_deferred_reply(AUTH_ALREADY_AUTHENTICATED.to_vec());
+                } else {
+                    client_write.write_all(AUTH_ALREADY_AUTHENTICATED).await?;
+                    client_write.flush().await?;
+                    state.add_backend_to_client(AUTH_ALREADY_AUTHENTICATED.len() as u64);
+                }
+            }
+            AuthenticatedStatefulAction::InterceptCapabilities => {
+                use crate::protocol::CAPABILITIES_WITHOUT_AUTHINFO;
+                if state.has_pending_backend_replies() {
+                    state.push_deferred_reply(CAPABILITIES_WITHOUT_AUTHINFO.to_vec());
+                } else {
+                    client_write
+                        .write_all(CAPABILITIES_WITHOUT_AUTHINFO)
+                        .await?;
+                    client_write.flush().await?;
+                    state.add_backend_to_client(CAPABILITIES_WITHOUT_AUTHINFO.len() as u64);
+                }
+            }
+            AuthenticatedStatefulAction::Reject(response) => {
+                if state.has_pending_backend_replies() {
+                    state.push_deferred_reply(response.as_bytes().to_vec());
+                } else {
+                    client_write.write_all(response.as_bytes()).await?;
+                    client_write.flush().await?;
+                    state.add_backend_to_client(response.len() as u64);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn forward_stateful_backend_bytes<W, BR>(
+        &self,
+        client_write: &mut W,
+        backend_read: &mut BR,
+        state: &mut crate::session::state::SessionLoopState,
+    ) -> Result<bool>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        BR: tokio::io::AsyncRead + Unpin,
+    {
+        let mut buffer = self.buffer_pool.acquire();
+        match buffer.read_from(backend_read).await {
+            Ok(0) => Ok(false),
+            Ok(n) => {
+                for segment in state.ordered_output_segments(&buffer[..n]) {
+                    match segment {
+                        OrderedOutputSegment::Backend(bytes) => {
+                            client_write.write_all(bytes).await?;
+                            state.add_backend_to_client(bytes.len() as u64);
+                        }
+                        OrderedOutputSegment::Local(reply) => {
+                            client_write.write_all(&reply).await?;
+                            state.add_backend_to_client(reply.len() as u64);
+                        }
+                    }
+                }
+                client_write.flush().await?;
+
+                Ok(true)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Handle stateful session - acquire backend and proxy bidirectionally
     ///
     /// # Errors
@@ -95,11 +210,38 @@ impl ClientSession {
 
         loop {
             line.clear();
-            let mut buffer = self.buffer_pool.acquire();
 
             // Periodic metrics flush
             if state.check_and_maybe_flush_metrics() {
                 state.flush_byte_deltas(&self.metrics, backend_id, self.username());
+            }
+
+            let replies = state.take_ready_deferred_replies();
+            if !replies.is_empty() {
+                for reply in replies {
+                    client_write.write_all(&reply).await?;
+                    state.add_backend_to_client(reply.len() as u64);
+                }
+                client_write.flush().await?;
+                continue;
+            }
+
+            if matches!(state.read_mode(), StatefulReadMode::DrainBackendReplies) {
+                match self
+                    .forward_stateful_backend_bytes(
+                        &mut client_write,
+                        &mut backend_read,
+                        &mut state,
+                    )
+                    .await
+                {
+                    Ok(true) => continue,
+                    Ok(false) => break,
+                    Err(e) => {
+                        warn!(client = %self.client_addr, error = %e, "Backend read error");
+                        break;
+                    }
+                }
             }
 
             tokio::select! {
@@ -128,23 +270,13 @@ impl ClientSession {
                             state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
 
                             if state.skip_auth_check {
-                                // RFC 4643 §2.2: After successful authentication, reject any
-                                // further AUTHINFO commands with 502 — but only when auth is
-                                // enabled. When auth is disabled skip_auth_check is true from
-                                // the start, and AUTHINFO should be forwarded to the backend.
-                                if self.auth_handler.is_enabled()
-                                    && request.kind() == crate::protocol::RequestKind::AuthInfo
-                                {
-                                    use crate::protocol::AUTH_ALREADY_AUTHENTICATED;
-                                    client_write.write_all(AUTH_ALREADY_AUTHENTICATED).await?;
-                                    client_write.flush().await?;
-                                    state.add_backend_to_client(
-                                        AUTH_ALREADY_AUTHENTICATED.len() as u64,
-                                    );
-                                } else {
-                                    request.write_wire_to(&mut backend_write).await?;
-                                    state.add_client_to_backend(request.request_wire_len().get());
-                                }
+                                self.handle_authenticated_stateful_request(
+                                    &request,
+                                    &mut client_write,
+                                    &mut backend_write,
+                                    &mut state,
+                                )
+                                .await?;
                             } else {
                                 // Auth path
                                 let auth_result = common::handle_stateful_auth_check(
@@ -173,13 +305,10 @@ impl ClientSession {
                 }
 
                 // Backend → Client
-                result = buffer.read_from(&mut backend_read) => {
+                result = self.forward_stateful_backend_bytes(&mut client_write, &mut backend_read, &mut state) => {
                     match result {
-                        Ok(0) => break, // Backend disconnected
-                        Ok(n) => {
-                            client_write.write_all(&buffer[..n]).await?;
-                            state.add_backend_to_client(n as u64);
-                        }
+                        Ok(true) => {}
+                        Ok(false) => break, // Backend disconnected
                         Err(e) => {
                             warn!(client = %self.client_addr, error = %e, "Backend read error");
                             break;

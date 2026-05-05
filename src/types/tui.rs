@@ -70,10 +70,22 @@ impl Throughput {
     /// Format as human-readable string
     #[must_use]
     pub fn format(&self) -> String {
-        if self.0 > 1_000_000.0 {
-            format!("{:.2} MB/s", self.0 / 1_000_000.0)
-        } else if self.0 > 1_000.0 {
-            format!("{:.2} KB/s", self.0 / 1_000.0)
+        const KIB: f64 = 1_024.0;
+        const MIB: f64 = KIB * 1_024.0;
+        const GIB: f64 = MIB * 1_024.0;
+        const TIB: f64 = GIB * 1_024.0;
+        const PIB: f64 = TIB * 1_024.0;
+
+        if self.0 >= PIB {
+            format!("{:.2} PiB/s", self.0 / PIB)
+        } else if self.0 >= TIB {
+            format!("{:.2} TiB/s", self.0 / TIB)
+        } else if self.0 >= GIB {
+            format!("{:.2} GiB/s", self.0 / GIB)
+        } else if self.0 >= MIB {
+            format!("{:.2} MiB/s", self.0 / MIB)
+        } else if self.0 >= KIB {
+            format!("{:.2} KiB/s", self.0 / KIB)
         } else {
             format!("{:.0} B/s", self.0)
         }
@@ -227,10 +239,10 @@ mod tests {
     #[test]
     fn test_bytes_per_second() {
         let bps = Throughput::new(1_500_000.0);
-        assert_eq!(bps.format(), "1.50 MB/s");
+        assert_eq!(bps.format(), "1.43 MiB/s");
 
         let bps2 = Throughput::new(2_500.0);
-        assert_eq!(bps2.format(), "2.50 KB/s");
+        assert_eq!(bps2.format(), "2.44 KiB/s");
 
         let bps3 = Throughput::new(500.0);
         assert_eq!(bps3.format(), "500 B/s");
@@ -240,13 +252,13 @@ mod tests {
 
     #[test]
     fn test_bytes_per_second_format_boundaries() {
-        // Just over 1 MB/s
-        assert_eq!(Throughput::new(1_000_001.0).format(), "1.00 MB/s");
-        // Just under 1 MB/s
-        assert_eq!(Throughput::new(999_999.0).format(), "1000.00 KB/s");
-        // Just over 1 KB/s
-        assert_eq!(Throughput::new(1_001.0).format(), "1.00 KB/s");
-        // Just under 1 KB/s
+        // Just over 1 MiB/s
+        assert_eq!(Throughput::new(1_048_577.0).format(), "1.00 MiB/s");
+        // Just under 1 MiB/s
+        assert_eq!(Throughput::new(1_048_575.0).format(), "1024.00 KiB/s");
+        // Just over 1 KiB/s
+        assert_eq!(Throughput::new(1_025.0).format(), "1.00 KiB/s");
+        // Just under 1 KiB/s
         assert_eq!(Throughput::new(999.0).format(), "999 B/s");
         // Zero
         assert_eq!(Throughput::zero().format(), "0 B/s");
@@ -260,8 +272,8 @@ mod tests {
 
     #[test]
     fn test_bytes_per_second_display() {
-        assert_eq!(Throughput::new(1_500_000.0).to_string(), "1.50 MB/s");
-        assert_eq!(Throughput::new(2_500.0).to_string(), "2.50 KB/s");
+        assert_eq!(Throughput::new(1_500_000.0).to_string(), "1.43 MiB/s");
+        assert_eq!(Throughput::new(2_500.0).to_string(), "2.44 KiB/s");
         assert_eq!(Throughput::new(500.0).to_string(), "500 B/s");
     }
 

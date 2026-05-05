@@ -342,9 +342,6 @@ async fn test_auth_flow_success_with_password() -> Result<()> {
             .await
     });
 
-    // Small delay to let server start
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
     // Connect client
     let mut stream = TcpStream::connect(addr).await?;
     let _buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 2);
@@ -383,8 +380,6 @@ async fn test_auth_flow_success_username_only() -> Result<()> {
             .await
     });
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
     let mut stream = TcpStream::connect(addr).await?;
 
     // Read greeting
@@ -413,8 +408,6 @@ async fn test_auth_flow_failure() -> Result<()> {
             .handle_auth_flow(AuthScenario::FailureInvalidCredentials)
             .await
     });
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
     let mut stream = TcpStream::connect(addr).await?;
 
@@ -454,8 +447,6 @@ async fn test_auth_flow_unexpected_response() -> Result<()> {
             .await
     });
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-
     let mut stream = TcpStream::connect(addr).await?;
 
     // Read greeting
@@ -487,8 +478,6 @@ async fn test_auth_flow_non_success_greeting() -> Result<()> {
             .handle_auth_flow(AuthScenario::NonSuccessGreeting)
             .await
     });
-
-    tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
 
     let mut stream = TcpStream::connect(addr).await?;
 
@@ -567,8 +556,7 @@ async fn test_buffer_pool_concurrent_access() {
         let handle = tokio::spawn(async move {
             let buffer = pool.acquire();
             assert_eq!(buffer.capacity(), 8192);
-            // Simulate some work
-            tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
         });
         handles.push(handle);
     }
