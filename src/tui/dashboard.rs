@@ -49,54 +49,105 @@ pub struct DashboardState {
 
 impl DashboardState {
     #[must_use]
+    fn backend_view(&self, backend_idx: usize) -> Option<&BackendView> {
+        self.backend_views.get(backend_idx)
+    }
+
+    #[must_use]
     pub fn latest_client_throughput(&self) -> Option<&ThroughputPoint> {
         self.client_history.last()
     }
 
     #[must_use]
     pub fn latest_backend_throughput(&self, backend_idx: usize) -> Option<&ThroughputPoint> {
-        self.backend_views
-            .get(backend_idx)
+        self.backend_view(backend_idx)
             .and_then(BackendView::latest_throughput)
     }
 
     #[must_use]
     pub fn throughput_history(&self, backend_idx: usize) -> Option<&[ThroughputPoint]> {
-        self.backend_views
-            .get(backend_idx)
+        self.backend_view(backend_idx)
             .map(|view| view.history.as_slice())
     }
 
     #[must_use]
     pub fn backend_pending_count(&self, backend_idx: usize) -> usize {
-        self.backend_views
-            .get(backend_idx)
+        self.backend_view(backend_idx)
             .map_or(0, |view| view.pending_count)
     }
 
     #[must_use]
     pub fn backend_load_ratio(&self, backend_idx: usize) -> Option<f64> {
-        self.backend_views
-            .get(backend_idx)
+        self.backend_view(backend_idx)
             .and_then(|view| view.load_ratio)
     }
 
     #[must_use]
     pub fn backend_stateful_count(&self, backend_idx: usize) -> usize {
-        self.backend_views
-            .get(backend_idx)
+        self.backend_view(backend_idx)
             .map_or(0, |view| view.stateful_count)
     }
 
     #[must_use]
     pub fn backend_traffic_share(&self, backend_idx: usize) -> Option<f64> {
-        self.backend_views
-            .get(backend_idx)
+        self.backend_view(backend_idx)
             .and_then(|view| view.traffic_share)
     }
 
     #[must_use]
     pub fn buffer_pool(&self) -> Option<&BufferPoolStats> {
         self.buffer_pool.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::metrics::{BackendHealthStatus, BackendStats, MetricsSnapshot};
+    use crate::tui::app::{ThroughputPoint, ViewMode};
+    use crate::types::Port;
+    use crate::types::tui::{Throughput, Timestamp};
+
+    fn sample_backend_view() -> BackendView {
+        BackendView {
+            server: Server::builder("backend.example.com", Port::try_new(119).unwrap())
+                .name("Backend")
+                .build()
+                .unwrap(),
+            stats: BackendStats::default(),
+            active_connections: 1,
+            health_status: BackendHealthStatus::Healthy,
+            pending_count: 2,
+            load_ratio: Some(0.5),
+            stateful_count: 3,
+            traffic_share: Some(42.0),
+            history: vec![ThroughputPoint::new_backend(
+                Timestamp::now(),
+                Throughput::new(1.0),
+                Throughput::new(2.0),
+                crate::types::tui::CommandsPerSecond::new(3.0),
+            )],
+        }
+    }
+
+    #[test]
+    fn backend_accessors_handle_out_of_range_indices() {
+        let state = DashboardState {
+            snapshot: MetricsSnapshot::default(),
+            backend_views: vec![sample_backend_view()],
+            client_history: Vec::new(),
+            system_stats: Default::default(),
+            view_mode: ViewMode::Normal,
+            show_details: false,
+            log_lines: Vec::new(),
+            buffer_pool: None,
+        };
+
+        assert!(state.latest_backend_throughput(1).is_none());
+        assert!(state.throughput_history(1).is_none());
+        assert_eq!(state.backend_pending_count(1), 0);
+        assert!(state.backend_load_ratio(1).is_none());
+        assert_eq!(state.backend_stateful_count(1), 0);
+        assert!(state.backend_traffic_share(1).is_none());
     }
 }

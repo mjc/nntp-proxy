@@ -513,15 +513,16 @@ impl TuiApp {
     /// Get throughput history for a backend
     #[must_use]
     pub fn throughput_history(&self, backend_idx: usize) -> &VecDeque<ThroughputPoint> {
-        self.backend_history[backend_idx].points()
+        self.backend_history(backend_idx)
+            .expect("backend history index should be valid")
+            .points()
     }
 
     /// Get latest backend throughput for a backend
     #[must_use]
     pub fn latest_backend_throughput(&self, backend_idx: usize) -> Option<&ThroughputPoint> {
-        self.backend_history
-            .get(backend_idx)
-            .and_then(|h| h.latest())
+        self.backend_history(backend_idx)
+            .and_then(ThroughputHistory::latest)
     }
 
     /// Get log buffer for displaying recent log messages
@@ -534,6 +535,11 @@ impl TuiApp {
     #[must_use]
     pub const fn view_mode(&self) -> ViewMode {
         self.view_mode
+    }
+
+    #[must_use]
+    fn backend_history(&self, backend_idx: usize) -> Option<&ThroughputHistory> {
+        self.backend_history.get(backend_idx)
     }
 
     /// Toggle between normal and log fullscreen view
