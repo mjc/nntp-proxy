@@ -17,9 +17,11 @@ use tracing::debug;
 const LINGER_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `TCP_USER_TIMEOUT` - faster dead connection detection on Linux
+#[cfg(target_os = "linux")]
 const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `IP_TOS` value for throughput optimization
+#[cfg(target_os = "linux")]
 const TOS_THROUGHPUT: u32 = 0x08;
 
 /// Trait for network optimization strategies
@@ -545,11 +547,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_tcp_user_timeout_constant() {
         assert_eq!(TCP_USER_TIMEOUT, Duration::from_secs(30));
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn test_tos_throughput_constant() {
         assert_eq!(TOS_THROUGHPUT, 0x08);
     }
