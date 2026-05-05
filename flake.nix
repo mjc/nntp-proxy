@@ -15,7 +15,9 @@
     nixpkgs,
     flake-utils,
     rust-overlay,
-  }:
+  }: let
+    cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+  in
     flake-utils.lib.eachDefaultSystem (system: let
       overlays = [(import rust-overlay)];
       pkgs = import nixpkgs {
@@ -62,7 +64,7 @@
         [
           rustToolchain
           pkg-config
-          cmake  # Required for zlib-ng feature in flate2
+          cmake # Required for zlib-ng feature in flate2
 
           # Code quality & linting
           cargo-deny
@@ -87,14 +89,13 @@
           cargo-flamegraph
 
           # Build acceleration
-          sccache  # Build cache
+          sccache # Build cache
         ]
         ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
           perf
           cargo-llvm-cov
-          mold  # Fast linker (Linux only)
+          mold # Fast linker (Linux only)
         ];
-
 
       # Cross-compilation tools (separate to avoid environment pollution)
       crossCompilationTools = with pkgs; [
@@ -111,10 +112,20 @@
         pkgsCross.mingwW64.buildPackages.binutils
       ];
 
-      buildInputs = with pkgs; [
+      devBuildInputs = with pkgs; [
         openssl
         zlib
         bashInteractive
+      ];
+
+      packageNativeBuildInputs = with pkgs; [
+        pkg-config
+        cmake
+      ];
+
+      packageBuildInputs = with pkgs; [
+        openssl
+        zlib
       ];
 
       # Map system to Rust target triple env var prefix
@@ -124,10 +135,40 @@
         else if system == "x86_64-darwin" then "CARGO_TARGET_X86_64_APPLE_DARWIN"
         else if system == "aarch64-darwin" then "CARGO_TARGET_AARCH64_APPLE_DARWIN"
         else throw "Unsupported system: ${system}";
+
+      package = pkgs.rustPlatform.buildRustPackage {
+        pname = cargoToml.package.name;
+        version = cargoToml.package.version;
+        src = ./.;
+
+        cargoLock = {
+          lockFile = ./Cargo.lock;
+        };
+
+        nativeBuildInputs = packageNativeBuildInputs;
+        buildInputs = packageBuildInputs;
+        cargoBuildFlags = ["--bin" "nntp-proxy"];
+
+        OPENSSL_DIR = "${pkgs.openssl.dev}";
+        OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
+        PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig";
+
+        meta = with pkgs.lib; {
+          description = cargoToml.package.description;
+          homepage = cargoToml.package.homepage;
+          license = licenses.mit;
+          mainProgram = cargoToml.package.name;
+          platforms = platforms.all;
+        };
+      };
     in {
+      apps.default = flake-utils.lib.mkApp {
+        drv = package;
+      };
+
       devShells.default = pkgs.mkShell {
         nativeBuildInputs = basicNativeBuildInputs;
-        inherit buildInputs;
+        buildInputs = devBuildInputs;
 
         shellHook = ''
           export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
@@ -196,7 +237,7 @@
 
         # tikv-jemalloc-sys builds jemalloc from source; its configure script
         # fails strerror_r detection when _FORTIFY_SOURCE is set at -O0 (NixOS default).
-        hardeningDisable = [ "fortify" ];
+        hardeningDisable = ["fortify"];
       };
 
       # Cross-compilation shell with all the tooling
@@ -205,7 +246,7 @@
       # and cause conflicts with CMAKE builds. Zig handles all cross-compilation itself.
       devShells.cross = pkgs.mkShell {
         nativeBuildInputs = basicNativeBuildInputs ++ crossCompilationTools;
-        inherit buildInputs;
+        buildInputs = devBuildInputs;
 
         shellHook = ''
           export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
@@ -243,28 +284,12 @@
         OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
         PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig";
       };
-      packages.default = pkgs.rustPlatform.buildRustPackage {
-        pname = "nntp-proxy";
-        version = "0.1.0";
-        src = ./.;
 
-        cargoLock = {
-          lockFile = ./Cargo.lock;
-        };
-
-        nativeBuildInputs = basicNativeBuildInputs;
-        inherit buildInputs;
-
-        # Environment variables for building with OpenSSL
-        OPENSSL_DIR = "${pkgs.openssl.dev}";
-        OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
-        PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig";
-
-        meta = with pkgs.lib; {
-          description = "A round-robin NNTP proxy server";
-          license = licenses.mit;
-          platforms = platforms.all;
-        };
-      };
-    });
+      packages.default = package;
+      packages.nntp-proxy = package;
+    })
+    // {
+      nixosModules.default = import ./nix/module.nix {inherit self;};
+      nixosModules.nntp-proxy = self.nixosModules.default;
+    };
 }

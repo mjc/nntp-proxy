@@ -375,6 +375,51 @@ Use the included Nix shell if desired:
 nix develop
 ```
 
+Build the packaged binary with Nix:
+
+```bash
+nix build .#default
+```
+
+For NixOS, the flake exports `nixosModules.default`, which adds a
+`services.nntp-proxy` module. It can either use an existing `config.toml`, or
+render one from `services.nntp-proxy.settings`:
+
+```nix
+{
+  inputs.nntp-proxy.url = "github:mjc/nntp-proxy";
+
+  outputs = { nixpkgs, nntp-proxy, ... }: {
+    nixosConfigurations.proxy = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        nntp-proxy.nixosModules.default
+        {
+          services.nntp-proxy = {
+            enable = true;
+            openFirewall = true;
+            settings = {
+              proxy.port = 8119;
+              routing.mode = "hybrid";
+              servers = [
+                {
+                  host = "news.example.com";
+                  port = 563;
+                  name = "Primary";
+                  use_tls = true;
+                  tls_verify_cert = true;
+                  max_connections = 20;
+                }
+              ];
+            };
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
 Common checks:
 
 ```bash
