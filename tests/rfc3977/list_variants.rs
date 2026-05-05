@@ -38,7 +38,7 @@ async fn test_list_newsgroups_multiline() -> Result<()> {
         "Expected alt.test in LIST output"
     );
 
-    drop(backend);
+    backend.abort();
     Ok(())
 }
 
@@ -64,6 +64,6 @@ async fn test_listgroup_multiline_uses_211_and_preserves_body() -> Result<()> {
     );
     assert_eq!(lines, vec!["1\r\n".to_string(), "2\r\n".to_string()]);
 
-    drop(backend);
+    backend.abort();
     Ok(())
 }

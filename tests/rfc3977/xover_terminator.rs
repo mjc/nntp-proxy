@@ -45,6 +45,6 @@ async fn test_xover_multiline_terminator() -> Result<()> {
         "Expected overview line with msgid"
     );
 
-    drop(backend);
+    backend.abort();
     Ok(())
 }

@@ -36,8 +36,8 @@ fn article_backend(port: u16, message_id: &str) -> MockNntpServer {
     MockNntpServer::new(port)
         .with_name("ArticleBackend")
         .on_command(
-            &format!("ARTICLE {message_id}"),
-            &format!(
+            format!("ARTICLE {message_id}"),
+            format!(
                 "220 0 {}\r\nSubject: Test\r\n\r\nBody for {}\r\n.\r\n",
                 resp_id, display
             ),

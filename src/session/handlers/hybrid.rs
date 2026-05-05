@@ -119,11 +119,12 @@ impl ClientSession {
 
         // Build initial state with carried-over byte counts
         let initial_bytes = stateful_initial_client_bytes(client_to_backend_bytes, initial_request);
-        let state = crate::session::state::SessionLoopState::from_initial_bytes(
+        let mut state = crate::session::state::SessionLoopState::from_initial_bytes(
             initial_bytes,
             backend_to_client_bytes,
             self.auth_handler.is_enabled(),
         );
+        state.mark_backend_request_sent(initial_request.kind());
 
         // Split backend for bidirectional proxy
         let (backend_read, backend_write) = tokio::io::split(&mut **conn_guard);

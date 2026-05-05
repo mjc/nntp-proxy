@@ -763,26 +763,31 @@ impl RequestContext {
 
     #[must_use]
     pub fn expects_multiline_response(&self, status: StatusCode) -> bool {
-        let code = status.as_u16();
-        if status.is_error() {
-            return false;
-        }
-
-        matches!(
-            (self.kind, code),
-            (RequestKind::Article, 220)
-                | (RequestKind::Head, 221)
-                | (RequestKind::Body, 222)
-                | (RequestKind::ListGroup, 211)
-                | (RequestKind::Help, 100)
-                | (RequestKind::Capabilities, 101)
-                | (RequestKind::List, 215)
-                | (RequestKind::Over | RequestKind::Xover, 224)
-                | (RequestKind::Hdr | RequestKind::Xhdr, 225)
-                | (RequestKind::NewNews, 230)
-                | (RequestKind::NewGroups, 231)
-        ) || matches!(self.kind, RequestKind::Unknown) && status_implies_multiline(code)
+        request_kind_expects_multiline(self.kind, status)
     }
+}
+
+#[must_use]
+pub(crate) fn request_kind_expects_multiline(kind: RequestKind, status: StatusCode) -> bool {
+    let code = status.as_u16();
+    if status.is_error() {
+        return false;
+    }
+
+    matches!(
+        (kind, code),
+        (RequestKind::Article, 220)
+            | (RequestKind::Head, 221)
+            | (RequestKind::Body, 222)
+            | (RequestKind::ListGroup, 211)
+            | (RequestKind::Help, 100)
+            | (RequestKind::Capabilities, 101)
+            | (RequestKind::List, 215)
+            | (RequestKind::Over | RequestKind::Xover, 224)
+            | (RequestKind::Hdr | RequestKind::Xhdr, 225)
+            | (RequestKind::NewNews, 230)
+            | (RequestKind::NewGroups, 231)
+    ) || matches!(kind, RequestKind::Unknown) && status_implies_multiline(code)
 }
 
 fn trim_line_end(mut line: &[u8]) -> &[u8] {

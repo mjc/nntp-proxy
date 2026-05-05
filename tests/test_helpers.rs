@@ -126,12 +126,13 @@ impl MockNntpServer {
                         }
 
                         let mut handled = false;
-                        for (prefix, response) in &handlers {
-                            if cmd_upper.starts_with(prefix) {
-                                let _ = stream.write_all(response.as_bytes()).await;
-                                handled = true;
-                                break;
-                            }
+                        if let Some((_, response)) = handlers
+                            .iter()
+                            .filter(|(prefix, _)| cmd_upper.starts_with(prefix.as_str()))
+                            .max_by_key(|(prefix, _)| prefix.len())
+                        {
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            handled = true;
                         }
 
                         if !handled {
@@ -645,7 +646,10 @@ pub async fn send_command_read_line(
 
     let mut reader = tokio::io::BufReader::new(&mut *stream);
     let mut line = String::new();
-    reader.read_line(&mut line).await?;
+    let n = reader.read_line(&mut line).await?;
+    if n == 0 {
+        anyhow::bail!("Connection closed while reading response line");
+    }
     Ok(line)
 }
 
@@ -666,7 +670,10 @@ pub async fn send_article_read_multiline_response(
 
     let mut reader = tokio::io::BufReader::new(&mut *stream);
     let mut status_line = String::new();
-    reader.read_line(&mut status_line).await?;
+    let n = reader.read_line(&mut status_line).await?;
+    if n == 0 {
+        anyhow::bail!("Connection closed while reading ARTICLE status line");
+    }
 
     eprintln!("Received status: {}", status_line.trim());
 
@@ -713,7 +720,10 @@ pub async fn send_command_read_multiline_response(
 
     let mut reader = tokio::io::BufReader::new(&mut *stream);
     let mut status_line = String::new();
-    reader.read_line(&mut status_line).await?;
+    let n = reader.read_line(&mut status_line).await?;
+    if n == 0 {
+        anyhow::bail!("Connection closed while reading response status line");
+    }
 
     // Only attempt multiline reads for responses that are defined as multiline by
     // the NNTP/RFC semantics. This avoids hanging when the server returns a

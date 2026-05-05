@@ -22,6 +22,7 @@ pub(crate) use request::{
     MAX_COMMAND_LINE_OCTETS, RequestCacheArticleNumber, RequestCacheAvailability,
     RequestCacheEntryMetadata, RequestCachePayloadKind, RequestCacheStatus, RequestCacheTier,
     RequestCacheTimestampMillis, RequestResponseMetadata, ResponsePayloadLen,
+    request_kind_expects_multiline,
 };
 pub use request::{
     RequestContext, RequestKind, RequestRouteClass, RequestWireLen, ResponseWireLen,

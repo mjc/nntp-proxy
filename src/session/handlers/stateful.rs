@@ -55,11 +55,11 @@ impl ClientSession {
             AuthenticatedStatefulAction::Forward => {
                 request.write_wire_to(backend_write).await?;
                 state.add_client_to_backend(request.request_wire_len().get());
-                state.mark_backend_request_sent();
+                state.mark_backend_request_sent(request.kind());
             }
             AuthenticatedStatefulAction::RejectAuthAlreadyAuthenticated => {
                 use crate::protocol::AUTH_ALREADY_AUTHENTICATED;
-                if state.awaiting_backend_reply {
+                if state.has_pending_backend_replies() {
                     state.push_deferred_reply(AUTH_ALREADY_AUTHENTICATED.to_vec());
                 } else {
                     client_write.write_all(AUTH_ALREADY_AUTHENTICATED).await?;
@@ -69,7 +69,7 @@ impl ClientSession {
             }
             AuthenticatedStatefulAction::InterceptCapabilities => {
                 use crate::protocol::CAPABILITIES_WITHOUT_AUTHINFO;
-                if state.awaiting_backend_reply {
+                if state.has_pending_backend_replies() {
                     state.push_deferred_reply(CAPABILITIES_WITHOUT_AUTHINFO.to_vec());
                 } else {
                     client_write
@@ -80,7 +80,7 @@ impl ClientSession {
                 }
             }
             AuthenticatedStatefulAction::Reject(response) => {
-                if state.awaiting_backend_reply {
+                if state.has_pending_backend_replies() {
                     state.push_deferred_reply(response.as_bytes().to_vec());
                 } else {
                     client_write.write_all(response.as_bytes()).await?;
@@ -249,17 +249,20 @@ impl ClientSession {
                         Ok(n) => {
                             client_write.write_all(&buffer[..n]).await?;
                             state.add_backend_to_client(n as u64);
-                            state.mark_backend_reply_started();
+                            state.observe_backend_bytes(&buffer[..n]);
 
-                            // Emit deferred local replies only after earlier backend bytes
-                            // have been forwarded to preserve command/response ordering.
-                            let replies = state.take_deferred_replies();
-                            if !replies.is_empty() {
-                                for r in replies {
-                                    client_write.write_all(&r).await?;
-                                    state.add_backend_to_client(r.len() as u64);
+                            if !state.has_pending_backend_replies() {
+                                // Emit deferred local replies only after all earlier backend
+                                // responses have completed, not merely after the first backend
+                                // bytes arrive.
+                                let replies = state.take_deferred_replies();
+                                if !replies.is_empty() {
+                                    for r in replies {
+                                        client_write.write_all(&r).await?;
+                                        state.add_backend_to_client(r.len() as u64);
+                                    }
+                                    client_write.flush().await?;
                                 }
-                                client_write.flush().await?;
                             }
                         }
                         Err(e) => {

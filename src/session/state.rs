@@ -3,7 +3,95 @@
 //! This module provides the `SessionLoopState` struct which encapsulates
 //! all mutable state needed during a session command loop.
 
+use std::collections::VecDeque;
+
+use crate::protocol::{RequestKind, StatusCode, request_kind_expects_multiline};
+use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
 use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
+
+struct PendingBackendResponse {
+    kind: RequestKind,
+    state: PendingBackendResponseState,
+}
+
+enum PendingBackendResponseState {
+    AwaitingStatusLine(Vec<u8>),
+    ReadingMultiline { tail: TailBuffer },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingChunkProgress {
+    consumed: usize,
+    completed: bool,
+}
+
+impl PendingBackendResponse {
+    fn new(kind: RequestKind) -> Self {
+        Self {
+            kind,
+            state: PendingBackendResponseState::AwaitingStatusLine(Vec::new()),
+        }
+    }
+
+    fn consume(&mut self, chunk: &[u8]) -> PendingChunkProgress {
+        match &mut self.state {
+            PendingBackendResponseState::AwaitingStatusLine(status_line) => {
+                let Some(pos) = memchr::memchr(b'\n', chunk) else {
+                    status_line.extend_from_slice(chunk);
+                    return PendingChunkProgress {
+                        consumed: chunk.len(),
+                        completed: false,
+                    };
+                };
+
+                let end = pos + 1;
+                status_line.extend_from_slice(&chunk[..end]);
+                let is_multiline = StatusCode::parse(status_line)
+                    .is_some_and(|status| request_kind_expects_multiline(self.kind, status));
+
+                if !is_multiline {
+                    return PendingChunkProgress {
+                        consumed: end,
+                        completed: true,
+                    };
+                }
+
+                let body = &chunk[end..];
+                let mut tail = TailBuffer::default();
+                match tail.detect_terminator(body) {
+                    TerminatorStatus::FoundAt(pos) => PendingChunkProgress {
+                        consumed: end + pos,
+                        completed: true,
+                    },
+                    TerminatorStatus::NotFound => {
+                        tail.update(body);
+                        self.state = PendingBackendResponseState::ReadingMultiline { tail };
+                        PendingChunkProgress {
+                            consumed: chunk.len(),
+                            completed: false,
+                        }
+                    }
+                }
+            }
+            PendingBackendResponseState::ReadingMultiline { tail } => {
+                let status = tail.detect_terminator(chunk);
+                match status {
+                    TerminatorStatus::FoundAt(pos) => PendingChunkProgress {
+                        consumed: pos,
+                        completed: true,
+                    },
+                    TerminatorStatus::NotFound => {
+                        tail.update(chunk);
+                        PendingChunkProgress {
+                            consumed: chunk.len(),
+                            completed: false,
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
 
 /// Session loop state for tracking bytes, auth, and metrics
 ///
@@ -15,7 +103,6 @@ use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 /// let state = SessionLoopState::new(auth_enabled)
 ///     .with_initial_bytes(1000, 500);
 /// ```
-#[derive(Debug, Clone)]
 pub struct SessionLoopState {
     /// Bytes sent from client to backend
     pub client_to_backend: ClientToBackendBytes,
@@ -31,8 +118,8 @@ pub struct SessionLoopState {
     pub auth_username: Option<String>,
     /// Whether to skip auth checking (optimization after first auth)
     pub skip_auth_check: bool,
-    /// Whether a forwarded backend command is still awaiting its next response bytes.
-    pub awaiting_backend_reply: bool,
+    /// Forwarded backend replies that must complete before deferred local replies can flush.
+    pending_backend_replies: VecDeque<PendingBackendResponse>,
     /// Local replies deferred until earlier backend output has been sent first.
     deferred_replies: Vec<Vec<u8>>,
 }
@@ -58,7 +145,7 @@ impl SessionLoopState {
             iteration_count: 0,
             auth_username: None,
             skip_auth_check: !auth_enabled,
-            awaiting_backend_reply: false,
+            pending_backend_replies: VecDeque::new(),
             deferred_replies: Vec::new(),
         }
     }
@@ -173,14 +260,39 @@ impl SessionLoopState {
 
     /// Mark that a backend request was forwarded and its reply must be ordered first.
     #[inline]
-    pub fn mark_backend_request_sent(&mut self) {
-        self.awaiting_backend_reply = true;
+    pub fn mark_backend_request_sent(&mut self, kind: RequestKind) {
+        self.pending_backend_replies
+            .push_back(PendingBackendResponse::new(kind));
     }
 
-    /// Mark that backend bytes have started arriving for the outstanding request.
+    /// Whether earlier forwarded backend replies are still ahead of any deferred local replies.
     #[inline]
-    pub fn mark_backend_reply_started(&mut self) {
-        self.awaiting_backend_reply = false;
+    #[must_use]
+    pub fn has_pending_backend_replies(&self) -> bool {
+        !self.pending_backend_replies.is_empty()
+    }
+
+    /// Advance pending reply framing using newly forwarded backend bytes.
+    pub fn observe_backend_bytes(&mut self, chunk: &[u8]) {
+        let mut offset = 0;
+
+        while offset < chunk.len() {
+            let Some(front) = self.pending_backend_replies.front_mut() else {
+                break;
+            };
+
+            let progress = front.consume(&chunk[offset..]);
+            if progress.consumed == 0 {
+                break;
+            }
+
+            offset += progress.consumed;
+            if progress.completed {
+                self.pending_backend_replies.pop_front();
+            } else {
+                break;
+            }
+        }
     }
 
     /// Queue a local reply until earlier backend output has been sent.
@@ -217,7 +329,7 @@ mod tests {
         let state = SessionLoopState::default();
         assert_eq!(state.client_to_backend.as_u64(), 0);
         assert!(state.skip_auth_check); // Default = auth disabled
-        assert!(!state.awaiting_backend_reply);
+        assert!(!state.has_pending_backend_replies());
     }
 
     #[test]
@@ -268,8 +380,8 @@ mod tests {
     fn test_session_loop_state_deferred_replies() {
         let mut state = SessionLoopState::new(false);
 
-        state.mark_backend_request_sent();
-        assert!(state.awaiting_backend_reply);
+        state.mark_backend_request_sent(RequestKind::Date);
+        assert!(state.has_pending_backend_replies());
 
         state.push_deferred_reply(b"205 Goodbye\r\n".to_vec());
         assert_eq!(
@@ -277,8 +389,36 @@ mod tests {
             vec![b"205 Goodbye\r\n".to_vec()]
         );
 
-        state.mark_backend_reply_started();
-        assert!(!state.awaiting_backend_reply);
+        state.observe_backend_bytes(b"111 20260505120000\r\n");
+        assert!(!state.has_pending_backend_replies());
+    }
+
+    #[test]
+    fn test_pending_backend_replies_wait_for_multiline_terminator() {
+        let mut state = SessionLoopState::new(false);
+
+        state.mark_backend_request_sent(RequestKind::Help);
+        state.observe_backend_bytes(b"100 Help follows\r\nline one\r\n");
+        assert!(state.has_pending_backend_replies());
+
+        state.observe_backend_bytes(b".\r\n");
+        assert!(!state.has_pending_backend_replies());
+    }
+
+    #[test]
+    fn test_pending_backend_replies_track_pipelined_responses_fifo() {
+        let mut state = SessionLoopState::new(false);
+
+        state.mark_backend_request_sent(RequestKind::Date);
+        state.mark_backend_request_sent(RequestKind::Help);
+        state.observe_backend_bytes(b"111 20260505120000\r\n100 Help follows\r\nline one\r\n");
+        assert!(
+            state.has_pending_backend_replies(),
+            "HELP should remain pending until the multiline terminator arrives"
+        );
+
+        state.observe_backend_bytes(b".\r\n");
+        assert!(!state.has_pending_backend_replies());
     }
 
     #[test]
