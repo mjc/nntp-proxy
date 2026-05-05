@@ -4,47 +4,28 @@
 
 use anyhow::Result;
 use nntp_proxy::RoutingMode;
-use tokio::net::TcpListener;
 
-use crate::test_helpers::{
-    MockNntpServer, connect_and_read_greeting, create_test_config,
-    send_command_read_multiline_response, spawn_proxy_with_config,
-};
+use crate::test_helpers::{MockNntpServer, RfcTestClient};
 
 #[tokio::test]
 async fn test_xover_multiline_terminator() -> Result<()> {
-    // Start backend that returns GROUP and a multiline XOVER
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let port = listener.local_addr()?.port();
+    let mut client = RfcTestClient::spawn(RoutingMode::Stateful, "xover-backend", |port| {
+        MockNntpServer::new(port)
+            .with_name("XoverBackend")
+            .on_command("GROUP", "211 100 1 100 alt.test\r\n")
+            .on_command(
+                "XOVER",
+                "224 1 Overview follows\r\n1\t<msg1@example.com>\tSubject1\r\n.\r\n",
+            )
+    })
+    .await?;
 
-    let backend = MockNntpServer::new(port)
-        .with_name("XoverBackend")
-        .on_command("GROUP", "211 100 1 100 alt.test\r\n")
-        .on_command(
-            "XOVER",
-            "224 1 Overview follows\r\n1\t<msg1@example.com>\tSubject1\r\n.\r\n",
-        )
-        .spawn_on_listener(listener);
-
-    let config = create_test_config(vec![(port, "xover-backend")]);
-    let proxy_port = spawn_proxy_with_config(config, RoutingMode::Stateful).await?;
-
-    let mut client = connect_and_read_greeting(proxy_port).await?;
-
-    // Select group
-    let _ = crate::test_helpers::send_command_read_line(&mut client, "GROUP alt.test").await?;
-
-    // Request XOVER and ensure we get the multiline body and terminator respected
-    let (status, lines) = send_command_read_multiline_response(&mut client, "XOVER").await?;
-    assert!(
-        status.starts_with("224"),
-        "Expected 224 XOVER response, got: {status:?}"
-    );
+    client.expect_status("GROUP alt.test", "211").await?;
+    let lines = client.expect_multiline("XOVER", "224").await?;
     assert!(
         lines.iter().any(|l| l.contains("<msg1@example.com>")),
         "Expected overview line with msgid"
     );
 
-    backend.abort();
     Ok(())
 }

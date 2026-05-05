@@ -5,45 +5,24 @@
 //! client session stays usable for subsequent commands.
 
 use anyhow::Result;
-use tokio::net::TcpListener;
 
-use crate::test_helpers::{
-    MockNntpServer, connect_and_read_greeting, create_test_config, send_command_read_line,
-    spawn_proxy_with_config,
-};
+use crate::test_helpers::{MockNntpServer, RfcTestClient};
 use nntp_proxy::RoutingMode;
-
-async fn spawn_reader_client(mode: RoutingMode) -> Result<tokio::net::TcpStream> {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_port = backend_listener.local_addr()?.port();
-    let _backend = MockNntpServer::new(backend_port)
-        .with_name("ReaderBackend")
-        .on_command("LIST", "215 list follows\r\n.\r\n")
-        .spawn_on_listener(backend_listener);
-
-    let config = create_test_config(vec![(backend_port, "reader-backend")]);
-    let proxy_port = spawn_proxy_with_config(config, mode).await?;
-    connect_and_read_greeting(proxy_port).await
-}
 
 async fn assert_command_rejected_but_session_continues(
     mode: RoutingMode,
     command: &str,
     expected_status: &str,
 ) -> Result<()> {
-    let mut client = spawn_reader_client(mode).await?;
+    let mut client = RfcTestClient::spawn(mode, "reader-backend", |port| {
+        MockNntpServer::new(port)
+            .with_name("ReaderBackend")
+            .on_command("LIST", "215 list follows\r\n.\r\n")
+    })
+    .await?;
 
-    let response = send_command_read_line(&mut client, command).await?;
-    assert!(
-        response.starts_with(expected_status),
-        "Expected {expected_status} for {command:?} in {mode:?}, got: {response:?}"
-    );
-
-    let response = send_command_read_line(&mut client, "LIST").await?;
-    assert!(
-        response.starts_with("215"),
-        "{command:?} rejection should not terminate the session in {mode:?}, got: {response:?}"
-    );
+    client.expect_status(command, expected_status).await?;
+    client.expect_status("LIST", "215").await?;
 
     Ok(())
 }

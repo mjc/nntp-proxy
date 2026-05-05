@@ -1,26 +1,9 @@
 //! RFC 3977 utility command tests (`HELP`, bare `LIST`).
 
 use anyhow::Result;
-use tokio::net::{TcpListener, TcpStream};
 
-use crate::test_helpers::{
-    MockNntpServer, connect_and_read_greeting, create_test_config, send_command_read_line,
-    send_command_read_multiline_response, spawn_proxy_with_config,
-};
+use crate::test_helpers::{MockNntpServer, RfcTestClient};
 use nntp_proxy::RoutingMode;
-
-async fn spawn_client_with_backend(
-    mode: RoutingMode,
-    backend: MockNntpServer,
-) -> Result<TcpStream> {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_port = backend_listener.local_addr()?.port();
-    let _backend = backend.spawn_on_listener(backend_listener);
-
-    let config = create_test_config(vec![(backend_port, "utility-backend")]);
-    let proxy_port = spawn_proxy_with_config(config, mode).await?;
-    connect_and_read_greeting(proxy_port).await
-}
 
 fn utility_backend(port: u16) -> MockNntpServer {
     MockNntpServer::new(port)
@@ -38,36 +21,26 @@ fn utility_backend(port: u16) -> MockNntpServer {
 
 #[tokio::test]
 async fn test_help_returns_multiline_and_session_continues() -> Result<()> {
-    let mut client = spawn_client_with_backend(RoutingMode::PerCommand, utility_backend(0)).await?;
+    let mut client =
+        RfcTestClient::spawn(RoutingMode::PerCommand, "utility-backend", utility_backend).await?;
 
-    let (status, lines) = send_command_read_multiline_response(&mut client, "HELP").await?;
-    assert!(
-        status.starts_with("100"),
-        "RFC 3977 §7.5: HELP should return 100, got: {status:?}"
-    );
+    let lines = client.expect_multiline("HELP", "100").await?;
     assert_eq!(
         lines,
         vec!["This server supports NNTP basics\r\n".to_string()]
     );
 
-    let response = send_command_read_line(&mut client, "DATE").await?;
-    assert!(
-        response.starts_with("111"),
-        "Session should remain usable after HELP, got: {response:?}"
-    );
+    client.expect_status("DATE", "111").await?;
 
     Ok(())
 }
 
 #[tokio::test]
 async fn test_list_returns_multiline_group_listing() -> Result<()> {
-    let mut client = spawn_client_with_backend(RoutingMode::Hybrid, utility_backend(0)).await?;
+    let mut client =
+        RfcTestClient::spawn(RoutingMode::Hybrid, "utility-backend", utility_backend).await?;
 
-    let (status, lines) = send_command_read_multiline_response(&mut client, "LIST").await?;
-    assert!(
-        status.starts_with("215"),
-        "RFC 3977 §7.6: LIST should return 215, got: {status:?}"
-    );
+    let lines = client.expect_multiline("LIST", "215").await?;
     assert_eq!(
         lines,
         vec![
@@ -76,11 +49,7 @@ async fn test_list_returns_multiline_group_listing() -> Result<()> {
         ]
     );
 
-    let response = send_command_read_line(&mut client, "DATE").await?;
-    assert!(
-        response.starts_with("111"),
-        "Hybrid session should remain usable after LIST, got: {response:?}"
-    );
+    client.expect_status("DATE", "111").await?;
 
     Ok(())
 }

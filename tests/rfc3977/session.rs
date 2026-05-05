@@ -3,70 +3,28 @@
 //! Tests authentication, QUIT handling, and message extraction through the public API
 
 use anyhow::Result;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{Duration, timeout};
 
-use crate::test_helpers::{MockNntpServer, create_test_server_config};
-use nntp_proxy::NntpProxy;
+use crate::test_helpers::{
+    MockNntpServer, connect_and_read_greeting, send_command_read_line, spawn_single_backend_proxy,
+    spawn_single_backend_proxy_with_auth,
+};
 use nntp_proxy::auth::AuthHandler;
-use nntp_proxy::config::{ClientAuth, Config, RoutingMode, UserCredentials};
+use nntp_proxy::config::RoutingMode;
 
 #[tokio::test]
 async fn test_quit_command_integration() -> Result<()> {
-    // Setup proxy
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_port = backend_listener.local_addr()?.port();
-    drop(backend_listener);
+    let (proxy_port, _backend) =
+        spawn_single_backend_proxy(RoutingMode::Hybrid, "backend", |port| {
+            MockNntpServer::new(port)
+                .with_name("Backend")
+                .on_command("QUIT", "205 Goodbye\r\n")
+        })
+        .await?;
 
-    let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let proxy_port = proxy_listener.local_addr()?.port();
-
-    let _mock = MockNntpServer::new(backend_port)
-        .with_name("Backend")
-        .on_command("QUIT", "205 Goodbye\r\n")
-        .spawn();
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let config = Config {
-        servers: vec![create_test_server_config(
-            "127.0.0.1",
-            backend_port,
-            "backend",
-        )],
-        ..Default::default()
-    };
-
-    let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
-
-    tokio::spawn(async move {
-        loop {
-            if let Ok((stream, addr)) = proxy_listener.accept().await {
-                let proxy_clone = proxy.clone();
-                tokio::spawn(async move {
-                    let _ = proxy_clone.handle_client(stream, addr.into()).await;
-                });
-            }
-        }
-    });
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Connect and test QUIT
-    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
-
-    let mut buffer = vec![0u8; 1024];
-    let _ = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
-
-    // Send QUIT
-    client.write_all(b"QUIT\r\n").await?;
-    let n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
-    let response = String::from_utf8_lossy(&buffer[..n]);
-
-    // Should get goodbye response
+    let mut client = connect_and_read_greeting(proxy_port).await?;
+    let response = send_command_read_line(&mut client, "QUIT").await?;
     assert!(
-        response.contains("205") || response.contains("Goodbye"),
+        response.starts_with("205"),
         "Expected goodbye response, got: {response}"
     );
 
@@ -75,91 +33,39 @@ async fn test_quit_command_integration() -> Result<()> {
 
 #[tokio::test]
 async fn test_auth_command_integration() -> Result<()> {
-    // Setup proxy with auth
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_port = backend_listener.local_addr()?.port();
-    drop(backend_listener);
-
-    let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let proxy_port = proxy_listener.local_addr()?.port();
-
-    let _mock = MockNntpServer::new(backend_port)
-        .with_name("Backend")
-        .on_command("HELP", "100 Help\r\n")
-        .spawn();
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let config = Config {
-        servers: vec![create_test_server_config(
-            "127.0.0.1",
-            backend_port,
-            "backend",
-        )],
-        client_auth: ClientAuth {
-            users: vec![UserCredentials {
-                username: "testuser".to_string(),
-                password: "testpass".to_string(),
-            }],
-            greeting: None,
+    let (proxy_port, _backend) = spawn_single_backend_proxy_with_auth(
+        RoutingMode::Hybrid,
+        "backend",
+        "testuser",
+        "testpass",
+        |port| {
+            MockNntpServer::new(port)
+                .with_name("Backend")
+                .on_command("DATE", "111 20260505155900\r\n")
         },
-        ..Default::default()
-    };
+    )
+    .await?;
 
-    let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
-
-    tokio::spawn(async move {
-        loop {
-            if let Ok((stream, addr)) = proxy_listener.accept().await {
-                let proxy_clone = proxy.clone();
-                tokio::spawn(async move {
-                    let _ = proxy_clone.handle_client(stream, addr.into()).await;
-                });
-            }
-        }
-    });
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Connect and try to send command without auth
-    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
-
-    let mut buffer = vec![0u8; 1024];
-    let _ = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
-
-    // Try HELP without auth - should get 480
-    client.write_all(b"HELP\r\n").await?;
-    let n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
-    let response = String::from_utf8_lossy(&buffer[..n]);
+    let mut client = connect_and_read_greeting(proxy_port).await?;
     assert!(
-        response.starts_with("480"),
-        "Expected auth required, got: {response}"
+        send_command_read_line(&mut client, "DATE")
+            .await?
+            .starts_with("480")
     );
-
-    // Authenticate
-    client.write_all(b"AUTHINFO USER testuser\r\n").await?;
-    let n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
-    let response = String::from_utf8_lossy(&buffer[..n]);
     assert!(
-        response.starts_with("381"),
-        "Expected password required, got: {response}"
+        send_command_read_line(&mut client, "AUTHINFO USER testuser")
+            .await?
+            .starts_with("381")
     );
-
-    client.write_all(b"AUTHINFO PASS testpass\r\n").await?;
-    let n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
-    let response = String::from_utf8_lossy(&buffer[..n]);
     assert!(
-        response.starts_with("281"),
-        "Expected auth success, got: {response}"
+        send_command_read_line(&mut client, "AUTHINFO PASS testpass")
+            .await?
+            .starts_with("281")
     );
-
-    // Now HELP should work
-    client.write_all(b"HELP\r\n").await?;
-    let n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
-    let response = String::from_utf8_lossy(&buffer[..n]);
     assert!(
-        response.contains("100"),
-        "Expected help response, got: {response}"
+        send_command_read_line(&mut client, "DATE")
+            .await?
+            .starts_with("111")
     );
 
     Ok(())
@@ -188,88 +94,52 @@ async fn test_auth_handler_disabled() -> Result<()> {
 
 #[tokio::test]
 async fn test_concurrent_auth_sessions() -> Result<()> {
-    // Setup proxy with auth
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_port = backend_listener.local_addr()?.port();
-    drop(backend_listener);
-
-    let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let proxy_port = proxy_listener.local_addr()?.port();
-
-    let _mock = MockNntpServer::new(backend_port)
-        .with_name("Backend")
-        .on_command("HELP", "100 Help\r\n")
-        .spawn();
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    let config = Config {
-        servers: vec![create_test_server_config(
-            "127.0.0.1",
-            backend_port,
-            "backend",
-        )],
-        client_auth: ClientAuth {
-            users: vec![UserCredentials {
-                username: "user".to_string(),
-                password: "pass".to_string(),
-            }],
-            greeting: None,
+    let (proxy_port, _backend) = spawn_single_backend_proxy_with_auth(
+        RoutingMode::Hybrid,
+        "backend",
+        "user",
+        "pass",
+        |port| {
+            MockNntpServer::new(port)
+                .with_name("Backend")
+                .on_command("DATE", "111 20260505155900\r\n")
         },
-        ..Default::default()
-    };
+    )
+    .await?;
 
-    let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
+    let mut client1 = connect_and_read_greeting(proxy_port).await?;
+    let mut client2 = connect_and_read_greeting(proxy_port).await?;
 
-    tokio::spawn(async move {
-        loop {
-            if let Ok((stream, addr)) = proxy_listener.accept().await {
-                let proxy_clone = proxy.clone();
-                tokio::spawn(async move {
-                    let _ = proxy_clone.handle_client(stream, addr.into()).await;
-                });
-            }
-        }
-    });
-
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Connect two clients and auth both
-    let mut client1 = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
-    let mut client2 = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
-
-    let mut buffer1 = vec![0u8; 1024];
-    let mut buffer2 = vec![0u8; 1024];
-
-    // Read greetings
-    let _ = timeout(Duration::from_secs(1), client1.read(&mut buffer1)).await??;
-    let _ = timeout(Duration::from_secs(1), client2.read(&mut buffer2)).await??;
-
-    // Auth both clients
-    client1.write_all(b"AUTHINFO USER user\r\n").await?;
-    client2.write_all(b"AUTHINFO USER user\r\n").await?;
-
-    let _ = timeout(Duration::from_secs(1), client1.read(&mut buffer1)).await??;
-    let _ = timeout(Duration::from_secs(1), client2.read(&mut buffer2)).await??;
-
-    client1.write_all(b"AUTHINFO PASS pass\r\n").await?;
-    client2.write_all(b"AUTHINFO PASS pass\r\n").await?;
-
-    let n1 = timeout(Duration::from_secs(1), client1.read(&mut buffer1)).await??;
-    let n2 = timeout(Duration::from_secs(1), client2.read(&mut buffer2)).await??;
-
-    assert!(n1 > 0);
-    assert!(n2 > 0);
-
-    // Both should be authenticated
-    client1.write_all(b"HELP\r\n").await?;
-    client2.write_all(b"HELP\r\n").await?;
-
-    let n1 = timeout(Duration::from_secs(1), client1.read(&mut buffer1)).await??;
-    let n2 = timeout(Duration::from_secs(1), client2.read(&mut buffer2)).await??;
-
-    assert!(n1 > 0);
-    assert!(n2 > 0);
+    assert!(
+        send_command_read_line(&mut client1, "AUTHINFO USER user")
+            .await?
+            .starts_with("381")
+    );
+    assert!(
+        send_command_read_line(&mut client2, "AUTHINFO USER user")
+            .await?
+            .starts_with("381")
+    );
+    assert!(
+        send_command_read_line(&mut client1, "AUTHINFO PASS pass")
+            .await?
+            .starts_with("281")
+    );
+    assert!(
+        send_command_read_line(&mut client2, "AUTHINFO PASS pass")
+            .await?
+            .starts_with("281")
+    );
+    assert!(
+        send_command_read_line(&mut client1, "DATE")
+            .await?
+            .starts_with("111")
+    );
+    assert!(
+        send_command_read_line(&mut client2, "DATE")
+            .await?
+            .starts_with("111")
+    );
 
     Ok(())
 }

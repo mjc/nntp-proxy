@@ -3,26 +3,9 @@
 //! Verify ARTICLE <message-id> behavior in per-command routing.
 
 use anyhow::Result;
-use tokio::net::TcpListener;
 
-use crate::test_helpers::{
-    MockNntpServer, connect_and_read_greeting, create_test_config,
-    send_article_read_multiline_response, spawn_proxy_with_config,
-};
+use crate::test_helpers::{MockNntpServer, RfcTestClient};
 use nntp_proxy::RoutingMode;
-
-async fn spawn_client_with_backend(
-    mode: RoutingMode,
-    backend: MockNntpServer,
-) -> Result<tokio::net::TcpStream> {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_port = backend_listener.local_addr()?.port();
-    let _backend = backend.spawn_on_listener(backend_listener);
-
-    let config = create_test_config(vec![(backend_port, "article-backend")]);
-    let proxy_port = spawn_proxy_with_config(config, mode).await?;
-    connect_and_read_greeting(proxy_port).await
-}
 
 fn article_backend(port: u16, message_id: &str) -> MockNntpServer {
     // Avoid double-wrapping angle brackets if the caller already provided them.
@@ -47,18 +30,15 @@ fn article_backend(port: u16, message_id: &str) -> MockNntpServer {
 #[tokio::test]
 async fn test_article_by_message_id_in_per_command_mode() -> Result<()> {
     let msgid = "<msgid-123@example.com>";
-    let mut client =
-        spawn_client_with_backend(RoutingMode::PerCommand, article_backend(0, msgid)).await?;
+    let mut client = RfcTestClient::spawn(RoutingMode::PerCommand, "article-backend", |port| {
+        article_backend(port, msgid)
+    })
+    .await?;
 
-    let (status, body) = send_article_read_multiline_response(&mut client, msgid).await?;
-    assert!(
-        status.starts_with("220"),
-        "Expected 220 ARTICLE response, got: {status:?}"
-    );
-    let concatenated = body.concat();
+    let concatenated = client.expect_article(msgid, "220").await?.concat();
     assert!(
         concatenated.contains("Body for"),
-        "ARTICLE body should be returned in per-command mode, got: {body:?}"
+        "ARTICLE body should be returned in per-command mode, got: {concatenated:?}"
     );
     Ok(())
 }

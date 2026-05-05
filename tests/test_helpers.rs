@@ -288,8 +288,7 @@ pub async fn spawn_test_proxy(proxy: NntpProxy, port: u16, per_command_routing: 
                 if attempt == 4 {
                     panic!("Failed to bind proxy listener on {proxy_addr}: {e}");
                 }
-                // Small sleep before retry
-                tokio::time::sleep(Duration::from_millis(30)).await;
+                tokio::task::yield_now().await;
             }
         }
     }
@@ -365,8 +364,6 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
 /// Returns an error if the server never becomes reachable within the allotted attempts.
 pub async fn wait_for_server(addr: &str, max_attempts: u32) -> Result<()> {
     for attempt in 1..=max_attempts {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
         if tokio::net::TcpStream::connect(addr).await.is_ok() {
             return Ok(());
         }
@@ -376,6 +373,8 @@ pub async fn wait_for_server(addr: &str, max_attempts: u32) -> Result<()> {
                 "Server at {addr} did not become ready after {max_attempts} attempts"
             ));
         }
+
+        tokio::task::yield_now().await;
     }
 
     Ok(())
@@ -519,8 +518,6 @@ pub async fn setup_proxy_with_backends(
         mock_handles.push(handle);
     }
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
     // Create proxy config
     let config = create_test_config(
         backend_ports
@@ -555,8 +552,6 @@ pub async fn setup_proxy_with_backends(
             }
         }
     });
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
 
     Ok((proxy_port, backend_ports, mock_handles))
 }
@@ -603,6 +598,45 @@ pub async fn spawn_proxy_with_config(
     Ok(proxy_port)
 }
 
+/// Spawn a proxy backed by a single mock backend and return the proxy port.
+///
+/// This is the shared setup used by tests that need to connect one or more raw
+/// clients instead of using [`RfcTestClient`].
+pub async fn spawn_single_backend_proxy<F>(
+    routing_mode: nntp_proxy::RoutingMode,
+    backend_name: &str,
+    build_backend: F,
+) -> Result<(u16, AbortHandle)>
+where
+    F: FnOnce(u16) -> MockNntpServer,
+{
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let backend = build_backend(backend_port).spawn_on_listener(backend_listener);
+    let config = create_test_config(vec![(backend_port, backend_name)]);
+    let proxy_port = spawn_proxy_with_config(config, routing_mode).await?;
+    Ok((proxy_port, backend))
+}
+
+/// Spawn an auth-enabled proxy backed by a single mock backend and return the proxy port.
+pub async fn spawn_single_backend_proxy_with_auth<F>(
+    routing_mode: nntp_proxy::RoutingMode,
+    _backend_name: &str,
+    username: &str,
+    password: &str,
+    build_backend: F,
+) -> Result<(u16, AbortHandle)>
+where
+    F: FnOnce(u16) -> MockNntpServer,
+{
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let backend = build_backend(backend_port).spawn_on_listener(backend_listener);
+    let config = create_test_config_with_auth(vec![backend_port], username, password);
+    let proxy_port = spawn_proxy_with_config(config, routing_mode).await?;
+    Ok((proxy_port, backend))
+}
+
 /// Connect to proxy and read greeting.
 ///
 /// # Errors
@@ -615,6 +649,151 @@ pub async fn connect_and_read_greeting(proxy_port: u16) -> Result<tokio::net::Tc
     }
 
     Ok(stream)
+}
+
+/// Connected RFC test client backed by a single spawned mock backend.
+///
+/// This fixture collapses the repetitive integration-test setup of:
+/// bind backend listener → spawn backend → create config → spawn proxy → connect client.
+pub struct RfcTestClient {
+    stream: tokio::net::TcpStream,
+    #[allow(dead_code)]
+    backend: AbortHandle,
+}
+
+impl RfcTestClient {
+    /// Spawn a client/proxy pair backed by one mock backend using default config.
+    pub async fn spawn<F>(
+        routing_mode: nntp_proxy::RoutingMode,
+        backend_name: &str,
+        build_backend: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(u16) -> MockNntpServer,
+    {
+        Self::spawn_with_config(
+            routing_mode,
+            backend_name,
+            create_test_config,
+            build_backend,
+        )
+        .await
+    }
+
+    /// Spawn a client/proxy pair backed by one mock backend using auth-enabled config.
+    pub async fn spawn_with_auth<F>(
+        routing_mode: nntp_proxy::RoutingMode,
+        backend_name: &str,
+        username: &str,
+        password: &str,
+        build_backend: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(u16) -> MockNntpServer,
+    {
+        Self::spawn_with_config(
+            routing_mode,
+            backend_name,
+            |servers| {
+                let ports = servers.into_iter().map(|(port, _)| port).collect();
+                create_test_config_with_auth(ports, username, password)
+            },
+            build_backend,
+        )
+        .await
+    }
+
+    async fn spawn_with_config<F, C>(
+        routing_mode: nntp_proxy::RoutingMode,
+        backend_name: &str,
+        make_config: C,
+        build_backend: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(u16) -> MockNntpServer,
+        C: FnOnce(Vec<(u16, &str)>) -> Config,
+    {
+        let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let backend_port = backend_listener.local_addr()?.port();
+        let backend = build_backend(backend_port).spawn_on_listener(backend_listener);
+        let config = make_config(vec![(backend_port, backend_name)]);
+        let proxy_port = spawn_proxy_with_config(config, routing_mode).await?;
+        let stream = connect_and_read_greeting(proxy_port).await?;
+
+        Ok(Self { stream, backend })
+    }
+
+    /// Borrow the underlying stream for bespoke pipelining/reader assertions.
+    pub fn stream_mut(&mut self) -> &mut tokio::net::TcpStream {
+        &mut self.stream
+    }
+
+    /// Consume the fixture and return the connected stream for custom readers.
+    pub fn into_stream(self) -> tokio::net::TcpStream {
+        self.stream
+    }
+
+    /// Send a command and return the single-line response.
+    pub async fn send_line(&mut self, command: &str) -> Result<String> {
+        send_command_read_line(&mut self.stream, command).await
+    }
+
+    /// Send a command and return the multiline response.
+    pub async fn send_multiline(&mut self, command: &str) -> Result<(String, Vec<String>)> {
+        send_command_read_multiline_response(&mut self.stream, command).await
+    }
+
+    /// Send ARTICLE and return the multiline response body.
+    pub async fn send_article(&mut self, selector: &str) -> Result<(String, Vec<String>)> {
+        send_article_read_multiline_response(&mut self.stream, selector).await
+    }
+
+    /// Send a command and assert the returned status prefix.
+    pub async fn expect_status(&mut self, command: &str, expected_prefix: &str) -> Result<String> {
+        let response = self.send_line(command).await?;
+        anyhow::ensure!(
+            response.starts_with(expected_prefix),
+            "Expected {expected_prefix} for command {command:?}, got: {response:?}"
+        );
+        Ok(response)
+    }
+
+    /// Send a command and assert the multiline response status prefix.
+    pub async fn expect_multiline(
+        &mut self,
+        command: &str,
+        expected_prefix: &str,
+    ) -> Result<Vec<String>> {
+        let (status, lines) = self.send_multiline(command).await?;
+        anyhow::ensure!(
+            status.starts_with(expected_prefix),
+            "Expected multiline status {expected_prefix} for command {command:?}, got: {status:?}"
+        );
+        Ok(lines)
+    }
+
+    /// Send ARTICLE and assert the returned status prefix.
+    pub async fn expect_article(
+        &mut self,
+        selector: &str,
+        expected_prefix: &str,
+    ) -> Result<Vec<String>> {
+        let (status, lines) = self.send_article(selector).await?;
+        anyhow::ensure!(
+            status.starts_with(expected_prefix),
+            "Expected ARTICLE status {expected_prefix} for selector {selector:?}, got: {status:?}"
+        );
+        Ok(lines)
+    }
+
+    /// Run a standard AUTHINFO USER/PASS flow and assert the expected status codes.
+    pub async fn authenticate(&mut self, username: &str, password: &str) -> Result<()> {
+        self.expect_status(&format!("AUTHINFO USER {username}"), "381")
+            .await?;
+        self.expect_status(&format!("AUTHINFO PASS {password}"), "281")
+            .await?;
+        Ok(())
+    }
 }
 
 async fn write_command_line(stream: &mut tokio::net::TcpStream, command: &str) -> Result<()> {

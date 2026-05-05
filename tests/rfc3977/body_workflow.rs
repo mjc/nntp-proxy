@@ -5,26 +5,9 @@
 //! large bodies and the expected 412/423 error paths.
 
 use anyhow::Result;
-use tokio::net::{TcpListener, TcpStream};
 
-use crate::test_helpers::{
-    MockNntpServer, connect_and_read_greeting, create_test_config, send_command_read_line,
-    send_command_read_multiline_response, spawn_proxy_with_config,
-};
+use crate::test_helpers::{MockNntpServer, RfcTestClient};
 use nntp_proxy::RoutingMode;
-
-async fn spawn_client_with_backend(
-    mode: RoutingMode,
-    backend: MockNntpServer,
-) -> Result<TcpStream> {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_port = backend_listener.local_addr()?.port();
-    let _backend = backend.spawn_on_listener(backend_listener);
-
-    let config = create_test_config(vec![(backend_port, "body-backend")]);
-    let proxy_port = spawn_proxy_with_config(config, mode).await?;
-    connect_and_read_greeting(proxy_port).await
-}
 
 fn large_body_response(status: &str) -> String {
     let mut response = String::from(status);
@@ -54,14 +37,12 @@ fn body_backend(port: u16) -> MockNntpServer {
 
 #[tokio::test]
 async fn test_body_by_message_id_returns_multiline_in_per_command_mode() -> Result<()> {
-    let mut client = spawn_client_with_backend(RoutingMode::PerCommand, body_backend(0)).await?;
+    let mut client =
+        RfcTestClient::spawn(RoutingMode::PerCommand, "body-backend", body_backend).await?;
 
-    let (status, lines) =
-        send_command_read_multiline_response(&mut client, "BODY <present@example.com>").await?;
-    assert!(
-        status.starts_with("222"),
-        "RFC 3977 §6.2.3: BODY by message-id should return 222, got: {status:?}"
-    );
+    let lines = client
+        .expect_multiline("BODY <present@example.com>", "222")
+        .await?;
     assert_eq!(lines, vec!["Body by message-id\r\n".to_string()]);
 
     Ok(())
@@ -69,19 +50,12 @@ async fn test_body_by_message_id_returns_multiline_in_per_command_mode() -> Resu
 
 #[tokio::test]
 async fn test_body_by_number_streams_large_multiline_body_after_group() -> Result<()> {
-    let mut client = spawn_client_with_backend(RoutingMode::Hybrid, body_backend(0)).await?;
+    let mut client =
+        RfcTestClient::spawn(RoutingMode::Hybrid, "body-backend", body_backend).await?;
 
-    let response = send_command_read_line(&mut client, "GROUP alt.test").await?;
-    assert!(
-        response.starts_with("211"),
-        "Expected GROUP to succeed before BODY by number, got: {response:?}"
-    );
+    client.expect_status("GROUP alt.test", "211").await?;
 
-    let (status, lines) = send_command_read_multiline_response(&mut client, "BODY 2").await?;
-    assert!(
-        status.starts_with("222 2 "),
-        "RFC 3977 §6.2.3: BODY by number should return 222, got: {status:?}"
-    );
+    let lines = client.expect_multiline("BODY 2", "222 2 ").await?;
     assert_eq!(lines.len(), 2048, "Expected the full large BODY payload");
     let body = lines.concat();
     assert!(
@@ -99,44 +73,23 @@ async fn test_body_by_number_streams_large_multiline_body_after_group() -> Resul
 
 #[tokio::test]
 async fn test_body_without_group_returns_412_in_stateful_mode() -> Result<()> {
-    let mut client = spawn_client_with_backend(RoutingMode::Stateful, body_backend(0)).await?;
+    let mut client =
+        RfcTestClient::spawn(RoutingMode::Stateful, "body-backend", body_backend).await?;
 
-    let response = send_command_read_line(&mut client, "BODY missing").await?;
-    assert!(
-        response.starts_with("412"),
-        "RFC 3977 §6.2.3: BODY without a selected group should return 412, got: {response:?}"
-    );
-
-    let response = send_command_read_line(&mut client, "GROUP alt.test").await?;
-    assert!(
-        response.starts_with("211"),
-        "Session should remain usable after 412 BODY, got: {response:?}"
-    );
+    client.expect_status("BODY missing", "412").await?;
+    client.expect_status("GROUP alt.test", "211").await?;
 
     Ok(())
 }
 
 #[tokio::test]
 async fn test_body_missing_article_number_returns_423_and_session_continues() -> Result<()> {
-    let mut client = spawn_client_with_backend(RoutingMode::Hybrid, body_backend(0)).await?;
+    let mut client =
+        RfcTestClient::spawn(RoutingMode::Hybrid, "body-backend", body_backend).await?;
 
-    let response = send_command_read_line(&mut client, "GROUP alt.test").await?;
-    assert!(
-        response.starts_with("211"),
-        "Expected GROUP to succeed before BODY by number, got: {response:?}"
-    );
-
-    let response = send_command_read_line(&mut client, "BODY 999").await?;
-    assert!(
-        response.starts_with("423"),
-        "RFC 3977 §6.2.3: missing BODY article numbers should return 423, got: {response:?}"
-    );
-
-    let response = send_command_read_line(&mut client, "LAST").await?;
-    assert!(
-        response.starts_with("223"),
-        "A 423 BODY response should not terminate the selected-group session, got: {response:?}"
-    );
+    client.expect_status("GROUP alt.test", "211").await?;
+    client.expect_status("BODY 999", "423").await?;
+    client.expect_status("LAST", "223").await?;
 
     Ok(())
 }
