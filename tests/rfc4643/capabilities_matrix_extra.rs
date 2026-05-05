@@ -33,9 +33,18 @@ async fn test_capabilities_in_hybrid_before_auth_injects_authinfo() -> Result<()
 
     let (status, lines) = send_command_read_multiline_response(&mut client, "CAPABILITIES").await?;
     let body = lines.concat();
-    assert!(status.starts_with("101"), "Expected 101 CAPABILITIES status, got: {status:?}");
-    assert!(body.contains("AUTHINFO USER PASS"), "Proxy should inject AUTHINFO when configured for client auth and before auth, got: {body:?}");
-    assert!(!body.contains("STARTTLS"), "Proxy must not leak STARTTLS, got: {body:?}");
+    assert!(
+        status.starts_with("101"),
+        "Expected 101 CAPABILITIES status, got: {status:?}"
+    );
+    assert!(
+        body.contains("AUTHINFO USER PASS"),
+        "Proxy should inject AUTHINFO when configured for client auth and before auth, got: {body:?}"
+    );
+    assert!(
+        !body.contains("STARTTLS"),
+        "Proxy must not leak STARTTLS, got: {body:?}"
+    );
     Ok(())
 }
 
@@ -44,13 +53,25 @@ async fn test_capabilities_in_per_command_after_auth_strips_authinfo() -> Result
     let mut client = spawn_caps_client_with_mode(RoutingMode::PerCommand).await?;
 
     let resp = send_command_read_line(&mut client, "AUTHINFO USER alice").await?;
-    assert!(resp.starts_with("381"), "Expected 381 password required, got: {resp:?}");
+    assert!(
+        resp.starts_with("381"),
+        "Expected 381 password required, got: {resp:?}"
+    );
     let resp = send_command_read_line(&mut client, "AUTHINFO PASS wonderland").await?;
-    assert!(resp.starts_with("281"), "Expected 281 auth accepted, got: {resp:?}");
+    assert!(
+        resp.starts_with("281"),
+        "Expected 281 auth accepted, got: {resp:?}"
+    );
 
     let (status, lines) = send_command_read_multiline_response(&mut client, "CAPABILITIES").await?;
     let body = lines.concat();
-    assert!(status.starts_with("101"), "Expected 101 CAPABILITIES after auth, got: {status:?}");
-    assert!(!body.contains("AUTHINFO"), "Proxy must not advertise AUTHINFO after client auth, got: {body:?}");
+    assert!(
+        status.starts_with("101"),
+        "Expected 101 CAPABILITIES after auth, got: {status:?}"
+    );
+    assert!(
+        !body.contains("AUTHINFO"),
+        "Proxy must not advertise AUTHINFO after client auth, got: {body:?}"
+    );
     Ok(())
 }

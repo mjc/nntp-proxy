@@ -7,6 +7,7 @@ pub mod authentication;
 pub mod backend;
 pub mod bypass_prevention;
 pub mod capabilities;
+pub mod capabilities_matrix_extra;
 pub mod command_gating;
 pub mod integration;
 pub mod review_claims;
