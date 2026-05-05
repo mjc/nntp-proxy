@@ -123,8 +123,9 @@ pub struct Config {
     pub memory: Memory,
     /// Cache configuration.
     ///
-    /// When omitted, the proxy leaves article caching disabled unless the CLI
-    /// explicitly enables it.
+    /// When omitted, the proxy still keeps the in-memory availability index for
+    /// routing/retry decisions, but skips explicit cache configuration and
+    /// availability-index persistence unless the CLI or config enables it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<Cache>,
     /// Health check configuration

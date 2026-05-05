@@ -207,7 +207,7 @@ impl NntpProxy {
         &self.buffer_pool
     }
 
-    /// Get the article cache (always present, though availability-only mode may be disabled)
+    /// Get the article cache (always present, including availability-only mode)
     #[must_use]
     #[inline]
     pub const fn cache(&self) -> &Arc<UnifiedCache> {

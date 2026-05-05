@@ -314,11 +314,8 @@ impl NntpProxyBuilder {
             Self::log_cache_config(cache_config, store_article_bodies);
             (cache, store_article_bodies)
         } else {
-            debug!("Cache not configured, leaving article caching disabled");
-            (
-                Arc::new(UnifiedCache::availability_disabled(Duration::MAX)),
-                false,
-            )
+            debug!("Cache not configured, using in-memory availability tracking only");
+            (Arc::new(UnifiedCache::availability(Duration::MAX)), false)
         };
 
         Ok(ctx.into_proxy(cache, store_article_bodies))
@@ -369,11 +366,8 @@ impl NntpProxyBuilder {
             Self::log_cache_config(cache_config, store_article_bodies);
             (cache, store_article_bodies)
         } else {
-            debug!("Cache not configured, leaving article caching disabled");
-            (
-                Arc::new(UnifiedCache::availability_disabled(Duration::MAX)),
-                false,
-            )
+            debug!("Cache not configured, using in-memory availability tracking only");
+            (Arc::new(UnifiedCache::availability(Duration::MAX)), false)
         };
 
         Ok(ctx.into_proxy(cache, store_article_bodies))
