@@ -2,7 +2,8 @@
 //!
 //! Bidirectional proxy: each client gets a dedicated backend connection.
 
-use crate::protocol::RequestContext;
+use crate::command::{CommandAction, CommandHandler, RejectResponse};
+use crate::protocol::{RequestContext, RequestKind, RequestRouteClass};
 use crate::session::{ClientSession, common};
 use crate::types::TransferMetrics;
 use anyhow::Result;
@@ -12,7 +13,73 @@ use tracing::{debug, error, warn};
 
 use crate::constants::buffer::{COMMAND, READER_CAPACITY};
 
+enum AuthenticatedStatefulAction {
+    Forward,
+    RejectAuthAlreadyAuthenticated,
+    InterceptCapabilities,
+    Reject(RejectResponse),
+}
+
+fn classify_authenticated_stateful_action(
+    request: &RequestContext,
+    auth_enabled: bool,
+) -> AuthenticatedStatefulAction {
+    match CommandHandler::classify_request(request) {
+        CommandAction::InterceptAuth(_) if auth_enabled => {
+            AuthenticatedStatefulAction::RejectAuthAlreadyAuthenticated
+        }
+        CommandAction::InterceptCapabilities => AuthenticatedStatefulAction::InterceptCapabilities,
+        CommandAction::Reject(response)
+            if matches!(request.kind(), RequestKind::Post | RequestKind::Ihave)
+                || request.route_class() == RequestRouteClass::Reject =>
+        {
+            AuthenticatedStatefulAction::Reject(response)
+        }
+        _ => AuthenticatedStatefulAction::Forward,
+    }
+}
+
 impl ClientSession {
+    async fn handle_authenticated_stateful_request<W, BW>(
+        &self,
+        request: &RequestContext,
+        client_write: &mut W,
+        backend_write: &mut BW,
+        state: &mut crate::session::state::SessionLoopState,
+    ) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+        BW: tokio::io::AsyncWrite + Unpin,
+    {
+        match classify_authenticated_stateful_action(request, self.auth_handler.is_enabled()) {
+            AuthenticatedStatefulAction::Forward => {
+                request.write_wire_to(backend_write).await?;
+                state.add_client_to_backend(request.request_wire_len().get());
+            }
+            AuthenticatedStatefulAction::RejectAuthAlreadyAuthenticated => {
+                use crate::protocol::AUTH_ALREADY_AUTHENTICATED;
+                client_write.write_all(AUTH_ALREADY_AUTHENTICATED).await?;
+                client_write.flush().await?;
+                state.add_backend_to_client(AUTH_ALREADY_AUTHENTICATED.len() as u64);
+            }
+            AuthenticatedStatefulAction::InterceptCapabilities => {
+                use crate::protocol::CAPABILITIES_WITHOUT_AUTHINFO;
+                client_write
+                    .write_all(CAPABILITIES_WITHOUT_AUTHINFO)
+                    .await?;
+                client_write.flush().await?;
+                state.add_backend_to_client(CAPABILITIES_WITHOUT_AUTHINFO.len() as u64);
+            }
+            AuthenticatedStatefulAction::Reject(response) => {
+                client_write.write_all(response.as_bytes()).await?;
+                client_write.flush().await?;
+                state.add_backend_to_client(response.len() as u64);
+            }
+        }
+
+        Ok(())
+    }
+
     /// Handle stateful session - acquire backend and proxy bidirectionally
     ///
     /// # Errors
@@ -128,23 +195,13 @@ impl ClientSession {
                             state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
 
                             if state.skip_auth_check {
-                                // RFC 4643 §2.2: After successful authentication, reject any
-                                // further AUTHINFO commands with 502 — but only when auth is
-                                // enabled. When auth is disabled skip_auth_check is true from
-                                // the start, and AUTHINFO should be forwarded to the backend.
-                                if self.auth_handler.is_enabled()
-                                    && request.kind() == crate::protocol::RequestKind::AuthInfo
-                                {
-                                    use crate::protocol::AUTH_ALREADY_AUTHENTICATED;
-                                    client_write.write_all(AUTH_ALREADY_AUTHENTICATED).await?;
-                                    client_write.flush().await?;
-                                    state.add_backend_to_client(
-                                        AUTH_ALREADY_AUTHENTICATED.len() as u64,
-                                    );
-                                } else {
-                                    request.write_wire_to(&mut backend_write).await?;
-                                    state.add_client_to_backend(request.request_wire_len().get());
-                                }
+                                self.handle_authenticated_stateful_request(
+                                    &request,
+                                    &mut client_write,
+                                    &mut backend_write,
+                                    &mut state,
+                                )
+                                .await?;
                             } else {
                                 // Auth path
                                 let auth_result = common::handle_stateful_auth_check(

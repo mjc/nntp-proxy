@@ -6,6 +6,7 @@
 pub mod authentication;
 pub mod backend;
 pub mod bypass_prevention;
+pub mod capabilities;
 pub mod integration;
 pub mod review_claims;
 pub mod rfc_compliance;

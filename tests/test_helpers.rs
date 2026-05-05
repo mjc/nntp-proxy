@@ -536,6 +536,48 @@ pub async fn setup_proxy_with_backends(
     Ok((proxy_port, backend_ports, mock_handles))
 }
 
+/// Spawn a proxy with the supplied config on a random loopback port.
+///
+/// Returns the chosen proxy port once the listener has been bound and the
+/// accept loop task has been spawned.
+///
+/// # Errors
+/// Returns any bind, address lookup, or proxy construction error.
+pub async fn spawn_proxy_with_config(
+    config: Config,
+    routing_mode: nntp_proxy::RoutingMode,
+) -> Result<u16> {
+    use nntp_proxy::NntpProxy;
+
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_port = proxy_listener.local_addr()?.port();
+    let proxy = NntpProxy::new(config, routing_mode).await?;
+
+    tokio::spawn(async move {
+        loop {
+            if let Ok((stream, addr)) = proxy_listener.accept().await {
+                let proxy_clone = proxy.clone();
+                let mode = routing_mode;
+                tokio::spawn(async move {
+                    use nntp_proxy::RoutingMode;
+                    let result = if matches!(mode, RoutingMode::PerCommand | RoutingMode::Hybrid) {
+                        proxy_clone
+                            .handle_client_per_command_routing(stream, addr.into())
+                            .await
+                    } else {
+                        proxy_clone.handle_client(stream, addr.into()).await
+                    };
+                    if let Err(error) = result {
+                        eprintln!("Proxy error handling client: {error}");
+                    }
+                });
+            }
+        }
+    });
+
+    Ok(proxy_port)
+}
+
 /// Connect to proxy and read greeting.
 ///
 /// # Errors
@@ -555,6 +597,32 @@ pub async fn connect_and_read_greeting(proxy_port: u16) -> Result<tokio::net::Tc
     // Return the raw stream (reader consumed it, need to recreate)
     drop(reader);
     Ok(stream)
+}
+
+/// Send a command and read its single-line response.
+///
+/// The command is terminated with CRLF if needed.
+///
+/// # Errors
+/// Returns any socket read/write error while exchanging the command.
+pub async fn send_command_read_line(
+    stream: &mut tokio::net::TcpStream,
+    command: &str,
+) -> Result<String> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    if command.ends_with("\r\n") {
+        stream.write_all(command.as_bytes()).await?;
+    } else {
+        stream
+            .write_all(format!("{command}\r\n").as_bytes())
+            .await?;
+    }
+
+    let mut reader = tokio::io::BufReader::new(&mut *stream);
+    let mut line = String::new();
+    reader.read_line(&mut line).await?;
+    Ok(line)
 }
 
 /// Send ARTICLE command and read its multiline response.
@@ -593,6 +661,44 @@ pub async fn send_article_read_multiline_response(
     }
 
     Ok((status_line, body_lines))
+}
+
+/// Send a command and read a multiline NNTP response until the terminator.
+///
+/// Returns the status line and each subsequent response line, excluding the
+/// terminating `.\r\n` line.
+///
+/// # Errors
+/// Returns any socket read/write error while exchanging the command.
+pub async fn send_command_read_multiline_response(
+    stream: &mut tokio::net::TcpStream,
+    command: &str,
+) -> Result<(String, Vec<String>)> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+    if command.ends_with("\r\n") {
+        stream.write_all(command.as_bytes()).await?;
+    } else {
+        stream
+            .write_all(format!("{command}\r\n").as_bytes())
+            .await?;
+    }
+
+    let mut reader = tokio::io::BufReader::new(&mut *stream);
+    let mut status_line = String::new();
+    reader.read_line(&mut status_line).await?;
+
+    let mut lines = Vec::new();
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).await?;
+        if line == ".\r\n" {
+            break;
+        }
+        lines.push(line);
+    }
+
+    Ok((status_line, lines))
 }
 
 // =============================================================================
