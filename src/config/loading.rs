@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::defaults;
-use super::types::{Config, Server};
+use super::types::{Config, Server, UserCredentials};
 
 type TomlTable = toml::map::Map<String, toml::Value>;
 
@@ -140,10 +140,42 @@ fn migrate_cache_precheck(config: &mut Config, raw: &toml::Value) -> bool {
     false
 }
 
+fn migrate_client_auth_users(config: &mut Config, raw: &toml::Value) -> bool {
+    if !config.client_auth.users.is_empty() {
+        return false;
+    }
+
+    let Some(client_auth) = table(raw, "client_auth") else {
+        return false;
+    };
+
+    let Some(username) = client_auth
+        .get("username")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+    else {
+        return false;
+    };
+    let Some(password) = client_auth
+        .get("password")
+        .and_then(|value| value.as_str())
+        .map(str::to_owned)
+    else {
+        return false;
+    };
+
+    config
+        .client_auth
+        .users
+        .push(UserCredentials { username, password });
+    true
+}
+
 fn migrate_legacy_config(config: &mut Config, raw: &toml::Value) -> bool {
     migrate_proxy_routing(config, raw)
         | migrate_proxy_memory(config, raw)
         | migrate_cache_precheck(config, raw)
+        | migrate_client_auth_users(config, raw)
 }
 
 /// Environment variable getter trait for dependency injection
@@ -368,7 +400,7 @@ fn load_config_with_env_provider<E: EnvProvider>(config_path: &str, env: &E) -> 
 
     if migrated {
         tracing::info!(
-            "Migrating legacy configuration schema in '{}' to the new routing/cache/memory layout",
+            "Migrating legacy configuration schema in '{}' to the new routing/cache/memory/client-auth layout",
             config_path
         );
         config = file_config;
@@ -1045,6 +1077,43 @@ socket_recv_buffer_size = 8388608
         assert!(migrated.contains("socket_recv_buffer_size = 8388608"));
         assert!(migrated.contains("buffer_pool_count = 64"));
         assert!(migrated.contains("capture_pool_count = 32"));
+    }
+
+    #[test]
+    fn test_load_config_migrates_legacy_client_auth_single_user() {
+        let mut temp_file = NamedTempFile::new().unwrap();
+
+        let config_content = r#"
+[[servers]]
+host = "legacy.example.com"
+port = 119
+name = "Legacy Server"
+
+[client_auth]
+greeting = "201 auth required"
+username = "legacy-user"
+password = "legacy-pass"
+"#;
+        temp_file.write_all(config_content.as_bytes()).unwrap();
+        temp_file.flush().unwrap();
+
+        let path = temp_file.path().to_str().unwrap().to_string();
+        let config = load_config_with_env_provider(&path, &MockEnv::new()).unwrap();
+
+        assert_eq!(
+            config.client_auth.greeting.as_deref(),
+            Some("201 auth required")
+        );
+        assert_eq!(config.client_auth.users.len(), 1);
+        assert_eq!(config.client_auth.users[0].username, "legacy-user");
+        assert_eq!(config.client_auth.users[0].password, "legacy-pass");
+
+        let migrated = std::fs::read_to_string(&path).unwrap();
+        assert!(migrated.contains("[client_auth]"));
+        assert!(migrated.contains("greeting = \"201 auth required\""));
+        assert!(migrated.contains("[[client_auth.users]]"));
+        assert!(migrated.contains("username = \"legacy-user\""));
+        assert!(migrated.contains("password = \"legacy-pass\""));
     }
 
     #[test]

@@ -295,7 +295,8 @@ pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
 /// the dedicated availability index.
 ///
 /// # Errors
-/// Returns an error if metrics or availability persistence fails.
+/// Returns an error if metrics or availability persistence fails, but still
+/// attempts both writes so one failure does not suppress the other.
 pub async fn persist_runtime_state(
     proxy: &std::sync::Arc<crate::NntpProxy>,
     stats_path: std::path::PathBuf,
@@ -304,20 +305,36 @@ pub async fn persist_runtime_state(
 ) -> Result<()> {
     use tracing::{info, warn};
 
+    let mut first_error = None;
+
     let metrics = proxy.metrics().clone();
-    save_metrics_to_disk_blocking(metrics, stats_path.clone(), server_names).await?;
-    info!("Metrics saved to {}", stats_path.display());
+    match save_metrics_to_disk_blocking(metrics, stats_path.clone(), server_names).await {
+        Ok(()) => info!("Metrics saved to {}", stats_path.display()),
+        Err(e) => {
+            warn!("Failed to save metrics on shutdown: {}", e);
+            first_error = Some(e);
+        }
+    }
 
     if let Some(path) = availability_path {
         let cache = proxy.cache().clone();
         match save_availability_to_disk_blocking(cache, path.clone()).await {
             Ok(true) => info!("Availability index saved to {}", path.display()),
             Ok(false) => {}
-            Err(e) => warn!("Failed to save availability index on shutdown: {}", e),
+            Err(e) => {
+                warn!("Failed to save availability index on shutdown: {}", e);
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
         }
     }
 
-    Ok(())
+    if let Some(error) = first_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
 }
 
 /// Spawn graceful shutdown handler
@@ -951,6 +968,11 @@ mod tests {
             ..Default::default()
         };
         assert!(resolve_availability_file_path("config.toml", Some(&cache)).is_none());
+    }
+
+    #[test]
+    fn test_resolve_availability_file_path_none_without_cache_config() {
+        assert!(resolve_availability_file_path("config.toml", None).is_none());
     }
 
     #[test]

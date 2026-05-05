@@ -190,12 +190,38 @@ impl CommonArgs {
         }
     }
 
-    /// Apply CLI argument overrides to loaded config
-    ///
-    /// This method modifies the provided config by applying any CLI arguments
-    /// that were explicitly set by the user. Arguments left at their default
-    /// (None) values do not modify the config.
-    pub fn apply_overrides(&self, config: &mut Config) {
+    fn legacy_env_var<E>(env_get: &E, keys: &[&str]) -> Option<String>
+    where
+        E: Fn(&str) -> Option<String>,
+    {
+        keys.iter().find_map(|key| env_get(key))
+    }
+
+    fn env_bool<E>(env_get: &E, keys: &[&str]) -> Option<bool>
+    where
+        E: Fn(&str) -> Option<String>,
+    {
+        Self::legacy_env_var(env_get, keys)?.parse().ok()
+    }
+
+    fn env_u64<E>(env_get: &E, keys: &[&str]) -> Option<u64>
+    where
+        E: Fn(&str) -> Option<String>,
+    {
+        Self::legacy_env_var(env_get, keys)?.parse().ok()
+    }
+
+    fn env_cache_capacity<E>(env_get: &E, keys: &[&str]) -> Option<CacheCapacity>
+    where
+        E: Fn(&str) -> Option<String>,
+    {
+        Self::legacy_env_var(env_get, keys)?.parse().ok()
+    }
+
+    fn apply_overrides_with_env<E>(&self, config: &mut Config, env_get: E)
+    where
+        E: Fn(&str) -> Option<String>,
+    {
         // Routing overrides
         if let Some(strategy) = self.backend_selection {
             config.routing.backend_selection = strategy;
@@ -204,31 +230,53 @@ impl CommonArgs {
             config.routing.routing_mode = rm;
         }
 
+        let article_cache_capacity = self
+            .article_cache_capacity
+            .or_else(|| Self::env_cache_capacity(&env_get, &["NNTP_PROXY_CACHE_CAPACITY"]));
+        let article_cache_ttl_secs = self
+            .article_cache_ttl_secs
+            .or_else(|| Self::env_u64(&env_get, &["NNTP_PROXY_CACHE_TTL"]));
+        let store_article_bodies = self
+            .store_article_bodies
+            .or_else(|| Self::env_bool(&env_get, &["NNTP_PROXY_CACHE_ARTICLES"]));
+
         // Cache overrides — create cache section if needed
-        if self.article_cache_capacity.is_some()
-            || self.article_cache_ttl_secs.is_some()
-            || self.store_article_bodies.is_some()
+        if article_cache_capacity.is_some()
+            || article_cache_ttl_secs.is_some()
+            || store_article_bodies.is_some()
         {
             let cache = config
                 .cache
                 .get_or_insert_with(crate::config::Cache::default);
-            if let Some(cap) = self.article_cache_capacity {
+            if let Some(cap) = article_cache_capacity {
                 cache.article_cache_capacity = cap;
             }
-            if let Some(ttl) = self.article_cache_ttl_secs {
+            if let Some(ttl) = article_cache_ttl_secs {
                 cache.article_cache_ttl_secs = Duration::from_secs(ttl);
             }
-            if let Some(articles) = self.store_article_bodies {
+            if let Some(articles) = store_article_bodies {
                 cache.store_article_bodies = articles;
             }
         }
 
         // Pipelining global override — applies to all servers
-        if let Some(enable) = self.backend_pipelining {
+        if let Some(enable) = self
+            .backend_pipelining
+            .or_else(|| Self::env_bool(&env_get, &["NNTP_PROXY_ENABLE_PIPELINING"]))
+        {
             for server in &mut config.servers {
                 server.backend_pipelining = enable;
             }
         }
+    }
+
+    /// Apply CLI argument overrides to loaded config
+    ///
+    /// This method modifies the provided config by applying any CLI arguments
+    /// that were explicitly set by the user. Arguments left at their default
+    /// (None) values do not modify the config.
+    pub fn apply_overrides(&self, config: &mut Config) {
+        self.apply_overrides_with_env(config, |key| std::env::var(key).ok());
     }
 }
 
@@ -491,6 +539,35 @@ mod tests {
         assert_eq!(cache.article_cache_capacity.get(), 128 * 1024 * 1024);
         assert_eq!(cache.article_cache_ttl_secs, Duration::from_hours(2));
         assert!(!cache.store_article_bodies);
+    }
+
+    #[test]
+    fn test_apply_overrides_legacy_env_compat() {
+        let args = default_args();
+        let mut config = Config {
+            cache: None,
+            servers: vec![
+                crate::config::Server::builder("server1.example.com", Port::try_new(119).unwrap())
+                    .backend_pipelining(false)
+                    .build()
+                    .unwrap(),
+            ],
+            ..Config::default()
+        };
+
+        args.apply_overrides_with_env(&mut config, |key| match key {
+            "NNTP_PROXY_CACHE_CAPACITY" => Some("128mb".to_string()),
+            "NNTP_PROXY_CACHE_TTL" => Some("7200".to_string()),
+            "NNTP_PROXY_CACHE_ARTICLES" => Some("false".to_string()),
+            "NNTP_PROXY_ENABLE_PIPELINING" => Some("true".to_string()),
+            _ => None,
+        });
+
+        let cache = config.cache.as_ref().unwrap();
+        assert_eq!(cache.article_cache_capacity.get(), 128_000_000);
+        assert_eq!(cache.article_cache_ttl_secs, Duration::from_hours(2));
+        assert!(!cache.store_article_bodies);
+        assert!(config.servers[0].backend_pipelining);
     }
 
     #[test]

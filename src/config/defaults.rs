@@ -2,7 +2,6 @@
 //!
 //! This module centralizes all default value functions used in serde deserialization.
 
-use super::types::Cache;
 use super::types::CompressionCodec;
 use crate::types::{CacheCapacity, MaxConnections, MaxErrors};
 use std::path::PathBuf;
@@ -60,23 +59,19 @@ pub const fn cache_ttl() -> Duration {
     Duration::from_hours(1)
 }
 
-/// Default for caching article bodies (false = availability-only mode)
+/// Default for caching article bodies in explicit `[cache]` sections.
+///
+/// Legacy cache configs omitted this field and expected full article caching,
+/// so the serde default stays `true` for backward compatibility.
 #[inline]
 pub const fn cache_articles() -> bool {
-    false
+    true
 }
 
 /// Default for adaptive availability prechecking (false = disabled)
 #[inline]
 pub const fn adaptive_precheck() -> bool {
     false
-}
-
-/// Default cache configuration option
-#[inline]
-#[must_use]
-pub fn default_cache_option() -> Option<Cache> {
-    Some(Cache::default())
 }
 
 /// Default socket receive buffer size

@@ -30,12 +30,10 @@ adaptive_precheck = false
 article_cache_capacity = "64mb"
 # Time-to-live for the article cache (default: 1 hour)
 article_cache_ttl_secs = 3600
-# Store full article bodies in the article cache (default: false for availability-only mode)
-store_article_bodies = false
-# Optional persistence file for availability-only mode
-# availability_index_path = "/var/cache/nntp-proxy/availability.idx"
+# Store full article bodies in the article cache (required for memory/disk article caching)
+store_article_bodies = true
 
-# Disk Cache Configuration (optional)
+# Disk Cache Configuration (optional, only used when store_article_bodies = true)
 # When configured, creates two-tier cache: memory -> disk -> backend
 # Articles evicted from memory are written to disk for later retrieval
 #

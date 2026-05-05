@@ -81,10 +81,17 @@ async fn run_proxy(
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
     let (tui_handle, tui_shutdown_tx) =
         launch_tui(ui_mode, &proxy, log_buffer, shutdown_tx.clone())?;
+    let error_shutdown_tx = tui_shutdown_tx.clone();
     spawn_signal_forwarder(shutdown_tx, tui_shutdown_tx);
 
     let accept_result =
         runtime::run_accept_loop(proxy.clone(), listener, shutdown_rx, routing_mode).await;
+
+    if accept_result.is_err()
+        && let Some(tx) = error_shutdown_tx
+    {
+        let _ = tx.send(()).await;
+    }
 
     if let Some(handle) = tui_handle {
         handle.await?;

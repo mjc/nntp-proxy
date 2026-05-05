@@ -110,7 +110,7 @@ impl std::fmt::Display for BackendSelectionStrategy {
 }
 
 /// Main proxy configuration
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct Config {
     /// Proxy server settings
     #[serde(default)]
@@ -121,11 +121,11 @@ pub struct Config {
     /// Memory configuration
     #[serde(default)]
     pub memory: Memory,
-    /// Cache configuration (optional in config - defaults to availability-only mode)
-    #[serde(
-        default = "super::defaults::default_cache_option",
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// Cache configuration.
+    ///
+    /// When omitted, the proxy leaves article caching disabled unless the CLI
+    /// explicitly enables it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<Cache>,
     /// Health check configuration
     #[serde(default)]
@@ -136,20 +136,6 @@ pub struct Config {
     /// List of backend NNTP servers
     #[serde(default)]
     pub servers: Vec<Server>,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            proxy: Proxy::default(),
-            routing: Routing::default(),
-            memory: Memory::default(),
-            cache: super::defaults::default_cache_option(),
-            health_check: HealthCheck::default(),
-            client_auth: ClientAuth::default(),
-            servers: Vec::new(),
-        }
-    }
 }
 
 /// Proxy server settings
@@ -299,7 +285,7 @@ pub struct Cache {
         alias = "ttl"
     )]
     pub article_cache_ttl_secs: Duration,
-    /// Whether to store full article bodies in the article cache (default: false)
+    /// Whether to store full article bodies in the article cache (default: true)
     ///
     /// When false:
     /// - Cache still tracks backend availability (smart routing, 430 retry)
@@ -966,6 +952,7 @@ mod tests {
         let cache = Cache::default();
         assert_eq!(cache.article_cache_capacity.get(), 64 * 1024 * 1024); // 64 MB
         assert_eq!(cache.article_cache_ttl_secs, Duration::from_hours(1));
+        assert!(cache.store_article_bodies);
     }
 
     // HealthCheck tests
@@ -1139,8 +1126,7 @@ mod tests {
         let config = Config::default();
         assert!(config.servers.is_empty());
         assert_eq!(config.proxy.host, "0.0.0.0");
-        assert!(config.cache.is_some());
-        assert!(!config.cache.as_ref().unwrap().store_article_bodies);
+        assert!(config.cache.is_none());
         assert!(!config.client_auth.is_enabled());
     }
 

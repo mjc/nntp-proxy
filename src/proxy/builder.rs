@@ -314,8 +314,11 @@ impl NntpProxyBuilder {
             Self::log_cache_config(cache_config, store_article_bodies);
             (cache, store_article_bodies)
         } else {
-            debug!("Cache not configured, using fixed-size availability-only mode");
-            (Arc::new(UnifiedCache::availability(Duration::MAX)), false)
+            debug!("Cache not configured, leaving article caching disabled");
+            (
+                Arc::new(UnifiedCache::availability_disabled(Duration::MAX)),
+                false,
+            )
         };
 
         Ok(ctx.into_proxy(cache, store_article_bodies))
@@ -366,8 +369,11 @@ impl NntpProxyBuilder {
             Self::log_cache_config(cache_config, store_article_bodies);
             (cache, store_article_bodies)
         } else {
-            debug!("Cache not configured, using fixed-size availability-only mode");
-            (Arc::new(UnifiedCache::availability(Duration::MAX)), false)
+            debug!("Cache not configured, leaving article caching disabled");
+            (
+                Arc::new(UnifiedCache::availability_disabled(Duration::MAX)),
+                false,
+            )
         };
 
         Ok(ctx.into_proxy(cache, store_article_bodies))
