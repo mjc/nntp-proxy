@@ -4,7 +4,7 @@
 
 use crate::command::{CommandAction, CommandHandler, RejectResponse};
 use crate::protocol::{RequestContext, RequestKind, RequestRouteClass};
-use crate::session::state::StatefulReadMode;
+use crate::session::state::{OrderedOutputSegment, StatefulReadMode};
 use crate::session::{ClientSession, common};
 use crate::types::TransferMetrics;
 use anyhow::Result;
@@ -108,18 +108,19 @@ impl ClientSession {
         match buffer.read_from(backend_read).await {
             Ok(0) => Ok(false),
             Ok(n) => {
-                client_write.write_all(&buffer[..n]).await?;
-                state.add_backend_to_client(n as u64);
-                state.observe_backend_bytes(&buffer[..n]);
-
-                let replies = state.take_ready_deferred_replies();
-                if !replies.is_empty() {
-                    for reply in replies {
-                        client_write.write_all(&reply).await?;
-                        state.add_backend_to_client(reply.len() as u64);
+                for segment in state.ordered_output_segments(&buffer[..n]) {
+                    match segment {
+                        OrderedOutputSegment::Backend(bytes) => {
+                            client_write.write_all(bytes).await?;
+                            state.add_backend_to_client(bytes.len() as u64);
+                        }
+                        OrderedOutputSegment::Local(reply) => {
+                            client_write.write_all(&reply).await?;
+                            state.add_backend_to_client(reply.len() as u64);
+                        }
                     }
-                    client_write.flush().await?;
                 }
+                client_write.flush().await?;
 
                 Ok(true)
             }

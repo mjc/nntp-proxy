@@ -30,6 +30,33 @@ const fn size_as_f64(value: usize) -> f64 {
     value as f64
 }
 
+#[allow(clippy::cast_precision_loss)] // Utilization percentages are display-only values.
+fn buffer_utilization_percent(in_use: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        size_as_f64(in_use * 100) / size_as_f64(total)
+    }
+}
+
+const fn backend_error_count_color(errors_4xx: u64, errors_5xx: u64) -> Color {
+    if errors_5xx > 0 {
+        Color::Red
+    } else if errors_4xx > 0 {
+        Color::Yellow
+    } else {
+        styles::VALUE_NEUTRAL
+    }
+}
+
+const fn connection_failures_color(failures: u64) -> Color {
+    if failures > 0 {
+        Color::Red
+    } else {
+        styles::VALUE_NEUTRAL
+    }
+}
+
 // ============================================================================
 // Widget Creation Helpers (Pure Functions)
 // ============================================================================
@@ -271,15 +298,16 @@ fn create_app_summary(
     // Add buffer stats in details mode if available
     if show_details && let Some(pool) = buffer_pool {
         let (_available, in_use, total) = pool.stats();
+        let utilization_percent = buffer_utilization_percent(in_use, total);
         lines.push(Line::from(vec![
             "Buffers: ".fg(styles::LABEL),
             format!(
                 "{}/{} ({:.0}%)",
                 format_count(in_use as u64),
                 format_count(total as u64),
-                size_as_f64(in_use * 100) / size_as_f64(total)
+                utilization_percent
             )
-            .fg(magnitude_color(total as u64)),
+            .fg(load_percentage_color(utilization_percent)),
         ]));
     }
 
@@ -473,9 +501,9 @@ fn backend_error_line(
             format_count(errors_4xx),
             format_count(errors_5xx)
         )
-        .fg(magnitude_color(errors_4xx.max(errors_5xx))),
+        .fg(backend_error_count_color(errors_4xx, errors_5xx)),
         " | Conn Fails: ".fg(styles::LABEL),
-        format_count(failures).fg(magnitude_color(failures)),
+        format_count(failures).fg(connection_failures_color(failures)),
     ])
 }
 
@@ -581,6 +609,30 @@ fn render_backend_list(
     let list = List::new(items).block(bordered_block("Backend Servers", styles::BORDER_NORMAL));
 
     f.render_widget(list, area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_backend_error_count_color_highlights_any_error() {
+        assert_eq!(backend_error_count_color(0, 0), styles::VALUE_NEUTRAL);
+        assert_eq!(backend_error_count_color(1, 0), Color::Yellow);
+        assert_eq!(backend_error_count_color(0, 1), Color::Red);
+    }
+
+    #[test]
+    fn test_connection_failures_color_highlights_nonzero_failures() {
+        assert_eq!(connection_failures_color(0), styles::VALUE_NEUTRAL);
+        assert_eq!(connection_failures_color(1), Color::Red);
+    }
+
+    #[test]
+    fn test_buffer_utilization_percent_handles_zero_total() {
+        assert_eq!(buffer_utilization_percent(0, 0), 0.0);
+        assert_eq!(buffer_utilization_percent(9, 10), 90.0);
+    }
 }
 
 /// Render data flow visualization as line graphs

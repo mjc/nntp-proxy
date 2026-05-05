@@ -21,6 +21,11 @@ enum OrderedReply {
     Local(Vec<u8>),
 }
 
+pub(in crate::session) enum OrderedOutputSegment<'a> {
+    Backend(&'a [u8]),
+    Local(Vec<u8>),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatefulReadMode {
     Bidirectional,
@@ -324,6 +329,59 @@ impl SessionLoopState {
         }
     }
 
+    /// Split a backend read chunk into ordered backend/local output segments.
+    ///
+    /// This preserves client-visible response ordering even when one read
+    /// contains bytes for multiple pipelined backend replies.
+    #[must_use]
+    pub(in crate::session) fn ordered_output_segments<'a>(
+        &mut self,
+        chunk: &'a [u8],
+    ) -> Vec<OrderedOutputSegment<'a>> {
+        let mut segments = Vec::new();
+        let mut offset = 0;
+
+        for reply in self.take_ready_deferred_replies() {
+            segments.push(OrderedOutputSegment::Local(reply));
+        }
+
+        while offset < chunk.len() {
+            let Some(front) = self.ordered_replies.front_mut() else {
+                segments.push(OrderedOutputSegment::Backend(&chunk[offset..]));
+                break;
+            };
+
+            match front {
+                OrderedReply::Backend(front) => {
+                    let progress = front.consume(&chunk[offset..]);
+                    if progress.consumed == 0 {
+                        break;
+                    }
+
+                    let end = offset + progress.consumed;
+                    segments.push(OrderedOutputSegment::Backend(&chunk[offset..end]));
+                    offset = end;
+
+                    if progress.completed {
+                        self.ordered_replies.pop_front();
+                        for reply in self.take_ready_deferred_replies() {
+                            segments.push(OrderedOutputSegment::Local(reply));
+                        }
+                    } else {
+                        break;
+                    }
+                }
+                OrderedReply::Local(_) => {
+                    for reply in self.take_ready_deferred_replies() {
+                        segments.push(OrderedOutputSegment::Local(reply));
+                    }
+                }
+            }
+        }
+
+        segments
+    }
+
     /// Queue a local reply until earlier backend output has been sent.
     pub fn push_deferred_reply(&mut self, reply: impl Into<Vec<u8>>) {
         self.ordered_replies
@@ -543,6 +601,35 @@ mod tests {
         assert_eq!(state.take_ready_deferred_replies(), vec![deferred]);
 
         state.observe_backend_bytes(b"111 20260505120001\r\n");
+        assert!(!state.has_pending_backend_replies());
+    }
+
+    #[test]
+    fn test_ordered_output_segments_split_backend_chunk_around_deferred_reply() {
+        let mut state = SessionLoopState::new(false);
+        let deferred = b"101 Capability list:\r\n.\r\n".to_vec();
+
+        state.mark_backend_request_sent(RequestKind::Date);
+        state.push_deferred_reply(deferred.clone());
+        state.mark_backend_request_sent(RequestKind::Date);
+
+        let rendered: Vec<Vec<u8>> = state
+            .ordered_output_segments(b"111 20260505120000\r\n111 20260505120001\r\n")
+            .into_iter()
+            .map(|segment| match segment {
+                OrderedOutputSegment::Backend(bytes) => bytes.to_vec(),
+                OrderedOutputSegment::Local(bytes) => bytes,
+            })
+            .collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                b"111 20260505120000\r\n".to_vec(),
+                deferred,
+                b"111 20260505120001\r\n".to_vec(),
+            ]
+        );
         assert!(!state.has_pending_backend_replies());
     }
 
