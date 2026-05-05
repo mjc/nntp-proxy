@@ -7,6 +7,11 @@
   cfg = config.services.nntp-proxy;
   tomlFormat = pkgs.formats.toml {};
   defaultPackage = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
+  serviceEnvironment =
+    cfg.environment
+    // lib.optionalAttrs (cfg.credentialsFile != null) {
+      NNTP_PROXY_CREDENTIALS_FILE = toString cfg.credentialsFile;
+    };
 
   hasCache = lib.hasAttrByPath ["cache"] cfg.settings;
   storesArticleBodies = lib.attrByPath ["cache" "store_article_bodies"] false cfg.settings;
@@ -95,6 +100,18 @@ in {
       description = "Environment variables exported to the systemd service.";
     };
 
+    credentialsFile = lib.mkOption {
+      type = with lib.types; nullOr (either path str);
+      default = null;
+      example = "/var/lib/nntp-proxy/credentials.toml";
+      description = ''
+        Optional credentials-only TOML overlay. When set, the service loads the
+        main config from `settings` or `configFile`, then merges backend and
+        client-auth passwords from this runtime file via
+        `NNTP_PROXY_CREDENTIALS_FILE`.
+      '';
+    };
+
     openFirewall = lib.mkEnableOption "opening the NNTP listener port in the firewall";
 
     listenPort = lib.mkOption {
@@ -124,7 +141,7 @@ in {
       wantedBy = ["multi-user.target"];
       wants = ["network-online.target"];
       after = ["network-online.target"];
-      environment = cfg.environment;
+      environment = serviceEnvironment;
 
       serviceConfig = {
         Type = "simple";

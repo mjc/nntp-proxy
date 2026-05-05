@@ -383,7 +383,9 @@ nix build .#default
 
 For NixOS, the flake exports `nixosModules.default`, which adds a
 `services.nntp-proxy` module. It can either use an existing `config.toml`, or
-render one from `services.nntp-proxy.settings`:
+render one from `services.nntp-proxy.settings`. A separate
+`services.nntp-proxy.credentialsFile` can provide secret backend/client
+passwords at runtime:
 
 ```nix
 {
@@ -398,6 +400,7 @@ render one from `services.nntp-proxy.settings`:
           services.nntp-proxy = {
             enable = true;
             openFirewall = true;
+            credentialsFile = "/var/lib/nntp-proxy/credentials.toml";
             settings = {
               proxy.port = 8119;
               routing.mode = "hybrid";
@@ -418,6 +421,19 @@ render one from `services.nntp-proxy.settings`:
     };
   };
 }
+```
+
+Example credentials overlay:
+
+```toml
+[[servers]]
+name = "Primary"
+username = "backend-user"
+password = "backend-pass"
+
+[[client_auth.users]]
+username = "reader"
+password = "reader-password"
 ```
 
 Common checks:

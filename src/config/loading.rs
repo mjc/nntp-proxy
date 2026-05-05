@@ -12,6 +12,30 @@ use super::defaults;
 use super::types::{Config, Server, UserCredentials};
 
 type TomlTable = toml::map::Map<String, toml::Value>;
+const CREDENTIALS_FILE_ENV: &str = "NNTP_PROXY_CREDENTIALS_FILE";
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct CredentialsOverlay {
+    #[serde(default)]
+    servers: Vec<ServerCredentialsOverlay>,
+    #[serde(default)]
+    client_auth: ClientAuthCredentialsOverlay,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct ServerCredentialsOverlay {
+    name: String,
+    #[serde(default)]
+    username: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct ClientAuthCredentialsOverlay {
+    #[serde(default)]
+    users: Vec<UserCredentials>,
+}
 
 fn table<'a>(value: &'a toml::Value, key: &str) -> Option<&'a TomlTable> {
     value.get(key)?.as_table()
@@ -29,6 +53,62 @@ fn path_with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut path = path.as_os_str().to_os_string();
     path.push(suffix);
     PathBuf::from(path)
+}
+
+fn apply_credentials_overlay(config: &mut Config, overlay_path: &str) -> Result<()> {
+    let overlay_content = fs::read_to_string(overlay_path)
+        .with_context(|| format!("Failed to read credentials overlay file '{overlay_path}'"))?;
+    let overlay: CredentialsOverlay = toml::from_str(&overlay_content)
+        .with_context(|| format!("Failed to parse credentials overlay file '{overlay_path}'"))?;
+
+    for server_overlay in overlay.servers {
+        let server = config
+            .servers
+            .iter_mut()
+            .find(|server| server.name.as_str() == server_overlay.name)
+            .with_context(|| {
+                format!(
+                    "Credentials overlay '{}' references unknown server '{}'",
+                    overlay_path, server_overlay.name
+                )
+            })?;
+
+        if let Some(username) = server_overlay.username {
+            server.username = Some(username);
+        }
+        if let Some(password) = server_overlay.password {
+            server.password = Some(password);
+        }
+    }
+
+    for user in overlay.client_auth.users {
+        if let Some(existing) = config
+            .client_auth
+            .users
+            .iter_mut()
+            .find(|existing| existing.username == user.username)
+        {
+            existing.password = user.password;
+        } else {
+            config.client_auth.users.push(user);
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_credentials_overlay_from_env<E: EnvProvider>(config: &mut Config, env: &E) -> Result<()> {
+    let Some(overlay_path) = env.get(CREDENTIALS_FILE_ENV) else {
+        return Ok(());
+    };
+
+    apply_credentials_overlay(config, &overlay_path)?;
+    tracing::info!(
+        "Loaded credentials overlay from '{}' via {}",
+        overlay_path,
+        CREDENTIALS_FILE_ENV
+    );
+    Ok(())
 }
 
 fn write_canonical_config(config_path: &str, config: &Config) -> Result<()> {
@@ -306,20 +386,6 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
     })
 }
 
-/// Load backend server configuration from environment variables
-///
-/// Supports indexed environment variables for Docker/container deployments:
-/// - `NNTP_SERVER_0_HOST`, `NNTP_SERVER_0_PORT`, `NNTP_SERVER_0_NAME`, etc.
-/// - `NNTP_SERVER_1_HOST`, `NNTP_SERVER_1_PORT`, `NNTP_SERVER_1_NAME`, etc.
-///
-/// Optional per-server variables:
-/// - `NNTP_SERVER_N_USERNAME` - Backend authentication username
-/// - `NNTP_SERVER_N_PASSWORD` - Backend authentication password
-/// - `NNTP_SERVER_N_MAX_CONNECTIONS` - Max connections (default: 10)
-fn load_servers_from_env() -> Option<Vec<Server>> {
-    load_servers_from_env_provider(&StdEnvProvider)
-}
-
 /// Load servers using a custom environment provider (testable version)
 pub fn load_servers_from_env_provider<E: EnvProvider>(env: &E) -> Option<Vec<Server>> {
     let servers: Vec<Server> = (0..)
@@ -349,15 +415,21 @@ pub fn has_server_env_vars() -> bool {
 ///
 /// Returns an error if no backend servers are configured via environment variables.
 pub fn load_config_from_env() -> Result<Config> {
+    load_config_from_env_provider(&StdEnvProvider)
+}
+
+fn load_config_from_env_provider<E: EnvProvider>(env: &E) -> Result<Config> {
     use anyhow::Context;
 
-    let servers = load_servers_from_env()
+    let servers = load_servers_from_env_provider(env)
         .context("No backend servers configured via environment variables. Set NNTP_SERVER_0_HOST, NNTP_SERVER_0_PORT, etc.")?;
 
-    let config = Config {
+    let mut config = Config {
         servers,
         ..Default::default()
     };
+
+    apply_credentials_overlay_from_env(&mut config, env)?;
 
     // Validate the loaded configuration
     config.validate()?;
@@ -422,6 +494,8 @@ fn load_config_with_env_provider<E: EnvProvider>(config_path: &str, env: &E) -> 
         );
         config.servers = env_servers;
     }
+
+    apply_credentials_overlay_from_env(&mut config, env)?;
 
     // Validate the loaded configuration
     config.validate()?;
@@ -867,6 +941,133 @@ name = "Test Server"
         assert_eq!(source, ConfigSource::File);
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.servers[0].host.as_str(), "test.example.com");
+    }
+
+    #[test]
+    fn test_load_config_applies_credentials_overlay() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        let config_content = r#"
+[[servers]]
+host = "news.example.com"
+port = 563
+name = "Primary"
+use_tls = true
+
+[proxy]
+port = 8121
+"#;
+        config_file.write_all(config_content.as_bytes()).unwrap();
+        config_file.flush().unwrap();
+
+        let mut credentials_file = NamedTempFile::new().unwrap();
+        let credentials_content = r#"
+[[servers]]
+name = "Primary"
+username = "backend-user"
+password = "backend-pass"
+
+[[client_auth.users]]
+username = "sabnzbd"
+password = "client-pass"
+"#;
+        credentials_file
+            .write_all(credentials_content.as_bytes())
+            .unwrap();
+        credentials_file.flush().unwrap();
+
+        let mut env = MockEnv::new();
+        env.set(
+            CREDENTIALS_FILE_ENV,
+            credentials_file.path().to_str().unwrap(),
+        );
+
+        let config =
+            load_config_with_env_provider(config_file.path().to_str().unwrap(), &env).unwrap();
+
+        assert_eq!(config.servers[0].username.as_deref(), Some("backend-user"));
+        assert_eq!(config.servers[0].password.as_deref(), Some("backend-pass"));
+        assert_eq!(config.client_auth.users.len(), 1);
+        assert_eq!(config.client_auth.users[0].username, "sabnzbd");
+        assert_eq!(config.client_auth.users[0].password, "client-pass");
+    }
+
+    #[test]
+    fn test_load_config_overlay_updates_existing_client_auth_user() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        let config_content = r#"
+[[servers]]
+host = "news.example.com"
+port = 563
+name = "Primary"
+
+[[client_auth.users]]
+username = "sabnzbd"
+password = "old-pass"
+"#;
+        config_file.write_all(config_content.as_bytes()).unwrap();
+        config_file.flush().unwrap();
+
+        let mut credentials_file = NamedTempFile::new().unwrap();
+        let credentials_content = r#"
+[[client_auth.users]]
+username = "sabnzbd"
+password = "new-pass"
+"#;
+        credentials_file
+            .write_all(credentials_content.as_bytes())
+            .unwrap();
+        credentials_file.flush().unwrap();
+
+        let mut env = MockEnv::new();
+        env.set(
+            CREDENTIALS_FILE_ENV,
+            credentials_file.path().to_str().unwrap(),
+        );
+
+        let config =
+            load_config_with_env_provider(config_file.path().to_str().unwrap(), &env).unwrap();
+
+        assert_eq!(config.client_auth.users.len(), 1);
+        assert_eq!(config.client_auth.users[0].password, "new-pass");
+    }
+
+    #[test]
+    fn test_load_config_overlay_errors_on_unknown_server() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        let config_content = r#"
+[[servers]]
+host = "news.example.com"
+port = 563
+name = "Primary"
+"#;
+        config_file.write_all(config_content.as_bytes()).unwrap();
+        config_file.flush().unwrap();
+
+        let mut credentials_file = NamedTempFile::new().unwrap();
+        let credentials_content = r#"
+[[servers]]
+name = "Missing"
+username = "backend-user"
+"#;
+        credentials_file
+            .write_all(credentials_content.as_bytes())
+            .unwrap();
+        credentials_file.flush().unwrap();
+
+        let mut env = MockEnv::new();
+        env.set(
+            CREDENTIALS_FILE_ENV,
+            credentials_file.path().to_str().unwrap(),
+        );
+
+        let error =
+            load_config_with_env_provider(config_file.path().to_str().unwrap(), &env).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("references unknown server 'Missing'")
+        );
     }
 
     #[test]
