@@ -41,7 +41,6 @@ async fn setup_test_proxy() -> Result<(u16, u16, tokio::task::AbortHandle)> {
     // Find available ports
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
-    drop(backend_listener);
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_port = proxy_listener.local_addr()?.port();
@@ -53,7 +52,7 @@ async fn setup_test_proxy() -> Result<(u16, u16, tokio::task::AbortHandle)> {
         .on_command("DATE", "111 20251120120000\r\n")
         .on_command("LIST", "215 List follows\r\n.\r\n")
         .on_command("QUIT", "205 Goodbye\r\n")
-        .spawn();
+        .spawn_on_listener(backend_listener);
 
     tokio::time::sleep(Duration::from_millis(100)).await;
 
