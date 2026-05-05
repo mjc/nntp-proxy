@@ -906,7 +906,7 @@ fn find_message_id(args: &[u8]) -> Option<(usize, usize)> {
         || !trimmed.ends_with(b">")
         || trimmed[1..trimmed.len() - 1]
             .iter()
-            .any(|byte| byte.is_ascii_whitespace())
+            .any(u8::is_ascii_whitespace)
     {
         return None;
     }

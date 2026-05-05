@@ -548,9 +548,8 @@ impl UnifiedCache {
     /// Ensures all async maintenance tasks complete for deterministic testing.
     pub async fn sync(&self) {
         match self {
-            Self::Availability(_) => {}
+            Self::Availability(_) | Self::Hybrid(_) => {}
             Self::Memory(cache) => cache.sync().await,
-            Self::Hybrid(_) => {} // foyer handles this differently
         }
     }
 

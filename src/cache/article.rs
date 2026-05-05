@@ -1061,10 +1061,7 @@ impl ArticleCache {
         backend_id: BackendId,
         tier: ttl::CacheTier,
     ) -> CachedArticle {
-        let mut entry = maybe_entry.map_or_else(
-            || new_entry_template.clone(),
-            |existing| existing.into_value(),
-        );
+        let mut entry = maybe_entry.map_or_else(|| new_entry_template.clone(), Entry::into_value);
         if !entry.is_complete_article() {
             entry.status_code = status_code;
             entry.tier = tier;
