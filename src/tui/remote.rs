@@ -111,6 +111,20 @@ async fn handle_dashboard_client(
     Ok(())
 }
 
+fn spawn_dashboard_client_task(stream: TcpStream, state_rx: watch::Receiver<Arc<DashboardState>>) {
+    tokio::spawn(async move {
+        if let Err(err) = handle_dashboard_client(stream, state_rx).await {
+            warn!("Dashboard websocket client error: {err}");
+        }
+    });
+}
+
+fn publish_dashboard_snapshot(app: &mut TuiApp, state_tx: &watch::Sender<Arc<DashboardState>>) {
+    app.update();
+    let state = Arc::new(app.snapshot_state());
+    let _ = state_tx.send(state);
+}
+
 /// Run the headless dashboard websocket publisher.
 pub async fn run_dashboard_publisher(
     mut app: TuiApp,
@@ -130,18 +144,12 @@ pub async fn run_dashboard_publisher(
                 break;
             }
             _ = update_interval.tick() => {
-                app.update();
-                let state = Arc::new(app.snapshot_state());
-                let _ = state_tx.send(state);
+                publish_dashboard_snapshot(&mut app, &state_tx);
             }
             accept_result = listener.accept() => {
                 let (stream, _) = accept_result?;
                 let rx = state_tx.subscribe();
-                tokio::spawn(async move {
-                    if let Err(err) = handle_dashboard_client(stream, rx).await {
-                        warn!("Dashboard websocket client error: {err}");
-                    }
-                });
+                spawn_dashboard_client_task(stream, rx);
             }
         }
     }
@@ -290,6 +298,19 @@ mod tests {
             dashboard_peer_label(Some("127.0.0.1:1234".parse().unwrap())),
             " from 127.0.0.1:1234"
         );
+    }
+
+    #[tokio::test]
+    async fn publish_dashboard_snapshot_updates_watch_channel() {
+        let mut app = build_test_app();
+        let (state_tx, mut state_rx) = watch::channel(Arc::new(app.snapshot_state()));
+
+        publish_dashboard_snapshot(&mut app, &state_tx);
+
+        state_rx.changed().await.expect("snapshot should update");
+        let snapshot = state_rx.borrow().clone();
+        assert_eq!(snapshot.backend_views.len(), 1);
+        assert_eq!(snapshot.view_mode, ViewMode::Normal);
     }
 
     #[tokio::test]
