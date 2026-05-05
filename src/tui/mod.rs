@@ -39,6 +39,14 @@ use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiInputAction {
+    None,
+    Quit,
+    ToggleLogFullscreen,
+    ToggleDetails,
+}
+
 /// Setup the terminal for TUI rendering
 fn setup_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
@@ -154,29 +162,11 @@ where
             _ = update_interval.tick() => {
                 app.update();
 
-                // Check events on blocking thread pool to not block async runtime
-                let has_events = tokio::task::spawn_blocking(|| {
-                    event::poll(Duration::from_millis(0))
-                }).await??;
-
-                if has_events {
-                    let key_event = tokio::task::spawn_blocking(|| {
-                        event::read()
-                    }).await??;
-
-                    if let Event::Key(key) = key_event
-                        && key.kind == KeyEventKind::Press
-                    {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => should_quit = true,
-                            KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                                should_quit = true;
-                            }
-                            KeyCode::Char('l') => app.toggle_log_fullscreen(),
-                            KeyCode::Char('d') => app.toggle_details(),
-                            _ => {}
-                        }
-                    }
+                match poll_tui_input(true).await? {
+                    TuiInputAction::Quit => should_quit = true,
+                    TuiInputAction::ToggleLogFullscreen => app.toggle_log_fullscreen(),
+                    TuiInputAction::ToggleDetails => app.toggle_details(),
+                    TuiInputAction::None => {}
                 }
 
                 if should_quit {
@@ -207,26 +197,8 @@ where
     loop {
         tokio::select! {
             _ = update_interval.tick() => {
-                let has_events = tokio::task::spawn_blocking(|| {
-                    event::poll(Duration::from_millis(0))
-                }).await??;
-
-                if has_events {
-                    let key_event = tokio::task::spawn_blocking(|| {
-                        event::read()
-                    }).await??;
-
-                    if let Event::Key(key) = key_event
-                        && key.kind == KeyEventKind::Press
-                    {
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => should_quit = true,
-                            KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
-                                should_quit = true;
-                            }
-                            _ => {}
-                        }
-                    }
+                if matches!(poll_tui_input(false).await?, TuiInputAction::Quit) {
+                    should_quit = true;
                 }
 
                 if should_quit {
@@ -281,4 +253,88 @@ fn draw_attached_dashboard(f: &mut ratatui::Frame, state: Option<&DashboardState
     f.render_widget(title, chunks[0]);
     f.render_widget(body, chunks[1]);
     f.render_widget(footer, chunks[2]);
+}
+
+fn key_event_action(
+    key: crossterm::event::KeyEvent,
+    allow_dashboard_actions: bool,
+) -> TuiInputAction {
+    if key.kind != KeyEventKind::Press {
+        return TuiInputAction::None;
+    }
+
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => TuiInputAction::Quit,
+        KeyCode::Char('c') if key.modifiers.contains(event::KeyModifiers::CONTROL) => {
+            TuiInputAction::Quit
+        }
+        KeyCode::Char('l') if allow_dashboard_actions => TuiInputAction::ToggleLogFullscreen,
+        KeyCode::Char('d') if allow_dashboard_actions => TuiInputAction::ToggleDetails,
+        _ => TuiInputAction::None,
+    }
+}
+
+async fn poll_tui_input(allow_dashboard_actions: bool) -> Result<TuiInputAction> {
+    let has_events =
+        tokio::task::spawn_blocking(|| event::poll(Duration::from_millis(0))).await??;
+
+    if !has_events {
+        return Ok(TuiInputAction::None);
+    }
+
+    let key_event = tokio::task::spawn_blocking(event::read).await??;
+    Ok(match key_event {
+        Event::Key(key) => key_event_action(key, allow_dashboard_actions),
+        _ => TuiInputAction::None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_event_action_quits_on_q_and_escape() {
+        let q = crossterm::event::KeyEvent::new(KeyCode::Char('q'), event::KeyModifiers::NONE);
+        let esc = crossterm::event::KeyEvent::new(KeyCode::Esc, event::KeyModifiers::NONE);
+
+        assert_eq!(key_event_action(q, true), TuiInputAction::Quit);
+        assert_eq!(key_event_action(esc, true), TuiInputAction::Quit);
+    }
+
+    #[test]
+    fn key_event_action_supports_dashboard_toggles_only_when_enabled() {
+        let log_toggle =
+            crossterm::event::KeyEvent::new(KeyCode::Char('l'), event::KeyModifiers::NONE);
+        let details_toggle =
+            crossterm::event::KeyEvent::new(KeyCode::Char('d'), event::KeyModifiers::NONE);
+
+        assert_eq!(
+            key_event_action(log_toggle, true),
+            TuiInputAction::ToggleLogFullscreen
+        );
+        assert_eq!(
+            key_event_action(details_toggle, true),
+            TuiInputAction::ToggleDetails
+        );
+        assert_eq!(key_event_action(log_toggle, false), TuiInputAction::None);
+        assert_eq!(
+            key_event_action(details_toggle, false),
+            TuiInputAction::None
+        );
+    }
+
+    #[test]
+    fn key_event_action_ignores_key_releases_and_other_input() {
+        let released = crossterm::event::KeyEvent {
+            code: KeyCode::Char('q'),
+            modifiers: event::KeyModifiers::NONE,
+            kind: KeyEventKind::Release,
+            state: event::KeyEventState::NONE,
+        };
+        let other = crossterm::event::KeyEvent::new(KeyCode::Char('x'), event::KeyModifiers::NONE);
+
+        assert_eq!(key_event_action(released, true), TuiInputAction::None);
+        assert_eq!(key_event_action(other, true), TuiInputAction::None);
+    }
 }
