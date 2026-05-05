@@ -712,7 +712,9 @@ impl ClientSession {
                         {
                             completed
                                 .context
-                                .write_response_payload_to(io.client_write)
+                                .response_payload()
+                                .expect("completed request context carries response payload")
+                                .write_all_to(io.client_write)
                                 .await
                                 .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
                             let response = completed

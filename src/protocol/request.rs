@@ -616,22 +616,17 @@ impl RequestContext {
         self.response_payload = Some(response);
     }
 
-    pub(crate) async fn write_response_payload_to<W>(&self, writer: &mut W) -> std::io::Result<()>
-    where
-        W: tokio::io::AsyncWriteExt + Unpin,
-    {
-        self.response_payload
-            .as_ref()
-            .expect("completed request context carries response payload")
-            .write_all_to(writer)
-            .await
+    #[inline]
+    #[must_use]
+    pub(crate) fn response_payload(&self) -> Option<&crate::pool::ChunkedResponse> {
+        self.response_payload.as_ref()
     }
 
     #[inline]
     #[cfg(test)]
     #[must_use]
     pub(crate) fn response_payload_eq(&self, expected: &[u8]) -> Option<bool> {
-        let response = self.response_payload.as_ref()?;
+        let response = self.response_payload()?;
         if response.len() != expected.len() {
             return Some(false);
         }

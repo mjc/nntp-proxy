@@ -310,7 +310,10 @@ pub async fn persist_runtime_state(
     let mut first_error = None;
 
     let metrics = proxy.metrics().clone();
-    match save_metrics_to_disk_blocking(metrics, stats_path.clone(), server_names).await {
+    let metrics_path = stats_path.clone();
+    match tokio::task::spawn_blocking(move || metrics.save_to_disk(&metrics_path, &server_names))
+        .await?
+    {
         Ok(()) => info!("Metrics saved to {}", stats_path.display()),
         Err(e) => {
             warn!("Failed to save metrics on shutdown: {}", e);
@@ -320,7 +323,8 @@ pub async fn persist_runtime_state(
 
     if let Some(path) = availability_path {
         let cache = proxy.cache().clone();
-        match save_availability_to_disk_blocking(cache, path.clone()).await {
+        let save_path = path.clone();
+        match tokio::task::spawn_blocking(move || cache.save_to_disk(&save_path)).await? {
             Ok(true) => info!("Availability index saved to {}", path.display()),
             Ok(false) => {}
             Err(e) => {
@@ -378,31 +382,6 @@ pub fn spawn_shutdown_handler(
     });
 
     shutdown_rx
-}
-
-/// Save metrics on Tokio's blocking thread pool.
-///
-/// `MetricsCollector::save_to_disk` uses `std::fs`, so callers from async
-/// tasks should delegate here instead of running filesystem work on a runtime
-/// worker.
-///
-/// # Errors
-/// Returns an error if the blocking task panics/cancels or if writing the
-/// metrics JSON fails.
-pub async fn save_metrics_to_disk_blocking(
-    metrics: crate::metrics::MetricsCollector,
-    stats_path: std::path::PathBuf,
-    server_names: Vec<String>,
-) -> Result<()> {
-    tokio::task::spawn_blocking(move || metrics.save_to_disk(&stats_path, &server_names)).await?
-}
-
-/// Save availability state on Tokio's blocking thread pool.
-pub async fn save_availability_to_disk_blocking(
-    cache: std::sync::Arc<crate::cache::UnifiedCache>,
-    availability_path: std::path::PathBuf,
-) -> Result<bool> {
-    tokio::task::spawn_blocking(move || cache.save_to_disk(&availability_path)).await?
 }
 
 /// Run the main accept loop for client connections
@@ -609,8 +588,13 @@ pub fn spawn_metrics_saver(
             let path = stats_path.clone();
             let names = server_names.clone();
             let metrics = proxy.metrics().clone();
-            if let Err(e) = save_metrics_to_disk_blocking(metrics, path, names).await {
-                warn!("Failed to save metrics to {}: {}", stats_path.display(), e);
+            let save_path = path.clone();
+            match tokio::task::spawn_blocking(move || metrics.save_to_disk(&save_path, &names))
+                .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("Failed to save metrics to {}: {}", stats_path.display(), e),
+                Err(e) => warn!("Failed to save metrics to {}: {}", stats_path.display(), e),
             }
         }
     });
@@ -638,12 +622,23 @@ pub fn spawn_availability_saver(
             interval.tick().await;
             let cache = proxy.cache().clone();
             let path = availability_path.clone();
-            if let Err(e) = save_availability_to_disk_blocking(cache, path.clone()).await {
-                warn!(
-                    "Failed to save availability index to {}: {}",
-                    path.display(),
-                    e
-                );
+            let save_path = path.clone();
+            match tokio::task::spawn_blocking(move || cache.save_to_disk(&save_path)).await {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => {
+                    warn!(
+                        "Failed to save availability index to {}: {}",
+                        path.display(),
+                        e
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to save availability index to {}: {}",
+                        path.display(),
+                        e
+                    );
+                }
             }
         }
     });

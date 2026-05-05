@@ -138,7 +138,11 @@ impl NntpClient {
     /// malformed or unexpected backend status codes.
     pub async fn stat(&self, message_id: &crate::types::MessageId<'_>) -> Result<bool> {
         let request = stat_request(message_id);
-        let mut conn = self.get_connection().await?;
+        let mut conn = self
+            .conn_pool
+            .get_pooled_connection()
+            .await
+            .context("Failed to get connection from pool")?;
         let mut buffer = self.buffer_pool.acquire();
 
         let response = send_request(&mut *conn, &request, &mut buffer).await?;
@@ -158,22 +162,17 @@ impl NntpClient {
             })
     }
 
-    /// Get a connection from the pool
-    #[inline]
-    async fn get_connection(&self) -> Result<Object<TcpManager>> {
-        self.conn_pool
-            .get_pooled_connection()
-            .await
-            .context("Failed to get connection from pool")
-    }
-
     /// Internal: fetch response into `PooledBuffer`
     ///
     /// # Errors
     /// Returns any connection, write, read, or backend-status validation error
     /// encountered while fetching the NNTP response.
     async fn fetch_response(&self, request: RequestContext) -> Result<PooledBuffer> {
-        let mut conn = self.get_connection().await?;
+        let mut conn = self
+            .conn_pool
+            .get_pooled_connection()
+            .await
+            .context("Failed to get connection from pool")?;
         let mut io_buffer = self.buffer_pool.acquire();
 
         let response = send_request(&mut *conn, &request, &mut io_buffer).await?;
