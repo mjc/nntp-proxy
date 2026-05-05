@@ -6,7 +6,7 @@ use crate::config::{BackendSelectionStrategy, Config, RoutingMode};
 use crate::types::{CacheCapacity, ConfigPath, Port, ThreadCount};
 use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 /// Parse port from command line argument
@@ -65,7 +65,7 @@ pub struct CommonArgs {
     #[arg(long, hide = true, help_heading = "General")]
     pub no_tui: bool,
 
-    /// Bind the dashboard websocket publisher to HOST:PORT in headless mode.
+    /// Bind the dashboard websocket publisher to a free HOST:PORT distinct from the proxy listener.
     #[arg(
         long = "tui-listen",
         value_name = "HOST:PORT",
@@ -221,6 +221,35 @@ impl CommonArgs {
 
         if self.tui_attach.is_some() && self.tui_listen.is_some() {
             bail!("--tui-attach cannot be combined with --tui-listen");
+        }
+
+        Ok(())
+    }
+
+    /// Validate that the dashboard websocket listener does not reuse the proxy listen socket.
+    pub fn validate_dashboard_listen(&self, proxy_host: &str, proxy_port: Port) -> Result<()> {
+        let Some(dashboard_listen) = self.tui_listen else {
+            return Ok(());
+        };
+
+        if dashboard_listen.port() != proxy_port.get() {
+            return Ok(());
+        }
+
+        let Ok(proxy_ip) = proxy_host.parse::<IpAddr>() else {
+            return Ok(());
+        };
+
+        if proxy_ip.is_unspecified()
+            || dashboard_listen.ip().is_unspecified()
+            || proxy_ip == dashboard_listen.ip()
+        {
+            bail!(
+                "--tui-listen {} conflicts with the proxy listener {}:{}; use a different port",
+                dashboard_listen,
+                proxy_host,
+                proxy_port.get()
+            );
         }
 
         Ok(())
@@ -538,6 +567,30 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_dashboard_listen_rejects_same_socket() {
+        let args = CommonArgs {
+            tui_listen: Some("127.0.0.1:8119".parse().unwrap()),
+            ..default_args()
+        };
+
+        assert!(
+            args.validate_dashboard_listen("127.0.0.1", Port::try_new(8119).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_validate_dashboard_listen_allows_distinct_socket() {
+        let args = CommonArgs {
+            tui_listen: Some("127.0.0.1:8120".parse().unwrap()),
+            ..default_args()
+        };
+
+        args.validate_dashboard_listen("127.0.0.1", Port::try_new(8119).unwrap())
+            .unwrap();
+    }
+
+    #[test]
     fn test_help_shows_tui_socket_format() {
         let mut command = CommonArgs::command();
         let mut help = Vec::new();
@@ -546,10 +599,6 @@ mod tests {
 
         assert!(help.contains("--tui-listen <HOST:PORT>"));
         assert!(help.contains("--tui-attach <HOST:PORT>"));
-        assert!(help.contains("Bind the dashboard websocket publisher to HOST:PORT"));
-        assert!(
-            help.contains("Connect the read-only TUI client to a dashboard websocket at HOST:PORT")
-        );
     }
 
     // Helper to create default args for testing

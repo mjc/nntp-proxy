@@ -23,6 +23,7 @@ TLS, cache behavior, and live metrics in one place.
 - `nntp-proxy` is the runtime executable.
 - The same binary can run headless or with the terminal dashboard via `--ui headless` or `--ui tui`.
 - Headless mode can also publish the dashboard state over websocket with `--tui-listen 127.0.0.1:8120` (`HOST:PORT`).
+  This must be a different socket from the main NNTP listener.
 - A separate terminal can attach read-only with `--ui tui --tui-attach 127.0.0.1:8120` (`HOST:PORT`).
 - Article caching is configured via `[cache]`; there is no separate cache-only executable.
 - Client-facing connections are plain NNTP only. The proxy does not terminate inbound TLS or offer a TLS listening mode.

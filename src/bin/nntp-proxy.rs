@@ -58,6 +58,7 @@ async fn run_proxy(
         .unwrap_or(config.routing.routing_mode);
     let (host, port) =
         runtime::resolve_listen_address(args.common.host.as_deref(), args.common.port, &config);
+    args.common.validate_dashboard_listen(&host, port)?;
 
     let stats_path = runtime::resolve_stats_file_path(
         args.common.config.as_str(),
