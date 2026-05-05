@@ -91,7 +91,7 @@ mod tests {
         let bounds_high = calculate_chart_bounds(max_throughput_high);
 
         // Should round up nicely
-        assert_f64_eq(bounds_high, 16_000_000.0);
+        assert_f64_eq(bounds_high, 15_728_640.0);
     }
 
     #[test]
@@ -109,8 +109,8 @@ mod tests {
         assert!(down.starts_with(text::ARROW_DOWN));
 
         // Should have throughput values
-        assert!(up.contains("MB/s") || up.contains("KB/s"));
-        assert!(down.contains("MB/s") || down.contains("KB/s"));
+        assert!(up.contains("MiB/s") || up.contains("KiB/s"));
+        assert!(down.contains("MiB/s") || down.contains("KiB/s"));
     }
 
     #[test]
@@ -125,13 +125,13 @@ mod tests {
     #[test]
     fn test_chart_axis_labels() {
         // Test that chart axis labels are reasonable
-        let max_throughput = 10_000_000.0; // 10 MB/s
+        let max_throughput = 10_485_760.0; // 10 MiB/s
         let label = format_throughput_label(max_throughput);
 
-        assert_eq!(label, "10 MB/s");
+        assert_eq!(label, "10 MiB/s");
 
         let half_label = format_throughput_label(max_throughput / 2.0);
-        assert_eq!(half_label, "5 MB/s");
+        assert_eq!(half_label, "5 MiB/s");
     }
 
     #[test]

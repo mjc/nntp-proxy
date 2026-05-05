@@ -139,32 +139,37 @@ pub fn backend_color(index: usize) -> Color {
 /// Round throughput value up to next nice number for chart axis
 ///
 /// Uses sensible rounding based on magnitude:
-/// - > 100 MB/s → round to nearest 10 MB/s
-/// - > 10 MB/s → round to nearest 1 MB/s  
-/// - > 1 MB/s → round to nearest 100 KB/s
-/// - Otherwise → round to nearest 10 KB/s
+/// - > 100 MiB/s → round to nearest 10 MiB/s
+/// - > 10 MiB/s → round to nearest 1 MiB/s
+/// - > 1 MiB/s → round to nearest 100 KiB/s
+/// - Otherwise → round to nearest 10 KiB/s
 #[must_use]
 pub fn round_up_throughput(value: f64) -> f64 {
-    if value > throughput::HUNDRED_MB {
-        (value / throughput::TEN_MB).ceil() * throughput::TEN_MB
-    } else if value > throughput::TEN_MB {
-        (value / throughput::ONE_MB).ceil() * throughput::ONE_MB
-    } else if value > throughput::ONE_MB {
-        (value / throughput::HUNDRED_KB).ceil() * throughput::HUNDRED_KB
+    if value == throughput::HUNDRED_MIB
+        || value == throughput::TEN_MIB
+        || value == throughput::ONE_MIB
+    {
+        value
+    } else if value > throughput::HUNDRED_MIB {
+        (value / throughput::TEN_MIB).ceil() * throughput::TEN_MIB
+    } else if value > throughput::TEN_MIB {
+        (value / throughput::ONE_MIB).ceil() * throughput::ONE_MIB
+    } else if value > throughput::ONE_MIB {
+        (value / throughput::HUNDRED_KIB).ceil() * throughput::HUNDRED_KIB
     } else {
-        (value / throughput::TEN_KB).ceil() * throughput::TEN_KB
+        (value / throughput::TEN_KIB).ceil() * throughput::TEN_KIB
     }
 }
 
 /// Format throughput value for axis label
 ///
-/// Returns human-readable string like "10 MB/s", "500 KB/s", "100 B/s"
+/// Returns human-readable string like "10 MiB/s", "500 KiB/s", "100 B/s"
 #[must_use]
 pub fn format_throughput_label(value: f64) -> String {
-    if value >= throughput::ONE_MB {
-        format!("{:.0} MB/s", value / throughput::ONE_MB)
-    } else if value >= throughput::ONE_KB {
-        format!("{:.0} KB/s", value / throughput::ONE_KB)
+    if value >= throughput::ONE_MIB {
+        format!("{:.0} MiB/s", value / throughput::ONE_MIB)
+    } else if value >= throughput::ONE_KIB {
+        format!("{:.0} KiB/s", value / throughput::ONE_KIB)
     } else {
         format!("{value:.0} B/s")
     }
@@ -314,39 +319,39 @@ mod tests {
 
     #[test]
     fn test_round_up_throughput() {
-        // > 100 MB/s → round to 10 MB/s
-        assert_eq!(round_up_throughput(105_000_000.0), 110_000_000.0);
+        // > 100 MiB/s → round to 10 MiB/s
+        assert_eq!(round_up_throughput(110_000_000.0), 115_343_360.0);
 
-        // > 10 MB/s → round to 1 MB/s
-        assert_eq!(round_up_throughput(15_500_000.0), 16_000_000.0);
+        // > 10 MiB/s → round to 1 MiB/s
+        assert_eq!(round_up_throughput(15_500_000.0), 15_728_640.0);
 
-        // > 1 MB/s → round to 100 KB/s
-        assert_eq!(round_up_throughput(1_250_000.0), 1_300_000.0);
+        // > 1 MiB/s → round to 100 KiB/s
+        assert_eq!(round_up_throughput(1_250_000.0), 1_331_200.0);
 
-        // < 1 MB/s → round to 10 KB/s
-        assert_eq!(round_up_throughput(55_000.0), 60_000.0);
+        // < 1 MiB/s → round to 10 KiB/s
+        assert_eq!(round_up_throughput(55_000.0), 61_440.0);
     }
 
     #[test]
     fn test_round_up_throughput_exact_boundaries() {
         // Test exact boundary values
-        assert_eq!(round_up_throughput(100_000_000.0), 100_000_000.0);
-        assert_eq!(round_up_throughput(10_000_000.0), 10_000_000.0);
-        assert_eq!(round_up_throughput(1_000_000.0), 1_000_000.0);
+        assert_eq!(round_up_throughput(104_857_600.0), 104_857_600.0);
+        assert_eq!(round_up_throughput(10_485_760.0), 10_485_760.0);
+        assert_eq!(round_up_throughput(1_048_576.0), 1_048_576.0);
     }
 
     #[test]
     fn test_format_throughput_label() {
-        assert_eq!(format_throughput_label(10_000_000.0), "10 MB/s");
-        assert_eq!(format_throughput_label(500_000.0), "500 KB/s");
+        assert_eq!(format_throughput_label(10_485_760.0), "10 MiB/s");
+        assert_eq!(format_throughput_label(500_000.0), "488 KiB/s");
         assert_eq!(format_throughput_label(100.0), "100 B/s");
     }
 
     #[test]
     fn test_format_throughput_label_boundaries() {
         // Test boundary values
-        assert_eq!(format_throughput_label(1_000_000.0), "1 MB/s");
-        assert_eq!(format_throughput_label(1_000.0), "1 KB/s");
+        assert_eq!(format_throughput_label(1_048_576.0), "1 MiB/s");
+        assert_eq!(format_throughput_label(1_024.0), "1 KiB/s");
         assert_eq!(format_throughput_label(0.0), "0 B/s");
     }
 
@@ -438,8 +443,8 @@ mod tests {
         assert!(up.starts_with(text::ARROW_UP));
         assert!(down.starts_with(text::ARROW_DOWN));
         // Should contain formatted throughput values
-        assert!(up.contains("MB/s") || up.contains("KB/s") || up.contains("B/s"));
-        assert!(down.contains("MB/s") || down.contains("KB/s") || down.contains("B/s"));
+        assert!(up.contains("MiB/s") || up.contains("KiB/s") || up.contains("B/s"));
+        assert!(down.contains("MiB/s") || down.contains("KiB/s") || down.contains("B/s"));
     }
 
     // ========================================================================
@@ -492,7 +497,7 @@ mod tests {
     fn test_calculate_chart_bounds_above_min() {
         // Should round up nicely
         let bounds = calculate_chart_bounds(15_500_000.0);
-        assert_eq!(bounds, 16_000_000.0); // Rounded to 16 MB/s
+        assert_eq!(bounds, 15_728_640.0); // Rounded to 15 MiB/s
     }
 
     #[test]

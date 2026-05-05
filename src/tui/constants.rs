@@ -47,7 +47,7 @@ pub mod layout {
 /// Chart configuration
 pub mod chart {
     pub const HISTORY_POINTS: f64 = 60.0;
-    pub const MIN_THROUGHPUT: f64 = 1_000_000.0; // 1 MB/s
+    pub const MIN_THROUGHPUT: f64 = 1_048_576.0; // 1 MiB/s
 
     pub const X_LABEL_0S: &str = "0s";
     pub const X_LABEL_5S: &str = "5s";
@@ -103,12 +103,12 @@ pub mod text {
 
 /// Constants for throughput calculations and formatting
 pub mod throughput {
-    pub const HUNDRED_MB: f64 = 100_000_000.0;
-    pub const TEN_MB: f64 = 10_000_000.0;
-    pub const ONE_MB: f64 = 1_000_000.0;
-    pub const HUNDRED_KB: f64 = 100_000.0;
-    pub const TEN_KB: f64 = 10_000.0;
-    pub const ONE_KB: f64 = 1_000.0;
+    pub const HUNDRED_MIB: f64 = 104_857_600.0;
+    pub const TEN_MIB: f64 = 10_485_760.0;
+    pub const ONE_MIB: f64 = 1_048_576.0;
+    pub const HUNDRED_KIB: f64 = 102_400.0;
+    pub const TEN_KIB: f64 = 10_240.0;
+    pub const ONE_KIB: f64 = 1_024.0;
 }
 
 #[cfg(test)]
@@ -151,7 +151,7 @@ mod tests {
     #[test]
     fn test_chart_constants() {
         assert_eq!(chart::HISTORY_POINTS, 60.0);
-        assert_eq!(chart::MIN_THROUGHPUT, 1_000_000.0);
+        assert_eq!(chart::MIN_THROUGHPUT, 1_048_576.0);
         assert_eq!(chart::X_LABEL_0S, "0s");
         assert_eq!(chart::X_LABEL_5S, "5s");
         assert_eq!(chart::X_LABEL_10S, "10s");
@@ -192,21 +192,21 @@ mod tests {
 
     #[test]
     fn test_throughput_constants() {
-        assert_eq!(throughput::HUNDRED_MB, 100_000_000.0);
-        assert_eq!(throughput::TEN_MB, 10_000_000.0);
-        assert_eq!(throughput::ONE_MB, 1_000_000.0);
-        assert_eq!(throughput::HUNDRED_KB, 100_000.0);
-        assert_eq!(throughput::TEN_KB, 10_000.0);
-        assert_eq!(throughput::ONE_KB, 1_000.0);
+        assert_eq!(throughput::HUNDRED_MIB, 104_857_600.0);
+        assert_eq!(throughput::TEN_MIB, 10_485_760.0);
+        assert_eq!(throughput::ONE_MIB, 1_048_576.0);
+        assert_eq!(throughput::HUNDRED_KIB, 102_400.0);
+        assert_eq!(throughput::TEN_KIB, 10_240.0);
+        assert_eq!(throughput::ONE_KIB, 1_024.0);
     }
 
     #[test]
     fn test_throughput_relationships() {
         // Verify mathematical relationships
-        assert_eq!(throughput::HUNDRED_MB, throughput::TEN_MB * 10.0);
-        assert_eq!(throughput::TEN_MB, throughput::ONE_MB * 10.0);
-        assert_eq!(throughput::ONE_MB, throughput::HUNDRED_KB * 10.0);
-        assert_eq!(throughput::HUNDRED_KB, throughput::TEN_KB * 10.0);
-        assert_eq!(throughput::TEN_KB, throughput::ONE_KB * 10.0);
+        assert_eq!(throughput::HUNDRED_MIB, throughput::TEN_MIB * 10.0);
+        assert_eq!(throughput::TEN_MIB, throughput::ONE_MIB * 10.0);
+        assert_eq!(throughput::ONE_MIB, throughput::ONE_KIB * 1024.0);
+        assert_eq!(throughput::HUNDRED_KIB, throughput::TEN_KIB * 10.0);
+        assert_eq!(throughput::TEN_KIB, throughput::ONE_KIB * 10.0);
     }
 }

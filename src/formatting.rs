@@ -7,23 +7,31 @@ const fn bytes_as_f64_for_display(bytes: u64) -> f64 {
     bytes as f64
 }
 
-/// Format bytes in human-readable format (KB, MB, GB)
+/// Format bytes in human-readable format using IEC units (KiB, MiB, GiB).
 #[inline]
 #[must_use]
 pub fn format_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    const KB_F64: f64 = 1024.0;
-    const MB_F64: f64 = KB_F64 * 1024.0;
-    const GB_F64: f64 = MB_F64 * 1024.0;
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    const TIB: u64 = GIB * 1024;
+    const PIB: u64 = TIB * 1024;
+    const KIB_F64: f64 = 1024.0;
+    const MIB_F64: f64 = KIB_F64 * 1024.0;
+    const GIB_F64: f64 = MIB_F64 * 1024.0;
+    const TIB_F64: f64 = GIB_F64 * 1024.0;
+    const PIB_F64: f64 = TIB_F64 * 1024.0;
 
-    if bytes >= GB {
-        format!("{:.2} GB", bytes_as_f64_for_display(bytes) / GB_F64)
-    } else if bytes >= MB {
-        format!("{:.2} MB", bytes_as_f64_for_display(bytes) / MB_F64)
-    } else if bytes >= KB {
-        format!("{:.2} KB", bytes_as_f64_for_display(bytes) / KB_F64)
+    if bytes >= PIB {
+        format!("{:.2} PiB", bytes_as_f64_for_display(bytes) / PIB_F64)
+    } else if bytes >= TIB {
+        format!("{:.2} TiB", bytes_as_f64_for_display(bytes) / TIB_F64)
+    } else if bytes >= GIB {
+        format!("{:.2} GiB", bytes_as_f64_for_display(bytes) / GIB_F64)
+    } else if bytes >= MIB {
+        format!("{:.2} MiB", bytes_as_f64_for_display(bytes) / MIB_F64)
+    } else if bytes >= KIB {
+        format!("{:.2} KiB", bytes_as_f64_for_display(bytes) / KIB_F64)
     } else {
         format!("{bytes} B")
     }
@@ -44,11 +52,11 @@ mod tests {
     fn test_format_bytes() {
         assert_eq!(format_bytes(0), "0 B");
         assert_eq!(format_bytes(512), "512 B");
-        assert_eq!(format_bytes(1024), "1.00 KB");
-        assert_eq!(format_bytes(1536), "1.50 KB");
-        assert_eq!(format_bytes(1_048_576), "1.00 MB");
-        assert_eq!(format_bytes(29_312_178), "27.95 MB");
-        assert_eq!(format_bytes(1_073_741_824), "1.00 GB");
+        assert_eq!(format_bytes(1024), "1.00 KiB");
+        assert_eq!(format_bytes(1536), "1.50 KiB");
+        assert_eq!(format_bytes(1_048_576), "1.00 MiB");
+        assert_eq!(format_bytes(29_312_178), "27.95 MiB");
+        assert_eq!(format_bytes(1_073_741_824), "1.00 GiB");
     }
 
     #[test]
