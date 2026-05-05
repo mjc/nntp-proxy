@@ -185,24 +185,31 @@ impl NntpClient {
             .status_code()
             .expect("validate_response returned Ok with parsed status");
         if request.expects_multiline_response(status_code) {
-            // Use a capture buffer as the accumulator: pooled, can grow beyond io_buffer
-            // capacity without panicking, returned to pool on drop.
-            let mut capture = self.buffer_pool.acquire_capture().await;
-            if let Err(err) = Self::drain_multiline_into(
-                &mut conn,
-                &mut io_buffer,
-                &mut capture,
-                response.bytes_read,
-            )
-            .await
-            {
-                self.conn_pool.remove_with_cooldown(conn);
-                return Err(err);
-            }
-            Ok(capture)
-        } else {
-            Ok(io_buffer)
+            return self
+                .fetch_multiline_response(conn, io_buffer, response.bytes_read)
+                .await;
         }
+
+        Ok(io_buffer)
+    }
+
+    async fn fetch_multiline_response(
+        &self,
+        mut conn: Object<TcpManager>,
+        mut io_buffer: PooledBuffer,
+        first_chunk_size: usize,
+    ) -> Result<PooledBuffer> {
+        // Use a capture buffer as the accumulator: pooled, can grow beyond io_buffer
+        // capacity without panicking, returned to pool on drop.
+        let mut capture = self.buffer_pool.acquire_capture().await;
+        if let Err(err) =
+            Self::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, first_chunk_size)
+                .await
+        {
+            self.conn_pool.remove_with_cooldown(conn);
+            return Err(err);
+        }
+        Ok(capture)
     }
 
     /// Stream remaining multiline response data into `capture`.
