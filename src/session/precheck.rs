@@ -479,6 +479,22 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use crate::cache::UnifiedCache;
+    use crate::metrics::MetricsCollector;
+    use crate::pool::BufferPool;
+    use crate::router::BackendSelector;
+    use crate::types::BufferSize;
+
+    fn test_owned_deps(num_backends: usize) -> OwnedDeps {
+        OwnedDeps {
+            router: Arc::new(BackendSelector::new()),
+            cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
+            buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 1),
+            metrics: MetricsCollector::new(num_backends),
+            cache_articles: true,
+        }
+    }
+
     #[test]
     fn summarize_finds_first() {
         let results = vec![
@@ -524,6 +540,51 @@ mod tests {
         assert_eq!(avail.checked_bits(), 0);
     }
 
+    #[test]
+    fn classify_precheck_result_records_non_430_4xx_as_error() {
+        let backend_id = BackendId::from_index(0);
+        let deps = test_owned_deps(1);
+
+        let result = classify_precheck_result(
+            &deps,
+            backend_id,
+            StatusCode::new(412),
+            Some((11, 22, 33)),
+            PrecheckHit::Availability(StatusCode::new(412)),
+        );
+
+        assert_eq!(result, QueryResult::Error);
+        let snapshot = deps.metrics.snapshot(None);
+        let backend = &snapshot.backend_stats[0];
+        assert_eq!(backend.total_commands.get(), 1);
+        assert_eq!(backend.ttfb_count.get(), 1);
+        assert_eq!(backend.errors_4xx.get(), 1);
+        assert_eq!(backend.errors_5xx.get(), 0);
+        assert_eq!(backend.errors.get(), 1);
+    }
+
+    #[test]
+    fn classify_precheck_result_records_5xx_as_error() {
+        let backend_id = BackendId::from_index(0);
+        let deps = test_owned_deps(1);
+
+        let result = classify_precheck_result(
+            &deps,
+            backend_id,
+            StatusCode::new(502),
+            None,
+            PrecheckHit::Availability(StatusCode::new(502)),
+        );
+
+        assert_eq!(result, QueryResult::Error);
+        let snapshot = deps.metrics.snapshot(None);
+        let backend = &snapshot.backend_stats[0];
+        assert_eq!(backend.total_commands.get(), 1);
+        assert_eq!(backend.errors_4xx.get(), 0);
+        assert_eq!(backend.errors_5xx.get(), 1);
+        assert_eq!(backend.errors.get(), 1);
+    }
+
     async fn spawn_truncated_precheck_server() -> std::net::SocketAddr {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
@@ -552,11 +613,9 @@ mod tests {
 
     #[tokio::test]
     async fn query_backend_returns_error_on_truncated_multiline_response() {
-        use crate::cache::UnifiedCache;
-        use crate::metrics::MetricsCollector;
-        use crate::pool::{BufferPool, DeadpoolConnectionProvider};
+        use crate::pool::DeadpoolConnectionProvider;
         use crate::router::BackendSelector;
-        use crate::types::{BackendId, BufferSize, ServerName};
+        use crate::types::{BackendId, ServerName};
 
         let addr = spawn_truncated_precheck_server().await;
 
@@ -593,7 +652,6 @@ mod tests {
 
     #[tokio::test]
     async fn cache_precheck_availability_hit_does_not_persist_positive_entry() {
-        use crate::cache::UnifiedCache;
         use crate::types::BackendId;
 
         let backend_id = BackendId::from_index(0);

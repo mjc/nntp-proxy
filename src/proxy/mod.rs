@@ -169,6 +169,17 @@ impl NntpProxy {
         info!("All connection pools have been shut down gracefully");
     }
 
+    /// Establish the configured pooled backend connections up front.
+    ///
+    /// This keeps the provider/server index alignment invariant inside
+    /// `NntpProxy` instead of spreading it to callers.
+    ///
+    /// # Errors
+    /// Returns any backend connection or handshake error from pool prewarming.
+    pub async fn prewarm_connections(&self) -> Result<()> {
+        crate::pool::prewarm_pools(&self.connection_providers, &self.servers).await
+    }
+
     /// Get the list of servers
     #[must_use]
     #[inline]

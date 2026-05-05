@@ -69,7 +69,7 @@ async fn run_proxy(
 
     // Prewarm connections BEFORE accepting clients (must complete first to avoid exceeding limits)
     info!("Prewarming connection pools...");
-    nntp_proxy::pool::prewarm_pools(proxy.connection_providers(), proxy.servers()).await?;
+    proxy.prewarm_connections().await?;
     info!("Connection pools ready, accepting clients");
 
     runtime::spawn_stats_flusher(proxy.connection_stats());

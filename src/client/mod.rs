@@ -312,6 +312,47 @@ mod tests {
         assert!(NntpClient::parse_stat_response(StatusCode::parse(b"400")).is_err());
     }
 
+    async fn spawn_fetch_test_server(
+        expected_command: &'static str,
+        response: &'static [u8],
+    ) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let _ = stream.write_all(b"200 mock\r\n").await;
+                        let mut cmd_buf = [0u8; 1024];
+                        loop {
+                            let Ok(n) = stream.read(&mut cmd_buf).await else {
+                                return;
+                            };
+                            if n == 0 {
+                                return;
+                            }
+
+                            let command = std::str::from_utf8(&cmd_buf[..n]).unwrap();
+                            if command.starts_with(expected_command) {
+                                let _ = stream.write_all(response).await;
+                                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                                return;
+                            }
+
+                            let _ = stream.write_all(b"200 OK\r\n").await;
+                        }
+                    });
+                }
+            }
+        });
+
+        addr
+    }
+
     /// Spawn a minimal NNTP server that sends a greeting, then waits for
     /// `notify` before sending `article_data`. Returns (addr, notify).
     ///
@@ -423,6 +464,19 @@ mod tests {
             .max_size(2)
             .build()
             .unwrap()
+    }
+
+    fn make_test_client(addr: std::net::SocketAddr) -> NntpClient {
+        use crate::pool::BufferPool;
+        use crate::types::BufferSize;
+
+        let provider = DeadpoolConnectionProvider::builder(addr.ip().to_string(), addr.port())
+            .name("test")
+            .max_connections(2)
+            .build()
+            .unwrap();
+        let buffer_pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 2);
+        NntpClient::new(provider, buffer_pool)
     }
 
     /// Verify `drain_multiline_into` captures the complete response when it all
@@ -547,5 +601,29 @@ mod tests {
             !conn.has_leftover(),
             "stashed bytes should be consumed first"
         );
+    }
+
+    #[tokio::test]
+    async fn fetch_head_reads_complete_multiline_response() {
+        let response = b"221 0 <test@example.com>\r\nSubject: test\r\nFrom: tester\r\n\r\n.\r\n";
+        let addr = spawn_fetch_test_server("HEAD <test@example.com>", response).await;
+        let client = make_test_client(addr);
+        let msg_id = crate::types::MessageId::new("<test@example.com>".to_string()).unwrap();
+
+        let buffer = client.fetch_head(&msg_id).await.unwrap();
+
+        assert_eq!(&buffer[..], response);
+    }
+
+    #[tokio::test]
+    async fn fetch_body_reads_complete_multiline_response() {
+        let response = b"222 0 <test@example.com>\r\nhello world\r\n.\r\n";
+        let addr = spawn_fetch_test_server("BODY <test@example.com>", response).await;
+        let client = make_test_client(addr);
+        let msg_id = crate::types::MessageId::new("<test@example.com>".to_string()).unwrap();
+
+        let buffer = client.fetch_body(&msg_id).await.unwrap();
+
+        assert_eq!(&buffer[..], response);
     }
 }
