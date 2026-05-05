@@ -55,7 +55,7 @@ async fn run_proxy(
     ui_mode: UiMode,
     log_buffer: Option<tui::LogBuffer>,
 ) -> Result<()> {
-    let launch = prepare_proxy_launch(&args, &config)?;
+    let launch = prepare_proxy_launch(&args, &config);
     args.common
         .validate_dashboard_listen(&launch.host, launch.port)?;
 
@@ -83,7 +83,7 @@ async fn run_proxy(
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
     let (tui_handle, tui_shutdown_tx) =
-        launch_tui(ui_mode, &proxy, log_buffer.clone(), shutdown_tx.clone())?;
+        launch_tui(ui_mode, &proxy, log_buffer.clone(), shutdown_tx.clone());
     let (dashboard_handle, dashboard_shutdown_tx) =
         launch_dashboard_publisher(args.common.tui_listen, &proxy, log_buffer).await?;
     let error_tui_shutdown_tx = tui_shutdown_tx.clone();
@@ -146,7 +146,8 @@ struct ProxyLaunch {
     metrics_store: Option<MetricsStore>,
 }
 
-fn prepare_proxy_launch(args: &Args, config: &nntp_proxy::config::Config) -> Result<ProxyLaunch> {
+/// Resolve the runtime launch parameters from CLI arguments and config.
+fn prepare_proxy_launch(args: &Args, config: &nntp_proxy::config::Config) -> ProxyLaunch {
     let routing_mode = args
         .common
         .routing_mode
@@ -166,7 +167,7 @@ fn prepare_proxy_launch(args: &Args, config: &nntp_proxy::config::Config) -> Res
         .collect();
     let metrics_store = runtime::load_metrics_from_disk(&stats_path, &server_names);
 
-    Ok(ProxyLaunch {
+    ProxyLaunch {
         routing_mode,
         host,
         port,
@@ -174,17 +175,18 @@ fn prepare_proxy_launch(args: &Args, config: &nntp_proxy::config::Config) -> Res
         availability_path,
         server_names,
         metrics_store,
-    })
+    }
 }
 
+/// Launch the local in-process TUI when `--ui tui` is selected.
 fn launch_tui(
     ui_mode: UiMode,
     proxy: &Arc<NntpProxy>,
     log_buffer: Option<tui::LogBuffer>,
     shutdown_tx: mpsc::Sender<()>,
-) -> Result<(Option<TuiHandle>, Option<mpsc::Sender<()>>)> {
+) -> (Option<TuiHandle>, Option<mpsc::Sender<()>>) {
     if !ui_mode.uses_tui() {
-        return Ok((None, None));
+        return (None, None);
     }
 
     let (tui_shutdown_tx, tui_shutdown_rx) = mpsc::channel::<()>(1);
@@ -205,9 +207,14 @@ fn launch_tui(
         info!("TUI closed");
     });
 
-    Ok((Some(handle), Some(tui_shutdown_tx)))
+    (Some(handle), Some(tui_shutdown_tx))
 }
 
+/// Launch the websocket dashboard publisher when `--tui-listen` is configured.
+///
+/// # Errors
+/// Returns an error if the dashboard listener cannot be bound or the task cannot
+/// be prepared.
 async fn launch_dashboard_publisher(
     listen_addr: Option<SocketAddr>,
     proxy: &Arc<NntpProxy>,
@@ -316,7 +323,7 @@ mod tests {
                 .unwrap(),
         ];
 
-        let launch = prepare_proxy_launch(&args, &config).unwrap();
+        let launch = prepare_proxy_launch(&args, &config);
 
         assert_eq!(launch.routing_mode, nntp_proxy::RoutingMode::Stateful);
         assert_eq!(launch.host, "127.0.0.1");

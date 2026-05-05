@@ -211,7 +211,11 @@ impl CommonArgs {
         }
     }
 
-    /// Validate dashboard-related flag combinations.
+    /// Validate combinations of UI-related runtime flags.
+    ///
+    /// # Errors
+    /// Returns an error when attach/listen flags are combined illegally or when
+    /// attached mode targets a non-loopback address.
     pub fn validate_runtime_mode(&self) -> Result<()> {
         let ui_mode = self.effective_ui_mode();
 
@@ -227,8 +231,7 @@ impl CommonArgs {
             && !attach_addr.ip().is_loopback()
         {
             bail!(
-                "--tui-attach {} must connect to a loopback address; use 127.0.0.1 or ::1",
-                attach_addr
+                "--tui-attach {attach_addr} must connect to a loopback address; use 127.0.0.1 or ::1"
             );
         }
 
@@ -236,6 +239,10 @@ impl CommonArgs {
     }
 
     /// Validate that the dashboard websocket listener does not reuse the proxy listen socket.
+    ///
+    /// # Errors
+    /// Returns an error when the dashboard listener is non-loopback or would
+    /// collide with the proxy listener on the same socket.
     pub fn validate_dashboard_listen(&self, proxy_host: &str, proxy_port: Port) -> Result<()> {
         let Some(dashboard_listen) = self.tui_listen else {
             return Ok(());
@@ -243,8 +250,7 @@ impl CommonArgs {
 
         if !dashboard_listen.ip().is_loopback() {
             bail!(
-                "--tui-listen {} must bind to a loopback address; use 127.0.0.1 or ::1",
-                dashboard_listen
+                "--tui-listen {dashboard_listen} must bind to a loopback address; use 127.0.0.1 or ::1"
             );
         }
 
@@ -362,15 +368,14 @@ fn proxy_listener_conflicts(
     let dashboard_ip = dashboard_listen.ip();
     let proxy_target = (proxy_host, proxy_port.get());
 
-    proxy_target
-        .to_socket_addrs()
-        .ok()
-        .map(|addrs| {
+    proxy_target.to_socket_addrs().ok().map_or_else(
+        || dashboard_ip.is_unspecified(),
+        |addrs| {
             addrs
                 .map(|addr| addr.ip())
                 .any(|proxy_ip| listener_ips_conflict(proxy_ip, dashboard_ip))
-        })
-        .unwrap_or_else(|| dashboard_ip.is_unspecified())
+        },
+    )
 }
 
 fn listener_ips_conflict(proxy_ip: IpAddr, dashboard_ip: IpAddr) -> bool {

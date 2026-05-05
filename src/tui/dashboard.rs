@@ -147,7 +147,7 @@ mod tests {
             snapshot: MetricsSnapshot::default(),
             backend_views: vec![sample_backend_view()],
             client_history: Vec::new(),
-            system_stats: Default::default(),
+            system_stats: SystemStats::default(),
             view_mode: ViewMode::Normal,
             show_details: false,
             log_lines: Vec::new(),

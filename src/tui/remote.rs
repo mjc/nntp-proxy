@@ -143,6 +143,10 @@ fn handle_dashboard_accept_result(
     }
 }
 
+/// Bind the dashboard websocket listener.
+///
+/// # Errors
+/// Returns an error when the address is not loopback or the socket cannot be bound.
 pub async fn bind_dashboard_listener(listen_addr: SocketAddr) -> anyhow::Result<TcpListener> {
     anyhow::ensure!(
         listen_addr.ip().is_loopback(),
@@ -155,6 +159,10 @@ pub async fn bind_dashboard_listener(listen_addr: SocketAddr) -> anyhow::Result<
     })
 }
 
+/// Run the headless dashboard publisher on an already-bound listener.
+///
+/// # Errors
+/// Returns an error if websocket publishing fails after startup.
 pub async fn run_dashboard_publisher_on_listener(
     mut app: TuiApp,
     listener: TcpListener,
@@ -184,6 +192,10 @@ pub async fn run_dashboard_publisher_on_listener(
 }
 
 /// Run the headless dashboard websocket publisher.
+///
+/// # Errors
+/// Returns an error if the listener cannot be bound or the publisher exits with
+/// an unrecoverable websocket error.
 pub async fn run_dashboard_publisher(
     app: TuiApp,
     listen_addr: SocketAddr,
@@ -258,7 +270,7 @@ async fn dashboard_reader_session(
     let last_snapshot = state_tx.borrow().latest_state.clone();
     let _ = state_tx.send(AttachedDashboard::connected(connect_addr, last_snapshot));
     let (_, source) = ws_stream.split();
-    forward_dashboard_states(source, state_tx).await.map(|_| {
+    forward_dashboard_states(source, state_tx).await.map(|()| {
         warn!("Attached dashboard websocket stream ended for {ws_url}");
         ReaderSessionOutcome::RetryAfterDelay
     })
@@ -291,8 +303,9 @@ where
 fn retry_reason(outcome: &anyhow::Result<ReaderSessionOutcome>) -> String {
     outcome
         .as_ref()
-        .map(|_| "connection dropped".to_string())
-        .unwrap_or_else(|err| err.to_string())
+        .map_or_else(std::string::ToString::to_string, |_| {
+            "connection dropped".to_string()
+        })
 }
 
 fn dashboard_target_from_ws_url(ws_url: &str) -> anyhow::Result<SocketAddr> {

@@ -181,6 +181,10 @@ pub async fn run_tui(
 }
 
 /// Run the TUI as a remote dashboard client connected to a headless publisher.
+///
+/// # Errors
+/// Returns an error when the target is non-loopback or when terminal setup,
+/// drawing, input, or restore operations fail.
 pub async fn run_attached_tui(connect_addr: SocketAddr) -> Result<()> {
     anyhow::ensure!(
         connect_addr.ip().is_loopback(),

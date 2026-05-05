@@ -20,6 +20,7 @@ pub enum ViewMode {
 }
 
 /// Historical throughput data point (generic over traffic direction)
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ThroughputPoint {
     /// Bytes sent per second
@@ -512,6 +513,9 @@ impl TuiApp {
 
     /// Get throughput history for a backend
     #[must_use]
+    ///
+    /// # Panics
+    /// Panics if `backend_idx` is out of range for the configured backend history.
     pub fn throughput_history(&self, backend_idx: usize) -> &VecDeque<ThroughputPoint> {
         self.backend_history(backend_idx)
             .expect("backend history index should be valid")
@@ -1190,32 +1194,32 @@ mod tests {
         let snapshot = app.snapshot_state();
 
         assert_eq!(snapshot.client_history.len(), 1);
-        assert_eq!(
+        assert_f64_eq(
             snapshot.client_history[0].sent_per_sec().get(),
-            client_point.sent_per_sec().get()
+            client_point.sent_per_sec().get(),
         );
-        assert_eq!(
+        assert_f64_eq(
             snapshot.client_history[0].received_per_sec().get(),
-            client_point.received_per_sec().get()
+            client_point.received_per_sec().get(),
         );
         assert_eq!(snapshot.backend_views.len(), 1);
         assert_eq!(snapshot.backend_views[0].history.len(), 1);
-        assert_eq!(
+        assert_f64_eq(
             snapshot.backend_views[0].history[0].sent_per_sec().get(),
-            backend_point.sent_per_sec().get()
+            backend_point.sent_per_sec().get(),
         );
-        assert_eq!(
+        assert_f64_eq(
             snapshot.backend_views[0].history[0]
                 .received_per_sec()
                 .get(),
-            backend_point.received_per_sec().get()
+            backend_point.received_per_sec().get(),
         );
-        assert_eq!(
+        assert_f64_eq(
             snapshot.backend_views[0].history[0]
                 .commands_per_sec()
                 .unwrap()
                 .get(),
-            backend_point.commands_per_sec().unwrap().get()
+            backend_point.commands_per_sec().unwrap().get(),
         );
         assert_eq!(
             snapshot.buffer_pool.as_ref().map(|pool| pool.total),

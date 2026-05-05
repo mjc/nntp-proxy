@@ -630,10 +630,10 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState) {
         .iter()
         .enumerate()
         .map(|(i, backend)| {
-            let stats = &backend.stats;
+            let backend_stats = &backend.stats;
             let server = &backend.server;
             let (health_icon, health_color) = health_indicator(backend.health_status);
-            let error_rate = stats.error_rate_percent();
+            let error_rate = backend_stats.error_rate_percent();
 
             // Format dynamic text values
             let cmd_per_sec = backend
@@ -644,11 +644,11 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState) {
                     |cps| format!("{:.0}", cps.get()),
                 );
 
-            let ttfb = stats
+            let ttfb = backend_stats
                 .average_ttfb_ms()
                 .map_or_else(|| "N/A".to_string(), |ms| format!("{ms:.1}ms"));
 
-            let avg_size = stats
+            let avg_size = backend_stats
                 .average_article_size()
                 .map_or_else(|| "N/A".to_string(), format_bytes);
 
@@ -672,13 +672,16 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState) {
                     cmd_per_sec,
                     ttfb,
                 ),
-                backend_transfer_line(stats.bytes_sent.as_u64(), stats.bytes_received.as_u64()),
-                backend_article_line(avg_size, stats.article_count.get()),
+                backend_transfer_line(
+                    backend_stats.bytes_sent.as_u64(),
+                    backend_stats.bytes_received.as_u64(),
+                ),
+                backend_article_line(avg_size, backend_stats.article_count.get()),
                 backend_error_line(
-                    stats.errors_4xx.get(),
-                    stats.errors_5xx.get(),
-                    !stats.errors.is_zero(),
-                    stats.connection_failures.get(),
+                    backend_stats.errors_4xx.get(),
+                    backend_stats.errors_5xx.get(),
+                    !backend_stats.errors.is_zero(),
+                    backend_stats.connection_failures.get(),
                 ),
             ];
 
