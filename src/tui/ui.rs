@@ -52,52 +52,15 @@ pub fn render_ui(
     state: &DashboardState,
     attached_ui_stats: Option<&crate::tui::SystemStats>,
 ) {
-    use crate::tui::app::ViewMode;
-
-    // Check if we're in log fullscreen mode
-    if state.view_mode == ViewMode::LogFullscreen {
-        // Fullscreen logs - show only title and logs
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints([
-                Constraint::Length(layout::TITLE_HEIGHT),
-                Constraint::Min(10), // Most of screen for logs
-                Constraint::Length(layout::FOOTER_HEIGHT),
-            ])
-            .split(f.area());
-
+    if let Some(chunks) = dashboard_fullscreen_chunks(state.view_mode, f.area()) {
         render_title(f, chunks[0], &state.snapshot);
         render_logs(f, chunks[1], state);
         render_footer(f, chunks[2]);
         return;
     }
 
-    // Normal mode - show all panels
-    // Determine if we have enough space for a log window
-    // We need at least 40 lines total to fit everything comfortably
-    let show_logs = f.area().height >= layout::MIN_HEIGHT_FOR_LOGS;
-
-    // Create main layout - dynamically add log section based on available space
-    let chunks = if show_logs {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints([
-                Constraint::Length(layout::TITLE_HEIGHT),
-                Constraint::Length(layout::SUMMARY_HEIGHT),
-                Constraint::Min(layout::MIN_CHART_HEIGHT),
-                Constraint::Length(layout::LOG_WINDOW_HEIGHT),
-                Constraint::Length(layout::FOOTER_HEIGHT),
-            ])
-            .split(f.area())
-    } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints(layout::main_sections())
-            .split(f.area())
-    };
+    let show_logs = should_show_dashboard_logs(f.area().height);
+    let chunks = dashboard_main_chunks(f.area(), show_logs);
 
     // Render each section
     render_title(f, chunks[0], &state.snapshot);
@@ -111,6 +74,54 @@ pub fn render_ui(
         render_footer(f, chunks[4]);
     } else {
         render_footer(f, chunks[3]);
+    }
+}
+
+fn should_show_dashboard_logs(area_height: u16) -> bool {
+    area_height >= layout::MIN_HEIGHT_FOR_LOGS
+}
+
+fn dashboard_fullscreen_chunks(
+    view_mode: crate::tui::app::ViewMode,
+    area: Rect,
+) -> Option<[Rect; 3]> {
+    if view_mode != crate::tui::app::ViewMode::LogFullscreen {
+        return None;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(layout::TITLE_HEIGHT),
+            Constraint::Min(10),
+            Constraint::Length(layout::FOOTER_HEIGHT),
+        ])
+        .split(area);
+    Some([chunks[0], chunks[1], chunks[2]])
+}
+
+fn dashboard_main_chunks(area: Rect, show_logs: bool) -> Vec<Rect> {
+    if show_logs {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(layout::TITLE_HEIGHT),
+                Constraint::Length(layout::SUMMARY_HEIGHT),
+                Constraint::Min(layout::MIN_CHART_HEIGHT),
+                Constraint::Length(layout::LOG_WINDOW_HEIGHT),
+                Constraint::Length(layout::FOOTER_HEIGHT),
+            ])
+            .split(area)
+            .to_vec()
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints(layout::main_sections())
+            .split(area)
+            .to_vec()
     }
 }
 
@@ -827,7 +838,9 @@ mod tests {
     use super::*;
     use crate::metrics::MetricsSnapshot;
     use crate::metrics::UserStats;
+    use crate::tui::app::ViewMode;
     use crate::tui::dashboard::BufferPoolStats;
+    use ratatui::layout::Rect;
 
     fn user_stats(name: &str, total_bytes: u64) -> UserStats {
         UserStats {
@@ -945,6 +958,26 @@ mod tests {
             !remote_lines
                 .iter()
                 .any(|line| line.contains("CPU:") && !line.contains("proxy"))
+        );
+    }
+
+    #[test]
+    fn dashboard_layout_helpers_distinguish_modes_and_height() {
+        assert!(should_show_dashboard_logs(layout::MIN_HEIGHT_FOR_LOGS));
+        assert!(!should_show_dashboard_logs(layout::MIN_HEIGHT_FOR_LOGS - 1));
+
+        assert!(
+            dashboard_fullscreen_chunks(ViewMode::LogFullscreen, Rect::new(0, 0, 80, 24)).is_some()
+        );
+        assert!(dashboard_fullscreen_chunks(ViewMode::Normal, Rect::new(0, 0, 80, 24)).is_none());
+
+        assert_eq!(
+            dashboard_main_chunks(Rect::new(0, 0, 80, 24), true).len(),
+            5
+        );
+        assert_eq!(
+            dashboard_main_chunks(Rect::new(0, 0, 80, 24), false).len(),
+            4
         );
     }
 }
