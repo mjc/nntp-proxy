@@ -4,6 +4,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use anyhow::Result;
 use clap::Parser;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -52,33 +53,16 @@ async fn run_proxy(
     ui_mode: UiMode,
     log_buffer: Option<tui::LogBuffer>,
 ) -> Result<()> {
-    let routing_mode = args
-        .common
-        .routing_mode
-        .unwrap_or(config.routing.routing_mode);
-    let (host, port) =
-        runtime::resolve_listen_address(args.common.host.as_deref(), args.common.port, &config);
-    args.common.validate_dashboard_listen(&host, port)?;
+    let launch = prepare_proxy_launch(&args, &config)?;
+    args.common
+        .validate_dashboard_listen(&launch.host, launch.port)?;
 
-    let stats_path = runtime::resolve_stats_file_path(
-        args.common.config.as_str(),
-        config.proxy.stats_file.as_ref(),
-    );
-    let availability_path =
-        runtime::resolve_availability_file_path(args.common.config.as_str(), config.cache.as_ref());
-    let server_names: Vec<String> = config
-        .servers
-        .iter()
-        .map(|s| s.name.as_ref().to_string())
-        .collect();
-    let metrics_store = runtime::load_metrics_from_disk(&stats_path, &server_names);
-
-    let proxy = build_proxy(config, routing_mode, metrics_store).await?;
-    if let Some(path) = availability_path.as_ref() {
+    let proxy = build_proxy(config, launch.routing_mode, launch.metrics_store).await?;
+    if let Some(path) = launch.availability_path.as_ref() {
         let _ = runtime::load_availability_from_disk(proxy.cache(), path);
     }
 
-    let listener = runtime::bind_listener(&host, port, routing_mode).await?;
+    let listener = runtime::bind_listener(&launch.host, launch.port, launch.routing_mode).await?;
 
     // Prewarm connections BEFORE accepting clients (must complete first to avoid exceeding limits)
     info!("Prewarming connection pools...");
@@ -87,8 +71,12 @@ async fn run_proxy(
 
     runtime::spawn_stats_flusher(proxy.connection_stats());
     runtime::spawn_cache_stats_logger(&proxy);
-    runtime::spawn_metrics_saver(&proxy, stats_path.clone(), server_names.clone());
-    runtime::spawn_availability_saver(&proxy, availability_path.clone());
+    runtime::spawn_metrics_saver(
+        &proxy,
+        launch.stats_path.clone(),
+        launch.server_names.clone(),
+    );
+    runtime::spawn_availability_saver(&proxy, launch.availability_path.clone());
     runtime::spawn_idle_connection_clearer(&proxy);
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
@@ -101,7 +89,7 @@ async fn run_proxy(
     spawn_signal_forwarder(shutdown_tx, tui_shutdown_tx, dashboard_shutdown_tx);
 
     let accept_result =
-        runtime::run_accept_loop(proxy.clone(), listener, shutdown_rx, routing_mode).await;
+        runtime::run_accept_loop(proxy.clone(), listener, shutdown_rx, launch.routing_mode).await;
 
     if accept_result.is_err() {
         if let Some(tx) = error_tui_shutdown_tx {
@@ -120,8 +108,13 @@ async fn run_proxy(
         handle.await?;
     }
 
-    if let Err(e) =
-        runtime::persist_runtime_state(&proxy, stats_path, availability_path, server_names).await
+    if let Err(e) = runtime::persist_runtime_state(
+        &proxy,
+        launch.stats_path,
+        launch.availability_path,
+        launch.server_names,
+    )
+    .await
     {
         warn!("Failed to persist runtime state after shutdown: {}", e);
     }
@@ -142,6 +135,47 @@ async fn build_proxy(
 }
 
 type TuiHandle = tokio::task::JoinHandle<()>;
+
+struct ProxyLaunch {
+    routing_mode: nntp_proxy::RoutingMode,
+    host: String,
+    port: nntp_proxy::types::Port,
+    stats_path: PathBuf,
+    availability_path: Option<PathBuf>,
+    server_names: Vec<String>,
+    metrics_store: Option<MetricsStore>,
+}
+
+fn prepare_proxy_launch(args: &Args, config: &nntp_proxy::config::Config) -> Result<ProxyLaunch> {
+    let routing_mode = args
+        .common
+        .routing_mode
+        .unwrap_or(config.routing.routing_mode);
+    let (host, port) =
+        runtime::resolve_listen_address(args.common.host.as_deref(), args.common.port, config);
+    let stats_path = runtime::resolve_stats_file_path(
+        args.common.config.as_str(),
+        config.proxy.stats_file.as_ref(),
+    );
+    let availability_path =
+        runtime::resolve_availability_file_path(args.common.config.as_str(), config.cache.as_ref());
+    let server_names: Vec<String> = config
+        .servers
+        .iter()
+        .map(|s| s.name.as_ref().to_string())
+        .collect();
+    let metrics_store = runtime::load_metrics_from_disk(&stats_path, &server_names);
+
+    Ok(ProxyLaunch {
+        routing_mode,
+        host,
+        port,
+        stats_path,
+        availability_path,
+        server_names,
+        metrics_store,
+    })
+}
 
 fn launch_tui(
     ui_mode: UiMode,
@@ -234,4 +268,59 @@ fn spawn_signal_forwarder(
         }
         let _ = shutdown_tx.send(()).await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nntp_proxy::config::Config;
+    use nntp_proxy::types::Port;
+    use std::path::PathBuf;
+
+    fn test_common_args() -> CommonArgs {
+        CommonArgs {
+            config: "config.toml".parse().unwrap(),
+            ui: UiMode::Headless,
+            no_tui: false,
+            tui_listen: None,
+            tui_attach: None,
+            port: None,
+            host: None,
+            routing_mode: Some(nntp_proxy::RoutingMode::Stateful),
+            backend_selection: None,
+            article_cache_capacity: None,
+            article_cache_ttl_secs: None,
+            store_article_bodies: None,
+            threads: None,
+            backend_pipelining: None,
+        }
+    }
+
+    #[test]
+    fn prepare_proxy_launch_prefers_cli_routing_mode_and_host_port() {
+        let args = Args {
+            common: CommonArgs {
+                routing_mode: Some(nntp_proxy::RoutingMode::Stateful),
+                host: Some("127.0.0.1".to_string()),
+                port: Some(Port::try_new(9120).unwrap()),
+                ..test_common_args()
+            },
+        };
+        let mut config = Config::default();
+        config.proxy.stats_file = Some(PathBuf::from("proxy-stats.json"));
+        config.servers = vec![
+            nntp_proxy::config::Server::builder("server.example.com", Port::try_new(119).unwrap())
+                .name("Primary")
+                .build()
+                .unwrap(),
+        ];
+
+        let launch = prepare_proxy_launch(&args, &config).unwrap();
+
+        assert_eq!(launch.routing_mode, nntp_proxy::RoutingMode::Stateful);
+        assert_eq!(launch.host, "127.0.0.1");
+        assert_eq!(launch.port.get(), 9120);
+        assert_eq!(launch.server_names, vec!["Primary".to_string()]);
+        assert!(launch.metrics_store.is_none());
+    }
 }
