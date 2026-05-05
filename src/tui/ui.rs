@@ -207,8 +207,26 @@ fn create_app_summary(
     show_details: bool,
     attached_ui_stats: Option<&crate::tui::SystemStats>,
 ) -> Paragraph<'static> {
-    /// Color for CPU usage based on threshold
-    const fn cpu_color(usage: f32) -> Color {
+    let lines = build_app_summary_lines(
+        snapshot,
+        system_stats,
+        buffer_pool,
+        show_details,
+        attached_ui_stats,
+    );
+    Paragraph::new(lines)
+        .block(bordered_block("App", styles::BORDER_NORMAL))
+        .alignment(Alignment::Left)
+}
+
+fn build_app_summary_lines(
+    snapshot: &crate::metrics::MetricsSnapshot,
+    system_stats: &crate::tui::SystemStats,
+    buffer_pool: Option<&BufferPoolStats>,
+    show_details: bool,
+    attached_ui_stats: Option<&crate::tui::SystemStats>,
+) -> Vec<Line<'static>> {
+    fn cpu_color(usage: f32) -> Color {
         if usage > 80.0 {
             Color::Red
         } else if usage > 50.0 {
@@ -218,8 +236,7 @@ fn create_app_summary(
         }
     }
 
-    /// Color for session count (highlight if active)
-    const fn session_color(count: usize) -> Color {
+    fn session_color(count: usize) -> Color {
         if count > 0 {
             styles::VALUE_PRIMARY
         } else {
@@ -227,12 +244,8 @@ fn create_app_summary(
         }
     }
 
-    /// Color for buffer pool utilization
-    const fn buffer_color(in_use: usize, total: usize) -> Color {
-        let percent = match (in_use * 100).checked_div(total) {
-            Some(v) => v,
-            None => 0,
-        };
+    fn buffer_color(in_use: usize, total: usize) -> Color {
+        let percent = (in_use * 100).checked_div(total).unwrap_or_default();
         if percent > 80 {
             Color::Red
         } else if percent > 60 {
@@ -242,17 +255,19 @@ fn create_app_summary(
         }
     }
 
+    let mut lines = vec![
+        Line::from(vec![
+            "Uptime: ".fg(styles::LABEL),
+            snapshot.format_uptime().fg(styles::VALUE_PRIMARY),
+        ]),
+        Line::from(vec![
+            "Stateful Sessions: ".fg(styles::LABEL),
+            format!("{}", snapshot.stateful_sessions).fg(session_color(snapshot.stateful_sessions)),
+        ]),
+    ];
+
     if let Some(ui_stats) = attached_ui_stats {
-        let lines = vec![
-            Line::from(vec![
-                "Uptime: ".fg(styles::LABEL),
-                snapshot.format_uptime().fg(styles::VALUE_PRIMARY),
-            ]),
-            Line::from(vec![
-                "Stateful Sessions: ".fg(styles::LABEL),
-                format!("{}", snapshot.stateful_sessions)
-                    .fg(session_color(snapshot.stateful_sessions)),
-            ]),
+        lines.extend([
             Line::from(vec![
                 "CPU (proxy, UI): ".fg(styles::LABEL),
                 format!("{:.1}%", system_stats.cpu_usage).fg(cpu_color(system_stats.cpu_usage)),
@@ -265,33 +280,20 @@ fn create_app_summary(
                 " / ".fg(styles::LABEL),
                 format_bytes(ui_stats.memory_bytes).fg(styles::VALUE_INFO),
             ]),
-        ];
-
-        return Paragraph::new(lines)
-            .block(bordered_block("App", styles::BORDER_NORMAL))
-            .alignment(Alignment::Left);
+        ]);
+    } else {
+        lines.extend([
+            Line::from(vec![
+                "CPU: ".fg(styles::LABEL),
+                format!("{:.1}%", system_stats.cpu_usage).fg(cpu_color(system_stats.cpu_usage)),
+            ]),
+            Line::from(vec![
+                "Memory: ".fg(styles::LABEL),
+                format_bytes(system_stats.memory_bytes).fg(styles::VALUE_INFO),
+            ]),
+        ]);
     }
 
-    let mut lines = vec![
-        Line::from(vec![
-            "Uptime: ".fg(styles::LABEL),
-            snapshot.format_uptime().fg(styles::VALUE_PRIMARY),
-        ]),
-        Line::from(vec![
-            "Stateful Sessions: ".fg(styles::LABEL),
-            format!("{}", snapshot.stateful_sessions).fg(session_color(snapshot.stateful_sessions)),
-        ]),
-        Line::from(vec![
-            "CPU: ".fg(styles::LABEL),
-            format!("{:.1}%", system_stats.cpu_usage).fg(cpu_color(system_stats.cpu_usage)),
-        ]),
-        Line::from(vec![
-            "Memory: ".fg(styles::LABEL),
-            format_bytes(system_stats.memory_bytes).fg(styles::VALUE_INFO),
-        ]),
-    ];
-
-    // Show pipeline stats if any batches have been processed
     if snapshot.pipeline_batches > 0 {
         let avg_batch =
             counter_as_f64(snapshot.pipeline_commands) / counter_as_f64(snapshot.pipeline_batches);
@@ -305,7 +307,6 @@ fn create_app_summary(
         ]));
     }
 
-    // Show backend pipeline multiplexing stats if any requests have been queued
     if snapshot.pipeline_requests_queued > 0 {
         lines.push(Line::from(vec![
             "Mux Queue: ".fg(styles::LABEL),
@@ -317,7 +318,6 @@ fn create_app_summary(
         ]));
     }
 
-    // Add buffer stats in details mode if available
     if show_details && let Some(pool) = buffer_pool {
         let usage_percent = if pool.total > 0 {
             size_as_f64(pool.in_use * 100) / size_as_f64(pool.total)
@@ -331,9 +331,7 @@ fn create_app_summary(
         ]));
     }
 
-    Paragraph::new(lines)
-        .block(bordered_block("App", styles::BORDER_NORMAL))
-        .alignment(Alignment::Left)
+    lines
 }
 
 /// Create cache summary panel
@@ -827,7 +825,9 @@ fn top_users_by_bytes(users: &[crate::metrics::UserStats]) -> Vec<&crate::metric
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::MetricsSnapshot;
     use crate::metrics::UserStats;
+    use crate::tui::dashboard::BufferPoolStats;
 
     fn user_stats(name: &str, total_bytes: u64) -> UserStats {
         UserStats {
@@ -897,5 +897,54 @@ mod tests {
         assert_eq!(top_users.len(), 10);
         assert_eq!(top_users[0].username, "user11");
         assert_eq!(top_users[9].username, "user2");
+    }
+
+    #[test]
+    fn app_summary_lines_switch_between_local_and_remote_stats() {
+        let snapshot = MetricsSnapshot::default();
+        let system_stats = crate::tui::SystemStats::default();
+        let buffer_pool = BufferPoolStats {
+            available: 3,
+            in_use: 2,
+            total: 5,
+        };
+
+        let local_lines =
+            build_app_summary_lines(&snapshot, &system_stats, Some(&buffer_pool), true, None)
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>();
+        let remote_lines = build_app_summary_lines(
+            &snapshot,
+            &system_stats,
+            Some(&buffer_pool),
+            true,
+            Some(&crate::tui::SystemStats {
+                cpu_usage: 12.5,
+                memory_bytes: 42,
+                ..Default::default()
+            }),
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+
+        assert!(local_lines.iter().any(|line| line.contains("CPU:")));
+        assert!(local_lines.iter().any(|line| line.contains("Memory:")));
+        assert!(
+            remote_lines
+                .iter()
+                .any(|line| line.contains("CPU (proxy, UI):"))
+        );
+        assert!(
+            remote_lines
+                .iter()
+                .any(|line| line.contains("Memory (proxy, UI):"))
+        );
+        assert!(
+            !remote_lines
+                .iter()
+                .any(|line| line.contains("CPU:") && !line.contains("proxy"))
+        );
     }
 }
