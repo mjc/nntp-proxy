@@ -48,6 +48,12 @@ fn dashboard_source_stream(
     source.filter_map(|message| async move { dashboard_state_from_message(message) })
 }
 
+fn dashboard_peer_label(peer_addr: Option<SocketAddr>) -> String {
+    peer_addr
+        .map(|addr| format!(" from {addr}"))
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReaderSessionOutcome {
     RetryAfterDelay,
@@ -85,11 +91,10 @@ async fn handle_dashboard_client(
     state_rx: watch::Receiver<Arc<DashboardState>>,
 ) -> anyhow::Result<()> {
     let peer_addr = stream.peer_addr().ok();
-    if let Some(peer_addr) = peer_addr {
-        info!("Dashboard websocket client connected from {peer_addr}");
-    } else {
-        info!("Dashboard websocket client connected");
-    }
+    info!(
+        "Dashboard websocket client connected{}",
+        dashboard_peer_label(peer_addr)
+    );
 
     let ws_stream = accept_async(stream).await?;
     let (sink, source) = ws_stream.split();
@@ -99,11 +104,10 @@ async fn handle_dashboard_client(
         drain_dashboard_source(source)
     )?;
 
-    if let Some(peer_addr) = peer_addr {
-        info!("Dashboard websocket client disconnected from {peer_addr}");
-    } else {
-        info!("Dashboard websocket client disconnected");
-    }
+    info!(
+        "Dashboard websocket client disconnected{}",
+        dashboard_peer_label(peer_addr)
+    );
     Ok(())
 }
 
@@ -277,6 +281,15 @@ mod tests {
             .is_none()
         );
         assert!(dashboard_state_from_message(Ok(Message::Text("{not-json}".into()))).is_none());
+    }
+
+    #[test]
+    fn dashboard_peer_label_formats_optional_peer_addresses() {
+        assert_eq!(dashboard_peer_label(None), "");
+        assert_eq!(
+            dashboard_peer_label(Some("127.0.0.1:1234".parse().unwrap())),
+            " from 127.0.0.1:1234"
+        );
     }
 
     #[tokio::test]
