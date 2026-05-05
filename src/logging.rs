@@ -27,13 +27,23 @@ fn leak_guard(guard: WorkerGuard) {
     std::mem::forget(guard);
 }
 
-fn init_headless_subscriber(file_level: &str) {
+fn init_headless_subscriber(file_level: &str) -> crate::tui::LogBuffer {
     let (debug_log, guard) = debug_log_writer();
+    let log_buffer = crate::tui::LogBuffer::new();
+    let log_writer = crate::tui::LogMakeWriter::new(log_buffer.clone());
 
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(|| std::io::LineWriter::new(std::io::stdout()))
+                .with_filter(env_filter()),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(log_writer)
+                .with_ansi(false)
+                .with_target(false)
+                .compact()
                 .with_filter(env_filter()),
         )
         .with(
@@ -45,6 +55,7 @@ fn init_headless_subscriber(file_level: &str) {
         .init();
 
     leak_guard(guard);
+    log_buffer
 }
 
 fn init_tui_subscriber(file_level: &str) -> crate::tui::LogBuffer {
@@ -87,10 +98,7 @@ pub fn init_dual_logging(file_level: &str) {
 #[must_use]
 pub fn init_logging(ui_mode: UiMode, file_level: &str) -> Option<crate::tui::LogBuffer> {
     match ui_mode {
-        UiMode::Headless => {
-            init_headless_subscriber(file_level);
-            None
-        }
+        UiMode::Headless => Some(init_headless_subscriber(file_level)),
         UiMode::Tui => Some(init_tui_subscriber(file_level)),
     }
 }

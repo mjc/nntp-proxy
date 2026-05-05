@@ -5,7 +5,7 @@
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
 /// System resource statistics for the current process
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SystemStats {
     /// CPU usage percentage (0.0 - 100.0 per core, can exceed 100.0 on multi-core)
     pub cpu_usage: f32,

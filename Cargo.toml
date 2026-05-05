@@ -48,6 +48,7 @@ dashmap = "6.1"  # Lock-free concurrent HashMap for metrics
 sysinfo = "0.38"  # System metrics (CPU, memory) for monitoring
 chrono = { version = "0.4", features = ["serde", "clock"], default-features = false }  # Timestamps for stats persistence
 serde_json = "1.0"  # JSON serialization for stats persistence
+tokio-tungstenite = "0.29"  # WebSocket transport for remote TUI attachment
 
 # Derive helpers to reduce newtype boilerplate
 nutype = { version = "0.7", features = ["serde"] }  # Validated newtypes with automatic derives

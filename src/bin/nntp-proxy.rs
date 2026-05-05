@@ -3,6 +3,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
 use anyhow::Result;
 use clap::Parser;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
@@ -20,12 +21,23 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    args.common.validate_runtime_mode()?;
+    let ui_mode = args.common.effective_ui_mode();
+
+    if ui_mode == UiMode::Tui
+        && let Some(connect_addr) = args.common.tui_attach
+    {
+        let threads = args.common.threads;
+        return RuntimeConfig::from_args(threads)
+            .build_runtime()?
+            .block_on(tui::run_attached_tui(connect_addr));
+    }
+
     let (mut config, _) = runtime::load_and_log_config(args.common.config.as_str())?;
 
     // Apply CLI argument overrides to config
     args.common.apply_overrides(&mut config);
 
-    let ui_mode = args.common.effective_ui_mode();
     let log_buffer = nntp_proxy::logging::init_logging(ui_mode, &config.proxy.log_file_level);
 
     let threads = args.common.threads.or(Some(config.proxy.threads));
@@ -80,20 +92,30 @@ async fn run_proxy(
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
     let (tui_handle, tui_shutdown_tx) =
-        launch_tui(ui_mode, &proxy, log_buffer, shutdown_tx.clone())?;
-    let error_shutdown_tx = tui_shutdown_tx.clone();
-    spawn_signal_forwarder(shutdown_tx, tui_shutdown_tx);
+        launch_tui(ui_mode, &proxy, log_buffer.clone(), shutdown_tx.clone())?;
+    let (dashboard_handle, dashboard_shutdown_tx) =
+        launch_dashboard_publisher(args.common.tui_listen, &proxy, log_buffer)?;
+    let error_tui_shutdown_tx = tui_shutdown_tx.clone();
+    let error_dashboard_shutdown_tx = dashboard_shutdown_tx.clone();
+    spawn_signal_forwarder(shutdown_tx, tui_shutdown_tx, dashboard_shutdown_tx);
 
     let accept_result =
         runtime::run_accept_loop(proxy.clone(), listener, shutdown_rx, routing_mode).await;
 
-    if accept_result.is_err()
-        && let Some(tx) = error_shutdown_tx
-    {
-        let _ = tx.send(()).await;
+    if accept_result.is_err() {
+        if let Some(tx) = error_tui_shutdown_tx {
+            let _ = tx.send(()).await;
+        }
+        if let Some(tx) = error_dashboard_shutdown_tx {
+            let _ = tx.send(()).await;
+        }
     }
 
     if let Some(handle) = tui_handle {
+        handle.await?;
+    }
+
+    if let Some(handle) = dashboard_handle {
         handle.await?;
     }
 
@@ -133,26 +155,13 @@ fn launch_tui(
     let (tui_shutdown_tx, tui_shutdown_rx) = mpsc::channel::<()>(1);
 
     info!("Building TUI dashboard...");
-    let mut builder = tui::TuiAppBuilder::new(
-        proxy.metrics().clone(),
-        proxy.router().clone(),
-        Arc::from(proxy.servers()),
-    );
-
-    if let Some(buffer) = log_buffer {
-        builder = builder.with_log_buffer(buffer);
-    }
-
     let cache = proxy.cache();
     info!(
         "Adding cache to TUI: entries={}, size={}",
         cache.entry_count(),
         cache.weighted_size()
     );
-    builder = builder.with_cache(cache.clone());
-    builder = builder.with_buffer_pool(proxy.buffer_pool().clone());
-
-    let tui_app = builder.build();
+    let tui_app = build_dashboard_app(proxy, log_buffer);
     let handle = tokio::spawn(async move {
         info!("Initializing TUI dashboard...");
         if let Err(e) = tui::run_tui(tui_app, shutdown_tx, tui_shutdown_rx).await {
@@ -164,15 +173,62 @@ fn launch_tui(
     Ok((Some(handle), Some(tui_shutdown_tx)))
 }
 
+fn launch_dashboard_publisher(
+    listen_addr: Option<SocketAddr>,
+    proxy: &Arc<NntpProxy>,
+    log_buffer: Option<tui::LogBuffer>,
+) -> Result<(Option<TuiHandle>, Option<mpsc::Sender<()>>)> {
+    let Some(listen_addr) = listen_addr else {
+        return Ok((None, None));
+    };
+
+    let (dashboard_shutdown_tx, dashboard_shutdown_rx) = mpsc::channel::<()>(1);
+
+    info!("Building websocket dashboard publisher...");
+    let tui_app = build_dashboard_app(proxy, log_buffer);
+    let handle = tokio::spawn(async move {
+        info!("Initializing websocket dashboard on {}", listen_addr);
+        if let Err(e) =
+            tui::run_dashboard_publisher(tui_app, listen_addr, dashboard_shutdown_rx).await
+        {
+            error!("Websocket dashboard error: {}", e);
+        }
+        info!("Websocket dashboard closed");
+    });
+
+    Ok((Some(handle), Some(dashboard_shutdown_tx)))
+}
+
+fn build_dashboard_app(proxy: &Arc<NntpProxy>, log_buffer: Option<tui::LogBuffer>) -> tui::TuiApp {
+    let mut builder = tui::TuiAppBuilder::new(
+        proxy.metrics().clone(),
+        proxy.router().clone(),
+        Arc::from(proxy.servers()),
+    );
+
+    if let Some(buffer) = log_buffer {
+        builder = builder.with_log_buffer(buffer);
+    }
+
+    builder
+        .with_cache(proxy.cache().clone())
+        .with_buffer_pool(proxy.buffer_pool().clone())
+        .build()
+}
+
 fn spawn_signal_forwarder(
     shutdown_tx: mpsc::Sender<()>,
     tui_shutdown_tx: Option<mpsc::Sender<()>>,
+    dashboard_shutdown_tx: Option<mpsc::Sender<()>>,
 ) {
     tokio::spawn(async move {
         runtime::shutdown_signal().await;
         info!("Shutdown signal received");
 
         if let Some(tx) = tui_shutdown_tx {
+            let _ = tx.send(()).await;
+        }
+        if let Some(tx) = dashboard_shutdown_tx {
             let _ = tx.send(()).await;
         }
         let _ = shutdown_tx.send(()).await;
