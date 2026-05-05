@@ -139,7 +139,7 @@ impl NntpClient {
     pub async fn stat(&self, message_id: &crate::types::MessageId<'_>) -> Result<bool> {
         let request = stat_request(message_id);
         let mut conn = self.get_connection().await?;
-        let mut buffer = self.buffer_pool.acquire().await;
+        let mut buffer = self.buffer_pool.acquire();
 
         let response = send_request(&mut *conn, &request, &mut buffer).await?;
 
@@ -174,7 +174,7 @@ impl NntpClient {
     /// encountered while fetching the NNTP response.
     async fn fetch_response(&self, request: &RequestContext) -> Result<PooledBuffer> {
         let mut conn = self.get_connection().await?;
-        let mut io_buffer = self.buffer_pool.acquire().await;
+        let mut io_buffer = self.buffer_pool.acquire();
 
         let response = send_request(&mut *conn, request, &mut io_buffer).await?;
 
@@ -201,7 +201,7 @@ impl NntpClient {
     ) -> Result<PooledBuffer> {
         // Use a capture buffer as the accumulator: pooled, can grow beyond io_buffer
         // capacity without panicking, returned to pool on drop.
-        let mut capture = self.buffer_pool.acquire_capture().await;
+        let mut capture = self.buffer_pool.acquire_capture();
         if let Err(err) =
             Self::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, first_chunk_size)
                 .await
@@ -442,8 +442,8 @@ mod tests {
         // Signal server to send article data now that the greeting is consumed
         notify.notify_one();
 
-        let mut io_buffer = buffer_pool.acquire().await;
-        let mut capture = buffer_pool.acquire_capture().await;
+        let mut io_buffer = buffer_pool.acquire();
+        let mut capture = buffer_pool.acquire_capture();
 
         // Simulate send_request pre-reading the full first response chunk
         let first_chunk_size = io_buffer.read_from(&mut *conn).await.unwrap();
@@ -477,8 +477,8 @@ mod tests {
         let mut conn = pool.get().await.unwrap();
         notify.notify_one();
 
-        let mut io_buffer = buffer_pool.acquire().await;
-        let mut capture = buffer_pool.acquire_capture().await;
+        let mut io_buffer = buffer_pool.acquire();
+        let mut capture = buffer_pool.acquire_capture();
 
         // first_chunk_size = 0: no pre-loaded data, all bytes arrive via the loop
         NntpClient::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, 0)
@@ -501,8 +501,8 @@ mod tests {
         let mut conn = pool.get().await.unwrap();
         notify.notify_one();
 
-        let mut io_buffer = buffer_pool.acquire().await;
-        let mut capture = buffer_pool.acquire_capture().await;
+        let mut io_buffer = buffer_pool.acquire();
+        let mut capture = buffer_pool.acquire_capture();
 
         let err = NntpClient::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, 0)
             .await
@@ -530,8 +530,8 @@ mod tests {
         let mut conn = pool.get().await.unwrap();
         notify.notify_one();
 
-        let mut io_buffer = buffer_pool.acquire().await;
-        let mut capture = buffer_pool.acquire_capture().await;
+        let mut io_buffer = buffer_pool.acquire();
+        let mut capture = buffer_pool.acquire_capture();
         let first_chunk_size = io_buffer.read_from(&mut *conn).await.unwrap();
 
         NntpClient::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, first_chunk_size)

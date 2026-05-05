@@ -153,9 +153,9 @@ impl ClientSession {
         // Phase 2: Read and stream responses in order.
         // Buffer acquired once, reused across all responses.
         // Scratch buffers are needed only while backend responses are being read.
-        let mut buffer = self.buffer_pool.acquire().await;
-        let mut leftover = self.buffer_pool.acquire().await;
-        let mut chunk_data = self.buffer_pool.acquire().await;
+        let mut buffer = self.buffer_pool.acquire();
+        let mut leftover = self.buffer_pool.acquire();
+        let mut chunk_data = self.buffer_pool.acquire();
         debug!(
             client = %self.client_addr,
             backend = ?backend_id,
@@ -785,7 +785,7 @@ impl ClientSession {
             request.verb()
         );
 
-        let mut buffer = self.buffer_pool.acquire().await;
+        let mut buffer = self.buffer_pool.acquire();
         let mut availability = availability.unwrap_or_default();
         debug!(
             "Client {} availability routing: missing_bits={:08b}, backend_count={}",

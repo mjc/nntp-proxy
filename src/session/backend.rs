@@ -357,7 +357,7 @@ mod tests {
         let mut stream = ChunkedStream::new(vec![b"20".to_vec(), b"0 OK\r\n".to_vec()]);
 
         let pool = crate::pool::BufferPool::for_tests();
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
 
         let request = RequestContext::from_verb_args(b"DATE", b"");
         let result = send_request(&mut stream, &request, &mut buffer).await;
@@ -375,7 +375,7 @@ mod tests {
         let mut stream = ChunkedStream::new(vec![b"111".to_vec(), b" 20260501173336\r\n".to_vec()]);
 
         let pool = crate::pool::BufferPool::for_tests();
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
 
         let request = RequestContext::from_verb_args(b"DATE", b"");
         let result = send_request(&mut stream, &request, &mut buffer).await;
@@ -398,7 +398,7 @@ mod tests {
         let mut stream = ChunkedStream::new(chunks);
 
         let pool = crate::pool::BufferPool::for_tests();
-        let mut buffer = pool.acquire().await;
+        let mut buffer = pool.acquire();
 
         let request = RequestContext::from_verb_args(b"GROUP", b"alt.test");
         let result = send_request(&mut stream, &request, &mut buffer).await;

@@ -303,16 +303,16 @@ async fn test_buffer_pool_basic_usage() {
     let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 2);
 
     // Get buffer
-    let buffer1 = buffer_pool.acquire().await;
+    let buffer1 = buffer_pool.acquire();
     assert_eq!(buffer1.capacity(), 8192);
 
     // Get another
-    let buffer2 = buffer_pool.acquire().await;
+    let buffer2 = buffer_pool.acquire();
     assert_eq!(buffer2.capacity(), 8192);
 
     // Drop and get again
     drop(buffer1);
-    let buffer3 = buffer_pool.acquire().await;
+    let buffer3 = buffer_pool.acquire();
     assert_eq!(buffer3.capacity(), 8192);
 }
 
@@ -323,7 +323,7 @@ async fn test_buffer_pool_different_sizes() {
 
     for size in &sizes {
         let buffer_pool = BufferPool::new(BufferSize::try_new(*size).unwrap(), 1);
-        let buffer = buffer_pool.acquire().await;
+        let buffer = buffer_pool.acquire();
         assert!(buffer.capacity() >= *size);
         assert_eq!(buffer.capacity() % 4096, 0);
     }
@@ -565,7 +565,7 @@ async fn test_buffer_pool_concurrent_access() {
     for _ in 0..20 {
         let pool = buffer_pool.clone();
         let handle = tokio::spawn(async move {
-            let buffer = pool.acquire().await;
+            let buffer = pool.acquire();
             assert_eq!(buffer.capacity(), 8192);
             // Simulate some work
             tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;

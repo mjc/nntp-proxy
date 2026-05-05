@@ -121,7 +121,7 @@ async fn execute_backend_query(
     };
     let mut conn = crate::pool::ConnectionGuard::new(conn_raw, provider.clone());
 
-    let mut buffer = deps.buffer_pool.acquire().await;
+    let mut buffer = deps.buffer_pool.acquire();
 
     let response = if should_sample_backend_timing() {
         backend::send_request_timed(&mut **conn, request, &mut buffer)
