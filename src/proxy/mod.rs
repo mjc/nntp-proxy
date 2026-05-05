@@ -24,7 +24,7 @@ use crate::auth::AuthHandler;
 use crate::cache::UnifiedCache;
 use crate::config::{Memory, RoutingMode, Server};
 use crate::metrics::{ConnectionStatsAggregator, MetricsCollector};
-use crate::pool::{BufferPool, DeadpoolConnectionProvider, prewarm_pools};
+use crate::pool::{BufferPool, DeadpoolConnectionProvider};
 use crate::router;
 
 #[derive(Debug, Clone)]
@@ -137,16 +137,6 @@ impl NntpProxy {
     #[must_use]
     pub const fn builder(config: crate::config::Config) -> NntpProxyBuilder {
         NntpProxyBuilder::new(config)
-    }
-
-    /// Prewarm all connection pools before accepting clients
-    /// Creates all connections concurrently and returns when ready
-    ///
-    /// # Errors
-    /// Returns any connection-establishment or backend-authentication error
-    /// encountered while prewarming the backend pools.
-    pub async fn prewarm_connections(&self) -> Result<()> {
-        prewarm_pools(&self.connection_providers, &self.servers).await
     }
 
     /// Gracefully shutdown all connection pools

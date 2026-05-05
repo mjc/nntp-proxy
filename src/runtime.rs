@@ -231,7 +231,9 @@ pub fn spawn_connection_prewarming(proxy: &std::sync::Arc<crate::NntpProxy>) {
     let proxy = Arc::clone(proxy);
     tokio::spawn(async move {
         info!("Prewarming connection pools...");
-        if let Err(e) = proxy.prewarm_connections().await {
+        if let Err(e) =
+            crate::pool::prewarm_pools(proxy.connection_providers(), proxy.servers()).await
+        {
             warn!("Failed to prewarm connection pools: {}", e);
             return;
         }

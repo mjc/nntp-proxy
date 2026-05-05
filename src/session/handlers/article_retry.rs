@@ -120,9 +120,7 @@ impl ClientSession {
 
         // Phase 1: Write all commands, then flush
         for i in 0..batch.len() {
-            if let Err(e) =
-                crate::session::backend::write_request(&mut **conn, batch.context(i)).await
-            {
+            if let Err(e) = batch.context(i).write_wire_to(&mut **conn).await {
                 warn!(
                     client = %self.client_addr,
                     backend = ?backend_id,

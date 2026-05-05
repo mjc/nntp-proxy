@@ -10,7 +10,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::connection_error::ConnectionError;
 use crate::protocol::{authinfo_pass, authinfo_user};
-use crate::session::backend;
 use crate::stream::ConnectionStream;
 use crate::tls::{TlsConfig, TlsManager};
 
@@ -305,7 +304,7 @@ impl TcpManager {
             return Ok(());
         };
 
-        backend::write_request(stream, &authinfo_user(username)).await?;
+        authinfo_user(username).write_wire_to(stream).await?;
         let n = stream.read(buffer).await?;
         let response = &buffer[..n];
         let response_str = String::from_utf8_lossy(response);
@@ -320,7 +319,7 @@ impl TcpManager {
                 });
             };
 
-            backend::write_request(stream, &authinfo_pass(password)).await?;
+            authinfo_pass(password).write_wire_to(stream).await?;
             let n = stream.read(buffer).await?;
             let response = &buffer[..n];
             let response_str = String::from_utf8_lossy(response);

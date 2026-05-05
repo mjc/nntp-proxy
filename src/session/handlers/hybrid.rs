@@ -112,7 +112,8 @@ impl ClientSession {
         );
 
         // Forward the triggering request (response handled by proxy loop)
-        crate::session::backend::write_request(&mut **conn_guard, initial_request)
+        initial_request
+            .write_wire_to(&mut **conn_guard)
             .await
             .context("Failed to send initial request to backend")?;
 

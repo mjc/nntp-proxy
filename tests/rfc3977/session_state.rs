@@ -120,9 +120,11 @@ async fn test_mode_reader_sent_to_backend() -> Result<()> {
     };
 
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
-    proxy.prewarm_connections().await.ok();
+    nntp_proxy::pool::prewarm_pools(proxy.connection_providers(), proxy.servers())
+        .await
+        .ok();
 
-    // prewarm_connections().await returns after pool connections are established,
+    // prewarm_pools(...).await returns after pool connections are established,
     // which includes the full handshake (greeting → auth → MODE READER).
     // The backend task sends each command through the channel asynchronously,
     // so we drive the receiver until MODE READER arrives rather than sleeping.

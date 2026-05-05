@@ -129,7 +129,7 @@ async fn execute_pipeline_batch(
 
     // Phase 1: Write all commands
     for (i, req) in batch.iter().enumerate() {
-        if let Err(e) = crate::session::backend::write_request(conn, &req.context).await {
+        if let Err(e) = req.context.write_wire_to(conn).await {
             warn!(
                 "Pipeline worker backend {:?}: write failed at command {}/{}: {}",
                 backend_id,
