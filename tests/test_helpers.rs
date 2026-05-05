@@ -719,7 +719,7 @@ pub async fn send_command_read_multiline_response(
     // the NNTP/RFC semantics. This avoids hanging when the server returns a
     // single-line error or closes the connection mid-response.
     let multiline_prefixes = [
-        "100", "101", "215", "220", "221", "222", "224", "225", "230", "231", "235",
+        "100", "101", "211", "215", "220", "221", "222", "224", "225", "230", "231", "235",
     ];
     let is_multiline = multiline_prefixes
         .iter()

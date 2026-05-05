@@ -31,6 +31,10 @@ pub struct SessionLoopState {
     pub auth_username: Option<String>,
     /// Whether to skip auth checking (optimization after first auth)
     pub skip_auth_check: bool,
+    /// Whether a forwarded backend command is still awaiting its next response bytes.
+    pub awaiting_backend_reply: bool,
+    /// Local replies deferred until earlier backend output has been sent first.
+    deferred_replies: Vec<Vec<u8>>,
 }
 
 impl Default for SessionLoopState {
@@ -54,6 +58,8 @@ impl SessionLoopState {
             iteration_count: 0,
             auth_username: None,
             skip_auth_check: !auth_enabled,
+            awaiting_backend_reply: false,
+            deferred_replies: Vec::new(),
         }
     }
 
@@ -149,20 +155,43 @@ impl SessionLoopState {
 
     /// Mark authentication as complete (skip future checks)
     #[inline]
-    pub const fn mark_authenticated(&mut self) {
+    pub fn mark_authenticated(&mut self) {
         self.skip_auth_check = true;
     }
 
     /// Update state based on auth handler result
     ///
     /// Returns the bytes written for convenience in chaining.
-    pub const fn apply_auth_result(&mut self, result: &super::common::AuthHandlerResult) -> u64 {
+    pub fn apply_auth_result(&mut self, result: &super::common::AuthHandlerResult) -> u64 {
         let bytes = result.bytes_written();
         self.add_backend_to_client(bytes);
         if result.should_skip_further_checks() {
             self.mark_authenticated();
         }
         bytes
+    }
+
+    /// Mark that a backend request was forwarded and its reply must be ordered first.
+    #[inline]
+    pub fn mark_backend_request_sent(&mut self) {
+        self.awaiting_backend_reply = true;
+    }
+
+    /// Mark that backend bytes have started arriving for the outstanding request.
+    #[inline]
+    pub fn mark_backend_reply_started(&mut self) {
+        self.awaiting_backend_reply = false;
+    }
+
+    /// Queue a local reply until earlier backend output has been sent.
+    pub fn push_deferred_reply(&mut self, reply: impl Into<Vec<u8>>) {
+        self.deferred_replies.push(reply.into());
+    }
+
+    /// Drain deferred local replies in order.
+    #[must_use]
+    pub fn take_deferred_replies(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.deferred_replies)
     }
 }
 
@@ -188,6 +217,7 @@ mod tests {
         let state = SessionLoopState::default();
         assert_eq!(state.client_to_backend.as_u64(), 0);
         assert!(state.skip_auth_check); // Default = auth disabled
+        assert!(!state.awaiting_backend_reply);
     }
 
     #[test]
@@ -232,6 +262,23 @@ mod tests {
 
         state.mark_authenticated();
         assert!(state.skip_auth_check);
+    }
+
+    #[test]
+    fn test_session_loop_state_deferred_replies() {
+        let mut state = SessionLoopState::new(false);
+
+        state.mark_backend_request_sent();
+        assert!(state.awaiting_backend_reply);
+
+        state.push_deferred_reply(b"205 Goodbye\r\n".to_vec());
+        assert_eq!(
+            state.take_deferred_replies(),
+            vec![b"205 Goodbye\r\n".to_vec()]
+        );
+
+        state.mark_backend_reply_started();
+        assert!(!state.awaiting_backend_reply);
     }
 
     #[test]

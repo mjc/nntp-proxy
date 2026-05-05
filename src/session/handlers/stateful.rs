@@ -55,25 +55,38 @@ impl ClientSession {
             AuthenticatedStatefulAction::Forward => {
                 request.write_wire_to(backend_write).await?;
                 state.add_client_to_backend(request.request_wire_len().get());
+                state.mark_backend_request_sent();
             }
             AuthenticatedStatefulAction::RejectAuthAlreadyAuthenticated => {
                 use crate::protocol::AUTH_ALREADY_AUTHENTICATED;
-                client_write.write_all(AUTH_ALREADY_AUTHENTICATED).await?;
-                client_write.flush().await?;
-                state.add_backend_to_client(AUTH_ALREADY_AUTHENTICATED.len() as u64);
+                if state.awaiting_backend_reply {
+                    state.push_deferred_reply(AUTH_ALREADY_AUTHENTICATED.to_vec());
+                } else {
+                    client_write.write_all(AUTH_ALREADY_AUTHENTICATED).await?;
+                    client_write.flush().await?;
+                    state.add_backend_to_client(AUTH_ALREADY_AUTHENTICATED.len() as u64);
+                }
             }
             AuthenticatedStatefulAction::InterceptCapabilities => {
                 use crate::protocol::CAPABILITIES_WITHOUT_AUTHINFO;
-                client_write
-                    .write_all(CAPABILITIES_WITHOUT_AUTHINFO)
-                    .await?;
-                client_write.flush().await?;
-                state.add_backend_to_client(CAPABILITIES_WITHOUT_AUTHINFO.len() as u64);
+                if state.awaiting_backend_reply {
+                    state.push_deferred_reply(CAPABILITIES_WITHOUT_AUTHINFO.to_vec());
+                } else {
+                    client_write
+                        .write_all(CAPABILITIES_WITHOUT_AUTHINFO)
+                        .await?;
+                    client_write.flush().await?;
+                    state.add_backend_to_client(CAPABILITIES_WITHOUT_AUTHINFO.len() as u64);
+                }
             }
             AuthenticatedStatefulAction::Reject(response) => {
-                client_write.write_all(response.as_bytes()).await?;
-                client_write.flush().await?;
-                state.add_backend_to_client(response.len() as u64);
+                if state.awaiting_backend_reply {
+                    state.push_deferred_reply(response.as_bytes().to_vec());
+                } else {
+                    client_write.write_all(response.as_bytes()).await?;
+                    client_write.flush().await?;
+                    state.add_backend_to_client(response.len() as u64);
+                }
             }
         }
 
@@ -236,6 +249,18 @@ impl ClientSession {
                         Ok(n) => {
                             client_write.write_all(&buffer[..n]).await?;
                             state.add_backend_to_client(n as u64);
+                            state.mark_backend_reply_started();
+
+                            // Emit deferred local replies only after earlier backend bytes
+                            // have been forwarded to preserve command/response ordering.
+                            let replies = state.take_deferred_replies();
+                            if !replies.is_empty() {
+                                for r in replies {
+                                    client_write.write_all(&r).await?;
+                                    state.add_backend_to_client(r.len() as u64);
+                                }
+                                client_write.flush().await?;
+                            }
                         }
                         Err(e) => {
                             warn!(client = %self.client_addr, error = %e, "Backend read error");
