@@ -35,7 +35,7 @@ fn article_backend(port: u16, message_id: &str) -> MockNntpServer {
 
 #[tokio::test]
 async fn test_article_by_message_id_in_per_command_mode() -> Result<()> {
-    let msgid = "msgid-123@example.com";
+    let msgid = "<msgid-123@example.com>";
     let mut client =
         spawn_client_with_backend(RoutingMode::PerCommand, article_backend(0, msgid)).await?;
 
