@@ -8,6 +8,7 @@ pub mod article;
 pub mod article_by_msgid;
 pub mod commands;
 pub mod errors;
+pub mod head_stat;
 pub mod list_variants;
 pub mod multiline;
 pub mod response;
