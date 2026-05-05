@@ -576,56 +576,61 @@ impl TuiApp {
     /// Build a serializable snapshot of the current dashboard state.
     #[must_use]
     pub fn snapshot_state(&self) -> DashboardState {
-        let backend_views = self
-            .snapshot
-            .backend_stats
-            .iter()
-            .zip(self.servers.iter())
-            .enumerate()
-            .map(|(i, (stats, server))| {
-                let pending_count = self.backend_pending_count(i);
-                let load_ratio = self.backend_load_ratio(i);
-                let stateful_count = self.backend_stateful_count(i);
-                let traffic_share = self.backend_traffic_share(i);
-                let history = self
-                    .backend_history
-                    .get(i)
-                    .map_or_else(Vec::new, |history| {
-                        history.points().iter().cloned().collect()
-                    });
-
-                BackendView {
-                    server: server.clone(),
-                    stats: stats.clone(),
-                    active_connections: stats.active_connections.get(),
-                    health_status: stats.health_status,
-                    pending_count,
-                    load_ratio,
-                    stateful_count,
-                    traffic_share,
-                    history,
-                }
-            })
-            .collect();
-
-        let buffer_pool = self.buffer_pool.as_ref().map(|pool| {
-            let (available, in_use, total) = pool.stats();
-            BufferPoolStats {
-                available,
-                in_use,
-                total,
-            }
-        });
+        let buffer_pool = self.buffer_pool.as_ref().map(Self::snapshot_buffer_pool);
 
         DashboardState {
             snapshot: self.snapshot.as_ref().clone(),
-            backend_views,
+            backend_views: self.snapshot_backend_views(),
             client_history: self.client_history.points().iter().cloned().collect(),
             system_stats: self.system_stats.clone(),
             view_mode: self.view_mode,
             show_details: self.show_details,
             log_lines: self.log_buffer.all_lines(),
             buffer_pool,
+        }
+    }
+
+    fn snapshot_backend_views(&self) -> Vec<BackendView> {
+        self.snapshot
+            .backend_stats
+            .iter()
+            .zip(self.servers.iter())
+            .enumerate()
+            .map(|(i, (stats, server))| self.snapshot_backend_view(i, server, stats))
+            .collect()
+    }
+
+    fn snapshot_backend_view(
+        &self,
+        backend_idx: usize,
+        server: &Server,
+        stats: &crate::metrics::BackendStats,
+    ) -> BackendView {
+        BackendView {
+            server: server.clone(),
+            stats: stats.clone(),
+            active_connections: stats.active_connections.get(),
+            health_status: stats.health_status,
+            pending_count: self.backend_pending_count(backend_idx),
+            load_ratio: self.backend_load_ratio(backend_idx),
+            stateful_count: self.backend_stateful_count(backend_idx),
+            traffic_share: self.backend_traffic_share(backend_idx),
+            history: Self::snapshot_throughput_history(self.backend_history(backend_idx)),
+        }
+    }
+
+    fn snapshot_throughput_history(history: Option<&ThroughputHistory>) -> Vec<ThroughputPoint> {
+        history
+            .map(|history| history.points().iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn snapshot_buffer_pool(pool: &crate::pool::BufferPool) -> BufferPoolStats {
+        let (available, in_use, total) = pool.stats();
+        BufferPoolStats {
+            available,
+            in_use,
+            total,
         }
     }
 }
@@ -1089,5 +1094,73 @@ mod tests {
         assert_eq!(decoded.view_mode, ViewMode::Normal);
         assert!(!decoded.show_details);
         assert!(decoded.buffer_pool.is_none());
+    }
+
+    #[test]
+    fn test_snapshot_state_collects_history_and_buffer_pool() {
+        use crate::pool::BufferPool;
+        use crate::tui::log_capture::LogBuffer;
+        use crate::types::BufferSize;
+
+        let log_buffer = LogBuffer::new();
+        let metrics = MetricsCollector::new(1);
+        let router = Arc::new(BackendSelector::new());
+        let servers = create_test_servers(1);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 4);
+
+        let mut app = TuiAppBuilder::new(metrics, router, servers)
+            .with_log_buffer(log_buffer)
+            .with_buffer_pool(buffer_pool)
+            .build();
+
+        let client_point = ThroughputPoint::new_client(
+            Timestamp::now(),
+            Throughput::new(10.0),
+            Throughput::new(20.0),
+        );
+        let backend_point = ThroughputPoint::new_backend(
+            Timestamp::now(),
+            Throughput::new(30.0),
+            Throughput::new(40.0),
+            CommandsPerSecond::new(5.0),
+        );
+
+        app.client_history.push(client_point.clone());
+        app.backend_history[0].push(backend_point.clone());
+
+        let snapshot = app.snapshot_state();
+
+        assert_eq!(snapshot.client_history.len(), 1);
+        assert_eq!(
+            snapshot.client_history[0].sent_per_sec().get(),
+            client_point.sent_per_sec().get()
+        );
+        assert_eq!(
+            snapshot.client_history[0].received_per_sec().get(),
+            client_point.received_per_sec().get()
+        );
+        assert_eq!(snapshot.backend_views.len(), 1);
+        assert_eq!(snapshot.backend_views[0].history.len(), 1);
+        assert_eq!(
+            snapshot.backend_views[0].history[0].sent_per_sec().get(),
+            backend_point.sent_per_sec().get()
+        );
+        assert_eq!(
+            snapshot.backend_views[0].history[0]
+                .received_per_sec()
+                .get(),
+            backend_point.received_per_sec().get()
+        );
+        assert_eq!(
+            snapshot.backend_views[0].history[0]
+                .commands_per_sec()
+                .unwrap()
+                .get(),
+            backend_point.commands_per_sec().unwrap().get()
+        );
+        assert_eq!(
+            snapshot.buffer_pool.as_ref().map(|pool| pool.total),
+            Some(4)
+        );
     }
 }
