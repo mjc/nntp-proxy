@@ -58,6 +58,7 @@ impl PendingBackendResponse {
 
                 let body = &chunk[end..];
                 let mut tail = TailBuffer::default();
+                tail.update(status_line);
                 match tail.detect_terminator(body) {
                     TerminatorStatus::FoundAt(pos) => PendingChunkProgress {
                         consumed: end + pos,
@@ -403,6 +404,18 @@ mod tests {
 
         state.observe_backend_bytes(b".\r\n");
         assert!(!state.has_pending_backend_replies());
+    }
+
+    #[test]
+    fn test_pending_backend_replies_handle_empty_multiline_body() {
+        let mut state = SessionLoopState::new(false);
+
+        state.mark_backend_request_sent(RequestKind::Help);
+        state.observe_backend_bytes(b"100 Help follows\r\n.\r\n");
+        assert!(
+            !state.has_pending_backend_replies(),
+            "empty multiline replies should complete at the immediate terminator"
+        );
     }
 
     #[test]
