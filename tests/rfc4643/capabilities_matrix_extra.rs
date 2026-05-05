@@ -308,3 +308,62 @@ async fn test_stateful_capabilities_stays_ordered_before_later_backend_reply() -
 
     Ok(())
 }
+
+#[tokio::test]
+async fn test_stateful_capabilities_stays_ordered_between_backend_replies() -> Result<()> {
+    let mut client = spawn_authenticated_stateful_caps_client().await?;
+
+    let resp = send_command_read_line(&mut client, "AUTHINFO USER alice").await?;
+    assert!(
+        resp.starts_with("381"),
+        "Expected 381 password required, got: {resp:?}"
+    );
+    let resp = send_command_read_line(&mut client, "AUTHINFO PASS wonderland").await?;
+    assert!(
+        resp.starts_with("281"),
+        "Expected 281 auth accepted, got: {resp:?}"
+    );
+
+    client
+        .write_all(b"DATE\r\nCAPABILITIES\r\nDATE\r\n")
+        .await?;
+
+    let mut reader = BufReader::new(client);
+    let first_date = read_line_with_timeout(&mut reader).await?;
+    assert!(
+        first_date.starts_with("111"),
+        "Expected first DATE response before CAPABILITIES, got: {first_date:?}"
+    );
+
+    let caps_status = read_line_with_timeout(&mut reader).await?;
+    assert!(
+        caps_status.starts_with("101"),
+        "Expected deferred CAPABILITIES between DATE responses, got: {caps_status:?}"
+    );
+
+    let caps_version = read_line_with_timeout(&mut reader).await?;
+    assert_eq!(caps_version, "VERSION 2\r\n");
+
+    let caps_reader = read_line_with_timeout(&mut reader).await?;
+    assert_eq!(caps_reader, "READER\r\n");
+
+    let caps_over = read_line_with_timeout(&mut reader).await?;
+    assert_eq!(caps_over, "OVER\r\n");
+
+    let caps_hdr = read_line_with_timeout(&mut reader).await?;
+    assert_eq!(caps_hdr, "HDR\r\n");
+
+    let caps_terminator = read_line_with_timeout(&mut reader).await?;
+    assert_eq!(
+        caps_terminator, ".\r\n",
+        "Expected full CAPABILITIES response before the second DATE"
+    );
+
+    let second_date = read_line_with_timeout(&mut reader).await?;
+    assert!(
+        second_date.starts_with("111"),
+        "Expected second DATE only after deferred CAPABILITIES, got: {second_date:?}"
+    );
+
+    Ok(())
+}

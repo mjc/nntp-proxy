@@ -363,6 +363,14 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
 /// # Errors
 /// Returns an error if the server never becomes reachable within the allotted attempts.
 pub async fn wait_for_server(addr: &str, max_attempts: u32) -> Result<()> {
+    const WAIT_FOR_SERVER_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+    let mut retry_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + WAIT_FOR_SERVER_RETRY_DELAY,
+        WAIT_FOR_SERVER_RETRY_DELAY,
+    );
+    retry_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     for attempt in 1..=max_attempts {
         if tokio::net::TcpStream::connect(addr).await.is_ok() {
             return Ok(());
@@ -374,7 +382,7 @@ pub async fn wait_for_server(addr: &str, max_attempts: u32) -> Result<()> {
             ));
         }
 
-        tokio::task::yield_now().await;
+        retry_interval.tick().await;
     }
 
     Ok(())

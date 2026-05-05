@@ -112,15 +112,13 @@ impl ClientSession {
                 state.add_backend_to_client(n as u64);
                 state.observe_backend_bytes(&buffer[..n]);
 
-                if !state.has_pending_backend_replies() {
-                    let replies = state.take_deferred_replies();
-                    if !replies.is_empty() {
-                        for reply in replies {
-                            client_write.write_all(&reply).await?;
-                            state.add_backend_to_client(reply.len() as u64);
-                        }
-                        client_write.flush().await?;
+                let replies = state.take_ready_deferred_replies();
+                if !replies.is_empty() {
+                    for reply in replies {
+                        client_write.write_all(&reply).await?;
+                        state.add_backend_to_client(reply.len() as u64);
                     }
+                    client_write.flush().await?;
                 }
 
                 Ok(true)
@@ -215,6 +213,16 @@ impl ClientSession {
             // Periodic metrics flush
             if state.check_and_maybe_flush_metrics() {
                 state.flush_byte_deltas(&self.metrics, backend_id, self.username());
+            }
+
+            let replies = state.take_ready_deferred_replies();
+            if !replies.is_empty() {
+                for reply in replies {
+                    client_write.write_all(&reply).await?;
+                    state.add_backend_to_client(reply.len() as u64);
+                }
+                client_write.flush().await?;
+                continue;
             }
 
             if matches!(state.read_mode(), StatefulReadMode::DrainBackendReplies) {

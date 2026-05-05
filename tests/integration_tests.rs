@@ -27,15 +27,15 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
     // Start mock servers using builder
     let _mock1 = MockNntpServer::new(mock_port1)
         .with_name("Mock NNTP Server")
-        .on_command("HELP", "100 HELP command received\r\n")
+        .on_command("DATE", "111 20260505120000\r\n")
         .spawn();
     let _mock2 = MockNntpServer::new(mock_port2)
         .with_name("Mock NNTP Server")
-        .on_command("HELP", "100 HELP command received\r\n")
+        .on_command("DATE", "111 20260505120000\r\n")
         .spawn();
 
-    // Give servers time to start
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{mock_port1}"), 20).await?;
+    wait_for_server(&format!("127.0.0.1:{mock_port2}"), 20).await?;
 
     // Create proxy configuration
     let config = Config {
@@ -60,21 +60,8 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
 
     // Start proxy server
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
-    let listener = TcpListener::bind(&proxy_addr).await?;
-
-    tokio::spawn(async move {
-        loop {
-            if let Ok((stream, addr)) = listener.accept().await {
-                let proxy_clone = proxy.clone();
-                tokio::spawn(async move {
-                    let _ = proxy_clone.handle_client(stream, addr.into()).await;
-                });
-            }
-        }
-    });
-
-    // Give proxy time to start
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    spawn_test_proxy(proxy, proxy_port, false).await;
+    wait_for_server(&proxy_addr, 20).await?;
 
     // Test client connection through proxy
     let mut client = TcpStream::connect(&proxy_addr).await?;
@@ -86,12 +73,12 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
     assert!(welcome.contains("201 NNTP Proxy Ready"));
 
     // Send a test command
-    client.write_all(b"HELP\r\n").await?;
+    client.write_all(b"DATE\r\n").await?;
 
     // Read echo response
     let n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
     let response = String::from_utf8_lossy(&buffer[..n]);
-    assert!(response.contains("HELP") || response.contains("100"));
+    assert!(response.contains("111"));
 
     // Send QUIT command
     client.write_all(b"QUIT\r\n").await?;

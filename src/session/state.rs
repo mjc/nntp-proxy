@@ -16,6 +16,11 @@ struct PendingBackendResponse {
     state: PendingBackendResponseState,
 }
 
+enum OrderedReply {
+    Backend(PendingBackendResponse),
+    Local(Vec<u8>),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatefulReadMode {
     Bidirectional,
@@ -139,10 +144,8 @@ pub struct SessionLoopState {
     pub auth_username: Option<String>,
     /// Whether to skip auth checking (optimization after first auth)
     pub skip_auth_check: bool,
-    /// Forwarded backend replies that must complete before deferred local replies can flush.
-    pending_backend_replies: VecDeque<PendingBackendResponse>,
-    /// Local replies deferred until earlier backend output has been sent first.
-    deferred_replies: Vec<Vec<u8>>,
+    /// Forwarded backend replies and deferred local replies in client-visible order.
+    ordered_replies: VecDeque<OrderedReply>,
 }
 
 impl Default for SessionLoopState {
@@ -166,8 +169,7 @@ impl SessionLoopState {
             iteration_count: 0,
             auth_username: None,
             skip_auth_check: !auth_enabled,
-            pending_backend_replies: VecDeque::new(),
-            deferred_replies: Vec::new(),
+            ordered_replies: VecDeque::new(),
         }
     }
 
@@ -282,15 +284,17 @@ impl SessionLoopState {
     /// Mark that a backend request was forwarded and its reply must be ordered first.
     #[inline]
     pub fn mark_backend_request_sent(&mut self, kind: RequestKind) {
-        self.pending_backend_replies
-            .push_back(PendingBackendResponse::new(kind));
+        self.ordered_replies
+            .push_back(OrderedReply::Backend(PendingBackendResponse::new(kind)));
     }
 
     /// Whether earlier forwarded backend replies are still ahead of any deferred local replies.
     #[inline]
     #[must_use]
     pub fn has_pending_backend_replies(&self) -> bool {
-        !self.pending_backend_replies.is_empty()
+        self.ordered_replies
+            .iter()
+            .any(|reply| matches!(reply, OrderedReply::Backend(_)))
     }
 
     /// Advance pending reply framing using newly forwarded backend bytes.
@@ -298,7 +302,11 @@ impl SessionLoopState {
         let mut offset = 0;
 
         while offset < chunk.len() {
-            let Some(front) = self.pending_backend_replies.front_mut() else {
+            let Some(front) = self.ordered_replies.front_mut() else {
+                break;
+            };
+
+            let OrderedReply::Backend(front) = front else {
                 break;
             };
 
@@ -309,7 +317,7 @@ impl SessionLoopState {
 
             offset += progress.consumed;
             if progress.completed {
-                self.pending_backend_replies.pop_front();
+                self.ordered_replies.pop_front();
             } else {
                 break;
             }
@@ -318,30 +326,48 @@ impl SessionLoopState {
 
     /// Queue a local reply until earlier backend output has been sent.
     pub fn push_deferred_reply(&mut self, reply: impl Into<Vec<u8>>) {
-        self.deferred_replies.push(reply.into());
+        self.ordered_replies
+            .push_back(OrderedReply::Local(reply.into()));
     }
 
     /// Whether deferred local replies remain queued.
     #[inline]
     #[must_use]
     pub fn has_deferred_replies(&self) -> bool {
-        !self.deferred_replies.is_empty()
+        self.ordered_replies
+            .iter()
+            .any(|reply| matches!(reply, OrderedReply::Local(_)))
     }
 
     /// Reading mode for the stateful loop.
     #[must_use]
     pub fn read_mode(&self) -> StatefulReadMode {
-        if self.has_pending_backend_replies() && self.has_deferred_replies() {
+        let has_deferred_reply_behind_front = self
+            .ordered_replies
+            .iter()
+            .skip(1)
+            .any(|reply| matches!(reply, OrderedReply::Local(_)));
+
+        if matches!(self.ordered_replies.front(), Some(OrderedReply::Backend(_)))
+            && has_deferred_reply_behind_front
+        {
             StatefulReadMode::DrainBackendReplies
         } else {
             StatefulReadMode::Bidirectional
         }
     }
 
-    /// Drain deferred local replies in order.
+    /// Drain deferred local replies that are ready at the front of the ordered queue.
     #[must_use]
-    pub fn take_deferred_replies(&mut self) -> Vec<Vec<u8>> {
-        std::mem::take(&mut self.deferred_replies)
+    pub fn take_ready_deferred_replies(&mut self) -> Vec<Vec<u8>> {
+        let mut replies = Vec::new();
+        while let Some(OrderedReply::Local(_)) = self.ordered_replies.front() {
+            let Some(OrderedReply::Local(reply)) = self.ordered_replies.pop_front() else {
+                break;
+            };
+            replies.push(reply);
+        }
+        replies
     }
 }
 
@@ -422,13 +448,14 @@ mod tests {
         assert!(state.has_pending_backend_replies());
 
         state.push_deferred_reply(b"205 Goodbye\r\n".to_vec());
-        assert_eq!(
-            state.take_deferred_replies(),
-            vec![b"205 Goodbye\r\n".to_vec()]
-        );
+        assert!(state.take_ready_deferred_replies().is_empty());
 
         state.observe_backend_bytes(b"111 20260505120000\r\n");
         assert!(!state.has_pending_backend_replies());
+        assert_eq!(
+            state.take_ready_deferred_replies(),
+            vec![b"205 Goodbye\r\n".to_vec()]
+        );
     }
 
     #[test]
@@ -496,6 +523,27 @@ mod tests {
             !state.has_pending_backend_replies(),
             "oversized status lines should stop pending bookkeeping instead of growing forever"
         );
+    }
+
+    #[test]
+    fn test_deferred_local_reply_flushes_before_later_backend_reply() {
+        let mut state = SessionLoopState::new(false);
+        let deferred = b"101 Capability list:\r\n.\r\n".to_vec();
+
+        state.mark_backend_request_sent(RequestKind::Date);
+        state.push_deferred_reply(deferred.clone());
+        state.mark_backend_request_sent(RequestKind::Date);
+
+        state.observe_backend_bytes(b"111 20260505120000\r\n");
+        assert!(
+            state.has_pending_backend_replies(),
+            "later backend replies must remain pending after the first one completes"
+        );
+        assert_eq!(state.read_mode(), StatefulReadMode::Bidirectional);
+        assert_eq!(state.take_ready_deferred_replies(), vec![deferred]);
+
+        state.observe_backend_bytes(b"111 20260505120001\r\n");
+        assert!(!state.has_pending_backend_replies());
     }
 
     #[test]
