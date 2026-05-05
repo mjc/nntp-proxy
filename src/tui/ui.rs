@@ -746,11 +746,7 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
         ]
     }
 
-    // Functional pipeline: sort → take top 10 → find max → build items
-    let mut sorted_users = snapshot.user_stats.iter().collect::<Vec<_>>();
-    sorted_users.sort_by_key(|u| std::cmp::Reverse(u.total_bytes()));
-
-    let top_users: Vec<_> = sorted_users.into_iter().take(10).collect();
+    let top_users = top_users_by_bytes(&snapshot.user_stats);
     let max_total = top_users.iter().map(|u| u.total_bytes()).max().unwrap_or(1);
 
     // Header row
@@ -781,9 +777,24 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
     f.render_widget(list, area);
 }
 
+fn top_users_by_bytes(users: &[crate::metrics::UserStats]) -> Vec<&crate::metrics::UserStats> {
+    let mut sorted_users = users.iter().collect::<Vec<_>>();
+    sorted_users.sort_by_key(|user| std::cmp::Reverse(user.total_bytes()));
+    sorted_users.into_iter().take(10).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metrics::UserStats;
+
+    fn user_stats(name: &str, total_bytes: u64) -> UserStats {
+        UserStats {
+            username: name.to_string(),
+            bytes_sent: crate::types::BytesSent::new(total_bytes),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn recent_log_lines_returns_full_slice_when_count_exceeds_length() {
@@ -815,5 +826,35 @@ mod tests {
         let recent = recent_log_lines(&lines, 0);
 
         assert!(recent.is_empty());
+    }
+
+    #[test]
+    fn top_users_by_bytes_sorts_descending() {
+        let users = vec![
+            user_stats("alice", 10),
+            user_stats("bob", 30),
+            user_stats("carol", 20),
+        ];
+
+        let top_users = top_users_by_bytes(&users);
+
+        let usernames = top_users
+            .iter()
+            .map(|user| user.username.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(usernames, vec!["bob", "carol", "alice"]);
+    }
+
+    #[test]
+    fn top_users_by_bytes_caps_results_at_ten() {
+        let users = (0..12)
+            .map(|i| user_stats(&format!("user{i}"), i))
+            .collect::<Vec<_>>();
+
+        let top_users = top_users_by_bytes(&users);
+
+        assert_eq!(top_users.len(), 10);
+        assert_eq!(top_users[0].username, "user11");
+        assert_eq!(top_users[9].username, "user2");
     }
 }
