@@ -6,6 +6,7 @@
 
 pub mod article;
 pub mod article_by_msgid;
+pub mod body_workflow;
 pub mod commands;
 pub mod discovery_commands;
 pub mod errors;
@@ -18,5 +19,6 @@ pub mod session;
 pub mod session_state;
 pub mod stateful_workflow;
 pub mod unsupported;
+pub mod utility_commands;
 pub mod xover_edgecases;
 pub mod xover_terminator;
