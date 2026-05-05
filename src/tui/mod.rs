@@ -182,6 +182,10 @@ pub async fn run_tui(
 
 /// Run the TUI as a remote dashboard client connected to a headless publisher.
 pub async fn run_attached_tui(connect_addr: SocketAddr) -> Result<()> {
+    anyhow::ensure!(
+        connect_addr.ip().is_loopback(),
+        "Attached dashboard client must connect to a loopback address: {connect_addr}"
+    );
     let (state_tx, mut state_rx) =
         tokio::sync::watch::channel(AttachedDashboard::connecting(connect_addr));
     let _reader = spawn_dashboard_reader(connect_addr, state_tx);
@@ -488,5 +492,14 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Last error: connection refused"))
         );
+    }
+
+    #[tokio::test]
+    async fn run_attached_tui_rejects_non_loopback_target() {
+        let err = run_attached_tui("10.0.0.5:8120".parse().unwrap())
+            .await
+            .expect_err("non-loopback attach should fail");
+
+        assert!(format!("{err:#}").contains("must connect to a loopback address"));
     }
 }

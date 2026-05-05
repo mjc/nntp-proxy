@@ -25,6 +25,7 @@ TLS, cache behavior, and live metrics in one place.
 - Headless mode can also publish the dashboard state over websocket with `--tui-listen 127.0.0.1:8120` (`HOST:PORT`).
   This must be a different socket from the main NNTP listener and must stay on a loopback address.
 - A separate terminal can attach read-only with `--ui tui --tui-attach 127.0.0.1:8120` (`HOST:PORT`).
+  This also stays loopback-only.
 - Article caching is configured via `[cache]`; there is no separate cache-only executable.
 - Client-facing connections are plain NNTP only. The proxy does not terminate inbound TLS or offer a TLS listening mode.
 
@@ -315,7 +316,7 @@ Common flags:
 | `--config <FILE>` | `NNTP_PROXY_CONFIG` | Default: `config.toml` | Config file path. |
 | `--ui <MODE>` | `NNTP_PROXY_UI` | `headless` or `tui`; default: `headless` | Selects how the single `nntp-proxy` binary runs: plain server logging or the terminal dashboard. |
 | `--tui-listen <HOST:PORT>` | `NNTP_PROXY_TUI_LISTEN` | `HOST:PORT` | Bind the dashboard websocket publisher to a loopback socket address in headless mode. |
-| `--tui-attach <HOST:PORT>` | `NNTP_PROXY_TUI_ATTACH` | `HOST:PORT` | Connect the read-only TUI client to a dashboard websocket at a socket address. |
+| `--tui-attach <HOST:PORT>` | `NNTP_PROXY_TUI_ATTACH` | `HOST:PORT` | Connect the read-only TUI client to a dashboard websocket on a loopback socket address. |
 | `--host <HOST>` | `NNTP_PROXY_HOST` | Default from config; otherwise `0.0.0.0` | Override `[proxy].host`. |
 | `--port <PORT>` | `NNTP_PROXY_PORT` | Default from config; otherwise `8119` | Override `[proxy].port`. |
 | `--routing-mode <MODE>` | `NNTP_PROXY_ROUTING_MODE` | `hybrid`, `stateful`, or `per-command`; default from config | Override `[routing].mode`. |

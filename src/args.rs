@@ -74,7 +74,7 @@ pub struct CommonArgs {
     )]
     pub tui_listen: Option<SocketAddr>,
 
-    /// Connect the read-only TUI client to a dashboard websocket at HOST:PORT.
+    /// Connect the read-only TUI client to a loopback dashboard websocket at HOST:PORT.
     #[arg(
         long = "tui-attach",
         value_name = "HOST:PORT",
@@ -221,6 +221,15 @@ impl CommonArgs {
 
         if self.tui_attach.is_some() && self.tui_listen.is_some() {
             bail!("--tui-attach cannot be combined with --tui-listen");
+        }
+
+        if let Some(attach_addr) = self.tui_attach
+            && !attach_addr.ip().is_loopback()
+        {
+            bail!(
+                "--tui-attach {} must connect to a loopback address; use 127.0.0.1 or ::1",
+                attach_addr
+            );
         }
 
         Ok(())
@@ -586,6 +595,17 @@ mod tests {
             ui: UiMode::Tui,
             tui_attach: Some("127.0.0.1:8119".parse().unwrap()),
             tui_listen: Some("127.0.0.1:8120".parse().unwrap()),
+            ..default_args()
+        };
+
+        assert!(args.validate_runtime_mode().is_err());
+    }
+
+    #[test]
+    fn test_validate_runtime_mode_rejects_non_loopback_attach() {
+        let args = CommonArgs {
+            ui: UiMode::Tui,
+            tui_attach: Some("10.0.0.5:8119".parse().unwrap()),
             ..default_args()
         };
 
