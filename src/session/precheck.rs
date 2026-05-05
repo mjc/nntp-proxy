@@ -270,7 +270,18 @@ fn classify_precheck_result(
             deps.metrics.record_error_4xx(backend_id);
             QueryResult::Missing(backend_id)
         }
-        _ => QueryResult::Error,
+        400..=499 => {
+            deps.metrics.record_error_4xx(backend_id);
+            QueryResult::Error
+        }
+        500..=599 => {
+            deps.metrics.record_error_5xx(backend_id);
+            QueryResult::Error
+        }
+        _ => {
+            deps.metrics.record_error(backend_id);
+            QueryResult::Error
+        }
     }
 }
 
