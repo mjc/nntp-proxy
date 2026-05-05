@@ -6,7 +6,7 @@ use crate::config::{BackendSelectionStrategy, Config, RoutingMode};
 use crate::types::{CacheCapacity, ConfigPath, Port, ThreadCount};
 use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::time::Duration;
 
 /// Parse port from command line argument
@@ -236,14 +236,7 @@ impl CommonArgs {
             return Ok(());
         }
 
-        let Ok(proxy_ip) = proxy_host.parse::<IpAddr>() else {
-            return Ok(());
-        };
-
-        if proxy_ip.is_unspecified()
-            || dashboard_listen.ip().is_unspecified()
-            || proxy_ip == dashboard_listen.ip()
-        {
+        if proxy_listener_conflicts(proxy_host, proxy_port, dashboard_listen) {
             bail!(
                 "--tui-listen {} conflicts with the proxy listener {}:{}; use a different port",
                 dashboard_listen,
@@ -343,6 +336,32 @@ impl CommonArgs {
     pub fn apply_overrides(&self, config: &mut Config) {
         self.apply_overrides_with_env(config, |key| std::env::var(key).ok());
     }
+}
+
+fn proxy_listener_conflicts(
+    proxy_host: &str,
+    proxy_port: Port,
+    dashboard_listen: SocketAddr,
+) -> bool {
+    let dashboard_ip = dashboard_listen.ip();
+    let proxy_target = (proxy_host, proxy_port.get());
+
+    proxy_target
+        .to_socket_addrs()
+        .ok()
+        .map(|addrs| {
+            addrs
+                .map(|addr| addr.ip())
+                .any(|proxy_ip| listener_ips_conflict(proxy_ip, dashboard_ip))
+        })
+        .unwrap_or_else(|| dashboard_ip.is_unspecified())
+}
+
+fn listener_ips_conflict(proxy_ip: IpAddr, dashboard_ip: IpAddr) -> bool {
+    proxy_ip.is_unspecified()
+        || dashboard_ip.is_unspecified()
+        || proxy_ip == dashboard_ip
+        || (proxy_ip.is_loopback() && dashboard_ip.is_loopback())
 }
 
 #[cfg(test)]
@@ -588,6 +607,32 @@ mod tests {
 
         args.validate_dashboard_listen("127.0.0.1", Port::try_new(8119).unwrap())
             .unwrap();
+    }
+
+    #[test]
+    fn test_validate_dashboard_listen_rejects_localhost_alias_collision() {
+        let args = CommonArgs {
+            tui_listen: Some("127.0.0.1:8119".parse().unwrap()),
+            ..default_args()
+        };
+
+        assert!(
+            args.validate_dashboard_listen("localhost", Port::try_new(8119).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_validate_dashboard_listen_rejects_loopback_alias_collision() {
+        let args = CommonArgs {
+            tui_listen: Some("[::1]:8119".parse().unwrap()),
+            ..default_args()
+        };
+
+        assert!(
+            args.validate_dashboard_listen("127.0.0.1", Port::try_new(8119).unwrap())
+                .is_err()
+        );
     }
 
     #[test]

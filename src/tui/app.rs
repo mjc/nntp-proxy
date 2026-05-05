@@ -576,6 +576,12 @@ impl TuiApp {
     /// Build a serializable snapshot of the current dashboard state.
     #[must_use]
     pub fn snapshot_state(&self) -> DashboardState {
+        self.snapshot_state_with_log_limit(None)
+    }
+
+    /// Build a serializable snapshot of the current dashboard state with a bounded log tail.
+    #[must_use]
+    pub fn snapshot_state_with_log_limit(&self, log_limit: Option<usize>) -> DashboardState {
         let buffer_pool = self.buffer_pool.as_ref().map(Self::snapshot_buffer_pool);
 
         DashboardState {
@@ -585,8 +591,15 @@ impl TuiApp {
             system_stats: self.system_stats.clone(),
             view_mode: self.view_mode,
             show_details: self.show_details,
-            log_lines: self.log_buffer.all_lines(),
+            log_lines: self.snapshot_log_lines(log_limit),
             buffer_pool,
+        }
+    }
+
+    fn snapshot_log_lines(&self, log_limit: Option<usize>) -> Vec<String> {
+        match log_limit {
+            Some(limit) => self.log_buffer.recent_lines(limit),
+            None => self.log_buffer.all_lines(),
         }
     }
 
@@ -1098,6 +1111,33 @@ mod tests {
         assert_eq!(decoded.view_mode, ViewMode::Normal);
         assert!(!decoded.show_details);
         assert!(decoded.buffer_pool.is_none());
+    }
+
+    #[test]
+    fn test_snapshot_state_with_log_limit_keeps_recent_tail() {
+        use crate::tui::log_capture::LogBuffer;
+
+        let log_buffer = LogBuffer::new();
+        for i in 0..5 {
+            log_buffer.push(format!("Dashboard log line {i}"));
+        }
+
+        let metrics = MetricsCollector::new(1);
+        let router = Arc::new(BackendSelector::new());
+        let servers = create_test_servers(1);
+
+        let app = TuiAppBuilder::new(metrics, router, servers)
+            .with_log_buffer(log_buffer)
+            .build();
+
+        let snapshot = app.snapshot_state_with_log_limit(Some(2));
+        assert_eq!(
+            snapshot.log_lines,
+            vec![
+                "Dashboard log line 3".to_string(),
+                "Dashboard log line 4".to_string()
+            ]
+        );
     }
 
     #[test]

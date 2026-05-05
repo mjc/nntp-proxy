@@ -18,8 +18,10 @@ use crate::tui::constants::styles;
 pub use app::{TuiApp, TuiAppBuilder, ViewMode};
 pub use dashboard::{BackendView, BufferPoolStats, DashboardState};
 pub use log_capture::{LogBuffer, LogMakeWriter};
-pub use remote::run_dashboard_publisher;
 pub(crate) use remote::spawn_dashboard_reader;
+pub use remote::{
+    bind_dashboard_listener, run_dashboard_publisher, run_dashboard_publisher_on_listener,
+};
 pub use system_stats::{SystemMonitor, SystemStats};
 
 use anyhow::Result;

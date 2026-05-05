@@ -83,7 +83,7 @@ async fn run_proxy(
     let (tui_handle, tui_shutdown_tx) =
         launch_tui(ui_mode, &proxy, log_buffer.clone(), shutdown_tx.clone())?;
     let (dashboard_handle, dashboard_shutdown_tx) =
-        launch_dashboard_publisher(args.common.tui_listen, &proxy, log_buffer)?;
+        launch_dashboard_publisher(args.common.tui_listen, &proxy, log_buffer).await?;
     let error_tui_shutdown_tx = tui_shutdown_tx.clone();
     let error_dashboard_shutdown_tx = dashboard_shutdown_tx.clone();
     spawn_signal_forwarder(shutdown_tx, tui_shutdown_tx, dashboard_shutdown_tx);
@@ -208,7 +208,7 @@ fn launch_tui(
     Ok((Some(handle), Some(tui_shutdown_tx)))
 }
 
-fn launch_dashboard_publisher(
+async fn launch_dashboard_publisher(
     listen_addr: Option<SocketAddr>,
     proxy: &Arc<NntpProxy>,
     log_buffer: Option<tui::LogBuffer>,
@@ -221,10 +221,11 @@ fn launch_dashboard_publisher(
 
     info!("Building websocket dashboard publisher...");
     let tui_app = build_dashboard_app(proxy, log_buffer);
+    let listener = tui::bind_dashboard_listener(listen_addr).await?;
     let handle = tokio::spawn(async move {
         info!("Initializing websocket dashboard on {}", listen_addr);
         if let Err(e) =
-            tui::run_dashboard_publisher(tui_app, listen_addr, dashboard_shutdown_rx).await
+            tui::run_dashboard_publisher_on_listener(tui_app, listener, dashboard_shutdown_rx).await
         {
             error!("Websocket dashboard error: {}", e);
         }

@@ -13,6 +13,8 @@ use tokio::sync::watch;
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use tracing::{info, warn};
 
+const DASHBOARD_LOG_LINE_LIMIT: usize = 256;
+
 #[allow(clippy::cast_precision_loss)]
 fn dashboard_message(state: &DashboardState) -> anyhow::Result<Message> {
     Ok(Message::Text(serde_json::to_string(state)?.into()))
@@ -122,22 +124,26 @@ fn spawn_dashboard_client_task(stream: TcpStream, state_rx: watch::Receiver<Arc<
 
 fn publish_dashboard_snapshot(app: &mut TuiApp, state_tx: &watch::Sender<Arc<DashboardState>>) {
     app.update();
-    let state = Arc::new(app.snapshot_state());
+    let state = Arc::new(app.snapshot_state_with_log_limit(Some(DASHBOARD_LOG_LINE_LIMIT)));
     let _ = state_tx.send(state);
 }
 
-/// Run the headless dashboard websocket publisher.
-pub async fn run_dashboard_publisher(
-    mut app: TuiApp,
-    listen_addr: SocketAddr,
-    mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
-) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(listen_addr).await.with_context(|| {
+pub async fn bind_dashboard_listener(listen_addr: SocketAddr) -> anyhow::Result<TcpListener> {
+    TcpListener::bind(listen_addr).await.with_context(|| {
         format!(
             "Failed to bind dashboard websocket listener at {listen_addr}; ensure that socket is free and distinct from the proxy listener"
         )
-    })?;
-    let (state_tx, _state_rx) = watch::channel(Arc::new(app.snapshot_state()));
+    })
+}
+
+pub async fn run_dashboard_publisher_on_listener(
+    mut app: TuiApp,
+    listener: TcpListener,
+    mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
+) -> anyhow::Result<()> {
+    let (state_tx, _state_rx) = watch::channel(Arc::new(
+        app.snapshot_state_with_log_limit(Some(DASHBOARD_LOG_LINE_LIMIT)),
+    ));
     let mut update_interval = tokio::time::interval(Duration::from_millis(250));
     update_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -158,6 +164,16 @@ pub async fn run_dashboard_publisher(
     }
 
     Ok(())
+}
+
+/// Run the headless dashboard websocket publisher.
+pub async fn run_dashboard_publisher(
+    app: TuiApp,
+    listen_addr: SocketAddr,
+    shutdown_rx: tokio::sync::mpsc::Receiver<()>,
+) -> anyhow::Result<()> {
+    let listener = bind_dashboard_listener(listen_addr).await?;
+    run_dashboard_publisher_on_listener(app, listener, shutdown_rx).await
 }
 
 /// Spawn a background task that keeps the attached TUI synced to a websocket dashboard.

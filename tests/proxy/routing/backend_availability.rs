@@ -9,10 +9,28 @@
 use anyhow::Result;
 use nntp_proxy::RoutingMode;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::test_helpers::{
     connect_and_read_greeting, send_article_read_multiline_response, setup_proxy_with_backends,
 };
+
+async fn read_line(stream: &mut tokio::net::TcpStream, context: &str) -> Result<String> {
+    let mut bytes = Vec::with_capacity(128);
+    let mut byte = [0u8; 1];
+
+    loop {
+        let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut byte)).await??;
+        if n == 0 {
+            anyhow::bail!("Connection closed while reading {context}");
+        }
+
+        bytes.push(byte[0]);
+        if byte[0] == b'\n' {
+            return String::from_utf8(bytes).map_err(Into::into);
+        }
+    }
+}
 
 #[tokio::test]
 async fn test_all_backends_exhausted_returns_430() -> Result<()> {
@@ -184,6 +202,45 @@ async fn test_retry_stops_after_all_backends_tried() -> Result<()> {
         duration < Duration::from_secs(5),
         "Should not take more than 5 seconds"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_pipelined_missing_articles_fall_back_to_430_responses() -> Result<()> {
+    let (proxy_port, _backend_ports, _mock_handles) = setup_proxy_with_backends(
+        vec![("Backend1", false), ("Backend2", false)],
+        RoutingMode::PerCommand,
+    )
+    .await?;
+
+    let mut client = connect_and_read_greeting(proxy_port).await?;
+
+    let (status, body) =
+        send_article_read_multiline_response(&mut client, "<cached-missing@example.com>").await?;
+    assert!(status.starts_with("430"));
+    assert!(body.is_empty());
+
+    client
+        .write_all(
+            b"ARTICLE <cached-missing@example.com>\r\nARTICLE <cached-missing@example.com>\r\n",
+        )
+        .await?;
+    client.flush().await?;
+
+    let first = read_line(&mut client, "first pipelined ARTICLE response").await?;
+    let second = read_line(&mut client, "second pipelined ARTICLE response").await?;
+
+    assert!(
+        first.starts_with("430"),
+        "Expected 430 for first pipelined cached-missing ARTICLE, got: {first}"
+    );
+    assert!(
+        second.starts_with("430"),
+        "Expected 430 for second pipelined cached-missing ARTICLE, got: {second}"
+    );
+
+    client.write_all(b"QUIT\r\n").await?;
 
     Ok(())
 }

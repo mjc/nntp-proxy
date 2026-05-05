@@ -111,7 +111,9 @@ impl ClientSession {
                     error = %err,
                     "No eligible backend available for pipelined article batch"
                 );
-                return Err(super::no_backends_available_disconnect());
+                return Err(SessionError::Backend(anyhow::anyhow!(
+                    "no eligible backend available for pipelined article batch"
+                )));
             }
         };
         let guard = CommandGuard::new(router.clone(), backend_id);
