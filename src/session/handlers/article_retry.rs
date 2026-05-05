@@ -739,11 +739,11 @@ impl ClientSession {
                                 "Client {} pipeline got 430 from backend {:?}, falling through to retry loop",
                                 self.client_addr, completed_backend_id
                             );
-                            availability
-                                .get_or_insert_default()
-                                .record_missing(completed_backend_id);
+                            self.handle_430_availability(
+                                completed_backend_id,
+                                availability.get_or_insert_default(),
+                            );
                             self.metrics.record_pipeline_complete();
-                            self.metrics.record_error_4xx(completed_backend_id);
                         }
                         Ok(Err(e)) => {
                             debug!(

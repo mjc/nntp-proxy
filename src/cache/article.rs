@@ -10,7 +10,9 @@ use crate::protocol::{
 };
 use crate::router::BackendCount;
 use crate::types::{BackendId, MessageId};
+use moka::Entry;
 use moka::future::Cache;
+use moka::ops::compute::Op;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -1018,6 +1020,93 @@ impl ArticleCache {
         }
     }
 
+    fn merge_ingest_entry(
+        maybe_entry: Option<Entry<Arc<str>, CachedArticle>>,
+        new_entry_template: &CachedArticle,
+        backend_id: BackendId,
+    ) -> CachedArticle {
+        if let Some(existing) = maybe_entry {
+            let mut entry = existing.into_value();
+
+            let existing_complete = entry.is_complete_article();
+            let new_complete = new_entry_template.is_complete_article();
+            let should_replace = match (existing_complete, new_complete) {
+                (false, true) => true,
+                (true, false) => false,
+                (true, true) | (false, false) => {
+                    new_entry_template.payload_len() > entry.payload_len()
+                }
+            };
+
+            if should_replace {
+                entry.status_code = new_entry_template.status_code;
+                entry.payload = new_entry_template.payload.clone();
+                entry.tier = new_entry_template.tier;
+            }
+
+            entry.inserted_at = ttl::CacheTimestampMillis::now();
+            entry.record_backend_has(backend_id);
+            entry
+        } else {
+            let mut entry = new_entry_template.clone();
+            entry.record_backend_has(backend_id);
+            entry
+        }
+    }
+
+    fn merge_backend_has_status_entry(
+        maybe_entry: Option<Entry<Arc<str>, CachedArticle>>,
+        new_entry_template: &CachedArticle,
+        status_code: StatusCode,
+        backend_id: BackendId,
+        tier: ttl::CacheTier,
+    ) -> CachedArticle {
+        let mut entry = maybe_entry.map_or_else(
+            || new_entry_template.clone(),
+            |existing| existing.into_value(),
+        );
+        if !entry.is_complete_article() {
+            entry.status_code = status_code;
+            entry.tier = tier;
+            entry.payload = CachedPayload::AvailabilityOnly;
+        }
+        entry.inserted_at = ttl::CacheTimestampMillis::now();
+        entry.record_backend_has(backend_id);
+        entry
+    }
+
+    fn merge_backend_missing_entry(
+        maybe_entry: Option<Entry<Arc<str>, CachedArticle>>,
+        backend_id: BackendId,
+    ) -> CachedArticle {
+        if let Some(existing) = maybe_entry {
+            let mut entry = existing.into_value();
+            entry.record_backend_missing(backend_id);
+            entry
+        } else {
+            let mut entry = CachedArticle::missing(ttl::CacheTier::new(0));
+            entry.record_backend_missing(backend_id);
+            entry
+        }
+    }
+
+    fn compute_availability_update(
+        maybe_entry: Option<Entry<Arc<str>, CachedArticle>>,
+        availability: ArticleAvailability,
+    ) -> Op<CachedArticle> {
+        if let Some(existing) = maybe_entry {
+            let mut entry = existing.into_value();
+            entry.backend_availability.merge_from(&availability);
+            Op::Put(entry)
+        } else if availability.any_backend_has_article() {
+            Op::Nop
+        } else {
+            let mut entry = CachedArticle::missing(ttl::CacheTier::new(0));
+            entry.backend_availability = availability;
+            Op::Put(entry)
+        }
+    }
+
     /// Upsert cache entry (insert or update) - ATOMIC OPERATION
     ///
     /// Uses moka's `entry().and_upsert_with()` for atomic get-modify-store.
@@ -1045,42 +1134,12 @@ impl ArticleCache {
         // the race condition between get() and insert() calls
         self.cache
             .entry(key)
-            .and_upsert_with(|maybe_entry| {
-                let new_entry = if let Some(existing) = maybe_entry {
-                    let mut entry = existing.into_value();
-
-                    // Decide whether to update buffer based on completeness
-                    let existing_complete = entry.is_complete_article();
-                    let new_complete = new_entry_template.is_complete_article();
-
-                    let should_replace = match (existing_complete, new_complete) {
-                        (false, true) => true,  // Availability-only -> complete: always replace
-                        (true, false) => false, // Complete -> availability-only: never replace
-                        (true, true) | (false, false) => {
-                            new_entry_template.payload_len() > entry.payload_len()
-                        }
-                    };
-
-                    if should_replace {
-                        entry.status_code = new_entry_template.status_code;
-                        entry.payload = new_entry_template.payload.clone();
-                        entry.tier = tier;
-                    }
-
-                    // Refresh TTL on every successful upsert, independent of buffer replacement
-                    entry.inserted_at = ttl::CacheTimestampMillis::now();
-
-                    // Mark backend as having the article
-                    entry.record_backend_has(backend_id);
-                    entry
-                } else {
-                    // New entry with tier
-                    let mut entry = new_entry_template.clone();
-                    entry.record_backend_has(backend_id);
-                    entry
-                };
-
-                std::future::ready(new_entry)
+            .and_upsert_with(move |maybe_entry| {
+                std::future::ready(Self::merge_ingest_entry(
+                    maybe_entry,
+                    &new_entry_template,
+                    backend_id,
+                ))
             })
             .await;
     }
@@ -1098,19 +1157,14 @@ impl ArticleCache {
 
         self.cache
             .entry(key)
-            .and_upsert_with(|maybe_entry| {
-                let mut entry = maybe_entry.map_or_else(
-                    || new_entry_template.clone(),
-                    |existing| existing.into_value(),
-                );
-                if !entry.is_complete_article() {
-                    entry.status_code = status_code;
-                    entry.tier = tier;
-                    entry.payload = CachedPayload::AvailabilityOnly;
-                }
-                entry.inserted_at = ttl::CacheTimestampMillis::now();
-                entry.record_backend_has(backend_id);
-                std::future::ready(entry)
+            .and_upsert_with(move |maybe_entry| {
+                std::future::ready(Self::merge_backend_has_status_entry(
+                    maybe_entry,
+                    &new_entry_template,
+                    status_code,
+                    backend_id,
+                    tier,
+                ))
             })
             .await;
     }
@@ -1136,19 +1190,8 @@ impl ArticleCache {
         let entry = self
             .cache
             .entry(key)
-            .and_upsert_with(|maybe_entry| {
-                let new_entry = if let Some(existing) = maybe_entry {
-                    let mut entry = existing.into_value();
-                    entry.record_backend_missing(backend_id);
-                    entry
-                } else {
-                    // First 430 for this article - create typed missing entry.
-                    let mut entry = CachedArticle::missing(ttl::CacheTier::new(0));
-                    entry.record_backend_missing(backend_id);
-                    entry
-                };
-
-                std::future::ready(new_entry)
+            .and_upsert_with(move |maybe_entry| {
+                std::future::ready(Self::merge_backend_missing_entry(maybe_entry, backend_id))
             })
             .await;
 
@@ -1176,8 +1219,6 @@ impl ArticleCache {
         message_id: MessageId<'_>,
         availability: &ArticleAvailability,
     ) {
-        use moka::ops::compute::Op;
-
         // Only sync if we actually tried some backends
         if availability.checked_bits() == 0 {
             return;
@@ -1191,27 +1232,8 @@ impl ArticleCache {
         let result = self
             .cache
             .entry(key)
-            .and_compute_with(|maybe_entry| {
-                let op = if let Some(existing) = maybe_entry {
-                    // Merge availability into existing entry
-                    let mut entry = existing.into_value();
-                    entry.backend_availability.merge_from(&availability);
-                    Op::Put(entry)
-                } else {
-                    // No existing entry - only create a missing entry if all checked backends returned 430.
-                    if availability.any_backend_has_article() {
-                        // A backend successfully provided the article.
-                        // Don't create a missing entry - let upsert() handle it with the real article data.
-                        Op::Nop
-                    } else {
-                        // All checked backends returned 430 - create a missing entry to track this.
-                        let mut entry = CachedArticle::missing(ttl::CacheTier::new(0));
-                        entry.backend_availability = availability;
-                        Op::Put(entry)
-                    }
-                };
-
-                std::future::ready(op)
+            .and_compute_with(move |maybe_entry| {
+                std::future::ready(Self::compute_availability_update(maybe_entry, availability))
             })
             .await;
 

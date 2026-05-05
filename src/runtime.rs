@@ -305,51 +305,115 @@ pub async fn persist_runtime_state(
     availability_path: Option<std::path::PathBuf>,
     server_names: Vec<String>,
 ) -> Result<()> {
-    use tracing::{info, warn};
-
     let mut first_error = None;
 
     let metrics = proxy.metrics().clone();
     let metrics_path = stats_path.clone();
-    match tokio::task::spawn_blocking(move || metrics.save_to_disk(&metrics_path, &server_names))
-        .await
-    {
-        Ok(Ok(())) => info!("Metrics saved to {}", stats_path.display()),
-        Ok(Err(e)) => {
-            warn!("Failed to save metrics on shutdown: {}", e);
-            first_error = Some(e);
-        }
-        Err(e) => {
-            warn!("Failed to join metrics save task on shutdown: {}", e);
-            first_error = Some(e.into());
-        }
-    }
+    handle_shutdown_metrics_save_result(
+        &mut first_error,
+        &stats_path,
+        tokio::task::spawn_blocking(move || metrics.save_to_disk(&metrics_path, &server_names))
+            .await,
+    );
 
     if let Some(path) = availability_path {
         let cache = proxy.cache().clone();
         let save_path = path.clone();
-        match tokio::task::spawn_blocking(move || cache.save_to_disk(&save_path)).await {
-            Ok(Ok(true)) => info!("Availability index saved to {}", path.display()),
-            Ok(Ok(false)) => {}
-            Ok(Err(e)) => {
-                warn!("Failed to save availability index on shutdown: {}", e);
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
-            }
-            Err(e) => {
-                warn!("Failed to join availability save task on shutdown: {}", e);
-                if first_error.is_none() {
-                    first_error = Some(e.into());
-                }
-            }
-        }
+        handle_shutdown_availability_save_result(
+            &mut first_error,
+            &path,
+            tokio::task::spawn_blocking(move || cache.save_to_disk(&save_path)).await,
+        );
     }
 
     if let Some(error) = first_error {
         Err(error)
     } else {
         Ok(())
+    }
+}
+
+fn remember_first_persistence_error(slot: &mut Option<anyhow::Error>, error: anyhow::Error) {
+    if slot.is_none() {
+        *slot = Some(error);
+    }
+}
+
+fn handle_shutdown_metrics_save_result(
+    first_error: &mut Option<anyhow::Error>,
+    stats_path: &std::path::Path,
+    result: Result<Result<()>, tokio::task::JoinError>,
+) {
+    use tracing::{info, warn};
+
+    match result {
+        Ok(Ok(())) => info!("Metrics saved to {}", stats_path.display()),
+        Ok(Err(e)) => {
+            warn!("Failed to save metrics on shutdown: {}", e);
+            remember_first_persistence_error(first_error, e);
+        }
+        Err(e) => {
+            warn!("Failed to join metrics save task on shutdown: {}", e);
+            remember_first_persistence_error(first_error, e.into());
+        }
+    }
+}
+
+fn handle_shutdown_availability_save_result(
+    first_error: &mut Option<anyhow::Error>,
+    availability_path: &std::path::Path,
+    result: Result<Result<bool>, tokio::task::JoinError>,
+) {
+    use tracing::{info, warn};
+
+    match result {
+        Ok(Ok(true)) => info!(
+            "Availability index saved to {}",
+            availability_path.display()
+        ),
+        Ok(Ok(false)) => {}
+        Ok(Err(e)) => {
+            warn!("Failed to save availability index on shutdown: {}", e);
+            remember_first_persistence_error(first_error, e);
+        }
+        Err(e) => {
+            warn!("Failed to join availability save task on shutdown: {}", e);
+            remember_first_persistence_error(first_error, e.into());
+        }
+    }
+}
+
+fn handle_periodic_metrics_save_result(
+    stats_path: &std::path::Path,
+    result: Result<Result<()>, tokio::task::JoinError>,
+) {
+    use tracing::warn;
+
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => warn!("Failed to save metrics to {}: {}", stats_path.display(), e),
+        Err(e) => warn!("Failed to save metrics to {}: {}", stats_path.display(), e),
+    }
+}
+
+fn handle_periodic_availability_save_result(
+    availability_path: &std::path::Path,
+    result: Result<Result<bool>, tokio::task::JoinError>,
+) {
+    use tracing::warn;
+
+    match result {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => warn!(
+            "Failed to save availability index to {}: {}",
+            availability_path.display(),
+            e
+        ),
+        Err(e) => warn!(
+            "Failed to save availability index to {}: {}",
+            availability_path.display(),
+            e
+        ),
     }
 }
 
@@ -587,7 +651,6 @@ pub fn spawn_metrics_saver(
     server_names: Vec<String>,
 ) {
     use std::sync::Arc;
-    use tracing::warn;
 
     let proxy = Arc::clone(proxy);
     tokio::spawn(async move {
@@ -599,13 +662,10 @@ pub fn spawn_metrics_saver(
             let names = server_names.clone();
             let metrics = proxy.metrics().clone();
             let save_path = path.clone();
-            match tokio::task::spawn_blocking(move || metrics.save_to_disk(&save_path, &names))
-                .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => warn!("Failed to save metrics to {}: {}", stats_path.display(), e),
-                Err(e) => warn!("Failed to save metrics to {}: {}", stats_path.display(), e),
-            }
+            handle_periodic_metrics_save_result(
+                &stats_path,
+                tokio::task::spawn_blocking(move || metrics.save_to_disk(&save_path, &names)).await,
+            );
         }
     });
 }
@@ -618,7 +678,6 @@ pub fn spawn_availability_saver(
     availability_path: Option<std::path::PathBuf>,
 ) {
     use std::sync::Arc;
-    use tracing::warn;
 
     let Some(availability_path) = availability_path else {
         return;
@@ -633,23 +692,10 @@ pub fn spawn_availability_saver(
             let cache = proxy.cache().clone();
             let path = availability_path.clone();
             let save_path = path.clone();
-            match tokio::task::spawn_blocking(move || cache.save_to_disk(&save_path)).await {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => {
-                    warn!(
-                        "Failed to save availability index to {}: {}",
-                        path.display(),
-                        e
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to save availability index to {}: {}",
-                        path.display(),
-                        e
-                    );
-                }
-            }
+            handle_periodic_availability_save_result(
+                &path,
+                tokio::task::spawn_blocking(move || cache.save_to_disk(&save_path)).await,
+            );
         }
     });
 }
