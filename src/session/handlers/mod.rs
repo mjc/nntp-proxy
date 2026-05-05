@@ -12,6 +12,13 @@
 
 mod article_retry;
 
+fn no_backends_available_disconnect() -> crate::session::SessionError {
+    crate::session::SessionError::ClientDisconnect(std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        "No backends available for routing",
+    ))
+}
+
 /// Split a single-line pipelined response at its `\n` boundary in-place.
 ///
 /// In a pipelined batch, a single TCP read may contain the single-line response
@@ -44,3 +51,16 @@ mod per_command;
 mod pipeline;
 pub(crate) mod pipeline_worker;
 mod stateful;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_backends_available_disconnect_is_classified_as_client_disconnect() {
+        assert!(matches!(
+            no_backends_available_disconnect(),
+            crate::session::SessionError::ClientDisconnect(_)
+        ));
+    }
+}

@@ -109,7 +109,17 @@ impl ClientSession {
         state: &mut ArticleAttemptState<'_>,
     ) -> Result<BackendAttemptResult, SessionError> {
         let backend_id =
-            router.route_with_availability(self.client_id, Some(state.availability))?;
+            match router.route_with_availability(self.client_id, Some(state.availability)) {
+                Ok(backend_id) => backend_id,
+                Err(err) => {
+                    debug!(
+                        client = %self.client_addr,
+                        error = %err,
+                        "No eligible backend available for article retry"
+                    );
+                    return Err(super::no_backends_available_disconnect());
+                }
+            };
         let guard = CommandGuard::new(router.clone(), backend_id);
         let Some(provider) = router.backend_provider(backend_id) else {
             state.availability.record_missing(backend_id);

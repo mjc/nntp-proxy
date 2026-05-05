@@ -385,20 +385,7 @@ mod tests {
 
     #[tokio::test]
     async fn reader_applies_latest_state() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test port");
-        let addr = listener.local_addr().expect("local addr");
-
         let (state_tx, mut state_rx) = watch::channel(None::<DashboardState>);
-        let reader =
-            spawn_dashboard_reader_with_retry_delay(addr, state_tx, Duration::from_millis(25));
-
-        let (stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
-            .await
-            .expect("reader should connect")
-            .expect("accept reader connection");
-        let mut ws = accept_async(stream).await.expect("accept websocket");
 
         let first = DashboardState {
             snapshot: MetricsSnapshot::default(),
@@ -422,29 +409,27 @@ mod tests {
         second.log_lines = vec!["second".to_string()];
         second.show_details = true;
 
-        ws.send(Message::Text(
-            serde_json::to_string(&first)
-                .expect("serialize first")
-                .into(),
-        ))
-        .await
-        .expect("send first state");
-        ws.send(Message::Text(
-            serde_json::to_string(&second)
-                .expect("serialize second")
-                .into(),
-        ))
-        .await
-        .expect("send second state");
+        let source = stream::iter(vec![
+            Ok(Message::Text(
+                serde_json::to_string(&first)
+                    .expect("serialize first")
+                    .into(),
+            )),
+            Ok(Message::Text(
+                serde_json::to_string(&second)
+                    .expect("serialize second")
+                    .into(),
+            )),
+        ]);
+
+        forward_dashboard_states(source, state_tx)
+            .await
+            .expect("forward dashboard states");
 
         let observed = wait_for_log_lines(&mut state_rx, &["second"], Duration::from_secs(3)).await;
 
         assert_eq!(observed.log_lines, vec!["second".to_string()]);
         assert!(observed.show_details);
-
-        let _ = ws.close(None).await;
-        reader.abort();
-        let _ = reader.await;
     }
 
     #[tokio::test]

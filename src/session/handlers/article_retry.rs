@@ -103,7 +103,17 @@ impl ClientSession {
         // One pending count for one connection — don't inflate pending by N,
         // as that skews load_ratio and can cause other sessions to over-allocate
         // connections on other backends, hitting provider connection limits.
-        let backend_id = router.route_with_availability(self.client_id, Some(&availability))?;
+        let backend_id = match router.route_with_availability(self.client_id, Some(&availability)) {
+            Ok(backend_id) => backend_id,
+            Err(err) => {
+                debug!(
+                    client = %self.client_addr,
+                    error = %err,
+                    "No eligible backend available for pipelined article batch"
+                );
+                return Err(super::no_backends_available_disconnect());
+            }
+        };
         let guard = CommandGuard::new(router.clone(), backend_id);
 
         let Some(provider) = router.backend_provider(backend_id) else {
@@ -828,8 +838,9 @@ impl ClientSession {
                 Ok(BackendAttemptResult::BackendUnavailable) => {}
                 Err(e @ SessionError::ClientDisconnect(_)) => {
                     debug!(
-                        "Client {} disconnected, stopping retry loop",
-                        self.client_addr
+                        "Client {} no eligible backends remain for {:?}",
+                        self.client_addr,
+                        request.message_id_value()
                     );
                     return Err(e);
                 }
