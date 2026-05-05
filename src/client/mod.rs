@@ -80,11 +80,11 @@ impl NntpClient {
     /// Returns any connection, write, or backend-response error encountered while
     /// fetching the BODY response.
     #[inline]
-    pub async fn fetch_body(
+    pub fn fetch_body(
         &self,
         message_id: &crate::types::MessageId<'_>,
-    ) -> Result<PooledBuffer> {
-        self.fetch_response(&body_request(message_id)).await
+    ) -> impl std::future::Future<Output = Result<PooledBuffer>> + '_ {
+        self.fetch_response(body_request(message_id))
     }
 
     /// Fetch article headers (HEAD command)
@@ -99,11 +99,11 @@ impl NntpClient {
     /// Returns any connection, write, or backend-response error encountered while
     /// fetching the HEAD response.
     #[inline]
-    pub async fn fetch_head(
+    pub fn fetch_head(
         &self,
         message_id: &crate::types::MessageId<'_>,
-    ) -> Result<PooledBuffer> {
-        self.fetch_response(&head_request(message_id)).await
+    ) -> impl std::future::Future<Output = Result<PooledBuffer>> + '_ {
+        self.fetch_response(head_request(message_id))
     }
 
     /// Fetch full article (ARTICLE command)
@@ -118,11 +118,11 @@ impl NntpClient {
     /// Returns any connection, write, or backend-response error encountered while
     /// fetching the ARTICLE response.
     #[inline]
-    pub async fn fetch_article(
+    pub fn fetch_article(
         &self,
         message_id: &crate::types::MessageId<'_>,
-    ) -> Result<PooledBuffer> {
-        self.fetch_response(&article_request(message_id)).await
+    ) -> impl std::future::Future<Output = Result<PooledBuffer>> + '_ {
+        self.fetch_response(article_request(message_id))
     }
 
     /// Check if article exists (STAT command)
@@ -172,11 +172,11 @@ impl NntpClient {
     /// # Errors
     /// Returns any connection, write, read, or backend-status validation error
     /// encountered while fetching the NNTP response.
-    async fn fetch_response(&self, request: &RequestContext) -> Result<PooledBuffer> {
+    async fn fetch_response(&self, request: RequestContext) -> Result<PooledBuffer> {
         let mut conn = self.get_connection().await?;
         let mut io_buffer = self.buffer_pool.acquire();
 
-        let response = send_request(&mut *conn, request, &mut io_buffer).await?;
+        let response = send_request(&mut *conn, &request, &mut io_buffer).await?;
 
         // Validate response - early return on errors
         Self::validate_response(&response)?;
