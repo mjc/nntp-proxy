@@ -47,7 +47,7 @@ fn bordered_block(title: &'static str, border_color: Color) -> Block<'static> {
 // ============================================================================
 
 /// Render the main UI
-pub fn render_ui(f: &mut Frame, state: &DashboardState) {
+pub fn render_ui(f: &mut Frame, state: &DashboardState, attached_ui_memory_bytes: Option<u64>) {
     use crate::tui::app::ViewMode;
 
     // Check if we're in log fullscreen mode
@@ -97,7 +97,7 @@ pub fn render_ui(f: &mut Frame, state: &DashboardState) {
 
     // Render each section
     render_title(f, chunks[0], &state.snapshot);
-    render_summary(f, chunks[1], state);
+    render_summary(f, chunks[1], state, attached_ui_memory_bytes);
 
     // Backends area now contains 3 columns: backends, chart, and user stats
     render_backends(f, chunks[2], state);
@@ -134,7 +134,12 @@ fn render_title(f: &mut Frame, area: Rect, snapshot: &crate::metrics::MetricsSna
 }
 
 /// Render summary statistics
-fn render_summary(f: &mut Frame, area: Rect, state: &DashboardState) {
+fn render_summary(
+    f: &mut Frame,
+    area: Rect,
+    state: &DashboardState,
+    attached_ui_memory_bytes: Option<u64>,
+) {
     let snapshot = &state.snapshot;
     let system_stats = &state.system_stats;
 
@@ -158,6 +163,7 @@ fn render_summary(f: &mut Frame, area: Rect, state: &DashboardState) {
         system_stats,
         state.buffer_pool(),
         state.show_details,
+        attached_ui_memory_bytes,
     );
 
     // Middle: Cache summary
@@ -195,6 +201,7 @@ fn create_app_summary(
     system_stats: &crate::tui::SystemStats,
     buffer_pool: Option<&BufferPoolStats>,
     show_details: bool,
+    attached_ui_memory_bytes: Option<u64>,
 ) -> Paragraph<'static> {
     /// Color for CPU usage based on threshold
     const fn cpu_color(usage: f32) -> Color {
@@ -231,6 +238,14 @@ fn create_app_summary(
         }
     }
 
+    let is_attached = attached_ui_memory_bytes.is_some();
+    let cpu_label = if is_attached { "Proxy CPU: " } else { "CPU: " };
+    let memory_label = if is_attached {
+        "Proxy Memory: "
+    } else {
+        "Memory: "
+    };
+
     let mut lines = vec![
         Line::from(vec![
             "Uptime: ".fg(styles::LABEL),
@@ -241,14 +256,21 @@ fn create_app_summary(
             format!("{}", snapshot.stateful_sessions).fg(session_color(snapshot.stateful_sessions)),
         ]),
         Line::from(vec![
-            "CPU: ".fg(styles::LABEL),
+            cpu_label.fg(styles::LABEL),
             format!("{:.1}%", system_stats.cpu_usage).fg(cpu_color(system_stats.cpu_usage)),
         ]),
         Line::from(vec![
-            "Memory: ".fg(styles::LABEL),
+            memory_label.fg(styles::LABEL),
             format_bytes(system_stats.memory_bytes).fg(styles::VALUE_INFO),
         ]),
     ];
+
+    if let Some(ui_memory_bytes) = attached_ui_memory_bytes {
+        lines.push(Line::from(vec![
+            "UI Memory: ".fg(styles::LABEL),
+            format_bytes(ui_memory_bytes).fg(styles::VALUE_INFO),
+        ]));
+    }
 
     // Show pipeline stats if any batches have been processed
     if snapshot.pipeline_batches > 0 {

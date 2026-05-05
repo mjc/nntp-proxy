@@ -128,9 +128,12 @@ pub async fn run_tui(
 pub async fn run_attached_tui(connect_addr: SocketAddr) -> Result<()> {
     let (state_tx, mut state_rx) = tokio::sync::watch::channel(None::<DashboardState>);
     let _reader = spawn_dashboard_reader(connect_addr, state_tx);
+    let mut local_system_monitor = SystemMonitor::new();
 
     with_terminal_session(move |terminal| {
-        Box::pin(async move { run_attached_app(terminal, &mut state_rx).await })
+        Box::pin(async move {
+            run_attached_app(terminal, &mut state_rx, &mut local_system_monitor).await
+        })
     })
     .await
 }
@@ -148,7 +151,7 @@ where
     let mut update_interval = tokio::time::interval(Duration::from_millis(250));
 
     // Initial render
-    terminal.draw(|f| ui::render_ui(f, &app.snapshot_state()))?;
+    terminal.draw(|f| ui::render_ui(f, &app.snapshot_state(), None))?;
 
     let mut should_quit = false;
 
@@ -162,18 +165,15 @@ where
             _ = update_interval.tick() => {
                 app.update();
 
-                match poll_tui_input(true).await? {
-                    TuiInputAction::Quit => should_quit = true,
-                    TuiInputAction::ToggleLogFullscreen => app.toggle_log_fullscreen(),
-                    TuiInputAction::ToggleDetails => app.toggle_details(),
-                    TuiInputAction::None => {}
+                if apply_tui_input(true, Some(app)).await? {
+                    should_quit = true;
                 }
 
                 if should_quit {
                     break;
                 }
 
-                terminal.draw(|f| ui::render_ui(f, &app.snapshot_state()))?;
+                terminal.draw(|f| ui::render_ui(f, &app.snapshot_state(), None))?;
             }
         }
     }
@@ -184,6 +184,7 @@ where
 async fn run_attached_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     state_rx: &mut tokio::sync::watch::Receiver<Option<DashboardState>>,
+    local_system_monitor: &mut SystemMonitor,
 ) -> Result<()>
 where
     B::Error: Send + Sync + 'static,
@@ -192,12 +193,14 @@ where
     let mut should_quit = false;
 
     let state = state_rx.borrow().clone();
-    terminal.draw(|f| draw_attached_dashboard(f, state.as_ref()))?;
+    let local_system_stats = local_system_monitor.update();
+    terminal
+        .draw(|f| draw_attached_dashboard(f, state.as_ref(), local_system_stats.memory_bytes))?;
 
     loop {
         tokio::select! {
             _ = update_interval.tick() => {
-                if matches!(poll_tui_input(false).await?, TuiInputAction::Quit) {
+                if apply_tui_input(false, None).await? {
                     should_quit = true;
                 }
 
@@ -206,7 +209,10 @@ where
                 }
 
                 let state = state_rx.borrow().clone();
-                terminal.draw(|f| draw_attached_dashboard(f, state.as_ref()))?;
+                let local_system_stats = local_system_monitor.update();
+                terminal.draw(|f| {
+                    draw_attached_dashboard(f, state.as_ref(), local_system_stats.memory_bytes)
+                })?;
             }
         }
     }
@@ -214,9 +220,13 @@ where
     Ok(())
 }
 
-fn draw_attached_dashboard(f: &mut ratatui::Frame, state: Option<&DashboardState>) {
+fn draw_attached_dashboard(
+    f: &mut ratatui::Frame,
+    state: Option<&DashboardState>,
+    local_memory_bytes: u64,
+) {
     if let Some(state) = state {
-        ui::render_ui(f, state);
+        ui::render_ui(f, state, Some(local_memory_bytes));
         return;
     }
 
@@ -287,6 +297,25 @@ async fn poll_tui_input(allow_dashboard_actions: bool) -> Result<TuiInputAction>
         Event::Key(key) => key_event_action(key, allow_dashboard_actions),
         _ => TuiInputAction::None,
     })
+}
+
+async fn apply_tui_input(allow_dashboard_actions: bool, app: Option<&mut TuiApp>) -> Result<bool> {
+    match poll_tui_input(allow_dashboard_actions).await? {
+        TuiInputAction::Quit => Ok(true),
+        TuiInputAction::ToggleLogFullscreen => {
+            if let Some(app) = app {
+                app.toggle_log_fullscreen();
+            }
+            Ok(false)
+        }
+        TuiInputAction::ToggleDetails => {
+            if let Some(app) = app {
+                app.toggle_details();
+            }
+            Ok(false)
+        }
+        TuiInputAction::None => Ok(false),
+    }
 }
 
 #[cfg(test)]
