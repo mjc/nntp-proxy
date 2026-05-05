@@ -645,7 +645,7 @@ pub async fn connect_and_read_greeting(proxy_port: u16) -> Result<tokio::net::Tc
     let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
     let line = read_line_from_stream(&mut stream, "proxy greeting").await?;
     if !line.starts_with("201") {
-        anyhow::bail!("Expected 200 greeting, got: {line}");
+        anyhow::bail!("Expected 201 greeting, got: {line}");
     }
 
     Ok(stream)
@@ -816,11 +816,16 @@ async fn read_line_from_stream(
 ) -> Result<String> {
     use tokio::io::AsyncReadExt;
 
+    const READ_LINE_TIMEOUT: Duration = Duration::from_secs(2);
+
     let mut bytes = Vec::with_capacity(128);
     let mut byte = [0u8; 1];
 
     loop {
-        let n = stream.read(&mut byte).await?;
+        let n = match tokio::time::timeout(READ_LINE_TIMEOUT, stream.read(&mut byte)).await {
+            Ok(result) => result?,
+            Err(_) => anyhow::bail!("Timed out while reading {context}"),
+        };
         if n == 0 {
             if bytes.is_empty() {
                 anyhow::bail!("Connection closed while reading {context}");
@@ -894,15 +899,21 @@ pub async fn send_command_read_multiline_response(
     write_command_line(stream, command).await?;
     let status_line = read_line_from_stream(stream, "response status line").await?;
 
-    // Only attempt multiline reads for responses that are defined as multiline by
-    // the NNTP/RFC semantics. This avoids hanging when the server returns a
-    // single-line error or closes the connection mid-response.
-    let multiline_prefixes = [
-        "100", "101", "211", "215", "220", "221", "222", "224", "225", "230", "231",
-    ];
-    let is_multiline = multiline_prefixes
-        .iter()
-        .any(|p| status_line.starts_with(p));
+    // Only attempt multiline reads for command/response pairs that are defined
+    // as multiline by NNTP semantics. Status 211 is ambiguous: GROUP is
+    // single-line, while LISTGROUP is multiline.
+    let command_upper = command.trim().to_ascii_uppercase();
+    let is_multiline = status_line.starts_with("100")
+        || status_line.starts_with("101")
+        || status_line.starts_with("215")
+        || status_line.starts_with("220")
+        || status_line.starts_with("221")
+        || status_line.starts_with("222")
+        || status_line.starts_with("224")
+        || status_line.starts_with("225")
+        || status_line.starts_with("230")
+        || status_line.starts_with("231")
+        || (status_line.starts_with("211") && command_upper.starts_with("LISTGROUP"));
 
     let mut lines = Vec::new();
     if is_multiline {

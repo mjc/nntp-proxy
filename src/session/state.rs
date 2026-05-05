@@ -9,6 +9,8 @@ use crate::protocol::{RequestKind, StatusCode, request_kind_expects_multiline};
 use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
 use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
+const MAX_PENDING_STATUS_LINE_BYTES: usize = crate::constants::buffer::COMMAND;
+
 struct PendingBackendResponse {
     kind: RequestKind,
     state: PendingBackendResponseState,
@@ -43,6 +45,12 @@ impl PendingBackendResponse {
         match &mut self.state {
             PendingBackendResponseState::AwaitingStatusLine(status_line) => {
                 let Some(pos) = memchr::memchr(b'\n', chunk) else {
+                    if status_line.len() + chunk.len() > MAX_PENDING_STATUS_LINE_BYTES {
+                        return PendingChunkProgress {
+                            consumed: chunk.len(),
+                            completed: true,
+                        };
+                    }
                     status_line.extend_from_slice(chunk);
                     return PendingChunkProgress {
                         consumed: chunk.len(),
@@ -51,6 +59,12 @@ impl PendingBackendResponse {
                 };
 
                 let end = pos + 1;
+                if status_line.len() + end > MAX_PENDING_STATUS_LINE_BYTES {
+                    return PendingChunkProgress {
+                        consumed: chunk.len(),
+                        completed: true,
+                    };
+                }
                 status_line.extend_from_slice(&chunk[..end]);
                 let is_multiline = StatusCode::parse(status_line)
                     .is_some_and(|status| request_kind_expects_multiline(self.kind, status));
@@ -469,6 +483,19 @@ mod tests {
 
         state.observe_backend_bytes(b".\r\n");
         assert!(!state.has_pending_backend_replies());
+    }
+
+    #[test]
+    fn test_pending_backend_reply_status_line_cap_prevents_unbounded_growth() {
+        let mut state = SessionLoopState::new(false);
+        state.mark_backend_request_sent(RequestKind::Date);
+
+        state.observe_backend_bytes(&vec![b'x'; MAX_PENDING_STATUS_LINE_BYTES + 1]);
+
+        assert!(
+            !state.has_pending_backend_replies(),
+            "oversized status lines should stop pending bookkeeping instead of growing forever"
+        );
     }
 
     #[test]
