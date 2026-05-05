@@ -128,6 +128,21 @@ fn publish_dashboard_snapshot(app: &mut TuiApp, state_tx: &watch::Sender<Arc<Das
     let _ = state_tx.send(state);
 }
 
+fn handle_dashboard_accept_result(
+    accept_result: std::io::Result<(TcpStream, SocketAddr)>,
+    state_tx: &watch::Sender<Arc<DashboardState>>,
+) {
+    match accept_result {
+        Ok((stream, _)) => {
+            let rx = state_tx.subscribe();
+            spawn_dashboard_client_task(stream, rx);
+        }
+        Err(err) => {
+            warn!(error = %err, "Dashboard websocket accept failed; continuing");
+        }
+    }
+}
+
 pub async fn bind_dashboard_listener(listen_addr: SocketAddr) -> anyhow::Result<TcpListener> {
     anyhow::ensure!(
         listen_addr.ip().is_loopback(),
@@ -160,9 +175,7 @@ pub async fn run_dashboard_publisher_on_listener(
                 publish_dashboard_snapshot(&mut app, &state_tx);
             }
             accept_result = listener.accept() => {
-                let (stream, _) = accept_result?;
-                let rx = state_tx.subscribe();
-                spawn_dashboard_client_task(stream, rx);
+                handle_dashboard_accept_result(accept_result, &state_tx);
             }
         }
     }
@@ -427,6 +440,19 @@ mod tests {
         assert!(err.contains("ensure that socket is free"));
     }
 
+    #[test]
+    fn dashboard_accept_errors_are_nonfatal() {
+        let app = build_test_app();
+        let (state_tx, _state_rx) = watch::channel(Arc::new(
+            app.snapshot_state_with_log_limit(Some(DASHBOARD_LOG_LINE_LIMIT)),
+        ));
+
+        handle_dashboard_accept_result(
+            Err(std::io::Error::other("synthetic accept error")),
+            &state_tx,
+        );
+    }
+
     #[tokio::test]
     async fn dashboard_publisher_rejects_non_loopback_listener() {
         let err = bind_dashboard_listener("0.0.0.0:8120".parse().unwrap())
@@ -482,10 +508,13 @@ mod tests {
             .await
             .expect("bind test port");
         let addr = listener.local_addr().expect("local addr");
-        drop(listener);
 
         let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
-        let publisher = tokio::spawn(run_dashboard_publisher(app, addr, shutdown_rx));
+        let publisher = tokio::spawn(run_dashboard_publisher_on_listener(
+            app,
+            listener,
+            shutdown_rx,
+        ));
 
         let (ws_stream, _) = tokio::time::timeout(Duration::from_secs(3), async {
             loop {

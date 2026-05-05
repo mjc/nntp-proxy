@@ -65,19 +65,19 @@ pub struct CommonArgs {
     #[arg(long, hide = true, help_heading = "General")]
     pub no_tui: bool,
 
-    /// Bind the dashboard websocket publisher to a free loopback HOST:PORT distinct from the proxy listener.
+    /// Bind the dashboard websocket publisher to a free loopback IP:PORT distinct from the proxy listener.
     #[arg(
         long = "tui-listen",
-        value_name = "HOST:PORT",
+        value_name = "IP:PORT",
         env = "NNTP_PROXY_TUI_LISTEN",
         help_heading = "General"
     )]
     pub tui_listen: Option<SocketAddr>,
 
-    /// Connect the read-only TUI client to a loopback dashboard websocket at HOST:PORT.
+    /// Connect the read-only TUI client to a loopback dashboard websocket at IP:PORT.
     #[arg(
         long = "tui-attach",
-        value_name = "HOST:PORT",
+        value_name = "IP:PORT",
         env = "NNTP_PROXY_TUI_ATTACH",
         help_heading = "General"
     )]
@@ -682,8 +682,8 @@ mod tests {
         command.write_long_help(&mut help).unwrap();
         let help = String::from_utf8(help).unwrap();
 
-        assert!(help.contains("--tui-listen <HOST:PORT>"));
-        assert!(help.contains("--tui-attach <HOST:PORT>"));
+        assert!(help.contains("--tui-listen <IP:PORT>"));
+        assert!(help.contains("--tui-attach <IP:PORT>"));
     }
 
     // Helper to create default args for testing

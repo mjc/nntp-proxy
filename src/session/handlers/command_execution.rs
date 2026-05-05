@@ -117,7 +117,7 @@ impl ClientSession {
                         error = %err,
                         "No eligible backend available for article retry"
                     );
-                    return Err(super::no_backends_available_disconnect());
+                    return Ok(BackendAttemptResult::BackendUnavailable);
                 }
             };
         let guard = CommandGuard::new(router.clone(), backend_id);

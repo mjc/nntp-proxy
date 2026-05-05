@@ -28,6 +28,8 @@ fn main() -> Result<()> {
     if ui_mode == UiMode::Tui
         && let Some(connect_addr) = args.common.tui_attach
     {
+        let file_level = nntp_proxy::Config::default().proxy.log_file_level;
+        let _ = nntp_proxy::logging::init_logging(UiMode::Tui, &file_level);
         let threads = args.common.threads;
         return RuntimeConfig::from_args(threads)
             .build_runtime()?
