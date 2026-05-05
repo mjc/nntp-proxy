@@ -54,6 +54,7 @@ pub struct CommonArgs {
     #[arg(
         long,
         value_enum,
+        value_name = "MODE",
         default_value_t = UiMode::DEFAULT,
         env = "NNTP_PROXY_UI",
         help_heading = "General"
@@ -64,17 +65,19 @@ pub struct CommonArgs {
     #[arg(long, hide = true, help_heading = "General")]
     pub no_tui: bool,
 
-    /// Bind address for the dashboard websocket publisher in headless mode.
+    /// Bind the dashboard websocket publisher to HOST:PORT in headless mode.
     #[arg(
         long = "tui-listen",
+        value_name = "HOST:PORT",
         env = "NNTP_PROXY_TUI_LISTEN",
         help_heading = "General"
     )]
     pub tui_listen: Option<SocketAddr>,
 
-    /// Connect the TUI client to a running dashboard websocket publisher.
+    /// Connect the read-only TUI client to a dashboard websocket at HOST:PORT.
     #[arg(
         long = "tui-attach",
+        value_name = "HOST:PORT",
         env = "NNTP_PROXY_TUI_ATTACH",
         help_heading = "General"
     )]
@@ -316,6 +319,7 @@ impl CommonArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
     fn test_common_args_defaults() {
@@ -531,6 +535,21 @@ mod tests {
         };
 
         assert!(args.validate_runtime_mode().is_err());
+    }
+
+    #[test]
+    fn test_help_shows_tui_socket_format() {
+        let mut command = CommonArgs::command();
+        let mut help = Vec::new();
+        command.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        assert!(help.contains("--tui-listen <HOST:PORT>"));
+        assert!(help.contains("--tui-attach <HOST:PORT>"));
+        assert!(help.contains("Bind the dashboard websocket publisher to HOST:PORT"));
+        assert!(
+            help.contains("Connect the read-only TUI client to a dashboard websocket at HOST:PORT")
+        );
     }
 
     // Helper to create default args for testing
