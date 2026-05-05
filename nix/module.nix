@@ -29,7 +29,7 @@
             cache.availability_index_path = "/var/cache/nntp-proxy/availability.idx";
           })
           (lib.optionalAttrs hasDiskCache {
-            cache.disk.path = "/var/cache/nntp-proxy/articles";
+            cache.disk.path = "/var/cache/nntp-proxy/disk-cache";
           })
           cfg.settings
         ]
@@ -134,14 +134,15 @@ in {
 
     networking.firewall.allowedTCPPorts = lib.optional cfg.openFirewall listenPort;
 
-    systemd.tmpfiles.rules = lib.optional (cfg.configFile == null && hasDiskCache) "d /var/cache/nntp-proxy/articles 0750 - - - -";
-
     systemd.services.nntp-proxy = {
       description = "NNTP proxy service";
       wantedBy = ["multi-user.target"];
       wants = ["network-online.target"];
       after = ["network-online.target"];
       environment = serviceEnvironment;
+      preStart = lib.optionalString (cfg.configFile == null && hasDiskCache) ''
+        ${pkgs.coreutils}/bin/mkdir -p /var/cache/nntp-proxy/disk-cache
+      '';
 
       serviceConfig = {
         Type = "simple";
