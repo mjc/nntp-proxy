@@ -27,10 +27,14 @@ fn leak_guard(guard: WorkerGuard) {
     std::mem::forget(guard);
 }
 
-fn init_headless_subscriber(file_level: &str) {
+fn init_headless_subscriber(
+    file_level: &str,
+    capture_tui_buffer: bool,
+) -> Option<crate::tui::LogBuffer> {
     let (debug_log, guard) = debug_log_writer();
+    let log_buffer = capture_tui_buffer.then(crate::tui::LogBuffer::new);
 
-    tracing_subscriber::registry()
+    let subscriber = tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(|| std::io::LineWriter::new(std::io::stdout()))
@@ -41,10 +45,24 @@ fn init_headless_subscriber(file_level: &str) {
                 .with_writer(debug_log)
                 .with_ansi(false)
                 .with_filter(file_filter(file_level)),
-        )
-        .init();
+        );
+
+    match log_buffer.clone() {
+        Some(log_buffer) => subscriber
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(crate::tui::LogMakeWriter::new(log_buffer))
+                    .with_ansi(false)
+                    .with_target(false)
+                    .compact()
+                    .with_filter(env_filter()),
+            )
+            .init(),
+        None => subscriber.init(),
+    }
 
     leak_guard(guard);
+    log_buffer
 }
 
 fn init_tui_subscriber(file_level: &str) -> crate::tui::LogBuffer {
@@ -77,7 +95,7 @@ fn init_tui_subscriber(file_level: &str) -> crate::tui::LogBuffer {
 ///
 /// Headless mode logs to line-buffered stdout and `debug.log`.
 pub fn init_dual_logging(file_level: &str) {
-    let _ = init_logging(UiMode::Headless, file_level);
+    let _ = init_logging(UiMode::Headless, file_level, false);
 }
 
 /// Initialize logging for the unified binary.
@@ -85,12 +103,13 @@ pub fn init_dual_logging(file_level: &str) {
 /// Headless mode logs to line-buffered stdout and `debug.log`.
 /// TUI mode logs to the in-memory TUI buffer and `debug.log`.
 #[must_use]
-pub fn init_logging(ui_mode: UiMode, file_level: &str) -> Option<crate::tui::LogBuffer> {
+pub fn init_logging(
+    ui_mode: UiMode,
+    file_level: &str,
+    capture_headless_tui_buffer: bool,
+) -> Option<crate::tui::LogBuffer> {
     match ui_mode {
-        UiMode::Headless => {
-            init_headless_subscriber(file_level);
-            None
-        }
+        UiMode::Headless => init_headless_subscriber(file_level, capture_headless_tui_buffer),
         UiMode::Tui => Some(init_tui_subscriber(file_level)),
     }
 }

@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Websocket-attached TUI for headless mode** ([#67](https://github.com/mjc/nntp-proxy/pull/67))
+  - Added a headless dashboard publisher via `--tui-listen IP:PORT` and a read-only attached TUI client via `--tui-attach IP:PORT`.
+  - Attached dashboards reconnect automatically, keep the last good snapshot on disconnect, and show proxy CPU/memory alongside local TUI CPU/memory.
+  - Dashboard publish/attach mode is loopback-only and uses a redacted dashboard payload instead of exposing full backend configuration.
+
 - **RFC 8054 backend wire compression** ([#53](https://github.com/mjc/nntp-proxy/pull/53))
   - Added `COMPRESS DEFLATE` negotiation for proxy-to-backend links with configurable compression mode and level.
   - Backend responses can now be transparently compressed without changing client-side NNTP behavior.
@@ -46,6 +51,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Reworked cache response generation and ingestion to use borrowed bytes and typed cache parts, reducing copying on cache hits.
 
 ### Fixed
+
+- **Article retry fallback behavior** ([#67](https://github.com/mjc/nntp-proxy/pull/67))
+  - `ARTICLE`/`BODY` requests that are already known missing across eligible backends now return `430` instead of disconnecting the client.
+  - This also fixes the pipelined batch path so cached-missing article requests fail with protocol responses instead of dropping the session.
+
+- **Dashboard startup and connection handling** ([#67](https://github.com/mjc/nntp-proxy/pull/67))
+  - Dashboard listener bind failures now fail startup clearly instead of leaving the proxy running without the requested dashboard endpoint.
+  - Remote dashboard publishing and attach handling were hardened around shutdown, reconnects, and listener/test race conditions.
 
 - **Backend connection state and multiline response framing** ([#58](https://github.com/mjc/nntp-proxy/pull/58), [#59](https://github.com/mjc/nntp-proxy/pull/59))
   - Fixed pooled-connection read-ahead handling so bytes past `\r\n.\r\n` are preserved for the next response instead of desynchronizing reused backend connections.

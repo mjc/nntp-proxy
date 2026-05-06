@@ -42,7 +42,7 @@ impl Default for HistorySize {
 ///
 /// This is distinct from `metrics::BytesPerSecond` (u64) which is used for rate calculations.
 /// This type includes display formatting methods for the TUI.
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub struct Throughput(f64);
 
 impl Throughput {
@@ -111,7 +111,7 @@ impl From<f64> for Throughput {
 }
 
 /// Type-safe command rate in commands per second
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, serde::Serialize, serde::Deserialize)]
 pub struct CommandsPerSecond(f64);
 
 impl CommandsPerSecond {

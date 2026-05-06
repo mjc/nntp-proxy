@@ -30,7 +30,7 @@ mod user_stats;
 pub use backend_stats::BackendStats;
 pub use collector::MetricsCollector;
 pub use connection_stats::ConnectionStatsAggregator;
-pub use snapshot::MetricsSnapshot;
+pub use snapshot::{DiskCacheStats, MetricsSnapshot};
 pub use store::{BackendStore, MetricsStore, UserMetrics};
 pub use types::*;
 pub use user_stats::UserStats;
