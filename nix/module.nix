@@ -157,6 +157,17 @@ in {
       description = "Additional arguments appended to the `nntp-proxy` command line.";
     };
 
+    tuiListen = lib.mkOption {
+      type = with lib.types; nullOr str;
+      default = null;
+      example = "127.0.0.1:8120";
+      description = ''
+        Optional loopback `IP:PORT` for the headless dashboard websocket publisher.
+        When set, the service starts with `--tui-listen` so a separate terminal can
+        attach read-only via `nntp-proxy --ui tui --tui-attach ...`.
+      '';
+    };
+
     environment = lib.mkOption {
       type = with lib.types; attrsOf str;
       default = {};
@@ -219,6 +230,8 @@ in {
         Type = "simple";
         ExecStart = lib.escapeShellArgs (
           [(lib.getExe cfg.package) "--ui" "headless" "--config" (toString configPath)]
+          ++ lib.optional (cfg.tuiListen != null) "--tui-listen"
+          ++ lib.optional (cfg.tuiListen != null) cfg.tuiListen
           ++ cfg.extraArgs
         );
         DynamicUser = true;

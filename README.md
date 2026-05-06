@@ -403,7 +403,8 @@ For NixOS, the flake exports `nixosModules.default`, which adds a
 `services.nntp-proxy` module. It can either use an existing `config.toml`, or
 render one from `services.nntp-proxy.settings`. A separate
 `services.nntp-proxy.credentialsFile` can provide secret backend/client
-passwords at runtime:
+passwords at runtime, and `services.nntp-proxy.tuiListen` can expose the
+loopback-only websocket dashboard for an attached TUI:
 
 ```nix
 {
@@ -419,6 +420,7 @@ passwords at runtime:
             enable = true;
             openFirewall = true;
             credentialsFile = "/var/lib/nntp-proxy/credentials.toml";
+            tuiListen = "127.0.0.1:8120";
             settings = {
               proxy.port = 8119;
               routing.mode = "hybrid";
@@ -439,6 +441,12 @@ passwords at runtime:
     };
   };
 }
+```
+
+Attach from another terminal with:
+
+```bash
+nntp-proxy --ui tui --tui-attach 127.0.0.1:8120
 ```
 
 Example credentials overlay:
