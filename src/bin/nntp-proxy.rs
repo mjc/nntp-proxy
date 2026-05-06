@@ -24,12 +24,14 @@ fn main() -> Result<()> {
     let args = Args::parse();
     args.common.validate_runtime_mode()?;
     let ui_mode = args.common.effective_ui_mode();
+    let capture_headless_tui_buffer =
+        ui_mode == UiMode::Headless && args.common.tui_listen.is_some();
 
     if ui_mode == UiMode::Tui
         && let Some(connect_addr) = args.common.tui_attach
     {
         let file_level = nntp_proxy::Config::default().proxy.log_file_level;
-        let _ = nntp_proxy::logging::init_logging(UiMode::Tui, &file_level);
+        let _ = nntp_proxy::logging::init_logging(UiMode::Tui, &file_level, false);
         let threads = args.common.threads;
         return RuntimeConfig::from_args(threads)
             .build_runtime()?
@@ -41,7 +43,11 @@ fn main() -> Result<()> {
     // Apply CLI argument overrides to config
     args.common.apply_overrides(&mut config);
 
-    let log_buffer = nntp_proxy::logging::init_logging(ui_mode, &config.proxy.log_file_level);
+    let log_buffer = nntp_proxy::logging::init_logging(
+        ui_mode,
+        &config.proxy.log_file_level,
+        capture_headless_tui_buffer,
+    );
 
     let threads = args.common.threads.or(Some(config.proxy.threads));
     RuntimeConfig::from_args(threads)

@@ -44,6 +44,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
+const LOCAL_TUI_LOG_LINE_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RemoteDashboardStatus {
@@ -216,7 +217,7 @@ where
     let mut update_interval = tokio::time::interval(Duration::from_millis(250));
 
     // Initial render
-    terminal.draw(|f| ui::render_ui(f, &app.snapshot_state(), None, None))?;
+    terminal.draw(|f| ui::render_ui(f, &renderable_dashboard_state(app), None, None))?;
 
     let mut should_quit = false;
 
@@ -238,12 +239,16 @@ where
                     break;
                 }
 
-                terminal.draw(|f| ui::render_ui(f, &app.snapshot_state(), None, None))?;
+                terminal.draw(|f| ui::render_ui(f, &renderable_dashboard_state(app), None, None))?;
             }
         }
     }
 
     Ok(())
+}
+
+fn renderable_dashboard_state(app: &TuiApp) -> DashboardState {
+    app.snapshot_state_with_log_limit(Some(LOCAL_TUI_LOG_LINE_LIMIT))
 }
 
 async fn run_attached_app<B: ratatui::backend::Backend>(
@@ -418,6 +423,11 @@ async fn apply_tui_input(allow_dashboard_actions: bool, app: Option<&mut TuiApp>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Server;
+    use crate::metrics::MetricsCollector;
+    use crate::router::BackendSelector;
+    use crate::types::Port;
+    use std::sync::Arc;
 
     #[test]
     fn key_event_action_quits_on_q_and_escape() {
@@ -505,5 +515,32 @@ mod tests {
             .expect_err("non-loopback attach should fail");
 
         assert!(format!("{err:#}").contains("must connect to a loopback address"));
+    }
+
+    #[test]
+    fn renderable_dashboard_state_limits_local_log_tail() {
+        let log_buffer = LogBuffer::new();
+        for i in 0..(LOCAL_TUI_LOG_LINE_LIMIT + 10) {
+            log_buffer.push(format!("line {i}"));
+        }
+
+        let app = TuiAppBuilder::new(
+            MetricsCollector::new(1),
+            Arc::new(BackendSelector::new()),
+            Arc::from(vec![
+                Server::builder("backend.example.com", Port::try_new(119).unwrap())
+                    .name("Backend")
+                    .build()
+                    .unwrap(),
+            ]),
+        )
+        .with_log_buffer(log_buffer)
+        .build();
+
+        let state = renderable_dashboard_state(&app);
+
+        assert_eq!(state.log_lines.len(), LOCAL_TUI_LOG_LINE_LIMIT);
+        assert_eq!(state.log_lines.first().map(String::as_str), Some("line 10"));
+        assert_eq!(state.log_lines.last().map(String::as_str), Some("line 265"));
     }
 }
