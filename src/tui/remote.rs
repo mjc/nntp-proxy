@@ -322,10 +322,10 @@ fn dashboard_target_from_ws_url(ws_url: &str) -> anyhow::Result<SocketAddr> {
 mod tests {
     use super::*;
     use crate::config::Server;
-    use crate::metrics::{MetricsCollector, MetricsSnapshot};
+    use crate::metrics::MetricsCollector;
     use crate::router::BackendSelector;
     use crate::tui::app::{ThroughputPoint, ViewMode};
-    use crate::tui::dashboard::BufferPoolStats;
+    use crate::tui::dashboard::{BufferPoolStats, DashboardMetrics};
     use crate::types::Port;
     use crate::types::tui::{Throughput, Timestamp};
     use std::sync::Arc;
@@ -354,17 +354,25 @@ mod tests {
         TuiApp::new(metrics, router, servers)
     }
 
-    #[test]
-    fn dashboard_state_from_message_parses_text_frames() {
-        let state = DashboardState {
-            snapshot: MetricsSnapshot::default(),
+    fn empty_dashboard_state() -> DashboardState {
+        DashboardState {
+            metrics: DashboardMetrics::default(),
             backend_views: Vec::new(),
+            top_users: Vec::new(),
             client_history: Vec::new(),
             system_stats: crate::tui::SystemStats::default(),
             view_mode: ViewMode::Normal,
             show_details: false,
-            log_lines: vec!["hello".to_string()],
+            log_lines: Vec::new(),
             buffer_pool: None,
+        }
+    }
+
+    #[test]
+    fn dashboard_state_from_message_parses_text_frames() {
+        let state = DashboardState {
+            log_lines: vec!["hello".to_string()],
+            ..empty_dashboard_state()
         };
         let message = Message::Text(serde_json::to_string(&state).unwrap().into());
 
@@ -572,13 +580,14 @@ mod tests {
         let (state_tx, mut state_rx) = watch::channel(AttachedDashboard::connecting(connect_addr));
 
         let first = DashboardState {
-            snapshot: MetricsSnapshot::default(),
             backend_views: Vec::new(),
+            top_users: Vec::new(),
             client_history: vec![ThroughputPoint::new_client(
                 Timestamp::now(),
                 Throughput::new(1.0),
                 Throughput::new(2.0),
             )],
+            metrics: DashboardMetrics::default(),
             system_stats: crate::tui::SystemStats::default(),
             view_mode: ViewMode::Normal,
             show_details: false,
@@ -640,14 +649,8 @@ mod tests {
         let mut ws = accept_async(stream).await.expect("accept websocket");
 
         let good = DashboardState {
-            snapshot: MetricsSnapshot::default(),
-            backend_views: Vec::new(),
-            client_history: Vec::new(),
-            system_stats: crate::tui::SystemStats::default(),
-            view_mode: ViewMode::Normal,
-            show_details: false,
             log_lines: vec!["good".to_string()],
-            buffer_pool: None,
+            ..empty_dashboard_state()
         };
 
         ws.send(Message::Text(
@@ -699,14 +702,8 @@ mod tests {
             .expect("accept initial websocket");
 
         let first = DashboardState {
-            snapshot: MetricsSnapshot::default(),
-            backend_views: Vec::new(),
-            client_history: Vec::new(),
-            system_stats: crate::tui::SystemStats::default(),
-            view_mode: ViewMode::Normal,
-            show_details: false,
             log_lines: vec!["first".to_string()],
-            buffer_pool: None,
+            ..empty_dashboard_state()
         };
         first_ws
             .send(Message::Text(
@@ -750,10 +747,6 @@ mod tests {
             .expect("accept reconnect websocket");
 
         let second = DashboardState {
-            snapshot: MetricsSnapshot::default(),
-            backend_views: Vec::new(),
-            client_history: Vec::new(),
-            system_stats: crate::tui::SystemStats::default(),
             view_mode: ViewMode::LogFullscreen,
             show_details: true,
             log_lines: vec!["second".to_string()],
@@ -762,6 +755,7 @@ mod tests {
                 in_use: 1,
                 total: 3,
             }),
+            ..empty_dashboard_state()
         };
         second_ws
             .send(Message::Text(

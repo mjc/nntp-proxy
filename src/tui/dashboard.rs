@@ -1,9 +1,16 @@
 //! Serializable dashboard state shared between local and attached TUI modes.
 
-use crate::metrics::{BackendHealthStatus, BackendStats, MetricsSnapshot};
+use crate::metrics::{
+    BackendHealthStatus, BackendStats, CommandCount, DiskCacheStats, ErrorCount, MetricsSnapshot,
+    UserStats,
+};
 use crate::tui::app::{ThroughputPoint, ViewMode};
 use crate::tui::system_stats::SystemStats;
-use crate::types::{HostName, MaxConnections, Port, ServerName};
+use crate::types::{
+    BackendToClientBytes, BytesPerSecondRate, BytesReceived, BytesSent, ClientToBackendBytes,
+    HostName, MaxConnections, Port, ServerName, TotalConnections,
+};
+use std::time::Duration;
 
 /// Snapshot of the I/O buffer pool used by the summary panel.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
@@ -43,11 +50,112 @@ impl BackendView {
     }
 }
 
+/// Serialized user stats used by the dashboard payload.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DashboardUserStats {
+    pub username: String,
+    pub active_connections: usize,
+    pub total_connections: TotalConnections,
+    pub bytes_sent: BytesSent,
+    pub bytes_received: BytesReceived,
+    pub bytes_sent_per_sec: BytesPerSecondRate,
+    pub bytes_received_per_sec: BytesPerSecondRate,
+    pub total_commands: CommandCount,
+    pub errors: ErrorCount,
+}
+
+impl DashboardUserStats {
+    #[must_use]
+    pub fn from_user_stats(user: &UserStats) -> Self {
+        Self {
+            username: user.username.clone(),
+            active_connections: user.active_connections,
+            total_connections: user.total_connections,
+            bytes_sent: user.bytes_sent,
+            bytes_received: user.bytes_received,
+            bytes_sent_per_sec: user.bytes_sent_per_sec,
+            bytes_received_per_sec: user.bytes_received_per_sec,
+            total_commands: user.total_commands,
+            errors: user.errors,
+        }
+    }
+
+    #[must_use]
+    pub const fn total_bytes(&self) -> u64 {
+        self.bytes_sent
+            .as_u64()
+            .saturating_add(self.bytes_received.as_u64())
+    }
+}
+
+/// Serialized metrics used by the dashboard payload.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct DashboardMetrics {
+    pub total_connections: u64,
+    pub active_connections: usize,
+    pub stateful_sessions: usize,
+    pub client_to_backend_bytes: ClientToBackendBytes,
+    pub backend_to_client_bytes: BackendToClientBytes,
+    pub uptime: Duration,
+    pub cache_entries: u64,
+    pub cache_size_bytes: u64,
+    pub cache_hit_rate: f64,
+    pub disk_cache: Option<DiskCacheStats>,
+    pub pipeline_batches: u64,
+    pub pipeline_commands: u64,
+    pub pipeline_requests_queued: u64,
+    pub pipeline_requests_completed: u64,
+}
+
+impl DashboardMetrics {
+    #[must_use]
+    pub fn from_snapshot(snapshot: &MetricsSnapshot) -> Self {
+        Self {
+            total_connections: snapshot.total_connections,
+            active_connections: snapshot.active_connections,
+            stateful_sessions: snapshot.stateful_sessions,
+            client_to_backend_bytes: snapshot.client_to_backend_bytes,
+            backend_to_client_bytes: snapshot.backend_to_client_bytes,
+            uptime: snapshot.uptime,
+            cache_entries: snapshot.cache_entries,
+            cache_size_bytes: snapshot.cache_size_bytes,
+            cache_hit_rate: snapshot.cache_hit_rate,
+            disk_cache: snapshot.disk_cache,
+            pipeline_batches: snapshot.pipeline_batches,
+            pipeline_commands: snapshot.pipeline_commands,
+            pipeline_requests_queued: snapshot.pipeline_requests_queued,
+            pipeline_requests_completed: snapshot.pipeline_requests_completed,
+        }
+    }
+
+    #[must_use]
+    pub fn format_uptime(&self) -> String {
+        let secs = self.uptime.as_secs();
+        let hours = secs / 3600;
+        let minutes = (secs % 3600) / 60;
+        let seconds = secs % 60;
+
+        if hours > 0 {
+            format!("{hours}h {minutes}m {seconds}s")
+        } else if minutes > 0 {
+            format!("{minutes}m {seconds}s")
+        } else {
+            format!("{seconds}s")
+        }
+    }
+
+    #[must_use]
+    pub const fn total_bytes(&self) -> u64 {
+        self.client_to_backend_bytes.as_u64() + self.backend_to_client_bytes.as_u64()
+    }
+}
+
 /// Full dashboard state, suitable for rendering locally or over websocket.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DashboardState {
-    pub snapshot: MetricsSnapshot,
+    pub metrics: DashboardMetrics,
     pub backend_views: Vec<BackendView>,
+    pub top_users: Vec<DashboardUserStats>,
     pub client_history: Vec<ThroughputPoint>,
     pub system_stats: SystemStats,
     pub view_mode: ViewMode,
@@ -112,7 +220,7 @@ impl DashboardState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::{BackendHealthStatus, BackendStats, MetricsSnapshot};
+    use crate::metrics::{BackendHealthStatus, BackendStats};
     use crate::tui::app::{ThroughputPoint, ViewMode};
     use crate::types::Port;
     use crate::types::tui::{Throughput, Timestamp};
@@ -144,8 +252,9 @@ mod tests {
     #[test]
     fn backend_accessors_handle_out_of_range_indices() {
         let state = DashboardState {
-            snapshot: MetricsSnapshot::default(),
+            metrics: DashboardMetrics::default(),
             backend_views: vec![sample_backend_view()],
+            top_users: Vec::new(),
             client_history: Vec::new(),
             system_stats: SystemStats::default(),
             view_mode: ViewMode::Normal,

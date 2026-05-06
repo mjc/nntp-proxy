@@ -3,7 +3,10 @@
 use crate::config::Server;
 use crate::metrics::{MetricsCollector, MetricsSnapshot};
 use crate::router::BackendSelector;
-use crate::tui::dashboard::{BackendDisplay, BackendView, BufferPoolStats, DashboardState};
+use crate::tui::dashboard::{
+    BackendDisplay, BackendView, BufferPoolStats, DashboardMetrics, DashboardState,
+    DashboardUserStats,
+};
 use crate::tui::log_capture::LogBuffer;
 use crate::types::tui::{CommandsPerSecond, HistorySize, Throughput, Timestamp};
 use std::collections::VecDeque;
@@ -589,8 +592,9 @@ impl TuiApp {
         let buffer_pool = self.buffer_pool.as_ref().map(Self::snapshot_buffer_pool);
 
         DashboardState {
-            snapshot: self.snapshot.as_ref().clone(),
+            metrics: DashboardMetrics::from_snapshot(self.snapshot.as_ref()),
             backend_views: self.snapshot_backend_views(),
+            top_users: self.snapshot_top_users(),
             client_history: self.client_history.points().iter().cloned().collect(),
             system_stats: self.system_stats.clone(),
             view_mode: self.view_mode,
@@ -654,6 +658,18 @@ impl TuiApp {
             in_use,
             total,
         }
+    }
+
+    fn snapshot_top_users(&self) -> Vec<DashboardUserStats> {
+        let mut top_users = self
+            .snapshot
+            .user_stats
+            .iter()
+            .map(DashboardUserStats::from_user_stats)
+            .collect::<Vec<_>>();
+        top_users.sort_by_key(|user| std::cmp::Reverse(user.total_bytes()));
+        top_users.truncate(10);
+        top_users
     }
 }
 
@@ -1113,6 +1129,7 @@ mod tests {
 
         let snapshot = app.snapshot_state();
         assert_eq!(snapshot.backend_views.len(), 1);
+        assert_eq!(snapshot.top_users.len(), 0);
         assert_eq!(snapshot.client_history.len(), 0);
         assert_eq!(snapshot.log_lines, vec!["Dashboard log line".to_string()]);
         assert_eq!(snapshot.view_mode, ViewMode::Normal);
@@ -1125,6 +1142,7 @@ mod tests {
             serde_json::from_str(&json).expect("snapshot should deserialize");
 
         assert_eq!(decoded.backend_views.len(), 1);
+        assert_eq!(decoded.top_users.len(), 0);
         assert_eq!(decoded.log_lines, vec!["Dashboard log line".to_string()]);
         assert_eq!(decoded.view_mode, ViewMode::Normal);
         assert!(!decoded.show_details);
@@ -1204,6 +1222,7 @@ mod tests {
         );
         assert_eq!(snapshot.backend_views.len(), 1);
         assert_eq!(snapshot.backend_views[0].history.len(), 1);
+        assert_eq!(snapshot.top_users.len(), 0);
         assert_f64_eq(
             snapshot.backend_views[0].history[0].sent_per_sec().get(),
             backend_point.sent_per_sec().get(),
@@ -1225,5 +1244,71 @@ mod tests {
             snapshot.buffer_pool.as_ref().map(|pool| pool.total),
             Some(4)
         );
+    }
+
+    #[test]
+    fn test_snapshot_state_serializes_dashboard_metrics_and_top_users() {
+        use crate::metrics::{CommandCount, DiskCacheStats, ErrorCount};
+
+        let metrics = MetricsCollector::new(1);
+        let router = Arc::new(BackendSelector::new());
+        let servers = create_test_servers(1);
+        let mut app = TuiAppBuilder::new(metrics, router, servers).build();
+
+        app.snapshot = Arc::new(MetricsSnapshot {
+            total_connections: 42,
+            active_connections: 3,
+            stateful_sessions: 2,
+            client_to_backend_bytes: crate::types::ClientToBackendBytes::new(100),
+            backend_to_client_bytes: crate::types::BackendToClientBytes::new(250),
+            uptime: Duration::from_secs(61),
+            user_stats: vec![crate::metrics::UserStats {
+                username: "alice".to_string(),
+                active_connections: 2,
+                total_connections: crate::types::TotalConnections::new(9),
+                bytes_sent: crate::types::BytesSent::new(500),
+                bytes_received: crate::types::BytesReceived::new(700),
+                bytes_sent_per_sec: crate::types::BytesPerSecondRate::new(11),
+                bytes_received_per_sec: crate::types::BytesPerSecondRate::new(13),
+                total_commands: CommandCount::new(17),
+                errors: ErrorCount::new(1),
+            }],
+            cache_entries: 7,
+            cache_size_bytes: 8192,
+            cache_hit_rate: 12.5,
+            disk_cache: Some(DiskCacheStats {
+                disk_hits: 3,
+                disk_hit_rate: 50.0,
+                disk_capacity: 1024,
+                bytes_written: 2048,
+                bytes_read: 1024,
+                write_ios: 4,
+                read_ios: 5,
+            }),
+            pipeline_batches: 6,
+            pipeline_commands: 12,
+            pipeline_requests_queued: 8,
+            pipeline_requests_completed: 7,
+            ..MetricsSnapshot::default()
+        });
+
+        let snapshot = app.snapshot_state();
+        let json = serde_json::to_string(&snapshot).expect("snapshot should serialize");
+        let decoded: DashboardState =
+            serde_json::from_str(&json).expect("snapshot should deserialize");
+
+        assert_eq!(decoded.metrics.total_connections, 42);
+        assert_eq!(decoded.metrics.active_connections, 3);
+        assert_eq!(decoded.metrics.stateful_sessions, 2);
+        assert_eq!(decoded.metrics.cache_entries, 7);
+        assert_eq!(decoded.metrics.cache_size_bytes, 8192);
+        assert_eq!(decoded.metrics.cache_hit_rate, 12.5);
+        assert_eq!(decoded.metrics.pipeline_batches, 6);
+        assert_eq!(decoded.metrics.pipeline_commands, 12);
+        assert_eq!(decoded.top_users.len(), 1);
+        assert_eq!(decoded.top_users[0].username, "alice");
+        assert_eq!(decoded.top_users[0].active_connections, 2);
+        assert_eq!(decoded.top_users[0].bytes_sent_per_sec.get(), 11);
+        assert_eq!(decoded.top_users[0].bytes_received_per_sec.get(), 13);
     }
 }

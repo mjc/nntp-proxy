@@ -840,7 +840,7 @@ impl ClientSession {
                 Ok(BackendAttemptResult::BackendUnavailable) => {}
                 Err(e @ SessionError::ClientDisconnect(_)) => {
                     debug!(
-                        "Client {} no eligible backends remain for {:?}",
+                        "Client {} disconnected during article retry for {:?}",
                         self.client_addr,
                         request.message_id_value()
                     );

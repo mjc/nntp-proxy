@@ -3,7 +3,9 @@
 use crate::formatting::format_bytes;
 use crate::tui::RemoteDashboardStatus;
 use crate::tui::constants::{chart, layout, styles, text};
-use crate::tui::dashboard::{BufferPoolStats, DashboardState};
+use crate::tui::dashboard::{
+    BufferPoolStats, DashboardMetrics, DashboardState, DashboardUserStats,
+};
 use crate::tui::helpers::{
     build_chart_data, calculate_chart_bounds, connection_failure_color, create_sparkline,
     error_count_color, error_rate_color, format_error_rate, format_summary_throughput,
@@ -55,7 +57,7 @@ pub(crate) fn render_ui(
     remote_status: Option<&RemoteDashboardStatus>,
 ) {
     if let Some(chunks) = dashboard_fullscreen_chunks(state.view_mode, f.area()) {
-        render_title(f, chunks[0], &state.snapshot, remote_status);
+        render_title(f, chunks[0], &state.metrics, remote_status);
         render_logs(f, chunks[1], state);
         render_footer(f, chunks[2]);
         return;
@@ -65,7 +67,7 @@ pub(crate) fn render_ui(
     let chunks = dashboard_main_chunks(f.area(), show_logs);
 
     // Render each section
-    render_title(f, chunks[0], &state.snapshot, remote_status);
+    render_title(f, chunks[0], &state.metrics, remote_status);
     render_summary(f, chunks[1], state, attached_ui_stats);
 
     // Backends area now contains 3 columns: backends, chart, and user stats
@@ -131,10 +133,10 @@ fn dashboard_main_chunks(area: Rect, show_logs: bool) -> Vec<Rect> {
 fn render_title(
     f: &mut Frame,
     area: Rect,
-    snapshot: &crate::metrics::MetricsSnapshot,
+    metrics: &DashboardMetrics,
     remote_status: Option<&RemoteDashboardStatus>,
 ) {
-    let title = Paragraph::new(build_title_lines(snapshot, remote_status))
+    let title = Paragraph::new(build_title_lines(metrics, remote_status))
         .block(bordered_block("", styles::BORDER_ACTIVE))
         .alignment(Alignment::Center);
 
@@ -142,7 +144,7 @@ fn render_title(
 }
 
 fn build_title_lines(
-    snapshot: &crate::metrics::MetricsSnapshot,
+    metrics: &DashboardMetrics,
     remote_status: Option<&RemoteDashboardStatus>,
 ) -> Vec<Line<'static>> {
     let title_suffix = remote_status.map_or_else(
@@ -164,11 +166,11 @@ fn build_title_lines(
         || {
             Line::from(vec![
                 "Uptime: ".fg(styles::LABEL),
-                snapshot.format_uptime().fg(styles::VALUE_PRIMARY).bold(),
+                metrics.format_uptime().fg(styles::VALUE_PRIMARY).bold(),
                 "  |  Active: ".fg(styles::LABEL),
-                format!("{} connections", snapshot.active_connections).fg(styles::VALUE_SECONDARY),
+                format!("{} connections", metrics.active_connections).fg(styles::VALUE_SECONDARY),
                 "  |  Total: ".fg(styles::LABEL),
-                format!("{} connections", snapshot.total_connections).fg(styles::VALUE_NEUTRAL),
+                format!("{} connections", metrics.total_connections).fg(styles::VALUE_NEUTRAL),
             ])
         },
         build_remote_title_status_line,
@@ -220,7 +222,7 @@ fn render_summary(
     state: &DashboardState,
     attached_ui_stats: Option<&crate::tui::SystemStats>,
 ) {
-    let snapshot = &state.snapshot;
+    let metrics = &state.metrics;
     let system_stats = &state.system_stats;
 
     // Get latest throughput from history (extracted for testing)
@@ -239,7 +241,7 @@ fn render_summary(
 
     // Left: App summary (uptime, sessions, buffer stats in details mode)
     let left_summary = create_app_summary(
-        snapshot,
+        metrics,
         system_stats,
         state.buffer_pool(),
         state.show_details,
@@ -247,11 +249,11 @@ fn render_summary(
     );
 
     // Middle: Cache summary
-    let middle_summary = create_cache_summary(snapshot);
+    let middle_summary = create_cache_summary(metrics);
 
     // Right: Data transfer summary
     let right_summary =
-        create_transfer_summary(snapshot, &client_to_backend_str, &backend_to_client_str);
+        create_transfer_summary(metrics, &client_to_backend_str, &backend_to_client_str);
 
     f.render_widget(left_summary, summary_chunks[0]);
     f.render_widget(middle_summary, summary_chunks[1]);
@@ -268,7 +270,7 @@ fn render_backends(f: &mut Frame, area: Rect, state: &DashboardState) {
 
     render_backend_list(f, chunks[0], state);
     render_data_flow(f, chunks[1], state);
-    render_user_stats(f, chunks[2], &state.snapshot);
+    render_user_stats(f, chunks[2], &state.top_users);
 }
 
 // ============================================================================
@@ -277,14 +279,14 @@ fn render_backends(f: &mut Frame, area: Rect, state: &DashboardState) {
 
 /// Create app summary panel (uptime, CPU, memory, buffer stats in details mode)
 fn create_app_summary(
-    snapshot: &crate::metrics::MetricsSnapshot,
+    metrics: &DashboardMetrics,
     system_stats: &crate::tui::SystemStats,
     buffer_pool: Option<&BufferPoolStats>,
     show_details: bool,
     attached_ui_stats: Option<&crate::tui::SystemStats>,
 ) -> Paragraph<'static> {
     let lines = build_app_summary_lines(
-        snapshot,
+        metrics,
         system_stats,
         buffer_pool,
         show_details,
@@ -296,7 +298,7 @@ fn create_app_summary(
 }
 
 fn build_app_summary_lines(
-    snapshot: &crate::metrics::MetricsSnapshot,
+    metrics: &DashboardMetrics,
     system_stats: &crate::tui::SystemStats,
     buffer_pool: Option<&BufferPoolStats>,
     show_details: bool,
@@ -334,11 +336,11 @@ fn build_app_summary_lines(
     let mut lines = vec![
         Line::from(vec![
             "Uptime: ".fg(styles::LABEL),
-            snapshot.format_uptime().fg(styles::VALUE_PRIMARY),
+            metrics.format_uptime().fg(styles::VALUE_PRIMARY),
         ]),
         Line::from(vec![
             "Stateful Sessions: ".fg(styles::LABEL),
-            format!("{}", snapshot.stateful_sessions).fg(session_color(snapshot.stateful_sessions)),
+            format!("{}", metrics.stateful_sessions).fg(session_color(metrics.stateful_sessions)),
         ]),
     ];
 
@@ -370,25 +372,25 @@ fn build_app_summary_lines(
         ]);
     }
 
-    if snapshot.pipeline_batches > 0 {
+    if metrics.pipeline_batches > 0 {
         let avg_batch =
-            counter_as_f64(snapshot.pipeline_commands) / counter_as_f64(snapshot.pipeline_batches);
+            counter_as_f64(metrics.pipeline_commands) / counter_as_f64(metrics.pipeline_batches);
         lines.push(Line::from(vec![
             "Pipeline: ".fg(styles::LABEL),
             format!(
                 "{} batches (avg {:.1} cmds)",
-                snapshot.pipeline_batches, avg_batch
+                metrics.pipeline_batches, avg_batch
             )
             .fg(styles::VALUE_INFO),
         ]));
     }
 
-    if snapshot.pipeline_requests_queued > 0 {
+    if metrics.pipeline_requests_queued > 0 {
         lines.push(Line::from(vec![
             "Mux Queue: ".fg(styles::LABEL),
             format!(
                 "{} queued, {} completed",
-                snapshot.pipeline_requests_queued, snapshot.pipeline_requests_completed
+                metrics.pipeline_requests_queued, metrics.pipeline_requests_completed
             )
             .fg(styles::VALUE_INFO),
         ]));
@@ -411,7 +413,7 @@ fn build_app_summary_lines(
 }
 
 /// Create cache summary panel
-fn create_cache_summary(snapshot: &crate::metrics::MetricsSnapshot) -> Paragraph<'static> {
+fn create_cache_summary(metrics: &DashboardMetrics) -> Paragraph<'static> {
     /// Color for cache entries (highlight if non-empty)
     const fn entries_color(count: u64) -> Color {
         if count > 0 {
@@ -441,17 +443,17 @@ fn create_cache_summary(snapshot: &crate::metrics::MetricsSnapshot) -> Paragraph
     }
 
     // Check if this is hybrid cache mode
-    let is_hybrid = snapshot.disk_cache.is_some();
+    let is_hybrid = metrics.disk_cache.is_some();
 
     // Build lines based on cache type
     let lines = if is_hybrid {
         // Hybrid cache: show disk-relevant stats
-        let disk = snapshot.disk_cache.as_ref().unwrap();
+        let disk = metrics.disk_cache.as_ref().unwrap();
         vec![
             Line::from(vec![
                 "Hit Rate: ".fg(styles::LABEL),
-                format!("{:.1}%", snapshot.cache_hit_rate)
-                    .fg(hit_rate_color(snapshot.cache_hit_rate)),
+                format!("{:.1}%", metrics.cache_hit_rate)
+                    .fg(hit_rate_color(metrics.cache_hit_rate)),
             ]),
             Line::from(vec![
                 "Disk Written: ".fg(styles::LABEL),
@@ -476,16 +478,16 @@ fn create_cache_summary(snapshot: &crate::metrics::MetricsSnapshot) -> Paragraph
         vec![
             Line::from(vec![
                 "Entries: ".fg(styles::LABEL),
-                format!("{}", snapshot.cache_entries).fg(entries_color(snapshot.cache_entries)),
+                format!("{}", metrics.cache_entries).fg(entries_color(metrics.cache_entries)),
             ]),
             Line::from(vec![
                 "Size: ".fg(styles::LABEL),
-                format_bytes(snapshot.cache_size_bytes).fg(styles::VALUE_NEUTRAL),
+                format_bytes(metrics.cache_size_bytes).fg(styles::VALUE_NEUTRAL),
             ]),
             Line::from(vec![
                 "Hit Rate: ".fg(styles::LABEL),
-                format!("{:.1}%", snapshot.cache_hit_rate)
-                    .fg(hit_rate_color(snapshot.cache_hit_rate)),
+                format!("{:.1}%", metrics.cache_hit_rate)
+                    .fg(hit_rate_color(metrics.cache_hit_rate)),
             ]),
         ]
     };
@@ -499,7 +501,7 @@ fn create_cache_summary(snapshot: &crate::metrics::MetricsSnapshot) -> Paragraph
 
 /// Create data transfer summary panel
 fn create_transfer_summary<'a>(
-    snapshot: &crate::metrics::MetricsSnapshot,
+    metrics: &DashboardMetrics,
     client_to_backend: &'a str,
     backend_to_client: &'a str,
 ) -> Paragraph<'a> {
@@ -514,7 +516,7 @@ fn create_transfer_summary<'a>(
         ]),
         Line::from(vec![
             "Total: ".fg(styles::LABEL),
-            format_bytes(snapshot.total_bytes()).fg(styles::VALUE_PRIMARY),
+            format_bytes(metrics.total_bytes()).fg(styles::VALUE_PRIMARY),
         ]),
     ])
     .block(bordered_block("Data Transfer", styles::BORDER_NORMAL))
@@ -826,7 +828,7 @@ fn recent_log_lines(lines: &[String], count: usize) -> &[String] {
 }
 
 /// Render per-user statistics panel
-fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::MetricsSnapshot) {
+fn render_user_stats(f: &mut Frame, area: Rect, top_users: &[DashboardUserStats]) {
     /// Truncate username to fit display width
     fn format_username(username: &str) -> String {
         const MAX_LEN: usize = 12;
@@ -840,7 +842,7 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
     }
 
     /// Create user stat lines
-    fn user_stat_lines(user: &crate::metrics::UserStats, sparkline: String) -> Vec<Line<'static>> {
+    fn user_stat_lines(user: &DashboardUserStats, sparkline: String) -> Vec<Line<'static>> {
         vec![
             Line::from(vec![
                 format_username(&user.username).fg(Color::Cyan),
@@ -864,7 +866,6 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
         ]
     }
 
-    let top_users = top_users_by_bytes(&snapshot.user_stats);
     let max_total = top_users.iter().map(|u| u.total_bytes()).max().unwrap_or(1);
 
     // Header row
@@ -878,7 +879,7 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
 
     // User rows - functional map
     let user_items: Vec<ListItem> = top_users
-        .into_iter()
+        .iter()
         .map(|user| {
             let sparkline = create_sparkline(user.total_bytes(), max_total);
             ListItem::new(user_stat_lines(user, sparkline))
@@ -895,26 +896,25 @@ fn render_user_stats(f: &mut Frame, area: Rect, snapshot: &crate::metrics::Metri
     f.render_widget(list, area);
 }
 
-fn top_users_by_bytes(users: &[crate::metrics::UserStats]) -> Vec<&crate::metrics::UserStats> {
-    let mut sorted_users = users.iter().collect::<Vec<_>>();
-    sorted_users.sort_by_key(|user| std::cmp::Reverse(user.total_bytes()));
-    sorted_users.into_iter().take(10).collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::MetricsSnapshot;
-    use crate::metrics::UserStats;
+    use crate::metrics::{CommandCount, ErrorCount};
     use crate::tui::app::ViewMode;
-    use crate::tui::dashboard::BufferPoolStats;
+    use crate::tui::dashboard::{BufferPoolStats, DashboardMetrics};
     use ratatui::layout::Rect;
 
-    fn user_stats(name: &str, total_bytes: u64) -> UserStats {
-        UserStats {
+    fn user_stats(name: &str, total_bytes: u64) -> DashboardUserStats {
+        DashboardUserStats {
             username: name.to_string(),
+            active_connections: 0,
+            total_connections: crate::types::TotalConnections::new(0),
             bytes_sent: crate::types::BytesSent::new(total_bytes),
-            ..Default::default()
+            bytes_received: crate::types::BytesReceived::ZERO,
+            bytes_sent_per_sec: crate::types::BytesPerSecondRate::new(0),
+            bytes_received_per_sec: crate::types::BytesPerSecondRate::new(0),
+            total_commands: CommandCount::new(0),
+            errors: ErrorCount::new(0),
         }
     }
 
@@ -951,38 +951,31 @@ mod tests {
     }
 
     #[test]
-    fn top_users_by_bytes_sorts_descending() {
-        let users = vec![
-            user_stats("alice", 10),
+    fn render_user_stats_uses_pre_sorted_users() {
+        let users = [
             user_stats("bob", 30),
             user_stats("carol", 20),
+            user_stats("alice", 10),
         ];
-
-        let top_users = top_users_by_bytes(&users);
-
-        let usernames = top_users
+        let rendered = users
             .iter()
-            .map(|user| user.username.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(usernames, vec!["bob", "carol", "alice"]);
-    }
-
-    #[test]
-    fn top_users_by_bytes_caps_results_at_ten() {
-        let users = (0..12)
-            .map(|i| user_stats(&format!("user{i}"), i))
+            .map(|user| {
+                user_stat_lines_for_test(user)
+                    .into_iter()
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
             .collect::<Vec<_>>();
 
-        let top_users = top_users_by_bytes(&users);
-
-        assert_eq!(top_users.len(), 10);
-        assert_eq!(top_users[0].username, "user11");
-        assert_eq!(top_users[9].username, "user2");
+        assert!(rendered[0].contains("bob"));
+        assert!(rendered[1].contains("carol"));
+        assert!(rendered[2].contains("alice"));
     }
 
     #[test]
     fn app_summary_lines_switch_between_local_and_remote_stats() {
-        let snapshot = MetricsSnapshot::default();
+        let metrics = DashboardMetrics::default();
         let system_stats = crate::tui::SystemStats::default();
         let buffer_pool = BufferPoolStats {
             available: 3,
@@ -991,12 +984,12 @@ mod tests {
         };
 
         let local_lines =
-            build_app_summary_lines(&snapshot, &system_stats, Some(&buffer_pool), true, None)
+            build_app_summary_lines(&metrics, &system_stats, Some(&buffer_pool), true, None)
                 .into_iter()
                 .map(|line| line.to_string())
                 .collect::<Vec<_>>();
         let remote_lines = build_app_summary_lines(
-            &snapshot,
+            &metrics,
             &system_stats,
             Some(&buffer_pool),
             true,
@@ -1051,13 +1044,13 @@ mod tests {
 
     #[test]
     fn title_lines_switch_between_local_and_remote_status() {
-        let snapshot = MetricsSnapshot::default();
-        let local_lines = build_title_lines(&snapshot, None)
+        let metrics = DashboardMetrics::default();
+        let local_lines = build_title_lines(&metrics, None)
             .into_iter()
             .map(|line| line.to_string())
             .collect::<Vec<_>>();
         let remote_lines = build_title_lines(
-            &snapshot,
+            &metrics,
             Some(&RemoteDashboardStatus::Reconnecting {
                 target: "127.0.0.1:8120".parse().unwrap(),
                 retry_delay: std::time::Duration::from_secs(1),
@@ -1089,5 +1082,40 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Snapshot: last known"))
         );
+    }
+
+    fn user_stat_lines_for_test(user: &DashboardUserStats) -> Vec<Line<'static>> {
+        fn format_username(username: &str) -> String {
+            const MAX_LEN: usize = 12;
+            const TRUNCATE_AT: usize = 9;
+            if username.len() > MAX_LEN {
+                let truncated: String = username.chars().take(TRUNCATE_AT).collect();
+                format!("{truncated}...")
+            } else {
+                format!("{username:<MAX_LEN$}")
+            }
+        }
+
+        vec![
+            Line::from(vec![
+                format_username(&user.username).fg(Color::Cyan),
+                " ".into(),
+                create_sparkline(user.total_bytes(), user.total_bytes()).fg(Color::Blue),
+                " ".into(),
+                format!("{:>5}", user.active_connections).fg(Color::Green),
+            ]),
+            Line::from(vec![
+                "  ↑".into(),
+                format!("{:>8}", format_bytes(user.bytes_sent.as_u64())).fg(Color::Blue),
+                "  ↓".into(),
+                format!("{:>8}", format_bytes(user.bytes_received.as_u64())).fg(Color::Magenta),
+            ]),
+            Line::from(vec![
+                "  Rate: ".into(),
+                format!("↑{}/s", format_bytes(user.bytes_sent_per_sec.get())).fg(Color::Cyan),
+                " ".into(),
+                format!("↓{}/s", format_bytes(user.bytes_received_per_sec.get())).fg(Color::Yellow),
+            ]),
+        ]
     }
 }

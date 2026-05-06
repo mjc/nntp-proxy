@@ -223,6 +223,10 @@ impl CommonArgs {
             bail!("--tui-attach requires --ui tui");
         }
 
+        if self.tui_listen.is_some() && ui_mode != UiMode::Headless {
+            bail!("--tui-listen requires headless mode; use --ui headless");
+        }
+
         if self.tui_attach.is_some() && self.tui_listen.is_some() {
             bail!("--tui-attach cannot be combined with --tui-listen");
         }
@@ -608,6 +612,17 @@ mod tests {
         let args = CommonArgs {
             ui: UiMode::Tui,
             tui_attach: Some("10.0.0.5:8119".parse().unwrap()),
+            ..default_args()
+        };
+
+        assert!(args.validate_runtime_mode().is_err());
+    }
+
+    #[test]
+    fn test_validate_runtime_mode_rejects_tui_listen_with_local_tui() {
+        let args = CommonArgs {
+            ui: UiMode::Tui,
+            tui_listen: Some("127.0.0.1:8119".parse().unwrap()),
             ..default_args()
         };
 
