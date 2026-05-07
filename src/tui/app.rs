@@ -1311,4 +1311,87 @@ mod tests {
         assert_eq!(decoded.top_users[0].bytes_sent_per_sec.get(), 11);
         assert_eq!(decoded.top_users[0].bytes_received_per_sec.get(), 13);
     }
+
+    #[test]
+    fn test_throughput_point_preserves_raw_and_smoothed_rates_for_dashboard_serde() {
+        let point = ThroughputPoint::new_backend_estimate(
+            Timestamp::now(),
+            Throughput::new(10_000.0),
+            Throughput::new(2_500.0),
+            Throughput::new(20_000.0),
+            Throughput::new(5_000.0),
+            CommandsPerSecond::new(100.0),
+            CommandsPerSecond::new(25.0),
+        );
+
+        assert_f64_eq(point.raw_sent_per_sec().get(), 10_000.0);
+        assert_f64_eq(point.sent_per_sec().get(), 2_500.0);
+        assert_f64_eq(point.raw_received_per_sec().get(), 20_000.0);
+        assert_f64_eq(point.received_per_sec().get(), 5_000.0);
+        assert_f64_eq(point.raw_commands_per_sec().unwrap().get(), 100.0);
+        assert_f64_eq(point.commands_per_sec().unwrap().get(), 25.0);
+
+        let json = serde_json::to_string(&point).expect("point should serialize");
+        let decoded: ThroughputPoint =
+            serde_json::from_str(&json).expect("point should deserialize");
+        assert_f64_eq(decoded.raw_sent_per_sec().get(), 10_000.0);
+        assert_f64_eq(decoded.sent_per_sec().get(), 2_500.0);
+    }
+
+    #[test]
+    fn test_throughput_point_deserializes_legacy_dashboard_payload() {
+        let json = r#"{
+            "sent_per_sec": 1234.0,
+            "received_per_sec": 5678.0,
+            "commands_per_sec": 9.0
+        }"#;
+
+        let decoded: ThroughputPoint =
+            serde_json::from_str(json).expect("legacy point should deserialize");
+
+        assert_f64_eq(decoded.raw_sent_per_sec().get(), 1234.0);
+        assert_f64_eq(decoded.sent_per_sec().get(), 1234.0);
+        assert_f64_eq(decoded.raw_received_per_sec().get(), 5678.0);
+        assert_f64_eq(decoded.received_per_sec().get(), 5678.0);
+        assert_f64_eq(decoded.raw_commands_per_sec().unwrap().get(), 9.0);
+        assert_f64_eq(decoded.commands_per_sec().unwrap().get(), 9.0);
+    }
+
+    #[test]
+    fn test_tui_update_uses_smoothed_backend_and_user_rates() {
+        let metrics = MetricsCollector::new(1);
+        let router = Arc::new(BackendSelector::new());
+        let servers = create_test_servers(1);
+        let mut app = TuiApp::new(metrics.clone(), router, servers);
+
+        app.update();
+
+        std::thread::sleep(Duration::from_millis(20));
+        metrics.record_backend_to_client_bytes_for(crate::types::BackendId::from_index(0), 1_000);
+        metrics.user_bytes_received(Some("alice"), 1_000);
+        app.update();
+
+        std::thread::sleep(Duration::from_millis(20));
+        metrics.record_backend_to_client_bytes_for(crate::types::BackendId::from_index(0), 100_000);
+        metrics.user_bytes_received(Some("alice"), 100_000);
+        app.update();
+
+        let backend = app.latest_backend_throughput(0).unwrap();
+        assert!(
+            backend.received_per_sec().get() < backend.raw_received_per_sec().get(),
+            "backend display rate should use smoothed value"
+        );
+
+        let user = app
+            .snapshot()
+            .user_stats
+            .iter()
+            .find(|user| user.username == "alice")
+            .expect("alice stats should exist");
+        let raw_received = backend.raw_received_per_sec().get() as u64;
+        assert!(
+            user.bytes_received_per_sec.get() < raw_received,
+            "user display rate should use smoothed value"
+        );
+    }
 }

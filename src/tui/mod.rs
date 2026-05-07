@@ -7,6 +7,7 @@ mod constants;
 mod dashboard;
 mod helpers;
 pub mod log_capture;
+mod rate_estimator;
 mod remote;
 mod system_stats;
 mod types;
