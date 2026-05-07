@@ -379,14 +379,6 @@ pub struct TuiApp {
 }
 
 impl TuiApp {
-    #[cfg(test)]
-    #[allow(clippy::cast_precision_loss)] // TUI rates are derived display values, not exact persisted counters.
-    const fn counter_as_f64(value: u64) -> f64 {
-        // TUI throughput and rate calculations are display-only aggregates.
-        // The exact counters remain stored as integers in the metrics snapshot.
-        value as f64
-    }
-
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // TUI smoothed rates are non-negative display values.
     const fn rate_as_u64(rate: RatePerSecond) -> u64 {
         rate.get() as u64
@@ -403,28 +395,6 @@ impl TuiApp {
         servers: Arc<[Server]>,
     ) -> Self {
         TuiAppBuilder::new(metrics, router, servers).build()
-    }
-
-    /// Calculate byte transfer rate from byte delta and time delta
-    #[cfg(test)]
-    #[inline]
-    fn calculate_rate(byte_delta: u64, time_delta_secs: f64) -> Throughput {
-        if time_delta_secs > 0.0 {
-            Throughput::new(Self::counter_as_f64(byte_delta) / time_delta_secs)
-        } else {
-            Throughput::zero()
-        }
-    }
-
-    /// Calculate command rate from command delta and time delta
-    #[cfg(test)]
-    #[inline]
-    fn calculate_command_rate(cmd_delta: u64, time_delta_secs: f64) -> CommandsPerSecond {
-        if time_delta_secs > 0.0 {
-            CommandsPerSecond::new(Self::counter_as_f64(cmd_delta) / time_delta_secs)
-        } else {
-            CommandsPerSecond::zero()
-        }
     }
 
     fn estimate_or_decay(
@@ -481,30 +451,6 @@ impl TuiApp {
             received,
             raw_commands,
             commands,
-        )
-    }
-
-    #[must_use]
-    #[cfg(test)]
-    fn build_backend_throughput_point(
-        now: Timestamp,
-        time_delta: f64,
-        new_stats: &crate::metrics::BackendStats,
-        prev_stats: &crate::metrics::BackendStats,
-    ) -> ThroughputPoint {
-        let sent_delta = new_stats.bytes_sent.saturating_sub(prev_stats.bytes_sent);
-        let recv_delta = new_stats
-            .bytes_received
-            .saturating_sub(prev_stats.bytes_received);
-        let cmd_delta = new_stats
-            .total_commands
-            .saturating_sub(prev_stats.total_commands);
-
-        ThroughputPoint::new_backend(
-            now,
-            Self::calculate_rate(sent_delta.into(), time_delta),
-            Self::calculate_rate(recv_delta.into(), time_delta),
-            Self::calculate_command_rate(cmd_delta.get(), time_delta),
         )
     }
 
@@ -1133,62 +1079,6 @@ mod tests {
 
         assert!(t0 < t1, "Backend 0 should have less than backend 1");
         assert!(t1 < t2, "Backend 1 should have less than backend 2");
-    }
-
-    #[test]
-    fn test_calculate_rate() {
-        // Zero time should give zero rate
-        let rate = TuiApp::calculate_rate(1000, 0.0);
-        assert_f64_eq(rate.get(), 0.0);
-
-        // 1000 bytes in 1 second = 1000 B/s
-        let rate = TuiApp::calculate_rate(1000, 1.0);
-        assert_f64_eq(rate.get(), 1000.0);
-
-        // 1000 bytes in 0.5 seconds = 2000 B/s
-        let rate = TuiApp::calculate_rate(1000, 0.5);
-        assert_f64_eq(rate.get(), 2000.0);
-    }
-
-    #[test]
-    fn test_calculate_command_rate() {
-        // Zero time should give zero rate
-        let rate = TuiApp::calculate_command_rate(100, 0.0);
-        assert_f64_eq(rate.get(), 0.0);
-
-        // 100 commands in 1 second = 100 cmd/s
-        let rate = TuiApp::calculate_command_rate(100, 1.0);
-        assert_f64_eq(rate.get(), 100.0);
-
-        // 50 commands in 0.5 seconds = 100 cmd/s
-        let rate = TuiApp::calculate_command_rate(50, 0.5);
-        assert_f64_eq(rate.get(), 100.0);
-    }
-
-    #[test]
-    fn test_build_backend_throughput_point() {
-        use crate::metrics::{BackendStats, CommandCount};
-        use crate::types::{BytesReceived, BytesSent};
-
-        let prev = BackendStats {
-            bytes_sent: BytesSent::new(100),
-            bytes_received: BytesReceived::new(200),
-            total_commands: CommandCount::new(10),
-            ..Default::default()
-        };
-
-        let next = BackendStats {
-            bytes_sent: BytesSent::new(250),
-            bytes_received: BytesReceived::new(500),
-            total_commands: CommandCount::new(40),
-            ..prev.clone()
-        };
-
-        let point = TuiApp::build_backend_throughput_point(Timestamp::now(), 0.5, &next, &prev);
-
-        assert_f64_eq(point.sent_per_sec().get(), 300.0);
-        assert_f64_eq(point.received_per_sec().get(), 600.0);
-        assert_f64_eq(point.commands_per_sec().unwrap().get(), 60.0);
     }
 
     #[test]
