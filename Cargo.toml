@@ -64,7 +64,6 @@ webpki-roots = "1.0.3"  # Mozilla CA certificate bundle fallback
 crc32fast = "1.5.0"
 yenc = "0.2.2"  # yEnc encoding/decoding - faster and more correct than custom impl
 bytesize = { version = "2.3.1", features = ["serde"] }
-serde_bytes = "0.11.19"
 twox-hash = "2.1.2"
 rand = "0.10"  # Jittered backoff for stale-connection retries
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }  # RFC 8054 COMPRESS DEFLATE
