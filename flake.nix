@@ -160,6 +160,20 @@
         buildInputs = packageBuildInputs;
         cargoBuildFlags = ["--bin" "nntp-proxy"];
 
+        postInstall = ''
+          cat > "$out/bin/nntp-proxy-tui" <<'EOF'
+          #!/bin/sh
+          attach_addr="127.0.0.1:8120"
+          if [ "$#" -gt 0 ] && [ "''${1#-}" = "$1" ]; then
+            attach_addr="$1"
+            shift
+          fi
+          exec "@out@/bin/nntp-proxy" --ui tui --tui-attach "$attach_addr" "$@"
+          EOF
+          substituteInPlace "$out/bin/nntp-proxy-tui" --replace-fail "@out@" "$out"
+          chmod +x "$out/bin/nntp-proxy-tui"
+        '';
+
         OPENSSL_DIR = "${pkgs.openssl.dev}";
         OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
         PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig";
