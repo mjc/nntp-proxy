@@ -128,7 +128,7 @@ echo "════════════════════════�
 echo ""
 
 # Enter cross-compilation environment if not already in it
-if [ -z "${RUSTUP_TOOLCHAIN:-}" ] || [ ! -f "/tmp/.in-nix-cross-env" ]; then
+if [ -z "${NNTP_PROXY_CROSS_SHELL:-}" ] || [ ! -f "/tmp/.in-nix-cross-env" ]; then
     log_info "Entering Nix cross-compilation environment..."
     touch /tmp/.in-nix-cross-env
     exec nix develop .#cross -c "$0" "$@"

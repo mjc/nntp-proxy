@@ -45,7 +45,7 @@ ratatui = "0.30"  # Terminal UI framework
 crossterm = "0.29"  # Cross-platform terminal manipulation
 smallvec = { version = "1.13", features = ["serde"] }  # Stack-allocated vectors for small collections
 dashmap = "6.1"  # Lock-free concurrent HashMap for metrics
-sysinfo = "0.38"  # System metrics (CPU, memory) for monitoring
+sysinfo = "0.39"  # System metrics (CPU, memory) for monitoring
 chrono = { version = "0.4", features = ["serde", "clock"], default-features = false }  # Timestamps for stats persistence
 serde_json = "1.0"  # JSON serialization for stats persistence
 tokio-tungstenite = "0.29"  # WebSocket transport for remote TUI attachment

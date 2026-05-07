@@ -17,6 +17,7 @@
     rust-overlay,
   }: let
     cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
+    rustVersion = "1.95.0";
   in
     flake-utils.lib.eachDefaultSystem (system: let
       overlays = [(import rust-overlay)];
@@ -24,7 +25,7 @@
         inherit system overlays;
       };
 
-      rustToolchain = pkgs.rust-bin.stable.latest.default.override {
+      rustToolchain = pkgs.rust-bin.stable.${rustVersion}.default.override {
         extensions = ["rust-src" "rust-analyzer" "llvm-tools-preview"];
       };
 
@@ -38,8 +39,8 @@
         exec ${pkgs.cargo-udeps}/bin/cargo-udeps "$@"
       '';
 
-      # Nightly toolchain with all cross-compilation targets for releases
-      rustNightlyToolchain = pkgs.rust-bin.nightly.latest.default.override {
+      # Stable toolchain with all cross-compilation targets for releases
+      rustCrossToolchain = pkgs.rust-bin.stable.${rustVersion}.default.override {
         extensions = ["rust-src"];
         targets =
           [
@@ -99,7 +100,7 @@
 
       # Cross-compilation tools (separate to avoid environment pollution)
       crossCompilationTools = with pkgs; [
-        rustNightlyToolchain # For cross-compilation builds
+        rustCrossToolchain # For cross-compilation builds
         cargo-zigbuild
         zig
         cmake
@@ -198,12 +199,12 @@
             export ${cargoTargetEnvPrefix}_RUSTFLAGS="-C target-cpu=native"
           ''}
 
-          echo "🦀 Rust development environment loaded (NIGHTLY)!"
+          echo "🦀 Rust development environment loaded!"
           echo "   Rust version: $(rustc --version)"
           echo "   Cargo version: $(cargo --version)"
           echo "   OpenSSL version: ${pkgs.openssl.version}"
           echo ""
-          echo "🔧 Cross-compilation: Use './scripts/build-release.sh <version>' with nightly toolchain"
+          echo "🔧 Cross-compilation: Use './scripts/build-release.sh <version>' with the pinned stable toolchain"
           echo ""
           echo "📦 Available commands:"
           echo "   cargo build       - Build the project"
@@ -262,9 +263,8 @@
           export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
           export PKG_CONFIG_PATH="${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig"
 
-          # Add nightly toolchain to PATH for cross-compilation
-          export PATH="${rustNightlyToolchain}/bin:$PATH"
-          export RUSTUP_TOOLCHAIN="nightly"
+          export PATH="${rustCrossToolchain}/bin:$PATH"
+          export NNTP_PROXY_CROSS_SHELL=1
 
           # Ensure no CC/CXX pollution - cargo-zigbuild uses Zig as linker
           unset CC
@@ -284,7 +284,7 @@
           fi
 
           echo "🦀 Cross-compilation environment loaded!"
-          echo "   Nightly toolchain: ${rustNightlyToolchain}/bin/rustc"
+          echo "   Rust toolchain: ${rustCrossToolchain}/bin/rustc"
           echo "   Using cargo-zigbuild with Zig as linker (no mingw pollution)"
           echo "   Windows libraries: ''${MINGW_LIBS}"
           echo ""
