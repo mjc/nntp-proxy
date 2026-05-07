@@ -17,7 +17,8 @@
     rust-overlay,
   }: let
     cargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
-    rustVersion = "1.95.0";
+    rustToolchainToml = builtins.fromTOML (builtins.readFile ./rust-toolchain.toml);
+    rustVersion = rustToolchainToml.toolchain.channel;
   in
     flake-utils.lib.eachDefaultSystem (system: let
       overlays = [(import rust-overlay)];
@@ -27,6 +28,11 @@
 
       rustToolchain = pkgs.rust-bin.stable.${rustVersion}.default.override {
         extensions = ["rust-src" "rust-analyzer" "llvm-tools-preview"];
+      };
+
+      rustPlatform = pkgs.makeRustPlatform {
+        cargo = rustToolchain;
+        rustc = rustToolchain;
       };
 
       # Nightly toolchain for tools that require it (cargo-udeps)
@@ -141,7 +147,7 @@
         else if system == "aarch64-darwin" then "CARGO_TARGET_AARCH64_APPLE_DARWIN"
         else throw "Unsupported system: ${system}";
 
-      package = pkgs.rustPlatform.buildRustPackage ({
+      package = rustPlatform.buildRustPackage ({
         pname = cargoToml.package.name;
         version = cargoToml.package.version;
         src = ./.;

@@ -8,6 +8,10 @@ on:
       - '**.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'flake.nix'
+      - 'Dockerfile'
+      - 'scripts/check-rust-version.sh'
       - '.cargo/**'
       - '.github/workflows/rust.yml'
   pull_request:
@@ -15,6 +19,10 @@ on:
       - '**.rs'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'flake.nix'
+      - 'Dockerfile'
+      - 'scripts/check-rust-version.sh'
       - '.cargo/**'
       - '.github/workflows/rust.yml'
 
@@ -33,9 +41,23 @@ jobs:
     steps:
     - uses: actions/checkout@v6
 
+    - name: Read Rust toolchain
+      id: rust-toolchain
+      run: |
+        channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+        if [ -z "$channel" ]; then
+          echo "Could not read channel from rust-toolchain.toml" >&2
+          exit 1
+        fi
+        echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+    - name: Check Rust version pins
+      run: ./scripts/check-rust-version.sh
+
     - name: Install Rust
-      uses: dtolnay/rust-toolchain@1.95.0
+      uses: dtolnay/rust-toolchain@master
       with:
+        toolchain: ${{ steps.rust-toolchain.outputs.channel }}
         components: llvm-tools-preview
 
     - name: Setup Rust cache

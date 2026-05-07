@@ -10,6 +10,9 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
+COPY rust-toolchain.toml ./
+RUN rustup toolchain install "$(sed -n 's/^channel = \"\\(.*\\)\"/\\1/p' rust-toolchain.toml)"
+
 # Copy everything and build
 COPY Cargo.toml Cargo.lock ./
 COPY src/ src/

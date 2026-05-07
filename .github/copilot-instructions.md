@@ -3,9 +3,9 @@
 This document provides comprehensive guidance for understanding and working with the NNTP Proxy codebase. It is optimized for GitHub Copilot to provide better context-aware suggestions.
 
 **Last Updated:** May 4, 2026  
-**Version:** 0.4.0  
+**Version:** See `Cargo.toml`.  
 **Rust Edition:** 2024  
-**MSRV:** 1.85+
+**MSRV:** See `rust-toolchain.toml`.
 
 ---
 
