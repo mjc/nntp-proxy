@@ -8,8 +8,9 @@ use crate::tui::dashboard::{
     DashboardUserStats,
 };
 use crate::tui::log_capture::LogBuffer;
+use crate::tui::rate_estimator::{CumulativeCount, RateEstimate, RateEstimator, RatePerSecond};
 use crate::types::tui::{CommandsPerSecond, HistorySize, Throughput, Timestamp};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 /// TUI view mode - controls what is displayed
@@ -26,12 +27,21 @@ pub enum ViewMode {
 #[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ThroughputPoint {
-    /// Bytes sent per second
+    /// Smoothed bytes sent per second
     sent_per_sec: Throughput,
-    /// Bytes received per second
+    /// Smoothed bytes received per second
     received_per_sec: Throughput,
-    /// Commands processed per second (backend only)
+    /// Smoothed commands processed per second (backend only)
     commands_per_sec: Option<CommandsPerSecond>,
+    /// Raw interval bytes sent per second
+    #[serde(default)]
+    raw_sent_per_sec: Option<Throughput>,
+    /// Raw interval bytes received per second
+    #[serde(default)]
+    raw_received_per_sec: Option<Throughput>,
+    /// Raw interval commands processed per second (backend only)
+    #[serde(default)]
+    raw_commands_per_sec: Option<CommandsPerSecond>,
 }
 
 impl ThroughputPoint {
@@ -47,6 +57,31 @@ impl ThroughputPoint {
             sent_per_sec,
             received_per_sec,
             commands_per_sec: Some(commands_per_sec),
+            raw_sent_per_sec: Some(sent_per_sec),
+            raw_received_per_sec: Some(received_per_sec),
+            raw_commands_per_sec: Some(commands_per_sec),
+        }
+    }
+
+    /// Create a new backend throughput point from raw and smoothed estimates.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new_backend_estimate(
+        _timestamp: Timestamp,
+        raw_sent_per_sec: Throughput,
+        sent_per_sec: Throughput,
+        raw_received_per_sec: Throughput,
+        received_per_sec: Throughput,
+        raw_commands_per_sec: CommandsPerSecond,
+        commands_per_sec: CommandsPerSecond,
+    ) -> Self {
+        Self {
+            sent_per_sec,
+            received_per_sec,
+            commands_per_sec: Some(commands_per_sec),
+            raw_sent_per_sec: Some(raw_sent_per_sec),
+            raw_received_per_sec: Some(raw_received_per_sec),
+            raw_commands_per_sec: Some(raw_commands_per_sec),
         }
     }
 
@@ -61,6 +96,28 @@ impl ThroughputPoint {
             sent_per_sec,
             received_per_sec,
             commands_per_sec: None,
+            raw_sent_per_sec: Some(sent_per_sec),
+            raw_received_per_sec: Some(received_per_sec),
+            raw_commands_per_sec: None,
+        }
+    }
+
+    /// Create a new client throughput point from raw and smoothed estimates.
+    #[must_use]
+    pub const fn new_client_estimate(
+        _timestamp: Timestamp,
+        raw_sent_per_sec: Throughput,
+        sent_per_sec: Throughput,
+        raw_received_per_sec: Throughput,
+        received_per_sec: Throughput,
+    ) -> Self {
+        Self {
+            sent_per_sec,
+            received_per_sec,
+            commands_per_sec: None,
+            raw_sent_per_sec: Some(raw_sent_per_sec),
+            raw_received_per_sec: Some(raw_received_per_sec),
+            raw_commands_per_sec: None,
         }
     }
 
@@ -83,6 +140,27 @@ impl ThroughputPoint {
     #[inline]
     pub const fn commands_per_sec(&self) -> Option<CommandsPerSecond> {
         self.commands_per_sec
+    }
+
+    /// Get raw sent bytes per second.
+    #[must_use]
+    #[inline]
+    pub fn raw_sent_per_sec(&self) -> Throughput {
+        self.raw_sent_per_sec.unwrap_or(self.sent_per_sec)
+    }
+
+    /// Get raw received bytes per second.
+    #[must_use]
+    #[inline]
+    pub fn raw_received_per_sec(&self) -> Throughput {
+        self.raw_received_per_sec.unwrap_or(self.received_per_sec)
+    }
+
+    /// Get raw commands per second (if backend point).
+    #[must_use]
+    #[inline]
+    pub fn raw_commands_per_sec(&self) -> Option<CommandsPerSecond> {
+        self.raw_commands_per_sec.or(self.commands_per_sec)
     }
 }
 
@@ -122,6 +200,19 @@ impl ThroughputHistory {
     fn latest(&self) -> Option<&ThroughputPoint> {
         self.points.back()
     }
+}
+
+#[derive(Debug, Clone, Default)]
+struct BackendRateEstimators {
+    sent: RateEstimator,
+    received: RateEstimator,
+    commands: RateEstimator,
+}
+
+#[derive(Debug, Clone, Default)]
+struct UserRateEstimators {
+    sent: RateEstimator,
+    received: RateEstimator,
 }
 
 /// TUI application builder
@@ -217,6 +308,9 @@ impl TuiAppBuilder {
         let backend_history = (0..backend_count)
             .map(|_| ThroughputHistory::new(self.history_size))
             .collect();
+        let backend_rate_estimators = (0..backend_count)
+            .map(|_| BackendRateEstimators::default())
+            .collect();
 
         TuiApp {
             metrics: self.metrics,
@@ -226,7 +320,11 @@ impl TuiAppBuilder {
             buffer_pool: self.buffer_pool,
             snapshot,
             backend_history,
+            backend_rate_estimators,
             client_history: ThroughputHistory::new(self.history_size),
+            client_sent_estimator: RateEstimator::default(),
+            client_received_estimator: RateEstimator::default(),
+            user_rate_estimators: HashMap::new(),
             previous_snapshot: None,
             last_update: Timestamp::now(),
             log_buffer: Arc::new(self.log_buffer.unwrap_or_default()),
@@ -250,8 +348,16 @@ pub struct TuiApp {
     snapshot: Arc<MetricsSnapshot>,
     /// Historical throughput data per backend
     backend_history: Vec<ThroughputHistory>,
+    /// Per-backend rate estimators
+    backend_rate_estimators: Vec<BackendRateEstimators>,
     /// Historical client throughput (global)
     client_history: ThroughputHistory,
+    /// Global client-to-backend rate estimator
+    client_sent_estimator: RateEstimator,
+    /// Global backend-to-client rate estimator
+    client_received_estimator: RateEstimator,
+    /// Per-user byte rate estimators keyed by username
+    user_rate_estimators: HashMap<String, UserRateEstimators>,
     /// Previous snapshot for calculating deltas (Arc for zero-cost sharing)
     previous_snapshot: Option<Arc<MetricsSnapshot>>,
     /// Last update time
@@ -273,6 +379,7 @@ pub struct TuiApp {
 }
 
 impl TuiApp {
+    #[cfg(test)]
     #[allow(clippy::cast_precision_loss)] // TUI rates are derived display values, not exact persisted counters.
     const fn counter_as_f64(value: u64) -> f64 {
         // TUI throughput and rate calculations are display-only aggregates.
@@ -280,10 +387,8 @@ impl TuiApp {
         value as f64
     }
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // UI throughput truncates fractional, non-negative bytes/sec for display.
-    const fn throughput_as_u64(rate: Throughput) -> u64 {
-        // Displayed per-user byte rates are derived from non-negative throughput
-        // samples; truncating fractional bytes/sec matches the existing UI.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // TUI smoothed rates are non-negative display values.
+    const fn rate_as_u64(rate: RatePerSecond) -> u64 {
         rate.get() as u64
     }
 
@@ -301,6 +406,7 @@ impl TuiApp {
     }
 
     /// Calculate byte transfer rate from byte delta and time delta
+    #[cfg(test)]
     #[inline]
     fn calculate_rate(byte_delta: u64, time_delta_secs: f64) -> Throughput {
         if time_delta_secs > 0.0 {
@@ -311,6 +417,7 @@ impl TuiApp {
     }
 
     /// Calculate command rate from command delta and time delta
+    #[cfg(test)]
     #[inline]
     fn calculate_command_rate(cmd_delta: u64, time_delta_secs: f64) -> CommandsPerSecond {
         if time_delta_secs > 0.0 {
@@ -320,7 +427,65 @@ impl TuiApp {
         }
     }
 
+    fn estimate_or_decay(
+        estimator: &mut RateEstimator,
+        total: u64,
+        now: Timestamp,
+    ) -> RateEstimate {
+        estimator
+            .record(CumulativeCount::new(total), now)
+            .unwrap_or_else(|| RateEstimate::new(RatePerSecond::zero(), estimator.rate_at(now)))
+    }
+
+    fn throughput_estimate(
+        estimator: &mut RateEstimator,
+        total: u64,
+        now: Timestamp,
+    ) -> (Throughput, Throughput) {
+        let estimate = Self::estimate_or_decay(estimator, total, now);
+        (
+            Throughput::new(estimate.raw().get()),
+            Throughput::new(estimate.smoothed().get()),
+        )
+    }
+
+    fn command_estimate(
+        estimator: &mut RateEstimator,
+        total: u64,
+        now: Timestamp,
+    ) -> (CommandsPerSecond, CommandsPerSecond) {
+        let estimate = Self::estimate_or_decay(estimator, total, now);
+        (
+            CommandsPerSecond::new(estimate.raw().get()),
+            CommandsPerSecond::new(estimate.smoothed().get()),
+        )
+    }
+
+    fn build_backend_estimated_throughput_point(
+        now: Timestamp,
+        estimators: &mut BackendRateEstimators,
+        stats: &crate::metrics::BackendStats,
+    ) -> ThroughputPoint {
+        let (raw_sent, sent) =
+            Self::throughput_estimate(&mut estimators.sent, stats.bytes_sent.as_u64(), now);
+        let (raw_received, received) =
+            Self::throughput_estimate(&mut estimators.received, stats.bytes_received.as_u64(), now);
+        let (raw_commands, commands) =
+            Self::command_estimate(&mut estimators.commands, stats.total_commands.get(), now);
+
+        ThroughputPoint::new_backend_estimate(
+            now,
+            raw_sent,
+            sent,
+            raw_received,
+            received,
+            raw_commands,
+            commands,
+        )
+    }
+
     #[must_use]
+    #[cfg(test)]
     fn build_backend_throughput_point(
         now: Timestamp,
         time_delta: f64,
@@ -343,36 +508,19 @@ impl TuiApp {
         )
     }
 
-    /// Calculate per-user rates from deltas
-    #[inline]
-    fn calculate_user_rates(
+    fn estimate_user_rates(
+        now: Timestamp,
+        estimators: &mut UserRateEstimators,
         current: &crate::metrics::UserStats,
-        prev_snapshot: &crate::metrics::MetricsSnapshot,
-        time_delta: f64,
     ) -> crate::metrics::UserStats {
         use crate::types::BytesPerSecondRate;
 
-        let (bytes_sent_per_sec, bytes_received_per_sec) = prev_snapshot
-            .user_stats
-            .iter()
-            .find(|u| u.username == current.username)
-            .map_or(
-                (BytesPerSecondRate::ZERO, BytesPerSecondRate::ZERO),
-                |prev| {
-                    let sent_delta = current.bytes_sent.saturating_sub(prev.bytes_sent);
-                    let recv_delta = current.bytes_received.saturating_sub(prev.bytes_received);
-                    (
-                        BytesPerSecondRate::new(Self::throughput_as_u64(Self::calculate_rate(
-                            sent_delta.into(),
-                            time_delta,
-                        ))),
-                        BytesPerSecondRate::new(Self::throughput_as_u64(Self::calculate_rate(
-                            recv_delta.into(),
-                            time_delta,
-                        ))),
-                    )
-                },
-            );
+        let sent = Self::estimate_or_decay(&mut estimators.sent, current.bytes_sent.as_u64(), now);
+        let received = Self::estimate_or_decay(
+            &mut estimators.received,
+            current.bytes_received.as_u64(),
+            now,
+        );
 
         crate::metrics::UserStats {
             username: current.username.clone(),
@@ -382,9 +530,64 @@ impl TuiApp {
             bytes_received: current.bytes_received,
             total_commands: current.total_commands,
             errors: current.errors,
-            bytes_sent_per_sec,
-            bytes_received_per_sec,
+            bytes_sent_per_sec: BytesPerSecondRate::new(Self::rate_as_u64(sent.smoothed())),
+            bytes_received_per_sec: BytesPerSecondRate::new(Self::rate_as_u64(received.smoothed())),
         }
+    }
+
+    fn empty_user_estimators_at(now: Timestamp) -> UserRateEstimators {
+        let mut estimators = UserRateEstimators::default();
+        estimators.sent.record(CumulativeCount::new(0), now);
+        estimators.received.record(CumulativeCount::new(0), now);
+        estimators
+    }
+
+    fn prune_user_estimators(&mut self, user_stats: &[crate::metrics::UserStats]) {
+        let active_users = user_stats
+            .iter()
+            .map(|stats| stats.username.as_str())
+            .collect::<HashSet<_>>();
+        self.user_rate_estimators
+            .retain(|username, _| active_users.contains(username.as_str()));
+    }
+
+    fn seed_rate_estimators(&mut self, snapshot: &crate::metrics::MetricsSnapshot, now: Timestamp) {
+        self.client_sent_estimator.record(
+            CumulativeCount::new(snapshot.client_to_backend_bytes.as_u64()),
+            now,
+        );
+        self.client_received_estimator.record(
+            CumulativeCount::new(snapshot.backend_to_client_bytes.as_u64()),
+            now,
+        );
+
+        self.backend_rate_estimators
+            .iter_mut()
+            .zip(snapshot.backend_stats.iter())
+            .for_each(|(estimators, stats)| {
+                estimators
+                    .sent
+                    .record(CumulativeCount::new(stats.bytes_sent.as_u64()), now);
+                estimators
+                    .received
+                    .record(CumulativeCount::new(stats.bytes_received.as_u64()), now);
+                estimators
+                    .commands
+                    .record(CumulativeCount::new(stats.total_commands.get()), now);
+            });
+
+        self.user_rate_estimators.clear();
+        snapshot.user_stats.iter().for_each(|stats| {
+            let mut estimators = UserRateEstimators::default();
+            estimators
+                .sent
+                .record(CumulativeCount::new(stats.bytes_sent.as_u64()), now);
+            estimators
+                .received
+                .record(CumulativeCount::new(stats.bytes_received.as_u64()), now);
+            self.user_rate_estimators
+                .insert(stats.username.clone(), estimators);
+        });
     }
 
     /// Update metrics snapshot and calculate throughput
@@ -398,44 +601,50 @@ impl TuiApp {
                 .with_pool_status(&self.router),
         );
         let now = Timestamp::now();
-        let time_delta = now.duration_since(self.last_update).as_secs_f64();
 
-        if let Some(prev) = &self.previous_snapshot {
-            // Calculate client traffic deltas (global totals)
-            let client_to_backend_delta = new_snapshot
-                .client_to_backend_bytes
-                .saturating_sub(prev.client_to_backend_bytes);
-            let backend_to_client_delta = new_snapshot
-                .backend_to_client_bytes
-                .saturating_sub(prev.backend_to_client_bytes);
+        if self.previous_snapshot.is_some() {
+            let (raw_client_sent_rate, client_sent_rate) = Self::throughput_estimate(
+                &mut self.client_sent_estimator,
+                new_snapshot.client_to_backend_bytes.as_u64(),
+                now,
+            );
+            let (raw_client_recv_rate, client_recv_rate) = Self::throughput_estimate(
+                &mut self.client_received_estimator,
+                new_snapshot.backend_to_client_bytes.as_u64(),
+                now,
+            );
 
-            // Calculate rates
-            let client_sent_rate = Self::calculate_rate(client_to_backend_delta.into(), time_delta);
-            let client_recv_rate = Self::calculate_rate(backend_to_client_delta.into(), time_delta);
-
-            // Store client throughput point
-            let client_point = ThroughputPoint::new_client(now, client_sent_rate, client_recv_rate);
+            let client_point = ThroughputPoint::new_client_estimate(
+                now,
+                raw_client_sent_rate,
+                client_sent_rate,
+                raw_client_recv_rate,
+                client_recv_rate,
+            );
             self.client_history.push(client_point);
 
             self.backend_history
                 .iter_mut()
-                .zip(
-                    new_snapshot
-                        .backend_stats
-                        .iter()
-                        .zip(prev.backend_stats.iter()),
-                )
-                .for_each(|(history, (new_stats, prev_stats))| {
-                    history.push(Self::build_backend_throughput_point(
-                        now, time_delta, new_stats, prev_stats,
+                .zip(self.backend_rate_estimators.iter_mut())
+                .zip(new_snapshot.backend_stats.iter())
+                .for_each(|((history, estimators), stats)| {
+                    history.push(Self::build_backend_estimated_throughput_point(
+                        now, estimators, stats,
                     ));
                 });
 
-            // Enrich user stats with calculated rates
+            self.prune_user_estimators(&new_snapshot.user_stats);
             let user_stats = new_snapshot
                 .user_stats
                 .iter()
-                .map(|stats| Self::calculate_user_rates(stats, prev, time_delta))
+                .map(|stats| {
+                    let last_update = self.last_update;
+                    let estimators = self
+                        .user_rate_estimators
+                        .entry(stats.username.clone())
+                        .or_insert_with(|| Self::empty_user_estimators_at(last_update));
+                    Self::estimate_user_rates(now, estimators, stats)
+                })
                 .collect();
 
             // Build enriched snapshot (shares backend_stats via Arc)
@@ -446,6 +655,7 @@ impl TuiApp {
             });
             self.previous_snapshot = Some(new_snapshot);
         } else {
+            self.seed_rate_estimators(&new_snapshot, now);
             // First update - no previous snapshot
             self.previous_snapshot = Some(Arc::clone(&new_snapshot));
             self.snapshot = new_snapshot;
