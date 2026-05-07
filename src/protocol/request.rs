@@ -844,7 +844,7 @@ const fn classify_verb(verb: &[u8]) -> RequestKind {
                             const _: [(); $len] = [(); $lit.len()];
                         )+
                         $(
-                            if $verb.eq_ignore_ascii_case($lit) {
+                            if eq_ignore_ascii_case_const($verb, $lit) {
                                 $kind
                             } else
                         )+
@@ -900,6 +900,29 @@ const fn classify_verb(verb: &[u8]) -> RequestKind {
             b"CAPABILITIES" => RequestKind::Capabilities,
         },
     )
+}
+
+const fn eq_ignore_ascii_case_const(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+
+    let mut index = 0;
+    while index < left.len() {
+        if ascii_upper(left[index]) != ascii_upper(right[index]) {
+            return false;
+        }
+        index += 1;
+    }
+
+    true
+}
+
+const fn ascii_upper(byte: u8) -> u8 {
+    match byte {
+        b'a'..=b'z' => byte - 32,
+        _ => byte,
+    }
 }
 
 fn find_message_id(args: &[u8]) -> Option<(usize, usize)> {

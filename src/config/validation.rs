@@ -209,7 +209,10 @@ mod tests {
 
     #[test]
     fn test_validate_server_with_recommended_keepalive() {
-        let server = create_test_server("test", Some(Duration::from_mins(1)));
+        let server = create_test_server(
+            "test",
+            Some(crate::constants::duration_polyfill::from_minutes(1)),
+        );
         validate_server(&server);
     }
 
@@ -223,7 +226,10 @@ mod tests {
     #[test]
     fn test_validate_server_with_high_keepalive_warns() {
         // This should warn but not fail
-        let server = create_test_server("test", Some(Duration::from_mins(10)));
+        let server = create_test_server(
+            "test",
+            Some(crate::constants::duration_polyfill::from_minutes(10)),
+        );
         validate_server(&server);
     }
 

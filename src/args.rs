@@ -773,7 +773,10 @@ mod tests {
 
         let cache = config.cache.as_ref().unwrap();
         assert_eq!(cache.article_cache_capacity.get(), 128 * 1024 * 1024);
-        assert_eq!(cache.article_cache_ttl_secs, Duration::from_hours(2));
+        assert_eq!(
+            cache.article_cache_ttl_secs,
+            crate::constants::duration_polyfill::from_hours(2)
+        );
         assert!(!cache.store_article_bodies);
     }
 
@@ -801,7 +804,10 @@ mod tests {
 
         let cache = config.cache.as_ref().unwrap();
         assert_eq!(cache.article_cache_capacity.get(), 128_000_000);
-        assert_eq!(cache.article_cache_ttl_secs, Duration::from_hours(2));
+        assert_eq!(
+            cache.article_cache_ttl_secs,
+            crate::constants::duration_polyfill::from_hours(2)
+        );
         assert!(!cache.store_article_bodies);
         assert!(config.servers[0].backend_pipelining);
     }

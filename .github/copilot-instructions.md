@@ -5,7 +5,8 @@ This document provides comprehensive guidance for understanding and working with
 **Last Updated:** May 4, 2026  
 **Version:** See `Cargo.toml`.  
 **Rust Edition:** 2024  
-**MSRV:** See `rust-toolchain.toml`.
+**MSRV:** See `Cargo.toml`.  
+**Development Toolchain:** See `rust-toolchain.toml`.
 
 ---
 

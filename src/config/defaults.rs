@@ -56,7 +56,7 @@ pub fn cache_max_capacity() -> CacheCapacity {
 #[inline]
 #[must_use]
 pub const fn cache_ttl() -> Duration {
-    Duration::from_hours(1)
+    crate::constants::duration_polyfill::from_hours(1)
 }
 
 /// Default for caching article bodies in explicit `[cache]` sections.
@@ -182,7 +182,7 @@ pub const fn disk_cache_shards() -> usize {
 /// Prevents stale connections from accumulating during overnight idle periods.
 #[inline]
 pub const fn backend_idle_timeout() -> Duration {
-    Duration::from_mins(10)
+    crate::constants::duration_polyfill::from_minutes(10)
 }
 
 /// Default for backend pipelining (enabled)

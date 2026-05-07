@@ -5,6 +5,23 @@
 
 use std::time::Duration;
 
+/// Polyfill for `Duration` constructors unavailable on the project MSRV.
+pub mod duration_polyfill {
+    use super::Duration;
+
+    #[inline]
+    #[must_use]
+    pub const fn from_minutes(value: u64) -> Duration {
+        Duration::from_secs(value * 60)
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn from_hours(value: u64) -> Duration {
+        Duration::from_secs(value * 60 * 60)
+    }
+}
+
 /// Buffer size constants
 ///
 /// All buffer sizes are carefully chosen for NNTP workloads:
@@ -127,7 +144,7 @@ pub mod timeout {
     pub const BACKEND_READ: Duration = Duration::from_secs(30);
 
     /// Timeout for executing a command on backend
-    pub const COMMAND_EXECUTION: Duration = Duration::from_mins(1);
+    pub const COMMAND_EXECUTION: Duration = crate::constants::duration_polyfill::from_minutes(1);
 
     /// Connection timeout for backend connections
     pub const CONNECTION: Duration = Duration::from_secs(10);

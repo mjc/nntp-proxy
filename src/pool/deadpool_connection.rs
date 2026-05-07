@@ -163,7 +163,7 @@ impl TcpManager {
         let sock_ref = socket2::SockRef::from(&tcp_stream);
         sock_ref.set_keepalive(true)?;
         let keepalive = socket2::TcpKeepalive::new()
-            .with_time(std::time::Duration::from_mins(1))
+            .with_time(crate::constants::duration_polyfill::from_minutes(1))
             .with_interval(std::time::Duration::from_secs(10));
         sock_ref.set_tcp_keepalive(&keepalive)?;
         sock_ref.set_tcp_nodelay(true)?;

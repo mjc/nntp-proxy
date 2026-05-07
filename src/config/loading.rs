@@ -756,7 +756,7 @@ mod tests {
         let server = parse_server_from_env(0, &env).unwrap();
         assert_eq!(
             server.connection_keepalive,
-            Some(std::time::Duration::from_mins(5))
+            Some(crate::constants::duration_polyfill::from_minutes(5))
         );
     }
 

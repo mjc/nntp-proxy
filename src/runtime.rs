@@ -273,7 +273,8 @@ pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
     // Cache is always present now
     let cache = Arc::clone(proxy.cache());
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(tokio::time::Duration::from_mins(1));
+        let mut interval =
+            tokio::time::interval(crate::constants::duration_polyfill::from_minutes(1));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
@@ -712,7 +713,7 @@ pub fn spawn_idle_connection_clearer(proxy: &std::sync::Arc<crate::NntpProxy>) {
     use std::time::Duration;
 
     /// How often to check for idle backends
-    const CHECK_INTERVAL: Duration = Duration::from_mins(1);
+    const CHECK_INTERVAL: Duration = crate::constants::duration_polyfill::from_minutes(1);
 
     let proxy = Arc::clone(proxy);
 

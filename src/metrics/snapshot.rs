@@ -284,7 +284,7 @@ mod tests {
             stateful_sessions: 2,
             client_to_backend_bytes: ClientToBackendBytes::new(1500),
             backend_to_client_bytes: BackendToClientBytes::new(3500),
-            uptime: Duration::from_hours(1),
+            uptime: crate::constants::duration_polyfill::from_hours(1),
             backend_stats: vec![backend1, backend2].into(),
             user_stats: vec![],
             cache_entries: 0,

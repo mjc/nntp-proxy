@@ -842,7 +842,7 @@ mod tests {
         for server in proxy.servers() {
             assert_eq!(
                 server.backend_idle_timeout,
-                Duration::from_mins(10),
+                crate::constants::duration_polyfill::from_minutes(10),
                 "Server '{}' should have default 10-minute backend_idle_timeout",
                 server.name.as_ref(),
             );
@@ -991,7 +991,7 @@ mod tests {
                 Server::builder("server2.example.com", Port::try_new(119).unwrap())
                     .name("Long Timeout")
                     .max_connections(MaxConnections::try_new(2).unwrap())
-                    .backend_idle_timeout(Duration::from_hours(24)) // 24h
+                    .backend_idle_timeout(crate::constants::duration_polyfill::from_hours(24)) // 24h
                     .build()
                     .unwrap(),
             ],
@@ -1025,7 +1025,7 @@ mod tests {
                 Server::builder("server2.example.com", Port::try_new(119).unwrap())
                     .name("Long Timeout")
                     .max_connections(MaxConnections::try_new(2).unwrap())
-                    .backend_idle_timeout(Duration::from_hours(24))
+                    .backend_idle_timeout(crate::constants::duration_polyfill::from_hours(24))
                     .build()
                     .unwrap(),
             ],

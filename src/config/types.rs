@@ -952,7 +952,10 @@ mod tests {
     fn test_cache_default() {
         let cache = Cache::default();
         assert_eq!(cache.article_cache_capacity.get(), 64 * 1024 * 1024); // 64 MB
-        assert_eq!(cache.article_cache_ttl_secs, Duration::from_hours(1));
+        assert_eq!(
+            cache.article_cache_ttl_secs,
+            crate::constants::duration_polyfill::from_hours(1)
+        );
         assert!(cache.store_article_bodies);
     }
 
@@ -1082,7 +1085,7 @@ mod tests {
 
     #[test]
     fn test_server_builder_with_keepalive() {
-        let keepalive = Duration::from_mins(5);
+        let keepalive = crate::constants::duration_polyfill::from_minutes(5);
         let server = Server::builder("localhost", Port::try_new(119).unwrap())
             .connection_keepalive(keepalive)
             .build()

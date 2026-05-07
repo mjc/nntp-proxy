@@ -10,13 +10,21 @@ if [[ -z "$toolchain" ]]; then
     exit 1
 fi
 
-msrv="${toolchain%.*}"
 cargo_msrv="$(
     sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml
 )"
 
-if [[ "$cargo_msrv" != "$msrv" ]]; then
-    echo "Cargo.toml rust-version is $cargo_msrv, expected $msrv from rust-toolchain.toml ($toolchain)" >&2
+if [[ -z "$cargo_msrv" ]]; then
+    echo "Could not read rust-version from Cargo.toml" >&2
+    exit 1
+fi
+
+lowest="$(
+    printf '%s\n%s\n' "$toolchain" "$cargo_msrv" | sort -V | head -n1
+)"
+
+if [[ "$lowest" != "$cargo_msrv" ]]; then
+    echo "Cargo.toml rust-version ($cargo_msrv) cannot exceed rust-toolchain.toml channel ($toolchain)" >&2
     exit 1
 fi
 
