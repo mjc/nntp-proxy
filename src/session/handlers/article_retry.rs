@@ -15,6 +15,7 @@ use crate::session::handlers::command_execution::{ArticleAttemptState, BackendAt
 use crate::session::routing::{CacheAction, determine_cache_action_for_request};
 use crate::types::{BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
+use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
@@ -209,15 +210,26 @@ impl ClientSession {
             );
 
             let (tx, rx) = tokio::sync::oneshot::channel();
-            let queued_context = if request.is_large_transfer() && !self.cache_articles {
-                QueuedContext::new_streaming(
+            let queued_context = if request.is_large_transfer() {
+                let delivery = if self.article_buffer {
+                    crate::router::backend_queue::PipelineDelivery::Buffered
+                } else if self.cache_articles {
+                    crate::router::backend_queue::PipelineDelivery::StreamAndCapture(
+                        io.client_writer.clone(),
+                    )
+                } else {
+                    crate::router::backend_queue::PipelineDelivery::StreamToClient(
+                        io.client_writer.clone(),
+                    )
+                };
+                QueuedContext::new(request.clone(), self.client_addr, tx, delivery)
+            } else {
+                QueuedContext::new(
                     request.clone(),
                     self.client_addr,
                     tx,
-                    io.client_writer.clone(),
+                    crate::router::backend_queue::PipelineDelivery::Buffered,
                 )
-            } else {
-                QueuedContext::new(request.clone(), self.client_addr, tx)
             };
 
             match queue.try_enqueue(queued_context) {
@@ -231,31 +243,32 @@ impl ClientSession {
                                 .response_metadata()
                                 .is_some_and(|response| response.status().as_u16() != 430) =>
                         {
+                            let completed_backend_id = completed
+                                .context
+                                .backend_id()
+                                .expect("completed queued request records backend id");
+                            let response = completed
+                                .context
+                                .response_metadata()
+                                .expect("completed queued request records response metadata");
                             let cache_action = determine_cache_action_for_request(
                                 &completed.context,
-                                completed
-                                    .context
-                                    .response_metadata()
-                                    .expect("completed queued request records response metadata")
-                                    .status(),
+                                response.status(),
                                 self.cache_articles,
                                 completed.context.has_message_id(),
                             );
                             if let Some(payload) = completed.context.take_response_payload() {
-                                let mut client_write = io.client_writer.lock().await;
-                                payload
-                                    .write_all_to(&mut *client_write)
-                                    .await
-                                    .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
-                                drop(client_write);
+                                if !completed.response_streamed {
+                                    let mut client_write = io.client_writer.lock().await;
+                                    payload
+                                        .write_all_to(&mut *client_write)
+                                        .await
+                                        .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                                }
 
                                 if matches!(cache_action, CacheAction::CaptureArticle)
                                     && let Some(msg_id) = completed.context.message_id_value()
                                 {
-                                    let completed_backend_id = completed
-                                        .context
-                                        .backend_id()
-                                        .expect("completed queued request records backend id");
                                     let tier = self.tier_for_backend(completed_backend_id);
                                     self.spawn_cache_upsert_buffer(
                                         &msg_id,
@@ -265,10 +278,19 @@ impl ClientSession {
                                     );
                                 }
                             }
-                            let response = completed
-                                .context
-                                .response_metadata()
-                                .expect("completed queued request records response metadata");
+                            if matches!(cache_action, CacheAction::TrackAvailability)
+                                && let Some(msg_id) = completed.context.message_id_value()
+                                && !completed
+                                    .context
+                                    .cache_records_backend_has_article(completed_backend_id)
+                            {
+                                self.spawn_cache_upsert_availability(
+                                    &msg_id,
+                                    response.status(),
+                                    completed_backend_id,
+                                    self.tier_for_backend(completed_backend_id),
+                                );
+                            }
                             *io.backend_to_client_bytes =
                                 io.backend_to_client_bytes.add(response.wire_len().get());
                             *io.client_to_backend_bytes = io
@@ -292,6 +314,12 @@ impl ClientSession {
                                 availability.get_or_insert_default(),
                             );
                             self.metrics.record_pipeline_complete();
+                        }
+                        Ok(Err(crate::router::backend_queue::PipelineError::ClientDisconnect)) => {
+                            return Err(SessionError::ClientDisconnect(io::Error::new(
+                                io::ErrorKind::BrokenPipe,
+                                "client disconnected during pipelined stream",
+                            )));
                         }
                         Ok(Err(e)) => {
                             debug!(

@@ -21,6 +21,8 @@ use crate::session::SharedClientWriter;
 pub struct CompletedPipelineRequest {
     /// Typed request context that was completed in backend-connection FIFO order.
     pub context: RequestContext,
+    /// Whether the worker already wrote the response bytes to the client.
+    pub response_streamed: bool,
 }
 
 struct EnqueueGuard<'a> {
@@ -45,6 +47,7 @@ pub enum PipelineError {
     ConnectionAcquire,
     WriteFailed { index: usize, batch_len: usize },
     FlushFailed,
+    ClientDisconnect,
     ReadFailed,
     ConnectionLost { completed: usize, batch_len: usize },
 }
@@ -57,6 +60,7 @@ impl std::fmt::Display for PipelineError {
                 write!(f, "write failed at command {index}/{batch_len}")
             }
             Self::FlushFailed => f.write_str("flush failed"),
+            Self::ClientDisconnect => f.write_str("client disconnected"),
             Self::ReadFailed => f.write_str("read error"),
             Self::ConnectionLost {
                 completed,
@@ -70,6 +74,7 @@ impl std::fmt::Display for PipelineError {
 pub enum PipelineDelivery {
     Buffered,
     StreamToClient(SharedClientWriter),
+    StreamAndCapture(SharedClientWriter),
 }
 
 /// A request queued for pipeline execution on a backend
@@ -89,27 +94,13 @@ impl QueuedContext {
         context: RequestContext,
         client_addr: crate::types::ClientAddress,
         client_return: oneshot::Sender<PipelineResponse>,
+        delivery: PipelineDelivery,
     ) -> Self {
         Self {
             context,
             client_addr,
             client_return,
-            delivery: PipelineDelivery::Buffered,
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn new_streaming(
-        context: RequestContext,
-        client_addr: crate::types::ClientAddress,
-        client_return: oneshot::Sender<PipelineResponse>,
-        client_writer: SharedClientWriter,
-    ) -> Self {
-        Self {
-            context,
-            client_addr,
-            client_return,
-            delivery: PipelineDelivery::StreamToClient(client_writer),
+            delivery,
         }
     }
 
@@ -123,9 +114,10 @@ impl QueuedContext {
     /// Responses are matched by each backend connection's FIFO order; consuming
     /// the queued context here prevents delivering response data without its
     /// matching request context.
-    pub(crate) fn complete_context(self) {
+    pub(crate) fn complete_context(self, response_streamed: bool) {
         let _ = self.client_return.send(Ok(CompletedPipelineRequest {
             context: self.context,
+            response_streamed,
         }));
     }
 
@@ -301,6 +293,7 @@ mod tests {
                 request_context(b"ARTICLE <test@example.com>\r\n"),
                 client_addr(),
                 tx,
+                PipelineDelivery::Buffered,
             ))
             .unwrap();
         assert_eq!(queue_depth(&queue), 1);
@@ -317,6 +310,7 @@ mod tests {
                     request_context(request.as_bytes()),
                     client_addr(),
                     tx,
+                    PipelineDelivery::Buffered,
                 ))
                 .unwrap();
         }
@@ -325,6 +319,7 @@ mod tests {
             request_context(b"ARTICLE <overflow@example.com>\r\n"),
             client_addr(),
             tx,
+            PipelineDelivery::Buffered,
         ));
         assert!(result.is_err());
         assert!(matches!(
@@ -347,6 +342,7 @@ mod tests {
                     request_context(request.as_bytes()),
                     client_addr(),
                     tx,
+                    PipelineDelivery::Buffered,
                 ))
                 .unwrap();
         }
@@ -378,6 +374,7 @@ mod tests {
                 request_context(b"HELLO\r\n"),
                 client_addr(),
                 tx,
+                PipelineDelivery::Buffered,
             ))
             .unwrap();
 
@@ -397,6 +394,7 @@ mod tests {
                 "write failed at command 2/5",
             ),
             (PipelineError::FlushFailed, "flush failed"),
+            (PipelineError::ClientDisconnect, "client disconnected"),
             (PipelineError::ReadFailed, "read error"),
             (
                 PipelineError::ConnectionLost {
@@ -430,13 +428,14 @@ mod tests {
             crate::protocol::StatusCode::new(223),
             crate::pool::ChunkedResponse::default(),
         );
-        let queued = QueuedContext::new(context, client_addr(), tx);
+        let queued = QueuedContext::new(context, client_addr(), tx, PipelineDelivery::Buffered);
 
-        queued.complete_context();
+        queued.complete_context(false);
 
         let completed = rx.blocking_recv().unwrap().unwrap();
         assert_eq!(completed.context.message_id(), Some("<test@example.com>"));
         assert_eq!(completed.context.backend_id(), Some(backend_id));
+        assert!(!completed.response_streamed);
         assert_eq!(
             completed.context.response_metadata(),
             Some(crate::protocol::RequestResponseMetadata::new(
@@ -458,6 +457,7 @@ mod tests {
             request_context(b"STAT <test@example.com>\r\n"),
             client_addr(),
             tx,
+            PipelineDelivery::Buffered,
         );
 
         queued.complete_error(PipelineError::ReadFailed);

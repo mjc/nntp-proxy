@@ -65,7 +65,17 @@ pub const fn cache_ttl() -> Duration {
 /// so the serde default stays `true` for backward compatibility.
 #[inline]
 pub const fn cache_articles() -> bool {
-    false
+    true
+}
+
+/// Default for buffering ARTICLE/BODY responses before writing to the client.
+///
+/// This is configured independently from caching so operators can choose
+/// whether large responses are streamed or assembled first.
+#[inline]
+#[must_use]
+pub const fn article_buffer() -> bool {
+    true
 }
 
 /// Default for adaptive availability prechecking (false = disabled)

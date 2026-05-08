@@ -243,6 +243,13 @@ pub struct Memory {
     /// Number of buffers in the capture pool
     #[serde(default = "super::defaults::capture_pool_count")]
     pub capture_pool_count: usize,
+    /// Whether ARTICLE/BODY responses are buffered before writing to the client.
+    ///
+    /// When false, large responses stream directly to the client while the backend
+    /// is still producing them. When true, the proxy assembles the full response
+    /// first and only then writes it to the client.
+    #[serde(default = "super::defaults::article_buffer")]
+    pub article_buffer: bool,
 }
 
 impl Default for Memory {
@@ -254,6 +261,7 @@ impl Default for Memory {
             buffer_pool_count: defaults::buffer_pool_count(),
             capture_pool_size: defaults::capture_pool_size(),
             capture_pool_count: defaults::capture_pool_count(),
+            article_buffer: defaults::article_buffer(),
         }
     }
 }
@@ -956,7 +964,31 @@ mod tests {
             cache.article_cache_ttl_secs,
             crate::constants::duration_polyfill::from_hours(1)
         );
-        assert!(!cache.store_article_bodies);
+        assert!(cache.store_article_bodies);
+    }
+
+    #[test]
+    fn test_memory_default() {
+        let memory = Memory::default();
+        assert_eq!(
+            memory.socket_recv_buffer_size,
+            crate::constants::socket::HIGH_THROUGHPUT_RECV_BUFFER
+        );
+        assert_eq!(
+            memory.socket_send_buffer_size,
+            crate::constants::socket::HIGH_THROUGHPUT_SEND_BUFFER
+        );
+        assert_eq!(memory.buffer_pool_size, crate::constants::buffer::POOL);
+        assert_eq!(
+            memory.buffer_pool_count,
+            crate::constants::buffer::POOL_COUNT
+        );
+        assert_eq!(memory.capture_pool_size, crate::constants::buffer::CAPTURE);
+        assert_eq!(
+            memory.capture_pool_count,
+            crate::constants::buffer::CAPTURE_COUNT
+        );
+        assert!(memory.article_buffer);
     }
 
     // HealthCheck tests

@@ -434,38 +434,62 @@ impl ClientSession {
         );
 
         debug!(
-            "stream_response_to_client: code={}, is_multiline_body={}, cache_articles={}, has_msg_id={}, action={:?}",
+            "stream_response_to_client: code={}, is_multiline_body={}, cache_articles={}, article_buffer={}, has_msg_id={}, action={:?}",
             code,
             is_multiline_body,
             self.cache_articles,
+            self.article_buffer,
             params.msg_id.is_some(),
             cache_action
         );
 
-        match (is_multiline_body, cache_action) {
-            (true, CacheAction::CaptureArticle) => {
-                self.buffer_and_cache_multiline_response(pooled_conn, client_write, ctx, params)
+        if is_multiline_body {
+            let should_buffer = params.request.is_large_transfer() && self.article_buffer;
+            if should_buffer {
+                return self
+                    .deliver_buffered_multiline_response(
+                        pooled_conn,
+                        client_write,
+                        ctx,
+                        params,
+                        cache_action,
+                    )
+                    .await;
+            }
+
+            return match cache_action {
+                CacheAction::CaptureArticle => {
+                    self.stream_and_capture_multiline_response(
+                        pooled_conn,
+                        client_write,
+                        ctx,
+                        params,
+                    )
                     .await
-            }
-            (true, CacheAction::TrackAvailability) => {
-                self.stream_multiline_with_availability_tracking(
-                    pooled_conn,
-                    client_write,
-                    ctx,
-                    params,
-                )
-                .await
-            }
-            (true, _) => {
-                streaming::stream_multiline_response(
-                    &mut **pooled_conn,
-                    client_write,
-                    params.first_chunk,
-                    ctx,
-                )
-                .await
-            }
-            (false, CacheAction::TrackStat) => {
+                }
+                CacheAction::TrackAvailability => {
+                    self.stream_multiline_with_availability_tracking(
+                        pooled_conn,
+                        client_write,
+                        ctx,
+                        params,
+                    )
+                    .await
+                }
+                _ => {
+                    streaming::stream_multiline_response(
+                        &mut **pooled_conn,
+                        client_write,
+                        params.first_chunk,
+                        ctx,
+                    )
+                    .await
+                }
+            };
+        }
+
+        match cache_action {
+            CacheAction::TrackStat => {
                 self.write_single_line_response(client_write, params.first_chunk)
                     .await?;
                 self.maybe_cache_upsert_buffer(
@@ -475,19 +499,20 @@ impl ClientSession {
                 );
                 Ok(params.first_chunk.len() as u64)
             }
-            (false, _) => {
+            _ => {
                 self.write_single_line_response(client_write, params.first_chunk)
                     .await
             }
         }
     }
 
-    async fn buffer_and_cache_multiline_response<W>(
+    async fn deliver_buffered_multiline_response<W>(
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
         client_write: &mut W,
         ctx: &streaming::StreamContext<'_>,
         params: ResponseStreamParams<'_>,
+        cache_action: CacheAction,
     ) -> Result<u64, StreamingError>
     where
         W: AsyncWrite + Unpin,
@@ -507,8 +532,50 @@ impl ClientSession {
             );
         }
         let captured_len = captured.len();
-        self.maybe_cache_upsert_buffer(params.msg_id, captured.into(), ctx.backend_id);
+        match cache_action {
+            CacheAction::CaptureArticle => {
+                self.maybe_cache_upsert_buffer(params.msg_id, captured.into(), ctx.backend_id);
+            }
+            CacheAction::TrackAvailability => {
+                if let Some(msg_id) = params.msg_id
+                    && !params
+                        .request
+                        .cache_records_backend_has_article(ctx.backend_id)
+                {
+                    self.spawn_cache_upsert_availability(
+                        msg_id,
+                        params.status_code,
+                        ctx.backend_id,
+                        self.tier_for_backend(ctx.backend_id),
+                    );
+                }
+            }
+            CacheAction::TrackStat | CacheAction::None => {}
+        }
         Ok(captured_len as u64)
+    }
+
+    async fn stream_and_capture_multiline_response<W>(
+        &self,
+        pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+        client_write: &mut W,
+        ctx: &streaming::StreamContext<'_>,
+        params: ResponseStreamParams<'_>,
+    ) -> Result<u64, StreamingError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let mut captured = crate::pool::ChunkedResponse::default();
+        let bytes = streaming::stream_multiline_response_with_capture(
+            &mut **pooled_conn,
+            client_write,
+            params.first_chunk,
+            ctx,
+            &mut captured,
+        )
+        .await?;
+        self.maybe_cache_upsert_buffer(params.msg_id, captured.into(), ctx.backend_id);
+        Ok(bytes)
     }
 
     async fn stream_multiline_with_availability_tracking<W>(

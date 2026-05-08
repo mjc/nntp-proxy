@@ -30,6 +30,12 @@ pub struct PipelineWorkerConfig {
     pub(crate) backend_id: BackendId,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PipelineReadResult {
+    data_len: u64,
+    response_streamed: bool,
+}
+
 /// Run the pipeline worker loop for a single backend.
 ///
 /// This function runs forever (until the task is cancelled). It:
@@ -102,9 +108,8 @@ pub async fn backend_pipeline_worker(
             let _ = conn.release(); // batch healthy; return connection to pool
         }
         // !success: conn drops here → ConnectionGuard::remove_with_cooldown
-        // Unconditional: !success means a backend write, flush, or read failed.
-        // Client disconnects only close the oneshot response channel; they do
-        // not affect the backend connection and cannot cause !success here.
+        // Unconditional: !success means the current batch can no longer safely
+        // reuse the backend connection, including streamed client disconnects.
 
         // Record pipeline batch metrics
         if batch_len > 1 {
@@ -188,23 +193,25 @@ async fn execute_pipeline_batch(
                 backend_id,
             )
             .await
-            .map(|()| {
-                req.context
+            .map(|()| PipelineReadResult {
+                data_len: req
+                    .context
                     .response_payload_len()
-                    .map_or(0, ResponsePayloadLen::get) as u64
+                    .map_or(0, ResponsePayloadLen::get) as u64,
+                response_streamed: false,
             })
         };
 
         match read_result {
-            Ok(data_len) => {
+            Ok(read_result) => {
                 metrics.record_command(backend_id);
-                metrics.record_backend_to_client_bytes_for(backend_id, data_len);
+                metrics.record_backend_to_client_bytes_for(backend_id, read_result.data_len);
                 metrics.record_client_to_backend_bytes_for(
                     backend_id,
                     req.context.request_wire_len().as_u64(),
                 );
 
-                req.complete_context();
+                req.complete_context(read_result.response_streamed);
             }
             Err(crate::session::streaming::StreamingError::ClientDisconnect(io_err)) => {
                 debug!(
@@ -217,7 +224,7 @@ async fn execute_pipeline_batch(
                     "Pipeline worker client disconnect during streamed response; retiring connection to avoid batch desync"
                 );
 
-                req.complete_error(PipelineError::ReadFailed);
+                req.complete_error(PipelineError::ClientDisconnect);
 
                 let error_msg = PipelineError::ConnectionLost {
                     completed: response_index + 1,
@@ -287,7 +294,7 @@ async fn execute_streaming_pipeline_response(
     result_buf: &mut crate::pool::ChunkedResponse,
     buffer_pool: &BufferPool,
     backend_id: BackendId,
-) -> Result<u64, crate::session::streaming::StreamingError> {
+) -> Result<PipelineReadResult, crate::session::streaming::StreamingError> {
     let (status_code, initial_len) =
         crate::session::streaming::read_prefetched_response_status(io_buffer, conn).await?;
 
@@ -303,7 +310,10 @@ async fn execute_streaming_pipeline_response(
         let bytes = response.len() as u64;
         req.context
             .complete_backend_response(backend_id, status_code, response);
-        return Ok(bytes);
+        return Ok(PipelineReadResult {
+            data_len: bytes,
+            response_streamed: false,
+        });
     }
 
     let delivery = req.delivery().clone();
@@ -328,62 +338,116 @@ async fn execute_streaming_pipeline_response(
                     RequestResponseMetadata::new(status_code, (bytes as usize).into()),
                 );
                 result_buf.clear();
+                return Ok(PipelineReadResult {
+                    data_len: bytes,
+                    response_streamed: true,
+                });
+            }
+            PipelineDelivery::StreamAndCapture(client_writer) => {
+                let mut client_write = client_writer.lock().await;
+                result_buf
+                    .write_all_to(&mut *client_write)
+                    .await
+                    .map_err(crate::session::streaming::StreamingError::ClientDisconnect)?;
+                let response = std::mem::take(result_buf);
+                req.context
+                    .complete_backend_response(backend_id, status_code, response);
+                return Ok(PipelineReadResult {
+                    data_len: bytes,
+                    response_streamed: true,
+                });
             }
             PipelineDelivery::Buffered => {
                 let response = std::mem::take(result_buf);
                 req.context
                     .complete_backend_response(backend_id, status_code, response);
+                return Ok(PipelineReadResult {
+                    data_len: bytes,
+                    response_streamed: false,
+                });
             }
         }
-        return Ok(bytes);
     }
-
-    let PipelineDelivery::StreamToClient(client_writer) = delivery else {
-        let ctx = crate::session::streaming::StreamContext {
-            client_addr: req.client_addr,
-            backend_id,
-            buffer_pool,
-        };
-        let response = crate::session::streaming::buffer_multiline_response(
-            conn,
-            &io_buffer[..initial_len],
-            &ctx,
-        )
-        .await?;
-        let bytes = response.len() as u64;
-        req.context
-            .complete_backend_response(backend_id, status_code, response);
-        return Ok(bytes);
-    };
 
     let ctx = crate::session::streaming::StreamContext {
         client_addr: req.client_addr,
         backend_id,
         buffer_pool,
     };
-    let mut leftover = buffer_pool.acquire();
-    let mut client_write = client_writer.lock().await;
-    let bytes = crate::session::streaming::stream_multiline_response_pipelined(
-        conn,
-        &mut *client_write,
-        &io_buffer[..initial_len],
-        &ctx,
-        &mut leftover,
-    )
-    .await?;
-    drop(client_write);
+    match delivery {
+        PipelineDelivery::Buffered => {
+            let response = crate::session::streaming::buffer_multiline_response(
+                conn,
+                &io_buffer[..initial_len],
+                &ctx,
+            )
+            .await?;
+            let bytes = response.len() as u64;
+            req.context
+                .complete_backend_response(backend_id, status_code, response);
+            Ok(PipelineReadResult {
+                data_len: bytes,
+                response_streamed: false,
+            })
+        }
+        PipelineDelivery::StreamToClient(client_writer) => {
+            let mut leftover = buffer_pool.acquire();
+            let mut client_write = client_writer.lock().await;
+            let bytes = crate::session::streaming::stream_multiline_response_pipelined(
+                conn,
+                &mut *client_write,
+                &io_buffer[..initial_len],
+                &ctx,
+                &mut leftover,
+            )
+            .await?;
+            drop(client_write);
 
-    if !leftover.is_empty() {
-        conn.stash_leftover(&leftover[..])
-            .map_err(crate::session::streaming::StreamingError::Io)?;
-        leftover.clear();
+            if !leftover.is_empty() {
+                conn.stash_leftover(&leftover[..])
+                    .map_err(crate::session::streaming::StreamingError::Io)?;
+                leftover.clear();
+            }
+
+            req.context.record_backend_response(
+                backend_id,
+                RequestResponseMetadata::new(status_code, (bytes as usize).into()),
+            );
+            Ok(PipelineReadResult {
+                data_len: bytes,
+                response_streamed: true,
+            })
+        }
+        PipelineDelivery::StreamAndCapture(client_writer) => {
+            let mut leftover = buffer_pool.acquire();
+            let mut client_write = client_writer.lock().await;
+            let bytes =
+                crate::session::streaming::stream_multiline_response_pipelined_with_capture(
+                    conn,
+                    &mut *client_write,
+                    &io_buffer[..initial_len],
+                    &ctx,
+                    &mut leftover,
+                    result_buf,
+                )
+                .await?;
+            drop(client_write);
+
+            if !leftover.is_empty() {
+                conn.stash_leftover(&leftover[..])
+                    .map_err(crate::session::streaming::StreamingError::Io)?;
+                leftover.clear();
+            }
+
+            let response = std::mem::take(result_buf);
+            req.context
+                .complete_backend_response(backend_id, status_code, response);
+            Ok(PipelineReadResult {
+                data_len: bytes,
+                response_streamed: true,
+            })
+        }
     }
-
-    req.context.record_backend_response(
-        backend_id,
-        RequestResponseMetadata::new(status_code, (bytes as usize).into()),
-    );
-    Ok(bytes)
 }
 
 /// Buffer the complete response shape for the supplied request context.
@@ -451,7 +515,12 @@ mod tests {
     ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (
-            QueuedContext::new(request_context(command.as_bytes()), client_addr(), tx),
+            QueuedContext::new(
+                request_context(command.as_bytes()),
+                client_addr(),
+                tx,
+                PipelineDelivery::Buffered,
+            ),
             rx,
         )
     }
@@ -668,11 +737,11 @@ mod tests {
         let mut conn = mock_backend_conn(response).await;
         let (client_writer, mut client_stream) = mock_client_writer().await;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let batch = vec![QueuedContext::new_streaming(
+        let batch = vec![QueuedContext::new(
             request_context(ARTICLE_REQUEST),
             client_addr(),
             tx,
-            client_writer,
+            PipelineDelivery::StreamToClient(client_writer),
         )];
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
@@ -691,6 +760,7 @@ mod tests {
         assert!(!conn.has_leftover());
 
         let completed = rx.await.unwrap().unwrap();
+        assert!(completed.response_streamed);
         assert_eq!(
             completed
                 .context
@@ -716,11 +786,11 @@ mod tests {
         let mut conn = mock_backend_conn(response).await;
         let (client_writer, mut client_stream) = mock_client_writer().await;
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let batch = vec![QueuedContext::new_streaming(
+        let batch = vec![QueuedContext::new(
             request_context(ARTICLE_REQUEST),
             client_addr(),
             tx,
-            client_writer,
+            PipelineDelivery::StreamToClient(client_writer),
         )];
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
@@ -738,6 +808,7 @@ mod tests {
         assert!(batch.is_empty());
 
         let completed = rx.await.unwrap().unwrap();
+        assert!(!completed.response_streamed);
         assert_eq!(
             completed
                 .context
@@ -773,6 +844,7 @@ mod tests {
             request_context(ARTICLE_REQUEST),
             client_addr(),
             tx,
+            PipelineDelivery::Buffered,
         )];
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
@@ -790,6 +862,7 @@ mod tests {
         assert!(batch.is_empty());
 
         let completed = rx.await.unwrap().unwrap();
+        assert!(!completed.response_streamed);
         assert_eq!(
             completed
                 .context
@@ -828,13 +901,18 @@ mod tests {
         let (tx1, rx1) = tokio::sync::oneshot::channel();
         let (tx2, rx2) = tokio::sync::oneshot::channel();
         let batch = vec![
-            QueuedContext::new_streaming(
+            QueuedContext::new(
                 request_context(ARTICLE_REQUEST),
                 client_addr(),
                 tx1,
-                client_writer,
+                PipelineDelivery::StreamToClient(client_writer),
             ),
-            QueuedContext::new(request_context(STAT_REQUEST), client_addr(), tx2),
+            QueuedContext::new(
+                request_context(STAT_REQUEST),
+                client_addr(),
+                tx2,
+                PipelineDelivery::Buffered,
+            ),
         ];
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
@@ -854,7 +932,10 @@ mod tests {
         );
         assert!(batch.is_empty());
 
-        assert!(matches!(rx1.await.unwrap(), Err(PipelineError::ReadFailed)));
+        assert!(matches!(
+            rx1.await.unwrap(),
+            Err(PipelineError::ClientDisconnect)
+        ));
         assert!(matches!(
             rx2.await.unwrap(),
             Err(PipelineError::ConnectionLost {

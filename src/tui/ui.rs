@@ -388,8 +388,19 @@ fn build_app_summary_lines(
             )
         };
         lines.push(Line::from(vec![
-            "Pipeline Live: ".fg(styles::LABEL),
+            "Pipeline In-Flight: ".fg(styles::LABEL),
             live_summary.fg(styles::VALUE_INFO),
+        ]));
+    }
+
+    if metrics.pipeline_queue_capacity > 0 {
+        lines.push(Line::from(vec![
+            "Pipeline Queue: ".fg(styles::LABEL),
+            format!(
+                "{}/{} backlog",
+                metrics.pipeline_queue_depth, metrics.pipeline_queue_capacity
+            )
+            .fg(styles::VALUE_INFO),
         ]));
     }
 
@@ -408,7 +419,7 @@ fn build_app_summary_lines(
 
     if metrics.pipeline_requests_queued > 0 {
         lines.push(Line::from(vec![
-            "Mux Queue: ".fg(styles::LABEL),
+            "Mux Totals: ".fg(styles::LABEL),
             format!(
                 "{} queued, {} completed",
                 metrics.pipeline_requests_queued, metrics.pipeline_requests_completed
@@ -636,7 +647,7 @@ fn backend_details_line(
     pipeline_capacity: Option<usize>,
 ) -> Line<'static> {
     let mut spans: Vec<Span> = vec![
-        "  Load/Pipeline: ".fg(styles::LABEL),
+        "  In Flight: ".fg(styles::LABEL),
         format!("{pending} in-flight").fg(pending_count_color(pending)),
     ];
 
@@ -652,7 +663,7 @@ fn backend_details_line(
     if let Some(capacity) = pipeline_capacity {
         spans.push(
             format!(
-                " | Queue: {}/{}",
+                " | Queue Backlog: {}/{}",
                 pipeline_depth.unwrap_or_default(),
                 capacity
             )
@@ -1145,9 +1156,9 @@ mod tests {
         .collect::<Vec<_>>();
 
         assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("Pipeline Live: 3 in-flight across 24 backend conns"))
+            lines.iter().any(
+                |line| line.contains("Pipeline In-Flight: 3 in-flight across 24 backend conns")
+            )
         );
         assert!(
             !lines
@@ -1161,10 +1172,10 @@ mod tests {
         let with_pipeline = backend_details_line(4, Some(0.25), 1, Some(3), Some(8)).to_string();
         let without_pipeline = backend_details_line(4, Some(0.25), 1, None, None).to_string();
 
-        assert!(with_pipeline.contains("Load/Pipeline: 4 in-flight (25%)"));
+        assert!(with_pipeline.contains("In Flight: 4 in-flight (25%)"));
         assert!(with_pipeline.contains("Stateful: 1"));
-        assert!(with_pipeline.contains("Queue: 3/8"));
-        assert!(!without_pipeline.contains("Queue:"));
+        assert!(with_pipeline.contains("Queue Backlog: 3/8"));
+        assert!(!without_pipeline.contains("Queue Backlog:"));
     }
 
     fn user_stat_lines_for_test(user: &DashboardUserStats) -> Vec<Line<'static>> {

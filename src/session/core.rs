@@ -39,6 +39,8 @@ pub struct ClientSession {
 
     /// Whether to cache article bodies (config-driven)
     pub(super) cache_articles: bool,
+    /// Whether ARTICLE/BODY responses are buffered before client delivery.
+    pub(super) article_buffer: bool,
 
     /// Whether to use adaptive availability prechecking for STAT/HEAD
     pub(super) adaptive_precheck: bool,
@@ -87,6 +89,7 @@ pub struct ClientSessionBuilder {
     connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
     cache: Arc<crate::cache::UnifiedCache>,
     cache_articles: bool,
+    article_buffer: bool,
     adaptive_precheck: bool,
 }
 
@@ -147,6 +150,13 @@ impl ClientSessionBuilder {
         self
     }
 
+    /// Set whether large ARTICLE/BODY responses are buffered before client delivery.
+    #[must_use]
+    pub const fn with_article_buffer(mut self, article_buffer: bool) -> Self {
+        self.article_buffer = article_buffer;
+        self
+    }
+
     /// Configure adaptive availability prechecking
     #[must_use]
     pub const fn with_adaptive_precheck(mut self, enable: bool) -> Self {
@@ -183,6 +193,7 @@ impl ClientSessionBuilder {
             connection_stats: self.connection_stats,
             cache: self.cache,
             cache_articles: self.cache_articles,
+            article_buffer: self.article_buffer,
             adaptive_precheck: self.adaptive_precheck,
         }
     }
@@ -216,6 +227,7 @@ impl ClientSession {
             connection_stats: None,
             cache: Self::default_cache(),
             cache_articles: true,
+            article_buffer: true,
             adaptive_precheck: false,
         }
     }
@@ -247,6 +259,7 @@ impl ClientSession {
                 std::time::Duration::MAX,
             )),
             cache_articles: true,
+            article_buffer: true,
             adaptive_precheck: false,
         }
     }
@@ -291,6 +304,7 @@ impl ClientSession {
                 std::time::Duration::MAX,
             )),
             cache_articles: true,
+            article_buffer: true,
             adaptive_precheck: false,
         }
     }

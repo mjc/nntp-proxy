@@ -238,6 +238,29 @@ where
     stream_multiline_response_impl(backend_read, client_write, first_chunk, ctx, None, None).await
 }
 
+/// Stream a multiline response while also capturing the exact bytes that were sent.
+pub(crate) async fn stream_multiline_response_with_capture<R, W>(
+    backend_read: &mut R,
+    client_write: &mut W,
+    first_chunk: &[u8],
+    ctx: &StreamContext<'_>,
+    capture: &mut crate::pool::ChunkedResponse,
+) -> Result<u64, StreamingError>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    stream_multiline_response_impl(
+        backend_read,
+        client_write,
+        first_chunk,
+        ctx,
+        Some(capture),
+        None,
+    )
+    .await
+}
+
 fn stash_leftover(
     conn: &mut crate::stream::ConnectionStream,
     remainder: &[u8],
@@ -509,6 +532,30 @@ where
         first_chunk,
         ctx,
         None,
+        Some(leftover),
+    )
+    .await
+}
+
+/// Like [`stream_multiline_response_pipelined`], but also captures the streamed bytes.
+pub(crate) async fn stream_multiline_response_pipelined_with_capture<R, W>(
+    backend_read: &mut R,
+    client_write: &mut W,
+    first_chunk: &[u8],
+    ctx: &StreamContext<'_>,
+    leftover: &mut crate::pool::PooledBuffer,
+    capture: &mut crate::pool::ChunkedResponse,
+) -> Result<u64, StreamingError>
+where
+    R: AsyncReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    stream_multiline_response_impl(
+        backend_read,
+        client_write,
+        first_chunk,
+        ctx,
+        Some(capture),
         Some(leftover),
     )
     .await
