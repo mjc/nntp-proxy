@@ -372,19 +372,24 @@ fn build_app_summary_lines(
         ]);
     }
 
-    lines.push(Line::from(vec![
-        "In-Flight: ".fg(styles::LABEL),
-        format!("{} requests", metrics.in_flight_requests).fg(styles::VALUE_INFO),
-    ]));
+    let queued_requests = metrics
+        .in_flight_requests
+        .saturating_sub(metrics.pipeline_depth);
 
     if metrics.pipeline_enabled_backends > 0 {
         lines.push(Line::from(vec![
             "Pipelined: ".fg(styles::LABEL),
-            format!(
-                "{} across {} backend conns",
-                metrics.pipeline_depth, metrics.pipeline_connection_capacity
-            )
-            .fg(styles::VALUE_INFO),
+            format!("{}", metrics.pipeline_depth).fg(styles::VALUE_INFO),
+            ", Queued: ".fg(styles::LABEL),
+            format!("{queued_requests}").fg(styles::VALUE_INFO),
+            " across ".fg(styles::LABEL),
+            format!("{}", metrics.pipeline_connection_capacity).fg(styles::VALUE_INFO),
+            " backend conns".fg(styles::LABEL),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            "Queued: ".fg(styles::LABEL),
+            format!("{queued_requests} requests").fg(styles::VALUE_INFO),
         ]));
     }
 
@@ -622,24 +627,28 @@ fn backend_error_line(
     ])
 }
 
-/// Create details line: in-flight load, stateful connections, and pipelined depth.
+/// Create details line: queued load, stateful connections, and pipelined depth.
 fn backend_details_line(
     pending: usize,
     _load_ratio: Option<f64>,
     stateful: usize,
     pipeline_depth: Option<usize>,
 ) -> Line<'static> {
-    let mut spans: Vec<Span> = vec![
-        "  In Flight: ".fg(styles::LABEL),
-        format!("{pending}").fg(pending_count_color(pending)),
-    ];
+    let queued = pending.saturating_sub(pipeline_depth.unwrap_or_default());
+    let mut spans: Vec<Span> = Vec::with_capacity(5);
 
     if stateful > 0 {
-        spans.push(format!(" | Stateful: {stateful}").fg(Color::Cyan));
+        spans.push(format!("  Stateful: {stateful} | ").fg(Color::Cyan));
     }
 
     if let Some(depth) = pipeline_depth {
-        spans.push(format!(" | Pipelined: {depth}").fg(styles::VALUE_INFO));
+        spans.push("Pipelined: ".fg(styles::LABEL));
+        spans.push(format!("{depth}").fg(styles::VALUE_INFO));
+        spans.push(", Queued: ".fg(styles::LABEL));
+        spans.push(format!("{queued}").fg(pending_count_color(queued)));
+    } else {
+        spans.push("  Queued: ".fg(styles::LABEL));
+        spans.push(format!("{queued}").fg(pending_count_color(queued)));
     }
 
     Line::from(spans)
@@ -1129,12 +1138,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("In-Flight: 7 requests"))
-        );
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("Pipelined: 3 across 24 backend conns"))
+                .any(|line| line.contains("Pipelined: 3, Queued: 4 across 24 backend conns"))
         );
         assert!(
             !lines
@@ -1148,10 +1152,10 @@ mod tests {
         let with_pipeline = backend_details_line(4, Some(0.25), 1, Some(3)).to_string();
         let without_pipeline = backend_details_line(4, Some(0.25), 1, None).to_string();
 
-        assert!(with_pipeline.contains("In Flight: 4"));
         assert!(with_pipeline.contains("Stateful: 1"));
-        assert!(with_pipeline.contains("Pipelined: 3"));
+        assert!(with_pipeline.contains("Pipelined: 3, Queued: 1"));
         assert!(!with_pipeline.contains('%'));
+        assert!(without_pipeline.contains("Queued: 4"));
         assert!(!without_pipeline.contains("Pipelined:"));
     }
 
