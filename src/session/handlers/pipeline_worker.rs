@@ -251,20 +251,12 @@ async fn execute_pipeline_batch(
                     command_verb = ?req.context.verb(),
                     leftover_bytes = conn.leftover_len(),
                     error = %io_err,
-                    "Pipeline worker client disconnect during streamed response; retiring connection to avoid batch desync"
+                    "Pipeline worker client disconnect during streamed response; backend drained cleanly, continuing batch"
                 );
 
                 req.complete_error(PipelineError::ClientDisconnect);
-
-                let error_msg = PipelineError::ConnectionLost {
-                    completed: response_index + 1,
-                    batch_len,
-                };
-                while let Some(remaining_req) = batch.pop() {
-                    remaining_req.complete_error(error_msg);
-                }
-
-                return (false, batch);
+                pipeline_depth.complete_one();
+                continue;
             }
             Err(e) => {
                 warn!(
@@ -423,14 +415,14 @@ async fn execute_streaming_pipeline_response(
         PipelineDelivery::StreamToClient(client_writer) => {
             let mut leftover = buffer_pool.acquire();
             let mut client_write = client_writer.lock().await;
-            let bytes = crate::session::streaming::stream_multiline_response_pipelined(
+            let stream_result = crate::session::streaming::stream_multiline_response_pipelined(
                 conn,
                 &mut *client_write,
                 &io_buffer[..initial_len],
                 &ctx,
                 &mut leftover,
             )
-            .await?;
+            .await;
             drop(client_write);
 
             if !leftover.is_empty() {
@@ -438,6 +430,8 @@ async fn execute_streaming_pipeline_response(
                     .map_err(crate::session::streaming::StreamingError::Io)?;
                 leftover.clear();
             }
+
+            let bytes = stream_result?;
 
             req.context.record_backend_response(
                 backend_id,
@@ -451,7 +445,7 @@ async fn execute_streaming_pipeline_response(
         PipelineDelivery::StreamAndCapture(client_writer) => {
             let mut leftover = buffer_pool.acquire();
             let mut client_write = client_writer.lock().await;
-            let bytes =
+            let stream_result =
                 crate::session::streaming::stream_multiline_response_pipelined_with_capture(
                     conn,
                     &mut *client_write,
@@ -460,7 +454,7 @@ async fn execute_streaming_pipeline_response(
                     &mut leftover,
                     result_buf,
                 )
-                .await?;
+                .await;
             drop(client_write);
 
             if !leftover.is_empty() {
@@ -468,6 +462,8 @@ async fn execute_streaming_pipeline_response(
                     .map_err(crate::session::streaming::StreamingError::Io)?;
                 leftover.clear();
             }
+
+            let bytes = stream_result?;
 
             let response = std::mem::take(result_buf);
             req.context
@@ -989,7 +985,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_pipeline_batch_aborts_after_streamed_client_disconnect() {
+    async fn test_execute_pipeline_batch_continues_after_streamed_client_disconnect() {
         let pool = BufferPool::for_tests();
         let metrics = MetricsCollector::new(1);
         let backend_id = BackendId::from_index(0);
@@ -1035,8 +1031,8 @@ mod tests {
         .await;
 
         assert!(
-            !success,
-            "streamed client disconnect must retire the connection"
+            success,
+            "streamed client disconnect should swallow the drained response and keep the batch running"
         );
         assert!(batch.is_empty());
 
@@ -1044,13 +1040,98 @@ mod tests {
             rx1.await.unwrap(),
             Err(PipelineError::ClientDisconnect)
         ));
-        assert!(matches!(
+        assert_eq!(expect_success_status(rx2.await.unwrap()), 430);
+    }
+
+    #[tokio::test]
+    async fn test_execute_pipeline_batch_drains_all_streamed_responses_for_disconnected_client() {
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(1);
+        let backend_id = BackendId::from_index(0);
+        let queue = BackendQueue::new(5);
+
+        let article_response = |msg_id: &str| {
+            format!("220 0 {msg_id} article\r\nSubject: test\r\n\r\nBody line\r\n.\r\n")
+        };
+        let wire = format!(
+            "{}{}{}{}223 0 <other@example> status\r\n",
+            article_response("<dead-1@example>"),
+            article_response("<dead-2@example>"),
+            article_response("<dead-3@example>"),
+            article_response("<dead-4@example>"),
+        );
+        let mut conn = mock_backend_conn(wire.as_bytes()).await;
+        let (client_writer, client_stream) = mock_client_writer().await;
+        let std_client_stream = client_stream.into_std().unwrap();
+        socket2::SockRef::from(&std_client_stream)
+            .set_linger(Some(std::time::Duration::ZERO))
+            .unwrap();
+        drop(std_client_stream);
+
+        let (tx1, rx1) = tokio::sync::oneshot::channel();
+        let (tx2, rx2) = tokio::sync::oneshot::channel();
+        let (tx3, rx3) = tokio::sync::oneshot::channel();
+        let (tx4, rx4) = tokio::sync::oneshot::channel();
+        let (tx5, rx5) = tokio::sync::oneshot::channel();
+        let batch = vec![
+            QueuedContext::new(
+                request_context(b"ARTICLE <dead-1@example>\r\n"),
+                client_addr(),
+                tx1,
+                PipelineDelivery::StreamToClient(client_writer.clone()),
+            ),
+            QueuedContext::new(
+                request_context(b"ARTICLE <dead-2@example>\r\n"),
+                client_addr(),
+                tx2,
+                PipelineDelivery::StreamToClient(client_writer.clone()),
+            ),
+            QueuedContext::new(
+                request_context(b"ARTICLE <dead-3@example>\r\n"),
+                client_addr(),
+                tx3,
+                PipelineDelivery::StreamToClient(client_writer.clone()),
+            ),
+            QueuedContext::new(
+                request_context(b"ARTICLE <dead-4@example>\r\n"),
+                client_addr(),
+                tx4,
+                PipelineDelivery::StreamToClient(client_writer),
+            ),
+            QueuedContext::new(
+                request_context(b"STAT <other@example>\r\n"),
+                client_addr(),
+                tx5,
+                PipelineDelivery::Buffered,
+            ),
+        ];
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+
+        let (success, batch) = execute_pipeline_batch(
+            backend_id,
+            &queue,
+            &mut conn,
+            batch,
+            &metrics,
+            &pool,
+            &mut result_buf,
+        )
+        .await;
+
+        assert!(
+            success,
+            "disconnecting one client should still drain every already-sent response and preserve the backend connection"
+        );
+        assert!(batch.is_empty());
+        for response in [
+            rx1.await.unwrap(),
             rx2.await.unwrap(),
-            Err(PipelineError::ConnectionLost {
-                completed: 1,
-                batch_len: 2,
-            })
-        ));
+            rx3.await.unwrap(),
+            rx4.await.unwrap(),
+        ] {
+            assert!(matches!(response, Err(PipelineError::ClientDisconnect)));
+        }
+        assert_eq!(expect_success_status(rx5.await.unwrap()), 223);
     }
 
     #[tokio::test]

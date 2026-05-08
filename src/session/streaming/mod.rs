@@ -114,10 +114,13 @@ struct DrainContext<'a> {
     write_len: usize,
     chunk_len: usize,
     total_bytes: u64,
+    /// The full chunk containing the client write failure.
+    chunk_data: &'a [u8],
     /// The slice already written (or attempted) — used to seed `TailBuffer.update()`
     /// so cross-chunk terminator detection works correctly across the drain boundary.
-    tail_data: &'a [u8],
+    written_data: &'a [u8],
     terminator_found: bool,
+    leftover_out: Option<&'a mut crate::pool::PooledBuffer>,
     ctx: &'a StreamContext<'a>,
 }
 
@@ -130,7 +133,7 @@ struct DrainContext<'a> {
 async fn handle_client_write_error<R>(
     error: std::io::Error,
     backend_read: &mut R,
-    ctx: DrainContext<'_>,
+    mut ctx: DrainContext<'_>,
 ) -> StreamingError
 where
     R: AsyncReadExt + Unpin,
@@ -159,8 +162,21 @@ where
 
     // Drain backend if terminator not yet found to keep connection clean.
     // tail_data seeds TailBuffer so cross-chunk boundary detection works correctly.
-    if !ctx.terminator_found {
-        match drain_until_terminator(backend_read, ctx.tail_data, ctx.ctx).await {
+    if ctx.terminator_found {
+        if let Err(stash_err) =
+            stash_stream_leftover(&mut ctx.leftover_out, &ctx.chunk_data[ctx.write_len..])
+        {
+            return stash_err;
+        }
+    } else {
+        match drain_until_terminator(
+            backend_read,
+            ctx.written_data,
+            &mut ctx.leftover_out,
+            ctx.ctx,
+        )
+        .await
+        {
             Ok(()) => {} // Drain succeeded — backend is clean
             Err(drain_err) => {
                 warn!(
@@ -188,6 +204,7 @@ where
 async fn drain_until_terminator<R>(
     backend_read: &mut R,
     initial_tail: &[u8],
+    leftover_out: &mut Option<&mut crate::pool::PooledBuffer>,
     ctx: &StreamContext<'_>,
 ) -> Result<()>
 where
@@ -205,7 +222,10 @@ where
             anyhow::bail!("Backend closed connection before multiline terminator during drain");
         }
         let data = &chunk[..n];
-        if tail.detect_terminator(data).is_found() {
+        let status = tail.detect_terminator(data);
+        if status.is_found() {
+            let write_len = status.write_len(data.len());
+            stash_stream_leftover(leftover_out, &data[write_len..])?;
             break;
         }
         tail.update(data);
@@ -598,6 +618,7 @@ async fn process_chunk<R, W>(
     data: &[u8],
     tail: &mut TailBuffer,
     capture: &mut Option<&mut crate::pool::ChunkedResponse>,
+    leftover_out: &mut Option<&mut crate::pool::PooledBuffer>,
     client_write: &mut W,
     state: ChunkProcessState<'_, R>,
 ) -> Result<ChunkResult, StreamingError>
@@ -623,8 +644,10 @@ where
                 write_len,
                 chunk_len: data.len(),
                 total_bytes: *state.total_bytes,
-                tail_data: &data[..write_len],
+                chunk_data: data,
+                written_data: &data[..write_len],
                 terminator_found: status.is_found(),
+                leftover_out: leftover_out.take(),
                 ctx: state.ctx,
             },
         )
@@ -692,6 +715,7 @@ where
         first_chunk,
         tail,
         capture,
+        leftover_out,
         client_write,
         ChunkProcessState {
             backend_read,
@@ -766,6 +790,7 @@ where
             data,
             tail,
             capture,
+            leftover_out,
             client_write,
             ChunkProcessState {
                 backend_read,
@@ -893,9 +918,12 @@ mod tests {
         let mut reader = Cursor::new(data);
         let pool = test_helpers::make_pool();
         let ctx = test_helpers::make_ctx(&pool);
+        let mut leftover = pool.acquire();
+        let mut leftover_out = Some(&mut leftover);
 
-        let result = drain_until_terminator(&mut reader, b"", &ctx).await;
+        let result = drain_until_terminator(&mut reader, b"", &mut leftover_out, &ctx).await;
         assert!(result.is_ok());
+        assert!(leftover.is_empty());
     }
 
     #[tokio::test]
@@ -905,10 +933,13 @@ mod tests {
         let mut reader = Cursor::new(data);
         let pool = test_helpers::make_pool();
         let ctx = test_helpers::make_ctx(&pool);
+        let mut leftover = pool.acquire();
+        let mut leftover_out = Some(&mut leftover);
 
         // Start with tail that could span
-        let result = drain_until_terminator(&mut reader, b"\r\n", &ctx).await;
+        let result = drain_until_terminator(&mut reader, b"\r\n", &mut leftover_out, &ctx).await;
         assert!(result.is_ok());
+        assert!(leftover.is_empty());
     }
 
     #[tokio::test]
@@ -918,8 +949,10 @@ mod tests {
         let mut reader = Cursor::new(data);
         let pool = test_helpers::make_pool();
         let ctx = test_helpers::make_ctx(&pool);
+        let mut leftover = pool.acquire();
+        let mut leftover_out = Some(&mut leftover);
 
-        let result = drain_until_terminator(&mut reader, b"", &ctx).await;
+        let result = drain_until_terminator(&mut reader, b"", &mut leftover_out, &ctx).await;
         assert!(result.is_err(), "EOF before terminator must be an error");
     }
 
@@ -950,13 +983,16 @@ mod tests {
         let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
         let pool = test_helpers::make_pool();
         let stream_ctx = test_helpers::make_ctx(&pool);
+        let mut leftover = pool.acquire();
 
         let ctx = DrainContext {
             write_len: 10,
             chunk_len: 10,
             total_bytes: 10,
-            tail_data: b"",
+            chunk_data: b"",
+            written_data: b"",
             terminator_found: false, // Must drain
+            leftover_out: Some(&mut leftover),
             ctx: &stream_ctx,
         };
 
@@ -1141,13 +1177,17 @@ mod tests {
         let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
         let pool = test_helpers::make_pool();
         let stream_ctx = test_helpers::make_ctx(&pool);
+        let mut leftover = pool.acquire();
+        let chunk = b"test";
 
         let ctx = DrainContext {
-            write_len: 100,
-            chunk_len: 100, // Same as write_len = complete chunk
-            total_bytes: 100,
-            tail_data: b"test",
+            write_len: chunk.len(),
+            chunk_len: chunk.len(), // Same as write_len = complete chunk
+            total_bytes: chunk.len() as u64,
+            chunk_data: chunk,
+            written_data: chunk,
             terminator_found: true,
+            leftover_out: Some(&mut leftover),
             ctx: &stream_ctx,
         };
 
@@ -1166,13 +1206,16 @@ mod tests {
         let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
         let pool = test_helpers::make_pool();
         let stream_ctx = test_helpers::make_ctx(&pool);
+        let mut leftover = pool.acquire();
 
         let ctx = DrainContext {
             write_len: 50,
             chunk_len: 100, // Different from write_len = incomplete
             total_bytes: 500,
-            tail_data: b"",
+            chunk_data: b"",
+            written_data: b"",
             terminator_found: false, // Need to drain
+            leftover_out: Some(&mut leftover),
             ctx: &stream_ctx,
         };
 
@@ -1192,13 +1235,16 @@ mod tests {
         let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
         let pool = test_helpers::make_pool();
         let stream_ctx = test_helpers::make_ctx(&pool);
+        let mut leftover = pool.acquire();
 
         let ctx = DrainContext {
             write_len: 10,
             chunk_len: 10,
             total_bytes: 10,
-            tail_data: b"",
+            chunk_data: b"",
+            written_data: b"",
             terminator_found: false,
+            leftover_out: Some(&mut leftover),
             ctx: &stream_ctx,
         };
 
@@ -1211,6 +1257,55 @@ mod tests {
         // Verify backend was drained (cursor should be at or near end)
         let pos = backend.position();
         assert!(pos >= remaining_data.len() as u64 - 5); // Near end after draining
+    }
+
+    #[tokio::test]
+    async fn test_handle_client_write_error_stashes_leftover_from_same_chunk() {
+        let mut backend = Cursor::new(b"" as &[u8]);
+        let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
+        let pool = test_helpers::make_pool();
+        let stream_ctx = test_helpers::make_ctx(&pool);
+        let mut leftover = pool.acquire();
+        let chunk = b"Body\r\n.\r\n223 0 <next@example> status\r\n";
+
+        let ctx = DrainContext {
+            write_len: b"Body\r\n.\r\n".len(),
+            chunk_len: chunk.len(),
+            total_bytes: 9,
+            chunk_data: chunk,
+            written_data: &chunk[..b"Body\r\n.\r\n".len()],
+            terminator_found: true,
+            leftover_out: Some(&mut leftover),
+            ctx: &stream_ctx,
+        };
+
+        let result = handle_client_write_error(error, &mut backend, ctx).await;
+        assert!(matches!(result, StreamingError::ClientDisconnect(_)));
+        assert_eq!(&leftover[..], b"223 0 <next@example> status\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_handle_client_write_error_stashes_leftover_after_drain() {
+        let mut backend = Cursor::new(b"rest of body\r\n.\r\n223 0 <next@example> status\r\n");
+        let error = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken pipe");
+        let pool = test_helpers::make_pool();
+        let stream_ctx = test_helpers::make_ctx(&pool);
+        let mut leftover = pool.acquire();
+
+        let ctx = DrainContext {
+            write_len: 5,
+            chunk_len: 12,
+            total_bytes: 5,
+            chunk_data: b"first chunk",
+            written_data: b"first",
+            terminator_found: false,
+            leftover_out: Some(&mut leftover),
+            ctx: &stream_ctx,
+        };
+
+        let result = handle_client_write_error(error, &mut backend, ctx).await;
+        assert!(matches!(result, StreamingError::ClientDisconnect(_)));
+        assert_eq!(&leftover[..], b"223 0 <next@example> status\r\n");
     }
 
     // =========================================================================
