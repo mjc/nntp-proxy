@@ -964,7 +964,7 @@ mod tests {
             cache.article_cache_ttl_secs,
             crate::constants::duration_polyfill::from_hours(1)
         );
-        assert!(cache.store_article_bodies);
+        assert!(!cache.store_article_bodies);
     }
 
     #[test]

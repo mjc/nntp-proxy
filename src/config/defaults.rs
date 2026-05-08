@@ -61,11 +61,10 @@ pub const fn cache_ttl() -> Duration {
 
 /// Default for caching article bodies in explicit `[cache]` sections.
 ///
-/// Legacy cache configs omitted this field and expected full article caching,
-/// so the serde default stays `true` for backward compatibility.
+/// Default to availability-only caching unless full body storage is explicitly enabled.
 #[inline]
 pub const fn cache_articles() -> bool {
-    true
+    false
 }
 
 /// Default for buffering ARTICLE/BODY responses before writing to the client.
