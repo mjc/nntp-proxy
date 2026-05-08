@@ -176,6 +176,7 @@ pub mod precheck;
 pub(crate) mod retry;
 pub(crate) mod routing;
 pub mod session_error;
+pub(crate) mod shared_client_writer;
 pub mod state;
 pub mod streaming;
 
@@ -185,4 +186,5 @@ pub use core::{ClientSession, ClientSessionBuilder};
 pub use metrics_ext::MetricsRecorder;
 pub use mode_state::{ModeState, SessionMode};
 pub use session_error::SessionError;
+pub(crate) use shared_client_writer::SharedClientWriter;
 pub use state::SessionLoopState;

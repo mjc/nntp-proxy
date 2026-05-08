@@ -36,13 +36,16 @@ impl ClientSession {
     ///
     /// Returns `CacheLookupResult::Hit` if served, `PartialHit` if entry existed but
     /// wasn't servable, or `Miss`.
-    pub(super) async fn try_serve_from_cache(
+    pub(super) async fn try_serve_from_cache<W>(
         &self,
         request: &mut RequestContext,
         router: &Arc<BackendSelector>,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_write: &mut W,
         backend_to_client_bytes: &mut BackendToClientBytes,
-    ) -> Result<CacheLookupResult> {
+    ) -> Result<CacheLookupResult>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let Some(msg_id_for_lookup) = request.message_id() else {
             request.record_cache_status(RequestCacheStatus::Miss);
             return Ok(CacheLookupResult::Miss);

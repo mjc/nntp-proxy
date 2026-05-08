@@ -1490,6 +1490,9 @@ mod tests {
             .try_enqueue(crate::router::backend_queue::QueuedContext::new(
                 crate::protocol::RequestContext::parse(b"STAT <test@example.com>\r\n")
                     .expect("valid request"),
+                crate::types::ClientAddress::new(
+                    "127.0.0.1:8119".parse().expect("valid client addr"),
+                ),
                 tx,
             ))
             .expect("queue request");

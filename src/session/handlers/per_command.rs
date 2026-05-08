@@ -56,22 +56,22 @@ enum BatchSwitchTarget {
 }
 
 /// Parameters for executing a command decision
-struct CommandExecutionParams<'a, 'b> {
+struct CommandExecutionParams<'a> {
     request: &'a mut RequestContext,
     skip_auth_check: bool,
     router: &'a Arc<BackendSelector>,
-    client_write: &'a mut tokio::net::tcp::WriteHalf<'b>,
+    client_writer: &'a crate::session::SharedClientWriter,
     auth_username: &'a mut Option<String>,
     client_to_backend_bytes: ClientToBackendBytes,
     backend_to_client_bytes: &'a mut BackendToClientBytes,
 }
 
 /// Parameters for processing a single command (full flow including QUIT handling)
-struct ProcessCommandParams<'a, 'b> {
+struct ProcessCommandParams<'a> {
     request: &'a mut RequestContext,
     skip_auth_check: bool,
     router: &'a Arc<BackendSelector>,
-    client_write: &'a mut tokio::net::tcp::WriteHalf<'b>,
+    client_writer: &'a crate::session::SharedClientWriter,
     auth_username: &'a mut Option<String>,
     client_to_backend_bytes: ClientToBackendBytes,
     backend_to_client_bytes: &'a mut BackendToClientBytes,
@@ -115,13 +115,13 @@ impl ClientSession {
     /// Handles all routing decision types: auth, forwarding, rejection, etc.
     async fn execute_command_decision(
         &self,
-        params: CommandExecutionParams<'_, '_>,
+        params: CommandExecutionParams<'_>,
     ) -> Result<CommandResult> {
         let request = params.request;
         let skip_auth_check = params.skip_auth_check;
         let CommandExecutionParams {
             router,
-            client_write,
+            client_writer,
             auth_username,
             client_to_backend_bytes,
             backend_to_client_bytes,
@@ -139,7 +139,7 @@ impl ClientSession {
             CommandRoutingDecision::InterceptAuth => {
                 self.handle_intercept_auth(
                     request,
-                    client_write,
+                    client_writer,
                     auth_username,
                     backend_to_client_bytes,
                 )
@@ -149,28 +149,28 @@ impl ClientSession {
                 self.handle_forward_decision(
                     request,
                     router,
-                    client_write,
+                    client_writer,
                     client_to_backend_bytes,
                     backend_to_client_bytes,
                 )
                 .await
             }
             CommandRoutingDecision::RequireAuth => {
-                self.handle_require_auth(request, client_write, backend_to_client_bytes)
+                self.handle_require_auth(request, client_writer, backend_to_client_bytes)
                     .await
             }
             CommandRoutingDecision::SwitchToStateful => {
                 Ok(self.handle_stateful_switch_decision(request))
             }
             CommandRoutingDecision::Reject => {
-                self.handle_rejected_request(request, client_write, backend_to_client_bytes)
+                self.handle_rejected_request(request, client_writer, backend_to_client_bytes)
                     .await
             }
             CommandRoutingDecision::InterceptCapabilities => {
                 self.handle_capabilities_request(
                     request,
                     skip_auth_check,
-                    client_write,
+                    client_writer,
                     backend_to_client_bytes,
                 )
                 .await
@@ -181,7 +181,7 @@ impl ClientSession {
     async fn handle_intercept_auth(
         &self,
         request: &mut RequestContext,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_writer: &crate::session::SharedClientWriter,
         auth_username: &mut Option<String>,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<CommandResult> {
@@ -191,10 +191,11 @@ impl ClientSession {
             unreachable!("InterceptAuth decision must come from InterceptAuth action")
         };
 
+        let mut client_write = client_writer.lock().await;
         let result = common::handle_auth_command(
             &self.auth_handler,
             auth_action,
-            client_write,
+            &mut *client_write,
             auth_username,
             &self.auth_state,
         )
@@ -220,7 +221,7 @@ impl ClientSession {
         &self,
         request: &mut RequestContext,
         router: &Arc<BackendSelector>,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_writer: &crate::session::SharedClientWriter,
         client_to_backend_bytes: ClientToBackendBytes,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<CommandResult> {
@@ -234,7 +235,7 @@ impl ClientSession {
         self.route_and_execute_request(
             router.clone(),
             request,
-            client_write,
+            client_writer,
             &mut client_to_backend_bytes,
             backend_to_client_bytes,
         )
@@ -247,10 +248,11 @@ impl ClientSession {
     async fn handle_require_auth(
         &self,
         request: &mut RequestContext,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_writer: &crate::session::SharedClientWriter,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<CommandResult> {
         debug!("Client {} decision: RequireAuth", self.client_addr);
+        let mut client_write = client_writer.lock().await;
         client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
         record_local_response(request, codes::AUTH_REQUIRED, AUTH_REQUIRED_FOR_COMMAND);
         *backend_to_client_bytes = backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
@@ -278,7 +280,7 @@ impl ClientSession {
     async fn handle_rejected_request(
         &self,
         request: &mut RequestContext,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_writer: &crate::session::SharedClientWriter,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<CommandResult> {
         debug!("Client {} decision: Reject", self.client_addr);
@@ -286,6 +288,7 @@ impl ClientSession {
         let CommandAction::Reject(response) = action else {
             unreachable!("Reject decision must come from Reject action")
         };
+        let mut client_write = client_writer.lock().await;
         client_write.write_all(response.as_bytes()).await?;
         request.record_local_response(response.metadata());
         *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
@@ -298,7 +301,7 @@ impl ClientSession {
         &self,
         request: &mut RequestContext,
         skip_auth_check: bool,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_writer: &crate::session::SharedClientWriter,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<CommandResult> {
         debug!(
@@ -310,6 +313,7 @@ impl ClientSession {
         } else {
             crate::protocol::CAPABILITIES_WITH_AUTHINFO
         };
+        let mut client_write = client_writer.lock().await;
         client_write.write_all(capabilities).await?;
         record_local_response(request, codes::CAPABILITY_LIST, capabilities);
         *backend_to_client_bytes = backend_to_client_bytes.add(capabilities.len());
@@ -323,22 +327,24 @@ impl ClientSession {
     /// Returns `SingleCommandResult` indicating whether to continue, quit, or switch to stateful mode.
     async fn process_single_command(
         &self,
-        params: ProcessCommandParams<'_, '_>,
+        params: ProcessCommandParams<'_>,
     ) -> Result<SingleCommandResult> {
         let ProcessCommandParams {
             request,
             skip_auth_check,
             router,
-            client_write,
+            client_writer,
             auth_username,
             client_to_backend_bytes,
             backend_to_client_bytes,
         } = params;
 
         // Handle QUIT locally
-        if let common::QuitStatus::Quit(bytes) =
-            common::handle_quit_command(request, client_write).await?
-        {
+        let quit_status = {
+            let mut client_write = client_writer.lock().await;
+            common::handle_quit_command(request, &mut *client_write).await?
+        };
+        if let common::QuitStatus::Quit(bytes) = quit_status {
             record_local_response(
                 request,
                 codes::CONNECTION_CLOSING,
@@ -354,7 +360,7 @@ impl ClientSession {
                 request,
                 skip_auth_check,
                 router,
-                client_write,
+                client_writer,
                 auth_username,
                 client_to_backend_bytes,
                 backend_to_client_bytes,
@@ -377,7 +383,7 @@ impl ClientSession {
     /// switching into stateful mode fails.
     pub async fn handle_per_command_routing(
         &self,
-        mut client_stream: TcpStream,
+        client_stream: TcpStream,
     ) -> Result<TransferMetrics, SessionError> {
         let Some(router) = self.router.as_ref() else {
             return Err(SessionError::Backend(anyhow::anyhow!(
@@ -385,11 +391,11 @@ impl ClientSession {
             )));
         };
 
-        let (client_read, client_write) = client_stream.split();
+        let (client_read, client_write) = client_stream.into_split();
         Box::pin(self.run_per_command_loop(
             router,
             BufReader::with_capacity(READER_CAPACITY, client_read),
-            client_write,
+            crate::session::SharedClientWriter::new(client_write),
         ))
         .await
     }
@@ -397,8 +403,8 @@ impl ClientSession {
     async fn run_per_command_loop(
         &self,
         router: &Arc<BackendSelector>,
-        mut client_reader: BufReader<tokio::net::tcp::ReadHalf<'_>>,
-        mut client_write: tokio::net::tcp::WriteHalf<'_>,
+        mut client_reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
+        client_writer: crate::session::SharedClientWriter,
     ) -> Result<TransferMetrics, SessionError> {
         debug!("Client {} entering command loop", self.client_addr);
         let mut command_buf = Vec::with_capacity(COMMAND);
@@ -417,7 +423,7 @@ impl ClientSession {
             };
 
             match self
-                .handle_command_batch(router, &mut client_write, &mut state, &mut batch)
+                .handle_command_batch(router, &client_writer, &mut state, &mut batch)
                 .await?
             {
                 BatchLoopAction::Continue => {}
@@ -426,7 +432,7 @@ impl ClientSession {
                     return self
                         .switch_batch_to_stateful(
                             client_reader,
-                            client_write,
+                            client_writer,
                             &mut batch,
                             target,
                             &state,
@@ -442,7 +448,7 @@ impl ClientSession {
 
     async fn read_next_batch(
         &self,
-        client_reader: &mut BufReader<tokio::net::tcp::ReadHalf<'_>>,
+        client_reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
         command_buf: &mut Vec<u8>,
         metrics: TransferMetrics,
     ) -> Option<crate::session::handlers::pipeline::RequestBatch> {
@@ -467,20 +473,20 @@ impl ClientSession {
     async fn handle_command_batch(
         &self,
         router: &Arc<BackendSelector>,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_writer: &crate::session::SharedClientWriter,
         state: &mut PerCommandLoopState,
         batch: &mut crate::session::handlers::pipeline::RequestBatch,
     ) -> Result<BatchLoopAction, SessionError> {
-        if let Some(action) = self.handle_batch_rejections(batch, client_write).await? {
+        if let Some(action) = self.handle_batch_rejections(batch, client_writer).await? {
             return Ok(action);
         }
 
         match self
-            .process_pipelineable_batch(router, client_write, state, batch)
+            .process_pipelineable_batch(router, client_writer, state, batch)
             .await?
         {
             BatchLoopAction::Continue => {
-                self.handle_trailing_command(router, client_write, state, batch)
+                self.handle_trailing_command(router, client_writer, state, batch)
                     .await
             }
             action => Ok(action),
@@ -490,13 +496,14 @@ impl ClientSession {
     async fn handle_batch_rejections(
         &self,
         batch: &crate::session::handlers::pipeline::RequestBatch,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_writer: &crate::session::SharedClientWriter,
     ) -> Result<Option<BatchLoopAction>, SessionError> {
         if batch.is_first_oversized() {
             warn!(
                 "Client {} sent oversized first command, rejecting with 501",
                 self.client_addr
             );
+            let mut client_write = client_writer.lock().await;
             client_write
                 .write_all(crate::protocol::COMMAND_TOO_LONG)
                 .await
@@ -508,6 +515,7 @@ impl ClientSession {
                 "Client {} sent invalid first command, rejecting with 501",
                 self.client_addr
             );
+            let mut client_write = client_writer.lock().await;
             client_write
                 .write_all(crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE)
                 .await
@@ -525,8 +533,8 @@ impl ClientSession {
     async fn process_pipelineable_batch(
         &self,
         router: &Arc<BackendSelector>,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        state: &mut PerCommandLoopState,
+        client_writer: &crate::session::SharedClientWriter,
+        _state: &mut PerCommandLoopState,
         batch: &mut crate::session::handlers::pipeline::RequestBatch,
     ) -> Result<BatchLoopAction, SessionError> {
         let batch_size = batch.len();
@@ -540,18 +548,11 @@ impl ClientSession {
             );
         }
 
-        let all_large_transfer =
-            batch_size > 1 && (0..batch_size).all(|i| batch.context(i).is_large_transfer());
-        let batch_handled = self
-            .try_execute_article_batch(router, batch, client_write, state, all_large_transfer)
+        let action = self
+            .process_pipelineable_commands(router, client_writer, _state, batch)
             .await?;
-        if !batch_handled {
-            let action = self
-                .process_pipelineable_commands(router, client_write, state, batch)
-                .await?;
-            if !matches!(action, BatchLoopAction::Continue) {
-                return Ok(action);
-            }
+        if !matches!(action, BatchLoopAction::Continue) {
+            return Ok(action);
         }
         if batch_size > 1 {
             self.metrics.record_pipeline_batch(batch_size as u64);
@@ -559,46 +560,10 @@ impl ClientSession {
         Ok(BatchLoopAction::Continue)
     }
 
-    async fn try_execute_article_batch(
-        &self,
-        router: &Arc<BackendSelector>,
-        batch: &crate::session::handlers::pipeline::RequestBatch,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        state: &mut PerCommandLoopState,
-        all_large_transfer: bool,
-    ) -> Result<bool, SessionError> {
-        if !all_large_transfer {
-            return Ok(false);
-        }
-
-        match self
-            .batch_execute_articles(
-                router,
-                batch,
-                client_write,
-                crate::session::handlers::article_retry::BatchPipelineState {
-                    client_to_backend_bytes: &mut state.client_to_backend_bytes,
-                    backend_to_client_bytes: &mut state.backend_to_client_bytes,
-                },
-            )
-            .await
-        {
-            Ok(()) => Ok(true),
-            Err(e @ SessionError::ClientDisconnect(_)) => Err(e),
-            Err(e) => {
-                debug!(
-                    "Client {} batch execution failed, falling through to individual: {}",
-                    self.client_addr, e
-                );
-                Ok(false)
-            }
-        }
-    }
-
     async fn process_pipelineable_commands(
         &self,
         router: &Arc<BackendSelector>,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_writer: &crate::session::SharedClientWriter,
         state: &mut PerCommandLoopState,
         batch: &mut crate::session::handlers::pipeline::RequestBatch,
     ) -> Result<BatchLoopAction, SessionError> {
@@ -622,7 +587,7 @@ impl ClientSession {
                     request,
                     skip_auth_check: state.skip_auth_check,
                     router,
-                    client_write,
+                    client_writer,
                     auth_username: &mut state.auth_username,
                     client_to_backend_bytes: state.client_to_backend_bytes,
                     backend_to_client_bytes: &mut state.backend_to_client_bytes,
@@ -647,7 +612,7 @@ impl ClientSession {
     async fn handle_trailing_command(
         &self,
         router: &Arc<BackendSelector>,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_writer: &crate::session::SharedClientWriter,
         state: &mut PerCommandLoopState,
         batch: &mut crate::session::handlers::pipeline::RequestBatch,
     ) -> Result<BatchLoopAction, SessionError> {
@@ -657,6 +622,7 @@ impl ClientSession {
                 self.client_addr,
                 batch.trailing_wire_len()
             );
+            let mut client_write = client_writer.lock().await;
             client_write
                 .write_all(crate::protocol::COMMAND_TOO_LONG)
                 .await
@@ -668,6 +634,7 @@ impl ClientSession {
                 "Client {} sent invalid trailing command, rejecting",
                 self.client_addr
             );
+            let mut client_write = client_writer.lock().await;
             client_write
                 .write_all(crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE)
                 .await
@@ -697,7 +664,7 @@ impl ClientSession {
                 request: trailing_context,
                 skip_auth_check: state.skip_auth_check,
                 router,
-                client_write,
+                client_writer,
                 auth_username: &mut state.auth_username,
                 client_to_backend_bytes: state.client_to_backend_bytes,
                 backend_to_client_bytes: &mut state.backend_to_client_bytes,
@@ -717,8 +684,8 @@ impl ClientSession {
 
     async fn switch_batch_to_stateful(
         &self,
-        client_reader: BufReader<tokio::net::tcp::ReadHalf<'_>>,
-        client_write: tokio::net::tcp::WriteHalf<'_>,
+        client_reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
+        client_writer: crate::session::SharedClientWriter,
         batch: &mut crate::session::handlers::pipeline::RequestBatch,
         target: BatchSwitchTarget,
         state: &PerCommandLoopState,
@@ -731,6 +698,12 @@ impl ClientSession {
             },
             BatchSwitchTarget::Context(_) => return Ok(state.transfer_metrics()),
         };
+
+        let client_write = client_writer.try_into_inner().map_err(|_| {
+            SessionError::Backend(anyhow::anyhow!(
+                "client writer still shared while switching to stateful mode"
+            ))
+        })?;
 
         self.switch_to_stateful_mode(
             client_reader,

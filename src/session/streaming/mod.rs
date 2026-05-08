@@ -274,6 +274,61 @@ fn validate_response_prefix(
     })
 }
 
+pub(crate) async fn read_prefetched_response_status(
+    io_buffer: &mut crate::pool::PooledBuffer,
+    conn: &mut crate::stream::ConnectionStream,
+) -> Result<(crate::protocol::StatusCode, usize), StreamingError> {
+    let source = if conn.has_leftover() {
+        "leftover"
+    } else {
+        "fresh_read"
+    };
+    let n = io_buffer.read_from(conn).await.map_err(|e| {
+        StreamingError::Io(anyhow::Error::from(e).context("Failed to read response from backend"))
+    })?;
+    if n == 0 {
+        return Err(StreamingError::Io(anyhow::anyhow!(
+            "Backend connection closed unexpectedly"
+        )));
+    }
+    while crate::session::backend::status_line_end(io_buffer).is_none() {
+        let more = io_buffer.read_more(conn).await.map_err(|e| {
+            StreamingError::Io(anyhow::Error::from(e).context("Failed to read partial status line"))
+        })?;
+        if more == 0 {
+            return Err(StreamingError::Io(anyhow::anyhow!(
+                "Backend EOF before complete status line ({} bytes)",
+                io_buffer.initialized()
+            )));
+        }
+    }
+
+    let initial_len = io_buffer.initialized();
+    let response = &io_buffer[..initial_len];
+    let status_code = validate_response_prefix(response, source)?;
+    Ok((status_code, initial_len))
+}
+
+pub(crate) fn buffer_prefetched_single_line_response(
+    io_buffer: &crate::pool::PooledBuffer,
+    conn: &mut crate::stream::ConnectionStream,
+    result_buf: &mut crate::pool::ChunkedResponse,
+    pool: &crate::pool::BufferPool,
+    initial_len: usize,
+) -> Result<(), StreamingError> {
+    result_buf.clear();
+    let response = &io_buffer[..initial_len];
+    result_buf.extend_from_slice(pool, response);
+    if let Some(pos) = memchr::memchr(b'\n', response) {
+        let end = pos + 1;
+        if end < response.len() {
+            stash_leftover(conn, &response[end..])?;
+            result_buf.truncate(end);
+        }
+    }
+    Ok(())
+}
+
 async fn fill_multiline_response(
     io_buffer: &mut crate::pool::PooledBuffer,
     conn: &mut crate::stream::ConnectionStream,
@@ -284,6 +339,7 @@ async fn fill_multiline_response(
 ) -> Result<(), StreamingError> {
     use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
 
+    response.clear();
     let mut tail = TailBuffer::default();
 
     match tail.detect_terminator(&io_buffer[..initial_chunk_len]) {
@@ -342,46 +398,10 @@ pub(crate) async fn buffer_response_for_request(
     pool: &crate::pool::BufferPool,
     backend_id: crate::types::BackendId,
 ) -> Result<crate::protocol::StatusCode, StreamingError> {
-    result_buf.clear();
-
-    let source = if conn.has_leftover() {
-        "leftover"
-    } else {
-        "fresh_read"
-    };
-    let n = io_buffer.read_from(conn).await.map_err(|e| {
-        StreamingError::Io(anyhow::Error::from(e).context("Failed to read response from backend"))
-    })?;
-    if n == 0 {
-        return Err(StreamingError::Io(anyhow::anyhow!(
-            "Backend connection closed unexpectedly"
-        )));
-    }
-    while crate::session::backend::status_line_end(io_buffer).is_none() {
-        let more = io_buffer.read_more(conn).await.map_err(|e| {
-            StreamingError::Io(anyhow::Error::from(e).context("Failed to read partial status line"))
-        })?;
-        if more == 0 {
-            return Err(StreamingError::Io(anyhow::anyhow!(
-                "Backend EOF before complete status line ({} bytes)",
-                io_buffer.initialized()
-            )));
-        }
-    }
-
-    let initial_len = io_buffer.initialized();
-    let response = &io_buffer[..initial_len];
-    let status_code = validate_response_prefix(response, source)?;
+    let (status_code, initial_len) = read_prefetched_response_status(io_buffer, conn).await?;
 
     if !request.expects_multiline_response(status_code) {
-        result_buf.extend_from_slice(pool, response);
-        if let Some(pos) = memchr::memchr(b'\n', response) {
-            let end = pos + 1;
-            if end < response.len() {
-                stash_leftover(conn, &response[end..])?;
-                result_buf.truncate(end);
-            }
-        }
+        buffer_prefetched_single_line_response(io_buffer, conn, result_buf, pool, initial_len)?;
         return Ok(status_code);
     }
 

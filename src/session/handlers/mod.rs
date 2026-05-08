@@ -24,6 +24,7 @@ mod article_retry;
 /// 5-byte `\r\n.\r\n` that ends a *multiline* response body.
 ///
 /// [`TailBuffer`]: crate::session::streaming::tail_buffer::TailBuffer
+#[allow(dead_code)]
 pub(super) fn split_single_line_response(
     response: &mut crate::pool::PooledBuffer,
     leftover: &mut crate::pool::PooledBuffer,

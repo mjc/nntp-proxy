@@ -15,13 +15,14 @@ use crate::session::handlers::command_execution::{ArticleAttemptState, BackendAt
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
 
 use crate::protocol::RequestContext;
 use crate::session::handlers::pipeline::RequestBatch;
 use crate::session::precheck;
 
+#[allow(dead_code)]
 /// Mutable pipeline batch state passed into `batch_execute_articles`
 pub(super) struct BatchPipelineState<'a> {
     pub client_to_backend_bytes: &'a mut ClientToBackendBytes,
@@ -32,6 +33,7 @@ pub(super) struct BatchPipelineState<'a> {
 ///
 /// Groups the backend connection, its ID, and the scratch buffer to keep
 /// `process_batch_response`'s parameter count within clippy limits.
+#[allow(dead_code)]
 struct BatchConnContext<'a> {
     conn: &'a mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
     backend_id: BackendId,
@@ -41,6 +43,7 @@ struct BatchConnContext<'a> {
 }
 
 /// Per-response outcome from `process_batch_response`
+#[allow(dead_code)]
 enum BatchStep {
     /// Response handled successfully; continue to the next command.
     Continue,
@@ -53,6 +56,7 @@ enum BatchStep {
 }
 
 /// Outcome of writing a validated backend response to the client.
+#[allow(dead_code)]
 enum BatchWriteOutcome {
     /// Response bytes were written successfully.
     Written(u64),
@@ -61,8 +65,8 @@ enum BatchWriteOutcome {
 }
 
 /// Client-side write state shared across cache, precheck, pipeline, and direct routing paths.
-struct RequestExecutionIo<'a, 'b> {
-    client_write: &'a mut tokio::net::tcp::WriteHalf<'b>,
+struct RequestExecutionIo<'a> {
+    client_writer: &'a crate::session::SharedClientWriter,
     client_to_backend_bytes: &'a mut ClientToBackendBytes,
     backend_to_client_bytes: &'a mut BackendToClientBytes,
 }
@@ -84,6 +88,7 @@ impl ClientSession {
     /// responses in order. This exploits TCP pipelining: the backend starts
     /// responding immediately, and responses queue in our receive buffer while
     /// we stream earlier ones to the client.
+    #[allow(dead_code)]
     pub(super) async fn batch_execute_articles(
         &self,
         router: &Arc<BackendSelector>,
@@ -224,6 +229,7 @@ impl ClientSession {
     /// This method does **not** call `remove_with_cooldown` — that responsibility belongs
     /// to the caller. Instead it returns `BackendDead` to signal that the
     /// backend connection must be discarded and the client session closed.
+    #[allow(dead_code)]
     async fn process_batch_response(
         &self,
         batch: &RequestBatch,
@@ -287,6 +293,7 @@ impl ClientSession {
         Ok(BatchStep::Continue)
     }
 
+    #[allow(dead_code)]
     async fn read_batch_response_chunk(
         &self,
         batch: &RequestBatch,
@@ -357,6 +364,7 @@ impl ClientSession {
         Ok(from_leftover)
     }
 
+    #[allow(dead_code)]
     async fn extend_batch_status_line(
         &self,
         idx: usize,
@@ -406,6 +414,7 @@ impl ClientSession {
         Ok(())
     }
 
+    #[allow(dead_code)]
     fn log_invalid_batch_response(
         &self,
         request: &RequestContext,
@@ -430,6 +439,7 @@ impl ClientSession {
         );
     }
 
+    #[allow(dead_code)]
     async fn handle_batch_not_found(
         &self,
         request: &RequestContext,
@@ -464,6 +474,7 @@ impl ClientSession {
         Ok(BatchStep::Continue)
     }
 
+    #[allow(dead_code)]
     async fn write_batch_success_response(
         &self,
         batch: &RequestBatch,
@@ -541,6 +552,7 @@ impl ClientSession {
         Ok(BatchWriteOutcome::Written(chunk_data.len() as u64))
     }
 
+    #[allow(dead_code)]
     fn record_batch_response_metrics(
         &self,
         request: &RequestContext,
@@ -568,14 +580,14 @@ impl ClientSession {
         &self,
         router: Arc<BackendSelector>,
         request: &mut RequestContext,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_writer: &crate::session::SharedClientWriter,
         client_to_backend_bytes: &mut ClientToBackendBytes,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<(), SessionError> {
         self.log_route_request(request);
 
         let mut io = RequestExecutionIo {
-            client_write,
+            client_writer,
             client_to_backend_bytes,
             backend_to_client_bytes,
         };
@@ -587,10 +599,9 @@ impl ClientSession {
             PreparedRequest::Continue { availability } => availability,
         };
 
-        if !request.is_large_transfer()
-            && self
-                .try_pipeline_request(&router, request, &mut io, &mut availability)
-                .await?
+        if self
+            .try_pipeline_request(&router, request, &mut io, &mut availability)
+            .await?
         {
             return Ok(());
         }
@@ -618,17 +629,25 @@ impl ClientSession {
         &self,
         router: &Arc<BackendSelector>,
         request: &mut RequestContext,
-        io: &mut RequestExecutionIo<'_, '_>,
+        io: &mut RequestExecutionIo<'_>,
     ) -> Result<PreparedRequest, SessionError> {
-        let availability = match self
-            .try_serve_from_cache(request, router, io.client_write, io.backend_to_client_bytes)
-            .await?
-        {
-            CacheLookupResult::Hit => return Ok(PreparedRequest::Served),
-            CacheLookupResult::PartialHit => request
-                .cache_availability()
-                .map(Self::request_cache_availability),
-            CacheLookupResult::Miss => None,
+        let availability = {
+            let mut client_write = io.client_writer.lock().await;
+            match self
+                .try_serve_from_cache(
+                    request,
+                    router,
+                    &mut *client_write,
+                    io.backend_to_client_bytes,
+                )
+                .await?
+            {
+                CacheLookupResult::Hit => return Ok(PreparedRequest::Served),
+                CacheLookupResult::PartialHit => request
+                    .cache_availability()
+                    .map(Self::request_cache_availability),
+                CacheLookupResult::Miss => None,
+            }
         };
         if self.try_adaptive_precheck(router, request, io).await? {
             return Ok(PreparedRequest::Served);
@@ -647,7 +666,7 @@ impl ClientSession {
         &self,
         router: &Arc<BackendSelector>,
         request: &RequestContext,
-        io: &mut RequestExecutionIo<'_, '_>,
+        io: &mut RequestExecutionIo<'_>,
     ) -> Result<bool, SessionError> {
         if !self.adaptive_precheck || !(request.is_stat() || request.is_head()) {
             return Ok(false);
@@ -657,9 +676,10 @@ impl ClientSession {
         };
 
         let deps = self.precheck_deps(router);
+        let mut client_write = io.client_writer.lock().await;
         let bytes_written = if let Some(entry) = precheck::precheck(&deps, request, &msg_id).await {
             if let Some(write) = write_cached_article_response(
-                io.client_write,
+                &mut *client_write,
                 &entry,
                 request.kind(),
                 msg_id.as_str(),
@@ -669,18 +689,19 @@ impl ClientSession {
             {
                 write.wire_len.get()
             } else {
-                Self::write_no_such_article_response(io.client_write).await?
+                Self::write_no_such_article_response(&mut *client_write).await?
             }
         } else {
-            Self::write_no_such_article_response(io.client_write).await?
+            Self::write_no_such_article_response(&mut *client_write).await?
         };
         *io.backend_to_client_bytes = io.backend_to_client_bytes.add(bytes_written);
         Ok(true)
     }
 
-    async fn write_no_such_article_response(
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-    ) -> Result<usize, SessionError> {
+    async fn write_no_such_article_response<W>(client_write: &mut W) -> Result<usize, SessionError>
+    where
+        W: AsyncWrite + Unpin,
+    {
         client_write
             .write_all(crate::protocol::NO_SUCH_ARTICLE)
             .await
@@ -692,9 +713,16 @@ impl ClientSession {
         &self,
         router: &Arc<BackendSelector>,
         request: &RequestContext,
-        io: &mut RequestExecutionIo<'_, '_>,
+        io: &mut RequestExecutionIo<'_>,
         availability: &mut Option<ArticleAvailability>,
     ) -> Result<bool, SessionError> {
+        if request.is_large_transfer() && self.cache_articles {
+            // Full-article cache capture still lives in the direct execution path.
+            // Until the shared worker can stream and capture without re-buffering,
+            // keep cacheable ARTICLE/BODY requests on the direct path.
+            return Ok(false);
+        }
+
         if let Ok(backend_id) =
             router.route_with_availability(self.client_id, availability.as_ref())
             && let Some(queue) = router.get_backend_queue(backend_id)
@@ -709,7 +737,16 @@ impl ClientSession {
             );
 
             let (tx, rx) = tokio::sync::oneshot::channel();
-            let queued_context = QueuedContext::new(request.clone(), tx);
+            let queued_context = if request.is_large_transfer() {
+                QueuedContext::new_streaming(
+                    request.clone(),
+                    self.client_addr,
+                    tx,
+                    io.client_writer.clone(),
+                )
+            } else {
+                QueuedContext::new(request.clone(), self.client_addr, tx)
+            };
 
             match queue.try_enqueue(queued_context) {
                 Ok(()) => {
@@ -722,13 +759,13 @@ impl ClientSession {
                                 .response_metadata()
                                 .is_some_and(|response| response.status().as_u16() != 430) =>
                         {
-                            completed
-                                .context
-                                .response_payload()
-                                .expect("completed request context carries response payload")
-                                .write_all_to(io.client_write)
-                                .await
-                                .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                            if let Some(payload) = completed.context.response_payload() {
+                                let mut client_write = io.client_writer.lock().await;
+                                payload
+                                    .write_all_to(&mut *client_write)
+                                    .await
+                                    .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                            }
                             let response = completed
                                 .context
                                 .response_metadata()
@@ -788,7 +825,7 @@ impl ClientSession {
         router: &Arc<BackendSelector>,
         request: &mut RequestContext,
         availability: Option<ArticleAvailability>,
-        io: &mut RequestExecutionIo<'_, '_>,
+        io: &mut RequestExecutionIo<'_>,
     ) -> Result<(), SessionError> {
         debug!(
             "Client {} starting availability routing for request kind={:?}, verb={:?}",
@@ -807,18 +844,20 @@ impl ClientSession {
         );
 
         while !availability.all_exhausted(router.backend_count()) {
-            let attempt = self
-                .try_backend_for_article(
+            let attempt = {
+                let mut client_write = io.client_writer.lock().await;
+                self.try_backend_for_article(
                     router,
                     request,
-                    io.client_write,
+                    &mut *client_write,
                     &mut ArticleAttemptState {
                         availability: &mut availability,
                         buffer: &mut buffer,
                         client_to_backend_bytes: io.client_to_backend_bytes,
                     },
                 )
-                .await;
+                .await
+            };
             match attempt {
                 Ok(BackendAttemptResult::Success) => {
                     let response = request
@@ -864,13 +903,17 @@ impl ClientSession {
         let msg_id = request.message_id_value();
         self.sync_availability_if_needed(msg_id.as_ref(), &availability)
             .await;
-        self.send_430_to_client(io.client_write, io.backend_to_client_bytes)
-            .await?;
+        {
+            let mut client_write = io.client_writer.lock().await;
+            self.send_430_to_client(&mut *client_write, io.backend_to_client_bytes)
+                .await?;
+        }
 
         Ok(())
     }
 
     /// Load article availability from cache or create fresh tracker
+    #[allow(dead_code)]
     pub(super) async fn load_article_availability(
         &self,
         msg_id: Option<&crate::types::MessageId<'_>>,

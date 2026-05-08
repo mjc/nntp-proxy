@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Notify, oneshot};
 
 use crate::protocol::RequestContext;
+use crate::session::SharedClientWriter;
 
 /// A queued request completed by one backend connection.
 #[derive(Debug)]
@@ -65,12 +66,20 @@ impl std::fmt::Display for PipelineError {
     }
 }
 
+#[derive(Clone, Debug)]
+pub enum PipelineDelivery {
+    Buffered,
+    StreamToClient(SharedClientWriter),
+}
+
 /// A request queued for pipeline execution on a backend
 pub struct QueuedContext {
     /// Typed request context. Owns verb/args, not redundant serialized bytes.
     pub context: RequestContext,
+    pub client_addr: crate::types::ClientAddress,
     /// Return path to the client session that queued this request.
     client_return: oneshot::Sender<PipelineResponse>,
+    delivery: PipelineDelivery,
 }
 
 impl QueuedContext {
@@ -78,12 +87,35 @@ impl QueuedContext {
     #[must_use]
     pub(crate) const fn new(
         context: RequestContext,
+        client_addr: crate::types::ClientAddress,
         client_return: oneshot::Sender<PipelineResponse>,
     ) -> Self {
         Self {
             context,
+            client_addr,
             client_return,
+            delivery: PipelineDelivery::Buffered,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn new_streaming(
+        context: RequestContext,
+        client_addr: crate::types::ClientAddress,
+        client_return: oneshot::Sender<PipelineResponse>,
+        client_writer: SharedClientWriter,
+    ) -> Self {
+        Self {
+            context,
+            client_addr,
+            client_return,
+            delivery: PipelineDelivery::StreamToClient(client_writer),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn delivery(&self) -> &PipelineDelivery {
+        &self.delivery
     }
 
     /// Complete this queued context after a response reader has filled it.
@@ -248,6 +280,10 @@ mod tests {
     use crate::types::BackendId;
     use std::sync::Arc;
 
+    fn client_addr() -> crate::types::ClientAddress {
+        crate::types::ClientAddress::new("127.0.0.1:8119".parse().expect("valid client addr"))
+    }
+
     fn request_context(line: &[u8]) -> RequestContext {
         RequestContext::parse(line).expect("valid request line")
     }
@@ -263,6 +299,7 @@ mod tests {
         queue
             .try_enqueue(QueuedContext::new(
                 request_context(b"ARTICLE <test@example.com>\r\n"),
+                client_addr(),
                 tx,
             ))
             .unwrap();
@@ -276,12 +313,17 @@ mod tests {
             let (tx, _rx) = oneshot::channel();
             let request = format!("ARTICLE <test{i}@example.com>\r\n");
             queue
-                .try_enqueue(QueuedContext::new(request_context(request.as_bytes()), tx))
+                .try_enqueue(QueuedContext::new(
+                    request_context(request.as_bytes()),
+                    client_addr(),
+                    tx,
+                ))
                 .unwrap();
         }
         let (tx, _rx) = oneshot::channel();
         let result = queue.try_enqueue(QueuedContext::new(
             request_context(b"ARTICLE <overflow@example.com>\r\n"),
+            client_addr(),
             tx,
         ));
         assert!(result.is_err());
@@ -301,7 +343,11 @@ mod tests {
             let (tx, _rx) = oneshot::channel();
             let request = format!("CMD {i}\r\n");
             queue
-                .try_enqueue(QueuedContext::new(request_context(request.as_bytes()), tx))
+                .try_enqueue(QueuedContext::new(
+                    request_context(request.as_bytes()),
+                    client_addr(),
+                    tx,
+                ))
                 .unwrap();
         }
 
@@ -328,7 +374,11 @@ mod tests {
         // Now enqueue
         let (tx, _rx) = oneshot::channel();
         queue
-            .try_enqueue(QueuedContext::new(request_context(b"HELLO\r\n"), tx))
+            .try_enqueue(QueuedContext::new(
+                request_context(b"HELLO\r\n"),
+                client_addr(),
+                tx,
+            ))
             .unwrap();
 
         let batch = handle.await.unwrap();
@@ -380,7 +430,7 @@ mod tests {
             crate::protocol::StatusCode::new(223),
             crate::pool::ChunkedResponse::default(),
         );
-        let queued = QueuedContext::new(context, tx);
+        let queued = QueuedContext::new(context, client_addr(), tx);
 
         queued.complete_context();
 
@@ -404,7 +454,11 @@ mod tests {
     #[test]
     fn test_queued_context_error_completes_without_response_data() {
         let (tx, rx) = oneshot::channel();
-        let queued = QueuedContext::new(request_context(b"STAT <test@example.com>\r\n"), tx);
+        let queued = QueuedContext::new(
+            request_context(b"STAT <test@example.com>\r\n"),
+            client_addr(),
+            tx,
+        );
 
         queued.complete_error(PipelineError::ReadFailed);
 

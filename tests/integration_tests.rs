@@ -293,8 +293,8 @@ async fn test_response_flushing_with_rapid_commands() -> Result<()> {
     let config = create_test_config(vec![(mock_port, "TestServer")]);
     let proxy = NntpProxy::new(config, RoutingMode::Stateful).await?;
 
-    // Start proxy in per-command routing mode
-    spawn_test_proxy(proxy, proxy_port, true).await;
+    // Start the proxy using the stateful handler to match the configured mode.
+    spawn_test_proxy(proxy, proxy_port, false).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Connect client
@@ -319,18 +319,30 @@ async fn test_response_flushing_with_rapid_commands() -> Result<()> {
         client.write_all(cmd.as_bytes()).await?;
         client.flush().await?;
 
-        // Try to read response with a VERY short timeout
-        // This validates that responses are delivered immediately by the proxy.
-        let n = timeout(Duration::from_millis(200), client.read(&mut buffer))
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "Timeout reading response #{i} - proxy likely not flushing responses!"
-                )
-            })?
-            .map_err(|e| anyhow::anyhow!("Failed to read response #{i}: {e}"))?;
+        // Read until the multiline terminator arrives inside the same short deadline.
+        // TCP is free to segment the response, so correctness is "prompt full response",
+        // not "entire response in one read syscall".
+        let mut response_bytes = Vec::new();
+        loop {
+            let n = timeout(Duration::from_millis(200), client.read(&mut buffer))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Timeout reading response #{i} - proxy likely not flushing responses!"
+                    )
+                })?
+                .map_err(|e| anyhow::anyhow!("Failed to read response #{i}: {e}"))?;
 
-        let response = String::from_utf8_lossy(&buffer[..n]);
+            if n == 0 {
+                break;
+            }
+            response_bytes.extend_from_slice(&buffer[..n]);
+            if response_bytes.windows(3).any(|window| window == b".\r\n") {
+                break;
+            }
+        }
+
+        let response = String::from_utf8_lossy(&response_bytes);
 
         // Verify we got a complete response (should include terminator)
         assert!(

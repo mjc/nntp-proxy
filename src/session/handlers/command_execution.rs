@@ -17,7 +17,7 @@ use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
 
 const BACKEND_TIMING_SAMPLE_MASK: u64 = 0x0f;
@@ -101,13 +101,16 @@ impl ClientSession {
     ///
     /// If the pooled connection is stale (connection error), automatically retries
     /// with a fresh connection before returning an error.
-    pub(super) async fn try_backend_for_article(
+    pub(super) async fn try_backend_for_article<W>(
         &self,
         router: &Arc<BackendSelector>,
         request: &mut RequestContext,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_write: &mut W,
         state: &mut ArticleAttemptState<'_>,
-    ) -> Result<BackendAttemptResult, SessionError> {
+    ) -> Result<BackendAttemptResult, SessionError>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let backend_id =
             match router.route_with_availability(self.client_id, Some(state.availability)) {
                 Ok(backend_id) => backend_id,
@@ -236,13 +239,16 @@ impl ClientSession {
         });
     }
 
-    async fn stream_successful_backend_response(
+    async fn stream_successful_backend_response<W>(
         &self,
         mut conn: crate::pool::ConnectionGuard,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_write: &mut W,
         backend_id: BackendId,
         params: ResponseStreamParams<'_>,
-    ) -> Result<RequestResponseMetadata, SessionError> {
+    ) -> Result<RequestResponseMetadata, SessionError>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let is_multiline_body = params
             .request
             .expects_multiline_response(params.status_code);
@@ -267,6 +273,10 @@ impl ClientSession {
             Ok(bytes) => bytes,
             Err(e) => return Err(self.handle_streaming_error(conn, backend_id, params.request, e)),
         };
+        client_write
+            .flush()
+            .await
+            .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
 
         debug!(
             client = %self.client_addr,
@@ -401,13 +411,16 @@ impl ClientSession {
     ///
     /// Returns `StreamingError` so callers can decide the connection's pool fate
     /// without string/downcast inspection.
-    async fn stream_response_to_client(
+    async fn stream_response_to_client<W>(
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_write: &mut W,
         ctx: &streaming::StreamContext<'_>,
         params: ResponseStreamParams<'_>,
-    ) -> Result<u64, StreamingError> {
+    ) -> Result<u64, StreamingError>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let code = params.status_code.as_u16();
         let is_multiline_body = params
             .request
@@ -469,13 +482,16 @@ impl ClientSession {
         }
     }
 
-    async fn buffer_and_cache_multiline_response(
+    async fn buffer_and_cache_multiline_response<W>(
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_write: &mut W,
         ctx: &streaming::StreamContext<'_>,
         params: ResponseStreamParams<'_>,
-    ) -> Result<u64, StreamingError> {
+    ) -> Result<u64, StreamingError>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let captured =
             streaming::buffer_multiline_response(pooled_conn, params.first_chunk, ctx).await?;
         captured
@@ -495,13 +511,16 @@ impl ClientSession {
         Ok(captured_len as u64)
     }
 
-    async fn stream_multiline_with_availability_tracking(
+    async fn stream_multiline_with_availability_tracking<W>(
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_write: &mut W,
         ctx: &streaming::StreamContext<'_>,
         params: ResponseStreamParams<'_>,
-    ) -> Result<u64, StreamingError> {
+    ) -> Result<u64, StreamingError>
+    where
+        W: AsyncWrite + Unpin,
+    {
         // Availability-only mode should not buffer the article body.
         // Keep first-byte latency and memory bounded by streaming directly,
         // then cache only typed availability metadata after the terminator is seen.
@@ -527,11 +546,14 @@ impl ClientSession {
         Ok(bytes)
     }
 
-    async fn write_single_line_response(
+    async fn write_single_line_response<W>(
         &self,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_write: &mut W,
         response: &[u8],
-    ) -> Result<u64, StreamingError> {
+    ) -> Result<u64, StreamingError>
+    where
+        W: AsyncWrite + Unpin,
+    {
         // Backend is already clean here because the full single-line response was read up front.
         client_write
             .write_all(response)
@@ -542,11 +564,14 @@ impl ClientSession {
 
     /// Handle backend error (metrics and cleanup)
     /// Send standardized 430 response to client
-    pub(super) async fn send_430_to_client(
+    pub(super) async fn send_430_to_client<W>(
         &self,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_write: &mut W,
         backend_to_client_bytes: &mut BackendToClientBytes,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
         client_write
             .write_all(crate::protocol::NO_SUCH_ARTICLE)
             .await?;
