@@ -12,6 +12,7 @@ use crate::session::handlers::cache_operations::{
     CacheLookupResult, write_cached_article_response,
 };
 use crate::session::handlers::command_execution::{ArticleAttemptState, BackendAttemptResult};
+use crate::session::routing::{CacheAction, determine_cache_action_for_request};
 use crate::types::{BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
 use std::sync::Arc;
@@ -194,13 +195,6 @@ impl ClientSession {
         io: &mut RequestExecutionIo<'_>,
         availability: &mut Option<ArticleAvailability>,
     ) -> Result<bool, SessionError> {
-        if request.is_large_transfer() && self.cache_articles {
-            // Full-article cache capture still lives in the direct execution path.
-            // Until the shared worker can stream and capture without re-buffering,
-            // keep cacheable ARTICLE/BODY requests on the direct path.
-            return Ok(false);
-        }
-
         if let Ok(backend_id) =
             router.route_with_availability(self.client_id, availability.as_ref())
             && let Some(queue) = router.get_backend_queue(backend_id)
@@ -215,7 +209,7 @@ impl ClientSession {
             );
 
             let (tx, rx) = tokio::sync::oneshot::channel();
-            let queued_context = if request.is_large_transfer() {
+            let queued_context = if request.is_large_transfer() && !self.cache_articles {
                 QueuedContext::new_streaming(
                     request.clone(),
                     self.client_addr,
@@ -231,18 +225,45 @@ impl ClientSession {
                     self.metrics.record_pipeline_enqueue();
 
                     match rx.await {
-                        Ok(Ok(completed))
+                        Ok(Ok(mut completed))
                             if completed
                                 .context
                                 .response_metadata()
                                 .is_some_and(|response| response.status().as_u16() != 430) =>
                         {
-                            if let Some(payload) = completed.context.response_payload() {
+                            let cache_action = determine_cache_action_for_request(
+                                &completed.context,
+                                completed
+                                    .context
+                                    .response_metadata()
+                                    .expect("completed queued request records response metadata")
+                                    .status(),
+                                self.cache_articles,
+                                completed.context.has_message_id(),
+                            );
+                            if let Some(payload) = completed.context.take_response_payload() {
                                 let mut client_write = io.client_writer.lock().await;
                                 payload
                                     .write_all_to(&mut *client_write)
                                     .await
                                     .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                                drop(client_write);
+
+                                if matches!(cache_action, CacheAction::CaptureArticle)
+                                    && let Some(msg_id) = completed.context.message_id_value()
+                                {
+                                    let completed_backend_id = completed
+                                        .context
+                                        .backend_id()
+                                        .expect("completed queued request records backend id");
+                                    let tier = self.tier_for_backend(completed_backend_id);
+                                    self.spawn_cache_upsert_buffer(
+                                        &msg_id,
+                                        payload.into(),
+                                        completed_backend_id,
+                                        tier,
+                                    );
+                                }
                             }
                             let response = completed
                                 .context

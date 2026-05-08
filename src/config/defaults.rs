@@ -65,7 +65,7 @@ pub const fn cache_ttl() -> Duration {
 /// so the serde default stays `true` for backward compatibility.
 #[inline]
 pub const fn cache_articles() -> bool {
-    true
+    false
 }
 
 /// Default for adaptive availability prechecking (false = disabled)

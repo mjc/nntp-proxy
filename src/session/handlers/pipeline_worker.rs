@@ -307,21 +307,6 @@ async fn execute_streaming_pipeline_response(
     }
 
     let delivery = req.delivery().clone();
-    let PipelineDelivery::StreamToClient(client_writer) = delivery else {
-        crate::session::streaming::buffer_prefetched_single_line_response(
-            io_buffer,
-            conn,
-            result_buf,
-            buffer_pool,
-            initial_len,
-        )?;
-        let response = std::mem::take(result_buf);
-        let bytes = response.len() as u64;
-        req.context
-            .complete_backend_response(backend_id, status_code, response);
-        return Ok(bytes);
-    };
-
     if !req.context.expects_multiline_response(status_code) {
         crate::session::streaming::buffer_prefetched_single_line_response(
             io_buffer,
@@ -331,18 +316,45 @@ async fn execute_streaming_pipeline_response(
             initial_len,
         )?;
         let bytes = result_buf.len() as u64;
-        let mut client_write = client_writer.lock().await;
-        result_buf
-            .write_all_to(&mut *client_write)
-            .await
-            .map_err(crate::session::streaming::StreamingError::ClientDisconnect)?;
-        req.context.record_backend_response(
-            backend_id,
-            RequestResponseMetadata::new(status_code, (bytes as usize).into()),
-        );
-        result_buf.clear();
+        match delivery {
+            PipelineDelivery::StreamToClient(client_writer) => {
+                let mut client_write = client_writer.lock().await;
+                result_buf
+                    .write_all_to(&mut *client_write)
+                    .await
+                    .map_err(crate::session::streaming::StreamingError::ClientDisconnect)?;
+                req.context.record_backend_response(
+                    backend_id,
+                    RequestResponseMetadata::new(status_code, (bytes as usize).into()),
+                );
+                result_buf.clear();
+            }
+            PipelineDelivery::Buffered => {
+                let response = std::mem::take(result_buf);
+                req.context
+                    .complete_backend_response(backend_id, status_code, response);
+            }
+        }
         return Ok(bytes);
     }
+
+    let PipelineDelivery::StreamToClient(client_writer) = delivery else {
+        let ctx = crate::session::streaming::StreamContext {
+            client_addr: req.client_addr,
+            backend_id,
+            buffer_pool,
+        };
+        let response = crate::session::streaming::buffer_multiline_response(
+            conn,
+            &io_buffer[..initial_len],
+            &ctx,
+        )
+        .await?;
+        let bytes = response.len() as u64;
+        req.context
+            .complete_backend_response(backend_id, status_code, response);
+        return Ok(bytes);
+    };
 
     let ctx = crate::session::streaming::StreamContext {
         client_addr: req.client_addr,
@@ -747,6 +759,54 @@ mod tests {
         let mut streamed = Vec::new();
         client_stream.read_to_end(&mut streamed).await.unwrap();
         assert!(streamed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_execute_pipeline_batch_keeps_buffered_large_transfer_payload() {
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(1);
+        let backend_id = BackendId::from_index(0);
+        let response = b"220 0 <msg@id> article\r\nSubject: test\r\n\r\nBody line\r\n.\r\n";
+        let mut conn = mock_backend_conn(response).await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let batch = vec![QueuedContext::new(
+            request_context(ARTICLE_REQUEST),
+            client_addr(),
+            tx,
+        )];
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+
+        let (success, batch) = execute_pipeline_batch(
+            backend_id,
+            &mut conn,
+            batch,
+            &metrics,
+            &pool,
+            &mut result_buf,
+        )
+        .await;
+
+        assert!(success);
+        assert!(batch.is_empty());
+
+        let completed = rx.await.unwrap().unwrap();
+        assert_eq!(
+            completed
+                .context
+                .response_metadata()
+                .expect("buffered large transfer records metadata")
+                .status()
+                .as_u16(),
+            220
+        );
+        assert_eq!(
+            completed
+                .context
+                .response_payload()
+                .expect("buffered large transfer keeps payload")
+                .to_vec(),
+            response
+        );
     }
 
     #[tokio::test]
