@@ -443,6 +443,7 @@ async fn execute_streaming_pipeline_response(
             })
         }
         PipelineDelivery::StreamAndCapture(client_writer) => {
+            result_buf.clear();
             let mut leftover = buffer_pool.acquire();
             let mut client_write = client_writer.lock().await;
             let stream_result =
@@ -862,6 +863,52 @@ mod tests {
         let mut streamed = Vec::new();
         client_stream.read_to_end(&mut streamed).await.unwrap();
         assert!(streamed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stream_and_capture_clears_stale_capture_bytes_before_reuse() {
+        let pool = BufferPool::for_tests();
+        let backend_id = BackendId::from_index(0);
+        let mut io_buffer = pool.acquire();
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+        result_buf.extend_from_slice(&pool, b"stale-bytes");
+
+        let fresh_response =
+            b"220 0 <fresh@example> article\r\nSubject: fresh\r\n\r\nfresh-body\r\n.\r\n";
+        let mut fresh_conn = mock_backend_conn(fresh_response).await;
+        let (fresh_writer, mut fresh_client) = mock_client_writer().await;
+        let (fresh_tx, _fresh_rx) = tokio::sync::oneshot::channel();
+        let mut fresh_req = QueuedContext::new(
+            request_context(b"ARTICLE <fresh@example>\r\n"),
+            client_addr(),
+            fresh_tx,
+            PipelineDelivery::StreamAndCapture(fresh_writer),
+        );
+
+        let read = execute_streaming_pipeline_response(
+            &mut fresh_req,
+            &mut fresh_conn,
+            &mut io_buffer,
+            &mut result_buf,
+            &pool,
+            backend_id,
+        )
+        .await
+        .expect("fresh streamed capture should succeed");
+        assert!(read.response_streamed);
+
+        assert_eq!(
+            fresh_req
+                .context
+                .response_payload()
+                .expect("fresh streamed capture should complete")
+                .to_vec(),
+            fresh_response
+        );
+
+        let mut streamed = vec![0u8; fresh_response.len()];
+        fresh_client.read_exact(&mut streamed).await.unwrap();
+        assert_eq!(streamed, fresh_response);
     }
 
     #[tokio::test]

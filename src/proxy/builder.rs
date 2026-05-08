@@ -393,7 +393,12 @@ pub(super) struct BuildContext {
 #[inline]
 fn pipeline_worker_count(server: &Server) -> usize {
     if server.backend_pipelining {
-        server.max_connections.get()
+        let max_connections = server.max_connections.get();
+        if max_connections > 1 {
+            max_connections - 1
+        } else {
+            1
+        }
     } else {
         0
     }
@@ -613,13 +618,21 @@ mod tests {
     }
 
     #[test]
-    fn test_pipeline_worker_count_matches_backend_connection_capacity() {
+    fn test_pipeline_worker_count_reserves_one_pool_slot_for_non_pipeline_work() {
         let enabled = Server::builder("127.0.0.1", crate::types::Port::try_new(119).unwrap())
             .name("enabled")
             .max_connections(crate::types::MaxConnections::try_new(42).unwrap())
             .build()
             .unwrap();
-        assert_eq!(pipeline_worker_count(&enabled), 42);
+        assert_eq!(pipeline_worker_count(&enabled), 41);
+
+        let single_connection =
+            Server::builder("127.0.0.1", crate::types::Port::try_new(119).unwrap())
+                .name("single")
+                .max_connections(crate::types::MaxConnections::try_new(1).unwrap())
+                .build()
+                .unwrap();
+        assert_eq!(pipeline_worker_count(&single_connection), 1);
 
         let disabled = Server::builder("127.0.0.1", crate::types::Port::try_new(119).unwrap())
             .name("disabled")
