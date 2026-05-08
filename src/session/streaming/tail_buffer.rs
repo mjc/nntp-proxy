@@ -111,9 +111,11 @@ impl TailBuffer {
     }
     /// Detect terminator in chunk, considering possible boundary spanning
     ///
-    /// **Performance**: `find_terminator_end()` checks end first (O(1)),
-    /// then scans candidate dot bytes if terminator is mid-chunk (rare).
-    /// This optimizes the 99% case where terminator is at chunk end.
+    /// Returns the first complete terminator in the current chunk.
+    ///
+    /// This must prefer the earliest terminator, not the suffix terminator, because
+    /// pipelined reads can contain multiple complete NNTP responses in one chunk.
+    /// Returning the suffix terminator would merge several responses into one.
     #[must_use]
     pub fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
         find_terminator_end(chunk).map_or_else(
@@ -134,22 +136,18 @@ impl TailBuffer {
 /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1),
 /// the terminator is exactly "\r\n.\r\n" (CRLF, dot, CRLF).
 ///
-/// **Hot path optimization**: Check end first (99% case for streaming chunks),
-/// then scan for the terminator's distinguishing dot byte for mid-chunk leftovers.
+/// Returns the earliest complete terminator when multiple responses are packed
+/// into the same read buffer.
 #[inline]
 fn find_terminator_end(data: &[u8]) -> Option<usize> {
     const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
 
     data.len().checked_sub(TERMINATOR.len()).and_then(|_| {
-        if is_terminator_suffix(data) {
-            Some(data.len())
-        } else {
-            memchr::memchr_iter(b'.', data)
-                .skip_while(|&pos| pos < 2)
-                .take_while(|&pos| pos + 3 <= data.len())
-                .find(|&pos| data[pos - 2..pos + 3] == *TERMINATOR)
-                .map(|pos| pos + 3)
-        }
+        memchr::memchr_iter(b'.', data)
+            .skip_while(|&pos| pos < 2)
+            .take_while(|&pos| pos + 3 <= data.len())
+            .find(|&pos| data[pos - 2..pos + 3] == *TERMINATOR)
+            .map(|pos| pos + 3)
     })
 }
 
@@ -557,6 +555,19 @@ mod tests {
         assert!(pos < data.len());
         assert!(pos >= 5); // Position of terminator end
         assert_eq!(data[pos - 5..pos], *b"\r\n.\r\n");
+    }
+
+    #[test]
+    fn prop_find_terminator_end_prefers_first_terminator_when_multiple_exist() {
+        let data = b"222 1 <a@b>\r\nbody-1\r\n.\r\n222 2 <c@d>\r\nbody-2\r\n.\r\n";
+        let result = find_terminator_end(data).expect("first terminator should be found");
+
+        assert_eq!(result, b"222 1 <a@b>\r\nbody-1\r\n.\r\n".len());
+        assert_eq!(data[result - 5..result], *b"\r\n.\r\n");
+        assert!(
+            result < data.len(),
+            "first terminator should leave the second response as leftover"
+        );
     }
 
     #[test]

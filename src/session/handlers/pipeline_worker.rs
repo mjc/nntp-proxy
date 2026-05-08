@@ -1614,6 +1614,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pipeline_batch_pairs_four_body_responses_to_matching_requests_on_single_connection()
+     {
+        use tokio::io::AsyncReadExt;
+
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(4);
+        let backend_id = BackendId::from_index(0);
+        let queue = BackendQueue::new(4);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (commands_tx, commands_rx) = tokio::sync::oneshot::channel();
+
+        let expected_wire = concat!(
+            "BODY <body-1@example>\r\n",
+            "BODY <body-2@example>\r\n",
+            "BODY <body-3@example>\r\n",
+            "BODY <body-4@example>\r\n"
+        )
+        .as_bytes()
+        .to_vec();
+        let responses = concat!(
+            "222 1 <body-1@example>\r\nbody-1-line\r\n.\r\n",
+            "222 2 <body-2@example>\r\nbody-2-line\r\n.\r\n",
+            "222 3 <body-3@example>\r\nbody-3-line\r\n.\r\n",
+            "222 4 <body-4@example>\r\nbody-4-line\r\n.\r\n"
+        )
+        .as_bytes()
+        .to_vec();
+        let expected_wire_for_backend = expected_wire.clone();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let mut received = Vec::new();
+            while received.len() < expected_wire_for_backend.len() {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => received.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = commands_tx.send(received);
+            stream.write_all(&responses).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = ConnectionStream::plain(stream);
+
+        let (req1, rx1) = queued_context("BODY <body-1@example>\r\n");
+        let (req2, rx2) = queued_context("BODY <body-2@example>\r\n");
+        let (req3, rx3) = queued_context("BODY <body-3@example>\r\n");
+        let (req4, rx4) = queued_context("BODY <body-4@example>\r\n");
+        let batch = vec![req1, req2, req3, req4];
+
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+
+        let (success, _batch) = execute_pipeline_batch(
+            backend_id,
+            &queue,
+            &mut conn,
+            batch,
+            &metrics,
+            &pool,
+            &mut result_buf,
+        )
+        .await;
+        assert_eq!(commands_rx.await.unwrap(), expected_wire);
+        let response1 = rx1.await.unwrap();
+        let response2 = rx2.await.unwrap();
+        let response3 = rx3.await.unwrap();
+        let response4 = rx4.await.unwrap();
+
+        let summarize = |response: &PipelineResponse| match response {
+            Ok(completed) => (
+                completed.context.message_id().map(str::to_owned),
+                completed.context.backend_id(),
+                completed
+                    .context
+                    .response_metadata()
+                    .map(|metadata| metadata.status().as_u16()),
+                completed
+                    .context
+                    .response_payload()
+                    .map(|payload| payload.to_vec()),
+                None,
+            ),
+            Err(error) => (None, None, None, None, Some(*error)),
+        };
+
+        assert!(
+            success,
+            "expected single-connection 4x BODY pipeline to succeed; leftover={} summaries={:?}",
+            conn.leftover_len(),
+            [
+                summarize(&response1),
+                summarize(&response2),
+                summarize(&response3),
+                summarize(&response4),
+            ]
+        );
+        assert!(!conn.has_leftover());
+
+        assert_eq!(
+            [
+                response1.expect("BODY request should complete"),
+                response2.expect("BODY request should complete"),
+                response3.expect("BODY request should complete"),
+                response4.expect("BODY request should complete"),
+            ]
+            .map(|completed| (
+                completed.context.message_id().map(str::to_owned),
+                completed.context.backend_id(),
+                completed
+                    .context
+                    .response_metadata()
+                    .map(|metadata| metadata.status().as_u16()),
+                completed
+                    .context
+                    .response_payload()
+                    .expect("buffered BODY response keeps payload")
+                    .to_vec(),
+            )),
+            [
+                (
+                    Some("<body-1@example>".to_owned()),
+                    Some(backend_id),
+                    Some(222),
+                    b"222 1 <body-1@example>\r\nbody-1-line\r\n.\r\n".to_vec(),
+                ),
+                (
+                    Some("<body-2@example>".to_owned()),
+                    Some(backend_id),
+                    Some(222),
+                    b"222 2 <body-2@example>\r\nbody-2-line\r\n.\r\n".to_vec(),
+                ),
+                (
+                    Some("<body-3@example>".to_owned()),
+                    Some(backend_id),
+                    Some(222),
+                    b"222 3 <body-3@example>\r\nbody-3-line\r\n.\r\n".to_vec(),
+                ),
+                (
+                    Some("<body-4@example>".to_owned()),
+                    Some(backend_id),
+                    Some(222),
+                    b"222 4 <body-4@example>\r\nbody-4-line\r\n.\r\n".to_vec(),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn test_pipeline_batches_keep_independent_backend_connection_fifo() {
         async fn run_backend_batch(
             backend_id: BackendId,
