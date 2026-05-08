@@ -119,7 +119,7 @@ impl RequestBatch {
     }
 
     /// Get a typed context by index from the pipelineable commands.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(super) fn context(&self, i: usize) -> &RequestContext {
         &self.contexts[i]
     }

@@ -3,9 +3,10 @@ use std::io::Write;
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant, timeout, timeout_at};
 
 use nntp_proxy::config::{ClientAuth, HealthCheck, Proxy, Server};
+use nntp_proxy::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
 use nntp_proxy::{Config, NntpProxy, RoutingMode, load_config};
 
 mod test_helpers;
@@ -322,9 +323,11 @@ async fn test_response_flushing_with_rapid_commands() -> Result<()> {
         // Read until the multiline terminator arrives inside the same short deadline.
         // TCP is free to segment the response, so correctness is "prompt full response",
         // not "entire response in one read syscall".
+        let deadline = Instant::now() + Duration::from_millis(200);
         let mut response_bytes = Vec::new();
+        let mut tail = TailBuffer::default();
         loop {
-            let n = timeout(Duration::from_millis(200), client.read(&mut buffer))
+            let n = timeout_at(deadline, client.read(&mut buffer))
                 .await
                 .map_err(|_| {
                     anyhow::anyhow!(
@@ -336,17 +339,22 @@ async fn test_response_flushing_with_rapid_commands() -> Result<()> {
             if n == 0 {
                 break;
             }
-            response_bytes.extend_from_slice(&buffer[..n]);
-            if response_bytes.windows(3).any(|window| window == b".\r\n") {
-                break;
+            let chunk = &buffer[..n];
+            response_bytes.extend_from_slice(chunk);
+            match tail.detect_terminator(chunk) {
+                TerminatorStatus::FoundAt(_) => break,
+                TerminatorStatus::NotFound => tail.update(chunk),
             }
         }
 
         let response = String::from_utf8_lossy(&response_bytes);
+        let terminator_found = TailBuffer::default()
+            .detect_terminator(&response_bytes)
+            .is_found();
 
-        // Verify we got a complete response (should include terminator)
+        // Verify we got a complete response (should include the NNTP multiline terminator)
         assert!(
-            response.contains("220") && response.contains(".\r\n"),
+            response.contains("220") && terminator_found,
             "Response #{i} incomplete or malformed: {response}"
         );
     }
