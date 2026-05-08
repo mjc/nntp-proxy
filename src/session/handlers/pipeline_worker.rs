@@ -11,7 +11,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::metrics::MetricsCollector;
 use crate::pool::{BufferPool, DeadpoolConnectionProvider};
@@ -80,7 +80,7 @@ pub async fn backend_pipeline_worker(
     buffer_pool: BufferPool,
 ) {
     let backend_id = config.backend_id;
-    info!(
+    debug!(
         "Pipeline worker started for backend {:?} (batch_size={})",
         backend_id, config.batch_size
     );

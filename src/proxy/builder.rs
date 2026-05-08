@@ -470,7 +470,7 @@ impl BuildContext {
                     ));
                 }
 
-                info!(
+                debug!(
                     "Spawned {} pipeline workers for backend {:?} ({}) batch_size={}",
                     worker_count, backend_id, server.name, server.pipeline_batch_size
                 );
