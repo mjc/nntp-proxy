@@ -642,7 +642,7 @@ fn backend_details_line(
     }
 
     if let Some(depth) = pipeline_depth {
-        spans.push("Pipelined: ".fg(styles::LABEL));
+        spans.push("  Pipelined: ".fg(styles::LABEL));
         spans.push(format!("{depth}").fg(styles::VALUE_INFO));
         spans.push(", Queued: ".fg(styles::LABEL));
         spans.push(format!("{queued}").fg(pending_count_color(queued)));
@@ -1153,7 +1153,7 @@ mod tests {
         let without_pipeline = backend_details_line(4, Some(0.25), 1, None).to_string();
 
         assert!(with_pipeline.contains("Stateful: 1"));
-        assert!(with_pipeline.contains("Pipelined: 3, Queued: 1"));
+        assert!(with_pipeline.contains("  Pipelined: 3, Queued: 1"));
         assert!(!with_pipeline.contains('%'));
         assert!(without_pipeline.contains("Queued: 4"));
         assert!(!without_pipeline.contains("Pipelined:"));

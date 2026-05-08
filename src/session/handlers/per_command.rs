@@ -567,21 +567,52 @@ impl ClientSession {
         state: &mut PerCommandLoopState,
         batch: &mut crate::session::handlers::pipeline::RequestBatch,
     ) -> Result<BatchLoopAction, SessionError> {
-        for i in 0..batch.len() {
+        let batch_size = batch.len();
+        let mut pending_requests = Vec::with_capacity(batch.len());
+
+        for i in 0..batch_size {
+            {
+                let request = batch.context_mut(i);
+                debug!(
+                    "Client {} received {} request bytes: kind={:?}, verb={:?}",
+                    self.client_addr,
+                    request.request_wire_len().get(),
+                    request.kind(),
+                    request.verb()
+                );
+
+                state.client_to_backend_bytes = state
+                    .client_to_backend_bytes
+                    .add(request.request_wire_len().get());
+                state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
+
+                let decision = decide_request_routing(
+                    request,
+                    state.skip_auth_check,
+                    self.auth_handler.is_enabled(),
+                    self.mode_state.routing_mode(),
+                );
+                if batch_size > 1
+                    && request.is_large_transfer()
+                    && matches!(decision, CommandRoutingDecision::Forward)
+                    && let Some(pending) =
+                        self.try_enqueue_pipeline_request(router, request, client_writer, None)
+                {
+                    pending_requests.push((i, pending));
+                    continue;
+                }
+            }
+
+            self.finish_pending_pipeline_requests(
+                router,
+                client_writer,
+                state,
+                batch,
+                &mut pending_requests,
+            )
+            .await?;
+
             let request = batch.context_mut(i);
-            debug!(
-                "Client {} received {} request bytes: kind={:?}, verb={:?}",
-                self.client_addr,
-                request.request_wire_len().get(),
-                request.kind(),
-                request.verb()
-            );
-
-            state.client_to_backend_bytes = state
-                .client_to_backend_bytes
-                .add(request.request_wire_len().get());
-            state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
-
             match self
                 .process_single_command(ProcessCommandParams {
                     request,
@@ -606,7 +637,43 @@ impl ClientSession {
             }
         }
 
+        self.finish_pending_pipeline_requests(
+            router,
+            client_writer,
+            state,
+            batch,
+            &mut pending_requests,
+        )
+        .await?;
+
         Ok(BatchLoopAction::Continue)
+    }
+
+    async fn finish_pending_pipeline_requests(
+        &self,
+        router: &Arc<BackendSelector>,
+        client_writer: &crate::session::SharedClientWriter,
+        state: &mut PerCommandLoopState,
+        batch: &mut crate::session::handlers::pipeline::RequestBatch,
+        pending_requests: &mut Vec<(
+            usize,
+            crate::session::handlers::article_retry::PendingPipelineRequest,
+        )>,
+    ) -> Result<(), SessionError> {
+        for (index, pending) in pending_requests.drain(..) {
+            let request = batch.context_mut(index);
+            let mut client_to_backend_bytes = state.client_to_backend_bytes;
+            let mut availability = None;
+            let mut io = crate::session::handlers::article_retry::RequestExecutionIo {
+                client_writer,
+                client_to_backend_bytes: &mut client_to_backend_bytes,
+                backend_to_client_bytes: &mut state.backend_to_client_bytes,
+            };
+            self.finish_pipeline_request(router, request, pending, &mut io, &mut availability)
+                .await?;
+        }
+
+        Ok(())
     }
 
     async fn handle_trailing_command(

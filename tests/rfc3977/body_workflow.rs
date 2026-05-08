@@ -19,6 +19,11 @@ use crate::test_helpers::{
 };
 use nntp_proxy::{Config, RoutingMode};
 
+const PIPELINE_COMMON_RESPONSES: &[(&str, &str)] = &[
+    ("MODE READER", "200 Posting prohibited\r\n"),
+    ("DATE", "111 20260508120000\r\n"),
+];
+
 fn large_body_response(status: &str) -> String {
     let mut response = String::from(status);
     for idx in 0..2048 {
@@ -142,10 +147,46 @@ async fn read_multiline_response(stream: &mut TcpStream) -> Result<(String, Vec<
     Ok((status_line, lines))
 }
 
-#[tokio::test]
-async fn test_body_pipelining_pairs_four_responses_on_single_backend_connection() -> Result<()> {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_port = backend_listener.local_addr()?.port();
+async fn read_multiline_responses(
+    stream: &mut TcpStream,
+    count: usize,
+) -> Result<Vec<(String, Vec<String>)>> {
+    let mut responses = Vec::with_capacity(count);
+    for _ in 0..count {
+        responses.push(read_multiline_response(stream).await?);
+    }
+    Ok(responses)
+}
+
+async fn write_commands(stream: &mut TcpStream, commands: &[&str]) -> Result<()> {
+    for command in commands {
+        stream.write_all(command.as_bytes()).await?;
+    }
+    stream.flush().await?;
+    Ok(())
+}
+
+fn pipeline_backend_config(backend_port: u16, name: &str) -> Config {
+    let mut server =
+        create_test_server_config_with_max_connections("127.0.0.1", backend_port, name, 1);
+    server.pipeline_batch_size = 4;
+    Config {
+        servers: vec![server],
+        ..Default::default()
+    }
+}
+
+fn find_pipeline_response<'a>(command: &str, responses: &'a [(&str, &str)]) -> Option<&'a str> {
+    responses
+        .iter()
+        .find_map(|(expected, response)| (*expected == command).then_some(*response))
+}
+
+fn spawn_delayed_pipeline_backend(
+    backend_listener: TcpListener,
+    delayed_responses: &'static [(&'static str, &'static str)],
+    immediate_responses: &'static [(&'static str, &'static str)],
+) -> (Arc<AtomicUsize>, Arc<tokio::sync::Mutex<Vec<String>>>) {
     let connection_count = Arc::new(AtomicUsize::new(0));
     let seen_commands = Arc::new(tokio::sync::Mutex::new(Vec::<String>::new()));
     let connection_count_for_task = connection_count.clone();
@@ -163,6 +204,7 @@ async fn test_body_pipelining_pairs_four_responses_on_single_backend_connection(
             }
 
             let mut pending = Vec::new();
+            let mut delayed = Vec::new();
             let mut buffer = [0u8; 1024];
             while let Ok(n) = stream.read(&mut buffer).await {
                 if n == 0 {
@@ -175,27 +217,22 @@ async fn test_body_pipelining_pairs_four_responses_on_single_backend_connection(
                     let command = String::from_utf8_lossy(&line).trim().to_string();
                     seen_commands_for_task.lock().await.push(command.clone());
 
-                    let response = match command.as_str() {
-                        "MODE READER" => Some("200 Posting prohibited\r\n"),
-                        "DATE" => Some("111 20260508120000\r\n"),
-                        "BODY <body-1@example>" => {
-                            Some("222 1 <body-1@example>\r\nbody-1-line\r\n.\r\n")
+                    if let Some(response) = find_pipeline_response(&command, delayed_responses) {
+                        delayed.push(response);
+                        if delayed.len() == delayed_responses.len() {
+                            for response in delayed.drain(..) {
+                                if stream.write_all(response.as_bytes()).await.is_err() {
+                                    break;
+                                }
+                            }
                         }
-                        "BODY <body-2@example>" => {
-                            Some("222 2 <body-2@example>\r\nbody-2-line\r\n.\r\n")
-                        }
-                        "BODY <body-3@example>" => {
-                            Some("222 3 <body-3@example>\r\nbody-3-line\r\n.\r\n")
-                        }
-                        "BODY <body-4@example>" => {
-                            Some("222 4 <body-4@example>\r\nbody-4-line\r\n.\r\n")
-                        }
-                        _ => Some("500 Unexpected command\r\n"),
-                    };
+                        continue;
+                    }
 
-                    if let Some(response) = response
-                        && stream.write_all(response.as_bytes()).await.is_err()
-                    {
+                    let response = find_pipeline_response(&command, immediate_responses)
+                        .or_else(|| find_pipeline_response(&command, PIPELINE_COMMON_RESPONSES))
+                        .unwrap_or("500 Unexpected command\r\n");
+                    if stream.write_all(response.as_bytes()).await.is_err() {
                         break;
                     }
                 }
@@ -203,44 +240,59 @@ async fn test_body_pipelining_pairs_four_responses_on_single_backend_connection(
         }
     });
 
-    let mut server = create_test_server_config_with_max_connections(
-        "127.0.0.1",
-        backend_port,
-        "BodyPipeline",
-        1,
-    );
-    server.pipeline_batch_size = 4;
-    let config = Config {
-        servers: vec![server],
-        ..Default::default()
-    };
+    (connection_count, seen_commands)
+}
 
-    let proxy_port = spawn_proxy_with_config(config, RoutingMode::PerCommand).await?;
+#[tokio::test]
+async fn test_body_pipelining_pairs_four_responses_on_single_backend_connection() -> Result<()> {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let (connection_count, seen_commands) = spawn_delayed_pipeline_backend(
+        backend_listener,
+        &[
+            (
+                "BODY <body-1@example>",
+                "222 1 <body-1@example>\r\nbody-1-line\r\n.\r\n",
+            ),
+            (
+                "BODY <body-2@example>",
+                "222 2 <body-2@example>\r\nbody-2-line\r\n.\r\n",
+            ),
+            (
+                "BODY <body-3@example>",
+                "222 3 <body-3@example>\r\nbody-3-line\r\n.\r\n",
+            ),
+            (
+                "BODY <body-4@example>",
+                "222 4 <body-4@example>\r\nbody-4-line\r\n.\r\n",
+            ),
+        ],
+        &[],
+    );
+
+    let proxy_port = spawn_proxy_with_config(
+        pipeline_backend_config(backend_port, "BodyPipeline"),
+        RoutingMode::PerCommand,
+    )
+    .await?;
     let mut client = connect_and_read_greeting(proxy_port).await?;
 
-    client
-        .write_all(
-            concat!(
-                "BODY <body-1@example>\r\n",
-                "BODY <body-2@example>\r\n",
-                "BODY <body-3@example>\r\n",
-                "BODY <body-4@example>\r\n"
-            )
-            .as_bytes(),
-        )
-        .await?;
-    client.flush().await?;
+    write_commands(
+        &mut client,
+        &[
+            "BODY <body-1@example>\r\n",
+            "BODY <body-2@example>\r\n",
+            "BODY <body-3@example>\r\n",
+            "BODY <body-4@example>\r\n",
+        ],
+    )
+    .await?;
 
-    let responses = [
-        read_multiline_response(&mut client).await?,
-        read_multiline_response(&mut client).await?,
-        read_multiline_response(&mut client).await?,
-        read_multiline_response(&mut client).await?,
-    ];
+    let responses = read_multiline_responses(&mut client, 4).await?;
 
     assert_eq!(
         responses,
-        [
+        vec![
             (
                 "222 1 <body-1@example>\r\n".to_string(),
                 vec!["body-1-line\r\n".to_string()],
@@ -279,6 +331,190 @@ async fn test_body_pipelining_pairs_four_responses_on_single_backend_connection(
         connection_count.load(Ordering::SeqCst),
         1,
         "expected all pipelined BODY commands to share one backend connection"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_article_pipelining_pairs_four_responses_on_single_backend_connection() -> Result<()> {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let (connection_count, seen_commands) = spawn_delayed_pipeline_backend(
+        backend_listener,
+        &[
+            (
+                "ARTICLE <article-1@example>",
+                "220 1 <article-1@example>\r\narticle-1-line\r\n.\r\n",
+            ),
+            (
+                "ARTICLE <article-2@example>",
+                "220 2 <article-2@example>\r\narticle-2-line\r\n.\r\n",
+            ),
+            (
+                "ARTICLE <article-3@example>",
+                "220 3 <article-3@example>\r\narticle-3-line\r\n.\r\n",
+            ),
+            (
+                "ARTICLE <article-4@example>",
+                "220 4 <article-4@example>\r\narticle-4-line\r\n.\r\n",
+            ),
+        ],
+        &[],
+    );
+
+    let proxy_port = spawn_proxy_with_config(
+        pipeline_backend_config(backend_port, "ArticlePipeline"),
+        RoutingMode::PerCommand,
+    )
+    .await?;
+    let mut client = connect_and_read_greeting(proxy_port).await?;
+
+    write_commands(
+        &mut client,
+        &[
+            "ARTICLE <article-1@example>\r\n",
+            "ARTICLE <article-2@example>\r\n",
+            "ARTICLE <article-3@example>\r\n",
+            "ARTICLE <article-4@example>\r\n",
+        ],
+    )
+    .await?;
+
+    let responses = read_multiline_responses(&mut client, 4).await?;
+    assert_eq!(
+        responses,
+        vec![
+            (
+                "220 1 <article-1@example>\r\n".to_string(),
+                vec!["article-1-line\r\n".to_string()],
+            ),
+            (
+                "220 2 <article-2@example>\r\n".to_string(),
+                vec!["article-2-line\r\n".to_string()],
+            ),
+            (
+                "220 3 <article-3@example>\r\n".to_string(),
+                vec!["article-3-line\r\n".to_string()],
+            ),
+            (
+                "220 4 <article-4@example>\r\n".to_string(),
+                vec!["article-4-line\r\n".to_string()],
+            ),
+        ]
+    );
+
+    let seen_commands = seen_commands.lock().await.clone();
+    let article_commands = seen_commands
+        .into_iter()
+        .filter(|command| command.starts_with("ARTICLE "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        article_commands,
+        vec![
+            "ARTICLE <article-1@example>".to_string(),
+            "ARTICLE <article-2@example>".to_string(),
+            "ARTICLE <article-3@example>".to_string(),
+            "ARTICLE <article-4@example>".to_string(),
+        ]
+    );
+    assert_eq!(
+        connection_count.load(Ordering::SeqCst),
+        1,
+        "expected all pipelined ARTICLE commands to share one backend connection"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_body_pipeline_batch_drains_before_trailing_group_switch() -> Result<()> {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let (_connection_count, seen_commands) = spawn_delayed_pipeline_backend(
+        backend_listener,
+        &[
+            (
+                "BODY <body-1@example>",
+                "222 1 <body-1@example>\r\nbody-1-line\r\n.\r\n",
+            ),
+            (
+                "BODY <body-2@example>",
+                "222 2 <body-2@example>\r\nbody-2-line\r\n.\r\n",
+            ),
+            (
+                "BODY <body-3@example>",
+                "222 3 <body-3@example>\r\nbody-3-line\r\n.\r\n",
+            ),
+            (
+                "BODY <body-4@example>",
+                "222 4 <body-4@example>\r\nbody-4-line\r\n.\r\n",
+            ),
+        ],
+        &[("GROUP alt.test", "211 4 1 4 alt.test\r\n")],
+    );
+
+    let proxy_port = spawn_proxy_with_config(
+        pipeline_backend_config(backend_port, "BodyPipelineTrailingGroup"),
+        RoutingMode::Hybrid,
+    )
+    .await?;
+    let mut client = connect_and_read_greeting(proxy_port).await?;
+
+    write_commands(
+        &mut client,
+        &[
+            "BODY <body-1@example>\r\n",
+            "BODY <body-2@example>\r\n",
+            "BODY <body-3@example>\r\n",
+            "BODY <body-4@example>\r\n",
+            "GROUP alt.test\r\n",
+        ],
+    )
+    .await?;
+
+    let responses = read_multiline_responses(&mut client, 4).await?;
+    assert_eq!(
+        responses,
+        vec![
+            (
+                "222 1 <body-1@example>\r\n".to_string(),
+                vec!["body-1-line\r\n".to_string()],
+            ),
+            (
+                "222 2 <body-2@example>\r\n".to_string(),
+                vec!["body-2-line\r\n".to_string()],
+            ),
+            (
+                "222 3 <body-3@example>\r\n".to_string(),
+                vec!["body-3-line\r\n".to_string()],
+            ),
+            (
+                "222 4 <body-4@example>\r\n".to_string(),
+                vec!["body-4-line\r\n".to_string()],
+            ),
+        ]
+    );
+    assert_eq!(
+        read_line(&mut client, "GROUP status line").await?,
+        "211 4 1 4 alt.test\r\n"
+    );
+
+    let seen_commands = seen_commands.lock().await.clone();
+    let relevant_commands = seen_commands
+        .into_iter()
+        .filter(|command| command.starts_with("BODY ") || command.starts_with("GROUP "))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        relevant_commands,
+        vec![
+            "BODY <body-1@example>".to_string(),
+            "BODY <body-2@example>".to_string(),
+            "BODY <body-3@example>".to_string(),
+            "BODY <body-4@example>".to_string(),
+            "GROUP alt.test".to_string(),
+        ],
+        "expected trailing GROUP to be forwarded only after the queued BODY batch completed"
     );
 
     Ok(())

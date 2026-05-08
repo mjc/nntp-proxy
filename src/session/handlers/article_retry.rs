@@ -4,7 +4,9 @@
 //! to skip backends that have already returned 430 for a given article.
 
 use crate::cache::ArticleAvailability;
-use crate::router::backend_queue::QueuedContext;
+use crate::router::backend_queue::{
+    CompletedPipelineRequest, PipelineDelivery, PipelineResponse, QueuedContext,
+};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::ClientSession;
 use crate::session::SessionError;
@@ -18,16 +20,22 @@ use anyhow::Result;
 use std::io;
 use std::sync::Arc;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
 use crate::protocol::RequestContext;
 use crate::session::precheck;
 
 /// Client-side write state shared across cache, precheck, pipeline, and direct routing paths.
-struct RequestExecutionIo<'a> {
-    client_writer: &'a crate::session::SharedClientWriter,
-    client_to_backend_bytes: &'a mut ClientToBackendBytes,
-    backend_to_client_bytes: &'a mut BackendToClientBytes,
+pub(super) struct RequestExecutionIo<'a> {
+    pub(super) client_writer: &'a crate::session::SharedClientWriter,
+    pub(super) client_to_backend_bytes: &'a mut ClientToBackendBytes,
+    pub(super) backend_to_client_bytes: &'a mut BackendToClientBytes,
+}
+
+pub(super) struct PendingPipelineRequest {
+    guard: CommandGuard,
+    rx: oneshot::Receiver<PipelineResponse>,
 }
 
 /// Result of preparing a request before pipeline/direct backend execution.
@@ -196,155 +204,214 @@ impl ClientSession {
         io: &mut RequestExecutionIo<'_>,
         availability: &mut Option<ArticleAvailability>,
     ) -> Result<bool, SessionError> {
-        if let Ok(backend_id) =
-            router.route_with_availability(self.client_id, availability.as_ref())
-            && let Some(queue) = router.get_backend_queue(backend_id)
+        if let Some(pending) = self.try_enqueue_pipeline_request(
+            router,
+            request,
+            io.client_writer,
+            availability.as_ref(),
+        ) && self
+            .await_pipeline_request(pending, io, availability)
+            .await?
+            .is_some()
         {
-            let guard = CommandGuard::new(router.clone(), backend_id);
-            debug!(
-                "Client {} using pipeline path for backend {:?}: kind={:?}, verb={:?}",
-                self.client_addr,
-                backend_id,
-                request.kind(),
-                request.verb()
-            );
-
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            let queued_context = if request.is_large_transfer() {
-                let delivery = if self.article_buffer {
-                    crate::router::backend_queue::PipelineDelivery::Buffered
-                } else if self.cache_articles {
-                    crate::router::backend_queue::PipelineDelivery::StreamAndCapture(
-                        io.client_writer.clone(),
-                    )
-                } else {
-                    crate::router::backend_queue::PipelineDelivery::StreamToClient(
-                        io.client_writer.clone(),
-                    )
-                };
-                QueuedContext::new(request.clone(), self.client_addr, tx, delivery)
-            } else {
-                QueuedContext::new(
-                    request.clone(),
-                    self.client_addr,
-                    tx,
-                    crate::router::backend_queue::PipelineDelivery::Buffered,
-                )
-            };
-
-            match queue.try_enqueue(queued_context) {
-                Ok(()) => {
-                    self.metrics.record_pipeline_enqueue();
-
-                    match rx.await {
-                        Ok(Ok(mut completed))
-                            if completed
-                                .context
-                                .response_metadata()
-                                .is_some_and(|response| response.status().as_u16() != 430) =>
-                        {
-                            let completed_backend_id = completed
-                                .context
-                                .backend_id()
-                                .expect("completed queued request records backend id");
-                            let response = completed
-                                .context
-                                .response_metadata()
-                                .expect("completed queued request records response metadata");
-                            let cache_action = determine_cache_action_for_request(
-                                &completed.context,
-                                response.status(),
-                                self.cache_articles,
-                                completed.context.has_message_id(),
-                            );
-                            if let Some(payload) = completed.context.take_response_payload() {
-                                if !completed.response_streamed {
-                                    let mut client_write = io.client_writer.lock().await;
-                                    payload
-                                        .write_all_to(&mut *client_write)
-                                        .await
-                                        .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
-                                }
-
-                                if matches!(cache_action, CacheAction::CaptureArticle)
-                                    && let Some(msg_id) = completed.context.message_id_value()
-                                {
-                                    let tier = self.tier_for_backend(completed_backend_id);
-                                    self.spawn_cache_upsert_buffer(
-                                        &msg_id,
-                                        payload.into(),
-                                        completed_backend_id,
-                                        tier,
-                                    );
-                                }
-                            }
-                            if matches!(cache_action, CacheAction::TrackAvailability)
-                                && let Some(msg_id) = completed.context.message_id_value()
-                                && !completed
-                                    .context
-                                    .cache_records_backend_has_article(completed_backend_id)
-                            {
-                                self.spawn_cache_upsert_availability(
-                                    &msg_id,
-                                    response.status(),
-                                    completed_backend_id,
-                                    self.tier_for_backend(completed_backend_id),
-                                );
-                            }
-                            *io.backend_to_client_bytes =
-                                io.backend_to_client_bytes.add(response.wire_len().get());
-                            *io.client_to_backend_bytes = io
-                                .client_to_backend_bytes
-                                .add(completed.context.request_wire_len().get());
-                            self.metrics.record_pipeline_complete();
-                            guard.complete();
-                            return Ok(true);
-                        }
-                        Ok(Ok(completed)) => {
-                            let completed_backend_id = completed
-                                .context
-                                .backend_id()
-                                .expect("completed queued request records backend id");
-                            debug!(
-                                "Client {} pipeline got 430 from backend {:?}, falling through to retry loop",
-                                self.client_addr, completed_backend_id
-                            );
-                            self.handle_430_availability(
-                                completed_backend_id,
-                                availability.get_or_insert_default(),
-                            );
-                            self.metrics.record_pipeline_complete();
-                        }
-                        Ok(Err(crate::router::backend_queue::PipelineError::ClientDisconnect)) => {
-                            return Err(SessionError::ClientDisconnect(io::Error::new(
-                                io::ErrorKind::BrokenPipe,
-                                "client disconnected during pipelined stream",
-                            )));
-                        }
-                        Ok(Err(e)) => {
-                            debug!(
-                                "Client {} pipeline error for backend {:?}: {}",
-                                self.client_addr, backend_id, e
-                            );
-                        }
-                        Err(_) => {
-                            debug!(
-                                "Client {} pipeline worker dropped response channel",
-                                self.client_addr
-                            );
-                        }
-                    }
-                }
-                Err(e) => {
-                    debug!(
-                        "Client {} pipeline queue full for backend {:?}: {}",
-                        self.client_addr, backend_id, e
-                    );
-                }
-            }
+            return Ok(true);
         }
 
         Ok(false)
+    }
+
+    fn pipeline_delivery(
+        &self,
+        request: &RequestContext,
+        client_writer: &crate::session::SharedClientWriter,
+    ) -> PipelineDelivery {
+        if !request.is_large_transfer() {
+            return PipelineDelivery::Buffered;
+        }
+
+        if self.article_buffer {
+            PipelineDelivery::Buffered
+        } else if self.cache_articles {
+            PipelineDelivery::StreamAndCapture(client_writer.clone())
+        } else {
+            PipelineDelivery::StreamToClient(client_writer.clone())
+        }
+    }
+
+    pub(super) fn try_enqueue_pipeline_request(
+        &self,
+        router: &Arc<BackendSelector>,
+        request: &RequestContext,
+        client_writer: &crate::session::SharedClientWriter,
+        availability: Option<&ArticleAvailability>,
+    ) -> Option<PendingPipelineRequest> {
+        let Ok(backend_id) = router.route_with_availability(self.client_id, availability) else {
+            return None;
+        };
+        let queue = router.get_backend_queue(backend_id)?;
+
+        debug!(
+            "Client {} using pipeline path for backend {:?}: kind={:?}, verb={:?}",
+            self.client_addr,
+            backend_id,
+            request.kind(),
+            request.verb()
+        );
+
+        let guard = CommandGuard::new(router.clone(), backend_id);
+        let (tx, rx) = oneshot::channel();
+        let queued_context = QueuedContext::new(
+            request.clone(),
+            self.client_addr,
+            tx,
+            self.pipeline_delivery(request, client_writer),
+        );
+
+        match queue.try_enqueue(queued_context) {
+            Ok(()) => {
+                self.metrics.record_pipeline_enqueue();
+                Some(PendingPipelineRequest { guard, rx })
+            }
+            Err(e) => {
+                debug!(
+                    "Client {} pipeline queue full for backend {:?}: {}",
+                    self.client_addr, backend_id, e
+                );
+                None
+            }
+        }
+    }
+
+    async fn await_pipeline_request(
+        &self,
+        pending: PendingPipelineRequest,
+        io: &mut RequestExecutionIo<'_>,
+        availability: &mut Option<ArticleAvailability>,
+    ) -> Result<Option<CompletedPipelineRequest>, SessionError> {
+        let PendingPipelineRequest { guard, rx } = pending;
+        let backend_id = guard.backend_id();
+
+        match rx.await {
+            Ok(Ok(mut completed))
+                if completed
+                    .context
+                    .response_metadata()
+                    .is_some_and(|response| response.status().as_u16() != 430) =>
+            {
+                let completed_backend_id = completed
+                    .context
+                    .backend_id()
+                    .expect("completed queued request records backend id");
+                let response = completed
+                    .context
+                    .response_metadata()
+                    .expect("completed queued request records response metadata");
+                let cache_action = determine_cache_action_for_request(
+                    &completed.context,
+                    response.status(),
+                    self.cache_articles,
+                    completed.context.has_message_id(),
+                );
+                if let Some(payload) = completed.context.take_response_payload() {
+                    if !completed.response_streamed {
+                        let mut client_write = io.client_writer.lock().await;
+                        payload
+                            .write_all_to(&mut *client_write)
+                            .await
+                            .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                    }
+
+                    if matches!(cache_action, CacheAction::CaptureArticle)
+                        && let Some(msg_id) = completed.context.message_id_value()
+                    {
+                        let tier = self.tier_for_backend(completed_backend_id);
+                        self.spawn_cache_upsert_buffer(
+                            &msg_id,
+                            payload.into(),
+                            completed_backend_id,
+                            tier,
+                        );
+                    }
+                }
+                if matches!(cache_action, CacheAction::TrackAvailability)
+                    && let Some(msg_id) = completed.context.message_id_value()
+                    && !completed
+                        .context
+                        .cache_records_backend_has_article(completed_backend_id)
+                {
+                    self.spawn_cache_upsert_availability(
+                        &msg_id,
+                        response.status(),
+                        completed_backend_id,
+                        self.tier_for_backend(completed_backend_id),
+                    );
+                }
+                *io.backend_to_client_bytes =
+                    io.backend_to_client_bytes.add(response.wire_len().get());
+                *io.client_to_backend_bytes = io
+                    .client_to_backend_bytes
+                    .add(completed.context.request_wire_len().get());
+                self.metrics.record_pipeline_complete();
+                guard.complete();
+                Ok(Some(completed))
+            }
+            Ok(Ok(completed)) => {
+                let completed_backend_id = completed
+                    .context
+                    .backend_id()
+                    .expect("completed queued request records backend id");
+                debug!(
+                    "Client {} pipeline got 430 from backend {:?}, falling through to retry loop",
+                    self.client_addr, completed_backend_id
+                );
+                self.handle_430_availability(
+                    completed_backend_id,
+                    availability.get_or_insert_default(),
+                );
+                self.metrics.record_pipeline_complete();
+                Ok(None)
+            }
+            Ok(Err(crate::router::backend_queue::PipelineError::ClientDisconnect)) => {
+                Err(SessionError::ClientDisconnect(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "client disconnected during pipelined stream",
+                )))
+            }
+            Ok(Err(e)) => {
+                debug!(
+                    "Client {} pipeline error for backend {:?}: {}",
+                    self.client_addr, backend_id, e
+                );
+                Ok(None)
+            }
+            Err(_) => {
+                debug!(
+                    "Client {} pipeline worker dropped response channel",
+                    self.client_addr
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    pub(super) async fn finish_pipeline_request(
+        &self,
+        router: &Arc<BackendSelector>,
+        request: &mut RequestContext,
+        pending: PendingPipelineRequest,
+        io: &mut RequestExecutionIo<'_>,
+        availability: &mut Option<ArticleAvailability>,
+    ) -> Result<(), SessionError> {
+        if let Some(completed) = self
+            .await_pipeline_request(pending, io, availability)
+            .await?
+        {
+            *request = completed.context;
+            return Ok(());
+        }
+
+        self.execute_article_retry_loop(router, request, availability.take(), io)
+            .await
     }
 
     async fn execute_article_retry_loop(
