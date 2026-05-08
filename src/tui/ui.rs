@@ -9,7 +9,7 @@ use crate::tui::dashboard::{
 use crate::tui::helpers::{
     build_chart_data, calculate_chart_bounds, connection_failure_color, create_sparkline,
     error_count_color, error_rate_color, format_error_rate, format_summary_throughput,
-    format_throughput_label, health_indicator, load_percentage_color, pending_count_color,
+    format_throughput_label, health_indicator, pending_count_color,
 };
 use ratatui::{
     Frame,
@@ -381,7 +381,7 @@ fn build_app_summary_lines(
         lines.push(Line::from(vec![
             "Pipelined: ".fg(styles::LABEL),
             format!(
-                "{} sent across {} backend conns",
+                "{} across {} backend conns",
                 metrics.pipeline_depth, metrics.pipeline_connection_capacity
             )
             .fg(styles::VALUE_INFO),
@@ -636,7 +636,7 @@ fn backend_error_line(
 /// Create details line: in-flight load, stateful connections, pipelined depth, and queue backlog.
 fn backend_details_line(
     pending: usize,
-    load_ratio: Option<f64>,
+    _load_ratio: Option<f64>,
     stateful: usize,
     pipeline_depth: Option<usize>,
     pipeline_queue_depth: Option<usize>,
@@ -644,20 +644,15 @@ fn backend_details_line(
 ) -> Line<'static> {
     let mut spans: Vec<Span> = vec![
         "  In Flight: ".fg(styles::LABEL),
-        format!("{pending} in-flight").fg(pending_count_color(pending)),
+        format!("{pending}").fg(pending_count_color(pending)),
     ];
-
-    if let Some(ratio) = load_ratio {
-        let ratio_percent = ratio * 100.0;
-        spans.push(format!(" ({ratio_percent:.0}%)").fg(load_percentage_color(ratio_percent)));
-    }
 
     if stateful > 0 {
         spans.push(format!(" | Stateful: {stateful}").fg(Color::Cyan));
     }
 
     if let Some(depth) = pipeline_depth {
-        spans.push(format!(" | Pipelined: {depth} sent").fg(styles::VALUE_INFO));
+        spans.push(format!(" | Pipelined: {depth}").fg(styles::VALUE_INFO));
     }
 
     if let Some(capacity) = pipeline_queue_capacity {
@@ -1165,7 +1160,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("Pipelined: 3 sent across 24 backend conns"))
+                .any(|line| line.contains("Pipelined: 3 across 24 backend conns"))
         );
         assert!(
             !lines
@@ -1180,10 +1175,11 @@ mod tests {
             backend_details_line(4, Some(0.25), 1, Some(3), Some(2), Some(8)).to_string();
         let without_pipeline = backend_details_line(4, Some(0.25), 1, None, None, None).to_string();
 
-        assert!(with_pipeline.contains("In Flight: 4 in-flight (25%)"));
+        assert!(with_pipeline.contains("In Flight: 4"));
         assert!(with_pipeline.contains("Stateful: 1"));
-        assert!(with_pipeline.contains("Pipelined: 3 sent"));
+        assert!(with_pipeline.contains("Pipelined: 3"));
         assert!(with_pipeline.contains("Queue Backlog: 2/8"));
+        assert!(!with_pipeline.contains('%'));
         assert!(!without_pipeline.contains("Pipelined:"));
         assert!(!without_pipeline.contains("Queue Backlog:"));
     }

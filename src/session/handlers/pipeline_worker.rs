@@ -921,6 +921,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_execute_pipeline_batch_tracks_live_pipeline_depth_until_responses_finish() {
+        use tokio::io::AsyncReadExt;
+
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(2);
+        let backend_id = BackendId::from_index(0);
+        let queue = Arc::new(BackendQueue::new(2));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (commands_read_tx, commands_read_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let mut received = 0usize;
+            let expected = b"STAT <a@b>\r\n".len() + b"STAT <c@d>\r\n".len();
+            while received < expected {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => received += n,
+                }
+            }
+
+            let _ = commands_read_tx.send(());
+            let _ = release_rx.await;
+            stream
+                .write_all(b"223 0 <a@b> status\r\n223 0 <c@d> status\r\n")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = ConnectionStream::plain(stream);
+        let (req1, rx1) = queued_context("STAT <a@b>\r\n");
+        let (req2, rx2) = queued_context("STAT <c@d>\r\n");
+        let batch = vec![req1, req2];
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+        let queue_for_task = queue.clone();
+
+        let task = tokio::spawn(async move {
+            execute_pipeline_batch(
+                backend_id,
+                queue_for_task.as_ref(),
+                &mut conn,
+                batch,
+                &metrics,
+                &pool,
+                &mut result_buf,
+            )
+            .await
+        });
+
+        commands_read_rx.await.unwrap();
+        assert_eq!(queue.pipeline_depth(), 2);
+
+        release_tx.send(()).unwrap();
+        let (success, batch) = task.await.unwrap();
+        assert!(success);
+        assert!(batch.is_empty());
+        assert_eq!(queue.pipeline_depth(), 0);
+        assert_eq!(expect_success_status(rx1.await.unwrap()), 223);
+        assert_eq!(expect_success_status(rx2.await.unwrap()), 223);
+    }
+
+    #[tokio::test]
     async fn test_execute_pipeline_batch_aborts_after_streamed_client_disconnect() {
         let pool = BufferPool::for_tests();
         let metrics = MetricsCollector::new(1);

@@ -11,10 +11,13 @@
 
 use crossbeam::queue::SegQueue;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, oneshot};
 
 use crate::protocol::RequestContext;
 use crate::session::SharedClientWriter;
+
+const BATCH_COALESCE_WINDOW: Duration = Duration::from_millis(1);
 
 /// A queued request completed by one backend connection.
 #[derive(Debug)]
@@ -205,7 +208,8 @@ impl BackendQueue {
     /// Dequeue up to `max_batch` requests, reusing the provided Vec's allocation.
     ///
     /// Takes ownership of `batch`, clears it, fills with at least 1 request (blocks until
-    /// one is available), then greedily takes up to `max_batch` without waiting for more.
+    /// one is available), then briefly coalesces follow-up arrivals so workers do not
+    /// lock long-running ARTICLE/BODY responses into one-deep pipelines under bursty load.
     /// Returns the filled Vec so the caller can thread ownership through a loop.
     pub(crate) async fn dequeue_batch(
         &self,
@@ -223,14 +227,25 @@ impl BackendQueue {
                 self.depth.fetch_sub(1, Ordering::AcqRel);
                 batch.push(first);
 
-                // Greedily drain up to max_batch - 1 more
+                let deadline = Instant::now() + BATCH_COALESCE_WINDOW;
                 while batch.len() < max_batch {
+                    let notified = self.notify.notified();
+
                     match self.queue.pop() {
                         Some(req) => {
                             self.depth.fetch_sub(1, Ordering::AcqRel);
                             batch.push(req);
                         }
-                        None => break,
+                        None => {
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() {
+                                break;
+                            }
+
+                            if tokio::time::timeout(remaining, notified).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
 
@@ -391,6 +406,56 @@ mod tests {
         let batch = queue.dequeue_batch(10, batch).await;
         assert_eq!(batch.len(), 2);
         assert_eq!(queue_depth(&queue), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_dequeue_batch_coalesces_follow_up_arrivals_within_window() {
+        let queue = Arc::new(BackendQueue::new(100));
+        let queue_clone = queue.clone();
+
+        let handle = tokio::spawn(async move { queue_clone.dequeue_batch(4, Vec::new()).await });
+        tokio::task::yield_now().await;
+
+        for idx in 0..3 {
+            let (tx, _rx) = oneshot::channel();
+            let request = format!("STAT <msg{idx}@example.com>\r\n");
+            queue
+                .try_enqueue(QueuedContext::new(
+                    request_context(request.as_bytes()),
+                    client_addr(),
+                    tx,
+                    PipelineDelivery::Buffered,
+                ))
+                .unwrap();
+        }
+
+        tokio::time::advance(BATCH_COALESCE_WINDOW).await;
+        let batch = handle.await.unwrap();
+        assert_eq!(batch.len(), 3);
+        assert_eq!(queue.depth(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_dequeue_batch_returns_partial_batch_after_coalesce_timeout() {
+        let queue = Arc::new(BackendQueue::new(100));
+        let (tx, _rx) = oneshot::channel();
+        queue
+            .try_enqueue(QueuedContext::new(
+                request_context(b"STAT <single@example.com>\r\n"),
+                client_addr(),
+                tx,
+                PipelineDelivery::Buffered,
+            ))
+            .unwrap();
+
+        let queue_clone = queue.clone();
+        let handle = tokio::spawn(async move { queue_clone.dequeue_batch(4, Vec::new()).await });
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(BATCH_COALESCE_WINDOW).await;
+        let batch = handle.await.unwrap();
+        assert_eq!(batch.len(), 1);
+        assert_eq!(queue.depth(), 0);
     }
 
     #[tokio::test]

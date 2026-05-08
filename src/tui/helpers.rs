@@ -227,17 +227,6 @@ pub const fn error_rate_color(rate: f64) -> Color {
     }
 }
 
-/// Color for load percentage (pending/capacity ratio)
-#[must_use]
-pub const fn load_percentage_color(percent: f64) -> Color {
-    use super::constants::styles;
-    match percent {
-        p if p > 90.0 => Color::Red,
-        p if p > 70.0 => Color::Yellow,
-        _ => styles::VALUE_NEUTRAL,
-    }
-}
-
 /// Color for pending count
 #[must_use]
 pub const fn pending_count_color(pending: usize) -> Color {
