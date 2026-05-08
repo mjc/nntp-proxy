@@ -772,9 +772,22 @@ impl TuiApp {
             .servers
             .iter()
             .enumerate()
-            .filter_map(|(idx, _)| self.backend_pipeline_depth(idx))
+            .filter(|(_, server)| server.backend_pipelining)
+            .map(|(idx, _)| self.backend_pending_count(idx))
             .sum();
         metrics.pipeline_live_capacity = self
+            .servers
+            .iter()
+            .filter(|server| server.backend_pipelining)
+            .map(|server| server.max_connections.get())
+            .sum();
+        metrics.pipeline_queue_depth = self
+            .servers
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, _)| self.backend_pipeline_depth(idx))
+            .sum();
+        metrics.pipeline_queue_capacity = self
             .servers
             .iter()
             .enumerate()
@@ -1495,10 +1508,53 @@ mod tests {
         let snapshot = app.snapshot_state();
 
         assert_eq!(snapshot.metrics.pipeline_enabled_backends, 1);
-        assert_eq!(snapshot.metrics.pipeline_live_depth, 1);
-        assert_eq!(snapshot.metrics.pipeline_live_capacity, 8);
+        assert_eq!(snapshot.metrics.pipeline_live_depth, 0);
+        assert_eq!(snapshot.metrics.pipeline_live_capacity, 10);
+        assert_eq!(snapshot.metrics.pipeline_queue_depth, 1);
+        assert_eq!(snapshot.metrics.pipeline_queue_capacity, 8);
         assert_eq!(snapshot.backend_views[0].pipeline_queue_depth, Some(1));
         assert_eq!(snapshot.backend_views[0].pipeline_queue_capacity, Some(8));
+    }
+
+    #[test]
+    fn test_pipeline_live_depth_uses_same_pending_count_as_backend_load() {
+        let metrics = MetricsCollector::new(1);
+        let mut router = BackendSelector::new();
+        let provider = crate::pool::DeadpoolConnectionProvider::new(
+            "backend.example.com".to_string(),
+            119,
+            "Backend".to_string(),
+            10,
+            None,
+            None,
+        );
+        let backend_id = crate::types::BackendId::from_index(0);
+        router.add_backend(
+            backend_id,
+            crate::types::ServerName::try_new("Backend".to_string()).unwrap(),
+            provider,
+            0,
+        );
+        router.mark_backend_pending(backend_id);
+        router.mark_backend_pending(backend_id);
+        router.mark_backend_pending(backend_id);
+        router.mark_backend_pending(backend_id);
+        router.mark_backend_pending(backend_id);
+
+        let servers: Arc<[Server]> = vec![
+            Server::builder("backend.example.com", Port::try_new(119).unwrap())
+                .name("Backend")
+                .build()
+                .unwrap(),
+        ]
+        .into();
+
+        let app = TuiApp::new(metrics, Arc::new(router), servers);
+        let snapshot = app.snapshot_state();
+
+        assert_eq!(snapshot.backend_views[0].pending_count, 5);
+        assert_eq!(snapshot.metrics.pipeline_live_depth, 5);
+        assert_eq!(snapshot.metrics.pipeline_live_capacity, 10);
     }
 
     #[test]

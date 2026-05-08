@@ -115,6 +115,10 @@ pub struct DashboardMetrics {
     pub pipeline_live_depth: usize,
     #[serde(default)]
     pub pipeline_live_capacity: usize,
+    #[serde(default)]
+    pub pipeline_queue_depth: usize,
+    #[serde(default)]
+    pub pipeline_queue_capacity: usize,
 }
 
 impl DashboardMetrics {
@@ -138,6 +142,8 @@ impl DashboardMetrics {
             pipeline_enabled_backends: 0,
             pipeline_live_depth: 0,
             pipeline_live_capacity: 0,
+            pipeline_queue_depth: 0,
+            pipeline_queue_capacity: 0,
         }
     }
 

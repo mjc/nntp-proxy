@@ -373,15 +373,23 @@ fn build_app_summary_lines(
     }
 
     if metrics.pipeline_enabled_backends > 0 {
+        let over_capacity = metrics
+            .pipeline_live_depth
+            .saturating_sub(metrics.pipeline_live_capacity);
+        let live_summary = if over_capacity > 0 {
+            format!(
+                "{} in-flight across {} backend conns ({} over)",
+                metrics.pipeline_live_depth, metrics.pipeline_live_capacity, over_capacity
+            )
+        } else {
+            format!(
+                "{} in-flight across {} backend conns",
+                metrics.pipeline_live_depth, metrics.pipeline_live_capacity
+            )
+        };
         lines.push(Line::from(vec![
             "Pipeline Live: ".fg(styles::LABEL),
-            format!(
-                "{} queued / {} cap across {} backends",
-                metrics.pipeline_live_depth,
-                metrics.pipeline_live_capacity,
-                metrics.pipeline_enabled_backends
-            )
-            .fg(styles::VALUE_INFO),
+            live_summary.fg(styles::VALUE_INFO),
         ]));
     }
 
@@ -619,7 +627,7 @@ fn backend_error_line(
     ])
 }
 
-/// Create details line: pending, load ratio, stateful connections, pipeline queue.
+/// Create details line: in-flight load, stateful connections, pipeline queue.
 fn backend_details_line(
     pending: usize,
     load_ratio: Option<f64>,
@@ -628,7 +636,7 @@ fn backend_details_line(
     pipeline_capacity: Option<usize>,
 ) -> Line<'static> {
     let mut spans: Vec<Span> = vec![
-        "  Load: ".fg(styles::LABEL),
+        "  Load/Pipeline: ".fg(styles::LABEL),
         format!("{pending} in-flight").fg(pending_count_color(pending)),
     ];
 
@@ -644,7 +652,7 @@ fn backend_details_line(
     if let Some(capacity) = pipeline_capacity {
         spans.push(
             format!(
-                " | Pipeline: {}/{}",
+                " | Queue: {}/{}",
                 pipeline_depth.unwrap_or_default(),
                 capacity
             )
@@ -1139,7 +1147,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("Pipeline Live: 3 queued / 24 cap across 2 backends"))
+                .any(|line| line.contains("Pipeline Live: 3 in-flight across 24 backend conns"))
         );
         assert!(
             !lines
@@ -1153,10 +1161,10 @@ mod tests {
         let with_pipeline = backend_details_line(4, Some(0.25), 1, Some(3), Some(8)).to_string();
         let without_pipeline = backend_details_line(4, Some(0.25), 1, None, None).to_string();
 
-        assert!(with_pipeline.contains("Load: 4 in-flight (25%)"));
+        assert!(with_pipeline.contains("Load/Pipeline: 4 in-flight (25%)"));
         assert!(with_pipeline.contains("Stateful: 1"));
-        assert!(with_pipeline.contains("Pipeline: 3/8"));
-        assert!(!without_pipeline.contains("Pipeline:"));
+        assert!(with_pipeline.contains("Queue: 3/8"));
+        assert!(!without_pipeline.contains("Queue:"));
     }
 
     fn user_stat_lines_for_test(user: &DashboardUserStats) -> Vec<Line<'static>> {
