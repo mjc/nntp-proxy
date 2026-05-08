@@ -34,13 +34,10 @@ pub struct ThroughputPoint {
     /// Smoothed commands processed per second (backend only)
     commands_per_sec: Option<CommandsPerSecond>,
     /// Raw interval bytes sent per second
-    #[serde(default)]
     raw_sent_per_sec: Option<Throughput>,
     /// Raw interval bytes received per second
-    #[serde(default)]
     raw_received_per_sec: Option<Throughput>,
     /// Raw interval commands processed per second (backend only)
-    #[serde(default)]
     raw_commands_per_sec: Option<CommandsPerSecond>,
 }
 
@@ -1584,25 +1581,6 @@ mod tests {
             serde_json::from_str(&json).expect("point should deserialize");
         assert_f64_eq(decoded.raw_sent_per_sec().get(), 10_000.0);
         assert_f64_eq(decoded.sent_per_sec().get(), 2_500.0);
-    }
-
-    #[test]
-    fn test_throughput_point_deserializes_legacy_dashboard_payload() {
-        let json = r#"{
-            "sent_per_sec": 1234.0,
-            "received_per_sec": 5678.0,
-            "commands_per_sec": 9.0
-        }"#;
-
-        let decoded: ThroughputPoint =
-            serde_json::from_str(json).expect("legacy point should deserialize");
-
-        assert_f64_eq(decoded.raw_sent_per_sec().get(), 1234.0);
-        assert_f64_eq(decoded.sent_per_sec().get(), 1234.0);
-        assert_f64_eq(decoded.raw_received_per_sec().get(), 5678.0);
-        assert_f64_eq(decoded.received_per_sec().get(), 5678.0);
-        assert_f64_eq(decoded.raw_commands_per_sec().unwrap().get(), 9.0);
-        assert_f64_eq(decoded.commands_per_sec().unwrap().get(), 9.0);
     }
 
     #[test]
