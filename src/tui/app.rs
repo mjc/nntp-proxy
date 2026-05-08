@@ -670,6 +670,22 @@ impl TuiApp {
             .map(|share| share.get())
     }
 
+    /// Get the live pipeline queue depth for a backend, if backend pipelining is enabled.
+    #[must_use]
+    pub fn backend_pipeline_depth(&self, backend_idx: usize) -> Option<usize> {
+        use crate::types::BackendId;
+        self.router
+            .backend_pipeline_depth(BackendId::from_index(backend_idx))
+    }
+
+    /// Get the configured pipeline queue capacity for a backend, if enabled.
+    #[must_use]
+    pub fn backend_pipeline_capacity(&self, backend_idx: usize) -> Option<usize> {
+        use crate::types::BackendId;
+        self.router
+            .backend_pipeline_capacity(BackendId::from_index(backend_idx))
+    }
+
     /// Get throughput history for a backend
     #[must_use]
     ///
@@ -746,9 +762,27 @@ impl TuiApp {
     #[must_use]
     pub fn snapshot_state_with_log_limit(&self, log_limit: Option<usize>) -> DashboardState {
         let buffer_pool = self.buffer_pool.as_ref().map(Self::snapshot_buffer_pool);
+        let mut metrics = DashboardMetrics::from_snapshot(self.snapshot.as_ref());
+        metrics.pipeline_enabled_backends = self
+            .servers
+            .iter()
+            .filter(|server| server.backend_pipelining)
+            .count();
+        metrics.pipeline_live_depth = self
+            .servers
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, _)| self.backend_pipeline_depth(idx))
+            .sum();
+        metrics.pipeline_live_capacity = self
+            .servers
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, _)| self.backend_pipeline_capacity(idx))
+            .sum();
 
         DashboardState {
-            metrics: DashboardMetrics::from_snapshot(self.snapshot.as_ref()),
+            metrics,
             backend_views: self.snapshot_backend_views(),
             top_users: self.snapshot_top_users(),
             client_history: self.client_history.points().iter().cloned().collect(),
@@ -797,6 +831,8 @@ impl TuiApp {
             load_ratio: self.backend_load_ratio(backend_idx),
             stateful_count: self.backend_stateful_count(backend_idx),
             traffic_share: self.backend_traffic_share(backend_idx),
+            pipeline_queue_depth: self.backend_pipeline_depth(backend_idx),
+            pipeline_queue_capacity: self.backend_pipeline_capacity(backend_idx),
             history: Self::snapshot_throughput_history(self.backend_history(backend_idx)),
         }
     }
@@ -1410,6 +1446,59 @@ mod tests {
         assert_eq!(decoded.top_users[0].active_connections, 2);
         assert_eq!(decoded.top_users[0].bytes_sent_per_sec.get(), 11);
         assert_eq!(decoded.top_users[0].bytes_received_per_sec.get(), 13);
+    }
+
+    #[test]
+    fn test_snapshot_state_includes_live_pipeline_queue_stats() {
+        use tokio::sync::oneshot;
+
+        let metrics = MetricsCollector::new(1);
+        let mut router = BackendSelector::new();
+        let provider = crate::pool::DeadpoolConnectionProvider::new(
+            "backend.example.com".to_string(),
+            119,
+            "Backend".to_string(),
+            10,
+            None,
+            None,
+        );
+        let backend_id = crate::types::BackendId::from_index(0);
+        let queue = Arc::new(crate::router::BackendQueue::new(8));
+        router.add_backend_with_queue(
+            backend_id,
+            crate::types::ServerName::try_new("Backend".to_string()).unwrap(),
+            provider,
+            0,
+            Some(queue.clone()),
+        );
+
+        let (tx, _rx) = oneshot::channel();
+        queue
+            .try_enqueue(crate::router::backend_queue::QueuedContext::new(
+                crate::protocol::RequestContext::parse(b"STAT <test@example.com>\r\n")
+                    .expect("valid request"),
+                tx,
+            ))
+            .expect("queue request");
+
+        let servers: Arc<[Server]> = vec![
+            Server::builder("backend.example.com", Port::try_new(119).unwrap())
+                .name("Backend")
+                .backend_pipelining(true)
+                .pipeline_queue_depth(8)
+                .build()
+                .unwrap(),
+        ]
+        .into();
+
+        let app = TuiApp::new(metrics, Arc::new(router), servers);
+        let snapshot = app.snapshot_state();
+
+        assert_eq!(snapshot.metrics.pipeline_enabled_backends, 1);
+        assert_eq!(snapshot.metrics.pipeline_live_depth, 1);
+        assert_eq!(snapshot.metrics.pipeline_live_capacity, 8);
+        assert_eq!(snapshot.backend_views[0].pipeline_queue_depth, Some(1));
+        assert_eq!(snapshot.backend_views[0].pipeline_queue_capacity, Some(8));
     }
 
     #[test]

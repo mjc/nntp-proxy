@@ -40,6 +40,10 @@ pub struct BackendView {
     pub load_ratio: Option<f64>,
     pub stateful_count: usize,
     pub traffic_share: Option<f64>,
+    #[serde(default)]
+    pub pipeline_queue_depth: Option<usize>,
+    #[serde(default)]
+    pub pipeline_queue_capacity: Option<usize>,
     pub history: Vec<ThroughputPoint>,
 }
 
@@ -105,6 +109,12 @@ pub struct DashboardMetrics {
     pub pipeline_commands: u64,
     pub pipeline_requests_queued: u64,
     pub pipeline_requests_completed: u64,
+    #[serde(default)]
+    pub pipeline_enabled_backends: usize,
+    #[serde(default)]
+    pub pipeline_live_depth: usize,
+    #[serde(default)]
+    pub pipeline_live_capacity: usize,
 }
 
 impl DashboardMetrics {
@@ -125,6 +135,9 @@ impl DashboardMetrics {
             pipeline_commands: snapshot.pipeline_commands,
             pipeline_requests_queued: snapshot.pipeline_requests_queued,
             pipeline_requests_completed: snapshot.pipeline_requests_completed,
+            pipeline_enabled_backends: 0,
+            pipeline_live_depth: 0,
+            pipeline_live_capacity: 0,
         }
     }
 
@@ -212,6 +225,18 @@ impl DashboardState {
     }
 
     #[must_use]
+    pub fn backend_pipeline_depth(&self, backend_idx: usize) -> Option<usize> {
+        self.backend_view(backend_idx)
+            .and_then(|view| view.pipeline_queue_depth)
+    }
+
+    #[must_use]
+    pub fn backend_pipeline_capacity(&self, backend_idx: usize) -> Option<usize> {
+        self.backend_view(backend_idx)
+            .and_then(|view| view.pipeline_queue_capacity)
+    }
+
+    #[must_use]
     pub fn buffer_pool(&self) -> Option<&BufferPoolStats> {
         self.buffer_pool.as_ref()
     }
@@ -240,6 +265,8 @@ mod tests {
             load_ratio: Some(0.5),
             stateful_count: 3,
             traffic_share: Some(42.0),
+            pipeline_queue_depth: Some(1),
+            pipeline_queue_capacity: Some(8),
             history: vec![ThroughputPoint::new_backend(
                 Timestamp::now(),
                 Throughput::new(1.0),
@@ -269,5 +296,7 @@ mod tests {
         assert!(state.backend_load_ratio(1).is_none());
         assert_eq!(state.backend_stateful_count(1), 0);
         assert!(state.backend_traffic_share(1).is_none());
+        assert!(state.backend_pipeline_depth(1).is_none());
+        assert!(state.backend_pipeline_capacity(1).is_none());
     }
 }

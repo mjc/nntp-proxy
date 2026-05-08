@@ -215,6 +215,20 @@ impl BackendQueue {
             notified.await;
         }
     }
+
+    /// Current number of queued requests waiting for the worker.
+    #[must_use]
+    #[inline]
+    pub(crate) fn depth(&self) -> usize {
+        self.depth.load(Ordering::Relaxed)
+    }
+
+    /// Configured maximum queue depth before backpressure rejects new work.
+    #[must_use]
+    #[inline]
+    pub(crate) const fn max_depth(&self) -> usize {
+        self.max_depth
+    }
 }
 
 // QueuedContext contains a oneshot::Sender which isn't Debug

@@ -372,6 +372,19 @@ fn build_app_summary_lines(
         ]);
     }
 
+    if metrics.pipeline_enabled_backends > 0 {
+        lines.push(Line::from(vec![
+            "Pipeline Live: ".fg(styles::LABEL),
+            format!(
+                "{} queued / {} cap across {} backends",
+                metrics.pipeline_live_depth,
+                metrics.pipeline_live_capacity,
+                metrics.pipeline_enabled_backends
+            )
+            .fg(styles::VALUE_INFO),
+        ]));
+    }
+
     if metrics.pipeline_batches > 0 {
         let avg_batch =
             counter_as_f64(metrics.pipeline_commands) / counter_as_f64(metrics.pipeline_batches);
@@ -606,8 +619,14 @@ fn backend_error_line(
     ])
 }
 
-/// Create details line: pending, load ratio, stateful connections
-fn backend_details_line(pending: usize, load_ratio: Option<f64>, stateful: usize) -> Line<'static> {
+/// Create details line: pending, load ratio, stateful connections, pipeline queue.
+fn backend_details_line(
+    pending: usize,
+    load_ratio: Option<f64>,
+    stateful: usize,
+    pipeline_depth: Option<usize>,
+    pipeline_capacity: Option<usize>,
+) -> Line<'static> {
     let mut spans: Vec<Span> = vec![
         "  Load: ".fg(styles::LABEL),
         format!("{pending} in-flight").fg(pending_count_color(pending)),
@@ -620,6 +639,17 @@ fn backend_details_line(pending: usize, load_ratio: Option<f64>, stateful: usize
 
     if stateful > 0 {
         spans.push(format!(" | Stateful: {stateful}").fg(Color::Cyan));
+    }
+
+    if let Some(capacity) = pipeline_capacity {
+        spans.push(
+            format!(
+                " | Pipeline: {}/{}",
+                pipeline_depth.unwrap_or_default(),
+                capacity
+            )
+            .fg(styles::VALUE_INFO),
+        );
     }
 
     Line::from(spans)
@@ -693,6 +723,8 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState) {
                     state.backend_pending_count(i),
                     state.backend_load_ratio(i),
                     state.backend_stateful_count(i),
+                    state.backend_pipeline_depth(i),
+                    state.backend_pipeline_capacity(i),
                 ));
             }
 
@@ -1082,6 +1114,49 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Snapshot: last known"))
         );
+    }
+
+    #[test]
+    fn app_summary_lines_include_live_pipeline_stats_without_batches() {
+        let metrics = DashboardMetrics {
+            pipeline_enabled_backends: 2,
+            pipeline_live_depth: 3,
+            pipeline_live_capacity: 24,
+            ..DashboardMetrics::default()
+        };
+
+        let lines = build_app_summary_lines(
+            &metrics,
+            &crate::tui::SystemStats::default(),
+            None,
+            false,
+            None,
+        )
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>();
+
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("Pipeline Live: 3 queued / 24 cap across 2 backends"))
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("Pipeline: 0 batches"))
+        );
+    }
+
+    #[test]
+    fn backend_details_line_includes_pipeline_only_when_available() {
+        let with_pipeline = backend_details_line(4, Some(0.25), 1, Some(3), Some(8)).to_string();
+        let without_pipeline = backend_details_line(4, Some(0.25), 1, None, None).to_string();
+
+        assert!(with_pipeline.contains("Load: 4 in-flight (25%)"));
+        assert!(with_pipeline.contains("Stateful: 1"));
+        assert!(with_pipeline.contains("Pipeline: 3/8"));
+        assert!(!without_pipeline.contains("Pipeline:"));
     }
 
     fn user_stat_lines_for_test(user: &DashboardUserStats) -> Vec<Line<'static>> {

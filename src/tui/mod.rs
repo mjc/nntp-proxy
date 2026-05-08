@@ -108,6 +108,43 @@ enum TuiInputAction {
     ToggleDetails,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AttachedViewOverrides {
+    view_mode: Option<ViewMode>,
+    show_details: Option<bool>,
+}
+
+impl AttachedViewOverrides {
+    fn toggle_log_fullscreen(&mut self, current_state: Option<&DashboardState>) {
+        let current_mode = self
+            .view_mode
+            .or_else(|| current_state.map(|state| state.view_mode))
+            .unwrap_or(ViewMode::Normal);
+        self.view_mode = Some(match current_mode {
+            ViewMode::Normal => ViewMode::LogFullscreen,
+            ViewMode::LogFullscreen => ViewMode::Normal,
+        });
+    }
+
+    fn toggle_details(&mut self, current_state: Option<&DashboardState>) {
+        let show_details = self
+            .show_details
+            .or_else(|| current_state.map(|state| state.show_details))
+            .unwrap_or(false);
+        self.show_details = Some(!show_details);
+    }
+
+    fn apply_to(&self, mut state: DashboardState) -> DashboardState {
+        if let Some(view_mode) = self.view_mode {
+            state.view_mode = view_mode;
+        }
+        if let Some(show_details) = self.show_details {
+            state.show_details = show_details;
+        }
+        state
+    }
+}
+
 /// Setup the terminal for TUI rendering
 fn setup_terminal() -> Result<TuiTerminal> {
     enable_raw_mode()?;
@@ -262,16 +299,22 @@ where
 {
     let mut update_interval = tokio::time::interval(Duration::from_millis(250));
     let mut should_quit = false;
+    let mut view_overrides = AttachedViewOverrides::default();
 
     let state = state_rx.borrow().clone();
     let local_system_stats = local_system_monitor.update();
-    terminal.draw(|f| draw_attached_dashboard(f, &state, &local_system_stats))?;
+    terminal.draw(|f| draw_attached_dashboard(f, &state, &view_overrides, &local_system_stats))?;
 
     loop {
         tokio::select! {
             _ = update_interval.tick() => {
-                if apply_tui_input(false, None).await? {
-                    should_quit = true;
+                match poll_tui_input(true).await? {
+                    TuiInputAction::Quit => should_quit = true,
+                    TuiInputAction::ToggleLogFullscreen => view_overrides
+                        .toggle_log_fullscreen(state_rx.borrow().latest_state.as_ref()),
+                    TuiInputAction::ToggleDetails => view_overrides
+                        .toggle_details(state_rx.borrow().latest_state.as_ref()),
+                    TuiInputAction::None => {}
                 }
 
                 if should_quit {
@@ -280,7 +323,9 @@ where
 
                 let state = state_rx.borrow().clone();
                 let local_system_stats = local_system_monitor.update();
-                terminal.draw(|f| draw_attached_dashboard(f, &state, &local_system_stats))?;
+                terminal.draw(|f| {
+                    draw_attached_dashboard(f, &state, &view_overrides, &local_system_stats)
+                })?;
             }
         }
     }
@@ -291,10 +336,11 @@ where
 fn draw_attached_dashboard(
     f: &mut ratatui::Frame,
     attached: &AttachedDashboard,
+    view_overrides: &AttachedViewOverrides,
     local_system_stats: &SystemStats,
 ) {
-    if let Some(state) = attached.latest_state.as_ref() {
-        ui::render_ui(f, state, Some(local_system_stats), Some(&attached.status));
+    if let Some(state) = renderable_attached_state(attached, view_overrides) {
+        ui::render_ui(f, &state, Some(local_system_stats), Some(&attached.status));
         return;
     }
 
@@ -331,6 +377,16 @@ fn draw_attached_dashboard(
     f.render_widget(title, chunks[0]);
     f.render_widget(body, chunks[1]);
     f.render_widget(footer, chunks[2]);
+}
+
+fn renderable_attached_state(
+    attached: &AttachedDashboard,
+    view_overrides: &AttachedViewOverrides,
+) -> Option<DashboardState> {
+    attached
+        .latest_state
+        .clone()
+        .map(|state| view_overrides.apply_to(state))
 }
 
 fn build_attached_placeholder_lines(status: &RemoteDashboardStatus) -> Vec<Line<'static>> {
@@ -543,5 +599,60 @@ mod tests {
         assert_eq!(state.log_lines.len(), LOCAL_TUI_LOG_LINE_LIMIT);
         assert_eq!(state.log_lines.first().map(String::as_str), Some("line 10"));
         assert_eq!(state.log_lines.last().map(String::as_str), Some("line 265"));
+    }
+
+    #[test]
+    fn renderable_attached_state_applies_local_overrides() {
+        let state = DashboardState {
+            metrics: crate::tui::dashboard::DashboardMetrics::default(),
+            backend_views: Vec::new(),
+            top_users: Vec::new(),
+            client_history: Vec::new(),
+            system_stats: SystemStats::default(),
+            view_mode: ViewMode::Normal,
+            show_details: false,
+            log_lines: vec!["line".to_string()],
+            buffer_pool: None,
+        };
+        let attached = AttachedDashboard::connected("127.0.0.1:8120".parse().unwrap(), Some(state));
+        let mut overrides = AttachedViewOverrides::default();
+
+        overrides.toggle_details(attached.latest_state.as_ref());
+        overrides.toggle_log_fullscreen(attached.latest_state.as_ref());
+
+        let rendered = renderable_attached_state(&attached, &overrides).expect("dashboard state");
+        assert!(rendered.show_details);
+        assert_eq!(rendered.view_mode, ViewMode::LogFullscreen);
+        assert_eq!(rendered.log_lines, vec!["line".to_string()]);
+    }
+
+    #[test]
+    fn renderable_attached_state_preserves_local_overrides_across_new_remote_snapshots() {
+        let state = DashboardState {
+            metrics: crate::tui::dashboard::DashboardMetrics::default(),
+            backend_views: Vec::new(),
+            top_users: Vec::new(),
+            client_history: Vec::new(),
+            system_stats: SystemStats::default(),
+            view_mode: ViewMode::Normal,
+            show_details: false,
+            log_lines: vec!["first".to_string()],
+            buffer_pool: None,
+        };
+        let mut overrides = AttachedViewOverrides::default();
+        overrides.toggle_details(Some(&state));
+        overrides.toggle_log_fullscreen(Some(&state));
+
+        let next_state = DashboardState {
+            log_lines: vec!["second".to_string()],
+            ..state
+        };
+        let attached =
+            AttachedDashboard::connected("127.0.0.1:8120".parse().unwrap(), Some(next_state));
+
+        let rendered = renderable_attached_state(&attached, &overrides).expect("dashboard state");
+        assert!(rendered.show_details);
+        assert_eq!(rendered.view_mode, ViewMode::LogFullscreen);
+        assert_eq!(rendered.log_lines, vec!["second".to_string()]);
     }
 }
