@@ -141,6 +141,7 @@ pub struct BackendQueue {
     queue: SegQueue<QueuedContext>,
     notify: Notify,
     depth: AtomicUsize,
+    pipeline_depth: AtomicUsize,
     max_depth: usize,
 }
 
@@ -152,6 +153,7 @@ impl BackendQueue {
             queue: SegQueue::new(),
             notify: Notify::new(),
             depth: AtomicUsize::new(0),
+            pipeline_depth: AtomicUsize::new(0),
             max_depth,
         }
     }
@@ -247,6 +249,26 @@ impl BackendQueue {
         self.depth.load(Ordering::Relaxed)
     }
 
+    /// Current number of pipelined requests already written to backend connections
+    /// and still awaiting responses.
+    #[must_use]
+    #[inline]
+    pub(crate) fn pipeline_depth(&self) -> usize {
+        self.pipeline_depth.load(Ordering::Relaxed)
+    }
+
+    /// Mark `count` requests as written to backend connections and awaiting responses.
+    #[inline]
+    pub(crate) fn mark_pipeline_sent(&self, count: usize) {
+        self.pipeline_depth.fetch_add(count, Ordering::AcqRel);
+    }
+
+    /// Mark `count` written requests as no longer awaiting responses.
+    #[inline]
+    pub(crate) fn mark_pipeline_resolved(&self, count: usize) {
+        self.pipeline_depth.fetch_sub(count, Ordering::AcqRel);
+    }
+
     /// Configured maximum queue depth before backpressure rejects new work.
     #[must_use]
     #[inline]
@@ -329,6 +351,21 @@ mod tests {
                 max_depth: 2
             }
         ));
+    }
+
+    #[test]
+    fn test_pipeline_depth_tracks_written_requests_separately_from_queue_backlog() {
+        let queue = BackendQueue::new(4);
+
+        assert_eq!(queue.depth(), 0);
+        assert_eq!(queue.pipeline_depth(), 0);
+
+        queue.mark_pipeline_sent(3);
+        assert_eq!(queue.depth(), 0);
+        assert_eq!(queue.pipeline_depth(), 3);
+
+        queue.mark_pipeline_resolved(2);
+        assert_eq!(queue.pipeline_depth(), 1);
     }
 
     #[tokio::test]

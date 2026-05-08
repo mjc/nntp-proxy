@@ -41,6 +41,8 @@ pub struct BackendView {
     pub stateful_count: usize,
     pub traffic_share: Option<f64>,
     #[serde(default)]
+    pub pipeline_depth: Option<usize>,
+    #[serde(default)]
     pub pipeline_queue_depth: Option<usize>,
     #[serde(default)]
     pub pipeline_queue_capacity: Option<usize>,
@@ -110,11 +112,13 @@ pub struct DashboardMetrics {
     pub pipeline_requests_queued: u64,
     pub pipeline_requests_completed: u64,
     #[serde(default)]
+    pub in_flight_requests: usize,
+    #[serde(default)]
     pub pipeline_enabled_backends: usize,
     #[serde(default)]
-    pub pipeline_live_depth: usize,
+    pub pipeline_depth: usize,
     #[serde(default)]
-    pub pipeline_live_capacity: usize,
+    pub pipeline_connection_capacity: usize,
     #[serde(default)]
     pub pipeline_queue_depth: usize,
     #[serde(default)]
@@ -139,9 +143,10 @@ impl DashboardMetrics {
             pipeline_commands: snapshot.pipeline_commands,
             pipeline_requests_queued: snapshot.pipeline_requests_queued,
             pipeline_requests_completed: snapshot.pipeline_requests_completed,
+            in_flight_requests: 0,
             pipeline_enabled_backends: 0,
-            pipeline_live_depth: 0,
-            pipeline_live_capacity: 0,
+            pipeline_depth: 0,
+            pipeline_connection_capacity: 0,
             pipeline_queue_depth: 0,
             pipeline_queue_capacity: 0,
         }
@@ -233,11 +238,17 @@ impl DashboardState {
     #[must_use]
     pub fn backend_pipeline_depth(&self, backend_idx: usize) -> Option<usize> {
         self.backend_view(backend_idx)
+            .and_then(|view| view.pipeline_depth)
+    }
+
+    #[must_use]
+    pub fn backend_pipeline_queue_depth(&self, backend_idx: usize) -> Option<usize> {
+        self.backend_view(backend_idx)
             .and_then(|view| view.pipeline_queue_depth)
     }
 
     #[must_use]
-    pub fn backend_pipeline_capacity(&self, backend_idx: usize) -> Option<usize> {
+    pub fn backend_pipeline_queue_capacity(&self, backend_idx: usize) -> Option<usize> {
         self.backend_view(backend_idx)
             .and_then(|view| view.pipeline_queue_capacity)
     }
@@ -271,6 +282,7 @@ mod tests {
             load_ratio: Some(0.5),
             stateful_count: 3,
             traffic_share: Some(42.0),
+            pipeline_depth: Some(2),
             pipeline_queue_depth: Some(1),
             pipeline_queue_capacity: Some(8),
             history: vec![ThroughputPoint::new_backend(
@@ -303,6 +315,7 @@ mod tests {
         assert_eq!(state.backend_stateful_count(1), 0);
         assert!(state.backend_traffic_share(1).is_none());
         assert!(state.backend_pipeline_depth(1).is_none());
-        assert!(state.backend_pipeline_capacity(1).is_none());
+        assert!(state.backend_pipeline_queue_depth(1).is_none());
+        assert!(state.backend_pipeline_queue_capacity(1).is_none());
     }
 }

@@ -552,16 +552,23 @@ impl BackendSelector {
             .and_then(|b| b.pipeline_queue.as_ref())
     }
 
-    /// Get the live pipeline queue depth for a backend, if pipelining is enabled.
+    /// Get the live pipelined request depth for a backend, if pipelining is enabled.
     #[must_use]
     pub fn backend_pipeline_depth(&self, backend_id: BackendId) -> Option<usize> {
+        self.get_backend_queue(backend_id)
+            .map(|queue| queue.pipeline_depth())
+    }
+
+    /// Get the live pipeline queue backlog for a backend, if pipelining is enabled.
+    #[must_use]
+    pub fn backend_pipeline_queue_depth(&self, backend_id: BackendId) -> Option<usize> {
         self.get_backend_queue(backend_id)
             .map(|queue| queue.depth())
     }
 
     /// Get the configured pipeline queue capacity for a backend, if enabled.
     #[must_use]
-    pub fn backend_pipeline_capacity(&self, backend_id: BackendId) -> Option<usize> {
+    pub fn backend_pipeline_queue_capacity(&self, backend_id: BackendId) -> Option<usize> {
         self.get_backend_queue(backend_id)
             .map(|queue| queue.max_depth())
     }
