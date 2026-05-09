@@ -91,20 +91,20 @@ pub(crate) fn render_ui(
     }
 
     let show_logs = should_show_dashboard_logs(f.area().height);
-    let chunks = dashboard_main_chunks(f.area(), show_logs);
-
-    // Render each section
-    render_title(f, chunks[0], &state.metrics, remote_status);
-    render_summary(f, chunks[1], state, attached_ui_stats, show_details);
-
-    // Backends area now contains 3 columns: backends, chart, and user stats
-    render_backends(f, chunks[2], state, show_details);
-
-    if show_logs {
-        render_logs(f, chunks[3], &state.log_lines, show_details);
-        render_footer(f, chunks[4]);
-    } else {
-        render_footer(f, chunks[3]);
+    match dashboard_main_chunks(f.area(), show_logs) {
+        DashboardMainChunks::WithLogs([title, summary, backends, logs, footer]) => {
+            render_title(f, title, &state.metrics, remote_status);
+            render_summary(f, summary, state, attached_ui_stats, show_details);
+            render_backends(f, backends, state, show_details);
+            render_logs(f, logs, &state.log_lines, show_details);
+            render_footer(f, footer);
+        }
+        DashboardMainChunks::WithoutLogs([title, summary, backends, footer]) => {
+            render_title(f, title, &state.metrics, remote_status);
+            render_summary(f, summary, state, attached_ui_stats, show_details);
+            render_backends(f, backends, state, show_details);
+            render_footer(f, footer);
+        }
     }
 }
 
@@ -123,22 +123,40 @@ pub(crate) fn render_attached_ui(
     }
 
     let show_logs = should_show_dashboard_logs(f.area().height);
-    let chunks = dashboard_main_chunks(f.area(), show_logs);
-
-    render_title_lines(f, chunks[0], &render_cache.title_lines);
-    render_summary(f, chunks[1], state, None, show_details);
-    render_backends(f, chunks[2], state, show_details);
-
-    if show_logs {
-        render_logs(f, chunks[3], &state.log_lines, show_details);
-        render_footer(f, chunks[4]);
-    } else {
-        render_footer(f, chunks[3]);
+    match dashboard_main_chunks(f.area(), show_logs) {
+        DashboardMainChunks::WithLogs([title, summary, backends, logs, footer]) => {
+            render_title_lines(f, title, &render_cache.title_lines);
+            render_summary(f, summary, state, None, show_details);
+            render_backends(f, backends, state, show_details);
+            render_logs(f, logs, &state.log_lines, show_details);
+            render_footer(f, footer);
+        }
+        DashboardMainChunks::WithoutLogs([title, summary, backends, footer]) => {
+            render_title_lines(f, title, &render_cache.title_lines);
+            render_summary(f, summary, state, None, show_details);
+            render_backends(f, backends, state, show_details);
+            render_footer(f, footer);
+        }
     }
 }
 
 fn should_show_dashboard_logs(area_height: u16) -> bool {
     area_height >= layout::MIN_HEIGHT_FOR_LOGS
+}
+
+enum DashboardMainChunks {
+    WithLogs([Rect; 5]),
+    WithoutLogs([Rect; 4]),
+}
+
+#[cfg(test)]
+impl DashboardMainChunks {
+    const fn len(&self) -> usize {
+        match self {
+            Self::WithLogs(_) => 5,
+            Self::WithoutLogs(_) => 4,
+        }
+    }
 }
 
 fn dashboard_fullscreen_chunks(
@@ -149,39 +167,42 @@ fn dashboard_fullscreen_chunks(
         return None;
     }
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .margin(1)
-        .constraints([
-            Constraint::Length(layout::TITLE_HEIGHT),
-            Constraint::Min(10),
-            Constraint::Length(layout::FOOTER_HEIGHT),
-        ])
-        .split(area);
-    Some([chunks[0], chunks[1], chunks[2]])
-}
-
-fn dashboard_main_chunks(area: Rect, show_logs: bool) -> Vec<Rect> {
-    if show_logs {
+    Some(
         Layout::default()
             .direction(Direction::Vertical)
             .margin(1)
             .constraints([
                 Constraint::Length(layout::TITLE_HEIGHT),
-                Constraint::Length(layout::SUMMARY_HEIGHT),
-                Constraint::Min(layout::MIN_CHART_HEIGHT),
-                Constraint::Length(layout::LOG_WINDOW_HEIGHT),
+                Constraint::Min(10),
                 Constraint::Length(layout::FOOTER_HEIGHT),
             ])
-            .split(area)
-            .to_vec()
+            .areas(area),
+    )
+}
+
+fn dashboard_main_chunks(area: Rect, show_logs: bool) -> DashboardMainChunks {
+    if show_logs {
+        DashboardMainChunks::WithLogs(
+            Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints([
+                    Constraint::Length(layout::TITLE_HEIGHT),
+                    Constraint::Length(layout::SUMMARY_HEIGHT),
+                    Constraint::Min(layout::MIN_CHART_HEIGHT),
+                    Constraint::Length(layout::LOG_WINDOW_HEIGHT),
+                    Constraint::Length(layout::FOOTER_HEIGHT),
+                ])
+                .areas(area),
+        )
     } else {
-        Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints(layout::main_sections())
-            .split(area)
-            .to_vec()
+        DashboardMainChunks::WithoutLogs(
+            Layout::default()
+                .direction(Direction::Vertical)
+                .margin(1)
+                .constraints(layout::main_sections())
+                .areas(area),
+        )
     }
 }
 
@@ -561,26 +582,26 @@ fn render_summary(
     let system_stats = &state.system_stats;
 
     // Split summary box into three columns
-    let summary_chunks = Layout::default()
+    let [app_summary, cache_summary, transfer_summary] = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Percentage(33),
             Constraint::Percentage(34),
             Constraint::Percentage(33),
         ])
-        .split(area);
+        .areas(area);
 
     render_app_summary_panel(
         f,
-        summary_chunks[0],
+        app_summary,
         metrics,
         system_stats,
         state.buffer_pool(),
         show_details,
         attached_ui_stats,
     );
-    render_cache_summary_panel(f, summary_chunks[1], metrics);
-    render_transfer_summary_panel(f, summary_chunks[2], state);
+    render_cache_summary_panel(f, cache_summary, metrics);
+    render_transfer_summary_panel(f, transfer_summary, state);
 }
 
 fn render_app_summary_panel(
@@ -1049,14 +1070,14 @@ fn percent_text_f64(value: f64) -> ArrayString<16> {
 /// Render backend server visualization
 fn render_backends(f: &mut Frame, area: Rect, state: &DashboardState, show_details: bool) {
     // Split into three columns: backend list, data flow chart, and top users
-    let chunks = Layout::default()
+    let [backend_list, data_flow, user_stats] = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(layout::backend_columns())
-        .split(area);
+        .areas(area);
 
-    render_backend_list(f, chunks[0], state, show_details);
-    render_data_flow(f, chunks[1], state);
-    render_user_stats(f, chunks[2], &state.top_users);
+    render_backend_list(f, backend_list, state, show_details);
+    render_data_flow(f, data_flow, state);
+    render_user_stats(f, user_stats, &state.top_users);
 }
 
 // ============================================================================
