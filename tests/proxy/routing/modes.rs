@@ -338,7 +338,7 @@ async fn test_connection_error_handling() -> Result<()> {
     drop(client);
 
     // Proxy should handle this gracefully (no panic)
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{proxy_port}"), 20).await?;
 
     // Should be able to connect a new client
     let mut client2 = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;

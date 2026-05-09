@@ -25,6 +25,8 @@ use tokio::net::{
     TcpListener,
     tcp::{OwnedReadHalf, OwnedWriteHalf},
 };
+use tokio::sync::Notify;
+use tokio::time::timeout;
 
 async fn read_multiline_response<R>(reader: &mut BufReader<R>) -> String
 where
@@ -46,21 +48,30 @@ where
     status_line
 }
 
+async fn yield_background_work() {
+    for _ in 0..128 {
+        tokio::task::yield_now().await;
+    }
+}
+
 /// Count how many times backends are queried
 #[derive(Clone)]
 struct BackendQueryCounter {
     count: Arc<AtomicU64>,
+    updates: Arc<Notify>,
 }
 
 impl BackendQueryCounter {
     fn new() -> Self {
         Self {
             count: Arc::new(AtomicU64::new(0)),
+            updates: Arc::new(Notify::new()),
         }
     }
 
     fn increment(&self) {
         self.count.fetch_add(1, Ordering::SeqCst);
+        self.updates.notify_waiters();
     }
 
     fn get(&self) -> u64 {
@@ -69,6 +80,49 @@ impl BackendQueryCounter {
 
     fn reset(&self) {
         self.count.store(0, Ordering::SeqCst);
+    }
+
+    async fn wait_for_at_least(&self, expected: u64, within: Duration) {
+        timeout(within, async {
+            loop {
+                let notified = self.updates.notified();
+                if self.get() >= expected {
+                    return;
+                }
+                notified.await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!("Timed out waiting for backend query count to reach {expected}")
+        });
+    }
+
+    async fn assert_stays_at_most(&self, max_allowed: u64, within: Duration) {
+        assert!(
+            self.get() <= max_allowed,
+            "Backend query count already exceeded limit: {} > {}",
+            self.get(),
+            max_allowed
+        );
+
+        let result = timeout(within, async {
+            loop {
+                let notified = self.updates.notified();
+                let current = self.get();
+                assert!(
+                    current <= max_allowed,
+                    "Backend query count exceeded limit: {current} > {max_allowed}"
+                );
+                notified.await;
+            }
+        })
+        .await;
+
+        assert!(
+            result.is_err(),
+            "Backend query count kept changing while verifying limit <= {max_allowed}"
+        );
     }
 }
 
@@ -240,8 +294,7 @@ async fn test_stat_cache_hit_zero_backend_queries() {
     reader.read_line(&mut line).await.unwrap();
     assert!(line.starts_with("223"), "Should get 223 response: {line}");
 
-    // Wait for prechecking to complete and cache to populate
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    counter.wait_for_at_least(1, Duration::from_secs(1)).await;
 
     let first_queries = counter.get();
     assert!(
@@ -261,8 +314,9 @@ async fn test_stat_cache_hit_zero_backend_queries() {
     reader.read_line(&mut line).await.unwrap();
     assert!(line.starts_with("223"), "Should get 223 response: {line}");
 
-    // Wait a bit to ensure no background queries happened
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    counter
+        .assert_stays_at_most(1, Duration::from_millis(200))
+        .await;
 
     let second_queries = counter.get();
 
@@ -325,7 +379,7 @@ async fn test_head_cache_hit_zero_backend_queries() {
         }
     }
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    counter.wait_for_at_least(1, Duration::from_secs(1)).await;
     let first_queries = counter.get();
     assert!(first_queries >= 1, "First HEAD should query backend");
 
@@ -349,7 +403,9 @@ async fn test_head_cache_hit_zero_backend_queries() {
         }
     }
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    counter
+        .assert_stays_at_most(1, Duration::from_millis(200))
+        .await;
     let second_queries = counter.get();
 
     assert!(
@@ -398,7 +454,7 @@ async fn test_article_cache_hit_zero_backend_queries() {
     let first_queries = counter.get();
     assert_eq!(first_queries, 1, "First ARTICLE should query backend once");
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    yield_background_work().await;
     counter.reset();
 
     // Second ARTICLE - MUST hit cache
@@ -454,7 +510,7 @@ async fn test_batched_article_cache_hits_zero_backend_queries() {
     read_multiline_response(&mut reader).await;
     assert_eq!(counter.get(), 1, "First ARTICLE should query backend once");
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    yield_background_work().await;
     counter.reset();
 
     write_half
@@ -567,7 +623,7 @@ async fn test_cached_430_zero_backend_queries() {
     reader.read_line(&mut line).await.unwrap();
     assert!(line.starts_with("430"), "Should get 430 response: {line}");
 
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    counter.wait_for_at_least(1, Duration::from_secs(1)).await;
     let first_queries = counter.get();
     assert!(first_queries >= 1, "First query should hit backend");
 
@@ -585,7 +641,9 @@ async fn test_cached_430_zero_backend_queries() {
         "Should still get 430 response: {line}"
     );
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    counter
+        .assert_stays_at_most(1, Duration::from_millis(200))
+        .await;
     let second_queries = counter.get();
 
     assert!(

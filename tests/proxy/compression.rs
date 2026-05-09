@@ -117,7 +117,7 @@ async fn test_compression_disabled_skips_negotiation() -> Result<()> {
     let compress_received = mock.compress_was_received();
     let _handle = mock.spawn_on_listener(mock_listener);
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
 
     let config = Config {
         servers: vec![build_server_config(mock_port, Some(false))],
@@ -180,7 +180,7 @@ async fn test_compression_auto_fallback_on_unsupported() -> Result<()> {
     let compress_received = mock.compress_was_received();
     let _handle = mock.spawn_on_listener(mock_listener);
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
 
     let config = Config {
         servers: vec![build_server_config(mock_port, None)],
@@ -241,7 +241,7 @@ async fn test_compression_required_fails_on_unsupported() -> Result<()> {
     let mock = CompressionMockServer::new("500 Command not recognized\r\n");
     let _handle = mock.spawn_on_listener(mock_listener);
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
 
     let config = Config {
         servers: vec![build_server_config(mock_port, Some(true))],

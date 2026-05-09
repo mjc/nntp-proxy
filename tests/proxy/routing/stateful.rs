@@ -64,8 +64,6 @@ fn test_stateful_connection_concurrent_access() {
         handles.push(std::thread::spawn(move || {
             // Try to acquire and immediately release
             if router_clone.try_acquire_stateful(backend_id) {
-                // Simulate some work
-                std::thread::sleep(std::time::Duration::from_millis(1));
                 router_clone.release_stateful(backend_id);
                 1
             } else {

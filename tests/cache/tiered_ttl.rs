@@ -14,6 +14,7 @@ use nntp_proxy::cache::ttl::{
 };
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
+use tokio::time::timeout;
 
 fn assert_multiplier_cases(cases: &[(u8, u64)]) {
     cases.iter().for_each(|(tier, expected)| {
@@ -69,6 +70,19 @@ async fn cached_tier(cache: &ArticleCache, message_id: &MessageId<'_>) -> u8 {
         .expect("Should be cached")
         .tier()
         .get()
+}
+
+async fn wait_until_absent(cache: &ArticleCache, message_id: &MessageId<'_>, within: Duration) {
+    timeout(within, async {
+        loop {
+            if cache.get(message_id).await.is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("Timed out waiting for {message_id} to expire"));
 }
 
 // =============================================================================
@@ -240,11 +254,7 @@ async fn test_cache_tier_0_expires_at_base_ttl() {
     // Should be cached immediately
     assert!(cache.get(&msg_id).await.is_some());
 
-    // Wait for tier 0 to expire (50ms + larger buffer to avoid flakiness)
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Should be expired now
-    assert!(cache.get(&msg_id).await.is_none());
+    wait_until_absent(&cache, &msg_id, Duration::from_secs(1)).await;
 }
 
 #[tokio::test]
@@ -256,24 +266,23 @@ async fn test_cache_higher_tier_longer_ttl() {
 
     // Insert with tier 1 (2x TTL = 400ms)
     upsert_tier(&cache, msg_id.clone(), 1, "Body").await;
+    let tier0_control = MessageId::from_borrowed("<tier1-control@example.com>").unwrap();
+    upsert_tier(&cache, tier0_control.clone(), 0, "Control").await;
 
     // Verify tier was stored correctly
     let stored_tier = cached_tier(&cache, &msg_id).await;
     assert_eq!(stored_tier, 1, "Tier should be stored as 1");
 
-    // Wait 250ms - tier 0 would expire (200ms), but tier 1 should still be valid (400ms)
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    wait_until_absent(&cache, &tier0_control, Duration::from_secs(1)).await;
 
-    // Tier 1 should still be cached (effective TTL = 400ms)
+    // Tier 1 should still be cached after the equivalent tier 0 entry expires.
     let entry = cache.get(&msg_id).await;
     assert!(
         entry.is_some(),
-        "Tier 1 should survive past base TTL (waited 250ms, tier 1 TTL is 400ms, stored tier was {stored_tier})"
+        "Tier 1 should survive past base TTL once the control tier 0 entry expires; stored tier was {stored_tier}"
     );
 
-    // Wait another 200ms (total 450ms) - should now be expired
-    // Increased total wait to 500ms to avoid flakiness under CI load
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    wait_until_absent(&cache, &msg_id, Duration::from_secs(1)).await;
     assert!(
         cache.get(&msg_id).await.is_none(),
         "Tier 1 should expire at 2x TTL"
@@ -289,15 +298,15 @@ async fn test_cache_tier_2_even_longer() {
 
     // Insert with tier 2 (4x TTL = 800ms)
     upsert_tier(&cache, msg_id.clone(), 2, "Body").await;
+    let tier1_control = MessageId::from_borrowed("<tier2-control@example.com>").unwrap();
+    upsert_tier(&cache, tier1_control.clone(), 1, "Control").await;
 
-    // Wait 500ms - both tier 0 (200ms) and tier 1 (400ms) would expire
-    // Using 500ms to avoid flakiness under CI load (larger buffer over the 400ms threshold)
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_until_absent(&cache, &tier1_control, Duration::from_secs(2)).await;
 
-    // Tier 2 should still be cached (effective TTL = 800ms)
+    // Tier 2 should outlive the equivalent tier 1 entry.
     assert!(
         cache.get(&msg_id).await.is_some(),
-        "Tier 2 should survive past tier 1 TTL (waited 500ms, tier 2 TTL is 800ms)"
+        "Tier 2 should survive past tier 1 TTL"
     );
 }
 

@@ -526,9 +526,13 @@ fn test_snapshot_total_bytes() {
 fn test_uptime_tracking() {
     let collector = MetricsCollector::new(1);
 
-    std::thread::sleep(std::time::Duration::from_millis(10));
-
-    let snapshot = collector.snapshot(None);
+    let snapshot = loop {
+        let snapshot = collector.snapshot(None);
+        if snapshot.uptime.as_millis() >= 10 {
+            break snapshot;
+        }
+        std::thread::yield_now();
+    };
     assert!(snapshot.uptime.as_millis() >= 10);
 }
 

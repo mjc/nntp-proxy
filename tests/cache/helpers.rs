@@ -12,8 +12,22 @@ use nntp_proxy::protocol::RequestKind;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::time::timeout;
 
 use super::article_response_bytes;
+
+async fn wait_until_cache_miss(cache: &ArticleCache, msgid: &MessageId<'_>, within: Duration) {
+    timeout(within, async {
+        loop {
+            if cache.get(msgid).await.is_none() {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("Timed out waiting for {msgid} to expire from cache"));
+}
 
 /// Test cache hit serves cached content
 #[tokio::test]
@@ -102,11 +116,7 @@ async fn test_cache_ttl_expiration() -> Result<()> {
     // Should be in cache immediately
     assert!(cache.get(&msgid).await.is_some());
 
-    // Wait for TTL to expire
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
-    // Should be gone
-    assert!(cache.get(&msgid).await.is_none());
+    wait_until_cache_miss(&cache, &msgid, Duration::from_secs(1)).await;
 
     Ok(())
 }
@@ -116,7 +126,7 @@ async fn test_cache_ttl_expiration() -> Result<()> {
 async fn test_cache_capacity_limit() -> Result<()> {
     let cache = Arc::new(ArticleCache::new(2, Duration::from_secs(300))); // Only 2 entries
 
-    // Insert 3 articles with delays for deterministic eviction
+    // Insert 3 articles; the cache should evict back to its configured capacity.
     for i in 1..=3 {
         let msg_str = format!("<test{i}@example.com>");
         let msgid = MessageId::from_borrowed(&msg_str).unwrap();
@@ -124,8 +134,9 @@ async fn test_cache_capacity_limit() -> Result<()> {
         cache
             .upsert_ingest(msgid, buffer, BackendId::from_index(0), 0.into())
             .await;
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
+
+    cache.sync().await;
 
     let stats = cache.stats();
     assert!(

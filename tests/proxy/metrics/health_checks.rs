@@ -13,6 +13,7 @@ use nntp_proxy::stream::ConnectionStream;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
 use tokio::time::timeout;
 
 fn assert_f64_eq(actual: f64, expected: f64) {
@@ -31,8 +32,7 @@ async fn test_tcp_alive_check_healthy_connection() -> Result<()> {
     // Spawn a server that accepts but doesn't send data
     let server_handle = tokio::spawn(async move {
         let (_stream, _) = listener.accept().await.unwrap();
-        // Keep connection open but idle
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        std::future::pending::<()>().await;
     });
 
     // Connect and check health
@@ -56,17 +56,17 @@ async fn test_tcp_alive_check_healthy_connection() -> Result<()> {
 async fn test_tcp_alive_check_closed_connection() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
+    let (closed_tx, closed_rx) = oneshot::channel();
 
     // Server that immediately closes connection
     let server_handle = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         drop(stream); // Close immediately
+        let _ = closed_tx.send(());
     });
 
     let stream = TcpStream::connect(addr).await?;
-
-    // Wait for server to close
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    closed_rx.await?;
 
     let mut conn_stream = ConnectionStream::plain(stream);
 
@@ -86,19 +86,19 @@ async fn test_tcp_alive_check_closed_connection() -> Result<()> {
 async fn test_tcp_alive_check_unexpected_data() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
+    let (sent_tx, sent_rx) = oneshot::channel();
 
     // Server that sends unexpected data
     let server_handle = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await.unwrap();
         // Send data immediately - unexpected for idle connection
         stream.write_all(b"UNEXPECTED DATA\r\n").await.unwrap();
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        let _ = sent_tx.send(());
+        std::future::pending::<()>().await;
     });
 
     let stream = TcpStream::connect(addr).await?;
-
-    // Give server time to send data
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    sent_rx.await?;
 
     let mut conn_stream = ConnectionStream::plain(stream);
 
@@ -194,8 +194,7 @@ async fn test_date_health_check_timeout() -> Result<()> {
         // Read command but never respond
         let mut buf = [0u8; 64];
         let _ = stream.read(&mut buf).await;
-        // Sleep longer than health check timeout
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        std::future::pending::<()>().await;
     });
 
     let stream = TcpStream::connect(addr).await?;
@@ -401,7 +400,7 @@ async fn test_date_health_check_partial_response() -> Result<()> {
 
         // Send incomplete response (no CRLF)
         stream.write_all(b"111").await.unwrap();
-        tokio::time::sleep(Duration::from_secs(10)).await;
+        std::future::pending::<()>().await;
     });
 
     let stream = TcpStream::connect(addr).await?;
@@ -465,7 +464,7 @@ async fn test_tcp_alive_check_non_destructive() -> Result<()> {
     // Spawn a simple server
     let server_handle = tokio::spawn(async move {
         let (_stream, _) = listener.accept().await.unwrap();
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        std::future::pending::<()>().await;
     });
 
     let stream = TcpStream::connect(addr).await?;

@@ -19,7 +19,7 @@ use tokio::time::{Duration, timeout};
 
 mod test_helpers;
 use nntp_proxy::{Config, NntpProxy, RoutingMode};
-use test_helpers::{MockNntpServer, create_test_server_config};
+use test_helpers::{MockNntpServer, create_test_server_config, wait_for_server};
 
 /// Strategy for generating valid NNTP message IDs
 fn message_id_strategy() -> impl Strategy<Value = String> {
@@ -54,7 +54,7 @@ async fn setup_test_proxy() -> Result<(u16, u16, tokio::task::AbortHandle)> {
         .on_command("QUIT", "205 Goodbye\r\n")
         .spawn_on_listener(backend_listener);
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{backend_port}"), 20).await?;
 
     // Create and start proxy
     let config = Config {
@@ -79,7 +79,7 @@ async fn setup_test_proxy() -> Result<(u16, u16, tokio::task::AbortHandle)> {
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_server(&format!("127.0.0.1:{proxy_port}"), 20).await?;
 
     Ok((proxy_port, backend_port, mock))
 }
