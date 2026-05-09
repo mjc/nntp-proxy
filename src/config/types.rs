@@ -157,7 +157,7 @@ pub struct Proxy {
     pub backend_selection: BackendSelectionStrategy,
     /// Validate yEnc structure and checksums (default: true)
     pub validate_yenc: bool,
-    /// Minimum log level for the debug.log file appender (default: "warn")
+    /// Filter directives for the optional local-TUI `debug.log` appender (default: "warn")
     /// Accepts tracing filter directives: "error", "warn", "info", "debug", "trace"
     #[serde(default = "super::defaults::log_file_level")]
     pub log_file_level: String,

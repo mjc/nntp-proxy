@@ -555,13 +555,13 @@ fn create_transfer_summary<'a>(
 // ============================================================================
 
 /// Create header line: health icon, server name, error rate
-fn backend_header_line<'a>(
-    health_icon: &'a str,
+fn backend_header_line(
+    health_icon: &'static str,
     health_color: Color,
-    server_name: &'a str,
+    server_name: String,
     error_text: String,
     error_rate: f64,
-) -> Line<'a> {
+) -> Line<'static> {
     Line::from(vec![
         health_icon.fg(health_color).bold(),
         " ".into(),
@@ -664,89 +664,103 @@ fn backend_details_line(
 
 /// Render list of backend servers with their stats
 fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_details: bool) {
-    let items: Vec<ListItem> = state
-        .backend_views
-        .iter()
-        .enumerate()
-        .map(|(i, backend)| {
-            let backend_stats = &backend.stats;
-            let server = &backend.server;
-            let (health_icon, health_color) = health_indicator(backend.health_status);
-            let error_rate = backend_stats.error_rate_percent();
+    let paragraph = Paragraph::new(backend_display_lines(state, show_details))
+        .block(bordered_block("Backend Servers", styles::BORDER_NORMAL))
+        .alignment(Alignment::Left);
 
-            // Format dynamic text values
-            let cmd_per_sec = backend
-                .latest_throughput()
-                .and_then(super::app::ThroughputPoint::commands_per_sec)
-                .map_or_else(
-                    || text::DEFAULT_CMD_RATE.to_string(),
-                    |cps| format!("{:.0}", cps.get()),
-                );
+    f.render_widget(paragraph, area);
+}
 
-            let ttfb = backend_stats
-                .average_ttfb_ms()
-                .map_or_else(|| "N/A".to_string(), |ms| format!("{ms:.1}ms"));
+fn backend_display_lines(state: &DashboardState, show_details: bool) -> Vec<Line<'static>> {
+    let lines_per_backend = if show_details { 7 } else { 6 };
+    let spacer_lines = state.backend_views.len().saturating_sub(1);
+    let mut lines =
+        Vec::with_capacity(state.backend_views.len() * lines_per_backend + spacer_lines);
 
-            let avg_size = backend_stats
-                .average_article_size()
-                .map_or_else(|| "N/A".to_string(), format_bytes);
+    for (i, backend) in state.backend_views.iter().enumerate() {
+        let backend_stats = &backend.stats;
+        let server = &backend.server;
+        let (health_icon, health_color) = health_indicator(backend.health_status);
+        let error_rate = backend_stats.error_rate_percent();
 
-            // Build base content lines
-            let mut content = vec![
-                backend_header_line(
-                    health_icon,
-                    health_color,
-                    server.name.as_str(),
-                    format_error_rate(error_rate),
-                    error_rate,
-                ),
-                backend_address_line(
-                    &server.host,
-                    server.port.get(),
-                    state.backend_traffic_share(i),
-                ),
-                backend_metrics_line(
-                    backend.active_connections,
-                    server.max_connections.get(),
-                    cmd_per_sec,
-                    ttfb,
-                ),
-                backend_transfer_line(
-                    backend_stats.bytes_sent.as_u64(),
-                    backend_stats.bytes_received.as_u64(),
-                ),
-                backend_article_line(avg_size, backend_stats.article_count.get()),
-                backend_error_line(
-                    backend_stats.errors_4xx.get(),
-                    backend_stats.errors_5xx.get(),
-                    !backend_stats.errors.is_zero(),
-                    backend_stats.connection_failures.get(),
-                ),
-            ];
+        let cmd_per_sec = backend
+            .latest_throughput()
+            .and_then(super::app::ThroughputPoint::commands_per_sec)
+            .map_or_else(
+                || text::DEFAULT_CMD_RATE.to_string(),
+                |cps| format!("{:.0}", cps.get()),
+            );
 
-            // Add details line in details mode
-            if show_details {
-                content.push(backend_details_line(
-                    state.backend_pending_count(i),
-                    state.backend_load_ratio(i),
-                    state.backend_stateful_count(i),
-                    state.backend_pipeline_depth(i),
-                ));
-            }
+        let ttfb = backend_stats
+            .average_ttfb_ms()
+            .map_or_else(|| "N/A".to_string(), |ms| format!("{ms:.1}ms"));
 
-            ListItem::new(content)
-        })
-        .collect();
+        let avg_size = backend_stats
+            .average_article_size()
+            .map_or_else(|| "N/A".to_string(), format_bytes);
 
-    let list = List::new(items).block(bordered_block("Backend Servers", styles::BORDER_NORMAL));
+        lines.extend([
+            backend_header_line(
+                health_icon,
+                health_color,
+                server.name.as_str().to_string(),
+                format_error_rate(error_rate),
+                error_rate,
+            ),
+            backend_address_line(
+                &server.host,
+                server.port.get(),
+                state.backend_traffic_share(i),
+            ),
+            backend_metrics_line(
+                backend.active_connections,
+                server.max_connections.get(),
+                cmd_per_sec,
+                ttfb,
+            ),
+            backend_transfer_line(
+                backend_stats.bytes_sent.as_u64(),
+                backend_stats.bytes_received.as_u64(),
+            ),
+            backend_article_line(avg_size, backend_stats.article_count.get()),
+            backend_error_line(
+                backend_stats.errors_4xx.get(),
+                backend_stats.errors_5xx.get(),
+                !backend_stats.errors.is_zero(),
+                backend_stats.connection_failures.get(),
+            ),
+        ]);
 
-    f.render_widget(list, area);
+        if show_details {
+            lines.push(backend_details_line(
+                state.backend_pending_count(i),
+                state.backend_load_ratio(i),
+                state.backend_stateful_count(i),
+                state.backend_pipeline_depth(i),
+            ));
+        }
+
+        if i + 1 != state.backend_views.len() {
+            lines.push(Line::default());
+        }
+    }
+
+    lines
 }
 
 /// Render data flow visualization as line graphs
 fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
     // Build chart data in single pass (no nested loops)
     let (chart_data, max_throughput) = build_chart_data(&state.backend_views);
+
+    if max_throughput <= 0.0 {
+        let placeholder = Paragraph::new(Line::from("No throughput samples yet"))
+            .style(Style::default().fg(styles::LABEL))
+            .block(bordered_block(chart::TITLE, styles::BORDER_NORMAL))
+            .alignment(Alignment::Center);
+        f.render_widget(placeholder, area);
+        return;
+    }
 
     // Calculate chart bounds (extracted for testing)
     let max_throughput_rounded = calculate_chart_bounds(max_throughput);
@@ -846,9 +860,7 @@ fn render_logs(f: &mut Frame, area: Rect, log_lines: &[String], show_details: bo
         visible_lines
     };
 
-    let text = recent_log_lines(log_lines, fetch_count).join("\n");
-
-    let mut paragraph = Paragraph::new(text)
+    let mut paragraph = Paragraph::new(recent_log_text_lines(log_lines, fetch_count))
         .style(Style::default().fg(Color::Gray))
         .block(bordered_block(" Recent Logs ", styles::BORDER_ACTIVE));
 
@@ -862,6 +874,13 @@ fn render_logs(f: &mut Frame, area: Rect, log_lines: &[String], show_details: bo
 fn recent_log_lines(lines: &[String], count: usize) -> &[String] {
     let start = lines.len().saturating_sub(count);
     &lines[start..]
+}
+
+fn recent_log_text_lines(lines: &[String], count: usize) -> Vec<Line<'_>> {
+    recent_log_lines(lines, count)
+        .iter()
+        .map(|line| Line::from(line.as_str()))
+        .collect()
 }
 
 /// Render per-user statistics panel
@@ -985,6 +1004,18 @@ mod tests {
         let recent = recent_log_lines(&lines, 0);
 
         assert!(recent.is_empty());
+    }
+
+    #[test]
+    fn recent_log_text_lines_preserve_visible_content_without_joining() {
+        let lines = vec!["one".to_string(), "two".to_string(), "three".to_string()];
+
+        let rendered = recent_log_text_lines(&lines, 2)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(rendered, vec!["two".to_string(), "three".to_string()]);
     }
 
     #[test]
@@ -1164,6 +1195,54 @@ mod tests {
         assert!(!with_pipeline.contains('%'));
         assert!(without_pipeline.contains("Pending: 4"));
         assert!(!without_pipeline.contains("Pipelined:"));
+    }
+
+    #[test]
+    fn backend_display_lines_insert_blank_lines_between_backends() {
+        let state = DashboardState {
+            metrics: DashboardMetrics::default(),
+            backend_views: vec![test_backend_view("one"), test_backend_view("two")],
+            top_users: Vec::new(),
+            client_history: Vec::new(),
+            system_stats: crate::tui::SystemStats::default(),
+            view_mode: ViewMode::Normal,
+            show_details: false,
+            log_lines: Vec::new(),
+            buffer_pool: None,
+        };
+
+        let lines = backend_display_lines(&state, false)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+
+        assert!(lines.iter().any(|line| line.contains("one")));
+        assert!(lines.iter().any(|line| line.contains("two")));
+        assert!(lines.iter().any(String::is_empty));
+    }
+
+    fn test_backend_view(name: &str) -> crate::tui::dashboard::BackendView {
+        use crate::metrics::{BackendHealthStatus, BackendStats};
+        use crate::tui::dashboard::{BackendDisplay, BackendView};
+        use crate::types::{HostName, MaxConnections, Port, ServerName};
+
+        BackendView {
+            server: BackendDisplay {
+                host: HostName::try_new("backend.example.com".to_string()).unwrap(),
+                port: Port::try_new(119).unwrap(),
+                name: ServerName::try_new(name.to_string()).unwrap(),
+                max_connections: MaxConnections::try_new(10).unwrap(),
+            },
+            stats: BackendStats::default(),
+            active_connections: 0,
+            health_status: BackendHealthStatus::Healthy,
+            pending_count: 0,
+            load_ratio: None,
+            stateful_count: 0,
+            traffic_share: None,
+            pipeline_depth: None,
+            history: Vec::new(),
+        }
     }
 
     fn user_stat_lines_for_test(user: &DashboardUserStats) -> Vec<Line<'static>> {
