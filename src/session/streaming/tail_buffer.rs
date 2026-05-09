@@ -142,13 +142,7 @@ impl TailBuffer {
 fn find_terminator_end(data: &[u8]) -> Option<usize> {
     const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
 
-    data.len().checked_sub(TERMINATOR.len()).and_then(|_| {
-        memchr::memchr_iter(b'.', data)
-            .skip_while(|&pos| pos < 2)
-            .take_while(|&pos| pos + 3 <= data.len())
-            .find(|&pos| data[pos - 2..pos + 3] == *TERMINATOR)
-            .map(|pos| pos + 3)
-    })
+    memchr::memmem::find(data, TERMINATOR).map(|start| start + TERMINATOR.len())
 }
 
 #[inline]

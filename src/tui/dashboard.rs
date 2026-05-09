@@ -42,10 +42,6 @@ pub struct BackendView {
     pub traffic_share: Option<f64>,
     #[serde(default)]
     pub pipeline_depth: Option<usize>,
-    #[serde(default)]
-    pub pipeline_queue_depth: Option<usize>,
-    #[serde(default)]
-    pub pipeline_queue_capacity: Option<usize>,
     pub history: Vec<ThroughputPoint>,
 }
 
@@ -119,10 +115,6 @@ pub struct DashboardMetrics {
     pub pipeline_depth: usize,
     #[serde(default)]
     pub pipeline_connection_capacity: usize,
-    #[serde(default)]
-    pub pipeline_queue_depth: usize,
-    #[serde(default)]
-    pub pipeline_queue_capacity: usize,
 }
 
 impl DashboardMetrics {
@@ -147,8 +139,6 @@ impl DashboardMetrics {
             pipeline_enabled_backends: 0,
             pipeline_depth: 0,
             pipeline_connection_capacity: 0,
-            pipeline_queue_depth: 0,
-            pipeline_queue_capacity: 0,
         }
     }
 
@@ -242,18 +232,6 @@ impl DashboardState {
     }
 
     #[must_use]
-    pub fn backend_pipeline_queue_depth(&self, backend_idx: usize) -> Option<usize> {
-        self.backend_view(backend_idx)
-            .and_then(|view| view.pipeline_queue_depth)
-    }
-
-    #[must_use]
-    pub fn backend_pipeline_queue_capacity(&self, backend_idx: usize) -> Option<usize> {
-        self.backend_view(backend_idx)
-            .and_then(|view| view.pipeline_queue_capacity)
-    }
-
-    #[must_use]
     pub fn buffer_pool(&self) -> Option<&BufferPoolStats> {
         self.buffer_pool.as_ref()
     }
@@ -283,8 +261,6 @@ mod tests {
             stateful_count: 3,
             traffic_share: Some(42.0),
             pipeline_depth: Some(2),
-            pipeline_queue_depth: Some(1),
-            pipeline_queue_capacity: Some(8),
             history: vec![ThroughputPoint::new_backend(
                 Timestamp::now(),
                 Throughput::new(1.0),
@@ -315,7 +291,5 @@ mod tests {
         assert_eq!(state.backend_stateful_count(1), 0);
         assert!(state.backend_traffic_share(1).is_none());
         assert!(state.backend_pipeline_depth(1).is_none());
-        assert!(state.backend_pipeline_queue_depth(1).is_none());
-        assert!(state.backend_pipeline_queue_capacity(1).is_none());
     }
 }

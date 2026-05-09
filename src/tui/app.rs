@@ -675,22 +675,6 @@ impl TuiApp {
             .backend_pipeline_depth(BackendId::from_index(backend_idx))
     }
 
-    /// Get the live pipeline queue backlog for a backend, if backend pipelining is enabled.
-    #[must_use]
-    pub fn backend_pipeline_queue_depth(&self, backend_idx: usize) -> Option<usize> {
-        use crate::types::BackendId;
-        self.router
-            .backend_pipeline_queue_depth(BackendId::from_index(backend_idx))
-    }
-
-    /// Get the configured pipeline queue capacity for a backend, if enabled.
-    #[must_use]
-    pub fn backend_pipeline_queue_capacity(&self, backend_idx: usize) -> Option<usize> {
-        use crate::types::BackendId;
-        self.router
-            .backend_pipeline_queue_capacity(BackendId::from_index(backend_idx))
-    }
-
     /// Get throughput history for a backend
     #[must_use]
     ///
@@ -792,19 +776,6 @@ impl TuiApp {
             .filter(|server| server.backend_pipelining)
             .map(|server| server.max_connections.get())
             .sum();
-        metrics.pipeline_queue_depth = self
-            .servers
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, _)| self.backend_pipeline_queue_depth(idx))
-            .sum();
-        metrics.pipeline_queue_capacity = self
-            .servers
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, _)| self.backend_pipeline_queue_capacity(idx))
-            .sum();
-
         DashboardState {
             metrics,
             backend_views: self.snapshot_backend_views(),
@@ -856,8 +827,6 @@ impl TuiApp {
             stateful_count: self.backend_stateful_count(backend_idx),
             traffic_share: self.backend_traffic_share(backend_idx),
             pipeline_depth: self.backend_pipeline_depth(backend_idx),
-            pipeline_queue_depth: self.backend_pipeline_queue_depth(backend_idx),
-            pipeline_queue_capacity: self.backend_pipeline_queue_capacity(backend_idx),
             history: Self::snapshot_throughput_history(self.backend_history(backend_idx)),
         }
     }
@@ -1528,11 +1497,7 @@ mod tests {
         assert_eq!(snapshot.metrics.pipeline_enabled_backends, 1);
         assert_eq!(snapshot.metrics.pipeline_depth, 3);
         assert_eq!(snapshot.metrics.pipeline_connection_capacity, 10);
-        assert_eq!(snapshot.metrics.pipeline_queue_depth, 1);
-        assert_eq!(snapshot.metrics.pipeline_queue_capacity, 8);
         assert_eq!(snapshot.backend_views[0].pipeline_depth, Some(3));
-        assert_eq!(snapshot.backend_views[0].pipeline_queue_depth, Some(1));
-        assert_eq!(snapshot.backend_views[0].pipeline_queue_capacity, Some(8));
     }
 
     #[test]

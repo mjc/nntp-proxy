@@ -257,13 +257,6 @@ impl BackendQueue {
         }
     }
 
-    /// Current number of queued requests waiting for the worker.
-    #[must_use]
-    #[inline]
-    pub(crate) fn depth(&self) -> usize {
-        self.depth.load(Ordering::Relaxed)
-    }
-
     /// Current number of pipelined requests already written to backend connections
     /// and still awaiting responses.
     #[must_use]
@@ -282,13 +275,6 @@ impl BackendQueue {
     #[inline]
     pub(crate) fn mark_pipeline_resolved(&self, count: usize) {
         self.pipeline_depth.fetch_sub(count, Ordering::AcqRel);
-    }
-
-    /// Configured maximum queue depth before backpressure rejects new work.
-    #[must_use]
-    #[inline]
-    pub(crate) const fn max_depth(&self) -> usize {
-        self.max_depth
     }
 }
 
@@ -372,11 +358,11 @@ mod tests {
     fn test_pipeline_depth_tracks_written_requests_separately_from_queue_backlog() {
         let queue = BackendQueue::new(4);
 
-        assert_eq!(queue.depth(), 0);
+        assert_eq!(queue_depth(&queue), 0);
         assert_eq!(queue.pipeline_depth(), 0);
 
         queue.mark_pipeline_sent(3);
-        assert_eq!(queue.depth(), 0);
+        assert_eq!(queue_depth(&queue), 0);
         assert_eq!(queue.pipeline_depth(), 3);
 
         queue.mark_pipeline_resolved(2);
@@ -432,7 +418,7 @@ mod tests {
         tokio::time::advance(BATCH_COALESCE_WINDOW).await;
         let batch = handle.await.unwrap();
         assert_eq!(batch.len(), 3);
-        assert_eq!(queue.depth(), 0);
+        assert_eq!(queue_depth(&queue), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -455,7 +441,7 @@ mod tests {
         tokio::time::advance(BATCH_COALESCE_WINDOW).await;
         let batch = handle.await.unwrap();
         assert_eq!(batch.len(), 1);
-        assert_eq!(queue.depth(), 0);
+        assert_eq!(queue_depth(&queue), 0);
     }
 
     #[tokio::test]
