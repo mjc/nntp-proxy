@@ -39,7 +39,7 @@ pub(super) struct PendingPipelineRequest {
 }
 
 /// Result of preparing a request before pipeline/direct backend execution.
-enum PreparedRequest {
+pub(super) enum PreparedRequest {
     /// The response was already written to the client.
     Served,
     /// Continue with backend routing using resolved availability state.
@@ -102,7 +102,7 @@ impl ClientSession {
         );
     }
 
-    async fn prepare_request_execution(
+    pub(super) async fn prepare_request_execution(
         &self,
         router: &Arc<BackendSelector>,
         request: &mut RequestContext,

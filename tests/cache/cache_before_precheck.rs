@@ -20,8 +20,28 @@ use nntp_proxy::types::Port;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
+
+async fn read_multiline_response<R>(reader: &mut BufReader<R>) -> String
+where
+    R: AsyncRead + Unpin,
+{
+    let mut line = String::new();
+    line.clear();
+    reader.read_line(&mut line).await.unwrap();
+    assert!(line.starts_with("220"), "Should get 220 response: {line}");
+
+    loop {
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        if line.trim() == "." {
+            break;
+        }
+    }
+
+    line
+}
 
 /// Count how many times backends are queried
 #[derive(Clone)]
@@ -423,18 +443,7 @@ async fn test_article_cache_hit_zero_backend_queries() {
         .write_all(b"ARTICLE <test@example.com>\r\n")
         .await
         .unwrap();
-    line.clear();
-    reader.read_line(&mut line).await.unwrap();
-    assert!(line.starts_with("220"), "Should get 220 response: {line}");
-
-    // Read multiline response
-    loop {
-        line.clear();
-        reader.read_line(&mut line).await.unwrap();
-        if line.trim() == "." {
-            break;
-        }
-    }
+    read_multiline_response(&mut reader).await;
 
     let first_queries = counter.get();
     assert_eq!(first_queries, 1, "First ARTICLE should query backend once");
@@ -447,18 +456,7 @@ async fn test_article_cache_hit_zero_backend_queries() {
         .write_all(b"ARTICLE <test@example.com>\r\n")
         .await
         .unwrap();
-    line.clear();
-    reader.read_line(&mut line).await.unwrap();
-    assert!(line.starts_with("220"), "Should get 220 response: {line}");
-
-    // Read multiline response
-    loop {
-        line.clear();
-        reader.read_line(&mut line).await.unwrap();
-        if line.trim() == "." {
-            break;
-        }
-    }
+    read_multiline_response(&mut reader).await;
 
     let second_queries = counter.get();
 
@@ -466,6 +464,75 @@ async fn test_article_cache_hit_zero_backend_queries() {
         second_queries, 0,
         "CRITICAL BUG: ARTICLE cache hit triggered {second_queries} backend queries. \
          Cache hits must not pick or query a backend."
+    );
+
+    write_half.write_all(b"QUIT\r\n").await.unwrap();
+}
+
+/// CRITICAL TEST: Batched ARTICLE cache hits must not bypass cache/precheck preparation.
+#[tokio::test]
+async fn test_batched_article_cache_hits_zero_backend_queries() {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_port = backend_listener.local_addr().unwrap().port();
+
+    let counter = BackendQueryCounter::new();
+    let _mock = spawn_counting_mock_server(backend_listener, "TestBackend", counter.clone(), true);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let config = Config {
+        servers: vec![
+            Server::builder("127.0.0.1", Port::try_new(backend_port).unwrap())
+                .name("TestBackend")
+                .build()
+                .unwrap(),
+        ],
+        cache: Some(Cache {
+            store_article_bodies: true,
+            adaptive_precheck: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand)
+        .await
+        .unwrap();
+    let proxy_port = spawn_test_proxy(proxy).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
+        .await
+        .unwrap();
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    let mut line = String::new();
+    reader.read_line(&mut line).await.unwrap();
+
+    counter.reset();
+
+    write_half
+        .write_all(b"ARTICLE <test@example.com>\r\n")
+        .await
+        .unwrap();
+    read_multiline_response(&mut reader).await;
+    assert_eq!(counter.get(), 1, "First ARTICLE should query backend once");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    counter.reset();
+
+    write_half
+        .write_all(b"ARTICLE <test@example.com>\r\nARTICLE <test@example.com>\r\n")
+        .await
+        .unwrap();
+    read_multiline_response(&mut reader).await;
+    read_multiline_response(&mut reader).await;
+
+    let second_queries = counter.get();
+    assert_eq!(
+        second_queries, 0,
+        "CRITICAL BUG: batched ARTICLE cache hits triggered {second_queries} backend queries. \
+         Batched cache hits must not bypass cache/precheck preparation."
     );
 
     write_half.write_all(b"QUIT\r\n").await.unwrap();

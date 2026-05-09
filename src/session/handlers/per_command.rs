@@ -571,6 +571,8 @@ impl ClientSession {
         let mut pending_requests = Vec::with_capacity(batch.len());
 
         for i in 0..batch_size {
+            let mut prepared_served = false;
+            let mut enqueued_pending = None;
             {
                 let request = batch.context_mut(i);
                 debug!(
@@ -595,12 +597,42 @@ impl ClientSession {
                 if batch_size > 1
                     && request.is_large_transfer()
                     && matches!(decision, CommandRoutingDecision::Forward)
-                    && let Some(pending) =
-                        self.try_enqueue_pipeline_request(router, request, client_writer, None)
                 {
-                    pending_requests.push((i, pending));
-                    continue;
+                    let mut io = crate::session::handlers::article_retry::RequestExecutionIo {
+                        client_writer,
+                        client_to_backend_bytes: &mut state.client_to_backend_bytes,
+                        backend_to_client_bytes: &mut state.backend_to_client_bytes,
+                    };
+                    match self
+                        .prepare_request_execution(router, request, &mut io)
+                        .await?
+                    {
+                        crate::session::handlers::article_retry::PreparedRequest::Served => {
+                            prepared_served = true;
+                        }
+                        crate::session::handlers::article_retry::PreparedRequest::Continue {
+                            availability,
+                        } => {
+                            if let Some(pending) = self.try_enqueue_pipeline_request(
+                                router,
+                                request,
+                                client_writer,
+                                availability.as_ref(),
+                            ) {
+                                enqueued_pending = Some((i, pending, availability));
+                            }
+                        }
+                    }
                 }
+            }
+
+            if let Some(pending) = enqueued_pending.take() {
+                pending_requests.push(pending);
+                continue;
+            }
+
+            if prepared_served {
+                continue;
             }
 
             self.finish_pending_pipeline_requests(
@@ -658,12 +690,12 @@ impl ClientSession {
         pending_requests: &mut Vec<(
             usize,
             crate::session::handlers::article_retry::PendingPipelineRequest,
+            Option<crate::cache::ArticleAvailability>,
         )>,
     ) -> Result<(), SessionError> {
-        for (index, pending) in pending_requests.drain(..) {
+        for (index, pending, mut availability) in pending_requests.drain(..) {
             let request = batch.context_mut(index);
             let mut client_to_backend_bytes = state.client_to_backend_bytes;
-            let mut availability = None;
             let mut io = crate::session::handlers::article_retry::RequestExecutionIo {
                 client_writer,
                 client_to_backend_bytes: &mut client_to_backend_bytes,
