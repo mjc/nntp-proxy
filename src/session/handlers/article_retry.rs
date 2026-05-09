@@ -633,4 +633,18 @@ mod tests {
 
         assert!(matches!(delivery, PipelineDelivery::Buffered));
     }
+
+    #[tokio::test]
+    async fn pipeline_delivery_keeps_article_number_requests_buffered() {
+        let session = test_session(false, true);
+        let writer = shared_writer().await;
+        let request = RequestContext::parse(b"BODY 12345\r\n").unwrap();
+
+        assert!(!request.has_message_id());
+        assert!(!request.is_large_transfer());
+
+        let delivery = session.pipeline_delivery(&request, &writer, false);
+
+        assert!(matches!(delivery, PipelineDelivery::Buffered));
+    }
 }
