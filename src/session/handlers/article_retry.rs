@@ -209,6 +209,7 @@ impl ClientSession {
             request,
             io.client_writer,
             availability.as_ref(),
+            false,
         ) && self
             .await_pipeline_request(pending, io, availability)
             .await?
@@ -224,8 +225,13 @@ impl ClientSession {
         &self,
         request: &RequestContext,
         client_writer: &crate::session::SharedClientWriter,
+        preserve_response_order: bool,
     ) -> PipelineDelivery {
         if !request.is_large_transfer() {
+            return PipelineDelivery::Buffered;
+        }
+
+        if preserve_response_order {
             return PipelineDelivery::Buffered;
         }
 
@@ -244,6 +250,7 @@ impl ClientSession {
         request: &RequestContext,
         client_writer: &crate::session::SharedClientWriter,
         availability: Option<&ArticleAvailability>,
+        preserve_response_order: bool,
     ) -> Option<PendingPipelineRequest> {
         let Ok(backend_id) = router.route_with_availability(self.client_id, availability) else {
             return None;
@@ -264,7 +271,7 @@ impl ClientSession {
             request.clone(),
             self.client_addr,
             tx,
-            self.pipeline_delivery(request, client_writer),
+            self.pipeline_delivery(request, client_writer, preserve_response_order),
         );
 
         match queue.try_enqueue(queued_context) {
@@ -559,5 +566,71 @@ impl ClientSession {
                 .sync_availability(msg_id_ref.clone(), availability)
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+
+    use tokio::net::{TcpListener, TcpStream};
+
+    use crate::auth::AuthHandler;
+    use crate::config::RoutingMode;
+    use crate::metrics::MetricsCollector;
+    use crate::pool::BufferPool;
+    use crate::protocol::RequestContext;
+    use crate::router::backend_queue::PipelineDelivery;
+    use crate::session::ClientSession;
+    use crate::types::{BufferSize, ClientAddress};
+
+    fn test_session(article_buffer: bool, cache_articles: bool) -> ClientSession {
+        let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        ClientSession::builder(
+            ClientAddress::from(addr),
+            BufferPool::new(BufferSize::try_new(8192).unwrap(), 2),
+            Arc::new(AuthHandler::new(None, None).unwrap()),
+            MetricsCollector::new(1),
+        )
+        .with_routing_mode(RoutingMode::PerCommand)
+        .with_article_buffer(article_buffer)
+        .with_cache_articles(cache_articles)
+        .build()
+    }
+
+    async fn shared_writer() -> crate::session::SharedClientWriter {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = TcpStream::connect(addr);
+        let accept = listener.accept();
+        let (client, server) = tokio::join!(connect, accept);
+        let client = client.unwrap();
+        let server = server.unwrap().0;
+        drop(server);
+        let (_read_half, write_half) = client.into_split();
+        crate::session::SharedClientWriter::new(write_half)
+    }
+
+    #[tokio::test]
+    async fn pipeline_delivery_keeps_first_large_transfer_streaming() {
+        let session = test_session(false, false);
+        let writer = shared_writer().await;
+        let request = RequestContext::parse(b"BODY <one@example>\r\n").unwrap();
+
+        let delivery = session.pipeline_delivery(&request, &writer, false);
+
+        assert!(matches!(delivery, PipelineDelivery::StreamToClient(_)));
+    }
+
+    #[tokio::test]
+    async fn pipeline_delivery_buffers_later_large_transfer_to_preserve_order() {
+        let session = test_session(false, false);
+        let writer = shared_writer().await;
+        let request = RequestContext::parse(b"BODY <two@example>\r\n").unwrap();
+
+        let delivery = session.pipeline_delivery(&request, &writer, true);
+
+        assert!(matches!(delivery, PipelineDelivery::Buffered));
     }
 }

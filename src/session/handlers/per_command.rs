@@ -635,6 +635,7 @@ impl ClientSession {
                                 request,
                                 client_writer,
                                 availability.as_ref(),
+                                !pending_requests.is_empty(),
                             ) {
                                 enqueued_pending = Some((i, pending, availability));
                             }

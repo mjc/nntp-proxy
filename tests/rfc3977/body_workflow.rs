@@ -9,8 +9,10 @@ use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::io::{
+    AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader,
+};
+use tokio::net::TcpListener;
 use tokio::time::{Duration, timeout};
 
 use crate::test_helpers::{
@@ -109,35 +111,28 @@ async fn test_body_missing_article_number_returns_423_and_session_continues() ->
     Ok(())
 }
 
-async fn read_line(stream: &mut TcpStream, context: &str) -> Result<String> {
-    let mut bytes = Vec::with_capacity(128);
-    let mut byte = [0u8; 1];
-
-    loop {
-        let n = match timeout(Duration::from_secs(2), stream.read(&mut byte)).await {
-            Ok(result) => result?,
-            Err(_) => anyhow::bail!("Timed out while reading {context}"),
-        };
-        if n == 0 {
-            if bytes.is_empty() {
-                anyhow::bail!("Connection closed while reading {context}");
-            }
-            anyhow::bail!("Connection closed before line terminator while reading {context}");
-        }
-
-        bytes.push(byte[0]);
-        if byte[0] == b'\n' {
-            return String::from_utf8(bytes).map_err(Into::into);
-        }
+async fn read_line<R>(reader: &mut R, context: &str) -> Result<String>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let mut line = String::new();
+    match timeout(Duration::from_secs(2), reader.read_line(&mut line)).await {
+        Ok(Ok(0)) => anyhow::bail!("Connection closed while reading {context}"),
+        Ok(Ok(_)) => Ok(line),
+        Ok(Err(err)) => Err(err.into()),
+        Err(_) => anyhow::bail!("Timed out while reading {context}"),
     }
 }
 
-async fn read_multiline_response(stream: &mut TcpStream) -> Result<(String, Vec<String>)> {
-    let status_line = read_line(stream, "BODY status line").await?;
+async fn read_multiline_response<R>(reader: &mut R) -> Result<(String, Vec<String>)>
+where
+    R: AsyncBufRead + Unpin,
+{
+    let status_line = read_line(reader, "BODY status line").await?;
     let mut lines = Vec::new();
 
     loop {
-        let line = read_line(stream, "BODY response line").await?;
+        let line = read_line(reader, "BODY response line").await?;
         if line == ".\r\n" {
             break;
         }
@@ -147,18 +142,24 @@ async fn read_multiline_response(stream: &mut TcpStream) -> Result<(String, Vec<
     Ok((status_line, lines))
 }
 
-async fn read_multiline_responses(
-    stream: &mut TcpStream,
+async fn read_multiline_responses<R>(
+    reader: &mut R,
     count: usize,
-) -> Result<Vec<(String, Vec<String>)>> {
+) -> Result<Vec<(String, Vec<String>)>>
+where
+    R: AsyncBufRead + Unpin,
+{
     let mut responses = Vec::with_capacity(count);
     for _ in 0..count {
-        responses.push(read_multiline_response(stream).await?);
+        responses.push(read_multiline_response(reader).await?);
     }
     Ok(responses)
 }
 
-async fn write_commands(stream: &mut TcpStream, commands: &[&str]) -> Result<()> {
+async fn write_commands<W>(stream: &mut W, commands: &[&str]) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     for command in commands {
         stream.write_all(command.as_bytes()).await?;
     }
@@ -275,10 +276,12 @@ async fn test_body_pipelining_pairs_four_responses_on_single_backend_connection(
         RoutingMode::PerCommand,
     )
     .await?;
-    let mut client = connect_and_read_greeting(proxy_port).await?;
+    let client = connect_and_read_greeting(proxy_port).await?;
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
 
     write_commands(
-        &mut client,
+        &mut write_half,
         &[
             "BODY <body-1@example>\r\n",
             "BODY <body-2@example>\r\n",
@@ -288,7 +291,7 @@ async fn test_body_pipelining_pairs_four_responses_on_single_backend_connection(
     )
     .await?;
 
-    let responses = read_multiline_responses(&mut client, 4).await?;
+    let responses = read_multiline_responses(&mut reader, 4).await?;
 
     assert_eq!(
         responses,
@@ -368,10 +371,12 @@ async fn test_article_pipelining_pairs_four_responses_on_single_backend_connecti
         RoutingMode::PerCommand,
     )
     .await?;
-    let mut client = connect_and_read_greeting(proxy_port).await?;
+    let client = connect_and_read_greeting(proxy_port).await?;
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
 
     write_commands(
-        &mut client,
+        &mut write_half,
         &[
             "ARTICLE <article-1@example>\r\n",
             "ARTICLE <article-2@example>\r\n",
@@ -381,7 +386,7 @@ async fn test_article_pipelining_pairs_four_responses_on_single_backend_connecti
     )
     .await?;
 
-    let responses = read_multiline_responses(&mut client, 4).await?;
+    let responses = read_multiline_responses(&mut reader, 4).await?;
     assert_eq!(
         responses,
         vec![
@@ -459,10 +464,12 @@ async fn test_body_pipeline_batch_drains_before_trailing_group_switch() -> Resul
         RoutingMode::Hybrid,
     )
     .await?;
-    let mut client = connect_and_read_greeting(proxy_port).await?;
+    let client = connect_and_read_greeting(proxy_port).await?;
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
 
     write_commands(
-        &mut client,
+        &mut write_half,
         &[
             "BODY <body-1@example>\r\n",
             "BODY <body-2@example>\r\n",
@@ -473,7 +480,7 @@ async fn test_body_pipeline_batch_drains_before_trailing_group_switch() -> Resul
     )
     .await?;
 
-    let responses = read_multiline_responses(&mut client, 4).await?;
+    let responses = read_multiline_responses(&mut reader, 4).await?;
     assert_eq!(
         responses,
         vec![
@@ -496,7 +503,7 @@ async fn test_body_pipeline_batch_drains_before_trailing_group_switch() -> Resul
         ]
     );
     assert_eq!(
-        read_line(&mut client, "GROUP status line").await?,
+        read_line(&mut reader, "GROUP status line").await?,
         "211 4 1 4 alt.test\r\n"
     );
 
