@@ -45,6 +45,7 @@ bytes = "1.0"  # Efficient byte buffer for zero-copy operations
 ratatui = "0.30"  # Terminal UI framework
 crossterm = "0.29"  # Cross-platform terminal manipulation
 smallvec = { version = "1.13", features = ["serde"] }  # Stack-allocated vectors for small collections
+arrayvec = "0.7"  # Stack-backed strings for small display formatting without heap allocation
 dashmap = "6.1"  # Lock-free concurrent HashMap for metrics
 sysinfo = { version = "=0.38.4", default-features = false, features = ["system"] }  # Process metrics (CPU, memory, threads) for TUI monitoring
 chrono = { version = "0.4", features = ["serde", "clock"], default-features = false }  # Timestamps for stats persistence

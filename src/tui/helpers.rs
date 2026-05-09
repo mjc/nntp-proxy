@@ -227,16 +227,6 @@ pub const fn error_rate_color(rate: f64) -> Color {
     }
 }
 
-/// Color for pending count
-#[must_use]
-pub const fn pending_count_color(pending: usize) -> Color {
-    if pending > 0 {
-        Color::Yellow
-    } else {
-        super::constants::styles::VALUE_NEUTRAL
-    }
-}
-
 /// Color for error count
 #[must_use]
 pub const fn error_count_color(has_errors: bool) -> Color {

@@ -9,8 +9,9 @@ use crate::tui::dashboard::{
 use crate::tui::helpers::{
     build_chart_data, calculate_chart_bounds, connection_failure_color, create_sparkline,
     error_count_color, error_rate_color, format_error_rate, format_summary_throughput,
-    format_throughput_label, health_indicator, pending_count_color,
+    format_throughput_label, health_indicator,
 };
+use arrayvec::ArrayString;
 use ratatui::{
     Frame,
     buffer::Buffer,
@@ -20,6 +21,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Axis, Block, Chart, Dataset, GraphType, List, ListItem, Paragraph, Wrap},
 };
+use std::fmt::Write as _;
 
 #[allow(clippy::cast_precision_loss)] // Chart labels and percentages are presentation-only values.
 const fn counter_as_f64(value: u64) -> f64 {
@@ -54,18 +56,6 @@ fn untitled_bordered_block(border_color: Color) -> Block<'static> {
 #[derive(Debug, Clone)]
 pub(crate) struct AttachedRenderCache {
     title_lines: Vec<Line<'static>>,
-    compact_backend_lines: Vec<Line<'static>>,
-    detailed_backend_lines: Vec<Line<'static>>,
-}
-
-impl AttachedRenderCache {
-    fn backend_lines(&self, show_details: bool) -> &[Line<'static>] {
-        if show_details {
-            &self.detailed_backend_lines
-        } else {
-            &self.compact_backend_lines
-        }
-    }
 }
 
 pub(crate) fn build_attached_render_cache(
@@ -74,8 +64,6 @@ pub(crate) fn build_attached_render_cache(
 ) -> AttachedRenderCache {
     AttachedRenderCache {
         title_lines: build_title_lines(&state.metrics, Some(remote_status)),
-        compact_backend_lines: backend_display_lines(state, false),
-        detailed_backend_lines: backend_display_lines(state, true),
     }
 }
 
@@ -139,12 +127,7 @@ pub(crate) fn render_attached_ui(
 
     render_title_lines(f, chunks[0], &render_cache.title_lines);
     render_summary(f, chunks[1], state, None, show_details);
-    render_backends_cached(
-        f,
-        chunks[2],
-        state,
-        render_cache.backend_lines(show_details),
-    );
+    render_backends(f, chunks[2], state, show_details);
 
     if show_logs {
         render_logs(f, chunks[3], &state.log_lines, show_details);
@@ -209,8 +192,38 @@ fn render_title(
     metrics: &DashboardMetrics,
     remote_status: Option<&RemoteDashboardStatus>,
 ) {
-    let lines = build_title_lines(metrics, remote_status);
-    render_title_lines(f, area, &lines);
+    let block = untitled_bordered_block(styles::BORDER_ACTIVE);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let right = inner.left().saturating_add(inner.width);
+    let buffer = f.buffer_mut();
+
+    let title_y = inner.top();
+    let mut title_x = centered_x(inner, title_title_width(remote_status));
+    write_part(
+        buffer,
+        &mut title_x,
+        title_y,
+        right,
+        "NNTP Proxy ",
+        Style::default()
+            .fg(styles::BORDER_ACTIVE)
+            .add_modifier(Modifier::BOLD),
+    );
+    let (suffix, suffix_style) = title_suffix(remote_status);
+    write_part(buffer, &mut title_x, title_y, right, suffix, suffix_style);
+
+    if inner.height < 2 {
+        return;
+    }
+
+    let info_y = inner.top().saturating_add(1);
+    render_title_info_row(buffer, inner, info_y, metrics, remote_status);
 }
 
 fn render_title_lines(f: &mut Frame, area: Rect, lines: &[Line<'_>]) {
@@ -221,6 +234,247 @@ fn render_title_lines(f: &mut Frame, area: Rect, lines: &[Line<'_>]) {
         lines,
         Alignment::Center,
     );
+}
+
+fn centered_x(area: Rect, content_width: u16) -> u16 {
+    area.left()
+        .saturating_add(area.width.saturating_sub(content_width) / 2)
+}
+
+fn title_suffix(remote_status: Option<&RemoteDashboardStatus>) -> (&'static str, Style) {
+    remote_status.map_or_else(
+        || {
+            (
+                "- Real-Time Metrics Dashboard",
+                Style::default().fg(Color::White),
+            )
+        },
+        |status| match status {
+            RemoteDashboardStatus::Connecting { .. } => (
+                "- Attached Dashboard (connecting)",
+                Style::default().fg(Color::Yellow),
+            ),
+            RemoteDashboardStatus::Connected { .. } => (
+                "- Attached Dashboard (live)",
+                Style::default().fg(styles::VALUE_PRIMARY),
+            ),
+            RemoteDashboardStatus::Reconnecting { .. } => (
+                "- Attached Dashboard (reconnecting)",
+                Style::default().fg(Color::Yellow),
+            ),
+        },
+    )
+}
+
+fn title_title_width(remote_status: Option<&RemoteDashboardStatus>) -> u16 {
+    let (suffix, _) = title_suffix(remote_status);
+    u16::try_from("NNTP Proxy ".len() + suffix.len()).unwrap_or(u16::MAX)
+}
+
+fn render_title_info_row(
+    buffer: &mut Buffer,
+    area: Rect,
+    y: u16,
+    metrics: &DashboardMetrics,
+    remote_status: Option<&RemoteDashboardStatus>,
+) {
+    let right = area.left().saturating_add(area.width);
+    let mut x = area.left();
+
+    match remote_status {
+        Some(status) => render_remote_title_status_row(buffer, &mut x, y, right, status),
+        None => render_local_title_status_row(buffer, &mut x, y, right, metrics),
+    }
+}
+
+fn render_local_title_status_row(
+    buffer: &mut Buffer,
+    x: &mut u16,
+    y: u16,
+    right: u16,
+    metrics: &DashboardMetrics,
+) {
+    let uptime = metrics.format_uptime();
+    let active = connections_text(metrics.active_connections);
+    let total = connections_text_u64(metrics.total_connections);
+
+    write_part(
+        buffer,
+        x,
+        y,
+        right,
+        "Uptime: ",
+        Style::default().fg(styles::LABEL),
+    );
+    write_part(
+        buffer,
+        x,
+        y,
+        right,
+        &uptime,
+        Style::default()
+            .fg(styles::VALUE_PRIMARY)
+            .add_modifier(Modifier::BOLD),
+    );
+    write_part(
+        buffer,
+        x,
+        y,
+        right,
+        "  |  Active: ",
+        Style::default().fg(styles::LABEL),
+    );
+    write_part(
+        buffer,
+        x,
+        y,
+        right,
+        &active,
+        Style::default().fg(styles::VALUE_SECONDARY),
+    );
+    write_part(
+        buffer,
+        x,
+        y,
+        right,
+        "  |  Total: ",
+        Style::default().fg(styles::LABEL),
+    );
+    write_part(
+        buffer,
+        x,
+        y,
+        right,
+        &total,
+        Style::default().fg(styles::VALUE_NEUTRAL),
+    );
+}
+
+fn render_remote_title_status_row(
+    buffer: &mut Buffer,
+    x: &mut u16,
+    y: u16,
+    right: u16,
+    status: &RemoteDashboardStatus,
+) {
+    write_part(
+        buffer,
+        x,
+        y,
+        right,
+        "Remote: ",
+        Style::default().fg(styles::LABEL),
+    );
+    match status {
+        RemoteDashboardStatus::Connecting { target } => {
+            write_part(
+                buffer,
+                x,
+                y,
+                right,
+                "connecting",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            );
+            render_target_part(buffer, x, y, right, target);
+        }
+        RemoteDashboardStatus::Connected { target } => {
+            write_part(
+                buffer,
+                x,
+                y,
+                right,
+                "live",
+                Style::default()
+                    .fg(styles::VALUE_PRIMARY)
+                    .add_modifier(Modifier::BOLD),
+            );
+            render_target_part(buffer, x, y, right, target);
+        }
+        RemoteDashboardStatus::Reconnecting {
+            target,
+            retry_delay,
+            ..
+        } => {
+            write_part(
+                buffer,
+                x,
+                y,
+                right,
+                "reconnecting",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            );
+            let mut delay = ArrayString::<24>::new();
+            let _ = write!(&mut delay, " in {:.1}s", retry_delay.as_secs_f32());
+            write_part(
+                buffer,
+                x,
+                y,
+                right,
+                &delay,
+                Style::default().fg(styles::LABEL),
+            );
+            render_target_part(buffer, x, y, right, target);
+            write_part(
+                buffer,
+                x,
+                y,
+                right,
+                "  |  Snapshot: ",
+                Style::default().fg(styles::LABEL),
+            );
+            write_part(
+                buffer,
+                x,
+                y,
+                right,
+                "last known",
+                Style::default().fg(Color::Yellow),
+            );
+        }
+    }
+}
+
+fn render_target_part(
+    buffer: &mut Buffer,
+    x: &mut u16,
+    y: u16,
+    right: u16,
+    target: &std::net::SocketAddr,
+) {
+    write_part(
+        buffer,
+        x,
+        y,
+        right,
+        "  |  Target: ",
+        Style::default().fg(styles::LABEL),
+    );
+    let mut target_buf = ArrayString::<64>::new();
+    let _ = write!(&mut target_buf, "{target}");
+    write_part(
+        buffer,
+        x,
+        y,
+        right,
+        &target_buf,
+        Style::default().fg(styles::VALUE_INFO),
+    );
+}
+
+fn connections_text(count: usize) -> ArrayString<32> {
+    let mut value = ArrayString::<32>::new();
+    let _ = write!(&mut value, "{count} connections");
+    value
+}
+
+fn connections_text_u64(count: u64) -> ArrayString<32> {
+    let mut value = ArrayString::<32>::new();
+    let _ = write!(&mut value, "{count} connections");
+    value
 }
 
 fn build_title_lines(
@@ -306,10 +560,6 @@ fn render_summary(
     let metrics = &state.metrics;
     let system_stats = &state.system_stats;
 
-    // Get latest throughput from history (extracted for testing)
-    let (client_to_backend_str, backend_to_client_str) =
-        format_summary_throughput(state.latest_client_throughput());
-
     // Split summary box into three columns
     let summary_chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -320,43 +570,480 @@ fn render_summary(
         ])
         .split(area);
 
-    // Left: App summary (uptime, sessions, buffer stats in details mode)
-    let left_summary = build_app_summary_lines(
+    render_app_summary_panel(
+        f,
+        summary_chunks[0],
         metrics,
         system_stats,
         state.buffer_pool(),
         show_details,
         attached_ui_stats,
     );
+    render_cache_summary_panel(f, summary_chunks[1], metrics);
+    render_transfer_summary_panel(f, summary_chunks[2], state);
+}
 
-    // Middle: Cache summary
-    let middle_summary = build_cache_summary_lines(metrics);
+fn render_app_summary_panel(
+    f: &mut Frame,
+    area: Rect,
+    metrics: &DashboardMetrics,
+    system_stats: &crate::tui::SystemStats,
+    buffer_pool: Option<&BufferPoolStats>,
+    show_details: bool,
+    attached_ui_stats: Option<&crate::tui::SystemStats>,
+) {
+    fn cpu_color(usage: f32) -> Color {
+        if usage > 80.0 {
+            Color::Red
+        } else if usage > 50.0 {
+            Color::Yellow
+        } else {
+            styles::VALUE_INFO
+        }
+    }
 
-    // Right: Data transfer summary
-    let right_summary =
-        build_transfer_summary_lines(metrics, &client_to_backend_str, &backend_to_client_str);
+    fn session_color(count: usize) -> Color {
+        if count > 0 {
+            styles::VALUE_PRIMARY
+        } else {
+            styles::VALUE_NEUTRAL
+        }
+    }
 
-    render_block_lines(
-        f,
-        summary_chunks[0],
-        bordered_block("App", styles::BORDER_NORMAL),
-        &left_summary,
-        Alignment::Left,
+    fn buffer_color(in_use: usize, total: usize) -> Color {
+        let percent = (in_use * 100).checked_div(total).unwrap_or_default();
+        if percent > 80 {
+            Color::Red
+        } else if percent > 60 {
+            Color::Yellow
+        } else {
+            styles::VALUE_INFO
+        }
+    }
+
+    let block = bordered_block("App", styles::BORDER_NORMAL);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let right = inner.left().saturating_add(inner.width);
+    let buffer = f.buffer_mut();
+    let mut row = 0u16;
+
+    let uptime = metrics.format_uptime();
+    render_label_value_row(
+        buffer,
+        inner,
+        &mut row,
+        right,
+        "Uptime: ",
+        &uptime,
+        Style::default().fg(styles::VALUE_PRIMARY),
     );
-    render_block_lines(
-        f,
-        summary_chunks[1],
-        bordered_block(cache_summary_title(metrics), styles::BORDER_NORMAL),
-        &middle_summary,
-        Alignment::Left,
+
+    let stateful = metrics.stateful_sessions.to_string();
+    render_label_value_row(
+        buffer,
+        inner,
+        &mut row,
+        right,
+        "Stateful Sessions: ",
+        &stateful,
+        Style::default().fg(session_color(metrics.stateful_sessions)),
     );
-    render_block_lines(
-        f,
-        summary_chunks[2],
-        bordered_block("Data Transfer", styles::BORDER_NORMAL),
-        &right_summary,
-        Alignment::Left,
+
+    if let Some(ui_stats) = attached_ui_stats {
+        let proxy_cpu = percent_text(system_stats.cpu_usage);
+        let ui_cpu = percent_text(ui_stats.cpu_usage);
+        render_dual_value_row(
+            buffer,
+            inner,
+            &mut row,
+            right,
+            "CPU (proxy, UI): ",
+            (
+                &proxy_cpu,
+                Style::default().fg(cpu_color(system_stats.cpu_usage)),
+            ),
+            (&ui_cpu, Style::default().fg(cpu_color(ui_stats.cpu_usage))),
+        );
+
+        let proxy_mem = format_bytes(system_stats.memory_bytes);
+        let ui_mem = format_bytes(ui_stats.memory_bytes);
+        render_dual_value_row(
+            buffer,
+            inner,
+            &mut row,
+            right,
+            "Memory (proxy, UI): ",
+            (&proxy_mem, Style::default().fg(styles::VALUE_INFO)),
+            (&ui_mem, Style::default().fg(styles::VALUE_INFO)),
+        );
+    } else {
+        let cpu = percent_text(system_stats.cpu_usage);
+        render_label_value_row(
+            buffer,
+            inner,
+            &mut row,
+            right,
+            "CPU: ",
+            &cpu,
+            Style::default().fg(cpu_color(system_stats.cpu_usage)),
+        );
+
+        let mem = format_bytes(system_stats.memory_bytes);
+        render_label_value_row(
+            buffer,
+            inner,
+            &mut row,
+            right,
+            "Memory: ",
+            &mem,
+            Style::default().fg(styles::VALUE_INFO),
+        );
+    }
+
+    let pending_requests = metrics
+        .in_flight_requests
+        .saturating_sub(metrics.pipeline_depth);
+
+    if metrics.pipeline_enabled_backends > 0 {
+        let mut text = ArrayString::<96>::new();
+        let _ = write!(
+            &mut text,
+            "{}, Pending: {} across {} backend conns",
+            metrics.pipeline_depth, pending_requests, metrics.pipeline_connection_capacity
+        );
+        render_label_value_row(
+            buffer,
+            inner,
+            &mut row,
+            right,
+            "Pipelined: ",
+            &text,
+            Style::default().fg(styles::VALUE_INFO),
+        );
+    } else {
+        let mut text = ArrayString::<48>::new();
+        let _ = write!(&mut text, "{pending_requests} requests");
+        render_label_value_row(
+            buffer,
+            inner,
+            &mut row,
+            right,
+            "Pending: ",
+            &text,
+            Style::default().fg(styles::VALUE_INFO),
+        );
+    }
+
+    if metrics.pipeline_batches > 0 {
+        let avg_batch =
+            counter_as_f64(metrics.pipeline_commands) / counter_as_f64(metrics.pipeline_batches);
+        let mut text = ArrayString::<64>::new();
+        let _ = write!(
+            &mut text,
+            "{} batches (avg {:.1} cmds)",
+            metrics.pipeline_batches, avg_batch
+        );
+        render_label_value_row(
+            buffer,
+            inner,
+            &mut row,
+            right,
+            "Pipeline: ",
+            &text,
+            Style::default().fg(styles::VALUE_INFO),
+        );
+    }
+
+    if metrics.pipeline_requests_queued > 0 {
+        let mut text = ArrayString::<64>::new();
+        let _ = write!(
+            &mut text,
+            "{} queued, {} completed",
+            metrics.pipeline_requests_queued, metrics.pipeline_requests_completed
+        );
+        render_label_value_row(
+            buffer,
+            inner,
+            &mut row,
+            right,
+            "Mux Totals: ",
+            &text,
+            Style::default().fg(styles::VALUE_INFO),
+        );
+    }
+
+    if show_details && let Some(pool) = buffer_pool {
+        let usage_percent = if pool.total > 0 {
+            size_as_f64(pool.in_use * 100) / size_as_f64(pool.total)
+        } else {
+            0.0
+        };
+        let mut text = ArrayString::<48>::new();
+        let _ = write!(
+            &mut text,
+            "{}/{} ({usage_percent:.0}%)",
+            pool.in_use, pool.total
+        );
+        render_label_value_row(
+            buffer,
+            inner,
+            &mut row,
+            right,
+            "Buffers: ",
+            &text,
+            Style::default().fg(buffer_color(pool.in_use, pool.total)),
+        );
+    }
+}
+
+fn render_cache_summary_panel(f: &mut Frame, area: Rect, metrics: &DashboardMetrics) {
+    const fn entries_color(count: u64) -> Color {
+        if count > 0 {
+            styles::VALUE_INFO
+        } else {
+            styles::VALUE_NEUTRAL
+        }
+    }
+
+    const fn hit_rate_color(rate: f64) -> Color {
+        if rate > 50.0 {
+            styles::VALUE_PRIMARY
+        } else if rate > 0.0 {
+            styles::VALUE_INFO
+        } else {
+            styles::VALUE_NEUTRAL
+        }
+    }
+
+    const fn non_zero_color(value: u64) -> Color {
+        if value > 0 {
+            styles::VALUE_INFO
+        } else {
+            styles::VALUE_NEUTRAL
+        }
+    }
+
+    let block = bordered_block(cache_summary_title(metrics), styles::BORDER_NORMAL);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let right = inner.left().saturating_add(inner.width);
+    let buffer = f.buffer_mut();
+    let mut row = 0u16;
+    let hit_rate = percent_text_f64(metrics.cache_hit_rate);
+
+    if let Some(disk) = metrics.disk_cache.as_ref() {
+        render_label_value_row(
+            buffer,
+            inner,
+            &mut row,
+            right,
+            "Hit Rate: ",
+            &hit_rate,
+            Style::default().fg(hit_rate_color(metrics.cache_hit_rate)),
+        );
+        let written = format_bytes(disk.bytes_written);
+        render_label_value_row(
+            buffer,
+            inner,
+            &mut row,
+            right,
+            "Disk Written: ",
+            &written,
+            Style::default().fg(non_zero_color(disk.bytes_written)),
+        );
+        let read = format_bytes(disk.bytes_read);
+        render_label_value_row(
+            buffer,
+            inner,
+            &mut row,
+            right,
+            "Disk Read: ",
+            &read,
+            Style::default().fg(non_zero_color(disk.bytes_read)),
+        );
+        let mut hits = ArrayString::<48>::new();
+        let _ = write!(&mut hits, "{} ({:.1}%)", disk.disk_hits, disk.disk_hit_rate);
+        render_label_value_row(
+            buffer,
+            inner,
+            &mut row,
+            right,
+            "Disk Hits: ",
+            &hits,
+            Style::default().fg(non_zero_color(disk.disk_hits)),
+        );
+        let io_count = disk.write_ios.to_string();
+        render_label_value_row(
+            buffer,
+            inner,
+            &mut row,
+            right,
+            "Write I/Os: ",
+            &io_count,
+            Style::default().fg(styles::VALUE_NEUTRAL),
+        );
+    } else {
+        let entries = metrics.cache_entries.to_string();
+        render_label_value_row(
+            buffer,
+            inner,
+            &mut row,
+            right,
+            "Entries: ",
+            &entries,
+            Style::default().fg(entries_color(metrics.cache_entries)),
+        );
+        let size = format_bytes(metrics.cache_size_bytes);
+        render_label_value_row(
+            buffer,
+            inner,
+            &mut row,
+            right,
+            "Size: ",
+            &size,
+            Style::default().fg(styles::VALUE_NEUTRAL),
+        );
+        render_label_value_row(
+            buffer,
+            inner,
+            &mut row,
+            right,
+            "Hit Rate: ",
+            &hit_rate,
+            Style::default().fg(hit_rate_color(metrics.cache_hit_rate)),
+        );
+    }
+}
+
+fn render_transfer_summary_panel(f: &mut Frame, area: Rect, state: &DashboardState) {
+    let (client_to_backend, backend_to_client) =
+        format_summary_throughput(state.latest_client_throughput());
+    let total = format_bytes(state.metrics.total_bytes());
+
+    let block = bordered_block("Data Transfer", styles::BORDER_NORMAL);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let right = inner.left().saturating_add(inner.width);
+    let buffer = f.buffer_mut();
+    let mut row = 0u16;
+
+    render_label_value_row(
+        buffer,
+        inner,
+        &mut row,
+        right,
+        "Client → Backend: ",
+        &client_to_backend,
+        Style::default().fg(styles::VALUE_SECONDARY),
     );
+    render_label_value_row(
+        buffer,
+        inner,
+        &mut row,
+        right,
+        "Backend → Client: ",
+        &backend_to_client,
+        Style::default()
+            .fg(styles::VALUE_PRIMARY)
+            .add_modifier(Modifier::BOLD),
+    );
+    render_label_value_row(
+        buffer,
+        inner,
+        &mut row,
+        right,
+        "Total: ",
+        &total,
+        Style::default().fg(styles::VALUE_PRIMARY),
+    );
+}
+
+fn render_label_value_row(
+    buffer: &mut Buffer,
+    area: Rect,
+    row: &mut u16,
+    right: u16,
+    label: &str,
+    value: &str,
+    value_style: Style,
+) {
+    if *row >= area.height {
+        return;
+    }
+
+    let y = area.top().saturating_add(*row);
+    let mut x = area.left();
+    write_part(
+        buffer,
+        &mut x,
+        y,
+        right,
+        label,
+        Style::default().fg(styles::LABEL),
+    );
+    write_part(buffer, &mut x, y, right, value, value_style);
+    *row = row.saturating_add(1);
+}
+
+fn render_dual_value_row(
+    buffer: &mut Buffer,
+    area: Rect,
+    row: &mut u16,
+    right: u16,
+    label: &str,
+    value_a: (&str, Style),
+    value_b: (&str, Style),
+) {
+    if *row >= area.height {
+        return;
+    }
+
+    let y = area.top().saturating_add(*row);
+    let mut x = area.left();
+    write_part(
+        buffer,
+        &mut x,
+        y,
+        right,
+        label,
+        Style::default().fg(styles::LABEL),
+    );
+    write_part(buffer, &mut x, y, right, value_a.0, value_a.1);
+    write_part(
+        buffer,
+        &mut x,
+        y,
+        right,
+        " / ",
+        Style::default().fg(styles::LABEL),
+    );
+    write_part(buffer, &mut x, y, right, value_b.0, value_b.1);
+    *row = row.saturating_add(1);
+}
+
+fn percent_text(value: f32) -> ArrayString<16> {
+    let mut text = ArrayString::<16>::new();
+    let _ = write!(&mut text, "{value:.1}%");
+    text
+}
+
+fn percent_text_f64(value: f64) -> ArrayString<16> {
+    let mut text = ArrayString::<16>::new();
+    let _ = write!(&mut text, "{value:.1}%");
+    text
 }
 
 /// Render backend server visualization
@@ -372,26 +1059,11 @@ fn render_backends(f: &mut Frame, area: Rect, state: &DashboardState, show_detai
     render_user_stats(f, chunks[2], &state.top_users);
 }
 
-fn render_backends_cached(
-    f: &mut Frame,
-    area: Rect,
-    state: &DashboardState,
-    backend_lines: &[Line<'_>],
-) {
-    let chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(layout::backend_columns())
-        .split(area);
-
-    render_backend_lines(f, chunks[0], backend_lines);
-    render_data_flow(f, chunks[1], state);
-    render_user_stats(f, chunks[2], &state.top_users);
-}
-
 // ============================================================================
 // Summary Panel Builders (Pure Functions)
 // ============================================================================
 
+#[cfg(test)]
 fn build_app_summary_lines(
     metrics: &DashboardMetrics,
     system_stats: &crate::tui::SystemStats,
@@ -536,252 +1208,39 @@ fn cache_summary_title(metrics: &DashboardMetrics) -> &'static str {
     }
 }
 
-/// Build cache summary panel lines
-fn build_cache_summary_lines(metrics: &DashboardMetrics) -> Vec<Line<'static>> {
-    /// Color for cache entries (highlight if non-empty)
-    const fn entries_color(count: u64) -> Color {
-        if count > 0 {
-            styles::VALUE_INFO
-        } else {
-            styles::VALUE_NEUTRAL
-        }
-    }
-
-    /// Color for hit rate (green if >50%, blue if >0%, gray otherwise)
-    const fn hit_rate_color(rate: f64) -> Color {
-        if rate > 50.0 {
-            styles::VALUE_PRIMARY
-        } else if rate > 0.0 {
-            styles::VALUE_INFO
-        } else {
-            styles::VALUE_NEUTRAL
-        }
-    }
-
-    const fn non_zero_color(value: u64) -> Color {
-        if value > 0 {
-            styles::VALUE_INFO
-        } else {
-            styles::VALUE_NEUTRAL
-        }
-    }
-
-    // Check if this is hybrid cache mode
-    let is_hybrid = metrics.disk_cache.is_some();
-
-    // Build lines based on cache type
-    if is_hybrid {
-        // Hybrid cache: show disk-relevant stats
-        let disk = metrics.disk_cache.as_ref().unwrap();
-        vec![
-            Line::from(vec![
-                "Hit Rate: ".fg(styles::LABEL),
-                format!("{:.1}%", metrics.cache_hit_rate)
-                    .fg(hit_rate_color(metrics.cache_hit_rate)),
-            ]),
-            Line::from(vec![
-                "Disk Written: ".fg(styles::LABEL),
-                format_bytes(disk.bytes_written).fg(non_zero_color(disk.bytes_written)),
-            ]),
-            Line::from(vec![
-                "Disk Read: ".fg(styles::LABEL),
-                format_bytes(disk.bytes_read).fg(non_zero_color(disk.bytes_read)),
-            ]),
-            Line::from(vec![
-                "Disk Hits: ".fg(styles::LABEL),
-                format!("{} ({:.1}%)", disk.disk_hits, disk.disk_hit_rate)
-                    .fg(non_zero_color(disk.disk_hits)),
-            ]),
-            Line::from(vec![
-                "Write I/Os: ".fg(styles::LABEL),
-                format!("{}", disk.write_ios).fg(styles::VALUE_NEUTRAL),
-            ]),
-        ]
-    } else {
-        // Memory-only cache: show memory stats
-        vec![
-            Line::from(vec![
-                "Entries: ".fg(styles::LABEL),
-                format!("{}", metrics.cache_entries).fg(entries_color(metrics.cache_entries)),
-            ]),
-            Line::from(vec![
-                "Size: ".fg(styles::LABEL),
-                format_bytes(metrics.cache_size_bytes).fg(styles::VALUE_NEUTRAL),
-            ]),
-            Line::from(vec![
-                "Hit Rate: ".fg(styles::LABEL),
-                format!("{:.1}%", metrics.cache_hit_rate)
-                    .fg(hit_rate_color(metrics.cache_hit_rate)),
-            ]),
-        ]
-    }
-}
-
-/// Build data transfer summary panel lines
-fn build_transfer_summary_lines(
-    metrics: &DashboardMetrics,
-    client_to_backend: &str,
-    backend_to_client: &str,
-) -> Vec<Line<'static>> {
-    vec![
-        Line::from(vec![
-            "Client → Backend: ".fg(styles::LABEL),
-            client_to_backend.to_string().fg(styles::VALUE_SECONDARY),
-        ]),
-        Line::from(vec![
-            "Backend → Client: ".fg(styles::LABEL),
-            backend_to_client
-                .to_string()
-                .fg(styles::VALUE_PRIMARY)
-                .bold(),
-        ]),
-        Line::from(vec![
-            "Total: ".fg(styles::LABEL),
-            format_bytes(metrics.total_bytes()).fg(styles::VALUE_PRIMARY),
-        ]),
-    ]
-}
-
 // ============================================================================
 // Backend List Rendering Helpers
 // ============================================================================
 
-/// Create header line: health icon, server name, error rate
-fn backend_header_line(
-    health_icon: &'static str,
-    health_color: Color,
-    server_name: String,
-    error_text: String,
-    error_rate: f64,
-) -> Line<'static> {
-    Line::from(vec![
-        health_icon.fg(health_color).bold(),
-        " ".into(),
-        server_name.fg(Color::White).bold(),
-        error_text.fg(error_rate_color(error_rate)),
-    ])
-}
-
-/// Create address line: host:port with optional traffic share
-fn backend_address_line(host: &str, port: u16, traffic_share: Option<f64>) -> Line<'static> {
-    let mut spans: Vec<Span> = vec!["  ".into(), format!("{host}:{port}").fg(styles::LABEL)];
-
-    if let Some(share) = traffic_share {
-        spans.push(format!(" ({share:.1}% share)").fg(Color::Cyan));
-    }
-
-    Line::from(spans)
-}
-
-/// Create metrics line: connections, cmd/s, TTFB
-fn backend_metrics_line(
-    active: usize,
-    max: usize,
-    cmd_per_sec: String,
-    ttfb: String,
-) -> Line<'static> {
-    Line::from(vec![
-        "  Used/Max: ".fg(styles::LABEL),
-        format!("{active}/{max}").fg(styles::VALUE_SECONDARY),
-        " | Cmd/s: ".fg(styles::LABEL),
-        cmd_per_sec.fg(styles::VALUE_INFO),
-        " | TTFB: ".fg(styles::LABEL),
-        ttfb.fg(styles::VALUE_INFO),
-    ])
-}
-
-/// Create transfer line: bytes sent/received with arrows
-fn backend_transfer_line(sent: u64, received: u64) -> Line<'static> {
-    Line::from(vec![
-        format!("  {} ", text::ARROW_UP).fg(styles::VALUE_PRIMARY),
-        format_bytes(sent).fg(styles::VALUE_PRIMARY),
-        format!("  {} ", text::ARROW_DOWN).fg(styles::VALUE_NEUTRAL),
-        format_bytes(received).fg(styles::VALUE_NEUTRAL),
-    ])
-}
-
-/// Create article stats line: average size and count
-fn backend_article_line(avg_size: String, count: u64) -> Line<'static> {
-    Line::from(vec![
-        "  Avg Article: ".fg(styles::LABEL),
-        avg_size.fg(styles::VALUE_INFO),
-        " | Articles: ".fg(styles::LABEL),
-        format!("{count}").fg(styles::VALUE_NEUTRAL),
-    ])
-}
-
-/// Create error stats line: 4xx/5xx errors and connection failures
-fn backend_error_line(
-    errors_4xx: u64,
-    errors_5xx: u64,
-    has_errors: bool,
-    failures: u64,
-) -> Line<'static> {
-    Line::from(vec![
-        "  Errors: ".fg(styles::LABEL),
-        format!("4xx:{errors_4xx} 5xx:{errors_5xx}").fg(error_count_color(has_errors)),
-        " | Conn Fails: ".fg(styles::LABEL),
-        format!("{failures}").fg(connection_failure_color(failures)),
-    ])
-}
-
-/// Create details line: pending load, stateful connections, and pipelined depth.
-fn backend_details_line(
-    pending: usize,
-    _load_ratio: Option<f64>,
-    stateful: usize,
-    pipeline_depth: Option<usize>,
-) -> Line<'static> {
-    let non_pipelined_pending = pending.saturating_sub(pipeline_depth.unwrap_or_default());
-    let mut spans: Vec<Span> = Vec::with_capacity(5);
-
-    if stateful > 0 {
-        spans.push(format!("  Stateful: {stateful} | ").fg(Color::Cyan));
-    }
-
-    if let Some(depth) = pipeline_depth {
-        spans.push("  Pipelined: ".fg(styles::LABEL));
-        spans.push(format!("{depth}").fg(styles::VALUE_INFO));
-        spans.push(", Pending: ".fg(styles::LABEL));
-        spans.push(
-            format!("{non_pipelined_pending}").fg(pending_count_color(non_pipelined_pending)),
-        );
-    } else {
-        spans.push("  Pending: ".fg(styles::LABEL));
-        spans.push(format!("{pending}").fg(pending_count_color(pending)));
-    }
-
-    Line::from(spans)
-}
-
 /// Render list of backend servers with their stats
 fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_details: bool) {
-    let lines = backend_display_lines(state, show_details);
-    render_backend_lines(f, area, &lines);
-}
+    let block = bordered_block("Backend Servers", styles::BORDER_NORMAL);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-fn render_backend_lines(f: &mut Frame, area: Rect, lines: &[Line<'_>]) {
-    render_block_lines(
-        f,
-        area,
-        bordered_block("Backend Servers", styles::BORDER_NORMAL),
-        lines,
-        Alignment::Left,
-    );
-}
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
-fn backend_display_lines(state: &DashboardState, show_details: bool) -> Vec<Line<'static>> {
-    let lines_per_backend = if show_details { 7 } else { 6 };
-    let spacer_lines = state.backend_views.len().saturating_sub(1);
-    let mut lines =
-        Vec::with_capacity(state.backend_views.len() * lines_per_backend + spacer_lines);
+    let right = inner.left().saturating_add(inner.width);
+    let buffer = f.buffer_mut();
+    let mut row = 0u16;
 
     for (i, backend) in state.backend_views.iter().enumerate() {
+        if row >= inner.height {
+            break;
+        }
+
         let backend_stats = &backend.stats;
         let server = &backend.server;
+        let y = inner.top().saturating_add(row);
         let (health_icon, health_color) = health_indicator(backend.health_status);
         let error_rate = backend_stats.error_rate_percent();
-
+        let error_text = format_error_rate(error_rate);
+        let address = format!("{}:{}", server.host, server.port.get());
+        let share_text = state
+            .backend_traffic_share(i)
+            .map(|share| format!(" ({share:.1}% share)"));
         let cmd_per_sec = backend
             .latest_throughput()
             .and_then(super::app::ThroughputPoint::commands_per_sec)
@@ -789,62 +1248,392 @@ fn backend_display_lines(state: &DashboardState, show_details: bool) -> Vec<Line
                 || text::DEFAULT_CMD_RATE.to_string(),
                 |cps| format!("{:.0}", cps.get()),
             );
-
         let ttfb = backend_stats
             .average_ttfb_ms()
             .map_or_else(|| "N/A".to_string(), |ms| format!("{ms:.1}ms"));
+        let sent = format_bytes(backend_stats.bytes_sent.as_u64());
+        let received = format_bytes(backend_stats.bytes_received.as_u64());
+        let avg_size = backend_stats
+            .average_article_size()
+            .map_or_else(|| "N/A".to_string(), format_bytes);
+        let error_counts = format!(
+            "4xx:{} 5xx:{}",
+            backend_stats.errors_4xx.get(),
+            backend_stats.errors_5xx.get()
+        );
+        let failures = backend_stats.connection_failures.get().to_string();
+        let used_max = format!(
+            "{}/{}",
+            backend.active_connections,
+            server.max_connections.get()
+        );
+        let article_count = backend_stats.article_count.get().to_string();
 
+        let mut x = inner.left();
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            health_icon,
+            Style::default()
+                .fg(health_color)
+                .add_modifier(Modifier::BOLD),
+        );
+        write_part(buffer, &mut x, y, right, " ", Style::default());
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            server.name.as_str(),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        );
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            &error_text,
+            Style::default().fg(error_rate_color(error_rate)),
+        );
+        row = row.saturating_add(1);
+
+        if row >= inner.height {
+            break;
+        }
+        let y = inner.top().saturating_add(row);
+        let mut x = inner.left();
+        write_part(buffer, &mut x, y, right, "  ", Style::default());
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            &address,
+            Style::default().fg(styles::LABEL),
+        );
+        if let Some(ref share_text) = share_text {
+            write_part(
+                buffer,
+                &mut x,
+                y,
+                right,
+                share_text,
+                Style::default().fg(Color::Cyan),
+            );
+        }
+        row = row.saturating_add(1);
+
+        if row >= inner.height {
+            break;
+        }
+        let y = inner.top().saturating_add(row);
+        let mut x = inner.left();
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            "  Used/Max: ",
+            Style::default().fg(styles::LABEL),
+        );
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            &used_max,
+            Style::default().fg(styles::VALUE_SECONDARY),
+        );
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            " | Cmd/s: ",
+            Style::default().fg(styles::LABEL),
+        );
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            &cmd_per_sec,
+            Style::default().fg(styles::VALUE_INFO),
+        );
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            " | TTFB: ",
+            Style::default().fg(styles::LABEL),
+        );
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            &ttfb,
+            Style::default().fg(styles::VALUE_INFO),
+        );
+        row = row.saturating_add(1);
+
+        if row >= inner.height {
+            break;
+        }
+        let y = inner.top().saturating_add(row);
+        let mut x = inner.left();
+        write_part(buffer, &mut x, y, right, "  ", Style::default());
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            text::ARROW_UP,
+            Style::default().fg(styles::VALUE_PRIMARY),
+        );
+        write_part(buffer, &mut x, y, right, " ", Style::default());
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            &sent,
+            Style::default().fg(styles::VALUE_PRIMARY),
+        );
+        write_part(buffer, &mut x, y, right, "  ", Style::default());
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            text::ARROW_DOWN,
+            Style::default().fg(styles::VALUE_NEUTRAL),
+        );
+        write_part(buffer, &mut x, y, right, " ", Style::default());
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            &received,
+            Style::default().fg(styles::VALUE_NEUTRAL),
+        );
+        row = row.saturating_add(1);
+
+        if row >= inner.height {
+            break;
+        }
+        let y = inner.top().saturating_add(row);
+        let mut x = inner.left();
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            "  Avg Article: ",
+            Style::default().fg(styles::LABEL),
+        );
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            &avg_size,
+            Style::default().fg(styles::VALUE_INFO),
+        );
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            " | Articles: ",
+            Style::default().fg(styles::LABEL),
+        );
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            &article_count,
+            Style::default().fg(styles::VALUE_NEUTRAL),
+        );
+        row = row.saturating_add(1);
+
+        if row >= inner.height {
+            break;
+        }
+        let y = inner.top().saturating_add(row);
+        let mut x = inner.left();
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            "  Errors: ",
+            Style::default().fg(styles::LABEL),
+        );
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            &error_counts,
+            Style::default().fg(error_count_color(!backend_stats.errors.is_zero())),
+        );
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            " | Conn Fails: ",
+            Style::default().fg(styles::LABEL),
+        );
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            &failures,
+            Style::default().fg(connection_failure_color(
+                backend_stats.connection_failures.get(),
+            )),
+        );
+        row = row.saturating_add(1);
+
+        if show_details && row < inner.height {
+            let y = inner.top().saturating_add(row);
+            let mut x = inner.left();
+            let pending = state.backend_pending_count(i);
+            let stateful = state.backend_stateful_count(i);
+            let pipeline_depth = state.backend_pipeline_depth(i);
+            let detail_text = backend_details_text(pending, stateful, pipeline_depth);
+            write_part(
+                buffer,
+                &mut x,
+                y,
+                right,
+                &detail_text,
+                Style::default().fg(styles::LABEL),
+            );
+            row = row.saturating_add(1);
+        }
+
+        if i + 1 != state.backend_views.len() && row < inner.height {
+            row = row.saturating_add(1);
+        }
+    }
+}
+
+fn write_part(buffer: &mut Buffer, x: &mut u16, y: u16, right: u16, text: &str, style: Style) {
+    if *x >= right || text.is_empty() {
+        return;
+    }
+
+    let remaining = right.saturating_sub(*x) as usize;
+    let (next_x, _) = buffer.set_stringn(*x, y, text, remaining, style);
+    *x = next_x;
+}
+
+fn backend_details_text(pending: usize, stateful: usize, pipeline_depth: Option<usize>) -> String {
+    let non_pipelined_pending = pending.saturating_sub(pipeline_depth.unwrap_or_default());
+    let mut text = String::new();
+
+    if stateful > 0 {
+        text.push_str(&format!("  Stateful: {stateful} | "));
+    }
+
+    if let Some(depth) = pipeline_depth {
+        text.push_str(&format!(
+            "  Pipelined: {depth}, Pending: {non_pipelined_pending}"
+        ));
+    } else {
+        text.push_str(&format!("  Pending: {pending}"));
+    }
+
+    text
+}
+
+#[cfg(test)]
+fn backend_row_texts(state: &DashboardState, show_details: bool) -> Vec<String> {
+    let mut rows = Vec::new();
+
+    for (i, backend) in state.backend_views.iter().enumerate() {
+        let backend_stats = &backend.stats;
+        let server = &backend.server;
+        let error_rate = backend_stats.error_rate_percent();
+        let cmd_per_sec = backend
+            .latest_throughput()
+            .and_then(super::app::ThroughputPoint::commands_per_sec)
+            .map_or_else(
+                || text::DEFAULT_CMD_RATE.to_string(),
+                |cps| format!("{:.0}", cps.get()),
+            );
+        let ttfb = backend_stats
+            .average_ttfb_ms()
+            .map_or_else(|| "N/A".to_string(), |ms| format!("{ms:.1}ms"));
         let avg_size = backend_stats
             .average_article_size()
             .map_or_else(|| "N/A".to_string(), format_bytes);
 
-        lines.extend([
-            backend_header_line(
-                health_icon,
-                health_color,
-                server.name.as_str().to_string(),
-                format_error_rate(error_rate),
-                error_rate,
+        rows.push(format!(
+            "{} {}{}",
+            health_indicator(backend.health_status).0,
+            server.name,
+            format_error_rate(error_rate)
+        ));
+        rows.push(match state.backend_traffic_share(i) {
+            Some(share) => format!(
+                "  {}:{} ({share:.1}% share)",
+                server.host,
+                server.port.get()
             ),
-            backend_address_line(
-                &server.host,
-                server.port.get(),
-                state.backend_traffic_share(i),
-            ),
-            backend_metrics_line(
-                backend.active_connections,
-                server.max_connections.get(),
-                cmd_per_sec,
-                ttfb,
-            ),
-            backend_transfer_line(
-                backend_stats.bytes_sent.as_u64(),
-                backend_stats.bytes_received.as_u64(),
-            ),
-            backend_article_line(avg_size, backend_stats.article_count.get()),
-            backend_error_line(
-                backend_stats.errors_4xx.get(),
-                backend_stats.errors_5xx.get(),
-                !backend_stats.errors.is_zero(),
-                backend_stats.connection_failures.get(),
-            ),
-        ]);
+            None => format!("  {}:{}", server.host, server.port.get()),
+        });
+        rows.push(format!(
+            "  Used/Max: {}/{} | Cmd/s: {} | TTFB: {}",
+            backend.active_connections,
+            server.max_connections.get(),
+            cmd_per_sec,
+            ttfb
+        ));
+        rows.push(format!(
+            "  {} {}  {} {}",
+            text::ARROW_UP,
+            format_bytes(backend_stats.bytes_sent.as_u64()),
+            text::ARROW_DOWN,
+            format_bytes(backend_stats.bytes_received.as_u64())
+        ));
+        rows.push(format!(
+            "  Avg Article: {} | Articles: {}",
+            avg_size,
+            backend_stats.article_count.get()
+        ));
+        rows.push(format!(
+            "  Errors: 4xx:{} 5xx:{} | Conn Fails: {}",
+            backend_stats.errors_4xx.get(),
+            backend_stats.errors_5xx.get(),
+            backend_stats.connection_failures.get()
+        ));
 
         if show_details {
-            lines.push(backend_details_line(
+            rows.push(backend_details_text(
                 state.backend_pending_count(i),
-                state.backend_load_ratio(i),
                 state.backend_stateful_count(i),
                 state.backend_pipeline_depth(i),
             ));
         }
 
         if i + 1 != state.backend_views.len() {
-            lines.push(Line::default());
+            rows.push(String::new());
         }
     }
 
-    lines
+    rows
 }
 
 /// Render data flow visualization as line graphs
@@ -1228,8 +2017,7 @@ mod tests {
                 .to_string()
                 .contains("Attached Dashboard (live)")
         );
-        assert!(cache.compact_backend_lines.is_empty());
-        assert!(cache.detailed_backend_lines.is_empty());
+        assert_eq!(cache.title_lines.len(), 2);
     }
 
     #[test]
@@ -1401,8 +2189,8 @@ mod tests {
 
     #[test]
     fn backend_details_line_includes_pipeline_only_when_available() {
-        let with_pipeline = backend_details_line(4, Some(0.25), 1, Some(3)).to_string();
-        let without_pipeline = backend_details_line(4, Some(0.25), 1, None).to_string();
+        let with_pipeline = backend_details_text(4, 1, Some(3));
+        let without_pipeline = backend_details_text(4, 1, None);
 
         assert!(with_pipeline.contains("Stateful: 1"));
         assert!(with_pipeline.contains("  Pipelined: 3, Pending: 1"));
@@ -1425,10 +2213,7 @@ mod tests {
             buffer_pool: None,
         };
 
-        let lines = backend_display_lines(&state, false)
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
+        let lines = backend_row_texts(&state, false);
 
         assert!(lines.iter().any(|line| line.contains("one")));
         assert!(lines.iter().any(|line| line.contains("two")));
