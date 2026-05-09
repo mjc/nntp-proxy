@@ -125,6 +125,12 @@ impl TailBuffer {
 ///
 /// Returns the earliest complete terminator when multiple responses are packed
 /// into the same read buffer.
+///
+/// We intentionally do not restore the old suffix-only/boundary-only fast path
+/// here. That split behavior was easy to misuse, and using it in buffered or
+/// pipelined paths caused one response to absorb bytes from the next response
+/// in the same read. The small extra scan cost is acceptable compared to the
+/// correctness requirement that every caller gets the first real terminator.
 #[inline]
 fn find_terminator_end(data: &[u8]) -> Option<usize> {
     const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
