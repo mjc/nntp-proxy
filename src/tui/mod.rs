@@ -65,22 +65,32 @@ pub(crate) enum RemoteDashboardStatus {
 #[derive(Debug, Clone)]
 pub(crate) struct AttachedDashboard {
     pub latest_state: Option<Arc<DashboardState>>,
+    render_cache: Option<Arc<ui::AttachedRenderCache>>,
+    placeholder_lines: Vec<Line<'static>>,
     pub status: RemoteDashboardStatus,
 }
 
 impl AttachedDashboard {
-    fn connecting(target: SocketAddr) -> Self {
+    fn new(status: RemoteDashboardStatus, latest_state: Option<Arc<DashboardState>>) -> Self {
+        let render_cache = latest_state
+            .as_deref()
+            .map(|state| Arc::new(ui::build_attached_render_cache(state, &status)));
+        let placeholder_lines = build_attached_placeholder_lines(&status);
+
         Self {
-            latest_state: None,
-            status: RemoteDashboardStatus::Connecting { target },
+            latest_state,
+            render_cache,
+            placeholder_lines,
+            status,
         }
     }
 
+    fn connecting(target: SocketAddr) -> Self {
+        Self::new(RemoteDashboardStatus::Connecting { target }, None)
+    }
+
     fn connected(target: SocketAddr, latest_state: Option<Arc<DashboardState>>) -> Self {
-        Self {
-            latest_state,
-            status: RemoteDashboardStatus::Connected { target },
-        }
+        Self::new(RemoteDashboardStatus::Connected { target }, latest_state)
     }
 
     fn reconnecting(
@@ -89,14 +99,14 @@ impl AttachedDashboard {
         latest_state: Option<Arc<DashboardState>>,
         last_error: impl Into<String>,
     ) -> Self {
-        Self {
-            latest_state,
-            status: RemoteDashboardStatus::Reconnecting {
+        Self::new(
+            RemoteDashboardStatus::Reconnecting {
                 target,
                 retry_delay,
                 last_error: last_error.into(),
             },
-        }
+            latest_state,
+        )
     }
 }
 
@@ -344,13 +354,12 @@ fn draw_attached_dashboard(
     view_overrides: &AttachedViewOverrides,
 ) {
     if let Some(rendered) = renderable_attached_state(attached, view_overrides) {
-        ui::render_ui(
+        ui::render_attached_ui(
             f,
             rendered.state,
-            None,
-            Some(&attached.status),
-            Some(rendered.view_mode),
-            Some(rendered.show_details),
+            rendered.render_cache,
+            rendered.view_mode,
+            rendered.show_details,
         );
         return;
     }
@@ -372,8 +381,6 @@ fn draw_attached_dashboard(
         "- Attached Dashboard".fg(Color::White),
     ]);
 
-    let body = build_attached_placeholder_lines(&attached.status);
-
     let footer = Line::from(vec![
         "Press ".fg(crate::tui::constants::styles::LABEL),
         "q".fg(crate::tui::constants::styles::VALUE_INFO).bold(),
@@ -383,7 +390,7 @@ fn draw_attached_dashboard(
     ]);
 
     render_centered_line(f, chunks[0], &title);
-    render_centered_lines(f, chunks[1], &body);
+    render_centered_lines(f, chunks[1], &attached.placeholder_lines);
     render_centered_line(f, chunks[2], &footer);
 }
 
@@ -419,6 +426,7 @@ fn render_line_centered_at(f: &mut ratatui::Frame, area: Rect, y: u16, line: &Li
 #[derive(Debug, Clone, Copy)]
 struct RenderableAttachedState<'a> {
     state: &'a DashboardState,
+    render_cache: &'a ui::AttachedRenderCache,
     view_mode: ViewMode,
     show_details: bool,
 }
@@ -428,8 +436,10 @@ fn renderable_attached_state<'a>(
     view_overrides: &AttachedViewOverrides,
 ) -> Option<RenderableAttachedState<'a>> {
     let state = attached.latest_state.as_deref()?;
+    let render_cache = attached.render_cache.as_deref()?;
     Some(RenderableAttachedState {
         state,
+        render_cache,
         view_mode: view_overrides.view_mode.unwrap_or(state.view_mode),
         show_details: view_overrides.show_details.unwrap_or(state.show_details),
     })
@@ -669,6 +679,7 @@ mod tests {
         let attached =
             AttachedDashboard::connected("127.0.0.1:8120".parse().unwrap(), Some(Arc::new(state)));
         let rendered = renderable_attached_state(&attached, &overrides).expect("dashboard state");
+        assert!(attached.render_cache.is_some());
         assert!(rendered.show_details);
         assert_eq!(rendered.view_mode, ViewMode::LogFullscreen);
         assert_eq!(rendered.state.log_lines, vec!["line".to_string()]);
@@ -781,6 +792,7 @@ mod tests {
         overrides.toggle_log_fullscreen(attached.latest_state.as_deref());
 
         let rendered = renderable_attached_state(&attached, &overrides).expect("dashboard state");
+        assert!(attached.render_cache.is_some());
         assert!(rendered.show_details);
         assert_eq!(rendered.view_mode, ViewMode::LogFullscreen);
         assert_eq!(rendered.state.log_lines, vec!["line".to_string()]);
@@ -813,6 +825,7 @@ mod tests {
         );
 
         let rendered = renderable_attached_state(&attached, &overrides).expect("dashboard state");
+        assert!(attached.render_cache.is_some());
         assert!(rendered.show_details);
         assert_eq!(rendered.view_mode, ViewMode::LogFullscreen);
         assert_eq!(rendered.state.log_lines, vec!["second".to_string()]);

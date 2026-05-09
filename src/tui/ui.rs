@@ -51,6 +51,34 @@ fn untitled_bordered_block(border_color: Color) -> Block<'static> {
     Block::bordered().border_style(Style::new().fg(border_color))
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct AttachedRenderCache {
+    title_lines: Vec<Line<'static>>,
+    compact_backend_lines: Vec<Line<'static>>,
+    detailed_backend_lines: Vec<Line<'static>>,
+}
+
+impl AttachedRenderCache {
+    fn backend_lines(&self, show_details: bool) -> &[Line<'static>] {
+        if show_details {
+            &self.detailed_backend_lines
+        } else {
+            &self.compact_backend_lines
+        }
+    }
+}
+
+pub(crate) fn build_attached_render_cache(
+    state: &DashboardState,
+    remote_status: &RemoteDashboardStatus,
+) -> AttachedRenderCache {
+    AttachedRenderCache {
+        title_lines: build_title_lines(&state.metrics, Some(remote_status)),
+        compact_backend_lines: backend_display_lines(state, false),
+        detailed_backend_lines: backend_display_lines(state, true),
+    }
+}
+
 // ============================================================================
 // Render Functions
 // ============================================================================
@@ -83,6 +111,40 @@ pub(crate) fn render_ui(
 
     // Backends area now contains 3 columns: backends, chart, and user stats
     render_backends(f, chunks[2], state, show_details);
+
+    if show_logs {
+        render_logs(f, chunks[3], &state.log_lines, show_details);
+        render_footer(f, chunks[4]);
+    } else {
+        render_footer(f, chunks[3]);
+    }
+}
+
+pub(crate) fn render_attached_ui(
+    f: &mut Frame,
+    state: &DashboardState,
+    render_cache: &AttachedRenderCache,
+    view_mode: crate::tui::app::ViewMode,
+    show_details: bool,
+) {
+    if let Some(chunks) = dashboard_fullscreen_chunks(view_mode, f.area()) {
+        render_title_lines(f, chunks[0], &render_cache.title_lines);
+        render_logs(f, chunks[1], &state.log_lines, show_details);
+        render_footer(f, chunks[2]);
+        return;
+    }
+
+    let show_logs = should_show_dashboard_logs(f.area().height);
+    let chunks = dashboard_main_chunks(f.area(), show_logs);
+
+    render_title_lines(f, chunks[0], &render_cache.title_lines);
+    render_summary(f, chunks[1], state, None, show_details);
+    render_backends_cached(
+        f,
+        chunks[2],
+        state,
+        render_cache.backend_lines(show_details),
+    );
 
     if show_logs {
         render_logs(f, chunks[3], &state.log_lines, show_details);
@@ -148,11 +210,15 @@ fn render_title(
     remote_status: Option<&RemoteDashboardStatus>,
 ) {
     let lines = build_title_lines(metrics, remote_status);
+    render_title_lines(f, area, &lines);
+}
+
+fn render_title_lines(f: &mut Frame, area: Rect, lines: &[Line<'_>]) {
     render_block_lines(
         f,
         area,
         untitled_bordered_block(styles::BORDER_ACTIVE),
-        &lines,
+        lines,
         Alignment::Center,
     );
 }
@@ -302,6 +368,22 @@ fn render_backends(f: &mut Frame, area: Rect, state: &DashboardState, show_detai
         .split(area);
 
     render_backend_list(f, chunks[0], state, show_details);
+    render_data_flow(f, chunks[1], state);
+    render_user_stats(f, chunks[2], &state.top_users);
+}
+
+fn render_backends_cached(
+    f: &mut Frame,
+    area: Rect,
+    state: &DashboardState,
+    backend_lines: &[Line<'_>],
+) {
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(layout::backend_columns())
+        .split(area);
+
+    render_backend_lines(f, chunks[0], backend_lines);
     render_data_flow(f, chunks[1], state);
     render_user_stats(f, chunks[2], &state.top_users);
 }
@@ -675,11 +757,15 @@ fn backend_details_line(
 /// Render list of backend servers with their stats
 fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_details: bool) {
     let lines = backend_display_lines(state, show_details);
+    render_backend_lines(f, area, &lines);
+}
+
+fn render_backend_lines(f: &mut Frame, area: Rect, lines: &[Line<'_>]) {
     render_block_lines(
         f,
         area,
         bordered_block("Backend Servers", styles::BORDER_NORMAL),
-        &lines,
+        lines,
         Alignment::Left,
     );
 }
@@ -1106,6 +1192,44 @@ mod tests {
             footer_help_line().to_string(),
             "Press q or Esc to exit  |  L to toggle logs  |  d for details  |  Ctrl+C to shutdown"
         );
+    }
+
+    #[test]
+    fn attached_render_cache_prebuilds_remote_title_and_backend_strings() {
+        let state = DashboardState {
+            metrics: DashboardMetrics {
+                active_connections: 3,
+                total_connections: 5,
+                ..DashboardMetrics::default()
+            },
+            backend_views: Vec::new(),
+            top_users: Vec::new(),
+            client_history: Vec::new(),
+            system_stats: crate::tui::SystemStats::default(),
+            view_mode: ViewMode::Normal,
+            show_details: false,
+            log_lines: vec!["line".to_string()],
+            buffer_pool: Some(BufferPoolStats {
+                available: 3,
+                in_use: 1,
+                total: 4,
+            }),
+        };
+
+        let cache = build_attached_render_cache(
+            &state,
+            &RemoteDashboardStatus::Connected {
+                target: "127.0.0.1:8120".parse().unwrap(),
+            },
+        );
+
+        assert!(
+            cache.title_lines[0]
+                .to_string()
+                .contains("Attached Dashboard (live)")
+        );
+        assert!(cache.compact_backend_lines.is_empty());
+        assert!(cache.detailed_backend_lines.is_empty());
     }
 
     #[test]
