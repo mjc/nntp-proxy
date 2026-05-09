@@ -76,7 +76,9 @@ impl std::fmt::Display for PipelineError {
 #[derive(Clone, Debug)]
 pub enum PipelineDelivery {
     Buffered,
+    #[allow(dead_code)]
     StreamToClient(SharedClientWriter),
+    #[allow(dead_code)]
     StreamAndCapture(SharedClientWriter),
 }
 

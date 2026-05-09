@@ -243,13 +243,6 @@ pub struct Memory {
     /// Number of buffers in the capture pool
     #[serde(default = "super::defaults::capture_pool_count")]
     pub capture_pool_count: usize,
-    /// Whether ARTICLE/BODY responses are buffered before writing to the client.
-    ///
-    /// When false, large responses stream directly to the client while the backend
-    /// is still producing them. When true, the proxy assembles the full response
-    /// first and only then writes it to the client.
-    #[serde(default = "super::defaults::article_buffer")]
-    pub article_buffer: bool,
 }
 
 impl Default for Memory {
@@ -261,7 +254,6 @@ impl Default for Memory {
             buffer_pool_count: defaults::buffer_pool_count(),
             capture_pool_size: defaults::capture_pool_size(),
             capture_pool_count: defaults::capture_pool_count(),
-            article_buffer: defaults::article_buffer(),
         }
     }
 }
@@ -988,7 +980,6 @@ mod tests {
             memory.capture_pool_count,
             crate::constants::buffer::CAPTURE_COUNT
         );
-        assert!(memory.article_buffer);
     }
 
     // HealthCheck tests

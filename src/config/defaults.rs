@@ -67,16 +67,6 @@ pub const fn cache_articles() -> bool {
     false
 }
 
-/// Default for buffering ARTICLE/BODY responses before writing to the client.
-///
-/// This is configured independently from caching so operators can choose
-/// whether large responses are streamed or assembled first.
-#[inline]
-#[must_use]
-pub const fn article_buffer() -> bool {
-    true
-}
-
 /// Default for adaptive availability prechecking (false = disabled)
 #[inline]
 pub const fn adaptive_precheck() -> bool {

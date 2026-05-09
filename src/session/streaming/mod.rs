@@ -259,6 +259,7 @@ where
 }
 
 /// Stream a multiline response while also capturing the exact bytes that were sent.
+#[allow(dead_code)]
 pub(crate) async fn stream_multiline_response_with_capture<R, W>(
     backend_read: &mut R,
     client_write: &mut W,

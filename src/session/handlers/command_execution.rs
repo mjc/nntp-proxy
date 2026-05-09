@@ -434,58 +434,24 @@ impl ClientSession {
         );
 
         debug!(
-            "stream_response_to_client: code={}, is_multiline_body={}, cache_articles={}, article_buffer={}, has_msg_id={}, action={:?}",
+            "stream_response_to_client: code={}, is_multiline_body={}, cache_articles={}, has_msg_id={}, action={:?}",
             code,
             is_multiline_body,
             self.cache_articles,
-            self.article_buffer,
             params.msg_id.is_some(),
             cache_action
         );
 
         if is_multiline_body {
-            let should_buffer = params.request.is_large_transfer() && self.article_buffer;
-            if should_buffer {
-                return self
-                    .deliver_buffered_multiline_response(
-                        pooled_conn,
-                        client_write,
-                        ctx,
-                        params,
-                        cache_action,
-                    )
-                    .await;
-            }
-
-            return match cache_action {
-                CacheAction::CaptureArticle => {
-                    self.stream_and_capture_multiline_response(
-                        pooled_conn,
-                        client_write,
-                        ctx,
-                        params,
-                    )
-                    .await
-                }
-                CacheAction::TrackAvailability => {
-                    self.stream_multiline_with_availability_tracking(
-                        pooled_conn,
-                        client_write,
-                        ctx,
-                        params,
-                    )
-                    .await
-                }
-                _ => {
-                    streaming::stream_multiline_response(
-                        &mut **pooled_conn,
-                        client_write,
-                        params.first_chunk,
-                        ctx,
-                    )
-                    .await
-                }
-            };
+            return self
+                .deliver_buffered_multiline_response(
+                    pooled_conn,
+                    client_write,
+                    ctx,
+                    params,
+                    cache_action,
+                )
+                .await;
         }
 
         match cache_action {
@@ -555,6 +521,7 @@ impl ClientSession {
         Ok(captured_len as u64)
     }
 
+    #[allow(dead_code)]
     async fn stream_and_capture_multiline_response<W>(
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
@@ -578,6 +545,7 @@ impl ClientSession {
         Ok(bytes)
     }
 
+    #[allow(dead_code)]
     async fn stream_multiline_with_availability_tracking<W>(
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,

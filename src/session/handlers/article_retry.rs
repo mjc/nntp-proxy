@@ -225,20 +225,14 @@ impl ClientSession {
     fn pipeline_delivery(
         &self,
         request: &RequestContext,
-        client_writer: &crate::session::SharedClientWriter,
+        _client_writer: &crate::session::SharedClientWriter,
         _preserve_response_order: bool,
     ) -> PipelineDelivery {
         if !request.is_large_transfer() {
             return PipelineDelivery::Buffered;
         }
 
-        if self.article_buffer {
-            PipelineDelivery::Buffered
-        } else if self.cache_articles {
-            PipelineDelivery::StreamAndCapture(client_writer.clone())
-        } else {
-            PipelineDelivery::StreamToClient(client_writer.clone())
-        }
+        PipelineDelivery::Buffered
     }
 
     pub(super) fn try_enqueue_pipeline_request(
@@ -599,7 +593,7 @@ mod tests {
     use crate::types::{BackendToClientBytes, BufferSize, ClientAddress, ClientToBackendBytes};
     use tokio::sync::oneshot;
 
-    fn test_session(article_buffer: bool, cache_articles: bool) -> ClientSession {
+    fn test_session(cache_articles: bool) -> ClientSession {
         let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
         ClientSession::builder(
             ClientAddress::from(addr),
@@ -608,7 +602,6 @@ mod tests {
             MetricsCollector::new(1),
         )
         .with_routing_mode(RoutingMode::PerCommand)
-        .with_article_buffer(article_buffer)
         .with_cache_articles(cache_articles)
         .build()
     }
@@ -641,38 +634,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pipeline_delivery_keeps_first_large_transfer_streaming() {
-        let session = test_session(false, false);
+    async fn pipeline_delivery_buffers_large_transfer_even_when_article_buffer_disabled() {
+        let session = test_session(false);
         let writer = shared_writer().await;
         let request = RequestContext::parse(b"BODY <one@example>\r\n").unwrap();
 
         let delivery = session.pipeline_delivery(&request, &writer, false);
 
-        assert!(matches!(delivery, PipelineDelivery::StreamToClient(_)));
+        assert!(matches!(delivery, PipelineDelivery::Buffered));
     }
 
     #[tokio::test]
-    async fn pipeline_delivery_preserve_response_order_keeps_later_large_transfer_streaming() {
-        let session = test_session(false, false);
+    async fn pipeline_delivery_buffers_later_large_transfer_when_response_order_matters() {
+        let session = test_session(false);
         let writer = shared_writer().await;
         let request = RequestContext::parse(b"BODY <two@example>\r\n").unwrap();
 
         let first_delivery = session.pipeline_delivery(&request, &writer, false);
         let later_delivery = session.pipeline_delivery(&request, &writer, true);
 
-        assert!(
-            matches!(first_delivery, PipelineDelivery::StreamToClient(_)),
-            "baseline large transfers should stream directly to the client"
-        );
-        assert!(
-            matches!(later_delivery, PipelineDelivery::StreamToClient(_)),
-            "later large transfers in the same batch must keep streaming; forcing Buffered here stalls client-visible progress and recreates the timeout regression"
-        );
+        assert!(matches!(first_delivery, PipelineDelivery::Buffered));
+        assert!(matches!(later_delivery, PipelineDelivery::Buffered));
+    }
+
+    #[tokio::test]
+    async fn pipeline_delivery_buffers_large_transfer_even_when_cache_capture_enabled() {
+        let session = test_session(true);
+        let writer = shared_writer().await;
+        let request = RequestContext::parse(b"BODY <cache@example>\r\n").unwrap();
+
+        let delivery = session.pipeline_delivery(&request, &writer, false);
+
+        assert!(matches!(delivery, PipelineDelivery::Buffered));
     }
 
     #[tokio::test]
     async fn pipeline_delivery_keeps_article_number_requests_buffered() {
-        let session = test_session(false, true);
+        let session = test_session(true);
         let writer = shared_writer().await;
         let request = RequestContext::parse(b"BODY 12345\r\n").unwrap();
 
@@ -686,7 +684,7 @@ mod tests {
 
     #[tokio::test]
     async fn await_pipeline_request_treats_streamed_read_failure_as_terminal() {
-        let session = test_session(false, false);
+        let session = test_session(false);
         let writer = shared_writer().await;
         let router = Arc::new(BackendSelector::new());
         let pending = pending_request(router, true, PipelineError::ReadFailed);
@@ -708,7 +706,7 @@ mod tests {
 
     #[tokio::test]
     async fn await_pipeline_request_allows_buffered_read_failure_to_retry() {
-        let session = test_session(false, false);
+        let session = test_session(false);
         let writer = shared_writer().await;
         let router = Arc::new(BackendSelector::new());
         let pending = pending_request(router, false, PipelineError::ReadFailed);
