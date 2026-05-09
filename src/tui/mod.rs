@@ -253,11 +253,10 @@ where
 {
     // Create update interval (4 times per second for responsive UI)
     let mut update_interval = tokio::time::interval(Duration::from_millis(250));
+    let mut input_rx = spawn_tui_input_reader(true);
 
     // Initial render
     terminal.draw(|f| ui::render_ui(f, &renderable_dashboard_state(app), None, None))?;
-
-    let mut should_quit = false;
 
     loop {
         tokio::select! {
@@ -265,18 +264,15 @@ where
             _ = shutdown_rx.recv() => {
                 break;
             }
+            Some(action) = input_rx.recv() => {
+                if handle_local_tui_action(action, app) {
+                    break;
+                }
+                terminal.draw(|f| ui::render_ui(f, &renderable_dashboard_state(app), None, None))?;
+            }
             // Update timer - check for events only on ticks to reduce overhead
             _ = update_interval.tick() => {
                 app.update();
-
-                if apply_tui_input(true, Some(app)).await? {
-                    should_quit = true;
-                }
-
-                if should_quit {
-                    break;
-                }
-
                 terminal.draw(|f| ui::render_ui(f, &renderable_dashboard_state(app), None, None))?;
             }
         }
@@ -298,7 +294,7 @@ where
     B::Error: Send + Sync + 'static,
 {
     let mut update_interval = tokio::time::interval(Duration::from_millis(250));
-    let mut should_quit = false;
+    let mut input_rx = spawn_tui_input_reader(true);
     let mut view_overrides = AttachedViewOverrides::default();
 
     let state = state_rx.borrow().clone();
@@ -307,20 +303,22 @@ where
 
     loop {
         tokio::select! {
-            _ = update_interval.tick() => {
-                match poll_tui_input(true).await? {
-                    TuiInputAction::Quit => should_quit = true,
-                    TuiInputAction::ToggleLogFullscreen => view_overrides
-                        .toggle_log_fullscreen(state_rx.borrow().latest_state.as_ref()),
-                    TuiInputAction::ToggleDetails => view_overrides
-                        .toggle_details(state_rx.borrow().latest_state.as_ref()),
-                    TuiInputAction::None => {}
-                }
-
-                if should_quit {
+            Some(action) = input_rx.recv() => {
+                if handle_attached_tui_action(
+                    action,
+                    &mut view_overrides,
+                    state_rx.borrow().latest_state.as_ref(),
+                ) {
                     break;
                 }
 
+                let state = state_rx.borrow().clone();
+                let local_system_stats = local_system_monitor.update();
+                terminal.draw(|f| {
+                    draw_attached_dashboard(f, &state, &view_overrides, &local_system_stats)
+                })?;
+            }
+            _ = update_interval.tick() => {
                 let state = state_rx.borrow().clone();
                 let local_system_stats = local_system_monitor.update();
                 terminal.draw(|f| {
@@ -428,7 +426,7 @@ fn key_event_action(
     key: crossterm::event::KeyEvent,
     allow_dashboard_actions: bool,
 ) -> TuiInputAction {
-    if key.kind != KeyEventKind::Press {
+    if key.kind == KeyEventKind::Release {
         return TuiInputAction::None;
     }
 
@@ -443,37 +441,68 @@ fn key_event_action(
     }
 }
 
-async fn poll_tui_input(allow_dashboard_actions: bool) -> Result<TuiInputAction> {
-    let has_events =
-        tokio::task::spawn_blocking(|| event::poll(Duration::from_millis(0))).await??;
-
-    if !has_events {
-        return Ok(TuiInputAction::None);
-    }
-
-    let key_event = tokio::task::spawn_blocking(event::read).await??;
-    Ok(match key_event {
-        Event::Key(key) => key_event_action(key, allow_dashboard_actions),
-        _ => TuiInputAction::None,
-    })
+fn spawn_tui_input_reader(
+    allow_dashboard_actions: bool,
+) -> mpsc::UnboundedReceiver<TuiInputAction> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::task::spawn_blocking(move || {
+        loop {
+            match event::poll(Duration::from_millis(50)) {
+                Ok(true) => {
+                    let Ok(event) = event::read() else {
+                        break;
+                    };
+                    let Event::Key(key) = event else {
+                        continue;
+                    };
+                    let action = key_event_action(key, allow_dashboard_actions);
+                    if action != TuiInputAction::None && tx.send(action).is_err() {
+                        break;
+                    }
+                }
+                Ok(false) => {
+                    if tx.is_closed() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    rx
 }
 
-async fn apply_tui_input(allow_dashboard_actions: bool, app: Option<&mut TuiApp>) -> Result<bool> {
-    match poll_tui_input(allow_dashboard_actions).await? {
-        TuiInputAction::Quit => Ok(true),
+fn handle_local_tui_action(action: TuiInputAction, app: &mut TuiApp) -> bool {
+    match action {
+        TuiInputAction::Quit => true,
         TuiInputAction::ToggleLogFullscreen => {
-            if let Some(app) = app {
-                app.toggle_log_fullscreen();
-            }
-            Ok(false)
+            app.toggle_log_fullscreen();
+            false
         }
         TuiInputAction::ToggleDetails => {
-            if let Some(app) = app {
-                app.toggle_details();
-            }
-            Ok(false)
+            app.toggle_details();
+            false
         }
-        TuiInputAction::None => Ok(false),
+        TuiInputAction::None => false,
+    }
+}
+
+fn handle_attached_tui_action(
+    action: TuiInputAction,
+    view_overrides: &mut AttachedViewOverrides,
+    current_state: Option<&DashboardState>,
+) -> bool {
+    match action {
+        TuiInputAction::Quit => true,
+        TuiInputAction::ToggleLogFullscreen => {
+            view_overrides.toggle_log_fullscreen(current_state);
+            false
+        }
+        TuiInputAction::ToggleDetails => {
+            view_overrides.toggle_details(current_state);
+            false
+        }
+        TuiInputAction::None => false,
     }
 }
 
@@ -529,6 +558,56 @@ mod tests {
 
         assert_eq!(key_event_action(released, true), TuiInputAction::None);
         assert_eq!(key_event_action(other, true), TuiInputAction::None);
+    }
+
+    #[test]
+    fn key_event_action_accepts_repeat_events_for_attached_tui() {
+        let repeated = crossterm::event::KeyEvent {
+            code: KeyCode::Char('d'),
+            modifiers: event::KeyModifiers::NONE,
+            kind: KeyEventKind::Repeat,
+            state: event::KeyEventState::NONE,
+        };
+
+        assert_eq!(
+            key_event_action(repeated, true),
+            TuiInputAction::ToggleDetails
+        );
+    }
+
+    #[test]
+    fn handle_attached_tui_action_applies_overrides() {
+        let state = DashboardState {
+            metrics: crate::tui::dashboard::DashboardMetrics::default(),
+            backend_views: Vec::new(),
+            top_users: Vec::new(),
+            client_history: Vec::new(),
+            system_stats: SystemStats::default(),
+            view_mode: ViewMode::Normal,
+            show_details: false,
+            log_lines: vec!["line".to_string()],
+            buffer_pool: None,
+        };
+        let mut overrides = AttachedViewOverrides::default();
+
+        assert!(!handle_attached_tui_action(
+            TuiInputAction::ToggleDetails,
+            &mut overrides,
+            Some(&state),
+        ));
+        assert!(!handle_attached_tui_action(
+            TuiInputAction::ToggleLogFullscreen,
+            &mut overrides,
+            Some(&state),
+        ));
+
+        let rendered = renderable_attached_state(
+            &AttachedDashboard::connected("127.0.0.1:8120".parse().unwrap(), Some(state)),
+            &overrides,
+        )
+        .expect("dashboard state");
+        assert!(rendered.show_details);
+        assert_eq!(rendered.view_mode, ViewMode::LogFullscreen);
     }
 
     #[test]

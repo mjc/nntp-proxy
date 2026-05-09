@@ -13,7 +13,8 @@ use tokio::sync::watch;
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use tracing::{info, warn};
 
-const DASHBOARD_LOG_LINE_LIMIT: usize = 256;
+const REMOTE_DASHBOARD_LOG_LINE_LIMIT: usize = 64;
+const REMOTE_DASHBOARD_HISTORY_LIMIT: usize = 15;
 
 #[allow(clippy::cast_precision_loss)]
 fn dashboard_message(state: &DashboardState) -> anyhow::Result<Message> {
@@ -124,7 +125,10 @@ fn spawn_dashboard_client_task(stream: TcpStream, state_rx: watch::Receiver<Arc<
 
 fn publish_dashboard_snapshot(app: &mut TuiApp, state_tx: &watch::Sender<Arc<DashboardState>>) {
     app.update();
-    let state = Arc::new(app.snapshot_state_with_log_limit(Some(DASHBOARD_LOG_LINE_LIMIT)));
+    let state = Arc::new(app.snapshot_state_with_limits(
+        Some(REMOTE_DASHBOARD_LOG_LINE_LIMIT),
+        Some(REMOTE_DASHBOARD_HISTORY_LIMIT),
+    ));
     let _ = state_tx.send(state);
 }
 
@@ -168,9 +172,10 @@ pub async fn run_dashboard_publisher_on_listener(
     listener: TcpListener,
     mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
 ) -> anyhow::Result<()> {
-    let (state_tx, _state_rx) = watch::channel(Arc::new(
-        app.snapshot_state_with_log_limit(Some(DASHBOARD_LOG_LINE_LIMIT)),
-    ));
+    let (state_tx, _state_rx) = watch::channel(Arc::new(app.snapshot_state_with_limits(
+        Some(REMOTE_DASHBOARD_LOG_LINE_LIMIT),
+        Some(REMOTE_DASHBOARD_HISTORY_LIMIT),
+    )));
     let mut update_interval = tokio::time::interval(Duration::from_millis(250));
     update_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -326,8 +331,9 @@ mod tests {
     use crate::router::BackendSelector;
     use crate::tui::app::{ThroughputPoint, ViewMode};
     use crate::tui::dashboard::{BufferPoolStats, DashboardMetrics};
+    use crate::tui::{LogBuffer, TuiAppBuilder};
     use crate::types::Port;
-    use crate::types::tui::{Throughput, Timestamp};
+    use crate::types::tui::{HistorySize, Throughput, Timestamp};
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
@@ -464,13 +470,53 @@ mod tests {
     #[test]
     fn dashboard_accept_errors_are_nonfatal() {
         let app = build_test_app();
-        let (state_tx, _state_rx) = watch::channel(Arc::new(
-            app.snapshot_state_with_log_limit(Some(DASHBOARD_LOG_LINE_LIMIT)),
-        ));
+        let (state_tx, _state_rx) = watch::channel(Arc::new(app.snapshot_state_with_limits(
+            Some(REMOTE_DASHBOARD_LOG_LINE_LIMIT),
+            Some(REMOTE_DASHBOARD_HISTORY_LIMIT),
+        )));
 
         handle_dashboard_accept_result(
             Err(std::io::Error::other("synthetic accept error")),
             &state_tx,
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_dashboard_snapshot_limits_remote_logs_and_history() {
+        let metrics = MetricsCollector::new(1);
+        let router = Arc::new(BackendSelector::new());
+        let servers = create_test_servers(1);
+        let log_buffer = LogBuffer::new();
+        for i in 0..100 {
+            log_buffer.push(format!("line {i}"));
+        }
+
+        let mut app = TuiAppBuilder::new(metrics, router, servers)
+            .with_log_buffer(log_buffer)
+            .with_history_size(HistorySize::new(32))
+            .build();
+
+        for _ in 0..20 {
+            app.update();
+        }
+
+        let (state_tx, mut state_rx) = watch::channel(Arc::new(app.snapshot_state()));
+        publish_dashboard_snapshot(&mut app, &state_tx);
+        state_rx.changed().await.expect("snapshot should update");
+
+        let snapshot = state_rx.borrow().clone();
+        assert_eq!(snapshot.log_lines.len(), REMOTE_DASHBOARD_LOG_LINE_LIMIT);
+        assert_eq!(
+            snapshot.log_lines.first().map(String::as_str),
+            Some("line 36")
+        );
+        assert_eq!(
+            snapshot.client_history.len(),
+            REMOTE_DASHBOARD_HISTORY_LIMIT,
+        );
+        assert_eq!(
+            snapshot.backend_views[0].history.len(),
+            REMOTE_DASHBOARD_HISTORY_LIMIT,
         );
     }
 

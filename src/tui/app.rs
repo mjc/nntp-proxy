@@ -744,12 +744,22 @@ impl TuiApp {
     /// Build a serializable snapshot of the current dashboard state.
     #[must_use]
     pub fn snapshot_state(&self) -> DashboardState {
-        self.snapshot_state_with_log_limit(None)
+        self.snapshot_state_with_limits(None, None)
     }
 
     /// Build a serializable snapshot of the current dashboard state with a bounded log tail.
     #[must_use]
     pub fn snapshot_state_with_log_limit(&self, log_limit: Option<usize>) -> DashboardState {
+        self.snapshot_state_with_limits(log_limit, None)
+    }
+
+    /// Build a serializable snapshot with bounded log and history tails.
+    #[must_use]
+    pub fn snapshot_state_with_limits(
+        &self,
+        log_limit: Option<usize>,
+        history_limit: Option<usize>,
+    ) -> DashboardState {
         let buffer_pool = self.buffer_pool.as_ref().map(Self::snapshot_buffer_pool);
         let mut metrics = DashboardMetrics::from_snapshot(self.snapshot.as_ref());
         metrics.in_flight_requests = self
@@ -778,9 +788,12 @@ impl TuiApp {
             .sum();
         DashboardState {
             metrics,
-            backend_views: self.snapshot_backend_views(),
+            backend_views: self.snapshot_backend_views(history_limit),
             top_users: self.snapshot_top_users(),
-            client_history: self.client_history.points().iter().cloned().collect(),
+            client_history: Self::snapshot_history_points(
+                self.client_history.points(),
+                history_limit,
+            ),
             system_stats: self.system_stats.clone(),
             view_mode: self.view_mode,
             show_details: self.show_details,
@@ -796,13 +809,13 @@ impl TuiApp {
         }
     }
 
-    fn snapshot_backend_views(&self) -> Vec<BackendView> {
+    fn snapshot_backend_views(&self, history_limit: Option<usize>) -> Vec<BackendView> {
         self.snapshot
             .backend_stats
             .iter()
             .zip(self.servers.iter())
             .enumerate()
-            .map(|(i, (stats, server))| self.snapshot_backend_view(i, server, stats))
+            .map(|(i, (stats, server))| self.snapshot_backend_view(i, server, stats, history_limit))
             .collect()
     }
 
@@ -811,6 +824,7 @@ impl TuiApp {
         backend_idx: usize,
         server: &Server,
         stats: &crate::metrics::BackendStats,
+        history_limit: Option<usize>,
     ) -> BackendView {
         BackendView {
             server: BackendDisplay {
@@ -827,14 +841,28 @@ impl TuiApp {
             stateful_count: self.backend_stateful_count(backend_idx),
             traffic_share: self.backend_traffic_share(backend_idx),
             pipeline_depth: self.backend_pipeline_depth(backend_idx),
-            history: Self::snapshot_throughput_history(self.backend_history(backend_idx)),
+            history: Self::snapshot_throughput_history(
+                self.backend_history(backend_idx),
+                history_limit,
+            ),
         }
     }
 
-    fn snapshot_throughput_history(history: Option<&ThroughputHistory>) -> Vec<ThroughputPoint> {
+    fn snapshot_throughput_history(
+        history: Option<&ThroughputHistory>,
+        history_limit: Option<usize>,
+    ) -> Vec<ThroughputPoint> {
         history
-            .map(|history| history.points().iter().cloned().collect())
+            .map(|history| Self::snapshot_history_points(history.points(), history_limit))
             .unwrap_or_default()
+    }
+
+    fn snapshot_history_points(
+        points: &VecDeque<ThroughputPoint>,
+        history_limit: Option<usize>,
+    ) -> Vec<ThroughputPoint> {
+        let start = history_limit.map_or(0, |limit| points.len().saturating_sub(limit));
+        points.iter().skip(start).cloned().collect()
     }
 
     fn snapshot_buffer_pool(pool: &crate::pool::BufferPool) -> BufferPoolStats {
