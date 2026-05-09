@@ -34,10 +34,9 @@ use crossterm::{
 use futures::future::BoxFuture;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Stylize},
     text::Line,
-    widgets::Paragraph,
 };
 use std::io;
 use std::net::SocketAddr;
@@ -366,29 +365,55 @@ fn draw_attached_dashboard(
         ])
         .split(f.area());
 
-    let title = Paragraph::new(Line::from(vec![
+    let title = Line::from(vec![
         "NNTP Proxy "
             .fg(crate::tui::constants::styles::BORDER_ACTIVE)
             .bold(),
         "- Attached Dashboard".fg(Color::White),
-    ]))
-    .alignment(Alignment::Center);
+    ]);
 
-    let body = Paragraph::new(build_attached_placeholder_lines(&attached.status))
-        .alignment(Alignment::Center);
+    let body = build_attached_placeholder_lines(&attached.status);
 
-    let footer = Paragraph::new(Line::from(vec![
+    let footer = Line::from(vec![
         "Press ".fg(crate::tui::constants::styles::LABEL),
         "q".fg(crate::tui::constants::styles::VALUE_INFO).bold(),
         " or ".fg(crate::tui::constants::styles::LABEL),
         "Esc".fg(crate::tui::constants::styles::VALUE_INFO).bold(),
         " to exit".fg(crate::tui::constants::styles::LABEL),
-    ]))
-    .alignment(Alignment::Center);
+    ]);
 
-    f.render_widget(title, chunks[0]);
-    f.render_widget(body, chunks[1]);
-    f.render_widget(footer, chunks[2]);
+    render_centered_line(f, chunks[0], &title);
+    render_centered_lines(f, chunks[1], &body);
+    render_centered_line(f, chunks[2], &footer);
+}
+
+fn render_centered_lines(f: &mut ratatui::Frame, area: Rect, lines: &[Line<'_>]) {
+    if lines.is_empty() || area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let visible_lines = area.height.min(lines.len() as u16);
+    let start_y = area.y + area.height.saturating_sub(visible_lines) / 2;
+
+    for (offset, line) in lines.iter().take(visible_lines as usize).enumerate() {
+        let y = start_y + offset as u16;
+        render_line_centered_at(f, area, y, line);
+    }
+}
+
+fn render_centered_line(f: &mut ratatui::Frame, area: Rect, line: &Line<'_>) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let y = area.y + area.height.saturating_sub(1) / 2;
+    render_line_centered_at(f, area, y, line);
+}
+
+fn render_line_centered_at(f: &mut ratatui::Frame, area: Rect, y: u16, line: &Line<'_>) {
+    let line_width = line.width() as u16;
+    let x = area.x + area.width.saturating_sub(line_width) / 2;
+    f.buffer_mut().set_line(x, y, line, area.width);
 }
 
 #[derive(Debug, Clone, Copy)]

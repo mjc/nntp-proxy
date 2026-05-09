@@ -13,6 +13,7 @@ use crate::tui::helpers::{
 };
 use ratatui::{
     Frame,
+    buffer::Buffer,
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     symbols,
@@ -146,11 +147,14 @@ fn render_title(
     metrics: &DashboardMetrics,
     remote_status: Option<&RemoteDashboardStatus>,
 ) {
-    let title = Paragraph::new(build_title_lines(metrics, remote_status))
-        .block(untitled_bordered_block(styles::BORDER_ACTIVE))
-        .alignment(Alignment::Center);
-
-    f.render_widget(title, area);
+    let lines = build_title_lines(metrics, remote_status);
+    render_block_lines(
+        f,
+        area,
+        untitled_bordered_block(styles::BORDER_ACTIVE),
+        &lines,
+        Alignment::Center,
+    );
 }
 
 fn build_title_lines(
@@ -251,7 +255,7 @@ fn render_summary(
         .split(area);
 
     // Left: App summary (uptime, sessions, buffer stats in details mode)
-    let left_summary = create_app_summary(
+    let left_summary = build_app_summary_lines(
         metrics,
         system_stats,
         state.buffer_pool(),
@@ -260,15 +264,33 @@ fn render_summary(
     );
 
     // Middle: Cache summary
-    let middle_summary = create_cache_summary(metrics);
+    let middle_summary = build_cache_summary_lines(metrics);
 
     // Right: Data transfer summary
     let right_summary =
-        create_transfer_summary(metrics, &client_to_backend_str, &backend_to_client_str);
+        build_transfer_summary_lines(metrics, &client_to_backend_str, &backend_to_client_str);
 
-    f.render_widget(left_summary, summary_chunks[0]);
-    f.render_widget(middle_summary, summary_chunks[1]);
-    f.render_widget(right_summary, summary_chunks[2]);
+    render_block_lines(
+        f,
+        summary_chunks[0],
+        bordered_block("App", styles::BORDER_NORMAL),
+        &left_summary,
+        Alignment::Left,
+    );
+    render_block_lines(
+        f,
+        summary_chunks[1],
+        bordered_block(cache_summary_title(metrics), styles::BORDER_NORMAL),
+        &middle_summary,
+        Alignment::Left,
+    );
+    render_block_lines(
+        f,
+        summary_chunks[2],
+        bordered_block("Data Transfer", styles::BORDER_NORMAL),
+        &right_summary,
+        Alignment::Left,
+    );
 }
 
 /// Render backend server visualization
@@ -287,26 +309,6 @@ fn render_backends(f: &mut Frame, area: Rect, state: &DashboardState, show_detai
 // ============================================================================
 // Summary Panel Builders (Pure Functions)
 // ============================================================================
-
-/// Create app summary panel (uptime, CPU, memory, buffer stats in details mode)
-fn create_app_summary(
-    metrics: &DashboardMetrics,
-    system_stats: &crate::tui::SystemStats,
-    buffer_pool: Option<&BufferPoolStats>,
-    show_details: bool,
-    attached_ui_stats: Option<&crate::tui::SystemStats>,
-) -> Paragraph<'static> {
-    let lines = build_app_summary_lines(
-        metrics,
-        system_stats,
-        buffer_pool,
-        show_details,
-        attached_ui_stats,
-    );
-    Paragraph::new(lines)
-        .block(bordered_block("App", styles::BORDER_NORMAL))
-        .alignment(Alignment::Left)
-}
 
 fn build_app_summary_lines(
     metrics: &DashboardMetrics,
@@ -444,8 +446,16 @@ fn build_app_summary_lines(
     lines
 }
 
-/// Create cache summary panel
-fn create_cache_summary(metrics: &DashboardMetrics) -> Paragraph<'static> {
+fn cache_summary_title(metrics: &DashboardMetrics) -> &'static str {
+    if metrics.disk_cache.is_some() {
+        "Cache (Hybrid)"
+    } else {
+        "Cache"
+    }
+}
+
+/// Build cache summary panel lines
+fn build_cache_summary_lines(metrics: &DashboardMetrics) -> Vec<Line<'static>> {
     /// Color for cache entries (highlight if non-empty)
     const fn entries_color(count: u64) -> Color {
         if count > 0 {
@@ -478,7 +488,7 @@ fn create_cache_summary(metrics: &DashboardMetrics) -> Paragraph<'static> {
     let is_hybrid = metrics.disk_cache.is_some();
 
     // Build lines based on cache type
-    let lines = if is_hybrid {
+    if is_hybrid {
         // Hybrid cache: show disk-relevant stats
         let disk = metrics.disk_cache.as_ref().unwrap();
         vec![
@@ -522,37 +532,32 @@ fn create_cache_summary(metrics: &DashboardMetrics) -> Paragraph<'static> {
                     .fg(hit_rate_color(metrics.cache_hit_rate)),
             ]),
         ]
-    };
-
-    let title = if is_hybrid { "Cache (Hybrid)" } else { "Cache" };
-
-    Paragraph::new(lines)
-        .block(bordered_block(title, styles::BORDER_NORMAL))
-        .alignment(Alignment::Left)
+    }
 }
 
-/// Create data transfer summary panel
-fn create_transfer_summary<'a>(
+/// Build data transfer summary panel lines
+fn build_transfer_summary_lines(
     metrics: &DashboardMetrics,
-    client_to_backend: &'a str,
-    backend_to_client: &'a str,
-) -> Paragraph<'a> {
-    Paragraph::new(vec![
+    client_to_backend: &str,
+    backend_to_client: &str,
+) -> Vec<Line<'static>> {
+    vec![
         Line::from(vec![
             "Client → Backend: ".fg(styles::LABEL),
-            client_to_backend.fg(styles::VALUE_SECONDARY),
+            client_to_backend.to_string().fg(styles::VALUE_SECONDARY),
         ]),
         Line::from(vec![
             "Backend → Client: ".fg(styles::LABEL),
-            backend_to_client.fg(styles::VALUE_PRIMARY).bold(),
+            backend_to_client
+                .to_string()
+                .fg(styles::VALUE_PRIMARY)
+                .bold(),
         ]),
         Line::from(vec![
             "Total: ".fg(styles::LABEL),
             format_bytes(metrics.total_bytes()).fg(styles::VALUE_PRIMARY),
         ]),
-    ])
-    .block(bordered_block("Data Transfer", styles::BORDER_NORMAL))
-    .alignment(Alignment::Left)
+    ]
 }
 
 // ============================================================================
@@ -669,11 +674,14 @@ fn backend_details_line(
 
 /// Render list of backend servers with their stats
 fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_details: bool) {
-    let paragraph = Paragraph::new(backend_display_lines(state, show_details))
-        .block(bordered_block("Backend Servers", styles::BORDER_NORMAL))
-        .alignment(Alignment::Left);
-
-    f.render_widget(paragraph, area);
+    let lines = backend_display_lines(state, show_details);
+    render_block_lines(
+        f,
+        area,
+        bordered_block("Backend Servers", styles::BORDER_NORMAL),
+        &lines,
+        Alignment::Left,
+    );
 }
 
 fn backend_display_lines(state: &DashboardState, show_details: bool) -> Vec<Line<'static>> {
@@ -759,11 +767,17 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
     let (chart_data, max_throughput) = build_chart_data(&state.backend_views);
 
     if max_throughput <= 0.0 {
-        let placeholder = Paragraph::new(Line::from("No throughput samples yet"))
-            .style(Style::default().fg(styles::LABEL))
-            .block(bordered_block(chart::TITLE, styles::BORDER_NORMAL))
-            .alignment(Alignment::Center);
-        f.render_widget(placeholder, area);
+        let placeholder = Line::from(Span::styled(
+            "No throughput samples yet",
+            Style::default().fg(styles::LABEL),
+        ));
+        render_block_lines(
+            f,
+            area,
+            bordered_block(chart::TITLE, styles::BORDER_NORMAL),
+            std::slice::from_ref(&placeholder),
+            Alignment::Center,
+        );
         return;
     }
 
@@ -837,21 +851,14 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
 
 /// Render footer with help text
 fn render_footer(f: &mut Frame, area: Rect) {
-    let block = untitled_bordered_block(styles::LABEL);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
     let footer = footer_help_line();
-    let footer_width = u16::try_from(footer.width()).unwrap_or(u16::MAX);
-    let left_padding = inner.width.saturating_sub(footer_width) / 2;
-    let x = inner.left().saturating_add(left_padding);
-    let width = inner.width.saturating_sub(left_padding);
-
-    f.render_widget(footer, Rect::new(x, inner.top(), width, 1));
+    render_block_lines(
+        f,
+        area,
+        untitled_bordered_block(styles::LABEL),
+        std::slice::from_ref(&footer),
+        Alignment::Center,
+    );
 }
 
 fn footer_help_line() -> Line<'static> {
@@ -879,15 +886,71 @@ fn render_logs(f: &mut Frame, area: Rect, log_lines: &[String], show_details: bo
         visible_lines
     };
 
-    let mut paragraph = Paragraph::new(recent_log_text_lines(log_lines, fetch_count))
-        .style(Style::default().fg(Color::Gray))
-        .block(bordered_block(" Recent Logs ", styles::BORDER_ACTIVE));
-
     if show_details {
-        paragraph = paragraph.wrap(Wrap { trim: false });
+        let paragraph = Paragraph::new(recent_log_text_lines(log_lines, fetch_count))
+            .style(Style::default().fg(Color::Gray))
+            .block(bordered_block(" Recent Logs ", styles::BORDER_ACTIVE))
+            .wrap(Wrap { trim: false });
+        f.render_widget(paragraph, area);
+        return;
     }
 
-    f.render_widget(paragraph, area);
+    let block = bordered_block(" Recent Logs ", styles::BORDER_ACTIVE);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    for (row, line) in recent_log_lines(log_lines, fetch_count)
+        .iter()
+        .take(inner.height as usize)
+        .enumerate()
+    {
+        let rendered = Line::from(Span::styled(
+            line.as_str(),
+            Style::default().fg(Color::Gray),
+        ));
+        f.buffer_mut().set_line(
+            inner.left(),
+            inner.top().saturating_add(row as u16),
+            &rendered,
+            inner.width,
+        );
+    }
+}
+
+fn render_block_lines(
+    f: &mut Frame,
+    area: Rect,
+    block: Block<'static>,
+    lines: &[Line<'_>],
+    alignment: Alignment,
+) {
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let buffer = f.buffer_mut();
+    for (row, line) in lines.iter().take(inner.height as usize).enumerate() {
+        render_line(buffer, inner, row as u16, line, alignment);
+    }
+}
+
+fn render_line(buffer: &mut Buffer, area: Rect, row: u16, line: &Line<'_>, alignment: Alignment) {
+    let line_width = u16::try_from(line.width()).unwrap_or(u16::MAX);
+    let offset = match alignment {
+        Alignment::Center => area.width.saturating_sub(line_width) / 2,
+        Alignment::Right => area.width.saturating_sub(line_width),
+        Alignment::Left => 0,
+    };
+    let x = area.left().saturating_add(offset);
+    let width = area.width.saturating_sub(offset);
+    buffer.set_line(x, area.top().saturating_add(row), line, width);
 }
 
 fn recent_log_lines(lines: &[String], count: usize) -> &[String] {
