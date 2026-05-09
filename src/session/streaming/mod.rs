@@ -626,7 +626,7 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    // Detect terminator location: within chunk or spanning boundary
+    // Always split at the first terminator so packed responses never merge.
     let status = tail.detect_terminator(data);
     let write_len = status.write_len(data.len());
 
@@ -1380,6 +1380,34 @@ mod tests {
         assert_eq!(&writer[..], &expected_written[..]);
         // Leftover should contain "430 No such article\r\n"
         assert_eq!(&leftover[..], b"430 No such article\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_stream_pipelined_prefers_spanning_terminator_before_later_response() {
+        let first_response = b"220 Article follows\r\nBody1\r\n.\r\n";
+        let second_response = b"220 Article follows\r\nBody2\r\n.\r\n";
+        let first_chunk = b"220 Article follows\r\nBody1\r\n.";
+        let second_read = [b"\r\n".as_slice(), second_response.as_slice()].concat();
+
+        let mut reader = Cursor::new(second_read.as_slice());
+        let mut writer = Vec::new();
+        let pool = test_helpers::make_pool();
+        let mut leftover = pool.acquire();
+        let ctx = test_helpers::make_ctx(&pool);
+
+        let result = stream_multiline_response_pipelined(
+            &mut reader,
+            &mut writer,
+            first_chunk,
+            &ctx,
+            &mut leftover,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), first_response.len() as u64);
+        assert_eq!(&writer[..], first_response.as_slice());
+        assert_eq!(&leftover[..], second_response.as_slice());
     }
 
     #[tokio::test]

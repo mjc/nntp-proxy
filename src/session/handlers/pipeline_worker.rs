@@ -1295,6 +1295,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_buffer_response_for_request_prefers_spanning_terminator_before_later_response() {
+        let pool = BufferPool::for_tests();
+        let mut buffer = pool.acquire();
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+
+        let first = b"220 0 <a@b> article\r\nBody one\r\n.\r\n";
+        let second = b"220 0 <c@d> article\r\nBody two\r\n.\r\n";
+        let chunk1 = b"220 0 <a@b> article\r\nBody one\r\n.".to_vec();
+        let chunk2 = [b"\r\n".as_slice(), second.as_slice()].concat();
+        let mut conn = mock_backend_conn_chunked(vec![chunk1, chunk2]).await;
+
+        let status1 = buffer_response_for_request(
+            ARTICLE_REQUEST,
+            &mut buffer,
+            &mut conn,
+            &mut result_buf,
+            &pool,
+        )
+        .await
+        .expect("should stop at the spanning terminator");
+
+        assert_eq!(status1.as_u16(), 220);
+        assert_eq!(result_buf.to_vec(), first);
+        assert!(conn.has_leftover(), "next response should remain stashed");
+
+        let status2 = buffer_response_for_request(
+            ARTICLE_REQUEST,
+            &mut buffer,
+            &mut conn,
+            &mut result_buf,
+            &pool,
+        )
+        .await
+        .expect("should consume the stashed second response");
+
+        assert_eq!(status2.as_u16(), 220);
+        assert_eq!(result_buf.to_vec(), second);
+    }
+
+    #[tokio::test]
     async fn test_buffer_response_for_request_uses_request_context_for_same_status_framing() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire();

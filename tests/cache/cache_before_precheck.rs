@@ -14,14 +14,17 @@
 //!
 //! DO NOT DELETE THESE TESTS. DO NOT REFACTOR THEM AWAY.
 
-use nntp_proxy::NntpProxy;
+use crate::test_helpers::{connect_and_read_greeting, spawn_proxy_with_config};
 use nntp_proxy::config::{Cache, Config, RoutingMode, Server};
 use nntp_proxy::types::Port;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{
+    TcpListener,
+    tcp::{OwnedReadHalf, OwnedWriteHalf},
+};
 
 async fn read_multiline_response<R>(reader: &mut BufReader<R>) -> String
 where
@@ -175,23 +178,13 @@ fn spawn_counting_mock_server(
     task.abort_handle()
 }
 
-async fn spawn_test_proxy(proxy: NntpProxy) -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    tokio::spawn(async move {
-        while let Ok((stream, addr)) = listener.accept().await {
-            let proxy = proxy.clone();
-            tokio::spawn(async move {
-                proxy
-                    .handle_client_per_command_routing(stream, addr.into())
-                    .await
-                    .ok();
-            });
-        }
-    });
-
-    port
+async fn connect_test_client(config: Config) -> (BufReader<OwnedReadHalf>, OwnedWriteHalf) {
+    let proxy_port = spawn_proxy_with_config(config, RoutingMode::PerCommand)
+        .await
+        .unwrap();
+    let client = connect_and_read_greeting(proxy_port).await.unwrap();
+    let (read_half, write_half) = client.into_split();
+    (BufReader::new(read_half), write_half)
 }
 
 /// CRITICAL TEST: Cache check must happen BEFORE adaptive prechecking for STAT
@@ -215,7 +208,6 @@ async fn test_stat_cache_hit_zero_backend_queries() {
 
     // Spawn counting mock server (has article)
     let _mock = spawn_counting_mock_server(backend_listener, "TestBackend", counter.clone(), true);
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Create proxy config with caching and adaptive precheck
     let config = Config {
@@ -233,23 +225,8 @@ async fn test_stat_cache_hit_zero_backend_queries() {
         ..Default::default()
     };
 
-    // Start proxy
-    let proxy = nntp_proxy::NntpProxy::new(config.clone(), RoutingMode::PerCommand)
-        .await
-        .unwrap();
-    let proxy_port = spawn_test_proxy(proxy).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Connect client
-    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
-        .await
-        .unwrap();
-    let (read_half, mut write_half) = client.split();
-    let mut reader = BufReader::new(read_half);
-
-    // Read greeting
+    let (mut reader, mut write_half) = connect_test_client(config).await;
     let mut line = String::new();
-    reader.read_line(&mut line).await.unwrap();
 
     // Reset counter before test
     counter.reset();
@@ -309,7 +286,6 @@ async fn test_head_cache_hit_zero_backend_queries() {
 
     let counter = BackendQueryCounter::new();
     let _mock = spawn_counting_mock_server(backend_listener, "TestBackend", counter.clone(), true);
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
         servers: vec![
@@ -326,20 +302,8 @@ async fn test_head_cache_hit_zero_backend_queries() {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand)
-        .await
-        .unwrap();
-    let proxy_port = spawn_test_proxy(proxy).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
-        .await
-        .unwrap();
-    let (read_half, mut write_half) = client.split();
-    let mut reader = BufReader::new(read_half);
-
+    let (mut reader, mut write_half) = connect_test_client(config).await;
     let mut line = String::new();
-    reader.read_line(&mut line).await.unwrap();
 
     counter.reset();
 
@@ -404,7 +368,6 @@ async fn test_article_cache_hit_zero_backend_queries() {
 
     let counter = BackendQueryCounter::new();
     let _mock = spawn_counting_mock_server(backend_listener, "TestBackend", counter.clone(), true);
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
         servers: vec![
@@ -421,20 +384,7 @@ async fn test_article_cache_hit_zero_backend_queries() {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand)
-        .await
-        .unwrap();
-    let proxy_port = spawn_test_proxy(proxy).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
-        .await
-        .unwrap();
-    let (read_half, mut write_half) = client.split();
-    let mut reader = BufReader::new(read_half);
-
-    let mut line = String::new();
-    reader.read_line(&mut line).await.unwrap();
+    let (mut reader, mut write_half) = connect_test_client(config).await;
 
     counter.reset();
 
@@ -477,7 +427,6 @@ async fn test_batched_article_cache_hits_zero_backend_queries() {
 
     let counter = BackendQueryCounter::new();
     let _mock = spawn_counting_mock_server(backend_listener, "TestBackend", counter.clone(), true);
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
         servers: vec![
@@ -494,20 +443,7 @@ async fn test_batched_article_cache_hits_zero_backend_queries() {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand)
-        .await
-        .unwrap();
-    let proxy_port = spawn_test_proxy(proxy).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
-        .await
-        .unwrap();
-    let (read_half, mut write_half) = client.into_split();
-    let mut reader = BufReader::new(read_half);
-
-    let mut line = String::new();
-    reader.read_line(&mut line).await.unwrap();
+    let (mut reader, mut write_half) = connect_test_client(config).await;
 
     counter.reset();
 
@@ -546,7 +482,6 @@ async fn test_article_without_payload_cache_queries_backend_each_time() {
 
     let counter = BackendQueryCounter::new();
     let _mock = spawn_counting_mock_server(backend_listener, "TestBackend", counter.clone(), true);
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
         servers: vec![
@@ -563,19 +498,8 @@ async fn test_article_without_payload_cache_queries_backend_each_time() {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand)
-        .await
-        .unwrap();
-    let proxy_port = spawn_test_proxy(proxy).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
-        .await
-        .unwrap();
-    let (read_half, mut write_half) = client.split();
-    let mut reader = BufReader::new(read_half);
+    let (mut reader, mut write_half) = connect_test_client(config).await;
     let mut line = String::new();
-    reader.read_line(&mut line).await.unwrap();
 
     for expected_queries in 1..=2 {
         write_half
@@ -613,7 +537,6 @@ async fn test_cached_430_zero_backend_queries() {
     let counter = BackendQueryCounter::new();
     // Server doesn't have article (returns 430)
     let _mock = spawn_counting_mock_server(backend_listener, "TestBackend", counter.clone(), false);
-    tokio::time::sleep(Duration::from_millis(100)).await;
 
     let config = Config {
         servers: vec![
@@ -630,20 +553,8 @@ async fn test_cached_430_zero_backend_queries() {
         ..Default::default()
     };
 
-    let proxy = NntpProxy::new(config.clone(), RoutingMode::PerCommand)
-        .await
-        .unwrap();
-    let proxy_port = spawn_test_proxy(proxy).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}"))
-        .await
-        .unwrap();
-    let (read_half, mut write_half) = client.split();
-    let mut reader = BufReader::new(read_half);
-
+    let (mut reader, mut write_half) = connect_test_client(config).await;
     let mut line = String::new();
-    reader.read_line(&mut line).await.unwrap();
 
     counter.reset();
 

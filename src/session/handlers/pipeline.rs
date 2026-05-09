@@ -385,4 +385,43 @@ mod tests {
         assert!(batch.is_trailing_invalid());
         assert!(batch.trailing_context().is_none());
     }
+
+    #[tokio::test]
+    async fn read_command_batch_preserves_trailing_group_after_four_body_commands() {
+        let session = test_session();
+        let (mut client, server) = tokio::io::duplex(4096);
+        client
+            .write_all(
+                concat!(
+                    "BODY <body-1@example>\r\n",
+                    "BODY <body-2@example>\r\n",
+                    "BODY <body-3@example>\r\n",
+                    "BODY <body-4@example>\r\n",
+                    "GROUP alt.test\r\n",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        drop(client);
+
+        let mut reader = BufReader::new(server);
+        let mut command_buf = Vec::with_capacity(COMMAND);
+
+        let batch = session
+            .read_command_batch(&mut reader, &mut command_buf)
+            .await
+            .unwrap();
+
+        assert_eq!(batch.len(), 4);
+        for idx in 0..4 {
+            assert_eq!(batch.context(idx).kind(), RequestKind::Body);
+        }
+        let trailing = batch
+            .trailing_context()
+            .expect("GROUP should be preserved as the trailing stateful command");
+        assert_eq!(trailing.kind(), RequestKind::Group);
+        assert_eq!(trailing.args(), b"alt.test");
+        assert_eq!(trailing.route_class(), RequestRouteClass::Stateful);
+    }
 }

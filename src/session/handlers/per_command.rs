@@ -712,10 +712,9 @@ impl ClientSession {
     ) -> Result<(), SessionError> {
         for (index, pending, mut availability) in pending_requests.drain(..) {
             let request = batch.context_mut(index);
-            let mut client_to_backend_bytes = state.client_to_backend_bytes;
             let mut io = crate::session::handlers::article_retry::RequestExecutionIo {
                 client_writer,
-                client_to_backend_bytes: &mut client_to_backend_bytes,
+                client_to_backend_bytes: &mut state.client_to_backend_bytes,
                 backend_to_client_bytes: &mut state.backend_to_client_bytes,
             };
             self.finish_pipeline_request(router, request, pending, &mut io, &mut availability)
