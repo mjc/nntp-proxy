@@ -295,6 +295,8 @@ mod tests {
         CommonArgs {
             config: "config.toml".parse().unwrap(),
             ui: UiMode::Headless,
+            tui: false,
+            headless: false,
             no_tui: false,
             tui_listen: None,
             tui_attach: None,

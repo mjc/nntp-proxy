@@ -5,7 +5,7 @@
 
 use crate::cache::ArticleAvailability;
 use crate::router::backend_queue::{
-    CompletedPipelineRequest, PipelineDelivery, PipelineResponse, QueuedContext,
+    CompletedPipelineRequest, PipelineDelivery, PipelineError, PipelineResponse, QueuedContext,
 };
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::ClientSession;
@@ -36,6 +36,7 @@ pub(super) struct RequestExecutionIo<'a> {
 pub(super) struct PendingPipelineRequest {
     guard: CommandGuard,
     rx: oneshot::Receiver<PipelineResponse>,
+    streamed_delivery: bool,
 }
 
 /// Result of preparing a request before pipeline/direct backend execution.
@@ -225,13 +226,9 @@ impl ClientSession {
         &self,
         request: &RequestContext,
         client_writer: &crate::session::SharedClientWriter,
-        preserve_response_order: bool,
+        _preserve_response_order: bool,
     ) -> PipelineDelivery {
         if !request.is_large_transfer() {
-            return PipelineDelivery::Buffered;
-        }
-
-        if preserve_response_order {
             return PipelineDelivery::Buffered;
         }
 
@@ -267,17 +264,21 @@ impl ClientSession {
 
         let guard = CommandGuard::new(router.clone(), backend_id);
         let (tx, rx) = oneshot::channel();
-        let queued_context = QueuedContext::new(
-            request.clone(),
-            self.client_addr,
-            tx,
-            self.pipeline_delivery(request, client_writer, preserve_response_order),
+        let delivery = self.pipeline_delivery(request, client_writer, preserve_response_order);
+        let streamed_delivery = matches!(
+            &delivery,
+            PipelineDelivery::StreamToClient(_) | PipelineDelivery::StreamAndCapture(_)
         );
+        let queued_context = QueuedContext::new(request.clone(), self.client_addr, tx, delivery);
 
         match queue.try_enqueue(queued_context) {
             Ok(()) => {
                 self.metrics.record_pipeline_enqueue();
-                Some(PendingPipelineRequest { guard, rx })
+                Some(PendingPipelineRequest {
+                    guard,
+                    rx,
+                    streamed_delivery,
+                })
             }
             Err(e) => {
                 debug!(
@@ -295,7 +296,11 @@ impl ClientSession {
         io: &mut RequestExecutionIo<'_>,
         availability: &mut Option<ArticleAvailability>,
     ) -> Result<Option<CompletedPipelineRequest>, SessionError> {
-        let PendingPipelineRequest { guard, rx } = pending;
+        let PendingPipelineRequest {
+            guard,
+            rx,
+            streamed_delivery,
+        } = pending;
         let backend_id = guard.backend_id();
 
         match rx.await {
@@ -382,6 +387,12 @@ impl ClientSession {
                 Err(SessionError::ClientDisconnect(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "client disconnected during pipelined stream",
+                )))
+            }
+            Ok(Err(PipelineError::ReadFailed)) if streamed_delivery => {
+                Err(SessionError::Backend(anyhow::anyhow!(
+                    "streamed pipeline read failed on backend {:?}; closing session to avoid response desync",
+                    backend_id
                 )))
             }
             Ok(Err(e)) => {
@@ -571,6 +582,7 @@ impl ClientSession {
 
 #[cfg(test)]
 mod tests {
+    use super::{PendingPipelineRequest, RequestExecutionIo};
     use std::net::SocketAddr;
     use std::sync::Arc;
 
@@ -581,9 +593,11 @@ mod tests {
     use crate::metrics::MetricsCollector;
     use crate::pool::BufferPool;
     use crate::protocol::RequestContext;
-    use crate::router::backend_queue::PipelineDelivery;
-    use crate::session::ClientSession;
-    use crate::types::{BufferSize, ClientAddress};
+    use crate::router::backend_queue::{PipelineDelivery, PipelineError};
+    use crate::router::{BackendSelector, CommandGuard};
+    use crate::session::{ClientSession, SessionError};
+    use crate::types::{BackendToClientBytes, BufferSize, ClientAddress, ClientToBackendBytes};
+    use tokio::sync::oneshot;
 
     fn test_session(article_buffer: bool, cache_articles: bool) -> ClientSession {
         let addr: SocketAddr = "127.0.0.1:9999".parse().unwrap();
@@ -612,6 +626,20 @@ mod tests {
         crate::session::SharedClientWriter::new(write_half)
     }
 
+    fn pending_request(
+        router: Arc<BackendSelector>,
+        streamed_delivery: bool,
+        error: PipelineError,
+    ) -> PendingPipelineRequest {
+        let (tx, rx) = oneshot::channel();
+        tx.send(Err(error)).unwrap();
+        PendingPipelineRequest {
+            guard: CommandGuard::new(router, crate::types::BackendId::from_index(0)),
+            rx,
+            streamed_delivery,
+        }
+    }
+
     #[tokio::test]
     async fn pipeline_delivery_keeps_first_large_transfer_streaming() {
         let session = test_session(false, false);
@@ -624,14 +652,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pipeline_delivery_buffers_later_large_transfer_to_preserve_order() {
+    async fn pipeline_delivery_preserve_response_order_keeps_later_large_transfer_streaming() {
         let session = test_session(false, false);
         let writer = shared_writer().await;
         let request = RequestContext::parse(b"BODY <two@example>\r\n").unwrap();
 
-        let delivery = session.pipeline_delivery(&request, &writer, true);
+        let first_delivery = session.pipeline_delivery(&request, &writer, false);
+        let later_delivery = session.pipeline_delivery(&request, &writer, true);
 
-        assert!(matches!(delivery, PipelineDelivery::Buffered));
+        assert!(
+            matches!(first_delivery, PipelineDelivery::StreamToClient(_)),
+            "baseline large transfers should stream directly to the client"
+        );
+        assert!(
+            matches!(later_delivery, PipelineDelivery::StreamToClient(_)),
+            "later large transfers in the same batch must keep streaming; forcing Buffered here stalls client-visible progress and recreates the timeout regression"
+        );
     }
 
     #[tokio::test]
@@ -646,5 +682,49 @@ mod tests {
         let delivery = session.pipeline_delivery(&request, &writer, false);
 
         assert!(matches!(delivery, PipelineDelivery::Buffered));
+    }
+
+    #[tokio::test]
+    async fn await_pipeline_request_treats_streamed_read_failure_as_terminal() {
+        let session = test_session(false, false);
+        let writer = shared_writer().await;
+        let router = Arc::new(BackendSelector::new());
+        let pending = pending_request(router, true, PipelineError::ReadFailed);
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_to_client_bytes = BackendToClientBytes::zero();
+        let mut io = RequestExecutionIo {
+            client_writer: &writer,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_to_client_bytes: &mut backend_to_client_bytes,
+        };
+        let mut availability = None;
+
+        let result = session
+            .await_pipeline_request(pending, &mut io, &mut availability)
+            .await;
+
+        assert!(matches!(result, Err(SessionError::Backend(_))));
+    }
+
+    #[tokio::test]
+    async fn await_pipeline_request_allows_buffered_read_failure_to_retry() {
+        let session = test_session(false, false);
+        let writer = shared_writer().await;
+        let router = Arc::new(BackendSelector::new());
+        let pending = pending_request(router, false, PipelineError::ReadFailed);
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_to_client_bytes = BackendToClientBytes::zero();
+        let mut io = RequestExecutionIo {
+            client_writer: &writer,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_to_client_bytes: &mut backend_to_client_bytes,
+        };
+        let mut availability = None;
+
+        let result = session
+            .await_pipeline_request(pending, &mut io, &mut availability)
+            .await;
+
+        assert!(matches!(result, Ok(None)));
     }
 }

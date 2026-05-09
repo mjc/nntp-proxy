@@ -61,6 +61,14 @@ pub struct CommonArgs {
     )]
     pub ui: UiMode,
 
+    /// Shorthand for `--ui tui`.
+    #[arg(long, help_heading = "General", conflicts_with_all = ["ui", "headless"])]
+    pub tui: bool,
+
+    /// Shorthand for `--ui headless`.
+    #[arg(long, help_heading = "General", conflicts_with_all = ["ui", "tui", "no_tui"])]
+    pub headless: bool,
+
     /// Disable the terminal dashboard and run in headless mode.
     #[arg(long, hide = true, help_heading = "General")]
     pub no_tui: bool,
@@ -204,8 +212,10 @@ impl CommonArgs {
     /// `--no-tui` remains as a hidden compatibility alias for headless mode.
     #[must_use]
     pub const fn effective_ui_mode(&self) -> UiMode {
-        if self.no_tui {
+        if self.no_tui || self.headless {
             UiMode::Headless
+        } else if self.tui {
+            UiMode::Tui
         } else {
             self.ui
         }
@@ -220,11 +230,11 @@ impl CommonArgs {
         let ui_mode = self.effective_ui_mode();
 
         if self.tui_attach.is_some() && ui_mode != UiMode::Tui {
-            bail!("--tui-attach requires --ui tui");
+            bail!("--tui-attach requires TUI mode; use --ui tui or --tui");
         }
 
         if self.tui_listen.is_some() && ui_mode != UiMode::Headless {
-            bail!("--tui-listen requires headless mode; use --ui headless");
+            bail!("--tui-listen requires headless mode; use --ui headless or --headless");
         }
 
         if self.tui_attach.is_some() && self.tui_listen.is_some() {
@@ -575,9 +585,40 @@ mod tests {
     }
 
     #[test]
+    fn test_common_args_parse_tui_shorthand() {
+        let args = CommonArgs::parse_from(["nntp-proxy", "--tui"]);
+        assert!(args.tui);
+        assert_eq!(args.effective_ui_mode(), UiMode::Tui);
+    }
+
+    #[test]
+    fn test_common_args_parse_headless_shorthand() {
+        let args = CommonArgs::parse_from(["nntp-proxy", "--headless"]);
+        assert!(args.headless);
+        assert_eq!(args.effective_ui_mode(), UiMode::Headless);
+    }
+
+    #[test]
+    fn test_common_args_rejects_duplicate_ui_selectors() {
+        assert!(CommonArgs::try_parse_from(["nntp-proxy", "--ui", "tui", "--tui"]).is_err());
+        assert!(CommonArgs::try_parse_from(["nntp-proxy", "--tui", "--headless"]).is_err());
+    }
+
+    #[test]
     fn test_validate_runtime_mode_accepts_attach_client() {
         let args = CommonArgs {
             ui: UiMode::Tui,
+            tui_attach: Some("127.0.0.1:8119".parse().unwrap()),
+            ..default_args()
+        };
+
+        args.validate_runtime_mode().unwrap();
+    }
+
+    #[test]
+    fn test_validate_runtime_mode_accepts_attach_with_tui_shorthand() {
+        let args = CommonArgs {
+            tui: true,
             tui_attach: Some("127.0.0.1:8119".parse().unwrap()),
             ..default_args()
         };
@@ -616,6 +657,17 @@ mod tests {
         };
 
         assert!(args.validate_runtime_mode().is_err());
+    }
+
+    #[test]
+    fn test_validate_runtime_mode_accepts_tui_listen_with_headless_shorthand() {
+        let args = CommonArgs {
+            headless: true,
+            tui_listen: Some("127.0.0.1:8119".parse().unwrap()),
+            ..default_args()
+        };
+
+        args.validate_runtime_mode().unwrap();
     }
 
     #[test]
@@ -697,6 +749,8 @@ mod tests {
         command.write_long_help(&mut help).unwrap();
         let help = String::from_utf8(help).unwrap();
 
+        assert!(help.contains("--tui"));
+        assert!(help.contains("--headless"));
         assert!(help.contains("--tui-listen <IP:PORT>"));
         assert!(help.contains("--tui-attach <IP:PORT>"));
     }
@@ -706,6 +760,8 @@ mod tests {
         CommonArgs {
             config: ConfigPath::new("config.toml").unwrap(),
             ui: UiMode::Headless,
+            tui: false,
+            headless: false,
             no_tui: false,
             tui_listen: None,
             tui_attach: None,
