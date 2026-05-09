@@ -22,13 +22,20 @@ const REMOTE_DASHBOARD_TOP_USER_LIMIT: usize = 5;
 
 #[allow(clippy::cast_precision_loss)]
 fn dashboard_message(state: &DashboardState) -> anyhow::Result<Message> {
-    Ok(Message::Text(serde_json::to_string(state)?.into()))
+    Ok(Message::Binary(
+        bincode::serialize(state)
+            .context("failed to serialize dashboard state")?
+            .into(),
+    ))
 }
 
 fn dashboard_state_from_message(
     message: Result<Message, tokio_tungstenite::tungstenite::Error>,
 ) -> Option<Arc<DashboardState>> {
     match message {
+        Ok(Message::Binary(bytes)) => bincode::deserialize::<DashboardState>(bytes.as_ref())
+            .ok()
+            .map(Arc::new),
         Ok(Message::Text(text)) => serde_json::from_str::<DashboardState>(text.as_str())
             .ok()
             .map(Arc::new),
@@ -509,6 +516,18 @@ mod tests {
             log_lines: vec!["hello".to_string()],
             ..empty_dashboard_state()
         };
+        let message = Message::Binary(bincode::serialize(&state).unwrap().into());
+
+        let parsed = dashboard_state_from_message(Ok(message)).expect("state should parse");
+        assert_eq!(parsed.log_lines, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn dashboard_state_from_message_accepts_legacy_text_frames() {
+        let state = DashboardState {
+            log_lines: vec!["hello".to_string()],
+            ..empty_dashboard_state()
+        };
         let message = Message::Text(serde_json::to_string(&state).unwrap().into());
 
         let parsed = dashboard_state_from_message(Ok(message)).expect("state should parse");
@@ -516,7 +535,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_state_from_message_ignores_non_text_and_invalid_json() {
+    fn dashboard_state_from_message_ignores_non_state_and_invalid_payloads() {
         assert!(dashboard_state_from_message(Ok(Message::Binary(vec![1, 2, 3].into()))).is_none());
         assert!(dashboard_state_from_message(Ok(Message::Ping(vec![1, 2].into()))).is_none());
         assert!(
@@ -791,10 +810,10 @@ mod tests {
             .expect("ws message")
             .expect("valid ws frame");
 
-        let Message::Text(text) = message else {
-            panic!("expected text frame");
+        let Message::Binary(bytes) = message else {
+            panic!("expected binary frame");
         };
-        let state = serde_json::from_str::<DashboardState>(text.as_str())
+        let state = bincode::deserialize::<DashboardState>(bytes.as_ref())
             .expect("deserialize dashboard state");
 
         assert_eq!(state.backend_views.len(), 1);
@@ -839,13 +858,11 @@ mod tests {
         second.show_details = true;
 
         let source = stream::iter(vec![
-            Ok(Message::Text(
-                serde_json::to_string(&first)
-                    .expect("serialize first")
-                    .into(),
+            Ok(Message::Binary(
+                bincode::serialize(&first).expect("serialize first").into(),
             )),
-            Ok(Message::Text(
-                serde_json::to_string(&second)
+            Ok(Message::Binary(
+                bincode::serialize(&second)
                     .expect("serialize second")
                     .into(),
             )),
@@ -894,8 +911,8 @@ mod tests {
             ..empty_dashboard_state()
         };
 
-        ws.send(Message::Text(
-            serde_json::to_string(&good).expect("serialize good").into(),
+        ws.send(Message::Binary(
+            bincode::serialize(&good).expect("serialize good").into(),
         ))
         .await
         .expect("send good state");
@@ -952,10 +969,8 @@ mod tests {
             ..empty_dashboard_state()
         };
         first_ws
-            .send(Message::Text(
-                serde_json::to_string(&first)
-                    .expect("serialize first")
-                    .into(),
+            .send(Message::Binary(
+                bincode::serialize(&first).expect("serialize first").into(),
             ))
             .await
             .expect("send first state");
@@ -1020,8 +1035,8 @@ mod tests {
             ..empty_dashboard_state()
         };
         second_ws
-            .send(Message::Text(
-                serde_json::to_string(&second)
+            .send(Message::Binary(
+                bincode::serialize(&second)
                     .expect("serialize second")
                     .into(),
             ))
@@ -1066,11 +1081,11 @@ mod tests {
             REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT,
         )
         .expect("serialize tailored state");
-        let Message::Text(text) = message else {
-            panic!("expected text frame");
+        let Message::Binary(bytes) = message else {
+            panic!("expected binary frame");
         };
         let tailored =
-            serde_json::from_str::<DashboardState>(text.as_str()).expect("deserialize state");
+            bincode::deserialize::<DashboardState>(bytes.as_ref()).expect("deserialize state");
 
         assert_eq!(
             tailored.log_lines.len(),

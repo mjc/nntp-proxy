@@ -1577,6 +1577,7 @@ version = "0.5.0"
 dependencies = [
  "anyhow",
  "arrayvec",
+ "bincode",
  "bytes",
  "bytesize",
  "chrono",
