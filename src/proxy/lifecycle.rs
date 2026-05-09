@@ -91,21 +91,29 @@ impl NntpProxy {
         let now = self.start_instant.elapsed();
         let idle_duration = now.saturating_sub(last_activity);
 
-        let mut any_cleared = false;
+        let mut stale_backends = Vec::new();
         for (server, provider) in self.servers.iter().zip(&self.connection_providers) {
             if idle_duration > server.backend_idle_timeout {
-                info!(
-                    backend = server.name.as_ref(),
-                    idle_secs = idle_duration.as_secs(),
-                    timeout_secs = server.backend_idle_timeout.as_secs(),
-                    "Clearing idle backend connections"
-                );
                 provider.clear_idle_connections();
-                any_cleared = true;
+                stale_backends.push((
+                    server.name.as_ref().to_string(),
+                    server.backend_idle_timeout.as_secs(),
+                ));
             }
         }
 
-        any_cleared
+        if stale_backends.is_empty() {
+            return false;
+        }
+
+        info!(
+            idle_secs = idle_duration.as_secs(),
+            backend_count = stale_backends.len(),
+            stale_backends = ?stale_backends,
+            "Clearing idle backend connections"
+        );
+
+        true
     }
 
     /// Build a session with standard configuration (conditionally enables metrics)

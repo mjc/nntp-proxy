@@ -222,9 +222,11 @@ pub async fn run_attached_tui(connect_addr: SocketAddr) -> Result<()> {
     );
     let (state_tx, mut state_rx) =
         tokio::sync::watch::channel(AttachedDashboard::connecting(connect_addr));
-    let _reader = spawn_dashboard_reader(connect_addr, state_tx);
+    let (log_tail_tx, log_tail_rx) =
+        tokio::sync::watch::channel(attached_log_line_limit(ViewMode::Normal));
+    let _reader = spawn_dashboard_reader(connect_addr, state_tx, log_tail_rx);
     with_terminal_session(move |terminal| {
-        Box::pin(async move { run_attached_app(terminal, &mut state_rx).await })
+        Box::pin(async move { run_attached_app(terminal, &mut state_rx, log_tail_tx).await })
     })
     .await
 }
@@ -294,6 +296,7 @@ fn renderable_dashboard_state(app: &TuiApp) -> DashboardState {
 async fn run_attached_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     state_rx: &mut tokio::sync::watch::Receiver<AttachedDashboard>,
+    log_tail_tx: tokio::sync::watch::Sender<usize>,
 ) -> Result<()>
 where
     B::Error: Send + Sync + 'static,
@@ -314,6 +317,7 @@ where
                     action,
                     &mut view_overrides,
                     state_rx.borrow().latest_state.as_deref(),
+                    &log_tail_tx,
                 ) {
                     break;
                 }
@@ -510,11 +514,17 @@ fn handle_attached_tui_action(
     action: TuiInputAction,
     view_overrides: &mut AttachedViewOverrides,
     current_state: Option<&DashboardState>,
+    log_tail_tx: &tokio::sync::watch::Sender<usize>,
 ) -> bool {
     match action {
         TuiInputAction::Quit => true,
         TuiInputAction::ToggleLogFullscreen => {
             view_overrides.toggle_log_fullscreen(current_state);
+            let view_mode = view_overrides
+                .view_mode
+                .or_else(|| current_state.map(|state| state.view_mode))
+                .unwrap_or(ViewMode::Normal);
+            let _ = log_tail_tx.send(attached_log_line_limit(view_mode));
             false
         }
         TuiInputAction::ToggleDetails => {
@@ -522,6 +532,13 @@ fn handle_attached_tui_action(
             false
         }
         TuiInputAction::None => false,
+    }
+}
+
+const fn attached_log_line_limit(view_mode: ViewMode) -> usize {
+    match view_mode {
+        ViewMode::Normal => remote::REMOTE_DASHBOARD_LOG_LINE_LIMIT,
+        ViewMode::LogFullscreen => remote::REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT,
     }
 }
 
@@ -608,16 +625,20 @@ mod tests {
             buffer_pool: None,
         };
         let mut overrides = AttachedViewOverrides::default();
+        let (log_tail_tx, log_tail_rx) =
+            tokio::sync::watch::channel(attached_log_line_limit(ViewMode::Normal));
 
         assert!(!handle_attached_tui_action(
             TuiInputAction::ToggleDetails,
             &mut overrides,
             Some(&state),
+            &log_tail_tx,
         ));
         assert!(!handle_attached_tui_action(
             TuiInputAction::ToggleLogFullscreen,
             &mut overrides,
             Some(&state),
+            &log_tail_tx,
         ));
 
         let attached =
@@ -626,6 +647,22 @@ mod tests {
         assert!(rendered.show_details);
         assert_eq!(rendered.view_mode, ViewMode::LogFullscreen);
         assert_eq!(rendered.state.log_lines, vec!["line".to_string()]);
+        assert_eq!(
+            *log_tail_rx.borrow(),
+            attached_log_line_limit(ViewMode::LogFullscreen)
+        );
+    }
+
+    #[test]
+    fn attached_log_line_limit_tracks_view_mode() {
+        assert_eq!(
+            attached_log_line_limit(ViewMode::Normal),
+            remote::REMOTE_DASHBOARD_LOG_LINE_LIMIT
+        );
+        assert_eq!(
+            attached_log_line_limit(ViewMode::LogFullscreen),
+            remote::REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT
+        );
     }
 
     #[test]

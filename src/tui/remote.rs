@@ -2,9 +2,11 @@
 
 use crate::tui::TuiApp;
 use crate::tui::dashboard::DashboardState;
+use crate::tui::log_capture::LogBuffer;
 use crate::tui::{AttachedDashboard, RemoteDashboardStatus};
 use anyhow::Context;
-use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt, future, stream};
+use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt, future};
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,8 +15,10 @@ use tokio::sync::watch;
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
 use tracing::{info, warn};
 
-const REMOTE_DASHBOARD_LOG_LINE_LIMIT: usize = 64;
+pub(crate) const REMOTE_DASHBOARD_LOG_LINE_LIMIT: usize = 8;
+pub(crate) const REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT: usize = 64;
 const REMOTE_DASHBOARD_HISTORY_LIMIT: usize = 15;
+const REMOTE_DASHBOARD_TOP_USER_LIMIT: usize = 5;
 
 #[allow(clippy::cast_precision_loss)]
 fn dashboard_message(state: &DashboardState) -> anyhow::Result<Message> {
@@ -32,20 +36,32 @@ fn dashboard_state_from_message(
     }
 }
 
-fn dashboard_state_stream(
-    state_rx: watch::Receiver<Arc<DashboardState>>,
-) -> impl Stream<Item = Arc<DashboardState>> {
-    let initial_state = state_rx.borrow().clone();
-    let updates = stream::unfold(state_rx, |mut state_rx| async move {
-        if state_rx.changed().await.is_ok() {
-            let state = state_rx.borrow().clone();
-            Some((state, state_rx))
-        } else {
-            None
-        }
-    });
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+enum DashboardClientRequest {
+    SetLogTail { lines: usize },
+}
 
-    stream::once(async move { initial_state }).chain(updates)
+fn dashboard_client_request_message(request: DashboardClientRequest) -> anyhow::Result<Message> {
+    Ok(Message::Text(serde_json::to_string(&request)?.into()))
+}
+
+fn dashboard_client_request_from_message(
+    message: Result<Message, tokio_tungstenite::tungstenite::Error>,
+) -> Option<DashboardClientRequest> {
+    match message {
+        Ok(Message::Text(text)) => {
+            serde_json::from_str::<DashboardClientRequest>(text.as_str()).ok()
+        }
+        _ => None,
+    }
+}
+
+fn sanitize_log_tail_limit(lines: usize) -> usize {
+    lines.clamp(
+        REMOTE_DASHBOARD_LOG_LINE_LIMIT,
+        REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT,
+    )
 }
 
 fn dashboard_source_stream(
@@ -66,28 +82,60 @@ enum ReaderSessionOutcome {
 }
 
 async fn send_dashboard_state_stream<S>(
-    sink: S,
-    state_rx: watch::Receiver<Arc<DashboardState>>,
+    mut sink: S,
+    mut state_rx: watch::Receiver<Arc<DashboardState>>,
+    mut log_tail_rx: watch::Receiver<usize>,
+    log_buffer: LogBuffer,
 ) -> anyhow::Result<()>
 where
     S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
 {
-    dashboard_state_stream(state_rx)
-        .map(|state| dashboard_message(state.as_ref()))
-        .try_fold(sink, |mut sink, message| async move {
-            sink.send(message).await?;
-            Ok::<_, anyhow::Error>(sink)
-        })
-        .await
-        .map(|_| ())
+    let mut state = state_rx.borrow().clone();
+    let mut log_tail = *log_tail_rx.borrow();
+
+    loop {
+        sink.send(dashboard_message_for_client(
+            state.as_ref(),
+            &log_buffer,
+            log_tail,
+        )?)
+        .await?;
+
+        tokio::select! {
+            changed = state_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                state = state_rx.borrow().clone();
+            }
+            changed = log_tail_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                log_tail = *log_tail_rx.borrow();
+            }
+        }
+    }
+
+    Ok(())
 }
 
-async fn drain_dashboard_source<S>(source: S) -> anyhow::Result<()>
+async fn receive_dashboard_client_requests<S>(
+    source: S,
+    log_tail_tx: watch::Sender<usize>,
+) -> anyhow::Result<()>
 where
     S: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    dashboard_source_stream(source)
-        .for_each(|_| future::ready(()))
+    source
+        .filter_map(|message| future::ready(dashboard_client_request_from_message(message)))
+        .for_each(|request| {
+            let log_tail_tx = log_tail_tx.clone();
+            async move {
+                let DashboardClientRequest::SetLogTail { lines } = request;
+                let _ = log_tail_tx.send(sanitize_log_tail_limit(lines));
+            }
+        })
         .await;
     Ok(())
 }
@@ -95,6 +143,7 @@ where
 async fn handle_dashboard_client(
     stream: TcpStream,
     state_rx: watch::Receiver<Arc<DashboardState>>,
+    log_buffer: LogBuffer,
 ) -> anyhow::Result<()> {
     let peer_addr = stream.peer_addr().ok();
     info!(
@@ -104,10 +153,11 @@ async fn handle_dashboard_client(
 
     let ws_stream = accept_async(stream).await?;
     let (sink, source) = ws_stream.split();
+    let (log_tail_tx, log_tail_rx) = watch::channel(REMOTE_DASHBOARD_LOG_LINE_LIMIT);
 
     futures::try_join!(
-        send_dashboard_state_stream(sink, state_rx),
-        drain_dashboard_source(source)
+        send_dashboard_state_stream(sink, state_rx, log_tail_rx, log_buffer),
+        receive_dashboard_client_requests(source, log_tail_tx)
     )?;
 
     info!(
@@ -117,31 +167,47 @@ async fn handle_dashboard_client(
     Ok(())
 }
 
-fn spawn_dashboard_client_task(stream: TcpStream, state_rx: watch::Receiver<Arc<DashboardState>>) {
+fn spawn_dashboard_client_task(
+    stream: TcpStream,
+    state_rx: watch::Receiver<Arc<DashboardState>>,
+    log_buffer: LogBuffer,
+) {
     tokio::spawn(async move {
-        if let Err(err) = handle_dashboard_client(stream, state_rx).await {
+        if let Err(err) = handle_dashboard_client(stream, state_rx, log_buffer).await {
             warn!("Dashboard websocket client error: {err}");
         }
     });
 }
 
+fn dashboard_message_for_client(
+    state: &DashboardState,
+    log_buffer: &LogBuffer,
+    log_tail: usize,
+) -> anyhow::Result<Message> {
+    if log_tail == REMOTE_DASHBOARD_LOG_LINE_LIMIT {
+        return dashboard_message(state);
+    }
+
+    let mut tailored_state = state.clone();
+    tailored_state.log_lines = log_buffer.recent_lines(log_tail);
+    dashboard_message(&tailored_state)
+}
+
 fn publish_dashboard_snapshot(app: &mut TuiApp, state_tx: &watch::Sender<Arc<DashboardState>>) {
     app.update();
-    let state = Arc::new(app.snapshot_state_with_limits(
-        Some(REMOTE_DASHBOARD_LOG_LINE_LIMIT),
-        Some(REMOTE_DASHBOARD_HISTORY_LIMIT),
-    ));
+    let state = Arc::new(remote_dashboard_state(app));
     let _ = state_tx.send(state);
 }
 
 fn handle_dashboard_accept_result(
     accept_result: std::io::Result<(TcpStream, SocketAddr)>,
     state_tx: &watch::Sender<Arc<DashboardState>>,
+    log_buffer: &LogBuffer,
 ) {
     match accept_result {
         Ok((stream, _)) => {
             let rx = state_tx.subscribe();
-            spawn_dashboard_client_task(stream, rx);
+            spawn_dashboard_client_task(stream, rx, log_buffer.clone());
         }
         Err(err) => {
             warn!(error = %err, "Dashboard websocket accept failed; continuing");
@@ -174,10 +240,8 @@ pub async fn run_dashboard_publisher_on_listener(
     listener: TcpListener,
     mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
 ) -> anyhow::Result<()> {
-    let (state_tx, _state_rx) = watch::channel(Arc::new(app.snapshot_state_with_limits(
-        Some(REMOTE_DASHBOARD_LOG_LINE_LIMIT),
-        Some(REMOTE_DASHBOARD_HISTORY_LIMIT),
-    )));
+    let (state_tx, _state_rx) = watch::channel(Arc::new(remote_dashboard_state(&app)));
+    let log_buffer = app.log_buffer().as_ref().clone();
     let mut update_interval = tokio::time::interval(Duration::from_millis(250));
     update_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -190,7 +254,7 @@ pub async fn run_dashboard_publisher_on_listener(
                 publish_dashboard_snapshot(&mut app, &state_tx);
             }
             accept_result = listener.accept() => {
-                handle_dashboard_accept_result(accept_result, &state_tx);
+                handle_dashboard_accept_result(accept_result, &state_tx, &log_buffer);
             }
         }
     }
@@ -216,13 +280,20 @@ pub async fn run_dashboard_publisher(
 pub(crate) fn spawn_dashboard_reader(
     connect_addr: SocketAddr,
     state_tx: watch::Sender<AttachedDashboard>,
+    log_tail_rx: watch::Receiver<usize>,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_dashboard_reader_with_retry_delay(connect_addr, state_tx, Duration::from_secs(1))
+    spawn_dashboard_reader_with_retry_delay(
+        connect_addr,
+        state_tx,
+        log_tail_rx,
+        Duration::from_secs(1),
+    )
 }
 
 fn spawn_dashboard_reader_with_retry_delay(
     connect_addr: SocketAddr,
     state_tx: watch::Sender<AttachedDashboard>,
+    log_tail_rx: watch::Receiver<usize>,
     retry_delay: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -231,7 +302,8 @@ fn spawn_dashboard_reader_with_retry_delay(
         info!("Connecting attached dashboard client to {ws_url}");
 
         loop {
-            let session_result = dashboard_reader_session(&ws_url, state_tx.clone()).await;
+            let session_result =
+                dashboard_reader_session(&ws_url, state_tx.clone(), log_tail_rx.clone()).await;
             if !dashboard_reader_should_retry(&session_result) {
                 if let Err(err) = session_result {
                     warn!("Attached dashboard websocket reader stopped for {ws_url}: {err}");
@@ -263,6 +335,7 @@ fn dashboard_reader_should_retry(outcome: &anyhow::Result<ReaderSessionOutcome>)
 async fn dashboard_reader_session(
     ws_url: &str,
     state_tx: watch::Sender<AttachedDashboard>,
+    mut log_tail_rx: watch::Receiver<usize>,
 ) -> anyhow::Result<ReaderSessionOutcome> {
     let connect_addr = dashboard_target_from_ws_url(ws_url)?;
     let (ws_stream, _) = match connect_async(ws_url).await {
@@ -276,11 +349,64 @@ async fn dashboard_reader_session(
     info!("Attached dashboard websocket connected to {ws_url}");
     let last_snapshot = state_tx.borrow().latest_state.clone();
     let _ = state_tx.send(AttachedDashboard::connected(connect_addr, last_snapshot));
-    let (_, source) = ws_stream.split();
-    forward_dashboard_states(source, state_tx).await.map(|()| {
-        warn!("Attached dashboard websocket stream ended for {ws_url}");
-        ReaderSessionOutcome::RetryAfterDelay
-    })
+    let (sink, source) = ws_stream.split();
+    let send_requests = send_dashboard_client_requests(sink, &mut log_tail_rx);
+    let forward_states = forward_dashboard_states(source, state_tx);
+    tokio::pin!(send_requests);
+    tokio::pin!(forward_states);
+
+    match future::select(send_requests, forward_states).await {
+        future::Either::Left((result, _)) | future::Either::Right((result, _)) => result?,
+    }
+
+    warn!("Attached dashboard websocket stream ended for {ws_url}");
+    Ok(ReaderSessionOutcome::RetryAfterDelay)
+}
+
+async fn send_dashboard_client_requests<S>(
+    mut sink: S,
+    log_tail_rx: &mut watch::Receiver<usize>,
+) -> anyhow::Result<()>
+where
+    S: Sink<Message, Error = tokio_tungstenite::tungstenite::Error> + Unpin,
+{
+    let mut current_tail = *log_tail_rx.borrow();
+    if current_tail != REMOTE_DASHBOARD_LOG_LINE_LIMIT {
+        sink.send(dashboard_client_request_message(
+            DashboardClientRequest::SetLogTail {
+                lines: current_tail,
+            },
+        )?)
+        .await?;
+    }
+
+    loop {
+        if log_tail_rx.changed().await.is_err() {
+            break;
+        }
+        current_tail = *log_tail_rx.borrow();
+        sink.send(dashboard_client_request_message(
+            DashboardClientRequest::SetLogTail {
+                lines: current_tail,
+            },
+        )?)
+        .await?;
+    }
+
+    Ok(())
+}
+
+fn trim_remote_dashboard_state(state: &mut DashboardState) {
+    state.top_users.truncate(REMOTE_DASHBOARD_TOP_USER_LIMIT);
+}
+
+fn remote_dashboard_state(app: &TuiApp) -> DashboardState {
+    let mut state = app.snapshot_state_with_limits(
+        Some(REMOTE_DASHBOARD_LOG_LINE_LIMIT),
+        Some(REMOTE_DASHBOARD_HISTORY_LIMIT),
+    );
+    trim_remote_dashboard_state(&mut state);
+    state
 }
 
 async fn forward_dashboard_states<S>(
@@ -336,6 +462,7 @@ mod tests {
     use crate::tui::{LogBuffer, TuiAppBuilder};
     use crate::types::Port;
     use crate::types::tui::{HistorySize, Throughput, Timestamp};
+    use futures::{FutureExt, stream};
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
@@ -399,6 +526,33 @@ mod tests {
             .is_none()
         );
         assert!(dashboard_state_from_message(Ok(Message::Text("{not-json}".into()))).is_none());
+    }
+
+    #[test]
+    fn dashboard_client_request_round_trips() {
+        let message = dashboard_client_request_message(DashboardClientRequest::SetLogTail {
+            lines: REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT,
+        })
+        .expect("serialize request");
+
+        let parsed =
+            dashboard_client_request_from_message(Ok(message)).expect("request should parse");
+
+        assert_eq!(
+            parsed,
+            DashboardClientRequest::SetLogTail {
+                lines: REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT
+            }
+        );
+    }
+
+    #[test]
+    fn sanitize_log_tail_limit_clamps_to_supported_range() {
+        assert_eq!(sanitize_log_tail_limit(1), REMOTE_DASHBOARD_LOG_LINE_LIMIT);
+        assert_eq!(
+            sanitize_log_tail_limit(REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT + 10),
+            REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT
+        );
     }
 
     #[test]
@@ -472,14 +626,12 @@ mod tests {
     #[test]
     fn dashboard_accept_errors_are_nonfatal() {
         let app = build_test_app();
-        let (state_tx, _state_rx) = watch::channel(Arc::new(app.snapshot_state_with_limits(
-            Some(REMOTE_DASHBOARD_LOG_LINE_LIMIT),
-            Some(REMOTE_DASHBOARD_HISTORY_LIMIT),
-        )));
+        let (state_tx, _state_rx) = watch::channel(Arc::new(remote_dashboard_state(&app)));
 
         handle_dashboard_accept_result(
             Err(std::io::Error::other("synthetic accept error")),
             &state_tx,
+            app.log_buffer().as_ref(),
         );
     }
 
@@ -510,7 +662,7 @@ mod tests {
         assert_eq!(snapshot.log_lines.len(), REMOTE_DASHBOARD_LOG_LINE_LIMIT);
         assert_eq!(
             snapshot.log_lines.first().map(String::as_str),
-            Some("line 36")
+            Some("line 92")
         );
         assert_eq!(
             snapshot.client_history.len(),
@@ -519,6 +671,41 @@ mod tests {
         assert_eq!(
             snapshot.backend_views[0].history.len(),
             REMOTE_DASHBOARD_HISTORY_LIMIT,
+        );
+    }
+
+    #[test]
+    fn trim_remote_dashboard_state_limits_top_users() {
+        let mut state = DashboardState {
+            metrics: crate::tui::dashboard::DashboardMetrics::default(),
+            backend_views: Vec::new(),
+            top_users: (0..10)
+                .map(|idx| crate::tui::dashboard::DashboardUserStats {
+                    username: format!("user-{idx}"),
+                    active_connections: 0,
+                    total_connections: crate::types::TotalConnections::new(0),
+                    bytes_sent: crate::types::BytesSent::ZERO,
+                    bytes_received: crate::types::BytesReceived::ZERO,
+                    bytes_sent_per_sec: crate::types::BytesPerSecondRate::new(0),
+                    bytes_received_per_sec: crate::types::BytesPerSecondRate::new(0),
+                    total_commands: crate::metrics::CommandCount::new(0),
+                    errors: crate::metrics::ErrorCount::new(0),
+                })
+                .collect(),
+            client_history: Vec::new(),
+            system_stats: crate::tui::SystemStats::default(),
+            view_mode: ViewMode::Normal,
+            show_details: false,
+            log_lines: Vec::new(),
+            buffer_pool: None,
+        };
+
+        trim_remote_dashboard_state(&mut state);
+
+        assert_eq!(state.top_users.len(), REMOTE_DASHBOARD_TOP_USER_LIMIT);
+        assert_eq!(
+            state.top_users.first().map(|user| user.username.as_str()),
+            Some("user-0")
         );
     }
 
@@ -540,7 +727,8 @@ mod tests {
         drop(listener);
 
         let (state_tx, _state_rx) = watch::channel(AttachedDashboard::connecting(addr));
-        let outcome = dashboard_reader_session(&format!("ws://{addr}"), state_tx)
+        let (_log_tail_tx, log_tail_rx) = watch::channel(REMOTE_DASHBOARD_LOG_LINE_LIMIT);
+        let outcome = dashboard_reader_session(&format!("ws://{addr}"), state_tx, log_tail_rx)
             .await
             .expect("reader session");
 
@@ -687,8 +875,13 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
 
         let (state_tx, mut state_rx) = watch::channel(AttachedDashboard::connecting(addr));
-        let reader =
-            spawn_dashboard_reader_with_retry_delay(addr, state_tx, Duration::from_millis(25));
+        let (_log_tail_tx, log_tail_rx) = watch::channel(REMOTE_DASHBOARD_LOG_LINE_LIMIT);
+        let reader = spawn_dashboard_reader_with_retry_delay(
+            addr,
+            state_tx,
+            log_tail_rx,
+            Duration::from_millis(25),
+        );
 
         let (stream, _) = tokio::time::timeout(Duration::from_secs(3), listener.accept())
             .await
@@ -738,8 +931,13 @@ mod tests {
         let addr = listener.local_addr().expect("local addr");
 
         let (state_tx, mut state_rx) = watch::channel(AttachedDashboard::connecting(addr));
-        let reader =
-            spawn_dashboard_reader_with_retry_delay(addr, state_tx, Duration::from_millis(25));
+        let (log_tail_tx, log_tail_rx) = watch::channel(REMOTE_DASHBOARD_LOG_LINE_LIMIT);
+        let reader = spawn_dashboard_reader_with_retry_delay(
+            addr,
+            state_tx,
+            log_tail_rx,
+            Duration::from_millis(25),
+        );
 
         let first_conn = tokio::time::timeout(Duration::from_secs(3), listener.accept())
             .await
@@ -793,6 +991,22 @@ mod tests {
         let mut second_ws = accept_async(second_conn.0)
             .await
             .expect("accept reconnect websocket");
+        assert!(
+            second_ws.next().now_or_never().is_none(),
+            "default log tail should not send an initial control frame"
+        );
+        let _ = log_tail_tx.send(REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT);
+        let request = tokio::time::timeout(Duration::from_secs(3), second_ws.next())
+            .await
+            .expect("receive log-tail request")
+            .expect("request frame")
+            .expect("valid ws frame");
+        assert_eq!(
+            dashboard_client_request_from_message(Ok(request)),
+            Some(DashboardClientRequest::SetLogTail {
+                lines: REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT
+            })
+        );
 
         let second = DashboardState {
             view_mode: ViewMode::LogFullscreen,
@@ -832,5 +1046,43 @@ mod tests {
         drop(second_ws);
         reader.abort();
         let _ = reader.await;
+    }
+
+    #[test]
+    fn dashboard_message_for_client_expands_log_tail_on_request() {
+        let log_buffer = LogBuffer::new();
+        for i in 0..100 {
+            log_buffer.push(format!("line {i}"));
+        }
+
+        let state = DashboardState {
+            log_lines: log_buffer.recent_lines(REMOTE_DASHBOARD_LOG_LINE_LIMIT),
+            ..empty_dashboard_state()
+        };
+
+        let message = dashboard_message_for_client(
+            &state,
+            &log_buffer,
+            REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT,
+        )
+        .expect("serialize tailored state");
+        let Message::Text(text) = message else {
+            panic!("expected text frame");
+        };
+        let tailored =
+            serde_json::from_str::<DashboardState>(text.as_str()).expect("deserialize state");
+
+        assert_eq!(
+            tailored.log_lines.len(),
+            REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT
+        );
+        assert_eq!(
+            tailored.log_lines.first().map(String::as_str),
+            Some("line 36")
+        );
+        assert_eq!(
+            tailored.log_lines.last().map(String::as_str),
+            Some("line 99")
+        );
     }
 }

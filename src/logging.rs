@@ -29,6 +29,18 @@ pub fn should_write_debug_log(ui_mode: UiMode, is_attached_tui: bool, file_level
     ui_mode == UiMode::Tui && !is_attached_tui && wants_debug_log_file(file_level)
 }
 
+#[must_use]
+pub const fn should_capture_in_memory_logs(
+    ui_mode: UiMode,
+    is_attached_tui: bool,
+    capture_headless_tui_buffer: bool,
+) -> bool {
+    match ui_mode {
+        UiMode::Headless => capture_headless_tui_buffer,
+        UiMode::Tui => !is_attached_tui,
+    }
+}
+
 fn debug_log_writer() -> (NonBlocking, WorkerGuard) {
     let file_appender = tracing_appender::rolling::never(".", "debug.log");
     tracing_appender::non_blocking(file_appender)
@@ -40,8 +52,8 @@ fn leak_guard(guard: WorkerGuard) {
     std::mem::forget(guard);
 }
 
-fn init_headless_subscriber(capture_tui_buffer: bool) -> Option<crate::tui::LogBuffer> {
-    let log_buffer = capture_tui_buffer.then(crate::tui::LogBuffer::new);
+fn init_headless_subscriber(capture_in_memory_logs: bool) -> Option<crate::tui::LogBuffer> {
+    let log_buffer = capture_in_memory_logs.then(crate::tui::LogBuffer::new);
 
     let subscriber = tracing_subscriber::registry().with(
         tracing_subscriber::fmt::layer()
@@ -66,34 +78,66 @@ fn init_headless_subscriber(capture_tui_buffer: bool) -> Option<crate::tui::LogB
     log_buffer
 }
 
-fn init_tui_subscriber(file_level: &str, write_debug_log: bool) -> crate::tui::LogBuffer {
-    let log_buffer = crate::tui::LogBuffer::new();
-    let log_writer = crate::tui::LogMakeWriter::new(log_buffer.clone());
-    let subscriber = tracing_subscriber::registry().with(
-        tracing_subscriber::fmt::layer()
-            .with_writer(log_writer)
-            .with_ansi(false)
-            .with_target(false)
-            .compact()
-            .with_filter(env_filter()),
-    );
-
-    if write_debug_log {
-        let (debug_log, guard) = debug_log_writer();
-        subscriber
-            .with(
-                tracing_subscriber::fmt::layer()
-                    .with_writer(debug_log)
-                    .with_ansi(false)
-                    .with_filter(file_filter(file_level)),
-            )
-            .init();
-        leak_guard(guard);
-    } else {
-        subscriber.init();
+fn init_tui_subscriber(
+    file_level: &str,
+    capture_in_memory_logs: bool,
+    write_debug_log: bool,
+) -> Option<crate::tui::LogBuffer> {
+    match (capture_in_memory_logs, write_debug_log) {
+        (true, true) => {
+            let log_buffer = crate::tui::LogBuffer::new();
+            let (debug_log, guard) = debug_log_writer();
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(crate::tui::LogMakeWriter::new(log_buffer.clone()))
+                        .with_ansi(false)
+                        .with_target(false)
+                        .compact()
+                        .with_filter(env_filter()),
+                )
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(debug_log)
+                        .with_ansi(false)
+                        .with_filter(file_filter(file_level)),
+                )
+                .init();
+            leak_guard(guard);
+            Some(log_buffer)
+        }
+        (true, false) => {
+            let log_buffer = crate::tui::LogBuffer::new();
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(crate::tui::LogMakeWriter::new(log_buffer.clone()))
+                        .with_ansi(false)
+                        .with_target(false)
+                        .compact()
+                        .with_filter(env_filter()),
+                )
+                .init();
+            Some(log_buffer)
+        }
+        (false, true) => {
+            let (debug_log, guard) = debug_log_writer();
+            tracing_subscriber::registry()
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .with_writer(debug_log)
+                        .with_ansi(false)
+                        .with_filter(file_filter(file_level)),
+                )
+                .init();
+            leak_guard(guard);
+            None
+        }
+        (false, false) => {
+            tracing_subscriber::registry().init();
+            None
+        }
     }
-
-    log_buffer
 }
 
 /// Initialize logging with dual output for legacy headless call sites.
@@ -112,12 +156,12 @@ pub fn init_dual_logging(file_level: &str) {
 pub fn init_logging(
     ui_mode: UiMode,
     file_level: &str,
-    capture_headless_tui_buffer: bool,
+    capture_in_memory_logs: bool,
     write_debug_log: bool,
 ) -> Option<crate::tui::LogBuffer> {
     match ui_mode {
-        UiMode::Headless => init_headless_subscriber(capture_headless_tui_buffer),
-        UiMode::Tui => Some(init_tui_subscriber(file_level, write_debug_log)),
+        UiMode::Headless => init_headless_subscriber(capture_in_memory_logs),
+        UiMode::Tui => init_tui_subscriber(file_level, capture_in_memory_logs, write_debug_log),
     }
 }
 
@@ -141,6 +185,18 @@ mod tests {
             UiMode::Tui,
             false,
             "warn,mycrate=info"
+        ));
+    }
+
+    #[test]
+    fn should_capture_in_memory_logs_skips_attached_clients() {
+        assert!(should_capture_in_memory_logs(UiMode::Tui, false, false));
+        assert!(!should_capture_in_memory_logs(UiMode::Tui, true, false));
+        assert!(should_capture_in_memory_logs(UiMode::Headless, false, true));
+        assert!(!should_capture_in_memory_logs(
+            UiMode::Headless,
+            false,
+            false
         ));
     }
 }

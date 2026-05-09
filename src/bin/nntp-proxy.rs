@@ -48,10 +48,15 @@ fn main() -> Result<()> {
         args.common.tui_attach.is_some(),
         &config.proxy.log_file_level,
     );
+    let capture_in_memory_logs = nntp_proxy::logging::should_capture_in_memory_logs(
+        ui_mode,
+        args.common.tui_attach.is_some(),
+        capture_headless_tui_buffer,
+    );
     let log_buffer = nntp_proxy::logging::init_logging(
         ui_mode,
         &config.proxy.log_file_level,
-        capture_headless_tui_buffer,
+        capture_in_memory_logs,
         write_debug_log,
     );
 

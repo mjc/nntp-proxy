@@ -45,6 +45,11 @@ fn bordered_block(title: &'static str, border_color: Color) -> Block<'static> {
         .border_style(Style::new().fg(border_color))
 }
 
+#[inline]
+fn untitled_bordered_block(border_color: Color) -> Block<'static> {
+    Block::bordered().border_style(Style::new().fg(border_color))
+}
+
 // ============================================================================
 // Render Functions
 // ============================================================================
@@ -142,7 +147,7 @@ fn render_title(
     remote_status: Option<&RemoteDashboardStatus>,
 ) {
     let title = Paragraph::new(build_title_lines(metrics, remote_status))
-        .block(bordered_block("", styles::BORDER_ACTIVE))
+        .block(untitled_bordered_block(styles::BORDER_ACTIVE))
         .alignment(Alignment::Center);
 
     f.render_widget(title, area);
@@ -832,7 +837,25 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
 
 /// Render footer with help text
 fn render_footer(f: &mut Frame, area: Rect) {
-    let footer = Paragraph::new(Line::from(vec![
+    let block = untitled_bordered_block(styles::LABEL);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let footer = footer_help_line();
+    let footer_width = u16::try_from(footer.width()).unwrap_or(u16::MAX);
+    let left_padding = inner.width.saturating_sub(footer_width) / 2;
+    let x = inner.left().saturating_add(left_padding);
+    let width = inner.width.saturating_sub(left_padding);
+
+    f.render_widget(footer, Rect::new(x, inner.top(), width, 1));
+}
+
+fn footer_help_line() -> Line<'static> {
+    Line::from(vec![
         "Press ".fg(styles::LABEL),
         "q".fg(styles::VALUE_INFO).bold(),
         " or ".fg(styles::LABEL),
@@ -844,11 +867,7 @@ fn render_footer(f: &mut Frame, area: Rect) {
         " for details  |  ".fg(styles::LABEL),
         "Ctrl+C".fg(styles::VALUE_INFO).bold(),
         " to shutdown".fg(styles::LABEL),
-    ]))
-    .block(bordered_block("", styles::LABEL))
-    .alignment(Alignment::Center);
-
-    f.render_widget(footer, area);
+    ])
 }
 
 /// Render recent log messages
@@ -1016,6 +1035,14 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(rendered, vec!["two".to_string(), "three".to_string()]);
+    }
+
+    #[test]
+    fn footer_help_line_preserves_help_text() {
+        assert_eq!(
+            footer_help_line().to_string(),
+            "Press q or Esc to exit  |  L to toggle logs  |  d for details  |  Ctrl+C to shutdown"
+        );
     }
 
     #[test]
