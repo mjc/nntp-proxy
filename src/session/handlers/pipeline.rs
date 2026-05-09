@@ -119,7 +119,6 @@ impl RequestBatch {
     }
 
     /// Get a typed context by index from the pipelineable commands.
-    #[cfg(test)]
     pub(super) fn context(&self, i: usize) -> &RequestContext {
         &self.contexts[i]
     }

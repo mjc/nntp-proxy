@@ -28,9 +28,9 @@ where
     R: AsyncRead + Unpin,
 {
     let mut line = String::new();
-    line.clear();
     reader.read_line(&mut line).await.unwrap();
     assert!(line.starts_with("220"), "Should get 220 response: {line}");
+    let status_line = line.clone();
 
     loop {
         line.clear();
@@ -40,7 +40,7 @@ where
         }
     }
 
-    line
+    status_line
 }
 
 /// Count how many times backends are queried

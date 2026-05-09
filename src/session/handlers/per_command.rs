@@ -571,29 +571,46 @@ impl ClientSession {
         let mut pending_requests = Vec::with_capacity(batch.len());
 
         for i in 0..batch_size {
+            let request = batch.context(i);
+            debug!(
+                "Client {} received {} request bytes: kind={:?}, verb={:?}",
+                self.client_addr,
+                request.request_wire_len().get(),
+                request.kind(),
+                request.verb()
+            );
+
+            state.client_to_backend_bytes = state
+                .client_to_backend_bytes
+                .add(request.request_wire_len().get());
+            state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
+
+            let decision = decide_request_routing(
+                request,
+                state.skip_auth_check,
+                self.auth_handler.is_enabled(),
+                self.mode_state.routing_mode(),
+            );
+            let flush_before_prepare = batch_size > 1
+                && request.is_large_transfer()
+                && matches!(decision, CommandRoutingDecision::Forward)
+                && !pending_requests.is_empty()
+                && self.has_servable_cached_response(request).await;
+            if flush_before_prepare {
+                self.finish_pending_pipeline_requests(
+                    router,
+                    client_writer,
+                    state,
+                    batch,
+                    &mut pending_requests,
+                )
+                .await?;
+            }
+
             let mut prepared_served = false;
             let mut enqueued_pending = None;
             {
                 let request = batch.context_mut(i);
-                debug!(
-                    "Client {} received {} request bytes: kind={:?}, verb={:?}",
-                    self.client_addr,
-                    request.request_wire_len().get(),
-                    request.kind(),
-                    request.verb()
-                );
-
-                state.client_to_backend_bytes = state
-                    .client_to_backend_bytes
-                    .add(request.request_wire_len().get());
-                state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
-
-                let decision = decide_request_routing(
-                    request,
-                    state.skip_auth_check,
-                    self.auth_handler.is_enabled(),
-                    self.mode_state.routing_mode(),
-                );
                 if batch_size > 1
                     && request.is_large_transfer()
                     && matches!(decision, CommandRoutingDecision::Forward)
