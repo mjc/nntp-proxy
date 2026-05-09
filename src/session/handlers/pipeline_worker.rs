@@ -15,8 +15,8 @@ use tracing::{debug, warn};
 
 use crate::metrics::MetricsCollector;
 use crate::pool::{BufferPool, DeadpoolConnectionProvider};
-use crate::protocol::{RequestResponseMetadata, ResponsePayloadLen};
-use crate::router::backend_queue::{BackendQueue, PipelineDelivery, PipelineError, QueuedContext};
+use crate::protocol::ResponsePayloadLen;
+use crate::router::backend_queue::{BackendQueue, PipelineError, QueuedContext};
 #[cfg(test)]
 use crate::session::backend::parse_backend_status;
 use crate::types::BackendId;
@@ -33,7 +33,6 @@ pub struct PipelineWorkerConfig {
 #[derive(Debug, Clone, Copy)]
 struct PipelineReadResult {
     data_len: u64,
-    response_streamed: bool,
 }
 
 struct PipelineDepthGuard<'a> {
@@ -227,7 +226,6 @@ async fn execute_pipeline_batch(
                     .context
                     .response_payload_len()
                     .map_or(0, ResponsePayloadLen::get) as u64,
-                response_streamed: false,
             })
         };
 
@@ -240,7 +238,7 @@ async fn execute_pipeline_batch(
                     req.context.request_wire_len().as_u64(),
                 );
 
-                req.complete_context(read_result.response_streamed);
+                req.complete_context();
                 pipeline_depth.complete_one();
             }
             Err(crate::session::streaming::StreamingError::ClientDisconnect(io_err)) => {
@@ -332,13 +330,8 @@ async fn execute_streaming_pipeline_response(
         let bytes = response.len() as u64;
         req.context
             .complete_backend_response(backend_id, status_code, response);
-        return Ok(PipelineReadResult {
-            data_len: bytes,
-            response_streamed: false,
-        });
+        return Ok(PipelineReadResult { data_len: bytes });
     }
-
-    let delivery = req.delivery().clone();
     if !req.context.expects_multiline_response(status_code) {
         crate::session::streaming::buffer_prefetched_single_line_response(
             io_buffer,
@@ -348,47 +341,10 @@ async fn execute_streaming_pipeline_response(
             initial_len,
         )?;
         let bytes = result_buf.len() as u64;
-        match delivery {
-            PipelineDelivery::StreamToClient(client_writer) => {
-                let mut client_write = client_writer.lock().await;
-                result_buf
-                    .write_all_to(&mut *client_write)
-                    .await
-                    .map_err(crate::session::streaming::StreamingError::ClientDisconnect)?;
-                req.context.record_backend_response(
-                    backend_id,
-                    RequestResponseMetadata::new(status_code, (bytes as usize).into()),
-                );
-                result_buf.clear();
-                return Ok(PipelineReadResult {
-                    data_len: bytes,
-                    response_streamed: true,
-                });
-            }
-            PipelineDelivery::StreamAndCapture(client_writer) => {
-                let mut client_write = client_writer.lock().await;
-                result_buf
-                    .write_all_to(&mut *client_write)
-                    .await
-                    .map_err(crate::session::streaming::StreamingError::ClientDisconnect)?;
-                let response = std::mem::take(result_buf);
-                req.context
-                    .complete_backend_response(backend_id, status_code, response);
-                return Ok(PipelineReadResult {
-                    data_len: bytes,
-                    response_streamed: true,
-                });
-            }
-            PipelineDelivery::Buffered => {
-                let response = std::mem::take(result_buf);
-                req.context
-                    .complete_backend_response(backend_id, status_code, response);
-                return Ok(PipelineReadResult {
-                    data_len: bytes,
-                    response_streamed: false,
-                });
-            }
-        }
+        let response = std::mem::take(result_buf);
+        req.context
+            .complete_backend_response(backend_id, status_code, response);
+        return Ok(PipelineReadResult { data_len: bytes });
     }
 
     let ctx = crate::session::streaming::StreamContext {
@@ -396,85 +352,13 @@ async fn execute_streaming_pipeline_response(
         backend_id,
         buffer_pool,
     };
-    match delivery {
-        PipelineDelivery::Buffered => {
-            let response = crate::session::streaming::buffer_multiline_response(
-                conn,
-                &io_buffer[..initial_len],
-                &ctx,
-            )
+    let response =
+        crate::session::streaming::buffer_multiline_response(conn, &io_buffer[..initial_len], &ctx)
             .await?;
-            let bytes = response.len() as u64;
-            req.context
-                .complete_backend_response(backend_id, status_code, response);
-            Ok(PipelineReadResult {
-                data_len: bytes,
-                response_streamed: false,
-            })
-        }
-        PipelineDelivery::StreamToClient(client_writer) => {
-            let mut leftover = buffer_pool.acquire();
-            let mut client_write = client_writer.lock().await;
-            let stream_result = crate::session::streaming::stream_multiline_response_pipelined(
-                conn,
-                &mut *client_write,
-                &io_buffer[..initial_len],
-                &ctx,
-                &mut leftover,
-            )
-            .await;
-            drop(client_write);
-
-            if !leftover.is_empty() {
-                conn.stash_leftover(&leftover[..])
-                    .map_err(crate::session::streaming::StreamingError::Io)?;
-                leftover.clear();
-            }
-
-            let bytes = stream_result?;
-
-            req.context.record_backend_response(
-                backend_id,
-                RequestResponseMetadata::new(status_code, (bytes as usize).into()),
-            );
-            Ok(PipelineReadResult {
-                data_len: bytes,
-                response_streamed: true,
-            })
-        }
-        PipelineDelivery::StreamAndCapture(client_writer) => {
-            result_buf.clear();
-            let mut leftover = buffer_pool.acquire();
-            let mut client_write = client_writer.lock().await;
-            let stream_result =
-                crate::session::streaming::stream_multiline_response_pipelined_with_capture(
-                    conn,
-                    &mut *client_write,
-                    &io_buffer[..initial_len],
-                    &ctx,
-                    &mut leftover,
-                    result_buf,
-                )
-                .await;
-            drop(client_write);
-
-            if !leftover.is_empty() {
-                conn.stash_leftover(&leftover[..])
-                    .map_err(crate::session::streaming::StreamingError::Io)?;
-                leftover.clear();
-            }
-
-            let bytes = stream_result?;
-
-            let response = std::mem::take(result_buf);
-            req.context
-                .complete_backend_response(backend_id, status_code, response);
-            Ok(PipelineReadResult {
-                data_len: bytes,
-                response_streamed: true,
-            })
-        }
-    }
+    let bytes = response.len() as u64;
+    req.context
+        .complete_backend_response(backend_id, status_code, response);
+    Ok(PipelineReadResult { data_len: bytes })
 }
 
 /// Buffer the complete response shape for the supplied request context.
@@ -542,12 +426,7 @@ mod tests {
     ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (
-            QueuedContext::new(
-                request_context(command.as_bytes()),
-                client_addr(),
-                tx,
-                PipelineDelivery::Buffered,
-            ),
+            QueuedContext::new(request_context(command.as_bytes()), client_addr(), tx),
             rx,
         )
     }
@@ -603,15 +482,6 @@ mod tests {
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         ConnectionStream::plain(stream)
-    }
-
-    async fn mock_client_writer() -> (crate::session::SharedClientWriter, tokio::net::TcpStream) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
-        let (server, _) = listener.accept().await.unwrap();
-        let (_read_half, write_half) = server.into_split();
-        (crate::session::SharedClientWriter::new(write_half), client)
     }
 
     async fn run_single_line_pipeline_batch(
@@ -758,57 +628,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_execute_pipeline_batch_streams_large_transfer_to_client() {
-        let pool = BufferPool::for_tests();
-        let metrics = MetricsCollector::new(1);
-        let backend_id = BackendId::from_index(0);
-        let queue = BackendQueue::new(1);
-        let response = b"220 0 <msg@id> article\r\nSubject: test\r\n\r\nBody line\r\n.\r\n";
-        let mut conn = mock_backend_conn(response).await;
-        let (client_writer, mut client_stream) = mock_client_writer().await;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let batch = vec![QueuedContext::new(
-            request_context(ARTICLE_REQUEST),
-            client_addr(),
-            tx,
-            PipelineDelivery::StreamToClient(client_writer),
-        )];
-        let mut result_buf = crate::pool::ChunkedResponse::default();
-
-        let (success, batch) = execute_pipeline_batch(
-            backend_id,
-            &queue,
-            &mut conn,
-            batch,
-            &metrics,
-            &pool,
-            &mut result_buf,
-        )
-        .await;
-
-        assert!(success);
-        assert!(batch.is_empty());
-        assert!(!conn.has_leftover());
-
-        let completed = rx.await.unwrap().unwrap();
-        assert!(completed.response_streamed);
-        assert_eq!(
-            completed
-                .context
-                .response_metadata()
-                .expect("streamed response records metadata")
-                .status()
-                .as_u16(),
-            220
-        );
-        assert!(completed.context.response_payload().is_none());
-
-        let mut streamed = Vec::new();
-        client_stream.read_to_end(&mut streamed).await.unwrap();
-        assert_eq!(streamed, response);
-    }
-
-    #[tokio::test]
     async fn test_execute_pipeline_batch_keeps_large_transfer_430_buffered() {
         let pool = BufferPool::for_tests();
         let metrics = MetricsCollector::new(1);
@@ -816,13 +635,11 @@ mod tests {
         let queue = BackendQueue::new(1);
         let response = b"430 No such article\r\n";
         let mut conn = mock_backend_conn(response).await;
-        let (client_writer, mut client_stream) = mock_client_writer().await;
         let (tx, rx) = tokio::sync::oneshot::channel();
         let batch = vec![QueuedContext::new(
             request_context(ARTICLE_REQUEST),
             client_addr(),
             tx,
-            PipelineDelivery::StreamToClient(client_writer),
         )];
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
@@ -841,7 +658,6 @@ mod tests {
         assert!(batch.is_empty());
 
         let completed = rx.await.unwrap().unwrap();
-        assert!(!completed.response_streamed);
         assert_eq!(
             completed
                 .context
@@ -859,56 +675,6 @@ mod tests {
                 .to_vec(),
             response
         );
-
-        let mut streamed = Vec::new();
-        client_stream.read_to_end(&mut streamed).await.unwrap();
-        assert!(streamed.is_empty());
-    }
-
-    #[tokio::test]
-    async fn test_stream_and_capture_clears_stale_capture_bytes_before_reuse() {
-        let pool = BufferPool::for_tests();
-        let backend_id = BackendId::from_index(0);
-        let mut io_buffer = pool.acquire();
-        let mut result_buf = crate::pool::ChunkedResponse::default();
-        result_buf.extend_from_slice(&pool, b"stale-bytes");
-
-        let fresh_response =
-            b"220 0 <fresh@example> article\r\nSubject: fresh\r\n\r\nfresh-body\r\n.\r\n";
-        let mut fresh_conn = mock_backend_conn(fresh_response).await;
-        let (fresh_writer, mut fresh_client) = mock_client_writer().await;
-        let (fresh_tx, _fresh_rx) = tokio::sync::oneshot::channel();
-        let mut fresh_req = QueuedContext::new(
-            request_context(b"ARTICLE <fresh@example>\r\n"),
-            client_addr(),
-            fresh_tx,
-            PipelineDelivery::StreamAndCapture(fresh_writer),
-        );
-
-        let read = execute_streaming_pipeline_response(
-            &mut fresh_req,
-            &mut fresh_conn,
-            &mut io_buffer,
-            &mut result_buf,
-            &pool,
-            backend_id,
-        )
-        .await
-        .expect("fresh streamed capture should succeed");
-        assert!(read.response_streamed);
-
-        assert_eq!(
-            fresh_req
-                .context
-                .response_payload()
-                .expect("fresh streamed capture should complete")
-                .to_vec(),
-            fresh_response
-        );
-
-        let mut streamed = vec![0u8; fresh_response.len()];
-        fresh_client.read_exact(&mut streamed).await.unwrap();
-        assert_eq!(streamed, fresh_response);
     }
 
     #[tokio::test]
@@ -924,7 +690,6 @@ mod tests {
             request_context(ARTICLE_REQUEST),
             client_addr(),
             tx,
-            PipelineDelivery::Buffered,
         )];
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
@@ -943,7 +708,6 @@ mod tests {
         assert!(batch.is_empty());
 
         let completed = rx.await.unwrap().unwrap();
-        assert!(!completed.response_streamed);
         assert_eq!(
             completed
                 .context
@@ -1029,156 +793,6 @@ mod tests {
         assert_eq!(queue.pipeline_depth(), 0);
         assert_eq!(expect_success_status(rx1.await.unwrap()), 223);
         assert_eq!(expect_success_status(rx2.await.unwrap()), 223);
-    }
-
-    #[tokio::test]
-    async fn test_execute_pipeline_batch_continues_after_streamed_client_disconnect() {
-        let pool = BufferPool::for_tests();
-        let metrics = MetricsCollector::new(1);
-        let backend_id = BackendId::from_index(0);
-        let queue = BackendQueue::new(2);
-        let mut response = b"220 0 <msg@id> article\r\nSubject: test\r\n\r\n".to_vec();
-        for _ in 0..1024 {
-            response.extend_from_slice(
-                b"Body line that should fail to stream after client disconnect\r\n",
-            );
-        }
-        response.extend_from_slice(b".\r\n430 No such article\r\n");
-        let mut conn = mock_backend_conn(&response).await;
-        let (client_writer, client_stream) = mock_client_writer().await;
-        drop(client_stream);
-
-        let (tx1, rx1) = tokio::sync::oneshot::channel();
-        let (tx2, rx2) = tokio::sync::oneshot::channel();
-        let batch = vec![
-            QueuedContext::new(
-                request_context(ARTICLE_REQUEST),
-                client_addr(),
-                tx1,
-                PipelineDelivery::StreamToClient(client_writer),
-            ),
-            QueuedContext::new(
-                request_context(STAT_REQUEST),
-                client_addr(),
-                tx2,
-                PipelineDelivery::Buffered,
-            ),
-        ];
-        let mut result_buf = crate::pool::ChunkedResponse::default();
-
-        let (success, batch) = execute_pipeline_batch(
-            backend_id,
-            &queue,
-            &mut conn,
-            batch,
-            &metrics,
-            &pool,
-            &mut result_buf,
-        )
-        .await;
-
-        assert!(
-            success,
-            "streamed client disconnect should swallow the drained response and keep the batch running"
-        );
-        assert!(batch.is_empty());
-
-        assert!(matches!(
-            rx1.await.unwrap(),
-            Err(PipelineError::ClientDisconnect)
-        ));
-        assert_eq!(expect_success_status(rx2.await.unwrap()), 430);
-    }
-
-    #[tokio::test]
-    async fn test_execute_pipeline_batch_drains_all_streamed_responses_for_disconnected_client() {
-        let pool = BufferPool::for_tests();
-        let metrics = MetricsCollector::new(1);
-        let backend_id = BackendId::from_index(0);
-        let queue = BackendQueue::new(5);
-
-        let article_response = |msg_id: &str| {
-            format!("220 0 {msg_id} article\r\nSubject: test\r\n\r\nBody line\r\n.\r\n")
-        };
-        let wire = format!(
-            "{}{}{}{}223 0 <other@example> status\r\n",
-            article_response("<dead-1@example>"),
-            article_response("<dead-2@example>"),
-            article_response("<dead-3@example>"),
-            article_response("<dead-4@example>"),
-        );
-        let mut conn = mock_backend_conn(wire.as_bytes()).await;
-        let (client_writer, client_stream) = mock_client_writer().await;
-        let std_client_stream = client_stream.into_std().unwrap();
-        socket2::SockRef::from(&std_client_stream)
-            .set_linger(Some(std::time::Duration::ZERO))
-            .unwrap();
-        drop(std_client_stream);
-
-        let (tx1, rx1) = tokio::sync::oneshot::channel();
-        let (tx2, rx2) = tokio::sync::oneshot::channel();
-        let (tx3, rx3) = tokio::sync::oneshot::channel();
-        let (tx4, rx4) = tokio::sync::oneshot::channel();
-        let (tx5, rx5) = tokio::sync::oneshot::channel();
-        let batch = vec![
-            QueuedContext::new(
-                request_context(b"ARTICLE <dead-1@example>\r\n"),
-                client_addr(),
-                tx1,
-                PipelineDelivery::StreamToClient(client_writer.clone()),
-            ),
-            QueuedContext::new(
-                request_context(b"ARTICLE <dead-2@example>\r\n"),
-                client_addr(),
-                tx2,
-                PipelineDelivery::StreamToClient(client_writer.clone()),
-            ),
-            QueuedContext::new(
-                request_context(b"ARTICLE <dead-3@example>\r\n"),
-                client_addr(),
-                tx3,
-                PipelineDelivery::StreamToClient(client_writer.clone()),
-            ),
-            QueuedContext::new(
-                request_context(b"ARTICLE <dead-4@example>\r\n"),
-                client_addr(),
-                tx4,
-                PipelineDelivery::StreamToClient(client_writer),
-            ),
-            QueuedContext::new(
-                request_context(b"STAT <other@example>\r\n"),
-                client_addr(),
-                tx5,
-                PipelineDelivery::Buffered,
-            ),
-        ];
-        let mut result_buf = crate::pool::ChunkedResponse::default();
-
-        let (success, batch) = execute_pipeline_batch(
-            backend_id,
-            &queue,
-            &mut conn,
-            batch,
-            &metrics,
-            &pool,
-            &mut result_buf,
-        )
-        .await;
-
-        assert!(
-            success,
-            "disconnecting one client should still drain every already-sent response and preserve the backend connection"
-        );
-        assert!(batch.is_empty());
-        for response in [
-            rx1.await.unwrap(),
-            rx2.await.unwrap(),
-            rx3.await.unwrap(),
-            rx4.await.unwrap(),
-        ] {
-            assert!(matches!(response, Err(PipelineError::ClientDisconnect)));
-        }
-        assert_eq!(expect_success_status(rx5.await.unwrap()), 223);
     }
 
     #[tokio::test]

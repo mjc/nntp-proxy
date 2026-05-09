@@ -1475,7 +1475,6 @@ mod tests {
                     "127.0.0.1:8119".parse().expect("valid client addr"),
                 ),
                 tx,
-                crate::router::backend_queue::PipelineDelivery::Buffered,
             ))
             .expect("queue request");
         queue.mark_pipeline_sent(3);
