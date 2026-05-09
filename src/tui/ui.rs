@@ -55,10 +55,15 @@ pub(crate) fn render_ui(
     state: &DashboardState,
     attached_ui_stats: Option<&crate::tui::SystemStats>,
     remote_status: Option<&RemoteDashboardStatus>,
+    view_mode_override: Option<crate::tui::app::ViewMode>,
+    show_details_override: Option<bool>,
 ) {
-    if let Some(chunks) = dashboard_fullscreen_chunks(state.view_mode, f.area()) {
+    let view_mode = view_mode_override.unwrap_or(state.view_mode);
+    let show_details = show_details_override.unwrap_or(state.show_details);
+
+    if let Some(chunks) = dashboard_fullscreen_chunks(view_mode, f.area()) {
         render_title(f, chunks[0], &state.metrics, remote_status);
-        render_logs(f, chunks[1], state);
+        render_logs(f, chunks[1], &state.log_lines, show_details);
         render_footer(f, chunks[2]);
         return;
     }
@@ -68,13 +73,13 @@ pub(crate) fn render_ui(
 
     // Render each section
     render_title(f, chunks[0], &state.metrics, remote_status);
-    render_summary(f, chunks[1], state, attached_ui_stats);
+    render_summary(f, chunks[1], state, attached_ui_stats, show_details);
 
     // Backends area now contains 3 columns: backends, chart, and user stats
-    render_backends(f, chunks[2], state);
+    render_backends(f, chunks[2], state, show_details);
 
     if show_logs {
-        render_logs(f, chunks[3], state);
+        render_logs(f, chunks[3], &state.log_lines, show_details);
         render_footer(f, chunks[4]);
     } else {
         render_footer(f, chunks[3]);
@@ -221,6 +226,7 @@ fn render_summary(
     area: Rect,
     state: &DashboardState,
     attached_ui_stats: Option<&crate::tui::SystemStats>,
+    show_details: bool,
 ) {
     let metrics = &state.metrics;
     let system_stats = &state.system_stats;
@@ -244,7 +250,7 @@ fn render_summary(
         metrics,
         system_stats,
         state.buffer_pool(),
-        state.show_details,
+        show_details,
         attached_ui_stats,
     );
 
@@ -261,14 +267,14 @@ fn render_summary(
 }
 
 /// Render backend server visualization
-fn render_backends(f: &mut Frame, area: Rect, state: &DashboardState) {
+fn render_backends(f: &mut Frame, area: Rect, state: &DashboardState, show_details: bool) {
     // Split into three columns: backend list, data flow chart, and top users
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(layout::backend_columns())
         .split(area);
 
-    render_backend_list(f, chunks[0], state);
+    render_backend_list(f, chunks[0], state, show_details);
     render_data_flow(f, chunks[1], state);
     render_user_stats(f, chunks[2], &state.top_users);
 }
@@ -657,7 +663,7 @@ fn backend_details_line(
 }
 
 /// Render list of backend servers with their stats
-fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState) {
+fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_details: bool) {
     let items: Vec<ListItem> = state
         .backend_views
         .iter()
@@ -719,7 +725,7 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState) {
             ];
 
             // Add details line in details mode
-            if state.show_details {
+            if show_details {
                 content.push(backend_details_line(
                     state.backend_pending_count(i),
                     state.backend_load_ratio(i),
@@ -832,22 +838,21 @@ fn render_footer(f: &mut Frame, area: Rect) {
 }
 
 /// Render recent log messages
-fn render_logs(f: &mut Frame, area: Rect, state: &DashboardState) {
-    let details = state.show_details;
+fn render_logs(f: &mut Frame, area: Rect, log_lines: &[String], show_details: bool) {
     let visible_lines = area.height.saturating_sub(2) as usize;
-    let fetch_count = if details {
+    let fetch_count = if show_details {
         visible_lines * 3
     } else {
         visible_lines
     };
 
-    let text = recent_log_lines(&state.log_lines, fetch_count).join("\n");
+    let text = recent_log_lines(log_lines, fetch_count).join("\n");
 
     let mut paragraph = Paragraph::new(text)
         .style(Style::default().fg(Color::Gray))
         .block(bordered_block(" Recent Logs ", styles::BORDER_ACTIVE));
 
-    if details {
+    if show_details {
         paragraph = paragraph.wrap(Wrap { trim: false });
     }
 

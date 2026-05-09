@@ -23,9 +23,11 @@ fn dashboard_message(state: &DashboardState) -> anyhow::Result<Message> {
 
 fn dashboard_state_from_message(
     message: Result<Message, tokio_tungstenite::tungstenite::Error>,
-) -> Option<DashboardState> {
+) -> Option<Arc<DashboardState>> {
     match message {
-        Ok(Message::Text(text)) => serde_json::from_str::<DashboardState>(text.as_str()).ok(),
+        Ok(Message::Text(text)) => serde_json::from_str::<DashboardState>(text.as_str())
+            .ok()
+            .map(Arc::new),
         _ => None,
     }
 }
@@ -48,7 +50,7 @@ fn dashboard_state_stream(
 
 fn dashboard_source_stream(
     source: impl Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>,
-) -> impl Stream<Item = DashboardState> {
+) -> impl Stream<Item = Arc<DashboardState>> {
     source.filter_map(|message| async move { dashboard_state_from_message(message) })
 }
 
@@ -289,12 +291,12 @@ where
     S: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
     dashboard_source_stream(source)
-        .map(Ok::<DashboardState, anyhow::Error>)
+        .map(Ok::<Arc<DashboardState>, anyhow::Error>)
         .try_fold(state_tx, |state_tx, state| async move {
             let connect_addr = match &state_tx.borrow().status {
                 RemoteDashboardStatus::Connecting { target }
                 | RemoteDashboardStatus::Connected { target }
-                | RemoteDashboardStatus::Reconnecting { target, .. } => *target,
+                | RemoteDashboardStatus::Reconnecting { target, .. } => target.to_owned(),
             };
             state_tx
                 .send(AttachedDashboard::connected(connect_addr, Some(state)))
@@ -549,7 +551,7 @@ mod tests {
         state_rx: &mut watch::Receiver<AttachedDashboard>,
         expected: &[&str],
         timeout: Duration,
-    ) -> DashboardState {
+    ) -> Arc<DashboardState> {
         tokio::time::timeout(timeout, async {
             loop {
                 if let Some(state) = state_rx.borrow().latest_state.clone()

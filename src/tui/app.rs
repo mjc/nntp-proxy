@@ -367,7 +367,7 @@ pub struct TuiApp {
     show_details: bool,
     /// System resource monitor
     system_monitor: crate::tui::SystemMonitor,
-    /// Current system stats (CPU, memory, threads)
+    /// Current system stats (CPU and memory)
     system_stats: crate::tui::SystemStats,
     /// Article cache (optional - only present in caching mode)
     cache: Option<Arc<crate::cache::UnifiedCache>>,
@@ -729,7 +729,7 @@ impl TuiApp {
         self.show_details
     }
 
-    /// Get current system stats (CPU, memory, threads)
+    /// Get current system stats (CPU and memory)
     #[must_use]
     pub const fn system_stats(&self) -> &crate::tui::SystemStats {
         &self.system_stats

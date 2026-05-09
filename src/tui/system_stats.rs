@@ -1,6 +1,6 @@
 //! System resource monitoring for TUI display
 //!
-//! Tracks CPU usage, memory consumption, and thread count for the proxy process.
+//! Tracks CPU usage and memory consumption for the proxy process.
 
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
 
@@ -15,8 +15,6 @@ pub struct SystemStats {
     pub memory_bytes: u64,
     /// Peak memory usage in bytes
     pub peak_memory_bytes: u64,
-    /// Number of active threads
-    pub thread_count: usize,
 }
 
 /// System resource monitor
@@ -31,21 +29,27 @@ pub struct SystemMonitor {
 }
 
 impl SystemMonitor {
+    fn refresh_kind() -> ProcessRefreshKind {
+        ProcessRefreshKind::nothing()
+            .with_cpu()
+            .with_memory()
+            .without_tasks()
+    }
+
     /// Create a new system monitor for the current process
     ///
     /// # Panics
     /// Panics if `sysinfo` cannot determine the current process ID.
     #[must_use]
     pub fn new() -> Self {
-        let mut system = System::new_with_specifics(
-            RefreshKind::nothing().with_processes(ProcessRefreshKind::everything()),
-        );
-
-        // Get current process PID
+        let mut system =
+            System::new_with_specifics(RefreshKind::nothing().with_processes(Self::refresh_kind()));
         let pid = sysinfo::get_current_pid().expect("Failed to get current PID");
-
-        // Initial refresh
-        system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            Self::refresh_kind(),
+        );
 
         Self {
             system,
@@ -61,15 +65,16 @@ impl SystemMonitor {
     /// First call may return zero for CPU usage - sysinfo needs 2+ samples.
     #[must_use]
     pub fn update(&mut self) -> SystemStats {
-        // Refresh only our process (efficient)
-        self.system
-            .refresh_processes(ProcessesToUpdate::Some(&[self.pid]), true);
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[self.pid]),
+            true,
+            Self::refresh_kind(),
+        );
 
         if let Some(process) = self.system.process(self.pid) {
             let cpu = process.cpu_usage();
             let memory = process.memory();
 
-            // Update peaks
             if cpu > self.peak_cpu {
                 self.peak_cpu = cpu;
             }
@@ -82,10 +87,8 @@ impl SystemMonitor {
                 peak_cpu_usage: self.peak_cpu,
                 memory_bytes: memory,
                 peak_memory_bytes: self.peak_memory,
-                thread_count: process.tasks().map_or(1, std::collections::HashSet::len),
             }
         } else {
-            // Process not found (shouldn't happen for our own PID)
             SystemStats::default()
         }
     }
@@ -102,7 +105,6 @@ impl SystemMonitor {
                 peak_cpu_usage: self.peak_cpu,
                 memory_bytes: process.memory(),
                 peak_memory_bytes: self.peak_memory,
-                thread_count: process.tasks().map_or(1, std::collections::HashSet::len),
             })
     }
 }
@@ -119,14 +121,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_refresh_kind_only_enables_needed_process_fields() {
+        let kind = SystemMonitor::refresh_kind();
+
+        assert!(kind.cpu());
+        assert!(kind.memory());
+        assert!(!kind.tasks());
+        assert!(!kind.disk_usage());
+    }
+
+    #[test]
     fn test_system_monitor_creation() {
         let monitor = SystemMonitor::new();
         let stats = monitor.current();
 
         // Memory should be > 0 for a running process
         assert!(stats.memory_bytes > 0);
-        // Thread count should be >= 1
-        assert!(stats.thread_count >= 1);
         // CPU might be 0 on first sample
         assert!(stats.cpu_usage >= 0.0);
     }
@@ -143,9 +153,11 @@ mod tests {
         let stats2 = monitor.update();
         assert!(stats2.memory_bytes > 0);
 
-        // CPU and thread count should be reasonable
+        // CPU should be reasonable
         assert!(stats2.cpu_usage >= 0.0);
-        assert!(stats2.thread_count >= 1);
+        assert!(stats2.peak_memory_bytes >= stats1.memory_bytes);
+        assert!(stats2.peak_memory_bytes >= stats2.memory_bytes);
+        assert!(stats2.peak_cpu_usage >= stats2.cpu_usage);
     }
 
     #[test]
@@ -166,6 +178,5 @@ mod tests {
         assert_eq!(stats.peak_cpu_usage, 0.0);
         assert_eq!(stats.memory_bytes, 0);
         assert_eq!(stats.peak_memory_bytes, 0);
-        assert_eq!(stats.thread_count, 0);
     }
 }
