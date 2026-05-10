@@ -34,7 +34,7 @@ use crossterm::{
 use futures::future::BoxFuture;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::Rect,
     style::{Color, Stylize},
     text::Line,
 };
@@ -364,15 +364,7 @@ fn draw_attached_dashboard(
         return;
     }
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .margin(1)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(3),
-        ])
-        .split(f.area());
+    let chunks = attached_placeholder_chunks(f.area());
 
     let title = Line::from(vec![
         "NNTP Proxy "
@@ -392,6 +384,30 @@ fn draw_attached_dashboard(
     render_centered_line(f, chunks[0], &title);
     render_centered_lines(f, chunks[1], &attached.placeholder_lines);
     render_centered_line(f, chunks[2], &footer);
+}
+
+fn attached_placeholder_chunks(area: Rect) -> [Rect; 3] {
+    let inner = Rect::new(
+        area.x.saturating_add(area.width.min(1)),
+        area.y.saturating_add(area.height.min(1)),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    let title = 3.min(inner.height);
+    let remaining_after_title = inner.height.saturating_sub(title);
+    let footer = 3.min(remaining_after_title);
+    let body = remaining_after_title.saturating_sub(footer);
+
+    [
+        Rect::new(inner.x, inner.y, inner.width, title),
+        Rect::new(inner.x, inner.y.saturating_add(title), inner.width, body),
+        Rect::new(
+            inner.x,
+            inner.y.saturating_add(title).saturating_add(body),
+            inner.width,
+            footer,
+        ),
+    ]
 }
 
 fn render_centered_lines(f: &mut ratatui::Frame, area: Rect, lines: &[Line<'_>]) {
@@ -733,6 +749,14 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Last error: connection refused"))
         );
+    }
+
+    #[test]
+    fn attached_placeholder_chunks_match_previous_geometry() {
+        let chunks = attached_placeholder_chunks(Rect::new(0, 0, 80, 24));
+        assert_eq!(chunks[0], Rect::new(1, 1, 78, 3));
+        assert_eq!(chunks[1], Rect::new(1, 4, 78, 16));
+        assert_eq!(chunks[2], Rect::new(1, 20, 78, 3));
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ use arrayvec::ArrayString;
 use ratatui::{
     Frame,
     buffer::Buffer,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Rect},
     style::{Color, Modifier, Style, Stylize},
     symbols,
     text::{Line, Span},
@@ -167,43 +167,171 @@ fn dashboard_fullscreen_chunks(
         return None;
     }
 
-    Some(
-        Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints([
-                Constraint::Length(layout::TITLE_HEIGHT),
-                Constraint::Min(10),
-                Constraint::Length(layout::FOOTER_HEIGHT),
-            ])
-            .areas(area),
-    )
+    let inner = inset_rect(area, 1);
+    Some(split_vertical_three(
+        inner,
+        layout::TITLE_HEIGHT,
+        layout::FOOTER_HEIGHT,
+    ))
 }
 
 fn dashboard_main_chunks(area: Rect, show_logs: bool) -> DashboardMainChunks {
+    let inner = inset_rect(area, 1);
     if show_logs {
-        DashboardMainChunks::WithLogs(
-            Layout::default()
-                .direction(Direction::Vertical)
-                .margin(1)
-                .constraints([
-                    Constraint::Length(layout::TITLE_HEIGHT),
-                    Constraint::Length(layout::SUMMARY_HEIGHT),
-                    Constraint::Min(layout::MIN_CHART_HEIGHT),
-                    Constraint::Length(layout::LOG_WINDOW_HEIGHT),
-                    Constraint::Length(layout::FOOTER_HEIGHT),
-                ])
-                .areas(area),
-        )
+        DashboardMainChunks::WithLogs(split_dashboard_main_with_logs(inner))
     } else {
-        DashboardMainChunks::WithoutLogs(
-            Layout::default()
-                .direction(Direction::Vertical)
-                .margin(1)
-                .constraints(layout::main_sections())
-                .areas(area),
-        )
+        DashboardMainChunks::WithoutLogs(split_dashboard_main_without_logs(inner))
     }
+}
+
+fn inset_rect(area: Rect, margin: u16) -> Rect {
+    let x = area.x.saturating_add(area.width.min(margin));
+    let y = area.y.saturating_add(area.height.min(margin));
+    let width = area.width.saturating_sub(margin.saturating_mul(2));
+    let height = area.height.saturating_sub(margin.saturating_mul(2));
+    Rect::new(x, y, width, height)
+}
+
+fn split_vertical_three(area: Rect, top_height: u16, bottom_height: u16) -> [Rect; 3] {
+    let top = top_height.min(area.height);
+    let remaining_after_top = area.height.saturating_sub(top);
+    let bottom = bottom_height.min(remaining_after_top);
+    let middle = remaining_after_top.saturating_sub(bottom);
+
+    [
+        Rect::new(area.x, area.y, area.width, top),
+        Rect::new(area.x, area.y.saturating_add(top), area.width, middle),
+        Rect::new(
+            area.x,
+            area.y.saturating_add(top).saturating_add(middle),
+            area.width,
+            bottom,
+        ),
+    ]
+}
+
+fn split_dashboard_main_without_logs(area: Rect) -> [Rect; 4] {
+    let title = layout::TITLE_HEIGHT.min(area.height);
+    let remaining_after_title = area.height.saturating_sub(title);
+    let summary = layout::SUMMARY_HEIGHT.min(remaining_after_title);
+    let remaining_after_summary = remaining_after_title.saturating_sub(summary);
+    let footer = layout::FOOTER_HEIGHT.min(remaining_after_summary);
+    let backends = remaining_after_summary.saturating_sub(footer);
+    debug_assert!(
+        backends >= layout::MIN_CHART_HEIGHT
+            || area.height < layout::TITLE_HEIGHT + layout::SUMMARY_HEIGHT + layout::FOOTER_HEIGHT
+    );
+
+    [
+        Rect::new(area.x, area.y, area.width, title),
+        Rect::new(area.x, area.y.saturating_add(title), area.width, summary),
+        Rect::new(
+            area.x,
+            area.y.saturating_add(title).saturating_add(summary),
+            area.width,
+            backends,
+        ),
+        Rect::new(
+            area.x,
+            area.y
+                .saturating_add(title)
+                .saturating_add(summary)
+                .saturating_add(backends),
+            area.width,
+            footer,
+        ),
+    ]
+}
+
+fn split_dashboard_main_with_logs(area: Rect) -> [Rect; 5] {
+    let title = layout::TITLE_HEIGHT.min(area.height);
+    let remaining_after_title = area.height.saturating_sub(title);
+    let summary = layout::SUMMARY_HEIGHT.min(remaining_after_title);
+    let remaining_after_summary = remaining_after_title.saturating_sub(summary);
+    let logs = layout::LOG_WINDOW_HEIGHT.min(remaining_after_summary);
+    let remaining_after_logs = remaining_after_summary.saturating_sub(logs);
+    let footer = layout::FOOTER_HEIGHT.min(remaining_after_logs);
+    let backends = remaining_after_logs.saturating_sub(footer);
+    debug_assert!(
+        backends >= layout::MIN_CHART_HEIGHT
+            || area.height
+                < layout::TITLE_HEIGHT
+                    + layout::SUMMARY_HEIGHT
+                    + layout::LOG_WINDOW_HEIGHT
+                    + layout::FOOTER_HEIGHT
+    );
+
+    [
+        Rect::new(area.x, area.y, area.width, title),
+        Rect::new(area.x, area.y.saturating_add(title), area.width, summary),
+        Rect::new(
+            area.x,
+            area.y.saturating_add(title).saturating_add(summary),
+            area.width,
+            backends,
+        ),
+        Rect::new(
+            area.x,
+            area.y
+                .saturating_add(title)
+                .saturating_add(summary)
+                .saturating_add(backends),
+            area.width,
+            logs,
+        ),
+        Rect::new(
+            area.x,
+            area.y
+                .saturating_add(title)
+                .saturating_add(summary)
+                .saturating_add(backends)
+                .saturating_add(logs),
+            area.width,
+            footer,
+        ),
+    ]
+}
+
+fn split_summary_columns(area: Rect) -> [Rect; 3] {
+    let first = area.width.saturating_mul(33) / 100;
+    let second = area.width.saturating_mul(34) / 100;
+    let third = area.width.saturating_sub(first).saturating_sub(second);
+
+    [
+        Rect::new(area.x, area.y, first, area.height),
+        Rect::new(area.x.saturating_add(first), area.y, second, area.height),
+        Rect::new(
+            area.x.saturating_add(first).saturating_add(second),
+            area.y,
+            third,
+            area.height,
+        ),
+    ]
+}
+
+fn split_backend_columns(area: Rect) -> [Rect; 3] {
+    let user_stats = area.width / 4;
+    let primary = area.width.saturating_sub(user_stats);
+    let backend_list = primary / 2;
+    let data_flow = primary.saturating_sub(backend_list);
+
+    [
+        Rect::new(area.x, area.y, backend_list, area.height),
+        Rect::new(
+            area.x.saturating_add(backend_list),
+            area.y,
+            data_flow,
+            area.height,
+        ),
+        Rect::new(
+            area.x
+                .saturating_add(backend_list)
+                .saturating_add(data_flow),
+            area.y,
+            user_stats,
+            area.height,
+        ),
+    ]
 }
 
 /// Render the title bar
@@ -582,14 +710,7 @@ fn render_summary(
     let system_stats = &state.system_stats;
 
     // Split summary box into three columns
-    let [app_summary, cache_summary, transfer_summary] = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(33),
-            Constraint::Percentage(34),
-            Constraint::Percentage(33),
-        ])
-        .areas(area);
+    let [app_summary, cache_summary, transfer_summary] = split_summary_columns(area);
 
     render_app_summary_panel(
         f,
@@ -1070,10 +1191,7 @@ fn percent_text_f64(value: f64) -> ArrayString<16> {
 /// Render backend server visualization
 fn render_backends(f: &mut Frame, area: Rect, state: &DashboardState, show_details: bool) {
     // Split into three columns: backend list, data flow chart, and top users
-    let [backend_list, data_flow, user_stats] = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints(layout::backend_columns())
-        .areas(area);
+    let [backend_list, data_flow, user_stats] = split_backend_columns(area);
 
     render_backend_list(f, backend_list, state, show_details);
     render_data_flow(f, data_flow, state);
@@ -2118,19 +2236,50 @@ mod tests {
         assert!(should_show_dashboard_logs(layout::MIN_HEIGHT_FOR_LOGS));
         assert!(!should_show_dashboard_logs(layout::MIN_HEIGHT_FOR_LOGS - 1));
 
-        assert!(
-            dashboard_fullscreen_chunks(ViewMode::LogFullscreen, Rect::new(0, 0, 80, 24)).is_some()
-        );
+        let fullscreen =
+            dashboard_fullscreen_chunks(ViewMode::LogFullscreen, Rect::new(0, 0, 80, 24))
+                .expect("fullscreen layout");
+        assert_eq!(fullscreen[0], Rect::new(1, 1, 78, 3));
+        assert_eq!(fullscreen[1], Rect::new(1, 4, 78, 16));
+        assert_eq!(fullscreen[2], Rect::new(1, 20, 78, 3));
         assert!(dashboard_fullscreen_chunks(ViewMode::Normal, Rect::new(0, 0, 80, 24)).is_none());
 
-        assert_eq!(
-            dashboard_main_chunks(Rect::new(0, 0, 80, 24), true).len(),
-            5
-        );
-        assert_eq!(
-            dashboard_main_chunks(Rect::new(0, 0, 80, 24), false).len(),
-            4
-        );
+        let with_logs = dashboard_main_chunks(Rect::new(0, 0, 80, 40), true);
+        assert_eq!(with_logs.len(), 5);
+        let DashboardMainChunks::WithLogs([title, summary, backends, logs, footer]) = with_logs
+        else {
+            panic!("expected layout with logs");
+        };
+        assert_eq!(title, Rect::new(1, 1, 78, 3));
+        assert_eq!(summary, Rect::new(1, 4, 78, 6));
+        assert_eq!(backends, Rect::new(1, 10, 78, 16));
+        assert_eq!(logs, Rect::new(1, 26, 78, 10));
+        assert_eq!(footer, Rect::new(1, 36, 78, 3));
+
+        let without_logs = dashboard_main_chunks(Rect::new(0, 0, 80, 24), false);
+        assert_eq!(without_logs.len(), 4);
+        let DashboardMainChunks::WithoutLogs([title, summary, backends, footer]) = without_logs
+        else {
+            panic!("expected layout without logs");
+        };
+        assert_eq!(title, Rect::new(1, 1, 78, 3));
+        assert_eq!(summary, Rect::new(1, 4, 78, 6));
+        assert_eq!(backends, Rect::new(1, 10, 78, 10));
+        assert_eq!(footer, Rect::new(1, 20, 78, 3));
+    }
+
+    #[test]
+    fn manual_horizontal_layout_helpers_match_expected_proportions() {
+        let [app_summary, cache_summary, transfer_summary] =
+            split_summary_columns(Rect::new(10, 5, 100, 6));
+        assert_eq!(app_summary, Rect::new(10, 5, 33, 6));
+        assert_eq!(cache_summary, Rect::new(43, 5, 34, 6));
+        assert_eq!(transfer_summary, Rect::new(77, 5, 33, 6));
+
+        let [backend_list, data_flow, user_stats] = split_backend_columns(Rect::new(2, 3, 100, 8));
+        assert_eq!(backend_list, Rect::new(2, 3, 37, 8));
+        assert_eq!(data_flow, Rect::new(39, 3, 38, 8));
+        assert_eq!(user_stats, Rect::new(77, 3, 25, 8));
     }
 
     #[test]
