@@ -203,12 +203,16 @@ impl ClientSession {
         io: &mut RequestExecutionIo<'_>,
         availability: &mut Option<ArticleAvailability>,
     ) -> Result<bool, SessionError> {
-        if let Some(pending) =
-            self.try_enqueue_pipeline_request(router, request, availability.as_ref())
-            && self
-                .await_pipeline_request(pending, io, availability)
-                .await?
-                .is_some()
+        if let Some(pending) = self.try_enqueue_pipeline_request(
+            router,
+            request,
+            io.client_writer,
+            true,
+            availability.as_ref(),
+        ) && self
+            .await_pipeline_request(pending, io, availability)
+            .await?
+            .is_some()
         {
             return Ok(true);
         }
@@ -220,6 +224,8 @@ impl ClientSession {
         &self,
         router: &Arc<BackendSelector>,
         request: &RequestContext,
+        client_writer: &crate::session::SharedClientWriter,
+        allow_streaming_delivery: bool,
         availability: Option<&ArticleAvailability>,
     ) -> Option<PendingPipelineRequest> {
         let Ok(backend_id) = router.route_with_availability(self.client_id, availability) else {
@@ -237,8 +243,18 @@ impl ClientSession {
 
         let guard = CommandGuard::new(router.clone(), backend_id);
         let (tx, rx) = oneshot::channel();
-        let streamed_delivery = false;
-        let queued_context = QueuedContext::new(request.clone(), self.client_addr, tx);
+        let streamed_delivery =
+            allow_streaming_delivery && request.is_large_transfer() && !self.cache_articles;
+        let queued_context = if streamed_delivery {
+            QueuedContext::new_streaming(
+                request.clone(),
+                self.client_addr,
+                tx,
+                client_writer.clone(),
+            )
+        } else {
+            QueuedContext::new(request.clone(), self.client_addr, tx)
+        };
 
         match queue.try_enqueue(queued_context) {
             Ok(()) => {
@@ -364,6 +380,26 @@ impl ClientSession {
                     backend_id
                 )))
             }
+            Ok(Err(crate::router::backend_queue::PipelineError::FlushFailed)) => {
+                Err(SessionError::Backend(anyhow::anyhow!(
+                    "pipeline flush failed on backend {:?}; closing session to avoid retrying with unknown backend write state",
+                    backend_id
+                )))
+            }
+            Ok(Err(crate::router::backend_queue::PipelineError::WriteFailed {
+                index,
+                batch_len,
+            })) => Err(SessionError::Backend(anyhow::anyhow!(
+                "pipeline write failed at command {index}/{batch_len} on backend {:?}; closing session to avoid retrying with unknown backend write state",
+                backend_id
+            ))),
+            Ok(Err(crate::router::backend_queue::PipelineError::ConnectionLost {
+                completed,
+                batch_len,
+            })) => Err(SessionError::Backend(anyhow::anyhow!(
+                "pipeline connection lost after response {completed}/{batch_len} on backend {:?}; closing session to avoid retrying with unknown backend response state",
+                backend_id
+            ))),
             Ok(Err(e)) => {
                 debug!(
                     "Client {} pipeline error for backend {:?}: {}",
@@ -371,13 +407,10 @@ impl ClientSession {
                 );
                 Ok(None)
             }
-            Err(_) => {
-                debug!(
-                    "Client {} pipeline worker dropped response channel",
-                    self.client_addr
-                );
-                Ok(None)
-            }
+            Err(_) => Err(SessionError::Backend(anyhow::anyhow!(
+                "pipeline worker dropped response channel for backend {:?}; closing session to avoid retrying with unknown backend response state",
+                backend_id
+            ))),
         }
     }
 
@@ -607,6 +640,18 @@ mod tests {
         }
     }
 
+    fn dropped_pending_request(
+        router: Arc<BackendSelector>,
+        streamed_delivery: bool,
+    ) -> PendingPipelineRequest {
+        let (_tx, rx) = oneshot::channel();
+        PendingPipelineRequest {
+            guard: CommandGuard::new(router, crate::types::BackendId::from_index(0)),
+            rx,
+            streamed_delivery,
+        }
+    }
+
     #[tokio::test]
     async fn await_pipeline_request_allows_buffered_read_failure_to_retry() {
         let session = test_session(false);
@@ -652,5 +697,119 @@ mod tests {
             result,
             Err(crate::session::SessionError::Backend(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn await_pipeline_request_makes_worker_channel_drop_terminal() {
+        let session = test_session(false);
+        let writer = shared_writer().await;
+        let router = Arc::new(BackendSelector::new());
+        let pending = dropped_pending_request(router, false);
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_to_client_bytes = BackendToClientBytes::zero();
+        let mut io = RequestExecutionIo {
+            client_writer: &writer,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_to_client_bytes: &mut backend_to_client_bytes,
+        };
+        let mut availability = None;
+
+        let result = session
+            .await_pipeline_request(pending, &mut io, &mut availability)
+            .await;
+
+        assert!(
+            matches!(result, Err(crate::session::SessionError::Backend(_))),
+            "dropped worker channels must be terminal because backend response state is unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_pipeline_request_makes_flush_failure_terminal() {
+        let session = test_session(false);
+        let writer = shared_writer().await;
+        let router = Arc::new(BackendSelector::new());
+        let pending = pending_request(router, false, PipelineError::FlushFailed);
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_to_client_bytes = BackendToClientBytes::zero();
+        let mut io = RequestExecutionIo {
+            client_writer: &writer,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_to_client_bytes: &mut backend_to_client_bytes,
+        };
+        let mut availability = None;
+
+        let result = session
+            .await_pipeline_request(pending, &mut io, &mut availability)
+            .await;
+
+        assert!(
+            matches!(result, Err(crate::session::SessionError::Backend(_))),
+            "flush failures must be terminal because the pipeline write boundary is unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_pipeline_request_makes_connection_lost_terminal() {
+        let session = test_session(false);
+        let writer = shared_writer().await;
+        let router = Arc::new(BackendSelector::new());
+        let pending = pending_request(
+            router,
+            false,
+            PipelineError::ConnectionLost {
+                completed: 1,
+                batch_len: 2,
+            },
+        );
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_to_client_bytes = BackendToClientBytes::zero();
+        let mut io = RequestExecutionIo {
+            client_writer: &writer,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_to_client_bytes: &mut backend_to_client_bytes,
+        };
+        let mut availability = None;
+
+        let result = session
+            .await_pipeline_request(pending, &mut io, &mut availability)
+            .await;
+
+        assert!(
+            matches!(result, Err(crate::session::SessionError::Backend(_))),
+            "connection-lost errors must be terminal because the queued request may already be in an unknown state"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_pipeline_request_makes_write_failure_terminal() {
+        let session = test_session(false);
+        let writer = shared_writer().await;
+        let router = Arc::new(BackendSelector::new());
+        let pending = pending_request(
+            router,
+            false,
+            PipelineError::WriteFailed {
+                index: 2,
+                batch_len: 4,
+            },
+        );
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_to_client_bytes = BackendToClientBytes::zero();
+        let mut io = RequestExecutionIo {
+            client_writer: &writer,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_to_client_bytes: &mut backend_to_client_bytes,
+        };
+        let mut availability = None;
+
+        let result = session
+            .await_pipeline_request(pending, &mut io, &mut availability)
+            .await;
+
+        assert!(
+            matches!(result, Err(crate::session::SessionError::Backend(_))),
+            "write failures must be terminal because the backend may already have observed a partial batch"
+        );
     }
 }

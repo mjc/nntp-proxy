@@ -15,8 +15,8 @@ use tracing::{debug, warn};
 
 use crate::metrics::MetricsCollector;
 use crate::pool::{BufferPool, DeadpoolConnectionProvider};
-use crate::protocol::ResponsePayloadLen;
-use crate::router::backend_queue::{BackendQueue, PipelineError, QueuedContext};
+use crate::protocol::{RequestResponseMetadata, ResponsePayloadLen};
+use crate::router::backend_queue::{BackendQueue, PipelineDelivery, PipelineError, QueuedContext};
 #[cfg(test)]
 use crate::session::backend::parse_backend_status;
 use crate::types::BackendId;
@@ -352,13 +352,45 @@ async fn execute_streaming_pipeline_response(
         backend_id,
         buffer_pool,
     };
-    let response =
-        crate::session::streaming::buffer_multiline_response(conn, &io_buffer[..initial_len], &ctx)
+    match req.delivery().clone() {
+        PipelineDelivery::Buffered => {
+            let response = crate::session::streaming::buffer_multiline_response(
+                conn,
+                &io_buffer[..initial_len],
+                &ctx,
+            )
             .await?;
-    let bytes = response.len() as u64;
-    req.context
-        .complete_backend_response(backend_id, status_code, response);
-    Ok(PipelineReadResult { data_len: bytes })
+            let bytes = response.len() as u64;
+            req.context
+                .complete_backend_response(backend_id, status_code, response);
+            Ok(PipelineReadResult { data_len: bytes })
+        }
+        PipelineDelivery::StreamToClient(client_writer) => {
+            let mut leftover = buffer_pool.acquire();
+            let mut client_write = client_writer.lock().await;
+            let bytes = crate::session::streaming::stream_multiline_response_pipelined(
+                conn,
+                &mut *client_write,
+                &io_buffer[..initial_len],
+                &ctx,
+                &mut leftover,
+            )
+            .await?;
+            drop(client_write);
+
+            if !leftover.is_empty() {
+                conn.stash_leftover(&leftover[..])
+                    .map_err(crate::session::streaming::StreamingError::Io)?;
+                leftover.clear();
+            }
+
+            req.context.record_backend_response(
+                backend_id,
+                RequestResponseMetadata::new(status_code, (bytes as usize).into()),
+            );
+            Ok(PipelineReadResult { data_len: bytes })
+        }
+    }
 }
 
 /// Buffer the complete response shape for the supplied request context.
@@ -482,6 +514,15 @@ mod tests {
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         ConnectionStream::plain(stream)
+    }
+
+    async fn mock_client_writer() -> (crate::session::SharedClientWriter, tokio::net::TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (_read_half, write_half) = server.into_split();
+        (crate::session::SharedClientWriter::new(write_half), client)
     }
 
     async fn run_single_line_pipeline_batch(
@@ -725,6 +766,60 @@ mod tests {
                 .to_vec(),
             response
         );
+    }
+
+    #[tokio::test]
+    async fn test_execute_pipeline_batch_streams_large_transfer_to_client() {
+        use tokio::io::AsyncReadExt;
+
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(1);
+        let backend_id = BackendId::from_index(0);
+        let queue = BackendQueue::new(1);
+        let response = b"220 0 <msg@id> article\r\nSubject: test\r\n\r\nBody line\r\n.\r\n";
+        let mut conn = mock_backend_conn(response).await;
+        let (client_writer, mut client_stream) = mock_client_writer().await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let batch = vec![QueuedContext::new_streaming(
+            request_context(ARTICLE_REQUEST),
+            client_addr(),
+            tx,
+            client_writer,
+        )];
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+
+        let (success, batch) = execute_pipeline_batch(
+            backend_id,
+            &queue,
+            &mut conn,
+            batch,
+            &metrics,
+            &pool,
+            &mut result_buf,
+        )
+        .await;
+
+        assert!(success);
+        assert!(batch.is_empty());
+
+        let completed = rx.await.unwrap().unwrap();
+        assert_eq!(
+            completed
+                .context
+                .response_metadata()
+                .expect("streamed response records metadata")
+                .status()
+                .as_u16(),
+            220
+        );
+        assert!(
+            completed.context.response_payload().is_none(),
+            "streamed pipeline response must not buffer the article body in request context"
+        );
+
+        let mut streamed = Vec::new();
+        client_stream.read_to_end(&mut streamed).await.unwrap();
+        assert_eq!(streamed, response);
     }
 
     #[tokio::test]
@@ -1609,6 +1704,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pipeline_batch_pairs_spanning_multiline_terminator_before_next_status() {
+        use tokio::io::AsyncReadExt;
+
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(2);
+        let backend_id = BackendId::from_index(0);
+        let queue = BackendQueue::new(2);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let mut received = 0usize;
+            let expected = b"BODY <a@b>\r\n".len() + b"STAT <c@d>\r\n".len();
+            while received < expected {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => received += n,
+                }
+            }
+
+            stream
+                .write_all(b"222 0 <a@b>\r\nBody line\r\n.")
+                .await
+                .unwrap();
+            stream
+                .write_all(b"\r\n223 0 <c@d> status\r\n")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = ConnectionStream::plain(stream);
+        let (req1, rx1) = queued_context("BODY <a@b>\r\n");
+        let (req2, rx2) = queued_context("STAT <c@d>\r\n");
+        let batch = vec![req1, req2];
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+
+        let (success, batch) = execute_pipeline_batch(
+            backend_id,
+            &queue,
+            &mut conn,
+            batch,
+            &metrics,
+            &pool,
+            &mut result_buf,
+        )
+        .await;
+
+        assert!(success);
+        assert!(batch.is_empty());
+        assert!(!conn.has_leftover());
+
+        let completed_body = rx1.await.unwrap().unwrap();
+        assert_eq!(
+            completed_body
+                .context
+                .response_payload()
+                .expect("BODY response stays buffered")
+                .to_vec(),
+            b"222 0 <a@b>\r\nBody line\r\n.\r\n"
+        );
+
+        assert_eq!(expect_success_status(rx2.await.unwrap()), 223);
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_batch_multiline_eof_fails_current_and_remaining_requests() {
+        use tokio::io::AsyncReadExt;
+
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(2);
+        let backend_id = BackendId::from_index(0);
+        let queue = BackendQueue::new(2);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let mut received = 0usize;
+            let expected = b"BODY <a@b>\r\n".len() + b"STAT <c@d>\r\n".len();
+            while received < expected {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => received += n,
+                }
+            }
+
+            stream
+                .write_all(b"222 0 <a@b>\r\nBody line\r\n")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = ConnectionStream::plain(stream);
+        let (req1, rx1) = queued_context("BODY <a@b>\r\n");
+        let (req2, rx2) = queued_context("STAT <c@d>\r\n");
+        let batch = vec![req1, req2];
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+
+        let (success, _batch) = execute_pipeline_batch(
+            backend_id,
+            &queue,
+            &mut conn,
+            batch,
+            &metrics,
+            &pool,
+            &mut result_buf,
+        )
+        .await;
+
+        assert!(!success, "partial multiline EOF must retire the connection");
+        assert!(!conn.has_leftover());
+
+        assert!(matches!(rx1.await.unwrap(), Err(PipelineError::ReadFailed)));
+        assert!(matches!(
+            rx2.await.unwrap(),
+            Err(PipelineError::ConnectionLost {
+                completed: 1,
+                batch_len: 2
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn test_pipeline_batch_retires_connection_with_leftover_after_final_response() {
         use tokio::io::AsyncReadExt;
 
@@ -1662,6 +1889,55 @@ mod tests {
 
         assert_eq!(expect_success_status(rx1.await.unwrap()), 223);
         assert_eq!(expect_success_status(rx2.await.unwrap()), 430);
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_batch_retires_connection_with_garbage_after_final_multiline_response() {
+        use tokio::io::AsyncReadExt;
+
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(1);
+        let backend_id = BackendId::from_index(0);
+        let queue = BackendQueue::new(1);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            stream
+                .write_all(b"222 0 <a@b>\r\nBody line\r\n.\r\n223 0 <c@d> status\r\n")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = ConnectionStream::plain(stream);
+
+        let (req, rx) = queued_context("BODY <a@b>\r\n");
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+
+        let (success, batch) = execute_pipeline_batch(
+            backend_id,
+            &queue,
+            &mut conn,
+            vec![req],
+            &metrics,
+            &pool,
+            &mut result_buf,
+        )
+        .await;
+
+        assert!(
+            !success,
+            "extra packed bytes after the final multiline response must retire the connection"
+        );
+        assert!(batch.is_empty());
+        assert!(conn.has_leftover());
+        assert_eq!(expect_success_status(rx.await.unwrap()), 222);
     }
 
     #[test]

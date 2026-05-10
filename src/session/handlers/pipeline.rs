@@ -489,6 +489,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_command_batch_resumes_partial_second_body_burst_before_trailing_group() {
+        let session = test_session();
+        let (mut client, server) = tokio::io::duplex(4096);
+        client
+            .write_all(
+                concat!(
+                    "BODY <body-1@example>\r\n",
+                    "BODY <body-2@example>\r\n",
+                    "BODY <body-3@example>\r\n",
+                    "BODY <body-4@example>\r\n",
+                    "BODY <body-5@examp",
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        let mut reader = BufReader::new(server);
+        let mut command_buf = Vec::with_capacity(COMMAND);
+
+        let first_batch = session
+            .read_command_batch(&mut reader, &mut command_buf)
+            .await
+            .unwrap();
+        assert_eq!(first_batch.len(), 4);
+        for idx in 0..4 {
+            assert_eq!(first_batch.context(idx).kind(), RequestKind::Body);
+            assert_eq!(
+                first_batch.context(idx).args(),
+                format!("<body-{}@example>", idx + 1).as_bytes()
+            );
+        }
+        assert!(first_batch.trailing_context().is_none());
+
+        client
+            .write_all(b"le>\r\nGROUP alt.test\r\n")
+            .await
+            .unwrap();
+        drop(client);
+
+        let second_batch = session
+            .read_command_batch(&mut reader, &mut command_buf)
+            .await
+            .unwrap();
+        assert_eq!(second_batch.len(), 1);
+        assert_eq!(second_batch.context(0).kind(), RequestKind::Body);
+        assert_eq!(second_batch.context(0).args(), b"<body-5@example>");
+
+        let trailing = second_batch
+            .trailing_context()
+            .expect("GROUP should remain trailing after resuming the partial BODY");
+        assert_eq!(trailing.kind(), RequestKind::Group);
+        assert_eq!(trailing.args(), b"alt.test");
+        assert_eq!(trailing.route_class(), RequestRouteClass::Stateful);
+    }
+
+    #[tokio::test]
     async fn read_command_batch_reads_second_buffered_article_burst_with_trailing_group() {
         let session = test_session();
         let (mut client, server) = tokio::io::duplex(4096);

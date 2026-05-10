@@ -633,6 +633,8 @@ impl ClientSession {
                             if let Some(pending) = self.try_enqueue_pipeline_request(
                                 router,
                                 request,
+                                client_writer,
+                                pending_requests.is_empty(),
                                 availability.as_ref(),
                             ) {
                                 enqueued_pending = Some((i, pending, availability));
