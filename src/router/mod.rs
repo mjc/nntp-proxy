@@ -556,6 +556,13 @@ impl BackendSelector {
     #[must_use]
     pub fn backend_pipeline_depth(&self, backend_id: BackendId) -> Option<usize> {
         self.get_backend_queue(backend_id)
+            .map(|queue| queue.pipeline_depth())
+    }
+
+    /// Get the live pipeline queue backlog for a backend, if pipelining is enabled.
+    #[must_use]
+    pub fn backend_pipeline_queue_depth(&self, backend_id: BackendId) -> Option<usize> {
+        self.get_backend_queue(backend_id)
             .map(|queue| queue.depth())
     }
 

@@ -678,6 +678,14 @@ impl TuiApp {
             .backend_pipeline_depth(BackendId::from_index(backend_idx))
     }
 
+    /// Get the live pipeline queue backlog for a backend, if backend pipelining is enabled.
+    #[must_use]
+    pub fn backend_pipeline_queue_depth(&self, backend_idx: usize) -> Option<usize> {
+        use crate::types::BackendId;
+        self.router
+            .backend_pipeline_queue_depth(BackendId::from_index(backend_idx))
+    }
+
     /// Get the configured pipeline queue capacity for a backend, if enabled.
     #[must_use]
     pub fn backend_pipeline_capacity(&self, backend_idx: usize) -> Option<usize> {
@@ -768,14 +776,20 @@ impl TuiApp {
             .iter()
             .filter(|server| server.backend_pipelining)
             .count();
-        metrics.pipeline_live_depth = self
+        metrics.in_flight_requests = self
+            .servers
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| self.backend_pending_count(idx))
+            .sum();
+        metrics.pipeline_depth = self
             .servers
             .iter()
             .enumerate()
             .filter(|(_, server)| server.backend_pipelining)
-            .map(|(idx, _)| self.backend_pending_count(idx))
+            .map(|(idx, _)| self.backend_pipeline_depth(idx).unwrap_or_default())
             .sum();
-        metrics.pipeline_live_capacity = self
+        metrics.pipeline_connection_capacity = self
             .servers
             .iter()
             .filter(|server| server.backend_pipelining)
@@ -785,7 +799,7 @@ impl TuiApp {
             .servers
             .iter()
             .enumerate()
-            .filter_map(|(idx, _)| self.backend_pipeline_depth(idx))
+            .filter_map(|(idx, _)| self.backend_pipeline_queue_depth(idx))
             .sum();
         metrics.pipeline_queue_capacity = self
             .servers
@@ -844,7 +858,8 @@ impl TuiApp {
             load_ratio: self.backend_load_ratio(backend_idx),
             stateful_count: self.backend_stateful_count(backend_idx),
             traffic_share: self.backend_traffic_share(backend_idx),
-            pipeline_queue_depth: self.backend_pipeline_depth(backend_idx),
+            pipeline_depth: self.backend_pipeline_depth(backend_idx),
+            pipeline_queue_depth: self.backend_pipeline_queue_depth(backend_idx),
             pipeline_queue_capacity: self.backend_pipeline_capacity(backend_idx),
             history: Self::snapshot_throughput_history(self.backend_history(backend_idx)),
         }
@@ -1511,16 +1526,18 @@ mod tests {
         let snapshot = app.snapshot_state();
 
         assert_eq!(snapshot.metrics.pipeline_enabled_backends, 1);
-        assert_eq!(snapshot.metrics.pipeline_live_depth, 0);
-        assert_eq!(snapshot.metrics.pipeline_live_capacity, 10);
+        assert_eq!(snapshot.metrics.in_flight_requests, 0);
+        assert_eq!(snapshot.metrics.pipeline_depth, 0);
+        assert_eq!(snapshot.metrics.pipeline_connection_capacity, 10);
         assert_eq!(snapshot.metrics.pipeline_queue_depth, 1);
         assert_eq!(snapshot.metrics.pipeline_queue_capacity, 8);
+        assert_eq!(snapshot.backend_views[0].pipeline_depth, Some(0));
         assert_eq!(snapshot.backend_views[0].pipeline_queue_depth, Some(1));
         assert_eq!(snapshot.backend_views[0].pipeline_queue_capacity, Some(8));
     }
 
     #[test]
-    fn test_pipeline_live_depth_uses_same_pending_count_as_backend_load() {
+    fn test_pipeline_depth_uses_written_requests_not_pending_load() {
         let metrics = MetricsCollector::new(1);
         let mut router = BackendSelector::new();
         let provider = crate::pool::DeadpoolConnectionProvider::new(
@@ -1532,17 +1549,22 @@ mod tests {
             None,
         );
         let backend_id = crate::types::BackendId::from_index(0);
-        router.add_backend(
+        router.add_backend_with_queue(
             backend_id,
             crate::types::ServerName::try_new("Backend".to_string()).unwrap(),
             provider,
             0,
+            Some(Arc::new(crate::router::backend_queue::BackendQueue::new(8))),
         );
         router.mark_backend_pending(backend_id);
         router.mark_backend_pending(backend_id);
         router.mark_backend_pending(backend_id);
         router.mark_backend_pending(backend_id);
         router.mark_backend_pending(backend_id);
+        router
+            .get_backend_queue(backend_id)
+            .expect("pipeline queue")
+            .mark_pipeline_sent(3);
 
         let servers: Arc<[Server]> = vec![
             Server::builder("backend.example.com", Port::try_new(119).unwrap())
@@ -1556,8 +1578,10 @@ mod tests {
         let snapshot = app.snapshot_state();
 
         assert_eq!(snapshot.backend_views[0].pending_count, 5);
-        assert_eq!(snapshot.metrics.pipeline_live_depth, 5);
-        assert_eq!(snapshot.metrics.pipeline_live_capacity, 10);
+        assert_eq!(snapshot.metrics.in_flight_requests, 5);
+        assert_eq!(snapshot.metrics.pipeline_depth, 3);
+        assert_eq!(snapshot.metrics.pipeline_connection_capacity, 10);
+        assert_eq!(snapshot.backend_views[0].pipeline_depth, Some(3));
     }
 
     #[test]

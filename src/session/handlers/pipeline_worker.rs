@@ -30,6 +30,31 @@ pub struct PipelineWorkerConfig {
     pub(crate) backend_id: BackendId,
 }
 
+struct PipelineDepthGuard<'a> {
+    queue: &'a BackendQueue,
+    outstanding: usize,
+}
+
+impl<'a> PipelineDepthGuard<'a> {
+    fn new(queue: &'a BackendQueue, outstanding: usize) -> Self {
+        queue.mark_pipeline_sent(outstanding);
+        Self { queue, outstanding }
+    }
+
+    fn complete_one(&mut self) {
+        self.outstanding = self.outstanding.saturating_sub(1);
+        self.queue.mark_pipeline_resolved(1);
+    }
+}
+
+impl Drop for PipelineDepthGuard<'_> {
+    fn drop(&mut self) {
+        if self.outstanding > 0 {
+            self.queue.mark_pipeline_resolved(self.outstanding);
+        }
+    }
+}
+
 /// Run the pipeline worker loop for a single backend.
 ///
 /// This function runs forever (until the task is cancelled). It:
@@ -90,6 +115,7 @@ pub async fn backend_pipeline_worker(
         let success;
         (success, batch) = execute_pipeline_batch(
             backend_id,
+            queue.as_ref(),
             &mut conn,
             batch,
             &metrics,
@@ -119,6 +145,7 @@ pub async fn backend_pipeline_worker(
 /// (now-drained) batch Vec for allocation reuse.
 async fn execute_pipeline_batch(
     backend_id: BackendId,
+    queue: &BackendQueue,
     conn: &mut crate::stream::ConnectionStream,
     mut batch: Vec<QueuedContext>,
     metrics: &MetricsCollector,
@@ -160,6 +187,8 @@ async fn execute_pipeline_batch(
         let batch = fail_batch(batch, PipelineError::FlushFailed);
         return (false, batch);
     }
+
+    let mut pipeline_depth = PipelineDepthGuard::new(queue, batch_len);
 
     // Phase 2: Read responses in order (with shared buffer + connection-stashed leftovers)
     let mut buffer = buffer_pool.acquire();
@@ -205,9 +234,11 @@ async fn execute_pipeline_batch(
                 );
 
                 req.complete_context();
+                pipeline_depth.complete_one();
             }
             Err(crate::session::streaming::StreamingError::ClientDisconnect(_)) => {
                 req.complete_error(PipelineError::ReadFailed);
+                pipeline_depth.complete_one();
             }
             Err(e) => {
                 warn!(
@@ -549,6 +580,7 @@ mod tests {
         let mut result_buf = crate::pool::ChunkedResponse::default();
         let (success, _batch) = execute_pipeline_batch(
             backend_id,
+            &BackendQueue::new(16),
             &mut conn,
             batch,
             &metrics,
@@ -657,6 +689,7 @@ mod tests {
 
         let (success, batch) = execute_pipeline_batch(
             backend_id,
+            &BackendQueue::new(16),
             &mut conn,
             batch,
             &metrics,
@@ -705,6 +738,7 @@ mod tests {
 
         let (success, batch) = execute_pipeline_batch(
             backend_id,
+            &BackendQueue::new(16),
             &mut conn,
             batch,
             &metrics,
@@ -1063,6 +1097,7 @@ mod tests {
 
         let (success, _batch) = execute_pipeline_batch(
             backend_id,
+            &BackendQueue::new(16),
             &mut conn,
             batch,
             &metrics,
@@ -1110,6 +1145,7 @@ mod tests {
 
         let (success, _batch) = execute_pipeline_batch(
             backend_id,
+            &BackendQueue::new(16),
             &mut conn,
             batch,
             &metrics,
@@ -1180,6 +1216,7 @@ mod tests {
 
         let (success, _batch) = execute_pipeline_batch(
             backend_id,
+            &BackendQueue::new(16),
             &mut conn,
             batch,
             &metrics,
@@ -1243,6 +1280,7 @@ mod tests {
 
             let (success, _batch) = execute_pipeline_batch(
                 backend_id,
+                &BackendQueue::new(16),
                 &mut conn,
                 vec![req1, req2],
                 &metrics,
@@ -1358,6 +1396,7 @@ mod tests {
 
         let (success, _batch) = execute_pipeline_batch(
             backend_id,
+            &BackendQueue::new(16),
             &mut conn,
             batch,
             &metrics,
@@ -1481,6 +1520,7 @@ mod tests {
 
         let (success, _batch) = execute_pipeline_batch(
             backend_id,
+            &BackendQueue::new(16),
             &mut conn,
             batch,
             &metrics,
@@ -1534,6 +1574,7 @@ mod tests {
 
         let (success, _batch) = execute_pipeline_batch(
             backend_id,
+            &BackendQueue::new(16),
             &mut conn,
             batch,
             &metrics,
