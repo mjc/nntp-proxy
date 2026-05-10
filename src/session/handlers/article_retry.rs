@@ -34,7 +34,6 @@ pub(super) struct RequestExecutionIo<'a> {
 pub(super) struct PendingPipelineRequest {
     guard: CommandGuard,
     rx: oneshot::Receiver<PipelineResponse>,
-    streamed_delivery: bool,
 }
 
 /// Result of preparing a request before pipeline/direct backend execution.
@@ -203,16 +202,12 @@ impl ClientSession {
         io: &mut RequestExecutionIo<'_>,
         availability: &mut Option<ArticleAvailability>,
     ) -> Result<bool, SessionError> {
-        if let Some(pending) = self.try_enqueue_pipeline_request(
-            router,
-            request,
-            io.client_writer,
-            true,
-            availability.as_ref(),
-        ) && self
-            .await_pipeline_request(pending, io, availability)
-            .await?
-            .is_some()
+        if let Some(pending) =
+            self.try_enqueue_pipeline_request(router, request, availability.as_ref())
+            && self
+                .await_pipeline_request(pending, io, availability)
+                .await?
+                .is_some()
         {
             return Ok(true);
         }
@@ -224,8 +219,6 @@ impl ClientSession {
         &self,
         router: &Arc<BackendSelector>,
         request: &RequestContext,
-        client_writer: &crate::session::SharedClientWriter,
-        allow_streaming_delivery: bool,
         availability: Option<&ArticleAvailability>,
     ) -> Option<PendingPipelineRequest> {
         let Ok(backend_id) = router.route_with_availability(self.client_id, availability) else {
@@ -243,27 +236,12 @@ impl ClientSession {
 
         let guard = CommandGuard::new(router.clone(), backend_id);
         let (tx, rx) = oneshot::channel();
-        let streamed_delivery =
-            allow_streaming_delivery && request.is_large_transfer() && !self.cache_articles;
-        let queued_context = if streamed_delivery {
-            QueuedContext::new_streaming(
-                request.clone(),
-                self.client_addr,
-                tx,
-                client_writer.clone(),
-            )
-        } else {
-            QueuedContext::new(request.clone(), self.client_addr, tx)
-        };
+        let queued_context = QueuedContext::new(request.clone(), self.client_addr, tx);
 
         match queue.try_enqueue(queued_context) {
             Ok(()) => {
                 self.metrics.record_pipeline_enqueue();
-                Some(PendingPipelineRequest {
-                    guard,
-                    rx,
-                    streamed_delivery,
-                })
+                Some(PendingPipelineRequest { guard, rx })
             }
             Err(e) => {
                 debug!(
@@ -281,11 +259,7 @@ impl ClientSession {
         io: &mut RequestExecutionIo<'_>,
         availability: &mut Option<ArticleAvailability>,
     ) -> Result<Option<CompletedPipelineRequest>, SessionError> {
-        let PendingPipelineRequest {
-            guard,
-            rx,
-            streamed_delivery,
-        } = pending;
+        let PendingPipelineRequest { guard, rx } = pending;
         let backend_id = guard.backend_id();
 
         match rx.await {
@@ -369,15 +343,7 @@ impl ClientSession {
             Ok(Err(crate::router::backend_queue::PipelineError::ClientDisconnect)) => {
                 Err(SessionError::ClientDisconnect(io::Error::new(
                     io::ErrorKind::BrokenPipe,
-                    "client disconnected during pipelined stream",
-                )))
-            }
-            Ok(Err(crate::router::backend_queue::PipelineError::ReadFailed))
-                if streamed_delivery =>
-            {
-                Err(SessionError::Backend(anyhow::anyhow!(
-                    "streamed pipeline read failed on backend {:?}; closing session to avoid response desync",
-                    backend_id
+                    "client disconnected during pipelined response delivery",
                 )))
             }
             Ok(Err(crate::router::backend_queue::PipelineError::FlushFailed)) => {
@@ -628,7 +594,6 @@ mod tests {
 
     fn pending_request(
         router: Arc<BackendSelector>,
-        streamed_delivery: bool,
         error: PipelineError,
     ) -> PendingPipelineRequest {
         let (tx, rx) = oneshot::channel();
@@ -636,19 +601,14 @@ mod tests {
         PendingPipelineRequest {
             guard: CommandGuard::new(router, crate::types::BackendId::from_index(0)),
             rx,
-            streamed_delivery,
         }
     }
 
-    fn dropped_pending_request(
-        router: Arc<BackendSelector>,
-        streamed_delivery: bool,
-    ) -> PendingPipelineRequest {
+    fn dropped_pending_request(router: Arc<BackendSelector>) -> PendingPipelineRequest {
         let (_tx, rx) = oneshot::channel();
         PendingPipelineRequest {
             guard: CommandGuard::new(router, crate::types::BackendId::from_index(0)),
             rx,
-            streamed_delivery,
         }
     }
 
@@ -657,7 +617,7 @@ mod tests {
         let session = test_session(false);
         let writer = shared_writer().await;
         let router = Arc::new(BackendSelector::new());
-        let pending = pending_request(router, false, PipelineError::ReadFailed);
+        let pending = pending_request(router, PipelineError::ReadFailed);
         let mut client_to_backend_bytes = ClientToBackendBytes::zero();
         let mut backend_to_client_bytes = BackendToClientBytes::zero();
         let mut io = RequestExecutionIo {
@@ -679,7 +639,7 @@ mod tests {
         let session = test_session(false);
         let writer = shared_writer().await;
         let router = Arc::new(BackendSelector::new());
-        let pending = pending_request(router, true, PipelineError::ReadFailed);
+        let pending = pending_request(router, PipelineError::ReadFailed);
         let mut client_to_backend_bytes = ClientToBackendBytes::zero();
         let mut backend_to_client_bytes = BackendToClientBytes::zero();
         let mut io = RequestExecutionIo {
@@ -704,7 +664,7 @@ mod tests {
         let session = test_session(false);
         let writer = shared_writer().await;
         let router = Arc::new(BackendSelector::new());
-        let pending = dropped_pending_request(router, false);
+        let pending = dropped_pending_request(router);
         let mut client_to_backend_bytes = ClientToBackendBytes::zero();
         let mut backend_to_client_bytes = BackendToClientBytes::zero();
         let mut io = RequestExecutionIo {
@@ -729,7 +689,7 @@ mod tests {
         let session = test_session(false);
         let writer = shared_writer().await;
         let router = Arc::new(BackendSelector::new());
-        let pending = pending_request(router, false, PipelineError::FlushFailed);
+        let pending = pending_request(router, PipelineError::FlushFailed);
         let mut client_to_backend_bytes = ClientToBackendBytes::zero();
         let mut backend_to_client_bytes = BackendToClientBytes::zero();
         let mut io = RequestExecutionIo {
@@ -756,7 +716,6 @@ mod tests {
         let router = Arc::new(BackendSelector::new());
         let pending = pending_request(
             router,
-            false,
             PipelineError::ConnectionLost {
                 completed: 1,
                 batch_len: 2,
@@ -788,7 +747,6 @@ mod tests {
         let router = Arc::new(BackendSelector::new());
         let pending = pending_request(
             router,
-            false,
             PipelineError::WriteFailed {
                 index: 2,
                 batch_len: 4,

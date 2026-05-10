@@ -354,6 +354,64 @@ fn spawn_gated_multiline_backend(
     (initial_written, release_tx)
 }
 
+fn spawn_packed_leftover_direct_backend(backend_listener: TcpListener) -> Arc<AtomicUsize> {
+    let connection_count = Arc::new(AtomicUsize::new(0));
+    let connection_count_for_task = connection_count.clone();
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = backend_listener.accept().await {
+            let connection_index = connection_count_for_task.fetch_add(1, Ordering::SeqCst) + 1;
+
+            if stream
+                .write_all(b"200 PackedLeftoverDirect Ready\r\n")
+                .await
+                .is_err()
+            {
+                continue;
+            }
+
+            let mut pending = Vec::new();
+            let mut buffer = [0u8; 1024];
+            while let Ok(n) = stream.read(&mut buffer).await {
+                if n == 0 {
+                    break;
+                }
+                pending.extend_from_slice(&buffer[..n]);
+
+                while let Some(line_end) = pending.windows(2).position(|w| w == b"\r\n") {
+                    let line = pending.drain(..line_end + 2).collect::<Vec<_>>();
+                    let command = String::from_utf8_lossy(&line).trim().to_string();
+
+                    if let Some(response) =
+                        find_pipeline_response(&command, PIPELINE_COMMON_RESPONSES)
+                    {
+                        if stream.write_all(response.as_bytes()).await.is_err() {
+                            break;
+                        }
+                        continue;
+                    }
+
+                    let response = match (connection_index, command.as_str()) {
+                        (1, "BODY <packed-leftover@example>") => {
+                            "222 0 <packed-leftover@example>\r\nbody-line\r\n.\r\n430 No such article\r\n"
+                        }
+                        (2, "STAT <fresh@example>") => "223 0 <fresh@example> status\r\n",
+                        _ => "500 Unexpected command\r\n",
+                    };
+                    if stream.write_all(response.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    if stream.flush().await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    connection_count
+}
+
 fn spawn_concurrent_pipeline_backend(
     backend_listener: TcpListener,
     delayed_responses: &'static [(&'static str, &'static str)],
@@ -509,58 +567,6 @@ async fn expect_buffered_until_backend_finishes(
     let body_line = read_line(&mut reader, body_context).await?;
     assert_eq!(status_line, expected_status);
     assert_eq!(body_line, expected_body_line);
-    assert_eq!(
-        read_line(&mut reader, "multiline terminator").await?,
-        ".\r\n"
-    );
-
-    Ok(())
-}
-
-async fn expect_streaming_before_backend_finishes(
-    proxy_port: u16,
-    expectation: BufferedResponseExpectation<'_>,
-    initial_written: Arc<Notify>,
-    release_tx: oneshot::Sender<()>,
-) -> Result<()> {
-    let BufferedResponseExpectation {
-        command,
-        status_context,
-        body_context,
-        expected_status,
-        expected_body_line,
-    } = expectation;
-    let client = connect_and_read_greeting(proxy_port).await?;
-    let (read_half, mut write_half) = client.into_split();
-    let mut reader = BufReader::new(read_half);
-
-    write_commands(&mut write_half, &[command]).await?;
-    initial_written.notified().await;
-
-    let status_line = timeout(
-        Duration::from_millis(200),
-        read_line(&mut reader, status_context),
-    )
-    .await??;
-    let body_line = timeout(
-        Duration::from_millis(200),
-        read_line(&mut reader, body_context),
-    )
-    .await??;
-    let terminator_result = timeout(
-        Duration::from_millis(200),
-        read_line(&mut reader, "multiline terminator"),
-    )
-    .await;
-
-    assert_eq!(status_line, expected_status);
-    assert_eq!(body_line, expected_body_line);
-    assert!(
-        terminator_result.is_err(),
-        "{command:?} should stream status/body before the backend sends the terminator"
-    );
-
-    let _ = release_tx.send(());
     assert_eq!(
         read_line(&mut reader, "multiline terminator").await?,
         ".\r\n"
@@ -1646,7 +1652,7 @@ async fn test_cached_article_pipeline_buffers_until_backend_finishes() -> Result
 }
 
 #[tokio::test]
-async fn test_per_command_body_pipeline_streams_before_backend_finishes_without_cache() -> Result<()>
+async fn test_per_command_body_pipeline_buffers_until_backend_finishes_without_cache() -> Result<()>
 {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
@@ -1663,7 +1669,7 @@ async fn test_per_command_body_pipeline_streams_before_backend_finishes_without_
     )
     .await?;
 
-    expect_streaming_before_backend_finishes(
+    expect_buffered_until_backend_finishes(
         proxy_port,
         BufferedResponseExpectation {
             command: "BODY <plain-body@example>\r\n",
@@ -1679,7 +1685,7 @@ async fn test_per_command_body_pipeline_streams_before_backend_finishes_without_
 }
 
 #[tokio::test]
-async fn test_per_command_article_pipeline_streams_before_backend_finishes_without_cache()
+async fn test_per_command_article_pipeline_buffers_until_backend_finishes_without_cache()
 -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
@@ -1696,7 +1702,7 @@ async fn test_per_command_article_pipeline_streams_before_backend_finishes_witho
     )
     .await?;
 
-    expect_streaming_before_backend_finishes(
+    expect_buffered_until_backend_finishes(
         proxy_port,
         BufferedResponseExpectation {
             command: "ARTICLE <plain-article@example>\r\n",
@@ -1712,7 +1718,7 @@ async fn test_per_command_article_pipeline_streams_before_backend_finishes_witho
 }
 
 #[tokio::test]
-async fn test_hybrid_body_message_id_streams_before_backend_finishes_before_stateful_switch()
+async fn test_hybrid_body_message_id_buffers_until_backend_finishes_before_stateful_switch()
 -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
@@ -1729,7 +1735,7 @@ async fn test_hybrid_body_message_id_streams_before_backend_finishes_before_stat
     )
     .await?;
 
-    expect_streaming_before_backend_finishes(
+    expect_buffered_until_backend_finishes(
         proxy_port,
         BufferedResponseExpectation {
             command: "BODY <hybrid-body@example>\r\n",
@@ -1745,7 +1751,7 @@ async fn test_hybrid_body_message_id_streams_before_backend_finishes_before_stat
 }
 
 #[tokio::test]
-async fn test_hybrid_article_message_id_streams_before_backend_finishes_before_stateful_switch()
+async fn test_hybrid_article_message_id_buffers_until_backend_finishes_before_stateful_switch()
 -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
@@ -1762,7 +1768,7 @@ async fn test_hybrid_article_message_id_streams_before_backend_finishes_before_s
     )
     .await?;
 
-    expect_streaming_before_backend_finishes(
+    expect_buffered_until_backend_finishes(
         proxy_port,
         BufferedResponseExpectation {
             command: "ARTICLE <hybrid-article@example>\r\n",
@@ -1775,6 +1781,42 @@ async fn test_hybrid_article_message_id_streams_before_backend_finishes_before_s
         release_tx,
     )
     .await
+}
+
+#[tokio::test]
+async fn test_per_command_direct_body_retires_connection_after_packed_stale_response() -> Result<()>
+{
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let connection_count = spawn_packed_leftover_direct_backend(backend_listener);
+
+    let proxy_port = spawn_proxy_with_config(
+        pipeline_backend_config_with_max_connections(backend_port, "DirectPackedLeftover", 1),
+        RoutingMode::PerCommand,
+    )
+    .await?;
+
+    let client = connect_and_read_greeting(proxy_port).await?;
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    write_commands(&mut write_half, &["BODY <packed-leftover@example>\r\n"]).await?;
+    let (status_line, body_lines) = read_multiline_response(&mut reader).await?;
+    assert_eq!(status_line, "222 0 <packed-leftover@example>\r\n");
+    assert_eq!(body_lines, vec!["body-line\r\n".to_string()]);
+
+    write_commands(&mut write_half, &["STAT <fresh@example>\r\n"]).await?;
+    assert_eq!(
+        read_line(&mut reader, "fresh STAT status").await?,
+        "223 0 <fresh@example> status\r\n"
+    );
+    assert_eq!(
+        connection_count.load(Ordering::SeqCst),
+        2,
+        "stale bytes packed after a direct BODY response must retire the backend connection before the next borrow"
+    );
+
+    Ok(())
 }
 
 #[tokio::test]
@@ -2048,6 +2090,74 @@ async fn test_body_client_disconnect_does_not_poison_other_client_on_shared_back
         body_connection_count.load(Ordering::SeqCst),
         1,
         "expected the surviving client to complete on the shared backend connection"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_article_client_disconnect_does_not_poison_other_client_on_shared_backend_connection()
+-> Result<()> {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let (article_connection_count, batches) = spawn_concurrent_pipeline_backend(
+        backend_listener,
+        &[
+            (
+                "ARTICLE <client-a@example>",
+                "220 1 <client-a@example>\r\nclient-a-line\r\n.\r\n",
+            ),
+            (
+                "ARTICLE <client-b@example>",
+                "220 2 <client-b@example>\r\nclient-b-line\r\n.\r\n",
+            ),
+        ],
+        1,
+    );
+
+    let proxy_port = spawn_proxy_with_config(
+        pipeline_backend_config_with_max_connections(
+            backend_port,
+            "DisconnectSharedArticlePipeline",
+            1,
+        ),
+        RoutingMode::PerCommand,
+    )
+    .await?;
+
+    let client_a = connect_and_read_greeting(proxy_port).await?;
+    let (read_half_a, mut write_half_a) = client_a.into_split();
+    let _reader_a = BufReader::new(read_half_a);
+
+    let client_b = connect_and_read_greeting(proxy_port).await?;
+    let (read_half_b, mut write_half_b) = client_b.into_split();
+    let mut reader_b = BufReader::new(read_half_b);
+
+    tokio::try_join!(
+        write_commands(&mut write_half_a, &["ARTICLE <client-a@example>\r\n"]),
+        write_commands(&mut write_half_b, &["ARTICLE <client-b@example>\r\n"]),
+    )?;
+
+    drop(write_half_a);
+
+    let (status_b, lines_b) = read_multiline_response(&mut reader_b).await?;
+
+    assert_eq!(status_b, "220 2 <client-b@example>\r\n");
+    assert_eq!(lines_b, vec!["client-b-line\r\n".to_string()]);
+
+    let recorded_batches = batches.lock().await.clone();
+    assert_eq!(
+        recorded_batches,
+        vec![vec![
+            "ARTICLE <client-a@example>".to_string(),
+            "ARTICLE <client-b@example>".to_string(),
+        ]],
+        "expected the disconnecting ARTICLE client and surviving client to share one backend pipeline batch"
+    );
+    assert_eq!(
+        article_connection_count.load(Ordering::SeqCst),
+        1,
+        "expected the surviving ARTICLE client to complete on the shared backend connection"
     );
 
     Ok(())

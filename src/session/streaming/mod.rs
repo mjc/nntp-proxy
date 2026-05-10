@@ -258,33 +258,6 @@ where
     stream_multiline_response_impl(backend_read, client_write, first_chunk, ctx, None, None).await
 }
 
-/// Stream multiline response from backend to client during pipelined batch execution.
-///
-/// Unlike [`stream_multiline_response`], this captures any bytes after the
-/// current response terminator into `leftover` so the next pipelined response
-/// can be parsed from the same backend connection without losing framing.
-pub(crate) async fn stream_multiline_response_pipelined<R, W>(
-    backend_read: &mut R,
-    client_write: &mut W,
-    first_chunk: &[u8],
-    ctx: &StreamContext<'_>,
-    leftover: &mut crate::pool::PooledBuffer,
-) -> Result<u64, StreamingError>
-where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
-    stream_multiline_response_impl(
-        backend_read,
-        client_write,
-        first_chunk,
-        ctx,
-        None,
-        Some(leftover),
-    )
-    .await
-}
-
 /// Stream a multiline response while also capturing the exact bytes that were sent.
 #[allow(dead_code)]
 pub(crate) async fn stream_multiline_response_with_capture<R, W>(
@@ -1102,6 +1075,80 @@ mod tests {
             .unwrap();
 
         assert_eq!(captured.to_vec(), response);
+    }
+
+    #[tokio::test]
+    async fn test_buffer_multiline_response_stashes_packed_next_response_from_first_chunk() {
+        let first_response = b"220 Article follows\r\nLine 1\r\n.\r\n";
+        let packed_next = b"223 0 <next@example>\r\n";
+        let mut packed = Vec::from(first_response.as_slice());
+        packed.extend_from_slice(packed_next);
+
+        let pool = test_helpers::make_pool();
+        let ctx = test_helpers::make_ctx(&pool);
+        let mut conn = test_helpers::mock_backend_conn(vec![]).await;
+
+        let captured = buffer_multiline_response(&mut conn, &packed, &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(captured.to_vec(), first_response);
+        assert!(conn.has_leftover());
+        assert_eq!(conn.leftover_len(), packed_next.len());
+
+        let mut io_buffer = pool.acquire();
+        let (status, initial_len) = read_prefetched_response_status(&mut io_buffer, &mut conn)
+            .await
+            .expect("packed next status line should be read from leftover");
+        assert_eq!(status.as_u16(), 223);
+
+        let mut buffered = crate::pool::ChunkedResponse::default();
+        buffer_prefetched_single_line_response(
+            &io_buffer,
+            &mut conn,
+            &mut buffered,
+            &pool,
+            initial_len,
+        )
+        .expect("single-line leftover should buffer cleanly");
+        assert_eq!(buffered.to_vec(), packed_next);
+        assert!(!conn.has_leftover());
+    }
+
+    #[tokio::test]
+    async fn test_buffer_multiline_response_stashes_packed_next_response_from_later_chunk() {
+        let first_chunk = b"220 Article follows\r\nLine 1\r\n";
+        let tail_chunk = b".\r\n223 0 <next@example>\r\n".to_vec();
+
+        let pool = test_helpers::make_pool();
+        let ctx = test_helpers::make_ctx(&pool);
+        let mut conn = test_helpers::mock_backend_conn(vec![tail_chunk]).await;
+
+        let captured = buffer_multiline_response(&mut conn, first_chunk, &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(captured.to_vec(), b"220 Article follows\r\nLine 1\r\n.\r\n");
+        assert!(conn.has_leftover());
+        assert_eq!(conn.leftover_len(), b"223 0 <next@example>\r\n".len());
+
+        let mut io_buffer = pool.acquire();
+        let (status, initial_len) = read_prefetched_response_status(&mut io_buffer, &mut conn)
+            .await
+            .expect("later packed status line should be read from leftover");
+        assert_eq!(status.as_u16(), 223);
+
+        let mut buffered = crate::pool::ChunkedResponse::default();
+        buffer_prefetched_single_line_response(
+            &io_buffer,
+            &mut conn,
+            &mut buffered,
+            &pool,
+            initial_len,
+        )
+        .expect("single-line leftover should buffer cleanly");
+        assert_eq!(buffered.to_vec(), b"223 0 <next@example>\r\n");
+        assert!(!conn.has_leftover());
     }
 
     #[tokio::test]

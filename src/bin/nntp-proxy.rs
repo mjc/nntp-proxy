@@ -165,10 +165,11 @@ struct ProxyLaunch {
 
 /// Resolve the runtime launch parameters from CLI arguments and config.
 fn prepare_proxy_launch(args: &Args, config: &nntp_proxy::config::Config) -> ProxyLaunch {
-    let routing_mode = args
+    let requested_routing_mode = args
         .common
         .routing_mode
         .unwrap_or(config.routing.routing_mode);
+    let routing_mode = force_per_command_routing_mode(requested_routing_mode);
     let (host, port) =
         runtime::resolve_listen_address(args.common.host.as_deref(), args.common.port, config);
     let stats_path = runtime::resolve_stats_file_path(
@@ -193,6 +194,16 @@ fn prepare_proxy_launch(args: &Args, config: &nntp_proxy::config::Config) -> Pro
         server_names,
         metrics_store,
     }
+}
+
+fn force_per_command_routing_mode(requested: nntp_proxy::RoutingMode) -> nntp_proxy::RoutingMode {
+    if requested != nntp_proxy::RoutingMode::PerCommand {
+        warn!(
+            requested = %requested,
+            "Hybrid and stateful routing are temporarily disabled; forcing per-command mode"
+        );
+    }
+    nntp_proxy::RoutingMode::PerCommand
 }
 
 /// Launch the local in-process TUI when `--ui tui` is selected.
@@ -344,7 +355,7 @@ mod tests {
 
         let launch = prepare_proxy_launch(&args, &config);
 
-        assert_eq!(launch.routing_mode, nntp_proxy::RoutingMode::Stateful);
+        assert_eq!(launch.routing_mode, nntp_proxy::RoutingMode::PerCommand);
         assert_eq!(launch.host, "127.0.0.1");
         assert_eq!(launch.port.get(), 9120);
         assert_eq!(launch.server_names, vec!["Primary".to_string()]);

@@ -15,7 +15,6 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Notify, oneshot};
 
 use crate::protocol::RequestContext;
-use crate::session::SharedClientWriter;
 
 const BATCH_COALESCE_WINDOW: Duration = Duration::from_millis(1);
 
@@ -71,20 +70,13 @@ impl std::fmt::Display for PipelineError {
     }
 }
 
-#[derive(Clone, Debug)]
-pub enum PipelineDelivery {
-    Buffered,
-    StreamToClient(SharedClientWriter),
-}
-
 /// A request queued for pipeline execution on a backend
 pub struct QueuedContext {
     /// Typed request context. Owns verb/args, not redundant serialized bytes.
     pub context: RequestContext,
-    pub client_addr: crate::types::ClientAddress,
+    _client_addr: crate::types::ClientAddress,
     /// Return path to the client session that queued this request.
     client_return: oneshot::Sender<PipelineResponse>,
-    delivery: PipelineDelivery,
 }
 
 impl QueuedContext {
@@ -97,30 +89,9 @@ impl QueuedContext {
     ) -> Self {
         Self {
             context,
-            client_addr,
+            _client_addr: client_addr,
             client_return,
-            delivery: PipelineDelivery::Buffered,
         }
-    }
-
-    #[must_use]
-    pub(crate) fn new_streaming(
-        context: RequestContext,
-        client_addr: crate::types::ClientAddress,
-        client_return: oneshot::Sender<PipelineResponse>,
-        client_writer: SharedClientWriter,
-    ) -> Self {
-        Self {
-            context,
-            client_addr,
-            client_return,
-            delivery: PipelineDelivery::StreamToClient(client_writer),
-        }
-    }
-
-    #[must_use]
-    pub(crate) const fn delivery(&self) -> &PipelineDelivery {
-        &self.delivery
     }
 
     /// Complete this queued context after a response reader has filled it.
