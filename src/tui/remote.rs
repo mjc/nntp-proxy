@@ -36,9 +36,6 @@ fn dashboard_state_from_message(
         Ok(Message::Binary(bytes)) => bincode::deserialize::<DashboardState>(bytes.as_ref())
             .ok()
             .map(Arc::new),
-        Ok(Message::Text(text)) => serde_json::from_str::<DashboardState>(text.as_str())
-            .ok()
-            .map(Arc::new),
         _ => None,
     }
 }
@@ -511,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_state_from_message_parses_text_frames() {
+    fn dashboard_state_from_message_parses_binary_frames() {
         let state = DashboardState {
             log_lines: vec!["hello".to_string()],
             ..empty_dashboard_state()
@@ -523,15 +520,14 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_state_from_message_accepts_legacy_text_frames() {
+    fn dashboard_state_from_message_rejects_text_frames() {
         let state = DashboardState {
             log_lines: vec!["hello".to_string()],
             ..empty_dashboard_state()
         };
         let message = Message::Text(serde_json::to_string(&state).unwrap().into());
 
-        let parsed = dashboard_state_from_message(Ok(message)).expect("state should parse");
-        assert_eq!(parsed.log_lines, vec!["hello".to_string()]);
+        assert!(dashboard_state_from_message(Ok(message)).is_none());
     }
 
     #[test]
