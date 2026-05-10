@@ -34,6 +34,7 @@ pub(super) struct RequestExecutionIo<'a> {
 pub(super) struct PendingPipelineRequest {
     guard: CommandGuard,
     rx: oneshot::Receiver<PipelineResponse>,
+    streamed_delivery: bool,
 }
 
 /// Result of preparing a request before pipeline/direct backend execution.
@@ -240,7 +241,8 @@ impl ClientSession {
 
         let guard = CommandGuard::new(router.clone(), backend_id);
         let (tx, rx) = oneshot::channel();
-        let queued_context = if request.is_large_transfer() && !self.cache_articles {
+        let streamed_delivery = request.is_large_transfer() && !self.cache_articles;
+        let queued_context = if streamed_delivery {
             QueuedContext::new_streaming(
                 request.clone(),
                 self.client_addr,
@@ -254,7 +256,11 @@ impl ClientSession {
         match queue.try_enqueue(queued_context) {
             Ok(()) => {
                 self.metrics.record_pipeline_enqueue();
-                Some(PendingPipelineRequest { guard, rx })
+                Some(PendingPipelineRequest {
+                    guard,
+                    rx,
+                    streamed_delivery,
+                })
             }
             Err(e) => {
                 debug!(
@@ -272,7 +278,11 @@ impl ClientSession {
         io: &mut RequestExecutionIo<'_>,
         availability: &mut Option<ArticleAvailability>,
     ) -> Result<Option<CompletedPipelineRequest>, SessionError> {
-        let PendingPipelineRequest { guard, rx } = pending;
+        let PendingPipelineRequest {
+            guard,
+            rx,
+            streamed_delivery,
+        } = pending;
         let backend_id = guard.backend_id();
 
         match rx.await {
@@ -357,6 +367,12 @@ impl ClientSession {
                 Err(SessionError::ClientDisconnect(io::Error::new(
                     io::ErrorKind::BrokenPipe,
                     "client disconnected during pipelined stream",
+                )))
+            }
+            Ok(Err(crate::router::backend_queue::PipelineError::ReadFailed)) if streamed_delivery => {
+                Err(SessionError::Backend(anyhow::anyhow!(
+                    "streamed pipeline read failed on backend {:?}; closing session to avoid response desync",
+                    backend_id
                 )))
             }
             Ok(Err(e)) => {
@@ -590,6 +606,7 @@ mod tests {
 
     fn pending_request(
         router: Arc<BackendSelector>,
+        streamed_delivery: bool,
         error: PipelineError,
     ) -> PendingPipelineRequest {
         let (tx, rx) = oneshot::channel();
@@ -597,6 +614,7 @@ mod tests {
         PendingPipelineRequest {
             guard: CommandGuard::new(router, crate::types::BackendId::from_index(0)),
             rx,
+            streamed_delivery,
         }
     }
 
@@ -605,7 +623,7 @@ mod tests {
         let session = test_session(false);
         let writer = shared_writer().await;
         let router = Arc::new(BackendSelector::new());
-        let pending = pending_request(router, PipelineError::ReadFailed);
+        let pending = pending_request(router, false, PipelineError::ReadFailed);
         let mut client_to_backend_bytes = ClientToBackendBytes::zero();
         let mut backend_to_client_bytes = BackendToClientBytes::zero();
         let mut io = RequestExecutionIo {
@@ -620,5 +638,30 @@ mod tests {
             .await;
 
         assert!(matches!(result, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn await_pipeline_request_makes_streamed_read_failure_terminal() {
+        let session = test_session(false);
+        let writer = shared_writer().await;
+        let router = Arc::new(BackendSelector::new());
+        let pending = pending_request(router, true, PipelineError::ReadFailed);
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_to_client_bytes = BackendToClientBytes::zero();
+        let mut io = RequestExecutionIo {
+            client_writer: &writer,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_to_client_bytes: &mut backend_to_client_bytes,
+        };
+        let mut availability = None;
+
+        let result = session
+            .await_pipeline_request(pending, &mut io, &mut availability)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::session::SessionError::Backend(_))
+        ));
     }
 }
