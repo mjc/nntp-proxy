@@ -16,6 +16,7 @@ use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
 use crate::protocol::RequestContext;
@@ -727,6 +728,7 @@ impl ClientSession {
             router.route_with_availability(self.client_id, availability.as_ref())
             && let Some(queue) = router.get_backend_queue(backend_id)
         {
+            let streamed_delivery = request.is_large_transfer();
             let guard = CommandGuard::new(router.clone(), backend_id);
             debug!(
                 "Client {} using pipeline path for backend {:?}: kind={:?}, verb={:?}",
@@ -751,61 +753,18 @@ impl ClientSession {
             match queue.try_enqueue(queued_context) {
                 Ok(()) => {
                     self.metrics.record_pipeline_enqueue();
-
-                    match rx.await {
-                        Ok(Ok(completed))
-                            if completed
-                                .context
-                                .response_metadata()
-                                .is_some_and(|response| response.status().as_u16() != 430) =>
-                        {
-                            if let Some(payload) = completed.context.response_payload() {
-                                let mut client_write = io.client_writer.lock().await;
-                                payload
-                                    .write_all_to(&mut *client_write)
-                                    .await
-                                    .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
-                            }
-                            let response = completed
-                                .context
-                                .response_metadata()
-                                .expect("completed queued request records response metadata");
-                            *io.backend_to_client_bytes =
-                                io.backend_to_client_bytes.add(response.wire_len().get());
-                            *io.client_to_backend_bytes = io
-                                .client_to_backend_bytes
-                                .add(completed.context.request_wire_len().get());
-                            self.metrics.record_pipeline_complete();
-                            guard.complete();
-                            return Ok(true);
-                        }
-                        Ok(Ok(completed)) => {
-                            let completed_backend_id = completed
-                                .context
-                                .backend_id()
-                                .expect("completed queued request records backend id");
-                            debug!(
-                                "Client {} pipeline got 430 from backend {:?}, falling through to retry loop",
-                                self.client_addr, completed_backend_id
-                            );
-                            self.handle_430_availability(
-                                completed_backend_id,
-                                availability.get_or_insert_default(),
-                            );
-                            self.metrics.record_pipeline_complete();
-                        }
-                        Ok(Err(e)) => {
-                            debug!(
-                                "Client {} pipeline error for backend {:?}: {}",
-                                self.client_addr, backend_id, e
-                            );
-                        }
-                        Err(_) => {
-                            debug!(
-                                "Client {} pipeline worker dropped response channel",
-                                self.client_addr
-                            );
-                        }
+                    if self
+                        .await_pipeline_request(
+                            backend_id,
+                            streamed_delivery,
+                            guard,
+                            rx,
+                            io,
+                            availability,
+                        )
+                        .await?
+                    {
+                        return Ok(true);
                     }
                 }
                 Err(e) => {
@@ -818,6 +777,85 @@ impl ClientSession {
         }
 
         Ok(false)
+    }
+
+    async fn await_pipeline_request(
+        &self,
+        backend_id: BackendId,
+        streamed_delivery: bool,
+        guard: CommandGuard,
+        rx: oneshot::Receiver<crate::router::backend_queue::PipelineResponse>,
+        io: &mut RequestExecutionIo<'_>,
+        availability: &mut Option<ArticleAvailability>,
+    ) -> Result<bool, SessionError> {
+        match rx.await {
+            Ok(Ok(completed))
+                if completed
+                    .context
+                    .response_metadata()
+                    .is_some_and(|response| response.status().as_u16() != 430) =>
+            {
+                if let Some(payload) = completed.context.response_payload() {
+                    let mut client_write = io.client_writer.lock().await;
+                    payload
+                        .write_all_to(&mut *client_write)
+                        .await
+                        .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                }
+                let response = completed
+                    .context
+                    .response_metadata()
+                    .expect("completed queued request records response metadata");
+                *io.backend_to_client_bytes =
+                    io.backend_to_client_bytes.add(response.wire_len().get());
+                *io.client_to_backend_bytes = io
+                    .client_to_backend_bytes
+                    .add(completed.context.request_wire_len().get());
+                self.metrics.record_pipeline_complete();
+                guard.complete();
+                Ok(true)
+            }
+            Ok(Ok(completed)) => {
+                let completed_backend_id = completed
+                    .context
+                    .backend_id()
+                    .expect("completed queued request records backend id");
+                debug!(
+                    "Client {} pipeline got 430 from backend {:?}, falling through to retry loop",
+                    self.client_addr, completed_backend_id
+                );
+                self.handle_430_availability(
+                    completed_backend_id,
+                    availability.get_or_insert_default(),
+                );
+                self.metrics.record_pipeline_complete();
+                Ok(false)
+            }
+            Ok(Err(e)) => {
+                debug!(
+                    "Client {} pipeline error for backend {:?}: {}",
+                    self.client_addr, backend_id, e
+                );
+                if streamed_delivery {
+                    return Err(SessionError::Backend(anyhow::anyhow!(
+                        "streamed pipeline request failed after partial client-visible progress: {e}"
+                    )));
+                }
+                Ok(false)
+            }
+            Err(_) => {
+                debug!(
+                    "Client {} pipeline worker dropped response channel",
+                    self.client_addr
+                );
+                if streamed_delivery {
+                    return Err(SessionError::Backend(anyhow::anyhow!(
+                        "streamed pipeline request lost response channel after partial client-visible progress"
+                    )));
+                }
+                Ok(false)
+            }
+        }
     }
 
     async fn execute_article_retry_loop(
@@ -966,5 +1004,115 @@ impl ClientSession {
                 .sync_availability(msg_id_ref.clone(), availability)
                 .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ClientSession, RequestExecutionIo};
+    use crate::auth::AuthHandler;
+    use crate::config::RoutingMode;
+    use crate::metrics::MetricsCollector;
+    use crate::pool::BufferPool;
+    use crate::router::backend_queue::PipelineError;
+    use crate::router::{BackendSelector, CommandGuard};
+    use crate::session::SharedClientWriter;
+    use crate::types::{BackendToClientBytes, BufferSize, ClientAddress, ClientToBackendBytes};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::sync::oneshot;
+
+    fn test_session(cache_articles: bool) -> ClientSession {
+        let addr: SocketAddr = "127.0.0.1:0".parse().expect("valid address");
+        ClientSession::builder(
+            ClientAddress::from(addr),
+            BufferPool::new(BufferSize::try_new(1024).expect("valid buffer size"), 1),
+            Arc::new(AuthHandler::new(None, None).expect("auth disabled")),
+            MetricsCollector::new(1),
+        )
+        .with_routing_mode(RoutingMode::PerCommand)
+        .with_cache_articles(cache_articles)
+        .build()
+    }
+
+    async fn shared_writer() -> SharedClientWriter {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect = TcpStream::connect(addr);
+        let accept = listener.accept();
+        let (client, server) = tokio::join!(connect, accept);
+        let client = client.unwrap();
+        let server = server.unwrap().0;
+        drop(server);
+        let (_read_half, write_half) = client.into_split();
+        SharedClientWriter::new(write_half)
+    }
+
+    fn pending_response(
+        error: PipelineError,
+    ) -> oneshot::Receiver<crate::router::backend_queue::PipelineResponse> {
+        let (tx, rx) = oneshot::channel();
+        tx.send(Err(error)).unwrap();
+        rx
+    }
+
+    #[tokio::test]
+    async fn await_pipeline_request_allows_buffered_read_failure_to_retry() {
+        let session = test_session(false);
+        let writer = shared_writer().await;
+        let router = Arc::new(BackendSelector::new());
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_to_client_bytes = BackendToClientBytes::zero();
+        let mut io = RequestExecutionIo {
+            client_writer: &writer,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_to_client_bytes: &mut backend_to_client_bytes,
+        };
+        let mut availability = None;
+
+        let result = session
+            .await_pipeline_request(
+                crate::types::BackendId::from_index(0),
+                false,
+                CommandGuard::new(router, crate::types::BackendId::from_index(0)),
+                pending_response(PipelineError::ReadFailed),
+                &mut io,
+                &mut availability,
+            )
+            .await;
+
+        assert!(matches!(result, Ok(false)));
+    }
+
+    #[tokio::test]
+    async fn await_pipeline_request_makes_streamed_read_failure_terminal() {
+        let session = test_session(false);
+        let writer = shared_writer().await;
+        let router = Arc::new(BackendSelector::new());
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_to_client_bytes = BackendToClientBytes::zero();
+        let mut io = RequestExecutionIo {
+            client_writer: &writer,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_to_client_bytes: &mut backend_to_client_bytes,
+        };
+        let mut availability = None;
+
+        let result = session
+            .await_pipeline_request(
+                crate::types::BackendId::from_index(0),
+                true,
+                CommandGuard::new(router, crate::types::BackendId::from_index(0)),
+                pending_response(PipelineError::ReadFailed),
+                &mut io,
+                &mut availability,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::session::SessionError::Backend(_))
+        ));
     }
 }
