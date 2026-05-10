@@ -203,15 +203,12 @@ impl ClientSession {
         io: &mut RequestExecutionIo<'_>,
         availability: &mut Option<ArticleAvailability>,
     ) -> Result<bool, SessionError> {
-        if let Some(pending) = self.try_enqueue_pipeline_request(
-            router,
-            request,
-            io.client_writer,
-            availability.as_ref(),
-        ) && self
-            .await_pipeline_request(pending, io, availability)
-            .await?
-            .is_some()
+        if let Some(pending) =
+            self.try_enqueue_pipeline_request(router, request, availability.as_ref())
+            && self
+                .await_pipeline_request(pending, io, availability)
+                .await?
+                .is_some()
         {
             return Ok(true);
         }
@@ -223,7 +220,6 @@ impl ClientSession {
         &self,
         router: &Arc<BackendSelector>,
         request: &RequestContext,
-        client_writer: &crate::session::SharedClientWriter,
         availability: Option<&ArticleAvailability>,
     ) -> Option<PendingPipelineRequest> {
         let Ok(backend_id) = router.route_with_availability(self.client_id, availability) else {
@@ -241,17 +237,8 @@ impl ClientSession {
 
         let guard = CommandGuard::new(router.clone(), backend_id);
         let (tx, rx) = oneshot::channel();
-        let streamed_delivery = request.is_large_transfer() && !self.cache_articles;
-        let queued_context = if streamed_delivery {
-            QueuedContext::new_streaming(
-                request.clone(),
-                self.client_addr,
-                tx,
-                client_writer.clone(),
-            )
-        } else {
-            QueuedContext::new(request.clone(), self.client_addr, tx)
-        };
+        let streamed_delivery = false;
+        let queued_context = QueuedContext::new(request.clone(), self.client_addr, tx);
 
         match queue.try_enqueue(queued_context) {
             Ok(()) => {
@@ -369,7 +356,9 @@ impl ClientSession {
                     "client disconnected during pipelined stream",
                 )))
             }
-            Ok(Err(crate::router::backend_queue::PipelineError::ReadFailed)) if streamed_delivery => {
+            Ok(Err(crate::router::backend_queue::PipelineError::ReadFailed))
+                if streamed_delivery =>
+            {
                 Err(SessionError::Backend(anyhow::anyhow!(
                     "streamed pipeline read failed on backend {:?}; closing session to avoid response desync",
                     backend_id

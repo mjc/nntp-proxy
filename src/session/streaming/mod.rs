@@ -258,33 +258,6 @@ where
     stream_multiline_response_impl(backend_read, client_write, first_chunk, ctx, None, None).await
 }
 
-/// Stream multiline response from backend to client during pipelined batch execution.
-///
-/// Unlike [`stream_multiline_response`], this captures any bytes after the
-/// current response terminator into `leftover` so the next pipelined response
-/// can be parsed from the same backend connection without losing framing.
-pub(crate) async fn stream_multiline_response_pipelined<R, W>(
-    backend_read: &mut R,
-    client_write: &mut W,
-    first_chunk: &[u8],
-    ctx: &StreamContext<'_>,
-    leftover: &mut crate::pool::PooledBuffer,
-) -> Result<u64, StreamingError>
-where
-    R: AsyncReadExt + Unpin,
-    W: AsyncWriteExt + Unpin,
-{
-    stream_multiline_response_impl(
-        backend_read,
-        client_write,
-        first_chunk,
-        ctx,
-        None,
-        Some(leftover),
-    )
-    .await
-}
-
 /// Stream a multiline response while also capturing the exact bytes that were sent.
 #[allow(dead_code)]
 pub(crate) async fn stream_multiline_response_with_capture<R, W>(

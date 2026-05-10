@@ -5,7 +5,7 @@ use crate::metrics::{MetricsCollector, MetricsSnapshot};
 use crate::router::BackendSelector;
 use crate::tui::dashboard::{
     BackendDisplay, BackendView, BufferPoolStats, DashboardMetrics, DashboardState,
-    DashboardUserStats,
+    DashboardUserStats, RemoteBackendView, RemoteDashboardState,
 };
 use crate::tui::log_capture::LogBuffer;
 use crate::tui::rate_estimator::{CumulativeCount, RateEstimate, RateEstimator, RatePerSecond};
@@ -802,6 +802,50 @@ impl TuiApp {
         }
     }
 
+    /// Build a serializable attached-dashboard snapshot with only remote-render fields.
+    #[must_use]
+    pub fn snapshot_remote_state_with_limits(
+        &self,
+        log_limit: Option<usize>,
+        history_limit: Option<usize>,
+        top_user_limit: Option<usize>,
+    ) -> RemoteDashboardState {
+        let mut metrics = DashboardMetrics::from_snapshot(self.snapshot.as_ref());
+        metrics.in_flight_requests = self
+            .servers
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| self.backend_pending_count(idx))
+            .sum();
+        metrics.pipeline_enabled_backends = self
+            .servers
+            .iter()
+            .filter(|server| server.backend_pipelining)
+            .count();
+        metrics.pipeline_depth = self
+            .servers
+            .iter()
+            .enumerate()
+            .filter(|(_, server)| server.backend_pipelining)
+            .map(|(idx, _)| self.backend_pipeline_depth(idx).unwrap_or_default())
+            .sum();
+        metrics.pipeline_connection_capacity = self
+            .servers
+            .iter()
+            .filter(|server| server.backend_pipelining)
+            .map(|server| server.max_connections.get())
+            .sum();
+
+        RemoteDashboardState {
+            metrics,
+            backend_views: self.snapshot_remote_backend_views(history_limit),
+            top_users: self.snapshot_top_users_with_limit(top_user_limit),
+            latest_client_throughput: self.client_history.latest().cloned(),
+            system_stats: self.system_stats.clone(),
+            log_lines: self.snapshot_log_lines(log_limit),
+        }
+    }
+
     fn snapshot_log_lines(&self, log_limit: Option<usize>) -> Vec<String> {
         match log_limit {
             Some(limit) => self.log_buffer.recent_lines(limit),
@@ -816,6 +860,21 @@ impl TuiApp {
             .zip(self.servers.iter())
             .enumerate()
             .map(|(i, (stats, server))| self.snapshot_backend_view(i, server, stats, history_limit))
+            .collect()
+    }
+
+    fn snapshot_remote_backend_views(
+        &self,
+        history_limit: Option<usize>,
+    ) -> Vec<RemoteBackendView> {
+        self.snapshot
+            .backend_stats
+            .iter()
+            .zip(self.servers.iter())
+            .enumerate()
+            .map(|(i, (stats, server))| {
+                self.snapshot_remote_backend_view(i, server, stats, history_limit)
+            })
             .collect()
     }
 
@@ -838,6 +897,34 @@ impl TuiApp {
             health_status: stats.health_status,
             pending_count: self.backend_pending_count(backend_idx),
             load_ratio: self.backend_load_ratio(backend_idx),
+            stateful_count: self.backend_stateful_count(backend_idx),
+            traffic_share: self.backend_traffic_share(backend_idx),
+            pipeline_depth: self.backend_pipeline_depth(backend_idx),
+            history: Self::snapshot_throughput_history(
+                self.backend_history(backend_idx),
+                history_limit,
+            ),
+        }
+    }
+
+    fn snapshot_remote_backend_view(
+        &self,
+        backend_idx: usize,
+        server: &Server,
+        stats: &crate::metrics::BackendStats,
+        history_limit: Option<usize>,
+    ) -> RemoteBackendView {
+        RemoteBackendView {
+            server: BackendDisplay {
+                host: server.host.clone(),
+                port: server.port,
+                name: server.name.clone(),
+                max_connections: server.max_connections,
+            },
+            stats: stats.clone(),
+            active_connections: stats.active_connections.get(),
+            health_status: stats.health_status,
+            pending_count: self.backend_pending_count(backend_idx),
             stateful_count: self.backend_stateful_count(backend_idx),
             traffic_share: self.backend_traffic_share(backend_idx),
             pipeline_depth: self.backend_pipeline_depth(backend_idx),
@@ -875,6 +962,13 @@ impl TuiApp {
     }
 
     fn snapshot_top_users(&self) -> Vec<DashboardUserStats> {
+        self.snapshot_top_users_with_limit(Some(10))
+    }
+
+    fn snapshot_top_users_with_limit(
+        &self,
+        top_user_limit: Option<usize>,
+    ) -> Vec<DashboardUserStats> {
         let mut top_users = self
             .snapshot
             .user_stats
@@ -882,7 +976,9 @@ impl TuiApp {
             .map(DashboardUserStats::from_user_stats)
             .collect::<Vec<_>>();
         top_users.sort_by_key(|user| std::cmp::Reverse(user.total_bytes()));
-        top_users.truncate(10);
+        if let Some(limit) = top_user_limit {
+            top_users.truncate(limit);
+        }
         top_users
     }
 }
