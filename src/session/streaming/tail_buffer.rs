@@ -109,20 +109,21 @@ impl TailBuffer {
             TerminatorStatus::NotFound
         }
     }
-    /// Detect terminator in chunk, considering possible boundary spanning
+    /// Detect the earliest complete terminator touching the current chunk.
     ///
-    /// **Performance**: `find_terminator_end()` checks end first (O(1)),
-    /// then scans candidate dot bytes if terminator is mid-chunk (rare).
-    /// This optimizes the 99% case where terminator is at chunk end.
+    /// Pipelined reads may contain multiple complete NNTP responses in one chunk,
+    /// so this must prefer the earliest terminator instead of the suffix one.
     #[must_use]
     pub fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
-        find_terminator_end(chunk).map_or_else(
-            || {
-                self.find_spanning_terminator(chunk)
-                    .map_or(TerminatorStatus::NotFound, TerminatorStatus::FoundAt)
-            },
-            TerminatorStatus::FoundAt,
-        )
+        match (
+            self.find_spanning_terminator(chunk),
+            find_terminator_end(chunk),
+        ) {
+            (Some(spanning), Some(in_chunk)) => TerminatorStatus::FoundAt(spanning.min(in_chunk)),
+            (Some(spanning), None) => TerminatorStatus::FoundAt(spanning),
+            (None, Some(in_chunk)) => TerminatorStatus::FoundAt(in_chunk),
+            (None, None) => TerminatorStatus::NotFound,
+        }
     }
 }
 
@@ -134,23 +135,13 @@ impl TailBuffer {
 /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1),
 /// the terminator is exactly "\r\n.\r\n" (CRLF, dot, CRLF).
 ///
-/// **Hot path optimization**: Check end first (99% case for streaming chunks),
-/// then scan for the terminator's distinguishing dot byte for mid-chunk leftovers.
+/// Returns the earliest complete terminator when multiple responses are packed
+/// into the same read buffer.
 #[inline]
 fn find_terminator_end(data: &[u8]) -> Option<usize> {
     const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
 
-    data.len().checked_sub(TERMINATOR.len()).and_then(|_| {
-        if is_terminator_suffix(data) {
-            Some(data.len())
-        } else {
-            memchr::memchr_iter(b'.', data)
-                .skip_while(|&pos| pos < 2)
-                .take_while(|&pos| pos + 3 <= data.len())
-                .find(|&pos| data[pos - 2..pos + 3] == *TERMINATOR)
-                .map(|pos| pos + 3)
-        }
-    })
+    memchr::memmem::find(data, TERMINATOR).map(|start| start + TERMINATOR.len())
 }
 
 #[inline]
@@ -464,6 +455,44 @@ mod tests {
         match status {
             TerminatorStatus::FoundAt(pos) => assert_eq!(pos, 3),
             TerminatorStatus::NotFound => panic!("Expected FoundAt(3), got {status:?}"),
+        }
+    }
+
+    #[test]
+    fn test_detect_terminator_prefers_spanning_before_later_in_chunk_terminator() {
+        let mut tail = TailBuffer::default();
+        tail.update(b"article content\r\n");
+        let chunk = b".\r\n220 1 <next@example>\r\nnext body\r\n.\r\n";
+
+        let status = tail.detect_terminator(chunk);
+
+        match status {
+            TerminatorStatus::FoundAt(pos) => {
+                assert_eq!(pos, 3);
+                assert_eq!(&chunk[..pos], b".\r\n");
+                assert_eq!(&chunk[pos..], b"220 1 <next@example>\r\nnext body\r\n.\r\n");
+            }
+            TerminatorStatus::NotFound => panic!("Expected FoundAt(3), got {status:?}"),
+        }
+    }
+
+    #[test]
+    fn test_detect_terminator_prefers_earliest_in_chunk_terminator() {
+        let tail = TailBuffer::default();
+        let chunk =
+            b"222 1 <body-1@example>\r\nbody-1-line\r\n.\r\n222 2 <body-2@example>\r\nbody-2-line\r\n.\r\n";
+
+        let status = tail.detect_terminator(chunk);
+
+        match status {
+            TerminatorStatus::FoundAt(pos) => {
+                let first_response = b"222 1 <body-1@example>\r\nbody-1-line\r\n.\r\n";
+                assert_eq!(pos, first_response.len());
+                assert_eq!(&chunk[..pos], first_response);
+            }
+            TerminatorStatus::NotFound => {
+                panic!("Expected first packed terminator, got {status:?}")
+            }
         }
     }
 
