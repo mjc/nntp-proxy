@@ -8,8 +8,6 @@ use ratatui::style::Color;
 
 /// Layout constraints for main UI sections
 pub mod layout {
-    use ratatui::layout::Constraint;
-
     pub const TITLE_HEIGHT: u16 = 3;
     pub const SUMMARY_HEIGHT: u16 = 6; // 3 columns with 4 lines each
     pub const FOOTER_HEIGHT: u16 = 3;
@@ -18,26 +16,6 @@ pub mod layout {
     pub const MIN_HEIGHT_FOR_LOGS: u16 = 40;
     /// Number of log lines visible in the log panel
     pub const LOG_WINDOW_HEIGHT: u16 = 10;
-
-    pub const BACKEND_LIST_WIDTH_PCT: u16 = 50;
-    pub const CHART_WIDTH_PCT: u16 = 50;
-
-    pub const fn main_sections() -> [Constraint; 4] {
-        [
-            Constraint::Length(TITLE_HEIGHT),
-            Constraint::Length(SUMMARY_HEIGHT),
-            Constraint::Min(MIN_CHART_HEIGHT),
-            Constraint::Length(FOOTER_HEIGHT),
-        ]
-    }
-
-    pub const fn backend_columns() -> [Constraint; 3] {
-        [
-            Constraint::Percentage(BACKEND_LIST_WIDTH_PCT),
-            Constraint::Percentage(CHART_WIDTH_PCT),
-            Constraint::Percentage(25), // Top users column
-        ]
-    }
 }
 
 // ============================================================================
@@ -122,30 +100,6 @@ mod tests {
         assert_eq!(layout::SUMMARY_HEIGHT, 6);
         assert_eq!(layout::FOOTER_HEIGHT, 3);
         assert_eq!(layout::MIN_CHART_HEIGHT, 8);
-        assert_eq!(layout::BACKEND_LIST_WIDTH_PCT, 50);
-        assert_eq!(layout::CHART_WIDTH_PCT, 50);
-    }
-
-    #[test]
-    fn test_main_sections_constraints() {
-        let sections = layout::main_sections();
-        assert_eq!(sections.len(), 4);
-        // Verify structure is correct
-        assert!(matches!(
-            sections[0],
-            ratatui::layout::Constraint::Length(_)
-        ));
-    }
-
-    #[test]
-    fn test_backend_columns_constraints() {
-        let columns = layout::backend_columns();
-        assert_eq!(columns.len(), 3);
-        // Verify structure is correct
-        assert!(matches!(
-            columns[0],
-            ratatui::layout::Constraint::Percentage(_)
-        ));
     }
 
     #[test]

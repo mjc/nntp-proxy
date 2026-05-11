@@ -32,17 +32,40 @@ pub(super) enum CacheLookupResult {
 }
 
 impl ClientSession {
+    pub(super) async fn has_servable_cached_response(&self, request: &RequestContext) -> bool {
+        let Some(msg_id) = request.message_id() else {
+            return false;
+        };
+
+        let Some(cached) = self.cache.get_request_message_id(msg_id).await else {
+            return false;
+        };
+
+        if !cached.has_availability_info() || !self.cache_articles {
+            return false;
+        }
+
+        if !request.is_stat() && !cached.is_complete_article() {
+            return false;
+        }
+
+        cached.cached_response_for(request.kind(), msg_id).is_some()
+    }
+
     /// Try to serve from cache
     ///
     /// Returns `CacheLookupResult::Hit` if served, `PartialHit` if entry existed but
     /// wasn't servable, or `Miss`.
-    pub(super) async fn try_serve_from_cache(
+    pub(super) async fn try_serve_from_cache<W>(
         &self,
         request: &mut RequestContext,
         router: &Arc<BackendSelector>,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_write: &mut W,
         backend_to_client_bytes: &mut BackendToClientBytes,
-    ) -> Result<CacheLookupResult> {
+    ) -> Result<CacheLookupResult>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let Some(msg_id_for_lookup) = request.message_id() else {
             request.record_cache_status(RequestCacheStatus::Miss);
             return Ok(CacheLookupResult::Miss);

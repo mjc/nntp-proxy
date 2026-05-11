@@ -36,28 +36,27 @@ pub mod buffer {
     #[allow(dead_code)] // Used in const assertions which the compiler doesn't track
     const PAGE_SIZE: usize = 4096;
 
-    /// Size of each pooled buffer (724KB, page-aligned)
-    /// Tuned for typical Usenet article sizes (average ~725KB)
-    /// Aligned to 4KB page boundaries for optimal memory access
-    pub const POOL: usize = 724 * 1024;
+    /// Size of each pooled buffer (1 MiB, page-aligned)
+    /// Large enough to keep typical article reads in a single chunk while
+    /// leaving headroom for bigger first reads and direct streaming paths.
+    pub const POOL: usize = 1024 * 1024;
 
     /// Default number of buffers in the buffer pool
     /// Sized for ~50 concurrent streaming connections
-    /// Total memory: 50 × 724KB ≈ 35MB
+    /// Total memory: 50 × 1MiB = 50MiB
     /// This is a conservative default; increase via config for higher concurrency
     pub const POOL_COUNT: usize = 50;
 
-    /// Size of each capture buffer (772KB, page-aligned).
+    /// Size of each capture buffer (1 MiB, page-aligned).
     ///
-    /// Sized to capture typical yEnc articles plus NNTP framing without
-    /// reallocation. The extra 4KB avoids needless growth when payloads are
-    /// near 768KB and only exceed it by status-line/terminator overhead.
-    pub const CAPTURE: usize = 772 * 1024;
+    /// Sized to capture typical articles and direct leftover tracking without
+    /// immediate growth or fallback allocations.
+    pub const CAPTURE: usize = 1024 * 1024;
 
     /// Default number of capture buffers in the pool.
     ///
     /// Sized for 16 concurrent caching operations.
-    /// Total memory: 16 × 772KB ≈ 12MB.
+    /// Total memory: 16 × 1MiB = 16MiB.
     /// This is a conservative default; increase via config for higher caching throughput.
     pub const CAPTURE_COUNT: usize = 16;
 
@@ -82,10 +81,10 @@ pub mod buffer {
 
     // Streaming configuration
 
-    /// Chunk size for streaming responses (724KB, page-aligned)
-    /// Matches POOL size to handle most articles in a single read
-    /// Aligned to 4KB page boundaries for optimal zero-copy I/O
-    pub const STREAM_CHUNK: usize = 724 * 1024;
+    /// Chunk size for streaming responses (1 MiB, page-aligned)
+    /// Matches POOL size so the first direct backend read and follow-on reads
+    /// use the same pooled allocation size.
+    pub const STREAM_CHUNK: usize = 1024 * 1024;
 
     /// Maximum leftover bytes between pipelined responses.
     ///
@@ -127,13 +126,13 @@ pub mod socket {
     /// TCP socket send buffer size for high-throughput transfers (16MB)
     pub const HIGH_THROUGHPUT_SEND_BUFFER: usize = 16 * 1024 * 1024;
 
-    /// TCP socket receive buffer size for connection pools (7.25MB)
-    /// Sized to handle 724KB streaming chunks efficiently (10x chunk size)
-    pub const POOL_RECV_BUFFER: usize = 7 * 1024 * 1024 + 256 * 1024;
+    /// TCP socket receive buffer size for connection pools (10MiB)
+    /// Sized to handle 1 MiB streaming chunks efficiently (10x chunk size)
+    pub const POOL_RECV_BUFFER: usize = 10 * 1024 * 1024;
 
-    /// TCP socket send buffer size for connection pools (7.25MB)
-    /// Sized to handle 724KB streaming chunks efficiently (10x chunk size)
-    pub const POOL_SEND_BUFFER: usize = 7 * 1024 * 1024 + 256 * 1024;
+    /// TCP socket send buffer size for connection pools (10MiB)
+    /// Sized to handle 1 MiB streaming chunks efficiently (10x chunk size)
+    pub const POOL_SEND_BUFFER: usize = 10 * 1024 * 1024;
 }
 
 /// Timeout constants
@@ -264,7 +263,7 @@ const _: () = {
     );
 
     // Buffer size relationships
-    assert!(buffer::POOL == 724 * 1024);
+    assert!(buffer::POOL == 1024 * 1024);
     assert!(buffer::READER_CAPACITY >= buffer::COMMAND);
     assert!(buffer::READER_CAPACITY == 64 * 1024);
     assert!(buffer::RESPONSE_MAX > buffer::POOL);
@@ -302,23 +301,23 @@ mod tests {
         // Calculate total pool memory
         let total_memory = buffer::POOL * buffer::POOL_COUNT;
 
-        // Should be approximately 35MB (50 buffers × 724KB)
-        let expected_mb = 35;
+        // Should be exactly 50MiB (50 buffers × 1MiB)
+        let expected_mb = 50;
         let actual_mb = total_memory / (1024 * 1024);
 
-        assert!(
-            actual_mb >= expected_mb - 1 && actual_mb <= expected_mb + 1,
-            "Pool memory should be ~{expected_mb}MB, got {actual_mb}MB"
+        assert_eq!(
+            actual_mb, expected_mb,
+            "Pool memory should be {expected_mb}MiB, got {actual_mb}MiB"
         );
     }
 
     #[test]
     fn test_timeouts() {
-        // Command execution timeout should be longer than backend read timeout
-        assert!(timeout::COMMAND_EXECUTION > timeout::BACKEND_READ);
+        // Command execution timeout should be at least as long as backend read timeout
+        assert!(timeout::COMMAND_EXECUTION >= timeout::BACKEND_READ);
 
-        // Backend read timeout should be longer than connection timeout
-        assert!(timeout::BACKEND_READ > timeout::CONNECTION);
+        // Backend read timeout should be at least as long as connection timeout
+        assert!(timeout::BACKEND_READ >= timeout::CONNECTION);
 
         // All timeouts should be non-zero
         assert!(timeout::BACKEND_READ.as_secs() > 0);

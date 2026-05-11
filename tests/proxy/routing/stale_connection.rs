@@ -12,7 +12,6 @@ use anyhow::Result;
 use nntp_proxy::{Cache, Config, NntpProxy, RoutingMode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
@@ -384,7 +383,9 @@ async fn test_per_command_retries_on_stale_connection() -> Result<()> {
     assert!(line.starts_with("223"), "First should work: {line}");
     line.clear();
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    for _ in 0..32 {
+        tokio::task::yield_now().await;
+    }
 
     // Second command - stale connection
     reader.get_mut().write_all(b"STAT <msg2@test>\r\n").await?;

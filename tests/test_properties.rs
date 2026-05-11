@@ -6,7 +6,7 @@ use nntp_proxy::cache::ArticleAvailability;
 use nntp_proxy::cache::ttl::{CacheTier, CacheTtlMillis, effective_ttl};
 use nntp_proxy::protocol::{Headers, RequestContext, RequestRouteClass, StatusCode};
 use nntp_proxy::router::BackendCount;
-use nntp_proxy::session::streaming::tail_buffer::TailBuffer;
+use nntp_proxy::session::tail_buffer::TailBuffer;
 use nntp_proxy::types::{BackendId, MessageId};
 use proptest::prelude::*;
 use std::fmt::Write as _;

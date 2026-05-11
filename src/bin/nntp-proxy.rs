@@ -31,7 +31,7 @@ fn main() -> Result<()> {
         && let Some(connect_addr) = args.common.tui_attach
     {
         let file_level = nntp_proxy::Config::default().proxy.log_file_level;
-        let _ = nntp_proxy::logging::init_logging(UiMode::Tui, &file_level, false);
+        let _ = nntp_proxy::logging::init_logging(UiMode::Tui, &file_level, false, false);
         let threads = args.common.threads;
         return RuntimeConfig::from_args(threads)
             .build_runtime()?
@@ -43,10 +43,21 @@ fn main() -> Result<()> {
     // Apply CLI argument overrides to config
     args.common.apply_overrides(&mut config);
 
+    let write_debug_log = nntp_proxy::logging::should_write_debug_log(
+        ui_mode,
+        args.common.tui_attach.is_some(),
+        &config.proxy.log_file_level,
+    );
+    let capture_in_memory_logs = nntp_proxy::logging::should_capture_in_memory_logs(
+        ui_mode,
+        args.common.tui_attach.is_some(),
+        capture_headless_tui_buffer,
+    );
     let log_buffer = nntp_proxy::logging::init_logging(
         ui_mode,
         &config.proxy.log_file_level,
-        capture_headless_tui_buffer,
+        capture_in_memory_logs,
+        write_debug_log,
     );
 
     let threads = args.common.threads.or(Some(config.proxy.threads));
@@ -154,10 +165,11 @@ struct ProxyLaunch {
 
 /// Resolve the runtime launch parameters from CLI arguments and config.
 fn prepare_proxy_launch(args: &Args, config: &nntp_proxy::config::Config) -> ProxyLaunch {
-    let routing_mode = args
+    let requested_routing_mode = args
         .common
         .routing_mode
         .unwrap_or(config.routing.routing_mode);
+    let routing_mode = force_per_command_routing_mode(requested_routing_mode);
     let (host, port) =
         runtime::resolve_listen_address(args.common.host.as_deref(), args.common.port, config);
     let stats_path = runtime::resolve_stats_file_path(
@@ -182,6 +194,20 @@ fn prepare_proxy_launch(args: &Args, config: &nntp_proxy::config::Config) -> Pro
         server_names,
         metrics_store,
     }
+}
+
+/// Temporarily force per-command routing at runtime while the shared
+/// large-transfer pipeline work is stabilized.
+fn force_per_command_routing_mode(requested: nntp_proxy::RoutingMode) -> nntp_proxy::RoutingMode {
+    if requested != nntp_proxy::RoutingMode::PerCommand {
+        warn!(
+            requested = %requested,
+            "Hybrid and stateful routing are temporarily disabled; forcing per-command mode"
+        );
+    } else {
+        info!("Per-command routing is currently forced at runtime");
+    }
+    nntp_proxy::RoutingMode::PerCommand
 }
 
 /// Launch the local in-process TUI when `--ui tui` is selected.
@@ -295,6 +321,8 @@ mod tests {
         CommonArgs {
             config: "config.toml".parse().unwrap(),
             ui: UiMode::Headless,
+            tui: false,
+            headless: false,
             no_tui: false,
             tui_listen: None,
             tui_attach: None,
@@ -331,7 +359,7 @@ mod tests {
 
         let launch = prepare_proxy_launch(&args, &config);
 
-        assert_eq!(launch.routing_mode, nntp_proxy::RoutingMode::Stateful);
+        assert_eq!(launch.routing_mode, nntp_proxy::RoutingMode::PerCommand);
         assert_eq!(launch.host, "127.0.0.1");
         assert_eq!(launch.port.get(), 9120);
         assert_eq!(launch.server_names, vec!["Primary".to_string()]);

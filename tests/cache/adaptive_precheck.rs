@@ -3,15 +3,16 @@
 //! Adaptive prechecking allows STAT/HEAD commands to check all backends
 //! simultaneously to build accurate availability cache while serving clients efficiently.
 
-use crate::test_helpers::{MockNntpServer, create_test_server_config};
+use crate::test_helpers::{MockNntpServer, create_test_server_config, wait_for_server};
 use anyhow::Result;
 use nntp_proxy::{Cache, Config, NntpProxy, RoutingMode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{sleep, timeout};
+use tokio::sync::{Notify, Semaphore};
+use tokio::time::timeout;
 
 /// Helper to create config with adaptive precheck enabled
 fn create_config_with_precheck(backend_port: u16, adaptive_precheck: bool) -> Config {
@@ -34,6 +35,7 @@ fn create_config_with_precheck(backend_port: u16, adaptive_precheck: bool) -> Co
 async fn setup_proxy_with_config(config: Config, routing_mode: RoutingMode) -> Result<u16> {
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_port = proxy_listener.local_addr()?.port();
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
 
     let proxy = NntpProxy::new(config, routing_mode).await?;
 
@@ -48,7 +50,7 @@ async fn setup_proxy_with_config(config: Config, routing_mode: RoutingMode) -> R
         }
     });
 
-    sleep(Duration::from_millis(100)).await;
+    wait_for_server(&proxy_addr, 20).await?;
     Ok(proxy_port)
 }
 
@@ -57,43 +59,43 @@ async fn setup_proxy_with_config(config: Config, routing_mode: RoutingMode) -> R
 async fn test_stat_precheck_first_response() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
-    drop(backend_listener);
 
     let request_count = Arc::new(AtomicUsize::new(0));
     let request_count_clone = request_count.clone();
+    let stat_seen = Arc::new(Notify::new());
+    let stat_seen_clone = stat_seen.clone();
+    let allow_response = Arc::new(Semaphore::new(0));
+    let allow_response_clone = allow_response.clone();
 
-    // Create backend that will respond after delay
+    // Create backend that waits for explicit test release before replying to STAT.
     tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{backend_port}"))
-            .await
-            .unwrap();
-
-        while let Ok((mut stream, _)) = listener.accept().await {
+        while let Ok((mut stream, _)) = backend_listener.accept().await {
             let count = request_count_clone.clone();
+            let stat_seen = stat_seen_clone.clone();
+            let allow_response = allow_response_clone.clone();
             tokio::spawn(async move {
                 // Send greeting
                 stream.write_all(b"200 Mock Server Ready\r\n").await.ok();
 
                 let mut buf = vec![0u8; 1024];
                 loop {
-                    match stream.try_read(&mut buf) {
+                    match stream.read(&mut buf).await {
                         Ok(n) if n > 0 => {
-                            let cmd = String::from_utf8_lossy(&buf[..n]);
+                            let commands = String::from_utf8_lossy(&buf[..n]);
 
-                            if cmd.starts_with("STAT") {
-                                count.fetch_add(1, Ordering::SeqCst);
-                                // Small delay but still respond successfully
-                                sleep(Duration::from_millis(50)).await;
-                                stream.write_all(b"223 0 <test@example.com>\r\n").await.ok();
-                            } else if cmd.starts_with("QUIT") {
-                                stream.write_all(b"205 Goodbye\r\n").await.ok();
-                                break;
-                            } else {
-                                stream.write_all(b"200 OK\r\n").await.ok();
+                            for cmd in commands.split("\r\n").filter(|cmd| !cmd.is_empty()) {
+                                if cmd.starts_with("STAT") {
+                                    count.fetch_add(1, Ordering::SeqCst);
+                                    stat_seen.notify_waiters();
+                                    allow_response.acquire().await.unwrap().forget();
+                                    stream.write_all(b"223 0 <test@example.com>\r\n").await.ok();
+                                } else if cmd.starts_with("QUIT") {
+                                    stream.write_all(b"205 Goodbye\r\n").await.ok();
+                                    return;
+                                } else {
+                                    stream.write_all(b"200 OK\r\n").await.ok();
+                                }
                             }
-                        }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            sleep(Duration::from_millis(10)).await;
                         }
                         Ok(_) | Err(_) => break,
                     }
@@ -101,8 +103,6 @@ async fn test_stat_precheck_first_response() -> Result<()> {
             });
         }
     });
-
-    sleep(Duration::from_millis(50)).await;
 
     let config = create_config_with_precheck(backend_port, true);
     let proxy_port = setup_proxy_with_config(config, RoutingMode::PerCommand).await?;
@@ -114,26 +114,27 @@ async fn test_stat_precheck_first_response() -> Result<()> {
     // Read greeting
     timeout(Duration::from_secs(1), client.read(&mut buf)).await??;
 
-    let start = std::time::Instant::now();
+    let stat_seen_notification = stat_seen.notified();
     client.write_all(b"STAT <test@example.com>\r\n").await?;
+
+    timeout(Duration::from_secs(1), stat_seen_notification).await?;
+    assert!(
+        timeout(Duration::from_millis(75), client.read(&mut buf))
+            .await
+            .is_err(),
+        "client should not receive an optimistic STAT response before backend reply"
+    );
+
+    allow_response.add_permits(1);
+
     let n = timeout(Duration::from_secs(1), client.read(&mut buf)).await??;
     let response = String::from_utf8_lossy(&buf[..n]);
-    let elapsed = start.elapsed();
 
     // Should get first backend's response (waits for actual response, not optimistic)
     assert!(
         response.starts_with("223"),
         "Expected 223 from backend, got: {response}"
     );
-
-    // Should be reasonably fast (first response bytes + small overhead)
-    assert!(
-        elapsed < Duration::from_millis(200),
-        "Response took too long: {elapsed:?}"
-    );
-
-    // Wait for background task to complete
-    sleep(Duration::from_millis(200)).await;
 
     // Backend should have been checked
     assert_eq!(
@@ -166,53 +167,53 @@ async fn test_head_precheck_first_response_wins() -> Result<()> {
         .spawn();
 
     // Backend 2: Slow responder
-    let backend2_checked = Arc::new(AtomicUsize::new(0));
-    let backend2_checked_clone = backend2_checked.clone();
-
     tokio::spawn(async move {
         let listener = TcpListener::bind(format!("127.0.0.1:{backend2_port}"))
             .await
             .unwrap();
 
-        while let Ok((mut stream, _)) = listener.accept().await {
-            let checked = backend2_checked_clone.clone();
+        while let Ok((stream, _)) = listener.accept().await {
             tokio::spawn(async move {
-                stream.write_all(b"200 Slow Server Ready\r\n").await.ok();
-
-                let mut buf = vec![0u8; 1024];
+                let mut reader = BufReader::new(stream);
+                reader
+                    .get_mut()
+                    .write_all(b"200 Slow Server Ready\r\n")
+                    .await
+                    .ok();
+                let mut line = String::new();
                 loop {
-                    match stream.try_read(&mut buf) {
-                        Ok(n) if n > 0 => {
-                            let cmd = String::from_utf8_lossy(&buf[..n]);
+                    line.clear();
+                    match reader.read_line(&mut line).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            let cmd = line.trim();
 
                             if cmd.starts_with("HEAD") {
-                                checked.fetch_add(1, Ordering::SeqCst);
-                                // Delay to ensure fast backend wins
-                                sleep(Duration::from_millis(200)).await;
-                                stream
+                                for _ in 0..64 {
+                                    tokio::task::yield_now().await;
+                                }
+                                reader
+                                    .get_mut()
                                     .write_all(
                                         b"221 0 <test@example.com>\r\nSubject: Slow\r\n\r\n.\r\n",
                                     )
                                     .await
                                     .ok();
                             } else if cmd.starts_with("QUIT") {
-                                stream.write_all(b"205 Goodbye\r\n").await.ok();
+                                reader.get_mut().write_all(b"205 Goodbye\r\n").await.ok();
                                 break;
                             } else {
-                                stream.write_all(b"200 OK\r\n").await.ok();
+                                reader.get_mut().write_all(b"200 OK\r\n").await.ok();
                             }
                         }
-                        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            sleep(Duration::from_millis(10)).await;
-                        }
-                        Ok(_) | Err(_) => break,
                     }
                 }
             });
         }
     });
 
-    sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{backend1_port}"), 20).await?;
+    wait_for_server(&format!("127.0.0.1:{backend2_port}"), 20).await?;
 
     // Create config with both backends
     let config = Config {
@@ -253,14 +254,6 @@ async fn test_head_precheck_first_response_wins() -> Result<()> {
         "Expected 221 response, got: {response}"
     );
 
-    // Wait for background task to complete checking slow backend
-    sleep(Duration::from_millis(500)).await;
-
-    // Note: We can't reliably verify that slow backend was checked because
-    // the background task may complete before the slow backend connection is established.
-    // The important part is that the client got the fast response.
-    // If slow backend was checked, great; if not, that's also acceptable.
-
     Ok(())
 }
 
@@ -276,7 +269,7 @@ async fn test_adaptive_precheck_disabled_by_default() -> Result<()> {
         .on_command("STAT", "223 0 <test@example.com>\r\n")
         .spawn();
 
-    sleep(Duration::from_millis(50)).await;
+    wait_for_server(&format!("127.0.0.1:{backend_port}"), 20).await?;
 
     // Config without adaptive precheck
     let config = create_config_with_precheck(backend_port, false);
@@ -315,7 +308,7 @@ async fn test_precheck_requires_message_id() -> Result<()> {
         .on_command("HEAD", "412 No newsgroup selected\r\n")
         .spawn();
 
-    sleep(Duration::from_millis(50)).await;
+    wait_for_server(&format!("127.0.0.1:{backend_port}"), 20).await?;
 
     let config = create_config_with_precheck(backend_port, true);
     let proxy_port = setup_proxy_with_config(config, RoutingMode::PerCommand).await?;
@@ -354,7 +347,7 @@ async fn test_precheck_only_in_per_command_mode() -> Result<()> {
         .with_name("test-backend")
         .spawn();
 
-    sleep(Duration::from_millis(50)).await;
+    wait_for_server(&format!("127.0.0.1:{backend_port}"), 20).await?;
 
     // Create proxy in STATEFUL mode (not per-command)
     let config = create_config_with_precheck(backend_port, true);

@@ -12,8 +12,11 @@
 use crossbeam::queue::SegQueue;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::{Notify, oneshot};
+use tokio::time::{Duration, Instant, timeout_at};
 
 use crate::protocol::RequestContext;
+
+const BATCH_COALESCE_WINDOW: Duration = Duration::from_millis(1);
 
 /// A queued request completed by one backend connection.
 #[derive(Debug)]
@@ -44,6 +47,7 @@ pub enum PipelineError {
     ConnectionAcquire,
     WriteFailed { index: usize, batch_len: usize },
     FlushFailed,
+    ClientDisconnect,
     ReadFailed,
     ConnectionLost { completed: usize, batch_len: usize },
 }
@@ -56,6 +60,7 @@ impl std::fmt::Display for PipelineError {
                 write!(f, "write failed at command {index}/{batch_len}")
             }
             Self::FlushFailed => f.write_str("flush failed"),
+            Self::ClientDisconnect => f.write_str("client disconnected"),
             Self::ReadFailed => f.write_str("read error"),
             Self::ConnectionLost {
                 completed,
@@ -69,6 +74,7 @@ impl std::fmt::Display for PipelineError {
 pub struct QueuedContext {
     /// Typed request context. Owns verb/args, not redundant serialized bytes.
     pub context: RequestContext,
+    _client_addr: crate::types::ClientAddress,
     /// Return path to the client session that queued this request.
     client_return: oneshot::Sender<PipelineResponse>,
 }
@@ -78,10 +84,12 @@ impl QueuedContext {
     #[must_use]
     pub(crate) const fn new(
         context: RequestContext,
+        client_addr: crate::types::ClientAddress,
         client_return: oneshot::Sender<PipelineResponse>,
     ) -> Self {
         Self {
             context,
+            _client_addr: client_addr,
             client_return,
         }
     }
@@ -117,6 +125,7 @@ pub struct BackendQueue {
     queue: SegQueue<QueuedContext>,
     notify: Notify,
     depth: AtomicUsize,
+    pipeline_depth: AtomicUsize,
     max_depth: usize,
 }
 
@@ -128,6 +137,7 @@ impl BackendQueue {
             queue: SegQueue::new(),
             notify: Notify::new(),
             depth: AtomicUsize::new(0),
+            pipeline_depth: AtomicUsize::new(0),
             max_depth,
         }
     }
@@ -179,7 +189,8 @@ impl BackendQueue {
     /// Dequeue up to `max_batch` requests, reusing the provided Vec's allocation.
     ///
     /// Takes ownership of `batch`, clears it, fills with at least 1 request (blocks until
-    /// one is available), then greedily takes up to `max_batch` without waiting for more.
+    /// one is available), then briefly coalesces follow-up arrivals so workers do not
+    /// lock long-running ARTICLE/BODY responses into one-deep pipelines under bursty load.
     /// Returns the filled Vec so the caller can thread ownership through a loop.
     pub(crate) async fn dequeue_batch(
         &self,
@@ -197,14 +208,25 @@ impl BackendQueue {
                 self.depth.fetch_sub(1, Ordering::AcqRel);
                 batch.push(first);
 
-                // Greedily drain up to max_batch - 1 more
+                let deadline = Instant::now() + BATCH_COALESCE_WINDOW;
                 while batch.len() < max_batch {
+                    let notified = self.notify.notified();
+
                     match self.queue.pop() {
                         Some(req) => {
                             self.depth.fetch_sub(1, Ordering::AcqRel);
                             batch.push(req);
                         }
-                        None => break,
+                        None => {
+                            let remaining = deadline.saturating_duration_since(Instant::now());
+                            if remaining.is_zero() {
+                                break;
+                            }
+
+                            if timeout_at(deadline, notified).await.is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
 
@@ -213,6 +235,42 @@ impl BackendQueue {
 
             // Queue is empty, await the notification we registered
             notified.await;
+        }
+    }
+
+    /// Current number of pipelined requests already written to backend connections
+    /// and still awaiting responses.
+    #[must_use]
+    #[inline]
+    pub(crate) fn pipeline_depth(&self) -> usize {
+        self.pipeline_depth.load(Ordering::Relaxed)
+    }
+
+    /// Mark `count` requests as written to backend connections and awaiting responses.
+    #[inline]
+    pub(crate) fn mark_pipeline_sent(&self, count: usize) {
+        self.pipeline_depth.fetch_add(count, Ordering::AcqRel);
+    }
+
+    /// Mark `count` written requests as no longer awaiting responses.
+    #[inline]
+    pub(crate) fn mark_pipeline_resolved(&self, count: usize) {
+        let mut current = self.pipeline_depth.load(Ordering::Acquire);
+        loop {
+            debug_assert!(
+                current >= count,
+                "pipeline depth underflow: resolving {count} from {current}"
+            );
+            let next = current.saturating_sub(count);
+            match self.pipeline_depth.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
         }
     }
 }
@@ -234,6 +292,10 @@ mod tests {
     use crate::types::BackendId;
     use std::sync::Arc;
 
+    fn client_addr() -> crate::types::ClientAddress {
+        crate::types::ClientAddress::new("127.0.0.1:8119".parse().expect("valid client addr"))
+    }
+
     fn request_context(line: &[u8]) -> RequestContext {
         RequestContext::parse(line).expect("valid request line")
     }
@@ -249,6 +311,7 @@ mod tests {
         queue
             .try_enqueue(QueuedContext::new(
                 request_context(b"ARTICLE <test@example.com>\r\n"),
+                client_addr(),
                 tx,
             ))
             .unwrap();
@@ -262,12 +325,17 @@ mod tests {
             let (tx, _rx) = oneshot::channel();
             let request = format!("ARTICLE <test{i}@example.com>\r\n");
             queue
-                .try_enqueue(QueuedContext::new(request_context(request.as_bytes()), tx))
+                .try_enqueue(QueuedContext::new(
+                    request_context(request.as_bytes()),
+                    client_addr(),
+                    tx,
+                ))
                 .unwrap();
         }
         let (tx, _rx) = oneshot::channel();
         let result = queue.try_enqueue(QueuedContext::new(
             request_context(b"ARTICLE <overflow@example.com>\r\n"),
+            client_addr(),
             tx,
         ));
         assert!(result.is_err());
@@ -280,6 +348,21 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_pipeline_depth_tracks_written_requests_separately_from_queue_backlog() {
+        let queue = BackendQueue::new(4);
+
+        assert_eq!(queue_depth(&queue), 0);
+        assert_eq!(queue.pipeline_depth(), 0);
+
+        queue.mark_pipeline_sent(3);
+        assert_eq!(queue_depth(&queue), 0);
+        assert_eq!(queue.pipeline_depth(), 3);
+
+        queue.mark_pipeline_resolved(2);
+        assert_eq!(queue.pipeline_depth(), 1);
+    }
+
     #[tokio::test]
     async fn test_dequeue_batch() {
         let queue = Arc::new(BackendQueue::new(100));
@@ -287,7 +370,11 @@ mod tests {
             let (tx, _rx) = oneshot::channel();
             let request = format!("CMD {i}\r\n");
             queue
-                .try_enqueue(QueuedContext::new(request_context(request.as_bytes()), tx))
+                .try_enqueue(QueuedContext::new(
+                    request_context(request.as_bytes()),
+                    client_addr(),
+                    tx,
+                ))
                 .unwrap();
         }
 
@@ -297,6 +384,54 @@ mod tests {
 
         let batch = queue.dequeue_batch(10, batch).await;
         assert_eq!(batch.len(), 2);
+        assert_eq!(queue_depth(&queue), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_dequeue_batch_coalesces_follow_up_arrivals_within_window() {
+        let queue = Arc::new(BackendQueue::new(100));
+        let queue_clone = queue.clone();
+
+        let handle = tokio::spawn(async move { queue_clone.dequeue_batch(4, Vec::new()).await });
+        tokio::task::yield_now().await;
+
+        for idx in 0..3 {
+            let (tx, _rx) = oneshot::channel();
+            let request = format!("STAT <msg{idx}@example.com>\r\n");
+            queue
+                .try_enqueue(QueuedContext::new(
+                    request_context(request.as_bytes()),
+                    client_addr(),
+                    tx,
+                ))
+                .unwrap();
+        }
+
+        tokio::time::advance(BATCH_COALESCE_WINDOW).await;
+        let batch = handle.await.unwrap();
+        assert_eq!(batch.len(), 3);
+        assert_eq!(queue_depth(&queue), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_dequeue_batch_returns_partial_batch_after_coalesce_timeout() {
+        let queue = Arc::new(BackendQueue::new(100));
+        let (tx, _rx) = oneshot::channel();
+        queue
+            .try_enqueue(QueuedContext::new(
+                request_context(b"STAT <single@example.com>\r\n"),
+                client_addr(),
+                tx,
+            ))
+            .unwrap();
+
+        let queue_clone = queue.clone();
+        let handle = tokio::spawn(async move { queue_clone.dequeue_batch(4, Vec::new()).await });
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(BATCH_COALESCE_WINDOW).await;
+        let batch = handle.await.unwrap();
+        assert_eq!(batch.len(), 1);
         assert_eq!(queue_depth(&queue), 0);
     }
 
@@ -314,7 +449,11 @@ mod tests {
         // Now enqueue
         let (tx, _rx) = oneshot::channel();
         queue
-            .try_enqueue(QueuedContext::new(request_context(b"HELLO\r\n"), tx))
+            .try_enqueue(QueuedContext::new(
+                request_context(b"HELLO\r\n"),
+                client_addr(),
+                tx,
+            ))
             .unwrap();
 
         let batch = handle.await.unwrap();
@@ -333,6 +472,7 @@ mod tests {
                 "write failed at command 2/5",
             ),
             (PipelineError::FlushFailed, "flush failed"),
+            (PipelineError::ClientDisconnect, "client disconnected"),
             (PipelineError::ReadFailed, "read error"),
             (
                 PipelineError::ConnectionLost {
@@ -366,7 +506,7 @@ mod tests {
             crate::protocol::StatusCode::new(223),
             crate::pool::ChunkedResponse::default(),
         );
-        let queued = QueuedContext::new(context, tx);
+        let queued = QueuedContext::new(context, client_addr(), tx);
 
         queued.complete_context();
 
@@ -390,7 +530,11 @@ mod tests {
     #[test]
     fn test_queued_context_error_completes_without_response_data() {
         let (tx, rx) = oneshot::channel();
-        let queued = QueuedContext::new(request_context(b"STAT <test@example.com>\r\n"), tx);
+        let queued = QueuedContext::new(
+            request_context(b"STAT <test@example.com>\r\n"),
+            client_addr(),
+            tx,
+        );
 
         queued.complete_error(PipelineError::ReadFailed);
 

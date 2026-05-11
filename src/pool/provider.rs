@@ -14,6 +14,8 @@ use crate::pool::PoolStatus;
 use crate::tls::TlsConfig;
 use anyhow::Result;
 use deadpool::managed;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::sync::broadcast;
@@ -725,7 +727,7 @@ impl DeadpoolConnectionProvider {
                     checked += 1;
 
                     // Perform DATE health check
-                    if let Err(e) = check_date_response(&mut conn_obj).await {
+                    if let Err(e) = check_date_response(&mut *conn_obj).await {
                         failed += 1;
                         warn!(
                             pool = %name,
@@ -776,22 +778,40 @@ impl DeadpoolConnectionProvider {
         let mut timeouts = managed::Timeouts::new();
         timeouts.wait = Some(crate::constants::timeout::SHUTDOWN_POOL_GET);
 
+        let mut idle_connections = Vec::with_capacity(status.available);
         for _ in 0..status.available {
             if let Ok(conn_obj) = self.pool.timeout_get(&timeouts).await {
-                let mut conn = Object::take(conn_obj);
-                // Timeout the write: a half-closed backend connection can block indefinitely
-                let _ = tokio::time::timeout(
-                    crate::constants::timeout::SHUTDOWN_QUIT_WRITE,
-                    conn.write_all(b"QUIT\r\n"),
-                )
-                .await;
+                idle_connections.push(Object::take(conn_obj));
             } else {
                 break;
             }
         }
 
+        shutdown_connections_concurrently(idle_connections, |mut conn| async move {
+            // Timeout the write: a half-closed backend connection can block indefinitely
+            let _ = tokio::time::timeout(
+                crate::constants::timeout::SHUTDOWN_QUIT_WRITE,
+                conn.write_all(b"QUIT\r\n"),
+            )
+            .await;
+        })
+        .await;
+
         self.pool.close();
     }
+}
+
+async fn shutdown_connections_concurrently<T, F, Fut>(connections: Vec<T>, shutdown_one: F)
+where
+    F: FnMut(T) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let mut pending = connections
+        .into_iter()
+        .map(shutdown_one)
+        .collect::<FuturesUnordered<_>>();
+
+    while pending.next().await.is_some() {}
 }
 
 /// Resize pool max THEN shut down and drop the connection.
@@ -1241,5 +1261,33 @@ mod tests {
         assert_eq!(provider.pool.status().max_size, max_size);
         assert_eq!(provider.active_cooldowns.load(Ordering::Acquire), 0);
         assert!(provider.is_shutting_down.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_shutdown_connections_concurrently_runs_all_writes_together() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let completed = Arc::new(AtomicUsize::new(0));
+        let completed_clone = completed.clone();
+        let task = tokio::spawn(async move {
+            shutdown_connections_concurrently(vec![1_u8, 2, 3], move |_| {
+                let completed = completed_clone.clone();
+                async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    completed.fetch_add(1, AtomicOrdering::Relaxed);
+                }
+            })
+            .await;
+        });
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_millis(499)).await;
+        assert_eq!(completed.load(AtomicOrdering::Relaxed), 0);
+        assert!(!task.is_finished());
+
+        tokio::time::advance(std::time::Duration::from_millis(1)).await;
+        task.await.unwrap();
+        assert_eq!(completed.load(AtomicOrdering::Relaxed), 3);
     }
 }

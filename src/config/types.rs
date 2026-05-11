@@ -157,7 +157,7 @@ pub struct Proxy {
     pub backend_selection: BackendSelectionStrategy,
     /// Validate yEnc structure and checksums (default: true)
     pub validate_yenc: bool,
-    /// Minimum log level for the debug.log file appender (default: "warn")
+    /// Filter directives for the optional local-TUI `debug.log` appender (default: "warn")
     /// Accepts tracing filter directives: "error", "warn", "info", "debug", "trace"
     #[serde(default = "super::defaults::log_file_level")]
     pub log_file_level: String,
@@ -957,6 +957,29 @@ mod tests {
             crate::constants::duration_polyfill::from_hours(1)
         );
         assert!(cache.store_article_bodies);
+    }
+
+    #[test]
+    fn test_memory_default() {
+        let memory = Memory::default();
+        assert_eq!(
+            memory.socket_recv_buffer_size,
+            crate::constants::socket::HIGH_THROUGHPUT_RECV_BUFFER
+        );
+        assert_eq!(
+            memory.socket_send_buffer_size,
+            crate::constants::socket::HIGH_THROUGHPUT_SEND_BUFFER
+        );
+        assert_eq!(memory.buffer_pool_size, crate::constants::buffer::POOL);
+        assert_eq!(
+            memory.buffer_pool_count,
+            crate::constants::buffer::POOL_COUNT
+        );
+        assert_eq!(memory.capture_pool_size, crate::constants::buffer::CAPTURE);
+        assert_eq!(
+            memory.capture_pool_count,
+            crate::constants::buffer::CAPTURE_COUNT
+        );
     }
 
     // HealthCheck tests

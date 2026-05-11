@@ -5,7 +5,7 @@
 //!
 //! # CRITICAL: Connection Hold Time Guarantees
 //!
-//! All connection salvage operations MUST complete in <1 second to prevent pool
+//! All connection salvage operations MUST complete in <=1 second to prevent pool
 //! starvation and throughput collapse. This is enforced by:
 //! - Compile-time const assertions on timeout values
 //! - Type-level guarantees preventing timeout loops
@@ -27,9 +27,8 @@ use crate::pool::provider::DeadpoolConnectionProvider;
 /// - Const assertions below
 /// - Code review guidelines
 ///
-/// Background: A previous implementation held connections for 10 seconds trying
-/// to drain unparseable data, causing 40% throughput regression (60 MB/s vs 100+ MB/s).
-pub const MAX_CONNECTION_SALVAGE_MS: u64 = 1000;
+/// Background: This bound must stay aligned with the configured DATE health-check timeout.
+pub const MAX_CONNECTION_SALVAGE_MS: u64 = 1_000;
 
 /// COMPILE-TIME ASSERTION: Prevent timeout loops from being added
 ///
@@ -135,6 +134,11 @@ impl Drop for ConnectionGuard {
         if !self.released
             && let Some(conn) = self.conn.take()
         {
+            tracing::debug!(
+                connection_type = conn.connection_type(),
+                leftover_bytes = conn.leftover_len(),
+                "ConnectionGuard dropping unreleased pooled connection; removing backend connection with cooldown"
+            );
             // Unconditional: remove_with_cooldown handles socket shutdown and
             // optional pool-size reduction (when a replacement_cooldown is configured).
             self.provider.remove_with_cooldown(conn);
@@ -177,7 +181,7 @@ pub async fn salvage_with_health_check(
 ) {
     use tracing::{debug, warn};
 
-    match crate::pool::health_check::check_date_response(&mut conn).await {
+    match crate::pool::health_check::check_date_response(&mut *conn).await {
         Ok(()) => {
             debug!("Connection salvaged after Invalid response - DATE check passed");
             drop(conn); // returns to pool
@@ -197,7 +201,7 @@ mod tests {
     /// Verify that `TailBuffer` detects terminators that span chunk boundaries.
     #[test]
     fn test_drain_cross_boundary_terminator() {
-        use crate::session::streaming::tail_buffer::TailBuffer;
+        use crate::session::tail_buffer::TailBuffer;
 
         // Simulate two reads where the terminator \r\n.\r\n is split:
         // First read ends with "\r\n.", second read starts with "\r\n"

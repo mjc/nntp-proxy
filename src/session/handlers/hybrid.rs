@@ -21,7 +21,6 @@ use crate::session::ClientSession;
 use crate::types::TransferMetrics;
 use anyhow::{Context, Result};
 use tokio::io::BufReader;
-use tokio::net::tcp::{ReadHalf, WriteHalf};
 use tracing::info;
 
 /// Error context for hybrid mode operations
@@ -82,14 +81,18 @@ impl ClientSession {
     ///
     /// # Errors
     /// Returns error if router unavailable, backend unreachable, or connection fails
-    pub(super) async fn switch_to_stateful_mode(
+    pub(super) async fn switch_to_stateful_mode<R, W>(
         &self,
-        client_reader: BufReader<ReadHalf<'_>>,
-        client_write: WriteHalf<'_>,
+        client_reader: BufReader<R>,
+        client_write: W,
         initial_request: &crate::protocol::RequestContext,
         client_to_backend_bytes: u64,
         backend_to_client_bytes: u64,
-    ) -> Result<TransferMetrics, crate::session::SessionError> {
+    ) -> Result<TransferMetrics, crate::session::SessionError>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+    {
         // One-way transition: PerCommand → Stateful
         self.mode_state.switch_to_stateful();
 

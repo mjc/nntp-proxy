@@ -43,7 +43,7 @@ async fn test_overlong_first_command_returns_501_and_continues() -> Result<()> {
         .on_command("LIST", "215 list follows\r\n.\r\n")
         .spawn_on_listener(backend_listener);
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_server(&format!("127.0.0.1:{backend_port}"), 20).await?;
 
     let config = create_test_config(vec![(backend_port, "TestBackend")]);
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
@@ -61,7 +61,7 @@ async fn test_overlong_first_command_returns_501_and_continues() -> Result<()> {
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{proxy_port}"), 20).await?;
 
     let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
 
@@ -116,7 +116,7 @@ async fn test_overlong_command_uses_501_not_500() -> Result<()> {
         .with_name("TestBackend501")
         .spawn_on_listener(backend_listener);
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_server(&format!("127.0.0.1:{backend_port}"), 20).await?;
 
     let config = create_test_config(vec![(backend_port, "TestBackend501")]);
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
@@ -134,7 +134,7 @@ async fn test_overlong_command_uses_501_not_500() -> Result<()> {
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{proxy_port}"), 20).await?;
 
     let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
 

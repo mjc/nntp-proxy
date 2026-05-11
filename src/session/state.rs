@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 
 use crate::protocol::{RequestKind, StatusCode, request_kind_expects_multiline};
-use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
+use crate::session::tail_buffer::{TailBuffer, TerminatorStatus};
 use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
 const MAX_PENDING_STATUS_LINE_BYTES: usize = crate::constants::buffer::COMMAND;

@@ -1,7 +1,7 @@
 //! RFC 3977 Section 3.1.1 - Multi-line Response and Byte-Stuffing Tests.
 
 use nntp_proxy::protocol::CRLF;
-use nntp_proxy::session::streaming::tail_buffer::TailBuffer;
+use nntp_proxy::session::tail_buffer::TailBuffer;
 
 fn unstuff_line(line: &str) -> &str {
     if line.starts_with("..") {

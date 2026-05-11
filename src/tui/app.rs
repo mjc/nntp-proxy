@@ -5,7 +5,7 @@ use crate::metrics::{MetricsCollector, MetricsSnapshot};
 use crate::router::BackendSelector;
 use crate::tui::dashboard::{
     BackendDisplay, BackendView, BufferPoolStats, DashboardMetrics, DashboardState,
-    DashboardUserStats,
+    DashboardUserStats, RemoteBackendView, RemoteDashboardState,
 };
 use crate::tui::log_capture::LogBuffer;
 use crate::tui::rate_estimator::{CumulativeCount, RateEstimate, RateEstimator, RatePerSecond};
@@ -34,13 +34,10 @@ pub struct ThroughputPoint {
     /// Smoothed commands processed per second (backend only)
     commands_per_sec: Option<CommandsPerSecond>,
     /// Raw interval bytes sent per second
-    #[serde(default)]
     raw_sent_per_sec: Option<Throughput>,
     /// Raw interval bytes received per second
-    #[serde(default)]
     raw_received_per_sec: Option<Throughput>,
     /// Raw interval commands processed per second (backend only)
-    #[serde(default)]
     raw_commands_per_sec: Option<CommandsPerSecond>,
 }
 
@@ -370,7 +367,7 @@ pub struct TuiApp {
     show_details: bool,
     /// System resource monitor
     system_monitor: crate::tui::SystemMonitor,
-    /// Current system stats (CPU, memory, threads)
+    /// Current system stats (CPU and memory)
     system_stats: crate::tui::SystemStats,
     /// Article cache (optional - only present in caching mode)
     cache: Option<Arc<crate::cache::UnifiedCache>>,
@@ -670,6 +667,14 @@ impl TuiApp {
             .map(|share| share.get())
     }
 
+    /// Get the live pipelined request depth for a backend, if backend pipelining is enabled.
+    #[must_use]
+    pub fn backend_pipeline_depth(&self, backend_idx: usize) -> Option<usize> {
+        use crate::types::BackendId;
+        self.router
+            .backend_pipeline_depth(BackendId::from_index(backend_idx))
+    }
+
     /// Get throughput history for a backend
     #[must_use]
     ///
@@ -724,7 +729,7 @@ impl TuiApp {
         self.show_details
     }
 
-    /// Get current system stats (CPU, memory, threads)
+    /// Get current system stats (CPU and memory)
     #[must_use]
     pub const fn system_stats(&self) -> &crate::tui::SystemStats {
         &self.system_stats
@@ -739,24 +744,105 @@ impl TuiApp {
     /// Build a serializable snapshot of the current dashboard state.
     #[must_use]
     pub fn snapshot_state(&self) -> DashboardState {
-        self.snapshot_state_with_log_limit(None)
+        self.snapshot_state_with_limits(None, None)
     }
 
     /// Build a serializable snapshot of the current dashboard state with a bounded log tail.
     #[must_use]
     pub fn snapshot_state_with_log_limit(&self, log_limit: Option<usize>) -> DashboardState {
-        let buffer_pool = self.buffer_pool.as_ref().map(Self::snapshot_buffer_pool);
+        self.snapshot_state_with_limits(log_limit, None)
+    }
 
+    /// Build a serializable snapshot with bounded log and history tails.
+    #[must_use]
+    pub fn snapshot_state_with_limits(
+        &self,
+        log_limit: Option<usize>,
+        history_limit: Option<usize>,
+    ) -> DashboardState {
+        let buffer_pool = self.buffer_pool.as_ref().map(Self::snapshot_buffer_pool);
+        let mut metrics = DashboardMetrics::from_snapshot(self.snapshot.as_ref());
+        metrics.in_flight_requests = self
+            .servers
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| self.backend_pending_count(idx))
+            .sum();
+        metrics.pipeline_enabled_backends = self
+            .servers
+            .iter()
+            .filter(|server| server.backend_pipelining)
+            .count();
+        metrics.pipeline_depth = self
+            .servers
+            .iter()
+            .enumerate()
+            .filter(|(_, server)| server.backend_pipelining)
+            .map(|(idx, _)| self.backend_pipeline_depth(idx).unwrap_or_default())
+            .sum();
+        metrics.pipeline_connection_capacity = self
+            .servers
+            .iter()
+            .filter(|server| server.backend_pipelining)
+            .map(|server| server.max_connections.get())
+            .sum();
         DashboardState {
-            metrics: DashboardMetrics::from_snapshot(self.snapshot.as_ref()),
-            backend_views: self.snapshot_backend_views(),
+            metrics,
+            backend_views: self.snapshot_backend_views(history_limit),
             top_users: self.snapshot_top_users(),
-            client_history: self.client_history.points().iter().cloned().collect(),
+            client_history: Self::snapshot_history_points(
+                self.client_history.points(),
+                history_limit,
+            ),
             system_stats: self.system_stats.clone(),
             view_mode: self.view_mode,
             show_details: self.show_details,
             log_lines: self.snapshot_log_lines(log_limit),
             buffer_pool,
+        }
+    }
+
+    /// Build a serializable attached-dashboard snapshot with only remote-render fields.
+    #[must_use]
+    pub fn snapshot_remote_state_with_limits(
+        &self,
+        log_limit: Option<usize>,
+        history_limit: Option<usize>,
+        top_user_limit: Option<usize>,
+    ) -> RemoteDashboardState {
+        let mut metrics = DashboardMetrics::from_snapshot(self.snapshot.as_ref());
+        metrics.in_flight_requests = self
+            .servers
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| self.backend_pending_count(idx))
+            .sum();
+        metrics.pipeline_enabled_backends = self
+            .servers
+            .iter()
+            .filter(|server| server.backend_pipelining)
+            .count();
+        metrics.pipeline_depth = self
+            .servers
+            .iter()
+            .enumerate()
+            .filter(|(_, server)| server.backend_pipelining)
+            .map(|(idx, _)| self.backend_pipeline_depth(idx).unwrap_or_default())
+            .sum();
+        metrics.pipeline_connection_capacity = self
+            .servers
+            .iter()
+            .filter(|server| server.backend_pipelining)
+            .map(|server| server.max_connections.get())
+            .sum();
+
+        RemoteDashboardState {
+            metrics,
+            backend_views: self.snapshot_remote_backend_views(history_limit),
+            top_users: self.snapshot_top_users_with_limit(top_user_limit),
+            latest_client_throughput: self.client_history.latest().cloned(),
+            system_stats: self.system_stats.clone(),
+            log_lines: self.snapshot_log_lines(log_limit),
         }
     }
 
@@ -767,13 +853,28 @@ impl TuiApp {
         }
     }
 
-    fn snapshot_backend_views(&self) -> Vec<BackendView> {
+    fn snapshot_backend_views(&self, history_limit: Option<usize>) -> Vec<BackendView> {
         self.snapshot
             .backend_stats
             .iter()
             .zip(self.servers.iter())
             .enumerate()
-            .map(|(i, (stats, server))| self.snapshot_backend_view(i, server, stats))
+            .map(|(i, (stats, server))| self.snapshot_backend_view(i, server, stats, history_limit))
+            .collect()
+    }
+
+    fn snapshot_remote_backend_views(
+        &self,
+        history_limit: Option<usize>,
+    ) -> Vec<RemoteBackendView> {
+        self.snapshot
+            .backend_stats
+            .iter()
+            .zip(self.servers.iter())
+            .enumerate()
+            .map(|(i, (stats, server))| {
+                self.snapshot_remote_backend_view(i, server, stats, history_limit)
+            })
             .collect()
     }
 
@@ -782,6 +883,7 @@ impl TuiApp {
         backend_idx: usize,
         server: &Server,
         stats: &crate::metrics::BackendStats,
+        history_limit: Option<usize>,
     ) -> BackendView {
         BackendView {
             server: BackendDisplay {
@@ -797,14 +899,57 @@ impl TuiApp {
             load_ratio: self.backend_load_ratio(backend_idx),
             stateful_count: self.backend_stateful_count(backend_idx),
             traffic_share: self.backend_traffic_share(backend_idx),
-            history: Self::snapshot_throughput_history(self.backend_history(backend_idx)),
+            pipeline_depth: self.backend_pipeline_depth(backend_idx),
+            history: Self::snapshot_throughput_history(
+                self.backend_history(backend_idx),
+                history_limit,
+            ),
         }
     }
 
-    fn snapshot_throughput_history(history: Option<&ThroughputHistory>) -> Vec<ThroughputPoint> {
+    fn snapshot_remote_backend_view(
+        &self,
+        backend_idx: usize,
+        server: &Server,
+        stats: &crate::metrics::BackendStats,
+        history_limit: Option<usize>,
+    ) -> RemoteBackendView {
+        RemoteBackendView {
+            server: BackendDisplay {
+                host: server.host.clone(),
+                port: server.port,
+                name: server.name.clone(),
+                max_connections: server.max_connections,
+            },
+            stats: stats.clone(),
+            active_connections: stats.active_connections.get(),
+            health_status: stats.health_status,
+            pending_count: self.backend_pending_count(backend_idx),
+            stateful_count: self.backend_stateful_count(backend_idx),
+            traffic_share: self.backend_traffic_share(backend_idx),
+            pipeline_depth: self.backend_pipeline_depth(backend_idx),
+            history: Self::snapshot_throughput_history(
+                self.backend_history(backend_idx),
+                history_limit,
+            ),
+        }
+    }
+
+    fn snapshot_throughput_history(
+        history: Option<&ThroughputHistory>,
+        history_limit: Option<usize>,
+    ) -> Vec<ThroughputPoint> {
         history
-            .map(|history| history.points().iter().cloned().collect())
+            .map(|history| Self::snapshot_history_points(history.points(), history_limit))
             .unwrap_or_default()
+    }
+
+    fn snapshot_history_points(
+        points: &VecDeque<ThroughputPoint>,
+        history_limit: Option<usize>,
+    ) -> Vec<ThroughputPoint> {
+        let start = history_limit.map_or(0, |limit| points.len().saturating_sub(limit));
+        points.iter().skip(start).cloned().collect()
     }
 
     fn snapshot_buffer_pool(pool: &crate::pool::BufferPool) -> BufferPoolStats {
@@ -817,6 +962,13 @@ impl TuiApp {
     }
 
     fn snapshot_top_users(&self) -> Vec<DashboardUserStats> {
+        self.snapshot_top_users_with_limit(Some(10))
+    }
+
+    fn snapshot_top_users_with_limit(
+        &self,
+        top_user_limit: Option<usize>,
+    ) -> Vec<DashboardUserStats> {
         let mut top_users = self
             .snapshot
             .user_stats
@@ -824,7 +976,9 @@ impl TuiApp {
             .map(DashboardUserStats::from_user_stats)
             .collect::<Vec<_>>();
         top_users.sort_by_key(|user| std::cmp::Reverse(user.total_bytes()));
-        top_users.truncate(10);
+        if let Some(limit) = top_user_limit {
+            top_users.truncate(limit);
+        }
         top_users
     }
 }
@@ -1413,6 +1567,105 @@ mod tests {
     }
 
     #[test]
+    fn test_snapshot_state_includes_live_pipeline_queue_stats() {
+        use tokio::sync::oneshot;
+
+        let metrics = MetricsCollector::new(1);
+        let mut router = BackendSelector::new();
+        let provider = crate::pool::DeadpoolConnectionProvider::new(
+            "backend.example.com".to_string(),
+            119,
+            "Backend".to_string(),
+            10,
+            None,
+            None,
+        );
+        let backend_id = crate::types::BackendId::from_index(0);
+        let queue = Arc::new(crate::router::BackendQueue::new(8));
+        router.add_backend_with_queue(
+            backend_id,
+            crate::types::ServerName::try_new("Backend".to_string()).unwrap(),
+            provider,
+            0,
+            Some(queue.clone()),
+        );
+
+        let (tx, _rx) = oneshot::channel();
+        queue
+            .try_enqueue(crate::router::backend_queue::QueuedContext::new(
+                crate::protocol::RequestContext::parse(b"STAT <test@example.com>\r\n")
+                    .expect("valid request"),
+                crate::types::ClientAddress::new(
+                    "127.0.0.1:8119".parse().expect("valid client addr"),
+                ),
+                tx,
+            ))
+            .expect("queue request");
+        queue.mark_pipeline_sent(3);
+
+        let servers: Arc<[Server]> = vec![
+            Server::builder("backend.example.com", Port::try_new(119).unwrap())
+                .name("Backend")
+                .backend_pipelining(true)
+                .pipeline_queue_depth(8)
+                .build()
+                .unwrap(),
+        ]
+        .into();
+
+        let app = TuiApp::new(metrics, Arc::new(router), servers);
+        let snapshot = app.snapshot_state();
+
+        assert_eq!(snapshot.metrics.in_flight_requests, 0);
+        assert_eq!(snapshot.metrics.pipeline_enabled_backends, 1);
+        assert_eq!(snapshot.metrics.pipeline_depth, 3);
+        assert_eq!(snapshot.metrics.pipeline_connection_capacity, 10);
+        assert_eq!(snapshot.backend_views[0].pipeline_depth, Some(3));
+    }
+
+    #[test]
+    fn test_in_flight_requests_use_same_pending_count_as_backend_load() {
+        let metrics = MetricsCollector::new(1);
+        let mut router = BackendSelector::new();
+        let provider = crate::pool::DeadpoolConnectionProvider::new(
+            "backend.example.com".to_string(),
+            119,
+            "Backend".to_string(),
+            10,
+            None,
+            None,
+        );
+        let backend_id = crate::types::BackendId::from_index(0);
+        router.add_backend(
+            backend_id,
+            crate::types::ServerName::try_new("Backend".to_string()).unwrap(),
+            provider,
+            0,
+        );
+        router.mark_backend_pending(backend_id);
+        router.mark_backend_pending(backend_id);
+        router.mark_backend_pending(backend_id);
+        router.mark_backend_pending(backend_id);
+        router.mark_backend_pending(backend_id);
+
+        let servers: Arc<[Server]> = vec![
+            Server::builder("backend.example.com", Port::try_new(119).unwrap())
+                .name("Backend")
+                .build()
+                .unwrap(),
+        ]
+        .into();
+
+        let app = TuiApp::new(metrics, Arc::new(router), servers);
+        let snapshot = app.snapshot_state();
+
+        assert_eq!(snapshot.backend_views[0].pending_count, 5);
+        assert_eq!(snapshot.metrics.in_flight_requests, 5);
+        assert_eq!(snapshot.metrics.pipeline_depth, 0);
+        assert_eq!(snapshot.metrics.pipeline_connection_capacity, 10);
+    }
+
+    #[test]
     fn test_throughput_point_preserves_raw_and_smoothed_rates_for_dashboard_serde() {
         let point = ThroughputPoint::new_backend_estimate(
             Timestamp::now(),
@@ -1436,25 +1689,6 @@ mod tests {
             serde_json::from_str(&json).expect("point should deserialize");
         assert_f64_eq(decoded.raw_sent_per_sec().get(), 10_000.0);
         assert_f64_eq(decoded.sent_per_sec().get(), 2_500.0);
-    }
-
-    #[test]
-    fn test_throughput_point_deserializes_legacy_dashboard_payload() {
-        let json = r#"{
-            "sent_per_sec": 1234.0,
-            "received_per_sec": 5678.0,
-            "commands_per_sec": 9.0
-        }"#;
-
-        let decoded: ThroughputPoint =
-            serde_json::from_str(json).expect("legacy point should deserialize");
-
-        assert_f64_eq(decoded.raw_sent_per_sec().get(), 1234.0);
-        assert_f64_eq(decoded.sent_per_sec().get(), 1234.0);
-        assert_f64_eq(decoded.raw_received_per_sec().get(), 5678.0);
-        assert_f64_eq(decoded.received_per_sec().get(), 5678.0);
-        assert_f64_eq(decoded.raw_commands_per_sec().unwrap().get(), 9.0);
-        assert_f64_eq(decoded.commands_per_sec().unwrap().get(), 9.0);
     }
 
     #[test]

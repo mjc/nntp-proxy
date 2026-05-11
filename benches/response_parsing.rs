@@ -28,7 +28,7 @@ mod status_code_parsing {
 
 mod terminator_finding {
     use super::{Bencher, black_box};
-    use nntp_proxy::session::streaming::tail_buffer::TailBuffer;
+    use nntp_proxy::session::tail_buffer::TailBuffer;
 
     /// Naive baseline: linear scan for terminator
     #[inline]
@@ -53,7 +53,7 @@ mod terminator_finding {
     /// but for these complete-response benchmarks, we use empty state.
     #[inline]
     fn find_terminator_production(data: &[u8]) -> Option<usize> {
-        use nntp_proxy::session::streaming::tail_buffer::TerminatorStatus;
+        use nntp_proxy::session::tail_buffer::TerminatorStatus;
 
         let tail = TailBuffer::default(); // Empty state - no previous chunks
         match tail.detect_terminator(data) {

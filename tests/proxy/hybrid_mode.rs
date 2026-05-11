@@ -30,7 +30,7 @@ async fn test_hybrid_mode_long_session_metrics_flush() -> Result<()> {
         )
         .spawn();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
 
     // Create proxy WITH metrics enabled to test metrics flushing
     let config = Config {
@@ -63,7 +63,7 @@ async fn test_hybrid_mode_long_session_metrics_flush() -> Result<()> {
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&proxy_addr, 20).await?;
 
     let mut client = TcpStream::connect(&proxy_addr).await?;
 
@@ -165,7 +165,7 @@ async fn test_hybrid_mode_command_error_in_stateful_mode() -> Result<()> {
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
 
     let server = Server::builder("127.0.0.1", Port::try_new(mock_port).unwrap())
         .name("Mock Server")
@@ -197,7 +197,7 @@ async fn test_hybrid_mode_command_error_in_stateful_mode() -> Result<()> {
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&proxy_addr, 20).await?;
 
     let mut client = TcpStream::connect(&proxy_addr).await?;
 

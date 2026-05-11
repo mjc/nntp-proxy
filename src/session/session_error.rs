@@ -67,11 +67,11 @@ impl From<anyhow::Error> for SessionError {
     }
 }
 
-/// Convert `StreamingError` to `SessionError`, preserving the disconnect signal.
-impl From<crate::session::streaming::StreamingError> for SessionError {
-    fn from(e: crate::session::streaming::StreamingError) -> Self {
+/// Convert buffered-response errors to `SessionError`, preserving the disconnect signal.
+impl From<crate::session::response_buffer::StreamingError> for SessionError {
+    fn from(e: crate::session::response_buffer::StreamingError) -> Self {
         match e {
-            crate::session::streaming::StreamingError::ClientDisconnect(io_err) => {
+            crate::session::response_buffer::StreamingError::ClientDisconnect(io_err) => {
                 Self::ClientDisconnect(io_err)
             }
             other => Self::Backend(other.into_anyhow()),
@@ -114,14 +114,15 @@ mod tests {
     #[test]
     fn client_disconnect_from_streaming_error() {
         let io_err = std::io::Error::from(ErrorKind::BrokenPipe);
-        let streaming_err = crate::session::streaming::StreamingError::ClientDisconnect(io_err);
+        let streaming_err =
+            crate::session::response_buffer::StreamingError::ClientDisconnect(io_err);
         let e = SessionError::from(streaming_err);
         assert!(matches!(e, SessionError::ClientDisconnect(_)));
     }
 
     #[test]
     fn backend_from_streaming_backend_eof() {
-        let streaming_err = crate::session::streaming::StreamingError::BackendEof {
+        let streaming_err = crate::session::response_buffer::StreamingError::BackendEof {
             backend_id: crate::types::BackendId::from_index(0),
             bytes_received: 100,
         };

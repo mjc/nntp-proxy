@@ -94,35 +94,24 @@ impl TailBuffer {
         }
         find_spanning_terminator(self.as_slice(), self.len(), chunk, chunk.len())
     }
-    /// Detect only terminators at the chunk suffix or spanning the prior boundary.
-    ///
-    /// Direct, non-pipelined streaming can use this for full read buffers: with no
-    /// queued backend response after the current article, a terminator cannot be
-    /// followed by valid leftover bytes in the same full-size read.
-    #[must_use]
-    pub fn detect_terminal_boundary(&self, chunk: &[u8]) -> TerminatorStatus {
-        if is_terminator_suffix(chunk) {
-            TerminatorStatus::FoundAt(chunk.len())
-        } else if let Some(end) = self.find_spanning_terminator(chunk) {
-            TerminatorStatus::FoundAt(end)
-        } else {
-            TerminatorStatus::NotFound
-        }
-    }
     /// Detect terminator in chunk, considering possible boundary spanning
     ///
-    /// **Performance**: `find_terminator_end()` checks end first (O(1)),
-    /// then scans candidate dot bytes if terminator is mid-chunk (rare).
-    /// This optimizes the 99% case where terminator is at chunk end.
+    /// Returns the earliest complete terminator touching the current chunk.
+    ///
+    /// This must prefer the earliest terminator, not the suffix terminator, because
+    /// pipelined reads can contain multiple complete NNTP responses in one chunk.
+    /// Returning the suffix terminator would merge several responses into one.
     #[must_use]
     pub fn detect_terminator(&self, chunk: &[u8]) -> TerminatorStatus {
-        find_terminator_end(chunk).map_or_else(
-            || {
-                self.find_spanning_terminator(chunk)
-                    .map_or(TerminatorStatus::NotFound, TerminatorStatus::FoundAt)
-            },
-            TerminatorStatus::FoundAt,
-        )
+        match (
+            self.find_spanning_terminator(chunk),
+            find_terminator_end(chunk),
+        ) {
+            (Some(spanning), Some(in_chunk)) => TerminatorStatus::FoundAt(spanning.min(in_chunk)),
+            (Some(spanning), None) => TerminatorStatus::FoundAt(spanning),
+            (None, Some(in_chunk)) => TerminatorStatus::FoundAt(in_chunk),
+            (None, None) => TerminatorStatus::NotFound,
+        }
     }
 }
 
@@ -134,32 +123,19 @@ impl TailBuffer {
 /// Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1),
 /// the terminator is exactly "\r\n.\r\n" (CRLF, dot, CRLF).
 ///
-/// **Hot path optimization**: Check end first (99% case for streaming chunks),
-/// then scan for the terminator's distinguishing dot byte for mid-chunk leftovers.
+/// Returns the earliest complete terminator when multiple responses are packed
+/// into the same read buffer.
+///
+/// We intentionally do not restore the old suffix-only/boundary-only fast path
+/// here. That split behavior was easy to misuse, and using it in buffered or
+/// pipelined paths caused one response to absorb bytes from the next response
+/// in the same read. The small extra scan cost is acceptable compared to the
+/// correctness requirement that every caller gets the first real terminator.
 #[inline]
 fn find_terminator_end(data: &[u8]) -> Option<usize> {
     const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
 
-    data.len().checked_sub(TERMINATOR.len()).and_then(|_| {
-        if is_terminator_suffix(data) {
-            Some(data.len())
-        } else {
-            memchr::memchr_iter(b'.', data)
-                .skip_while(|&pos| pos < 2)
-                .take_while(|&pos| pos + 3 <= data.len())
-                .find(|&pos| data[pos - 2..pos + 3] == *TERMINATOR)
-                .map(|pos| pos + 3)
-        }
-    })
-}
-
-#[inline]
-fn is_terminator_suffix(data: &[u8]) -> bool {
-    const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
-
-    data.len()
-        .checked_sub(TERMINATOR.len())
-        .is_some_and(|start| data[start..] == *TERMINATOR)
+    memchr::memmem::find(data, TERMINATOR).map(|start| start + TERMINATOR.len())
 }
 
 /// Find spanning terminator across boundary between tail and current chunk
@@ -421,38 +397,6 @@ mod tests {
     }
 
     #[test]
-    fn test_detect_terminal_boundary_ignores_mid_chunk_terminator() {
-        let tail = TailBuffer::default();
-        let chunk = b"Line 1\r\n.\r\nExtra data";
-
-        assert!(!tail.detect_terminal_boundary(chunk).is_found());
-    }
-
-    #[test]
-    fn test_detect_terminal_boundary_detects_suffix() {
-        let tail = TailBuffer::default();
-        let chunk = b"Line 1\r\n.\r\n";
-
-        assert_eq!(
-            tail.detect_terminal_boundary(chunk).write_len(chunk.len()),
-            chunk.len()
-        );
-    }
-
-    #[test]
-    fn test_detect_terminal_boundary_detects_spanning() {
-        let mut tail = TailBuffer::default();
-        tail.update(b"article content\r\n");
-
-        let chunk = b".\r\n";
-
-        assert_eq!(
-            tail.detect_terminal_boundary(chunk).write_len(chunk.len()),
-            3
-        );
-    }
-
-    #[test]
     fn test_detect_terminator_spanning() {
         let mut tail = TailBuffer::default();
         // Set up tail to end with part of terminator
@@ -463,6 +407,24 @@ mod tests {
 
         match status {
             TerminatorStatus::FoundAt(pos) => assert_eq!(pos, 3),
+            TerminatorStatus::NotFound => panic!("Expected FoundAt(3), got {status:?}"),
+        }
+    }
+
+    #[test]
+    fn test_detect_terminator_prefers_spanning_before_later_in_chunk_terminator() {
+        let mut tail = TailBuffer::default();
+        tail.update(b"article content\r\n");
+        let chunk = b".\r\n220 1 <next@example>\r\nnext body\r\n.\r\n";
+
+        let status = tail.detect_terminator(chunk);
+
+        match status {
+            TerminatorStatus::FoundAt(pos) => {
+                assert_eq!(pos, 3);
+                assert_eq!(&chunk[..pos], b".\r\n");
+                assert_eq!(&chunk[pos..], b"220 1 <next@example>\r\nnext body\r\n.\r\n");
+            }
             TerminatorStatus::NotFound => panic!("Expected FoundAt(3), got {status:?}"),
         }
     }
@@ -557,6 +519,19 @@ mod tests {
         assert!(pos < data.len());
         assert!(pos >= 5); // Position of terminator end
         assert_eq!(data[pos - 5..pos], *b"\r\n.\r\n");
+    }
+
+    #[test]
+    fn prop_find_terminator_end_prefers_first_terminator_when_multiple_exist() {
+        let data = b"222 1 <a@b>\r\nbody-1\r\n.\r\n222 2 <c@d>\r\nbody-2\r\n.\r\n";
+        let result = find_terminator_end(data).expect("first terminator should be found");
+
+        assert_eq!(result, b"222 1 <a@b>\r\nbody-1\r\n.\r\n".len());
+        assert_eq!(data[result - 5..result], *b"\r\n.\r\n");
+        assert!(
+            result < data.len(),
+            "first terminator should leave the second response as leftover"
+        );
     }
 
     #[test]

@@ -61,8 +61,8 @@ pub const fn cache_ttl() -> Duration {
 
 /// Default for caching article bodies in explicit `[cache]` sections.
 ///
-/// Legacy cache configs omitted this field and expected full article caching,
-/// so the serde default stays `true` for backward compatibility.
+/// Preserve the long-standing default of full article-body caching when `[cache]`
+/// is present and `store_article_bodies` is omitted.
 #[inline]
 pub const fn cache_articles() -> bool {
     true
@@ -97,7 +97,7 @@ pub const fn buffer_pool_size() -> usize {
 
 /// Default number of buffers in the main buffer pool
 /// Sized for ~50 concurrent connections with single buffer per connection
-/// Total memory: 50 × 724KB ≈ 35MB
+/// Total memory: 50 × 1MiB = 50MiB
 #[inline]
 #[must_use]
 pub const fn buffer_pool_count() -> usize {
@@ -113,7 +113,7 @@ pub const fn capture_pool_size() -> usize {
 
 /// Default number of buffers in the capture pool for caching
 /// Sized for 16 concurrent caching operations
-/// Total memory: 16 × 772KB ≈ 12MB
+/// Total memory: 16 × 1MiB = 16MiB
 #[inline]
 #[must_use]
 pub const fn capture_pool_count() -> usize {

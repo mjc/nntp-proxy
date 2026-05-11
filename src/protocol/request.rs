@@ -617,6 +617,12 @@ impl RequestContext {
     }
 
     #[inline]
+    pub(crate) fn take_response_payload(&mut self) -> Option<crate::pool::ChunkedResponse> {
+        self.response_payload.take()
+    }
+
+    #[inline]
+    #[cfg(test)]
     #[must_use]
     pub(crate) fn response_payload(&self) -> Option<&crate::pool::ChunkedResponse> {
         self.response_payload.as_ref()

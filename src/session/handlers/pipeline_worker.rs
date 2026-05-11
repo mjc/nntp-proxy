@@ -11,7 +11,7 @@
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::metrics::MetricsCollector;
 use crate::pool::{BufferPool, DeadpoolConnectionProvider};
@@ -28,6 +28,36 @@ pub struct PipelineWorkerConfig {
     pub(crate) batch_size: usize,
     /// Backend identifier for logging/metrics
     pub(crate) backend_id: BackendId,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PipelineReadResult {
+    data_len: u64,
+}
+
+struct PipelineDepthGuard<'a> {
+    queue: &'a BackendQueue,
+    outstanding: usize,
+}
+
+impl<'a> PipelineDepthGuard<'a> {
+    fn new(queue: &'a BackendQueue, outstanding: usize) -> Self {
+        queue.mark_pipeline_sent(outstanding);
+        Self { queue, outstanding }
+    }
+
+    fn complete_one(&mut self) {
+        self.outstanding = self.outstanding.saturating_sub(1);
+        self.queue.mark_pipeline_resolved(1);
+    }
+}
+
+impl Drop for PipelineDepthGuard<'_> {
+    fn drop(&mut self) {
+        if self.outstanding > 0 {
+            self.queue.mark_pipeline_resolved(self.outstanding);
+        }
+    }
 }
 
 /// Run the pipeline worker loop for a single backend.
@@ -49,7 +79,7 @@ pub async fn backend_pipeline_worker(
     buffer_pool: BufferPool,
 ) {
     let backend_id = config.backend_id;
-    info!(
+    debug!(
         "Pipeline worker started for backend {:?} (batch_size={})",
         backend_id, config.batch_size
     );
@@ -90,6 +120,7 @@ pub async fn backend_pipeline_worker(
         let success;
         (success, batch) = execute_pipeline_batch(
             backend_id,
+            queue.as_ref(),
             &mut conn,
             batch,
             &metrics,
@@ -102,9 +133,8 @@ pub async fn backend_pipeline_worker(
             let _ = conn.release(); // batch healthy; return connection to pool
         }
         // !success: conn drops here → ConnectionGuard::remove_with_cooldown
-        // Unconditional: !success means a backend write, flush, or read failed.
-        // Client disconnects only close the oneshot response channel; they do
-        // not affect the backend connection and cannot cause !success here.
+        // Unconditional: !success means the current batch can no longer safely
+        // reuse the backend connection, including streamed client disconnects.
 
         // Record pipeline batch metrics
         if batch_len > 1 {
@@ -119,6 +149,7 @@ pub async fn backend_pipeline_worker(
 /// (now-drained) batch Vec for allocation reuse.
 async fn execute_pipeline_batch(
     backend_id: BackendId,
+    queue: &BackendQueue,
     conn: &mut crate::stream::ConnectionStream,
     mut batch: Vec<QueuedContext>,
     metrics: &MetricsCollector,
@@ -161,6 +192,8 @@ async fn execute_pipeline_batch(
         return (false, batch);
     }
 
+    let mut pipeline_depth = PipelineDepthGuard::new(queue, batch_len);
+
     // Phase 2: Read responses in order (with shared buffer + connection-stashed leftovers)
     let mut buffer = buffer_pool.acquire();
     // result_buf is passed in as a parameter (hoisted to worker loop)
@@ -168,8 +201,7 @@ async fn execute_pipeline_batch(
     batch.reverse();
     let mut response_index = 0usize;
     while let Some(mut req) = batch.pop() {
-        // Read the response for this command
-        match crate::session::streaming::read_response_into_context(
+        let read_result = crate::session::response_buffer::read_response_into_context(
             &mut req.context,
             &mut buffer,
             conn,
@@ -178,21 +210,37 @@ async fn execute_pipeline_batch(
             backend_id,
         )
         .await
-        .map_err(crate::session::streaming::StreamingError::into_anyhow)
-        {
-            Ok(()) => {
+        .map(|()| PipelineReadResult {
+            data_len: req
+                .context
+                .response_payload_len()
+                .map_or(0, ResponsePayloadLen::get) as u64,
+        });
+
+        match read_result {
+            Ok(read_result) => {
                 metrics.record_command(backend_id);
-                let data_len = req
-                    .context
-                    .response_payload_len()
-                    .map_or(0, ResponsePayloadLen::get);
-                metrics.record_backend_to_client_bytes_for(backend_id, data_len as u64);
+                metrics.record_backend_to_client_bytes_for(backend_id, read_result.data_len);
                 metrics.record_client_to_backend_bytes_for(
                     backend_id,
                     req.context.request_wire_len().as_u64(),
                 );
 
                 req.complete_context();
+                pipeline_depth.complete_one();
+            }
+            Err(crate::session::response_buffer::StreamingError::ClientDisconnect(io_err)) => {
+                batch = fail_batch_on_client_disconnect(
+                    backend_id,
+                    req,
+                    batch,
+                    response_index,
+                    batch_len,
+                    conn.leftover_len(),
+                    io_err,
+                );
+                pipeline_depth.complete_one();
+                return (false, batch);
             }
             Err(e) => {
                 warn!(
@@ -245,6 +293,36 @@ async fn execute_pipeline_batch(
     (true, batch)
 }
 
+fn fail_batch_on_client_disconnect(
+    backend_id: BackendId,
+    current_req: QueuedContext,
+    mut remaining_batch: Vec<QueuedContext>,
+    response_index: usize,
+    batch_len: usize,
+    leftover_bytes: usize,
+    io_err: std::io::Error,
+) -> Vec<QueuedContext> {
+    debug!(
+        backend = ?backend_id,
+        response_index = response_index + 1,
+        batch_size = batch_len,
+        command_verb = ?current_req.context.verb(),
+        leftover_bytes,
+        error = %io_err,
+        "Pipeline worker client disconnect during pipelined response delivery; retiring backend connection and failing remaining batch"
+    );
+
+    current_req.complete_error(PipelineError::ClientDisconnect);
+    let error_msg = PipelineError::ConnectionLost {
+        completed: response_index + 1,
+        batch_len,
+    };
+    while let Some(remaining_req) = remaining_batch.pop() {
+        remaining_req.complete_error(error_msg);
+    }
+    remaining_batch
+}
+
 /// Buffer the complete response shape for the supplied request context.
 ///
 /// Fills `result_buf` with the response bytes for the supplied request context
@@ -260,7 +338,7 @@ async fn buffer_response_for_request(
     pool: &BufferPool,
 ) -> Result<crate::protocol::StatusCode> {
     let request = crate::protocol::RequestContext::parse(request_line).expect("valid request line");
-    crate::session::streaming::buffer_response_for_request(
+    crate::session::response_buffer::buffer_response_for_request(
         &request,
         buffer,
         conn,
@@ -269,7 +347,7 @@ async fn buffer_response_for_request(
         BackendId::from_index(0),
     )
     .await
-    .map_err(crate::session::streaming::StreamingError::into_anyhow)
+    .map_err(crate::session::response_buffer::StreamingError::into_anyhow)
 }
 
 /// Send error responses to all requests in a batch.
@@ -298,6 +376,10 @@ mod tests {
     const DATE_REQUEST: &[u8] = b"DATE\r\n";
     const STAT_REQUEST: &[u8] = b"STAT <test@example>\r\n";
 
+    fn client_addr() -> crate::types::ClientAddress {
+        crate::types::ClientAddress::new("127.0.0.1:8119".parse().expect("valid client addr"))
+    }
+
     fn queued_context(
         command: &str,
     ) -> (
@@ -306,7 +388,7 @@ mod tests {
     ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (
-            QueuedContext::new(request_context(command.as_bytes()), tx),
+            QueuedContext::new(request_context(command.as_bytes()), client_addr(), tx),
             rx,
         )
     }
@@ -373,6 +455,7 @@ mod tests {
         let pool = BufferPool::for_tests();
         let metrics = MetricsCollector::new(responses.len());
         let backend_id = BackendId::from_index(0);
+        let queue = BackendQueue::new(responses.len().max(1));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -416,6 +499,7 @@ mod tests {
         let mut result_buf = crate::pool::ChunkedResponse::default();
         let (success, _batch) = execute_pipeline_batch(
             backend_id,
+            &queue,
             &mut conn,
             batch,
             &metrics,
@@ -503,6 +587,174 @@ mod tests {
         assert_eq!(status.as_u16(), 220);
         assert_eq!(result_buf.to_vec(), response);
         assert!(!conn.has_leftover());
+    }
+
+    #[tokio::test]
+    async fn test_execute_pipeline_batch_keeps_large_transfer_430_buffered() {
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(1);
+        let backend_id = BackendId::from_index(0);
+        let queue = BackendQueue::new(1);
+        let response = b"430 No such article\r\n";
+        let mut conn = mock_backend_conn(response).await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let batch = vec![QueuedContext::new(
+            request_context(ARTICLE_REQUEST),
+            client_addr(),
+            tx,
+        )];
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+
+        let (success, batch) = execute_pipeline_batch(
+            backend_id,
+            &queue,
+            &mut conn,
+            batch,
+            &metrics,
+            &pool,
+            &mut result_buf,
+        )
+        .await;
+
+        assert!(success);
+        assert!(batch.is_empty());
+
+        let completed = rx.await.unwrap().unwrap();
+        assert_eq!(
+            completed
+                .context
+                .response_metadata()
+                .expect("430 is recorded on completed context")
+                .status()
+                .as_u16(),
+            430
+        );
+        assert_eq!(
+            completed
+                .context
+                .response_payload()
+                .expect("430 stays buffered for retry logic")
+                .to_vec(),
+            response
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_pipeline_batch_keeps_buffered_large_transfer_payload() {
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(1);
+        let backend_id = BackendId::from_index(0);
+        let queue = BackendQueue::new(1);
+        let response = b"220 0 <msg@id> article\r\nSubject: test\r\n\r\nBody line\r\n.\r\n";
+        let mut conn = mock_backend_conn(response).await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let batch = vec![QueuedContext::new(
+            request_context(ARTICLE_REQUEST),
+            client_addr(),
+            tx,
+        )];
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+
+        let (success, batch) = execute_pipeline_batch(
+            backend_id,
+            &queue,
+            &mut conn,
+            batch,
+            &metrics,
+            &pool,
+            &mut result_buf,
+        )
+        .await;
+
+        assert!(success);
+        assert!(batch.is_empty());
+
+        let completed = rx.await.unwrap().unwrap();
+        assert_eq!(
+            completed
+                .context
+                .response_metadata()
+                .expect("buffered large transfer records metadata")
+                .status()
+                .as_u16(),
+            220
+        );
+        assert_eq!(
+            completed
+                .context
+                .response_payload()
+                .expect("buffered large transfer keeps payload")
+                .to_vec(),
+            response
+        );
+    }
+
+    #[tokio::test]
+    async fn test_execute_pipeline_batch_tracks_live_pipeline_depth_until_responses_finish() {
+        use tokio::io::AsyncReadExt;
+
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(2);
+        let backend_id = BackendId::from_index(0);
+        let queue = Arc::new(BackendQueue::new(2));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (commands_read_tx, commands_read_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let mut received = 0usize;
+            let expected = b"STAT <a@b>\r\n".len() + b"STAT <c@d>\r\n".len();
+            while received < expected {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => received += n,
+                }
+            }
+
+            let _ = commands_read_tx.send(());
+            let _ = release_rx.await;
+            stream
+                .write_all(b"223 0 <a@b> status\r\n223 0 <c@d> status\r\n")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = ConnectionStream::plain(stream);
+        let (req1, rx1) = queued_context("STAT <a@b>\r\n");
+        let (req2, rx2) = queued_context("STAT <c@d>\r\n");
+        let batch = vec![req1, req2];
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+        let queue_for_task = queue.clone();
+
+        let task = tokio::spawn(async move {
+            execute_pipeline_batch(
+                backend_id,
+                queue_for_task.as_ref(),
+                &mut conn,
+                batch,
+                &metrics,
+                &pool,
+                &mut result_buf,
+            )
+            .await
+        });
+
+        commands_read_rx.await.unwrap();
+        assert_eq!(queue.pipeline_depth(), 2);
+
+        release_tx.send(()).unwrap();
+        let (success, batch) = task.await.unwrap();
+        assert!(success);
+        assert!(batch.is_empty());
+        assert_eq!(queue.pipeline_depth(), 0);
+        assert_eq!(expect_success_status(rx1.await.unwrap()), 223);
+        assert_eq!(expect_success_status(rx2.await.unwrap()), 223);
     }
 
     #[tokio::test]
@@ -616,6 +868,46 @@ mod tests {
 
         assert_eq!(status2.as_u16(), 430);
         assert_eq!(result_buf.to_vec(), b"430 No such article\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_buffer_response_for_request_prefers_spanning_terminator_before_later_response() {
+        let pool = BufferPool::for_tests();
+        let mut buffer = pool.acquire();
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+
+        let first = b"220 0 <a@b> article\r\nBody one\r\n.\r\n";
+        let second = b"220 0 <c@d> article\r\nBody two\r\n.\r\n";
+        let chunk1 = b"220 0 <a@b> article\r\nBody one\r\n.".to_vec();
+        let chunk2 = [b"\r\n".as_slice(), second.as_slice()].concat();
+        let mut conn = mock_backend_conn_chunked(vec![chunk1, chunk2]).await;
+
+        let status1 = buffer_response_for_request(
+            ARTICLE_REQUEST,
+            &mut buffer,
+            &mut conn,
+            &mut result_buf,
+            &pool,
+        )
+        .await
+        .expect("should stop at the spanning terminator");
+
+        assert_eq!(status1.as_u16(), 220);
+        assert_eq!(result_buf.to_vec(), first);
+        assert!(conn.has_leftover(), "next response should remain stashed");
+
+        let status2 = buffer_response_for_request(
+            ARTICLE_REQUEST,
+            &mut buffer,
+            &mut conn,
+            &mut result_buf,
+            &pool,
+        )
+        .await
+        .expect("should consume the stashed second response");
+
+        assert_eq!(status2.as_u16(), 220);
+        assert_eq!(result_buf.to_vec(), second);
     }
 
     #[tokio::test]
@@ -805,6 +1097,7 @@ mod tests {
         let pool = BufferPool::for_tests();
         let metrics = MetricsCollector::new(1);
         let backend_id = BackendId::from_index(0);
+        let queue = BackendQueue::new(1);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -828,6 +1121,7 @@ mod tests {
 
         let (success, _batch) = execute_pipeline_batch(
             backend_id,
+            &queue,
             &mut conn,
             batch,
             &metrics,
@@ -847,6 +1141,7 @@ mod tests {
         let pool = BufferPool::for_tests();
         let metrics = MetricsCollector::new(2);
         let backend_id = BackendId::from_index(0);
+        let queue = BackendQueue::new(2);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -875,6 +1170,7 @@ mod tests {
 
         let (success, _batch) = execute_pipeline_batch(
             backend_id,
+            &queue,
             &mut conn,
             batch,
             &metrics,
@@ -914,6 +1210,7 @@ mod tests {
         let pool = BufferPool::for_tests();
         let metrics = MetricsCollector::new(3);
         let backend_id = BackendId::from_index(0);
+        let queue = BackendQueue::new(3);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -945,6 +1242,7 @@ mod tests {
 
         let (success, _batch) = execute_pipeline_batch(
             backend_id,
+            &queue,
             &mut conn,
             batch,
             &metrics,
@@ -979,6 +1277,159 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pipeline_batch_pairs_four_body_responses_to_matching_requests_on_single_connection()
+     {
+        use tokio::io::AsyncReadExt;
+
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(4);
+        let backend_id = BackendId::from_index(0);
+        let queue = BackendQueue::new(4);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (commands_tx, commands_rx) = tokio::sync::oneshot::channel();
+
+        let expected_wire = concat!(
+            "BODY <body-1@example>\r\n",
+            "BODY <body-2@example>\r\n",
+            "BODY <body-3@example>\r\n",
+            "BODY <body-4@example>\r\n"
+        )
+        .as_bytes()
+        .to_vec();
+        let responses = concat!(
+            "222 1 <body-1@example>\r\nbody-1-line\r\n.\r\n",
+            "222 2 <body-2@example>\r\nbody-2-line\r\n.\r\n",
+            "222 3 <body-3@example>\r\nbody-3-line\r\n.\r\n",
+            "222 4 <body-4@example>\r\nbody-4-line\r\n.\r\n"
+        )
+        .as_bytes()
+        .to_vec();
+        let expected_wire_for_backend = expected_wire.clone();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let mut received = Vec::new();
+            while received.len() < expected_wire_for_backend.len() {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => received.extend_from_slice(&buf[..n]),
+                }
+            }
+            let _ = commands_tx.send(received);
+            stream.write_all(&responses).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = ConnectionStream::plain(stream);
+
+        let (req1, rx1) = queued_context("BODY <body-1@example>\r\n");
+        let (req2, rx2) = queued_context("BODY <body-2@example>\r\n");
+        let (req3, rx3) = queued_context("BODY <body-3@example>\r\n");
+        let (req4, rx4) = queued_context("BODY <body-4@example>\r\n");
+        let batch = vec![req1, req2, req3, req4];
+
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+
+        let (success, _batch) = execute_pipeline_batch(
+            backend_id,
+            &queue,
+            &mut conn,
+            batch,
+            &metrics,
+            &pool,
+            &mut result_buf,
+        )
+        .await;
+        assert_eq!(commands_rx.await.unwrap(), expected_wire);
+        let response1 = rx1.await.unwrap();
+        let response2 = rx2.await.unwrap();
+        let response3 = rx3.await.unwrap();
+        let response4 = rx4.await.unwrap();
+
+        let summarize = |response: &PipelineResponse| match response {
+            Ok(completed) => (
+                completed.context.message_id().map(str::to_owned),
+                completed.context.backend_id(),
+                completed
+                    .context
+                    .response_metadata()
+                    .map(|metadata| metadata.status().as_u16()),
+                completed
+                    .context
+                    .response_payload()
+                    .map(|payload| payload.to_vec()),
+                None,
+            ),
+            Err(error) => (None, None, None, None, Some(*error)),
+        };
+
+        assert!(
+            success,
+            "expected single-connection 4x BODY pipeline to succeed; leftover={} summaries={:?}",
+            conn.leftover_len(),
+            [
+                summarize(&response1),
+                summarize(&response2),
+                summarize(&response3),
+                summarize(&response4),
+            ]
+        );
+        assert!(!conn.has_leftover());
+
+        assert_eq!(
+            [
+                response1.expect("BODY request should complete"),
+                response2.expect("BODY request should complete"),
+                response3.expect("BODY request should complete"),
+                response4.expect("BODY request should complete"),
+            ]
+            .map(|completed| (
+                completed.context.message_id().map(str::to_owned),
+                completed.context.backend_id(),
+                completed
+                    .context
+                    .response_metadata()
+                    .map(|metadata| metadata.status().as_u16()),
+                completed
+                    .context
+                    .response_payload()
+                    .expect("buffered BODY response keeps payload")
+                    .to_vec(),
+            )),
+            [
+                (
+                    Some("<body-1@example>".to_owned()),
+                    Some(backend_id),
+                    Some(222),
+                    b"222 1 <body-1@example>\r\nbody-1-line\r\n.\r\n".to_vec(),
+                ),
+                (
+                    Some("<body-2@example>".to_owned()),
+                    Some(backend_id),
+                    Some(222),
+                    b"222 2 <body-2@example>\r\nbody-2-line\r\n.\r\n".to_vec(),
+                ),
+                (
+                    Some("<body-3@example>".to_owned()),
+                    Some(backend_id),
+                    Some(222),
+                    b"222 3 <body-3@example>\r\nbody-3-line\r\n.\r\n".to_vec(),
+                ),
+                (
+                    Some("<body-4@example>".to_owned()),
+                    Some(backend_id),
+                    Some(222),
+                    b"222 4 <body-4@example>\r\nbody-4-line\r\n.\r\n".to_vec(),
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn test_pipeline_batches_keep_independent_backend_connection_fifo() {
         async fn run_backend_batch(
             backend_id: BackendId,
@@ -989,6 +1440,7 @@ mod tests {
 
             let pool = BufferPool::for_tests();
             let metrics = MetricsCollector::new(2);
+            let queue = BackendQueue::new(2);
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
 
@@ -1008,6 +1460,7 @@ mod tests {
 
             let (success, _batch) = execute_pipeline_batch(
                 backend_id,
+                &queue,
                 &mut conn,
                 vec![req1, req2],
                 &metrics,
@@ -1071,6 +1524,7 @@ mod tests {
         let pool = BufferPool::for_tests();
         let metrics = MetricsCollector::new(2);
         let backend_id = BackendId::from_index(0);
+        let queue = BackendQueue::new(2);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1095,6 +1549,7 @@ mod tests {
 
         let (success, _batch) = execute_pipeline_batch(
             backend_id,
+            &queue,
             &mut conn,
             batch,
             &metrics,
@@ -1116,12 +1571,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pipeline_batch_pairs_spanning_multiline_terminator_before_next_status() {
+        use tokio::io::AsyncReadExt;
+
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(2);
+        let backend_id = BackendId::from_index(0);
+        let queue = BackendQueue::new(2);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let mut received = 0usize;
+            let expected = b"BODY <a@b>\r\n".len() + b"STAT <c@d>\r\n".len();
+            while received < expected {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => received += n,
+                }
+            }
+
+            stream
+                .write_all(b"222 0 <a@b>\r\nBody line\r\n.")
+                .await
+                .unwrap();
+            stream
+                .write_all(b"\r\n223 0 <c@d> status\r\n")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = ConnectionStream::plain(stream);
+        let (req1, rx1) = queued_context("BODY <a@b>\r\n");
+        let (req2, rx2) = queued_context("STAT <c@d>\r\n");
+        let batch = vec![req1, req2];
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+
+        let (success, batch) = execute_pipeline_batch(
+            backend_id,
+            &queue,
+            &mut conn,
+            batch,
+            &metrics,
+            &pool,
+            &mut result_buf,
+        )
+        .await;
+
+        assert!(success);
+        assert!(batch.is_empty());
+        assert!(!conn.has_leftover());
+
+        let completed_body = rx1.await.unwrap().unwrap();
+        assert_eq!(
+            completed_body
+                .context
+                .response_payload()
+                .expect("BODY response stays buffered")
+                .to_vec(),
+            b"222 0 <a@b>\r\nBody line\r\n.\r\n"
+        );
+
+        assert_eq!(expect_success_status(rx2.await.unwrap()), 223);
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_batch_multiline_eof_fails_current_and_remaining_requests() {
+        use tokio::io::AsyncReadExt;
+
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(2);
+        let backend_id = BackendId::from_index(0);
+        let queue = BackendQueue::new(2);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let mut received = 0usize;
+            let expected = b"BODY <a@b>\r\n".len() + b"STAT <c@d>\r\n".len();
+            while received < expected {
+                match stream.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => received += n,
+                }
+            }
+
+            stream
+                .write_all(b"222 0 <a@b>\r\nBody line\r\n")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = ConnectionStream::plain(stream);
+        let (req1, rx1) = queued_context("BODY <a@b>\r\n");
+        let (req2, rx2) = queued_context("STAT <c@d>\r\n");
+        let batch = vec![req1, req2];
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+
+        let (success, _batch) = execute_pipeline_batch(
+            backend_id,
+            &queue,
+            &mut conn,
+            batch,
+            &metrics,
+            &pool,
+            &mut result_buf,
+        )
+        .await;
+
+        assert!(!success, "partial multiline EOF must retire the connection");
+        assert!(!conn.has_leftover());
+
+        assert!(matches!(rx1.await.unwrap(), Err(PipelineError::ReadFailed)));
+        assert!(matches!(
+            rx2.await.unwrap(),
+            Err(PipelineError::ConnectionLost {
+                completed: 1,
+                batch_len: 2
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn test_pipeline_batch_retires_connection_with_leftover_after_final_response() {
         use tokio::io::AsyncReadExt;
 
         let pool = BufferPool::for_tests();
         let metrics = MetricsCollector::new(2);
         let backend_id = BackendId::from_index(0);
+        let queue = BackendQueue::new(2);
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1148,6 +1736,7 @@ mod tests {
 
         let (success, _batch) = execute_pipeline_batch(
             backend_id,
+            &queue,
             &mut conn,
             batch,
             &metrics,
@@ -1167,6 +1756,55 @@ mod tests {
 
         assert_eq!(expect_success_status(rx1.await.unwrap()), 223);
         assert_eq!(expect_success_status(rx2.await.unwrap()), 430);
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_batch_retires_connection_with_garbage_after_final_multiline_response() {
+        use tokio::io::AsyncReadExt;
+
+        let pool = BufferPool::for_tests();
+        let metrics = MetricsCollector::new(1);
+        let backend_id = BackendId::from_index(0);
+        let queue = BackendQueue::new(1);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = stream.read(&mut buf).await;
+            stream
+                .write_all(b"222 0 <a@b>\r\nBody line\r\n.\r\n223 0 <c@d> status\r\n")
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut conn = ConnectionStream::plain(stream);
+
+        let (req, rx) = queued_context("BODY <a@b>\r\n");
+        let mut result_buf = crate::pool::ChunkedResponse::default();
+
+        let (success, batch) = execute_pipeline_batch(
+            backend_id,
+            &queue,
+            &mut conn,
+            vec![req],
+            &metrics,
+            &pool,
+            &mut result_buf,
+        )
+        .await;
+
+        assert!(
+            !success,
+            "extra packed bytes after the final multiline response must retire the connection"
+        );
+        assert!(batch.is_empty());
+        assert!(conn.has_leftover());
+        assert_eq!(expect_success_status(rx.await.unwrap()), 222);
     }
 
     #[test]
@@ -1401,6 +2039,55 @@ mod tests {
         assert!(
             conn.leftover_len() < MAX_LEFTOVER_BYTES,
             "Leftover should be under limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_fails_remaining_batch_and_retires_connection() {
+        let (current_req, current_rx) = queued_context("BODY <body-1@example>\r\n");
+        let (remaining_req_1, remaining_rx_1) = queued_context("BODY <body-2@example>\r\n");
+        let (remaining_req_2, remaining_rx_2) = queued_context("BODY <body-3@example>\r\n");
+
+        let remaining = fail_batch_on_client_disconnect(
+            BackendId::from_index(0),
+            current_req,
+            vec![remaining_req_1, remaining_req_2],
+            0,
+            3,
+            17,
+            std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+        );
+
+        assert!(
+            remaining.is_empty(),
+            "batch should be fully drained on disconnect"
+        );
+        assert!(
+            matches!(
+                current_rx.await.unwrap(),
+                Err(PipelineError::ClientDisconnect)
+            ),
+            "current streamed request should surface the disconnect"
+        );
+        assert!(
+            matches!(
+                remaining_rx_1.await.unwrap(),
+                Err(PipelineError::ConnectionLost {
+                    completed: 1,
+                    batch_len: 3,
+                })
+            ),
+            "later queued requests should fail as connection-lost so callers do not keep using this backend state"
+        );
+        assert!(
+            matches!(
+                remaining_rx_2.await.unwrap(),
+                Err(PipelineError::ConnectionLost {
+                    completed: 1,
+                    batch_len: 3,
+                })
+            ),
+            "all later queued requests should fail after the disconnect"
         );
     }
 }

@@ -93,7 +93,7 @@ impl NntpProxyBuilder {
         self
     }
 
-    /// Override the configured main buffer pool size (724KB by default)
+    /// Override the configured main buffer pool size (1 MiB by default)
     ///
     /// This affects the size of each buffer in the pool. Larger buffers
     /// can improve throughput for large article transfers but use more memory.
@@ -390,6 +390,20 @@ pub(super) struct BuildContext {
     memory: Memory,
 }
 
+#[inline]
+fn pipeline_worker_count(server: &Server) -> usize {
+    if server.backend_pipelining {
+        let max_connections = server.max_connections.get();
+        if max_connections > 1 {
+            max_connections - 1
+        } else {
+            1
+        }
+    } else {
+        0
+    }
+}
+
 impl BuildContext {
     /// Construct the final `NntpProxy` from this context and a cache
     pub(super) fn into_proxy(
@@ -436,28 +450,34 @@ impl BuildContext {
 
         for (idx, server) in self.servers.iter().enumerate() {
             let backend_id = BackendId::from_index(idx);
+            let worker_count = pipeline_worker_count(server);
+            if worker_count == 0 {
+                continue;
+            }
 
             if let Some(queue) = self.router.get_backend_queue(backend_id) {
                 let config = PipelineWorkerConfig {
                     batch_size: server.pipeline_batch_size,
                     backend_id,
                 };
-                let queue = queue.clone();
-                let provider = Arc::new(self.connection_providers[idx].clone());
-                let metrics = self.metrics.clone();
-                let buffer_pool = self.buffer_pool.clone();
+                for _ in 0..worker_count {
+                    let queue = queue.clone();
+                    let provider = Arc::new(self.connection_providers[idx].clone());
+                    let metrics = self.metrics.clone();
+                    let buffer_pool = self.buffer_pool.clone();
 
-                tokio::spawn(backend_pipeline_worker(
-                    config,
-                    queue,
-                    provider,
-                    metrics,
-                    buffer_pool,
-                ));
+                    tokio::spawn(backend_pipeline_worker(
+                        config.clone(),
+                        queue,
+                        provider,
+                        metrics,
+                        buffer_pool,
+                    ));
+                }
 
-                info!(
-                    "Spawned pipeline worker for backend {:?} ({}) batch_size={}",
-                    backend_id, server.name, server.pipeline_batch_size
+                debug!(
+                    "Spawned {} pipeline workers for backend {:?} ({}) batch_size={}",
+                    worker_count, backend_id, server.name, server.pipeline_batch_size
                 );
             }
         }
@@ -595,5 +615,31 @@ mod tests {
                 .to_string()
                 .contains("No servers configured")
         );
+    }
+
+    #[test]
+    fn test_pipeline_worker_count_reserves_one_pool_slot_for_non_pipeline_work() {
+        let enabled = Server::builder("127.0.0.1", crate::types::Port::try_new(119).unwrap())
+            .name("enabled")
+            .max_connections(crate::types::MaxConnections::try_new(42).unwrap())
+            .build()
+            .unwrap();
+        assert_eq!(pipeline_worker_count(&enabled), 41);
+
+        let single_connection =
+            Server::builder("127.0.0.1", crate::types::Port::try_new(119).unwrap())
+                .name("single")
+                .max_connections(crate::types::MaxConnections::try_new(1).unwrap())
+                .build()
+                .unwrap();
+        assert_eq!(pipeline_worker_count(&single_connection), 1);
+
+        let disabled = Server::builder("127.0.0.1", crate::types::Port::try_new(119).unwrap())
+            .name("disabled")
+            .max_connections(crate::types::MaxConnections::try_new(42).unwrap())
+            .backend_pipelining(false)
+            .build()
+            .unwrap();
+        assert_eq!(pipeline_worker_count(&disabled), 0);
     }
 }

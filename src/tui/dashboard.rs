@@ -40,10 +40,34 @@ pub struct BackendView {
     pub load_ratio: Option<f64>,
     pub stateful_count: usize,
     pub traffic_share: Option<f64>,
+    #[serde(default)]
+    pub pipeline_depth: Option<usize>,
     pub history: Vec<ThroughputPoint>,
 }
 
 impl BackendView {
+    #[must_use]
+    pub fn latest_throughput(&self) -> Option<&ThroughputPoint> {
+        self.history.last()
+    }
+}
+
+/// A backend entry sent to attached dashboard clients.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RemoteBackendView {
+    pub server: BackendDisplay,
+    pub stats: BackendStats,
+    pub active_connections: usize,
+    pub health_status: BackendHealthStatus,
+    pub pending_count: usize,
+    pub stateful_count: usize,
+    pub traffic_share: Option<f64>,
+    #[serde(default)]
+    pub pipeline_depth: Option<usize>,
+    pub history: Vec<ThroughputPoint>,
+}
+
+impl RemoteBackendView {
     #[must_use]
     pub fn latest_throughput(&self) -> Option<&ThroughputPoint> {
         self.history.last()
@@ -105,6 +129,14 @@ pub struct DashboardMetrics {
     pub pipeline_commands: u64,
     pub pipeline_requests_queued: u64,
     pub pipeline_requests_completed: u64,
+    #[serde(default)]
+    pub in_flight_requests: usize,
+    #[serde(default)]
+    pub pipeline_enabled_backends: usize,
+    #[serde(default)]
+    pub pipeline_depth: usize,
+    #[serde(default)]
+    pub pipeline_connection_capacity: usize,
 }
 
 impl DashboardMetrics {
@@ -125,6 +157,10 @@ impl DashboardMetrics {
             pipeline_commands: snapshot.pipeline_commands,
             pipeline_requests_queued: snapshot.pipeline_requests_queued,
             pipeline_requests_completed: snapshot.pipeline_requests_completed,
+            in_flight_requests: 0,
+            pipeline_enabled_backends: 0,
+            pipeline_depth: 0,
+            pipeline_connection_capacity: 0,
         }
     }
 
@@ -162,6 +198,17 @@ pub struct DashboardState {
     pub show_details: bool,
     pub log_lines: Vec<String>,
     pub buffer_pool: Option<BufferPoolStats>,
+}
+
+/// Slim dashboard state sent to attached dashboard clients.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RemoteDashboardState {
+    pub metrics: DashboardMetrics,
+    pub backend_views: Vec<RemoteBackendView>,
+    pub top_users: Vec<DashboardUserStats>,
+    pub latest_client_throughput: Option<ThroughputPoint>,
+    pub system_stats: SystemStats,
+    pub log_lines: Vec<String>,
 }
 
 impl DashboardState {
@@ -212,8 +259,83 @@ impl DashboardState {
     }
 
     #[must_use]
+    pub fn backend_pipeline_depth(&self, backend_idx: usize) -> Option<usize> {
+        self.backend_view(backend_idx)
+            .and_then(|view| view.pipeline_depth)
+    }
+
+    #[must_use]
     pub fn buffer_pool(&self) -> Option<&BufferPoolStats> {
         self.buffer_pool.as_ref()
+    }
+}
+
+impl RemoteDashboardState {
+    #[must_use]
+    fn backend_view(&self, backend_idx: usize) -> Option<&RemoteBackendView> {
+        self.backend_views.get(backend_idx)
+    }
+
+    #[must_use]
+    pub fn latest_client_throughput(&self) -> Option<&ThroughputPoint> {
+        self.latest_client_throughput.as_ref()
+    }
+
+    #[must_use]
+    pub fn backend_pending_count(&self, backend_idx: usize) -> usize {
+        self.backend_view(backend_idx)
+            .map_or(0, |view| view.pending_count)
+    }
+
+    #[must_use]
+    pub fn backend_stateful_count(&self, backend_idx: usize) -> usize {
+        self.backend_view(backend_idx)
+            .map_or(0, |view| view.stateful_count)
+    }
+
+    #[must_use]
+    pub fn backend_traffic_share(&self, backend_idx: usize) -> Option<f64> {
+        self.backend_view(backend_idx)
+            .and_then(|view| view.traffic_share)
+    }
+
+    #[must_use]
+    pub fn backend_pipeline_depth(&self, backend_idx: usize) -> Option<usize> {
+        self.backend_view(backend_idx)
+            .and_then(|view| view.pipeline_depth)
+    }
+}
+
+impl From<BackendView> for RemoteBackendView {
+    fn from(view: BackendView) -> Self {
+        Self {
+            server: view.server,
+            stats: view.stats,
+            active_connections: view.active_connections,
+            health_status: view.health_status,
+            pending_count: view.pending_count,
+            stateful_count: view.stateful_count,
+            traffic_share: view.traffic_share,
+            pipeline_depth: view.pipeline_depth,
+            history: view.history,
+        }
+    }
+}
+
+impl From<DashboardState> for RemoteDashboardState {
+    fn from(state: DashboardState) -> Self {
+        Self {
+            metrics: state.metrics,
+            backend_views: state
+                .backend_views
+                .into_iter()
+                .map(RemoteBackendView::from)
+                .collect(),
+            top_users: state.top_users,
+            latest_client_throughput: state.client_history.last().cloned(),
+            system_stats: state.system_stats,
+            log_lines: state.log_lines,
+        }
     }
 }
 
@@ -240,6 +362,7 @@ mod tests {
             load_ratio: Some(0.5),
             stateful_count: 3,
             traffic_share: Some(42.0),
+            pipeline_depth: Some(2),
             history: vec![ThroughputPoint::new_backend(
                 Timestamp::now(),
                 Throughput::new(1.0),
@@ -269,5 +392,48 @@ mod tests {
         assert!(state.backend_load_ratio(1).is_none());
         assert_eq!(state.backend_stateful_count(1), 0);
         assert!(state.backend_traffic_share(1).is_none());
+        assert!(state.backend_pipeline_depth(1).is_none());
+    }
+
+    #[test]
+    fn remote_dashboard_state_keeps_latest_client_point_and_drops_local_only_fields() {
+        let latest_client = ThroughputPoint::new_client(
+            Timestamp::now(),
+            Throughput::new(10.0),
+            Throughput::new(20.0),
+        );
+        let state = DashboardState {
+            metrics: DashboardMetrics::default(),
+            backend_views: vec![sample_backend_view()],
+            top_users: Vec::new(),
+            client_history: vec![
+                ThroughputPoint::new_client(
+                    Timestamp::now(),
+                    Throughput::new(1.0),
+                    Throughput::new(2.0),
+                ),
+                latest_client.clone(),
+            ],
+            system_stats: SystemStats::default(),
+            view_mode: ViewMode::LogFullscreen,
+            show_details: true,
+            log_lines: vec!["hello".to_string()],
+            buffer_pool: Some(BufferPoolStats {
+                available: 1,
+                in_use: 2,
+                total: 3,
+            }),
+        };
+
+        let remote = RemoteDashboardState::from(state);
+
+        assert_eq!(remote.backend_views.len(), 1);
+        assert_eq!(remote.log_lines, vec!["hello".to_string()]);
+        assert_eq!(
+            remote
+                .latest_client_throughput()
+                .map(|point| point.sent_per_sec().get()),
+            Some(latest_client.sent_per_sec().get())
+        );
     }
 }

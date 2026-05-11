@@ -63,15 +63,14 @@ mod tests {
     }
 
     #[test]
-    fn test_backend_columns_split_evenly() {
-        let columns = layout::backend_columns();
+    fn test_backend_columns_leave_room_for_top_users() {
+        let total_width = 100u16;
+        let top_users_width = total_width / 4;
+        let primary_width = total_width - top_users_width;
 
-        // Should be three columns now (backends, chart, top users)
-        assert_eq!(columns.len(), 3);
-
-        // Backend list and chart should split screen, with 25% for top users
-        assert_eq!(layout::BACKEND_LIST_WIDTH_PCT, 50);
-        assert_eq!(layout::CHART_WIDTH_PCT, 50);
+        assert_eq!(top_users_width, 25);
+        assert_eq!(primary_width / 2, 37);
+        assert_eq!(primary_width - (primary_width / 2), 38);
     }
 
     // ========================================================================

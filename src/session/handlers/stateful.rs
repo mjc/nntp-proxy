@@ -55,6 +55,7 @@ impl ClientSession {
         match classify_authenticated_stateful_action(request, self.auth_handler.is_enabled()) {
             AuthenticatedStatefulAction::Forward => {
                 request.write_wire_to(backend_write).await?;
+                backend_write.flush().await?;
                 state.add_client_to_backend(request.request_wire_len().get());
                 state.mark_backend_request_sent(request.kind());
             }

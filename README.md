@@ -75,6 +75,7 @@ Connect a client to `localhost:8119` unless you changed `[proxy].port`.
 
 `routing.mode` controls how client sessions use backend connections:
 
+- **Current temporary behavior:** the runtime currently forces `per-command` mode even if the CLI or config requests `hybrid` or `stateful`. Keep those settings as documentation for the intended steady state, but expect the launched proxy to log and run in `per-command` mode for now.
 - `hybrid`: default. Stateless commands use pooled per-command routing until a stateful command appears; then the session switches to a dedicated backend connection.
 - `stateful`: one client session maps to one backend connection for the session lifetime.
 - `per-command`: each supported command can use a different backend; group-context commands are rejected.
@@ -102,7 +103,7 @@ Per-command mode rejects commands that depend on selected group or current artic
 - `XHDR`
 - `HDR`
 
-Use `hybrid` unless every client is known to be message-ID only.
+Once hybrid/stateful routing is re-enabled, use `hybrid` unless every client is known to be message-ID only.
 
 ## Configuration
 
@@ -187,8 +188,8 @@ connection_keepalive = 60
 
 `[cache]` controls article and availability storage:
 
-- `store_article_bodies = false` is the default. The proxy tracks which backend has an article but does not keep full article bodies.
-- `store_article_bodies = true` enables hot in-memory article-body caching.
+- `store_article_bodies = true` is the default when a `[cache]` section is present. The proxy keeps full article bodies in the in-memory cache unless you explicitly disable that.
+- Set `store_article_bodies = false` for availability-only caching. That keeps backend-availability knowledge without storing full article bodies.
 - `[cache.disk]` is optional and stores article bodies evicted from the memory cache.
 - `availability_index_path` persists availability-only routing knowledge across restarts.
 

@@ -34,13 +34,13 @@ use crossterm::{
 use futures::future::BoxFuture;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use ratatui::{
-    layout::{Alignment, Constraint, Direction, Layout},
+    layout::Rect,
     style::{Color, Stylize},
     text::Line,
-    widgets::Paragraph,
 };
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -64,39 +64,49 @@ pub(crate) enum RemoteDashboardStatus {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AttachedDashboard {
-    pub latest_state: Option<DashboardState>,
+    pub latest_state: Option<Arc<DashboardState>>,
+    render_cache: Option<Arc<ui::AttachedRenderCache>>,
+    placeholder_lines: Vec<Line<'static>>,
     pub status: RemoteDashboardStatus,
 }
 
 impl AttachedDashboard {
-    fn connecting(target: SocketAddr) -> Self {
+    fn new(status: RemoteDashboardStatus, latest_state: Option<Arc<DashboardState>>) -> Self {
+        let render_cache = latest_state
+            .as_deref()
+            .map(|state| Arc::new(ui::build_attached_render_cache(state, &status)));
+        let placeholder_lines = build_attached_placeholder_lines(&status);
+
         Self {
-            latest_state: None,
-            status: RemoteDashboardStatus::Connecting { target },
+            latest_state,
+            render_cache,
+            placeholder_lines,
+            status,
         }
     }
 
-    fn connected(target: SocketAddr, latest_state: Option<DashboardState>) -> Self {
-        Self {
-            latest_state,
-            status: RemoteDashboardStatus::Connected { target },
-        }
+    fn connecting(target: SocketAddr) -> Self {
+        Self::new(RemoteDashboardStatus::Connecting { target }, None)
+    }
+
+    fn connected(target: SocketAddr, latest_state: Option<Arc<DashboardState>>) -> Self {
+        Self::new(RemoteDashboardStatus::Connected { target }, latest_state)
     }
 
     fn reconnecting(
         target: SocketAddr,
         retry_delay: Duration,
-        latest_state: Option<DashboardState>,
+        latest_state: Option<Arc<DashboardState>>,
         last_error: impl Into<String>,
     ) -> Self {
-        Self {
-            latest_state,
-            status: RemoteDashboardStatus::Reconnecting {
+        Self::new(
+            RemoteDashboardStatus::Reconnecting {
                 target,
                 retry_delay,
                 last_error: last_error.into(),
             },
-        }
+            latest_state,
+        )
     }
 }
 
@@ -106,6 +116,33 @@ enum TuiInputAction {
     Quit,
     ToggleLogFullscreen,
     ToggleDetails,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct AttachedViewOverrides {
+    view_mode: Option<ViewMode>,
+    show_details: Option<bool>,
+}
+
+impl AttachedViewOverrides {
+    fn toggle_log_fullscreen(&mut self, current_state: Option<&DashboardState>) {
+        let current_mode = self
+            .view_mode
+            .or_else(|| current_state.map(|state| state.view_mode))
+            .unwrap_or(ViewMode::Normal);
+        self.view_mode = Some(match current_mode {
+            ViewMode::Normal => ViewMode::LogFullscreen,
+            ViewMode::LogFullscreen => ViewMode::Normal,
+        });
+    }
+
+    fn toggle_details(&mut self, current_state: Option<&DashboardState>) {
+        let show_details = self
+            .show_details
+            .or_else(|| current_state.map(|state| state.show_details))
+            .unwrap_or(false);
+        self.show_details = Some(!show_details);
+    }
 }
 
 /// Setup the terminal for TUI rendering
@@ -194,13 +231,11 @@ pub async fn run_attached_tui(connect_addr: SocketAddr) -> Result<()> {
     );
     let (state_tx, mut state_rx) =
         tokio::sync::watch::channel(AttachedDashboard::connecting(connect_addr));
-    let _reader = spawn_dashboard_reader(connect_addr, state_tx);
-    let mut local_system_monitor = SystemMonitor::new();
-
+    let (log_tail_tx, log_tail_rx) =
+        tokio::sync::watch::channel(attached_log_line_limit(ViewMode::Normal));
+    let _reader = spawn_dashboard_reader(connect_addr, state_tx, log_tail_rx);
     with_terminal_session(move |terminal| {
-        Box::pin(async move {
-            run_attached_app(terminal, &mut state_rx, &mut local_system_monitor).await
-        })
+        Box::pin(async move { run_attached_app(terminal, &mut state_rx, log_tail_tx).await })
     })
     .await
 }
@@ -216,11 +251,11 @@ where
 {
     // Create update interval (4 times per second for responsive UI)
     let mut update_interval = tokio::time::interval(Duration::from_millis(250));
+    let mut input_rx = spawn_tui_input_reader(true);
 
     // Initial render
-    terminal.draw(|f| ui::render_ui(f, &renderable_dashboard_state(app), None, None))?;
-
-    let mut should_quit = false;
+    terminal
+        .draw(|f| ui::render_ui(f, &renderable_dashboard_state(app), None, None, None, None))?;
 
     loop {
         tokio::select! {
@@ -228,19 +263,34 @@ where
             _ = shutdown_rx.recv() => {
                 break;
             }
+            Some(action) = input_rx.recv() => {
+                if handle_local_tui_action(action, app) {
+                    break;
+                }
+                terminal.draw(|f| {
+                    ui::render_ui(
+                        f,
+                        &renderable_dashboard_state(app),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                })?;
+            }
             // Update timer - check for events only on ticks to reduce overhead
             _ = update_interval.tick() => {
                 app.update();
-
-                if apply_tui_input(true, Some(app)).await? {
-                    should_quit = true;
-                }
-
-                if should_quit {
-                    break;
-                }
-
-                terminal.draw(|f| ui::render_ui(f, &renderable_dashboard_state(app), None, None))?;
+                terminal.draw(|f| {
+                    ui::render_ui(
+                        f,
+                        &renderable_dashboard_state(app),
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                })?;
             }
         }
     }
@@ -255,32 +305,42 @@ fn renderable_dashboard_state(app: &TuiApp) -> DashboardState {
 async fn run_attached_app<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     state_rx: &mut tokio::sync::watch::Receiver<AttachedDashboard>,
-    local_system_monitor: &mut SystemMonitor,
+    log_tail_tx: tokio::sync::watch::Sender<usize>,
 ) -> Result<()>
 where
     B::Error: Send + Sync + 'static,
 {
     let mut update_interval = tokio::time::interval(Duration::from_millis(250));
-    let mut should_quit = false;
+    let mut input_rx = spawn_tui_input_reader(true);
+    let mut view_overrides = AttachedViewOverrides::default();
 
-    let state = state_rx.borrow().clone();
-    let local_system_stats = local_system_monitor.update();
-    terminal.draw(|f| draw_attached_dashboard(f, &state, &local_system_stats))?;
+    terminal.draw(|f| {
+        let attached = state_rx.borrow();
+        draw_attached_dashboard(f, &attached, &view_overrides);
+    })?;
 
     loop {
         tokio::select! {
-            _ = update_interval.tick() => {
-                if apply_tui_input(false, None).await? {
-                    should_quit = true;
-                }
-
-                if should_quit {
+            Some(action) = input_rx.recv() => {
+                if handle_attached_tui_action(
+                    action,
+                    &mut view_overrides,
+                    state_rx.borrow().latest_state.as_deref(),
+                    &log_tail_tx,
+                ) {
                     break;
                 }
 
-                let state = state_rx.borrow().clone();
-                let local_system_stats = local_system_monitor.update();
-                terminal.draw(|f| draw_attached_dashboard(f, &state, &local_system_stats))?;
+                terminal.draw(|f| {
+                    let attached = state_rx.borrow();
+                    draw_attached_dashboard(f, &attached, &view_overrides);
+                })?;
+            }
+            _ = update_interval.tick() => {
+                terminal.draw(|f| {
+                    let attached = state_rx.borrow();
+                    draw_attached_dashboard(f, &attached, &view_overrides);
+                })?;
             }
         }
     }
@@ -291,46 +351,114 @@ where
 fn draw_attached_dashboard(
     f: &mut ratatui::Frame,
     attached: &AttachedDashboard,
-    local_system_stats: &SystemStats,
+    view_overrides: &AttachedViewOverrides,
 ) {
-    if let Some(state) = attached.latest_state.as_ref() {
-        ui::render_ui(f, state, Some(local_system_stats), Some(&attached.status));
+    if let Some(rendered) = renderable_attached_state(attached, view_overrides) {
+        ui::render_attached_ui(
+            f,
+            rendered.state,
+            rendered.render_cache,
+            rendered.view_mode,
+            rendered.show_details,
+        );
         return;
     }
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .margin(1)
-        .constraints([
-            Constraint::Length(3),
-            Constraint::Min(5),
-            Constraint::Length(3),
-        ])
-        .split(f.area());
+    let chunks = attached_placeholder_chunks(f.area());
 
-    let title = Paragraph::new(Line::from(vec![
+    let title = Line::from(vec![
         "NNTP Proxy "
             .fg(crate::tui::constants::styles::BORDER_ACTIVE)
             .bold(),
         "- Attached Dashboard".fg(Color::White),
-    ]))
-    .alignment(Alignment::Center);
+    ]);
 
-    let body = Paragraph::new(build_attached_placeholder_lines(&attached.status))
-        .alignment(Alignment::Center);
-
-    let footer = Paragraph::new(Line::from(vec![
+    let footer = Line::from(vec![
         "Press ".fg(crate::tui::constants::styles::LABEL),
         "q".fg(crate::tui::constants::styles::VALUE_INFO).bold(),
         " or ".fg(crate::tui::constants::styles::LABEL),
         "Esc".fg(crate::tui::constants::styles::VALUE_INFO).bold(),
         " to exit".fg(crate::tui::constants::styles::LABEL),
-    ]))
-    .alignment(Alignment::Center);
+    ]);
 
-    f.render_widget(title, chunks[0]);
-    f.render_widget(body, chunks[1]);
-    f.render_widget(footer, chunks[2]);
+    render_centered_line(f, chunks[0], &title);
+    render_centered_lines(f, chunks[1], &attached.placeholder_lines);
+    render_centered_line(f, chunks[2], &footer);
+}
+
+fn attached_placeholder_chunks(area: Rect) -> [Rect; 3] {
+    let inner = Rect::new(
+        area.x.saturating_add(area.width.min(1)),
+        area.y.saturating_add(area.height.min(1)),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(2),
+    );
+    let title = 3.min(inner.height);
+    let remaining_after_title = inner.height.saturating_sub(title);
+    let footer = 3.min(remaining_after_title);
+    let body = remaining_after_title.saturating_sub(footer);
+
+    [
+        Rect::new(inner.x, inner.y, inner.width, title),
+        Rect::new(inner.x, inner.y.saturating_add(title), inner.width, body),
+        Rect::new(
+            inner.x,
+            inner.y.saturating_add(title).saturating_add(body),
+            inner.width,
+            footer,
+        ),
+    ]
+}
+
+fn render_centered_lines(f: &mut ratatui::Frame, area: Rect, lines: &[Line<'_>]) {
+    if lines.is_empty() || area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let visible_lines = area.height.min(lines.len() as u16);
+    let start_y = area.y + area.height.saturating_sub(visible_lines) / 2;
+
+    for (offset, line) in lines.iter().take(visible_lines as usize).enumerate() {
+        let y = start_y + offset as u16;
+        render_line_centered_at(f, area, y, line);
+    }
+}
+
+fn render_centered_line(f: &mut ratatui::Frame, area: Rect, line: &Line<'_>) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let y = area.y + area.height.saturating_sub(1) / 2;
+    render_line_centered_at(f, area, y, line);
+}
+
+fn render_line_centered_at(f: &mut ratatui::Frame, area: Rect, y: u16, line: &Line<'_>) {
+    let line_width = line.width() as u16;
+    let x = area.x + area.width.saturating_sub(line_width) / 2;
+    f.buffer_mut().set_line(x, y, line, area.width);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RenderableAttachedState<'a> {
+    state: &'a DashboardState,
+    render_cache: &'a ui::AttachedRenderCache,
+    view_mode: ViewMode,
+    show_details: bool,
+}
+
+fn renderable_attached_state<'a>(
+    attached: &'a AttachedDashboard,
+    view_overrides: &AttachedViewOverrides,
+) -> Option<RenderableAttachedState<'a>> {
+    let state = attached.latest_state.as_deref()?;
+    let render_cache = attached.render_cache.as_deref()?;
+    Some(RenderableAttachedState {
+        state,
+        render_cache,
+        view_mode: view_overrides.view_mode.unwrap_or(state.view_mode),
+        show_details: view_overrides.show_details.unwrap_or(state.show_details),
+    })
 }
 
 fn build_attached_placeholder_lines(status: &RemoteDashboardStatus) -> Vec<Line<'static>> {
@@ -372,7 +500,7 @@ fn key_event_action(
     key: crossterm::event::KeyEvent,
     allow_dashboard_actions: bool,
 ) -> TuiInputAction {
-    if key.kind != KeyEventKind::Press {
+    if key.kind == KeyEventKind::Release {
         return TuiInputAction::None;
     }
 
@@ -387,37 +515,81 @@ fn key_event_action(
     }
 }
 
-async fn poll_tui_input(allow_dashboard_actions: bool) -> Result<TuiInputAction> {
-    let has_events =
-        tokio::task::spawn_blocking(|| event::poll(Duration::from_millis(0))).await??;
-
-    if !has_events {
-        return Ok(TuiInputAction::None);
-    }
-
-    let key_event = tokio::task::spawn_blocking(event::read).await??;
-    Ok(match key_event {
-        Event::Key(key) => key_event_action(key, allow_dashboard_actions),
-        _ => TuiInputAction::None,
-    })
+fn spawn_tui_input_reader(
+    allow_dashboard_actions: bool,
+) -> mpsc::UnboundedReceiver<TuiInputAction> {
+    let (tx, rx) = mpsc::unbounded_channel();
+    tokio::task::spawn_blocking(move || {
+        loop {
+            match event::poll(Duration::from_millis(50)) {
+                Ok(true) => {
+                    let Ok(event) = event::read() else {
+                        break;
+                    };
+                    let Event::Key(key) = event else {
+                        continue;
+                    };
+                    let action = key_event_action(key, allow_dashboard_actions);
+                    if action != TuiInputAction::None && tx.send(action).is_err() {
+                        break;
+                    }
+                }
+                Ok(false) => {
+                    if tx.is_closed() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+    rx
 }
 
-async fn apply_tui_input(allow_dashboard_actions: bool, app: Option<&mut TuiApp>) -> Result<bool> {
-    match poll_tui_input(allow_dashboard_actions).await? {
-        TuiInputAction::Quit => Ok(true),
+fn handle_local_tui_action(action: TuiInputAction, app: &mut TuiApp) -> bool {
+    match action {
+        TuiInputAction::Quit => true,
         TuiInputAction::ToggleLogFullscreen => {
-            if let Some(app) = app {
-                app.toggle_log_fullscreen();
-            }
-            Ok(false)
+            app.toggle_log_fullscreen();
+            false
         }
         TuiInputAction::ToggleDetails => {
-            if let Some(app) = app {
-                app.toggle_details();
-            }
-            Ok(false)
+            app.toggle_details();
+            false
         }
-        TuiInputAction::None => Ok(false),
+        TuiInputAction::None => false,
+    }
+}
+
+fn handle_attached_tui_action(
+    action: TuiInputAction,
+    view_overrides: &mut AttachedViewOverrides,
+    current_state: Option<&DashboardState>,
+    log_tail_tx: &tokio::sync::watch::Sender<usize>,
+) -> bool {
+    match action {
+        TuiInputAction::Quit => true,
+        TuiInputAction::ToggleLogFullscreen => {
+            view_overrides.toggle_log_fullscreen(current_state);
+            let view_mode = view_overrides
+                .view_mode
+                .or_else(|| current_state.map(|state| state.view_mode))
+                .unwrap_or(ViewMode::Normal);
+            let _ = log_tail_tx.send(attached_log_line_limit(view_mode));
+            false
+        }
+        TuiInputAction::ToggleDetails => {
+            view_overrides.toggle_details(current_state);
+            false
+        }
+        TuiInputAction::None => false,
+    }
+}
+
+const fn attached_log_line_limit(view_mode: ViewMode) -> usize {
+    match view_mode {
+        ViewMode::Normal => remote::REMOTE_DASHBOARD_LOG_LINE_LIMIT,
+        ViewMode::LogFullscreen => remote::REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT,
     }
 }
 
@@ -476,6 +648,76 @@ mod tests {
     }
 
     #[test]
+    fn key_event_action_accepts_repeat_events_for_attached_tui() {
+        let repeated = crossterm::event::KeyEvent {
+            code: KeyCode::Char('d'),
+            modifiers: event::KeyModifiers::NONE,
+            kind: KeyEventKind::Repeat,
+            state: event::KeyEventState::NONE,
+        };
+
+        assert_eq!(
+            key_event_action(repeated, true),
+            TuiInputAction::ToggleDetails
+        );
+    }
+
+    #[test]
+    fn handle_attached_tui_action_applies_overrides() {
+        let state = DashboardState {
+            metrics: crate::tui::dashboard::DashboardMetrics::default(),
+            backend_views: Vec::new(),
+            top_users: Vec::new(),
+            client_history: Vec::new(),
+            system_stats: SystemStats::default(),
+            view_mode: ViewMode::Normal,
+            show_details: false,
+            log_lines: vec!["line".to_string()],
+            buffer_pool: None,
+        };
+        let mut overrides = AttachedViewOverrides::default();
+        let (log_tail_tx, log_tail_rx) =
+            tokio::sync::watch::channel(attached_log_line_limit(ViewMode::Normal));
+
+        assert!(!handle_attached_tui_action(
+            TuiInputAction::ToggleDetails,
+            &mut overrides,
+            Some(&state),
+            &log_tail_tx,
+        ));
+        assert!(!handle_attached_tui_action(
+            TuiInputAction::ToggleLogFullscreen,
+            &mut overrides,
+            Some(&state),
+            &log_tail_tx,
+        ));
+
+        let attached =
+            AttachedDashboard::connected("127.0.0.1:8120".parse().unwrap(), Some(Arc::new(state)));
+        let rendered = renderable_attached_state(&attached, &overrides).expect("dashboard state");
+        assert!(attached.render_cache.is_some());
+        assert!(rendered.show_details);
+        assert_eq!(rendered.view_mode, ViewMode::LogFullscreen);
+        assert_eq!(rendered.state.log_lines, vec!["line".to_string()]);
+        assert_eq!(
+            *log_tail_rx.borrow(),
+            attached_log_line_limit(ViewMode::LogFullscreen)
+        );
+    }
+
+    #[test]
+    fn attached_log_line_limit_tracks_view_mode() {
+        assert_eq!(
+            attached_log_line_limit(ViewMode::Normal),
+            remote::REMOTE_DASHBOARD_LOG_LINE_LIMIT
+        );
+        assert_eq!(
+            attached_log_line_limit(ViewMode::LogFullscreen),
+            remote::REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT
+        );
+    }
+
+    #[test]
     fn attached_placeholder_lines_reflect_connection_state() {
         let connecting = build_attached_placeholder_lines(&RemoteDashboardStatus::Connecting {
             target: "127.0.0.1:8120".parse().unwrap(),
@@ -507,6 +749,14 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("Last error: connection refused"))
         );
+    }
+
+    #[test]
+    fn attached_placeholder_chunks_match_previous_geometry() {
+        let chunks = attached_placeholder_chunks(Rect::new(0, 0, 80, 24));
+        assert_eq!(chunks[0], Rect::new(1, 1, 78, 3));
+        assert_eq!(chunks[1], Rect::new(1, 4, 78, 16));
+        assert_eq!(chunks[2], Rect::new(1, 20, 78, 3));
     }
 
     #[tokio::test]
@@ -543,5 +793,65 @@ mod tests {
         assert_eq!(state.log_lines.len(), LOCAL_TUI_LOG_LINE_LIMIT);
         assert_eq!(state.log_lines.first().map(String::as_str), Some("line 10"));
         assert_eq!(state.log_lines.last().map(String::as_str), Some("line 265"));
+    }
+
+    #[test]
+    fn renderable_attached_state_applies_local_overrides() {
+        let state = DashboardState {
+            metrics: crate::tui::dashboard::DashboardMetrics::default(),
+            backend_views: Vec::new(),
+            top_users: Vec::new(),
+            client_history: Vec::new(),
+            system_stats: SystemStats::default(),
+            view_mode: ViewMode::Normal,
+            show_details: false,
+            log_lines: vec!["line".to_string()],
+            buffer_pool: None,
+        };
+        let attached =
+            AttachedDashboard::connected("127.0.0.1:8120".parse().unwrap(), Some(Arc::new(state)));
+        let mut overrides = AttachedViewOverrides::default();
+
+        overrides.toggle_details(attached.latest_state.as_deref());
+        overrides.toggle_log_fullscreen(attached.latest_state.as_deref());
+
+        let rendered = renderable_attached_state(&attached, &overrides).expect("dashboard state");
+        assert!(attached.render_cache.is_some());
+        assert!(rendered.show_details);
+        assert_eq!(rendered.view_mode, ViewMode::LogFullscreen);
+        assert_eq!(rendered.state.log_lines, vec!["line".to_string()]);
+    }
+
+    #[test]
+    fn renderable_attached_state_preserves_local_overrides_across_new_remote_snapshots() {
+        let state = DashboardState {
+            metrics: crate::tui::dashboard::DashboardMetrics::default(),
+            backend_views: Vec::new(),
+            top_users: Vec::new(),
+            client_history: Vec::new(),
+            system_stats: SystemStats::default(),
+            view_mode: ViewMode::Normal,
+            show_details: false,
+            log_lines: vec!["first".to_string()],
+            buffer_pool: None,
+        };
+        let mut overrides = AttachedViewOverrides::default();
+        overrides.toggle_details(Some(&state));
+        overrides.toggle_log_fullscreen(Some(&state));
+
+        let next_state = DashboardState {
+            log_lines: vec!["second".to_string()],
+            ..state
+        };
+        let attached = AttachedDashboard::connected(
+            "127.0.0.1:8120".parse().unwrap(),
+            Some(Arc::new(next_state)),
+        );
+
+        let rendered = renderable_attached_state(&attached, &overrides).expect("dashboard state");
+        assert!(attached.render_cache.is_some());
+        assert!(rendered.show_details);
+        assert_eq!(rendered.view_mode, ViewMode::LogFullscreen);
+        assert_eq!(rendered.state.log_lines, vec!["second".to_string()]);
     }
 }

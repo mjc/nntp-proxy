@@ -6,18 +6,18 @@
 use crate::protocol::{RequestContext, RequestResponseMetadata, StatusCode};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::SessionError;
+use crate::session::response_buffer::{BufferContext, StreamingError};
 use crate::session::retry::retry_once;
 use crate::session::routing::{
     CacheAction, MetricsAction, determine_cache_action_for_request,
     determine_metrics_action_for_request,
 };
-use crate::session::streaming::StreamingError;
-use crate::session::{ClientSession, backend, streaming};
+use crate::session::{ClientSession, backend};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
 
 const BACKEND_TIMING_SAMPLE_MASK: u64 = 0x0f;
@@ -57,7 +57,6 @@ impl BackendAttemptResult {
 /// multiple `try_backend_for_article` calls.
 pub(super) struct ArticleAttemptState<'a> {
     pub availability: &'a mut crate::cache::ArticleAvailability,
-    pub buffer: &'a mut crate::pool::PooledBuffer,
     pub client_to_backend_bytes: &'a mut ClientToBackendBytes,
 }
 
@@ -85,6 +84,7 @@ type PreparedBackendAttempt = Option<(
     crate::pool::ConnectionGuard,
     backend::BackendFirstResponse,
     StatusCode,
+    crate::pool::PooledBuffer,
 )>;
 
 /// Any client write failure after the full backend response is already buffered is terminal.
@@ -101,13 +101,16 @@ impl ClientSession {
     ///
     /// If the pooled connection is stale (connection error), automatically retries
     /// with a fresh connection before returning an error.
-    pub(super) async fn try_backend_for_article(
+    pub(super) async fn try_backend_for_article<W>(
         &self,
         router: &Arc<BackendSelector>,
         request: &mut RequestContext,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_write: &mut W,
         state: &mut ArticleAttemptState<'_>,
-    ) -> Result<BackendAttemptResult, SessionError> {
+    ) -> Result<BackendAttemptResult, SessionError>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let backend_id =
             match router.route_with_availability(self.client_id, Some(state.availability)) {
                 Ok(backend_id) => backend_id,
@@ -120,13 +123,28 @@ impl ClientSession {
                     return Ok(BackendAttemptResult::BackendUnavailable);
                 }
             };
+        debug!(
+            client = %self.client_addr,
+            backend = backend_id.as_index(),
+            command_verb = ?request.verb(),
+            msg_id = ?request.message_id_value(),
+            missing_bits = format_args!("{:08b}", state.availability.missing_bits()),
+            "Article retry selected backend for direct attempt"
+        );
         let guard = CommandGuard::new(router.clone(), backend_id);
         let Some(provider) = router.backend_provider(backend_id) else {
             state.availability.record_missing(backend_id);
+            debug!(
+                client = %self.client_addr,
+                backend = backend_id.as_index(),
+                command_verb = ?request.verb(),
+                msg_id = ?request.message_id_value(),
+                "Selected backend had no provider; treating as unavailable"
+            );
             return Ok(BackendAttemptResult::BackendUnavailable);
         };
 
-        let Some((conn, cmd_response, status_code)) = self
+        let Some((conn, cmd_response, status_code, buffer)) = self
             .prepare_backend_attempt(provider, backend_id, request, state)
             .await?
         else {
@@ -134,6 +152,13 @@ impl ClientSession {
         };
 
         if status_code.as_u16() == 430 {
+            debug!(
+                client = %self.client_addr,
+                backend = backend_id.as_index(),
+                command_verb = ?request.verb(),
+                msg_id = ?request.message_id_value(),
+                "Direct backend attempt returned 430 before streaming"
+            );
             self.handle_430_availability(backend_id, state.availability);
             let _ = conn.release();
             return Ok(BackendAttemptResult::ArticleNotFound { backend_id });
@@ -149,7 +174,7 @@ impl ClientSession {
                     request,
                     msg_id: msg_id.as_ref(),
                     status_code,
-                    first_chunk: &state.buffer[..cmd_response.bytes_read],
+                    first_chunk: &buffer[..cmd_response.bytes_read],
                 },
             )
             .await?;
@@ -165,8 +190,16 @@ impl ClientSession {
         state: &mut ArticleAttemptState<'_>,
     ) -> Result<PreparedBackendAttempt, SessionError> {
         let request_wire_len = request.request_wire_len().get();
-        let (conn, cmd_response, timings) = retry_once!(
-            self.execute_backend_attempt(provider, backend_id, request, state.buffer)
+        debug!(
+            client = %self.client_addr,
+            backend = backend_id.as_index(),
+            command_verb = ?request.verb(),
+            msg_id = ?request.message_id_value(),
+            request_wire_len,
+            "Preparing direct backend attempt"
+        );
+        let (conn, cmd_response, buffer, timings) = retry_once!(
+            self.execute_backend_attempt(provider, backend_id, request)
                 .await,
             client = self.client_addr,
             backend = backend_id.as_index()
@@ -179,21 +212,38 @@ impl ClientSession {
         *state.client_to_backend_bytes = state.client_to_backend_bytes.add(request_wire_len);
 
         let Some(status_code) = cmd_response.status_code() else {
+            debug!(
+                client = %self.client_addr,
+                backend = backend_id.as_index(),
+                command_verb = ?request.verb(),
+                msg_id = ?request.message_id_value(),
+                bytes_read = cmd_response.bytes_read,
+                "Backend attempt read bytes but could not parse a status code"
+            );
             self.handle_invalid_backend_response(
                 backend_id,
                 InvalidBackendResponseContext {
                     provider,
                     request,
                     availability: state.availability,
-                    buffer: state.buffer,
+                    buffer: &buffer,
                     conn,
                     bytes_read: cmd_response.bytes_read,
                 },
             );
             return Ok(None);
         };
+        debug!(
+            client = %self.client_addr,
+            backend = backend_id.as_index(),
+            command_verb = ?request.verb(),
+            msg_id = ?request.message_id_value(),
+            status_code = status_code.as_u16(),
+            bytes_read = cmd_response.bytes_read,
+            "Backend attempt parsed first response successfully"
+        );
 
-        Ok(Some((conn, cmd_response, status_code)))
+        Ok(Some((conn, cmd_response, status_code, buffer)))
     }
 
     fn handle_invalid_backend_response(
@@ -236,13 +286,16 @@ impl ClientSession {
         });
     }
 
-    async fn stream_successful_backend_response(
+    async fn stream_successful_backend_response<W>(
         &self,
         mut conn: crate::pool::ConnectionGuard,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_write: &mut W,
         backend_id: BackendId,
         params: ResponseStreamParams<'_>,
-    ) -> Result<RequestResponseMetadata, SessionError> {
+    ) -> Result<RequestResponseMetadata, SessionError>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let is_multiline_body = params
             .request
             .expects_multiline_response(params.status_code);
@@ -255,18 +308,21 @@ impl ClientSession {
             is_multiline_body,
             "Streaming backend response to client"
         );
-        let stream_ctx = streaming::StreamContext {
-            client_addr: self.client_addr,
+        let buffer_ctx = BufferContext {
             backend_id,
             buffer_pool: &self.buffer_pool,
         };
         let bytes_written = match self
-            .stream_response_to_client(&mut conn, client_write, &stream_ctx, params)
+            .stream_response_to_client(&mut conn, client_write, &buffer_ctx, params)
             .await
         {
             Ok(bytes) => bytes,
             Err(e) => return Err(self.handle_streaming_error(conn, backend_id, params.request, e)),
         };
+        client_write
+            .flush()
+            .await
+            .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
 
         debug!(
             client = %self.client_addr,
@@ -316,6 +372,12 @@ impl ClientSession {
                 "Buffered direct-path response ended with trailing backend bytes; retiring connection"
             );
         } else {
+            debug!(
+                client = %self.client_addr,
+                backend = backend_id.as_index(),
+                command_verb = ?request.verb(),
+                "Streaming error drained cleanly; releasing backend connection back to pool"
+            );
             let _ = conn.release();
         }
 
@@ -337,6 +399,12 @@ impl ClientSession {
                 "Direct per-command response left trailing backend bytes; retiring connection"
             );
         } else {
+            debug!(
+                client = %self.client_addr,
+                backend = backend_id.as_index(),
+                command_verb = ?request.verb(),
+                "Direct per-command response finished cleanly; releasing backend connection"
+            );
             let _ = conn.release();
         }
     }
@@ -350,22 +418,53 @@ impl ClientSession {
         provider: &crate::pool::DeadpoolConnectionProvider,
         backend_id: crate::types::BackendId,
         request: &RequestContext,
-        buffer: &mut crate::pool::PooledBuffer,
     ) -> Result<(
         crate::pool::ConnectionGuard,
         backend::BackendFirstResponse,
+        crate::pool::PooledBuffer,
         Option<BackendTimings>,
     )> {
+        debug!(
+            client = %self.client_addr,
+            backend = backend_id.as_index(),
+            command_verb = ?request.verb(),
+            msg_id = ?request.message_id_value(),
+            "Starting pool checkout for direct backend attempt"
+        );
         let conn = provider.get_pooled_connection().await?;
+        debug!(
+            client = %self.client_addr,
+            backend = backend_id.as_index(),
+            command_verb = ?request.verb(),
+            msg_id = ?request.message_id_value(),
+            "Pool checkout succeeded for direct backend attempt"
+        );
         let mut guard = crate::pool::ConnectionGuard::new(conn, provider.clone());
+        let mut buffer = self.buffer_pool.acquire();
 
+        debug!(
+            client = %self.client_addr,
+            backend = backend_id.as_index(),
+            command_verb = ?request.verb(),
+            msg_id = ?request.message_id_value(),
+            "Sending request to backend and waiting for first response bytes"
+        );
         let result = self
-            .execute_and_get_first_chunk(&mut guard, backend_id, request, buffer)
+            .execute_and_get_first_chunk(&mut guard, backend_id, request, &mut buffer)
             .await;
 
         match result {
-            Ok((cmd_response, timings)) => Ok((guard, cmd_response, timings)),
-            Err(e) => Err(e), // guard drops → remove_with_cooldown
+            Ok((cmd_response, timings)) => Ok((guard, cmd_response, buffer, timings)),
+            Err(e) => {
+                debug!(
+                    client = %self.client_addr,
+                    backend = backend_id.as_index(),
+                    command_verb = ?request.verb(),
+                    error = %e,
+                    "Backend attempt failed before response completed; dropping pooled connection"
+                );
+                Err(e) // guard drops → remove_with_cooldown
+            }
         }
     }
 
@@ -393,6 +492,15 @@ impl ClientSession {
 
         // Log any validation warnings
         response.log_warnings(&buffer[..response.bytes_read], self.client_addr, backend_id);
+        debug!(
+            client = %self.client_addr,
+            backend = backend_id.as_index(),
+            command_verb = ?request.verb(),
+            msg_id = ?request.message_id_value(),
+            bytes_read = response.bytes_read,
+            parsed_status = ?response.status_code(),
+            "Backend returned first response bytes for direct attempt"
+        );
 
         Ok((response, timings))
     }
@@ -401,13 +509,16 @@ impl ClientSession {
     ///
     /// Returns `StreamingError` so callers can decide the connection's pool fate
     /// without string/downcast inspection.
-    async fn stream_response_to_client(
+    async fn stream_response_to_client<W>(
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        ctx: &streaming::StreamContext<'_>,
+        client_write: &mut W,
+        ctx: &BufferContext<'_>,
         params: ResponseStreamParams<'_>,
-    ) -> Result<u64, StreamingError> {
+    ) -> Result<u64, StreamingError>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let code = params.status_code.as_u16();
         let is_multiline_body = params
             .request
@@ -429,55 +540,57 @@ impl ClientSession {
             cache_action
         );
 
-        match (is_multiline_body, cache_action) {
-            (true, CacheAction::CaptureArticle) => {
-                self.buffer_and_cache_multiline_response(pooled_conn, client_write, ctx, params)
-                    .await
-            }
-            (true, CacheAction::TrackAvailability) => {
-                self.stream_multiline_with_availability_tracking(
+        if is_multiline_body {
+            // Permanent policy: keep direct multiline replies fully buffered so
+            // packed trailing bytes are stashed deterministically before the
+            // connection can be reused or retired.
+            return self
+                .deliver_buffered_multiline_response(
                     pooled_conn,
                     client_write,
                     ctx,
                     params,
+                    cache_action,
                 )
-                .await
-            }
-            (true, _) => {
-                streaming::stream_multiline_response(
-                    &mut **pooled_conn,
-                    client_write,
-                    params.first_chunk,
-                    ctx,
-                )
-                .await
-            }
-            (false, CacheAction::TrackStat) => {
-                self.write_single_line_response(client_write, params.first_chunk)
+                .await;
+        }
+
+        match cache_action {
+            CacheAction::TrackStat => {
+                let bytes = self
+                    .write_single_line_response(pooled_conn, client_write, params.first_chunk)
                     .await?;
                 self.maybe_cache_upsert_buffer(
                     params.msg_id,
                     crate::cache::CacheIngestResponse::from(b"223\r\n".as_slice()),
                     ctx.backend_id,
                 );
-                Ok(params.first_chunk.len() as u64)
+                Ok(bytes)
             }
-            (false, _) => {
-                self.write_single_line_response(client_write, params.first_chunk)
+            _ => {
+                self.write_single_line_response(pooled_conn, client_write, params.first_chunk)
                     .await
             }
         }
     }
 
-    async fn buffer_and_cache_multiline_response(
+    async fn deliver_buffered_multiline_response<W>(
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        ctx: &streaming::StreamContext<'_>,
+        client_write: &mut W,
+        ctx: &BufferContext<'_>,
         params: ResponseStreamParams<'_>,
-    ) -> Result<u64, StreamingError> {
-        let captured =
-            streaming::buffer_multiline_response(pooled_conn, params.first_chunk, ctx).await?;
+        cache_action: CacheAction,
+    ) -> Result<u64, StreamingError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let captured = crate::session::response_buffer::buffer_multiline_response(
+            pooled_conn,
+            params.first_chunk,
+            ctx,
+        )
+        .await?;
         captured
             .write_all_to(client_write)
             .await
@@ -491,62 +604,72 @@ impl ClientSession {
             );
         }
         let captured_len = captured.len();
-        self.maybe_cache_upsert_buffer(params.msg_id, captured.into(), ctx.backend_id);
+        match cache_action {
+            CacheAction::CaptureArticle => {
+                self.maybe_cache_upsert_buffer(params.msg_id, captured.into(), ctx.backend_id);
+            }
+            CacheAction::TrackAvailability => {
+                if let Some(msg_id) = params.msg_id
+                    && !params
+                        .request
+                        .cache_records_backend_has_article(ctx.backend_id)
+                {
+                    self.spawn_cache_upsert_availability(
+                        msg_id,
+                        params.status_code,
+                        ctx.backend_id,
+                        self.tier_for_backend(ctx.backend_id),
+                    );
+                }
+            }
+            CacheAction::TrackStat | CacheAction::None => {}
+        }
         Ok(captured_len as u64)
     }
 
-    async fn stream_multiline_with_availability_tracking(
+    async fn write_single_line_response<W>(
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
-        ctx: &streaming::StreamContext<'_>,
-        params: ResponseStreamParams<'_>,
-    ) -> Result<u64, StreamingError> {
-        // Availability-only mode should not buffer the article body.
-        // Keep first-byte latency and memory bounded by streaming directly,
-        // then cache only typed availability metadata after the terminator is seen.
-        let bytes = streaming::stream_multiline_response(
-            &mut **pooled_conn,
-            client_write,
-            params.first_chunk,
-            ctx,
-        )
-        .await?;
-        if let Some(msg_id) = params.msg_id
-            && !params
-                .request
-                .cache_records_backend_has_article(ctx.backend_id)
-        {
-            self.spawn_cache_upsert_availability(
-                msg_id,
-                params.status_code,
-                ctx.backend_id,
-                self.tier_for_backend(ctx.backend_id),
-            );
-        }
-        Ok(bytes)
-    }
-
-    async fn write_single_line_response(
-        &self,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_write: &mut W,
         response: &[u8],
-    ) -> Result<u64, StreamingError> {
-        // Backend is already clean here because the full single-line response was read up front.
+    ) -> Result<u64, StreamingError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let Some(end) = crate::session::backend::status_line_end(response) else {
+            return Err(StreamingError::Io(anyhow::anyhow!(
+                "Prefetched single-line response missing status line terminator"
+            )));
+        };
+        if end < response.len() {
+            let leftover = &response[end..];
+            warn!(
+                client = %self.client_addr,
+                leftover_bytes = leftover.len(),
+                "Prefetched single-line response included packed trailing bytes; stashing leftover so the backend connection is retired"
+            );
+            pooled_conn
+                .stash_leftover(leftover)
+                .map_err(StreamingError::Io)?;
+        }
+
         client_write
-            .write_all(response)
+            .write_all(&response[..end])
             .await
             .map_err(classify_buffered_response_write_err)?;
-        Ok(response.len() as u64)
+        Ok(end as u64)
     }
 
     /// Handle backend error (metrics and cleanup)
     /// Send standardized 430 response to client
-    pub(super) async fn send_430_to_client(
+    pub(super) async fn send_430_to_client<W>(
         &self,
-        client_write: &mut tokio::net::tcp::WriteHalf<'_>,
+        client_write: &mut W,
         backend_to_client_bytes: &mut BackendToClientBytes,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        W: AsyncWrite + Unpin,
+    {
         client_write
             .write_all(crate::protocol::NO_SUCH_ARTICLE)
             .await?;
@@ -649,7 +772,7 @@ mod tests {
         let classified = classify_buffered_response_write_err(err);
         assert!(matches!(
             classified,
-            crate::session::streaming::StreamingError::ClientDisconnect(_)
+            crate::session::response_buffer::StreamingError::ClientDisconnect(_)
         ));
     }
 
@@ -659,7 +782,7 @@ mod tests {
         let classified = classify_buffered_response_write_err(err);
         assert!(matches!(
             classified,
-            crate::session::streaming::StreamingError::ClientDisconnect(_)
+            crate::session::response_buffer::StreamingError::ClientDisconnect(_)
         ));
     }
 }

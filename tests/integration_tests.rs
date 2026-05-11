@@ -3,9 +3,10 @@ use std::io::Write;
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::time::{Duration, timeout};
+use tokio::time::{Duration, Instant, timeout, timeout_at};
 
 use nntp_proxy::config::{ClientAuth, HealthCheck, Proxy, Server};
+use nntp_proxy::session::tail_buffer::{TailBuffer, TerminatorStatus};
 use nntp_proxy::{Config, NntpProxy, RoutingMode, load_config};
 
 mod test_helpers;
@@ -114,8 +115,8 @@ async fn test_round_robin_distribution() -> Result<()> {
         .on_command("HELP", "100 HELP command received\r\n")
         .spawn();
 
-    // Give servers time to start
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{mock_port1}"), 20).await?;
+    wait_for_server(&format!("127.0.0.1:{mock_port2}"), 20).await?;
 
     // Create proxy configuration
     let config = Config {
@@ -153,8 +154,7 @@ async fn test_round_robin_distribution() -> Result<()> {
         }
     });
 
-    // Give proxy time to start
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&proxy_addr, 20).await?;
 
     // Test multiple connections - they should all work
     // (Round-robin is tested internally in unit tests)
@@ -170,9 +170,6 @@ async fn test_round_robin_distribution() -> Result<()> {
 
         // Send QUIT to close connection
         let _ = client.write_all(b"QUIT\r\n").await;
-
-        // Small delay between connections
-        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
     Ok(())
@@ -243,8 +240,7 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
         }
     });
 
-    // Give proxy time to start
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&proxy_addr, 20).await?;
 
     // Test client connection - should receive greeting first, then error when backend connection fails
     let mut client = TcpStream::connect(&proxy_addr).await?;
@@ -287,18 +283,19 @@ async fn test_response_flushing_with_rapid_commands() -> Result<()> {
         .on_command("ARTICLE", "220 0 <test@example.com>\r\nArticle body line 1\r\nArticle body line 2\r\nArticle body line 3\r\n.\r\n")
         .spawn();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
 
     // Create proxy config
     let config = create_test_config(vec![(mock_port, "TestServer")]);
     let proxy = NntpProxy::new(config, RoutingMode::Stateful).await?;
 
-    // Start proxy in per-command routing mode
-    spawn_test_proxy(proxy, proxy_port, true).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Start the proxy using the stateful handler to match the configured mode.
+    spawn_test_proxy(proxy, proxy_port, false).await;
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+    wait_for_server(&proxy_addr, 20).await?;
 
     // Connect client
-    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
+    let mut client = TcpStream::connect(&proxy_addr).await?;
 
     // Read greeting with short timeout - should arrive immediately
     let mut buffer = [0; 1024];
@@ -319,22 +316,41 @@ async fn test_response_flushing_with_rapid_commands() -> Result<()> {
         client.write_all(cmd.as_bytes()).await?;
         client.flush().await?;
 
-        // Try to read response with a VERY short timeout
-        // This validates that responses are delivered immediately by the proxy.
-        let n = timeout(Duration::from_millis(200), client.read(&mut buffer))
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "Timeout reading response #{i} - proxy likely not flushing responses!"
-                )
-            })?
-            .map_err(|e| anyhow::anyhow!("Failed to read response #{i}: {e}"))?;
+        // Read until the multiline terminator arrives inside the same short deadline.
+        // TCP is free to segment the response, so correctness is "prompt full response",
+        // not "entire response in one read syscall".
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let mut response_bytes = Vec::new();
+        let mut tail = TailBuffer::default();
+        loop {
+            let n = timeout_at(deadline, client.read(&mut buffer))
+                .await
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Timeout reading response #{i} - proxy likely not flushing responses!"
+                    )
+                })?
+                .map_err(|e| anyhow::anyhow!("Failed to read response #{i}: {e}"))?;
 
-        let response = String::from_utf8_lossy(&buffer[..n]);
+            if n == 0 {
+                break;
+            }
+            let chunk = &buffer[..n];
+            response_bytes.extend_from_slice(chunk);
+            match tail.detect_terminator(chunk) {
+                TerminatorStatus::FoundAt(_) => break,
+                TerminatorStatus::NotFound => tail.update(chunk),
+            }
+        }
 
-        // Verify we got a complete response (should include terminator)
+        let response = String::from_utf8_lossy(&response_bytes);
+        let terminator_found = TailBuffer::default()
+            .detect_terminator(&response_bytes)
+            .is_found();
+
+        // Verify we got a complete response (should include the NNTP multiline terminator)
         assert!(
-            response.contains("220") && response.contains(".\r\n"),
+            response.contains("220") && terminator_found,
             "Response #{i} incomplete or malformed: {response}"
         );
     }
@@ -360,15 +376,16 @@ async fn test_auth_and_reject_response_flushing() -> Result<()> {
         .with_name("TestServer")
         .spawn();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
 
     let config = create_test_config(vec![(mock_port, "TestServer")]);
     let proxy = NntpProxy::new(config, RoutingMode::Stateful).await?;
 
     spawn_test_proxy(proxy, proxy_port, true).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+    wait_for_server(&proxy_addr, 20).await?;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
+    let mut client = TcpStream::connect(&proxy_addr).await?;
 
     // Read greeting - should arrive quickly
     let mut buffer = [0; 1024];
@@ -445,16 +462,16 @@ async fn test_sequential_requests_no_delay() -> Result<()> {
         .on_command("STAT", "200 Command OK\r\n")
         .spawn();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
 
     let config = create_test_config(vec![(mock_port, "TestServer")]);
     let proxy = NntpProxy::new(config, RoutingMode::Stateful).await?;
     spawn_test_proxy(proxy, proxy_port, true).await;
 
-    // Give proxy more time to initialize connection pool
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+    wait_for_server(&proxy_addr, 20).await?;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
+    let mut client = TcpStream::connect(&proxy_addr).await?;
 
     // Read greeting
     let mut buffer = [0; 1024];
@@ -520,8 +537,8 @@ async fn test_hybrid_mode_stateless_commands() -> Result<()> {
     let _mock1 = create_smart_mock_builder(mock_port1, "Server1").spawn();
     let _mock2 = create_smart_mock_builder(mock_port2, "Server2").spawn();
 
-    // Give servers time to start
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{mock_port1}"), 20).await?;
+    wait_for_server(&format!("127.0.0.1:{mock_port2}"), 20).await?;
 
     let config = Config {
         servers: vec![
@@ -546,8 +563,7 @@ async fn test_hybrid_mode_stateless_commands() -> Result<()> {
         }
     });
 
-    // Give proxy time to start
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&proxy_addr, 20).await?;
 
     // Connect to proxy and send stateless commands
     let mut client = TcpStream::connect(&proxy_addr).await?;
@@ -606,8 +622,7 @@ async fn test_hybrid_mode_stateful_switching() -> Result<()> {
 
     let _mock = create_smart_mock_builder(mock_port, "StatefulServer").spawn();
 
-    // Give server time to start
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
 
     let config = Config {
         servers: vec![create_test_server_config(
@@ -633,8 +648,7 @@ async fn test_hybrid_mode_stateful_switching() -> Result<()> {
         }
     });
 
-    // Give proxy time to start
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&proxy_addr, 20).await?;
 
     // Connect to proxy
     let mut client = TcpStream::connect(&proxy_addr).await?;
@@ -703,7 +717,7 @@ async fn test_hybrid_mode_multiple_clients() -> Result<()> {
     let _mock =
         create_smart_mock_builder(mock_port, "MultiServer").spawn_on_listener(mock_listener);
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
 
     let config = Config {
         servers: vec![create_test_server_config_with_max_connections(
@@ -729,7 +743,7 @@ async fn test_hybrid_mode_multiple_clients() -> Result<()> {
         }
     });
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&proxy_addr, 20).await?;
 
     // Run 3 clients concurrently
     let results = tokio::try_join!(
@@ -832,8 +846,7 @@ async fn test_backend_223_response_for_message_id() -> Result<()> {
         )
         .spawn();
 
-    // Give server time to start
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
 
     // Create proxy configuration
     let config = Config {
@@ -864,8 +877,7 @@ async fn test_backend_223_response_for_message_id() -> Result<()> {
         }
     });
 
-    // Give proxy time to start
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    wait_for_server(&proxy_addr, 20).await?;
 
     // Connect to proxy
     let mut client = TcpStream::connect(&proxy_addr).await?;
@@ -942,7 +954,7 @@ fn build_tiered_server(port: u16, name: &str, tier: u8) -> Result<Server> {
         .build()
 }
 
-async fn start_tiered_proxy(servers: Vec<Server>, proxy_port: u16) -> Result<()> {
+async fn start_tiered_proxy(servers: Vec<Server>) -> Result<u16> {
     let config = Config {
         servers,
         proxy: Proxy::default(),
@@ -952,10 +964,8 @@ async fn start_tiered_proxy(servers: Vec<Server>, proxy_port: u16) -> Result<()>
         cache: None,
         client_auth: ClientAuth::default(),
     };
-    let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
-    spawn_test_proxy(proxy, proxy_port, true).await;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    Ok(())
+    let proxy_port = spawn_proxy_with_config(config, RoutingMode::PerCommand).await?;
+    Ok(proxy_port)
 }
 
 async fn connect_tiered_client(proxy_port: u16) -> Result<TcpStream> {
@@ -1000,7 +1010,6 @@ async fn test_tier_0_exhaustion_before_escalation() -> Result<()> {
     let backend_0_port = get_available_port().await?;
     let backend_1_port = get_available_port().await?;
     let backend_2_port = get_available_port().await?;
-    let proxy_port = get_available_port().await?;
 
     // Start mock backends:
     // Backend 0 (tier 0): Returns 430 for the article
@@ -1030,16 +1039,15 @@ async fn test_tier_0_exhaustion_before_escalation() -> Result<()> {
         )
         .spawn();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{backend_0_port}"), 20).await?;
+    wait_for_server(&format!("127.0.0.1:{backend_1_port}"), 20).await?;
+    wait_for_server(&format!("127.0.0.1:{backend_2_port}"), 20).await?;
 
-    start_tiered_proxy(
-        vec![
-            build_tiered_server(backend_0_port, "Backend-0-Tier-0", 0)?,
-            build_tiered_server(backend_1_port, "Backend-1-Tier-0", 0)?,
-            build_tiered_server(backend_2_port, "Backend-2-Tier-1", 1)?,
-        ],
-        proxy_port,
-    )
+    let proxy_port = start_tiered_proxy(vec![
+        build_tiered_server(backend_0_port, "Backend-0-Tier-0", 0)?,
+        build_tiered_server(backend_1_port, "Backend-1-Tier-0", 0)?,
+        build_tiered_server(backend_2_port, "Backend-2-Tier-1", 1)?,
+    ])
     .await?;
     let mut client = connect_tiered_client(proxy_port).await?;
 
@@ -1076,7 +1084,6 @@ async fn test_tier_exhaustion_multi_tier() -> Result<()> {
     let backend_0_port = get_available_port().await?;
     let backend_1_port = get_available_port().await?;
     let backend_2_port = get_available_port().await?;
-    let proxy_port = get_available_port().await?;
 
     // Start mock backends:
     // Backend 0 (tier 0): Returns 430 for the article (doesn't have it)
@@ -1107,16 +1114,15 @@ async fn test_tier_exhaustion_multi_tier() -> Result<()> {
         )
         .spawn();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{backend_0_port}"), 20).await?;
+    wait_for_server(&format!("127.0.0.1:{backend_1_port}"), 20).await?;
+    wait_for_server(&format!("127.0.0.1:{backend_2_port}"), 20).await?;
 
-    start_tiered_proxy(
-        vec![
-            build_tiered_server(backend_0_port, "Backend-0-Tier-0", 0)?,
-            build_tiered_server(backend_1_port, "Backend-1-Tier-0", 0)?,
-            build_tiered_server(backend_2_port, "Backend-2-Tier-1", 1)?,
-        ],
-        proxy_port,
-    )
+    let proxy_port = start_tiered_proxy(vec![
+        build_tiered_server(backend_0_port, "Backend-0-Tier-0", 0)?,
+        build_tiered_server(backend_1_port, "Backend-1-Tier-0", 0)?,
+        build_tiered_server(backend_2_port, "Backend-2-Tier-1", 1)?,
+    ])
     .await?;
     let mut client = connect_tiered_client(proxy_port).await?;
 
@@ -1160,15 +1166,16 @@ async fn test_oversized_pipelined_command_rejected_with_500() -> Result<()> {
         .on_command("STAT", "223 0 <test@example.com> status\r\n")
         .spawn();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
 
     let config = create_test_config(vec![(mock_port, "TestServer")]);
     let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
 
     spawn_test_proxy(proxy, proxy_port, true).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+    wait_for_server(&proxy_addr, 20).await?;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
+    let mut client = TcpStream::connect(&proxy_addr).await?;
     let mut buffer = [0; 4096];
 
     // Read greeting
@@ -1229,15 +1236,16 @@ async fn test_empty_pipelined_command_rejected_with_501() -> Result<()> {
         .on_command("STAT", "223 0 <test@example.com> status\r\n")
         .spawn();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
 
     let config = create_test_config(vec![(mock_port, "TestServer")]);
     let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
 
     spawn_test_proxy(proxy, proxy_port, true).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+    wait_for_server(&proxy_addr, 20).await?;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
+    let mut client = TcpStream::connect(&proxy_addr).await?;
     let mut buffer = [0; 4096];
 
     let _n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
@@ -1286,15 +1294,16 @@ async fn test_partial_buffered_command_does_not_block() -> Result<()> {
         .on_command("STAT", "223 0 <test@example.com> status\r\n")
         .spawn();
 
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
 
     let config = create_test_config(vec![(mock_port, "TestServer")]);
     let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
 
     spawn_test_proxy(proxy, proxy_port, true).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+    wait_for_server(&proxy_addr, 20).await?;
 
-    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
+    let mut client = TcpStream::connect(&proxy_addr).await?;
     let mut buffer = [0; 4096];
 
     // Read greeting

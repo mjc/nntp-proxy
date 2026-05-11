@@ -191,7 +191,7 @@ async fn read_multiline_precheck_hit(
     buffer: &mut crate::pool::PooledBuffer,
     bytes_read: usize,
 ) -> Result<PrecheckHit, ()> {
-    use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
+    use crate::session::tail_buffer::{TailBuffer, TerminatorStatus};
 
     let mut response = deps
         .cache_articles
