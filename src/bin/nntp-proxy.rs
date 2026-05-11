@@ -196,12 +196,16 @@ fn prepare_proxy_launch(args: &Args, config: &nntp_proxy::config::Config) -> Pro
     }
 }
 
+/// Temporarily force per-command routing at runtime while the shared
+/// large-transfer pipeline work is stabilized.
 fn force_per_command_routing_mode(requested: nntp_proxy::RoutingMode) -> nntp_proxy::RoutingMode {
     if requested != nntp_proxy::RoutingMode::PerCommand {
         warn!(
             requested = %requested,
             "Hybrid and stateful routing are temporarily disabled; forcing per-command mode"
         );
+    } else {
+        info!("Per-command routing is currently forced at runtime");
     }
     nntp_proxy::RoutingMode::PerCommand
 }

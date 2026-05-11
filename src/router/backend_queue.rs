@@ -11,8 +11,8 @@
 
 use crossbeam::queue::SegQueue;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
 use tokio::sync::{Notify, oneshot};
+use tokio::time::{Duration, Instant, timeout_at};
 
 use crate::protocol::RequestContext;
 
@@ -223,7 +223,7 @@ impl BackendQueue {
                                 break;
                             }
 
-                            if tokio::time::timeout(remaining, notified).await.is_err() {
+                            if timeout_at(deadline, notified).await.is_err() {
                                 break;
                             }
                         }
@@ -255,7 +255,23 @@ impl BackendQueue {
     /// Mark `count` written requests as no longer awaiting responses.
     #[inline]
     pub(crate) fn mark_pipeline_resolved(&self, count: usize) {
-        self.pipeline_depth.fetch_sub(count, Ordering::AcqRel);
+        let mut current = self.pipeline_depth.load(Ordering::Acquire);
+        loop {
+            debug_assert!(
+                current >= count,
+                "pipeline depth underflow: resolving {count} from {current}"
+            );
+            let next = current.saturating_sub(count);
+            match self.pipeline_depth.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 }
 

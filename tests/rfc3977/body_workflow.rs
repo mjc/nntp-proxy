@@ -121,8 +121,19 @@ async fn read_line<R>(reader: &mut R, context: &str) -> Result<String>
 where
     R: AsyncBufRead + Unpin,
 {
+    read_line_with_timeout(reader, context, Duration::from_secs(2)).await
+}
+
+async fn read_line_with_timeout<R>(
+    reader: &mut R,
+    context: &str,
+    timeout_duration: Duration,
+) -> Result<String>
+where
+    R: AsyncBufRead + Unpin,
+{
     let mut line = String::new();
-    match timeout(Duration::from_secs(2), reader.read_line(&mut line)).await {
+    match timeout(timeout_duration, reader.read_line(&mut line)).await {
         Ok(Ok(0)) => anyhow::bail!("Connection closed while reading {context}"),
         Ok(Ok(_)) => Ok(line),
         Ok(Err(err)) => Err(err.into()),
@@ -608,16 +619,10 @@ async fn expect_buffered_until_backend_finishes(
     write_commands(&mut write_half, &[command]).await?;
     initial_written.notified().await;
 
-    let status_result = timeout(
-        Duration::from_millis(200),
-        read_line(&mut reader, status_context),
-    )
-    .await;
-    let body_line_result = timeout(
-        Duration::from_millis(200),
-        read_line(&mut reader, body_context),
-    )
-    .await;
+    let status_result =
+        read_line_with_timeout(&mut reader, status_context, Duration::from_millis(200)).await;
+    let body_line_result =
+        read_line_with_timeout(&mut reader, body_context, Duration::from_millis(200)).await;
 
     assert!(
         status_result.is_err(),
@@ -680,16 +685,10 @@ async fn expect_buffered_until_backend_finishes_with_auth(
     write_commands(&mut write_half, &[command]).await?;
     initial_written.notified().await;
 
-    let status_result = timeout(
-        Duration::from_millis(200),
-        read_line(&mut reader, status_context),
-    )
-    .await;
-    let body_line_result = timeout(
-        Duration::from_millis(200),
-        read_line(&mut reader, body_context),
-    )
-    .await;
+    let status_result =
+        read_line_with_timeout(&mut reader, status_context, Duration::from_millis(200)).await;
+    let body_line_result =
+        read_line_with_timeout(&mut reader, body_context, Duration::from_millis(200)).await;
 
     assert!(
         status_result.is_err(),

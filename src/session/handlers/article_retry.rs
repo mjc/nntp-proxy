@@ -315,11 +315,10 @@ impl ClientSession {
                         self.tier_for_backend(completed_backend_id),
                     );
                 }
+                // Queued request bytes are accounted for before enqueueing; do not
+                // add request_wire_len again on successful completion.
                 *io.backend_to_client_bytes =
                     io.backend_to_client_bytes.add(response.wire_len().get());
-                *io.client_to_backend_bytes = io
-                    .client_to_backend_bytes
-                    .add(completed.context.request_wire_len().get());
                 self.metrics.record_pipeline_complete();
                 guard.complete();
                 Ok(Some(completed))
@@ -366,6 +365,12 @@ impl ClientSession {
                 "pipeline connection lost after response {completed}/{batch_len} on backend {:?}; closing session to avoid retrying with unknown backend response state",
                 backend_id
             ))),
+            Ok(Err(crate::router::backend_queue::PipelineError::ReadFailed)) => {
+                Err(SessionError::Backend(anyhow::anyhow!(
+                    "pipeline read failed on backend {:?}; closing session because a streamed response may already have reached the client",
+                    backend_id
+                )))
+            }
             Ok(Err(e)) => {
                 debug!(
                     "Client {} pipeline error for backend {:?}: {}",
@@ -558,10 +563,13 @@ mod tests {
     use crate::config::RoutingMode;
     use crate::metrics::MetricsCollector;
     use crate::pool::BufferPool;
-    use crate::router::backend_queue::PipelineError;
+    use crate::protocol::{RequestContext, StatusCode};
+    use crate::router::backend_queue::{CompletedPipelineRequest, PipelineError};
     use crate::router::{BackendSelector, CommandGuard};
     use crate::session::ClientSession;
-    use crate::types::{BackendToClientBytes, BufferSize, ClientAddress, ClientToBackendBytes};
+    use crate::types::{
+        BackendId, BackendToClientBytes, BufferSize, ClientAddress, ClientToBackendBytes,
+    };
     use tokio::sync::oneshot;
 
     fn test_session(cache_articles: bool) -> ClientSession {
@@ -610,8 +618,25 @@ mod tests {
         }
     }
 
+    fn completed_pending_request(
+        router: Arc<BackendSelector>,
+        pool: &BufferPool,
+    ) -> PendingPipelineRequest {
+        let (tx, rx) = oneshot::channel();
+        let mut context =
+            RequestContext::parse(b"STAT <test@example>\r\n").expect("valid request line");
+        let mut response = crate::pool::ChunkedResponse::default();
+        response.extend_from_slice(pool, b"223 0 <test@example>\r\n");
+        context.complete_backend_response(BackendId::from_index(0), StatusCode::new(223), response);
+        tx.send(Ok(CompletedPipelineRequest { context })).unwrap();
+        PendingPipelineRequest {
+            guard: CommandGuard::new(router, BackendId::from_index(0)),
+            rx,
+        }
+    }
+
     #[tokio::test]
-    async fn await_pipeline_request_allows_buffered_read_failure_to_retry() {
+    async fn await_pipeline_request_makes_read_failure_terminal() {
         let session = test_session(false);
         let writer = shared_writer().await;
         let router = Arc::new(BackendSelector::new());
@@ -629,7 +654,59 @@ mod tests {
             .await_pipeline_request(pending, &mut io, &mut availability)
             .await;
 
+        assert!(
+            matches!(result, Err(crate::session::SessionError::Backend(_))),
+            "read failures must be terminal because a streamed response may already have reached the client"
+        );
+    }
+
+    #[tokio::test]
+    async fn await_pipeline_request_allows_connection_acquire_to_retry() {
+        let session = test_session(false);
+        let writer = shared_writer().await;
+        let router = Arc::new(BackendSelector::new());
+        let pending = pending_request(router, PipelineError::ConnectionAcquire);
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_to_client_bytes = BackendToClientBytes::zero();
+        let mut io = RequestExecutionIo {
+            client_writer: &writer,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_to_client_bytes: &mut backend_to_client_bytes,
+        };
+        let mut availability = None;
+
+        let result = session
+            .await_pipeline_request(pending, &mut io, &mut availability)
+            .await;
+
         assert!(matches!(result, Ok(None)));
+    }
+
+    #[tokio::test]
+    async fn await_pipeline_request_does_not_double_count_request_bytes_on_success() {
+        let session = test_session(false);
+        let writer = shared_writer().await;
+        let router = Arc::new(BackendSelector::new());
+        let pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 2);
+        let pending = completed_pending_request(router, &pool);
+        let mut client_to_backend_bytes = ClientToBackendBytes::new(23);
+        let mut backend_to_client_bytes = BackendToClientBytes::zero();
+        let mut io = RequestExecutionIo {
+            client_writer: &writer,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_to_client_bytes: &mut backend_to_client_bytes,
+        };
+        let mut availability = None;
+
+        let completed = session
+            .await_pipeline_request(pending, &mut io, &mut availability)
+            .await
+            .expect("queued success should complete")
+            .expect("queued success should return completed context");
+
+        assert_eq!(completed.context.request_wire_len().get(), 21);
+        assert_eq!(client_to_backend_bytes.as_u64(), 23);
+        assert_eq!(backend_to_client_bytes.as_u64(), 22);
     }
 
     #[tokio::test]

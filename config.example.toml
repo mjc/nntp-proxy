@@ -51,8 +51,8 @@ capture_pool_count = 16
 article_cache_capacity = "256mb"
 # Time-to-live for the article cache, in seconds
 article_cache_ttl_secs = 3600
-# Default false: track backend availability only, without storing article bodies.
-# This example sets true to enable full article-body caching (and the optional disk tier below).
+# Default true: store article bodies in the in-memory cache when [cache] is present.
+# Set false for availability-only caching without body storage.
 store_article_bodies = true
 # Optional persistence file for availability-only mode
 # availability_index_path = "/var/cache/nntp-proxy/availability.idx"

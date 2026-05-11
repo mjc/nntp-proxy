@@ -140,28 +140,31 @@ pub mod timeout {
     use super::Duration;
 
     /// Timeout for reading responses from backend servers
-    pub const BACKEND_READ: Duration = Duration::from_secs(100);
+    pub const BACKEND_READ: Duration = Duration::from_secs(30);
 
     /// Timeout for executing a command on backend
-    pub const COMMAND_EXECUTION: Duration = Duration::from_secs(100);
+    pub const COMMAND_EXECUTION: Duration = crate::constants::duration_polyfill::from_minutes(1);
 
     /// Connection timeout for backend connections
-    pub const CONNECTION: Duration = Duration::from_secs(100);
+    pub const CONNECTION: Duration = Duration::from_secs(10);
 
     /// Timeout for adaptive precheck queries (STAT/HEAD)
     /// If a backend doesn't respond within this time, treat as 430 (missing)
-    pub const PRECHECK_QUERY: Duration = Duration::from_secs(100);
+    /// This prevents slow backends from blocking all client connections
+    pub const PRECHECK_QUERY: Duration = Duration::from_secs(2);
 
     /// Timeout for closing the cache during graceful shutdown
     /// foyer's `close()` can hang indefinitely if the runtime is winding down
-    pub const CACHE_CLOSE: Duration = Duration::from_secs(100);
+    pub const CACHE_CLOSE: Duration = Duration::from_secs(3);
 
     /// Timeout for sending QUIT to an idle backend connection during shutdown
     /// Half-closed connections can block `write_all` indefinitely without this
-    pub const SHUTDOWN_QUIT_WRITE: Duration = Duration::from_secs(100);
+    pub const SHUTDOWN_QUIT_WRITE: Duration = Duration::from_millis(500);
 
     /// Timeout for acquiring an idle connection from the pool during shutdown
-    pub const SHUTDOWN_POOL_GET: Duration = Duration::from_secs(100);
+    /// Used to drain connections one at a time; should be near-instant if
+    /// the connection is truly idle
+    pub const SHUTDOWN_POOL_GET: Duration = Duration::from_millis(1);
 }
 
 /// Connection pool constants
@@ -175,14 +178,15 @@ pub mod pool {
     pub const DEFAULT_MIN_IDLE: usize = 2;
 
     /// Connection pool timeout for getting a connection
-    pub const GET_TIMEOUT_SECS: u64 = 100;
+    pub const GET_TIMEOUT_SECS: u64 = 5;
 
     /// Buffer size for TCP peek during health checks
     /// Only 1 byte needed to detect if connection is readable/closed
     pub const TCP_PEEK_BUFFER_SIZE: usize = 1;
 
     /// Health check timeout - how long to wait for DATE command response
-    pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_secs(100);
+    /// CRITICAL: Must be < `MAX_CONNECTION_SALVAGE_MS` (1000ms) to prevent pool starvation
+    pub const HEALTH_CHECK_TIMEOUT: Duration = Duration::from_millis(500);
 
     /// Buffer size for reading health check responses
     pub const HEALTH_CHECK_BUFFER_SIZE: usize = 512;
@@ -206,7 +210,8 @@ pub mod pool {
     pub const MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE: usize = 5;
 
     /// Timeout when attempting to get a connection for health checking (milliseconds)
-    pub const HEALTH_CHECK_POOL_TIMEOUT_MS: u64 = 100_000;
+    /// Short timeout to avoid blocking if pool is busy
+    pub const HEALTH_CHECK_POOL_TIMEOUT_MS: u64 = 100;
 }
 
 /// Per-command routing constants
@@ -276,7 +281,10 @@ const _: () = {
     // Health check constraints
     assert!(pool::MIN_RECOMMENDED_KEEPALIVE_SECS > 0);
     assert!(pool::MAX_RECOMMENDED_KEEPALIVE_SECS > pool::MIN_RECOMMENDED_KEEPALIVE_SECS);
-    assert!(pool::HEALTH_CHECK_POOL_TIMEOUT_MS > 0);
+    assert!(
+        pool::HEALTH_CHECK_POOL_TIMEOUT_MS < 1000,
+        "Health check timeout should be < 1s"
+    );
     assert!(pool::MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE > 0);
     assert!(
         pool::MAX_CONNECTIONS_PER_HEALTH_CHECK_CYCLE <= 10,

@@ -541,6 +541,9 @@ impl ClientSession {
         );
 
         if is_multiline_body {
+            // Permanent policy: keep direct multiline replies fully buffered so
+            // packed trailing bytes are stashed deterministically before the
+            // connection can be reused or retired.
             return self
                 .deliver_buffered_multiline_response(
                     pooled_conn,

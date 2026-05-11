@@ -110,6 +110,10 @@ pub struct CommonArgs {
     /// - stateful: 1:1 mode, each client gets a dedicated backend connection
     /// - per-command: Each command can use a different backend (stateless only)
     /// - hybrid: Starts in per-command mode, auto-switches to stateful on first stateful command
+    ///
+    /// Temporary note: the current runtime forces per-command mode even when another
+    /// routing mode is requested. Keep setting this explicitly so configs stay ready
+    /// for hybrid/stateful re-enablement.
     #[arg(
         short = 'm',
         long = "routing-mode",

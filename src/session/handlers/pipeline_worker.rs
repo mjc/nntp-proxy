@@ -230,19 +230,17 @@ async fn execute_pipeline_batch(
                 pipeline_depth.complete_one();
             }
             Err(crate::session::response_buffer::StreamingError::ClientDisconnect(io_err)) => {
-                debug!(
-                    backend = ?backend_id,
-                    response_index = response_index + 1,
-                    batch_size = batch_len,
-                    command_verb = ?req.context.verb(),
-                    leftover_bytes = conn.leftover_len(),
-                    error = %io_err,
-                    "Pipeline worker client disconnect during pipelined response delivery; backend drained cleanly, continuing batch"
+                batch = fail_batch_on_client_disconnect(
+                    backend_id,
+                    req,
+                    batch,
+                    response_index,
+                    batch_len,
+                    conn.leftover_len(),
+                    io_err,
                 );
-
-                req.complete_error(PipelineError::ClientDisconnect);
                 pipeline_depth.complete_one();
-                continue;
+                return (false, batch);
             }
             Err(e) => {
                 warn!(
@@ -293,6 +291,36 @@ async fn execute_pipeline_batch(
     }
 
     (true, batch)
+}
+
+fn fail_batch_on_client_disconnect(
+    backend_id: BackendId,
+    current_req: QueuedContext,
+    mut remaining_batch: Vec<QueuedContext>,
+    response_index: usize,
+    batch_len: usize,
+    leftover_bytes: usize,
+    io_err: std::io::Error,
+) -> Vec<QueuedContext> {
+    debug!(
+        backend = ?backend_id,
+        response_index = response_index + 1,
+        batch_size = batch_len,
+        command_verb = ?current_req.context.verb(),
+        leftover_bytes,
+        error = %io_err,
+        "Pipeline worker client disconnect during pipelined response delivery; retiring backend connection and failing remaining batch"
+    );
+
+    current_req.complete_error(PipelineError::ClientDisconnect);
+    let error_msg = PipelineError::ConnectionLost {
+        completed: response_index + 1,
+        batch_len,
+    };
+    while let Some(remaining_req) = remaining_batch.pop() {
+        remaining_req.complete_error(error_msg);
+    }
+    remaining_batch
 }
 
 /// Buffer the complete response shape for the supplied request context.
@@ -2011,6 +2039,55 @@ mod tests {
         assert!(
             conn.leftover_len() < MAX_LEFTOVER_BYTES,
             "Leftover should be under limit"
+        );
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_fails_remaining_batch_and_retires_connection() {
+        let (current_req, current_rx) = queued_context("BODY <body-1@example>\r\n");
+        let (remaining_req_1, remaining_rx_1) = queued_context("BODY <body-2@example>\r\n");
+        let (remaining_req_2, remaining_rx_2) = queued_context("BODY <body-3@example>\r\n");
+
+        let remaining = fail_batch_on_client_disconnect(
+            BackendId::from_index(0),
+            current_req,
+            vec![remaining_req_1, remaining_req_2],
+            0,
+            3,
+            17,
+            std::io::Error::from(std::io::ErrorKind::BrokenPipe),
+        );
+
+        assert!(
+            remaining.is_empty(),
+            "batch should be fully drained on disconnect"
+        );
+        assert!(
+            matches!(
+                current_rx.await.unwrap(),
+                Err(PipelineError::ClientDisconnect)
+            ),
+            "current streamed request should surface the disconnect"
+        );
+        assert!(
+            matches!(
+                remaining_rx_1.await.unwrap(),
+                Err(PipelineError::ConnectionLost {
+                    completed: 1,
+                    batch_len: 3,
+                })
+            ),
+            "later queued requests should fail as connection-lost so callers do not keep using this backend state"
+        );
+        assert!(
+            matches!(
+                remaining_rx_2.await.unwrap(),
+                Err(PipelineError::ConnectionLost {
+                    completed: 1,
+                    batch_len: 3,
+                })
+            ),
+            "all later queued requests should fail after the disconnect"
         );
     }
 }

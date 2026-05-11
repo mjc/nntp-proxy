@@ -5,7 +5,7 @@
 //!
 //! # CRITICAL: Connection Hold Time Guarantees
 //!
-//! All connection salvage operations MUST complete in <1 second to prevent pool
+//! All connection salvage operations MUST complete in <=1 second to prevent pool
 //! starvation and throughput collapse. This is enforced by:
 //! - Compile-time const assertions on timeout values
 //! - Type-level guarantees preventing timeout loops
@@ -27,8 +27,8 @@ use crate::pool::provider::DeadpoolConnectionProvider;
 /// - Const assertions below
 /// - Code review guidelines
 ///
-/// Background: This bound must match the configured health-check timeout.
-pub const MAX_CONNECTION_SALVAGE_MS: u64 = 100_000;
+/// Background: This bound must stay aligned with the configured DATE health-check timeout.
+pub const MAX_CONNECTION_SALVAGE_MS: u64 = 1_000;
 
 /// COMPILE-TIME ASSERTION: Prevent timeout loops from being added
 ///

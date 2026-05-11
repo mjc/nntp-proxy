@@ -61,10 +61,11 @@ pub const fn cache_ttl() -> Duration {
 
 /// Default for caching article bodies in explicit `[cache]` sections.
 ///
-/// Default to availability-only caching unless full body storage is explicitly enabled.
+/// Preserve the long-standing default of full article-body caching when `[cache]`
+/// is present and `store_article_bodies` is omitted.
 #[inline]
 pub const fn cache_articles() -> bool {
-    false
+    true
 }
 
 /// Default for adaptive availability prechecking (false = disabled)
