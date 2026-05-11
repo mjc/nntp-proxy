@@ -221,7 +221,7 @@ impl NntpClient {
         capture: &mut PooledBuffer,
         first_chunk_size: usize,
     ) -> Result<()> {
-        use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
+        use crate::session::tail_buffer::{TailBuffer, TerminatorStatus};
 
         let first_chunk = &io_buffer[..first_chunk_size];
         let mut tail = TailBuffer::default();

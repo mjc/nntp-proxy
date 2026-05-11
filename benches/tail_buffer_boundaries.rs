@@ -7,7 +7,7 @@
 //! Run with: cargo bench --bench `tail_buffer_boundaries`
 
 use divan::{Bencher, black_box};
-use nntp_proxy::session::streaming::tail_buffer::TailBuffer;
+use nntp_proxy::session::tail_buffer::TailBuffer;
 
 fn main() {
     divan::main();

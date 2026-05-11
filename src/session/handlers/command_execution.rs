@@ -6,13 +6,13 @@
 use crate::protocol::{RequestContext, RequestResponseMetadata, StatusCode};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::SessionError;
+use crate::session::response_buffer::{BufferContext, StreamingError};
 use crate::session::retry::retry_once;
 use crate::session::routing::{
     CacheAction, MetricsAction, determine_cache_action_for_request,
     determine_metrics_action_for_request,
 };
-use crate::session::streaming::StreamingError;
-use crate::session::{ClientSession, backend, streaming};
+use crate::session::{ClientSession, backend};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
 use std::sync::Arc;
@@ -308,13 +308,12 @@ impl ClientSession {
             is_multiline_body,
             "Streaming backend response to client"
         );
-        let stream_ctx = streaming::StreamContext {
-            client_addr: self.client_addr,
+        let buffer_ctx = BufferContext {
             backend_id,
             buffer_pool: &self.buffer_pool,
         };
         let bytes_written = match self
-            .stream_response_to_client(&mut conn, client_write, &stream_ctx, params)
+            .stream_response_to_client(&mut conn, client_write, &buffer_ctx, params)
             .await
         {
             Ok(bytes) => bytes,
@@ -514,7 +513,7 @@ impl ClientSession {
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
         client_write: &mut W,
-        ctx: &streaming::StreamContext<'_>,
+        ctx: &BufferContext<'_>,
         params: ResponseStreamParams<'_>,
     ) -> Result<u64, StreamingError>
     where
@@ -576,15 +575,19 @@ impl ClientSession {
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
         client_write: &mut W,
-        ctx: &streaming::StreamContext<'_>,
+        ctx: &BufferContext<'_>,
         params: ResponseStreamParams<'_>,
         cache_action: CacheAction,
     ) -> Result<u64, StreamingError>
     where
         W: AsyncWrite + Unpin,
     {
-        let captured =
-            streaming::buffer_multiline_response(pooled_conn, params.first_chunk, ctx).await?;
+        let captured = crate::session::response_buffer::buffer_multiline_response(
+            pooled_conn,
+            params.first_chunk,
+            ctx,
+        )
+        .await?;
         captured
             .write_all_to(client_write)
             .await
@@ -619,73 +622,6 @@ impl ClientSession {
             CacheAction::TrackStat | CacheAction::None => {}
         }
         Ok(captured_len as u64)
-    }
-
-    #[allow(dead_code)]
-    async fn stream_and_capture_multiline_response<W>(
-        &self,
-        pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
-        client_write: &mut W,
-        ctx: &streaming::StreamContext<'_>,
-        params: ResponseStreamParams<'_>,
-    ) -> Result<u64, StreamingError>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        let mut captured = crate::pool::ChunkedResponse::default();
-        let bytes = streaming::stream_multiline_response_with_capture(
-            &mut **pooled_conn,
-            client_write,
-            params.first_chunk,
-            ctx,
-            &mut captured,
-        )
-        .await?;
-        self.maybe_cache_upsert_buffer(params.msg_id, captured.into(), ctx.backend_id);
-        Ok(bytes)
-    }
-
-    #[allow(dead_code)]
-    #[allow(dead_code)]
-    async fn stream_multiline_with_availability_tracking<W>(
-        &self,
-        pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
-        client_write: &mut W,
-        ctx: &streaming::StreamContext<'_>,
-        params: ResponseStreamParams<'_>,
-    ) -> Result<u64, StreamingError>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        self.deliver_buffered_multiline_response(
-            pooled_conn,
-            client_write,
-            ctx,
-            params,
-            CacheAction::TrackAvailability,
-        )
-        .await
-    }
-
-    #[allow(dead_code)]
-    async fn stream_direct_multiline_response<W>(
-        &self,
-        pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
-        client_write: &mut W,
-        ctx: &streaming::StreamContext<'_>,
-        params: ResponseStreamParams<'_>,
-    ) -> Result<u64, StreamingError>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        self.deliver_buffered_multiline_response(
-            pooled_conn,
-            client_write,
-            ctx,
-            params,
-            CacheAction::None,
-        )
-        .await
     }
 
     async fn write_single_line_response<W>(
@@ -833,7 +769,7 @@ mod tests {
         let classified = classify_buffered_response_write_err(err);
         assert!(matches!(
             classified,
-            crate::session::streaming::StreamingError::ClientDisconnect(_)
+            crate::session::response_buffer::StreamingError::ClientDisconnect(_)
         ));
     }
 
@@ -843,7 +779,7 @@ mod tests {
         let classified = classify_buffered_response_write_err(err);
         assert!(matches!(
             classified,
-            crate::session::streaming::StreamingError::ClientDisconnect(_)
+            crate::session::response_buffer::StreamingError::ClientDisconnect(_)
         ));
     }
 }

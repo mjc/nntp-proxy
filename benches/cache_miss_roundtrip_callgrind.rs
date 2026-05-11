@@ -1,7 +1,7 @@
 //! Callgrind benchmarks for the real cache-miss proxy roundtrip path.
 //!
 //! These benches drive a client socket through a live per-command proxy with
-//! metadata-only cache enabled, so each `ARTICLE` request still streams from the
+//! metadata-only cache enabled, so each `ARTICLE` request still buffers through the
 //! backend while paying the request/cache/routing fixed costs of the miss path.
 //!
 //! Run with: `cargo bench --bench cache_miss_roundtrip_callgrind`
@@ -20,7 +20,7 @@ supported! {
         Callgrind, LibraryBenchmarkConfig, library_benchmark, library_benchmark_group, main,
     };
     use nntp_proxy::config::{Cache, Config, Server};
-    use nntp_proxy::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
+    use nntp_proxy::session::tail_buffer::{TailBuffer, TerminatorStatus};
     use nntp_proxy::types::{CacheCapacity, MaxConnections, Port};
     use nntp_proxy::{NntpProxy, RoutingMode};
     use std::hint::black_box;

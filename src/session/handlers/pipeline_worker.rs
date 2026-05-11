@@ -201,7 +201,7 @@ async fn execute_pipeline_batch(
     batch.reverse();
     let mut response_index = 0usize;
     while let Some(mut req) = batch.pop() {
-        let read_result = crate::session::streaming::read_response_into_context(
+        let read_result = crate::session::response_buffer::read_response_into_context(
             &mut req.context,
             &mut buffer,
             conn,
@@ -229,7 +229,7 @@ async fn execute_pipeline_batch(
                 req.complete_context();
                 pipeline_depth.complete_one();
             }
-            Err(crate::session::streaming::StreamingError::ClientDisconnect(io_err)) => {
+            Err(crate::session::response_buffer::StreamingError::ClientDisconnect(io_err)) => {
                 debug!(
                     backend = ?backend_id,
                     response_index = response_index + 1,
@@ -310,7 +310,7 @@ async fn buffer_response_for_request(
     pool: &BufferPool,
 ) -> Result<crate::protocol::StatusCode> {
     let request = crate::protocol::RequestContext::parse(request_line).expect("valid request line");
-    crate::session::streaming::buffer_response_for_request(
+    crate::session::response_buffer::buffer_response_for_request(
         &request,
         buffer,
         conn,
@@ -319,7 +319,7 @@ async fn buffer_response_for_request(
         BackendId::from_index(0),
     )
     .await
-    .map_err(crate::session::streaming::StreamingError::into_anyhow)
+    .map_err(crate::session::response_buffer::StreamingError::into_anyhow)
 }
 
 /// Send error responses to all requests in a batch.

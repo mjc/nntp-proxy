@@ -201,7 +201,7 @@ mod tests {
     /// Verify that `TailBuffer` detects terminators that span chunk boundaries.
     #[test]
     fn test_drain_cross_boundary_terminator() {
-        use crate::session::streaming::tail_buffer::TailBuffer;
+        use crate::session::tail_buffer::TailBuffer;
 
         // Simulate two reads where the terminator \r\n.\r\n is split:
         // First read ends with "\r\n.", second read starts with "\r\n"

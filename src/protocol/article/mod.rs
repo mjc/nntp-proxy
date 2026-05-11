@@ -314,7 +314,7 @@ fn find_blank_line(buf: &[u8], start: usize) -> Result<usize, ParseError> {
 
 /// Find multiline terminator (.\r\n)
 fn find_terminator(buf: &[u8], start: usize) -> Result<usize, ParseError> {
-    use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
+    use crate::session::tail_buffer::{TailBuffer, TerminatorStatus};
 
     // Empty body: terminator immediately follows blank line separator
     if buf.get(start..).is_some_and(|s| s.starts_with(b".\r\n")) {

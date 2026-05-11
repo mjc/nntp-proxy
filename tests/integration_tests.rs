@@ -6,7 +6,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, Instant, timeout, timeout_at};
 
 use nntp_proxy::config::{ClientAuth, HealthCheck, Proxy, Server};
-use nntp_proxy::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
+use nntp_proxy::session::tail_buffer::{TailBuffer, TerminatorStatus};
 use nntp_proxy::{Config, NntpProxy, RoutingMode, load_config};
 
 mod test_helpers;
