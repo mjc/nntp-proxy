@@ -727,7 +727,7 @@ impl DeadpoolConnectionProvider {
                     checked += 1;
 
                     // Perform DATE health check
-                    if let Err(e) = check_date_response(&mut conn_obj).await {
+                    if let Err(e) = check_date_response(&mut *conn_obj).await {
                         failed += 1;
                         warn!(
                             pool = %name,

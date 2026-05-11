@@ -144,7 +144,7 @@ impl PooledBuffer {
     ///
     /// # Performance
     ///
-    /// Capture buffers are pre-allocated with sufficient capacity (772KB by default) and
+    /// Capture buffers are pre-allocated with sufficient capacity (1 MiB by default) and
     /// pages are pre-faulted. As long as total accumulated data fits within
     /// capacity, this operation performs NO allocations or page faults.
     ///
@@ -540,7 +540,7 @@ impl BufferPool {
     /// Pages are pre-faulted to eliminate soft page faults during streaming.
     ///
     /// # Arguments
-    /// * `capacity` - Size of each capture buffer in bytes (e.g., 772KB by default)
+    /// * `capacity` - Size of each capture buffer in bytes (e.g., 1 MiB by default)
     /// * `count` - Number of capture buffers to pre-allocate
     #[must_use]
     pub fn with_capture_pool(mut self, capacity: usize, count: usize) -> Self {
@@ -622,11 +622,6 @@ impl BufferPool {
         let buffer = self.pool.pop().map_or_else(
             || {
                 // Create new page-aligned buffer for better DMA performance
-                let in_use = self.buffers_in_use();
-                debug!(
-                    "Buffer pool exhausted (allocating beyond pool size). In use: {}/{}",
-                    in_use, self.max_pool_size
-                );
                 Self::create_aligned_buffer(self.buffer_size.get())
             },
             |buffer| {
@@ -663,13 +658,6 @@ impl BufferPool {
         let buffer = self.capture_pool.pop().map_or_else(
             || {
                 // Pool exhausted - allocate and pre-fault new buffer
-                let in_use = self
-                    .max_capture_pool_size
-                    .saturating_sub(self.capture_pool_size.load(Ordering::Relaxed));
-                debug!(
-                    "Capture pool exhausted (allocating beyond pool size). In use: {}/{}",
-                    in_use, self.max_capture_pool_size
-                );
                 let capacity = if self.capture_capacity > 0 {
                     self.capture_capacity
                 } else {

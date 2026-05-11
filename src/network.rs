@@ -14,11 +14,11 @@ use tokio::net::TcpStream;
 use tracing::debug;
 
 /// `SO_LINGER` timeout - prevents indefinite blocking on socket close
-const LINGER_TIMEOUT: Duration = Duration::from_secs(5);
+const LINGER_TIMEOUT: Duration = Duration::from_secs(100);
 
 /// `TCP_USER_TIMEOUT` - faster dead connection detection on Linux
 #[cfg(target_os = "linux")]
-const TCP_USER_TIMEOUT: Duration = Duration::from_secs(30);
+const TCP_USER_TIMEOUT: Duration = Duration::from_secs(100);
 
 /// `IP_TOS` value for throughput optimization
 #[cfg(target_os = "linux")]
@@ -543,13 +543,13 @@ mod tests {
 
     #[test]
     fn test_linger_timeout_constant() {
-        assert_eq!(LINGER_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(LINGER_TIMEOUT, Duration::from_secs(100));
     }
 
     #[test]
     #[cfg(target_os = "linux")]
     fn test_tcp_user_timeout_constant() {
-        assert_eq!(TCP_USER_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(TCP_USER_TIMEOUT, Duration::from_secs(100));
     }
 
     #[test]

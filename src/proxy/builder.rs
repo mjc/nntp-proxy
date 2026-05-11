@@ -93,7 +93,7 @@ impl NntpProxyBuilder {
         self
     }
 
-    /// Override the configured main buffer pool size (724KB by default)
+    /// Override the configured main buffer pool size (1 MiB by default)
     ///
     /// This affects the size of each buffer in the pool. Larger buffers
     /// can improve throughput for large article transfers but use more memory.

@@ -8,7 +8,7 @@
 use deadpool::managed;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
 use crate::constants::pool::{
@@ -179,6 +179,41 @@ pub(crate) fn validate_date_response(response: &str) -> Result<(), HealthCheckEr
     }
 }
 
+async fn read_date_response<C>(conn: &mut C) -> Result<String, HealthCheckError>
+where
+    C: AsyncRead + Unpin,
+{
+    let mut response_buf = [0u8; HEALTH_CHECK_BUFFER_SIZE];
+    let mut total = 0usize;
+
+    loop {
+        if total == response_buf.len() {
+            return Err(HealthCheckError::UnexpectedResponse(
+                String::from_utf8_lossy(&response_buf).into_owned(),
+            ));
+        }
+
+        let n = conn
+            .read(&mut response_buf[total..])
+            .await
+            .map_err(HealthCheckError::ReadError)?;
+
+        if n == 0 {
+            return Err(HealthCheckError::ConnectionClosedDuringCheck);
+        }
+
+        total += n;
+
+        if let Some(line_end) = crate::session::backend::status_line_end(&response_buf[..total]) {
+            if line_end != total {
+                return Err(HealthCheckError::UnexpectedData);
+            }
+
+            return Ok(String::from_utf8_lossy(&response_buf[..line_end]).into_owned());
+        }
+    }
+}
+
 /// Application-level health check using DATE command
 ///
 /// Sends DATE command and verifies response to ensure the NNTP connection
@@ -188,7 +223,10 @@ pub(crate) fn validate_date_response(response: &str) -> Result<(), HealthCheckEr
 /// # Errors
 /// Returns `HealthCheckError` when writing `DATE` fails, the response times out,
 /// the backend closes the connection, or the reply is not a valid `111` response.
-pub async fn check_date_response(conn: &mut ConnectionStream) -> Result<(), HealthCheckError> {
+pub async fn check_date_response<C>(conn: &mut C) -> Result<(), HealthCheckError>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+{
     // Wrap entire health check in single timeout
     let health_check = async {
         // Send DATE command
@@ -196,19 +234,7 @@ pub async fn check_date_response(conn: &mut ConnectionStream) -> Result<(), Heal
             .await
             .map_err(HealthCheckError::WriteError)?;
 
-        // Read response
-        let mut response_buf = [0u8; HEALTH_CHECK_BUFFER_SIZE];
-        let n = conn
-            .read(&mut response_buf)
-            .await
-            .map_err(HealthCheckError::ReadError)?;
-
-        if n == 0 {
-            return Err(HealthCheckError::ConnectionClosedDuringCheck);
-        }
-
-        // Validate DATE response
-        let response = String::from_utf8_lossy(&response_buf[..n]);
+        let response = read_date_response(conn).await?;
         validate_date_response(&response)
     };
 
@@ -222,6 +248,60 @@ pub async fn check_date_response(conn: &mut ConnectionStream) -> Result<(), Heal
 #[allow(clippy::float_cmp)] // These tests assert exact health-check failure rates from fixed counters.
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::AsyncWrite;
+
+    struct ChunkedStream {
+        chunks: VecDeque<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl ChunkedStream {
+        fn new(chunks: Vec<Vec<u8>>) -> Self {
+            Self {
+                chunks: chunks.into(),
+                written: Vec::new(),
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for ChunkedStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(chunk) = self.chunks.pop_front() {
+                let len = chunk.len().min(buf.remaining());
+                buf.put_slice(&chunk[..len]);
+                if len < chunk.len() {
+                    self.chunks.push_front(chunk[len..].to_vec());
+                }
+            }
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for ChunkedStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            self.written.extend_from_slice(buf);
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
 
     #[test]
     fn test_health_check_metrics_new() {
@@ -454,5 +534,17 @@ mod tests {
         assert!(validate_date_response("111 20231215120530\r\n").is_ok());
         assert!(validate_date_response("111 19700101000000\r\n").is_ok());
         assert!(validate_date_response("111 20991231235959\r\n").is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_check_date_response_reads_split_status_line() {
+        let mut stream = ChunkedStream::new(vec![b"111 20231215".to_vec(), b"120000\r\n".to_vec()]);
+
+        let result = check_date_response(&mut stream).await;
+        assert!(
+            result.is_ok(),
+            "split DATE responses should be consumed fully"
+        );
+        assert_eq!(stream.written, DATE_COMMAND);
     }
 }

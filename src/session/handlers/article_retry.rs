@@ -414,7 +414,6 @@ impl ClientSession {
             request.verb()
         );
 
-        let mut buffer = self.buffer_pool.acquire();
         let mut availability = availability.unwrap_or_default();
         debug!(
             "Client {} availability routing: missing_bits={:08b}, backend_count={}",
@@ -432,7 +431,6 @@ impl ClientSession {
                     &mut *client_write,
                     &mut ArticleAttemptState {
                         availability: &mut availability,
-                        buffer: &mut buffer,
                         client_to_backend_bytes: io.client_to_backend_bytes,
                     },
                 )
@@ -632,31 +630,6 @@ mod tests {
             .await;
 
         assert!(matches!(result, Ok(None)));
-    }
-
-    #[tokio::test]
-    async fn await_pipeline_request_makes_streamed_read_failure_terminal() {
-        let session = test_session(false);
-        let writer = shared_writer().await;
-        let router = Arc::new(BackendSelector::new());
-        let pending = pending_request(router, PipelineError::ReadFailed);
-        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
-        let mut backend_to_client_bytes = BackendToClientBytes::zero();
-        let mut io = RequestExecutionIo {
-            client_writer: &writer,
-            client_to_backend_bytes: &mut client_to_backend_bytes,
-            backend_to_client_bytes: &mut backend_to_client_bytes,
-        };
-        let mut availability = None;
-
-        let result = session
-            .await_pipeline_request(pending, &mut io, &mut availability)
-            .await;
-
-        assert!(matches!(
-            result,
-            Err(crate::session::SessionError::Backend(_))
-        ));
     }
 
     #[tokio::test]

@@ -27,9 +27,8 @@ use crate::pool::provider::DeadpoolConnectionProvider;
 /// - Const assertions below
 /// - Code review guidelines
 ///
-/// Background: A previous implementation held connections for 10 seconds trying
-/// to drain unparseable data, causing 40% throughput regression (60 MB/s vs 100+ MB/s).
-pub const MAX_CONNECTION_SALVAGE_MS: u64 = 1000;
+/// Background: This bound must match the configured health-check timeout.
+pub const MAX_CONNECTION_SALVAGE_MS: u64 = 100_000;
 
 /// COMPILE-TIME ASSERTION: Prevent timeout loops from being added
 ///
@@ -135,6 +134,11 @@ impl Drop for ConnectionGuard {
         if !self.released
             && let Some(conn) = self.conn.take()
         {
+            tracing::debug!(
+                connection_type = conn.connection_type(),
+                leftover_bytes = conn.leftover_len(),
+                "ConnectionGuard dropping unreleased pooled connection; removing backend connection with cooldown"
+            );
             // Unconditional: remove_with_cooldown handles socket shutdown and
             // optional pool-size reduction (when a replacement_cooldown is configured).
             self.provider.remove_with_cooldown(conn);
@@ -177,7 +181,7 @@ pub async fn salvage_with_health_check(
 ) {
     use tracing::{debug, warn};
 
-    match crate::pool::health_check::check_date_response(&mut conn).await {
+    match crate::pool::health_check::check_date_response(&mut *conn).await {
         Ok(()) => {
             debug!("Connection salvaged after Invalid response - DATE check passed");
             drop(conn); // returns to pool
