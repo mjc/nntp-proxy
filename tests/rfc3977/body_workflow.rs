@@ -412,7 +412,7 @@ fn spawn_packed_leftover_direct_backend(backend_listener: TcpListener) -> Arc<At
     connection_count
 }
 
-fn spawn_reusable_direct_body_backend(backend_listener: TcpListener) -> Arc<AtomicUsize> {
+fn spawn_reusable_direct_multiline_backend(backend_listener: TcpListener) -> Arc<AtomicUsize> {
     let connection_count = Arc::new(AtomicUsize::new(0));
     let connection_count_for_task = connection_count.clone();
 
@@ -455,6 +455,12 @@ fn spawn_reusable_direct_body_backend(backend_listener: TcpListener) -> Arc<Atom
                         }
                         "BODY <reuse-2@example>" => {
                             "222 2 <reuse-2@example>\r\nreuse-2-line\r\n.\r\n"
+                        }
+                        "ARTICLE <reuse-article-1@example>" => {
+                            "220 1 <reuse-article-1@example>\r\nreuse-article-1-line\r\n.\r\n"
+                        }
+                        "ARTICLE <reuse-article-2@example>" => {
+                            "220 2 <reuse-article-2@example>\r\nreuse-article-2-line\r\n.\r\n"
                         }
                         _ => "500 Unexpected command\r\n",
                     };
@@ -2184,11 +2190,50 @@ async fn test_per_command_body_pipeline_buffers_when_first_read_only_has_status_
 }
 
 #[tokio::test]
+async fn test_per_command_article_pipeline_buffers_when_first_read_only_has_status_line_with_client_auth()
+-> Result<()> {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let (initial_written, release_tx) = spawn_gated_multiline_backend(
+        backend_listener,
+        "ARTICLE <auth-status-only-article@example>",
+        "220 0 <auth-status-only-article@example>\r\n",
+        "auth-status-only-article-prefix\r\n.\r\n",
+    );
+
+    let mut config = pipeline_backend_config(backend_port, "AuthStatusOnlyArticlePipeline");
+    config.client_auth = nntp_proxy::config::ClientAuth {
+        users: vec![nntp_proxy::config::UserCredentials {
+            username: "test-user".to_string(),
+            password: "test-pass".to_string(),
+        }],
+        ..Default::default()
+    };
+
+    let proxy_port = spawn_proxy_with_config(config, RoutingMode::PerCommand).await?;
+    expect_buffered_until_backend_finishes_with_auth(
+        proxy_port,
+        BufferedResponseExpectation {
+            command: "ARTICLE <auth-status-only-article@example>\r\n",
+            status_context: "auth status-only ARTICLE status",
+            body_context: "auth status-only ARTICLE first line",
+            expected_status: "220 0 <auth-status-only-article@example>\r\n",
+            expected_body_line: "auth-status-only-article-prefix\r\n",
+        },
+        initial_written,
+        release_tx,
+        "test-user",
+        "test-pass",
+    )
+    .await
+}
+
+#[tokio::test]
 async fn test_per_command_direct_body_reuses_backend_connection_after_buffered_completion()
 -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
-    let connection_count = spawn_reusable_direct_body_backend(backend_listener);
+    let connection_count = spawn_reusable_direct_multiline_backend(backend_listener);
 
     let proxy_port = spawn_proxy_with_config(
         pipeline_backend_config_with_max_connections(backend_port, "ReusableDirectBody", 1),
@@ -2214,6 +2259,99 @@ async fn test_per_command_direct_body_reuses_backend_connection_after_buffered_c
         connection_count.load(Ordering::SeqCst),
         1,
         "buffered direct BODY completions should release a clean backend connection back to the pool"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_per_command_direct_article_reuses_backend_connection_after_buffered_completion()
+-> Result<()> {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let connection_count = spawn_reusable_direct_multiline_backend(backend_listener);
+
+    let proxy_port = spawn_proxy_with_config(
+        pipeline_backend_config_with_max_connections(backend_port, "ReusableDirectArticle", 1),
+        RoutingMode::PerCommand,
+    )
+    .await?;
+
+    let client = connect_and_read_greeting(proxy_port).await?;
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    write_commands(&mut write_half, &["ARTICLE <reuse-article-1@example>\r\n"]).await?;
+    let (status_line, body_lines) = read_multiline_response(&mut reader).await?;
+    assert_eq!(status_line, "220 1 <reuse-article-1@example>\r\n");
+    assert_eq!(body_lines, vec!["reuse-article-1-line\r\n".to_string()]);
+
+    write_commands(&mut write_half, &["ARTICLE <reuse-article-2@example>\r\n"]).await?;
+    let (status_line, body_lines) = read_multiline_response(&mut reader).await?;
+    assert_eq!(status_line, "220 2 <reuse-article-2@example>\r\n");
+    assert_eq!(body_lines, vec!["reuse-article-2-line\r\n".to_string()]);
+
+    assert_eq!(
+        connection_count.load(Ordering::SeqCst),
+        1,
+        "buffered direct ARTICLE completions should release a clean backend connection back to the pool"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_per_command_direct_body_reuses_backend_connection_after_buffered_completion_with_client_auth()
+-> Result<()> {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let connection_count = spawn_reusable_direct_multiline_backend(backend_listener);
+
+    let mut config =
+        pipeline_backend_config_with_max_connections(backend_port, "ReusableAuthDirectBody", 1);
+    config.client_auth = nntp_proxy::config::ClientAuth {
+        users: vec![nntp_proxy::config::UserCredentials {
+            username: "test-user".to_string(),
+            password: "test-pass".to_string(),
+        }],
+        ..Default::default()
+    };
+
+    let proxy_port = spawn_proxy_with_config(config, RoutingMode::PerCommand).await?;
+    let client = connect_and_read_greeting(proxy_port).await?;
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    write_commands(
+        &mut write_half,
+        &[
+            "AUTHINFO USER test-user\r\n",
+            "AUTHINFO PASS test-pass\r\n",
+            "BODY <reuse-1@example>\r\n",
+        ],
+    )
+    .await?;
+    assert_eq!(
+        read_line(&mut reader, "AUTHINFO USER status").await?,
+        "381 Password required\r\n"
+    );
+    assert_eq!(
+        read_line(&mut reader, "AUTHINFO PASS status").await?,
+        "281 Authentication accepted\r\n"
+    );
+    let (status_line, body_lines) = read_multiline_response(&mut reader).await?;
+    assert_eq!(status_line, "222 1 <reuse-1@example>\r\n");
+    assert_eq!(body_lines, vec!["reuse-1-line\r\n".to_string()]);
+
+    write_commands(&mut write_half, &["BODY <reuse-2@example>\r\n"]).await?;
+    let (status_line, body_lines) = read_multiline_response(&mut reader).await?;
+    assert_eq!(status_line, "222 2 <reuse-2@example>\r\n");
+    assert_eq!(body_lines, vec!["reuse-2-line\r\n".to_string()]);
+
+    assert_eq!(
+        connection_count.load(Ordering::SeqCst),
+        1,
+        "authenticated buffered direct BODY completions should still reuse the same clean backend connection"
     );
 
     Ok(())
