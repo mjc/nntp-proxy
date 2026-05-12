@@ -310,10 +310,10 @@ fn split_summary_columns(area: Rect) -> [Rect; 3] {
 }
 
 fn split_backend_columns(area: Rect) -> [Rect; 3] {
-    let user_stats = area.width / 4;
+    let user_stats = area.width.saturating_mul(22) / 100;
     let primary = area.width.saturating_sub(user_stats);
-    let backend_list = primary / 2;
-    let data_flow = primary.saturating_sub(backend_list);
+    let data_flow = primary.saturating_mul(56) / 100;
+    let backend_list = primary.saturating_sub(data_flow);
 
     [
         Rect::new(area.x, area.y, backend_list, area.height),
@@ -2277,9 +2277,9 @@ mod tests {
         assert_eq!(transfer_summary, Rect::new(77, 5, 33, 6));
 
         let [backend_list, data_flow, user_stats] = split_backend_columns(Rect::new(2, 3, 100, 8));
-        assert_eq!(backend_list, Rect::new(2, 3, 37, 8));
-        assert_eq!(data_flow, Rect::new(39, 3, 38, 8));
-        assert_eq!(user_stats, Rect::new(77, 3, 25, 8));
+        assert_eq!(backend_list, Rect::new(2, 3, 35, 8));
+        assert_eq!(data_flow, Rect::new(37, 3, 43, 8));
+        assert_eq!(user_stats, Rect::new(80, 3, 22, 8));
     }
 
     #[test]

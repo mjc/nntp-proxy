@@ -154,7 +154,7 @@ impl ClientSession {
                 client_stream
                     .write_all(BACKEND_UNAVAILABLE)
                     .await
-                    .map_err(|ie| crate::session::SessionError::Backend(ie.into()))?;
+                    .map_err(|ie| crate::session::SessionError::from(anyhow::Error::from(ie)))?;
                 return Err(crate::session::SessionError::Backend(anyhow::anyhow!(
                     "Failed to get pooled connection for '{server_name}': {e}"
                 )));

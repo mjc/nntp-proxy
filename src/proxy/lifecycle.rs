@@ -382,7 +382,7 @@ impl NntpProxy {
             let backend_id = self
                 .prepare_stateful_connection(&mut client_stream, client_addr)
                 .await
-                .map_err(SessionError::Backend)?;
+                .map_err(SessionError::from)?;
             let server_idx = backend_id.as_index();
 
             let session = self.create_session(client_addr, None);
@@ -440,7 +440,7 @@ impl NntpProxy {
 
         self.prepare_per_command_connection(&mut client_stream, client_addr)
             .await
-            .map_err(SessionError::Backend)?;
+            .map_err(SessionError::from)?;
 
         let session = self.create_session(client_addr, Some(self.router.clone()));
         let session_id = Self::generate_session_id(&session);
