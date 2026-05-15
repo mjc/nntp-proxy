@@ -305,9 +305,15 @@ impl HybridArticleCache {
     /// Checks memory first, then disk. Returns None if not found in either tier.
     /// Applies tier-aware TTL expiration - higher tier entries get longer TTLs.
     pub(crate) async fn get(&self, message_id: &MessageId<'_>) -> Option<DiskCachedArticle> {
-        let key = message_id.without_brackets().to_string();
-        let result = self.cache.get(&key).await;
+        self.get_by_cache_key(message_id.without_brackets()).await
+    }
 
+    /// Get an article by the cache key form of a message ID (without brackets).
+    ///
+    /// The hybrid cache accepts borrowed lookup keys and only owns the key if it
+    /// has to populate from disk, so RAM-tier hits avoid allocating a `String`.
+    pub(crate) async fn get_by_cache_key(&self, key: &str) -> Option<DiskCachedArticle> {
+        let result = self.cache.get(key).await;
         match result {
             Ok(Some(entry)) => {
                 let cloned = entry.value().clone();

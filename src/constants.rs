@@ -86,14 +86,6 @@ pub mod buffer {
     /// use the same pooled allocation size.
     pub const STREAM_CHUNK: usize = 1024 * 1024;
 
-    /// Maximum leftover bytes between pipelined responses.
-    ///
-    /// Leftover is a suffix of one TCP read, so normally bounded by buffer
-    /// capacity. This limit catches protocol desync where a backend sends
-    /// unexpected extra data after terminators. 128KB is generous — normal
-    /// leftover is under 8KB.
-    pub const MAX_LEFTOVER_BYTES: usize = 128 * 1024;
-
     // Compile-time validation
 
     /// Verify pool buffer is page-aligned at compile time

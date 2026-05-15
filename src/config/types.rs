@@ -573,7 +573,10 @@ pub struct Server {
         alias = "enable_pipelining"
     )]
     pub backend_pipelining: bool,
-    /// Maximum queue depth for pipelined requests (backpressure threshold)
+    /// Maximum queued pipelined requests per backend connection.
+    ///
+    /// The effective per-backend backpressure threshold is this value multiplied
+    /// by `max_connections`.
     /// Default: 1000
     #[serde(default = "super::defaults::pipeline_queue_depth")]
     pub pipeline_queue_depth: usize,
@@ -791,7 +794,7 @@ impl ServerBuilder {
         self
     }
 
-    /// Set pipeline queue depth
+    /// Set pipeline queue depth per backend connection
     #[must_use]
     pub const fn pipeline_queue_depth(mut self, depth: usize) -> Self {
         self.pipeline_queue_depth = Some(depth);

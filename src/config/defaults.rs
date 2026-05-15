@@ -191,7 +191,7 @@ pub const fn enable_pipelining() -> bool {
     true
 }
 
-/// Default pipeline queue depth
+/// Default pipeline queue depth per backend connection
 #[inline]
 pub const fn pipeline_queue_depth() -> usize {
     1000

@@ -181,7 +181,7 @@ impl NntpProxyBuilder {
                     let backend_id = BackendId::from_index(idx);
                     let pipeline_queue = if servers[idx].backend_pipelining {
                         Some(Arc::new(router::BackendQueue::new(
-                            servers[idx].pipeline_queue_depth,
+                            pipeline_queue_capacity(&servers[idx]),
                         )))
                     } else {
                         None
@@ -402,6 +402,13 @@ fn pipeline_worker_count(server: &Server) -> usize {
     } else {
         0
     }
+}
+
+#[inline]
+fn pipeline_queue_capacity(server: &Server) -> usize {
+    server
+        .pipeline_queue_depth
+        .saturating_mul(server.max_connections.get())
 }
 
 impl BuildContext {
@@ -641,5 +648,29 @@ mod tests {
             .build()
             .unwrap();
         assert_eq!(pipeline_worker_count(&disabled), 0);
+    }
+
+    #[test]
+    fn test_pipeline_queue_depth_is_per_backend_connection() {
+        let server = Server::builder("127.0.0.1", crate::types::Port::try_new(119).unwrap())
+            .name("enabled")
+            .max_connections(crate::types::MaxConnections::try_new(42).unwrap())
+            .pipeline_queue_depth(1000)
+            .build()
+            .unwrap();
+
+        assert_eq!(pipeline_queue_capacity(&server), 42_000);
+    }
+
+    #[test]
+    fn test_pipeline_queue_capacity_saturates_on_overflow() {
+        let server = Server::builder("127.0.0.1", crate::types::Port::try_new(119).unwrap())
+            .name("enabled")
+            .max_connections(crate::types::MaxConnections::try_new(42).unwrap())
+            .pipeline_queue_depth(usize::MAX)
+            .build()
+            .unwrap();
+
+        assert_eq!(pipeline_queue_capacity(&server), usize::MAX);
     }
 }

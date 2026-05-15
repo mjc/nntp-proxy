@@ -377,7 +377,7 @@ mod tests {
         let _client = client_handle.await.unwrap();
 
         let mut conn = ConnectionStream::plain(server_stream);
-        conn.stash_leftover(b"430 stale response\r\n").unwrap();
+        conn.stash_leftover(b"430 stale response\r\n");
 
         let result = check_tcp_alive(&mut conn);
         assert!(

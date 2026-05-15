@@ -276,11 +276,6 @@ async fn execute_pipeline_batch(
     // are more already-sent responses remaining in this borrow. If bytes remain
     // after the final expected response, returning the connection to the pool
     // would leak stale backend data into the next borrower.
-    debug_assert!(
-        conn.leftover_len() <= crate::constants::buffer::MAX_LEFTOVER_BYTES,
-        "Leftover buffer should never exceed MAX_LEFTOVER_BYTES after successful batch"
-    );
-
     if conn.has_leftover() {
         warn!(
             backend = ?backend_id,
@@ -1001,7 +996,7 @@ mod tests {
         // Backend will provide the rest of the response
         let mut conn = mock_backend_conn(b"0 No such article\r\n").await;
         // Leftover is only 2 bytes — too short to validate, triggers H5 additional read
-        conn.stash_leftover(b"43").unwrap();
+        conn.stash_leftover(b"43");
 
         let status = buffer_response_for_request(
             ARTICLE_REQUEST,
@@ -1934,52 +1929,23 @@ mod tests {
         }
     }
 
-    // NOTE: This test is skipped because TCP read sizes are unpredictable in tests.
-    // The bounds check in `buffer_response_for_request` prevents leftover from exceeding
-    // MAX_LEFTOVER_BYTES (128KB), but triggering this in a test is difficult because:
-    // 1. TCP reads are typically 8-16KB, not the full 724KB buffer size
-    // 2. We can't control how TCP splits data across reads
-    // 3. The check only triggers if a SINGLE read contains > 128KB of leftover data
-    //
-    // The check still provides defense-in-depth against protocol desync, even though
-    // it's hard to test. In practice, normal leftover is < 8KB, so 128KB is generous.
-    #[ignore = "flaky: TCP read sizes are unpredictable; leftover check requires single read > 128KB"]
     #[tokio::test]
-    async fn test_leftover_exceeds_max_size() {
-        use crate::constants::buffer::MAX_LEFTOVER_BYTES;
-
-        let pool = BufferPool::for_tests();
+    async fn test_packed_leftover_is_buffered_for_next_pipelined_response() {
+        let pool = BufferPool::new(
+            crate::types::BufferSize::try_new(3 * 1024 * 1024).expect("valid test buffer size"),
+            2,
+        );
         let mut buffer = pool.acquire();
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
-        // Create a multiline response that accumulates in result_buf across chunks,
-        // followed by oversized leftover. When the terminator is found, the remainder
-        // in the current chunk should exceed MAX_LEFTOVER_BYTES.
-        //
-        // NOTE: This test is flaky because TCP read sizes are unpredictable. Even if
-        // we send 138KB in one chunk, the read might only return 6-8KB at a time.
+        let mut response = Vec::new();
+        response.extend_from_slice(b"220 0 <first@example> article\r\nBody\r\n.\r\n");
+        let mut second_response = Vec::new();
+        second_response.extend_from_slice(b"220 0 <second@example> article\r\n");
+        second_response.extend_from_slice(&vec![b'x'; 2 * 1024 * 1024]);
+        response.extend_from_slice(&second_response);
 
-        let mut chunks = Vec::new();
-
-        // Part 1: Response header + body start (no terminator yet)
-        let mut part1 = Vec::new();
-        part1.extend_from_slice(b"220 0 <id> article\r\n");
-        part1.extend_from_slice(&vec![b'B'; 50000]); // 50KB of body
-        chunks.push(part1);
-
-        // Part 2: More body (no terminator yet)
-        let mut part2 = Vec::new();
-        part2.extend_from_slice(&vec![b'O'; 50000]); // Another 50KB
-        chunks.push(part2);
-
-        // Part 3: Terminator + oversized leftover
-        let mut part3 = Vec::new();
-        part3.extend_from_slice(&vec![b'D'; 10000]); // 10KB more body
-        part3.extend_from_slice(b"\r\n.\r\n"); // Terminator
-        part3.extend_from_slice(&vec![b'X'; MAX_LEFTOVER_BYTES + 1000]); // Oversized leftover
-        chunks.push(part3);
-
-        let mut conn = mock_backend_conn_chunked(chunks).await;
+        let mut conn = mock_backend_conn(&response).await;
 
         let result = buffer_response_for_request(
             ARTICLE_REQUEST,
@@ -1990,30 +1956,19 @@ mod tests {
         )
         .await;
 
-        // Should fail with bounds check error (if TCP delivers enough data in one read)
-        assert!(
-            result.is_err(),
-            "Should error when leftover exceeds max size"
-        );
-        let err = result.unwrap_err().to_string();
-        assert!(
-            err.contains("Leftover exceeds") || err.contains("protocol desync"),
-            "Error should mention leftover size limit: {err}"
-        );
+        assert!(result.is_ok(), "leftovers are valid in hot pipelines");
+        assert!(conn.has_leftover(), "second response should be buffered");
+        assert!(conn.leftover_len() <= second_response.len());
     }
 
     #[tokio::test]
-    async fn test_leftover_within_max_size() {
-        use crate::constants::buffer::MAX_LEFTOVER_BYTES;
-
+    async fn test_leftover_single_line_response_is_buffered() {
         let pool = BufferPool::for_tests();
         let mut buffer = pool.acquire();
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
-        // Create a response where leftover is within bounds (< MAX_LEFTOVER_BYTES)
         let mut normal_data = Vec::new();
         normal_data.extend_from_slice(b"220 0 <msg@id> article\r\nBody\r\n.\r\n");
-        // Add a reasonable amount of leftover data (well under the limit)
         normal_data.extend_from_slice(b"430 No such article\r\n");
 
         let mut conn = mock_backend_conn(&normal_data).await;
@@ -2027,19 +1982,15 @@ mod tests {
         )
         .await;
 
-        // Should succeed
         assert!(
             result.is_ok(),
-            "Should succeed when leftover is within max size"
+            "should succeed when the next response starts in the same read"
         );
         assert!(
             conn.has_leftover(),
             "Should have leftover from second response"
         );
-        assert!(
-            conn.leftover_len() < MAX_LEFTOVER_BYTES,
-            "Leftover should be under limit"
-        );
+        assert_eq!(conn.leftover_len(), b"430 No such article\r\n".len());
     }
 
     #[tokio::test]

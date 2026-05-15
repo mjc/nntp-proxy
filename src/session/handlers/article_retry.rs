@@ -21,7 +21,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
-use crate::protocol::RequestContext;
+use crate::protocol::{RequestContext, RequestKind};
 use crate::session::precheck;
 
 /// Client-side write state shared across cache, precheck, pipeline, and direct routing paths.
@@ -284,11 +284,34 @@ impl ClientSession {
                     completed.context.has_message_id(),
                 );
                 if let Some(payload) = completed.context.take_response_payload() {
+                    if matches!(completed.context.kind(), RequestKind::Body) {
+                        let body = payload.to_vec();
+                        debug!(
+                            client = %self.client_addr,
+                            backend = completed_backend_id.as_index(),
+                            command_verb = ?completed.context.verb(),
+                            status_code = response.status().as_u16(),
+                            response_len = body.len(),
+                            first_bytes_hex = %crate::session::backend::format_hex_preview(&body, 64),
+                            last_bytes_hex = %crate::session::backend::format_hex_tail_preview(&body, 64),
+                            "Dequeued buffered BODY response from pipeline worker for client delivery"
+                        );
+                    }
                     let mut client_write = io.client_writer.lock().await;
                     payload
                         .write_all_to(&mut *client_write)
                         .await
                         .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                    if matches!(completed.context.kind(), RequestKind::Body) {
+                        debug!(
+                            client = %self.client_addr,
+                            backend = completed_backend_id.as_index(),
+                            command_verb = ?completed.context.verb(),
+                            status_code = response.status().as_u16(),
+                            bytes_written = response.wire_len().get(),
+                            "Wrote buffered BODY response from pipeline worker to client"
+                        );
+                    }
 
                     if matches!(cache_action, CacheAction::CaptureArticle)
                         && let Some(msg_id) = completed.context.message_id_value()

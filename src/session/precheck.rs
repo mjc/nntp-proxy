@@ -196,29 +196,29 @@ async fn read_multiline_precheck_hit(
     let mut response = deps
         .cache_articles
         .then(crate::pool::ChunkedResponse::default);
-    if let Some(response) = &mut response {
-        response.extend_from_slice(&deps.buffer_pool, &buffer[..bytes_read]);
-    }
     let mut tail = TailBuffer::default();
-    match tail.detect_terminator(buffer.as_ref()) {
+    match tail.detect_terminator(&buffer[..bytes_read]) {
         TerminatorStatus::FoundAt(pos) => {
             // pos is after the terminator (terminator included in [..pos])
-            if pos < bytes_read && conn.stash_leftover(&buffer[pos..bytes_read]).is_err() {
-                return Err(());
+            if pos < bytes_read {
+                conn.stash_leftover(&buffer[pos..bytes_read]);
             }
             if let Some(response) = &mut response {
-                response.truncate(pos);
+                response.extend_from_slice(&deps.buffer_pool, &buffer[..pos]);
             }
         }
         TerminatorStatus::NotFound => {
-            tail.update(buffer.as_ref());
+            if let Some(response) = &mut response {
+                response.extend_from_slice(&deps.buffer_pool, &buffer[..bytes_read]);
+            }
+            tail.update(&buffer[..bytes_read]);
             loop {
                 match buffer.read_from(conn.as_mut()).await {
                     Ok(0) | Err(_) => return Err(()),
                     Ok(n) => match tail.detect_terminator(&buffer[..n]) {
                         TerminatorStatus::FoundAt(pos) => {
-                            if pos < n && conn.stash_leftover(&buffer[pos..n]).is_err() {
-                                return Err(());
+                            if pos < n {
+                                conn.stash_leftover(&buffer[pos..n]);
                             }
                             if let Some(response) = &mut response {
                                 response.extend_from_slice(&deps.buffer_pool, &buffer[..pos]);

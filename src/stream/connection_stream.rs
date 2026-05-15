@@ -3,12 +3,13 @@
 //! This module provides abstractions for handling different stream types (TCP, TLS, etc.)
 //! in a unified way. This is preparation for adding SSL/TLS support to backend connections.
 
-use bytes::BytesMut;
+use bytes::Bytes;
 
 use crate::compression::DecompressStream;
-use crate::constants::buffer::MAX_LEFTOVER_BYTES;
 use crate::tls::TlsStream;
+use std::collections::VecDeque;
 use std::io;
+use std::ops::Range;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -43,7 +44,23 @@ enum ConnectionTransport {
 #[derive(Debug)]
 pub struct ConnectionStream {
     transport: ConnectionTransport,
-    leftover: BytesMut,
+    leftover: VecDeque<LeftoverChunk>,
+}
+
+#[derive(Debug)]
+struct LeftoverChunk {
+    bytes: Bytes,
+    range: Range<usize>,
+}
+
+impl LeftoverChunk {
+    fn len(&self) -> usize {
+        self.range.len()
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes[self.range.clone()]
+    }
 }
 
 impl ConnectionStream {
@@ -74,7 +91,7 @@ impl ConnectionStream {
     fn new(transport: ConnectionTransport) -> Self {
         Self {
             transport,
-            leftover: BytesMut::new(),
+            leftover: VecDeque::new(),
         }
     }
 
@@ -198,19 +215,36 @@ impl ConnectionStream {
     }
 
     /// Stash bytes that were already read from the backend but belong to the next response.
-    ///
-    /// # Errors
-    /// Returns an error if stashing `bytes` would exceed the configured leftover
-    /// capacity, which indicates likely protocol desynchronization.
-    pub fn stash_leftover(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.leftover.len() + bytes.len() <= MAX_LEFTOVER_BYTES,
-            "Leftover exceeds {} bytes ({} bytes) — probable protocol desync",
-            MAX_LEFTOVER_BYTES,
-            self.leftover.len() + bytes.len()
-        );
-        self.leftover.extend_from_slice(bytes);
-        Ok(())
+    pub fn stash_leftover(&mut self, bytes: &[u8]) {
+        self.leftover.push_back(LeftoverChunk {
+            bytes: Bytes::copy_from_slice(bytes),
+            range: 0..bytes.len(),
+        });
+    }
+
+    /// Stash a range from shared bytes without copying.
+    pub fn stash_leftover_shared(&mut self, bytes: Bytes, range: Range<usize>) {
+        if range.is_empty() {
+            return;
+        }
+        debug_assert!(range.end <= bytes.len());
+        self.leftover.push_back(LeftoverChunk { bytes, range });
+    }
+
+    /// Requeue a shared leftover range ahead of any other read-ahead bytes.
+    pub fn push_front_leftover_shared(&mut self, bytes: Bytes, range: Range<usize>) {
+        if range.is_empty() {
+            return;
+        }
+        debug_assert!(range.end <= bytes.len());
+        self.leftover.push_front(LeftoverChunk { bytes, range });
+    }
+
+    /// Take the next read-ahead range without copying it through `AsyncRead`.
+    pub fn pop_leftover_shared(&mut self) -> Option<(Bytes, Range<usize>)> {
+        self.leftover
+            .pop_front()
+            .map(|chunk| (chunk.bytes, chunk.range))
     }
 
     #[must_use]
@@ -220,7 +254,7 @@ impl ConnectionStream {
 
     #[must_use]
     pub fn leftover_len(&self) -> usize {
-        self.leftover.len()
+        self.leftover.iter().map(LeftoverChunk::len).sum()
     }
 
     #[cfg(test)]
@@ -236,9 +270,19 @@ impl AsyncRead for ConnectionStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         if !self.leftover.is_empty() && buf.remaining() > 0 {
-            let n = self.leftover.len().min(buf.remaining());
-            let data = self.leftover.split_to(n);
-            buf.put_slice(&data);
+            let mut remaining = buf.remaining();
+            while remaining > 0 {
+                let Some(front) = self.leftover.front_mut() else {
+                    break;
+                };
+                let n = front.len().min(remaining);
+                buf.put_slice(&front.as_slice()[..n]);
+                front.range.start += n;
+                remaining -= n;
+                if front.range.is_empty() {
+                    self.leftover.pop_front();
+                }
+            }
             return Poll::Ready(Ok(()));
         }
 
@@ -436,7 +480,7 @@ mod tests {
         let _client = client_handle.await.unwrap();
 
         let mut conn = ConnectionStream::plain(server_stream);
-        conn.stash_leftover(b"left").unwrap();
+        conn.stash_leftover(b"left");
 
         let mut buf = [0u8; 4];
         conn.read_exact(&mut buf).await.unwrap();
@@ -448,7 +492,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stash_leftover_rejects_oversize() {
+    async fn test_stash_leftover_accepts_large_buffers() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -457,8 +501,49 @@ mod tests {
         let _client = client_handle.await.unwrap();
 
         let mut conn = ConnectionStream::plain(server_stream);
-        let oversized = vec![b'x'; MAX_LEFTOVER_BYTES + 1];
-        assert!(conn.stash_leftover(&oversized).is_err());
+        let large = vec![b'x'; 2 * 1024 * 1024];
+        conn.stash_leftover(&large);
+        assert_eq!(conn.leftover_len(), large.len());
+    }
+
+    #[tokio::test]
+    async fn test_stash_leftover_shared_reads_selected_range() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
+
+        let mut conn = ConnectionStream::plain(server_stream);
+        let bytes = Bytes::from_static(b"xxleftover-right");
+        conn.stash_leftover_shared(bytes, 2..10);
+        assert_eq!(conn.leftover_len(), b"leftover".len());
+
+        let mut buf = [0u8; 8];
+        conn.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"leftover");
+        assert!(!conn.has_leftover());
+    }
+
+    #[tokio::test]
+    async fn test_pop_leftover_shared_preserves_range_without_copying() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
+
+        let mut conn = ConnectionStream::plain(server_stream);
+        let bytes = Bytes::from_static(b"xxleftover-right");
+        let expected_ptr = bytes[2..10].as_ptr();
+        conn.stash_leftover_shared(bytes, 2..10);
+
+        let (popped, range) = conn.pop_leftover_shared().unwrap();
+        assert_eq!(&popped[range.clone()], b"leftover");
+        assert_eq!(popped[range].as_ptr(), expected_ptr);
+        assert!(!conn.has_leftover());
     }
 
     #[tokio::test]
@@ -476,7 +561,7 @@ mod tests {
         let _client = client_handle.await.unwrap();
 
         let mut conn = ConnectionStream::plain(server_stream);
-        conn.stash_leftover(b"left").unwrap();
+        conn.stash_leftover(b"left");
 
         let mut conn = conn.into_compressed(1).unwrap();
         assert!(conn.is_compressed());

@@ -395,9 +395,9 @@ impl UnifiedCache {
                 cache.get_by_cache_key(key).await
             }
             Self::Hybrid(cache) => {
-                let message_id = MessageId::from_borrowed(message_id).ok()?;
+                let key = message_id.strip_prefix('<')?.strip_suffix('>')?;
                 cache
-                    .get(&message_id)
+                    .get_by_cache_key(key)
                     .await
                     .map(|entry| entry.to_cached_article())
             }

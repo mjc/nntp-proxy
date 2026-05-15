@@ -231,7 +231,7 @@ impl NntpClient {
                 // pos is after the terminator (terminator included in [..pos])
                 capture.extend_from_slice(&first_chunk[..pos]);
                 if pos < first_chunk.len() {
-                    conn.stash_leftover(&first_chunk[pos..])?;
+                    conn.stash_leftover(&first_chunk[pos..]);
                 }
                 return Ok(());
             }
@@ -259,7 +259,7 @@ impl NntpClient {
                     // pos is after the terminator (terminator included in [..pos])
                     capture.extend_from_slice(&io_buffer[..pos]);
                     if pos < n {
-                        conn.stash_leftover(&io_buffer[pos..n])?;
+                        conn.stash_leftover(&io_buffer[pos..n]);
                     }
                     return Ok(());
                 }
