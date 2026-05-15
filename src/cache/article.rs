@@ -80,7 +80,7 @@ impl PartialOrd<usize> for CachedPayloadLen {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CachedPayload {
     Missing,
     AvailabilityOnly,
@@ -100,6 +100,41 @@ pub(crate) enum CachedPayload {
     Stat {
         article_number: Option<CachedArticleNumber>,
     },
+}
+
+impl Clone for CachedPayload {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Missing => Self::Missing,
+            Self::AvailabilityOnly => Self::AvailabilityOnly,
+            Self::Article {
+                article_number,
+                headers,
+                body,
+            } => Self::Article {
+                article_number: *article_number,
+                headers: Arc::clone(headers),
+                body: Arc::clone(body),
+            },
+            Self::Head {
+                article_number,
+                headers,
+            } => Self::Head {
+                article_number: *article_number,
+                headers: Arc::clone(headers),
+            },
+            Self::Body {
+                article_number,
+                body,
+            } => Self::Body {
+                article_number: *article_number,
+                body: Arc::clone(body),
+            },
+            Self::Stat { article_number } => Self::Stat {
+                article_number: *article_number,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

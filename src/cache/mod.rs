@@ -379,7 +379,7 @@ impl UnifiedCache {
             Self::Hybrid(cache) => cache
                 .get(message_id)
                 .await
-                .map(|entry| entry.to_cached_article()),
+                .map(hybrid_codec::DiskCachedArticle::into_cached_article),
         }
     }
 
@@ -399,7 +399,7 @@ impl UnifiedCache {
                 cache
                     .get_by_cache_key(key)
                     .await
-                    .map(|entry| entry.to_cached_article())
+                    .map(hybrid_codec::DiskCachedArticle::into_cached_article)
             }
         }
     }
