@@ -236,7 +236,12 @@ impl ClientSession {
 
         let guard = CommandGuard::new(router.clone(), backend_id);
         let (tx, rx) = oneshot::channel();
-        let queued_context = QueuedContext::new(request.clone(), self.client_addr, tx);
+        let queued_context = QueuedContext::new(
+            request.clone(),
+            self.client_addr,
+            tx,
+            crate::pipeline_timing::now_if_enabled(),
+        );
 
         match queue.try_enqueue(queued_context) {
             Ok(()) => {
@@ -262,7 +267,13 @@ impl ClientSession {
         let PendingPipelineRequest { guard, rx } = pending;
         let backend_id = guard.backend_id();
 
-        match rx.await {
+        let await_start = crate::pipeline_timing::now_if_enabled();
+        let received = rx.await;
+        if let Some(await_start) = await_start {
+            crate::pipeline_timing::record_client_await(await_start.elapsed());
+        }
+
+        match received {
             Ok(Ok(mut completed))
                 if completed
                     .context
@@ -297,11 +308,15 @@ impl ClientSession {
                             "Dequeued buffered BODY response from pipeline worker for client delivery"
                         );
                     }
+                    let write_start = crate::pipeline_timing::now_if_enabled();
                     let mut client_write = io.client_writer.lock().await;
                     payload
                         .write_all_to(&mut *client_write)
                         .await
                         .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                    if let Some(write_start) = write_start {
+                        crate::pipeline_timing::record_client_write(write_start.elapsed());
+                    }
                     if matches!(completed.context.kind(), RequestKind::Body) {
                         debug!(
                             client = %self.client_addr,

@@ -14,6 +14,7 @@ TLS, cache behavior, and live metrics in one place.
 - Availability-only cache mode by default, so smart routing works without storing article bodies.
 - RAM article-cache hits measured 5.16 GB/s on a Ryzen 9 5950X.
 - A hot-cache path with a 256 MB in-memory article cache and disk cache on SSD measured 2.58 GB/s on the same system.
+- A 10x end-to-end `nntpbench` matrix with the proxy in the middle averaged 6088.21 MiB/s across 112 points and 1,120 runs, with the best point at 9524.11 MiB/s. That is about 1.29x the `v0.4.0` matrix mean.
 - Allocation-conscious hot paths: borrowed request slices, preallocated buffer pools, and allocation-free cache key lookup in the steady state.
 - Optional terminal dashboard with persisted metrics across restarts.
 - TOML config, environment-based backend configuration, and CLI overrides.
@@ -219,6 +220,8 @@ Common server fields:
 | `tls_cert_path` | no | - | Additional PEM CA certificate. |
 | `connection_keepalive` | no | - | Send `DATE` on idle backend connections every N seconds. |
 | `backend_pipelining` | no | true | Enable backend request pipelining. |
+| `pipeline_queue_depth` | no | 1000 | Maximum queued pipelined requests per backend connection. |
+| `pipeline_batch_size` | no | 4 | Maximum commands sent in one backend pipeline batch. |
 
 The proxy currently supports up to 8 backend servers because article availability uses a compact bitset.
 
@@ -301,6 +304,7 @@ The current hot paths are designed to avoid avoidable heap work:
 
 - RAM article-cache hits measured 5.16 GB/s on a Ryzen 9 5950X.
 - With a 256 MB in-memory article cache and disk cache on SSD, the hot-cache path measured 2.58 GB/s on the same system.
+- The current end-to-end `nntpbench` matrix with the proxy in the middle averaged 6088.21 MiB/s across 112 points and 1,120 runs; the best point was 9524.11 MiB/s at 4 proxy threads, 4 backend connections, and 8 clients. That is about 1.29x the `v0.4.0` matrix mean.
 - Backend request forwarding uses parsed request slices instead of rebuilding command strings.
 - The main I/O and capture buffers are preallocated and prefaulted at startup.
 - Buffer acquisition is allocation-free while the configured pools have capacity; exhaustion intentionally falls back to allocating and logs that fact.

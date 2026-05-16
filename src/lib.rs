@@ -52,6 +52,7 @@ pub mod cache;
 pub mod command;
 pub mod config;
 pub mod constants;
+pub(crate) mod pipeline_timing;
 pub mod pool;
 pub mod router;
 pub mod runtime;

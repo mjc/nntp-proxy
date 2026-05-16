@@ -473,13 +473,22 @@ impl BuildContext {
                     let metrics = self.metrics.clone();
                     let buffer_pool = self.buffer_pool.clone();
 
-                    tokio::spawn(backend_pipeline_worker(
+                    let worker_task = backend_pipeline_worker(
                         config.clone(),
                         queue,
                         provider,
                         metrics,
                         buffer_pool,
-                    ));
+                    );
+
+                    #[cfg(tokio_unstable)]
+                    tokio::task::Builder::new()
+                        .name("backend-pipeline-worker")
+                        .spawn(worker_task)
+                        .expect("spawn backend pipeline worker");
+
+                    #[cfg(not(tokio_unstable))]
+                    tokio::spawn(worker_task);
                 }
 
                 debug!(

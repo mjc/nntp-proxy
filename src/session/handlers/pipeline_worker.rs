@@ -201,6 +201,8 @@ async fn execute_pipeline_batch(
     batch.reverse();
     let mut response_index = 0usize;
     while let Some(mut req) = batch.pop() {
+        req.record_queue_wait();
+        let read_start = crate::pipeline_timing::now_if_enabled();
         let read_result = crate::session::response_buffer::read_response_into_context(
             &mut req.context,
             &mut buffer,
@@ -219,6 +221,12 @@ async fn execute_pipeline_batch(
 
         match read_result {
             Ok(read_result) => {
+                if let Some(read_start) = read_start {
+                    crate::pipeline_timing::record_backend_read(
+                        read_start.elapsed(),
+                        read_result.data_len,
+                    );
+                }
                 metrics.record_command(backend_id);
                 metrics.record_backend_to_client_bytes_for(backend_id, read_result.data_len);
                 metrics.record_client_to_backend_bytes_for(
@@ -383,7 +391,7 @@ mod tests {
     ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (
-            QueuedContext::new(request_context(command.as_bytes()), client_addr(), tx),
+            QueuedContext::new(request_context(command.as_bytes()), client_addr(), tx, None),
             rx,
         )
     }
@@ -597,6 +605,7 @@ mod tests {
             request_context(ARTICLE_REQUEST),
             client_addr(),
             tx,
+            None,
         )];
         let mut result_buf = crate::pool::ChunkedResponse::default();
 
@@ -647,6 +656,7 @@ mod tests {
             request_context(ARTICLE_REQUEST),
             client_addr(),
             tx,
+            None,
         )];
         let mut result_buf = crate::pool::ChunkedResponse::default();
 

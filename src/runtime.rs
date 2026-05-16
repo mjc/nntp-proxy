@@ -487,7 +487,7 @@ pub async fn run_accept_loop(
                 let (stream, addr) = accept_result?;
                 let proxy = proxy.clone();
 
-                tokio::spawn(async move {
+                let client_task = async move {
                     let result = if uses_per_command {
                         proxy.handle_client_per_command_routing(stream, addr.into()).await
                     } else {
@@ -501,7 +501,15 @@ pub async fn run_accept_loop(
                             error!("Error handling client {}: {:?}", addr, e);
                         }
                     }
-                });
+                };
+
+                #[cfg(tokio_unstable)]
+                tokio::task::Builder::new()
+                    .name("client-session")
+                    .spawn(client_task)?;
+
+                #[cfg(not(tokio_unstable))]
+                tokio::spawn(client_task);
             }
         }
     }

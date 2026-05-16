@@ -1599,6 +1599,7 @@ mod tests {
                     "127.0.0.1:8119".parse().expect("valid client addr"),
                 ),
                 tx,
+                None,
             ))
             .expect("queue request");
         queue.mark_pipeline_sent(3);

@@ -11,6 +11,7 @@
 
 use crossbeam::queue::SegQueue;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant as StdInstant;
 use tokio::sync::{Notify, oneshot};
 use tokio::time::{Duration, Instant, timeout_at};
 
@@ -77,6 +78,7 @@ pub struct QueuedContext {
     _client_addr: crate::types::ClientAddress,
     /// Return path to the client session that queued this request.
     client_return: oneshot::Sender<PipelineResponse>,
+    enqueued_at: Option<StdInstant>,
 }
 
 impl QueuedContext {
@@ -86,11 +88,19 @@ impl QueuedContext {
         context: RequestContext,
         client_addr: crate::types::ClientAddress,
         client_return: oneshot::Sender<PipelineResponse>,
+        enqueued_at: Option<StdInstant>,
     ) -> Self {
         Self {
             context,
             _client_addr: client_addr,
             client_return,
+            enqueued_at,
+        }
+    }
+
+    pub(crate) fn record_queue_wait(&self) {
+        if let Some(enqueued_at) = self.enqueued_at {
+            crate::pipeline_timing::record_queue_wait(enqueued_at.elapsed());
         }
     }
 
@@ -313,6 +323,7 @@ mod tests {
                 request_context(b"ARTICLE <test@example.com>\r\n"),
                 client_addr(),
                 tx,
+                None,
             ))
             .unwrap();
         assert_eq!(queue_depth(&queue), 1);
@@ -329,6 +340,7 @@ mod tests {
                     request_context(request.as_bytes()),
                     client_addr(),
                     tx,
+                    None,
                 ))
                 .unwrap();
         }
@@ -337,6 +349,7 @@ mod tests {
             request_context(b"ARTICLE <overflow@example.com>\r\n"),
             client_addr(),
             tx,
+            None,
         ));
         assert!(result.is_err());
         assert!(matches!(
@@ -374,6 +387,7 @@ mod tests {
                     request_context(request.as_bytes()),
                     client_addr(),
                     tx,
+                    None,
                 ))
                 .unwrap();
         }
@@ -403,6 +417,7 @@ mod tests {
                     request_context(request.as_bytes()),
                     client_addr(),
                     tx,
+                    None,
                 ))
                 .unwrap();
         }
@@ -422,6 +437,7 @@ mod tests {
                 request_context(b"STAT <single@example.com>\r\n"),
                 client_addr(),
                 tx,
+                None,
             ))
             .unwrap();
 
@@ -453,6 +469,7 @@ mod tests {
                 request_context(b"HELLO\r\n"),
                 client_addr(),
                 tx,
+                None,
             ))
             .unwrap();
 
@@ -506,7 +523,7 @@ mod tests {
             crate::protocol::StatusCode::new(223),
             crate::pool::ChunkedResponse::default(),
         );
-        let queued = QueuedContext::new(context, client_addr(), tx);
+        let queued = QueuedContext::new(context, client_addr(), tx, None);
 
         queued.complete_context();
 
@@ -534,6 +551,7 @@ mod tests {
             request_context(b"STAT <test@example.com>\r\n"),
             client_addr(),
             tx,
+            None,
         );
 
         queued.complete_error(PipelineError::ReadFailed);
