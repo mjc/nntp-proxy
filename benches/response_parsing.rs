@@ -28,7 +28,7 @@ mod status_code_parsing {
 
 mod terminator_finding {
     use super::{Bencher, black_box};
-    use nntp_proxy::session::tail_buffer::TailBuffer;
+    use nntp_proxy::session::multiline_framing::find_terminator_end;
 
     /// Naive baseline: linear scan for terminator
     #[inline]
@@ -47,19 +47,10 @@ mod terminator_finding {
         None
     }
 
-    /// Production: `TailBuffer` with SIMD-accelerated detection
-    ///
-    /// Note: `TailBuffer` is stateful (tracks cross-boundary terminators),
-    /// but for these complete-response benchmarks, we use empty state.
+    /// Production: stateless terminator detection for complete buffers.
     #[inline]
     fn find_terminator_production(data: &[u8]) -> Option<usize> {
-        use nntp_proxy::session::tail_buffer::TerminatorStatus;
-
-        let tail = TailBuffer::default(); // Empty state - no previous chunks
-        match tail.detect_terminator(data) {
-            TerminatorStatus::FoundAt(pos) => Some(pos),
-            TerminatorStatus::NotFound => None,
-        }
+        find_terminator_end(data)
     }
 
     const SMALL_RESPONSE: &[u8] =

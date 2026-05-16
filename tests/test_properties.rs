@@ -6,7 +6,7 @@ use nntp_proxy::cache::ArticleAvailability;
 use nntp_proxy::cache::ttl::{CacheTier, CacheTtlMillis, effective_ttl};
 use nntp_proxy::protocol::{Headers, RequestContext, RequestRouteClass, StatusCode};
 use nntp_proxy::router::BackendCount;
-use nntp_proxy::session::tail_buffer::TailBuffer;
+use nntp_proxy::session::multiline_framing::find_terminator_end;
 use nntp_proxy::types::{BackendId, MessageId};
 use proptest::prelude::*;
 use std::fmt::Write as _;
@@ -697,9 +697,8 @@ proptest! {
         );
 
         // Terminator detection should find the real terminator, not a false positive
-        let tail = TailBuffer::default();
-        let status = tail.detect_terminator(data);
-        prop_assert!(status.is_found(),
+        let status = find_terminator_end(data);
+        prop_assert!(status.is_some(),
             "Terminator should be found in complete multiline response with code {code}");
     }
 
@@ -707,28 +706,15 @@ proptest! {
     fn prop_terminator_detection_matches_reference(
         data in prop::collection::vec(any::<u8>(), 0..500)
     ) {
-        // TailBuffer::detect_terminator result should match naive memmem::find
-        let tail = TailBuffer::default();
-        let status = tail.detect_terminator(&data);
-
-        let reference_pos = memchr::memmem::find(&data, b"\r\n.\r\n");
-
-        match (status.is_found(), reference_pos) {
-            // Both found or neither found — results agree
-            (true, Some(_)) | (false, None) => {}
-            (true, None) => {
-                // TailBuffer says found but reference didn't — this shouldn't happen
-                // unless the data is very short (< 5 bytes where TailBuffer tracks cross-boundary)
-                // For a single-chunk call, they should always agree
-                prop_assert!(false, "TailBuffer found terminator but reference didn't in {} bytes", data.len());
-            }
-            (false, Some(pos)) => {
-                // Reference found but TailBuffer didn't — shouldn't happen for single-chunk
-                prop_assert!(false,
-                    "Reference found terminator at {} but TailBuffer didn't in {} bytes",
-                    pos, data.len());
-            }
-        }
+        // Single-chunk framing should match a direct terminator scan.
+        let status = find_terminator_end(&data);
+        let reference_pos = memchr::memmem::find(&data, b"\r\n.\r\n").map(|start| start + 5);
+        prop_assert_eq!(
+            status,
+            reference_pos,
+            "Framing helper disagreed with reference in {} bytes",
+            data.len()
+        );
     }
 
     #[test]

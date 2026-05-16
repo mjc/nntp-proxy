@@ -354,12 +354,6 @@ impl UnifiedCache {
         Self::Availability(AvailabilityIndex::with_ttl(ttl))
     }
 
-    /// Create a disabled availability index that retains no entries.
-    #[must_use]
-    pub(crate) fn availability_disabled(ttl: std::time::Duration) -> Self {
-        Self::Availability(AvailabilityIndex::disabled(ttl))
-    }
-
     /// Create a memory-only cache
     #[must_use]
     pub fn memory(capacity: u64, ttl: std::time::Duration) -> Self {
@@ -385,8 +379,8 @@ impl UnifiedCache {
 
     /// Get an article from a validated request message-id string (`<...>`).
     ///
-    /// Memory cache hits avoid rebuilding a `MessageId`; hybrid cache still uses
-    /// the typed wrapper because its disk key path owns `String`s internally.
+    /// Memory and hybrid cache hits avoid rebuilding a `MessageId` by looking up
+    /// the stripped cache key directly.
     pub async fn get_request_message_id(&self, message_id: &str) -> Option<CachedArticle> {
         match self {
             Self::Availability(index) => index.get_request_message_id(message_id),

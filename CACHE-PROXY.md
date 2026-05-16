@@ -7,7 +7,7 @@ Caching is built into the main `nntp-proxy` binary. There is no separate `nntp-c
 ### Availability-only mode (default)
 
 - `store_article_bodies = false`
-- Tracks which backends have or do not have a message-ID
+- Tracks backend availability in the availability index
 - Persists routing knowledge with `availability_index_path` if you want it to survive restarts
 - Does **not** store article payloads
 
@@ -90,7 +90,7 @@ Recommended settings:
 
 - `nntp-proxy` can show cache metrics live when launched with the dashboard enabled
 - The proxy also logs periodic cache statistics
-- `stats.json` persists metrics; `availability.idx` persists availability-only knowledge when enabled
+- `stats.json` persists metrics; `availability.idx` persists the availability index when enabled
 
 ## Choosing a Mode
 

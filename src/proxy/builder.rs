@@ -235,24 +235,28 @@ impl NntpProxyBuilder {
 
     /// Log cache configuration details
     fn log_cache_config(cache_config: &crate::config::Cache, store_article_bodies: bool) {
-        let capacity = cache_config.article_cache_capacity.as_u64();
         if store_article_bodies {
             info!(
                 "Article cache enabled: max_capacity={}, ttl={}s (full caching)",
                 cache_config.article_cache_capacity,
                 cache_config.article_cache_ttl_secs.as_secs()
             );
-        } else if capacity < crate::cache::AvailabilityIndex::fixed_capacity_bytes() {
-            info!(
-                "Availability-only cache disabled: configured budget {} is smaller than fixed index size {} bytes",
-                cache_config.article_cache_capacity,
-                crate::cache::AvailabilityIndex::fixed_capacity_bytes()
-            );
         } else {
             info!(
                 "Backend availability tracking enabled: max_capacity={}, ttl={}s (fixed-size availability index, bodies not cached)",
                 cache_config.article_cache_capacity,
                 cache_config.article_cache_ttl_secs.as_secs()
+            );
+        }
+    }
+
+    fn warn_if_disk_cache_inactive(
+        cache_config: &crate::config::Cache,
+        store_article_bodies: bool,
+    ) {
+        if cache_config.disk.is_some() && !store_article_bodies {
+            warn!(
+                "Disk cache configured but store_article_bodies=false - disk cache is inactive in availability-only mode."
             );
         }
     }
@@ -274,14 +278,12 @@ impl NntpProxyBuilder {
             let capacity = cache_config.article_cache_capacity.as_u64();
             let store_article_bodies = cache_config.store_article_bodies;
 
+            Self::warn_if_disk_cache_inactive(cache_config, store_article_bodies);
+
             let cache = if !store_article_bodies {
-                Arc::new(
-                    if capacity < crate::cache::AvailabilityIndex::fixed_capacity_bytes() {
-                        UnifiedCache::availability_disabled(cache_config.article_cache_ttl_secs)
-                    } else {
-                        UnifiedCache::availability(cache_config.article_cache_ttl_secs)
-                    },
-                )
+                Arc::new(UnifiedCache::availability(
+                    cache_config.article_cache_ttl_secs,
+                ))
             } else if let Some(disk_config) = &cache_config.disk {
                 let hybrid_config = HybridCacheConfig {
                     memory_capacity: capacity,
@@ -340,6 +342,8 @@ impl NntpProxyBuilder {
         let (cache, store_article_bodies) = if let Some(cache_config) = &cache_config {
             let store_article_bodies = cache_config.store_article_bodies;
 
+            Self::warn_if_disk_cache_inactive(cache_config, store_article_bodies);
+
             if cache_config.disk.is_some() && store_article_bodies {
                 warn!(
                     "Disk cache configured but build_sync() called - using memory-only cache. Use build() for disk cache support."
@@ -353,14 +357,9 @@ impl NntpProxyBuilder {
                     cache_config.article_cache_ttl_secs,
                 ))
             } else {
-                let capacity = cache_config.article_cache_capacity.as_u64();
-                Arc::new(
-                    if capacity < crate::cache::AvailabilityIndex::fixed_capacity_bytes() {
-                        UnifiedCache::availability_disabled(cache_config.article_cache_ttl_secs)
-                    } else {
-                        UnifiedCache::availability(cache_config.article_cache_ttl_secs)
-                    },
-                )
+                Arc::new(UnifiedCache::availability(
+                    cache_config.article_cache_ttl_secs,
+                ))
             };
 
             Self::log_cache_config(cache_config, store_article_bodies);
@@ -574,26 +573,38 @@ mod tests {
     }
 
     #[test]
-    fn test_build_sync_disables_availability_index_when_budget_is_too_small() {
+    fn test_build_sync_keeps_availability_index_enabled_when_budget_is_too_small() {
         let proxy = NntpProxyBuilder::new(availability_only_config(1))
             .build_sync()
             .expect("Failed to build proxy");
 
         assert!(!proxy.store_article_bodies);
-        assert_eq!(proxy.cache.capacity(), 0);
-        assert_eq!(proxy.cache.weighted_size(), 0);
+        assert_eq!(
+            proxy.cache.capacity(),
+            AvailabilityIndex::fixed_capacity_bytes()
+        );
+        assert_eq!(
+            proxy.cache.weighted_size(),
+            AvailabilityIndex::fixed_capacity_bytes()
+        );
     }
 
     #[tokio::test]
-    async fn test_build_disables_availability_index_when_budget_is_too_small() {
+    async fn test_build_keeps_availability_index_enabled_when_budget_is_too_small() {
         let proxy = NntpProxyBuilder::new(availability_only_config(1))
             .build()
             .await
             .expect("Failed to build proxy");
 
         assert!(!proxy.store_article_bodies);
-        assert_eq!(proxy.cache.capacity(), 0);
-        assert_eq!(proxy.cache.weighted_size(), 0);
+        assert_eq!(
+            proxy.cache.capacity(),
+            AvailabilityIndex::fixed_capacity_bytes()
+        );
+        assert_eq!(
+            proxy.cache.weighted_size(),
+            AvailabilityIndex::fixed_capacity_bytes()
+        );
     }
 
     #[tokio::test]

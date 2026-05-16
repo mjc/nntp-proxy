@@ -314,21 +314,21 @@ fn find_blank_line(buf: &[u8], start: usize) -> Result<usize, ParseError> {
 
 /// Find multiline terminator (.\r\n)
 fn find_terminator(buf: &[u8], start: usize) -> Result<usize, ParseError> {
-    use crate::session::tail_buffer::{TailBuffer, TerminatorStatus};
+    use crate::session::multiline_framing::find_terminator_end;
 
     // Empty body: terminator immediately follows blank line separator
     if buf.get(start..).is_some_and(|s| s.starts_with(b".\r\n")) {
         return Ok(start);
     }
 
-    // Use TailBuffer (SIMD-accelerated via memchr) to find \r\n.\r\n
-    match TailBuffer::default().detect_terminator(&buf[start..]) {
-        TerminatorStatus::FoundAt(rel_pos) => {
+    // Use the stateless framing helper to find \r\n.\r\n within the buffer.
+    match find_terminator_end(&buf[start..]) {
+        Some(rel_pos) => {
             // rel_pos is the end of the 5-byte terminator within buf[start..]
             // Return position of '.' = 3 bytes before end of terminator
             Ok(start + rel_pos - 3)
         }
-        TerminatorStatus::NotFound => Err(ParseError::MissingTerminator),
+        None => Err(ParseError::MissingTerminator),
     }
 }
 

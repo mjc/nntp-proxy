@@ -29,7 +29,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added `RequestContext`-based request handling so validated request metadata can flow through routing, batching, cache lookup, and metrics without rebuilding ad-hoc command buffers.
   - Added a compact persisted availability-only index so exact 430 knowledge can be retained without storing article bodies.
 
+- **NixOS flake module and package derivation**
+  - Added `nixosModules.default` / `nixosModules.nntp-proxy` for declarative `services.nntp-proxy` deployments.
+  - The module can render config from `services.nntp-proxy.settings`, use an existing `configFile`, open the listener firewall port, manage writable stats/cache paths, and pass a runtime `credentialsFile` overlay for secrets.
+  - Added a shared Nix package derivation and TUI attach wrapper so flake packages and the NixOS module use the same packaged runtime.
+
 ### Changed
+
+- **Breaking: article-body caching now defaults off**
+  - `[cache].store_article_bodies` now defaults to `false`; backend availability is still tracked in the availability index.
+  - Existing deployments with a `[cache]` section that omitted `store_article_bodies` will switch from full article-body caching to availability-only tracking after upgrade.
+  - Operators who rely on memory or disk article-body cache hits should set `store_article_bodies = true` explicitly. `[cache.disk]` only stores article bodies when body caching is enabled.
 
 - **Substantial architecture refactor since 0.4.0**
   - Reworked the proxy around typed request/context plumbing, explicit cache metadata, backend pipeline queues, persisted metrics and availability state, config migration helpers, and corrected pooled-connection read-ahead handling.
@@ -81,7 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **End-to-end proxy-in-the-middle matrix baseline**
   - Ran a 10x `nntpbench` client -> `nntp-proxy` -> `nntpbench` server matrix across 112 points and 1,120 total runs.
-  - The overall mean was 6088.21 MiB/s, with the best point at 9524.11 MiB/s for 4 proxy threads, 4 backend connections, and 8 clients. That is about 1.29x the `v0.4.0` matrix mean.
+  - The overall mean was 6045.19 MiB/s, with the best point at 10579.84 MiB/s for 4 proxy threads, 8 backend connections, and 8 clients. That is about 1.28x the `v0.4.0` matrix mean.
 
 - **Major large-article throughput and CPU-efficiency improvement since 0.4.0**
   - The proxy hot path was rebuilt around byte-oriented typed requests, request-scoped response metadata, pooled buffers, and cache responses that can be written without flattening payloads into temporary `Vec`s.
@@ -102,7 +112,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added backend pipeline workers and FIFO completion queues so sequential `ARTICLE`/`BODY`/`HEAD`/`STAT` requests can be batched while preserving client response order.
   - Coalesced typed request writes, reused response buffers, pooled capture/scratch buffers, reduced repeated message-ID wrapping, and skipped unnecessary timing reads on untimed backend paths.
   - Cache-hit profiling drove vectored response writes: the 64 KiB native cache-hit sample improved from about 34.1 us / 1.92 GiB/s to about 28.3 us / 2.32 GiB/s after coalescing cached response writes, before later cache-hit refinements.
-  - Reworked terminator scanning around `TailBuffer`, `memmem`, and dot-first scans so multiline response validation is both safer and cheaper.
+  - Reworked terminator scanning around the multiline framing path, `memmem`, and dot-first scans so multiline response validation is both safer and cheaper.
 
 - **Disk-cache and availability-index performance**
   - Tuned foyer disk-cache behavior with higher parallelism, better block sizing, direct cache-entry construction on precheck paths, configurable compression codecs, and cold invalidation of old disk formats.
@@ -110,7 +120,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added adaptive availability sharding and guarded sync paths so availability persistence work is skipped when there is nothing meaningful to write.
 
 - **Benchmark coverage and measurement cleanup** ([#60](https://github.com/mjc/nntp-proxy/pull/60), [#61](https://github.com/mjc/nntp-proxy/pull/61))
-  - Added or refreshed benchmark suites for request parsing/serialization, cache ingest, cache lookup, cache response generation, router selection, end-to-end proxy behavior, streaming round-trips, and tail-buffer boundary handling.
+  - Added or refreshed benchmark suites for request parsing/serialization, cache ingest, cache lookup, cache response generation, router selection, end-to-end proxy behavior, streaming round-trips, and multiline-framing boundary handling.
   - Added realistic article-size cases, drained end-to-end response reads, cache-miss metadata-only cases, and in-memory streaming round-trip benchmarks.
   - Corrected the cache-miss callgrind harness so instruction-count comparisons reflect normal benchmark setup.
 

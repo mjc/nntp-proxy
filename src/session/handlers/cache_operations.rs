@@ -14,7 +14,7 @@ use crate::session::{ClientSession, precheck};
 use crate::types::{BackendId, BackendToClientBytes, MessageId};
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::io::AsyncWrite;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
 /// Result of a cache lookup attempt in `try_serve_from_cache`.
@@ -255,6 +255,7 @@ where
     };
     let wire_len = response.wire_len();
     response.write_to(client_write).await?;
+    client_write.flush().await?;
     Ok(Some(CachedResponseWrite {
         status: response.status(),
         wire_len,
@@ -289,6 +290,7 @@ mod tests {
             1024,
             Duration::from_secs(60),
         )))
+        .with_cache_articles(true)
         .build()
     }
 

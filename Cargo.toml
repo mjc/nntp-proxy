@@ -136,7 +136,7 @@ name = "cache_ingest"
 harness = false
 
 [[bench]]
-name = "tail_buffer_boundaries"
+name = "multiline_framing_boundaries"
 harness = false
 
 [[bench]]

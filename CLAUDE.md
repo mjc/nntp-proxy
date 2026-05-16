@@ -50,7 +50,7 @@
 
 ### 1. Terminator Detection
 
-**`TailBuffer` is the ONE AND ONLY place terminator detection can exist in this codebase. There must never be any other implementation anywhere.**
+**`MultilineFramer` is the ONE AND ONLY place streaming terminator detection can exist in this codebase. There must never be any other implementation anywhere.**
 
 An NNTP multiline response ends with `\r\n.\r\n` (5 bytes). Detecting this correctly across async chunk reads is subtle and easy to get wrong. Getting it wrong causes **connection pool collapse**.
 
@@ -64,7 +64,7 @@ if data.ends_with(b".\r\n") { ... }
 // ❌ Any helper wrapping ends_with
 fn has_terminator(data: &[u8]) -> bool { data.ends_with(b"\r\n.\r\n") }
 
-// ❌ Constant replicated outside tail_buffer.rs
+// ❌ Constant replicated outside multiline_framing.rs
 const MULTILINE_TERMINATOR: &[u8] = b"\r\n.\r\n";
 
 // ❌ Accumulate-then-check loop (the worst pattern)
@@ -78,24 +78,23 @@ loop {
 #### Correct: Streaming (most common case)
 
 ```rust
-use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
+use crate::session::multiline_framing::MultilineFramer;
 
-let mut tail = TailBuffer::default();
+let mut framer = MultilineFramer::default();
 loop {
     let n = stream.read(buffer.as_mut_slice()).await?;
     if n == 0 { break; }
     let chunk = &buffer[..n];
 
-    match tail.detect_terminator(chunk) {
-        TerminatorStatus::FoundAt(pos) => {
+    match framer.advance_to_next_terminator_end(chunk) {
+        Some(pos) => {
             // CRITICAL: pos is the byte offset immediately AFTER "\r\n.\r\n"
             // chunk[..pos] includes the terminator and no bytes from the next response
             client.write_all(&chunk[..pos]).await?;
             break;
         }
-        TerminatorStatus::NotFound => {
+        None => {
             client.write_all(chunk).await?;
-            tail.update(chunk);
         }
     }
 }
@@ -104,8 +103,9 @@ loop {
 #### Correct: Complete-buffer validation
 
 ```rust
-// TailBuffer with no prior state, checking a fully-accumulated buffer
-TailBuffer::default().detect_terminator(&buffer).is_found()
+use crate::session::multiline_framing::find_terminator_end;
+
+find_terminator_end(&buffer).is_some()
 ```
 
 #### Why `ends_with()` Causes Connection Pool Collapse
@@ -118,9 +118,9 @@ This caused a production bug (20 connections removed in rapid succession, pool e
 4. Loop continues, consuming the `220 0 <next-msg-id>\r\n` for the next pipelined command
 5. Next handler reads garbage → `Invalid` → `remove_with_cooldown()` → cascade to zero
 
-`TailBuffer::detect_terminator()` returns `FoundAt(pos)` at the correct boundary — pipelined bytes are never consumed from the wrong context.
+`MultilineFramer::advance_to_next_terminator_end()` returns the correct boundary and keeps the rolling state correct on misses — pipelined bytes are never consumed from the wrong context.
 
-**Location:** `src/session/streaming/tail_buffer.rs` (30+ tests, production-proven)
+**Location:** `src/session/multiline_framing.rs` (core inline tests plus broader state/response coverage, production-proven)
 
 ---
 
@@ -259,7 +259,7 @@ if is_large_transfer_command(cmd) { /* ARTICLE/BODY — route to batch pipeline 
 
 **Available in `src/protocol/responses.rs`:** `CRLF`, `TERMINATOR_TAIL_SIZE`
 
-**Do not add `MULTILINE_TERMINATOR` or `has_multiline_terminator()`** — these were deleted because they encouraged bypassing `TailBuffer`, causing pool collapse. Use `TailBuffer` (see Pattern #1).
+**Do not add `MULTILINE_TERMINATOR` or `has_multiline_terminator()`** — these were deleted because they encouraged bypassing `MultilineFramer`, causing pool collapse. Use `MultilineFramer` (see Pattern #1).
 
 ---
 
@@ -361,7 +361,7 @@ let snapshot = MetricsSnapshot { cache_hits: 10, ..Default::default() };
 fn find_terminator_new(data: &[u8]) -> Option<usize> { ... }
 
 // ✅ GOOD:
-use nntp_proxy::session::streaming::tail_buffer::find_terminator_end;
+use nntp_proxy::session::multiline_framing::find_terminator_end;
 ```
 
 **Performance testing:** Run `cargo bench` before and after performance-sensitive changes; accept no regressions.
@@ -391,9 +391,9 @@ enum SingleCommandResult { Continue { auth_succeeded: bool }, Quit(u64), SwitchT
 
 ## Anti-Patterns (Don't Do This)
 
-### ❌ 1. Any Terminator Detection Outside TailBuffer
+### ❌ 1. Any Terminator Detection Outside MultilineFramer
 
-Any occurrence of the following anywhere outside `tail_buffer.rs` is a bug:
+Any occurrence of the following anywhere outside `multiline_framing.rs` is a bug:
 - `ends_with(b"\r\n.\r\n")` or `ends_with(b".\r\n")`
 - `MULTILINE_TERMINATOR` or `TERMINATOR` constants
 - `has_multiline_terminator()` or similar helper functions
@@ -467,7 +467,7 @@ Never reimplement production functions in benchmarks — import them directly.
 
 Before submitting code:
 
-- [ ] No duplicate terminator detection (use `TailBuffer`)
+- [ ] No duplicate terminator detection (use `MultilineFramer`)
 - [ ] No scratch buffer allocations (use `BufferPool`)
 - [ ] No inline error kind checks (use centralized helpers)
 - [ ] No raw byte status code checks (use parsed `status_code`)

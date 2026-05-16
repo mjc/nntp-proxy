@@ -324,10 +324,14 @@ impl ClientSession {
             Ok(bytes) => bytes,
             Err(e) => return Err(self.handle_streaming_error(conn, backend_id, params.request, e)),
         };
-        client_write
-            .flush()
-            .await
-            .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+        if let Err(e) = client_write.flush().await {
+            return Err(self.handle_streaming_error(
+                conn,
+                backend_id,
+                params.request,
+                classify_buffered_response_write_err(e),
+            ));
+        }
 
         debug!(
             client = %self.client_addr,

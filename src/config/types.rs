@@ -123,9 +123,9 @@ pub struct Config {
     pub memory: Memory,
     /// Cache configuration.
     ///
-    /// When omitted, the proxy still keeps the in-memory availability index for
-    /// routing/retry decisions, but skips explicit cache configuration and
-    /// availability-index persistence unless the CLI or config enables it.
+    /// The proxy uses the cache for backend availability-driven routing/retry decisions.
+    /// In availability-only mode, availability tracking remains enabled and
+    /// `store_article_bodies` only controls whether the cache also retains full article bodies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<Cache>,
     /// Health check configuration
@@ -286,7 +286,7 @@ pub struct Cache {
         alias = "ttl"
     )]
     pub article_cache_ttl_secs: Duration,
-    /// Whether to store full article bodies in the article cache (default: true)
+    /// Whether to store full article bodies in the article cache (default: false)
     ///
     /// When false:
     /// - Cache still tracks backend availability (smart routing, 430 retry)
@@ -314,8 +314,9 @@ pub struct Cache {
 
     /// Path to the availability index persistence file (optional).
     ///
-    /// Only used when `store_article_bodies = false`. When omitted, the proxy uses
-    /// "availability.idx" alongside the config file.
+    /// This is only used in availability-only mode (`store_article_bodies = false`).
+    /// When set, the proxy uses this path to persist backend availability state;
+    /// otherwise it defaults to "availability.idx" alongside the config file.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -959,7 +960,7 @@ mod tests {
             cache.article_cache_ttl_secs,
             crate::constants::duration_polyfill::from_hours(1)
         );
-        assert!(cache.store_article_bodies);
+        assert!(!cache.store_article_bodies);
     }
 
     #[test]

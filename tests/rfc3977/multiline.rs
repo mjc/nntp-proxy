@@ -1,7 +1,7 @@
 //! RFC 3977 Section 3.1.1 - Multi-line Response and Byte-Stuffing Tests.
 
 use nntp_proxy::protocol::CRLF;
-use nntp_proxy::session::tail_buffer::TailBuffer;
+use nntp_proxy::session::multiline_framing::find_terminator_end;
 
 fn unstuff_line(line: &str) -> &str {
     if line.starts_with("..") {
@@ -154,7 +154,7 @@ fn test_protocol_constants() {
 }
 
 #[test]
-fn test_tail_buffer_terminator_detection() {
+fn test_find_terminator_end_detection() {
     for (response, found) in [
         (
             b"220 Article follows\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".as_slice(),
@@ -169,10 +169,7 @@ fn test_tail_buffer_terminator_detection() {
             true,
         ),
     ] {
-        assert_eq!(
-            TailBuffer::default().detect_terminator(response).is_found(),
-            found
-        );
+        assert_eq!(find_terminator_end(response).is_some(), found);
     }
 
     let response = b"222 Body\r\n..Content starting with dot\r\n.\r\n";

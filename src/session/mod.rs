@@ -172,6 +172,7 @@ pub mod core;
 pub mod handlers;
 pub mod metrics_ext;
 pub mod mode_state;
+pub mod multiline_framing;
 pub mod precheck;
 pub(crate) mod response_buffer;
 pub(crate) mod retry;
@@ -179,7 +180,6 @@ pub(crate) mod routing;
 pub mod session_error;
 pub(crate) mod shared_client_writer;
 pub mod state;
-pub mod tail_buffer;
 
 pub use auth_state::AuthState;
 pub use backend::format_hex_preview;

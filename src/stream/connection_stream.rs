@@ -216,10 +216,20 @@ impl ConnectionStream {
 
     /// Stash bytes that were already read from the backend but belong to the next response.
     pub fn stash_leftover(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
         self.leftover.push_back(LeftoverChunk {
             bytes: Bytes::copy_from_slice(bytes),
             range: 0..bytes.len(),
         });
+    }
+
+    /// Stash the remaining suffix of a read buffer, if any bytes remain.
+    pub fn stash_leftover_from(&mut self, bytes: &[u8], start: usize) {
+        if start < bytes.len() {
+            self.stash_leftover(&bytes[start..]);
+        }
     }
 
     /// Stash a range from shared bytes without copying.
@@ -504,6 +514,21 @@ mod tests {
         let large = vec![b'x'; 2 * 1024 * 1024];
         conn.stash_leftover(&large);
         assert_eq!(conn.leftover_len(), large.len());
+    }
+
+    #[tokio::test]
+    async fn test_stash_leftover_ignores_empty_buffers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
+
+        let mut conn = ConnectionStream::plain(server_stream);
+        conn.stash_leftover(b"");
+        assert!(!conn.has_leftover());
+        assert_eq!(conn.leftover_len(), 0);
     }
 
     #[tokio::test]

@@ -221,22 +221,19 @@ impl NntpClient {
         capture: &mut PooledBuffer,
         first_chunk_size: usize,
     ) -> Result<()> {
-        use crate::session::tail_buffer::{TailBuffer, TerminatorStatus};
+        use crate::session::multiline_framing::MultilineFramer;
 
         let first_chunk = &io_buffer[..first_chunk_size];
-        let mut tail = TailBuffer::default();
+        let mut framer = MultilineFramer::default();
 
-        match tail.detect_terminator(first_chunk) {
-            TerminatorStatus::FoundAt(pos) => {
+        match framer.advance_to_next_terminator_end(first_chunk) {
+            Some(pos) => {
                 // pos is after the terminator (terminator included in [..pos])
                 capture.extend_from_slice(&first_chunk[..pos]);
-                if pos < first_chunk.len() {
-                    conn.stash_leftover(&first_chunk[pos..]);
-                }
+                conn.stash_leftover_from(first_chunk, pos);
                 return Ok(());
             }
-            TerminatorStatus::NotFound => {
-                tail.update(first_chunk);
+            None => {
                 capture.extend_from_slice(first_chunk);
             }
         }
@@ -252,20 +249,17 @@ impl NntpClient {
             // NLL: chunk borrow ends before next read_from call
             let found_at = {
                 let chunk = &io_buffer[..n];
-                tail.detect_terminator(chunk)
+                framer.advance_to_next_terminator_end(chunk)
             };
             match found_at {
-                TerminatorStatus::FoundAt(pos) => {
+                Some(pos) => {
                     // pos is after the terminator (terminator included in [..pos])
                     capture.extend_from_slice(&io_buffer[..pos]);
-                    if pos < n {
-                        conn.stash_leftover(&io_buffer[pos..n]);
-                    }
+                    conn.stash_leftover_from(&io_buffer[..n], pos);
                     return Ok(());
                 }
-                TerminatorStatus::NotFound => {
+                None => {
                     let chunk = &io_buffer[..n];
-                    tail.update(chunk);
                     capture.extend_from_slice(chunk);
                 }
             }
@@ -513,7 +507,7 @@ mod tests {
     ///
     /// Uses an 8-byte I/O buffer against a 36-byte article, forcing 5 reads.
     /// Read 4 ends with `\r` and read 5 starts with `\n.\r\n`, so the terminator
-    /// `\r\n.\r\n` spans the boundary — exercising `TailBuffer` spanning detection.
+    /// `\r\n.\r\n` spans the boundary — exercising multiline framer spanning detection.
     #[tokio::test]
     async fn test_drain_multiline_into_multi_read_spanning_terminator() {
         use crate::pool::BufferPool;

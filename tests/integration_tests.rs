@@ -6,7 +6,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, Instant, timeout, timeout_at};
 
 use nntp_proxy::config::{ClientAuth, HealthCheck, Proxy, Server};
-use nntp_proxy::session::tail_buffer::{TailBuffer, TerminatorStatus};
+use nntp_proxy::session::multiline_framing::{MultilineFramer, find_terminator_end};
 use nntp_proxy::{Config, NntpProxy, RoutingMode, load_config};
 
 mod test_helpers;
@@ -321,7 +321,7 @@ async fn test_response_flushing_with_rapid_commands() -> Result<()> {
         // not "entire response in one read syscall".
         let deadline = Instant::now() + Duration::from_millis(200);
         let mut response_bytes = Vec::new();
-        let mut tail = TailBuffer::default();
+        let mut framer = MultilineFramer::default();
         loop {
             let n = timeout_at(deadline, client.read(&mut buffer))
                 .await
@@ -337,16 +337,13 @@ async fn test_response_flushing_with_rapid_commands() -> Result<()> {
             }
             let chunk = &buffer[..n];
             response_bytes.extend_from_slice(chunk);
-            match tail.detect_terminator(chunk) {
-                TerminatorStatus::FoundAt(_) => break,
-                TerminatorStatus::NotFound => tail.update(chunk),
+            if framer.advance_to_next_terminator_end(chunk).is_some() {
+                break;
             }
         }
 
         let response = String::from_utf8_lossy(&response_bytes);
-        let terminator_found = TailBuffer::default()
-            .detect_terminator(&response_bytes)
-            .is_found();
+        let terminator_found = find_terminator_end(&response_bytes).is_some();
 
         // Verify we got a complete response (should include the NNTP multiline terminator)
         assert!(

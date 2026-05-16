@@ -477,11 +477,6 @@ impl AvailabilityIndex {
     }
 
     #[must_use]
-    pub(crate) fn disabled(ttl: Duration) -> Self {
-        Self::with_capacity_and_generation_count(0, ttl, DEFAULT_GENERATIONS)
-    }
-
-    #[must_use]
     #[cfg(test)]
     fn with_test_capacity(capacity_bytes: u64) -> Self {
         Self::with_capacity_and_generation_count(capacity_bytes, Duration::MAX, DEFAULT_GENERATIONS)

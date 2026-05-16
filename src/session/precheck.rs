@@ -191,42 +191,36 @@ async fn read_multiline_precheck_hit(
     buffer: &mut crate::pool::PooledBuffer,
     bytes_read: usize,
 ) -> Result<PrecheckHit, ()> {
-    use crate::session::tail_buffer::{TailBuffer, TerminatorStatus};
+    use crate::session::multiline_framing::MultilineFramer;
 
     let mut response = deps
         .cache_articles
         .then(crate::pool::ChunkedResponse::default);
-    let mut tail = TailBuffer::default();
-    match tail.detect_terminator(&buffer[..bytes_read]) {
-        TerminatorStatus::FoundAt(pos) => {
+    let mut framer = MultilineFramer::default();
+    match framer.advance_to_next_terminator_end(&buffer[..bytes_read]) {
+        Some(pos) => {
             // pos is after the terminator (terminator included in [..pos])
-            if pos < bytes_read {
-                conn.stash_leftover(&buffer[pos..bytes_read]);
-            }
+            conn.stash_leftover_from(&buffer[..bytes_read], pos);
             if let Some(response) = &mut response {
                 response.extend_from_slice(&deps.buffer_pool, &buffer[..pos]);
             }
         }
-        TerminatorStatus::NotFound => {
+        None => {
             if let Some(response) = &mut response {
                 response.extend_from_slice(&deps.buffer_pool, &buffer[..bytes_read]);
             }
-            tail.update(&buffer[..bytes_read]);
             loop {
                 match buffer.read_from(conn.as_mut()).await {
                     Ok(0) | Err(_) => return Err(()),
-                    Ok(n) => match tail.detect_terminator(&buffer[..n]) {
-                        TerminatorStatus::FoundAt(pos) => {
-                            if pos < n {
-                                conn.stash_leftover(&buffer[pos..n]);
-                            }
+                    Ok(n) => match framer.advance_to_next_terminator_end(&buffer[..n]) {
+                        Some(pos) => {
+                            conn.stash_leftover_from(&buffer[..n], pos);
                             if let Some(response) = &mut response {
                                 response.extend_from_slice(&deps.buffer_pool, &buffer[..pos]);
                             }
                             break;
                         }
-                        TerminatorStatus::NotFound => {
-                            tail.update(&buffer[..n]);
+                        None => {
                             if let Some(response) = &mut response {
                                 response.extend_from_slice(&deps.buffer_pool, &buffer[..n]);
                             }

@@ -198,10 +198,10 @@ pub async fn salvage_with_health_check(
 #[cfg(test)]
 mod tests {
 
-    /// Verify that `TailBuffer` detects terminators that span chunk boundaries.
+    /// Verify that the multiline framer detects terminators that span chunk boundaries.
     #[test]
     fn test_drain_cross_boundary_terminator() {
-        use crate::session::tail_buffer::TailBuffer;
+        use crate::session::multiline_framing::MultilineFramer;
 
         // Simulate two reads where the terminator \r\n.\r\n is split:
         // First read ends with "\r\n.", second read starts with "\r\n"
@@ -221,17 +221,16 @@ mod tests {
             "windows() should not find terminator in chunk2"
         );
 
-        // New approach: TailBuffer tracks cross-boundary state
-        let mut tail = TailBuffer::default();
+        // New approach: the framer tracks cross-boundary state
+        let mut framer = MultilineFramer::default();
 
         // Process chunk1 — no terminator yet
-        assert!(!tail.detect_terminator(chunk1).is_found());
-        tail.update(chunk1);
+        assert!(framer.advance_to_next_terminator_end(chunk1).is_none());
 
         // Process chunk2 — spanning terminator detected!
         assert!(
-            tail.detect_terminator(chunk2).is_found(),
-            "TailBuffer should detect terminator spanning chunk boundary"
+            framer.next_terminator_end(chunk2).is_some(),
+            "MultilineFramer should detect terminator spanning chunk boundary"
         );
     }
 

@@ -137,7 +137,7 @@ impl ClientSessionBuilder {
         self
     }
 
-    /// Set whether to cache article bodies (default: true)
+    /// Set whether to cache article bodies.
     ///
     /// When false, only backend availability is tracked (saves memory).
     /// When true, full article bodies are cached.
@@ -215,7 +215,7 @@ impl ClientSession {
             metrics,
             connection_stats: None,
             cache: Self::default_cache(),
-            cache_articles: true,
+            cache_articles: false,
             adaptive_precheck: false,
         }
     }
@@ -246,7 +246,7 @@ impl ClientSession {
             cache: Arc::new(crate::cache::UnifiedCache::availability(
                 std::time::Duration::MAX,
             )),
-            cache_articles: true,
+            cache_articles: false,
             adaptive_precheck: false,
         }
     }
@@ -290,7 +290,7 @@ impl ClientSession {
             cache: Arc::new(crate::cache::UnifiedCache::availability(
                 std::time::Duration::MAX,
             )),
-            cache_articles: true,
+            cache_articles: false,
             adaptive_precheck: false,
         }
     }

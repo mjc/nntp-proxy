@@ -4,19 +4,19 @@
 //! cross-read boundaries and false positives, which matter for pipelined article
 //! streaming and leftover correctness.
 //!
-//! Run with: cargo bench --bench `tail_buffer_boundaries`
+//! Run with: cargo bench --bench `multiline_framing_boundaries`
 
 use divan::{Bencher, black_box};
-use nntp_proxy::session::tail_buffer::TailBuffer;
+use nntp_proxy::session::multiline_framing::MultilineFramer;
 
 fn main() {
     divan::main();
 }
 
 fn detect_with_previous_tail(previous: &[u8], current: &[u8]) -> bool {
-    let mut tail = TailBuffer::default();
-    tail.update(previous);
-    tail.detect_terminator(current).is_found()
+    let mut framer = MultilineFramer::default();
+    framer.update(previous);
+    framer.next_terminator_end(current).is_some()
 }
 
 fn large_body(size: usize, terminator: bool) -> Vec<u8> {
@@ -77,13 +77,13 @@ bench_split!(
 );
 
 mod full_chunk_scans {
-    use super::{Bencher, TailBuffer, black_box, large_body, naive_find_terminator};
+    use super::{Bencher, MultilineFramer, black_box, large_body, naive_find_terminator};
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn false_positive_dot_stuffed_line(bencher: Bencher) {
         let chunk = b"body\r\n..not terminator\r\nmore body\r\n";
-        let tail = TailBuffer::default();
-        bencher.bench(|| black_box(tail.detect_terminator(black_box(chunk)).is_found()));
+        let framer = MultilineFramer::default();
+        bencher.bench(|| black_box(framer.next_terminator_end(black_box(chunk)).is_some()));
     }
 
     macro_rules! bench_scan {
@@ -98,11 +98,13 @@ mod full_chunk_scans {
         };
     }
 
-    fn tail_detect(chunk: &[u8]) -> bool {
-        TailBuffer::default().detect_terminator(chunk).is_found()
+    fn framer_detect(chunk: &[u8]) -> bool {
+        MultilineFramer::default()
+            .next_terminator_end(chunk)
+            .is_some()
     }
 
-    bench_scan!(no_terminator_64k, 64 * 1024, false, 500, 100, tail_detect);
+    bench_scan!(no_terminator_64k, 64 * 1024, false, 500, 100, framer_detect);
     bench_scan!(
         naive_no_terminator_64k,
         64 * 1024,
@@ -117,7 +119,7 @@ mod full_chunk_scans {
         true,
         500,
         100,
-        tail_detect
+        framer_detect
     );
     bench_scan!(
         naive_terminator_at_end_64k,
@@ -133,7 +135,7 @@ mod full_chunk_scans {
         true,
         100,
         25,
-        tail_detect
+        framer_detect
     );
     bench_scan!(
         naive_terminator_at_end_1mb,

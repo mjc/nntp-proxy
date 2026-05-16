@@ -301,10 +301,9 @@ impl ChunkedResponse {
     /// new capture buffer is acquired.
     pub fn extend_from_slice(&mut self, pool: &BufferPool, mut data: &[u8]) {
         while !data.is_empty() {
-            let need_new_chunk = self
-                .chunks
-                .last()
-                .is_none_or(|chunk| chunk.initialized() == chunk.capacity());
+            let need_new_chunk = self.chunks.last().is_none_or(|chunk| {
+                chunk.range.end != chunk.initialized() || chunk.initialized() == chunk.capacity()
+            });
 
             if need_new_chunk {
                 self.chunks.push(ResponseChunk {
@@ -331,6 +330,8 @@ impl ChunkedResponse {
     /// Move a byte range from an initialized pooled buffer into this response.
     ///
     /// This avoids copying large backend reads into separate capture buffers.
+    /// Later appends will allocate a fresh pooled chunk when this range does not
+    /// end at the initialized length, so skipped bytes are never exposed.
     /// # Panics
     /// Panics if `range` is outside the buffer's initialized bytes.
     pub fn push_buffer_range(&mut self, buffer: PooledBuffer, range: Range<usize>) {
@@ -383,6 +384,25 @@ impl ChunkedResponse {
             }
             let take = remaining.min(chunk.len());
             out.extend_from_slice(&chunk[..take]);
+            remaining -= take;
+        }
+    }
+
+    /// Copy up to `len` bytes from the end of the response into a small stack-backed buffer.
+    pub fn copy_suffix_into(&self, len: usize, out: &mut SmallVec<[u8; 128]>) {
+        let total = len.min(self.len);
+        out.clear();
+        out.resize(total, 0);
+
+        let mut remaining = total;
+        for chunk in self.chunks.iter().rev().map(ResponseChunk::as_slice) {
+            if remaining == 0 {
+                break;
+            }
+            let take = remaining.min(chunk.len());
+            let dest_start = remaining - take;
+            let src_start = chunk.len() - take;
+            out[dest_start..dest_start + take].copy_from_slice(&chunk[src_start..]);
             remaining -= take;
         }
     }
@@ -978,6 +998,17 @@ mod tests {
         let mut prefix = SmallVec::<[u8; 128]>::new();
         response.copy_prefix_into(64, &mut prefix);
         assert_eq!(&prefix[..], b"430\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_chunked_response_copy_suffix_clamps_to_length() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 4);
+        let mut response = ChunkedResponse::default();
+        response.extend_from_slice(&pool, b"220 0 <id>\r\nBody\r\n.\r\n");
+
+        let mut suffix = SmallVec::<[u8; 128]>::new();
+        response.copy_suffix_into(8, &mut suffix);
+        assert_eq!(&suffix[..], b"ody\r\n.\r\n");
     }
 
     #[tokio::test]

@@ -20,7 +20,7 @@ supported! {
         Callgrind, LibraryBenchmarkConfig, library_benchmark, library_benchmark_group, main,
     };
     use nntp_proxy::config::{Cache, Config, Server};
-    use nntp_proxy::session::tail_buffer::{TailBuffer, TerminatorStatus};
+    use nntp_proxy::session::multiline_framing::MultilineFramer;
     use nntp_proxy::types::{CacheCapacity, MaxConnections, Port};
     use nntp_proxy::{NntpProxy, RoutingMode};
     use std::hint::black_box;
@@ -208,17 +208,14 @@ supported! {
 
     async fn read_multiline_into(stream: &mut TcpStream, buffer: &mut [u8]) -> usize {
         let mut total = 0usize;
-        let mut tail = TailBuffer::default();
+        let mut framer = MultilineFramer::default();
         loop {
             let n = stream.read(&mut buffer[total..]).await.unwrap();
             assert_ne!(n, 0, "proxy closed during benchmark response");
             let chunk = &buffer[total..total + n];
-            match tail.detect_terminator(chunk) {
-                TerminatorStatus::FoundAt(pos) => return total + pos,
-                TerminatorStatus::NotFound => {
-                    total += n;
-                    tail.update(chunk);
-                }
+            match framer.advance_to_next_terminator_end(chunk) {
+                Some(pos) => return total + pos,
+                None => total += n,
             }
         }
     }

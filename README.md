@@ -11,10 +11,10 @@ TLS, cache behavior, and live metrics in one place.
 - Per-backend TLS, backend authentication, connection limits, keep-alives, and tiering.
 - Plain NNTP listener only for clients; intended for trusted LAN/VPN/segmented-network deployment rather than direct internet exposure.
 - Optional article-body caching plus lightweight availability tracking.
-- Availability-only cache mode by default, so smart routing works without storing article bodies.
+- Backend availability is always tracked in the availability index; `[cache].store_article_bodies` is false by default and only controls whether full article bodies are cached too.
 - RAM article-cache hits measured 5.16 GB/s on a Ryzen 9 5950X.
 - A hot-cache path with a 256 MB in-memory article cache and disk cache on SSD measured 2.58 GB/s on the same system.
-- A 10x end-to-end `nntpbench` matrix with the proxy in the middle averaged 6088.21 MiB/s across 112 points and 1,120 runs, with the best point at 9524.11 MiB/s. That is about 1.29x the `v0.4.0` matrix mean.
+- A 10x end-to-end `nntpbench` matrix with the proxy in the middle averaged 6045.19 MiB/s across 112 points and 1,120 runs, with the best point at 10579.84 MiB/s. That is about 1.28x the `v0.4.0` matrix mean.
 - Allocation-conscious hot paths: borrowed request slices, preallocated buffer pools, and allocation-free cache key lookup in the steady state.
 - Optional terminal dashboard with persisted metrics across restarts.
 - TOML config, environment-based backend configuration, and CLI overrides.
@@ -151,7 +151,6 @@ capture_pool_count = 16
 article_cache_capacity = "256mb"
 article_cache_ttl_secs = 3600
 store_article_bodies = true
-# availability_index_path = "/var/cache/nntp-proxy/availability.idx"  # Only used when store_article_bodies = false
 
 # Optional article-body disk cache.
 [cache.disk]
@@ -189,10 +188,10 @@ connection_keepalive = 60
 
 `[cache]` controls article and availability storage:
 
-- `store_article_bodies = true` is the default when a `[cache]` section is present. The proxy keeps full article bodies in the in-memory cache unless you explicitly disable that.
-- Set `store_article_bodies = false` for availability-only caching. That keeps backend-availability knowledge without storing full article bodies.
-- `[cache.disk]` is optional and stores article bodies evicted from the memory cache.
-- `availability_index_path` persists availability-only routing knowledge across restarts.
+- `store_article_bodies = false` is the default. Set it to `true` for full article-body caching.
+- The proxy keeps backend availability tracking in the availability index either way.
+- `[cache.disk]` is optional and stores article bodies evicted from the memory cache; it only applies when `store_article_bodies = true`.
+- `availability_index_path` persists the availability-only index across restarts when `store_article_bodies = false`.
 
 `[memory]` controls transport memory, not article storage:
 
@@ -219,6 +218,12 @@ Common server fields:
 | `tls_verify_cert` | no | true | Keep true in production. |
 | `tls_cert_path` | no | - | Additional PEM CA certificate. |
 | `connection_keepalive` | no | - | Send `DATE` on idle backend connections every N seconds. |
+| `replacement_cooldown` | no | 30 | Wait this many seconds before replacing an actively removed connection; set `0` to disable. |
+| `health_check_max_per_cycle` | no | 10 | Maximum connections to check per health-check cycle. |
+| `health_check_pool_timeout` | no | 2 | Seconds to wait when acquiring a connection for health checking. |
+| `compress` | no | auto | RFC 8054 backend `COMPRESS DEFLATE`: omit to auto-detect, `true` to require, `false` to disable. |
+| `compress_level` | no | 1 | DEFLATE level `0`-`9`; higher improves ratio at higher CPU cost. |
+| `backend_idle_timeout` | no | 600 | Clear idle backend connections after this many seconds of proxy-wide inactivity; set `0` to disable. |
 | `backend_pipelining` | no | true | Enable backend request pipelining. |
 | `pipeline_queue_depth` | no | 1000 | Maximum queued pipelined requests per backend connection. |
 | `pipeline_batch_size` | no | 4 | Maximum commands sent in one backend pipeline batch. |
@@ -304,11 +309,61 @@ The current hot paths are designed to avoid avoidable heap work:
 
 - RAM article-cache hits measured 5.16 GB/s on a Ryzen 9 5950X.
 - With a 256 MB in-memory article cache and disk cache on SSD, the hot-cache path measured 2.58 GB/s on the same system.
-- The current end-to-end `nntpbench` matrix with the proxy in the middle averaged 6088.21 MiB/s across 112 points and 1,120 runs; the best point was 9524.11 MiB/s at 4 proxy threads, 4 backend connections, and 8 clients. That is about 1.29x the `v0.4.0` matrix mean.
+- The current end-to-end `nntpbench` matrix with the proxy in the middle averaged 6045.19 MiB/s across 112 points and 1,120 runs; the best point was 10579.84 MiB/s at 4 proxy threads, 8 backend connections, and 8 clients. That is about 1.28x the `v0.4.0` matrix mean.
 - Backend request forwarding uses parsed request slices instead of rebuilding command strings.
 - The main I/O and capture buffers are preallocated and prefaulted at startup.
 - Buffer acquisition is allocation-free while the configured pools have capacity; exhaustion intentionally falls back to allocating and logs that fact.
 - Article-cache lookup uses borrowed `&str` keys against `Arc<str>` cache keys, avoiding per-lookup key allocation.
+
+Mean MiB/s for the full 10x proxy-in-the-middle matrix:
+
+### 1 proxy thread
+
+| Backend connections | 1 client | 4 clients | 8 clients | 16 clients |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 5096.82 | 5603.85 | 5080.59 | 5562.53 |
+| 2 | 4988.13 | 5337.07 | 5055.09 | 4053.63 |
+| 4 | 4121.83 | 5024.75 | 5050.81 | 5193.26 |
+| 8 | 5026.49 | 3436.41 | 2914.60 | 2818.84 |
+| 16 | 5052.49 | 2895.72 | 2921.51 | 3088.55 |
+| 32 | 5201.64 | 3460.92 | 3119.53 | 3090.36 |
+| 64 | 5223.27 | 3503.72 | 3011.90 | 2960.26 |
+
+### 2 proxy threads
+
+| Backend connections | 1 client | 4 clients | 8 clients | 16 clients |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 5858.20 | 7141.30 | 7075.43 | 7165.40 |
+| 2 | 5802.50 | 7282.68 | 7301.87 | 7176.24 |
+| 4 | 5816.16 | 8198.82 | 8302.88 | 8230.66 |
+| 8 | 5542.93 | 6252.54 | 6133.07 | 5919.10 |
+| 16 | 5746.72 | 5828.64 | 5735.72 | 5669.70 |
+| 32 | 4864.04 | 5818.18 | 5609.14 | 5720.42 |
+| 64 | 4660.36 | 5662.07 | 5548.58 | 5681.12 |
+
+### 4 proxy threads
+
+| Backend connections | 1 client | 4 clients | 8 clients | 16 clients |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 4946.87 | 6272.52 | 6431.03 | 6405.27 |
+| 2 | 5097.72 | 6534.12 | 6502.43 | 6436.24 |
+| 4 | 5095.46 | 9470.84 | 9730.58 | 9805.24 |
+| 8 | 4171.03 | 9532.66 | 9771.43 | 9444.07 |
+| 16 | 4113.55 | 8917.30 | 9189.83 | 8902.27 |
+| 32 | 3658.32 | 8462.08 | 8669.34 | 9038.65 |
+| 64 | 3611.89 | 7956.29 | 5724.58 | 7259.69 |
+
+### 8 proxy threads
+
+| Backend connections | 1 client | 4 clients | 8 clients | 16 clients |
+| --- | ---: | ---: | ---: | ---: |
+| 1 | 4769.34 | 5828.79 | 5877.05 | 5964.22 |
+| 2 | 4862.62 | 6033.24 | 6318.42 | 6144.56 |
+| 4 | 5076.83 | 9169.22 | 9117.41 | 8989.47 |
+| 8 | 3770.25 | 6954.88 | 8400.75 | 7672.77 |
+| 16 | 3354.61 | 8203.74 | 6593.20 | 8062.83 |
+| 32 | 3373.62 | 7430.28 | 7760.55 | 8422.43 |
+| 64 | 3552.23 | 6538.54 | 7842.05 | 6187.45 |
 
 This is not an unconditional "zero allocations everywhere" claim. TLS handshakes, connection setup, logging, metrics snapshots, pool exhaustion, and oversized capture buffers can allocate. The steady-state forwarding/cache-hit path is the part intentionally kept allocation-free where the configured pools are sized correctly.
 

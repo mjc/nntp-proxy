@@ -550,7 +550,7 @@ pub fn resolve_stats_file_path(
     )
 }
 
-/// Resolve the availability persistence path for availability-only mode.
+/// Resolve the persistence path for the availability index when body storage is disabled.
 ///
 /// Returns None unless `store_article_bodies = false`. If `availability_index_path` is
 /// configured, use it; otherwise default to "availability.idx" alongside config.

@@ -160,6 +160,7 @@ async fn execute_pipeline_batch(
 
     // Phase 1: Write all commands
     for (i, req) in batch.iter().enumerate() {
+        req.record_queue_wait();
         if let Err(e) = req.context.write_wire_to(conn).await {
             warn!(
                 "Pipeline worker backend {:?}: write failed at command {}/{}: {}",
@@ -201,7 +202,6 @@ async fn execute_pipeline_batch(
     batch.reverse();
     let mut response_index = 0usize;
     while let Some(mut req) = batch.pop() {
-        req.record_queue_wait();
         let read_start = crate::pipeline_timing::now_if_enabled();
         let read_result = crate::session::response_buffer::read_response_into_context(
             &mut req.context,

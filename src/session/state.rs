@@ -6,7 +6,7 @@
 use std::collections::VecDeque;
 
 use crate::protocol::{RequestKind, StatusCode, request_kind_expects_multiline};
-use crate::session::tail_buffer::{TailBuffer, TerminatorStatus};
+use crate::session::multiline_framing::MultilineFramer;
 use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
 const MAX_PENDING_STATUS_LINE_BYTES: usize = crate::constants::buffer::COMMAND;
@@ -34,7 +34,7 @@ pub enum StatefulReadMode {
 
 enum PendingBackendResponseState {
     AwaitingStatusLine(Vec<u8>),
-    ReadingMultiline { tail: TailBuffer },
+    ReadingMultiline { framer: MultilineFramer },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,16 +87,18 @@ impl PendingBackendResponse {
                 }
 
                 let body = &chunk[end..];
-                let mut tail = TailBuffer::default();
-                tail.update(status_line);
-                match tail.detect_terminator(body) {
-                    TerminatorStatus::FoundAt(pos) => PendingChunkProgress {
+                let mut framer = MultilineFramer::default();
+                // Keep the status line in the rolling window so a body that begins
+                // with ".\r\n" still forms a spanning terminator across the split.
+                framer.update(status_line);
+                match framer.next_terminator_end(body) {
+                    Some(pos) => PendingChunkProgress {
                         consumed: end + pos,
                         completed: true,
                     },
-                    TerminatorStatus::NotFound => {
-                        tail.update(body);
-                        self.state = PendingBackendResponseState::ReadingMultiline { tail };
+                    None => {
+                        framer.update(body);
+                        self.state = PendingBackendResponseState::ReadingMultiline { framer };
                         PendingChunkProgress {
                             consumed: chunk.len(),
                             completed: false,
@@ -104,20 +106,16 @@ impl PendingBackendResponse {
                     }
                 }
             }
-            PendingBackendResponseState::ReadingMultiline { tail } => {
-                let status = tail.detect_terminator(chunk);
-                match status {
-                    TerminatorStatus::FoundAt(pos) => PendingChunkProgress {
+            PendingBackendResponseState::ReadingMultiline { framer } => {
+                match framer.advance_to_next_terminator_end(chunk) {
+                    Some(pos) => PendingChunkProgress {
                         consumed: pos,
                         completed: true,
                     },
-                    TerminatorStatus::NotFound => {
-                        tail.update(chunk);
-                        PendingChunkProgress {
-                            consumed: chunk.len(),
-                            completed: false,
-                        }
-                    }
+                    None => PendingChunkProgress {
+                        consumed: chunk.len(),
+                        completed: false,
+                    },
                 }
             }
         }
@@ -628,6 +626,64 @@ mod tests {
                 b"111 20260505120000\r\n".to_vec(),
                 deferred,
                 b"111 20260505120001\r\n".to_vec(),
+            ]
+        );
+        assert!(!state.has_pending_backend_replies());
+    }
+
+    #[test]
+    fn test_ordered_output_segments_split_packed_multiline_replies() {
+        let mut state = SessionLoopState::new(false);
+        state.mark_backend_request_sent(RequestKind::Help);
+        state.mark_backend_request_sent(RequestKind::Help);
+
+        let rendered: Vec<Vec<u8>> = state
+            .ordered_output_segments(
+                b"100 Help follows\r\nbody one\r\n.\r\n100 Help follows\r\nbody two\r\n.\r\n",
+            )
+            .into_iter()
+            .map(|segment| match segment {
+                OrderedOutputSegment::Backend(bytes) => bytes.to_vec(),
+                OrderedOutputSegment::Local(bytes) => bytes,
+            })
+            .collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                b"100 Help follows\r\nbody one\r\n.\r\n".to_vec(),
+                b"100 Help follows\r\nbody two\r\n.\r\n".to_vec(),
+            ]
+        );
+        assert!(!state.has_pending_backend_replies());
+    }
+
+    #[test]
+    fn test_ordered_output_segments_prefer_spanning_multiline_boundary() {
+        let mut state = SessionLoopState::new(false);
+        state.mark_backend_request_sent(RequestKind::Help);
+        state.mark_backend_request_sent(RequestKind::Help);
+
+        state.observe_backend_bytes(b"100 Help follows\r\nbody one\r\n");
+        assert!(
+            state.has_pending_backend_replies(),
+            "first HELP should remain pending until its terminator arrives"
+        );
+
+        let rendered: Vec<Vec<u8>> = state
+            .ordered_output_segments(b".\r\n100 Help follows\r\nbody two\r\n.\r\n")
+            .into_iter()
+            .map(|segment| match segment {
+                OrderedOutputSegment::Backend(bytes) => bytes.to_vec(),
+                OrderedOutputSegment::Local(bytes) => bytes,
+            })
+            .collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                b".\r\n".to_vec(),
+                b"100 Help follows\r\nbody two\r\n.\r\n".to_vec(),
             ]
         );
         assert!(!state.has_pending_backend_replies());

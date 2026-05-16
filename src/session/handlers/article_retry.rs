@@ -295,16 +295,21 @@ impl ClientSession {
                     completed.context.has_message_id(),
                 );
                 if let Some(payload) = completed.context.take_response_payload() {
-                    if matches!(completed.context.kind(), RequestKind::Body) {
-                        let body = payload.to_vec();
+                    if matches!(completed.context.kind(), RequestKind::Body)
+                        && tracing::enabled!(tracing::Level::DEBUG)
+                    {
+                        let mut head = smallvec::SmallVec::<[u8; 128]>::new();
+                        let mut tail = smallvec::SmallVec::<[u8; 128]>::new();
+                        payload.copy_prefix_into(64, &mut head);
+                        payload.copy_suffix_into(64, &mut tail);
                         debug!(
                             client = %self.client_addr,
                             backend = completed_backend_id.as_index(),
                             command_verb = ?completed.context.verb(),
                             status_code = response.status().as_u16(),
-                            response_len = body.len(),
-                            first_bytes_hex = %crate::session::backend::format_hex_preview(&body, 64),
-                            last_bytes_hex = %crate::session::backend::format_hex_tail_preview(&body, 64),
+                            response_len = payload.len(),
+                            first_bytes_hex = %crate::session::backend::format_hex_preview(&head, 64),
+                            last_bytes_hex = %crate::session::backend::format_hex_tail_preview(&tail, 64),
                             "Dequeued buffered BODY response from pipeline worker for client delivery"
                         );
                     }

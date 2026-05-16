@@ -9,7 +9,7 @@ use bytes::Bytes;
 use std::ops::Range;
 use tracing::warn;
 
-use crate::session::tail_buffer::{TailBuffer, TerminatorStatus};
+use crate::session::multiline_framing::MultilineFramer;
 
 /// Outcome of buffering a backend response.
 #[derive(Debug)]
@@ -220,14 +220,7 @@ fn buffer_single_line_response(
                     "Prefetched single-line response missing status line terminator"
                 ))
             })?;
-            let old = std::mem::replace(io_buffer, pool.acquire());
-            if end < len {
-                let bytes = old.freeze();
-                conn.stash_leftover_shared(bytes.clone(), end..len);
-                result_buf.push_shared_range(bytes, 0..end);
-            } else {
-                result_buf.push_buffer_range(old, 0..end);
-            }
+            push_buffer_prefix_to_response(io_buffer, conn, result_buf, pool, end, len);
         }
         PrefetchedResponse::Shared { bytes, range, .. } => {
             let response = &bytes[range.clone()];
@@ -246,34 +239,42 @@ fn buffer_single_line_response(
     Ok(())
 }
 
+fn push_buffer_prefix_to_response(
+    io_buffer: &mut crate::pool::PooledBuffer,
+    conn: &mut crate::stream::ConnectionStream,
+    response: &mut crate::pool::ChunkedResponse,
+    pool: &crate::pool::BufferPool,
+    prefix_len: usize,
+    total_len: usize,
+) {
+    let old = std::mem::replace(io_buffer, pool.acquire());
+    if prefix_len < total_len {
+        let bytes = old.freeze();
+        conn.stash_leftover_shared(bytes.clone(), prefix_len..total_len);
+        response.push_shared_range(bytes, 0..prefix_len);
+    } else {
+        response.push_buffer_range(old, 0..prefix_len);
+    }
+}
+
 fn process_shared_multiline_chunk(
     bytes: Bytes,
     range: Range<usize>,
     conn: &mut crate::stream::ConnectionStream,
     response: &mut crate::pool::ChunkedResponse,
-    tail: &mut TailBuffer,
+    framer: &mut MultilineFramer,
 ) -> bool {
     let chunk = &bytes[range.clone()];
-    let status = tail.detect_terminator(chunk);
-    let write_len = status.write_len(chunk.len());
+    let Some(write_len) = framer.advance_to_next_terminator_end(chunk) else {
+        response.push_shared_range(bytes, range);
+        return false;
+    };
     let write_end = range.start + write_len;
-
-    if status.is_found() {
-        response.push_shared_range(bytes.clone(), range.start..write_end);
-        if write_end < range.end {
-            conn.push_front_leftover_shared(bytes, write_end..range.end);
-        }
-        return true;
+    response.push_shared_range(bytes.clone(), range.start..write_end);
+    if write_end < range.end {
+        conn.push_front_leftover_shared(bytes, write_end..range.end);
     }
-
-    debug_assert_eq!(
-        write_len,
-        chunk.len(),
-        "non-terminal multiline chunk should consume full read"
-    );
-    tail.update(chunk);
-    response.push_shared_range(bytes, range);
-    false
+    true
 }
 
 async fn fill_multiline_response(
@@ -285,32 +286,31 @@ async fn fill_multiline_response(
     backend_id: crate::types::BackendId,
 ) -> Result<(), StreamingError> {
     response.clear();
-    let mut tail = TailBuffer::default();
+    let mut framer = MultilineFramer::default();
 
     match prefetched {
         PrefetchedResponse::Buffer {
             len: initial_chunk_len,
             ..
-        } => match tail.detect_terminator(&io_buffer[..initial_chunk_len]) {
-            TerminatorStatus::FoundAt(pos) => {
-                let old = std::mem::replace(io_buffer, pool.acquire());
-                if pos < initial_chunk_len {
-                    let bytes = old.freeze();
-                    conn.stash_leftover_shared(bytes.clone(), pos..initial_chunk_len);
-                    response.push_shared_range(bytes, 0..pos);
-                } else {
-                    response.push_buffer_range(old, 0..pos);
-                }
+        } => match framer.advance_to_next_terminator_end(&io_buffer[..initial_chunk_len]) {
+            Some(pos) => {
+                push_buffer_prefix_to_response(
+                    io_buffer,
+                    conn,
+                    response,
+                    pool,
+                    pos,
+                    initial_chunk_len,
+                );
                 return Ok(());
             }
-            TerminatorStatus::NotFound => {
-                tail.update(&io_buffer[..initial_chunk_len]);
+            None => {
                 let old = std::mem::replace(io_buffer, pool.acquire());
                 response.push_buffer_range(old, 0..initial_chunk_len);
             }
         },
         PrefetchedResponse::Shared { bytes, range, .. } => {
-            if process_shared_multiline_chunk(bytes, range, conn, response, &mut tail) {
+            if process_shared_multiline_chunk(bytes, range, conn, response, &mut framer) {
                 return Ok(());
             }
         }
@@ -318,7 +318,7 @@ async fn fill_multiline_response(
 
     loop {
         if let Some((bytes, range)) = conn.pop_leftover_shared() {
-            if process_shared_multiline_chunk(bytes, range, conn, response, &mut tail) {
+            if process_shared_multiline_chunk(bytes, range, conn, response, &mut framer) {
                 return Ok(());
             }
             continue;
@@ -336,28 +336,13 @@ async fn fill_multiline_response(
             });
         }
 
-        let status = tail.detect_terminator(&io_buffer[..n]);
-        let write_len = status.write_len(n);
-
-        if status.is_found() {
-            let old = std::mem::replace(io_buffer, pool.acquire());
-            if write_len < n {
-                let bytes = old.freeze();
-                conn.stash_leftover_shared(bytes.clone(), write_len..n);
-                response.push_shared_range(bytes, 0..write_len);
-            } else {
-                response.push_buffer_range(old, 0..write_len);
-            }
+        if let Some(write_len) = framer.advance_to_next_terminator_end(&io_buffer[..n]) {
+            push_buffer_prefix_to_response(io_buffer, conn, response, pool, write_len, n);
             return Ok(());
         }
 
-        debug_assert_eq!(
-            write_len, n,
-            "non-terminal multiline chunk should consume full read"
-        );
-        tail.update(&io_buffer[..write_len]);
         let old = std::mem::replace(io_buffer, pool.acquire());
-        response.push_buffer_range(old, 0..write_len);
+        response.push_buffer_range(old, 0..n);
     }
 }
 
