@@ -224,9 +224,6 @@ Common server fields:
 | `compress` | no | auto | RFC 8054 backend `COMPRESS DEFLATE`: omit to auto-detect, `true` to require, `false` to disable. |
 | `compress_level` | no | 1 | DEFLATE level `0`-`9`; higher improves ratio at higher CPU cost. |
 | `backend_idle_timeout` | no | 600 | Clear idle backend connections after this many seconds of proxy-wide inactivity; set `0` to disable. |
-| `backend_pipelining` | no | true | Enable backend request pipelining. |
-| `pipeline_queue_depth` | no | 1000 | Maximum queued pipelined requests per backend connection. |
-| `pipeline_batch_size` | no | 4 | Maximum commands sent in one backend pipeline batch. |
 
 The proxy currently supports up to 8 backend servers because article availability uses a compact bitset.
 
@@ -385,7 +382,6 @@ Common flags:
 | `--article-cache-ttl <SECONDS>` | `NNTP_PROXY_ARTICLE_CACHE_TTL_SECS` | Integer seconds; default from config | Override `[cache].article_cache_ttl_secs`. |
 | `--store-article-bodies <BOOL>` | `NNTP_PROXY_STORE_ARTICLE_BODIES` | `true` or `false`; default from config | Override `[cache].store_article_bodies`. |
 | `--threads <N>` | `NNTP_PROXY_THREADS` | `0` for CPU cores; otherwise integer; default from config | Override `[proxy].threads`. |
-| `--backend-pipelining <BOOL>` | `NNTP_PROXY_BACKEND_PIPELINING` | `true` or `false`; default from config | Override `backend_pipelining` for all configured servers. |
 
 Examples:
 

@@ -6,6 +6,7 @@
 use bytes::Bytes;
 
 use crate::compression::DecompressStream;
+use crate::constants::buffer::MAX_LEFTOVER_BYTES;
 use crate::tls::TlsStream;
 use std::collections::VecDeque;
 use std::io;
@@ -49,8 +50,13 @@ pub struct ConnectionStream {
 
 #[derive(Debug)]
 struct LeftoverChunk {
-    bytes: Bytes,
+    storage: LeftoverChunkStorage,
     range: Range<usize>,
+}
+
+#[derive(Debug)]
+enum LeftoverChunkStorage {
+    Shared(Bytes),
 }
 
 impl LeftoverChunk {
@@ -59,8 +65,20 @@ impl LeftoverChunk {
     }
 
     fn as_slice(&self) -> &[u8] {
-        &self.bytes[self.range.clone()]
+        match &self.storage {
+            LeftoverChunkStorage::Shared(bytes) => &bytes[self.range.clone()],
+        }
     }
+}
+
+fn ensure_leftover_capacity(current: usize, additional: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        current + additional <= MAX_LEFTOVER_BYTES,
+        "Leftover exceeds {} bytes ({} bytes) — probable protocol desync",
+        MAX_LEFTOVER_BYTES,
+        current + additional
+    );
+    Ok(())
 }
 
 impl ConnectionStream {
@@ -215,46 +233,67 @@ impl ConnectionStream {
     }
 
     /// Stash bytes that were already read from the backend but belong to the next response.
-    pub fn stash_leftover(&mut self, bytes: &[u8]) {
+    pub fn stash_leftover(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
         if bytes.is_empty() {
-            return;
+            return Ok(());
         }
+        ensure_leftover_capacity(self.leftover_len(), bytes.len())?;
         self.leftover.push_back(LeftoverChunk {
-            bytes: Bytes::copy_from_slice(bytes),
+            storage: LeftoverChunkStorage::Shared(Bytes::copy_from_slice(bytes)),
             range: 0..bytes.len(),
         });
+        Ok(())
     }
 
     /// Stash the remaining suffix of a read buffer, if any bytes remain.
-    pub fn stash_leftover_from(&mut self, bytes: &[u8], start: usize) {
+    pub fn stash_leftover_from(&mut self, bytes: &[u8], start: usize) -> anyhow::Result<()> {
         if start < bytes.len() {
-            self.stash_leftover(&bytes[start..]);
+            self.stash_leftover(&bytes[start..])?;
         }
+        Ok(())
     }
 
     /// Stash a range from shared bytes without copying.
-    pub fn stash_leftover_shared(&mut self, bytes: Bytes, range: Range<usize>) {
+    pub fn stash_leftover_shared(
+        &mut self,
+        bytes: Bytes,
+        range: Range<usize>,
+    ) -> anyhow::Result<()> {
         if range.is_empty() {
-            return;
+            return Ok(());
         }
         debug_assert!(range.end <= bytes.len());
-        self.leftover.push_back(LeftoverChunk { bytes, range });
+        ensure_leftover_capacity(self.leftover_len(), range.len())?;
+        self.leftover.push_back(LeftoverChunk {
+            storage: LeftoverChunkStorage::Shared(bytes),
+            range,
+        });
+        Ok(())
     }
 
     /// Requeue a shared leftover range ahead of any other read-ahead bytes.
-    pub fn push_front_leftover_shared(&mut self, bytes: Bytes, range: Range<usize>) {
+    pub fn push_front_leftover_shared(
+        &mut self,
+        bytes: Bytes,
+        range: Range<usize>,
+    ) -> anyhow::Result<()> {
         if range.is_empty() {
-            return;
+            return Ok(());
         }
         debug_assert!(range.end <= bytes.len());
-        self.leftover.push_front(LeftoverChunk { bytes, range });
+        ensure_leftover_capacity(self.leftover_len(), range.len())?;
+        self.leftover.push_front(LeftoverChunk {
+            storage: LeftoverChunkStorage::Shared(bytes),
+            range,
+        });
+        Ok(())
     }
 
-    /// Take the next read-ahead range without copying it through `AsyncRead`.
+    /// Take the next copied/shared read-ahead range without copying it through `AsyncRead`.
     pub fn pop_leftover_shared(&mut self) -> Option<(Bytes, Range<usize>)> {
-        self.leftover
-            .pop_front()
-            .map(|chunk| (chunk.bytes, chunk.range))
+        self.leftover.pop_front().map(|chunk| match chunk.storage {
+            LeftoverChunkStorage::Shared(bytes) => (bytes, chunk.range),
+        })
     }
 
     #[must_use]
@@ -267,7 +306,6 @@ impl ConnectionStream {
         self.leftover.iter().map(LeftoverChunk::len).sum()
     }
 
-    #[cfg(test)]
     pub fn clear_leftover(&mut self) {
         self.leftover.clear();
     }
@@ -490,7 +528,7 @@ mod tests {
         let _client = client_handle.await.unwrap();
 
         let mut conn = ConnectionStream::plain(server_stream);
-        conn.stash_leftover(b"left");
+        conn.stash_leftover(b"left").unwrap();
 
         let mut buf = [0u8; 4];
         conn.read_exact(&mut buf).await.unwrap();
@@ -502,7 +540,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stash_leftover_accepts_large_buffers() {
+    async fn test_stash_leftover_rejects_oversized_buffers() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -511,9 +549,10 @@ mod tests {
         let _client = client_handle.await.unwrap();
 
         let mut conn = ConnectionStream::plain(server_stream);
-        let large = vec![b'x'; 2 * 1024 * 1024];
-        conn.stash_leftover(&large);
-        assert_eq!(conn.leftover_len(), large.len());
+        let large = vec![b'x'; MAX_LEFTOVER_BYTES + 1];
+        let err = conn.stash_leftover(&large).unwrap_err();
+        assert!(err.to_string().contains(&MAX_LEFTOVER_BYTES.to_string()));
+        assert_eq!(conn.leftover_len(), 0);
     }
 
     #[tokio::test]
@@ -526,7 +565,7 @@ mod tests {
         let _client = client_handle.await.unwrap();
 
         let mut conn = ConnectionStream::plain(server_stream);
-        conn.stash_leftover(b"");
+        conn.stash_leftover(b"").unwrap();
         assert!(!conn.has_leftover());
         assert_eq!(conn.leftover_len(), 0);
     }
@@ -542,7 +581,7 @@ mod tests {
 
         let mut conn = ConnectionStream::plain(server_stream);
         let bytes = Bytes::from_static(b"xxleftover-right");
-        conn.stash_leftover_shared(bytes, 2..10);
+        conn.stash_leftover_shared(bytes, 2..10).unwrap();
         assert_eq!(conn.leftover_len(), b"leftover".len());
 
         let mut buf = [0u8; 8];
@@ -563,7 +602,7 @@ mod tests {
         let mut conn = ConnectionStream::plain(server_stream);
         let bytes = Bytes::from_static(b"xxleftover-right");
         let expected_ptr = bytes[2..10].as_ptr();
-        conn.stash_leftover_shared(bytes, 2..10);
+        conn.stash_leftover_shared(bytes, 2..10).unwrap();
 
         let (popped, range) = conn.pop_leftover_shared().unwrap();
         assert_eq!(&popped[range.clone()], b"leftover");
@@ -586,7 +625,7 @@ mod tests {
         let _client = client_handle.await.unwrap();
 
         let mut conn = ConnectionStream::plain(server_stream);
-        conn.stash_leftover(b"left");
+        conn.stash_leftover(b"left").unwrap();
 
         let mut conn = conn.into_compressed(1).unwrap();
         assert!(conn.is_compressed());
@@ -595,6 +634,24 @@ mod tests {
         let mut buf = [0u8; 4];
         conn.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"left");
+    }
+
+    #[tokio::test]
+    async fn test_push_front_leftover_shared_rejects_total_over_cap() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
+
+        let mut conn = ConnectionStream::plain(server_stream);
+        let bytes = Bytes::from(vec![b'x'; MAX_LEFTOVER_BYTES]);
+        conn.stash_leftover_shared(bytes.clone(), 0..MAX_LEFTOVER_BYTES)
+            .unwrap();
+        let err = conn.push_front_leftover_shared(bytes, 0..1).unwrap_err();
+        assert!(err.to_string().contains(&MAX_LEFTOVER_BYTES.to_string()));
+        assert_eq!(conn.leftover_len(), MAX_LEFTOVER_BYTES);
     }
 
     #[tokio::test]

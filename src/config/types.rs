@@ -564,27 +564,6 @@ pub struct Server {
         default = "super::defaults::backend_idle_timeout"
     )]
     pub backend_idle_timeout: Duration,
-
-    /// Enable backend pipelining (request multiplexing) for this server
-    /// When enabled, client requests are queued and batched onto shared connections
-    /// Default: true
-    #[serde(
-        default = "super::defaults::enable_pipelining",
-        rename = "backend_pipelining",
-        alias = "enable_pipelining"
-    )]
-    pub backend_pipelining: bool,
-    /// Maximum queued pipelined requests per backend connection.
-    ///
-    /// The effective per-backend backpressure threshold is this value multiplied
-    /// by `max_connections`.
-    /// Default: 1000
-    #[serde(default = "super::defaults::pipeline_queue_depth")]
-    pub pipeline_queue_depth: usize,
-    /// Maximum number of commands per pipeline batch
-    /// Default: 4
-    #[serde(default = "super::defaults::pipeline_batch_size")]
-    pub pipeline_batch_size: usize,
 }
 
 /// Builder for constructing `Server` instances
@@ -631,9 +610,6 @@ pub struct ServerBuilder {
     compress: Option<bool>,
     compress_level: Option<u32>,
     backend_idle_timeout: Option<Duration>,
-    backend_pipelining: bool,
-    pipeline_queue_depth: Option<usize>,
-    pipeline_batch_size: Option<usize>,
 }
 
 impl ServerBuilder {
@@ -662,9 +638,6 @@ impl ServerBuilder {
             compress: None,
             compress_level: None,
             backend_idle_timeout: None,
-            backend_pipelining: true,
-            pipeline_queue_depth: None,
-            pipeline_batch_size: None,
         }
     }
 
@@ -781,34 +754,6 @@ impl ServerBuilder {
         self
     }
 
-    /// Enable or disable backend pipelining (request multiplexing)
-    #[must_use]
-    pub const fn backend_pipelining(mut self, enabled: bool) -> Self {
-        self.backend_pipelining = enabled;
-        self
-    }
-
-    /// Backward-compatible alias for `backend_pipelining`.
-    #[must_use]
-    pub const fn enable_pipelining(mut self, enabled: bool) -> Self {
-        self.backend_pipelining = enabled;
-        self
-    }
-
-    /// Set pipeline queue depth per backend connection
-    #[must_use]
-    pub const fn pipeline_queue_depth(mut self, depth: usize) -> Self {
-        self.pipeline_queue_depth = Some(depth);
-        self
-    }
-
-    /// Set pipeline batch size
-    #[must_use]
-    pub const fn pipeline_batch_size(mut self, size: usize) -> Self {
-        self.pipeline_batch_size = Some(size);
-        self
-    }
-
     /// Build the Server
     ///
     /// # Errors
@@ -840,14 +785,6 @@ impl ServerBuilder {
             .health_check_pool_timeout
             .unwrap_or_else(super::defaults::health_check_pool_timeout);
 
-        let pipeline_queue_depth = self
-            .pipeline_queue_depth
-            .unwrap_or_else(super::defaults::pipeline_queue_depth);
-
-        let pipeline_batch_size = self
-            .pipeline_batch_size
-            .unwrap_or_else(super::defaults::pipeline_batch_size);
-
         Ok(Server {
             host,
             port,
@@ -870,9 +807,6 @@ impl ServerBuilder {
             backend_idle_timeout: self
                 .backend_idle_timeout
                 .unwrap_or_else(super::defaults::backend_idle_timeout),
-            backend_pipelining: self.backend_pipelining,
-            pipeline_queue_depth,
-            pipeline_batch_size,
         })
     }
 }

@@ -31,9 +31,6 @@
            │    ├─> PooledBuffer [acquire()]: single-read I/O scratch (724KB, pre-faulted)
            │    └─> PooledBuffer [acquire_capture()]: accumulator for caching (768KB, pre-faulted)
            │
-           └──> Pipeline Engine
-                ├─> BackendQueue: batched ARTICLE/BODY requests
-                └─> Batching: 4-16 commands per round-trip
 ```
 
 ### Routing Modes
@@ -338,7 +335,7 @@ Always add a comment at each `remove_with_cooldown` call site (inside `Connectio
 **Use `Server::builder()` — never hardcode struct literals:**
 ```rust
 // ❌ BAD: hardcodes defaults, breaks on new fields
-let server = Server { port: 8119, pipeline_batch_size: 16, /* ... 15 more */ };
+let server = Server { port: 8119, /* ... many more */ };
 
 // ✅ GOOD: tracks production defaults automatically
 let server = Server::builder().port(8119).build();

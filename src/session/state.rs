@@ -5,19 +5,23 @@
 
 use std::collections::VecDeque;
 
+use smallvec::SmallVec;
+
 use crate::protocol::{RequestKind, StatusCode, request_kind_expects_multiline};
 use crate::session::multiline_framing::MultilineFramer;
 use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
 const MAX_PENDING_STATUS_LINE_BYTES: usize = crate::constants::buffer::COMMAND;
+type PendingStatusLine = SmallVec<[u8; MAX_PENDING_STATUS_LINE_BYTES]>;
 
-struct PendingBackendResponse {
+pub(crate) struct PendingBackendResponse {
     kind: RequestKind,
     state: PendingBackendResponseState,
+    status_line: PendingStatusLine,
 }
 
 enum OrderedReply {
-    Backend(PendingBackendResponse),
+    Backend(Box<PendingBackendResponse>),
     Local(Vec<u8>),
 }
 
@@ -33,35 +37,36 @@ pub enum StatefulReadMode {
 }
 
 enum PendingBackendResponseState {
-    AwaitingStatusLine(Vec<u8>),
+    AwaitingStatusLine,
     ReadingMultiline { framer: MultilineFramer },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PendingChunkProgress {
-    consumed: usize,
-    completed: bool,
+pub(crate) struct PendingChunkProgress {
+    pub(crate) consumed: usize,
+    pub(crate) completed: bool,
 }
 
 impl PendingBackendResponse {
-    fn new(kind: RequestKind) -> Self {
+    pub(crate) fn new(kind: RequestKind) -> Self {
         Self {
             kind,
-            state: PendingBackendResponseState::AwaitingStatusLine(Vec::new()),
+            state: PendingBackendResponseState::AwaitingStatusLine,
+            status_line: PendingStatusLine::new(),
         }
     }
 
-    fn consume(&mut self, chunk: &[u8]) -> PendingChunkProgress {
+    pub(crate) fn consume(&mut self, chunk: &[u8]) -> PendingChunkProgress {
         match &mut self.state {
-            PendingBackendResponseState::AwaitingStatusLine(status_line) => {
+            PendingBackendResponseState::AwaitingStatusLine => {
                 let Some(pos) = memchr::memchr(b'\n', chunk) else {
-                    if status_line.len() + chunk.len() > MAX_PENDING_STATUS_LINE_BYTES {
+                    if self.status_line.len() + chunk.len() > MAX_PENDING_STATUS_LINE_BYTES {
                         return PendingChunkProgress {
                             consumed: chunk.len(),
                             completed: true,
                         };
                     }
-                    status_line.extend_from_slice(chunk);
+                    self.status_line.extend_from_slice(chunk);
                     return PendingChunkProgress {
                         consumed: chunk.len(),
                         completed: false,
@@ -69,14 +74,14 @@ impl PendingBackendResponse {
                 };
 
                 let end = pos + 1;
-                if status_line.len() + end > MAX_PENDING_STATUS_LINE_BYTES {
+                if self.status_line.len() + end > MAX_PENDING_STATUS_LINE_BYTES {
                     return PendingChunkProgress {
                         consumed: chunk.len(),
                         completed: true,
                     };
                 }
-                status_line.extend_from_slice(&chunk[..end]);
-                let is_multiline = StatusCode::parse(status_line)
+                self.status_line.extend_from_slice(&chunk[..end]);
+                let is_multiline = StatusCode::parse(self.status_line.as_slice())
                     .is_some_and(|status| request_kind_expects_multiline(self.kind, status));
 
                 if !is_multiline {
@@ -90,7 +95,8 @@ impl PendingBackendResponse {
                 let mut framer = MultilineFramer::default();
                 // Keep the status line in the rolling window so a body that begins
                 // with ".\r\n" still forms a spanning terminator across the split.
-                framer.update(status_line);
+                framer.update(self.status_line.as_slice());
+                self.status_line.clear();
                 match framer.next_terminator_end(body) {
                     Some(pos) => PendingChunkProgress {
                         consumed: end + pos,
@@ -288,7 +294,9 @@ impl SessionLoopState {
     #[inline]
     pub fn mark_backend_request_sent(&mut self, kind: RequestKind) {
         self.ordered_replies
-            .push_back(OrderedReply::Backend(PendingBackendResponse::new(kind)));
+            .push_back(OrderedReply::Backend(Box::new(
+                PendingBackendResponse::new(kind),
+            )));
     }
 
     /// Whether earlier forwarded backend replies are still ahead of any deferred local replies.
@@ -579,6 +587,29 @@ mod tests {
             !state.has_pending_backend_replies(),
             "oversized status lines should stop pending bookkeeping instead of growing forever"
         );
+    }
+
+    #[test]
+    fn test_pending_backend_reply_status_line_stays_inline_at_capacity() {
+        let mut pending = PendingBackendResponse::new(RequestKind::Date);
+        let chunk = vec![b'x'; MAX_PENDING_STATUS_LINE_BYTES];
+
+        let progress = pending.consume(&chunk);
+        assert_eq!(progress.consumed, chunk.len());
+        assert!(!progress.completed);
+
+        match pending.state {
+            PendingBackendResponseState::AwaitingStatusLine => {
+                assert_eq!(pending.status_line.len(), MAX_PENDING_STATUS_LINE_BYTES);
+                assert!(
+                    !pending.status_line.spilled(),
+                    "bounded status-line buffering should stay stack-backed in the hot path"
+                );
+            }
+            PendingBackendResponseState::ReadingMultiline { .. } => {
+                panic!("date reply should still be waiting for a newline")
+            }
+        }
     }
 
     #[test]

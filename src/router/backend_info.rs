@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::pool::DeadpoolConnectionProvider;
-use crate::router::backend_queue::BackendQueue;
 use crate::types::{BackendId, ServerName};
 
 /// Load ratio (pending requests / max connections)
@@ -197,8 +196,6 @@ pub(super) struct BackendInfo {
     pub(super) stateful_count: StatefulCount,
     /// Server tier for prioritization (lower = higher priority)
     pub(super) tier: u8,
-    /// Pipeline queue for request multiplexing (None if pipelining disabled)
-    pub(super) pipeline_queue: Option<Arc<BackendQueue>>,
 }
 
 impl BackendInfo {

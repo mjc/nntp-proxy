@@ -105,21 +105,19 @@ impl From<usize> for ResponseWireLen {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct ResponsePayloadLen(usize);
 
+#[cfg(test)]
 impl ResponsePayloadLen {
     #[must_use]
     pub(crate) const fn new(value: usize) -> Self {
         Self(value)
     }
-
-    #[must_use]
-    pub(crate) const fn get(self) -> usize {
-        self.0
-    }
 }
 
+#[cfg(test)]
 impl From<usize> for ResponsePayloadLen {
     fn from(value: usize) -> Self {
         Self::new(value)
@@ -139,6 +137,7 @@ impl RequestResponseMetadata {
     }
 
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) const fn status(self) -> StatusCode {
         self.status
     }
@@ -597,6 +596,7 @@ impl RequestContext {
 
     #[inline]
     #[must_use]
+    #[cfg(test)]
     pub(crate) const fn response_payload_len(&self) -> Option<ResponsePayloadLen> {
         match &self.response_payload {
             Some(response) => Some(ResponsePayloadLen::new(response.len())),
@@ -605,6 +605,7 @@ impl RequestContext {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn complete_backend_response(
         &mut self,
         backend_id: BackendId,
@@ -617,6 +618,7 @@ impl RequestContext {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn take_response_payload(&mut self) -> Option<crate::pool::ChunkedResponse> {
         self.response_payload.take()
     }

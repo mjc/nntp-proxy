@@ -9,10 +9,12 @@
 use crate::protocol::RequestContext;
 use crate::session::ClientSession;
 use anyhow::Result;
+use smallvec::SmallVec;
 use tokio::io::AsyncBufReadExt;
 
 /// Maximum pipeline depth (number of commands read from client buffer at once)
 const MAX_PIPELINE_DEPTH: usize = 16;
+type BatchContexts = SmallVec<[RequestContext; MAX_PIPELINE_DEPTH]>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestRejection {
@@ -26,7 +28,7 @@ enum RequestRejection {
 /// non-pipelineable line, keeping one request model for the whole batch.
 pub(super) struct RequestBatch {
     /// Typed contexts for each pipelineable command.
-    contexts: smallvec::SmallVec<[RequestContext; 4]>,
+    contexts: BatchContexts,
     /// Typed context for trailing non-pipelineable command if present.
     trailing_context: Option<RequestContext>,
     /// Rejection for the first command, before context creation.
@@ -67,7 +69,7 @@ impl RequestBatch {
     }
 
     const fn contexts_with_trailing_oversized(
-        contexts: smallvec::SmallVec<[RequestContext; 4]>,
+        contexts: BatchContexts,
         trailing_wire_len: usize,
     ) -> Self {
         Self {
@@ -80,9 +82,7 @@ impl RequestBatch {
         }
     }
 
-    const fn contexts_with_trailing_invalid(
-        contexts: smallvec::SmallVec<[RequestContext; 4]>,
-    ) -> Self {
+    const fn contexts_with_trailing_invalid(contexts: BatchContexts) -> Self {
         Self {
             contexts,
             trailing_context: None,
@@ -92,7 +92,7 @@ impl RequestBatch {
     }
 
     const fn contexts_with_trailing(
-        contexts: smallvec::SmallVec<[RequestContext; 4]>,
+        contexts: BatchContexts,
         trailing_context: RequestContext,
     ) -> Self {
         Self {
@@ -103,7 +103,7 @@ impl RequestBatch {
         }
     }
 
-    fn contexts(contexts: smallvec::SmallVec<[RequestContext; 4]>) -> Self {
+    fn contexts(contexts: BatchContexts) -> Self {
         Self {
             contexts,
             ..Self::empty()
@@ -219,7 +219,7 @@ impl ClientSession {
             return Ok(RequestBatch::trailing(request));
         }
 
-        let mut batch_contexts: smallvec::SmallVec<[RequestContext; 4]> = smallvec::SmallVec::new();
+        let mut batch_contexts = BatchContexts::new();
         batch_contexts.push(request);
 
         // Read more commands from the buffer (non-blocking)

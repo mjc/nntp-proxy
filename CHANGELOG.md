@@ -46,7 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The current tree is a broad redesign of routing, caching, persistence, and operator-facing runtime behavior compared to 0.4.0, not just an incremental feature release.
 
 - **Configuration and CLI naming refresh**
-  - Reorganized config around `[routing]`, `[memory]`, `[cache]`, and `[health_check]` with clearer canonical names such as `article_cache_capacity`, `article_cache_ttl_secs`, `store_article_bodies`, and `backend_pipelining`.
+  - Reorganized config around `[routing]`, `[memory]`, `[cache]`, and `[health_check]` with clearer canonical names such as `article_cache_capacity`, `article_cache_ttl_secs`, and `store_article_bodies`.
   - Config loading now migrates older layouts in place and CLI parsing keeps legacy flag aliases for compatibility.
 
 - **Runtime binary presentation**

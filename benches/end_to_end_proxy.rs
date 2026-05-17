@@ -42,7 +42,6 @@ fn bench_config(backend_port: u16, cache: Option<Cache>) -> Config {
             Server::builder("127.0.0.1", Port::try_new(backend_port).unwrap())
                 .name("bench-backend")
                 .max_connections(MaxConnections::try_new(4).unwrap())
-                .backend_pipelining(true)
                 .build()
                 .unwrap(),
         ],

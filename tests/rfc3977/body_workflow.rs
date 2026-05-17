@@ -199,7 +199,6 @@ fn pipeline_backend_config_with_max_connections(
         name,
         max_connections,
     );
-    server.pipeline_batch_size = 4;
     Config {
         servers: vec![server],
         ..Default::default()

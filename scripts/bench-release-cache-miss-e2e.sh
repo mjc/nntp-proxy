@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# End-to-end release benchmark for large article cache-miss performance.
+# End-to-end profiling-profile benchmark for large article cache-miss performance.
 #
 # Topology:
 #   nntpbench client -> measured nntp-proxy -> nntpbench mock NNTP server
 #
-# The client and backend both come from nntpbench. The client generates
-# deterministic Message-IDs locally, so this harness does not download or parse
-# any external dataset. The measured proxy has no [cache] section: every
-# measured request passes through the front proxy to nntpbench.
+# The client and backend both come from nntpbench. The harness always feeds the
+# client a synthetic segments file by default so ARTICLE/BODY requests stay on
+# comparable message-ID paths across nntpbench revisions. The measured proxy
+# has no [cache] section: every measured request passes through the front proxy
+# to nntpbench.
 
 RESULT_DIR=${RESULT_DIR:-"target/bench-results"}
 WORK_DIR=${WORK_DIR:-"$RESULT_DIR/release-cache-miss-e2e-work"}
@@ -29,6 +30,9 @@ NNTPBENCH_BODY_BYTES=${NNTPBENCH_BODY_BYTES:-$NNTPBENCH_ARTICLE_BYTES}
 NNTPBENCH_MAX_CONNECTIONS=${NNTPBENCH_MAX_CONNECTIONS:-4096}
 NNTPBENCH_MAX_PIPELINE_DEPTH=${NNTPBENCH_MAX_PIPELINE_DEPTH:-1024}
 NNTPBENCH_START_ID=${NNTPBENCH_START_ID:-1}
+NNTPBENCH_SEGMENTS_MODE=${NNTPBENCH_SEGMENTS_MODE:-always}
+NNTPBENCH_SEGMENT_COUNT=${NNTPBENCH_SEGMENT_COUNT:-65536}
+NNTPBENCH_SEGMENTS_FILE=${NNTPBENCH_SEGMENTS_FILE:-"$WORK_DIR/nntpbench-synthetic-segments.tsv"}
 
 SKIP_BUILDS=${SKIP_BUILDS:-0}
 THREADS_MATRIX=${THREADS_MATRIX:-"1 2 4 8"}
@@ -44,20 +48,15 @@ PROFILE_MEASURED=${PROFILE_MEASURED:-0}
 PROFILE_FREQ=${PROFILE_FREQ:-997}
 TOKIO_CONSOLE=${TOKIO_CONSOLE:-0}
 TOKIO_CONSOLE_PROCESS=${TOKIO_CONSOLE_PROCESS:-measured}
-PIPELINE_TIMING=${PIPELINE_TIMING:-0}
-PIPELINE_TIMING_PROCESS=${PIPELINE_TIMING_PROCESS:-measured}
 SHARDED_MEASURED_INSTANCES=${SHARDED_MEASURED_INSTANCES:-1}
 DIRECT_UPSTREAM=${DIRECT_UPSTREAM:-0}
 PROXY_CLI_MODE=${PROXY_CLI_MODE:-current}
 HOST=${HOST:-127.0.0.1}
+UPSTREAM_TASKSET=${UPSTREAM_TASKSET:-""}
+MEASURED_TASKSET=${MEASURED_TASKSET:-""}
+CLIENT_TASKSET=${CLIENT_TASKSET:-""}
 
-if [ -z "${CARGO_PROFILE:-}" ]; then
-    if [ "$PROFILE_UPSTREAM" = "1" ] || [ "$PROFILE_MEASURED" = "1" ]; then
-        CARGO_PROFILE=profiling
-    else
-        CARGO_PROFILE=release
-    fi
-fi
+CARGO_PROFILE=${CARGO_PROFILE:-profiling}
 
 if [ "$TARGET_ARTICLE_BYTES" -le 0 ]; then
     echo "TARGET_ARTICLE_BYTES must be greater than zero" >&2
@@ -78,6 +77,46 @@ MEASURED_PIDS=()
 MEASURED_PORTS=()
 UPSTREAM_PID=""
 MEASURED_PID=""
+
+should_use_nntpbench_segments() {
+    case "$NNTPBENCH_SEGMENTS_MODE" in
+        always|on|true|1)
+            return 0
+            ;;
+        never|off|false|0)
+            return 1
+            ;;
+        auto)
+            return 0
+            ;;
+        *)
+            echo "NNTPBENCH_SEGMENTS_MODE must be one of: auto, always, never" >&2
+            exit 1
+            ;;
+    esac
+}
+
+ensure_nntpbench_segments_file() {
+    if ! should_use_nntpbench_segments; then
+        return
+    fi
+
+    echo "Using synthetic nntpbench segments file at $NNTPBENCH_SEGMENTS_FILE"
+
+    python3 - "$NNTPBENCH_SEGMENTS_FILE" "$NNTPBENCH_SEGMENT_COUNT" "$NNTPBENCH_ARTICLE_BYTES" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+count = int(sys.argv[2])
+size = int(sys.argv[3])
+
+path.parent.mkdir(parents=True, exist_ok=True)
+with path.open("w", encoding="utf-8") as fh:
+    for idx in range(count):
+        fh.write(f"{size}\tbench.segment.{idx}@nntpbench.local\n")
+PY
+}
 
 reserve_port() {
     python3 - <<'PY'
@@ -163,6 +202,17 @@ print(float(sys.argv[1]) / float(sys.argv[2]))
 PY
 }
 
+run_with_optional_taskset() {
+    local cpu_list="$1"
+    shift
+
+    if [ -n "$cpu_list" ]; then
+        taskset -c "$cpu_list" "$@"
+    else
+        "$@"
+    fi
+}
+
 resolve_transfer_bytes_per_scenario() {
     if [ "$TRANSFER_BYTES_PER_SCENARIO" -gt 0 ]; then
         echo "$TRANSFER_BYTES_PER_SCENARIO"
@@ -232,7 +282,7 @@ start_upstream() {
     UPSTREAM_PORT=$(reserve_port)
 
     echo "Using flake-provided nntpbench backend at $NNTPBENCH_BIN"
-    "$NNTPBENCH_BIN" server \
+    run_with_optional_taskset "$UPSTREAM_TASKSET" "$NNTPBENCH_BIN" server \
         --listen "$HOST:$UPSTREAM_PORT" \
         --body-bytes "$NNTPBENCH_BODY_BYTES" \
         --article-bytes "$NNTPBENCH_ARTICLE_BYTES" \
@@ -304,7 +354,6 @@ port = $UPSTREAM_PORT
 name = "nntpbench-backend"
 max_connections = $backend_connections
 tier = 0
-backend_pipelining = true
 use_tls = false
 EOF
 }
@@ -359,19 +408,18 @@ start_measured_shards() {
         if [ "$TOKIO_CONSOLE" = "1" ] && [ "$TOKIO_CONSOLE_PROCESS" = "measured" ]; then
             measured_env+=(NNTP_PROXY_TOKIO_CONSOLE=1)
         fi
-        if [ "$PIPELINE_TIMING" = "1" ] && [ "$PIPELINE_TIMING_PROCESS" = "measured" ]; then
-            measured_env+=(NNTP_PROXY_PIPELINE_TIMING=1)
-        fi
-
         proxy_cmd=("$BIN" --config "$config_path")
         if [ "$PROXY_CLI_MODE" != "legacy" ]; then
             proxy_cmd+=(--ui headless)
         fi
 
         if [ "${#measured_env[@]}" -gt 0 ]; then
-            env "${measured_env[@]}" "${proxy_cmd[@]}" >"$shard_log" 2>&1 &
+            (
+                export "${measured_env[@]}"
+                run_with_optional_taskset "$MEASURED_TASKSET" "${proxy_cmd[@]}"
+            ) >"$shard_log" 2>&1 &
         else
-            "${proxy_cmd[@]}" >"$shard_log" 2>&1 &
+            run_with_optional_taskset "$MEASURED_TASKSET" "${proxy_cmd[@]}" >"$shard_log" 2>&1 &
         fi
         MEASURED_PIDS+=("$!")
     done
@@ -399,6 +447,9 @@ run_client_load() {
         if [ -n "$ports" ]; then
             cmd+=(--ports "$ports")
         fi
+        if should_use_nntpbench_segments; then
+            cmd+=(--segments "$NNTPBENCH_SEGMENTS_FILE")
+        fi
         cmd+=(
             --requests "$requests"
             --transfer-bytes "$transfer_bytes"
@@ -418,7 +469,7 @@ run_client_load() {
         if [ "$client_offset" -gt 0 ]; then
             cmd+=(--client-offset "$client_offset")
         fi
-        "${cmd[@]}"
+        run_with_optional_taskset "$CLIENT_TASKSET" "${cmd[@]}"
         return
     fi
 
@@ -453,6 +504,9 @@ PY
         if [ -n "$ports" ]; then
             cmd+=(--ports "$ports")
         fi
+        if should_use_nntpbench_segments; then
+            cmd+=(--segments "$NNTPBENCH_SEGMENTS_FILE")
+        fi
         cmd+=(
             --requests "$process_requests"
             --transfer-bytes "$process_transfer_bytes"
@@ -468,7 +522,7 @@ PY
             --stats-interval-secs 0
             --csv
         )
-        "${cmd[@]}" >"$run_dir/client-$process_idx.csv" &
+        run_with_optional_taskset "$CLIENT_TASKSET" "${cmd[@]}" >"$run_dir/client-$process_idx.csv" &
         pids+=("$!")
         offset=$((offset + process_clients))
     done
@@ -642,6 +696,7 @@ echo "Scenario target: requests=${REQUESTS_PER_SCENARIO:-0} transfer_bytes=$SCEN
 
 build_proxy_binary
 build_nntpbench_binary
+ensure_nntpbench_segments_file
 start_upstream
 
 echo "Writing results to $RESULT_FILE"

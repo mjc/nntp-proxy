@@ -228,9 +228,14 @@ impl NntpClient {
 
         match framer.advance_to_next_terminator_end(first_chunk) {
             Some(pos) => {
+                if pos != first_chunk.len() {
+                    anyhow::bail!(
+                        "Backend sent {} unexpected trailing bytes after multiline terminator",
+                        first_chunk.len() - pos
+                    );
+                }
                 // pos is after the terminator (terminator included in [..pos])
                 capture.extend_from_slice(&first_chunk[..pos]);
-                conn.stash_leftover_from(first_chunk, pos);
                 return Ok(());
             }
             None => {
@@ -253,9 +258,14 @@ impl NntpClient {
             };
             match found_at {
                 Some(pos) => {
+                    if pos != n {
+                        anyhow::bail!(
+                            "Backend sent {} unexpected trailing bytes after multiline terminator",
+                            n - pos
+                        );
+                    }
                     // pos is after the terminator (terminator included in [..pos])
                     capture.extend_from_slice(&io_buffer[..pos]);
-                    conn.stash_leftover_from(&io_buffer[..n], pos);
                     return Ok(());
                 }
                 None => {
@@ -563,7 +573,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drain_multiline_into_stashes_packed_leftover_response() {
+    async fn test_drain_multiline_into_errors_on_packed_suffix() {
         use crate::pool::BufferPool;
         use crate::types::BufferSize;
 
@@ -581,19 +591,19 @@ mod tests {
         let mut capture = buffer_pool.acquire_capture();
         let first_chunk_size = io_buffer.read_from(&mut *conn).await.unwrap();
 
-        NntpClient::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, first_chunk_size)
-            .await
-            .unwrap();
+        let err = NntpClient::drain_multiline_into(
+            &mut conn,
+            &mut io_buffer,
+            &mut capture,
+            first_chunk_size,
+        )
+        .await
+        .unwrap_err();
 
-        assert_eq!(&capture[..], article as &[u8]);
-        assert!(conn.has_leftover(), "next response should be stashed");
-        assert_eq!(conn.leftover_len(), b"430 No such article\r\n".len());
-
-        let next = io_buffer.read_from(&mut *conn).await.unwrap();
-        assert_eq!(&io_buffer[..next], b"430 No such article\r\n");
         assert!(
-            !conn.has_leftover(),
-            "stashed bytes should be consumed first"
+            err.to_string()
+                .contains("unexpected trailing bytes after multiline terminator"),
+            "unexpected error: {err:#}"
         );
     }
 

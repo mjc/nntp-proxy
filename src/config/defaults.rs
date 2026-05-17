@@ -185,24 +185,6 @@ pub const fn backend_idle_timeout() -> Duration {
     crate::constants::duration_polyfill::from_minutes(10)
 }
 
-/// Default for backend pipelining (enabled)
-#[inline]
-pub const fn enable_pipelining() -> bool {
-    true
-}
-
-/// Default pipeline queue depth per backend connection
-#[inline]
-pub const fn pipeline_queue_depth() -> usize {
-    1000
-}
-
-/// Default pipeline batch size
-#[inline]
-pub const fn pipeline_batch_size() -> usize {
-    4
-}
-
 /// Default connection replacement cooldown (30 seconds)
 #[inline]
 pub const fn replacement_cooldown() -> Duration {

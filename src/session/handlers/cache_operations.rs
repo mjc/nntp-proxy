@@ -32,26 +32,6 @@ pub(super) enum CacheLookupResult {
 }
 
 impl ClientSession {
-    pub(super) async fn has_servable_cached_response(&self, request: &RequestContext) -> bool {
-        let Some(msg_id) = request.message_id() else {
-            return false;
-        };
-
-        let Some(cached) = self.cache.get_request_message_id(msg_id).await else {
-            return false;
-        };
-
-        if !cached.has_availability_info() || !self.cache_articles {
-            return false;
-        }
-
-        if !request.is_stat() && !cached.is_complete_article() {
-            return false;
-        }
-
-        cached.cached_response_for(request.kind(), msg_id).is_some()
-    }
-
     /// Try to serve from cache
     ///
     /// Returns `CacheLookupResult::Hit` if served, `PartialHit` if entry existed but

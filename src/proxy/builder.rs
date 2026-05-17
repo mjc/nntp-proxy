@@ -179,19 +179,11 @@ impl NntpProxyBuilder {
                 router::BackendSelector::with_strategy(backend_strategy),
                 |mut r, (idx, provider)| {
                     let backend_id = BackendId::from_index(idx);
-                    let pipeline_queue = if servers[idx].backend_pipelining {
-                        Some(Arc::new(router::BackendQueue::new(
-                            pipeline_queue_capacity(&servers[idx]),
-                        )))
-                    } else {
-                        None
-                    };
-                    r.add_backend_with_queue(
+                    r.add_backend(
                         backend_id,
                         servers[idx].name.clone(),
                         provider.clone(),
                         servers[idx].tier,
-                        pipeline_queue,
                     );
                     r
                 },
@@ -389,27 +381,6 @@ pub(super) struct BuildContext {
     memory: Memory,
 }
 
-#[inline]
-fn pipeline_worker_count(server: &Server) -> usize {
-    if server.backend_pipelining {
-        let max_connections = server.max_connections.get();
-        if max_connections > 1 {
-            max_connections - 1
-        } else {
-            1
-        }
-    } else {
-        0
-    }
-}
-
-#[inline]
-fn pipeline_queue_capacity(server: &Server) -> usize {
-    server
-        .pipeline_queue_depth
-        .saturating_mul(server.max_connections.get())
-}
-
 impl BuildContext {
     /// Construct the final `NntpProxy` from this context and a cache
     pub(super) fn into_proxy(
@@ -417,9 +388,6 @@ impl BuildContext {
         cache: Arc<UnifiedCache>,
         store_article_bodies: bool,
     ) -> NntpProxy {
-        // Spawn pipeline workers for backends that have pipelining enabled
-        self.spawn_pipeline_workers();
-
         NntpProxy {
             servers: self.servers,
             router: self.router,
@@ -436,65 +404,6 @@ impl BuildContext {
             last_activity_nanos: Arc::new(AtomicU64::new(0)),
             active_clients: Arc::new(AtomicUsize::new(0)),
             start_instant: Instant::now(),
-        }
-    }
-
-    /// Spawn pipeline worker tasks for backends with pipelining enabled
-    ///
-    /// Only spawns if a Tokio runtime is available (skipped in sync test contexts).
-    fn spawn_pipeline_workers(&self) {
-        use crate::session::handlers::pipeline_worker::{
-            PipelineWorkerConfig, backend_pipeline_worker,
-        };
-        use crate::types::BackendId;
-
-        // Check if a Tokio runtime is available before spawning
-        let Ok(_handle) = tokio::runtime::Handle::try_current() else {
-            debug!("No Tokio runtime available, skipping pipeline worker spawning");
-            return;
-        };
-
-        for (idx, server) in self.servers.iter().enumerate() {
-            let backend_id = BackendId::from_index(idx);
-            let worker_count = pipeline_worker_count(server);
-            if worker_count == 0 {
-                continue;
-            }
-
-            if let Some(queue) = self.router.get_backend_queue(backend_id) {
-                let config = PipelineWorkerConfig {
-                    batch_size: server.pipeline_batch_size,
-                    backend_id,
-                };
-                for _ in 0..worker_count {
-                    let queue = queue.clone();
-                    let provider = Arc::new(self.connection_providers[idx].clone());
-                    let metrics = self.metrics.clone();
-                    let buffer_pool = self.buffer_pool.clone();
-
-                    let worker_task = backend_pipeline_worker(
-                        config.clone(),
-                        queue,
-                        provider,
-                        metrics,
-                        buffer_pool,
-                    );
-
-                    #[cfg(tokio_unstable)]
-                    tokio::task::Builder::new()
-                        .name("backend-pipeline-worker")
-                        .spawn(worker_task)
-                        .expect("spawn backend pipeline worker");
-
-                    #[cfg(not(tokio_unstable))]
-                    tokio::spawn(worker_task);
-                }
-
-                debug!(
-                    "Spawned {} pipeline workers for backend {:?} ({}) batch_size={}",
-                    worker_count, backend_id, server.name, server.pipeline_batch_size
-                );
-            }
         }
     }
 }
@@ -642,55 +551,5 @@ mod tests {
                 .to_string()
                 .contains("No servers configured")
         );
-    }
-
-    #[test]
-    fn test_pipeline_worker_count_reserves_one_pool_slot_for_non_pipeline_work() {
-        let enabled = Server::builder("127.0.0.1", crate::types::Port::try_new(119).unwrap())
-            .name("enabled")
-            .max_connections(crate::types::MaxConnections::try_new(42).unwrap())
-            .build()
-            .unwrap();
-        assert_eq!(pipeline_worker_count(&enabled), 41);
-
-        let single_connection =
-            Server::builder("127.0.0.1", crate::types::Port::try_new(119).unwrap())
-                .name("single")
-                .max_connections(crate::types::MaxConnections::try_new(1).unwrap())
-                .build()
-                .unwrap();
-        assert_eq!(pipeline_worker_count(&single_connection), 1);
-
-        let disabled = Server::builder("127.0.0.1", crate::types::Port::try_new(119).unwrap())
-            .name("disabled")
-            .max_connections(crate::types::MaxConnections::try_new(42).unwrap())
-            .backend_pipelining(false)
-            .build()
-            .unwrap();
-        assert_eq!(pipeline_worker_count(&disabled), 0);
-    }
-
-    #[test]
-    fn test_pipeline_queue_depth_is_per_backend_connection() {
-        let server = Server::builder("127.0.0.1", crate::types::Port::try_new(119).unwrap())
-            .name("enabled")
-            .max_connections(crate::types::MaxConnections::try_new(42).unwrap())
-            .pipeline_queue_depth(1000)
-            .build()
-            .unwrap();
-
-        assert_eq!(pipeline_queue_capacity(&server), 42_000);
-    }
-
-    #[test]
-    fn test_pipeline_queue_capacity_saturates_on_overflow() {
-        let server = Server::builder("127.0.0.1", crate::types::Port::try_new(119).unwrap())
-            .name("enabled")
-            .max_connections(crate::types::MaxConnections::try_new(42).unwrap())
-            .pipeline_queue_depth(usize::MAX)
-            .build()
-            .unwrap();
-
-        assert_eq!(pipeline_queue_capacity(&server), usize::MAX);
     }
 }

@@ -141,17 +141,6 @@ pub fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
         .join(" ")
 }
 
-/// Format a hex preview of the final bytes in a response for framing diagnostics.
-#[must_use]
-pub fn format_hex_tail_preview(data: &[u8], max_bytes: usize) -> String {
-    let start = data.len().saturating_sub(max_bytes);
-    data[start..]
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 // ─── Command execution ──────────────────────────────────────────────────────
 
 /// Metadata for the first backend response chunk.

@@ -17,5 +17,4 @@ pub(crate) use command_execution::should_sample_backend_timing;
 mod hybrid;
 mod per_command;
 mod pipeline;
-pub(crate) mod pipeline_worker;
 mod stateful;

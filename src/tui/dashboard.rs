@@ -40,8 +40,6 @@ pub struct BackendView {
     pub load_ratio: Option<f64>,
     pub stateful_count: usize,
     pub traffic_share: Option<f64>,
-    #[serde(default)]
-    pub pipeline_depth: Option<usize>,
     pub history: Vec<ThroughputPoint>,
 }
 
@@ -62,8 +60,6 @@ pub struct RemoteBackendView {
     pub pending_count: usize,
     pub stateful_count: usize,
     pub traffic_share: Option<f64>,
-    #[serde(default)]
-    pub pipeline_depth: Option<usize>,
     pub history: Vec<ThroughputPoint>,
 }
 
@@ -131,12 +127,6 @@ pub struct DashboardMetrics {
     pub pipeline_requests_completed: u64,
     #[serde(default)]
     pub in_flight_requests: usize,
-    #[serde(default)]
-    pub pipeline_enabled_backends: usize,
-    #[serde(default)]
-    pub pipeline_depth: usize,
-    #[serde(default)]
-    pub pipeline_connection_capacity: usize,
 }
 
 impl DashboardMetrics {
@@ -158,9 +148,6 @@ impl DashboardMetrics {
             pipeline_requests_queued: snapshot.pipeline_requests_queued,
             pipeline_requests_completed: snapshot.pipeline_requests_completed,
             in_flight_requests: 0,
-            pipeline_enabled_backends: 0,
-            pipeline_depth: 0,
-            pipeline_connection_capacity: 0,
         }
     }
 
@@ -259,12 +246,6 @@ impl DashboardState {
     }
 
     #[must_use]
-    pub fn backend_pipeline_depth(&self, backend_idx: usize) -> Option<usize> {
-        self.backend_view(backend_idx)
-            .and_then(|view| view.pipeline_depth)
-    }
-
-    #[must_use]
     pub fn buffer_pool(&self) -> Option<&BufferPoolStats> {
         self.buffer_pool.as_ref()
     }
@@ -298,12 +279,6 @@ impl RemoteDashboardState {
         self.backend_view(backend_idx)
             .and_then(|view| view.traffic_share)
     }
-
-    #[must_use]
-    pub fn backend_pipeline_depth(&self, backend_idx: usize) -> Option<usize> {
-        self.backend_view(backend_idx)
-            .and_then(|view| view.pipeline_depth)
-    }
 }
 
 impl From<BackendView> for RemoteBackendView {
@@ -316,7 +291,6 @@ impl From<BackendView> for RemoteBackendView {
             pending_count: view.pending_count,
             stateful_count: view.stateful_count,
             traffic_share: view.traffic_share,
-            pipeline_depth: view.pipeline_depth,
             history: view.history,
         }
     }
@@ -362,7 +336,6 @@ mod tests {
             load_ratio: Some(0.5),
             stateful_count: 3,
             traffic_share: Some(42.0),
-            pipeline_depth: Some(2),
             history: vec![ThroughputPoint::new_backend(
                 Timestamp::now(),
                 Throughput::new(1.0),
@@ -392,7 +365,6 @@ mod tests {
         assert!(state.backend_load_ratio(1).is_none());
         assert_eq!(state.backend_stateful_count(1), 0);
         assert!(state.backend_traffic_share(1).is_none());
-        assert!(state.backend_pipeline_depth(1).is_none());
     }
 
     #[test]

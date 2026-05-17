@@ -6,6 +6,7 @@
 use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata, StatusCode};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::SessionError;
+use crate::session::multiline_framing::MultilineFramer;
 use crate::session::response_buffer::StreamingError;
 use crate::session::retry::retry_once;
 use crate::session::routing::{
@@ -58,6 +59,7 @@ impl BackendAttemptResult {
 pub(super) struct ArticleAttemptState<'a> {
     pub availability: &'a mut crate::cache::ArticleAvailability,
     pub client_to_backend_bytes: &'a mut ClientToBackendBytes,
+    pub backend_connection: &'a mut Option<(BackendId, crate::pool::ConnectionGuard)>,
 }
 
 type BackendTimings = (u64, u64, u64);
@@ -159,7 +161,12 @@ impl ClientSession {
                 "Direct backend attempt returned 430 before streaming"
             );
             self.handle_430_availability(backend_id, state.availability);
-            let _ = conn.release();
+            self.release_or_reuse_connection(
+                conn,
+                backend_id,
+                request,
+                Some(state.backend_connection),
+            );
             return Ok(BackendAttemptResult::ArticleNotFound { backend_id });
         }
 
@@ -176,6 +183,7 @@ impl ClientSession {
                     msg_id: msg_id.as_ref(),
                     status_code,
                 },
+                Some(state.backend_connection),
             )
             .await?;
         guard.complete();
@@ -199,7 +207,7 @@ impl ClientSession {
             "Preparing direct backend attempt"
         );
         let (conn, cmd_response, buffer, timings) = retry_once!(
-            self.execute_backend_attempt(provider, backend_id, request)
+            self.execute_backend_attempt(provider, backend_id, request, state.backend_connection)
                 .await,
             client = self.client_addr,
             backend = backend_id.as_index()
@@ -286,6 +294,7 @@ impl ClientSession {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn stream_successful_backend_response<W>(
         &self,
         mut conn: crate::pool::ConnectionGuard,
@@ -294,6 +303,7 @@ impl ClientSession {
         mut first_buffer: crate::pool::PooledBuffer,
         first_chunk_len: usize,
         params: ResponseStreamParams<'_>,
+        backend_connection: Option<&mut Option<(BackendId, crate::pool::ConnectionGuard)>>,
     ) -> Result<RequestResponseMetadata, SessionError>
     where
         W: AsyncWrite + Unpin,
@@ -347,7 +357,7 @@ impl ClientSession {
             params.request.request_wire_len().as_u64(),
             bytes_written,
         );
-        self.release_or_retire_connection(conn, backend_id, params.request);
+        self.release_or_reuse_connection(conn, backend_id, params.request, backend_connection);
 
         Ok(RequestResponseMetadata::new(
             params.status_code,
@@ -393,11 +403,12 @@ impl ClientSession {
         SessionError::from(error)
     }
 
-    fn release_or_retire_connection(
+    fn release_or_reuse_connection(
         &self,
         conn: crate::pool::ConnectionGuard,
         backend_id: BackendId,
         request: &RequestContext,
+        backend_connection: Option<&mut Option<(BackendId, crate::pool::ConnectionGuard)>>,
     ) {
         if conn.has_leftover() {
             warn!(
@@ -407,6 +418,16 @@ impl ClientSession {
                 leftover_bytes = conn.leftover_len(),
                 "Direct per-command response left trailing backend bytes; retiring connection"
             );
+        } else if let Some(slot) = backend_connection
+            && slot.is_none()
+        {
+            debug!(
+                client = %self.client_addr,
+                backend = backend_id.as_index(),
+                command_verb = ?request.verb(),
+                "Direct per-command response finished cleanly; keeping backend connection for this client batch"
+            );
+            *slot = Some((backend_id, conn));
         } else {
             debug!(
                 client = %self.client_addr,
@@ -427,6 +448,7 @@ impl ClientSession {
         provider: &crate::pool::DeadpoolConnectionProvider,
         backend_id: crate::types::BackendId,
         request: &RequestContext,
+        backend_connection: &mut Option<(BackendId, crate::pool::ConnectionGuard)>,
     ) -> Result<(
         crate::pool::ConnectionGuard,
         backend::BackendFirstResponse,
@@ -440,15 +462,41 @@ impl ClientSession {
             msg_id = ?request.message_id_value(),
             "Starting pool checkout for direct backend attempt"
         );
-        let conn = provider.get_pooled_connection().await?;
-        debug!(
-            client = %self.client_addr,
-            backend = backend_id.as_index(),
-            command_verb = ?request.verb(),
-            msg_id = ?request.message_id_value(),
-            "Pool checkout succeeded for direct backend attempt"
-        );
-        let mut guard = crate::pool::ConnectionGuard::new(conn, provider.clone());
+        let mut guard = match backend_connection.take() {
+            Some((cached_backend_id, guard)) if cached_backend_id == backend_id => {
+                debug!(
+                    client = %self.client_addr,
+                    backend = backend_id.as_index(),
+                    command_verb = ?request.verb(),
+                    msg_id = ?request.message_id_value(),
+                    "Reusing backend connection for direct backend attempt"
+                );
+                guard
+            }
+            Some(cached) => {
+                *backend_connection = Some(cached);
+                let conn = provider.get_pooled_connection().await?;
+                debug!(
+                    client = %self.client_addr,
+                    backend = backend_id.as_index(),
+                    command_verb = ?request.verb(),
+                    msg_id = ?request.message_id_value(),
+                    "Pool checkout succeeded for direct backend attempt"
+                );
+                crate::pool::ConnectionGuard::new(conn, provider.clone())
+            }
+            None => {
+                let conn = provider.get_pooled_connection().await?;
+                debug!(
+                    client = %self.client_addr,
+                    backend = backend_id.as_index(),
+                    command_verb = ?request.verb(),
+                    msg_id = ?request.message_id_value(),
+                    "Pool checkout succeeded for direct backend attempt"
+                );
+                crate::pool::ConnectionGuard::new(conn, provider.clone())
+            }
+        };
         let mut buffer = self.buffer_pool.acquire();
 
         debug!(
@@ -480,7 +528,7 @@ impl ClientSession {
     /// Execute command on a connection and read first chunk.
     ///
     /// Takes `&mut ConnectionStream` (not a pool object) so it can be called
-    /// by both the pool-checkout path and future pipeline workers.
+    /// directly after pool checkout.
     async fn execute_and_get_first_chunk(
         &self,
         conn: &mut crate::stream::ConnectionStream,
@@ -545,6 +593,23 @@ impl ClientSession {
             params.msg_id.is_some(),
             cache_action
         );
+
+        if !matches!(cache_action, CacheAction::CaptureArticle)
+            && params
+                .request
+                .expects_multiline_response(params.status_code)
+        {
+            let bytes_written = Self::stream_uncaptured_multiline_response(
+                pooled_conn,
+                client_write,
+                backend_id,
+                first_buffer,
+                first_chunk_len,
+            )
+            .await?;
+            Self::apply_uncaptured_cache_action(cache_action, self, params, backend_id);
+            return Ok(bytes_written);
+        }
 
         let mut captured = crate::pool::ChunkedResponse::default();
         crate::session::response_buffer::buffer_prefetched_response_for_request(
@@ -621,6 +686,125 @@ impl ClientSession {
             CacheAction::None => {}
         }
         Ok(captured_len as u64)
+    }
+
+    async fn stream_uncaptured_multiline_response<W>(
+        pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+        client_write: &mut W,
+        backend_id: BackendId,
+        first_buffer: &mut crate::pool::PooledBuffer,
+        first_chunk_len: usize,
+    ) -> Result<u64, StreamingError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let mut framer = MultilineFramer::default();
+        let mut bytes_written = 0u64;
+
+        let first = &first_buffer[..first_chunk_len];
+        if Self::write_uncaptured_multiline_chunk(
+            client_write,
+            &mut framer,
+            first,
+            &mut bytes_written,
+        )
+        .await?
+        {
+            return Ok(bytes_written);
+        }
+        first_buffer.clear();
+
+        loop {
+            let n = first_buffer
+                .read_from(pooled_conn.as_mut())
+                .await
+                .map_err(|e| {
+                    StreamingError::Io(
+                        anyhow::Error::from(e).context("Failed to read remaining response body"),
+                    )
+                })?;
+            if n == 0 {
+                return Err(StreamingError::BackendEof {
+                    backend_id,
+                    bytes_received: bytes_written,
+                });
+            }
+
+            let chunk = &first_buffer[..n];
+            if Self::write_uncaptured_multiline_chunk(
+                client_write,
+                &mut framer,
+                chunk,
+                &mut bytes_written,
+            )
+            .await?
+            {
+                return Ok(bytes_written);
+            }
+        }
+    }
+
+    async fn write_uncaptured_multiline_chunk<W>(
+        client_write: &mut W,
+        framer: &mut MultilineFramer,
+        chunk: &[u8],
+        bytes_written: &mut u64,
+    ) -> Result<bool, StreamingError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let Some(write_len) = framer.advance_to_next_terminator_end(chunk) else {
+            client_write
+                .write_all(chunk)
+                .await
+                .map_err(classify_buffered_response_write_err)?;
+            *bytes_written += chunk.len() as u64;
+            return Ok(false);
+        };
+
+        if write_len != chunk.len() {
+            return Err(StreamingError::Io(anyhow::anyhow!(
+                "Backend sent {} unexpected trailing bytes after multiline terminator",
+                chunk.len() - write_len
+            )));
+        }
+
+        client_write
+            .write_all(&chunk[..write_len])
+            .await
+            .map_err(classify_buffered_response_write_err)?;
+        *bytes_written += write_len as u64;
+        Ok(true)
+    }
+
+    fn apply_uncaptured_cache_action(
+        cache_action: CacheAction,
+        session: &ClientSession,
+        params: ResponseStreamParams<'_>,
+        backend_id: BackendId,
+    ) {
+        match cache_action {
+            CacheAction::TrackAvailability => {
+                if let Some(msg_id) = params.msg_id
+                    && !params.request.cache_records_backend_has_article(backend_id)
+                {
+                    session.spawn_cache_upsert_availability(
+                        msg_id,
+                        params.status_code,
+                        backend_id,
+                        session.tier_for_backend(backend_id),
+                    );
+                }
+            }
+            CacheAction::TrackStat => {
+                session.maybe_cache_upsert_buffer(
+                    params.msg_id,
+                    crate::cache::CacheIngestResponse::from(b"223\r\n".as_slice()),
+                    backend_id,
+                );
+            }
+            CacheAction::CaptureArticle | CacheAction::None => {}
+        }
     }
 
     /// Handle backend error (metrics and cleanup)
@@ -878,6 +1062,7 @@ mod tests {
                     msg_id: None,
                     status_code: StatusCode::new(223),
                 },
+                None,
             )
             .await
             .expect_err("flush should fail with client disconnect");

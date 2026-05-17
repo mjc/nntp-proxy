@@ -165,15 +165,6 @@ pub struct CommonArgs {
     /// Number of worker threads (default: 1, use 0 for CPU cores)
     #[arg(short, long, env = "NNTP_PROXY_THREADS", help_heading = "Performance")]
     pub threads: Option<ThreadCount>,
-
-    /// Enable TCP command pipelining for all backends
-    #[arg(
-        long = "backend-pipelining",
-        alias = "enable-pipelining",
-        env = "NNTP_PROXY_BACKEND_PIPELINING",
-        help_heading = "Performance"
-    )]
-    pub backend_pipelining: Option<bool>,
 }
 
 impl CommonArgs {
@@ -356,16 +347,6 @@ impl CommonArgs {
                 cache.store_article_bodies = articles;
             }
         }
-
-        // Pipelining global override — applies to all servers
-        if let Some(enable) = self
-            .backend_pipelining
-            .or_else(|| Self::env_bool(&env_get, &["NNTP_PROXY_ENABLE_PIPELINING"]))
-        {
-            for server in &mut config.servers {
-                server.backend_pipelining = enable;
-            }
-        }
     }
 
     /// Apply CLI argument overrides to loaded config
@@ -542,8 +523,6 @@ mod tests {
             "7200",
             "--store-article-bodies",
             "true",
-            "--backend-pipelining",
-            "false",
         ]);
 
         assert_eq!(
@@ -556,7 +535,6 @@ mod tests {
         );
         assert_eq!(args.article_cache_ttl_secs, Some(7200));
         assert_eq!(args.store_article_bodies, Some(true));
-        assert_eq!(args.backend_pipelining, Some(false));
         assert_eq!(args.effective_ui_mode(), UiMode::Tui);
 
         let legacy_args = CommonArgs::parse_from([
@@ -570,8 +548,6 @@ mod tests {
             "3600",
             "--store-articles",
             "false",
-            "--enable-pipelining",
-            "true",
         ]);
 
         assert_eq!(
@@ -584,7 +560,6 @@ mod tests {
         );
         assert_eq!(legacy_args.article_cache_ttl_secs, Some(3600));
         assert_eq!(legacy_args.store_article_bodies, Some(false));
-        assert_eq!(legacy_args.backend_pipelining, Some(true));
         assert_eq!(legacy_args.effective_ui_mode(), UiMode::Headless);
     }
 
@@ -777,7 +752,6 @@ mod tests {
             article_cache_ttl_secs: None,
             store_article_bodies: None,
             threads: None,
-            backend_pipelining: None,
         }
     }
 
@@ -845,12 +819,6 @@ mod tests {
         let args = default_args();
         let mut config = Config {
             cache: None,
-            servers: vec![
-                crate::config::Server::builder("server1.example.com", Port::try_new(119).unwrap())
-                    .backend_pipelining(false)
-                    .build()
-                    .unwrap(),
-            ],
             ..Config::default()
         };
 
@@ -858,7 +826,6 @@ mod tests {
             "NNTP_PROXY_CACHE_CAPACITY" => Some("128mb".to_string()),
             "NNTP_PROXY_CACHE_TTL" => Some("7200".to_string()),
             "NNTP_PROXY_CACHE_ARTICLES" => Some("false".to_string()),
-            "NNTP_PROXY_ENABLE_PIPELINING" => Some("true".to_string()),
             _ => None,
         });
 
@@ -869,34 +836,5 @@ mod tests {
             crate::constants::duration_polyfill::from_hours(2)
         );
         assert!(!cache.store_article_bodies);
-        assert!(config.servers[0].backend_pipelining);
-    }
-
-    #[test]
-    fn test_apply_overrides_pipelining_all_servers() {
-        use crate::types::Port;
-
-        let args = CommonArgs {
-            backend_pipelining: Some(false),
-            ..default_args()
-        };
-        let mut config = Config::default();
-        config.servers = vec![
-            crate::config::Server::builder("server1.example.com", Port::try_new(119).unwrap())
-                .backend_pipelining(true)
-                .build()
-                .unwrap(),
-            crate::config::Server::builder("server2.example.com", Port::try_new(119).unwrap())
-                .backend_pipelining(true)
-                .build()
-                .unwrap(),
-        ];
-
-        args.apply_overrides(&mut config);
-
-        // All servers should have pipelining disabled
-        for server in &config.servers {
-            assert!(!server.backend_pipelining);
-        }
     }
 }

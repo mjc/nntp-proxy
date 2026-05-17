@@ -75,6 +75,13 @@ pub mod buffer {
     /// Increased to handle larger articles, prevents memory exhaustion
     pub const RESPONSE_MAX: usize = 2 * 1024 * 1024;
 
+    /// Maximum queued read-ahead bytes kept on a pooled backend connection.
+    ///
+    /// Larger leftovers indicate protocol desynchronization or unsolicited extra
+    /// responses, so the connection should be retired instead of buffering
+    /// unbounded data.
+    pub const MAX_LEFTOVER_BYTES: usize = 128 * 1024;
+
     /// Initial capacity for response accumulation buffers (8KB, page-aligned)
     /// Sized for typical status lines and small responses
     pub const RESPONSE_INITIAL: usize = 8192;

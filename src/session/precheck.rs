@@ -17,6 +17,7 @@ use futures::{StreamExt, stream::FuturesUnordered};
 
 #[derive(Debug)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum PrecheckHit {
     Payload(crate::cache::CacheIngestResponse),
     Availability(StatusCode),
@@ -25,6 +26,7 @@ pub(crate) enum PrecheckHit {
 /// Result of querying a backend for an article.
 #[derive(Debug)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum QueryResult {
     Found(BackendId, PrecheckHit),
     Missing(BackendId),
@@ -199,8 +201,10 @@ async fn read_multiline_precheck_hit(
     let mut framer = MultilineFramer::default();
     match framer.advance_to_next_terminator_end(&buffer[..bytes_read]) {
         Some(pos) => {
+            if pos != bytes_read {
+                return Err(());
+            }
             // pos is after the terminator (terminator included in [..pos])
-            conn.stash_leftover_from(&buffer[..bytes_read], pos);
             if let Some(response) = &mut response {
                 response.extend_from_slice(&deps.buffer_pool, &buffer[..pos]);
             }
@@ -214,7 +218,9 @@ async fn read_multiline_precheck_hit(
                     Ok(0) | Err(_) => return Err(()),
                     Ok(n) => match framer.advance_to_next_terminator_end(&buffer[..n]) {
                         Some(pos) => {
-                            conn.stash_leftover_from(&buffer[..n], pos);
+                            if pos != n {
+                                return Err(());
+                            }
                             if let Some(response) = &mut response {
                                 response.extend_from_slice(&deps.buffer_pool, &buffer[..pos]);
                             }
@@ -605,6 +611,34 @@ mod tests {
         addr
     }
 
+    async fn spawn_packed_precheck_server() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let _ = stream.write_all(b"200 mock\r\n").await;
+                        let mut buf = [0u8; 1024];
+                        let _ = stream.read(&mut buf).await;
+                        let _ = stream
+                            .write_all(
+                                b"220 0 <test@example.com>\r\nbody\r\n.\r\n430 No such article\r\n",
+                            )
+                            .await;
+                        let _ = stream.shutdown().await;
+                    });
+                }
+            }
+        });
+
+        addr
+    }
+
     #[tokio::test]
     async fn query_backend_returns_error_on_truncated_multiline_response() {
         use crate::pool::DeadpoolConnectionProvider;
@@ -612,6 +646,45 @@ mod tests {
         use crate::types::{BackendId, ServerName};
 
         let addr = spawn_truncated_precheck_server().await;
+
+        let mut selector = BackendSelector::new();
+        let backend_id = BackendId::from_index(0);
+        let provider = DeadpoolConnectionProvider::new(
+            "127.0.0.1".to_string(),
+            addr.port(),
+            "test".to_string(),
+            2,
+            None,
+            None,
+        );
+        selector.add_backend(
+            backend_id,
+            ServerName::try_new("test-server".to_string()).unwrap(),
+            provider,
+            0,
+        );
+
+        let deps = OwnedDeps {
+            router: Arc::new(selector),
+            cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
+            buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 2),
+            metrics: MetricsCollector::new(1),
+            cache_articles: true,
+        };
+
+        let request =
+            RequestContext::parse(b"ARTICLE <test@example.com>\r\n").expect("valid request line");
+        let result = query_backend(&deps, backend_id, &request).await;
+        assert_eq!(result, QueryResult::Error);
+    }
+
+    #[tokio::test]
+    async fn query_backend_returns_error_on_packed_multiline_suffix() {
+        use crate::pool::DeadpoolConnectionProvider;
+        use crate::router::BackendSelector;
+        use crate::types::{BackendId, ServerName};
+
+        let addr = spawn_packed_precheck_server().await;
 
         let mut selector = BackendSelector::new();
         let backend_id = BackendId::from_index(0);

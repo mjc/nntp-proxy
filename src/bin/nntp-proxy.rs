@@ -1,6 +1,3 @@
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
 use anyhow::Result;
 use clap::Parser;
 use std::net::SocketAddr;
@@ -97,6 +94,9 @@ async fn run_proxy(
     );
     runtime::spawn_availability_saver(&proxy, launch.availability_path.clone());
     runtime::spawn_idle_connection_clearer(&proxy);
+    runtime::spawn_response_write_metrics_logger();
+    runtime::spawn_client_writer_lock_metrics_logger();
+    runtime::spawn_tokio_runtime_metrics_logger();
 
     let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
     let (tui_handle, tui_shutdown_tx) =
@@ -334,7 +334,6 @@ mod tests {
             article_cache_ttl_secs: None,
             store_article_bodies: None,
             threads: None,
-            backend_pipelining: None,
         }
     }
 

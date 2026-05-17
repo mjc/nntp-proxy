@@ -36,7 +36,6 @@
 //! ```
 
 mod backend_info;
-pub(crate) mod backend_queue;
 mod strategies;
 
 use anyhow::Result;
@@ -44,8 +43,6 @@ use nutype::nutype;
 use std::cmp::Ordering as CmpOrdering;
 use std::sync::Arc;
 use tracing::{debug, info};
-
-pub(crate) use backend_queue::BackendQueue;
 
 use crate::config::BackendSelectionStrategy;
 use crate::pool::DeadpoolConnectionProvider;
@@ -310,18 +307,6 @@ impl BackendSelector {
         provider: DeadpoolConnectionProvider,
         tier: u8,
     ) {
-        self.add_backend_with_queue(backend_id, name, provider, tier, None);
-    }
-
-    /// Add a backend server with an optional internal pipeline queue.
-    pub(crate) fn add_backend_with_queue(
-        &mut self,
-        backend_id: BackendId,
-        name: ServerName,
-        provider: DeadpoolConnectionProvider,
-        tier: u8,
-        pipeline_queue: Option<Arc<BackendQueue>>,
-    ) {
         let max_connections = provider.max_size();
 
         // Update strategy-specific state
@@ -353,10 +338,6 @@ impl BackendSelector {
             }
         }
 
-        if pipeline_queue.is_some() {
-            info!("Backend {:?} ({}) pipeline queue enabled", backend_id, name);
-        }
-
         self.backends.push(BackendInfo {
             id: backend_id,
             name,
@@ -364,7 +345,6 @@ impl BackendSelector {
             pending_count: PendingCount::new(),
             stateful_count: StatefulCount::new(),
             tier,
-            pipeline_queue,
         });
 
         // H4: Maintain sorted unique tiers (avoids Vec allocation in select_backend hot path)
@@ -543,20 +523,6 @@ impl BackendSelector {
     #[must_use]
     pub fn backend_provider(&self, backend_id: BackendId) -> Option<&DeadpoolConnectionProvider> {
         self.find_backend(backend_id).map(|b| &b.provider)
-    }
-
-    /// Get the pipeline queue for a backend (if pipelining is enabled)
-    #[must_use]
-    pub(crate) fn get_backend_queue(&self, backend_id: BackendId) -> Option<&Arc<BackendQueue>> {
-        self.find_backend(backend_id)
-            .and_then(|b| b.pipeline_queue.as_ref())
-    }
-
-    /// Get the live pipelined request depth for a backend, if pipelining is enabled.
-    #[must_use]
-    pub fn backend_pipeline_depth(&self, backend_id: BackendId) -> Option<usize> {
-        self.get_backend_queue(backend_id)
-            .map(|queue| queue.pipeline_depth())
     }
 
     /// Get the number of backends
