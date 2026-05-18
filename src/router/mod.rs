@@ -457,13 +457,33 @@ impl BackendSelector {
                         self.backends.iter().find(&filter)
                     })
             }
-            SelectionStrategy::LeastLoaded(_) => {
-                // Select backend with lowest load ratio
-                self.backends.iter().filter(&filter).min_by(|a, b| {
-                    a.load_ratio()
-                        .partial_cmp(&b.load_ratio())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
+            SelectionStrategy::LeastLoaded(least_loaded) => {
+                let mut selected: Option<&BackendInfo> = None;
+                let mut selected_load = LoadRatio::MAX;
+                let mut ties = 0usize;
+
+                for backend in self.backends.iter().filter(&filter) {
+                    let load = backend.load_ratio();
+                    match load
+                        .partial_cmp(&selected_load)
+                        .unwrap_or(std::cmp::Ordering::Greater)
+                    {
+                        std::cmp::Ordering::Less => {
+                            selected = Some(backend);
+                            selected_load = load;
+                            ties = 1;
+                        }
+                        std::cmp::Ordering::Equal => {
+                            ties += 1;
+                            if least_loaded.should_replace_tie(ties) {
+                                selected = Some(backend);
+                            }
+                        }
+                        std::cmp::Ordering::Greater => {}
+                    }
+                }
+
+                selected
             }
         }
     }

@@ -19,6 +19,7 @@ static SAVE_LOCK: Mutex<()> = Mutex::new(());
 /// Two simultaneous saves will produce e.g. `stats.json.0.tmp` and `stats.json.1.tmp`,
 /// so they cannot clobber each other before the final atomic rename.
 static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+const MAX_RETAINED_USER_METRICS: usize = 1024;
 
 // ============================================================================
 // Serializable Format Types
@@ -260,6 +261,11 @@ impl UserMetrics {
         self.errors = persisted.errors;
         // active_connections intentionally not restored (live gauge)
     }
+
+    #[inline]
+    const fn total_bytes(&self) -> u64 {
+        self.bytes_sent.saturating_add(self.bytes_received)
+    }
 }
 
 impl MetricsStore {
@@ -364,6 +370,16 @@ impl MetricsStore {
                 .insert(persisted_user.username.clone(), user);
         }
 
+        let pruned_users = store.prune_user_metrics();
+        if pruned_users > 0 {
+            tracing::warn!(
+                pruned_users,
+                retained_users = store.user_metrics.len(),
+                limit = MAX_RETAINED_USER_METRICS,
+                "Pruned persisted user metrics to cap memory usage"
+            );
+        }
+
         tracing::info!(
             "Loaded stats from {:?} (saved at {})",
             path,
@@ -447,6 +463,71 @@ impl MetricsStore {
 
         tracing::debug!("Saved stats to {}", path.display());
         Ok(())
+    }
+
+    #[must_use]
+    pub fn prune_user_metrics(&self) -> usize {
+        self.prune_user_metrics_to(MAX_RETAINED_USER_METRICS)
+    }
+
+    fn prune_user_metrics_to(&self, limit: usize) -> usize {
+        if limit == 0 {
+            let keys = self
+                .user_metrics
+                .iter()
+                .map(|entry| entry.key().clone())
+                .collect::<Vec<_>>();
+            let removed = keys.len();
+            for username in keys {
+                self.user_metrics.remove(&username);
+            }
+            return removed;
+        }
+
+        let len = self.user_metrics.len();
+        if len <= limit {
+            return 0;
+        }
+
+        let mut ranked = self
+            .user_metrics
+            .iter()
+            .map(|entry| {
+                let user = entry.value();
+                (
+                    entry.key().clone(),
+                    user.active_connections > 0,
+                    user.total_bytes(),
+                    user.total_connections,
+                    user.total_commands,
+                    user.errors,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        ranked.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| b.2.cmp(&a.2))
+                .then_with(|| b.3.cmp(&a.3))
+                .then_with(|| b.4.cmp(&a.4))
+                .then_with(|| b.5.cmp(&a.5))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+
+        let active_count = ranked.iter().take_while(|entry| entry.1).count();
+        let keep_count = limit.max(active_count);
+        let to_remove = ranked
+            .into_iter()
+            .skip(keep_count)
+            .map(|(username, _, _, _, _, _)| username)
+            .collect::<Vec<_>>();
+        let removed = to_remove.len();
+
+        for username in to_remove {
+            self.user_metrics.remove(&username);
+        }
+
+        removed
     }
 }
 
@@ -600,6 +681,64 @@ mod tests {
         let bob = loaded.user_metrics.get("bob").unwrap();
         assert_eq!(bob.total_connections, 5);
         drop(bob);
+    }
+
+    #[test]
+    fn test_prune_user_metrics_to_keeps_most_active_and_heaviest_users() {
+        let store = MetricsStore::new(1);
+
+        let mut active = UserMetrics::new("active".to_string());
+        active.active_connections = 1;
+        active.bytes_sent = 1;
+        store.user_metrics.insert("active".to_string(), active);
+
+        let mut heavy = UserMetrics::new("heavy".to_string());
+        heavy.bytes_sent = 10_000;
+        store.user_metrics.insert("heavy".to_string(), heavy);
+
+        let mut medium = UserMetrics::new("medium".to_string());
+        medium.bytes_sent = 5_000;
+        store.user_metrics.insert("medium".to_string(), medium);
+
+        let mut light = UserMetrics::new("light".to_string());
+        light.bytes_sent = 100;
+        store.user_metrics.insert("light".to_string(), light);
+
+        let removed = store.prune_user_metrics_to(2);
+
+        assert_eq!(removed, 2);
+        assert!(store.user_metrics.contains_key("active"));
+        assert!(store.user_metrics.contains_key("heavy"));
+        assert!(!store.user_metrics.contains_key("medium"));
+        assert!(!store.user_metrics.contains_key("light"));
+    }
+
+    #[test]
+    fn test_metrics_store_load_prunes_excess_users() {
+        let temp_dir = TempDir::new().unwrap();
+        let stats_path = temp_dir.path().join("stats.json");
+        let server_names = vec!["backend1".to_string()];
+        let store = MetricsStore::new(1);
+
+        for i in 0..(MAX_RETAINED_USER_METRICS + 16) {
+            let mut user = UserMetrics::new(format!("user-{i:04}"));
+            user.bytes_sent = i as u64;
+            store.user_metrics.insert(user.username.clone(), user);
+        }
+
+        store.save(&stats_path, &server_names).unwrap();
+
+        let loaded = MetricsStore::load(&stats_path, &server_names)
+            .unwrap()
+            .expect("Should load");
+
+        assert_eq!(loaded.user_metrics.len(), MAX_RETAINED_USER_METRICS);
+        assert!(
+            loaded
+                .user_metrics
+                .contains_key(&format!("user-{:04}", MAX_RETAINED_USER_METRICS + 15))
+        );
+        assert!(!loaded.user_metrics.contains_key("user-0000"));
     }
 
     #[test]

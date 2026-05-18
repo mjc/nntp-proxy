@@ -66,15 +66,46 @@ impl WeightedRoundRobin {
 /// accounting for backend capacity (`max_connections`).
 ///
 /// Algorithm: Calculate `load_ratio` = pending / `max_connections` for each backend,
-/// select the one with lowest ratio. Breaks ties by choosing first occurrence.
+/// select the one with lowest ratio. Breaks equal-load ties with a cheap
+/// pseudo-random replacement decision.
 #[derive(Debug)]
-pub struct LeastLoaded;
+pub struct LeastLoaded {
+    tie_breaker: AtomicUsize,
+}
 
 impl LeastLoaded {
     /// Create a new least-loaded strategy
     #[must_use]
     pub const fn new() -> Self {
-        Self
+        Self {
+            tie_breaker: AtomicUsize::new(0),
+        }
+    }
+
+    /// Return true when an equal-load candidate should replace the current winner.
+    ///
+    /// This is only called after a real tie is found. It keeps the common no-tie
+    /// path free of random work and avoids allocating a candidate list.
+    #[must_use]
+    pub fn should_replace_tie(&self, tie_count: usize) -> bool {
+        debug_assert!(tie_count > 1);
+        if tie_count <= 1 {
+            return false;
+        }
+
+        let counter = self
+            .tie_breaker
+            .fetch_add(0x9e37_79b9_7f4a_7c15usize, Ordering::Relaxed);
+        Self::mix(counter).is_multiple_of(tie_count)
+    }
+
+    #[inline]
+    fn mix(mut value: usize) -> usize {
+        value ^= value >> 16;
+        value = value.wrapping_mul(0x7feb_352d);
+        value ^= value >> 15;
+        value = value.wrapping_mul(0x846c_a68b);
+        value ^ (value >> 16)
     }
 }
 

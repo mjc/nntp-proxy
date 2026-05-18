@@ -24,24 +24,27 @@ fn test_least_loaded_basic() {
         0, // tier
     );
 
-    // First request should go to backend 0 (both empty, picks first)
+    // First request can go to either backend when both are empty.
     let backend1 = selector.route(ClientId::new()).unwrap();
-    assert_eq!(backend1.as_index(), 0);
+    assert!(backend1.as_index() <= 1);
 
-    // Second request should go to backend 1 (backend 0 has 1 pending)
+    // Second request should go to the other backend.
     let backend2 = selector.route(ClientId::new()).unwrap();
-    assert_eq!(backend2.as_index(), 1);
+    assert_ne!(backend2, backend1);
 
-    // Third request should go to backend 0 again (both have 1 pending, picks first)
+    // Third request is another equal-load tie.
     let backend3 = selector.route(ClientId::new()).unwrap();
-    assert_eq!(backend3.as_index(), 0);
+    assert!(backend3.as_index() <= 1);
 
-    // Complete a command on backend 0
+    // Drain the test's pending commands and recreate a known imbalance.
     selector.complete_command(backend1);
+    selector.complete_command(backend2);
+    selector.complete_command(backend3);
+    selector.mark_backend_pending(BackendId::from_index(0));
 
-    // Next request should go to backend 0 (now has 1 pending vs backend 1's 1 pending)
+    // Next request should go to backend 1 (ratio 0/10 vs backend 0's 1/10).
     let backend4 = selector.route(ClientId::new()).unwrap();
-    assert_eq!(backend4.as_index(), 0);
+    assert_eq!(backend4.as_index(), 1);
 }
 
 #[test]

@@ -474,7 +474,16 @@ impl ClientSession {
                 guard
             }
             Some(cached) => {
-                *backend_connection = Some(cached);
+                let (cached_backend_id, cached_conn) = cached;
+                debug!(
+                    client = %self.client_addr,
+                    cached_backend = cached_backend_id.as_index(),
+                    backend = backend_id.as_index(),
+                    command_verb = ?request.verb(),
+                    msg_id = ?request.message_id_value(),
+                    "Releasing cached backend connection before switching backend"
+                );
+                let _ = cached_conn.release();
                 let conn = provider.get_pooled_connection().await?;
                 debug!(
                     client = %self.client_addr,
