@@ -8,8 +8,8 @@ use anyhow::Result;
 use crate::test_helpers::{MockNntpServer, RfcTestClient};
 use nntp_proxy::RoutingMode;
 
-fn overview_backend(port: u16) -> MockNntpServer {
-    MockNntpServer::new(port)
+fn overview_backend(_port: u16) -> MockNntpServer {
+    MockNntpServer::new()
         .with_name("OverviewBackend")
         .on_command("GROUP", "211 2 1 2 alt.test\r\n")
         .on_command(
@@ -26,8 +26,8 @@ fn overview_backend(port: u16) -> MockNntpServer {
         )
 }
 
-fn no_group_over_backend(port: u16) -> MockNntpServer {
-    MockNntpServer::new(port)
+fn no_group_over_backend(_port: u16) -> MockNntpServer {
+    MockNntpServer::new()
         .with_name("NoGroupOverviewBackend")
         .on_command("OVER", "412 No newsgroup selected\r\n")
         .on_command("GROUP", "211 2 1 2 alt.test\r\n")

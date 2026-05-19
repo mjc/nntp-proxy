@@ -14,29 +14,17 @@ use test_helpers::*;
 
 #[tokio::test]
 async fn test_proxy_with_mock_servers() -> Result<()> {
-    // Find available ports
-    let mock_port1 = get_available_port()
-        .await
-        .expect("Failed to get available port");
-    let mock_port2 = get_available_port()
-        .await
-        .expect("Failed to get available port");
-    let proxy_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-
     // Start mock servers using builder
-    let _mock1 = MockNntpServer::new(mock_port1)
+    let (mock_port1, _mock1) = MockNntpServer::new()
         .with_name("Mock NNTP Server")
         .on_command("DATE", "111 20260505120000\r\n")
-        .spawn();
-    let _mock2 = MockNntpServer::new(mock_port2)
+        .spawn_on_random_port()
+        .await?;
+    let (mock_port2, _mock2) = MockNntpServer::new()
         .with_name("Mock NNTP Server")
         .on_command("DATE", "111 20260505120000\r\n")
-        .spawn();
-
-    wait_for_server(&format!("127.0.0.1:{mock_port1}"), 20).await?;
-    wait_for_server(&format!("127.0.0.1:{mock_port2}"), 20).await?;
+        .spawn_on_random_port()
+        .await?;
 
     // Create proxy configuration
     let config = Config {
@@ -60,8 +48,8 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
     let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
 
     // Start proxy server
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, false).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
-    spawn_test_proxy(proxy, proxy_port, false).await;
     wait_for_server(&proxy_addr, 20).await?;
 
     // Test client connection through proxy
@@ -94,29 +82,17 @@ async fn test_proxy_with_mock_servers() -> Result<()> {
 
 #[tokio::test]
 async fn test_round_robin_distribution() -> Result<()> {
-    // Find available ports
-    let mock_port1 = get_available_port()
-        .await
-        .expect("Failed to get available port");
-    let mock_port2 = get_available_port()
-        .await
-        .expect("Failed to get available port");
-    let proxy_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-
     // Start mock servers using builder
-    let _mock1 = MockNntpServer::new(mock_port1)
+    let (mock_port1, _mock1) = MockNntpServer::new()
         .with_name("Mock Server 1")
         .on_command("HELP", "100 HELP command received\r\n")
-        .spawn();
-    let _mock2 = MockNntpServer::new(mock_port2)
+        .spawn_on_random_port()
+        .await?;
+    let (mock_port2, _mock2) = MockNntpServer::new()
         .with_name("Mock Server 2")
         .on_command("HELP", "100 HELP command received\r\n")
-        .spawn();
-
-    wait_for_server(&format!("127.0.0.1:{mock_port1}"), 20).await?;
-    wait_for_server(&format!("127.0.0.1:{mock_port2}"), 20).await?;
+        .spawn_on_random_port()
+        .await?;
 
     // Create proxy configuration
     let config = Config {
@@ -140,20 +116,8 @@ async fn test_round_robin_distribution() -> Result<()> {
     let proxy = NntpProxy::new(config, RoutingMode::Stateful).await?;
 
     // Start proxy server
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, false).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
-    let listener = TcpListener::bind(&proxy_addr).await?;
-
-    tokio::spawn(async move {
-        loop {
-            if let Ok((stream, addr)) = listener.accept().await {
-                let proxy_clone = proxy.clone();
-                tokio::spawn(async move {
-                    let _ = proxy_clone.handle_client(stream, addr.into()).await;
-                });
-            }
-        }
-    });
-
     wait_for_server(&proxy_addr, 20).await?;
 
     // Test multiple connections - they should all work
@@ -205,18 +169,11 @@ name = "Test Server 2"
 
 #[tokio::test]
 async fn test_proxy_handles_connection_failure() -> Result<()> {
-    let proxy_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-    let nonexistent_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-
     // Create proxy configuration with a server that doesn't exist
     let config = Config {
         servers: vec![create_test_server_config_with_max_connections(
             "127.0.0.1",
-            nonexistent_port,
+            1,
             "Nonexistent Server",
             10,
         )],
@@ -226,20 +183,8 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
     let proxy = NntpProxy::new(config, RoutingMode::Stateful).await?;
 
     // Start proxy server
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, false).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
-    let listener = TcpListener::bind(&proxy_addr).await?;
-
-    tokio::spawn(async move {
-        loop {
-            if let Ok((stream, addr)) = listener.accept().await {
-                let proxy_clone = proxy.clone();
-                tokio::spawn(async move {
-                    let _ = proxy_clone.handle_client(stream, addr.into()).await;
-                });
-            }
-        }
-    });
-
     wait_for_server(&proxy_addr, 20).await?;
 
     // Test client connection - should receive greeting first, then error when backend connection fails
@@ -269,28 +214,20 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
 /// This test validates response delivery timing regardless of flush implementation.
 #[tokio::test]
 async fn test_response_flushing_with_rapid_commands() -> Result<()> {
-    let mock_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-    let proxy_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-
     // Start mock server using builder with custom article responses
-    let _mock = MockNntpServer::new(mock_port)
+    let (mock_port, _mock) = MockNntpServer::new()
         .with_name("Mock NNTP Server")
         .on_command("BODY", "220 0 <test@example.com>\r\nArticle body line 1\r\nArticle body line 2\r\nArticle body line 3\r\n.\r\n")
         .on_command("ARTICLE", "220 0 <test@example.com>\r\nArticle body line 1\r\nArticle body line 2\r\nArticle body line 3\r\n.\r\n")
-        .spawn();
-
-    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
+        .spawn_on_random_port()
+        .await?;
 
     // Create proxy config
     let config = create_test_config(vec![(mock_port, "TestServer")]);
     let proxy = NntpProxy::new(config, RoutingMode::Stateful).await?;
 
     // Start the proxy using the stateful handler to match the configured mode.
-    spawn_test_proxy(proxy, proxy_port, false).await;
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, false).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
     wait_for_server(&proxy_addr, 20).await?;
 
@@ -361,24 +298,16 @@ async fn test_response_flushing_with_rapid_commands() -> Result<()> {
 /// Test that single-line responses (auth, reject) are also properly flushed
 #[tokio::test]
 async fn test_auth_and_reject_response_flushing() -> Result<()> {
-    let mock_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-    let proxy_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-
     // Start mock server using builder
-    let _mock = MockNntpServer::new(mock_port)
+    let (mock_port, _mock) = MockNntpServer::new()
         .with_name("TestServer")
-        .spawn();
-
-    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
+        .spawn_on_random_port()
+        .await?;
 
     let config = create_test_config(vec![(mock_port, "TestServer")]);
     let proxy = NntpProxy::new(config, RoutingMode::Stateful).await?;
 
-    spawn_test_proxy(proxy, proxy_port, true).await;
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, true).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
     wait_for_server(&proxy_addr, 20).await?;
 
@@ -446,25 +375,17 @@ async fn test_auth_and_reject_response_flushing() -> Result<()> {
 /// pool and causing subsequent commands to hang.
 #[tokio::test]
 async fn test_sequential_requests_no_delay() -> Result<()> {
-    let mock_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-    let proxy_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-
     // Start mock server using builder
-    let _mock = MockNntpServer::new(mock_port)
+    let (mock_port, _mock) = MockNntpServer::new()
         .with_name("Ready")
         .on_command("STAT", "200 Command OK\r\n")
-        .spawn();
-
-    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
+        .spawn_on_random_port()
+        .await?;
 
     let config = create_test_config(vec![(mock_port, "TestServer")]);
     let proxy = NntpProxy::new(config, RoutingMode::Stateful).await?;
-    spawn_test_proxy(proxy, proxy_port, true).await;
 
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, true).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
     wait_for_server(&proxy_addr, 20).await?;
 
@@ -520,22 +441,13 @@ async fn test_sequential_requests_no_delay() -> Result<()> {
 #[tokio::test]
 async fn test_hybrid_mode_stateless_commands() -> Result<()> {
     // Test hybrid mode with stateless commands only (should stay in per-command routing)
-    let mock_port1 = get_available_port()
-        .await
-        .expect("Failed to get available port");
-    let mock_port2 = get_available_port()
-        .await
-        .expect("Failed to get available port");
-    let proxy_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-
     // Start mock servers using builder with smart command handlers
-    let _mock1 = create_smart_mock_builder(mock_port1, "Server1").spawn();
-    let _mock2 = create_smart_mock_builder(mock_port2, "Server2").spawn();
-
-    wait_for_server(&format!("127.0.0.1:{mock_port1}"), 20).await?;
-    wait_for_server(&format!("127.0.0.1:{mock_port2}"), 20).await?;
+    let (mock_port1, _mock1) = create_smart_mock_builder("Server1")
+        .spawn_on_random_port()
+        .await?;
+    let (mock_port2, _mock2) = create_smart_mock_builder("Server2")
+        .spawn_on_random_port()
+        .await?;
 
     let config = Config {
         servers: vec![
@@ -546,20 +458,8 @@ async fn test_hybrid_mode_stateless_commands() -> Result<()> {
     };
 
     let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, true).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
-    let listener = TcpListener::bind(&proxy_addr).await?;
-
-    tokio::spawn(async move {
-        loop {
-            if let Ok((stream, addr)) = listener.accept().await {
-                let proxy_clone = proxy.clone();
-                tokio::spawn(async move {
-                    let _ = proxy_clone.handle_client(stream, addr.into()).await;
-                });
-            }
-        }
-    });
-
     wait_for_server(&proxy_addr, 20).await?;
 
     // Connect to proxy and send stateless commands
@@ -610,16 +510,9 @@ async fn test_hybrid_mode_stateless_commands() -> Result<()> {
 #[tokio::test]
 async fn test_hybrid_mode_stateful_switching() -> Result<()> {
     // Test hybrid mode switching from per-command to stateful on GROUP command
-    let mock_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-    let proxy_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-
-    let _mock = create_smart_mock_builder(mock_port, "StatefulServer").spawn();
-
-    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
+    let (mock_port, _mock) = create_smart_mock_builder("StatefulServer")
+        .spawn_on_random_port()
+        .await?;
 
     let config = Config {
         servers: vec![create_test_server_config(
@@ -631,20 +524,8 @@ async fn test_hybrid_mode_stateful_switching() -> Result<()> {
     };
 
     let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, true).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
-    let listener = TcpListener::bind(&proxy_addr).await?;
-
-    tokio::spawn(async move {
-        loop {
-            if let Ok((stream, addr)) = listener.accept().await {
-                let proxy_clone = proxy.clone();
-                tokio::spawn(async move {
-                    let _ = proxy_clone.handle_client(stream, addr.into()).await;
-                });
-            }
-        }
-    });
-
     wait_for_server(&proxy_addr, 20).await?;
 
     // Connect to proxy
@@ -711,8 +592,7 @@ async fn test_hybrid_mode_multiple_clients() -> Result<()> {
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_port = proxy_listener.local_addr()?.port();
 
-    let _mock =
-        create_smart_mock_builder(mock_port, "MultiServer").spawn_on_listener(mock_listener);
+    let _mock = create_smart_mock_builder("MultiServer").spawn_on_listener(mock_listener);
 
     wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
 
@@ -799,8 +679,8 @@ async fn test_hybrid_mode_multiple_clients() -> Result<()> {
 }
 
 /// Create a smart mock server builder with comprehensive NNTP command handlers
-fn create_smart_mock_builder(port: u16, server_name: &str) -> MockNntpServer {
-    MockNntpServer::new(port)
+fn create_smart_mock_builder(server_name: &str) -> MockNntpServer {
+    MockNntpServer::new()
         .with_name(format!("{server_name} Mock NNTP Server"))
         .on_command("LIST", "215 List of newsgroups\r\nalt.test 100 1 y\r\n.\r\n")
         .on_command("DATE", "111 20231013120000\r\n")
@@ -824,26 +704,17 @@ fn create_smart_mock_builder(port: u16, server_name: &str) -> MockNntpServer {
 /// backend behavior that the proxy should handle gracefully without warnings.
 #[tokio::test]
 async fn test_backend_223_response_for_message_id() -> Result<()> {
-    // Find available ports
-    let mock_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-    let proxy_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-
     // Start mock backend that returns 223 for missing articles by message-ID
     // This simulates real-world backend behavior observed in production
-    let _mock = MockNntpServer::new(mock_port)
+    let (mock_port, _mock) = MockNntpServer::new()
         .with_name("Backend That Returns 223")
         .on_command("ARTICLE <missing@", "223 0 <missing@example.com>\r\n")
         .on_command(
             "ARTICLE <exists@",
             "220 1 <exists@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         )
-        .spawn();
-
-    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
+        .spawn_on_random_port()
+        .await?;
 
     // Create proxy configuration
     let config = Config {
@@ -858,22 +729,8 @@ async fn test_backend_223_response_for_message_id() -> Result<()> {
 
     // Start proxy in per-command mode (where this issue was observed)
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
-    let proxy_clone = proxy.clone();
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, true).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
-    let proxy_addr_clone = proxy_addr.clone();
-
-    let _proxy_handle = tokio::spawn(async move {
-        let listener = TcpListener::bind(&proxy_addr_clone).await.unwrap();
-        while let Ok((stream, addr)) = listener.accept().await {
-            let proxy = proxy_clone.clone();
-            tokio::spawn(async move {
-                let _ = proxy
-                    .handle_client_per_command_routing(stream, addr.into())
-                    .await;
-            });
-        }
-    });
-
     wait_for_server(&proxy_addr, 20).await?;
 
     // Connect to proxy
@@ -1003,42 +860,36 @@ async fn assert_article_response(
 
 #[tokio::test]
 async fn test_tier_0_exhaustion_before_escalation() -> Result<()> {
-    // Find available ports
-    let backend_0_port = get_available_port().await?;
-    let backend_1_port = get_available_port().await?;
-    let backend_2_port = get_available_port().await?;
-
     // Start mock backends:
     // Backend 0 (tier 0): Returns 430 for the article
     // Backend 1 (tier 0): Has the article (returns 220)
     // Backend 2 (tier 1): Has the article but should NOT be tried if tier 0 works
-    let _backend_0 = MockNntpServer::new(backend_0_port)
+    let (backend_0_port, _backend_0) = MockNntpServer::new()
         .with_name("Backend-0-Tier-0")
         .on_command(
             "ARTICLE",
             "430 No such article\r\n", // Backend 0 doesn't have it
         )
-        .spawn();
+        .spawn_on_random_port()
+        .await?;
 
-    let _backend_1 = MockNntpServer::new(backend_1_port)
+    let (backend_1_port, _backend_1) = MockNntpServer::new()
         .with_name("Backend-1-Tier-0")
         .on_command(
             "ARTICLE",
             "220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody from backend 1\r\n.\r\n", // Backend 1 has it
         )
-        .spawn();
+        .spawn_on_random_port()
+        .await?;
 
-    let _backend_2 = MockNntpServer::new(backend_2_port)
+    let (backend_2_port, _backend_2) = MockNntpServer::new()
         .with_name("Backend-2-Tier-1")
         .on_command(
             "ARTICLE",
             "220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody from backend 2\r\n.\r\n",
         )
-        .spawn();
-
-    wait_for_server(&format!("127.0.0.1:{backend_0_port}"), 20).await?;
-    wait_for_server(&format!("127.0.0.1:{backend_1_port}"), 20).await?;
-    wait_for_server(&format!("127.0.0.1:{backend_2_port}"), 20).await?;
+        .spawn_on_random_port()
+        .await?;
 
     let proxy_port = start_tiered_proxy(vec![
         build_tiered_server(backend_0_port, "Backend-0-Tier-0", 0)?,
@@ -1077,43 +928,37 @@ async fn test_tier_0_exhaustion_before_escalation() -> Result<()> {
 
 #[tokio::test]
 async fn test_tier_exhaustion_multi_tier() -> Result<()> {
-    // Find available ports
-    let backend_0_port = get_available_port().await?;
-    let backend_1_port = get_available_port().await?;
-    let backend_2_port = get_available_port().await?;
-
     // Start mock backends:
     // Backend 0 (tier 0): Returns 430 for the article (doesn't have it)
     // Backend 1 (tier 0): Also returns 430 (doesn't have it either)
     // Backend 2 (tier 1): Has the article (returns 220)
     // CRITICAL: Backend 2 should ONLY be tried after BOTH tier 0 backends are exhausted
-    let _backend_0 = MockNntpServer::new(backend_0_port)
+    let (backend_0_port, _backend_0) = MockNntpServer::new()
         .with_name("Backend-0-Tier-0")
         .on_command(
             "ARTICLE",
             "430 No such article\r\n", // Backend 0 doesn't have it
         )
-        .spawn();
+        .spawn_on_random_port()
+        .await?;
 
-    let _backend_1 = MockNntpServer::new(backend_1_port)
+    let (backend_1_port, _backend_1) = MockNntpServer::new()
         .with_name("Backend-1-Tier-0")
         .on_command(
             "ARTICLE",
             "430 No such article\r\n", // Backend 1 doesn't have it either
         )
-        .spawn();
+        .spawn_on_random_port()
+        .await?;
 
-    let _backend_2 = MockNntpServer::new(backend_2_port)
+    let (backend_2_port, _backend_2) = MockNntpServer::new()
         .with_name("Backend-2-Tier-1")
         .on_command(
             "ARTICLE",
             "220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody from tier 1\r\n.\r\n", // Backend 2 has it
         )
-        .spawn();
-
-    wait_for_server(&format!("127.0.0.1:{backend_0_port}"), 20).await?;
-    wait_for_server(&format!("127.0.0.1:{backend_1_port}"), 20).await?;
-    wait_for_server(&format!("127.0.0.1:{backend_2_port}"), 20).await?;
+        .spawn_on_random_port()
+        .await?;
 
     let proxy_port = start_tiered_proxy(vec![
         build_tiered_server(backend_0_port, "Backend-0-Tier-0", 0)?,
@@ -1155,20 +1000,16 @@ async fn test_tier_exhaustion_multi_tier() -> Result<()> {
 /// RFC 3977 §3.2.1: 501 = syntax error (overlong command is a syntax error, not unknown)
 #[tokio::test]
 async fn test_oversized_pipelined_command_rejected_with_500() -> Result<()> {
-    let mock_port = get_available_port().await?;
-    let proxy_port = get_available_port().await?;
-
-    let _mock = MockNntpServer::new(mock_port)
+    let (mock_port, _mock) = MockNntpServer::new()
         .with_name("TestServer")
         .on_command("STAT", "223 0 <test@example.com> status\r\n")
-        .spawn();
-
-    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
+        .spawn_on_random_port()
+        .await?;
 
     let config = create_test_config(vec![(mock_port, "TestServer")]);
     let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
 
-    spawn_test_proxy(proxy, proxy_port, true).await;
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, true).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
     wait_for_server(&proxy_addr, 20).await?;
 
@@ -1225,20 +1066,16 @@ async fn test_oversized_pipelined_command_rejected_with_500() -> Result<()> {
 /// or get forwarded to a backend.
 #[tokio::test]
 async fn test_empty_pipelined_command_rejected_with_501() -> Result<()> {
-    let mock_port = get_available_port().await?;
-    let proxy_port = get_available_port().await?;
-
-    let _mock = MockNntpServer::new(mock_port)
+    let (mock_port, _mock) = MockNntpServer::new()
         .with_name("TestServer")
         .on_command("STAT", "223 0 <test@example.com> status\r\n")
-        .spawn();
-
-    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
+        .spawn_on_random_port()
+        .await?;
 
     let config = create_test_config(vec![(mock_port, "TestServer")]);
     let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
 
-    spawn_test_proxy(proxy, proxy_port, true).await;
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, true).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
     wait_for_server(&proxy_addr, 20).await?;
 
@@ -1283,20 +1120,16 @@ async fn test_empty_pipelined_command_rejected_with_501() -> Result<()> {
 /// respond, NOT block waiting for the partial command to complete.
 #[tokio::test]
 async fn test_partial_buffered_command_does_not_block() -> Result<()> {
-    let mock_port = get_available_port().await?;
-    let proxy_port = get_available_port().await?;
-
-    let _mock = MockNntpServer::new(mock_port)
+    let (mock_port, _mock) = MockNntpServer::new()
         .with_name("TestServer")
         .on_command("STAT", "223 0 <test@example.com> status\r\n")
-        .spawn();
-
-    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
+        .spawn_on_random_port()
+        .await?;
 
     let config = create_test_config(vec![(mock_port, "TestServer")]);
     let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
 
-    spawn_test_proxy(proxy, proxy_port, true).await;
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, true).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
     wait_for_server(&proxy_addr, 20).await?;
 

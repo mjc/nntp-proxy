@@ -9,8 +9,8 @@ use nntp_proxy::RoutingMode;
 
 use crate::test_helpers::{MockNntpServer, RfcTestClient};
 
-fn head_stat_backend(port: u16) -> MockNntpServer {
-    MockNntpServer::new(port)
+fn head_stat_backend(_port: u16) -> MockNntpServer {
+    MockNntpServer::new()
         .with_name("HeadStatBackend")
         .on_command(
             "HEAD <present@example.com>",

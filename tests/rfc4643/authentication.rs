@@ -10,7 +10,7 @@
 
 use std::sync::Arc;
 
-use crate::test_helpers::{create_test_config_with_auth, get_available_port, spawn_mock_server};
+use crate::test_helpers::{MockNntpServer, create_test_config_with_auth};
 use nntp_proxy::NntpProxy;
 use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
@@ -235,8 +235,6 @@ async fn test_session_with_auth_handler() {
     };
     use nntp_proxy::metrics::MetricsCollector;
 
-    let backend_port = get_available_port().await.unwrap();
-    let _handle = spawn_mock_server(backend_port, "Mock Backend");
     let buffer_pool = create_test_buffer_pool();
     let auth_handler = create_test_auth_handler_with("testuser", "testpass");
     let metrics = MetricsCollector::new(1);
@@ -254,8 +252,6 @@ async fn test_session_with_disabled_auth() {
     };
     use nntp_proxy::metrics::MetricsCollector;
 
-    let backend_port = get_available_port().await.unwrap();
-    let _handle = spawn_mock_server(backend_port, "Mock Backend");
     let buffer_pool = create_test_buffer_pool();
     let auth_handler = create_test_auth_handler_disabled();
     let metrics = MetricsCollector::new(1);
@@ -370,8 +366,11 @@ async fn test_session_builder_with_router_and_auth() {
 
 #[tokio::test]
 async fn test_proxy_creates_auth_handler_from_config() {
-    let backend_port = get_available_port().await.unwrap();
-    let _handle = spawn_mock_server(backend_port, "Mock Backend");
+    let (backend_port, _handle) = MockNntpServer::new()
+        .with_name("Mock Backend")
+        .spawn_on_random_port()
+        .await
+        .unwrap();
 
     let config = create_test_config_with_auth(vec![backend_port], "proxyuser", "proxypass");
 

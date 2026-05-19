@@ -37,6 +37,7 @@ use smallvec::SmallVec;
 /// Hot-path code should hand off one of these owned forms directly instead of
 /// flattening into a fresh `Vec<u8>` before spawning cache work.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum CacheIngestResponse {
     Owned(Box<[u8]>),
     Pooled(crate::pool::PooledBuffer),
@@ -363,6 +364,13 @@ impl UnifiedCache {
     /// Create a hybrid cache (async because foyer needs async initialization)
     pub async fn hybrid(config: HybridCacheConfig) -> anyhow::Result<Self> {
         Ok(Self::Hybrid(HybridArticleCache::new(config).await?))
+    }
+
+    /// Returns true when successful backend responses update positive
+    /// availability metadata.
+    #[must_use]
+    pub const fn records_backend_has_status(&self) -> bool {
+        !matches!(self, Self::Availability(_))
     }
 
     /// Get an article from the cache

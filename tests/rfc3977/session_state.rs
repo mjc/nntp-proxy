@@ -26,7 +26,7 @@ async fn test_proxy_sends_201_readonly_greeting() -> Result<()> {
     // to be ready — no sleep needed to wait for the mock server to bind.
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
-    let _backend = MockNntpServer::new(backend_port)
+    let _backend = MockNntpServer::new()
         .with_name("TestBackend")
         .spawn_on_listener(backend_listener);
 

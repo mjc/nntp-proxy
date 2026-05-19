@@ -151,28 +151,22 @@ async fn test_stat_precheck_first_response() -> Result<()> {
 async fn test_head_precheck_first_response_wins() -> Result<()> {
     let backend1_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend1_port = backend1_listener.local_addr()?.port();
-    drop(backend1_listener);
 
     let backend2_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend2_port = backend2_listener.local_addr()?.port();
-    drop(backend2_listener);
 
     // Backend 1: Fast responder
-    let _mock1 = MockNntpServer::new(backend1_port)
+    let _mock1 = MockNntpServer::new()
         .with_name("fast-backend")
         .on_command(
             "HEAD",
             "221 0 <test@example.com>\r\nSubject: Fast\r\n\r\n.\r\n",
         )
-        .spawn();
+        .spawn_on_listener(backend1_listener);
 
     // Backend 2: Slow responder
     tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{backend2_port}"))
-            .await
-            .unwrap();
-
-        while let Ok((stream, _)) = listener.accept().await {
+        while let Ok((stream, _)) = backend2_listener.accept().await {
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stream);
                 reader
@@ -262,14 +256,11 @@ async fn test_head_precheck_first_response_wins() -> Result<()> {
 async fn test_adaptive_precheck_disabled_by_default() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
-    drop(backend_listener);
 
-    let _mock = MockNntpServer::new(backend_port)
+    let _mock = MockNntpServer::new()
         .with_name("backend")
         .on_command("STAT", "223 0 <test@example.com>\r\n")
-        .spawn();
-
-    wait_for_server(&format!("127.0.0.1:{backend_port}"), 20).await?;
+        .spawn_on_listener(backend_listener);
 
     // Config without adaptive precheck
     let config = create_config_with_precheck(backend_port, false);
@@ -300,15 +291,12 @@ async fn test_adaptive_precheck_disabled_by_default() -> Result<()> {
 async fn test_precheck_requires_message_id() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
-    drop(backend_listener);
 
-    let _mock = MockNntpServer::new(backend_port)
+    let _mock = MockNntpServer::new()
         .with_name("backend")
         .on_command("STAT", "412 No newsgroup selected\r\n")
         .on_command("HEAD", "412 No newsgroup selected\r\n")
-        .spawn();
-
-    wait_for_server(&format!("127.0.0.1:{backend_port}"), 20).await?;
+        .spawn_on_listener(backend_listener);
 
     let config = create_config_with_precheck(backend_port, true);
     let proxy_port = setup_proxy_with_config(config, RoutingMode::PerCommand).await?;
@@ -341,13 +329,10 @@ async fn test_precheck_requires_message_id() -> Result<()> {
 async fn test_precheck_only_in_per_command_mode() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
-    drop(backend_listener);
 
-    let _mock = MockNntpServer::new(backend_port)
+    let _mock = MockNntpServer::new()
         .with_name("test-backend")
-        .spawn();
-
-    wait_for_server(&format!("127.0.0.1:{backend_port}"), 20).await?;
+        .spawn_on_listener(backend_listener);
 
     // Create proxy in STATEFUL mode (not per-command)
     let config = create_config_with_precheck(backend_port, true);

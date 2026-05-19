@@ -195,6 +195,16 @@ async fn read_multiline_precheck_hit(
 ) -> Result<PrecheckHit, ()> {
     use crate::session::multiline_framing::MultilineFramer;
 
+    fn push_precheck_buffer(
+        response: &mut crate::pool::ChunkedResponse,
+        pool: &crate::pool::BufferPool,
+        buffer: &mut crate::pool::PooledBuffer,
+        len: usize,
+    ) {
+        let old = std::mem::replace(buffer, pool.acquire());
+        response.push_buffer_range(old, 0..len);
+    }
+
     let mut response = deps
         .cache_articles
         .then(crate::pool::ChunkedResponse::default);
@@ -206,12 +216,12 @@ async fn read_multiline_precheck_hit(
             }
             // pos is after the terminator (terminator included in [..pos])
             if let Some(response) = &mut response {
-                response.extend_from_slice(&deps.buffer_pool, &buffer[..pos]);
+                push_precheck_buffer(response, &deps.buffer_pool, buffer, pos);
             }
         }
         None => {
             if let Some(response) = &mut response {
-                response.extend_from_slice(&deps.buffer_pool, &buffer[..bytes_read]);
+                push_precheck_buffer(response, &deps.buffer_pool, buffer, bytes_read);
             }
             loop {
                 match buffer.read_from(conn.as_mut()).await {
@@ -222,13 +232,13 @@ async fn read_multiline_precheck_hit(
                                 return Err(());
                             }
                             if let Some(response) = &mut response {
-                                response.extend_from_slice(&deps.buffer_pool, &buffer[..pos]);
+                                push_precheck_buffer(response, &deps.buffer_pool, buffer, pos);
                             }
                             break;
                         }
                         None => {
                             if let Some(response) = &mut response {
-                                response.extend_from_slice(&deps.buffer_pool, &buffer[..n]);
+                                push_precheck_buffer(response, &deps.buffer_pool, buffer, n);
                             }
                         }
                     },
@@ -321,8 +331,7 @@ async fn query_all_backends_racing(
                 // Spawn background task to complete remaining backends and update cache
                 let cache = deps.cache.clone();
                 let msg_id_owned = msg_id.to_owned();
-                let msg_id_log = msg_id.to_string();
-                let handle = tokio::spawn(async move {
+                tokio::spawn(async move {
                     // Collect remaining results
                     while let Some(result) = pending.next().await {
                         if let Ok(result) = result {
@@ -333,17 +342,6 @@ async fn query_all_backends_racing(
                     let (_, mut availability) = summarize(results);
                     availability.record_has(id);
                     cache.sync_availability(msg_id_owned, &availability).await;
-                });
-
-                // Log task failures in the background
-                tokio::spawn(async move {
-                    if let Err(e) = handle.await {
-                        tracing::error!(
-                            "Background precheck sync task panicked for {}: {}",
-                            msg_id_log,
-                            e
-                        );
-                    }
                 });
                 return Some((id, response));
             }

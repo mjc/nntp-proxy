@@ -126,21 +126,12 @@ mod tests {
     use crate::config::Server;
     use tokio::net::TcpListener;
 
-    /// Helper to find an available port
-    async fn find_available_port() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap().port()
-    }
-
     /// Spawn a simple mock NNTP server
-    fn spawn_mock_server(port: u16) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
+    async fn spawn_mock_server_on_random_port() -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-            let addr = format!("127.0.0.1:{port}");
-            let Ok(listener) = TcpListener::bind(&addr).await else {
-                return;
-            };
 
             while let Ok((mut stream, _)) = listener.accept().await {
                 tokio::spawn(async move {
@@ -161,18 +152,13 @@ mod tests {
                     }
                 });
             }
-        })
+        });
+        (port, handle)
     }
 
     #[tokio::test]
     async fn test_prewarm_pools_basic() {
-        let port = find_available_port().await;
-
-        // Start mock server
-        let _server = spawn_mock_server(port);
-
-        // Give server time to start
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let (port, _server) = spawn_mock_server_on_random_port().await;
 
         let servers = vec![
             Server::builder("127.0.0.1", crate::types::Port::try_new(port).unwrap())
@@ -205,14 +191,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_prewarm_pools_multiple_servers() {
-        let port1 = find_available_port().await;
-        let port2 = find_available_port().await;
-
         // Start two mock servers
-        let _server1 = spawn_mock_server(port1);
-        let _server2 = spawn_mock_server(port2);
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let (port1, _server1) = spawn_mock_server_on_random_port().await;
+        let (port2, _server2) = spawn_mock_server_on_random_port().await;
 
         let servers = vec![
             Server::builder("127.0.0.1", crate::types::Port::try_new(port1).unwrap())
@@ -290,9 +271,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prewarm_single_pool_success() {
-        let port = find_available_port().await;
-        let _server = spawn_mock_server(port);
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let (port, _server) = spawn_mock_server_on_random_port().await;
 
         let provider = crate::pool::DeadpoolConnectionProvider::new(
             "127.0.0.1".to_string(),
@@ -312,9 +291,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_prewarm_single_pool_single_connection() {
-        let port = find_available_port().await;
-        let _server = spawn_mock_server(port);
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        let (port, _server) = spawn_mock_server_on_random_port().await;
 
         let provider = crate::pool::DeadpoolConnectionProvider::new(
             "127.0.0.1".to_string(),
@@ -334,11 +311,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_prewarm_single_pool_zero_connections() {
-        let port = find_available_port().await;
-
         let provider = crate::pool::DeadpoolConnectionProvider::new(
             "127.0.0.1".to_string(),
-            port,
+            1,
             "TestServer".to_string(),
             0, // Zero connections
             None,
@@ -354,11 +329,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_prewarm_pools_mixed_success_failure() {
-        let good_port = find_available_port().await;
+        let (good_port, _server) = spawn_mock_server_on_random_port().await;
         let bad_port = 65499;
-
-        let _server = spawn_mock_server(good_port);
-        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
         let servers = vec![
             Server::builder("127.0.0.1", crate::types::Port::try_new(good_port).unwrap())

@@ -60,16 +60,17 @@ pub mod buffer {
     /// This is a conservative default; increase via config for higher caching throughput.
     pub const CAPTURE_COUNT: usize = 16;
 
-    /// `BufReader` capacity for client command parsing (64KB)
-    /// Large enough to handle any NNTP command line without multiple reads
-    /// Sized for efficient line-based reading with minimal syscalls
-    pub const READER_CAPACITY: usize = 64 * 1024;
-
     // Command and response limits
 
     /// Maximum command line size (512 bytes)
     /// NNTP commands are typically small: "ARTICLE <msgid@example.com>"
     pub const COMMAND: usize = 512;
+
+    /// `BufReader` capacity for client command parsing.
+    ///
+    /// NNTP command lines are capped at 512 bytes. This holds a full 16-command
+    /// pipeline batch without giving every client a 64KB read buffer.
+    pub const READER_CAPACITY: usize = COMMAND * 16;
 
     /// Maximum size for a single response (2MB)
     /// Increased to handle larger articles, prevents memory exhaustion
@@ -264,7 +265,7 @@ const _: () = {
     // Buffer size relationships
     assert!(buffer::POOL == 1024 * 1024);
     assert!(buffer::READER_CAPACITY >= buffer::COMMAND);
-    assert!(buffer::READER_CAPACITY == 64 * 1024);
+    assert!(buffer::READER_CAPACITY == buffer::COMMAND * 16);
     assert!(buffer::RESPONSE_MAX > buffer::POOL);
     assert!(buffer::RESPONSE_INITIAL >= buffer::COMMAND);
     assert!(buffer::RESPONSE_MAX > buffer::RESPONSE_INITIAL);

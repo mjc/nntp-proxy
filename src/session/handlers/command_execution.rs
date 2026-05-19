@@ -6,7 +6,6 @@
 use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata, StatusCode};
 use crate::router::{BackendSelector, CommandGuard};
 use crate::session::SessionError;
-use crate::session::multiline_framing::MultilineFramer;
 use crate::session::response_buffer::StreamingError;
 use crate::session::retry::retry_once;
 use crate::session::routing::{
@@ -603,23 +602,6 @@ impl ClientSession {
             cache_action
         );
 
-        if !matches!(cache_action, CacheAction::CaptureArticle)
-            && params
-                .request
-                .expects_multiline_response(params.status_code)
-        {
-            let bytes_written = Self::stream_uncaptured_multiline_response(
-                pooled_conn,
-                client_write,
-                backend_id,
-                first_buffer,
-                first_chunk_len,
-            )
-            .await?;
-            Self::apply_uncaptured_cache_action(cache_action, self, params, backend_id);
-            return Ok(bytes_written);
-        }
-
         let mut captured = crate::pool::ChunkedResponse::default();
         crate::session::response_buffer::buffer_prefetched_response_for_request(
             crate::session::response_buffer::PrefetchedResponseContext {
@@ -628,6 +610,7 @@ impl ClientSession {
                 initial_len: first_chunk_len,
                 pool: &self.buffer_pool,
                 backend_id,
+                allow_packed_suffix: true,
             },
             first_buffer,
             pooled_conn,
@@ -695,125 +678,6 @@ impl ClientSession {
             CacheAction::None => {}
         }
         Ok(captured_len as u64)
-    }
-
-    async fn stream_uncaptured_multiline_response<W>(
-        pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
-        client_write: &mut W,
-        backend_id: BackendId,
-        first_buffer: &mut crate::pool::PooledBuffer,
-        first_chunk_len: usize,
-    ) -> Result<u64, StreamingError>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        let mut framer = MultilineFramer::default();
-        let mut bytes_written = 0u64;
-
-        let first = &first_buffer[..first_chunk_len];
-        if Self::write_uncaptured_multiline_chunk(
-            client_write,
-            &mut framer,
-            first,
-            &mut bytes_written,
-        )
-        .await?
-        {
-            return Ok(bytes_written);
-        }
-        first_buffer.clear();
-
-        loop {
-            let n = first_buffer
-                .read_from(pooled_conn.as_mut())
-                .await
-                .map_err(|e| {
-                    StreamingError::Io(
-                        anyhow::Error::from(e).context("Failed to read remaining response body"),
-                    )
-                })?;
-            if n == 0 {
-                return Err(StreamingError::BackendEof {
-                    backend_id,
-                    bytes_received: bytes_written,
-                });
-            }
-
-            let chunk = &first_buffer[..n];
-            if Self::write_uncaptured_multiline_chunk(
-                client_write,
-                &mut framer,
-                chunk,
-                &mut bytes_written,
-            )
-            .await?
-            {
-                return Ok(bytes_written);
-            }
-        }
-    }
-
-    async fn write_uncaptured_multiline_chunk<W>(
-        client_write: &mut W,
-        framer: &mut MultilineFramer,
-        chunk: &[u8],
-        bytes_written: &mut u64,
-    ) -> Result<bool, StreamingError>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        let Some(write_len) = framer.advance_to_next_terminator_end(chunk) else {
-            client_write
-                .write_all(chunk)
-                .await
-                .map_err(classify_buffered_response_write_err)?;
-            *bytes_written += chunk.len() as u64;
-            return Ok(false);
-        };
-
-        if write_len != chunk.len() {
-            return Err(StreamingError::Io(anyhow::anyhow!(
-                "Backend sent {} unexpected trailing bytes after multiline terminator",
-                chunk.len() - write_len
-            )));
-        }
-
-        client_write
-            .write_all(&chunk[..write_len])
-            .await
-            .map_err(classify_buffered_response_write_err)?;
-        *bytes_written += write_len as u64;
-        Ok(true)
-    }
-
-    fn apply_uncaptured_cache_action(
-        cache_action: CacheAction,
-        session: &ClientSession,
-        params: ResponseStreamParams<'_>,
-        backend_id: BackendId,
-    ) {
-        match cache_action {
-            CacheAction::TrackAvailability => {
-                if let Some(msg_id) = params.msg_id
-                    && !params.request.cache_records_backend_has_article(backend_id)
-                {
-                    session.spawn_cache_upsert_availability(
-                        msg_id,
-                        params.status_code,
-                        backend_id,
-                        session.tier_for_backend(backend_id),
-                    );
-                }
-            }
-            CacheAction::TrackStat => {
-                session.maybe_cache_upsert_buffer(
-                    params.msg_id,
-                    crate::cache::CacheIngestResponse::from(b"223\r\n".as_slice()),
-                    backend_id,
-                );
-            }
-            CacheAction::CaptureArticle | CacheAction::None => {}
-        }
     }
 
     /// Handle backend error (metrics and cleanup)

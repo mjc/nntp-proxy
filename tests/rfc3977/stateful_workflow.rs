@@ -9,8 +9,8 @@ use anyhow::Result;
 use crate::test_helpers::{MockNntpServer, RfcTestClient};
 use nntp_proxy::RoutingMode;
 
-fn workflow_backend(port: u16) -> MockNntpServer {
-    MockNntpServer::new(port)
+fn workflow_backend(_port: u16) -> MockNntpServer {
+    MockNntpServer::new()
         .with_name("WorkflowBackend")
         .on_command("GROUP", "211 3 1 3 alt.test\r\n")
         .on_command("NEXT", "223 2 <second@example.com>\r\n")
@@ -21,15 +21,15 @@ fn workflow_backend(port: u16) -> MockNntpServer {
         )
 }
 
-fn no_such_group_backend(port: u16) -> MockNntpServer {
-    MockNntpServer::new(port)
+fn no_such_group_backend(_port: u16) -> MockNntpServer {
+    MockNntpServer::new()
         .with_name("MissingGroupBackend")
         .on_command("GROUP missing.group", "411 No such newsgroup\r\n")
         .on_command("DATE", "111 20260504112233\r\n")
 }
 
-fn missing_article_number_backend(port: u16) -> MockNntpServer {
-    MockNntpServer::new(port)
+fn missing_article_number_backend(_port: u16) -> MockNntpServer {
+    MockNntpServer::new()
         .with_name("MissingArticleBackend")
         .on_command("GROUP", "211 3 1 3 alt.test\r\n")
         .on_command("ARTICLE 999", "423 No article with that number\r\n")
@@ -38,8 +38,8 @@ fn missing_article_number_backend(port: u16) -> MockNntpServer {
 
 #[tokio::test]
 async fn test_next_without_group_returns_412_and_session_continues() -> Result<()> {
-    let mut client = RfcTestClient::spawn(RoutingMode::Stateful, "workflow-backend", |port| {
-        MockNntpServer::new(port)
+    let mut client = RfcTestClient::spawn(RoutingMode::Stateful, "workflow-backend", |_port| {
+        MockNntpServer::new()
             .with_name("NoGroupBackend")
             .on_command("NEXT", "412 No newsgroup selected\r\n")
             .on_command("GROUP", "211 3 1 3 alt.test\r\n")

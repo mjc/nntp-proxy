@@ -1,7 +1,7 @@
 /// Tests specifically targeting uncovered code paths in hybrid mode for increased coverage
 use anyhow::Result;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpStream;
 use tokio::time::{Duration, timeout};
 
 use nntp_proxy::config::Server;
@@ -14,23 +14,15 @@ use crate::test_helpers::*;
 /// This test sends >100 commands to trigger the `METRICS_FLUSH_INTERVAL` code path
 #[tokio::test]
 async fn test_hybrid_mode_long_session_metrics_flush() -> Result<()> {
-    let mock_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-    let proxy_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-
-    let _mock = MockNntpServer::new(mock_port)
+    let (mock_port, _mock) = MockNntpServer::new()
         .with_name("Long Session Server")
         .on_command("GROUP", "211 1000 1 1000 alt.test\r\n")
         .on_command(
             "ARTICLE",
             "220 1 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         )
-        .spawn();
-
-    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
+        .spawn_on_random_port()
+        .await?;
 
     // Create proxy WITH metrics enabled to test metrics flushing
     let config = Config {
@@ -47,22 +39,8 @@ async fn test_hybrid_mode_long_session_metrics_flush() -> Result<()> {
         .build()
         .await?;
 
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, true).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
-    let listener = TcpListener::bind(&proxy_addr).await?;
-
-    tokio::spawn(async move {
-        loop {
-            if let Ok((stream, addr)) = listener.accept().await {
-                let proxy_clone = proxy.clone();
-                tokio::spawn(async move {
-                    let _ = proxy_clone
-                        .handle_client_per_command_routing(stream, addr.into())
-                        .await;
-                });
-            }
-        }
-    });
-
     wait_for_server(&proxy_addr, 20).await?;
 
     let mut client = TcpStream::connect(&proxy_addr).await?;
@@ -110,22 +88,12 @@ async fn test_hybrid_mode_long_session_metrics_flush() -> Result<()> {
 /// This exercises the error handling code path that logs warnings and breaks the loop
 #[tokio::test]
 async fn test_hybrid_mode_command_error_in_stateful_mode() -> Result<()> {
-    let mock_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-    let proxy_port = get_available_port()
-        .await
-        .expect("Failed to get available port");
-
     // Create a mock server that will close connection after GROUP to simulate backend error
-    let mock_port_clone = mock_port;
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let mock_port = mock_listener.local_addr()?.port();
     tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{mock_port_clone}"))
-            .await
-            .unwrap();
-
         loop {
-            let (mut stream, _) = listener.accept().await.unwrap();
+            let (mut stream, _) = mock_listener.accept().await.unwrap();
 
             // Send greeting
             stream.write_all(b"200 Mock Server\r\n").await.unwrap();
@@ -181,22 +149,8 @@ async fn test_hybrid_mode_command_error_in_stateful_mode() -> Result<()> {
 
     let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
 
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, true).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
-    let listener = TcpListener::bind(&proxy_addr).await?;
-
-    tokio::spawn(async move {
-        loop {
-            if let Ok((stream, addr)) = listener.accept().await {
-                let proxy_clone = proxy.clone();
-                tokio::spawn(async move {
-                    let _ = proxy_clone
-                        .handle_client_per_command_routing(stream, addr.into())
-                        .await;
-                });
-            }
-        }
-    });
-
     wait_for_server(&proxy_addr, 20).await?;
 
     let mut client = TcpStream::connect(&proxy_addr).await?;

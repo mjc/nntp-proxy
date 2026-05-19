@@ -20,19 +20,18 @@ use crate::test_helpers::*;
 #[tokio::test]
 async fn test_single_greeting_per_command_mode() -> Result<()> {
     // Start a minimal mock backend
-    let mock_port = get_available_port().await?;
-    let _mock = MockNntpServer::new(mock_port)
+    let (mock_port, _mock) = MockNntpServer::new()
         .with_name("MockBackend")
-        .spawn();
+        .spawn_on_random_port()
+        .await?;
 
     // Start the proxy
-    let proxy_port = get_available_port().await?;
     let config = Config {
         servers: vec![create_test_server_config("127.0.0.1", mock_port, "Mock")],
         ..Default::default()
     };
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
-    spawn_test_proxy(proxy, proxy_port, true).await;
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, true).await?;
 
     // Give server+proxy time to be ready
     wait_for_server(&format!("127.0.0.1:{proxy_port}"), 20).await?;
@@ -78,17 +77,16 @@ async fn test_single_greeting_per_command_mode() -> Result<()> {
 #[tokio::test]
 async fn test_article_fetch_no_corruption() -> Result<()> {
     // Start a mock backend server
-    let mock_port = get_available_port().await?;
-    let _mock = MockNntpServer::new(mock_port)
+    let (mock_port, _mock) = MockNntpServer::new()
         .with_name("Mock Server")
         .on_command(
             "ARTICLE",
             "220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         )
-        .spawn();
+        .spawn_on_random_port()
+        .await?;
 
     // Start proxy
-    let proxy_port = get_available_port().await?;
     let config = Config {
         servers: vec![create_test_server_config(
             "127.0.0.1",
@@ -98,7 +96,7 @@ async fn test_article_fetch_no_corruption() -> Result<()> {
         ..Default::default()
     };
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
-    spawn_test_proxy(proxy, proxy_port, true).await;
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, true).await?;
     wait_for_server(&format!("127.0.0.1:{proxy_port}"), 20).await?;
 
     // Connect to proxy

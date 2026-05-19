@@ -104,6 +104,7 @@ pub(crate) struct PrefetchedResponseContext<'a> {
     pub initial_len: usize,
     pub pool: &'a crate::pool::BufferPool,
     pub backend_id: crate::types::BackendId,
+    pub allow_packed_suffix: bool,
 }
 
 #[cfg(test)]
@@ -280,22 +281,6 @@ fn push_buffer_prefix_to_response(
     Ok(())
 }
 
-fn copy_buffer_prefix_to_response(
-    io_buffer: &mut crate::pool::PooledBuffer,
-    conn: &mut crate::stream::ConnectionStream,
-    response: &mut crate::pool::ChunkedResponse,
-    pool: &crate::pool::BufferPool,
-    prefix_len: usize,
-    total_len: usize,
-) -> Result<(), StreamingError> {
-    debug_assert!(prefix_len <= total_len);
-    response.extend_from_slice(pool, &io_buffer[..prefix_len]);
-    conn.stash_leftover_from(io_buffer, prefix_len)
-        .map_err(StreamingError::Io)?;
-    io_buffer.clear();
-    Ok(())
-}
-
 fn validate_multiline_suffix(
     chunk_len: usize,
     terminator_end: usize,
@@ -316,19 +301,16 @@ fn process_shared_multiline_chunk(
     range: Range<usize>,
     conn: &mut crate::stream::ConnectionStream,
     response: &mut crate::pool::ChunkedResponse,
-    pool: &crate::pool::BufferPool,
     framer: &mut MultilineFramer,
     allow_packed_suffix: bool,
 ) -> Result<bool, StreamingError> {
     let chunk = &bytes[range.clone()];
     let Some(write_len) = framer.advance_to_next_terminator_end(chunk) else {
-        response.extend_from_slice(pool, chunk);
+        response.push_shared_range(bytes, range);
         return Ok(false);
     };
     validate_multiline_suffix(chunk.len(), write_len, allow_packed_suffix)?;
-    response.extend_from_slice(pool, &chunk[..write_len]);
-    conn.stash_leftover_from(chunk, write_len)
-        .map_err(StreamingError::Io)?;
+    push_shared_prefix_to_response(bytes, range, conn, response, write_len)?;
     Ok(true)
 }
 
@@ -351,7 +333,7 @@ async fn fill_multiline_response(
         } => match framer.advance_to_next_terminator_end(&io_buffer[..initial_chunk_len]) {
             Some(pos) => {
                 validate_multiline_suffix(initial_chunk_len, pos, allow_packed_suffix)?;
-                copy_buffer_prefix_to_response(
+                push_buffer_prefix_to_response(
                     io_buffer,
                     conn,
                     response,
@@ -362,8 +344,8 @@ async fn fill_multiline_response(
                 return Ok(());
             }
             None => {
-                response.extend_from_slice(pool, &io_buffer[..initial_chunk_len]);
-                io_buffer.clear();
+                let old = std::mem::replace(io_buffer, pool.acquire());
+                response.push_buffer_range(old, 0..initial_chunk_len);
             }
         },
         PrefetchedResponse::Shared { bytes, range, .. } => {
@@ -372,7 +354,6 @@ async fn fill_multiline_response(
                 range,
                 conn,
                 response,
-                pool,
                 &mut framer,
                 allow_packed_suffix,
             )? {
@@ -388,7 +369,6 @@ async fn fill_multiline_response(
                 range,
                 conn,
                 response,
-                pool,
                 &mut framer,
                 allow_packed_suffix,
             )? {
@@ -411,12 +391,12 @@ async fn fill_multiline_response(
 
         if let Some(write_len) = framer.advance_to_next_terminator_end(&io_buffer[..n]) {
             validate_multiline_suffix(n, write_len, allow_packed_suffix)?;
-            copy_buffer_prefix_to_response(io_buffer, conn, response, pool, write_len, n)?;
+            push_buffer_prefix_to_response(io_buffer, conn, response, pool, write_len, n)?;
             return Ok(());
         }
 
-        response.extend_from_slice(pool, &io_buffer[..n]);
-        io_buffer.clear();
+        let old = std::mem::replace(io_buffer, pool.acquire());
+        response.push_buffer_range(old, 0..n);
     }
 }
 
@@ -480,7 +460,7 @@ pub(crate) async fn buffer_prefetched_response_for_request(
         ctx.pool,
         prefetched,
         ctx.backend_id,
-        false,
+        ctx.allow_packed_suffix,
     )
     .await
 }
@@ -542,6 +522,7 @@ mod tests {
                 initial_len: first_chunk.len(),
                 pool,
                 backend_id: crate::types::BackendId::from_index(1),
+                allow_packed_suffix: false,
             },
             &mut io_buffer,
             conn,
@@ -682,7 +663,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn buffered_multiline_response_reuses_single_scratch_buffer_across_chunks() {
+    async fn buffered_multiline_response_moves_scratch_buffers_across_chunks() {
         let header = b"220 Article follows\r\n";
         let mut body_chunk = vec![b'x'; 94];
         body_chunk.extend_from_slice(b"\r\n");
@@ -707,6 +688,7 @@ mod tests {
                 initial_len: header.len(),
                 pool: &pool,
                 backend_id: crate::types::BackendId::from_index(1),
+                allow_packed_suffix: false,
             },
             &mut io_buffer,
             &mut conn,
@@ -718,8 +700,8 @@ mod tests {
         assert_eq!(captured.to_vec(), expected_response);
         assert_eq!(
             pool.available_buffers(),
-            1,
-            "only the active scratch buffer should remain checked out while the response is buffered"
+            0,
+            "buffered multiline response should hold pooled read buffers instead of copying into capture buffers"
         );
     }
 

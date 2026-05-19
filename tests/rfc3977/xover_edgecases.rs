@@ -7,8 +7,8 @@ use anyhow::Result;
 use crate::test_helpers::{MockNntpServer, RfcTestClient};
 use nntp_proxy::RoutingMode;
 
-fn xover_backend(port: u16) -> MockNntpServer {
-    MockNntpServer::new(port)
+fn xover_backend(_port: u16) -> MockNntpServer {
+    MockNntpServer::new()
         .with_name("XoverBackend")
         .on_command("GROUP", "211 1 1 1 alt.test\r\n")
         .on_command("XOVER 1-0", "501 Syntax error in range\r\n")
@@ -19,8 +19,8 @@ fn xover_backend(port: u16) -> MockNntpServer {
         )
 }
 
-fn no_group_xover_backend(port: u16) -> MockNntpServer {
-    MockNntpServer::new(port)
+fn no_group_xover_backend(_port: u16) -> MockNntpServer {
+    MockNntpServer::new()
         .with_name("NoGroupXoverBackend")
         .on_command("XOVER", "412 No newsgroup selected\r\n")
         .on_command("GROUP", "211 1 1 1 alt.test\r\n")

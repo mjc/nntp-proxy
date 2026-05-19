@@ -18,8 +18,6 @@ mod responses;
 pub use article::{Article, HeaderIter, Headers, ParseError, yenc};
 
 // Re-export response types and utilities
-#[cfg(test)]
-pub(crate) use request::ResponsePayloadLen;
 pub(crate) use request::{
     MAX_COMMAND_LINE_OCTETS, RequestCacheArticleNumber, RequestCacheAvailability,
     RequestCacheEntryMetadata, RequestCachePayloadKind, RequestCacheStatus, RequestCacheTier,

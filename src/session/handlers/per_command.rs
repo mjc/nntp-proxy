@@ -21,7 +21,7 @@ use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
 use crate::command::{CommandAction, CommandHandler};
-use crate::constants::buffer::{COMMAND, READER_CAPACITY};
+use crate::constants::buffer::READER_CAPACITY;
 use crate::router::BackendSelector;
 use crate::session::SessionError;
 use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
@@ -423,7 +423,7 @@ impl ClientSession {
         client_writer: crate::session::SharedClientWriter,
     ) -> Result<TransferMetrics, SessionError> {
         debug!("Client {} entering command loop", self.client_addr);
-        let mut command_buf = Vec::with_capacity(COMMAND);
+        let mut command_buf = [0u8; crate::protocol::MAX_COMMAND_LINE_OCTETS];
         let mut state = PerCommandLoopState::new(!self.auth_handler.is_enabled());
 
         loop {
@@ -467,7 +467,7 @@ impl ClientSession {
     async fn read_next_batch(
         &self,
         client_reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
-        command_buf: &mut Vec<u8>,
+        command_buf: &mut [u8; crate::protocol::MAX_COMMAND_LINE_OCTETS],
         metrics: TransferMetrics,
     ) -> Option<crate::session::handlers::pipeline::RequestBatch> {
         match self.read_command_batch(client_reader, command_buf).await {

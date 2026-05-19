@@ -21,15 +21,15 @@ async fn spawn_caps_client_with_mode_and_config(
     config_auth: bool,
 ) -> Result<RfcTestClient> {
     if config_auth {
-        RfcTestClient::spawn_with_auth(mode, "caps-backend", "alice", "wonderland", |port| {
-            MockNntpServer::new(port)
+        RfcTestClient::spawn_with_auth(mode, "caps-backend", "alice", "wonderland", |_port| {
+            MockNntpServer::new()
                 .with_name("CapsVariantBackend")
                 .on_command("CAPABILITIES", BACKEND_CAPS_VARIANT)
         })
         .await
     } else {
-        RfcTestClient::spawn(mode, "caps-backend", |port| {
-            MockNntpServer::new(port)
+        RfcTestClient::spawn(mode, "caps-backend", |_port| {
+            MockNntpServer::new()
                 .with_name("CapsVariantBackend")
                 .on_command("CAPABILITIES", BACKEND_CAPS_VARIANT)
         })

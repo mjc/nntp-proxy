@@ -15,8 +15,8 @@ async fn spawn_auth_client(
     username: &str,
     password: &str,
 ) -> Result<RfcTestClient> {
-    RfcTestClient::spawn_with_auth(mode, "auth-backend", username, password, |port| {
-        MockNntpServer::new(port)
+    RfcTestClient::spawn_with_auth(mode, "auth-backend", username, password, |_port| {
+        MockNntpServer::new()
     })
     .await
 }

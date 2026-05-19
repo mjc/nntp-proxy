@@ -651,16 +651,6 @@ impl RequestContext {
     }
 
     #[inline]
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) const fn response_payload_is_empty(&self) -> Option<bool> {
-        match &self.response_payload {
-            Some(response) => Some(response.is_empty()),
-            None => None,
-        }
-    }
-
-    #[inline]
     pub(crate) const fn record_backend_response(
         &mut self,
         backend_id: BackendId,

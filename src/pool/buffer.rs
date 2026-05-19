@@ -225,7 +225,7 @@ impl Drop for PooledBuffer {
 /// a multiline response is larger than the typical capture size.
 #[derive(Debug, Default)]
 pub struct ChunkedResponse {
-    chunks: SmallVec<[ResponseChunk; 2]>,
+    chunks: SmallVec<[ResponseChunk; 16]>,
     len: usize,
 }
 
@@ -268,13 +268,19 @@ fn response_write_metrics() -> &'static ResponseWriteMetrics {
     METRICS.get_or_init(ResponseWriteMetrics::default)
 }
 
-fn record_response_write_metrics(chunks: &[&[u8]], bytes_written: usize) {
+fn record_response_write_metrics(
+    chunk_count: usize,
+    bytes_written: usize,
+    tiny_chunks: usize,
+    tiny_chunk_bytes: usize,
+    small_chunks: usize,
+    small_chunk_bytes: usize,
+) {
     if !response_write_metrics_enabled() {
         return;
     }
 
     let metrics = response_write_metrics();
-    let chunk_count = chunks.len();
     metrics.responses.fetch_add(1, Ordering::Relaxed);
     metrics
         .chunks_written
@@ -282,17 +288,18 @@ fn record_response_write_metrics(chunks: &[&[u8]], bytes_written: usize) {
     metrics
         .bytes_written
         .fetch_add(bytes_written, Ordering::Relaxed);
-    for chunk in chunks {
-        let len = chunk.len();
-        if len <= 256 {
-            metrics.tiny_chunks.fetch_add(1, Ordering::Relaxed);
-            metrics.tiny_chunk_bytes.fetch_add(len, Ordering::Relaxed);
-        }
-        if len <= 4096 {
-            metrics.small_chunks.fetch_add(1, Ordering::Relaxed);
-            metrics.small_chunk_bytes.fetch_add(len, Ordering::Relaxed);
-        }
-    }
+    metrics
+        .tiny_chunks
+        .fetch_add(tiny_chunks, Ordering::Relaxed);
+    metrics
+        .tiny_chunk_bytes
+        .fetch_add(tiny_chunk_bytes, Ordering::Relaxed);
+    metrics
+        .small_chunks
+        .fetch_add(small_chunks, Ordering::Relaxed);
+    metrics
+        .small_chunk_bytes
+        .fetch_add(small_chunk_bytes, Ordering::Relaxed);
     metrics
         .max_chunks_per_response
         .fetch_max(chunk_count, Ordering::Relaxed);
@@ -594,9 +601,35 @@ impl ChunkedResponse {
     where
         W: AsyncWriteExt + Unpin,
     {
-        let chunks: SmallVec<[&[u8]; 16]> = self.iter_chunks().collect();
-        record_response_write_metrics(&chunks, self.len);
-        for chunk in chunks {
+        if response_write_metrics_enabled() {
+            let mut chunk_count = 0usize;
+            let mut tiny_chunks = 0usize;
+            let mut tiny_chunk_bytes = 0usize;
+            let mut small_chunks = 0usize;
+            let mut small_chunk_bytes = 0usize;
+            for chunk in self.iter_chunks() {
+                chunk_count += 1;
+                let len = chunk.len();
+                if len <= 256 {
+                    tiny_chunks += 1;
+                    tiny_chunk_bytes += len;
+                }
+                if len <= 4096 {
+                    small_chunks += 1;
+                    small_chunk_bytes += len;
+                }
+            }
+            record_response_write_metrics(
+                chunk_count,
+                self.len,
+                tiny_chunks,
+                tiny_chunk_bytes,
+                small_chunks,
+                small_chunk_bytes,
+            );
+        }
+
+        for chunk in self.iter_chunks() {
             writer.write_all(chunk).await?;
         }
         Ok(())
