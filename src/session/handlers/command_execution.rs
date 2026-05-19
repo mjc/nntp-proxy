@@ -96,6 +96,34 @@ const fn classify_buffered_response_write_err(e: std::io::Error) -> StreamingErr
     StreamingError::ClientDisconnect(e)
 }
 
+const fn can_write_without_owned_response(
+    request: &RequestContext,
+    cache_action: CacheAction,
+) -> bool {
+    matches!(
+        request.kind(),
+        RequestKind::Article | RequestKind::Body | RequestKind::Head
+    ) && matches!(
+        cache_action,
+        CacheAction::TrackAvailability | CacheAction::None
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResponseOwnership {
+    NotOwned,
+    Owned,
+}
+
+impl ResponseOwnership {
+    const fn for_request(request: &RequestContext, cache_action: CacheAction) -> Self {
+        match can_write_without_owned_response(request, cache_action) {
+            true => Self::NotOwned,
+            false => Self::Owned,
+        }
+    }
+}
+
 impl ClientSession {
     /// Try executing command on next available backend
     ///
@@ -586,7 +614,6 @@ impl ClientSession {
     where
         W: AsyncWrite + Unpin,
     {
-        let code = params.status_code.as_u16();
         let cache_action = determine_cache_action_for_request(
             params.request,
             params.status_code,
@@ -596,12 +623,120 @@ impl ClientSession {
 
         debug!(
             "stream_response_to_client: code={}, cache_articles={}, has_msg_id={}, action={:?}",
-            code,
+            params.status_code.as_u16(),
             self.cache_articles,
             params.msg_id.is_some(),
             cache_action
         );
 
+        let (bytes_written, captured) =
+            match ResponseOwnership::for_request(params.request, cache_action) {
+                ResponseOwnership::NotOwned => {
+                    let bytes = self
+                        .write_response_without_ownership(
+                            pooled_conn,
+                            client_write,
+                            backend_id,
+                            first_buffer,
+                            first_chunk_len,
+                            params,
+                        )
+                        .await?;
+                    (bytes, None)
+                }
+                ResponseOwnership::Owned => {
+                    let (bytes, response) = self
+                        .write_owned_response_to_client(
+                            pooled_conn,
+                            client_write,
+                            backend_id,
+                            first_buffer,
+                            first_chunk_len,
+                            params,
+                        )
+                        .await?;
+                    (bytes, Some(response))
+                }
+            };
+
+        self.apply_cache_action(cache_action, params, backend_id, captured);
+        Ok(bytes_written)
+    }
+
+    fn apply_cache_action(
+        &self,
+        cache_action: CacheAction,
+        params: ResponseStreamParams<'_>,
+        backend_id: BackendId,
+        captured: Option<crate::pool::ChunkedResponse>,
+    ) {
+        match (cache_action, params.msg_id, captured) {
+            (CacheAction::CaptureArticle, msg_id, Some(response)) => {
+                self.maybe_cache_upsert_buffer(msg_id, response.into(), backend_id);
+            }
+            (CacheAction::TrackAvailability, Some(msg_id), _)
+                if !params.request.cache_records_backend_has_article(backend_id) =>
+            {
+                self.spawn_cache_upsert_availability(
+                    msg_id,
+                    params.status_code,
+                    backend_id,
+                    self.tier_for_backend(backend_id),
+                );
+            }
+            (CacheAction::TrackStat, msg_id, _) => {
+                self.maybe_cache_upsert_buffer(
+                    msg_id,
+                    crate::cache::CacheIngestResponse::from(b"223\r\n".as_slice()),
+                    backend_id,
+                );
+            }
+            (CacheAction::None, _, _)
+            | (CacheAction::TrackAvailability, _, _)
+            | (CacheAction::CaptureArticle, _, None) => {}
+        }
+    }
+
+    async fn write_response_without_ownership<W>(
+        &self,
+        pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+        client_write: &mut W,
+        backend_id: BackendId,
+        first_buffer: &mut crate::pool::PooledBuffer,
+        first_chunk_len: usize,
+        params: ResponseStreamParams<'_>,
+    ) -> Result<u64, StreamingError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        crate::session::response_buffer::write_prefetched_response_for_request(
+            crate::session::response_buffer::WritePrefetchedResponseContext {
+                request: params.request,
+                status_code: params.status_code,
+                initial_len: first_chunk_len,
+                backend_id,
+                allow_packed_suffix: true,
+            },
+            first_buffer,
+            pooled_conn,
+            client_write,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_owned_response_to_client<W>(
+        &self,
+        pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+        client_write: &mut W,
+        backend_id: BackendId,
+        first_buffer: &mut crate::pool::PooledBuffer,
+        first_chunk_len: usize,
+        params: ResponseStreamParams<'_>,
+    ) -> Result<(u64, crate::pool::ChunkedResponse), StreamingError>
+    where
+        W: AsyncWrite + Unpin,
+    {
         let mut captured = crate::pool::ChunkedResponse::default();
         crate::session::response_buffer::buffer_prefetched_response_for_request(
             crate::session::response_buffer::PrefetchedResponseContext {
@@ -617,32 +752,12 @@ impl ClientSession {
             &mut captured,
         )
         .await?;
-        if matches!(params.request.kind(), RequestKind::Body) {
-            debug!(
-                client = %self.client_addr,
-                backend = backend_id.as_index(),
-                command_verb = ?params.request.verb(),
-                status_code = params.status_code.as_u16(),
-                response_len = captured.len(),
-                leftover_bytes = pooled_conn.leftover_len(),
-                "Buffered BODY response for direct client delivery"
-            );
-        }
+        self.log_body_response_buffered(pooled_conn, backend_id, params, captured.len());
         captured
             .write_all_to(client_write)
             .await
             .map_err(classify_buffered_response_write_err)?;
-        if matches!(params.request.kind(), RequestKind::Body) {
-            debug!(
-                client = %self.client_addr,
-                backend = backend_id.as_index(),
-                command_verb = ?params.request.verb(),
-                status_code = params.status_code.as_u16(),
-                bytes_written = captured.len(),
-                leftover_bytes = pooled_conn.leftover_len(),
-                "Wrote buffered BODY response to direct client"
-            );
-        }
+        self.log_body_response_written(pooled_conn, backend_id, params, captured.len());
         if let Some(msg_id_ref) = params.msg_id {
             debug!(
                 "Client {} caching full article for {} ({} bytes captured)",
@@ -651,33 +766,47 @@ impl ClientSession {
                 captured.len()
             );
         }
-        let captured_len = captured.len();
-        match cache_action {
-            CacheAction::CaptureArticle => {
-                self.maybe_cache_upsert_buffer(params.msg_id, captured.into(), backend_id);
-            }
-            CacheAction::TrackAvailability => {
-                if let Some(msg_id) = params.msg_id
-                    && !params.request.cache_records_backend_has_article(backend_id)
-                {
-                    self.spawn_cache_upsert_availability(
-                        msg_id,
-                        params.status_code,
-                        backend_id,
-                        self.tier_for_backend(backend_id),
-                    );
-                }
-            }
-            CacheAction::TrackStat => {
-                self.maybe_cache_upsert_buffer(
-                    params.msg_id,
-                    crate::cache::CacheIngestResponse::from(b"223\r\n".as_slice()),
-                    backend_id,
-                );
-            }
-            CacheAction::None => {}
+        Ok((captured.len() as u64, captured))
+    }
+
+    fn log_body_response_buffered(
+        &self,
+        pooled_conn: &deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+        backend_id: BackendId,
+        params: ResponseStreamParams<'_>,
+        response_len: usize,
+    ) {
+        if matches!(params.request.kind(), RequestKind::Body) {
+            debug!(
+                client = %self.client_addr,
+                backend = backend_id.as_index(),
+                command_verb = ?params.request.verb(),
+                status_code = params.status_code.as_u16(),
+                response_len,
+                leftover_bytes = pooled_conn.leftover_len(),
+                "Buffered BODY response for direct client delivery"
+            );
         }
-        Ok(captured_len as u64)
+    }
+
+    fn log_body_response_written(
+        &self,
+        pooled_conn: &deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
+        backend_id: BackendId,
+        params: ResponseStreamParams<'_>,
+        bytes_written: usize,
+    ) {
+        if matches!(params.request.kind(), RequestKind::Body) {
+            debug!(
+                client = %self.client_addr,
+                backend = backend_id.as_index(),
+                command_verb = ?params.request.verb(),
+                status_code = params.status_code.as_u16(),
+                bytes_written,
+                leftover_bytes = pooled_conn.leftover_len(),
+                "Wrote buffered BODY response to direct client"
+            );
+        }
     }
 
     /// Handle backend error (metrics and cleanup)

@@ -10,7 +10,10 @@ pub mod health_check;
 pub mod prewarming;
 pub mod provider;
 
-pub use buffer::{BufferPool, ChunkedResponse, PooledBuffer};
+pub use buffer::{
+    BufferPool, ChunkedResponse, HotPathAllocationMetricsSnapshot, PooledBuffer,
+    hot_path_allocation_metrics_snapshot, reset_hot_path_allocation_metrics,
+};
 pub use connection_guard::{ConnectionGuard, salvage_with_health_check};
 pub use connection_trait::{ConnectionProvider, PoolStatus};
 pub use health_check::{HealthCheckError, HealthCheckMetrics};

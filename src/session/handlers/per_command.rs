@@ -408,11 +408,11 @@ impl ClientSession {
         };
 
         let (client_read, client_write) = client_stream.into_split();
-        Box::pin(self.run_per_command_loop(
+        self.run_per_command_loop(
             router,
             BufReader::with_capacity(READER_CAPACITY, client_read),
             crate::session::SharedClientWriter::new(client_write),
-        ))
+        )
         .await
     }
 

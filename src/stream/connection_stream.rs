@@ -3,12 +3,13 @@
 //! This module provides abstractions for handling different stream types (TCP, TLS, etc.)
 //! in a unified way. This is preparation for adding SSL/TLS support to backend connections.
 
+use arrayvec::ArrayVec;
 use bytes::Bytes;
+use smallvec::SmallVec;
 
 use crate::compression::DecompressStream;
 use crate::constants::buffer::MAX_LEFTOVER_BYTES;
 use crate::tls::TlsStream;
-use std::collections::VecDeque;
 use std::io;
 use std::ops::Range;
 use std::pin::Pin;
@@ -45,7 +46,8 @@ enum ConnectionTransport {
 #[derive(Debug)]
 pub struct ConnectionStream {
     transport: ConnectionTransport,
-    leftover: VecDeque<LeftoverChunk>,
+    leftover: SmallVec<[LeftoverChunk; 4]>,
+    inline_leftover: ArrayVec<u8, 1024>,
 }
 
 #[derive(Debug)]
@@ -57,6 +59,13 @@ struct LeftoverChunk {
 #[derive(Debug)]
 enum LeftoverChunkStorage {
     Shared(Bytes),
+    Inline,
+}
+
+#[derive(Clone, Copy)]
+enum LeftoverOrder {
+    Front,
+    Back,
 }
 
 impl LeftoverChunk {
@@ -64,9 +73,10 @@ impl LeftoverChunk {
         self.range.len()
     }
 
-    fn as_slice(&self) -> &[u8] {
+    fn as_slice<'a>(&'a self, inline_leftover: &'a [u8]) -> &'a [u8] {
         match &self.storage {
             LeftoverChunkStorage::Shared(bytes) => &bytes[self.range.clone()],
+            LeftoverChunkStorage::Inline => &inline_leftover[self.range.clone()],
         }
     }
 }
@@ -109,7 +119,8 @@ impl ConnectionStream {
     fn new(transport: ConnectionTransport) -> Self {
         Self {
             transport,
-            leftover: VecDeque::new(),
+            leftover: SmallVec::new(),
+            inline_leftover: ArrayVec::new(),
         }
     }
 
@@ -136,6 +147,7 @@ impl ConnectionStream {
         Ok(Self {
             transport,
             leftover: self.leftover,
+            inline_leftover: self.inline_leftover,
         })
     }
 
@@ -234,23 +246,46 @@ impl ConnectionStream {
 
     /// Stash bytes that were already read from the backend but belong to the next response.
     pub fn stash_leftover(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
-        if bytes.is_empty() {
+        let Some(bytes) = (!bytes.is_empty()).then_some(bytes) else {
             return Ok(());
-        }
+        };
+
         ensure_leftover_capacity(self.leftover_len(), bytes.len())?;
-        self.leftover.push_back(LeftoverChunk {
-            storage: LeftoverChunkStorage::Shared(Bytes::copy_from_slice(bytes)),
-            range: 0..bytes.len(),
-        });
+
+        match self.inline_leftover.remaining_capacity() >= bytes.len() {
+            true => {
+                let start = self.inline_leftover.len();
+                self.inline_leftover
+                    .try_extend_from_slice(bytes)
+                    .map_err(|_| {
+                        anyhow::anyhow!(
+                            "Inline leftover slab rejected {} bytes despite capacity check",
+                            bytes.len()
+                        )
+                    })?;
+                self.leftover.push(LeftoverChunk {
+                    storage: LeftoverChunkStorage::Inline,
+                    range: start..start + bytes.len(),
+                });
+            }
+            false => {
+                crate::pool::buffer::record_packed_suffix_shared_fallback();
+                self.leftover.push(LeftoverChunk {
+                    storage: LeftoverChunkStorage::Shared(Bytes::copy_from_slice(bytes)),
+                    range: 0..bytes.len(),
+                });
+            }
+        }
         Ok(())
     }
 
     /// Stash the remaining suffix of a read buffer, if any bytes remain.
     pub fn stash_leftover_from(&mut self, bytes: &[u8], start: usize) -> anyhow::Result<()> {
         if start < bytes.len() {
-            self.stash_leftover(&bytes[start..])?;
+            self.stash_leftover(&bytes[start..])
+        } else {
+            Ok(())
         }
-        Ok(())
     }
 
     /// Stash a range from shared bytes without copying.
@@ -259,16 +294,7 @@ impl ConnectionStream {
         bytes: Bytes,
         range: Range<usize>,
     ) -> anyhow::Result<()> {
-        if range.is_empty() {
-            return Ok(());
-        }
-        debug_assert!(range.end <= bytes.len());
-        ensure_leftover_capacity(self.leftover_len(), range.len())?;
-        self.leftover.push_back(LeftoverChunk {
-            storage: LeftoverChunkStorage::Shared(bytes),
-            range,
-        });
-        Ok(())
+        self.stash_leftover_shared_ordered(bytes, range, LeftoverOrder::Back)
     }
 
     /// Requeue a shared leftover range ahead of any other read-ahead bytes.
@@ -277,23 +303,47 @@ impl ConnectionStream {
         bytes: Bytes,
         range: Range<usize>,
     ) -> anyhow::Result<()> {
-        if range.is_empty() {
+        self.stash_leftover_shared_ordered(bytes, range, LeftoverOrder::Front)
+    }
+
+    fn stash_leftover_shared_ordered(
+        &mut self,
+        bytes: Bytes,
+        range: Range<usize>,
+        order: LeftoverOrder,
+    ) -> anyhow::Result<()> {
+        let Some(range) = (!range.is_empty()).then_some(range) else {
             return Ok(());
-        }
+        };
+
         debug_assert!(range.end <= bytes.len());
         ensure_leftover_capacity(self.leftover_len(), range.len())?;
-        self.leftover.push_front(LeftoverChunk {
+        crate::pool::buffer::record_packed_suffix_shared_fallback();
+        let chunk = LeftoverChunk {
             storage: LeftoverChunkStorage::Shared(bytes),
             range,
-        });
+        };
+        match order {
+            LeftoverOrder::Front => self.leftover.insert(0, chunk),
+            LeftoverOrder::Back => self.leftover.push(chunk),
+        }
         Ok(())
     }
 
     /// Take the next copied/shared read-ahead range without copying it through `AsyncRead`.
     pub fn pop_leftover_shared(&mut self) -> Option<(Bytes, Range<usize>)> {
-        self.leftover.pop_front().map(|chunk| match chunk.storage {
-            LeftoverChunkStorage::Shared(bytes) => (bytes, chunk.range),
-        })
+        (!self.leftover.is_empty()).then_some(())?;
+        let chunk = self.leftover.remove(0);
+        match chunk.storage {
+            LeftoverChunkStorage::Shared(bytes) => Some((bytes, chunk.range)),
+            LeftoverChunkStorage::Inline => {
+                let range = chunk.range;
+                Some((
+                    Bytes::copy_from_slice(&self.inline_leftover[range.clone()]),
+                    0..range.len(),
+                ))
+            }
+        }
     }
 
     #[must_use]
@@ -308,6 +358,7 @@ impl ConnectionStream {
 
     pub fn clear_leftover(&mut self) {
         self.leftover.clear();
+        self.inline_leftover.clear();
     }
 }
 
@@ -320,15 +371,25 @@ impl AsyncRead for ConnectionStream {
         if !self.leftover.is_empty() && buf.remaining() > 0 {
             let mut remaining = buf.remaining();
             while remaining > 0 {
-                let Some(front) = self.leftover.front_mut() else {
+                if self.leftover.is_empty() {
                     break;
+                }
+
+                let n = {
+                    let front = &self.leftover[0];
+                    let n = front.len().min(remaining);
+                    buf.put_slice(&front.as_slice(&self.inline_leftover)[..n]);
+                    n
                 };
-                let n = front.len().min(remaining);
-                buf.put_slice(&front.as_slice()[..n]);
+
+                let front = &mut self.leftover[0];
                 front.range.start += n;
                 remaining -= n;
                 if front.range.is_empty() {
-                    self.leftover.pop_front();
+                    self.leftover.remove(0);
+                    if self.leftover.is_empty() {
+                        self.inline_leftover.clear();
+                    }
                 }
             }
             return Poll::Ready(Ok(()));

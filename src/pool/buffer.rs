@@ -243,6 +243,16 @@ struct ResponseWriteMetrics {
     max_chunks_per_response: AtomicUsize,
 }
 
+#[derive(Debug, Default)]
+struct HotPathAllocationMetrics {
+    regular_pool_fallback_allocations: AtomicUsize,
+    capture_pool_fallback_allocations: AtomicUsize,
+    chunked_response_metadata_spills: AtomicUsize,
+    packed_suffix_shared_fallbacks: AtomicUsize,
+    non_owned_response_write_chunks: AtomicUsize,
+    non_owned_response_write_bytes: AtomicUsize,
+}
+
 /// Snapshot of direct client write-path activity from `ChunkedResponse::write_all_to`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResponseWriteMetricsSnapshot {
@@ -258,6 +268,17 @@ pub struct ResponseWriteMetricsSnapshot {
     pub max_chunks_per_response: usize,
 }
 
+/// Snapshot of allocation-sensitive hot-path activity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HotPathAllocationMetricsSnapshot {
+    pub regular_pool_fallback_allocations: usize,
+    pub capture_pool_fallback_allocations: usize,
+    pub chunked_response_metadata_spills: usize,
+    pub packed_suffix_shared_fallbacks: usize,
+    pub non_owned_response_write_chunks: usize,
+    pub non_owned_response_write_bytes: usize,
+}
+
 fn response_write_metrics_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("NNTP_PROXY_RESPONSE_WRITE_METRICS_SECS").is_some())
@@ -266,6 +287,74 @@ fn response_write_metrics_enabled() -> bool {
 fn response_write_metrics() -> &'static ResponseWriteMetrics {
     static METRICS: OnceLock<ResponseWriteMetrics> = OnceLock::new();
     METRICS.get_or_init(ResponseWriteMetrics::default)
+}
+
+fn hot_path_allocation_metrics() -> &'static HotPathAllocationMetrics {
+    static METRICS: OnceLock<HotPathAllocationMetrics> = OnceLock::new();
+    METRICS.get_or_init(HotPathAllocationMetrics::default)
+}
+
+pub(crate) fn record_packed_suffix_shared_fallback() {
+    hot_path_allocation_metrics()
+        .packed_suffix_shared_fallbacks
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_non_owned_response_write_chunk(bytes: usize) {
+    let metrics = hot_path_allocation_metrics();
+    metrics
+        .non_owned_response_write_chunks
+        .fetch_add(1, Ordering::Relaxed);
+    metrics
+        .non_owned_response_write_bytes
+        .fetch_add(bytes, Ordering::Relaxed);
+}
+
+#[must_use]
+pub fn hot_path_allocation_metrics_snapshot() -> HotPathAllocationMetricsSnapshot {
+    let metrics = hot_path_allocation_metrics();
+    HotPathAllocationMetricsSnapshot {
+        regular_pool_fallback_allocations: metrics
+            .regular_pool_fallback_allocations
+            .load(Ordering::Relaxed),
+        capture_pool_fallback_allocations: metrics
+            .capture_pool_fallback_allocations
+            .load(Ordering::Relaxed),
+        chunked_response_metadata_spills: metrics
+            .chunked_response_metadata_spills
+            .load(Ordering::Relaxed),
+        packed_suffix_shared_fallbacks: metrics
+            .packed_suffix_shared_fallbacks
+            .load(Ordering::Relaxed),
+        non_owned_response_write_chunks: metrics
+            .non_owned_response_write_chunks
+            .load(Ordering::Relaxed),
+        non_owned_response_write_bytes: metrics
+            .non_owned_response_write_bytes
+            .load(Ordering::Relaxed),
+    }
+}
+
+pub fn reset_hot_path_allocation_metrics() {
+    let metrics = hot_path_allocation_metrics();
+    metrics
+        .regular_pool_fallback_allocations
+        .store(0, Ordering::Relaxed);
+    metrics
+        .capture_pool_fallback_allocations
+        .store(0, Ordering::Relaxed);
+    metrics
+        .chunked_response_metadata_spills
+        .store(0, Ordering::Relaxed);
+    metrics
+        .packed_suffix_shared_fallbacks
+        .store(0, Ordering::Relaxed);
+    metrics
+        .non_owned_response_write_chunks
+        .store(0, Ordering::Relaxed);
+    metrics
+        .non_owned_response_write_bytes
+        .store(0, Ordering::Relaxed);
 }
 
 fn record_response_write_metrics(
@@ -417,6 +506,11 @@ impl ChunkedResponse {
             let need_new_chunk = self.chunks.last().is_none_or(|chunk| !chunk.can_append());
 
             if need_new_chunk {
+                if self.chunks.len() == self.chunks.inline_size() {
+                    hot_path_allocation_metrics()
+                        .chunked_response_metadata_spills
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 self.chunks.push(ResponseChunk {
                     storage: ResponseChunkStorage::Pooled(pool.acquire_capture_now()),
                     range: 0..0,
@@ -450,6 +544,11 @@ impl ChunkedResponse {
             range.start <= range.end && range.end <= buffer.initialized(),
             "response range must be inside initialized buffer"
         );
+        if self.chunks.len() == self.chunks.inline_size() {
+            hot_path_allocation_metrics()
+                .chunked_response_metadata_spills
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.len += range.end - range.start;
         self.chunks.push(ResponseChunk {
             storage: ResponseChunkStorage::Pooled(buffer),
@@ -466,6 +565,11 @@ impl ChunkedResponse {
             range.start <= range.end && range.end <= buffer.initialized(),
             "response range must be inside initialized pooled buffer"
         );
+        if self.chunks.len() == self.chunks.inline_size() {
+            hot_path_allocation_metrics()
+                .chunked_response_metadata_spills
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.len += range.end - range.start;
         self.chunks.push(ResponseChunk {
             storage: ResponseChunkStorage::SharedPooled(buffer),
@@ -482,6 +586,11 @@ impl ChunkedResponse {
             range.start <= range.end && range.end <= bytes.len(),
             "response range must be inside shared buffer"
         );
+        if self.chunks.len() == self.chunks.inline_size() {
+            hot_path_allocation_metrics()
+                .chunked_response_metadata_spills
+                .fetch_add(1, Ordering::Relaxed);
+        }
         self.len += range.end - range.start;
         self.chunks.push(ResponseChunk {
             storage: ResponseChunkStorage::Shared(bytes),
@@ -841,6 +950,9 @@ impl BufferPool {
     fn acquire_now(&self) -> PooledBuffer {
         let buffer = self.pool.pop().map_or_else(
             || {
+                hot_path_allocation_metrics()
+                    .regular_pool_fallback_allocations
+                    .fetch_add(1, Ordering::Relaxed);
                 // Create new page-aligned buffer for better DMA performance
                 Self::create_aligned_buffer(self.buffer_size.get())
             },
@@ -877,6 +989,9 @@ impl BufferPool {
     pub(crate) fn acquire_capture_now(&self) -> PooledBuffer {
         let buffer = self.capture_pool.pop().map_or_else(
             || {
+                hot_path_allocation_metrics()
+                    .capture_pool_fallback_allocations
+                    .fetch_add(1, Ordering::Relaxed);
                 // Pool exhausted - allocate and pre-fault new buffer
                 let capacity = if self.capture_capacity > 0 {
                     self.capture_capacity

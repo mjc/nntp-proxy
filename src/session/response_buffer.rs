@@ -7,6 +7,7 @@
 use anyhow::Result;
 use bytes::Bytes;
 use std::ops::Range;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 #[cfg(test)]
 use tracing::warn;
 
@@ -103,6 +104,15 @@ pub(crate) struct PrefetchedResponseContext<'a> {
     pub status_code: crate::protocol::StatusCode,
     pub initial_len: usize,
     pub pool: &'a crate::pool::BufferPool,
+    pub backend_id: crate::types::BackendId,
+    pub allow_packed_suffix: bool,
+}
+
+/// Parameters for writing a prefetched backend response without owning it all.
+pub(crate) struct WritePrefetchedResponseContext<'a> {
+    pub request: &'a crate::protocol::RequestContext,
+    pub status_code: crate::protocol::StatusCode,
+    pub initial_len: usize,
     pub backend_id: crate::types::BackendId,
     pub allow_packed_suffix: bool,
 }
@@ -286,14 +296,87 @@ fn validate_multiline_suffix(
     terminator_end: usize,
     allow_packed_suffix: bool,
 ) -> Result<(), StreamingError> {
-    if allow_packed_suffix || terminator_end == chunk_len {
-        return Ok(());
+    match allow_packed_suffix || terminator_end == chunk_len {
+        true => Ok(()),
+        false => Err(StreamingError::Io(anyhow::anyhow!(
+            "Backend sent {} unexpected trailing bytes after multiline terminator",
+            chunk_len - terminator_end
+        ))),
     }
+}
 
-    Err(StreamingError::Io(anyhow::anyhow!(
-        "Backend sent {} unexpected trailing bytes after multiline terminator",
-        chunk_len - terminator_end
-    )))
+async fn write_response_chunk<W>(writer: &mut W, chunk: &[u8]) -> Result<u64, StreamingError>
+where
+    W: AsyncWrite + Unpin,
+{
+    writer
+        .write_all(chunk)
+        .await
+        .map_err(StreamingError::ClientDisconnect)?;
+    crate::pool::buffer::record_non_owned_response_write_chunk(chunk.len());
+    Ok(chunk.len() as u64)
+}
+
+async fn write_single_line_buffer<W>(
+    io_buffer: &mut crate::pool::PooledBuffer,
+    conn: &mut crate::stream::ConnectionStream,
+    writer: &mut W,
+    prefix_len: usize,
+    total_len: usize,
+) -> Result<u64, StreamingError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let bytes = write_response_chunk(writer, &io_buffer[..prefix_len]).await?;
+    (prefix_len < total_len)
+        .then(|| conn.stash_leftover_from(&io_buffer[..total_len], prefix_len))
+        .transpose()
+        .map_err(StreamingError::Io)?;
+    Ok(bytes)
+}
+
+async fn write_multiline_response<W>(
+    io_buffer: &mut crate::pool::PooledBuffer,
+    conn: &mut crate::stream::ConnectionStream,
+    writer: &mut W,
+    ctx: &WritePrefetchedResponseContext<'_>,
+) -> Result<u64, StreamingError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut framer = MultilineFramer::default();
+    let mut bytes_written = 0u64;
+    let mut current_len = ctx.initial_len;
+
+    loop {
+        match framer.advance_to_next_terminator_end(&io_buffer[..current_len]) {
+            Some(write_len) => {
+                validate_multiline_suffix(current_len, write_len, ctx.allow_packed_suffix)?;
+                bytes_written += write_response_chunk(writer, &io_buffer[..write_len]).await?;
+                (write_len < current_len)
+                    .then(|| conn.stash_leftover_from(&io_buffer[..current_len], write_len))
+                    .transpose()
+                    .map_err(StreamingError::Io)?;
+                return Ok(bytes_written);
+            }
+            None => {
+                bytes_written += write_response_chunk(writer, &io_buffer[..current_len]).await?;
+                current_len = match io_buffer.read_from(conn).await.map_err(|e| {
+                    StreamingError::Io(
+                        anyhow::Error::from(e).context("Failed to read remaining response body"),
+                    )
+                })? {
+                    0 => {
+                        return Err(StreamingError::BackendEof {
+                            backend_id: ctx.backend_id,
+                            bytes_received: bytes_written,
+                        });
+                    }
+                    n => n,
+                };
+            }
+        }
+    }
 }
 
 fn process_shared_multiline_chunk(
@@ -463,6 +546,34 @@ pub(crate) async fn buffer_prefetched_response_for_request(
         ctx.allow_packed_suffix,
     )
     .await
+}
+
+/// Write a response when the first backend read has already happened.
+///
+/// Bytes are written as each backend read buffer is proven safe by
+/// request-aware framing, so the proxy does not retain the complete response
+/// before client delivery.
+pub(crate) async fn write_prefetched_response_for_request<W>(
+    ctx: WritePrefetchedResponseContext<'_>,
+    io_buffer: &mut crate::pool::PooledBuffer,
+    conn: &mut crate::stream::ConnectionStream,
+    writer: &mut W,
+) -> Result<u64, StreamingError>
+where
+    W: AsyncWrite + Unpin,
+{
+    match ctx.request.expects_multiline_response(ctx.status_code) {
+        true => write_multiline_response(io_buffer, conn, writer, &ctx).await,
+        false => {
+            let response = &io_buffer[..ctx.initial_len];
+            let end = crate::session::backend::status_line_end(response).ok_or_else(|| {
+                StreamingError::Io(anyhow::anyhow!(
+                    "Prefetched single-line response missing status line terminator"
+                ))
+            })?;
+            write_single_line_buffer(io_buffer, conn, writer, end, ctx.initial_len).await
+        }
+    }
 }
 
 /// Read a complete NNTP response and attach it to the matching request context.

@@ -445,7 +445,7 @@ impl NntpProxy {
         let session = self.create_session(client_addr, Some(self.router.clone()));
         let session_id = Self::generate_session_id(&session);
 
-        let metrics = Box::pin(session.handle_per_command_routing(client_stream)).await;
+        let metrics = session.handle_per_command_routing(client_stream).await;
 
         self.finalize_per_command_session(metrics, client_addr, &session_id, &session)
     }
