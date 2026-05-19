@@ -14,9 +14,7 @@ use crate::types::BackendId;
 use foyer::Code;
 use std::io::{Read, Write};
 
-use super::article::{
-    CachedArticleNumber, CachedPayload, parse_payload, parse_payload_chunked_response,
-};
+use super::article::{CachedArticleNumber, CachedPayload, parse_payload};
 use super::availability::ArticleAvailability;
 use super::ttl;
 
@@ -411,32 +409,12 @@ impl DiskCachedArticle {
                 Self::from_contiguous_ingest_with_tier(buffer.as_ref(), tier)
             }
             super::CacheIngestResponse::Chunked(buffer) => {
-                Self::from_chunked_ingest_with_tier(&buffer, tier)
+                Self::from_contiguous_ingest_with_tier(buffer.to_vec(), tier)
             }
             super::CacheIngestResponse::Inline(buffer) => {
                 Self::from_contiguous_ingest_with_tier(buffer, tier)
             }
         }
-    }
-
-    #[must_use]
-    fn from_chunked_ingest_with_tier(
-        buffer: &crate::pool::ChunkedResponse,
-        tier: ttl::CacheTier,
-    ) -> Option<Self> {
-        let mut prefix = smallvec::SmallVec::<[u8; 128]>::new();
-        buffer.copy_prefix_into(3, &mut prefix);
-        let raw_code = StatusCode::parse(&prefix)?.as_u16();
-        let status_code = CacheableStatusCode::try_from(raw_code).ok()?;
-        let payload = parse_payload_chunked_response(StatusCode::new(raw_code), buffer);
-
-        Some(Self {
-            status_code,
-            availability: ArticleAvailability::new(),
-            timestamp: ttl::CacheTimestampMillis::now(),
-            tier,
-            payload,
-        })
     }
 
     #[must_use]
@@ -773,7 +751,7 @@ mod tests {
     }
 
     #[test]
-    fn disk_cached_article_ingests_chunked_cache_ingest_response_without_flattening_response() {
+    fn disk_cached_article_ingests_chunked_cache_ingest_response() {
         let pool = crate::pool::BufferPool::new(
             crate::types::BufferSize::try_new(1024).expect("valid buffer size"),
             1,

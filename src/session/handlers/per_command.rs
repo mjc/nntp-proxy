@@ -5,7 +5,7 @@
 //! execution, and cache logic are split into sub-modules:
 //!
 //! - [`article_retry`]: Availability-aware backend selection and retry logic
-//! - [`command_execution`]: Single-backend command execution and response streaming
+//! - [`command_execution`]: Single-backend command execution and response writing
 //! - [`cache_operations`]: Cache lookups, upserts, and tier helpers
 
 use crate::protocol::{
@@ -323,9 +323,9 @@ impl ClientSession {
             self.client_addr
         );
         let capabilities = if skip_auth_check {
-            crate::protocol::CAPABILITIES_WITHOUT_AUTHINFO
+            crate::session::response_buffer::CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE
         } else {
-            crate::protocol::CAPABILITIES_WITH_AUTHINFO
+            crate::session::response_buffer::CAPABILITIES_WITH_AUTHINFO_RESPONSE
         };
         let mut client_write = client_writer.lock().await;
         client_write.write_all(capabilities).await?;

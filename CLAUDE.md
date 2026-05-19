@@ -45,18 +45,22 @@
 
 ## Mandatory Patterns
 
-### 1. Terminator Detection
+### 1. Multiline Response Framing
 
-**`MultilineFramer` is the ONE AND ONLY place streaming terminator detection can exist in this codebase. There must never be any other implementation anywhere.**
+**`MultilineFramer` is the ONE AND ONLY place that may know about NNTP multiline response boundaries. There must never be any other implementation anywhere.**
 
-An NNTP multiline response ends with `\r\n.\r\n` (5 bytes). Detecting this correctly across async chunk reads is subtle and easy to get wrong. Getting it wrong causes **connection pool collapse**.
+After code calls `MultilineFramer`, it must not do any further buffer splitting, terminator checking, suffix checking, end-of-string checking, chunk-boundary handling, or leftover interpretation. A framed response is already framed. If a response is incomplete, the same `MultilineFramer` gets the next backend buffer. Callers do not inspect `\r`, `\n`, `.\r\n`, `\r\n.\r\n`, chunk ends, string ends, or byte offsets to decide response boundaries.
 
-#### Forbidden Patterns — Never Write These
+Detecting multiline boundaries correctly across async reads is subtle and easy to get wrong. Getting it wrong causes **connection pool collapse**.
+
+#### Forbidden Patterns — Never Write These Anywhere Outside `src/session/multiline_framing.rs`
 
 ```rust
 // ❌ ends_with check on accumulated buffer
 if data.ends_with(b"\r\n.\r\n") { ... }
 if data.ends_with(b".\r\n") { ... }
+if line == b".\r\n" { ... }
+if line.starts_with(b".") { ... }
 
 // ❌ Any helper wrapping ends_with
 fn has_terminator(data: &[u8]) -> bool { data.ends_with(b"\r\n.\r\n") }
@@ -64,58 +68,33 @@ fn has_terminator(data: &[u8]) -> bool { data.ends_with(b"\r\n.\r\n") }
 // ❌ Constant replicated outside multiline_framing.rs
 const MULTILINE_TERMINATOR: &[u8] = b"\r\n.\r\n";
 
-// ❌ Accumulate-then-check loop (the worst pattern)
+// ❌ Accumulate-then-check loop
 let mut accumulated = Vec::new();
 loop {
     accumulated.extend_from_slice(&buf[..n]);
     if accumulated.ends_with(b"\r\n.\r\n") { break; } // WRONG
 }
+
+// ❌ Caller-side split state after framing
+let split = framer.some_boundary_call(buf);
+client.write_all(&buf[..split.end]).await?;
+conn.stash_leftover(&buf[split.end..])?;
 ```
 
-#### Correct: Streaming (most common case)
+#### Required Shape
 
-```rust
-use crate::session::multiline_framing::MultilineFramer;
+- Call `MultilineFramer` or a method that is explicitly owned by `src/session/multiline_framing.rs`.
+- If incomplete, feed the next backend buffer back into the same framer.
+- If complete, use the typed operation returned/provided by the framer: write, capture, cache, or ordered response emission.
+- Do not export scanner primitives for callers to compose.
+- Do not add “fast paths” that inspect CR/LF/dot bytes elsewhere.
+- Do not add tests outside `multiline_framing.rs` that assert raw terminator offsets, chunk-boundary offsets, or suffix ranges.
 
-let mut framer = MultilineFramer::default();
-loop {
-    let n = stream.read(buffer.as_mut_slice()).await?;
-    if n == 0 { break; }
-    let chunk = &buffer[..n];
+`MultilineFramer` may internally use offsets, suffix ranges, and CR/LF/dot byte checks. Callers must not.
 
-    match framer.advance_to_next_terminator_end(chunk) {
-        Some(pos) => {
-            // CRITICAL: pos is the byte offset immediately AFTER "\r\n.\r\n"
-            // chunk[..pos] includes the terminator and no bytes from the next response
-            client.write_all(&chunk[..pos]).await?;
-            break;
-        }
-        None => {
-            client.write_all(chunk).await?;
-        }
-    }
-}
-```
+#### Why This Rule Exists
 
-#### Correct: Complete-buffer validation
-
-```rust
-use crate::session::multiline_framing::find_terminator_end;
-
-find_terminator_end(&buffer).is_some()
-```
-
-#### Why `ends_with()` Causes Connection Pool Collapse
-
-This caused a production bug (20 connections removed in rapid succession, pool exhausted):
-
-1. Backend sends article body + start of next pipelined response in the same TCP segment
-2. `read()` returns `[...article data...\r\n.\r\n200 Article follows\r\n...]`
-3. `ends_with(b"\r\n.\r\n")` returns **false** — buffer ends with `...200 Article follows\r\n...`
-4. Loop continues, consuming the `220 0 <next-msg-id>\r\n` for the next pipelined command
-5. Next handler reads garbage → `Invalid` → `remove_with_cooldown()` → cascade to zero
-
-`MultilineFramer::advance_to_next_terminator_end()` returns the correct boundary and keeps the rolling state correct on misses — pipelined bytes are never consumed from the wrong context.
+Past bugs came from callers trying to “optimize” with `ends_with`, manual chunk slicing, or packed suffix handling after the framer had already seen bytes. Those paths consumed bytes for later responses, dirtied pooled backend connections, and caused pool collapse. The only safe shape is one owner: `MultilineFramer`.
 
 **Location:** `src/session/multiline_framing.rs` (core inline tests plus broader state/response coverage, production-proven)
 

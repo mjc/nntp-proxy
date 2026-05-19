@@ -153,6 +153,14 @@ enum CachedResponseWirePayload<'a> {
 }
 
 impl CachedResponseWire<'_> {
+    fn response_completion() -> std::io::IoSlice<'static> {
+        crate::session::response_buffer::cached_response_completion()
+    }
+
+    fn response_completion_len() -> usize {
+        Self::response_completion().len()
+    }
+
     fn wire_len_usize(&self) -> usize {
         self.status_line.len() + self.payload_len()
     }
@@ -186,7 +194,7 @@ impl CachedResponseWire<'_> {
                     IoSlice::new(headers),
                     IoSlice::new(b"\r\n\r\n"),
                     IoSlice::new(body),
-                    IoSlice::new(b"\r\n.\r\n"),
+                    Self::response_completion(),
                 ];
                 crate::io_util::write_all_vectored(writer, &mut slices).await?;
             }
@@ -194,7 +202,7 @@ impl CachedResponseWire<'_> {
                 let mut slices = [
                     IoSlice::new(self.status_line()),
                     IoSlice::new(headers),
-                    IoSlice::new(b"\r\n.\r\n"),
+                    Self::response_completion(),
                 ];
                 crate::io_util::write_all_vectored(writer, &mut slices).await?;
             }
@@ -202,7 +210,7 @@ impl CachedResponseWire<'_> {
                 let mut slices = [
                     IoSlice::new(self.status_line()),
                     IoSlice::new(body),
-                    IoSlice::new(b"\r\n.\r\n"),
+                    Self::response_completion(),
                 ];
                 crate::io_util::write_all_vectored(writer, &mut slices).await?;
             }
@@ -214,10 +222,14 @@ impl CachedResponseWire<'_> {
         match self.payload {
             CachedResponseWirePayload::None => 0,
             CachedResponseWirePayload::Article { headers, body } => {
-                headers.len() + 4 + body.len() + 5
+                headers.len() + 4 + body.len() + Self::response_completion_len()
             }
-            CachedResponseWirePayload::Head { headers } => headers.len() + 5,
-            CachedResponseWirePayload::Body { body } => body.len() + 5,
+            CachedResponseWirePayload::Head { headers } => {
+                headers.len() + Self::response_completion_len()
+            }
+            CachedResponseWirePayload::Body { body } => {
+                body.len() + Self::response_completion_len()
+            }
         }
     }
 }
@@ -320,7 +332,7 @@ impl CachedPayload {
 /// Cache entry for an article.
 ///
 /// Stores typed response metadata and semantic payload only. Status lines and
-/// multiline terminators are regenerated when serving cache hits.
+/// wire response bytes are regenerated when serving cache hits.
 #[derive(Clone, Debug)]
 pub struct CachedArticle {
     /// Backend availability bitset (2 bytes)
@@ -422,29 +434,11 @@ impl CachedArticle {
                 Self::from_contiguous_ingest_with_tier(buffer.as_ref(), tier)
             }
             super::CacheIngestResponse::Chunked(buffer) => {
-                Self::from_chunked_ingest_with_tier(&buffer, tier)
+                Self::from_contiguous_ingest_with_tier(buffer.to_vec(), tier)
             }
             super::CacheIngestResponse::Inline(buffer) => {
                 Self::from_contiguous_ingest_with_tier(buffer, tier)
             }
-        }
-    }
-
-    #[must_use]
-    fn from_chunked_ingest_with_tier(
-        buffer: &crate::pool::ChunkedResponse,
-        tier: ttl::CacheTier,
-    ) -> Self {
-        let mut prefix = smallvec::SmallVec::<[u8; 128]>::new();
-        buffer.copy_prefix_into(3, &mut prefix);
-        let status_code = StatusCode::parse(&prefix).unwrap_or_else(|| StatusCode::new(430));
-        let payload = parse_payload_chunked_response(status_code, buffer);
-        Self {
-            backend_availability: ArticleAvailability::new(),
-            status_code,
-            payload,
-            tier,
-            inserted_at: ttl::CacheTimestampMillis::now(),
         }
     }
 
@@ -550,9 +544,6 @@ impl CachedArticle {
     /// Returns true if:
     /// 1. Status code is 220 (ARTICLE) or 222 (BODY)
     /// 2. Buffer contains actual content (not just a status line like "220\r\n")
-    ///
-    /// A complete response ends with ".\r\n" and is significantly longer
-    /// than a metadata-only availability response.
     ///
     /// This is used by the full article cache to determine if we can serve
     /// directly from cache or need to fetch additional data.
@@ -664,7 +655,7 @@ pub(crate) fn parse_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPay
         return CachedPayload::AvailabilityOnly;
     };
     let article_number = parse_article_number(&buffer[..status_end]);
-    let Some(payload) = payload_without_multiline_terminator(code, &buffer[status_end..]) else {
+    let Some(payload) = complete_response_body_for_status(code, &buffer[status_end..]) else {
         return match code {
             223 => CachedPayload::Stat { article_number },
             _ => CachedPayload::AvailabilityOnly,
@@ -673,199 +664,11 @@ pub(crate) fn parse_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPay
     payload_for_status(code, article_number, payload)
 }
 
-pub(crate) fn parse_payload_chunked_response(
-    status_code: StatusCode,
-    buffer: &crate::pool::ChunkedResponse,
-) -> CachedPayload {
-    let code = status_code.as_u16();
-    if code == 430 {
-        return CachedPayload::Missing;
-    }
-
-    let Some((status_end, article_number)) = chunked_status_line_end_and_article_number(buffer)
-    else {
-        return CachedPayload::AvailabilityOnly;
-    };
-
-    match code {
-        220..=222 => {
-            let Some(payload_end) = chunked_multiline_payload_end(buffer, status_end) else {
-                return CachedPayload::AvailabilityOnly;
-            };
-            payload_for_chunked_status(code, article_number, buffer, status_end, payload_end)
-        }
-        223 => CachedPayload::Stat { article_number },
-        _ => CachedPayload::AvailabilityOnly,
-    }
-}
-
-fn chunked_status_line_end_and_article_number(
-    buffer: &crate::pool::ChunkedResponse,
-) -> Option<(usize, Option<CachedArticleNumber>)> {
-    let mut position = 0;
-    let mut previous = 0;
-    let mut article_number = 0_u64;
-    let mut article_number_seen = false;
-    let mut article_number_valid = true;
-    let mut article_number_done = false;
-
-    for chunk in buffer.iter_chunks() {
-        for &byte in chunk {
-            if position >= 4 && !article_number_done {
-                match byte {
-                    b'0'..=b'9' if article_number_valid => {
-                        article_number_seen = true;
-                        article_number = article_number
-                            .checked_mul(10)
-                            .and_then(|value| value.checked_add(u64::from(byte - b'0')))
-                            .unwrap_or_else(|| {
-                                article_number_valid = false;
-                                0
-                            });
-                    }
-                    b' ' | b'\r' | b'\n' => {
-                        article_number_done = true;
-                    }
-                    _ => {
-                        article_number_valid = false;
-                    }
-                }
-            }
-
-            position += 1;
-            if previous == b'\r' && byte == b'\n' {
-                let parsed = (article_number_seen && article_number_valid)
-                    .then(|| CachedArticleNumber::new(article_number));
-                return Some((position, parsed));
-            }
-            previous = byte;
-        }
-    }
-
-    None
-}
-
-fn chunked_multiline_payload_end(
-    buffer: &crate::pool::ChunkedResponse,
-    payload_start: usize,
-) -> Option<usize> {
-    let payload_len = buffer.len().checked_sub(payload_start)?;
-    if payload_len == 3 && buffer.ends_with(b".\r\n") {
-        return Some(payload_start);
-    }
-    buffer
-        .ends_with(b"\r\n.\r\n")
-        .then(|| buffer.len().saturating_sub(5))
-}
-
-fn payload_for_chunked_status(
-    code: u16,
-    article_number: Option<CachedArticleNumber>,
-    buffer: &crate::pool::ChunkedResponse,
-    payload_start: usize,
-    payload_end: usize,
-) -> CachedPayload {
-    match code {
-        220 => {
-            if let Some(split) =
-                find_sequence_in_chunked_range(buffer, b"\r\n\r\n", payload_start, payload_end)
-            {
-                CachedPayload::Article {
-                    article_number,
-                    headers: copy_chunked_range(buffer, payload_start, split),
-                    body: copy_chunked_range(buffer, split + 4, payload_end),
-                }
-            } else {
-                CachedPayload::Article {
-                    article_number,
-                    headers: Arc::from([]),
-                    body: copy_chunked_range(buffer, payload_start, payload_end),
-                }
-            }
-        }
-        221 => CachedPayload::Head {
-            article_number,
-            headers: copy_chunked_range(buffer, payload_start, payload_end),
-        },
-        222 => CachedPayload::Body {
-            article_number,
-            body: copy_chunked_range(buffer, payload_start, payload_end),
-        },
-        _ => CachedPayload::AvailabilityOnly,
-    }
-}
-
-fn find_sequence_in_chunked_range(
-    buffer: &crate::pool::ChunkedResponse,
-    needle: &[u8; 4],
-    start: usize,
-    end: usize,
-) -> Option<usize> {
-    let mut position = 0;
-    let mut window = [0_u8; 4];
-    let mut seen = 0_usize;
-
-    for chunk in buffer.iter_chunks() {
-        for &byte in chunk {
-            if position >= end {
-                return None;
-            }
-            if position >= start {
-                window.copy_within(1.., 0);
-                window[3] = byte;
-                seen += 1;
-                if seen >= 4 && &window == needle {
-                    return Some(position + 1 - 4);
-                }
-            }
-            position += 1;
-        }
-    }
-
-    None
-}
-
-fn copy_chunked_range(
-    buffer: &crate::pool::ChunkedResponse,
-    start: usize,
-    end: usize,
-) -> Arc<[u8]> {
-    let len = end.saturating_sub(start);
-    let mut output = Vec::with_capacity(len);
-    let mut position = 0;
-
-    for chunk in buffer.iter_chunks() {
-        let chunk_start = position;
-        let chunk_end = position + chunk.len();
-        position = chunk_end;
-
-        if chunk_end <= start {
-            continue;
-        }
-        if chunk_start >= end {
-            break;
-        }
-
-        let copy_start = start.saturating_sub(chunk_start);
-        let copy_end = (end.min(chunk_end)) - chunk_start;
-        output.extend_from_slice(&chunk[copy_start..copy_end]);
-    }
-
-    Arc::from(output.into_boxed_slice())
-}
-
-fn payload_without_multiline_terminator(code: u16, payload: &[u8]) -> Option<&[u8]> {
+fn complete_response_body_for_status(code: u16, payload: &[u8]) -> Option<&[u8]> {
     if !matches!(code, 220..=222) {
         return Some(payload);
     }
-    if payload == b".\r\n" {
-        return Some(&[]);
-    }
-    payload.strip_suffix(b"\r\n.\r\n").or_else(|| {
-        payload
-            .strip_suffix(b".\r\n")
-            .filter(|_| payload.len() == 3)
-    })
+    crate::session::response_buffer::complete_response_body(payload)
 }
 
 fn payload_for_status(
@@ -1764,7 +1567,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_article_ingests_chunked_cache_ingest_response_without_flattening_response() {
+    fn cached_article_ingests_chunked_cache_ingest_response() {
         let pool = crate::pool::BufferPool::new(
             crate::types::BufferSize::try_new(1024).expect("valid buffer size"),
             1,
@@ -1793,7 +1596,7 @@ mod tests {
     }
 
     #[test]
-    fn chunked_cache_ingest_parses_article_number_without_copying_status_line() {
+    fn chunked_cache_ingest_parses_article_number() {
         let pool = crate::pool::BufferPool::new(
             crate::types::BufferSize::try_new(1024).expect("valid buffer size"),
             1,
@@ -1836,11 +1639,11 @@ mod tests {
             cached_article_from_ingest_bytes(b"221 0 <test@example.com>\r\nSubject: Test\r\n.\r\n");
         assert!(!head_response.is_complete_article());
 
-        // Missing terminator should NOT be complete
-        let no_terminator = cached_article_from_ingest_bytes(
+        // Incomplete article payloads should NOT be complete
+        let incomplete_article = cached_article_from_ingest_bytes(
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n",
         );
-        assert!(!no_terminator.is_complete_article());
+        assert!(!incomplete_article.is_complete_article());
     }
 
     #[test]

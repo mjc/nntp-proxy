@@ -34,7 +34,7 @@ fn should_capture_for_cache(
     has_message_id: bool,
 ) -> bool {
     cache_articles
-        && request.expects_multiline_response(response_code)
+        && request.has_response_body(response_code)
         && has_message_id
         && matches!(response_code.as_u16(), 220 | 222)
 }
@@ -47,8 +47,8 @@ pub fn should_track_availability(response_code: StatusCode, has_message_id: bool
 
 /// Determine caching action for a response
 ///
-/// The request context determines whether the status code carries a multiline
-/// payload for this command:
+/// The request context determines whether the status code carries a response
+/// body for this command:
 /// - ARTICLE + 220 = capture full article if enabled
 /// - HEAD + 221 = track availability
 /// - BODY + 222 = capture body payload if enabled, otherwise track availability
@@ -84,11 +84,11 @@ pub fn determine_cache_action_for_request(
         return CacheAction::None;
     }
 
-    let is_multiline_body = request.expects_multiline_response(response_code);
+    let has_response_body = request.has_response_body(response_code);
 
     if should_capture_for_cache(request, response_code, cache_articles, has_message_id) {
         CacheAction::CaptureArticle
-    } else if is_multiline_body && should_track_availability(response_code, has_message_id) {
+    } else if has_response_body && should_track_availability(response_code, has_message_id) {
         CacheAction::TrackAvailability
     } else if response_code.as_u16() == 223 {
         CacheAction::TrackStat
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn test_should_capture_for_cache_requires_all_conditions() {
-        // Response is not multiline for this request.
+        // Response is not a body response for this request.
         assert!(!should_capture_for_cache(
             &request("STAT <test@example.com>"),
             StatusCode::new(220),

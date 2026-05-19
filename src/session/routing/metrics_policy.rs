@@ -11,7 +11,7 @@ pub enum MetricsAction {
     Error4xx,
     /// Record 5xx error
     Error5xx,
-    /// Record article metrics for article-like multiline payload responses.
+    /// Record article metrics for article-like response body responses.
     Article,
     /// No special recording needed
     None,
@@ -38,8 +38,7 @@ pub fn determine_metrics_action_for_request(
         MetricsAction::Error4xx
     } else if response_code >= 500 {
         MetricsAction::Error5xx
-    } else if request.expects_multiline_response(status_code) && matches!(response_code, 220..=222)
-    {
+    } else if request.has_response_body(status_code) && matches!(response_code, 220..=222) {
         MetricsAction::Article
     } else {
         MetricsAction::None

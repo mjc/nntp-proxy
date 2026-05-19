@@ -136,7 +136,7 @@ impl Drop for ConnectionGuard {
         {
             tracing::debug!(
                 connection_type = conn.connection_type(),
-                leftover_bytes = conn.leftover_len(),
+                pending_bytes = conn.pending_bytes_len(),
                 "ConnectionGuard dropping unreleased pooled connection; removing backend connection with cooldown"
             );
             // Unconditional: remove_with_cooldown handles socket shutdown and
@@ -165,7 +165,7 @@ impl std::ops::DerefMut for ConnectionGuard {
 /// instead of immediately removing it. This helps prevent connection churn.
 ///
 /// # Strategy
-/// Send DATE command to verify connection is clean and responsive. If leftover
+/// Send DATE command to verify connection is clean and responsive. If pending bytes
 /// data exists in the stream, the DATE response will be corrupted and the check
 /// will fail - this is both faster (~1 RTT vs 10 seconds) and equally correct.
 ///
@@ -197,43 +197,6 @@ pub async fn salvage_with_health_check(
 
 #[cfg(test)]
 mod tests {
-
-    /// Verify that the multiline framer detects terminators that span chunk boundaries.
-    #[test]
-    fn test_drain_cross_boundary_terminator() {
-        use crate::session::multiline_framing::MultilineFramer;
-
-        // Simulate two reads where the terminator \r\n.\r\n is split:
-        // First read ends with "\r\n.", second read starts with "\r\n"
-        let chunk1 = b"220 Article follows\r\nBody content\r\n.";
-        let chunk2 = b"\r\n";
-
-        // Old approach: windows() on each chunk independently — would MISS this
-        let terminator = b"\r\n.\r\n";
-        let found_by_windows_chunk1 = chunk1.windows(terminator.len()).any(|w| w == terminator);
-        let found_by_windows_chunk2 = chunk2.windows(terminator.len()).any(|w| w == terminator);
-        assert!(
-            !found_by_windows_chunk1,
-            "windows() should not find terminator in chunk1"
-        );
-        assert!(
-            !found_by_windows_chunk2,
-            "windows() should not find terminator in chunk2"
-        );
-
-        // New approach: the framer tracks cross-boundary state
-        let mut framer = MultilineFramer::default();
-
-        // Process chunk1 — no terminator yet
-        assert!(framer.advance_to_next_terminator_end(chunk1).is_none());
-
-        // Process chunk2 — spanning terminator detected!
-        assert!(
-            framer.next_terminator_end(chunk2).is_some(),
-            "MultilineFramer should detect terminator spanning chunk boundary"
-        );
-    }
-
     // ─── ConnectionGuard pool-fate invariants ───────────────────────────────
     //
     // These tests verify two invariants that callers must rely on:

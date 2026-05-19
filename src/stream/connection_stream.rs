@@ -3,19 +3,24 @@
 //! This module provides abstractions for handling different stream types (TCP, TLS, etc.)
 //! in a unified way. This is preparation for adding SSL/TLS support to backend connections.
 
-use arrayvec::ArrayVec;
-use bytes::Bytes;
 use smallvec::SmallVec;
 
 use crate::compression::DecompressStream;
-use crate::constants::buffer::MAX_LEFTOVER_BYTES;
+use crate::constants::buffer::MAX_PENDING_BACKEND_BYTES;
 use crate::tls::TlsStream;
 use std::io;
-use std::ops::Range;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+
+const PENDING_BACKEND_INLINE_BYTES: usize = 1024;
+
+#[derive(Clone, Copy)]
+enum PendingByteOrder {
+    Front,
+    Back,
+}
 
 /// Trait for async streams that can be used for NNTP connections
 ///
@@ -41,51 +46,19 @@ enum ConnectionTransport {
 
 /// Unified stream type that can represent different connection types.
 ///
-/// The stream also owns a small read-ahead buffer used to preserve bytes that
+/// The stream also owns a small pending bytes buffer used to preserve bytes that
 /// were already consumed from the socket but belong to the next NNTP response.
 #[derive(Debug)]
 pub struct ConnectionStream {
     transport: ConnectionTransport,
-    leftover: SmallVec<[LeftoverChunk; 4]>,
-    inline_leftover: ArrayVec<u8, 1024>,
+    pending_bytes: SmallVec<[u8; PENDING_BACKEND_INLINE_BYTES]>,
 }
 
-#[derive(Debug)]
-struct LeftoverChunk {
-    storage: LeftoverChunkStorage,
-    range: Range<usize>,
-}
-
-#[derive(Debug)]
-enum LeftoverChunkStorage {
-    Shared(Bytes),
-    Inline,
-}
-
-#[derive(Clone, Copy)]
-enum LeftoverOrder {
-    Front,
-    Back,
-}
-
-impl LeftoverChunk {
-    fn len(&self) -> usize {
-        self.range.len()
-    }
-
-    fn as_slice<'a>(&'a self, inline_leftover: &'a [u8]) -> &'a [u8] {
-        match &self.storage {
-            LeftoverChunkStorage::Shared(bytes) => &bytes[self.range.clone()],
-            LeftoverChunkStorage::Inline => &inline_leftover[self.range.clone()],
-        }
-    }
-}
-
-fn ensure_leftover_capacity(current: usize, additional: usize) -> anyhow::Result<()> {
+fn ensure_pending_bytes_capacity(current: usize, additional: usize) -> anyhow::Result<()> {
     anyhow::ensure!(
-        current + additional <= MAX_LEFTOVER_BYTES,
-        "Leftover exceeds {} bytes ({} bytes) — probable protocol desync",
-        MAX_LEFTOVER_BYTES,
+        current + additional <= MAX_PENDING_BACKEND_BYTES,
+        "Pending bytes exceeds {} bytes ({} bytes): probable protocol desync",
+        MAX_PENDING_BACKEND_BYTES,
         current + additional
     );
     Ok(())
@@ -119,12 +92,11 @@ impl ConnectionStream {
     fn new(transport: ConnectionTransport) -> Self {
         Self {
             transport,
-            leftover: SmallVec::new(),
-            inline_leftover: ArrayVec::new(),
+            pending_bytes: SmallVec::new(),
         }
     }
 
-    /// Wrap the current transport in a decompressor, preserving any read-ahead bytes.
+    /// Wrap the current transport in a decompressor, preserving any pending bytes.
     ///
     /// Returns an error if compression is requested for a stream that is already compressed.
     /// This keeps the state transition explicit instead of panicking on an invalid call.
@@ -146,8 +118,7 @@ impl ConnectionStream {
 
         Ok(Self {
             transport,
-            leftover: self.leftover,
-            inline_leftover: self.inline_leftover,
+            pending_bytes: self.pending_bytes,
         })
     }
 
@@ -244,121 +215,55 @@ impl ConnectionStream {
         }
     }
 
-    /// Stash bytes that were already read from the backend but belong to the next response.
-    pub fn stash_leftover(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+    /// Queue bytes that were already read from the backend for the next response read.
+    pub fn queue_pending_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.queue_pending_bytes_ordered(bytes, PendingByteOrder::Back)
+    }
+
+    /// Queue bytes ahead of any bytes already retained by this connection.
+    pub fn queue_pending_bytes_first(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.queue_pending_bytes_ordered(bytes, PendingByteOrder::Front)
+    }
+
+    fn queue_pending_bytes_ordered(
+        &mut self,
+        bytes: &[u8],
+        order: PendingByteOrder,
+    ) -> anyhow::Result<()> {
         let Some(bytes) = (!bytes.is_empty()).then_some(bytes) else {
             return Ok(());
         };
 
-        ensure_leftover_capacity(self.leftover_len(), bytes.len())?;
+        ensure_pending_bytes_capacity(self.pending_bytes_len(), bytes.len())?;
 
-        match self.inline_leftover.remaining_capacity() >= bytes.len() {
-            true => {
-                let start = self.inline_leftover.len();
-                self.inline_leftover
-                    .try_extend_from_slice(bytes)
-                    .map_err(|_| {
-                        anyhow::anyhow!(
-                            "Inline leftover slab rejected {} bytes despite capacity check",
-                            bytes.len()
-                        )
-                    })?;
-                self.leftover.push(LeftoverChunk {
-                    storage: LeftoverChunkStorage::Inline,
-                    range: start..start + bytes.len(),
-                });
-            }
-            false => {
-                crate::pool::buffer::record_packed_suffix_shared_fallback();
-                self.leftover.push(LeftoverChunk {
-                    storage: LeftoverChunkStorage::Shared(Bytes::copy_from_slice(bytes)),
-                    range: 0..bytes.len(),
-                });
-            }
+        if self.pending_bytes.spilled()
+            || self.pending_bytes.len() + bytes.len() > PENDING_BACKEND_INLINE_BYTES
+        {
+            crate::pool::buffer::record_pending_backend_byte_heap_fallback();
         }
-        Ok(())
-    }
-
-    /// Stash the remaining suffix of a read buffer, if any bytes remain.
-    pub fn stash_leftover_from(&mut self, bytes: &[u8], start: usize) -> anyhow::Result<()> {
-        if start < bytes.len() {
-            self.stash_leftover(&bytes[start..])
-        } else {
-            Ok(())
-        }
-    }
-
-    /// Stash a range from shared bytes without copying.
-    pub fn stash_leftover_shared(
-        &mut self,
-        bytes: Bytes,
-        range: Range<usize>,
-    ) -> anyhow::Result<()> {
-        self.stash_leftover_shared_ordered(bytes, range, LeftoverOrder::Back)
-    }
-
-    /// Requeue a shared leftover range ahead of any other read-ahead bytes.
-    pub fn push_front_leftover_shared(
-        &mut self,
-        bytes: Bytes,
-        range: Range<usize>,
-    ) -> anyhow::Result<()> {
-        self.stash_leftover_shared_ordered(bytes, range, LeftoverOrder::Front)
-    }
-
-    fn stash_leftover_shared_ordered(
-        &mut self,
-        bytes: Bytes,
-        range: Range<usize>,
-        order: LeftoverOrder,
-    ) -> anyhow::Result<()> {
-        let Some(range) = (!range.is_empty()).then_some(range) else {
-            return Ok(());
-        };
-
-        debug_assert!(range.end <= bytes.len());
-        ensure_leftover_capacity(self.leftover_len(), range.len())?;
-        crate::pool::buffer::record_packed_suffix_shared_fallback();
-        let chunk = LeftoverChunk {
-            storage: LeftoverChunkStorage::Shared(bytes),
-            range,
-        };
         match order {
-            LeftoverOrder::Front => self.leftover.insert(0, chunk),
-            LeftoverOrder::Back => self.leftover.push(chunk),
+            PendingByteOrder::Back => self.pending_bytes.extend_from_slice(bytes),
+            PendingByteOrder::Front => {
+                let old = std::mem::take(&mut self.pending_bytes);
+                self.pending_bytes.extend_from_slice(bytes);
+                self.pending_bytes.extend_from_slice(&old);
+            }
         }
         Ok(())
     }
 
-    /// Take the next copied/shared read-ahead range without copying it through `AsyncRead`.
-    pub fn pop_leftover_shared(&mut self) -> Option<(Bytes, Range<usize>)> {
-        (!self.leftover.is_empty()).then_some(())?;
-        let chunk = self.leftover.remove(0);
-        match chunk.storage {
-            LeftoverChunkStorage::Shared(bytes) => Some((bytes, chunk.range)),
-            LeftoverChunkStorage::Inline => {
-                let range = chunk.range;
-                Some((
-                    Bytes::copy_from_slice(&self.inline_leftover[range.clone()]),
-                    0..range.len(),
-                ))
-            }
-        }
+    #[must_use]
+    pub fn has_pending_bytes(&self) -> bool {
+        !self.pending_bytes.is_empty()
     }
 
     #[must_use]
-    pub fn has_leftover(&self) -> bool {
-        !self.leftover.is_empty()
+    pub fn pending_bytes_len(&self) -> usize {
+        self.pending_bytes.len()
     }
 
-    #[must_use]
-    pub fn leftover_len(&self) -> usize {
-        self.leftover.iter().map(LeftoverChunk::len).sum()
-    }
-
-    pub fn clear_leftover(&mut self) {
-        self.leftover.clear();
-        self.inline_leftover.clear();
+    pub fn clear_pending_bytes(&mut self) {
+        self.pending_bytes.clear();
     }
 }
 
@@ -368,30 +273,10 @@ impl AsyncRead for ConnectionStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if !self.leftover.is_empty() && buf.remaining() > 0 {
-            let mut remaining = buf.remaining();
-            while remaining > 0 {
-                if self.leftover.is_empty() {
-                    break;
-                }
-
-                let n = {
-                    let front = &self.leftover[0];
-                    let n = front.len().min(remaining);
-                    buf.put_slice(&front.as_slice(&self.inline_leftover)[..n]);
-                    n
-                };
-
-                let front = &mut self.leftover[0];
-                front.range.start += n;
-                remaining -= n;
-                if front.range.is_empty() {
-                    self.leftover.remove(0);
-                    if self.leftover.is_empty() {
-                        self.inline_leftover.clear();
-                    }
-                }
-            }
+        if !self.pending_bytes.is_empty() && buf.remaining() > 0 {
+            let n = self.pending_bytes.len().min(buf.remaining());
+            buf.put_slice(&self.pending_bytes[..n]);
+            self.pending_bytes.drain(0..n);
             return Poll::Ready(Ok(()));
         }
 
@@ -575,7 +460,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_leftover_is_read_before_socket() {
+    async fn test_pending_bytes_is_read_before_socket() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -589,7 +474,7 @@ mod tests {
         let _client = client_handle.await.unwrap();
 
         let mut conn = ConnectionStream::plain(server_stream);
-        conn.stash_leftover(b"left").unwrap();
+        conn.queue_pending_bytes(b"left").unwrap();
 
         let mut buf = [0u8; 4];
         conn.read_exact(&mut buf).await.unwrap();
@@ -601,7 +486,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stash_leftover_rejects_oversized_buffers() {
+    async fn test_queue_pending_bytes_rejects_oversized_buffers() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -610,14 +495,17 @@ mod tests {
         let _client = client_handle.await.unwrap();
 
         let mut conn = ConnectionStream::plain(server_stream);
-        let large = vec![b'x'; MAX_LEFTOVER_BYTES + 1];
-        let err = conn.stash_leftover(&large).unwrap_err();
-        assert!(err.to_string().contains(&MAX_LEFTOVER_BYTES.to_string()));
-        assert_eq!(conn.leftover_len(), 0);
+        let large = vec![b'x'; MAX_PENDING_BACKEND_BYTES + 1];
+        let err = conn.queue_pending_bytes(&large).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&MAX_PENDING_BACKEND_BYTES.to_string())
+        );
+        assert_eq!(conn.pending_bytes_len(), 0);
     }
 
     #[tokio::test]
-    async fn test_stash_leftover_ignores_empty_buffers() {
+    async fn test_queue_pending_bytes_ignores_empty_buffers() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -626,53 +514,13 @@ mod tests {
         let _client = client_handle.await.unwrap();
 
         let mut conn = ConnectionStream::plain(server_stream);
-        conn.stash_leftover(b"").unwrap();
-        assert!(!conn.has_leftover());
-        assert_eq!(conn.leftover_len(), 0);
+        conn.queue_pending_bytes(b"").unwrap();
+        assert!(!conn.has_pending_bytes());
+        assert_eq!(conn.pending_bytes_len(), 0);
     }
 
     #[tokio::test]
-    async fn test_stash_leftover_shared_reads_selected_range() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
-        let (server_stream, _) = listener.accept().await.unwrap();
-        let _client = client_handle.await.unwrap();
-
-        let mut conn = ConnectionStream::plain(server_stream);
-        let bytes = Bytes::from_static(b"xxleftover-right");
-        conn.stash_leftover_shared(bytes, 2..10).unwrap();
-        assert_eq!(conn.leftover_len(), b"leftover".len());
-
-        let mut buf = [0u8; 8];
-        conn.read_exact(&mut buf).await.unwrap();
-        assert_eq!(&buf, b"leftover");
-        assert!(!conn.has_leftover());
-    }
-
-    #[tokio::test]
-    async fn test_pop_leftover_shared_preserves_range_without_copying() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
-        let (server_stream, _) = listener.accept().await.unwrap();
-        let _client = client_handle.await.unwrap();
-
-        let mut conn = ConnectionStream::plain(server_stream);
-        let bytes = Bytes::from_static(b"xxleftover-right");
-        let expected_ptr = bytes[2..10].as_ptr();
-        conn.stash_leftover_shared(bytes, 2..10).unwrap();
-
-        let (popped, range) = conn.pop_leftover_shared().unwrap();
-        assert_eq!(&popped[range.clone()], b"leftover");
-        assert_eq!(popped[range].as_ptr(), expected_ptr);
-        assert!(!conn.has_leftover());
-    }
-
-    #[tokio::test]
-    async fn test_into_compressed_preserves_leftover() {
+    async fn test_into_compressed_preserves_pending_bytes() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -686,33 +534,15 @@ mod tests {
         let _client = client_handle.await.unwrap();
 
         let mut conn = ConnectionStream::plain(server_stream);
-        conn.stash_leftover(b"left").unwrap();
+        conn.queue_pending_bytes(b"left").unwrap();
 
         let mut conn = conn.into_compressed(1).unwrap();
         assert!(conn.is_compressed());
-        assert_eq!(conn.leftover_len(), 4);
+        assert_eq!(conn.pending_bytes_len(), 4);
 
         let mut buf = [0u8; 4];
         conn.read_exact(&mut buf).await.unwrap();
         assert_eq!(&buf, b"left");
-    }
-
-    #[tokio::test]
-    async fn test_push_front_leftover_shared_rejects_total_over_cap() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
-        let (server_stream, _) = listener.accept().await.unwrap();
-        let _client = client_handle.await.unwrap();
-
-        let mut conn = ConnectionStream::plain(server_stream);
-        let bytes = Bytes::from(vec![b'x'; MAX_LEFTOVER_BYTES]);
-        conn.stash_leftover_shared(bytes.clone(), 0..MAX_LEFTOVER_BYTES)
-            .unwrap();
-        let err = conn.push_front_leftover_shared(bytes, 0..1).unwrap_err();
-        assert!(err.to_string().contains(&MAX_LEFTOVER_BYTES.to_string()));
-        assert_eq!(conn.leftover_len(), MAX_LEFTOVER_BYTES);
     }
 
     #[tokio::test]

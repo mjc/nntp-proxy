@@ -55,6 +55,12 @@ pub struct MockNntpServer {
     command_handlers: HashMap<String, String>,
 }
 
+impl Default for MockNntpServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MockNntpServer {
     async fn run_on_listener(
         listener: TcpListener,
@@ -762,7 +768,7 @@ async fn write_command_line(stream: &mut tokio::net::TcpStream, command: &str) -
     Ok(())
 }
 
-async fn read_line_from_stream(
+pub async fn read_line_from_stream(
     stream: &mut tokio::net::TcpStream,
     context: &str,
 ) -> Result<String> {

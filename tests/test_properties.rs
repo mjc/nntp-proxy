@@ -6,7 +6,6 @@ use nntp_proxy::cache::ArticleAvailability;
 use nntp_proxy::cache::ttl::{CacheTier, CacheTtlMillis, effective_ttl};
 use nntp_proxy::protocol::{Headers, RequestContext, RequestRouteClass, StatusCode};
 use nntp_proxy::router::BackendCount;
-use nntp_proxy::session::multiline_framing::find_terminator_end;
 use nntp_proxy::types::{BackendId, MessageId};
 use proptest::prelude::*;
 use std::fmt::Write as _;
@@ -696,25 +695,6 @@ proptest! {
             code
         );
 
-        // Terminator detection should find the real terminator, not a false positive
-        let status = find_terminator_end(data);
-        prop_assert!(status.is_some(),
-            "Terminator should be found in complete multiline response with code {code}");
-    }
-
-    #[test]
-    fn prop_terminator_detection_matches_reference(
-        data in prop::collection::vec(any::<u8>(), 0..500)
-    ) {
-        // Single-chunk framing should match a direct terminator scan.
-        let status = find_terminator_end(&data);
-        let reference_pos = memchr::memmem::find(&data, b"\r\n.\r\n").map(|start| start + 5);
-        prop_assert_eq!(
-            status,
-            reference_pos,
-            "Framing helper disagreed with reference in {} bytes",
-            data.len()
-        );
     }
 
     #[test]

@@ -49,7 +49,7 @@ pub mod buffer {
 
     /// Size of each capture buffer (1 MiB, page-aligned).
     ///
-    /// Sized to capture typical articles and direct leftover tracking without
+    /// Sized to capture typical articles and direct pending-byte tracking without
     /// immediate growth or fallback allocations.
     pub const CAPTURE: usize = 1024 * 1024;
 
@@ -76,12 +76,12 @@ pub mod buffer {
     /// Increased to handle larger articles, prevents memory exhaustion
     pub const RESPONSE_MAX: usize = 2 * 1024 * 1024;
 
-    /// Maximum queued read-ahead bytes kept on a pooled backend connection.
+    /// Maximum pending bytes kept on a pooled backend connection.
     ///
-    /// Larger leftovers indicate protocol desynchronization or unsolicited extra
+    /// Larger queues indicate protocol desynchronization or unsolicited extra
     /// responses, so the connection should be retired instead of buffering
     /// unbounded data.
-    pub const MAX_LEFTOVER_BYTES: usize = 128 * 1024;
+    pub const MAX_PENDING_BACKEND_BYTES: usize = 128 * 1024;
 
     /// Initial capacity for response accumulation buffers (8KB, page-aligned)
     /// Sized for typical status lines and small responses
@@ -212,15 +212,6 @@ pub mod pool {
     /// Timeout when attempting to get a connection for health checking (milliseconds)
     /// Short timeout to avoid blocking if pool is busy
     pub const HEALTH_CHECK_POOL_TIMEOUT_MS: u64 = 100;
-}
-
-/// Per-command routing constants
-pub mod per_command_routing {
-    /// Number of chunks to read ahead when checking for response terminator
-    pub const TERMINATOR_LOOKAHEAD_CHUNKS: usize = 4;
-
-    /// Maximum number of bytes to check for spanning terminator
-    pub const MAX_TERMINATOR_SPAN_CHECK: usize = 9;
 }
 
 /// Session and metrics constants

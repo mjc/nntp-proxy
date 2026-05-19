@@ -373,6 +373,12 @@ impl UnifiedCache {
         !matches!(self, Self::Availability(_))
     }
 
+    /// Returns true when this cache stores response payloads.
+    #[must_use]
+    pub const fn stores_payload_responses(&self) -> bool {
+        !matches!(self, Self::Availability(_))
+    }
+
     /// Get an article from the cache
     pub async fn get(&self, message_id: &MessageId<'_>) -> Option<CachedArticle> {
         match self {

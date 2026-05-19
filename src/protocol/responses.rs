@@ -6,9 +6,6 @@
 /// Line ending: "\r\n"
 pub const CRLF: &[u8] = b"\r\n";
 
-/// Terminator tail size for spanning terminator detection
-pub const TERMINATOR_TAIL_SIZE: usize = 4;
-
 /// Minimum response length (3-digit code + CRLF)
 pub const MIN_RESPONSE_LENGTH: usize = 5;
 
@@ -80,20 +77,6 @@ pub const NO_SUCH_ARTICLE: &[u8] = b"430 No such article\r\n";
 
 // Capabilities responses (RFC 3977 §5.2 + RFC 4643 §3.2)
 
-/// Synthetic CAPABILITIES response without AUTHINFO (authenticated or auth disabled)
-///
-/// Per [RFC 4643 §3.2](https://datatracker.ietf.org/doc/html/rfc4643#section-3.2),
-/// AUTHINFO MUST NOT be advertised after successful authentication.
-pub const CAPABILITIES_WITHOUT_AUTHINFO: &[u8] =
-    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nOVER\r\nHDR\r\n.\r\n";
-
-/// Synthetic CAPABILITIES response with AUTHINFO (auth required, not yet authenticated)
-///
-/// Per [RFC 4643 §3.2](https://datatracker.ietf.org/doc/html/rfc4643#section-3.2),
-/// AUTHINFO SHOULD be advertised before authentication when the server provides it.
-pub const CAPABILITIES_WITH_AUTHINFO: &[u8] =
-    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nAUTHINFO USER PASS\r\nOVER\r\nHDR\r\n.\r\n";
-
 // Response construction helpers
 
 /// Construct a greeting response (200)
@@ -154,7 +137,6 @@ mod tests {
     #[test]
     fn test_constants() {
         assert_eq!(CRLF, b"\r\n");
-        assert_eq!(TERMINATOR_TAIL_SIZE, 4);
     }
 
     #[test]
@@ -220,25 +202,6 @@ mod tests {
         assert!(POSTING_NOT_PERMITTED.starts_with(b"440"));
         assert!(BACKEND_ERROR.starts_with(b"503"));
         assert!(BACKEND_UNAVAILABLE.starts_with(b"400"));
-    }
-
-    #[test]
-    fn test_capabilities_constants() {
-        assert!(CAPABILITIES_WITHOUT_AUTHINFO.starts_with(b"101"));
-        assert!(CAPABILITIES_WITH_AUTHINFO.starts_with(b"101"));
-        // AUTHINFO present only in the pre-auth variant
-        assert!(
-            CAPABILITIES_WITH_AUTHINFO
-                .windows(8)
-                .any(|w| w == b"AUTHINFO")
-        );
-        assert!(
-            !CAPABILITIES_WITHOUT_AUTHINFO
-                .windows(8)
-                .any(|w| w == b"AUTHINFO")
-        );
-        assert!(CAPABILITIES_WITH_AUTHINFO.ends_with(b".\r\n"));
-        assert!(CAPABILITIES_WITHOUT_AUTHINFO.ends_with(b".\r\n"));
     }
 
     #[test]

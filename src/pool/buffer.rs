@@ -248,7 +248,7 @@ struct HotPathAllocationMetrics {
     regular_pool_fallback_allocations: AtomicUsize,
     capture_pool_fallback_allocations: AtomicUsize,
     chunked_response_metadata_spills: AtomicUsize,
-    packed_suffix_shared_fallbacks: AtomicUsize,
+    pending_backend_byte_heap_fallbacks: AtomicUsize,
     non_owned_response_write_chunks: AtomicUsize,
     non_owned_response_write_bytes: AtomicUsize,
 }
@@ -274,7 +274,7 @@ pub struct HotPathAllocationMetricsSnapshot {
     pub regular_pool_fallback_allocations: usize,
     pub capture_pool_fallback_allocations: usize,
     pub chunked_response_metadata_spills: usize,
-    pub packed_suffix_shared_fallbacks: usize,
+    pub pending_backend_byte_heap_fallbacks: usize,
     pub non_owned_response_write_chunks: usize,
     pub non_owned_response_write_bytes: usize,
 }
@@ -294,9 +294,9 @@ fn hot_path_allocation_metrics() -> &'static HotPathAllocationMetrics {
     METRICS.get_or_init(HotPathAllocationMetrics::default)
 }
 
-pub(crate) fn record_packed_suffix_shared_fallback() {
+pub(crate) fn record_pending_backend_byte_heap_fallback() {
     hot_path_allocation_metrics()
-        .packed_suffix_shared_fallbacks
+        .pending_backend_byte_heap_fallbacks
         .fetch_add(1, Ordering::Relaxed);
 }
 
@@ -323,8 +323,8 @@ pub fn hot_path_allocation_metrics_snapshot() -> HotPathAllocationMetricsSnapsho
         chunked_response_metadata_spills: metrics
             .chunked_response_metadata_spills
             .load(Ordering::Relaxed),
-        packed_suffix_shared_fallbacks: metrics
-            .packed_suffix_shared_fallbacks
+        pending_backend_byte_heap_fallbacks: metrics
+            .pending_backend_byte_heap_fallbacks
             .load(Ordering::Relaxed),
         non_owned_response_write_chunks: metrics
             .non_owned_response_write_chunks
@@ -347,7 +347,7 @@ pub fn reset_hot_path_allocation_metrics() {
         .chunked_response_metadata_spills
         .store(0, Ordering::Relaxed);
     metrics
-        .packed_suffix_shared_fallbacks
+        .pending_backend_byte_heap_fallbacks
         .store(0, Ordering::Relaxed);
     metrics
         .non_owned_response_write_chunks
@@ -624,25 +624,6 @@ impl ChunkedResponse {
         }
     }
 
-    /// Copy up to `len` bytes from the end of the response into a small stack-backed buffer.
-    pub fn copy_suffix_into(&self, len: usize, out: &mut SmallVec<[u8; 128]>) {
-        let total = len.min(self.len);
-        out.clear();
-        out.resize(total, 0);
-
-        let mut remaining = total;
-        for chunk in self.chunks.iter().rev().map(ResponseChunk::as_slice) {
-            if remaining == 0 {
-                break;
-            }
-            let take = remaining.min(chunk.len());
-            let dest_start = remaining - take;
-            let src_start = chunk.len() - take;
-            out[dest_start..dest_start + take].copy_from_slice(&chunk[src_start..]);
-            remaining -= take;
-        }
-    }
-
     /// Copy the buffered response into a contiguous `Vec<u8>`.
     #[must_use]
     pub fn to_vec(&self) -> Vec<u8> {
@@ -675,31 +656,6 @@ impl ChunkedResponse {
         }
 
         remaining.is_empty()
-    }
-
-    /// Returns true if buffered bytes end with `suffix`.
-    #[must_use]
-    pub fn ends_with(&self, suffix: &[u8]) -> bool {
-        if suffix.len() > self.len {
-            return false;
-        }
-
-        let mut remaining = suffix.len();
-        for chunk in self.chunks.iter().rev().map(ResponseChunk::as_slice) {
-            if remaining == 0 {
-                return true;
-            }
-            let data = chunk;
-            let take = remaining.min(data.len());
-            let suffix_start = remaining - take;
-            let data_start = data.len() - take;
-            if data[data_start..] != suffix[suffix_start..remaining] {
-                return false;
-            }
-            remaining -= take;
-        }
-
-        remaining == 0
     }
 
     /// Write all buffered chunks to a sink in order.
@@ -1252,7 +1208,6 @@ mod tests {
         assert!(chunks.len() > 1, "test requires multi-chunk buffering");
         assert_eq!(chunks.concat(), b"220 0 <id>\r\nBody\r\n.\r\n");
         assert!(response.starts_with(b"220 0 "));
-        assert!(response.ends_with(b"\r\n.\r\n"));
 
         let mut prefix = SmallVec::<[u8; 128]>::new();
         response.copy_prefix_into(12, &mut prefix);
@@ -1285,17 +1240,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_chunked_response_copy_suffix_clamps_to_length() {
-        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 4);
-        let mut response = ChunkedResponse::default();
-        response.extend_from_slice(&pool, b"220 0 <id>\r\nBody\r\n.\r\n");
-
-        let mut suffix = SmallVec::<[u8; 128]>::new();
-        response.copy_suffix_into(8, &mut suffix);
-        assert_eq!(&suffix[..], b"ody\r\n.\r\n");
-    }
-
-    #[tokio::test]
     async fn test_chunked_response_can_own_range_without_copying() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 2);
         let mut buffer = pool.acquire();
@@ -1309,7 +1253,6 @@ mod tests {
         assert_eq!(first.as_ptr(), expected_ptr);
         assert_eq!(first, b"220 0 <id>\r\nBody\r\n.\r\n");
         assert!(response.starts_with(b"220 0 "));
-        assert!(response.ends_with(b"\r\n.\r\n"));
     }
 
     #[tokio::test]

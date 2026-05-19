@@ -4,7 +4,7 @@
 
 use crate::command::{CommandAction, CommandHandler, RejectResponse};
 use crate::protocol::{RequestContext, RequestKind, RequestRouteClass};
-use crate::session::state::{OrderedOutputSegment, StatefulReadMode};
+use crate::session::state::StatefulReadMode;
 use crate::session::{ClientSession, common};
 use crate::types::TransferMetrics;
 use anyhow::Result;
@@ -70,15 +70,16 @@ impl ClientSession {
                 }
             }
             AuthenticatedStatefulAction::InterceptCapabilities => {
-                use crate::protocol::CAPABILITIES_WITHOUT_AUTHINFO;
+                use crate::session::response_buffer::CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE;
                 if state.has_pending_backend_replies() {
-                    state.push_deferred_reply(CAPABILITIES_WITHOUT_AUTHINFO.to_vec());
+                    state.push_deferred_reply(CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE.to_vec());
                 } else {
                     client_write
-                        .write_all(CAPABILITIES_WITHOUT_AUTHINFO)
+                        .write_all(CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE)
                         .await?;
                     client_write.flush().await?;
-                    state.add_backend_to_client(CAPABILITIES_WITHOUT_AUTHINFO.len() as u64);
+                    state
+                        .add_backend_to_client(CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE.len() as u64);
                 }
             }
             AuthenticatedStatefulAction::Reject(response) => {
@@ -109,17 +110,9 @@ impl ClientSession {
         match buffer.read_from(backend_read).await {
             Ok(0) => Ok(false),
             Ok(n) => {
-                for segment in state.ordered_output_segments(&buffer[..n]) {
-                    match segment {
-                        OrderedOutputSegment::Backend(bytes) => {
-                            client_write.write_all(bytes).await?;
-                            state.add_backend_to_client(bytes.len() as u64);
-                        }
-                        OrderedOutputSegment::Local(reply) => {
-                            client_write.write_all(&reply).await?;
-                            state.add_backend_to_client(reply.len() as u64);
-                        }
-                    }
+                for write in state.client_writes_for_backend_read(&buffer[..n]) {
+                    client_write.write_all(write.as_ref()).await?;
+                    state.add_backend_to_client(write.len() as u64);
                 }
                 client_write.flush().await?;
 

@@ -133,12 +133,12 @@ impl HealthCheckMetrics {
 /// - Other errors indicate TCP-level problems
 ///
 /// # Errors
-/// Returns a recycle error when the connection is closed, contains leftover data,
+/// Returns a recycle error when the connection is closed, has queued backend bytes,
 /// or the underlying TCP socket reports a health-check failure.
 pub fn check_tcp_alive(
     conn: &mut ConnectionStream,
 ) -> managed::RecycleResult<crate::connection_error::ConnectionError> {
-    if conn.has_leftover() {
+    if conn.has_pending_bytes() {
         return Err(HealthCheckError::UnexpectedData.into());
     }
 
@@ -204,12 +204,14 @@ where
 
         total += n;
 
-        if let Some(line_end) = crate::session::backend::status_line_end(&response_buf[..total]) {
-            if line_end != total {
+        match crate::session::backend::single_line_read(&response_buf[..total]) {
+            crate::session::backend::SingleLineRead::Complete { len } => {
+                return Ok(String::from_utf8_lossy(&response_buf[..len]).into_owned());
+            }
+            crate::session::backend::SingleLineRead::CompleteWithQueuedData => {
                 return Err(HealthCheckError::UnexpectedData);
             }
-
-            return Ok(String::from_utf8_lossy(&response_buf[..line_end]).into_owned());
+            crate::session::backend::SingleLineRead::Incomplete => {}
         }
     }
 }
@@ -367,7 +369,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_tcp_alive_check_rejects_buffered_leftover() {
+    async fn test_tcp_alive_check_rejects_queued_backend_bytes() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -377,12 +379,12 @@ mod tests {
         let _client = client_handle.await.unwrap();
 
         let mut conn = ConnectionStream::plain(server_stream);
-        conn.stash_leftover(b"430 stale response\r\n").unwrap();
+        conn.queue_pending_bytes(b"430 stale response\r\n").unwrap();
 
         let result = check_tcp_alive(&mut conn);
         assert!(
             result.is_err(),
-            "connections with buffered leftovers must not recycle"
+            "connections with queued backend bytes must not recycle"
         );
     }
 
@@ -537,7 +539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_date_response_reads_split_status_line() {
+    async fn test_check_date_response_reads_split_reply() {
         let mut stream = ChunkedStream::new(vec![b"111 20231215".to_vec(), b"120000\r\n".to_vec()]);
 
         let result = check_date_response(&mut stream).await;

@@ -90,24 +90,30 @@ pub fn parse_backend_status(
     }
 }
 
-/// Return the byte offset immediately after the response status line.
-///
-/// NNTP status lines are CRLF-terminated. We also treat a bare LF as a line
-/// boundary here so callers do not classify a partial status line as complete.
-#[must_use]
-pub fn status_line_end(data: &[u8]) -> Option<usize> {
-    memchr::memchr(b'\n', data).map(|pos| pos + 1)
+pub(crate) enum SingleLineRead {
+    Complete { len: usize },
+    CompleteWithQueuedData,
+    Incomplete,
 }
 
-async fn read_until_status_line<C>(conn: &mut C, buffer: &mut PooledBuffer) -> Result<()>
+#[must_use]
+pub(crate) fn single_line_read(data: &[u8]) -> SingleLineRead {
+    match memchr::memchr(b'\n', data).map(|pos| pos + 1) {
+        Some(len) if len == data.len() => SingleLineRead::Complete { len },
+        Some(_) => SingleLineRead::CompleteWithQueuedData,
+        None => SingleLineRead::Incomplete,
+    }
+}
+
+async fn read_until_initial_reply<C>(conn: &mut C, buffer: &mut PooledBuffer) -> Result<()>
 where
     C: AsyncReadExt + Unpin,
 {
-    while status_line_end(buffer).is_none() {
+    while matches!(single_line_read(buffer), SingleLineRead::Incomplete) {
         let more = buffer.read_more(conn).await?;
         if more == 0 {
             anyhow::bail!(
-                "Backend EOF before complete status line ({} bytes)",
+                "Backend EOF before complete initial reply ({} bytes)",
                 buffer.initialized()
             );
         }
@@ -143,18 +149,16 @@ pub fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
 
 // ─── Command execution ──────────────────────────────────────────────────────
 
-/// Metadata for the first backend response chunk.
+/// Parsed status metadata for the backend response currently in the pooled buffer.
 #[derive(Debug)]
-pub struct BackendFirstResponse {
-    /// Number of bytes read into buffer
-    pub(crate) bytes_read: usize,
+pub struct BackendResponseStatus {
     /// Parsed status code, if present
     pub(crate) status_code: Option<StatusCode>,
     /// Any validation warnings
     pub(crate) warnings: SmallVec<[ResponseWarning; 0]>,
 }
 
-impl BackendFirstResponse {
+impl BackendResponseStatus {
     /// Get status code if valid
     #[inline]
     #[must_use]
@@ -174,36 +178,27 @@ impl BackendFirstResponse {
         for warning in &self.warnings {
             match warning {
                 ResponseWarning::ShortResponse { bytes, min } => {
-                    let clamped_len = self.bytes_read.min(buffer.len());
                     warn!(
                         "Client {} got short response from backend {:?} ({} bytes < {} min): {:02x?}",
-                        client_addr,
-                        backend_id,
-                        bytes,
-                        min,
-                        &buffer[..clamped_len]
+                        client_addr, backend_id, bytes, min, buffer
                     );
                 }
                 ResponseWarning::InvalidResponse => {
-                    let clamped_len = self.bytes_read.min(buffer.len());
                     warn!(
                         client = %client_addr,
                         backend = ?backend_id,
-                        bytes_read = self.bytes_read,
-                        first_bytes_hex = %format_hex_preview(&buffer[..clamped_len], 256),
-                        first_bytes_utf8 = %String::from_utf8_lossy(&buffer[..clamped_len.min(256)]),
+                        first_bytes_hex = %format_hex_preview(buffer, 256),
+                        first_bytes_utf8 = %String::from_utf8_lossy(&buffer[..buffer.len().min(256)]),
                         "Backend returned invalid response"
                     );
                 }
                 ResponseWarning::UnusualStatusCode(code) => {
-                    let clamped_len = self.bytes_read.min(buffer.len());
                     warn!(
                         client = %client_addr,
                         backend = ?backend_id,
                         status_code = code,
-                        bytes_read = self.bytes_read,
-                        first_bytes_hex = %format_hex_preview(&buffer[..clamped_len], 256),
-                        first_bytes_utf8 = %String::from_utf8_lossy(&buffer[..clamped_len.min(256)]),
+                        first_bytes_hex = %format_hex_preview(buffer, 256),
+                        first_bytes_utf8 = %String::from_utf8_lossy(&buffer[..buffer.len().min(256)]),
                         "Backend returned unusual status code"
                     );
                 }
@@ -217,7 +212,7 @@ pub async fn send_request<C>(
     conn: &mut C,
     request: &RequestContext,
     buffer: &mut PooledBuffer,
-) -> Result<BackendFirstResponse>
+) -> Result<BackendResponseStatus>
 where
     C: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -228,13 +223,12 @@ where
         anyhow::bail!("Backend connection closed unexpectedly");
     }
 
-    read_until_status_line(conn, buffer).await?;
+    read_until_initial_reply(conn, buffer).await?;
     let min_len = crate::protocol::MIN_RESPONSE_LENGTH;
     let total = buffer.initialized();
     let validated = parse_backend_status(&buffer[..total], total, min_len);
 
-    Ok(BackendFirstResponse {
-        bytes_read: total,
+    Ok(BackendResponseStatus {
         status_code: validated.status_code,
         warnings: validated.warnings,
     })
@@ -245,7 +239,7 @@ pub async fn send_request_timed<C>(
     conn: &mut C,
     request: &RequestContext,
     buffer: &mut PooledBuffer,
-) -> Result<(BackendFirstResponse, u64, u64, u64)>
+) -> Result<(BackendResponseStatus, u64, u64, u64)>
 where
     C: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -260,7 +254,7 @@ where
         anyhow::bail!("Backend connection closed unexpectedly");
     }
 
-    read_until_status_line(conn, buffer).await?;
+    read_until_initial_reply(conn, buffer).await?;
     let min_len = crate::protocol::MIN_RESPONSE_LENGTH;
     let total = buffer.initialized();
     let after_recv = Instant::now();
@@ -271,8 +265,7 @@ where
     let validated = parse_backend_status(&buffer[..total], total, min_len);
 
     Ok((
-        BackendFirstResponse {
-            bytes_read: total,
+        BackendResponseStatus {
             status_code: validated.status_code,
             warnings: validated.warnings,
         },
@@ -356,11 +349,11 @@ mod tests {
         assert!(result.is_ok(), "send_request should handle partial reads");
         let resp = result.unwrap();
         assert_eq!(resp.status_code(), Some(StatusCode::new(200)));
-        assert!(!request.expects_multiline_response(resp.status_code().unwrap()));
+        assert!(!request.has_response_body(resp.status_code().unwrap()));
     }
 
     #[tokio::test]
-    async fn test_send_request_reads_complete_status_line_when_code_arrives_first() {
+    async fn test_send_request_reads_complete_initial_reply_when_code_arrives_first() {
         // RFC-compliant servers can split a single-line response across TCP reads.
         // Reading only the 3-byte status code would leave the rest of the line
         // in the socket for the next command and desynchronize the connection.
@@ -373,13 +366,12 @@ mod tests {
         let result = send_request(&mut stream, &request, &mut buffer).await;
         assert!(
             result.is_ok(),
-            "send_request should read through status-line CRLF"
+            "send_request should read through complete initial reply"
         );
         let resp = result.unwrap();
-        assert_eq!(resp.bytes_read, b"111 20260501173336\r\n".len());
         assert_eq!(resp.status_code(), Some(StatusCode::new(111)));
-        assert!(!request.expects_multiline_response(resp.status_code().unwrap()));
-        assert_eq!(&buffer[..resp.bytes_read], b"111 20260501173336\r\n");
+        assert!(!request.has_response_body(resp.status_code().unwrap()));
+        assert_eq!(&buffer[..buffer.initialized()], b"111 20260501173336\r\n");
     }
 
     #[tokio::test]
@@ -400,24 +392,22 @@ mod tests {
         );
         let resp = result.unwrap();
         assert_eq!(resp.status_code(), Some(StatusCode::new(211)));
-        assert!(!request.expects_multiline_response(resp.status_code().unwrap()));
+        assert!(!request.has_response_body(resp.status_code().unwrap()));
     }
 
     // ─── Command response tests ─────────────────────────────────────────────
 
     #[test]
-    fn test_backend_first_response_is_430() {
+    fn test_backend_response_status_is_430() {
         // Create a 430 response
-        let response = BackendFirstResponse {
-            bytes_read: 20,
+        let response = BackendResponseStatus {
             status_code: Some(StatusCode::new(430)),
             warnings: SmallVec::new(),
         };
         assert_eq!(response.status_code(), Some(StatusCode::new(430)));
 
         // Create a 220 response
-        let response = BackendFirstResponse {
-            bytes_read: 30,
+        let response = BackendResponseStatus {
             status_code: Some(StatusCode::new(220)),
             warnings: SmallVec::new(),
         };
@@ -425,9 +415,8 @@ mod tests {
     }
 
     #[test]
-    fn test_backend_first_response_status_code() {
-        let response = BackendFirstResponse {
-            bytes_read: 10,
+    fn test_backend_response_status_code() {
+        let response = BackendResponseStatus {
             status_code: Some(StatusCode::new(211)),
             warnings: SmallVec::new(),
         };

@@ -151,6 +151,10 @@ impl ClientSession {
         backend_id: crate::types::BackendId,
         tier: CacheTier,
     ) {
+        if !self.cache.stores_payload_responses() {
+            return;
+        }
+
         let cache_clone = self.cache.clone();
         let msg_id_owned = msg_id.to_owned();
         tokio::spawn(async move {

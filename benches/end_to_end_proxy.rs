@@ -144,6 +144,7 @@ fn spawn_proxy(listener: TcpListener, proxy: NntpProxy, mode: RoutingMode) {
 struct BenchProxy {
     stream: TcpStream,
     response_buffer: Box<[u8]>,
+    response_len: usize,
 }
 
 impl BenchProxy {
@@ -172,6 +173,7 @@ impl BenchProxy {
         Self {
             stream,
             response_buffer: vec![0; body_len + 512].into_boxed_slice(),
+            response_len: article_response(body_len).len(),
         }
     }
 
@@ -180,7 +182,12 @@ impl BenchProxy {
             .write_all(b"ARTICLE <bench@example.com>\r\n")
             .await
             .unwrap();
-        read_multiline_into(&mut self.stream, &mut self.response_buffer).await
+        read_exact_response_into(
+            &mut self.stream,
+            &mut self.response_buffer,
+            self.response_len,
+        )
+        .await
     }
 }
 
@@ -196,16 +203,18 @@ async fn read_line(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> usize {
     }
 }
 
-async fn read_multiline_into(stream: &mut TcpStream, buffer: &mut [u8]) -> usize {
+async fn read_exact_response_into(
+    stream: &mut TcpStream,
+    buffer: &mut [u8],
+    expected: usize,
+) -> usize {
     let mut total = 0;
-    loop {
+    while total < expected {
         let n = stream.read(&mut buffer[total..]).await.unwrap();
         assert_ne!(n, 0, "proxy closed during benchmark response");
         total += n;
-        if buffer[..total].ends_with(b"\r\n.\r\n") {
-            return total;
-        }
     }
+    total
 }
 
 fn bench_roundtrip(bencher: Bencher, body_len: usize, cache: Option<Cache>, warm_cache: bool) {

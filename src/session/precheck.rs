@@ -23,6 +23,16 @@ pub(crate) enum PrecheckHit {
     Availability(StatusCode),
 }
 
+impl PrecheckHit {
+    #[must_use]
+    const fn will_update_cache(&self, cache: &UnifiedCache) -> bool {
+        match self {
+            Self::Payload(_) => cache.stores_payload_responses(),
+            Self::Availability(_) => cache.records_backend_has_status(),
+        }
+    }
+}
+
 /// Result of querying a backend for an article.
 #[derive(Debug)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
@@ -71,6 +81,10 @@ async fn cache_precheck_hit(
     hit: PrecheckHit,
     tier: crate::cache::ttl::CacheTier,
 ) {
+    if !hit.will_update_cache(cache) {
+        return;
+    }
+
     match hit {
         PrecheckHit::Payload(data) => {
             cache.upsert_ingest(msg_id, data, backend_id, tier).await;
@@ -143,15 +157,8 @@ async fn execute_backend_query(
                 return Err(());
             };
 
-            let response = build_precheck_hit(
-                deps,
-                request,
-                status_code,
-                &mut conn,
-                &mut buffer,
-                cmd_response.bytes_read,
-            )
-            .await?;
+            let response =
+                build_precheck_hit(deps, request, status_code, &mut conn, &mut buffer).await?;
 
             let result = classify_precheck_result(deps, backend_id, status_code, timings, response);
 
@@ -171,81 +178,48 @@ async fn build_precheck_hit(
     status_code: StatusCode,
     conn: &mut crate::pool::ConnectionGuard,
     buffer: &mut crate::pool::PooledBuffer,
-    bytes_read: usize,
 ) -> Result<PrecheckHit, ()> {
-    if request.expects_multiline_response(status_code) {
-        return read_multiline_precheck_hit(deps, status_code, conn, buffer, bytes_read).await;
+    if request.has_response_body(status_code) {
+        return read_complete_precheck_hit(deps, status_code, conn, buffer).await;
     }
 
     if deps.cache_articles {
         Ok(PrecheckHit::Payload(
-            crate::cache::CacheIngestResponse::from(&buffer[..bytes_read]),
+            crate::cache::CacheIngestResponse::from(&buffer[..buffer.initialized()]),
         ))
     } else {
         Ok(PrecheckHit::Availability(status_code))
     }
 }
 
-async fn read_multiline_precheck_hit(
+async fn read_complete_precheck_hit(
     deps: &OwnedDeps,
     status_code: StatusCode,
     conn: &mut crate::pool::ConnectionGuard,
     buffer: &mut crate::pool::PooledBuffer,
-    bytes_read: usize,
 ) -> Result<PrecheckHit, ()> {
-    use crate::session::multiline_framing::MultilineFramer;
-
-    fn push_precheck_buffer(
-        response: &mut crate::pool::ChunkedResponse,
-        pool: &crate::pool::BufferPool,
-        buffer: &mut crate::pool::PooledBuffer,
-        len: usize,
-    ) {
-        let old = std::mem::replace(buffer, pool.acquire());
-        response.push_buffer_range(old, 0..len);
-    }
-
     let mut response = deps
         .cache_articles
         .then(crate::pool::ChunkedResponse::default);
-    let mut framer = MultilineFramer::default();
-    match framer.advance_to_next_terminator_end(&buffer[..bytes_read]) {
-        Some(pos) => {
-            if pos != bytes_read {
-                return Err(());
-            }
-            // pos is after the terminator (terminator included in [..pos])
-            if let Some(response) = &mut response {
-                push_precheck_buffer(response, &deps.buffer_pool, buffer, pos);
-            }
-        }
-        None => {
-            if let Some(response) = &mut response {
-                push_precheck_buffer(response, &deps.buffer_pool, buffer, bytes_read);
-            }
-            loop {
-                match buffer.read_from(conn.as_mut()).await {
-                    Ok(0) | Err(_) => return Err(()),
-                    Ok(n) => match framer.advance_to_next_terminator_end(&buffer[..n]) {
-                        Some(pos) => {
-                            if pos != n {
-                                return Err(());
-                            }
-                            if let Some(response) = &mut response {
-                                push_precheck_buffer(response, &deps.buffer_pool, buffer, pos);
-                            }
-                            break;
-                        }
-                        None => {
-                            if let Some(response) = &mut response {
-                                push_precheck_buffer(response, &deps.buffer_pool, buffer, n);
-                            }
-                        }
-                    },
-                }
-            }
-        }
+
+    if let Some(response) = &mut response {
+        crate::session::multiline_framing::IsolatedMultilineResponse::from_initial_read(
+            conn.as_mut(),
+            buffer,
+        )
+        .capture_chunked(&deps.buffer_pool, response)
+        .await
+        .map_err(|_| ())?;
+    } else {
+        crate::session::multiline_framing::IsolatedMultilineResponse::from_initial_read(
+            conn.as_mut(),
+            buffer,
+        )
+        .observe()
+        .await
+        .map_err(|_| ())?;
     }
+
     if let Some(response) = response {
         Ok(PrecheckHit::Payload(
             crate::cache::CacheIngestResponse::Chunked(response),
@@ -431,7 +405,9 @@ pub async fn precheck(
         let tier = crate::cache::ttl::CacheTier::new(0);
         // Move data into upsert, then retrieve the entry via cache.get().
         // The lookup is sub-microsecond vs 750KB memcpy from cloning.
-        cache_precheck_hit(&owned.cache, msg_id.to_owned(), backend_id, data, tier).await;
+        if data.will_update_cache(&owned.cache) {
+            cache_precheck_hit(&owned.cache, msg_id.to_owned(), backend_id, data, tier).await;
+        }
         owned.cache.get(msg_id).await
     } else {
         // No article found - availability is synced by background task
@@ -465,7 +441,9 @@ pub fn spawn_background_precheck(
             // When racing backends, we don't have visibility into which tier actually has
             // the article. Using tier 0 conservatively avoids overestimating TTL.
             let tier = crate::cache::ttl::CacheTier::new(0);
-            cache_precheck_hit(&owned.cache, msg_id.to_owned(), backend_id, data, tier).await;
+            if data.will_update_cache(&owned.cache) {
+                cache_precheck_hit(&owned.cache, msg_id.to_owned(), backend_id, data, tier).await;
+            }
         }
         owned.cache.sync_availability(msg_id, &availability).await;
     });
@@ -609,7 +587,7 @@ mod tests {
         addr
     }
 
-    async fn spawn_packed_precheck_server() -> std::net::SocketAddr {
+    async fn spawn_extra_response_precheck_server() -> std::net::SocketAddr {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -638,7 +616,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_backend_returns_error_on_truncated_multiline_response() {
+    async fn query_backend_returns_error_on_truncated_response_body() {
         use crate::pool::DeadpoolConnectionProvider;
         use crate::router::BackendSelector;
         use crate::types::{BackendId, ServerName};
@@ -677,12 +655,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_backend_returns_error_on_packed_multiline_suffix() {
+    async fn query_backend_returns_error_on_extra_precheck_response() {
         use crate::pool::DeadpoolConnectionProvider;
         use crate::router::BackendSelector;
         use crate::types::{BackendId, ServerName};
 
-        let addr = spawn_packed_precheck_server().await;
+        let addr = spawn_extra_response_precheck_server().await;
 
         let mut selector = BackendSelector::new();
         let backend_id = BackendId::from_index(0);

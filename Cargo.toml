@@ -135,10 +135,6 @@ name = "cache_ingest"
 harness = false
 
 [[bench]]
-name = "multiline_framing_boundaries"
-harness = false
-
-[[bench]]
 name = "end_to_end_proxy"
 harness = false
 

@@ -6,7 +6,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, Instant, timeout, timeout_at};
 
 use nntp_proxy::config::{ClientAuth, HealthCheck, Proxy, Server};
-use nntp_proxy::session::multiline_framing::{MultilineFramer, find_terminator_end};
 use nntp_proxy::{Config, NntpProxy, RoutingMode, load_config};
 
 mod test_helpers;
@@ -253,39 +252,34 @@ async fn test_response_flushing_with_rapid_commands() -> Result<()> {
         client.write_all(cmd.as_bytes()).await?;
         client.flush().await?;
 
-        // Read until the multiline terminator arrives inside the same short deadline.
         // TCP is free to segment the response, so correctness is "prompt full response",
         // not "entire response in one read syscall".
         let deadline = Instant::now() + Duration::from_millis(200);
-        let mut response_bytes = Vec::new();
-        let mut framer = MultilineFramer::default();
+        let status_line = timeout_at(deadline, read_line_from_stream(&mut client, "BODY status"))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Timeout reading response #{i} - proxy likely not flushing responses!"
+                )
+            })??;
+        let mut body_lines = Vec::new();
         loop {
-            let n = timeout_at(deadline, client.read(&mut buffer))
+            let line = timeout_at(deadline, read_line_from_stream(&mut client, "BODY line"))
                 .await
                 .map_err(|_| {
                     anyhow::anyhow!(
-                        "Timeout reading response #{i} - proxy likely not flushing responses!"
+                        "Timeout reading response #{i} body - proxy likely not flushing responses!"
                     )
-                })?
-                .map_err(|e| anyhow::anyhow!("Failed to read response #{i}: {e}"))?;
-
-            if n == 0 {
+                })??;
+            if line == ".\r\n" {
                 break;
             }
-            let chunk = &buffer[..n];
-            response_bytes.extend_from_slice(chunk);
-            if framer.advance_to_next_terminator_end(chunk).is_some() {
-                break;
-            }
+            body_lines.push(line);
         }
 
-        let response = String::from_utf8_lossy(&response_bytes);
-        let terminator_found = find_terminator_end(&response_bytes).is_some();
-
-        // Verify we got a complete response (should include the NNTP multiline terminator)
         assert!(
-            response.contains("220") && terminator_found,
-            "Response #{i} incomplete or malformed: {response}"
+            status_line.contains("220") && !body_lines.is_empty(),
+            "Response #{i} incomplete or malformed: {status_line}{body_lines:?}"
         );
     }
 
