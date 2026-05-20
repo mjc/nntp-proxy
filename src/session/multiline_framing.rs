@@ -90,15 +90,15 @@ impl CompleteMultilineWireChunk {
         W: AsyncWrite + Unpin,
     {
         let response = &buffer[self.response.clone()];
+        if self.next_response_input.start < buffer.len() {
+            conn.queue_pending_bytes_first(&buffer[self.next_response_input.clone()])
+                .map_err(crate::session::response_buffer::ResponseTransferError::Io)?;
+        }
         writer
             .write_all(response)
             .await
             .map_err(crate::session::response_buffer::ResponseTransferError::ClientDisconnect)?;
         crate::pool::buffer::record_non_owned_response_write_chunk(response.len());
-        if self.next_response_input.start < buffer.len() {
-            conn.queue_pending_bytes_first(&buffer[self.next_response_input.clone()])
-                .map_err(crate::session::response_buffer::ResponseTransferError::Io)?;
-        }
         Ok(response.len() as u64)
     }
 
@@ -184,15 +184,15 @@ impl FramedSingleLineChunk {
         W: AsyncWrite + Unpin,
     {
         let response = &buffer[self.response.clone()];
+        if self.next_response_input.start < buffer.len() {
+            conn.queue_pending_bytes_first(&buffer[self.next_response_input.clone()])
+                .map_err(crate::session::response_buffer::ResponseTransferError::Io)?;
+        }
         writer
             .write_all(response)
             .await
             .map_err(crate::session::response_buffer::ResponseTransferError::ClientDisconnect)?;
         crate::pool::buffer::record_non_owned_response_write_chunk(response.len());
-        if self.next_response_input.start < buffer.len() {
-            conn.queue_pending_bytes_first(&buffer[self.next_response_input.clone()])
-                .map_err(crate::session::response_buffer::ResponseTransferError::Io)?;
-        }
         Ok(response.len() as u64)
     }
 
@@ -943,7 +943,12 @@ impl PendingRequestFrame {
                     });
                 }
                 self.status_line.extend_from_slice(&chunk[offset..end]);
-                let status = crate::protocol::StatusCode::parse(self.status_line.as_slice())?;
+                let Some(status) = crate::protocol::StatusCode::parse(self.status_line.as_slice())
+                else {
+                    return Some(FramedResponseForRequest {
+                        response: offset..end,
+                    });
+                };
                 if !crate::protocol::request_kind_has_response_body(self.kind, status) {
                     return Some(FramedResponseForRequest {
                         response: offset..end,
@@ -965,7 +970,9 @@ impl PendingRequestFrame {
                         self.state = PendingRequestFrameState::ReadingMultiline { framer };
                         None
                     }
-                    Err(_) => None,
+                    Err(_) => Some(FramedResponseForRequest {
+                        response: offset..chunk.len(),
+                    }),
                 }
             }
             PendingRequestFrameState::ReadingMultiline { framer } => {
@@ -978,7 +985,10 @@ impl PendingRequestFrame {
                             response: offset..offset + complete.response.end,
                         })
                     }
-                    Ok(FramedMultilineChunk::Incomplete(_)) | Err(_) => None,
+                    Ok(FramedMultilineChunk::Incomplete(_)) => None,
+                    Err(_) => Some(FramedResponseForRequest {
+                        response: offset..chunk.len(),
+                    }),
                 }
             }
         }
@@ -1146,8 +1156,50 @@ fn find_spanning_terminator(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::AsyncWrite;
 
     const EXHAUSTIVE_BYTES: [u8; 4] = [b'\r', b'\n', b'.', b'x'];
+
+    struct FailingWriter;
+
+    impl AsyncWrite for FailingWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "client closed",
+            )))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    async fn loopback_connection_stream() -> crate::stream::ConnectionStream {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback listener");
+        let addr = listener.local_addr().expect("loopback addr");
+        let client = tokio::spawn(async move {
+            tokio::net::TcpStream::connect(addr)
+                .await
+                .expect("connect loopback client")
+        });
+        let (server, _) = listener.accept().await.expect("accept loopback client");
+        let _client = client.await.expect("client task");
+        crate::stream::ConnectionStream::plain(server)
+    }
 
     fn for_each_critical_byte_sequence(max_len: usize, f: &mut impl FnMut(&[u8])) {
         let mut data = Vec::with_capacity(max_len);
@@ -1432,6 +1484,62 @@ mod tests {
                 next_response_input: b".\r\n".len()..b".\r\n".len(),
             }))
         );
+    }
+
+    #[tokio::test]
+    async fn complete_multiline_write_preserves_packed_suffix_before_client_error() {
+        let chunk = b"220 article\r\nbody\r\n.\r\n223 0 <next>\r\n";
+        let response_len = b"220 article\r\nbody\r\n.\r\n".len();
+        let framed = CompleteMultilineWireChunk {
+            response: 0..response_len,
+            next_response_input: response_len..chunk.len(),
+        };
+        let mut conn = loopback_connection_stream().await;
+        let mut writer = FailingWriter;
+
+        let err = framed.write_from(&mut writer, chunk, &mut conn).await;
+
+        assert!(matches!(
+            err,
+            Err(crate::session::response_buffer::ResponseTransferError::ClientDisconnect(_))
+        ));
+        assert_eq!(conn.pending_bytes_len(), b"223 0 <next>\r\n".len());
+    }
+
+    #[tokio::test]
+    async fn single_line_write_preserves_packed_suffix_before_client_error() {
+        let chunk = b"223 0 <first>\r\n223 0 <next>\r\n";
+        let response_len = b"223 0 <first>\r\n".len();
+        let framed = FramedSingleLineChunk {
+            response: 0..response_len,
+            next_response_input: response_len..chunk.len(),
+        };
+        let mut conn = loopback_connection_stream().await;
+        let mut writer = FailingWriter;
+
+        let err = framed.write_from(&mut writer, chunk, &mut conn).await;
+
+        assert!(matches!(
+            err,
+            Err(crate::session::response_buffer::ResponseTransferError::ClientDisconnect(_))
+        ));
+        assert_eq!(conn.pending_bytes_len(), b"223 0 <next>\r\n".len());
+    }
+
+    #[test]
+    fn backend_reply_tracker_consumes_invalid_status_line() {
+        let mut tracker = BackendReplyTracker::default();
+        tracker.push_request(crate::protocol::RequestKind::Article);
+
+        let output = tracker.accept_backend_bytes(b"not-a-status\r\n");
+
+        assert_eq!(
+            output.as_slice(),
+            &[BackendReplyBytes::CompletedTrackedReply(
+                b"not-a-status\r\n"
+            )]
+        );
+        assert!(tracker.pending.is_empty());
     }
 
     #[test]
