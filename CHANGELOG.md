@@ -85,7 +85,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Typed request/cache correctness** ([#60](https://github.com/mjc/nntp-proxy/pull/60))
   - Fixed availability-only 430 retention so missing-article knowledge can be reused without a cached payload.
   - Tightened message-ID routing to require a single exact validated token and restored multiline fallback for unknown extension commands.
-  - Routed full-buffer multiline terminator detection through `TailBuffer` and guarded availability bit generation with `BackendId::availability_bit()`.
+  - Routed full-buffer multiline terminator detection through `MultilineFramer` and guarded availability bit generation with `BackendId::availability_bit()`.
 
 ### Performance
 

@@ -136,12 +136,14 @@ pool-exhaustion fallbacks.
 
 #### Mode 2: Capture buffers — `acquire_capture()`
 
-Pre-faulted empty `Vec<u8>` with `len == 0, capacity == 768KB`. For accumulating full streaming responses (caching path only).
+Pre-faulted empty `Vec<u8>` with `len == 0, capacity == 768KB`. For accumulating full responses only when a retention path explicitly needs ownership.
 
 ```rust
 // ✅ ONLY use under CacheAction::CaptureArticle:
 let mut captured = self.buffer_pool.acquire_capture().await;
-streaming::stream_and_capture_multiline_response(backend, client, first_chunk, ..., &mut captured).await?;
+ResponseCapture::from_buffer(request, first_buffer, backend, &mut captured, pool, backend_id)
+    .capture()
+    .await?;
 self.maybe_cache_upsert(msg_id, &captured, backend_id);
 
 // ❌ NEVER use acquire_capture() for single reads:
@@ -343,13 +345,13 @@ let snapshot = MetricsSnapshot { cache_hits: 10, ..Default::default() };
 
 ### Benchmarks
 
-**Never define local reimplementations — always import production functions:**
+**Never define local reimplementations — always use production framing:**
 ```rust
 // ❌ BAD: benchmark measures wrong code
 fn find_terminator_new(data: &[u8]) -> Option<usize> { ... }
 
-// ✅ GOOD:
-use nntp_proxy::session::multiline_framing::find_terminator_end;
+// ✅ GOOD: drive the same typed framing path as production callers
+use nntp_proxy::session::multiline_framing::MultilineFramer;
 ```
 
 **Performance testing:** Run `cargo bench` before and after performance-sensitive changes; accept no regressions.

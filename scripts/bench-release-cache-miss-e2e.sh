@@ -202,6 +202,23 @@ print(float(sys.argv[1]) / float(sys.argv[2]))
 PY
 }
 
+finish_perf_record() {
+    local pid="$1"
+    local data="$2"
+    local report="$3"
+    local label="$4"
+
+    if [ -z "$pid" ]; then
+        return
+    fi
+
+    kill -INT "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    perf report --stdio --no-children -i "$data" >"$report" 2>&1 || true
+    echo "$label perf data: $data"
+    echo "$label perf report: $report"
+}
+
 run_with_optional_taskset() {
     local cpu_list="$1"
     shift
@@ -584,14 +601,12 @@ run_direct_upstream_matrix() {
         fi
 
         local result
-        result=$(run_client_load "$UPSTREAM_PORT" "" "$clients" "$requests" "$transfer_bytes" 0 "$clients")
+        local result_status=0
+        result=$(run_client_load "$UPSTREAM_PORT" "" "$clients" "$requests" "$transfer_bytes" 0 "$clients") || result_status=$?
 
-        if [ -n "$perf_upstream_pid" ]; then
-            kill -INT "$perf_upstream_pid" 2>/dev/null || true
-            wait "$perf_upstream_pid" 2>/dev/null || true
-            perf report --stdio --no-children -i "$perf_upstream_data" >"$perf_upstream_report" 2>&1 || true
-            echo "Upstream direct perf data: $perf_upstream_data"
-            echo "Upstream direct perf report: $perf_upstream_report"
+        finish_perf_record "$perf_upstream_pid" "$perf_upstream_data" "$perf_upstream_report" "Upstream direct"
+        if [ "$result_status" -ne 0 ]; then
+            return "$result_status"
         fi
 
         IFS=, read -r reqs bytes elapsed client_cpu client_rss <<<"$result"
@@ -640,6 +655,7 @@ run_measured_scenario() {
     fi
 
     local result
+    local result_status=0
     result=$(run_client_load \
         "${MEASURED_PORTS[0]}" \
         "$(IFS=,; echo "${MEASURED_PORTS[*]}")" \
@@ -648,22 +664,13 @@ run_measured_scenario() {
         "$transfer_bytes" \
         0 \
         "$clients" \
-        "$WORK_DIR/client-load-$threads-$backend_connections-$clients-repeat-$repeat_index")
+        "$WORK_DIR/client-load-$threads-$backend_connections-$clients-repeat-$repeat_index") || result_status=$?
 
-    if [ -n "$perf_upstream_pid" ]; then
-        kill -INT "$perf_upstream_pid" 2>/dev/null || true
-        wait "$perf_upstream_pid" 2>/dev/null || true
-        perf report --stdio --no-children -i "$perf_upstream_data" >"$perf_upstream_report" 2>&1 || true
-        echo "Upstream perf data: $perf_upstream_data"
-        echo "Upstream perf report: $perf_upstream_report"
-    fi
-
-    if [ -n "$perf_measured_pid" ]; then
-        kill -INT "$perf_measured_pid" 2>/dev/null || true
-        wait "$perf_measured_pid" 2>/dev/null || true
-        perf report --stdio --no-children -i "$perf_measured_data" >"$perf_measured_report" 2>&1 || true
-        echo "Measured perf data: $perf_measured_data"
-        echo "Measured perf report: $perf_measured_report"
+    finish_perf_record "$perf_upstream_pid" "$perf_upstream_data" "$perf_upstream_report" "Upstream"
+    finish_perf_record "$perf_measured_pid" "$perf_measured_data" "$perf_measured_report" "Measured"
+    if [ "$result_status" -ne 0 ]; then
+        stop_measured_processes
+        return "$result_status"
     fi
 
     local after_ticks

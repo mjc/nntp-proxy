@@ -19,6 +19,13 @@ let
     else if pkgs.stdenv.hostPlatform.system == "x86_64-darwin" then "CARGO_TARGET_X86_64_APPLE_DARWIN"
     else if pkgs.stdenv.hostPlatform.system == "aarch64-darwin" then "CARGO_TARGET_AARCH64_APPLE_DARWIN"
     else throw "Unsupported system: ${pkgs.stdenv.hostPlatform.system}";
+
+  supportedPlatforms = [
+    "x86_64-linux"
+    "aarch64-linux"
+    "x86_64-darwin"
+    "aarch64-darwin"
+  ];
 in
   rustPlatform.buildRustPackage (
     {
@@ -69,7 +76,7 @@ in
         homepage = cargoToml.package.homepage;
         license = licenses.mit;
         mainProgram = cargoToml.package.name;
-        platforms = platforms.all;
+        platforms = supportedPlatforms;
       };
     }
     // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {

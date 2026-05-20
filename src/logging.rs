@@ -20,7 +20,9 @@ where
     S: for<'span> LookupSpan<'span>,
 {
     tokio_console_enabled().then(|| {
-        eprintln!("tokio-console listening on 127.0.0.1:6669");
+        eprintln!(
+            "tokio-console enabled; console-subscriber environment controls its bind address"
+        );
         console_subscriber::ConsoleLayer::builder()
             .with_default_env()
             .spawn()

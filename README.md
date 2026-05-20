@@ -11,10 +11,10 @@ TLS, cache behavior, and live metrics in one place.
 - Per-backend TLS, backend authentication, connection limits, keep-alives, and tiering.
 - Plain NNTP listener only for clients; intended for trusted LAN/VPN/segmented-network deployment rather than direct internet exposure.
 - Optional article-body caching plus lightweight availability tracking.
-- Backend availability is always tracked in the availability index; `[cache].store_article_bodies` is false by default and only controls whether full article bodies are cached too.
+- Backend availability is tracked when the configured cache capacity can hold the fixed availability index; `[cache].store_article_bodies` is false by default and only controls whether full article bodies are cached too.
 - RAM article-cache hits measured 5.16 GB/s on a Ryzen 9 5950X.
 - A hot-cache path with a 256 MB in-memory article cache and disk cache on SSD measured 2.58 GB/s on the same system.
-- Current 100GB cache-miss spot checks average 3881.42 MiB/s at `1/1/1` and 8622.58 MiB/s at `4/8/8` on the same system.
+- Current 100GB cache-miss spot checks average 3791.23 MiB/s at `1/1/1` and 8336.03 MiB/s at `4/8/8` on the same system.
 - Allocation-conscious hot paths: borrowed request slices, preallocated buffer pools, and allocation-free cache key lookup in the steady state.
 - Optional terminal dashboard with persisted metrics across restarts.
 - TOML config, environment-based backend configuration, and CLI overrides.
@@ -306,7 +306,7 @@ The current hot paths are designed to avoid avoidable heap work:
 
 - RAM article-cache hits measured 5.16 GB/s on a Ryzen 9 5950X.
 - With a 256 MB in-memory article cache and disk cache on SSD, the hot-cache path measured 2.58 GB/s on the same system.
-- Current 100GB cache-miss spot checks average 3881.42 MiB/s at `1/1/1` and 8622.58 MiB/s at `4/8/8` on the same system.
+- Current 100GB cache-miss spot checks average 3791.23 MiB/s at `1/1/1` and 8336.03 MiB/s at `4/8/8` on the same system.
 - Backend request forwarding uses parsed request slices instead of rebuilding command strings.
 - The main I/O and capture buffers are preallocated and prefaulted at startup.
 - Buffer acquisition is allocation-free while the configured pools have capacity; exhaustion intentionally falls back to allocating and logs that fact.
@@ -316,16 +316,16 @@ Current 100GB proxy-in-the-middle cache-miss spot checks:
 
 | Shape | Mean MiB/s | Median MiB/s | Stdev | Min | Max | Notes |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `1/1/1` | 3881.42 | 3895.40 | 105.28 | 3690.86 | 4003.93 | 10 runs, 1 MiB proxy I/O buffers |
-| `4/8/8` | 8622.58 | 8618.86 | 147.46 | 8326.10 | 8808.85 | 10 runs, 1 MiB proxy I/O buffers |
+| `1/1/1` | 3791.23 | 3798.88 | 127.00 | 3571.56 | 3963.27 | 10 runs, 1 MiB proxy I/O buffers |
+| `4/8/8` | 8336.03 | 8447.14 | 277.84 | 7770.93 | 8615.41 | 10 runs, 1 MiB proxy I/O buffers |
 
 Instrumented system-level `perf` runs are lower and should be used only for
 attribution, not throughput claims:
 
 | Shape | MiB/s | Elapsed s | Samples |
 | --- | ---: | ---: | ---: |
-| `1/1/1` | 3242.88 | 31.5769 | 52K |
-| `4/8/8` | 6897.02 | 14.8470 | 72K |
+| `1/1/1` | 2677.42 | 38.2457 | 35K |
+| `4/8/8` | 8460.52 | 12.1034 | 28K |
 
 This is not an unconditional "zero allocations everywhere" claim. TLS handshakes, connection setup, logging, metrics snapshots, pool exhaustion, and oversized capture buffers can allocate. The steady-state forwarding/cache-hit path is the part intentionally kept allocation-free where the configured pools are sized correctly.
 
@@ -531,7 +531,7 @@ Unexpected memory use:
 
 - `[cache].store_article_bodies` and `[cache].article_cache_capacity` control article-body memory.
 - `[memory]` controls socket buffers and buffer pools.
-- Disk cache capacity is under `[cache.disk]` and should be backed by SSD/NVMe for best results.
+- Disk cache capacity is under `[cache.disk]`, only applies when `store_article_bodies = true`, and should be backed by SSD/NVMe for best results.
 
 ## License
 

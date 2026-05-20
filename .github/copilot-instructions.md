@@ -598,54 +598,22 @@ pub fn parse(command: &str) -> Self {
 - Early returns for common cases
 - Zero string allocations
 
-### 2. Response Streaming (100x Throughput)
+### 2. Multiline Response Framing
 
-**Location:** `src/session/backend.rs`
+**Location:** `src/session/multiline_framing.rs`
 
-**Pattern:** Double-buffered streaming with terminator detection.
-
-```rust
-/// Stream multiline response from backend to client
-///
-/// PERFORMANCE CRITICAL - DO NOT BUFFER ENTIRE RESPONSE
-/// Uses double-buffering for 100x+ throughput improvement
-async fn stream_multiline_response(
-    client_write: &mut WriteHalf<'_>,
-    backend_read: &mut BufReader<ReadHalf<'_>>,
-    buffer: &mut PooledBuffer,
-) -> Result<u64> {
-    let mut bytes_written = 0u64;
-    let mut tail = TailBuffer::default();
-    
-    loop {
-        // Read chunk from backend
-        let n = backend_read.read(buffer.as_mut()).await?;
-        if n == 0 { break; }
-        
-        // Check for terminator
-        match tail.detect_terminator(&buffer[..n]) {
-            TerminatorStatus::FoundAt(pos) => {
-                client_write.write_all(&buffer[..pos]).await?;
-                bytes_written += pos as u64;
-                break;
-            }
-            _ => {
-                client_write.write_all(&buffer[..n]).await?;
-                bytes_written += n as u64;
-                tail.update(&buffer[..n]);
-            }
-        }
-    }
-    
-    Ok(bytes_written)
-}
-```
+**Pattern:** all NNTP multiline response boundary handling goes through
+`MultilineFramer`. Callers read into pooled buffers, pass those buffers to the
+framer, and use the typed framed operation it returns. No other file should
+inspect CR/LF/dot bytes, chunk ends, suffixes, leftovers, or terminator offsets
+to decide response boundaries.
 
 **Critical Points:**
-- Never call `read_to_end()` or `read_to_string()`
-- Stream chunks immediately to client
-- Use `TailBuffer` for cross-chunk terminator detection
-- Reuse `PooledBuffer` across iterations
+- Never call `read_to_end()` or `read_to_string()` on proxy response paths.
+- Never reimplement multiline terminator detection outside `MultilineFramer`.
+- If a response is incomplete, feed the next backend buffer back into the same framer.
+- After framing, use the typed framed response operation directly.
+- Reuse `PooledBuffer` across reads and keep normal pass-through ARTICLE/BODY/HEAD data borrowed.
 
 ### 3. Connection Pool Prewarming
 
@@ -909,14 +877,9 @@ fn test_multiline_detection() {
     assert!(!NntpResponse::is_multiline_response(200)); // Greeting
 }
 
-#[test]
-fn test_terminator_detection() {
-    let data = b"Article content\r\n.\r\n";
-    assert!(NntpResponse::has_terminator_at_end(data));
-    
-    let pos = NntpResponse::find_terminator_end(data);
-    assert_eq!(pos, Some(data.len()));
-}
+// Boundary, suffix, and raw terminator-offset tests belong in
+// src/session/multiline_framing.rs. Tests elsewhere should exercise typed
+// framed responses instead of duplicating CR/LF/dot checks.
 ```
 
 #### 3. Testing Authentication

@@ -123,9 +123,10 @@ pub struct Config {
     pub memory: Memory,
     /// Cache configuration.
     ///
-    /// The proxy uses the cache for backend availability-driven routing/retry decisions.
-    /// In availability-only mode, availability tracking remains enabled and
-    /// `store_article_bodies` only controls whether the cache also retains full article bodies.
+    /// The proxy uses the cache for backend availability-driven routing/retry
+    /// decisions when the configured capacity can hold the fixed availability
+    /// index. In availability-only mode, `store_article_bodies` only controls
+    /// whether the cache also retains full article bodies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<Cache>,
     /// Health check configuration
