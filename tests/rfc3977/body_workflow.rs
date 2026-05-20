@@ -529,13 +529,82 @@ async fn expect_buffered_until_backend_finishes(
     Ok(())
 }
 
-async fn expect_buffered_until_backend_finishes_with_auth(
+async fn expect_pass_through_borrows_initial_backend_bytes(
+    proxy_port: u16,
+    expectation: BufferedResponseExpectation<'_>,
+    initial_written: Arc<Notify>,
+    release_tx: oneshot::Sender<()>,
+    body_line_in_initial_write: bool,
+) -> Result<()> {
+    let BufferedResponseExpectation {
+        command,
+        status_context,
+        body_context,
+        expected_status,
+        expected_body_line,
+    } = expectation;
+    let client = connect_and_read_greeting(proxy_port).await?;
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    write_commands(&mut write_half, &[command]).await?;
+    initial_written.notified().await;
+
+    assert_eq!(
+        read_line(&mut reader, status_context).await?,
+        expected_status,
+        "{command:?} should forward already-framed status bytes without owning the full response"
+    );
+
+    if body_line_in_initial_write {
+        assert_eq!(
+            read_line(&mut reader, body_context).await?,
+            expected_body_line,
+            "{command:?} should forward already-framed body bytes without owning the full response"
+        );
+    } else {
+        let body_line_result =
+            read_line_with_timeout(&mut reader, body_context, Duration::from_millis(200)).await;
+        assert!(
+            body_line_result.is_err(),
+            "{command:?} must wait for more backend bytes when the current borrowed buffer has no body line"
+        );
+    }
+
+    let terminator_result = read_line_with_timeout(
+        &mut reader,
+        "multiline terminator before backend completion",
+        Duration::from_millis(200),
+    )
+    .await;
+    assert!(
+        terminator_result.is_err(),
+        "{command:?} must not synthesize completion before the backend sends the terminator"
+    );
+
+    let _ = release_tx.send(());
+    if !body_line_in_initial_write {
+        assert_eq!(
+            read_line(&mut reader, body_context).await?,
+            expected_body_line
+        );
+    }
+    assert_eq!(
+        read_line(&mut reader, "multiline terminator").await?,
+        ".\r\n"
+    );
+
+    Ok(())
+}
+
+async fn expect_pass_through_borrows_initial_backend_bytes_with_auth(
     proxy_port: u16,
     expectation: BufferedResponseExpectation<'_>,
     initial_written: Arc<Notify>,
     release_tx: oneshot::Sender<()>,
     username: &str,
     password: &str,
+    body_line_in_initial_write: bool,
 ) -> Result<()> {
     let BufferedResponseExpectation {
         command,
@@ -568,25 +637,42 @@ async fn expect_buffered_until_backend_finishes_with_auth(
     write_commands(&mut write_half, &[command]).await?;
     initial_written.notified().await;
 
-    let status_result =
-        read_line_with_timeout(&mut reader, status_context, Duration::from_millis(200)).await;
-    let body_line_result =
-        read_line_with_timeout(&mut reader, body_context, Duration::from_millis(200)).await;
-
-    assert!(
-        status_result.is_err(),
-        "{command:?} should stay buffered until the backend sends the terminator"
+    assert_eq!(
+        read_line(&mut reader, status_context).await?,
+        expected_status
     );
+    if body_line_in_initial_write {
+        assert_eq!(
+            read_line(&mut reader, body_context).await?,
+            expected_body_line
+        );
+    } else {
+        let body_line_result =
+            read_line_with_timeout(&mut reader, body_context, Duration::from_millis(200)).await;
+        assert!(
+            body_line_result.is_err(),
+            "{command:?} must wait for more backend bytes when the current borrowed buffer has no body line"
+        );
+    }
+
+    let terminator_result = read_line_with_timeout(
+        &mut reader,
+        "multiline terminator before backend completion",
+        Duration::from_millis(200),
+    )
+    .await;
     assert!(
-        body_line_result.is_err(),
-        "{command:?} body bytes should stay buffered until the backend finishes"
+        terminator_result.is_err(),
+        "{command:?} must not synthesize completion before the backend sends the terminator"
     );
 
     let _ = release_tx.send(());
-    let status_line = read_line(&mut reader, status_context).await?;
-    let body_line = read_line(&mut reader, body_context).await?;
-    assert_eq!(status_line, expected_status);
-    assert_eq!(body_line, expected_body_line);
+    if !body_line_in_initial_write {
+        assert_eq!(
+            read_line(&mut reader, body_context).await?,
+            expected_body_line
+        );
+    }
     assert_eq!(
         read_line(&mut reader, "multiline terminator").await?,
         ".\r\n"
@@ -1548,8 +1634,7 @@ async fn test_cached_article_pipeline_buffers_when_first_read_only_has_status_li
 }
 
 #[tokio::test]
-async fn test_per_command_body_pipeline_buffers_until_backend_finishes_without_cache() -> Result<()>
-{
+async fn test_per_command_body_pipeline_borrows_initial_bytes_without_cache() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -1565,7 +1650,7 @@ async fn test_per_command_body_pipeline_buffers_until_backend_finishes_without_c
     )
     .await?;
 
-    expect_buffered_until_backend_finishes(
+    expect_pass_through_borrows_initial_backend_bytes(
         proxy_port,
         BufferedResponseExpectation {
             command: "BODY <plain-body@example>\r\n",
@@ -1576,13 +1661,13 @@ async fn test_per_command_body_pipeline_buffers_until_backend_finishes_without_c
         },
         initial_written,
         release_tx,
+        true,
     )
     .await
 }
 
 #[tokio::test]
-async fn test_per_command_body_pipeline_buffers_when_first_read_only_has_status_line() -> Result<()>
-{
+async fn test_per_command_body_pipeline_borrows_status_then_waits_for_body() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -1598,7 +1683,7 @@ async fn test_per_command_body_pipeline_buffers_when_first_read_only_has_status_
     )
     .await?;
 
-    expect_buffered_until_backend_finishes(
+    expect_pass_through_borrows_initial_backend_bytes(
         proxy_port,
         BufferedResponseExpectation {
             command: "BODY <status-only-body@example>\r\n",
@@ -1609,13 +1694,13 @@ async fn test_per_command_body_pipeline_buffers_when_first_read_only_has_status_
         },
         initial_written,
         release_tx,
+        false,
     )
     .await
 }
 
 #[tokio::test]
-async fn test_per_command_article_pipeline_buffers_until_backend_finishes_without_cache()
--> Result<()> {
+async fn test_per_command_article_pipeline_borrows_initial_bytes_without_cache() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -1631,7 +1716,7 @@ async fn test_per_command_article_pipeline_buffers_until_backend_finishes_withou
     )
     .await?;
 
-    expect_buffered_until_backend_finishes(
+    expect_pass_through_borrows_initial_backend_bytes(
         proxy_port,
         BufferedResponseExpectation {
             command: "ARTICLE <plain-article@example>\r\n",
@@ -1642,13 +1727,13 @@ async fn test_per_command_article_pipeline_buffers_until_backend_finishes_withou
         },
         initial_written,
         release_tx,
+        true,
     )
     .await
 }
 
 #[tokio::test]
-async fn test_per_command_article_pipeline_buffers_when_first_read_only_has_status_line()
--> Result<()> {
+async fn test_per_command_article_pipeline_borrows_status_then_waits_for_body() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -1664,7 +1749,7 @@ async fn test_per_command_article_pipeline_buffers_when_first_read_only_has_stat
     )
     .await?;
 
-    expect_buffered_until_backend_finishes(
+    expect_pass_through_borrows_initial_backend_bytes(
         proxy_port,
         BufferedResponseExpectation {
             command: "ARTICLE <status-only-article@example>\r\n",
@@ -1675,13 +1760,13 @@ async fn test_per_command_article_pipeline_buffers_when_first_read_only_has_stat
         },
         initial_written,
         release_tx,
+        false,
     )
     .await
 }
 
 #[tokio::test]
-async fn test_hybrid_body_message_id_buffers_until_backend_finishes_before_stateful_switch()
--> Result<()> {
+async fn test_hybrid_body_message_id_borrows_initial_bytes_before_stateful_switch() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -1697,7 +1782,7 @@ async fn test_hybrid_body_message_id_buffers_until_backend_finishes_before_state
     )
     .await?;
 
-    expect_buffered_until_backend_finishes(
+    expect_pass_through_borrows_initial_backend_bytes(
         proxy_port,
         BufferedResponseExpectation {
             command: "BODY <hybrid-body@example>\r\n",
@@ -1708,12 +1793,13 @@ async fn test_hybrid_body_message_id_buffers_until_backend_finishes_before_state
         },
         initial_written,
         release_tx,
+        true,
     )
     .await
 }
 
 #[tokio::test]
-async fn test_hybrid_body_message_id_buffers_when_first_read_only_has_status_line() -> Result<()> {
+async fn test_hybrid_body_message_id_borrows_status_then_waits_for_body() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -1729,7 +1815,7 @@ async fn test_hybrid_body_message_id_buffers_when_first_read_only_has_status_lin
     )
     .await?;
 
-    expect_buffered_until_backend_finishes(
+    expect_pass_through_borrows_initial_backend_bytes(
         proxy_port,
         BufferedResponseExpectation {
             command: "BODY <hybrid-status-only-body@example>\r\n",
@@ -1740,13 +1826,14 @@ async fn test_hybrid_body_message_id_buffers_when_first_read_only_has_status_lin
         },
         initial_written,
         release_tx,
+        false,
     )
     .await
 }
 
 #[tokio::test]
-async fn test_hybrid_article_message_id_buffers_until_backend_finishes_before_stateful_switch()
--> Result<()> {
+async fn test_hybrid_article_message_id_borrows_initial_bytes_before_stateful_switch() -> Result<()>
+{
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -1762,7 +1849,7 @@ async fn test_hybrid_article_message_id_buffers_until_backend_finishes_before_st
     )
     .await?;
 
-    expect_buffered_until_backend_finishes(
+    expect_pass_through_borrows_initial_backend_bytes(
         proxy_port,
         BufferedResponseExpectation {
             command: "ARTICLE <hybrid-article@example>\r\n",
@@ -1773,13 +1860,13 @@ async fn test_hybrid_article_message_id_buffers_until_backend_finishes_before_st
         },
         initial_written,
         release_tx,
+        true,
     )
     .await
 }
 
 #[tokio::test]
-async fn test_hybrid_article_message_id_buffers_when_first_read_only_has_status_line() -> Result<()>
-{
+async fn test_hybrid_article_message_id_borrows_status_then_waits_for_body() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -1795,7 +1882,7 @@ async fn test_hybrid_article_message_id_buffers_when_first_read_only_has_status_
     )
     .await?;
 
-    expect_buffered_until_backend_finishes(
+    expect_pass_through_borrows_initial_backend_bytes(
         proxy_port,
         BufferedResponseExpectation {
             command: "ARTICLE <hybrid-status-only-article@example>\r\n",
@@ -1806,6 +1893,7 @@ async fn test_hybrid_article_message_id_buffers_when_first_read_only_has_status_
         },
         initial_written,
         release_tx,
+        false,
     )
     .await
 }
@@ -1847,7 +1935,7 @@ async fn test_per_command_direct_body_retires_connection_after_packed_stale_resp
 }
 
 #[tokio::test]
-async fn test_per_command_body_pipeline_buffers_when_first_read_only_has_status_line_with_client_auth()
+async fn test_per_command_body_pipeline_borrows_status_then_waits_for_body_with_client_auth()
 -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
@@ -1868,7 +1956,7 @@ async fn test_per_command_body_pipeline_buffers_when_first_read_only_has_status_
     };
 
     let proxy_port = spawn_proxy_with_config(config, RoutingMode::PerCommand).await?;
-    expect_buffered_until_backend_finishes_with_auth(
+    expect_pass_through_borrows_initial_backend_bytes_with_auth(
         proxy_port,
         BufferedResponseExpectation {
             command: "BODY <auth-status-only-body@example>\r\n",
@@ -1881,12 +1969,13 @@ async fn test_per_command_body_pipeline_buffers_when_first_read_only_has_status_
         release_tx,
         "test-user",
         "test-pass",
+        false,
     )
     .await
 }
 
 #[tokio::test]
-async fn test_per_command_article_pipeline_buffers_when_first_read_only_has_status_line_with_client_auth()
+async fn test_per_command_article_pipeline_borrows_status_then_waits_for_body_with_client_auth()
 -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
@@ -1907,7 +1996,7 @@ async fn test_per_command_article_pipeline_buffers_when_first_read_only_has_stat
     };
 
     let proxy_port = spawn_proxy_with_config(config, RoutingMode::PerCommand).await?;
-    expect_buffered_until_backend_finishes_with_auth(
+    expect_pass_through_borrows_initial_backend_bytes_with_auth(
         proxy_port,
         BufferedResponseExpectation {
             command: "ARTICLE <auth-status-only-article@example>\r\n",
@@ -1920,6 +2009,7 @@ async fn test_per_command_article_pipeline_buffers_when_first_read_only_has_stat
         release_tx,
         "test-user",
         "test-pass",
+        false,
     )
     .await
 }

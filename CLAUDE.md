@@ -122,6 +122,18 @@ buf.extend_from_slice(data); // WRONG
 let mut scratch = vec![0u8; 8192]; // WRONG: 1 allocation per request
 ```
 
+### Pass-through responses borrow bytes
+
+The normal proxy forwarding path is borrow-only/zero-copy from the proxy's point
+of view: read into a pooled buffer, let `MultilineFramer` produce the typed
+write operation, write borrowed slices, then reuse/return the buffer. Do not
+copy pass-through ARTICLE/BODY/HEAD data into `ChunkedResponse`, `Bytes`, `Vec`,
+capture buffers, frozen buffers, or detached buffers.
+
+Full-response ownership is only for explicit retention paths: payload caching,
+cache hits, list-style response exceptions, precheck/tests, or visible
+pool-exhaustion fallbacks.
+
 #### Mode 2: Capture buffers — `acquire_capture()`
 
 Pre-faulted empty `Vec<u8>` with `len == 0, capacity == 768KB`. For accumulating full streaming responses (caching path only).

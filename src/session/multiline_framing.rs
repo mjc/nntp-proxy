@@ -90,9 +90,10 @@ impl CompleteMultilineWireChunk {
         W: AsyncWrite + Unpin,
     {
         let response = &buffer[self.response.clone()];
-        writer.write_all(response).await.map_err(
-            crate::session::response_buffer::ResponseTransferError::ClientDisconnectBeforeResponseComplete,
-        )?;
+        writer
+            .write_all(response)
+            .await
+            .map_err(crate::session::response_buffer::ResponseTransferError::ClientDisconnect)?;
         crate::pool::buffer::record_non_owned_response_write_chunk(response.len());
         if self.next_response_input.start < buffer.len() {
             conn.queue_pending_bytes_first(&buffer[self.next_response_input.clone()])
@@ -183,9 +184,10 @@ impl FramedSingleLineChunk {
         W: AsyncWrite + Unpin,
     {
         let response = &buffer[self.response.clone()];
-        writer.write_all(response).await.map_err(
-            crate::session::response_buffer::ResponseTransferError::ClientDisconnectBeforeResponseComplete,
-        )?;
+        writer
+            .write_all(response)
+            .await
+            .map_err(crate::session::response_buffer::ResponseTransferError::ClientDisconnect)?;
         crate::pool::buffer::record_non_owned_response_write_chunk(response.len());
         if self.next_response_input.start < buffer.len() {
             conn.queue_pending_bytes_first(&buffer[self.next_response_input.clone()])
@@ -455,79 +457,6 @@ pub(crate) fn log_response_warnings(
     }
 }
 
-pub(crate) struct ResponseWrite<'a, W> {
-    pub(crate) request: &'a crate::protocol::RequestContext,
-    pub(crate) io_buffer: &'a mut crate::pool::PooledBuffer,
-    pub(crate) conn: &'a mut crate::stream::ConnectionStream,
-    pub(crate) writer: &'a mut W,
-    pub(crate) backend_id: crate::types::BackendId,
-}
-
-impl<W> ResponseWrite<'_, W>
-where
-    W: AsyncWrite + Unpin,
-{
-    pub(crate) async fn write(
-        self,
-    ) -> Result<u64, crate::session::response_buffer::ResponseTransferError> {
-        let ResponseWrite {
-            request,
-            io_buffer,
-            conn,
-            writer,
-            backend_id,
-        } = self;
-        let mut framer = MultilineFramer::default();
-        let initial_len = io_buffer.initialized();
-        let frame = ResponseFrame::parse(request, io_buffer).map_err(|err| {
-            crate::session::response_buffer::ResponseTransferError::Io(anyhow::anyhow!(
-                "Failed to frame prefetched response: {err:?}"
-            ))
-        })?;
-
-        if let ResponseFrame::SingleLine { framed, .. } = &frame {
-            return framed
-                .write_from(writer, &io_buffer[..initial_len], conn)
-                .await;
-        }
-
-        let mut bytes_written = 0u64;
-        let mut current_len = initial_len;
-        loop {
-            let (bytes, complete) = match framer.frame_multiline_chunk(&io_buffer[..current_len]) {
-                FramedMultilineChunk::Complete(complete) => complete
-                    .write_from(writer, &io_buffer[..current_len], conn)
-                    .await
-                    .map(|bytes| (bytes, true))?,
-                FramedMultilineChunk::Incomplete(incomplete) => incomplete
-                    .write_from(writer, &io_buffer[..current_len])
-                    .await
-                    .map(|bytes| (bytes, false))?,
-            };
-            bytes_written += bytes;
-            if complete {
-                return Ok(bytes_written);
-            }
-
-            current_len = match io_buffer.read_from(conn).await.map_err(|e| {
-                crate::session::response_buffer::ResponseTransferError::Io(
-                    anyhow::Error::from(e).context("Failed to read remaining response body"),
-                )
-            })? {
-                0 => {
-                    return Err(
-                        crate::session::response_buffer::ResponseTransferError::BackendEof {
-                            backend_id,
-                            bytes_received: bytes_written,
-                        },
-                    );
-                }
-                n => n,
-            };
-        }
-    }
-}
-
 pub(crate) struct IsolatedMultilineResponse<'a> {
     conn: &'a mut crate::stream::ConnectionStream,
     io_buffer: &'a mut crate::pool::PooledBuffer,
@@ -662,6 +591,79 @@ pub(crate) struct ResponseCapture<'a> {
     response: &'a mut crate::pool::ChunkedResponse,
     pool: &'a crate::pool::BufferPool,
     backend_id: crate::types::BackendId,
+}
+
+pub(crate) struct ResponseWrite<'a, W> {
+    pub(crate) request: &'a crate::protocol::RequestContext,
+    pub(crate) io_buffer: &'a mut crate::pool::PooledBuffer,
+    pub(crate) conn: &'a mut crate::stream::ConnectionStream,
+    pub(crate) writer: &'a mut W,
+    pub(crate) backend_id: crate::types::BackendId,
+}
+
+impl<W> ResponseWrite<'_, W>
+where
+    W: AsyncWrite + Unpin,
+{
+    pub(crate) async fn write(
+        self,
+    ) -> Result<u64, crate::session::response_buffer::ResponseTransferError> {
+        let ResponseWrite {
+            request,
+            io_buffer,
+            conn,
+            writer,
+            backend_id,
+        } = self;
+        let mut framer = MultilineFramer::default();
+        let initial_len = io_buffer.initialized();
+        let frame = ResponseFrame::parse(request, io_buffer).map_err(|err| {
+            crate::session::response_buffer::ResponseTransferError::Io(anyhow::anyhow!(
+                "Failed to frame prefetched response: {err:?}"
+            ))
+        })?;
+
+        if let ResponseFrame::SingleLine { framed, .. } = &frame {
+            return framed
+                .write_from(writer, &io_buffer[..initial_len], conn)
+                .await;
+        }
+
+        let mut bytes_written = 0u64;
+        let mut current_len = initial_len;
+        loop {
+            let (bytes, complete) = match framer.frame_multiline_chunk(&io_buffer[..current_len]) {
+                FramedMultilineChunk::Complete(complete) => complete
+                    .write_from(writer, &io_buffer[..current_len], conn)
+                    .await
+                    .map(|bytes| (bytes, true))?,
+                FramedMultilineChunk::Incomplete(incomplete) => incomplete
+                    .write_from(writer, &io_buffer[..current_len])
+                    .await
+                    .map(|bytes| (bytes, false))?,
+            };
+            bytes_written += bytes;
+            if complete {
+                return Ok(bytes_written);
+            }
+
+            current_len = match io_buffer.read_from(conn).await.map_err(|e| {
+                crate::session::response_buffer::ResponseTransferError::Io(
+                    anyhow::Error::from(e).context("Failed to read remaining response body"),
+                )
+            })? {
+                0 => {
+                    return Err(
+                        crate::session::response_buffer::ResponseTransferError::BackendEof {
+                            backend_id,
+                            bytes_received: bytes_written,
+                        },
+                    );
+                }
+                n => n,
+            };
+        }
+    }
 }
 
 impl<'a> ResponseCapture<'a> {

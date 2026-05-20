@@ -94,7 +94,7 @@ const fn classify_response_write_err(e: std::io::Error) -> ResponseTransferError
     ResponseTransferError::ClientDisconnect(e)
 }
 
-const fn can_write_without_owned_response(
+const fn can_discard_response_after_write(
     request: &RequestContext,
     cache_action: CacheAction,
 ) -> bool {
@@ -108,16 +108,16 @@ const fn can_write_without_owned_response(
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ResponseOwnership {
-    NotOwned,
-    Owned,
+enum ResponseRetention {
+    DiscardAfterWrite,
+    RetainAfterWrite,
 }
 
-impl ResponseOwnership {
+impl ResponseRetention {
     const fn for_request(request: &RequestContext, cache_action: CacheAction) -> Self {
-        match can_write_without_owned_response(request, cache_action) {
-            true => Self::NotOwned,
-            false => Self::Owned,
+        match can_discard_response_after_write(request, cache_action) {
+            true => Self::DiscardAfterWrite,
+            false => Self::RetainAfterWrite,
         }
     }
 }
@@ -728,10 +728,10 @@ impl ClientSession {
         );
 
         let (bytes_written, captured) =
-            match ResponseOwnership::for_request(params.request, cache_action) {
-                ResponseOwnership::NotOwned => {
+            match ResponseRetention::for_request(params.request, cache_action) {
+                ResponseRetention::DiscardAfterWrite => {
                     let bytes = self
-                        .write_response_without_ownership(
+                        .write_response_without_retention(
                             pooled_conn,
                             client_write,
                             backend_id,
@@ -741,9 +741,9 @@ impl ClientSession {
                         .await?;
                     (bytes, None)
                 }
-                ResponseOwnership::Owned => {
+                ResponseRetention::RetainAfterWrite => {
                     let (bytes, response) = self
-                        .write_owned_response_to_client(
+                        .write_response_with_retention(
                             pooled_conn,
                             client_write,
                             backend_id,
@@ -793,7 +793,7 @@ impl ClientSession {
         }
     }
 
-    async fn write_response_without_ownership<W>(
+    async fn write_response_without_retention<W>(
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
         client_write: &mut W,
@@ -816,7 +816,7 @@ impl ClientSession {
     }
 
     #[allow(clippy::too_many_arguments)]
-    async fn write_owned_response_to_client<W>(
+    async fn write_response_with_retention<W>(
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
         client_write: &mut W,
@@ -1185,7 +1185,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_disconnect_before_complete_response_body_retires_backend_connection() {
+    async fn write_disconnect_after_complete_response_reuses_backend_connection() {
         let session = test_session();
         let (port, accept_count) = spawn_greeting_server().await;
         let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
@@ -1199,8 +1199,7 @@ mod tests {
         let request = request_context(b"ARTICLE <test@example.com>\r\n");
         let mut client_write = WriteFailWriter;
         let mut first_buffer = BufferPool::new(BufferSize::try_new(8192).unwrap(), 1).acquire();
-        let response_prefix = b"220 Article follows\r\npartial body chunk\r\n";
-        first_buffer.copy_from_slice(response_prefix);
+        first_buffer.copy_from_slice(b"220 Article follows\r\nbody\r\n.\r\n");
 
         let err = session
             .write_successful_backend_response(
@@ -1216,19 +1215,18 @@ mod tests {
                 None,
             )
             .await
-            .expect_err("client write should fail before backend response is drained");
+            .expect_err("client write should fail after the framer completed the response");
 
         assert!(matches!(
             err,
             crate::session::SessionError::ClientDisconnect(_)
         ));
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let _fresh = provider.get_pooled_connection().await.unwrap();
+        let _reused = provider.get_pooled_connection().await.unwrap();
         assert_eq!(
             accept_count.load(Ordering::SeqCst),
-            2,
-            "client disconnect before complete response body leaves the backend write dirty"
+            1,
+            "client write failure after a complete framed response must not retire the backend connection"
         );
     }
 }
