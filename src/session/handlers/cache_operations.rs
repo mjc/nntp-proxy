@@ -14,7 +14,7 @@ use crate::session::{ClientSession, precheck};
 use crate::types::{BackendId, BackendToClientBytes, MessageId};
 use anyhow::Result;
 use std::sync::Arc;
-use tokio::io::AsyncWrite;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::debug;
 
 /// Result of a cache lookup attempt in `try_serve_from_cache`.
@@ -32,26 +32,6 @@ pub(super) enum CacheLookupResult {
 }
 
 impl ClientSession {
-    pub(super) async fn has_servable_cached_response(&self, request: &RequestContext) -> bool {
-        let Some(msg_id) = request.message_id() else {
-            return false;
-        };
-
-        let Some(cached) = self.cache.get_request_message_id(msg_id).await else {
-            return false;
-        };
-
-        if !cached.has_availability_info() || !self.cache_articles {
-            return false;
-        }
-
-        if !request.is_stat() && !cached.is_complete_article() {
-            return false;
-        }
-
-        cached.cached_response_for(request.kind(), msg_id).is_some()
-    }
-
     /// Try to serve from cache
     ///
     /// Returns `CacheLookupResult::Hit` if served, `PartialHit` if entry existed but
@@ -171,6 +151,10 @@ impl ClientSession {
         backend_id: crate::types::BackendId,
         tier: CacheTier,
     ) {
+        if !self.cache.stores_payload_responses() {
+            return;
+        }
+
         let cache_clone = self.cache.clone();
         let msg_id_owned = msg_id.to_owned();
         tokio::spawn(async move {
@@ -188,6 +172,10 @@ impl ClientSession {
         backend_id: crate::types::BackendId,
         tier: CacheTier,
     ) {
+        if !self.cache.records_backend_has_status() {
+            return;
+        }
+
         let cache_clone = self.cache.clone();
         let msg_id_owned = msg_id.to_owned();
         tokio::spawn(async move {
@@ -255,6 +243,7 @@ where
     };
     let wire_len = response.wire_len();
     response.write_to(client_write).await?;
+    client_write.flush().await?;
     Ok(Some(CachedResponseWrite {
         status: response.status(),
         wire_len,
@@ -289,6 +278,7 @@ mod tests {
             1024,
             Duration::from_secs(60),
         )))
+        .with_cache_articles(true)
         .build()
     }
 

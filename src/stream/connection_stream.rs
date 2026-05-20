@@ -3,16 +3,24 @@
 //! This module provides abstractions for handling different stream types (TCP, TLS, etc.)
 //! in a unified way. This is preparation for adding SSL/TLS support to backend connections.
 
-use bytes::BytesMut;
+use smallvec::SmallVec;
 
 use crate::compression::DecompressStream;
-use crate::constants::buffer::MAX_LEFTOVER_BYTES;
+use crate::constants::buffer::MAX_PENDING_BACKEND_BYTES;
 use crate::tls::TlsStream;
 use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
+
+const PENDING_BACKEND_INLINE_BYTES: usize = 1024;
+
+#[derive(Clone, Copy)]
+enum PendingByteOrder {
+    Front,
+    Back,
+}
 
 /// Trait for async streams that can be used for NNTP connections
 ///
@@ -38,12 +46,22 @@ enum ConnectionTransport {
 
 /// Unified stream type that can represent different connection types.
 ///
-/// The stream also owns a small read-ahead buffer used to preserve bytes that
+/// The stream also owns a small pending bytes buffer used to preserve bytes that
 /// were already consumed from the socket but belong to the next NNTP response.
 #[derive(Debug)]
 pub struct ConnectionStream {
     transport: ConnectionTransport,
-    leftover: BytesMut,
+    pending_bytes: SmallVec<[u8; PENDING_BACKEND_INLINE_BYTES]>,
+}
+
+fn ensure_pending_bytes_capacity(current: usize, additional: usize) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        current + additional <= MAX_PENDING_BACKEND_BYTES,
+        "Pending bytes exceeds {} bytes ({} bytes): probable protocol desync",
+        MAX_PENDING_BACKEND_BYTES,
+        current + additional
+    );
+    Ok(())
 }
 
 impl ConnectionStream {
@@ -74,11 +92,11 @@ impl ConnectionStream {
     fn new(transport: ConnectionTransport) -> Self {
         Self {
             transport,
-            leftover: BytesMut::new(),
+            pending_bytes: SmallVec::new(),
         }
     }
 
-    /// Wrap the current transport in a decompressor, preserving any read-ahead bytes.
+    /// Wrap the current transport in a decompressor, preserving any pending bytes.
     ///
     /// Returns an error if compression is requested for a stream that is already compressed.
     /// This keeps the state transition explicit instead of panicking on an invalid call.
@@ -100,7 +118,7 @@ impl ConnectionStream {
 
         Ok(Self {
             transport,
-            leftover: self.leftover,
+            pending_bytes: self.pending_bytes,
         })
     }
 
@@ -197,35 +215,55 @@ impl ConnectionStream {
         }
     }
 
-    /// Stash bytes that were already read from the backend but belong to the next response.
-    ///
-    /// # Errors
-    /// Returns an error if stashing `bytes` would exceed the configured leftover
-    /// capacity, which indicates likely protocol desynchronization.
-    pub fn stash_leftover(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.leftover.len() + bytes.len() <= MAX_LEFTOVER_BYTES,
-            "Leftover exceeds {} bytes ({} bytes) — probable protocol desync",
-            MAX_LEFTOVER_BYTES,
-            self.leftover.len() + bytes.len()
-        );
-        self.leftover.extend_from_slice(bytes);
+    /// Queue bytes that were already read from the backend for the next response read.
+    pub fn queue_pending_bytes(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.queue_pending_bytes_ordered(bytes, PendingByteOrder::Back)
+    }
+
+    /// Queue bytes ahead of any bytes already retained by this connection.
+    pub fn queue_pending_bytes_first(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        self.queue_pending_bytes_ordered(bytes, PendingByteOrder::Front)
+    }
+
+    fn queue_pending_bytes_ordered(
+        &mut self,
+        bytes: &[u8],
+        order: PendingByteOrder,
+    ) -> anyhow::Result<()> {
+        let Some(bytes) = (!bytes.is_empty()).then_some(bytes) else {
+            return Ok(());
+        };
+
+        ensure_pending_bytes_capacity(self.pending_bytes_len(), bytes.len())?;
+
+        if self.pending_bytes.spilled()
+            || self.pending_bytes.len() + bytes.len() > PENDING_BACKEND_INLINE_BYTES
+        {
+            crate::pool::buffer::record_pending_backend_byte_heap_fallback();
+        }
+        match order {
+            PendingByteOrder::Back => self.pending_bytes.extend_from_slice(bytes),
+            PendingByteOrder::Front => {
+                let old = std::mem::take(&mut self.pending_bytes);
+                self.pending_bytes.extend_from_slice(bytes);
+                self.pending_bytes.extend_from_slice(&old);
+            }
+        }
         Ok(())
     }
 
     #[must_use]
-    pub fn has_leftover(&self) -> bool {
-        !self.leftover.is_empty()
+    pub fn has_pending_bytes(&self) -> bool {
+        !self.pending_bytes.is_empty()
     }
 
     #[must_use]
-    pub fn leftover_len(&self) -> usize {
-        self.leftover.len()
+    pub fn pending_bytes_len(&self) -> usize {
+        self.pending_bytes.len()
     }
 
-    #[cfg(test)]
-    pub fn clear_leftover(&mut self) {
-        self.leftover.clear();
+    pub fn clear_pending_bytes(&mut self) {
+        self.pending_bytes.clear();
     }
 }
 
@@ -235,10 +273,10 @@ impl AsyncRead for ConnectionStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if !self.leftover.is_empty() && buf.remaining() > 0 {
-            let n = self.leftover.len().min(buf.remaining());
-            let data = self.leftover.split_to(n);
-            buf.put_slice(&data);
+        if !self.pending_bytes.is_empty() && buf.remaining() > 0 {
+            let n = self.pending_bytes.len().min(buf.remaining());
+            buf.put_slice(&self.pending_bytes[..n]);
+            self.pending_bytes.drain(0..n);
             return Poll::Ready(Ok(()));
         }
 
@@ -422,7 +460,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_leftover_is_read_before_socket() {
+    async fn test_pending_bytes_is_read_before_socket() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -436,7 +474,7 @@ mod tests {
         let _client = client_handle.await.unwrap();
 
         let mut conn = ConnectionStream::plain(server_stream);
-        conn.stash_leftover(b"left").unwrap();
+        conn.queue_pending_bytes(b"left").unwrap();
 
         let mut buf = [0u8; 4];
         conn.read_exact(&mut buf).await.unwrap();
@@ -448,7 +486,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_stash_leftover_rejects_oversize() {
+    async fn test_queue_pending_bytes_rejects_oversized_buffers() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -457,12 +495,32 @@ mod tests {
         let _client = client_handle.await.unwrap();
 
         let mut conn = ConnectionStream::plain(server_stream);
-        let oversized = vec![b'x'; MAX_LEFTOVER_BYTES + 1];
-        assert!(conn.stash_leftover(&oversized).is_err());
+        let large = vec![b'x'; MAX_PENDING_BACKEND_BYTES + 1];
+        let err = conn.queue_pending_bytes(&large).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&MAX_PENDING_BACKEND_BYTES.to_string())
+        );
+        assert_eq!(conn.pending_bytes_len(), 0);
     }
 
     #[tokio::test]
-    async fn test_into_compressed_preserves_leftover() {
+    async fn test_queue_pending_bytes_ignores_empty_buffers() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
+
+        let mut conn = ConnectionStream::plain(server_stream);
+        conn.queue_pending_bytes(b"").unwrap();
+        assert!(!conn.has_pending_bytes());
+        assert_eq!(conn.pending_bytes_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_into_compressed_preserves_pending_bytes() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
 
@@ -476,11 +534,11 @@ mod tests {
         let _client = client_handle.await.unwrap();
 
         let mut conn = ConnectionStream::plain(server_stream);
-        conn.stash_leftover(b"left").unwrap();
+        conn.queue_pending_bytes(b"left").unwrap();
 
         let mut conn = conn.into_compressed(1).unwrap();
         assert!(conn.is_compressed());
-        assert_eq!(conn.leftover_len(), 4);
+        assert_eq!(conn.pending_bytes_len(), 4);
 
         let mut buf = [0u8; 4];
         conn.read_exact(&mut buf).await.unwrap();

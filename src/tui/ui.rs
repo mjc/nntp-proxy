@@ -847,39 +847,17 @@ fn render_app_summary_panel(
         );
     }
 
-    let pending_requests = metrics
-        .in_flight_requests
-        .saturating_sub(metrics.pipeline_depth);
-
-    if metrics.pipeline_enabled_backends > 0 {
-        let mut text = ArrayString::<96>::new();
-        let _ = write!(
-            &mut text,
-            "{}, Pending: {} across {} backend conns",
-            metrics.pipeline_depth, pending_requests, metrics.pipeline_connection_capacity
-        );
-        render_label_value_row(
-            buffer,
-            inner,
-            &mut row,
-            right,
-            "Pipelined: ",
-            &text,
-            Style::default().fg(styles::VALUE_INFO),
-        );
-    } else {
-        let mut text = ArrayString::<48>::new();
-        let _ = write!(&mut text, "{pending_requests} requests");
-        render_label_value_row(
-            buffer,
-            inner,
-            &mut row,
-            right,
-            "Pending: ",
-            &text,
-            Style::default().fg(styles::VALUE_INFO),
-        );
-    }
+    let mut text = ArrayString::<48>::new();
+    let _ = write!(&mut text, "{} requests", metrics.in_flight_requests);
+    render_label_value_row(
+        buffer,
+        inner,
+        &mut row,
+        right,
+        "Pending: ",
+        &text,
+        Style::default().fg(styles::VALUE_INFO),
+    );
 
     if metrics.pipeline_batches > 0 {
         let avg_batch =
@@ -1278,26 +1256,10 @@ fn build_app_summary_lines(
         ]);
     }
 
-    let pending_requests = metrics
-        .in_flight_requests
-        .saturating_sub(metrics.pipeline_depth);
-
-    if metrics.pipeline_enabled_backends > 0 {
-        lines.push(Line::from(vec![
-            "Pipelined: ".fg(styles::LABEL),
-            format!("{}", metrics.pipeline_depth).fg(styles::VALUE_INFO),
-            ", Pending: ".fg(styles::LABEL),
-            format!("{pending_requests}").fg(styles::VALUE_INFO),
-            " across ".fg(styles::LABEL),
-            format!("{}", metrics.pipeline_connection_capacity).fg(styles::VALUE_INFO),
-            " backend conns".fg(styles::LABEL),
-        ]));
-    } else {
-        lines.push(Line::from(vec![
-            "Pending: ".fg(styles::LABEL),
-            format!("{pending_requests} requests").fg(styles::VALUE_INFO),
-        ]));
-    }
+    lines.push(Line::from(vec![
+        "Pending: ".fg(styles::LABEL),
+        format!("{} requests", metrics.in_flight_requests).fg(styles::VALUE_INFO),
+    ]));
 
     if metrics.pipeline_batches > 0 {
         let avg_batch =
@@ -1649,8 +1611,7 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
             let mut x = inner.left();
             let pending = state.backend_pending_count(i);
             let stateful = state.backend_stateful_count(i);
-            let pipeline_depth = state.backend_pipeline_depth(i);
-            let detail_text = backend_details_text(pending, stateful, pipeline_depth);
+            let detail_text = backend_details_text(pending, stateful);
             write_part(
                 buffer,
                 &mut x,
@@ -1678,21 +1639,14 @@ fn write_part(buffer: &mut Buffer, x: &mut u16, y: u16, right: u16, text: &str, 
     *x = next_x;
 }
 
-fn backend_details_text(pending: usize, stateful: usize, pipeline_depth: Option<usize>) -> String {
-    let non_pipelined_pending = pending.saturating_sub(pipeline_depth.unwrap_or_default());
+fn backend_details_text(pending: usize, stateful: usize) -> String {
     let mut text = String::new();
 
     if stateful > 0 {
         text.push_str(&format!("  Stateful: {stateful} | "));
     }
 
-    if let Some(depth) = pipeline_depth {
-        text.push_str(&format!(
-            "  Pipelined: {depth}, Pending: {non_pipelined_pending}"
-        ));
-    } else {
-        text.push_str(&format!("  Pending: {pending}"));
-    }
+    text.push_str(&format!("  Pending: {pending}"));
 
     text
 }
@@ -1763,7 +1717,6 @@ fn backend_row_texts(state: &DashboardState, show_details: bool) -> Vec<String> 
             rows.push(backend_details_text(
                 state.backend_pending_count(i),
                 state.backend_stateful_count(i),
-                state.backend_pipeline_depth(i),
             ));
         }
 
@@ -2325,48 +2278,12 @@ mod tests {
     }
 
     #[test]
-    fn app_summary_lines_include_live_pipeline_stats_without_batches() {
-        let metrics = DashboardMetrics {
-            in_flight_requests: 7,
-            pipeline_enabled_backends: 2,
-            pipeline_depth: 3,
-            pipeline_connection_capacity: 24,
-            ..DashboardMetrics::default()
-        };
+    fn backend_details_line_includes_pending_and_stateful_counts() {
+        let details = backend_details_text(4, 1);
 
-        let lines = build_app_summary_lines(
-            &metrics,
-            &crate::tui::SystemStats::default(),
-            None,
-            false,
-            None,
-        )
-        .into_iter()
-        .map(|line| line.to_string())
-        .collect::<Vec<_>>();
-
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("Pipelined: 3, Pending: 4 across 24 backend conns"))
-        );
-        assert!(
-            !lines
-                .iter()
-                .any(|line| line.contains("Pipeline: 0 batches"))
-        );
-    }
-
-    #[test]
-    fn backend_details_line_includes_pipeline_only_when_available() {
-        let with_pipeline = backend_details_text(4, 1, Some(3));
-        let without_pipeline = backend_details_text(4, 1, None);
-
-        assert!(with_pipeline.contains("Stateful: 1"));
-        assert!(with_pipeline.contains("  Pipelined: 3, Pending: 1"));
-        assert!(!with_pipeline.contains('%'));
-        assert!(without_pipeline.contains("Pending: 4"));
-        assert!(!without_pipeline.contains("Pipelined:"));
+        assert!(details.contains("Stateful: 1"));
+        assert!(details.contains("Pending: 4"));
+        assert!(!details.contains('%'));
     }
 
     #[test]
@@ -2409,7 +2326,6 @@ mod tests {
             load_ratio: None,
             stateful_count: 0,
             traffic_share: None,
-            pipeline_depth: None,
             history: Vec::new(),
         }
     }

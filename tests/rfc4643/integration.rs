@@ -32,7 +32,7 @@ async fn test_auth_flow_complete_with_valid_credentials() {
         "backend-1",
         "testuser",
         "testpass",
-        |port| MockNntpServer::new(port).with_name("test-backend"),
+        |_port| MockNntpServer::new().with_name("test-backend"),
     )
     .await
     .unwrap();
@@ -63,7 +63,7 @@ async fn test_auth_disabled_allows_immediate_commands() {
     let (proxy_port, _backend) = spawn_single_backend_proxy(
         nntp_proxy::config::RoutingMode::Stateful,
         "backend-1",
-        |port| MockNntpServer::new(port).with_name("test-backend"),
+        |_port| MockNntpServer::new().with_name("test-backend"),
     )
     .await
     .unwrap();
@@ -83,7 +83,7 @@ async fn test_auth_command_intercepted_not_sent_to_backend() {
         "backend-1",
         "user",
         "pass",
-        |port| MockNntpServer::new(port).with_name("test-backend"),
+        |_port| MockNntpServer::new().with_name("test-backend"),
     )
     .await
     .unwrap();
@@ -110,7 +110,7 @@ async fn test_multiple_clients_with_auth() {
         "backend-1",
         "user",
         "pass",
-        |port| MockNntpServer::new(port).with_name("test-backend"),
+        |_port| MockNntpServer::new().with_name("test-backend"),
     )
     .await
     .unwrap();

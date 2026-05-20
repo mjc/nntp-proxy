@@ -51,10 +51,9 @@ capture_pool_count = 16
 article_cache_capacity = "256mb"
 # Time-to-live for the article cache, in seconds
 article_cache_ttl_secs = 3600
-# Default true: store article bodies in the in-memory cache when [cache] is present.
-# Set false for availability-only caching without body storage.
+# Set true to store article bodies in memory and enable the disk tier below.
 store_article_bodies = true
-# Optional persistence file for availability-only mode
+# Optional persistence file for the availability-only index when store_article_bodies = false
 # availability_index_path = "/var/cache/nntp-proxy/availability.idx"
 
 # Disk Cache Configuration (optional)

@@ -292,6 +292,300 @@ pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
     });
 }
 
+fn response_write_metrics_interval() -> Option<std::time::Duration> {
+    let raw = std::env::var_os("NNTP_PROXY_RESPONSE_WRITE_METRICS_SECS")?;
+    let raw = raw.to_string_lossy();
+    let secs = raw.parse::<u64>().ok()?;
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+fn client_writer_lock_metrics_interval() -> Option<std::time::Duration> {
+    let raw = std::env::var_os("NNTP_PROXY_CLIENT_WRITER_LOCK_METRICS_SECS")?;
+    let raw = raw.to_string_lossy();
+    let secs = raw.parse::<u64>().ok()?;
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// Spawn background task to periodically log `ChunkedResponse::write_all_to` activity.
+///
+/// Enable this only for targeted profiling sessions:
+/// `NNTP_PROXY_RESPONSE_WRITE_METRICS_SECS=<seconds>`.
+pub fn spawn_response_write_metrics_logger() {
+    use tracing::info;
+
+    let Some(period) = response_write_metrics_interval() else {
+        return;
+    };
+
+    let mut previous = crate::pool::buffer::response_write_metrics_snapshot();
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            let current = crate::pool::buffer::response_write_metrics_snapshot();
+            let responses_delta = current.responses.saturating_sub(previous.responses);
+            let chunks_delta = current
+                .chunks_written
+                .saturating_sub(previous.chunks_written);
+            let bytes_delta = current.bytes_written.saturating_sub(previous.bytes_written);
+            let tiny_chunks_delta = current.tiny_chunks.saturating_sub(previous.tiny_chunks);
+            let tiny_chunk_bytes_delta = current
+                .tiny_chunk_bytes
+                .saturating_sub(previous.tiny_chunk_bytes);
+            let small_chunks_delta = current.small_chunks.saturating_sub(previous.small_chunks);
+            let small_chunk_bytes_delta = current
+                .small_chunk_bytes
+                .saturating_sub(previous.small_chunk_bytes);
+            let avg_chunks_milli = chunks_delta
+                .saturating_mul(1000)
+                .checked_div(responses_delta)
+                .unwrap_or(0);
+
+            info!(
+                responses_delta = responses_delta,
+                single_chunk_delta = current
+                    .single_chunk_responses
+                    .saturating_sub(previous.single_chunk_responses),
+                multi_chunk_delta = current
+                    .multi_chunk_responses
+                    .saturating_sub(previous.multi_chunk_responses),
+                chunks_delta = chunks_delta,
+                bytes_delta = bytes_delta,
+                tiny_chunks_delta = tiny_chunks_delta,
+                tiny_chunk_bytes_delta = tiny_chunk_bytes_delta,
+                small_chunks_delta = small_chunks_delta,
+                small_chunk_bytes_delta = small_chunk_bytes_delta,
+                avg_chunks_milli = avg_chunks_milli,
+                max_chunks_seen = current.max_chunks_per_response,
+                "Response write metrics"
+            );
+
+            previous = current;
+        }
+    });
+}
+
+/// Spawn background task to periodically log client-writer mutex contention.
+///
+/// Enable this only for targeted profiling sessions:
+/// `NNTP_PROXY_CLIENT_WRITER_LOCK_METRICS_SECS=<seconds>`.
+pub fn spawn_client_writer_lock_metrics_logger() {
+    use tracing::info;
+
+    let Some(period) = client_writer_lock_metrics_interval() else {
+        return;
+    };
+
+    let mut previous = crate::session::shared_client_writer::client_writer_lock_metrics_snapshot();
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            let current =
+                crate::session::shared_client_writer::client_writer_lock_metrics_snapshot();
+            let requests_delta = current.lock_requests.saturating_sub(previous.lock_requests);
+            let wait_nanos_delta = current.wait_nanos.saturating_sub(previous.wait_nanos);
+            let avg_wait_nanos = if current
+                .contended_locks
+                .saturating_sub(previous.contended_locks)
+                == 0
+            {
+                0
+            } else {
+                wait_nanos_delta
+                    / (current
+                        .contended_locks
+                        .saturating_sub(previous.contended_locks) as u64)
+            };
+
+            info!(
+                requests_delta = requests_delta,
+                immediate_delta = current
+                    .immediate_locks
+                    .saturating_sub(previous.immediate_locks),
+                contended_delta = current
+                    .contended_locks
+                    .saturating_sub(previous.contended_locks),
+                wait_nanos_delta = wait_nanos_delta,
+                avg_wait_nanos = avg_wait_nanos,
+                max_wait_nanos_seen = current.max_wait_nanos,
+                "Client writer lock metrics"
+            );
+
+            previous = current;
+        }
+    });
+}
+
+#[cfg(tokio_unstable)]
+#[derive(Clone, Copy, Debug)]
+struct TokioRuntimeMetricsSnapshot {
+    alive_tasks: usize,
+    workers: usize,
+    global_queue_depth: usize,
+    blocking_queue_depth: usize,
+    remote_schedule_count: u64,
+    budget_forced_yield_count: u64,
+    worker_local_schedule_count: u64,
+    worker_overflow_count: u64,
+    worker_steal_count: u64,
+    worker_steal_operations: u64,
+    worker_poll_count: u64,
+    worker_park_count: u64,
+    worker_noop_count: u64,
+    worker_busy_total_ns: u128,
+    worker_busy_min_ns: u128,
+    worker_busy_max_ns: u128,
+}
+
+#[cfg(tokio_unstable)]
+impl TokioRuntimeMetricsSnapshot {
+    fn capture(metrics: &tokio::runtime::RuntimeMetrics) -> Self {
+        let workers = metrics.num_workers();
+        let mut worker_local_schedule_count = 0u64;
+        let mut worker_overflow_count = 0u64;
+        let mut worker_steal_count = 0u64;
+        let mut worker_steal_operations = 0u64;
+        let mut worker_poll_count = 0u64;
+        let mut worker_park_count = 0u64;
+        let mut worker_noop_count = 0u64;
+        let mut worker_busy_total_ns = 0u128;
+        let mut worker_busy_min_ns = u128::MAX;
+        let mut worker_busy_max_ns = 0u128;
+
+        for worker in 0..workers {
+            worker_local_schedule_count += metrics.worker_local_schedule_count(worker);
+            worker_overflow_count += metrics.worker_overflow_count(worker);
+            worker_steal_count += metrics.worker_steal_count(worker);
+            worker_steal_operations += metrics.worker_steal_operations(worker);
+            worker_poll_count += metrics.worker_poll_count(worker);
+            worker_park_count += metrics.worker_park_count(worker);
+            worker_noop_count += metrics.worker_noop_count(worker);
+
+            let busy_ns = metrics.worker_total_busy_duration(worker).as_nanos();
+            worker_busy_total_ns += busy_ns;
+            worker_busy_min_ns = worker_busy_min_ns.min(busy_ns);
+            worker_busy_max_ns = worker_busy_max_ns.max(busy_ns);
+        }
+
+        Self {
+            alive_tasks: metrics.num_alive_tasks(),
+            workers,
+            global_queue_depth: metrics.global_queue_depth(),
+            blocking_queue_depth: metrics.blocking_queue_depth(),
+            remote_schedule_count: metrics.remote_schedule_count(),
+            budget_forced_yield_count: metrics.budget_forced_yield_count(),
+            worker_local_schedule_count,
+            worker_overflow_count,
+            worker_steal_count,
+            worker_steal_operations,
+            worker_poll_count,
+            worker_park_count,
+            worker_noop_count,
+            worker_busy_total_ns,
+            worker_busy_min_ns: if workers == 0 { 0 } else { worker_busy_min_ns },
+            worker_busy_max_ns,
+        }
+    }
+}
+
+#[cfg(tokio_unstable)]
+fn tokio_runtime_metrics_interval() -> Option<std::time::Duration> {
+    let raw = std::env::var_os("NNTP_PROXY_TOKIO_RUNTIME_METRICS_SECS")?;
+    let raw = raw.to_string_lossy();
+    let secs = raw.parse::<u64>().ok()?;
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// Spawn background task to periodically log Tokio runtime scheduler metrics.
+///
+/// Enable this only for targeted profiling sessions:
+/// `NNTP_PROXY_TOKIO_RUNTIME_METRICS_SECS=<seconds>`.
+#[cfg(tokio_unstable)]
+pub fn spawn_tokio_runtime_metrics_logger() {
+    use tracing::info;
+
+    let Some(period) = tokio_runtime_metrics_interval() else {
+        return;
+    };
+
+    let handle = tokio::runtime::Handle::current();
+    let mut previous = TokioRuntimeMetricsSnapshot::capture(&handle.metrics());
+
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            interval.tick().await;
+            let current = TokioRuntimeMetricsSnapshot::capture(&handle.metrics());
+
+            let busy_total_delta_ns = current
+                .worker_busy_total_ns
+                .saturating_sub(previous.worker_busy_total_ns);
+            let busy_min_delta_ns = current
+                .worker_busy_min_ns
+                .saturating_sub(previous.worker_busy_min_ns);
+            let busy_max_delta_ns = current
+                .worker_busy_max_ns
+                .saturating_sub(previous.worker_busy_max_ns);
+
+            info!(
+                workers = current.workers,
+                alive_tasks = current.alive_tasks,
+                global_queue_depth = current.global_queue_depth,
+                blocking_queue_depth = current.blocking_queue_depth,
+                remote_schedule_delta = current
+                    .remote_schedule_count
+                    .saturating_sub(previous.remote_schedule_count),
+                budget_forced_yield_delta = current
+                    .budget_forced_yield_count
+                    .saturating_sub(previous.budget_forced_yield_count),
+                worker_local_schedule_delta = current
+                    .worker_local_schedule_count
+                    .saturating_sub(previous.worker_local_schedule_count),
+                worker_overflow_delta = current
+                    .worker_overflow_count
+                    .saturating_sub(previous.worker_overflow_count),
+                worker_steal_delta = current
+                    .worker_steal_count
+                    .saturating_sub(previous.worker_steal_count),
+                worker_steal_ops_delta = current
+                    .worker_steal_operations
+                    .saturating_sub(previous.worker_steal_operations),
+                worker_poll_delta = current
+                    .worker_poll_count
+                    .saturating_sub(previous.worker_poll_count),
+                worker_park_delta = current
+                    .worker_park_count
+                    .saturating_sub(previous.worker_park_count),
+                worker_noop_delta = current
+                    .worker_noop_count
+                    .saturating_sub(previous.worker_noop_count),
+                worker_busy_total_ms_delta = busy_total_delta_ns / 1_000_000,
+                worker_busy_min_ms_delta = busy_min_delta_ns / 1_000_000,
+                worker_busy_max_ms_delta = busy_max_delta_ns / 1_000_000,
+                "Tokio runtime metrics"
+            );
+
+            previous = current;
+        }
+    });
+}
+
+#[cfg(not(tokio_unstable))]
+pub fn spawn_tokio_runtime_metrics_logger() {
+    if std::env::var_os("NNTP_PROXY_TOKIO_RUNTIME_METRICS_SECS").is_some() {
+        tracing::warn!("NNTP_PROXY_TOKIO_RUNTIME_METRICS_SECS requires a tokio_unstable build");
+    }
+}
+
 /// Persist runtime state that should survive process restarts.
 ///
 /// Saves metrics unconditionally and availability state when the proxy uses
@@ -487,7 +781,7 @@ pub async fn run_accept_loop(
                 let (stream, addr) = accept_result?;
                 let proxy = proxy.clone();
 
-                tokio::spawn(async move {
+                let client_task = async move {
                     let result = if uses_per_command {
                         proxy.handle_client_per_command_routing(stream, addr.into()).await
                     } else {
@@ -501,7 +795,15 @@ pub async fn run_accept_loop(
                             error!("Error handling client {}: {:?}", addr, e);
                         }
                     }
-                });
+                };
+
+                #[cfg(tokio_unstable)]
+                tokio::task::Builder::new()
+                    .name("client-session")
+                    .spawn(client_task)?;
+
+                #[cfg(not(tokio_unstable))]
+                tokio::spawn(client_task);
             }
         }
     }
@@ -542,7 +844,7 @@ pub fn resolve_stats_file_path(
     )
 }
 
-/// Resolve the availability persistence path for availability-only mode.
+/// Resolve the persistence path for the availability index when body storage is disabled.
 ///
 /// Returns None unless `store_article_bodies = false`. If `availability_index_path` is
 /// configured, use it; otherwise default to "availability.idx" alongside config.

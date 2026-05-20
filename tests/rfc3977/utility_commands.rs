@@ -5,8 +5,8 @@ use anyhow::Result;
 use crate::test_helpers::{MockNntpServer, RfcTestClient};
 use nntp_proxy::RoutingMode;
 
-fn utility_backend(port: u16) -> MockNntpServer {
-    MockNntpServer::new(port)
+fn utility_backend(_port: u16) -> MockNntpServer {
+    MockNntpServer::new()
         .with_name("UtilityBackend")
         .on_command(
             "HELP",

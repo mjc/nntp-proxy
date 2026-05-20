@@ -106,6 +106,23 @@ impl ConnectionGuard {
             .expect("ConnectionGuard::release() called on consumed guard")
     }
 
+    /// Close and remove the connection without applying replacement cooldown.
+    ///
+    /// Use this when the socket is dirty from a client-side abort, but the
+    /// backend did not fail and should not have its pool capacity reduced.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the guard has already been consumed.
+    pub fn retire_without_cooldown(mut self) {
+        self.released = true;
+        let conn = self
+            .conn
+            .take()
+            .expect("ConnectionGuard::retire_without_cooldown() called on consumed guard");
+        self.provider.remove_without_cooldown(conn);
+    }
+
     /// Get mutable reference to the connection
     ///
     /// # Panics
@@ -127,6 +144,16 @@ impl ConnectionGuard {
             .as_ref()
             .expect("ConnectionGuard already consumed")
     }
+
+    #[must_use]
+    pub fn connection_type(&self) -> &'static str {
+        self.get().connection_type()
+    }
+
+    #[must_use]
+    pub fn pending_bytes_len(&self) -> usize {
+        self.get().pending_bytes_len()
+    }
 }
 
 impl Drop for ConnectionGuard {
@@ -136,7 +163,7 @@ impl Drop for ConnectionGuard {
         {
             tracing::debug!(
                 connection_type = conn.connection_type(),
-                leftover_bytes = conn.leftover_len(),
+                pending_bytes = conn.pending_bytes_len(),
                 "ConnectionGuard dropping unreleased pooled connection; removing backend connection with cooldown"
             );
             // Unconditional: remove_with_cooldown handles socket shutdown and
@@ -165,7 +192,7 @@ impl std::ops::DerefMut for ConnectionGuard {
 /// instead of immediately removing it. This helps prevent connection churn.
 ///
 /// # Strategy
-/// Send DATE command to verify connection is clean and responsive. If leftover
+/// Send DATE command to verify connection is clean and responsive. If pending bytes
 /// data exists in the stream, the DATE response will be corrupted and the check
 /// will fail - this is both faster (~1 RTT vs 10 seconds) and equally correct.
 ///
@@ -197,44 +224,6 @@ pub async fn salvage_with_health_check(
 
 #[cfg(test)]
 mod tests {
-
-    /// Verify that `TailBuffer` detects terminators that span chunk boundaries.
-    #[test]
-    fn test_drain_cross_boundary_terminator() {
-        use crate::session::tail_buffer::TailBuffer;
-
-        // Simulate two reads where the terminator \r\n.\r\n is split:
-        // First read ends with "\r\n.", second read starts with "\r\n"
-        let chunk1 = b"220 Article follows\r\nBody content\r\n.";
-        let chunk2 = b"\r\n";
-
-        // Old approach: windows() on each chunk independently — would MISS this
-        let terminator = b"\r\n.\r\n";
-        let found_by_windows_chunk1 = chunk1.windows(terminator.len()).any(|w| w == terminator);
-        let found_by_windows_chunk2 = chunk2.windows(terminator.len()).any(|w| w == terminator);
-        assert!(
-            !found_by_windows_chunk1,
-            "windows() should not find terminator in chunk1"
-        );
-        assert!(
-            !found_by_windows_chunk2,
-            "windows() should not find terminator in chunk2"
-        );
-
-        // New approach: TailBuffer tracks cross-boundary state
-        let mut tail = TailBuffer::default();
-
-        // Process chunk1 — no terminator yet
-        assert!(!tail.detect_terminator(chunk1).is_found());
-        tail.update(chunk1);
-
-        // Process chunk2 — spanning terminator detected!
-        assert!(
-            tail.detect_terminator(chunk2).is_found(),
-            "TailBuffer should detect terminator spanning chunk boundary"
-        );
-    }
-
     // ─── ConnectionGuard pool-fate invariants ───────────────────────────────
     //
     // These tests verify two invariants that callers must rely on:

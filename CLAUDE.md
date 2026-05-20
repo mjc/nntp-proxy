@@ -31,9 +31,6 @@
            │    ├─> PooledBuffer [acquire()]: single-read I/O scratch (724KB, pre-faulted)
            │    └─> PooledBuffer [acquire_capture()]: accumulator for caching (768KB, pre-faulted)
            │
-           └──> Pipeline Engine
-                ├─> BackendQueue: batched ARTICLE/BODY requests
-                └─> Batching: 4-16 commands per round-trip
 ```
 
 ### Routing Modes
@@ -48,79 +45,58 @@
 
 ## Mandatory Patterns
 
-### 1. Terminator Detection
+### 1. Multiline Response Framing
 
-**`TailBuffer` is the ONE AND ONLY place terminator detection can exist in this codebase. There must never be any other implementation anywhere.**
+**`MultilineFramer` is the ONE AND ONLY place that may know about NNTP multiline response boundaries. There must never be any other implementation anywhere.**
 
-An NNTP multiline response ends with `\r\n.\r\n` (5 bytes). Detecting this correctly across async chunk reads is subtle and easy to get wrong. Getting it wrong causes **connection pool collapse**.
+After code calls `MultilineFramer`, it must not do any further buffer splitting, terminator checking, suffix checking, end-of-string checking, chunk-boundary handling, or leftover interpretation. A framed response is already framed. If a response is incomplete, the same `MultilineFramer` gets the next backend buffer. Callers do not inspect `\r`, `\n`, `.\r\n`, `\r\n.\r\n`, chunk ends, string ends, or byte offsets to decide response boundaries.
 
-#### Forbidden Patterns — Never Write These
+Detecting multiline boundaries correctly across async reads is subtle and easy to get wrong. Getting it wrong causes **connection pool collapse**.
+
+#### Forbidden Patterns — Never Write These Anywhere Outside `src/session/multiline_framing.rs`
 
 ```rust
 // ❌ ends_with check on accumulated buffer
 if data.ends_with(b"\r\n.\r\n") { ... }
 if data.ends_with(b".\r\n") { ... }
+if line == b".\r\n" { ... }
+if line.starts_with(b".") { ... }
 
 // ❌ Any helper wrapping ends_with
 fn has_terminator(data: &[u8]) -> bool { data.ends_with(b"\r\n.\r\n") }
 
-// ❌ Constant replicated outside tail_buffer.rs
+// ❌ Constant replicated outside multiline_framing.rs
 const MULTILINE_TERMINATOR: &[u8] = b"\r\n.\r\n";
 
-// ❌ Accumulate-then-check loop (the worst pattern)
+// ❌ Accumulate-then-check loop
 let mut accumulated = Vec::new();
 loop {
     accumulated.extend_from_slice(&buf[..n]);
     if accumulated.ends_with(b"\r\n.\r\n") { break; } // WRONG
 }
+
+// ❌ Caller-side split state after framing
+let split = framer.some_boundary_call(buf);
+client.write_all(&buf[..split.end]).await?;
+conn.stash_leftover(&buf[split.end..])?;
 ```
 
-#### Correct: Streaming (most common case)
+#### Required Shape
 
-```rust
-use crate::session::streaming::tail_buffer::{TailBuffer, TerminatorStatus};
+- Call `MultilineFramer` or a method that is explicitly owned by `src/session/multiline_framing.rs`.
+- If incomplete, feed the next backend buffer back into the same framer.
+- If complete, use the typed operation returned/provided by the framer: write, capture, cache, or ordered response emission.
+- Do not export scanner primitives for callers to compose.
+- Do not add “fast paths” that inspect CR/LF/dot bytes elsewhere.
+- Do not add tests outside `multiline_framing.rs` that assert raw terminator offsets, chunk-boundary offsets, or suffix ranges.
 
-let mut tail = TailBuffer::default();
-loop {
-    let n = stream.read(buffer.as_mut_slice()).await?;
-    if n == 0 { break; }
-    let chunk = &buffer[..n];
+`MultilineFramer` may internally use offsets, suffix ranges, and CR/LF/dot byte checks. Callers must not.
 
-    match tail.detect_terminator(chunk) {
-        TerminatorStatus::FoundAt(pos) => {
-            // CRITICAL: pos is the byte offset immediately AFTER "\r\n.\r\n"
-            // chunk[..pos] includes the terminator and no bytes from the next response
-            client.write_all(&chunk[..pos]).await?;
-            break;
-        }
-        TerminatorStatus::NotFound => {
-            client.write_all(chunk).await?;
-            tail.update(chunk);
-        }
-    }
-}
-```
+#### Why This Rule Exists
 
-#### Correct: Complete-buffer validation
+Past bugs came from callers trying to “optimize” with `ends_with`, manual chunk slicing, or packed suffix handling after the framer had already seen bytes. Those paths consumed bytes for later responses, dirtied pooled backend connections, and caused pool collapse. The only safe shape is one owner: `MultilineFramer`.
 
-```rust
-// TailBuffer with no prior state, checking a fully-accumulated buffer
-TailBuffer::default().detect_terminator(&buffer).is_found()
-```
-
-#### Why `ends_with()` Causes Connection Pool Collapse
-
-This caused a production bug (20 connections removed in rapid succession, pool exhausted):
-
-1. Backend sends article body + start of next pipelined response in the same TCP segment
-2. `read()` returns `[...article data...\r\n.\r\n200 Article follows\r\n...]`
-3. `ends_with(b"\r\n.\r\n")` returns **false** — buffer ends with `...200 Article follows\r\n...`
-4. Loop continues, consuming the `220 0 <next-msg-id>\r\n` for the next pipelined command
-5. Next handler reads garbage → `Invalid` → `remove_with_cooldown()` → cascade to zero
-
-`TailBuffer::detect_terminator()` returns `FoundAt(pos)` at the correct boundary — pipelined bytes are never consumed from the wrong context.
-
-**Location:** `src/session/streaming/tail_buffer.rs` (30+ tests, production-proven)
+**Location:** `src/session/multiline_framing.rs` (core inline tests plus broader state/response coverage, production-proven)
 
 ---
 
@@ -146,14 +122,28 @@ buf.extend_from_slice(data); // WRONG
 let mut scratch = vec![0u8; 8192]; // WRONG: 1 allocation per request
 ```
 
+### Pass-through responses borrow bytes
+
+The normal proxy forwarding path is borrow-only/zero-copy from the proxy's point
+of view: read into a pooled buffer, let `MultilineFramer` produce the typed
+write operation, write borrowed slices, then reuse/return the buffer. Do not
+copy pass-through ARTICLE/BODY/HEAD data into `ChunkedResponse`, `Bytes`, `Vec`,
+capture buffers, frozen buffers, or detached buffers.
+
+Full-response ownership is only for explicit retention paths: payload caching,
+cache hits, list-style response exceptions, precheck/tests, or visible
+pool-exhaustion fallbacks.
+
 #### Mode 2: Capture buffers — `acquire_capture()`
 
-Pre-faulted empty `Vec<u8>` with `len == 0, capacity == 768KB`. For accumulating full streaming responses (caching path only).
+Pre-faulted empty `Vec<u8>` with `len == 0, capacity == 768KB`. For accumulating full responses only when a retention path explicitly needs ownership.
 
 ```rust
 // ✅ ONLY use under CacheAction::CaptureArticle:
 let mut captured = self.buffer_pool.acquire_capture().await;
-streaming::stream_and_capture_multiline_response(backend, client, first_chunk, ..., &mut captured).await?;
+ResponseCapture::from_buffer(request, first_buffer, backend, &mut captured, pool, backend_id)
+    .capture()
+    .await?;
 self.maybe_cache_upsert(msg_id, &captured, backend_id);
 
 // ❌ NEVER use acquire_capture() for single reads:
@@ -259,7 +249,7 @@ if is_large_transfer_command(cmd) { /* ARTICLE/BODY — route to batch pipeline 
 
 **Available in `src/protocol/responses.rs`:** `CRLF`, `TERMINATOR_TAIL_SIZE`
 
-**Do not add `MULTILINE_TERMINATOR` or `has_multiline_terminator()`** — these were deleted because they encouraged bypassing `TailBuffer`, causing pool collapse. Use `TailBuffer` (see Pattern #1).
+**Do not add `MULTILINE_TERMINATOR` or `has_multiline_terminator()`** — these were deleted because they encouraged bypassing `MultilineFramer`, causing pool collapse. Use `MultilineFramer` (see Pattern #1).
 
 ---
 
@@ -338,7 +328,7 @@ Always add a comment at each `remove_with_cooldown` call site (inside `Connectio
 **Use `Server::builder()` — never hardcode struct literals:**
 ```rust
 // ❌ BAD: hardcodes defaults, breaks on new fields
-let server = Server { port: 8119, pipeline_batch_size: 16, /* ... 15 more */ };
+let server = Server { port: 8119, /* ... many more */ };
 
 // ✅ GOOD: tracks production defaults automatically
 let server = Server::builder().port(8119).build();
@@ -355,13 +345,13 @@ let snapshot = MetricsSnapshot { cache_hits: 10, ..Default::default() };
 
 ### Benchmarks
 
-**Never define local reimplementations — always import production functions:**
+**Never define local reimplementations — always use production framing:**
 ```rust
 // ❌ BAD: benchmark measures wrong code
 fn find_terminator_new(data: &[u8]) -> Option<usize> { ... }
 
-// ✅ GOOD:
-use nntp_proxy::session::streaming::tail_buffer::find_terminator_end;
+// ✅ GOOD: drive the same typed framing path as production callers
+use nntp_proxy::session::multiline_framing::MultilineFramer;
 ```
 
 **Performance testing:** Run `cargo bench` before and after performance-sensitive changes; accept no regressions.
@@ -391,9 +381,9 @@ enum SingleCommandResult { Continue { auth_succeeded: bool }, Quit(u64), SwitchT
 
 ## Anti-Patterns (Don't Do This)
 
-### ❌ 1. Any Terminator Detection Outside TailBuffer
+### ❌ 1. Any Terminator Detection Outside MultilineFramer
 
-Any occurrence of the following anywhere outside `tail_buffer.rs` is a bug:
+Any occurrence of the following anywhere outside `multiline_framing.rs` is a bug:
 - `ends_with(b"\r\n.\r\n")` or `ends_with(b".\r\n")`
 - `MULTILINE_TERMINATOR` or `TERMINATOR` constants
 - `has_multiline_terminator()` or similar helper functions
@@ -467,7 +457,7 @@ Never reimplement production functions in benchmarks — import them directly.
 
 Before submitting code:
 
-- [ ] No duplicate terminator detection (use `TailBuffer`)
+- [ ] No duplicate terminator detection (use `MultilineFramer`)
 - [ ] No scratch buffer allocations (use `BufferPool`)
 - [ ] No inline error kind checks (use centralized helpers)
 - [ ] No raw byte status code checks (use parsed `status_code`)

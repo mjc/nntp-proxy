@@ -9,10 +9,50 @@
 use crate::protocol::RequestContext;
 use crate::session::ClientSession;
 use anyhow::Result;
+use smallvec::SmallVec;
 use tokio::io::AsyncBufReadExt;
+use tokio::time::Duration;
 
 /// Maximum pipeline depth (number of commands read from client buffer at once)
 const MAX_PIPELINE_DEPTH: usize = 16;
+const COMMAND_LINE_CAPACITY: usize = crate::protocol::MAX_COMMAND_LINE_OCTETS;
+const PIPELINE_REFILL_GRACE: Duration = Duration::from_millis(1);
+type BatchContexts = SmallVec<[RequestContext; MAX_PIPELINE_DEPTH]>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommandLineKind {
+    Eof,
+    Oversized { wire_len: usize },
+    Parsed,
+}
+
+struct CommandLine {
+    kind: CommandLineKind,
+    request: Option<RequestContext>,
+}
+
+impl CommandLine {
+    const fn eof() -> Self {
+        Self {
+            kind: CommandLineKind::Eof,
+            request: None,
+        }
+    }
+
+    const fn oversized(wire_len: usize) -> Self {
+        Self {
+            kind: CommandLineKind::Oversized { wire_len },
+            request: None,
+        }
+    }
+
+    const fn parsed(request: Option<RequestContext>) -> Self {
+        Self {
+            kind: CommandLineKind::Parsed,
+            request,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RequestRejection {
@@ -26,7 +66,7 @@ enum RequestRejection {
 /// non-pipelineable line, keeping one request model for the whole batch.
 pub(super) struct RequestBatch {
     /// Typed contexts for each pipelineable command.
-    contexts: smallvec::SmallVec<[RequestContext; 4]>,
+    contexts: BatchContexts,
     /// Typed context for trailing non-pipelineable command if present.
     trailing_context: Option<RequestContext>,
     /// Rejection for the first command, before context creation.
@@ -67,7 +107,7 @@ impl RequestBatch {
     }
 
     const fn contexts_with_trailing_oversized(
-        contexts: smallvec::SmallVec<[RequestContext; 4]>,
+        contexts: BatchContexts,
         trailing_wire_len: usize,
     ) -> Self {
         Self {
@@ -80,9 +120,7 @@ impl RequestBatch {
         }
     }
 
-    const fn contexts_with_trailing_invalid(
-        contexts: smallvec::SmallVec<[RequestContext; 4]>,
-    ) -> Self {
+    const fn contexts_with_trailing_invalid(contexts: BatchContexts) -> Self {
         Self {
             contexts,
             trailing_context: None,
@@ -92,7 +130,7 @@ impl RequestBatch {
     }
 
     const fn contexts_with_trailing(
-        contexts: smallvec::SmallVec<[RequestContext; 4]>,
+        contexts: BatchContexts,
         trailing_context: RequestContext,
     ) -> Self {
         Self {
@@ -103,7 +141,7 @@ impl RequestBatch {
         }
     }
 
-    fn contexts(contexts: smallvec::SmallVec<[RequestContext; 4]>) -> Self {
+    fn contexts(contexts: BatchContexts) -> Self {
         Self {
             contexts,
             ..Self::empty()
@@ -180,6 +218,106 @@ impl RequestBatch {
 }
 
 impl ClientSession {
+    async fn read_command_line<R>(
+        reader: &mut tokio::io::BufReader<R>,
+        line_buf: &mut [u8; COMMAND_LINE_CAPACITY],
+    ) -> std::io::Result<CommandLine>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            return Ok(CommandLine::eof());
+        }
+        if let Some(pos) = memchr::memchr(b'\n', available) {
+            let wire_len = pos + 1;
+            if wire_len > crate::protocol::MAX_COMMAND_LINE_OCTETS {
+                reader.consume(wire_len);
+                return Ok(CommandLine::oversized(wire_len));
+            }
+            let request = RequestContext::parse(&available[..wire_len]);
+            reader.consume(wire_len);
+            return Ok(CommandLine::parsed(request));
+        }
+
+        let mut len = 0usize;
+        loop {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                return Ok(if len == 0 {
+                    CommandLine::eof()
+                } else {
+                    CommandLine::parsed(RequestContext::parse(&line_buf[..len]))
+                });
+            }
+
+            let newline = memchr::memchr(b'\n', available);
+            let take = newline.map_or(available.len(), |pos| pos + 1);
+            if len + take > crate::protocol::MAX_COMMAND_LINE_OCTETS {
+                reader.consume(take);
+                if newline.is_some() {
+                    return Ok(CommandLine::oversized(len + take));
+                }
+                return Self::drain_oversized_command_line(reader, len + take).await;
+            }
+
+            line_buf[len..len + take].copy_from_slice(&available[..take]);
+            reader.consume(take);
+            len += take;
+
+            if newline.is_some() {
+                return Ok(CommandLine::parsed(RequestContext::parse(&line_buf[..len])));
+            }
+        }
+    }
+
+    async fn drain_oversized_command_line<R>(
+        reader: &mut tokio::io::BufReader<R>,
+        mut wire_len: usize,
+    ) -> std::io::Result<CommandLine>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        loop {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                return Ok(CommandLine::oversized(wire_len));
+            }
+
+            let newline = memchr::memchr(b'\n', available);
+            let take = newline.map_or(available.len(), |pos| pos + 1);
+            reader.consume(take);
+            wire_len += take;
+
+            if newline.is_some() {
+                return Ok(CommandLine::oversized(wire_len));
+            }
+        }
+    }
+
+    fn buffered_complete_line<R>(reader: &tokio::io::BufReader<R>) -> bool
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        memchr::memchr(b'\n', reader.buffer()).is_some()
+    }
+
+    async fn refill_available_client_bytes<R>(
+        reader: &mut tokio::io::BufReader<R>,
+    ) -> std::io::Result<bool>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        if !reader.buffer().is_empty() {
+            return Ok(false);
+        }
+
+        match tokio::time::timeout(PIPELINE_REFILL_GRACE, reader.fill_buf()).await {
+            Ok(result) => result.map(|buf| !buf.is_empty()),
+            Err(_) => Ok(false),
+        }
+    }
+
     /// Read a batch of commands from the client's buffered reader.
     ///
     /// The first command always blocks (waiting for client input). Subsequent
@@ -191,27 +329,20 @@ impl ClientSession {
     pub(super) async fn read_command_batch<R>(
         &self,
         reader: &mut tokio::io::BufReader<R>,
-        command_buf: &mut Vec<u8>,
+        line_buf: &mut [u8; COMMAND_LINE_CAPACITY],
     ) -> Result<RequestBatch>
     where
         R: tokio::io::AsyncRead + Unpin,
     {
         // First command: blocking read (must wait for client)
-        command_buf.clear();
-        match reader.read_until(b'\n', command_buf).await {
-            Ok(0) => {
-                return Ok(RequestBatch::empty());
-            }
-            Ok(_) => {
-                // RFC 3977 §3.1: 512-byte command limit — return 501 and keep session alive
-                if command_buf.len() > crate::protocol::MAX_COMMAND_LINE_OCTETS {
-                    return Ok(RequestBatch::first_oversized());
-                }
-            }
-            Err(e) => return Err(e.into()),
-        }
+        let line = Self::read_command_line(reader, line_buf).await?;
+        let request = match line.kind {
+            CommandLineKind::Eof => return Ok(RequestBatch::empty()),
+            CommandLineKind::Parsed => line.request,
+            CommandLineKind::Oversized { .. } => return Ok(RequestBatch::first_oversized()),
+        };
 
-        let Some(request) = RequestContext::parse(command_buf) else {
+        let Some(request) = request else {
             return Ok(RequestBatch::first_invalid());
         };
         if !request.is_pipelineable() {
@@ -219,32 +350,34 @@ impl ClientSession {
             return Ok(RequestBatch::trailing(request));
         }
 
-        let mut batch_contexts: smallvec::SmallVec<[RequestContext; 4]> = smallvec::SmallVec::new();
+        let mut batch_contexts = BatchContexts::new();
         batch_contexts.push(request);
 
         // Read more commands from the buffer (non-blocking)
         while batch_contexts.len() < MAX_PIPELINE_DEPTH {
-            // Only proceed if buffer has a complete line (contains \n).
-            // Checking just is_empty() is insufficient: if the buffer has a partial
-            // command without \n, read_until() would block on the socket waiting for
-            // more data, defeating the non-blocking batch intent.
-            if memchr::memchr(b'\n', reader.buffer()).is_none() {
+            if !Self::buffered_complete_line(reader)
+                && !Self::refill_available_client_bytes(reader).await?
+            {
+                break;
+            }
+            // Only proceed if the buffer has a complete line. If a nonblocking
+            // refill found only a partial command, stop the batch so the next
+            // outer-loop read can wait for the command to complete.
+            if !Self::buffered_complete_line(reader) {
                 break;
             }
 
-            command_buf.clear();
-            match reader.read_until(b'\n', command_buf).await {
-                Ok(0) | Err(_) => break,
-                Ok(_) => {
-                    // M4: Reject oversized commands (end batch on invalid command)
-                    // Mark as oversized so caller sends 500 error instead of forwarding
-                    if command_buf.len() > crate::protocol::MAX_COMMAND_LINE_OCTETS {
-                        return Ok(RequestBatch::contexts_with_trailing_oversized(
-                            batch_contexts,
-                            command_buf.len(),
-                        ));
-                    }
-                    let Some(request) = RequestContext::parse(command_buf) else {
+            let line = Self::read_command_line(reader, line_buf).await?;
+            match line.kind {
+                CommandLineKind::Eof => break,
+                CommandLineKind::Oversized { wire_len } => {
+                    return Ok(RequestBatch::contexts_with_trailing_oversized(
+                        batch_contexts,
+                        wire_len,
+                    ));
+                }
+                CommandLineKind::Parsed => {
+                    let Some(request) = line.request else {
                         return Ok(RequestBatch::contexts_with_trailing_invalid(batch_contexts));
                     };
                     if !request.is_pipelineable() {
@@ -270,7 +403,6 @@ mod tests {
     use tokio::io::{AsyncWriteExt, BufReader};
 
     use crate::auth::AuthHandler;
-    use crate::constants::buffer::COMMAND;
     use crate::metrics::MetricsCollector;
     use crate::pool::BufferPool;
     use crate::protocol::{RequestKind, RequestRouteClass};
@@ -291,6 +423,10 @@ mod tests {
         .build()
     }
 
+    const fn command_line_buf() -> [u8; super::COMMAND_LINE_CAPACITY] {
+        [0; super::COMMAND_LINE_CAPACITY]
+    }
+
     #[tokio::test]
     async fn read_command_batch_preserves_non_utf8_trailing_command_bytes() {
         let session = test_session();
@@ -302,7 +438,7 @@ mod tests {
         drop(client);
 
         let mut reader = BufReader::new(server);
-        let mut command_buf = Vec::with_capacity(COMMAND);
+        let mut command_buf = command_line_buf();
 
         let batch = session
             .read_command_batch(&mut reader, &mut command_buf)
@@ -331,7 +467,7 @@ mod tests {
         drop(client);
 
         let mut reader = BufReader::new(server);
-        let mut command_buf = Vec::with_capacity(COMMAND);
+        let mut command_buf = command_line_buf();
 
         let batch = session
             .read_command_batch(&mut reader, &mut command_buf)
@@ -353,7 +489,7 @@ mod tests {
         drop(client);
 
         let mut reader = BufReader::new(server);
-        let mut command_buf = Vec::with_capacity(COMMAND);
+        let mut command_buf = command_line_buf();
 
         let batch = session
             .read_command_batch(&mut reader, &mut command_buf)
@@ -373,7 +509,7 @@ mod tests {
         drop(client);
 
         let mut reader = BufReader::new(server);
-        let mut command_buf = Vec::with_capacity(COMMAND);
+        let mut command_buf = command_line_buf();
 
         let batch = session
             .read_command_batch(&mut reader, &mut command_buf)
@@ -406,7 +542,7 @@ mod tests {
         drop(client);
 
         let mut reader = BufReader::new(server);
-        let mut command_buf = Vec::with_capacity(COMMAND);
+        let mut command_buf = command_line_buf();
 
         let batch = session
             .read_command_batch(&mut reader, &mut command_buf)
@@ -443,7 +579,7 @@ mod tests {
             .unwrap();
 
         let mut reader = BufReader::new(server);
-        let mut command_buf = Vec::with_capacity(COMMAND);
+        let mut command_buf = command_line_buf();
 
         let first_batch = session
             .read_command_batch(&mut reader, &mut command_buf)
@@ -507,7 +643,7 @@ mod tests {
             .unwrap();
 
         let mut reader = BufReader::new(server);
-        let mut command_buf = Vec::with_capacity(COMMAND);
+        let mut command_buf = command_line_buf();
 
         let first_batch = session
             .read_command_batch(&mut reader, &mut command_buf)
@@ -563,7 +699,7 @@ mod tests {
             .unwrap();
 
         let mut reader = BufReader::new(server);
-        let mut command_buf = Vec::with_capacity(COMMAND);
+        let mut command_buf = command_line_buf();
 
         let first_batch = session
             .read_command_batch(&mut reader, &mut command_buf)

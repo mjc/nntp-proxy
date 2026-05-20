@@ -20,12 +20,7 @@ use crate::test_helpers::{
     MockNntpServer, RfcTestClient, connect_and_read_greeting,
     create_test_server_config_with_max_connections, spawn_proxy_with_config,
 };
-use nntp_proxy::{
-    Config, RoutingMode,
-    config::{BackendSelectionStrategy, Cache},
-};
-
-type RecordedCommandBatches = Arc<tokio::sync::Mutex<Vec<Vec<String>>>>;
+use nntp_proxy::{Config, RoutingMode, config::Cache};
 
 const PIPELINE_COMMON_RESPONSES: &[(&str, &str)] = &[
     ("MODE READER", "200 Posting prohibited\r\n"),
@@ -41,8 +36,8 @@ fn large_body_response(status: &str) -> String {
     response
 }
 
-fn body_backend(port: u16) -> MockNntpServer {
-    MockNntpServer::new(port)
+fn body_backend(_port: u16) -> MockNntpServer {
+    MockNntpServer::new()
         .with_name("BodyBackend")
         .on_command(
             "BODY <present@example.com>",
@@ -193,13 +188,12 @@ fn pipeline_backend_config_with_max_connections(
     name: &str,
     max_connections: usize,
 ) -> Config {
-    let mut server = create_test_server_config_with_max_connections(
+    let server = create_test_server_config_with_max_connections(
         "127.0.0.1",
         backend_port,
         name,
         max_connections,
     );
-    server.pipeline_batch_size = 4;
     Config {
         servers: vec![server],
         ..Default::default()
@@ -217,15 +211,6 @@ fn pipeline_backend_config_with_cache(
         store_article_bodies: true,
         ..Default::default()
     });
-    config
-}
-
-fn multi_backend_pipeline_config(servers: Vec<nntp_proxy::config::Server>) -> Config {
-    let mut config = Config {
-        servers,
-        ..Default::default()
-    };
-    config.routing.backend_selection = BackendSelectionStrategy::WeightedRoundRobin;
     config
 }
 
@@ -489,108 +474,6 @@ fn spawn_reusable_direct_multiline_backend(backend_listener: TcpListener) -> Arc
     connection_count
 }
 
-fn spawn_concurrent_pipeline_backend(
-    backend_listener: TcpListener,
-    delayed_responses: &'static [(&'static str, &'static str)],
-    expected_connections: usize,
-) -> (Arc<AtomicUsize>, RecordedCommandBatches) {
-    let body_connection_count = Arc::new(AtomicUsize::new(0));
-    let batches = Arc::new(tokio::sync::Mutex::new(Vec::<Vec<String>>::new()));
-    let ready_connections = Arc::new(AtomicUsize::new(0));
-    let release_responses = Arc::new(Notify::new());
-    let body_connection_count_for_task = body_connection_count.clone();
-    let batches_for_task = batches.clone();
-    let ready_connections_for_task = ready_connections.clone();
-    let release_responses_for_task = release_responses.clone();
-
-    tokio::spawn(async move {
-        while let Ok((mut stream, _)) = backend_listener.accept().await {
-            let batches_for_connection = batches_for_task.clone();
-            let ready_connections_for_connection = ready_connections_for_task.clone();
-            let release_responses_for_connection = release_responses_for_task.clone();
-            let body_connection_count_for_connection = body_connection_count_for_task.clone();
-
-            tokio::spawn(async move {
-                if stream
-                    .write_all(b"200 ConcurrentBodyPipeline Ready\r\n")
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-
-                let mut pending = Vec::new();
-                let mut delayed = Vec::new();
-                let mut batch_commands = Vec::new();
-                let mut buffer = [0u8; 1024];
-
-                while let Ok(n) = stream.read(&mut buffer).await {
-                    if n == 0 {
-                        break;
-                    }
-                    pending.extend_from_slice(&buffer[..n]);
-
-                    while let Some(line_end) = pending.windows(2).position(|w| w == b"\r\n") {
-                        let line = pending.drain(..line_end + 2).collect::<Vec<_>>();
-                        let command = String::from_utf8_lossy(&line).trim().to_string();
-
-                        if let Some(response) = find_pipeline_response(&command, delayed_responses)
-                        {
-                            batch_commands.push(command);
-                            delayed.push(response);
-
-                            if delayed.len() == delayed_responses.len() / expected_connections {
-                                batches_for_connection
-                                    .lock()
-                                    .await
-                                    .push(batch_commands.clone());
-                                body_connection_count_for_connection.fetch_add(1, Ordering::SeqCst);
-
-                                let ready = ready_connections_for_connection
-                                    .fetch_add(1, Ordering::SeqCst)
-                                    + 1;
-                                if ready.is_multiple_of(expected_connections) {
-                                    release_responses_for_connection.notify_waiters();
-                                } else {
-                                    release_responses_for_connection.notified().await;
-                                }
-
-                                for response in delayed.drain(..) {
-                                    if stream.write_all(response.as_bytes()).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                batch_commands.clear();
-                            }
-                            continue;
-                        }
-
-                        let response = find_pipeline_response(&command, PIPELINE_COMMON_RESPONSES)
-                            .unwrap_or("500 Unexpected command\r\n");
-                        if stream.write_all(response.as_bytes()).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-            });
-        }
-    });
-
-    (body_connection_count, batches)
-}
-
-async fn run_multiline_pipeline_batch(
-    proxy_port: u16,
-    commands: &[&str],
-) -> Result<Vec<(String, Vec<String>)>> {
-    let client = connect_and_read_greeting(proxy_port).await?;
-    let (read_half, mut write_half) = client.into_split();
-    let mut reader = BufReader::new(read_half);
-
-    write_commands(&mut write_half, commands).await?;
-    read_multiline_responses(&mut reader, commands.len()).await
-}
-
 struct BufferedResponseExpectation<'a> {
     command: &'a str,
     status_context: &'a str,
@@ -646,13 +529,82 @@ async fn expect_buffered_until_backend_finishes(
     Ok(())
 }
 
-async fn expect_buffered_until_backend_finishes_with_auth(
+async fn expect_pass_through_borrows_initial_backend_bytes(
+    proxy_port: u16,
+    expectation: BufferedResponseExpectation<'_>,
+    initial_written: Arc<Notify>,
+    release_tx: oneshot::Sender<()>,
+    body_line_in_initial_write: bool,
+) -> Result<()> {
+    let BufferedResponseExpectation {
+        command,
+        status_context,
+        body_context,
+        expected_status,
+        expected_body_line,
+    } = expectation;
+    let client = connect_and_read_greeting(proxy_port).await?;
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    write_commands(&mut write_half, &[command]).await?;
+    initial_written.notified().await;
+
+    assert_eq!(
+        read_line(&mut reader, status_context).await?,
+        expected_status,
+        "{command:?} should forward already-framed status bytes without owning the full response"
+    );
+
+    if body_line_in_initial_write {
+        assert_eq!(
+            read_line(&mut reader, body_context).await?,
+            expected_body_line,
+            "{command:?} should forward already-framed body bytes without owning the full response"
+        );
+    } else {
+        let body_line_result =
+            read_line_with_timeout(&mut reader, body_context, Duration::from_millis(200)).await;
+        assert!(
+            body_line_result.is_err(),
+            "{command:?} must wait for more backend bytes when the current borrowed buffer has no body line"
+        );
+    }
+
+    let terminator_result = read_line_with_timeout(
+        &mut reader,
+        "multiline terminator before backend completion",
+        Duration::from_millis(200),
+    )
+    .await;
+    assert!(
+        terminator_result.is_err(),
+        "{command:?} must not synthesize completion before the backend sends the terminator"
+    );
+
+    let _ = release_tx.send(());
+    if !body_line_in_initial_write {
+        assert_eq!(
+            read_line(&mut reader, body_context).await?,
+            expected_body_line
+        );
+    }
+    assert_eq!(
+        read_line(&mut reader, "multiline terminator").await?,
+        ".\r\n"
+    );
+
+    Ok(())
+}
+
+async fn expect_pass_through_borrows_initial_backend_bytes_with_auth(
     proxy_port: u16,
     expectation: BufferedResponseExpectation<'_>,
     initial_written: Arc<Notify>,
     release_tx: oneshot::Sender<()>,
     username: &str,
     password: &str,
+    body_line_in_initial_write: bool,
 ) -> Result<()> {
     let BufferedResponseExpectation {
         command,
@@ -685,25 +637,42 @@ async fn expect_buffered_until_backend_finishes_with_auth(
     write_commands(&mut write_half, &[command]).await?;
     initial_written.notified().await;
 
-    let status_result =
-        read_line_with_timeout(&mut reader, status_context, Duration::from_millis(200)).await;
-    let body_line_result =
-        read_line_with_timeout(&mut reader, body_context, Duration::from_millis(200)).await;
-
-    assert!(
-        status_result.is_err(),
-        "{command:?} should stay buffered until the backend sends the terminator"
+    assert_eq!(
+        read_line(&mut reader, status_context).await?,
+        expected_status
     );
+    if body_line_in_initial_write {
+        assert_eq!(
+            read_line(&mut reader, body_context).await?,
+            expected_body_line
+        );
+    } else {
+        let body_line_result =
+            read_line_with_timeout(&mut reader, body_context, Duration::from_millis(200)).await;
+        assert!(
+            body_line_result.is_err(),
+            "{command:?} must wait for more backend bytes when the current borrowed buffer has no body line"
+        );
+    }
+
+    let terminator_result = read_line_with_timeout(
+        &mut reader,
+        "multiline terminator before backend completion",
+        Duration::from_millis(200),
+    )
+    .await;
     assert!(
-        body_line_result.is_err(),
-        "{command:?} body bytes should stay buffered until the backend finishes"
+        terminator_result.is_err(),
+        "{command:?} must not synthesize completion before the backend sends the terminator"
     );
 
     let _ = release_tx.send(());
-    let status_line = read_line(&mut reader, status_context).await?;
-    let body_line = read_line(&mut reader, body_context).await?;
-    assert_eq!(status_line, expected_status);
-    assert_eq!(body_line, expected_body_line);
+    if !body_line_in_initial_write {
+        assert_eq!(
+            read_line(&mut reader, body_context).await?,
+            expected_body_line
+        );
+    }
     assert_eq!(
         read_line(&mut reader, "multiline terminator").await?,
         ".\r\n"
@@ -813,6 +782,7 @@ async fn test_article_pipelining_pairs_four_responses_on_single_backend_connecti
     let backend_port = backend_listener.local_addr()?.port();
     let (connection_count, seen_commands) = spawn_delayed_pipeline_backend(
         backend_listener,
+        &[],
         &[
             (
                 "ARTICLE <article-1@example>",
@@ -831,7 +801,6 @@ async fn test_article_pipelining_pairs_four_responses_on_single_backend_connecti
                 "220 4 <article-4@example>\r\narticle-4-line\r\n.\r\n",
             ),
         ],
-        &[],
     );
 
     let proxy_port = spawn_proxy_with_config(
@@ -906,6 +875,7 @@ async fn test_body_pipeline_batch_drains_before_trailing_group_switch() -> Resul
     let backend_port = backend_listener.local_addr()?.port();
     let (_connection_count, seen_commands) = spawn_delayed_pipeline_backend(
         backend_listener,
+        &[],
         &[
             (
                 "BODY <body-1@example>",
@@ -923,8 +893,8 @@ async fn test_body_pipeline_batch_drains_before_trailing_group_switch() -> Resul
                 "BODY <body-4@example>",
                 "222 4 <body-4@example>\r\nbody-4-line\r\n.\r\n",
             ),
+            ("GROUP alt.test", "211 4 1 4 alt.test\r\n"),
         ],
-        &[("GROUP alt.test", "211 4 1 4 alt.test\r\n")],
     );
 
     let proxy_port = spawn_proxy_with_config(
@@ -1330,97 +1300,6 @@ async fn test_hybrid_partial_second_body_burst_resumes_before_trailing_group_swi
 }
 
 #[tokio::test]
-async fn test_body_second_burst_batches_four_commands_on_reused_backend_connection() -> Result<()> {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_port = backend_listener.local_addr()?.port();
-    let (body_connection_count, batches) = spawn_concurrent_pipeline_backend(
-        backend_listener,
-        &[
-            (
-                "BODY <body-1@example>",
-                "222 1 <body-1@example>\r\nbody-1-line\r\n.\r\n",
-            ),
-            (
-                "BODY <body-2@example>",
-                "222 2 <body-2@example>\r\nbody-2-line\r\n.\r\n",
-            ),
-            (
-                "BODY <body-3@example>",
-                "222 3 <body-3@example>\r\nbody-3-line\r\n.\r\n",
-            ),
-            (
-                "BODY <body-4@example>",
-                "222 4 <body-4@example>\r\nbody-4-line\r\n.\r\n",
-            ),
-        ],
-        1,
-    );
-
-    let proxy_port = spawn_proxy_with_config(
-        pipeline_backend_config_with_max_connections(backend_port, "SecondBurstBodyBatching", 1),
-        RoutingMode::PerCommand,
-    )
-    .await?;
-    let commands = &[
-        "BODY <body-1@example>\r\n",
-        "BODY <body-2@example>\r\n",
-        "BODY <body-3@example>\r\n",
-        "BODY <body-4@example>\r\n",
-    ];
-
-    let first_batch = run_multiline_pipeline_batch(proxy_port, commands).await?;
-    let second_batch = run_multiline_pipeline_batch(proxy_port, commands).await?;
-
-    let expected = vec![
-        (
-            "222 1 <body-1@example>\r\n".to_string(),
-            vec!["body-1-line\r\n".to_string()],
-        ),
-        (
-            "222 2 <body-2@example>\r\n".to_string(),
-            vec!["body-2-line\r\n".to_string()],
-        ),
-        (
-            "222 3 <body-3@example>\r\n".to_string(),
-            vec!["body-3-line\r\n".to_string()],
-        ),
-        (
-            "222 4 <body-4@example>\r\n".to_string(),
-            vec!["body-4-line\r\n".to_string()],
-        ),
-    ];
-    assert_eq!(first_batch, expected);
-    assert_eq!(second_batch, expected);
-
-    let recorded_batches = batches.lock().await.clone();
-    assert_eq!(
-        recorded_batches,
-        vec![
-            vec![
-                "BODY <body-1@example>".to_string(),
-                "BODY <body-2@example>".to_string(),
-                "BODY <body-3@example>".to_string(),
-                "BODY <body-4@example>".to_string(),
-            ],
-            vec![
-                "BODY <body-1@example>".to_string(),
-                "BODY <body-2@example>".to_string(),
-                "BODY <body-3@example>".to_string(),
-                "BODY <body-4@example>".to_string(),
-            ],
-        ],
-        "expected the reused backend connection to receive a full four-command BODY batch on the second burst"
-    );
-    assert_eq!(
-        body_connection_count.load(Ordering::SeqCst),
-        2,
-        "expected both bursts to reach the backend as full BODY pipeline batches"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_article_pipelining_reuses_healthy_backend_connection_across_batches() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
@@ -1631,102 +1510,6 @@ async fn test_article_second_burst_drains_before_trailing_group_switch() -> Resu
 }
 
 #[tokio::test]
-async fn test_hybrid_body_second_burst_batches_four_commands_before_stateful_switch() -> Result<()>
-{
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_port = backend_listener.local_addr()?.port();
-    let (body_connection_count, batches) = spawn_concurrent_pipeline_backend(
-        backend_listener,
-        &[
-            (
-                "BODY <body-1@example>",
-                "222 1 <body-1@example>\r\nbody-1-line\r\n.\r\n",
-            ),
-            (
-                "BODY <body-2@example>",
-                "222 2 <body-2@example>\r\nbody-2-line\r\n.\r\n",
-            ),
-            (
-                "BODY <body-3@example>",
-                "222 3 <body-3@example>\r\nbody-3-line\r\n.\r\n",
-            ),
-            (
-                "BODY <body-4@example>",
-                "222 4 <body-4@example>\r\nbody-4-line\r\n.\r\n",
-            ),
-        ],
-        1,
-    );
-
-    let proxy_port = spawn_proxy_with_config(
-        pipeline_backend_config_with_max_connections(
-            backend_port,
-            "HybridSecondBurstBodyBatching",
-            1,
-        ),
-        RoutingMode::Hybrid,
-    )
-    .await?;
-    let commands = &[
-        "BODY <body-1@example>\r\n",
-        "BODY <body-2@example>\r\n",
-        "BODY <body-3@example>\r\n",
-        "BODY <body-4@example>\r\n",
-    ];
-
-    let first_batch = run_multiline_pipeline_batch(proxy_port, commands).await?;
-    let second_batch = run_multiline_pipeline_batch(proxy_port, commands).await?;
-
-    let expected = vec![
-        (
-            "222 1 <body-1@example>\r\n".to_string(),
-            vec!["body-1-line\r\n".to_string()],
-        ),
-        (
-            "222 2 <body-2@example>\r\n".to_string(),
-            vec!["body-2-line\r\n".to_string()],
-        ),
-        (
-            "222 3 <body-3@example>\r\n".to_string(),
-            vec!["body-3-line\r\n".to_string()],
-        ),
-        (
-            "222 4 <body-4@example>\r\n".to_string(),
-            vec!["body-4-line\r\n".to_string()],
-        ),
-    ];
-    assert_eq!(first_batch, expected);
-    assert_eq!(second_batch, expected);
-
-    let recorded_batches = batches.lock().await.clone();
-    assert_eq!(
-        recorded_batches,
-        vec![
-            vec![
-                "BODY <body-1@example>".to_string(),
-                "BODY <body-2@example>".to_string(),
-                "BODY <body-3@example>".to_string(),
-                "BODY <body-4@example>".to_string(),
-            ],
-            vec![
-                "BODY <body-1@example>".to_string(),
-                "BODY <body-2@example>".to_string(),
-                "BODY <body-3@example>".to_string(),
-                "BODY <body-4@example>".to_string(),
-            ],
-        ],
-        "expected hybrid mode to keep batching message-ID BODY second bursts before any stateful switch"
-    );
-    assert_eq!(
-        body_connection_count.load(Ordering::SeqCst),
-        2,
-        "expected both hybrid message-ID bursts to reach the backend as full BODY pipeline batches"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_cached_body_pipeline_buffers_until_backend_finishes() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
@@ -1851,8 +1634,7 @@ async fn test_cached_article_pipeline_buffers_when_first_read_only_has_status_li
 }
 
 #[tokio::test]
-async fn test_per_command_body_pipeline_buffers_until_backend_finishes_without_cache() -> Result<()>
-{
+async fn test_per_command_body_pipeline_borrows_initial_bytes_without_cache() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -1868,7 +1650,7 @@ async fn test_per_command_body_pipeline_buffers_until_backend_finishes_without_c
     )
     .await?;
 
-    expect_buffered_until_backend_finishes(
+    expect_pass_through_borrows_initial_backend_bytes(
         proxy_port,
         BufferedResponseExpectation {
             command: "BODY <plain-body@example>\r\n",
@@ -1879,13 +1661,13 @@ async fn test_per_command_body_pipeline_buffers_until_backend_finishes_without_c
         },
         initial_written,
         release_tx,
+        true,
     )
     .await
 }
 
 #[tokio::test]
-async fn test_per_command_body_pipeline_buffers_when_first_read_only_has_status_line() -> Result<()>
-{
+async fn test_per_command_body_pipeline_borrows_status_then_waits_for_body() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -1901,7 +1683,7 @@ async fn test_per_command_body_pipeline_buffers_when_first_read_only_has_status_
     )
     .await?;
 
-    expect_buffered_until_backend_finishes(
+    expect_pass_through_borrows_initial_backend_bytes(
         proxy_port,
         BufferedResponseExpectation {
             command: "BODY <status-only-body@example>\r\n",
@@ -1912,13 +1694,13 @@ async fn test_per_command_body_pipeline_buffers_when_first_read_only_has_status_
         },
         initial_written,
         release_tx,
+        false,
     )
     .await
 }
 
 #[tokio::test]
-async fn test_per_command_article_pipeline_buffers_until_backend_finishes_without_cache()
--> Result<()> {
+async fn test_per_command_article_pipeline_borrows_initial_bytes_without_cache() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -1934,7 +1716,7 @@ async fn test_per_command_article_pipeline_buffers_until_backend_finishes_withou
     )
     .await?;
 
-    expect_buffered_until_backend_finishes(
+    expect_pass_through_borrows_initial_backend_bytes(
         proxy_port,
         BufferedResponseExpectation {
             command: "ARTICLE <plain-article@example>\r\n",
@@ -1945,13 +1727,13 @@ async fn test_per_command_article_pipeline_buffers_until_backend_finishes_withou
         },
         initial_written,
         release_tx,
+        true,
     )
     .await
 }
 
 #[tokio::test]
-async fn test_per_command_article_pipeline_buffers_when_first_read_only_has_status_line()
--> Result<()> {
+async fn test_per_command_article_pipeline_borrows_status_then_waits_for_body() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -1967,7 +1749,7 @@ async fn test_per_command_article_pipeline_buffers_when_first_read_only_has_stat
     )
     .await?;
 
-    expect_buffered_until_backend_finishes(
+    expect_pass_through_borrows_initial_backend_bytes(
         proxy_port,
         BufferedResponseExpectation {
             command: "ARTICLE <status-only-article@example>\r\n",
@@ -1978,13 +1760,13 @@ async fn test_per_command_article_pipeline_buffers_when_first_read_only_has_stat
         },
         initial_written,
         release_tx,
+        false,
     )
     .await
 }
 
 #[tokio::test]
-async fn test_hybrid_body_message_id_buffers_until_backend_finishes_before_stateful_switch()
--> Result<()> {
+async fn test_hybrid_body_message_id_borrows_initial_bytes_before_stateful_switch() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -2000,7 +1782,7 @@ async fn test_hybrid_body_message_id_buffers_until_backend_finishes_before_state
     )
     .await?;
 
-    expect_buffered_until_backend_finishes(
+    expect_pass_through_borrows_initial_backend_bytes(
         proxy_port,
         BufferedResponseExpectation {
             command: "BODY <hybrid-body@example>\r\n",
@@ -2011,12 +1793,13 @@ async fn test_hybrid_body_message_id_buffers_until_backend_finishes_before_state
         },
         initial_written,
         release_tx,
+        true,
     )
     .await
 }
 
 #[tokio::test]
-async fn test_hybrid_body_message_id_buffers_when_first_read_only_has_status_line() -> Result<()> {
+async fn test_hybrid_body_message_id_borrows_status_then_waits_for_body() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -2032,7 +1815,7 @@ async fn test_hybrid_body_message_id_buffers_when_first_read_only_has_status_lin
     )
     .await?;
 
-    expect_buffered_until_backend_finishes(
+    expect_pass_through_borrows_initial_backend_bytes(
         proxy_port,
         BufferedResponseExpectation {
             command: "BODY <hybrid-status-only-body@example>\r\n",
@@ -2043,13 +1826,14 @@ async fn test_hybrid_body_message_id_buffers_when_first_read_only_has_status_lin
         },
         initial_written,
         release_tx,
+        false,
     )
     .await
 }
 
 #[tokio::test]
-async fn test_hybrid_article_message_id_buffers_until_backend_finishes_before_stateful_switch()
--> Result<()> {
+async fn test_hybrid_article_message_id_borrows_initial_bytes_before_stateful_switch() -> Result<()>
+{
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -2065,7 +1849,7 @@ async fn test_hybrid_article_message_id_buffers_until_backend_finishes_before_st
     )
     .await?;
 
-    expect_buffered_until_backend_finishes(
+    expect_pass_through_borrows_initial_backend_bytes(
         proxy_port,
         BufferedResponseExpectation {
             command: "ARTICLE <hybrid-article@example>\r\n",
@@ -2076,13 +1860,13 @@ async fn test_hybrid_article_message_id_buffers_until_backend_finishes_before_st
         },
         initial_written,
         release_tx,
+        true,
     )
     .await
 }
 
 #[tokio::test]
-async fn test_hybrid_article_message_id_buffers_when_first_read_only_has_status_line() -> Result<()>
-{
+async fn test_hybrid_article_message_id_borrows_status_then_waits_for_body() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
     let (initial_written, release_tx) = spawn_gated_multiline_backend(
@@ -2098,7 +1882,7 @@ async fn test_hybrid_article_message_id_buffers_when_first_read_only_has_status_
     )
     .await?;
 
-    expect_buffered_until_backend_finishes(
+    expect_pass_through_borrows_initial_backend_bytes(
         proxy_port,
         BufferedResponseExpectation {
             command: "ARTICLE <hybrid-status-only-article@example>\r\n",
@@ -2109,6 +1893,7 @@ async fn test_hybrid_article_message_id_buffers_when_first_read_only_has_status_
         },
         initial_written,
         release_tx,
+        false,
     )
     .await
 }
@@ -2150,7 +1935,7 @@ async fn test_per_command_direct_body_retires_connection_after_packed_stale_resp
 }
 
 #[tokio::test]
-async fn test_per_command_body_pipeline_buffers_when_first_read_only_has_status_line_with_client_auth()
+async fn test_per_command_body_pipeline_borrows_status_then_waits_for_body_with_client_auth()
 -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
@@ -2171,7 +1956,7 @@ async fn test_per_command_body_pipeline_buffers_when_first_read_only_has_status_
     };
 
     let proxy_port = spawn_proxy_with_config(config, RoutingMode::PerCommand).await?;
-    expect_buffered_until_backend_finishes_with_auth(
+    expect_pass_through_borrows_initial_backend_bytes_with_auth(
         proxy_port,
         BufferedResponseExpectation {
             command: "BODY <auth-status-only-body@example>\r\n",
@@ -2184,12 +1969,13 @@ async fn test_per_command_body_pipeline_buffers_when_first_read_only_has_status_
         release_tx,
         "test-user",
         "test-pass",
+        false,
     )
     .await
 }
 
 #[tokio::test]
-async fn test_per_command_article_pipeline_buffers_when_first_read_only_has_status_line_with_client_auth()
+async fn test_per_command_article_pipeline_borrows_status_then_waits_for_body_with_client_auth()
 -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
@@ -2210,7 +1996,7 @@ async fn test_per_command_article_pipeline_buffers_when_first_read_only_has_stat
     };
 
     let proxy_port = spawn_proxy_with_config(config, RoutingMode::PerCommand).await?;
-    expect_buffered_until_backend_finishes_with_auth(
+    expect_pass_through_borrows_initial_backend_bytes_with_auth(
         proxy_port,
         BufferedResponseExpectation {
             command: "ARTICLE <auth-status-only-article@example>\r\n",
@@ -2223,6 +2009,7 @@ async fn test_per_command_article_pipeline_buffers_when_first_read_only_has_stat
         release_tx,
         "test-user",
         "test-pass",
+        false,
     )
     .await
 }
@@ -2351,513 +2138,6 @@ async fn test_per_command_direct_body_reuses_backend_connection_after_buffered_c
         connection_count.load(Ordering::SeqCst),
         1,
         "authenticated buffered direct BODY completions should still reuse the same clean backend connection"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_body_pipelining_uses_multiple_backend_connections_for_concurrent_clients()
--> Result<()> {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_port = backend_listener.local_addr()?.port();
-    let (body_connection_count, batches) = spawn_concurrent_pipeline_backend(
-        backend_listener,
-        &[
-            (
-                "BODY <client-a-1@example>",
-                "222 1 <client-a-1@example>\r\nclient-a-1-line\r\n.\r\n",
-            ),
-            (
-                "BODY <client-a-2@example>",
-                "222 2 <client-a-2@example>\r\nclient-a-2-line\r\n.\r\n",
-            ),
-            (
-                "BODY <client-a-3@example>",
-                "222 3 <client-a-3@example>\r\nclient-a-3-line\r\n.\r\n",
-            ),
-            (
-                "BODY <client-a-4@example>",
-                "222 4 <client-a-4@example>\r\nclient-a-4-line\r\n.\r\n",
-            ),
-            (
-                "BODY <client-b-1@example>",
-                "222 1 <client-b-1@example>\r\nclient-b-1-line\r\n.\r\n",
-            ),
-            (
-                "BODY <client-b-2@example>",
-                "222 2 <client-b-2@example>\r\nclient-b-2-line\r\n.\r\n",
-            ),
-            (
-                "BODY <client-b-3@example>",
-                "222 3 <client-b-3@example>\r\nclient-b-3-line\r\n.\r\n",
-            ),
-            (
-                "BODY <client-b-4@example>",
-                "222 4 <client-b-4@example>\r\nclient-b-4-line\r\n.\r\n",
-            ),
-        ],
-        2,
-    );
-
-    let proxy_port = spawn_proxy_with_config(
-        pipeline_backend_config_with_max_connections(backend_port, "ConcurrentBodyPipeline", 4),
-        RoutingMode::PerCommand,
-    )
-    .await?;
-
-    let client_a_commands = &[
-        "BODY <client-a-1@example>\r\n",
-        "BODY <client-a-2@example>\r\n",
-        "BODY <client-a-3@example>\r\n",
-        "BODY <client-a-4@example>\r\n",
-    ];
-    let client_b_commands = &[
-        "BODY <client-b-1@example>\r\n",
-        "BODY <client-b-2@example>\r\n",
-        "BODY <client-b-3@example>\r\n",
-        "BODY <client-b-4@example>\r\n",
-    ];
-
-    let (client_a_responses, client_b_responses) = timeout(Duration::from_secs(5), async {
-        tokio::try_join!(
-            run_multiline_pipeline_batch(proxy_port, client_a_commands),
-            run_multiline_pipeline_batch(proxy_port, client_b_commands),
-        )
-    })
-    .await??;
-
-    assert_eq!(
-        client_a_responses,
-        vec![
-            (
-                "222 1 <client-a-1@example>\r\n".to_string(),
-                vec!["client-a-1-line\r\n".to_string()],
-            ),
-            (
-                "222 2 <client-a-2@example>\r\n".to_string(),
-                vec!["client-a-2-line\r\n".to_string()],
-            ),
-            (
-                "222 3 <client-a-3@example>\r\n".to_string(),
-                vec!["client-a-3-line\r\n".to_string()],
-            ),
-            (
-                "222 4 <client-a-4@example>\r\n".to_string(),
-                vec!["client-a-4-line\r\n".to_string()],
-            ),
-        ]
-    );
-    assert_eq!(
-        client_b_responses,
-        vec![
-            (
-                "222 1 <client-b-1@example>\r\n".to_string(),
-                vec!["client-b-1-line\r\n".to_string()],
-            ),
-            (
-                "222 2 <client-b-2@example>\r\n".to_string(),
-                vec!["client-b-2-line\r\n".to_string()],
-            ),
-            (
-                "222 3 <client-b-3@example>\r\n".to_string(),
-                vec!["client-b-3-line\r\n".to_string()],
-            ),
-            (
-                "222 4 <client-b-4@example>\r\n".to_string(),
-                vec!["client-b-4-line\r\n".to_string()],
-            ),
-        ]
-    );
-
-    let mut seen_batches = batches.lock().await.clone();
-    seen_batches.sort();
-    assert_eq!(
-        seen_batches,
-        vec![
-            vec![
-                "BODY <client-a-1@example>".to_string(),
-                "BODY <client-a-2@example>".to_string(),
-                "BODY <client-a-3@example>".to_string(),
-                "BODY <client-a-4@example>".to_string(),
-            ],
-            vec![
-                "BODY <client-b-1@example>".to_string(),
-                "BODY <client-b-2@example>".to_string(),
-                "BODY <client-b-3@example>".to_string(),
-                "BODY <client-b-4@example>".to_string(),
-            ],
-        ]
-    );
-    assert_eq!(
-        body_connection_count.load(Ordering::SeqCst),
-        2,
-        "expected concurrent healthy BODY clients to reach two backend pipeline connections"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_body_pipelining_keeps_two_clients_ordered_on_one_backend_connection() -> Result<()> {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_port = backend_listener.local_addr()?.port();
-    let (body_connection_count, batches) = spawn_concurrent_pipeline_backend(
-        backend_listener,
-        &[
-            (
-                "BODY <client-a@example>",
-                "222 1 <client-a@example>\r\nclient-a-line\r\n.\r\n",
-            ),
-            (
-                "BODY <client-b@example>",
-                "222 2 <client-b@example>\r\nclient-b-line\r\n.\r\n",
-            ),
-        ],
-        1,
-    );
-
-    let proxy_port = spawn_proxy_with_config(
-        pipeline_backend_config_with_max_connections(backend_port, "SingleConnConcurrentBody", 1),
-        RoutingMode::PerCommand,
-    )
-    .await?;
-
-    let client_a = connect_and_read_greeting(proxy_port).await?;
-    let (read_half_a, mut write_half_a) = client_a.into_split();
-    let mut reader_a = BufReader::new(read_half_a);
-
-    let client_b = connect_and_read_greeting(proxy_port).await?;
-    let (read_half_b, mut write_half_b) = client_b.into_split();
-    let mut reader_b = BufReader::new(read_half_b);
-
-    tokio::try_join!(
-        write_commands(&mut write_half_a, &["BODY <client-a@example>\r\n"]),
-        write_commands(&mut write_half_b, &["BODY <client-b@example>\r\n"]),
-    )?;
-
-    let ((status_a, lines_a), (status_b, lines_b)) = tokio::try_join!(
-        read_multiline_response(&mut reader_a),
-        read_multiline_response(&mut reader_b),
-    )?;
-
-    assert_eq!(status_a, "222 1 <client-a@example>\r\n");
-    assert_eq!(lines_a, vec!["client-a-line\r\n".to_string()]);
-    assert_eq!(status_b, "222 2 <client-b@example>\r\n");
-    assert_eq!(lines_b, vec!["client-b-line\r\n".to_string()]);
-
-    let recorded_batches = batches.lock().await.clone();
-    assert_eq!(
-        recorded_batches,
-        vec![vec![
-            "BODY <client-a@example>".to_string(),
-            "BODY <client-b@example>".to_string(),
-        ]],
-        "expected both clients' BODY requests to share one backend pipeline batch"
-    );
-    assert_eq!(
-        body_connection_count.load(Ordering::SeqCst),
-        1,
-        "expected both clients to share one backend connection"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_body_client_disconnect_does_not_poison_other_client_on_shared_backend_connection()
--> Result<()> {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_port = backend_listener.local_addr()?.port();
-    let (body_connection_count, batches) = spawn_concurrent_pipeline_backend(
-        backend_listener,
-        &[
-            (
-                "BODY <client-a@example>",
-                "222 1 <client-a@example>\r\nclient-a-line\r\n.\r\n",
-            ),
-            (
-                "BODY <client-b@example>",
-                "222 2 <client-b@example>\r\nclient-b-line\r\n.\r\n",
-            ),
-        ],
-        1,
-    );
-
-    let proxy_port = spawn_proxy_with_config(
-        pipeline_backend_config_with_max_connections(
-            backend_port,
-            "DisconnectSharedBodyPipeline",
-            1,
-        ),
-        RoutingMode::PerCommand,
-    )
-    .await?;
-
-    let client_a = connect_and_read_greeting(proxy_port).await?;
-    let (read_half_a, mut write_half_a) = client_a.into_split();
-    let _reader_a = BufReader::new(read_half_a);
-
-    let client_b = connect_and_read_greeting(proxy_port).await?;
-    let (read_half_b, mut write_half_b) = client_b.into_split();
-    let mut reader_b = BufReader::new(read_half_b);
-
-    tokio::try_join!(
-        write_commands(&mut write_half_a, &["BODY <client-a@example>\r\n"]),
-        write_commands(&mut write_half_b, &["BODY <client-b@example>\r\n"]),
-    )?;
-
-    drop(write_half_a);
-
-    let (status_b, lines_b) = read_multiline_response(&mut reader_b).await?;
-
-    assert_eq!(status_b, "222 2 <client-b@example>\r\n");
-    assert_eq!(lines_b, vec!["client-b-line\r\n".to_string()]);
-
-    let recorded_batches = batches.lock().await.clone();
-    assert_eq!(
-        recorded_batches,
-        vec![vec![
-            "BODY <client-a@example>".to_string(),
-            "BODY <client-b@example>".to_string(),
-        ]],
-        "expected the disconnecting client and surviving client to share one backend pipeline batch"
-    );
-    assert_eq!(
-        body_connection_count.load(Ordering::SeqCst),
-        1,
-        "expected the surviving client to complete on the shared backend connection"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_article_client_disconnect_does_not_poison_other_client_on_shared_backend_connection()
--> Result<()> {
-    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_port = backend_listener.local_addr()?.port();
-    let (article_connection_count, batches) = spawn_concurrent_pipeline_backend(
-        backend_listener,
-        &[
-            (
-                "ARTICLE <client-a@example>",
-                "220 1 <client-a@example>\r\nclient-a-line\r\n.\r\n",
-            ),
-            (
-                "ARTICLE <client-b@example>",
-                "220 2 <client-b@example>\r\nclient-b-line\r\n.\r\n",
-            ),
-        ],
-        1,
-    );
-
-    let proxy_port = spawn_proxy_with_config(
-        pipeline_backend_config_with_max_connections(
-            backend_port,
-            "DisconnectSharedArticlePipeline",
-            1,
-        ),
-        RoutingMode::PerCommand,
-    )
-    .await?;
-
-    let client_a = connect_and_read_greeting(proxy_port).await?;
-    let (read_half_a, mut write_half_a) = client_a.into_split();
-    let _reader_a = BufReader::new(read_half_a);
-
-    let client_b = connect_and_read_greeting(proxy_port).await?;
-    let (read_half_b, mut write_half_b) = client_b.into_split();
-    let mut reader_b = BufReader::new(read_half_b);
-
-    tokio::try_join!(
-        write_commands(&mut write_half_a, &["ARTICLE <client-a@example>\r\n"]),
-        write_commands(&mut write_half_b, &["ARTICLE <client-b@example>\r\n"]),
-    )?;
-
-    drop(write_half_a);
-
-    let (status_b, lines_b) = read_multiline_response(&mut reader_b).await?;
-
-    assert_eq!(status_b, "220 2 <client-b@example>\r\n");
-    assert_eq!(lines_b, vec!["client-b-line\r\n".to_string()]);
-
-    let recorded_batches = batches.lock().await.clone();
-    assert_eq!(
-        recorded_batches,
-        vec![vec![
-            "ARTICLE <client-a@example>".to_string(),
-            "ARTICLE <client-b@example>".to_string(),
-        ]],
-        "expected the disconnecting ARTICLE client and surviving client to share one backend pipeline batch"
-    );
-    assert_eq!(
-        article_connection_count.load(Ordering::SeqCst),
-        1,
-        "expected the surviving ARTICLE client to complete on the shared backend connection"
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_body_430_retry_keeps_later_buffered_response_in_order() -> Result<()> {
-    let backend_a = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_a_port = backend_a.local_addr()?.port();
-    let backend_b = TcpListener::bind("127.0.0.1:0").await?;
-    let backend_b_port = backend_b.local_addr()?.port();
-
-    tokio::spawn(async move {
-        while let Ok((mut stream, _)) = backend_a.accept().await {
-            if stream
-                .write_all(b"200 RetryBackendA Ready\r\n")
-                .await
-                .is_err()
-            {
-                continue;
-            }
-
-            let mut pending = Vec::new();
-            let mut buffer = [0u8; 1024];
-            while let Ok(n) = stream.read(&mut buffer).await {
-                if n == 0 {
-                    break;
-                }
-                pending.extend_from_slice(&buffer[..n]);
-
-                while let Some(line_end) = pending.windows(2).position(|w| w == b"\r\n") {
-                    let line = pending.drain(..line_end + 2).collect::<Vec<_>>();
-                    let command = String::from_utf8_lossy(&line).trim().to_string();
-
-                    if let Some(response) =
-                        find_pipeline_response(&command, PIPELINE_COMMON_RESPONSES)
-                    {
-                        if stream.write_all(response.as_bytes()).await.is_err() {
-                            break;
-                        }
-                        continue;
-                    }
-
-                    let response = match command.as_str() {
-                        "BODY <retry@example>" => "430 No such article\r\n",
-                        _ => "500 Unexpected command\r\n",
-                    };
-                    if stream.write_all(response.as_bytes()).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    tokio::spawn(async move {
-        while let Ok((mut stream, _)) = backend_b.accept().await {
-            if stream
-                .write_all(b"200 RetryBackendB Ready\r\n")
-                .await
-                .is_err()
-            {
-                continue;
-            }
-
-            let mut pending = Vec::new();
-            let mut buffer = [0u8; 1024];
-            let mut retry_seen = false;
-            let mut later_seen = false;
-
-            while let Ok(n) = stream.read(&mut buffer).await {
-                if n == 0 {
-                    break;
-                }
-                pending.extend_from_slice(&buffer[..n]);
-
-                while let Some(line_end) = pending.windows(2).position(|w| w == b"\r\n") {
-                    let line = pending.drain(..line_end + 2).collect::<Vec<_>>();
-                    let command = String::from_utf8_lossy(&line).trim().to_string();
-
-                    if let Some(response) =
-                        find_pipeline_response(&command, PIPELINE_COMMON_RESPONSES)
-                    {
-                        if stream.write_all(response.as_bytes()).await.is_err() {
-                            break;
-                        }
-                        continue;
-                    }
-
-                    match command.as_str() {
-                        "BODY <later@example>" => {
-                            later_seen = true;
-                            if stream
-                                .write_all(b"222 0 <later@example>\r\nlater-line\r\n.\r\n")
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                            if retry_seen
-                                && stream
-                                    .write_all(b"222 0 <retry@example>\r\nretry-line\r\n.\r\n")
-                                    .await
-                                    .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        "BODY <retry@example>" => {
-                            retry_seen = true;
-                            if later_seen
-                                && stream
-                                    .write_all(b"222 0 <retry@example>\r\nretry-line\r\n.\r\n")
-                                    .await
-                                    .is_err()
-                            {
-                                break;
-                            }
-                        }
-                        _ => {
-                            if stream
-                                .write_all(b"500 Unexpected command\r\n")
-                                .await
-                                .is_err()
-                            {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    });
-
-    let server_a =
-        create_test_server_config_with_max_connections("127.0.0.1", backend_a_port, "RetryA", 1);
-    let server_b =
-        create_test_server_config_with_max_connections("127.0.0.1", backend_b_port, "RetryB", 1);
-    let proxy_port = spawn_proxy_with_config(
-        multi_backend_pipeline_config(vec![server_a, server_b]),
-        RoutingMode::PerCommand,
-    )
-    .await?;
-
-    let responses = run_multiline_pipeline_batch(
-        proxy_port,
-        &["BODY <retry@example>\r\n", "BODY <later@example>\r\n"],
-    )
-    .await?;
-
-    assert_eq!(
-        responses,
-        vec![
-            (
-                "222 0 <retry@example>\r\n".to_string(),
-                vec!["retry-line\r\n".to_string()],
-            ),
-            (
-                "222 0 <later@example>\r\n".to_string(),
-                vec!["later-line\r\n".to_string()],
-            ),
-        ],
-        "later queued BODY response must not overtake the first request after a 430 retry"
     );
 
     Ok(())

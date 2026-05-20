@@ -3,9 +3,41 @@
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::UiMode;
+
+#[cfg(feature = "tokio-console")]
+fn tokio_console_enabled() -> bool {
+    std::env::var_os("NNTP_PROXY_TOKIO_CONSOLE").is_some_and(|value| value != "0")
+}
+
+#[cfg(feature = "tokio-console")]
+fn tokio_console_layer<S>() -> Option<Box<dyn Layer<S> + Send + Sync + 'static>>
+where
+    S: tracing::Subscriber,
+    S: for<'span> LookupSpan<'span>,
+{
+    tokio_console_enabled().then(|| {
+        eprintln!(
+            "tokio-console enabled; console-subscriber environment controls its bind address"
+        );
+        console_subscriber::ConsoleLayer::builder()
+            .with_default_env()
+            .spawn()
+            .boxed()
+    })
+}
+
+#[cfg(not(feature = "tokio-console"))]
+fn tokio_console_layer<S>() -> Option<Box<dyn Layer<S> + Send + Sync + 'static>>
+where
+    S: tracing::Subscriber,
+    S: for<'span> LookupSpan<'span>,
+{
+    None
+}
 
 fn env_filter() -> tracing_subscriber::EnvFilter {
     tracing_subscriber::EnvFilter::try_from_default_env()
@@ -55,11 +87,13 @@ fn leak_guard(guard: WorkerGuard) {
 fn init_headless_subscriber(capture_in_memory_logs: bool) -> Option<crate::tui::LogBuffer> {
     let log_buffer = capture_in_memory_logs.then(crate::tui::LogBuffer::new);
 
-    let subscriber = tracing_subscriber::registry().with(
-        tracing_subscriber::fmt::layer()
-            .with_writer(|| std::io::LineWriter::new(std::io::stdout()))
-            .with_filter(env_filter()),
-    );
+    let subscriber = tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(|| std::io::LineWriter::new(std::io::stdout()))
+                .with_filter(env_filter()),
+        )
+        .with(tokio_console_layer());
 
     match log_buffer.clone() {
         Some(log_buffer) => subscriber
@@ -88,6 +122,7 @@ fn init_tui_subscriber(
             let log_buffer = crate::tui::LogBuffer::new();
             let (debug_log, guard) = debug_log_writer();
             tracing_subscriber::registry()
+                .with(tokio_console_layer())
                 .with(
                     tracing_subscriber::fmt::layer()
                         .with_writer(crate::tui::LogMakeWriter::new(log_buffer.clone()))
@@ -109,6 +144,7 @@ fn init_tui_subscriber(
         (true, false) => {
             let log_buffer = crate::tui::LogBuffer::new();
             tracing_subscriber::registry()
+                .with(tokio_console_layer())
                 .with(
                     tracing_subscriber::fmt::layer()
                         .with_writer(crate::tui::LogMakeWriter::new(log_buffer.clone()))
@@ -123,6 +159,7 @@ fn init_tui_subscriber(
         (false, true) => {
             let (debug_log, guard) = debug_log_writer();
             tracing_subscriber::registry()
+                .with(tokio_console_layer())
                 .with(
                     tracing_subscriber::fmt::layer()
                         .with_writer(debug_log)
@@ -134,7 +171,9 @@ fn init_tui_subscriber(
             None
         }
         (false, false) => {
-            tracing_subscriber::registry().init();
+            tracing_subscriber::registry()
+                .with(tokio_console_layer())
+                .init();
             None
         }
     }

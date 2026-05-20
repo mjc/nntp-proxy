@@ -9,8 +9,8 @@ use crate::test_helpers::{MockNntpServer, RfcTestClient};
 
 #[tokio::test]
 async fn test_xover_multiline_terminator() -> Result<()> {
-    let mut client = RfcTestClient::spawn(RoutingMode::Stateful, "xover-backend", |port| {
-        MockNntpServer::new(port)
+    let mut client = RfcTestClient::spawn(RoutingMode::Stateful, "xover-backend", |_port| {
+        MockNntpServer::new()
             .with_name("XoverBackend")
             .on_command("GROUP", "211 100 1 100 alt.test\r\n")
             .on_command(

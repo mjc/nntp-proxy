@@ -445,10 +445,9 @@ async fn test_precheck_metadata_only_then_article_request() -> Result<()> {
     let cached = cache.get(&msg_id).await.expect("Should have article");
     assert!(cached.is_complete_article());
     assert_eq!(cached.status_code().as_u16(), 220);
-    assert!(
-        article_response_bytes(&cached, RequestKind::Article, &msg_id)
-            .unwrap()
-            .ends_with(b".\r\n")
+    assert_eq!(
+        article_response_bytes(&cached, RequestKind::Article, &msg_id).unwrap(),
+        real_article
     );
 
     Ok(())

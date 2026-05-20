@@ -68,12 +68,13 @@ impl From<anyhow::Error> for SessionError {
 }
 
 /// Convert buffered-response errors to `SessionError`, preserving the disconnect signal.
-impl From<crate::session::response_buffer::StreamingError> for SessionError {
-    fn from(e: crate::session::response_buffer::StreamingError) -> Self {
+impl From<crate::session::response_buffer::ResponseTransferError> for SessionError {
+    fn from(e: crate::session::response_buffer::ResponseTransferError) -> Self {
         match e {
-            crate::session::response_buffer::StreamingError::ClientDisconnect(io_err) => {
-                Self::ClientDisconnect(io_err)
-            }
+            crate::session::response_buffer::ResponseTransferError::ClientDisconnect(io_err)
+            | crate::session::response_buffer::ResponseTransferError::ClientDisconnectBeforeResponseComplete(
+                io_err,
+            ) => Self::ClientDisconnect(io_err),
             other => Self::Backend(other.into_anyhow()),
         }
     }
@@ -112,21 +113,22 @@ mod tests {
     }
 
     #[test]
-    fn client_disconnect_from_streaming_error() {
+    fn client_disconnect_from_response_transfer_error() {
         let io_err = std::io::Error::from(ErrorKind::BrokenPipe);
-        let streaming_err =
-            crate::session::response_buffer::StreamingError::ClientDisconnect(io_err);
-        let e = SessionError::from(streaming_err);
+        let response_transfer_err =
+            crate::session::response_buffer::ResponseTransferError::ClientDisconnect(io_err);
+        let e = SessionError::from(response_transfer_err);
         assert!(matches!(e, SessionError::ClientDisconnect(_)));
     }
 
     #[test]
-    fn backend_from_streaming_backend_eof() {
-        let streaming_err = crate::session::response_buffer::StreamingError::BackendEof {
-            backend_id: crate::types::BackendId::from_index(0),
-            bytes_received: 100,
-        };
-        let e = SessionError::from(streaming_err);
+    fn backend_from_response_transfer_backend_eof() {
+        let response_transfer_err =
+            crate::session::response_buffer::ResponseTransferError::BackendEof {
+                backend_id: crate::types::BackendId::from_index(0),
+                bytes_received: 100,
+            };
+        let e = SessionError::from(response_transfer_err);
         assert!(matches!(e, SessionError::Backend(_)));
     }
 }

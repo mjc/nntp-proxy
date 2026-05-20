@@ -49,7 +49,7 @@ pub mod buffer {
 
     /// Size of each capture buffer (1 MiB, page-aligned).
     ///
-    /// Sized to capture typical articles and direct leftover tracking without
+    /// Sized to capture typical articles and direct pending-byte tracking without
     /// immediate growth or fallback allocations.
     pub const CAPTURE: usize = 1024 * 1024;
 
@@ -60,20 +60,28 @@ pub mod buffer {
     /// This is a conservative default; increase via config for higher caching throughput.
     pub const CAPTURE_COUNT: usize = 16;
 
-    /// `BufReader` capacity for client command parsing (64KB)
-    /// Large enough to handle any NNTP command line without multiple reads
-    /// Sized for efficient line-based reading with minimal syscalls
-    pub const READER_CAPACITY: usize = 64 * 1024;
-
     // Command and response limits
 
     /// Maximum command line size (512 bytes)
     /// NNTP commands are typically small: "ARTICLE <msgid@example.com>"
     pub const COMMAND: usize = 512;
 
+    /// `BufReader` capacity for client command parsing.
+    ///
+    /// NNTP command lines are capped at 512 bytes. This holds a full 16-command
+    /// pipeline batch without giving every client a 64KB read buffer.
+    pub const READER_CAPACITY: usize = COMMAND * 16;
+
     /// Maximum size for a single response (2MB)
     /// Increased to handle larger articles, prevents memory exhaustion
     pub const RESPONSE_MAX: usize = 2 * 1024 * 1024;
+
+    /// Maximum pending bytes kept on a pooled backend connection.
+    ///
+    /// Larger queues indicate protocol desynchronization or unsolicited extra
+    /// responses, so the connection should be retired instead of buffering
+    /// unbounded data.
+    pub const MAX_PENDING_BACKEND_BYTES: usize = 128 * 1024;
 
     /// Initial capacity for response accumulation buffers (8KB, page-aligned)
     /// Sized for typical status lines and small responses
@@ -85,14 +93,6 @@ pub mod buffer {
     /// Matches POOL size so the first direct backend read and follow-on reads
     /// use the same pooled allocation size.
     pub const STREAM_CHUNK: usize = 1024 * 1024;
-
-    /// Maximum leftover bytes between pipelined responses.
-    ///
-    /// Leftover is a suffix of one TCP read, so normally bounded by buffer
-    /// capacity. This limit catches protocol desync where a backend sends
-    /// unexpected extra data after terminators. 128KB is generous — normal
-    /// leftover is under 8KB.
-    pub const MAX_LEFTOVER_BYTES: usize = 128 * 1024;
 
     // Compile-time validation
 
@@ -214,15 +214,6 @@ pub mod pool {
     pub const HEALTH_CHECK_POOL_TIMEOUT_MS: u64 = 100;
 }
 
-/// Per-command routing constants
-pub mod per_command_routing {
-    /// Number of chunks to read ahead when checking for response terminator
-    pub const TERMINATOR_LOOKAHEAD_CHUNKS: usize = 4;
-
-    /// Maximum number of bytes to check for spanning terminator
-    pub const MAX_TERMINATOR_SPAN_CHECK: usize = 9;
-}
-
 /// Session and metrics constants
 pub mod session {
     /// Flush incremental metrics every N commands for long-running sessions
@@ -265,7 +256,7 @@ const _: () = {
     // Buffer size relationships
     assert!(buffer::POOL == 1024 * 1024);
     assert!(buffer::READER_CAPACITY >= buffer::COMMAND);
-    assert!(buffer::READER_CAPACITY == 64 * 1024);
+    assert!(buffer::READER_CAPACITY == buffer::COMMAND * 16);
     assert!(buffer::RESPONSE_MAX > buffer::POOL);
     assert!(buffer::RESPONSE_INITIAL >= buffer::COMMAND);
     assert!(buffer::RESPONSE_MAX > buffer::RESPONSE_INITIAL);

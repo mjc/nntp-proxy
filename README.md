@@ -11,9 +11,10 @@ TLS, cache behavior, and live metrics in one place.
 - Per-backend TLS, backend authentication, connection limits, keep-alives, and tiering.
 - Plain NNTP listener only for clients; intended for trusted LAN/VPN/segmented-network deployment rather than direct internet exposure.
 - Optional article-body caching plus lightweight availability tracking.
-- Availability-only cache mode by default, so smart routing works without storing article bodies.
+- Backend availability is tracked when the configured cache capacity can hold the fixed availability index; `[cache].store_article_bodies` is false by default and only controls whether full article bodies are cached too.
 - RAM article-cache hits measured 5.16 GB/s on a Ryzen 9 5950X.
 - A hot-cache path with a 256 MB in-memory article cache and disk cache on SSD measured 2.58 GB/s on the same system.
+- Current 100GB cache-miss spot checks average 3791.23 MiB/s at `1/1/1` and 8336.03 MiB/s at `4/8/8` on the same system.
 - Allocation-conscious hot paths: borrowed request slices, preallocated buffer pools, and allocation-free cache key lookup in the steady state.
 - Optional terminal dashboard with persisted metrics across restarts.
 - TOML config, environment-based backend configuration, and CLI overrides.
@@ -150,7 +151,6 @@ capture_pool_count = 16
 article_cache_capacity = "256mb"
 article_cache_ttl_secs = 3600
 store_article_bodies = true
-# availability_index_path = "/var/cache/nntp-proxy/availability.idx"  # Only used when store_article_bodies = false
 
 # Optional article-body disk cache.
 [cache.disk]
@@ -188,10 +188,10 @@ connection_keepalive = 60
 
 `[cache]` controls article and availability storage:
 
-- `store_article_bodies = true` is the default when a `[cache]` section is present. The proxy keeps full article bodies in the in-memory cache unless you explicitly disable that.
-- Set `store_article_bodies = false` for availability-only caching. That keeps backend-availability knowledge without storing full article bodies.
-- `[cache.disk]` is optional and stores article bodies evicted from the memory cache.
-- `availability_index_path` persists availability-only routing knowledge across restarts.
+- `store_article_bodies = false` is the default. Set it to `true` for full article-body caching.
+- The proxy keeps backend availability tracking in the availability index either way.
+- `[cache.disk]` is optional and stores article bodies evicted from the memory cache; it only applies when `store_article_bodies = true`.
+- `availability_index_path` persists the availability-only index across restarts when `store_article_bodies = false`.
 
 `[memory]` controls transport memory, not article storage:
 
@@ -218,7 +218,12 @@ Common server fields:
 | `tls_verify_cert` | no | true | Keep true in production. |
 | `tls_cert_path` | no | - | Additional PEM CA certificate. |
 | `connection_keepalive` | no | - | Send `DATE` on idle backend connections every N seconds. |
-| `backend_pipelining` | no | true | Enable backend request pipelining. |
+| `replacement_cooldown` | no | 30 | Wait this many seconds before replacing an actively removed connection; set `0` to disable. |
+| `health_check_max_per_cycle` | no | 10 | Maximum connections to check per health-check cycle. |
+| `health_check_pool_timeout` | no | 2 | Seconds to wait when acquiring a connection for health checking. |
+| `compress` | no | auto | RFC 8054 backend `COMPRESS DEFLATE`: omit to auto-detect, `true` to require, `false` to disable. |
+| `compress_level` | no | 1 | DEFLATE level `0`-`9`; higher improves ratio at higher CPU cost. |
+| `backend_idle_timeout` | no | 600 | Clear idle backend connections after this many seconds of proxy-wide inactivity; set `0` to disable. |
 
 The proxy currently supports up to 8 backend servers because article availability uses a compact bitset.
 
@@ -301,10 +306,26 @@ The current hot paths are designed to avoid avoidable heap work:
 
 - RAM article-cache hits measured 5.16 GB/s on a Ryzen 9 5950X.
 - With a 256 MB in-memory article cache and disk cache on SSD, the hot-cache path measured 2.58 GB/s on the same system.
+- Current 100GB cache-miss spot checks average 3791.23 MiB/s at `1/1/1` and 8336.03 MiB/s at `4/8/8` on the same system.
 - Backend request forwarding uses parsed request slices instead of rebuilding command strings.
 - The main I/O and capture buffers are preallocated and prefaulted at startup.
 - Buffer acquisition is allocation-free while the configured pools have capacity; exhaustion intentionally falls back to allocating and logs that fact.
 - Article-cache lookup uses borrowed `&str` keys against `Arc<str>` cache keys, avoiding per-lookup key allocation.
+
+Current 100GB proxy-in-the-middle cache-miss spot checks:
+
+| Shape | Mean MiB/s | Median MiB/s | Stdev | Min | Max | Notes |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `1/1/1` | 3791.23 | 3798.88 | 127.00 | 3571.56 | 3963.27 | 10 runs, 1 MiB proxy I/O buffers |
+| `4/8/8` | 8336.03 | 8447.14 | 277.84 | 7770.93 | 8615.41 | 10 runs, 1 MiB proxy I/O buffers |
+
+Instrumented system-level `perf` runs are lower and should be used only for
+attribution, not throughput claims:
+
+| Shape | MiB/s | Elapsed s | Samples |
+| --- | ---: | ---: | ---: |
+| `1/1/1` | 2677.42 | 38.2457 | 35K |
+| `4/8/8` | 8460.52 | 12.1034 | 28K |
 
 This is not an unconditional "zero allocations everywhere" claim. TLS handshakes, connection setup, logging, metrics snapshots, pool exhaustion, and oversized capture buffers can allocate. The steady-state forwarding/cache-hit path is the part intentionally kept allocation-free where the configured pools are sized correctly.
 
@@ -326,7 +347,6 @@ Common flags:
 | `--article-cache-ttl <SECONDS>` | `NNTP_PROXY_ARTICLE_CACHE_TTL_SECS` | Integer seconds; default from config | Override `[cache].article_cache_ttl_secs`. |
 | `--store-article-bodies <BOOL>` | `NNTP_PROXY_STORE_ARTICLE_BODIES` | `true` or `false`; default from config | Override `[cache].store_article_bodies`. |
 | `--threads <N>` | `NNTP_PROXY_THREADS` | `0` for CPU cores; otherwise integer; default from config | Override `[proxy].threads`. |
-| `--backend-pipelining <BOOL>` | `NNTP_PROXY_BACKEND_PIPELINING` | `true` or `false`; default from config | Override `backend_pipelining` for all configured servers. |
 
 Examples:
 
@@ -511,7 +531,7 @@ Unexpected memory use:
 
 - `[cache].store_article_bodies` and `[cache].article_cache_capacity` control article-body memory.
 - `[memory]` controls socket buffers and buffer pools.
-- Disk cache capacity is under `[cache.disk]` and should be backed by SSD/NVMe for best results.
+- Disk cache capacity is under `[cache.disk]`, only applies when `store_article_bodies = true`, and should be backed by SSD/NVMe for best results.
 
 ## License
 

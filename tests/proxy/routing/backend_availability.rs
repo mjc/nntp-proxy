@@ -7,12 +7,18 @@
 //! - Availability bitset edge cases
 
 use anyhow::Result;
+use nntp_proxy::NntpProxy;
 use nntp_proxy::RoutingMode;
+use nntp_proxy::config::{BackendSelectionStrategy, Cache, Config};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 
 use crate::test_helpers::{
-    connect_and_read_greeting, send_article_read_multiline_response, setup_proxy_with_backends,
+    connect_and_read_greeting, create_test_server_config, send_article_read_multiline_response,
+    setup_proxy_with_backends, spawn_test_proxy_on_random_port, wait_for_server,
 };
 
 async fn read_line(stream: &mut tokio::net::TcpStream, context: &str) -> Result<String> {
@@ -30,6 +36,95 @@ async fn read_line(stream: &mut tokio::net::TcpStream, context: &str) -> Result<
             return String::from_utf8(bytes).map_err(Into::into);
         }
     }
+}
+
+async fn spawn_counting_backend(
+    name: &'static str,
+    has_article: bool,
+    slow_body: bool,
+) -> Result<(u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let port = listener.local_addr()?.port();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let request_count = Arc::clone(&requests);
+
+    let handle = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let requests = Arc::clone(&request_count);
+            tokio::spawn(async move {
+                if stream
+                    .write_all(format!("200 {name} Ready\r\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+
+                let mut reader = BufReader::new(stream);
+                let mut line = String::new();
+                while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                    let cmd = line.trim().to_uppercase();
+                    let writer = reader.get_mut();
+
+                    if cmd.starts_with("BODY")
+                        || cmd.starts_with("ARTICLE")
+                        || cmd.starts_with("STAT")
+                    {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        if !has_article {
+                            if writer.write_all(b"430 No such article\r\n").await.is_err() {
+                                break;
+                            }
+                        } else if cmd.starts_with("STAT") {
+                            if writer
+                                .write_all(
+                                    b"223 0 <disconnect-sync@example.com> article exists\r\n",
+                                )
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        } else {
+                            if writer
+                                .write_all(b"222 0 <disconnect-sync@example.com> body follows\r\n")
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                            if slow_body {
+                                tokio::time::sleep(Duration::from_millis(25)).await;
+                            }
+                            for _ in 0..256 {
+                                if writer
+                                    .write_all(b"body line body line body line body line\r\n")
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                if slow_body {
+                                    tokio::time::sleep(Duration::from_millis(1)).await;
+                                }
+                            }
+                            let _ = writer.write_all(b".\r\n").await;
+                        }
+                    } else if cmd.starts_with("DATE") {
+                        let _ = writer.write_all(b"111 20260520000000\r\n").await;
+                    } else if cmd.starts_with("QUIT") {
+                        let _ = writer.write_all(b"205 Goodbye\r\n").await;
+                        break;
+                    } else {
+                        let _ = writer.write_all(b"200 OK\r\n").await;
+                    }
+                    line.clear();
+                }
+            });
+        }
+    });
+
+    Ok((port, requests, handle))
 }
 
 #[tokio::test]
@@ -113,6 +208,105 @@ async fn test_availability_learned_across_requests() -> Result<()> {
         status3.starts_with("220"),
         "Third request uses learned availability"
     );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_availability_learned_before_client_disconnect_is_persisted() -> Result<()> {
+    let (port0, backend0_requests, handle0) =
+        spawn_counting_backend("Backend0-430", false, false).await?;
+    let (port1, backend1_requests, handle1) =
+        spawn_counting_backend("Backend1-430", false, false).await?;
+    let (port2, backend2_requests, handle2) =
+        spawn_counting_backend("Backend2-Has", true, true).await?;
+
+    wait_for_server(&format!("127.0.0.1:{port0}"), 20).await?;
+    wait_for_server(&format!("127.0.0.1:{port1}"), 20).await?;
+    wait_for_server(&format!("127.0.0.1:{port2}"), 20).await?;
+
+    let config = Config {
+        servers: vec![
+            create_test_server_config("127.0.0.1", port0, "Backend0-430"),
+            create_test_server_config("127.0.0.1", port1, "Backend1-430"),
+            create_test_server_config("127.0.0.1", port2, "Backend2-Has"),
+        ],
+        cache: Some(Cache {
+            adaptive_precheck: false,
+            ..Default::default()
+        }),
+        routing: nntp_proxy::config::Routing {
+            backend_selection: BackendSelectionStrategy::WeightedRoundRobin,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, true).await?;
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+    wait_for_server(&proxy_addr, 20).await?;
+
+    {
+        let mut client = TcpStream::connect(&proxy_addr).await?;
+        let mut greeting = String::new();
+        let mut reader = BufReader::new(&mut client);
+        reader.read_line(&mut greeting).await?;
+
+        reader
+            .get_mut()
+            .write_all(b"BODY <disconnect-sync@example.com>\r\n")
+            .await?;
+        let mut status = String::new();
+        reader.read_line(&mut status).await?;
+        assert!(
+            status.starts_with("222"),
+            "first request should reach backend 2 before disconnect, got: {status}"
+        );
+    }
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(backend0_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(backend1_requests.load(Ordering::SeqCst), 1);
+    assert_eq!(backend2_requests.load(Ordering::SeqCst), 1);
+
+    backend0_requests.store(0, Ordering::SeqCst);
+    backend1_requests.store(0, Ordering::SeqCst);
+    backend2_requests.store(0, Ordering::SeqCst);
+
+    {
+        let mut client = TcpStream::connect(&proxy_addr).await?;
+        let mut greeting = String::new();
+        let mut reader = BufReader::new(&mut client);
+        reader.read_line(&mut greeting).await?;
+
+        reader
+            .get_mut()
+            .write_all(b"STAT <disconnect-sync@example.com>\r\n")
+            .await?;
+        let mut status = String::new();
+        reader.read_line(&mut status).await?;
+        assert!(
+            status.starts_with("223"),
+            "second request should route directly to backend 2, got: {status}"
+        );
+    }
+
+    assert_eq!(
+        backend0_requests.load(Ordering::SeqCst),
+        0,
+        "backend 0 miss learned before disconnect should be persisted"
+    );
+    assert_eq!(
+        backend1_requests.load(Ordering::SeqCst),
+        0,
+        "backend 1 miss learned before disconnect should be persisted"
+    );
+    assert_eq!(backend2_requests.load(Ordering::SeqCst), 1);
+
+    handle0.abort();
+    handle1.abort();
+    handle2.abort();
 
     Ok(())
 }

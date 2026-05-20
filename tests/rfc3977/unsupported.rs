@@ -14,8 +14,8 @@ async fn assert_command_rejected_but_session_continues(
     command: &str,
     expected_status: &str,
 ) -> Result<()> {
-    let mut client = RfcTestClient::spawn(mode, "reader-backend", |port| {
-        MockNntpServer::new(port)
+    let mut client = RfcTestClient::spawn(mode, "reader-backend", |_port| {
+        MockNntpServer::new()
             .with_name("ReaderBackend")
             .on_command("LIST", "215 list follows\r\n.\r\n")
     })

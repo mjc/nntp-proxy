@@ -7,8 +7,11 @@
 //!
 //! This prevents the "overnight 430" bug where all articles fail after idle periods.
 
-use crate::test_helpers::{create_test_server_config, get_available_port, wait_for_server};
+use crate::test_helpers::{
+    create_test_server_config, spawn_test_proxy_on_random_port, wait_for_server,
+};
 use anyhow::Result;
+use nntp_proxy::config::BackendSelectionStrategy;
 use nntp_proxy::{Cache, Config, NntpProxy, RoutingMode};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,7 +24,6 @@ use tokio::task::AbortHandle;
 ///
 /// This simulates backend servers that close idle connections.
 struct StaleConnectionServer {
-    port: u16,
     /// Number of commands to accept before closing the connection
     commands_before_close: usize,
     /// Track how many connections have been made
@@ -31,9 +33,8 @@ struct StaleConnectionServer {
 }
 
 impl StaleConnectionServer {
-    fn new(port: u16, commands_before_close: usize) -> Self {
+    fn new(commands_before_close: usize) -> Self {
         Self {
-            port,
             commands_before_close,
             connection_count: Arc::new(AtomicUsize::new(0)),
             ready: Arc::new(Notify::new()),
@@ -44,21 +45,18 @@ impl StaleConnectionServer {
         Arc::clone(&self.connection_count)
     }
 
-    fn ready_signal(&self) -> Arc<Notify> {
-        Arc::clone(&self.ready)
+    async fn spawn_on_random_port(self) -> Result<(u16, AbortHandle)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        Ok((port, self.spawn_on_listener(listener)))
     }
 
-    fn spawn(self) -> AbortHandle {
-        let port = self.port;
+    fn spawn_on_listener(self, listener: TcpListener) -> AbortHandle {
         let commands_before_close = self.commands_before_close;
         let connection_count = self.connection_count;
         let ready = self.ready;
 
         tokio::spawn(async move {
-            let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
-                .await
-                .expect("Failed to bind");
-
             ready.notify_one();
 
             while let Ok((mut stream, _)) = listener.accept().await {
@@ -66,7 +64,6 @@ impl StaleConnectionServer {
                 let commands_limit = commands_before_close;
 
                 tokio::spawn(async move {
-                    // Send greeting
                     if stream.write_all(b"200 StaleTest Ready\r\n").await.is_err() {
                         return;
                     }
@@ -83,33 +80,22 @@ impl StaleConnectionServer {
                         let cmd = String::from_utf8_lossy(&buffer[..n]);
                         let cmd_upper = cmd.trim().to_uppercase();
 
-                        // Handle COMPRESS DEFLATE (connection setup, don't count)
                         if cmd_upper.starts_with("COMPRESS") {
                             let _ = stream.write_all(b"500 Not supported\r\n").await;
                             continue;
-                        }
-                        // Handle MODE READER (connection setup, don't count)
-                        else if cmd_upper.starts_with("MODE") {
+                        } else if cmd_upper.starts_with("MODE") {
                             let _ = stream.write_all(b"200 Posting allowed\r\n").await;
                             continue;
-                        }
-                        // Handle AUTHINFO (connection setup, don't count)
-                        else if cmd_upper.starts_with("AUTHINFO") {
+                        } else if cmd_upper.starts_with("AUTHINFO") {
                             let _ = stream.write_all(b"281 Authentication accepted\r\n").await;
                             continue;
-                        }
-                        // Handle DATE (health check)
-                        else if cmd_upper.starts_with("DATE") {
+                        } else if cmd_upper.starts_with("DATE") {
                             let _ = stream.write_all(b"111 20251219120000\r\n").await;
                             command_count += 1;
-                        }
-                        // Handle QUIT
-                        else if cmd_upper.starts_with("QUIT") {
+                        } else if cmd_upper.starts_with("QUIT") {
                             let _ = stream.write_all(b"205 Goodbye\r\n").await;
                             break;
-                        }
-                        // Handle STAT/HEAD/ARTICLE
-                        else if cmd_upper.starts_with("STAT")
+                        } else if cmd_upper.starts_with("STAT")
                             || cmd_upper.starts_with("HEAD")
                             || cmd_upper.starts_with("ARTICLE")
                         {
@@ -117,16 +103,12 @@ impl StaleConnectionServer {
                                 .write_all(b"223 0 <test@example.com> article exists\r\n")
                                 .await;
                             command_count += 1;
-                        }
-                        // Default
-                        else {
+                        } else {
                             let _ = stream.write_all(b"200 OK\r\n").await;
                             command_count += 1;
                         }
 
-                        // Close connection after limit reached (simulating idle timeout)
                         if commands_limit > 0 && command_count >= commands_limit {
-                            // Close abruptly without QUIT response
                             break;
                         }
                     }
@@ -141,7 +123,6 @@ impl StaleConnectionServer {
 ///
 /// Simulates transient connection failures that should be retried.
 struct FailFirstNServer {
-    port: u16,
     /// Number of connections to fail before accepting
     fail_count: usize,
     connection_count: Arc<AtomicUsize>,
@@ -149,9 +130,8 @@ struct FailFirstNServer {
 }
 
 impl FailFirstNServer {
-    fn new(port: u16, fail_count: usize) -> Self {
+    fn new(fail_count: usize) -> Self {
         Self {
-            port,
             fail_count,
             connection_count: Arc::new(AtomicUsize::new(0)),
             ready: Arc::new(Notify::new()),
@@ -162,35 +142,29 @@ impl FailFirstNServer {
         Arc::clone(&self.connection_count)
     }
 
-    fn ready_signal(&self) -> Arc<Notify> {
-        Arc::clone(&self.ready)
+    async fn spawn_on_random_port(self) -> Result<(u16, AbortHandle)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+        Ok((port, self.spawn_on_listener(listener)))
     }
 
-    fn spawn(self) -> AbortHandle {
-        let port = self.port;
+    fn spawn_on_listener(self, listener: TcpListener) -> AbortHandle {
         let fail_count = self.fail_count;
         let connection_count = self.connection_count;
         let ready = self.ready;
 
         tokio::spawn(async move {
-            let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
-                .await
-                .expect("Failed to bind");
-
             ready.notify_one();
 
             while let Ok((mut stream, _)) = listener.accept().await {
                 let conn_num = connection_count.fetch_add(1, Ordering::SeqCst);
 
-                // First N connections fail immediately
                 if conn_num < fail_count {
-                    // Close without sending anything (simulates connection reset)
                     drop(stream);
                     continue;
                 }
 
                 tokio::spawn(async move {
-                    // Send greeting
                     if stream.write_all(b"200 FailFirst Ready\r\n").await.is_err() {
                         return;
                     }
@@ -232,17 +206,11 @@ impl FailFirstNServer {
 /// Test that precheck retries when pooled connection is stale
 #[tokio::test]
 async fn test_precheck_retries_on_stale_connection() -> Result<()> {
-    let port = get_available_port().await?;
-    let proxy_port = get_available_port().await?;
-
     // Server that closes connection after 2 commands (DATE healthcheck + 1 real command)
     // This simulates stale pool connections after idle period
-    let server = StaleConnectionServer::new(port, 2);
+    let server = StaleConnectionServer::new(2);
     let conn_count = server.connection_count();
-    let ready = server.ready_signal();
-    let _handle = server.spawn();
-
-    ready.notified().await;
+    let (port, _handle) = server.spawn_on_random_port().await?;
 
     // Create proxy with adaptive precheck enabled
     let config = Config {
@@ -255,21 +223,8 @@ async fn test_precheck_retries_on_stale_connection() -> Result<()> {
     };
 
     let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, false).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
-    let listener = TcpListener::bind(&proxy_addr).await?;
-
-    tokio::spawn({
-        let proxy = proxy.clone();
-        async move {
-            while let Ok((stream, addr)) = listener.accept().await {
-                let p = proxy.clone();
-                tokio::spawn(async move {
-                    let _ = p.handle_client(stream, addr.into()).await;
-                });
-            }
-        }
-    });
-
     wait_for_server(&proxy_addr, 20).await?;
 
     // Connect client
@@ -327,16 +282,10 @@ async fn test_precheck_retries_on_stale_connection() -> Result<()> {
 /// Test that per-command routing retries on stale connection
 #[tokio::test]
 async fn test_per_command_retries_on_stale_connection() -> Result<()> {
-    let port = get_available_port().await?;
-    let proxy_port = get_available_port().await?;
-
     // Server that closes after 1 command
-    let server = StaleConnectionServer::new(port, 1);
+    let server = StaleConnectionServer::new(1);
     let conn_count = server.connection_count();
-    let ready = server.ready_signal();
-    let _handle = server.spawn();
-
-    ready.notified().await;
+    let (port, _handle) = server.spawn_on_random_port().await?;
 
     // Disable precheck so we test the per_command path
     let config = Config {
@@ -349,23 +298,8 @@ async fn test_per_command_retries_on_stale_connection() -> Result<()> {
     };
 
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, true).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
-    let listener = TcpListener::bind(&proxy_addr).await?;
-
-    tokio::spawn({
-        let proxy = proxy.clone();
-        async move {
-            while let Ok((stream, addr)) = listener.accept().await {
-                let p = proxy.clone();
-                tokio::spawn(async move {
-                    let _ = p
-                        .handle_client_per_command_routing(stream, addr.into())
-                        .await;
-                });
-            }
-        }
-    });
-
     wait_for_server(&proxy_addr, 20).await?;
 
     let mut client = TcpStream::connect(&proxy_addr).await?;
@@ -403,16 +337,10 @@ async fn test_per_command_retries_on_stale_connection() -> Result<()> {
 /// Test that connection failures on first attempt are retried
 #[tokio::test]
 async fn test_retry_on_immediate_connection_failure() -> Result<()> {
-    let port = get_available_port().await?;
-    let proxy_port = get_available_port().await?;
-
     // Server that fails first 2 connections
-    let server = FailFirstNServer::new(port, 2);
+    let server = FailFirstNServer::new(2);
     let conn_count = server.connection_count();
-    let ready = server.ready_signal();
-    let _handle = server.spawn();
-
-    ready.notified().await;
+    let (port, _handle) = server.spawn_on_random_port().await?;
 
     let config = Config {
         servers: vec![create_test_server_config("127.0.0.1", port, "FailFirst")],
@@ -424,23 +352,8 @@ async fn test_retry_on_immediate_connection_failure() -> Result<()> {
     };
 
     let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, true).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
-    let listener = TcpListener::bind(&proxy_addr).await?;
-
-    tokio::spawn({
-        let proxy = proxy.clone();
-        async move {
-            while let Ok((stream, addr)) = listener.accept().await {
-                let p = proxy.clone();
-                tokio::spawn(async move {
-                    let _ = p
-                        .handle_client_per_command_routing(stream, addr.into())
-                        .await;
-                });
-            }
-        }
-    });
-
     wait_for_server(&proxy_addr, 20).await?;
 
     let mut client = TcpStream::connect(&proxy_addr).await?;
@@ -573,16 +486,13 @@ async fn test_430_cache_is_authoritative() -> Result<()> {
 #[tokio::test]
 async fn test_availability_survives_pool_clearing() -> Result<()> {
     // Backend 0: Returns 430 for our test article
-    let port0 = get_available_port().await?;
+    let listener0 = TcpListener::bind("127.0.0.1:0").await?;
+    let port0 = listener0.local_addr()?.port();
     let backend0_requests = Arc::new(AtomicUsize::new(0));
     let backend0_requests_clone = backend0_requests.clone();
 
     let handle0 = tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{port0}"))
-            .await
-            .unwrap();
-
-        while let Ok((mut stream, _)) = listener.accept().await {
+        while let Ok((mut stream, _)) = listener0.accept().await {
             let requests = backend0_requests_clone.clone();
             tokio::spawn(async move {
                 stream.write_all(b"200 Backend0 Ready\r\n").await.unwrap();
@@ -612,16 +522,13 @@ async fn test_availability_survives_pool_clearing() -> Result<()> {
     });
 
     // Backend 1: Has the article
-    let port1 = get_available_port().await?;
+    let listener1 = TcpListener::bind("127.0.0.1:0").await?;
+    let port1 = listener1.local_addr()?.port();
     let backend1_requests = Arc::new(AtomicUsize::new(0));
     let backend1_requests_clone = backend1_requests.clone();
 
     let handle1 = tokio::spawn(async move {
-        let listener = TcpListener::bind(format!("127.0.0.1:{port1}"))
-            .await
-            .unwrap();
-
-        while let Ok((mut stream, _)) = listener.accept().await {
+        while let Ok((mut stream, _)) = listener1.accept().await {
             let requests = backend1_requests_clone.clone();
             tokio::spawn(async move {
                 stream.write_all(b"200 Backend1 Ready\r\n").await.unwrap();
@@ -666,6 +573,10 @@ async fn test_availability_survives_pool_clearing() -> Result<()> {
             adaptive_precheck: false, // Don't precheck, let the request go through normally
             ..Default::default()
         }),
+        routing: nntp_proxy::config::Routing {
+            backend_selection: BackendSelectionStrategy::WeightedRoundRobin,
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -673,25 +584,8 @@ async fn test_availability_survives_pool_clearing() -> Result<()> {
 
     // Phase 1: Learn availability by making a request
     // The proxy will try backend 0 first, get 430, then try backend 1, get success
-    let proxy_port = get_available_port().await?;
+    let proxy_port = spawn_test_proxy_on_random_port((*proxy).clone(), true).await?;
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
-    let listener = TcpListener::bind(&proxy_addr).await?;
-
-    // Spawn proxy accept loop that handles multiple connections
-    tokio::spawn({
-        let proxy = proxy.clone();
-        async move {
-            while let Ok((stream, addr)) = listener.accept().await {
-                let p = proxy.clone();
-                tokio::spawn(async move {
-                    let _ = p
-                        .handle_client_per_command_routing(stream, addr.into())
-                        .await;
-                });
-            }
-        }
-    });
-
     wait_for_server(&proxy_addr, 20).await?;
 
     {

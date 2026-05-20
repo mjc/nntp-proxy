@@ -123,9 +123,10 @@ pub struct Config {
     pub memory: Memory,
     /// Cache configuration.
     ///
-    /// When omitted, the proxy still keeps the in-memory availability index for
-    /// routing/retry decisions, but skips explicit cache configuration and
-    /// availability-index persistence unless the CLI or config enables it.
+    /// The proxy uses the cache for backend availability-driven routing/retry
+    /// decisions when the configured capacity can hold the fixed availability
+    /// index. In availability-only mode, `store_article_bodies` only controls
+    /// whether the cache also retains full article bodies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<Cache>,
     /// Health check configuration
@@ -286,7 +287,7 @@ pub struct Cache {
         alias = "ttl"
     )]
     pub article_cache_ttl_secs: Duration,
-    /// Whether to store full article bodies in the article cache (default: true)
+    /// Whether to store full article bodies in the article cache (default: false)
     ///
     /// When false:
     /// - Cache still tracks backend availability (smart routing, 430 retry)
@@ -314,8 +315,9 @@ pub struct Cache {
 
     /// Path to the availability index persistence file (optional).
     ///
-    /// Only used when `store_article_bodies = false`. When omitted, the proxy uses
-    /// "availability.idx" alongside the config file.
+    /// This is only used in availability-only mode (`store_article_bodies = false`).
+    /// When set, the proxy uses this path to persist backend availability state;
+    /// otherwise it defaults to "availability.idx" alongside the config file.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -563,24 +565,6 @@ pub struct Server {
         default = "super::defaults::backend_idle_timeout"
     )]
     pub backend_idle_timeout: Duration,
-
-    /// Enable backend pipelining (request multiplexing) for this server
-    /// When enabled, client requests are queued and batched onto shared connections
-    /// Default: true
-    #[serde(
-        default = "super::defaults::enable_pipelining",
-        rename = "backend_pipelining",
-        alias = "enable_pipelining"
-    )]
-    pub backend_pipelining: bool,
-    /// Maximum queue depth for pipelined requests (backpressure threshold)
-    /// Default: 1000
-    #[serde(default = "super::defaults::pipeline_queue_depth")]
-    pub pipeline_queue_depth: usize,
-    /// Maximum number of commands per pipeline batch
-    /// Default: 4
-    #[serde(default = "super::defaults::pipeline_batch_size")]
-    pub pipeline_batch_size: usize,
 }
 
 /// Builder for constructing `Server` instances
@@ -627,9 +611,6 @@ pub struct ServerBuilder {
     compress: Option<bool>,
     compress_level: Option<u32>,
     backend_idle_timeout: Option<Duration>,
-    backend_pipelining: bool,
-    pipeline_queue_depth: Option<usize>,
-    pipeline_batch_size: Option<usize>,
 }
 
 impl ServerBuilder {
@@ -658,9 +639,6 @@ impl ServerBuilder {
             compress: None,
             compress_level: None,
             backend_idle_timeout: None,
-            backend_pipelining: true,
-            pipeline_queue_depth: None,
-            pipeline_batch_size: None,
         }
     }
 
@@ -777,34 +755,6 @@ impl ServerBuilder {
         self
     }
 
-    /// Enable or disable backend pipelining (request multiplexing)
-    #[must_use]
-    pub const fn backend_pipelining(mut self, enabled: bool) -> Self {
-        self.backend_pipelining = enabled;
-        self
-    }
-
-    /// Backward-compatible alias for `backend_pipelining`.
-    #[must_use]
-    pub const fn enable_pipelining(mut self, enabled: bool) -> Self {
-        self.backend_pipelining = enabled;
-        self
-    }
-
-    /// Set pipeline queue depth
-    #[must_use]
-    pub const fn pipeline_queue_depth(mut self, depth: usize) -> Self {
-        self.pipeline_queue_depth = Some(depth);
-        self
-    }
-
-    /// Set pipeline batch size
-    #[must_use]
-    pub const fn pipeline_batch_size(mut self, size: usize) -> Self {
-        self.pipeline_batch_size = Some(size);
-        self
-    }
-
     /// Build the Server
     ///
     /// # Errors
@@ -836,14 +786,6 @@ impl ServerBuilder {
             .health_check_pool_timeout
             .unwrap_or_else(super::defaults::health_check_pool_timeout);
 
-        let pipeline_queue_depth = self
-            .pipeline_queue_depth
-            .unwrap_or_else(super::defaults::pipeline_queue_depth);
-
-        let pipeline_batch_size = self
-            .pipeline_batch_size
-            .unwrap_or_else(super::defaults::pipeline_batch_size);
-
         Ok(Server {
             host,
             port,
@@ -866,9 +808,6 @@ impl ServerBuilder {
             backend_idle_timeout: self
                 .backend_idle_timeout
                 .unwrap_or_else(super::defaults::backend_idle_timeout),
-            backend_pipelining: self.backend_pipelining,
-            pipeline_queue_depth,
-            pipeline_batch_size,
         })
     }
 }
@@ -956,7 +895,7 @@ mod tests {
             cache.article_cache_ttl_secs,
             crate::constants::duration_polyfill::from_hours(1)
         );
-        assert!(cache.store_article_bodies);
+        assert!(!cache.store_article_bodies);
     }
 
     #[test]

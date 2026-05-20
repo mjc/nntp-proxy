@@ -145,21 +145,21 @@ impl NntpClient {
             .context("Failed to get connection from pool")?;
         let mut buffer = self.buffer_pool.acquire();
 
-        let response = send_request(&mut *conn, &request, &mut buffer).await?;
+        send_request(&mut *conn, &request, &mut buffer).await?;
+        let status_code = crate::session::multiline_framing::response_status(&request, &buffer)
+            .map_err(|_| anyhow::anyhow!("Invalid STAT response"))?;
 
-        Self::parse_stat_response(response.status_code())
+        Self::parse_stat_response(status_code)
     }
 
     /// Parse STAT response code into existence check
     #[inline]
-    fn parse_stat_response(status_code: Option<crate::protocol::StatusCode>) -> Result<bool> {
-        status_code
-            .ok_or_else(|| anyhow::anyhow!("Invalid STAT response"))
-            .and_then(|code| match code.as_u16() {
-                223 => Ok(true),  // Article exists
-                430 => Ok(false), // No such article
-                _ => anyhow::bail!("Unexpected STAT response: {code}"),
-            })
+    fn parse_stat_response(status_code: crate::protocol::StatusCode) -> Result<bool> {
+        match status_code.as_u16() {
+            223 => Ok(true),  // Article exists
+            430 => Ok(false), // No such article
+            code => anyhow::bail!("Unexpected STAT response: {code}"),
+        }
     }
 
     /// Internal: fetch response into `PooledBuffer`
@@ -175,35 +175,33 @@ impl NntpClient {
             .context("Failed to get connection from pool")?;
         let mut io_buffer = self.buffer_pool.acquire();
 
-        let response = send_request(&mut *conn, &request, &mut io_buffer).await?;
+        send_request(&mut *conn, &request, &mut io_buffer).await?;
+        let status_code = crate::session::multiline_framing::response_status(&request, &io_buffer)
+            .map_err(|_| anyhow::anyhow!("Invalid response from server"))?;
 
-        // Validate response - early return on errors
-        Self::validate_response(&response)?;
+        Self::validate_response(status_code)?;
 
-        let status_code = response
-            .status_code()
-            .expect("validate_response returned Ok with parsed status");
-        if request.expects_multiline_response(status_code) {
-            return self
-                .fetch_multiline_response(conn, io_buffer, response.bytes_read)
-                .await;
+        if request.has_response_body(status_code) {
+            return self.fetch_complete_response(conn, io_buffer).await;
         }
 
         Ok(io_buffer)
     }
 
-    async fn fetch_multiline_response(
+    async fn fetch_complete_response(
         &self,
         mut conn: Object<TcpManager>,
         mut io_buffer: PooledBuffer,
-        first_chunk_size: usize,
     ) -> Result<PooledBuffer> {
         // Use a capture buffer as the accumulator: pooled, can grow beyond io_buffer
         // capacity without panicking, returned to pool on drop.
         let mut capture = self.buffer_pool.acquire_capture();
-        if let Err(err) =
-            Self::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, first_chunk_size)
-                .await
+        if let Err(err) = crate::session::multiline_framing::IsolatedMultilineResponse::new(
+            &mut conn,
+            &mut io_buffer,
+        )
+        .capture_into(&mut capture)
+        .await
         {
             self.conn_pool.remove_with_cooldown(conn);
             return Err(err);
@@ -211,78 +209,14 @@ impl NntpClient {
         Ok(capture)
     }
 
-    /// Stream remaining multiline response data into `capture`.
-    ///
-    /// `io_buffer` is the scratch buffer for socket reads (fixed size).
-    /// `capture` is the accumulator returned to the caller (can grow).
-    async fn drain_multiline_into(
-        conn: &mut crate::stream::ConnectionStream,
-        io_buffer: &mut PooledBuffer,
-        capture: &mut PooledBuffer,
-        first_chunk_size: usize,
-    ) -> Result<()> {
-        use crate::session::tail_buffer::{TailBuffer, TerminatorStatus};
-
-        let first_chunk = &io_buffer[..first_chunk_size];
-        let mut tail = TailBuffer::default();
-
-        match tail.detect_terminator(first_chunk) {
-            TerminatorStatus::FoundAt(pos) => {
-                // pos is after the terminator (terminator included in [..pos])
-                capture.extend_from_slice(&first_chunk[..pos]);
-                if pos < first_chunk.len() {
-                    conn.stash_leftover(&first_chunk[pos..])?;
-                }
-                return Ok(());
-            }
-            TerminatorStatus::NotFound => {
-                tail.update(first_chunk);
-                capture.extend_from_slice(first_chunk);
-            }
-        }
-
-        loop {
-            let n = io_buffer
-                .read_from(conn)
-                .await
-                .context("Failed to read multiline response from backend")?;
-            if n == 0 {
-                anyhow::bail!("Backend closed connection before multiline terminator");
-            }
-            // NLL: chunk borrow ends before next read_from call
-            let found_at = {
-                let chunk = &io_buffer[..n];
-                tail.detect_terminator(chunk)
-            };
-            match found_at {
-                TerminatorStatus::FoundAt(pos) => {
-                    // pos is after the terminator (terminator included in [..pos])
-                    capture.extend_from_slice(&io_buffer[..pos]);
-                    if pos < n {
-                        conn.stash_leftover(&io_buffer[pos..n])?;
-                    }
-                    return Ok(());
-                }
-                TerminatorStatus::NotFound => {
-                    let chunk = &io_buffer[..n];
-                    tail.update(chunk);
-                    capture.extend_from_slice(chunk);
-                }
-            }
-        }
-    }
-
     /// Validate NNTP response status code
     #[inline]
-    fn validate_response(response: &crate::session::backend::BackendFirstResponse) -> Result<()> {
-        response
-            .status_code()
-            .ok_or_else(|| anyhow::anyhow!("Invalid response from server"))
-            .and_then(|code| match code.as_u16() {
-                430 => anyhow::bail!("Article not found (430)"),
-                code if code >= 400 => anyhow::bail!("Server error: {code}"),
-                _ => Ok(()),
-            })
+    fn validate_response(status_code: crate::protocol::StatusCode) -> Result<()> {
+        match status_code.as_u16() {
+            430 => anyhow::bail!("Article not found (430)"),
+            code if code >= 400 => anyhow::bail!("Server error: {code}"),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -294,22 +228,19 @@ mod tests {
     fn test_parse_stat_response_success() {
         use crate::protocol::StatusCode;
         // Article exists (223)
-        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"223")).unwrap());
+        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"223").unwrap()).unwrap());
 
         // Article not found (430)
-        assert!(!NntpClient::parse_stat_response(StatusCode::parse(b"430")).unwrap());
+        assert!(!NntpClient::parse_stat_response(StatusCode::parse(b"430").unwrap()).unwrap());
     }
 
     #[test]
     fn test_parse_stat_response_errors() {
         use crate::protocol::StatusCode;
-        // No status code
-        assert!(NntpClient::parse_stat_response(None).is_err());
-
         // Unexpected codes
-        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"500")).is_err());
-        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"200")).is_err());
-        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"400")).is_err());
+        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"500").unwrap()).is_err());
+        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"200").unwrap()).is_err());
+        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"400").unwrap()).is_err());
     }
 
     async fn spawn_fetch_test_server(
@@ -479,10 +410,20 @@ mod tests {
         NntpClient::new(provider, buffer_pool)
     }
 
-    /// Verify `drain_multiline_into` captures the complete response when it all
-    /// arrives in the first pre-read chunk (`first_chunk_size` == article length).
+    async fn capture_complete_response_for_test(
+        conn: &mut crate::stream::ConnectionStream,
+        io_buffer: &mut PooledBuffer,
+        capture: &mut PooledBuffer,
+    ) -> Result<()> {
+        crate::session::multiline_framing::IsolatedMultilineResponse::new(conn, io_buffer)
+            .capture_into(capture)
+            .await
+    }
+
+    /// Verify the session response reader captures the complete response when it all
+    /// arrives in the first pre-read buffer.
     #[tokio::test]
-    async fn test_drain_multiline_into_single_read() {
+    async fn test_complete_response_capture_single_read() {
         use crate::pool::BufferPool;
         use crate::types::BufferSize;
 
@@ -499,32 +440,32 @@ mod tests {
         let mut capture = buffer_pool.acquire_capture();
 
         // Simulate send_request pre-reading the full first response chunk
-        let first_chunk_size = io_buffer.read_from(&mut *conn).await.unwrap();
+        io_buffer.read_from(&mut *conn).await.unwrap();
 
-        NntpClient::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, first_chunk_size)
+        capture_complete_response_for_test(&mut conn, &mut io_buffer, &mut capture)
             .await
             .unwrap();
 
         assert_eq!(&capture[..], article as &[u8]);
     }
 
-    /// Verify `drain_multiline_into` accumulates correctly across multiple reads,
-    /// including when the NNTP terminator spans a read boundary (3+ reads).
+    /// Verify response capture accumulates correctly across multiple reads,
+    /// including when the response body completes across multiple reads.
     ///
     /// Uses an 8-byte I/O buffer against a 36-byte article, forcing 5 reads.
-    /// Read 4 ends with `\r` and read 5 starts with `\n.\r\n`, so the terminator
-    /// `\r\n.\r\n` spans the boundary — exercising `TailBuffer` spanning detection.
+    /// Read 4 ends in the middle of the response body end, exercising response capture
+    /// response-reader state.
     #[tokio::test]
-    async fn test_drain_multiline_into_multi_read_spanning_terminator() {
+    async fn test_complete_response_capture_multi_read_spanning_response_body_end() {
         use crate::pool::BufferPool;
         use crate::types::BufferSize;
 
         // 36 bytes total: 5 × 8-byte reads with 8-byte io_buffer.
-        // Terminator \r\n.\r\n spans read 4 ("\r") → read 5 ("\n.\r\n").
+        // The response body end spans two reads.
         let article = b"220 article\r\nLine one\r\nLine two\r\n.\r\n";
         let (addr, notify) = spawn_test_server(article).await;
         let pool = make_test_pool(addr);
-        // Tiny I/O buffer forces multiple reads and exercises the streaming loop
+        // Tiny I/O buffer forces multiple reads while capturing the complete response.
         let buffer_pool = BufferPool::new(BufferSize::try_new(8).unwrap(), 4);
 
         let mut conn = pool.get().await.unwrap();
@@ -533,8 +474,8 @@ mod tests {
         let mut io_buffer = buffer_pool.acquire();
         let mut capture = buffer_pool.acquire_capture();
 
-        // first_chunk_size = 0: no pre-loaded data, all bytes arrive via the loop
-        NntpClient::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, 0)
+        // No pre-loaded data; all bytes arrive via the framer loop.
+        capture_complete_response_for_test(&mut conn, &mut io_buffer, &mut capture)
             .await
             .unwrap();
 
@@ -542,7 +483,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_drain_multiline_into_errors_on_truncated_response() {
+    async fn test_complete_response_capture_errors_on_truncated_response() {
         use crate::pool::BufferPool;
         use crate::types::BufferSize;
 
@@ -557,26 +498,26 @@ mod tests {
         let mut io_buffer = buffer_pool.acquire();
         let mut capture = buffer_pool.acquire_capture();
 
-        let err = NntpClient::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, 0)
+        let err = capture_complete_response_for_test(&mut conn, &mut io_buffer, &mut capture)
             .await
             .unwrap_err();
 
         assert!(
             err.to_string()
-                .contains("Backend closed connection before multiline terminator"),
+                .contains("Backend closed connection before complete"),
             "unexpected error: {err:#}"
         );
     }
 
     #[tokio::test]
-    async fn test_drain_multiline_into_stashes_packed_leftover_response() {
+    async fn test_complete_response_capture_errors_on_extra_response_bytes() {
         use crate::pool::BufferPool;
         use crate::types::BufferSize;
 
         let article = b"220 body follows\r\nHello world\r\n.\r\n";
-        let packed = [article.as_slice(), b"430 No such article\r\n"].concat();
-        let packed: &'static [u8] = Box::leak(packed.into_boxed_slice());
-        let (addr, notify) = spawn_test_server(packed).await;
+        let extra_response = [article.as_slice(), b"430 No such article\r\n"].concat();
+        let extra_response: &'static [u8] = Box::leak(extra_response.into_boxed_slice());
+        let (addr, notify) = spawn_test_server(extra_response).await;
         let pool = make_test_pool(addr);
         let buffer_pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 2);
 
@@ -585,26 +526,17 @@ mod tests {
 
         let mut io_buffer = buffer_pool.acquire();
         let mut capture = buffer_pool.acquire_capture();
-        let first_chunk_size = io_buffer.read_from(&mut *conn).await.unwrap();
+        io_buffer.read_from(&mut *conn).await.unwrap();
 
-        NntpClient::drain_multiline_into(&mut conn, &mut io_buffer, &mut capture, first_chunk_size)
+        let err = capture_complete_response_for_test(&mut conn, &mut io_buffer, &mut capture)
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(&capture[..], article as &[u8]);
-        assert!(conn.has_leftover(), "next response should be stashed");
-        assert_eq!(conn.leftover_len(), b"430 No such article\r\n".len());
-
-        let next = io_buffer.read_from(&mut *conn).await.unwrap();
-        assert_eq!(&io_buffer[..next], b"430 No such article\r\n");
-        assert!(
-            !conn.has_leftover(),
-            "stashed bytes should be consumed first"
-        );
+        assert!(err.to_string().contains("unexpected"));
     }
 
     #[tokio::test]
-    async fn fetch_head_reads_complete_multiline_response() {
+    async fn fetch_head_reads_complete_response() {
         let response = b"221 0 <test@example.com>\r\nSubject: test\r\nFrom: tester\r\n\r\n.\r\n";
         let addr = spawn_fetch_test_server("HEAD <test@example.com>", response).await;
         let client = make_test_client(addr);
@@ -616,7 +548,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_body_reads_complete_multiline_response() {
+    async fn fetch_body_reads_complete_response() {
         let response = b"222 0 <test@example.com>\r\nhello world\r\n.\r\n";
         let addr = spawn_fetch_test_server("BODY <test@example.com>", response).await;
         let client = make_test_client(addr);

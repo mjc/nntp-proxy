@@ -10,7 +10,7 @@ Message-ID: <test@example.com>\r\n\
 \r\n\
 This is the article body.\r\n\
 Multiple lines of text.\r\n\
-.\r\n";
+";
 
 const VALID_ARTICLE_YENC: &[u8] = b"220 54321 <binary@example.com>\r\n\
 Subject: test.txt (1/1)\r\n\
@@ -19,20 +19,18 @@ Message-ID: <binary@example.com>\r\n\
 \r\n\
 =ybegin line=128 size=12 name=test.txt\r\n\
 r\x8f\x96\x96\x99VJ\xa3o\x98\x8dK\r\n\
-=yend size=12 crc32=0337ab3d\r\n\
-.\r\n";
+=yend size=12 crc32=0337ab3d\r\n";
 
 const VALID_HEAD: &[u8] = b"221 12345 <test@example.com>\r\n\
 Subject: Test Article\r\n\
 From: test@example.com\r\n\
 Date: Sat, 30 Nov 2024 12:00:00 +0000\r\n\
 Message-ID: <test@example.com>\r\n\
-.\r\n";
+";
 
 const VALID_BODY: &[u8] = b"222 12345 <test@example.com>\r\n\
 This is the article body.\r\n\
-Multiple lines of text.\r\n\
-.\r\n";
+Multiple lines of text.\r\n";
 
 const VALID_STAT: &[u8] = b"223 12345 <test@example.com>\r\n";
 
@@ -40,7 +38,7 @@ const ARTICLE_BY_MSGID: &[u8] = b"220 0 <msgid@example.com>\r\n\
 Subject: Retrieved by message-ID\r\n\
 \r\n\
 Body\r\n\
-.\r\n";
+";
 
 const BODY_WITH_HEADERS: &[u8] = b"222 12345 <test@example.com>\r\n\
 Subject: Should be ignored\r\n\
@@ -55,7 +53,7 @@ const FOLDED_HEADER: &[u8] = concat!(
     "From: test@example.com\r\n",
     "\r\n",
     "Body\r\n",
-    ".\r\n"
+    ""
 )
 .as_bytes();
 
@@ -140,17 +138,12 @@ fn test_parse_error_cases() {
             "missing separator",
         ),
         (
-            b"220 12345 <test@example.com>\r\nSubject: Test\r\n\r\nBody without terminator\r\n"
-                .as_slice(),
-            "missing terminator",
-        ),
-        (
-            b"220 12345 <test@example.com>\r\nSubject: Valid\r\nInvalidHeaderNoColon\r\n\r\nBody\r\n.\r\n"
+            b"220 12345 <test@example.com>\r\nSubject: Valid\r\nInvalidHeaderNoColon\r\n\r\nBody\r\n"
                 .as_slice(),
             "invalid header",
         ),
         (
-            b"221 12345 <test@example.com>\r\nSubject: Test\r\n\r\nThis body should not be here\r\n.\r\n"
+            b"221 12345 <test@example.com>\r\nSubject: Test\r\n\r\nThis body should not be here\r\n"
                 .as_slice(),
             "unexpected body",
         ),
@@ -164,7 +157,6 @@ fn test_parse_error_cases() {
         let result: Result<Article<'_>, _> = input.try_into();
         match (result, expected) {
             (Err(ParseError::MissingSeparator), "missing separator")
-            | (Err(ParseError::MissingTerminator), "missing terminator")
             | (Err(ParseError::InvalidHeader(_)), "invalid header")
             | (Err(ParseError::UnexpectedBody), "unexpected body")
             | (Err(ParseError::InvalidStatusCode(_)), "invalid status")
@@ -213,20 +205,18 @@ fn test_headers_iteration_and_message_id_header() {
 
 #[test]
 fn test_body_edge_cases() {
-    let empty_body = article(b"222 123 <test@example.com>\r\n.\r\n");
+    let empty_body = article(b"222 123 <test@example.com>\r\n");
     let body = empty_body.body.unwrap();
-    assert!(body.is_empty() || body == b"\r\n");
+    assert!(body.is_empty());
 
     let mut binary_article = b"222 123 <test@example.com>\r\n".to_vec();
     binary_article.extend_from_slice(&[0xFF, 0xFE, 0xFD, 0xFC, 0xFB]);
-    binary_article.extend_from_slice(b"\r\n.\r\n");
     assert!(article(&binary_article).body.unwrap().contains(&0xFF));
 
     let dotted = b"222 123 <test@example.com>\r\n\
 Line 1\r\n\
 ..Line starting with dot\r\n\
-Line 3\r\n\
-.\r\n";
+Line 3\r\n";
     let body = article(dotted).body.unwrap();
     assert!(
         std::str::from_utf8(body)

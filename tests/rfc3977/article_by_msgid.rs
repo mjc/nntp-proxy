@@ -7,7 +7,7 @@ use anyhow::Result;
 use crate::test_helpers::{MockNntpServer, RfcTestClient};
 use nntp_proxy::RoutingMode;
 
-fn article_backend(port: u16, message_id: &str) -> MockNntpServer {
+fn article_backend(message_id: &str) -> MockNntpServer {
     // Avoid double-wrapping angle brackets if the caller already provided them.
     let display = message_id.trim_matches(|c| c == '<' || c == '>');
     let resp_id = if message_id.starts_with('<') {
@@ -16,7 +16,7 @@ fn article_backend(port: u16, message_id: &str) -> MockNntpServer {
         format!("<{display}>")
     };
 
-    MockNntpServer::new(port)
+    MockNntpServer::new()
         .with_name("ArticleBackend")
         .on_command(
             format!("ARTICLE {message_id}"),
@@ -30,8 +30,8 @@ fn article_backend(port: u16, message_id: &str) -> MockNntpServer {
 #[tokio::test]
 async fn test_article_by_message_id_in_per_command_mode() -> Result<()> {
     let msgid = "<msgid-123@example.com>";
-    let mut client = RfcTestClient::spawn(RoutingMode::PerCommand, "article-backend", |port| {
-        article_backend(port, msgid)
+    let mut client = RfcTestClient::spawn(RoutingMode::PerCommand, "article-backend", |_port| {
+        article_backend(msgid)
     })
     .await?;
 

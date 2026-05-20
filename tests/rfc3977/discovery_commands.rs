@@ -8,8 +8,8 @@ use anyhow::Result;
 use crate::test_helpers::{MockNntpServer, RfcTestClient};
 use nntp_proxy::RoutingMode;
 
-fn discovery_backend(port: u16) -> MockNntpServer {
-    MockNntpServer::new(port)
+fn discovery_backend(_port: u16) -> MockNntpServer {
+    MockNntpServer::new()
         .with_name("DiscoveryBackend")
         .on_command("MODE READER", "200 Reader mode acknowledged\r\n")
         .on_command(

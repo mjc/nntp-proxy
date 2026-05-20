@@ -9,9 +9,6 @@ pub enum ParseError {
     #[error("Missing blank line separator between headers and body")]
     MissingSeparator,
 
-    #[error("Missing multiline terminator (CRLF.CRLF)")]
-    MissingTerminator,
-
     #[error("Invalid header: {0}")]
     InvalidHeader(String),
 

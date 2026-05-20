@@ -14,8 +14,8 @@ use nntp_proxy::config::RoutingMode;
 #[tokio::test]
 async fn test_quit_command_integration() -> Result<()> {
     let (proxy_port, _backend) =
-        spawn_single_backend_proxy(RoutingMode::Hybrid, "backend", |port| {
-            MockNntpServer::new(port)
+        spawn_single_backend_proxy(RoutingMode::Hybrid, "backend", |_port| {
+            MockNntpServer::new()
                 .with_name("Backend")
                 .on_command("QUIT", "205 Goodbye\r\n")
         })
@@ -38,8 +38,8 @@ async fn test_auth_command_integration() -> Result<()> {
         "backend",
         "testuser",
         "testpass",
-        |port| {
-            MockNntpServer::new(port)
+        |_port| {
+            MockNntpServer::new()
                 .with_name("Backend")
                 .on_command("DATE", "111 20260505155900\r\n")
         },
@@ -99,8 +99,8 @@ async fn test_concurrent_auth_sessions() -> Result<()> {
         "backend",
         "user",
         "pass",
-        |port| {
-            MockNntpServer::new(port)
+        |_port| {
+            MockNntpServer::new()
                 .with_name("Backend")
                 .on_command("DATE", "111 20260505155900\r\n")
         },

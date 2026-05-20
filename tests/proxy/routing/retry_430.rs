@@ -8,7 +8,8 @@ use anyhow::Result;
 use nntp_proxy::RoutingMode;
 
 use crate::test_helpers::{
-    connect_and_read_greeting, send_article_read_multiline_response, setup_proxy_with_backends,
+    MockNntpServer, connect_and_read_greeting, send_article_read_multiline_response,
+    setup_proxy_with_backends, spawn_single_backend_proxy,
 };
 
 #[tokio::test]
@@ -189,6 +190,40 @@ async fn test_430_retry_with_single_backend() -> Result<()> {
         "Expected 430 with single backend"
     );
     assert!(body.is_empty());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_430_retry_retires_connection_with_queued_backend_bytes() -> Result<()> {
+    let (proxy_port, _backend) =
+        spawn_single_backend_proxy(RoutingMode::PerCommand, "Packed430Backend", |_port| {
+            MockNntpServer::new()
+                .with_name("Packed430Backend")
+                .on_command(
+                    "ARTICLE",
+                    "430 No such article\r\n223 0 <stale@example.com>\r\n",
+                )
+        })
+        .await?;
+
+    let mut client = connect_and_read_greeting(proxy_port).await?;
+
+    let (first_status, first_body) =
+        send_article_read_multiline_response(&mut client, "<first@example.com>").await?;
+    assert!(
+        first_status.starts_with("430"),
+        "first request should exhaust the single backend, got {first_status:?}"
+    );
+    assert!(first_body.is_empty(), "430 response should have no body");
+
+    let (second_status, second_body) =
+        send_article_read_multiline_response(&mut client, "<second@example.com>").await?;
+    assert!(
+        second_status.starts_with("430"),
+        "stale queued backend bytes must not satisfy the next ARTICLE, got {second_status:?}"
+    );
+    assert!(second_body.is_empty(), "430 response should have no body");
 
     Ok(())
 }

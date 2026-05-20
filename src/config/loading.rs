@@ -380,9 +380,6 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         compress: None,
         compress_level: None,
         backend_idle_timeout: crate::config::defaults::backend_idle_timeout(),
-        backend_pipelining: crate::config::defaults::enable_pipelining(),
-        pipeline_queue_depth: crate::config::defaults::pipeline_queue_depth(),
-        pipeline_batch_size: crate::config::defaults::pipeline_batch_size(),
     })
 }
 
@@ -631,9 +628,6 @@ pub fn create_default_config() -> Config {
             compress: None,
             compress_level: None,
             backend_idle_timeout: defaults::backend_idle_timeout(),
-            backend_pipelining: defaults::enable_pipelining(),
-            pipeline_queue_depth: defaults::pipeline_queue_depth(),
-            pipeline_batch_size: defaults::pipeline_batch_size(),
         }],
         ..Default::default()
     }

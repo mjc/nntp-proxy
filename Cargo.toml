@@ -23,6 +23,7 @@ path = "src/lib.rs"
 
 [dependencies]
 tokio = { version = "1.0", features = ["net", "rt-multi-thread", "io-util", "time", "macros", "signal"] }
+console-subscriber = { version = "0.4", optional = true }
 futures = "0.3"  # Future combinators for join_all
 clap = { version = "4.0", features = ["derive", "env", "std", "help"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
@@ -34,7 +35,6 @@ anyhow = "1.0"
 thiserror = "2.0"
 socket2 = { version = "0.6", features = ["all"] }  # Safe cross-platform socket operations
 crossbeam = { version = "0.8", features = ["alloc", "std"] }  # Lock-free data structures with minimal features
-tikv-jemallocator = "0.6"  # jemalloc allocator for reduced page allocation overhead
 nix = { version = "0.31", features = ["sched", "process"] }  # Low-level system calls for CPU pinning
 deadpool = "0.13"
 memchr = { version = "2.7", features = ["libc"] }  # Fast byte searching with system optimizations
@@ -85,6 +85,10 @@ iai-callgrind = "0.16.1"  # Instruction-count benchmarking for hot path comparis
 [features]
 default = []
 zlib-ng = ["flate2/zlib-ng"]  # SIMD-optimized compression (requires cmake; ~2-3x faster)
+tokio-console = ["dep:console-subscriber", "tokio/tracing"]  # Runtime/task instrumentation for tokio-console; build with RUSTFLAGS="--cfg tokio_unstable"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 [[bench]]
 name = "command_parsing"
@@ -128,10 +132,6 @@ harness = false
 
 [[bench]]
 name = "cache_ingest"
-harness = false
-
-[[bench]]
-name = "tail_buffer_boundaries"
 harness = false
 
 [[bench]]

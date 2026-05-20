@@ -1,9 +1,10 @@
 use crate::types::BufferSize;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
 use crossbeam::queue::SegQueue;
 use smallvec::SmallVec;
-use std::ops::Deref;
+use std::ops::{Deref, Range};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tracing::{debug, info};
@@ -121,22 +122,6 @@ impl PooledBuffer {
         self.buffer.clear();
     }
 
-    /// Shorten the logical initialized length without changing the backing allocation.
-    ///
-    /// Used by response framing helpers when a read contains bytes beyond the current
-    /// response boundary and the remainder is stashed as leftover for the next response.
-    ///
-    /// # Panics
-    /// Panics if `len` exceeds the current initialized byte count.
-    #[inline]
-    pub fn truncate(&mut self, len: usize) {
-        assert!(
-            len <= self.buffer.len(),
-            "truncate length exceeds initialized bytes"
-        );
-        self.buffer.truncate(len);
-    }
-
     /// Append data to the buffer (accumulator mode)
     ///
     /// Used when `PooledBuffer` is acquired from capture pool for accumulating
@@ -168,6 +153,15 @@ impl PooledBuffer {
             );
         }
         self.buffer.extend_from_slice(data);
+    }
+
+    /// Freeze the initialized bytes into a shared immutable buffer.
+    ///
+    /// The backing allocation is intentionally detached from the pool because
+    /// ownership escapes through `Bytes`.
+    #[must_use]
+    pub fn freeze(mut self) -> Bytes {
+        std::mem::take(&mut self.buffer).freeze()
     }
 }
 
@@ -231,8 +225,253 @@ impl Drop for PooledBuffer {
 /// a multiline response is larger than the typical capture size.
 #[derive(Debug, Default)]
 pub struct ChunkedResponse {
-    chunks: Vec<PooledBuffer>,
+    chunks: SmallVec<[ResponseChunk; 16]>,
     len: usize,
+}
+
+#[derive(Debug, Default)]
+struct ResponseWriteMetrics {
+    responses: AtomicUsize,
+    single_chunk_responses: AtomicUsize,
+    multi_chunk_responses: AtomicUsize,
+    chunks_written: AtomicUsize,
+    bytes_written: AtomicUsize,
+    tiny_chunks: AtomicUsize,
+    tiny_chunk_bytes: AtomicUsize,
+    small_chunks: AtomicUsize,
+    small_chunk_bytes: AtomicUsize,
+    max_chunks_per_response: AtomicUsize,
+}
+
+#[derive(Debug, Default)]
+struct HotPathAllocationMetrics {
+    regular_pool_fallback_allocations: AtomicUsize,
+    capture_pool_fallback_allocations: AtomicUsize,
+    chunked_response_metadata_spills: AtomicUsize,
+    pending_backend_byte_heap_fallbacks: AtomicUsize,
+    non_owned_response_write_chunks: AtomicUsize,
+    non_owned_response_write_bytes: AtomicUsize,
+}
+
+/// Snapshot of direct client write-path activity from `ChunkedResponse::write_all_to`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ResponseWriteMetricsSnapshot {
+    pub responses: usize,
+    pub single_chunk_responses: usize,
+    pub multi_chunk_responses: usize,
+    pub chunks_written: usize,
+    pub bytes_written: usize,
+    pub tiny_chunks: usize,
+    pub tiny_chunk_bytes: usize,
+    pub small_chunks: usize,
+    pub small_chunk_bytes: usize,
+    pub max_chunks_per_response: usize,
+}
+
+/// Snapshot of allocation-sensitive hot-path activity.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HotPathAllocationMetricsSnapshot {
+    pub regular_pool_fallback_allocations: usize,
+    pub capture_pool_fallback_allocations: usize,
+    pub chunked_response_metadata_spills: usize,
+    pub pending_backend_byte_heap_fallbacks: usize,
+    pub non_owned_response_write_chunks: usize,
+    pub non_owned_response_write_bytes: usize,
+}
+
+fn response_write_metrics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("NNTP_PROXY_RESPONSE_WRITE_METRICS_SECS").is_some())
+}
+
+fn response_write_metrics() -> &'static ResponseWriteMetrics {
+    static METRICS: OnceLock<ResponseWriteMetrics> = OnceLock::new();
+    METRICS.get_or_init(ResponseWriteMetrics::default)
+}
+
+fn hot_path_allocation_metrics() -> &'static HotPathAllocationMetrics {
+    static METRICS: OnceLock<HotPathAllocationMetrics> = OnceLock::new();
+    METRICS.get_or_init(HotPathAllocationMetrics::default)
+}
+
+pub(crate) fn record_pending_backend_byte_heap_fallback() {
+    hot_path_allocation_metrics()
+        .pending_backend_byte_heap_fallbacks
+        .fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn record_non_owned_response_write_chunk(bytes: usize) {
+    let metrics = hot_path_allocation_metrics();
+    metrics
+        .non_owned_response_write_chunks
+        .fetch_add(1, Ordering::Relaxed);
+    metrics
+        .non_owned_response_write_bytes
+        .fetch_add(bytes, Ordering::Relaxed);
+}
+
+#[must_use]
+pub fn hot_path_allocation_metrics_snapshot() -> HotPathAllocationMetricsSnapshot {
+    let metrics = hot_path_allocation_metrics();
+    HotPathAllocationMetricsSnapshot {
+        regular_pool_fallback_allocations: metrics
+            .regular_pool_fallback_allocations
+            .load(Ordering::Relaxed),
+        capture_pool_fallback_allocations: metrics
+            .capture_pool_fallback_allocations
+            .load(Ordering::Relaxed),
+        chunked_response_metadata_spills: metrics
+            .chunked_response_metadata_spills
+            .load(Ordering::Relaxed),
+        pending_backend_byte_heap_fallbacks: metrics
+            .pending_backend_byte_heap_fallbacks
+            .load(Ordering::Relaxed),
+        non_owned_response_write_chunks: metrics
+            .non_owned_response_write_chunks
+            .load(Ordering::Relaxed),
+        non_owned_response_write_bytes: metrics
+            .non_owned_response_write_bytes
+            .load(Ordering::Relaxed),
+    }
+}
+
+pub fn reset_hot_path_allocation_metrics() {
+    let metrics = hot_path_allocation_metrics();
+    metrics
+        .regular_pool_fallback_allocations
+        .store(0, Ordering::Relaxed);
+    metrics
+        .capture_pool_fallback_allocations
+        .store(0, Ordering::Relaxed);
+    metrics
+        .chunked_response_metadata_spills
+        .store(0, Ordering::Relaxed);
+    metrics
+        .pending_backend_byte_heap_fallbacks
+        .store(0, Ordering::Relaxed);
+    metrics
+        .non_owned_response_write_chunks
+        .store(0, Ordering::Relaxed);
+    metrics
+        .non_owned_response_write_bytes
+        .store(0, Ordering::Relaxed);
+}
+
+fn record_response_write_metrics(
+    chunk_count: usize,
+    bytes_written: usize,
+    tiny_chunks: usize,
+    tiny_chunk_bytes: usize,
+    small_chunks: usize,
+    small_chunk_bytes: usize,
+) {
+    if !response_write_metrics_enabled() {
+        return;
+    }
+
+    let metrics = response_write_metrics();
+    metrics.responses.fetch_add(1, Ordering::Relaxed);
+    metrics
+        .chunks_written
+        .fetch_add(chunk_count, Ordering::Relaxed);
+    metrics
+        .bytes_written
+        .fetch_add(bytes_written, Ordering::Relaxed);
+    metrics
+        .tiny_chunks
+        .fetch_add(tiny_chunks, Ordering::Relaxed);
+    metrics
+        .tiny_chunk_bytes
+        .fetch_add(tiny_chunk_bytes, Ordering::Relaxed);
+    metrics
+        .small_chunks
+        .fetch_add(small_chunks, Ordering::Relaxed);
+    metrics
+        .small_chunk_bytes
+        .fetch_add(small_chunk_bytes, Ordering::Relaxed);
+    metrics
+        .max_chunks_per_response
+        .fetch_max(chunk_count, Ordering::Relaxed);
+    if chunk_count <= 1 {
+        metrics
+            .single_chunk_responses
+            .fetch_add(1, Ordering::Relaxed);
+    } else {
+        metrics
+            .multi_chunk_responses
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[must_use]
+pub fn response_write_metrics_snapshot() -> ResponseWriteMetricsSnapshot {
+    let metrics = response_write_metrics();
+    ResponseWriteMetricsSnapshot {
+        responses: metrics.responses.load(Ordering::Relaxed),
+        single_chunk_responses: metrics.single_chunk_responses.load(Ordering::Relaxed),
+        multi_chunk_responses: metrics.multi_chunk_responses.load(Ordering::Relaxed),
+        chunks_written: metrics.chunks_written.load(Ordering::Relaxed),
+        bytes_written: metrics.bytes_written.load(Ordering::Relaxed),
+        tiny_chunks: metrics.tiny_chunks.load(Ordering::Relaxed),
+        tiny_chunk_bytes: metrics.tiny_chunk_bytes.load(Ordering::Relaxed),
+        small_chunks: metrics.small_chunks.load(Ordering::Relaxed),
+        small_chunk_bytes: metrics.small_chunk_bytes.load(Ordering::Relaxed),
+        max_chunks_per_response: metrics.max_chunks_per_response.load(Ordering::Relaxed),
+    }
+}
+
+#[derive(Debug)]
+struct ResponseChunk {
+    storage: ResponseChunkStorage,
+    range: Range<usize>,
+}
+
+#[derive(Debug)]
+enum ResponseChunkStorage {
+    Pooled(PooledBuffer),
+    SharedPooled(Arc<PooledBuffer>),
+    Shared(Bytes),
+}
+
+impl ResponseChunk {
+    fn as_slice(&self) -> &[u8] {
+        match &self.storage {
+            ResponseChunkStorage::Pooled(buffer) => &buffer.as_ref()[self.range.clone()],
+            ResponseChunkStorage::SharedPooled(buffer) => &buffer.as_ref()[self.range.clone()],
+            ResponseChunkStorage::Shared(bytes) => &bytes[self.range.clone()],
+        }
+    }
+
+    fn initialized(&self) -> usize {
+        match &self.storage {
+            ResponseChunkStorage::Pooled(buffer) => buffer.initialized(),
+            ResponseChunkStorage::SharedPooled(buffer) => buffer.initialized(),
+            ResponseChunkStorage::Shared(bytes) => bytes.len(),
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match &self.storage {
+            ResponseChunkStorage::Pooled(buffer) => buffer.capacity(),
+            ResponseChunkStorage::SharedPooled(buffer) => buffer.capacity(),
+            ResponseChunkStorage::Shared(bytes) => bytes.len(),
+        }
+    }
+
+    fn can_append(&self) -> bool {
+        matches!(self.storage, ResponseChunkStorage::Pooled(_))
+            && self.range.end == self.initialized()
+            && self.initialized() < self.capacity()
+    }
+
+    fn extend_from_slice(&mut self, data: &[u8]) {
+        match &mut self.storage {
+            ResponseChunkStorage::Pooled(buffer) => buffer.extend_from_slice(data),
+            ResponseChunkStorage::SharedPooled(_) | ResponseChunkStorage::Shared(_) => {
+                panic!("cannot extend shared response chunk")
+            }
+        }
+    }
 }
 
 impl ChunkedResponse {
@@ -264,13 +503,18 @@ impl ChunkedResponse {
     /// new capture buffer is acquired.
     pub fn extend_from_slice(&mut self, pool: &BufferPool, mut data: &[u8]) {
         while !data.is_empty() {
-            let need_new_chunk = self
-                .chunks
-                .last()
-                .is_none_or(|chunk| chunk.initialized() == chunk.capacity());
+            let need_new_chunk = self.chunks.last().is_none_or(|chunk| !chunk.can_append());
 
             if need_new_chunk {
-                self.chunks.push(pool.acquire_capture_now());
+                if self.chunks.len() == self.chunks.inline_size() {
+                    hot_path_allocation_metrics()
+                        .chunked_response_metadata_spills
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                self.chunks.push(ResponseChunk {
+                    storage: ResponseChunkStorage::Pooled(pool.acquire_capture_now()),
+                    range: 0..0,
+                });
             }
 
             let chunk = self
@@ -282,50 +526,88 @@ impl ChunkedResponse {
 
             let take = available.min(data.len());
             chunk.extend_from_slice(&data[..take]);
+            chunk.range.end += take;
             self.len += take;
             data = &data[take..];
         }
     }
 
-    /// Truncate the buffered response to the given absolute length.
+    /// Move a byte range from an initialized pooled buffer into this response.
+    ///
+    /// This avoids copying large backend reads into separate capture buffers.
+    /// Later appends will allocate a fresh pooled chunk when this range does not
+    /// end at the initialized length, so skipped bytes are never exposed.
+    /// # Panics
+    /// Panics if `range` is outside the buffer's initialized bytes.
+    pub fn push_buffer_range(&mut self, buffer: PooledBuffer, range: Range<usize>) {
+        assert!(
+            range.start <= range.end && range.end <= buffer.initialized(),
+            "response range must be inside initialized buffer"
+        );
+        if self.chunks.len() == self.chunks.inline_size() {
+            hot_path_allocation_metrics()
+                .chunked_response_metadata_spills
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        self.len += range.end - range.start;
+        self.chunks.push(ResponseChunk {
+            storage: ResponseChunkStorage::Pooled(buffer),
+            range,
+        });
+    }
+
+    /// Add a range from a shared pooled buffer without copying.
     ///
     /// # Panics
-    /// Panics if `len` exceeds the total buffered byte count.
-    pub fn truncate(&mut self, len: usize) {
-        assert!(len <= self.len, "truncate length exceeds buffered bytes");
-        if len == self.len {
-            return;
+    /// Panics if `range` is outside the pooled buffer's initialized bytes.
+    pub fn push_shared_pooled_range(&mut self, buffer: Arc<PooledBuffer>, range: Range<usize>) {
+        assert!(
+            range.start <= range.end && range.end <= buffer.initialized(),
+            "response range must be inside initialized pooled buffer"
+        );
+        if self.chunks.len() == self.chunks.inline_size() {
+            hot_path_allocation_metrics()
+                .chunked_response_metadata_spills
+                .fetch_add(1, Ordering::Relaxed);
         }
+        self.len += range.end - range.start;
+        self.chunks.push(ResponseChunk {
+            storage: ResponseChunkStorage::SharedPooled(buffer),
+            range,
+        });
+    }
 
-        let mut remaining = len;
-        let mut keep_chunks = 0;
-
-        for chunk in &mut self.chunks {
-            let chunk_len = chunk.initialized();
-            if remaining >= chunk_len {
-                remaining -= chunk_len;
-                keep_chunks += 1;
-                continue;
-            }
-
-            chunk.truncate(remaining);
-            keep_chunks += 1;
-            break;
+    /// Add a range from shared immutable bytes without copying.
+    ///
+    /// # Panics
+    /// Panics if `range` is outside the shared buffer.
+    pub fn push_shared_range(&mut self, bytes: Bytes, range: Range<usize>) {
+        assert!(
+            range.start <= range.end && range.end <= bytes.len(),
+            "response range must be inside shared buffer"
+        );
+        if self.chunks.len() == self.chunks.inline_size() {
+            hot_path_allocation_metrics()
+                .chunked_response_metadata_spills
+                .fetch_add(1, Ordering::Relaxed);
         }
-
-        self.chunks.truncate(keep_chunks);
-        self.len = len;
+        self.len += range.end - range.start;
+        self.chunks.push(ResponseChunk {
+            storage: ResponseChunkStorage::Shared(bytes),
+            range,
+        });
     }
 
     /// First chunk of buffered data, if any.
+    #[cfg(test)]
     #[must_use]
     pub fn first_chunk(&self) -> Option<&[u8]> {
-        self.chunks.first().map(AsRef::as_ref)
+        self.chunks.first().map(ResponseChunk::as_slice)
     }
 
     /// Iterate buffered chunks without flattening.
     pub fn iter_chunks(&self) -> impl Iterator<Item = &[u8]> {
-        self.chunks.iter().map(AsRef::as_ref)
+        self.chunks.iter().map(ResponseChunk::as_slice)
     }
 
     /// Copy up to `len` bytes from the front of the response into a small stack-backed buffer.
@@ -360,12 +642,12 @@ impl ChunkedResponse {
         }
 
         let mut remaining = prefix;
-        for chunk in &self.chunks {
+        for chunk in self.iter_chunks() {
             if remaining.is_empty() {
                 return true;
             }
 
-            let data = chunk.as_ref();
+            let data = chunk;
             let take = data.len().min(remaining.len());
             if data[..take] != remaining[..take] {
                 return false;
@@ -376,31 +658,6 @@ impl ChunkedResponse {
         remaining.is_empty()
     }
 
-    /// Returns true if buffered bytes end with `suffix`.
-    #[must_use]
-    pub fn ends_with(&self, suffix: &[u8]) -> bool {
-        if suffix.len() > self.len {
-            return false;
-        }
-
-        let mut remaining = suffix.len();
-        for chunk in self.chunks.iter().rev() {
-            if remaining == 0 {
-                return true;
-            }
-            let data = chunk.as_ref();
-            let take = remaining.min(data.len());
-            let suffix_start = remaining - take;
-            let data_start = data.len() - take;
-            if data[data_start..] != suffix[suffix_start..remaining] {
-                return false;
-            }
-            remaining -= take;
-        }
-
-        remaining == 0
-    }
-
     /// Write all buffered chunks to a sink in order.
     ///
     /// # Errors
@@ -409,6 +666,34 @@ impl ChunkedResponse {
     where
         W: AsyncWriteExt + Unpin,
     {
+        if response_write_metrics_enabled() {
+            let mut chunk_count = 0usize;
+            let mut tiny_chunks = 0usize;
+            let mut tiny_chunk_bytes = 0usize;
+            let mut small_chunks = 0usize;
+            let mut small_chunk_bytes = 0usize;
+            for chunk in self.iter_chunks() {
+                chunk_count += 1;
+                let len = chunk.len();
+                if len <= 256 {
+                    tiny_chunks += 1;
+                    tiny_chunk_bytes += len;
+                }
+                if len <= 4096 {
+                    small_chunks += 1;
+                    small_chunk_bytes += len;
+                }
+            }
+            record_response_write_metrics(
+                chunk_count,
+                self.len,
+                tiny_chunks,
+                tiny_chunk_bytes,
+                small_chunks,
+                small_chunk_bytes,
+            );
+        }
+
         for chunk in self.iter_chunks() {
             writer.write_all(chunk).await?;
         }
@@ -621,6 +906,9 @@ impl BufferPool {
     fn acquire_now(&self) -> PooledBuffer {
         let buffer = self.pool.pop().map_or_else(
             || {
+                hot_path_allocation_metrics()
+                    .regular_pool_fallback_allocations
+                    .fetch_add(1, Ordering::Relaxed);
                 // Create new page-aligned buffer for better DMA performance
                 Self::create_aligned_buffer(self.buffer_size.get())
             },
@@ -657,6 +945,9 @@ impl BufferPool {
     pub(crate) fn acquire_capture_now(&self) -> PooledBuffer {
         let buffer = self.capture_pool.pop().map_or_else(
             || {
+                hot_path_allocation_metrics()
+                    .capture_pool_fallback_allocations
+                    .fetch_add(1, Ordering::Relaxed);
                 // Pool exhausted - allocate and pre-fault new buffer
                 let capacity = if self.capture_capacity > 0 {
                     self.capture_capacity
@@ -818,17 +1109,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_clear_and_truncate_only_change_initialized_length() {
+    async fn test_clear_only_changes_initialized_length() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
         let mut buffer = pool.acquire();
         let capacity = buffer.capacity();
 
         buffer.copy_from_slice(b"abcdef");
-        buffer.truncate(3);
-        assert_eq!(buffer.initialized(), 3);
-        assert_eq!(&*buffer, b"abc");
-        assert_eq!(buffer.capacity(), capacity);
-
         buffer.clear();
         assert_eq!(buffer.initialized(), 0);
         assert_eq!(buffer.len(), 0);
@@ -922,11 +1208,24 @@ mod tests {
         assert!(chunks.len() > 1, "test requires multi-chunk buffering");
         assert_eq!(chunks.concat(), b"220 0 <id>\r\nBody\r\n.\r\n");
         assert!(response.starts_with(b"220 0 "));
-        assert!(response.ends_with(b"\r\n.\r\n"));
 
         let mut prefix = SmallVec::<[u8; 128]>::new();
         response.copy_prefix_into(12, &mut prefix);
         assert_eq!(&prefix[..], b"220 0 <id>\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_chunked_response_uses_more_capture_buffers_instead_of_growing_one() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 4);
+        let mut response = ChunkedResponse::default();
+
+        response.extend_from_slice(&pool, b"123456789abcdefghi");
+
+        let chunks: Vec<&[u8]> = response.iter_chunks().collect();
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.len()).collect::<Vec<_>>(),
+            vec![8, 8, 2]
+        );
     }
 
     #[tokio::test]
@@ -938,6 +1237,60 @@ mod tests {
         let mut prefix = SmallVec::<[u8; 128]>::new();
         response.copy_prefix_into(64, &mut prefix);
         assert_eq!(&prefix[..], b"430\r\n");
+    }
+
+    #[tokio::test]
+    async fn test_chunked_response_can_own_range_without_copying() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 2);
+        let mut buffer = pool.acquire();
+        buffer.copy_from_slice(b"xx220 0 <id>\r\nBody\r\n.\r\nyy");
+        let expected_ptr = buffer.as_ref()[2..].as_ptr();
+
+        let mut response = ChunkedResponse::default();
+        response.push_buffer_range(buffer, 2..23);
+
+        let first = response.first_chunk().expect("range chunk");
+        assert_eq!(first.as_ptr(), expected_ptr);
+        assert_eq!(first, b"220 0 <id>\r\nBody\r\n.\r\n");
+        assert!(response.starts_with(b"220 0 "));
+    }
+
+    #[tokio::test]
+    async fn test_chunked_response_can_share_pooled_range_without_copying() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 2);
+        let mut buffer = pool.acquire();
+        buffer.copy_from_slice(b"xx220 0 <id>\r\nBody\r\n.\r\nyy");
+        let shared = std::sync::Arc::new(buffer);
+        let expected_ptr = shared.as_ref()[2..].as_ptr();
+
+        let mut response = ChunkedResponse::default();
+        response.push_shared_pooled_range(std::sync::Arc::clone(&shared), 2..23);
+
+        let first = response.first_chunk().expect("shared pooled range chunk");
+        assert_eq!(first.as_ptr(), expected_ptr);
+        assert_eq!(first, b"220 0 <id>\r\nBody\r\n.\r\n");
+        drop(response);
+        drop(shared);
+        assert_eq!(pool.available_buffers(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_freeze_detaches_bytes_from_pool_ownership() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
+        let mut buffer = pool.acquire();
+        buffer.copy_from_slice(b"223 0 <id>\r\n");
+        assert_eq!(pool.available_buffers(), 0);
+
+        let bytes = buffer.freeze();
+        assert_eq!(&bytes[..], b"223 0 <id>\r\n");
+
+        drop(bytes);
+
+        assert_eq!(
+            pool.available_buffers(),
+            0,
+            "dropping frozen bytes must not return the detached allocation to the pool"
+        );
     }
 
     #[tokio::test]

@@ -13,8 +13,8 @@ const USERNAME: &str = "alice";
 const PASSWORD: &str = "wonderland";
 
 async fn spawn_auth_gating_client(mode: RoutingMode) -> Result<RfcTestClient> {
-    RfcTestClient::spawn_with_auth(mode, "auth-gating-backend", USERNAME, PASSWORD, |port| {
-        MockNntpServer::new(port)
+    RfcTestClient::spawn_with_auth(mode, "auth-gating-backend", USERNAME, PASSWORD, |_port| {
+        MockNntpServer::new()
             .with_name("AuthGatingBackend")
             .on_command("DATE", "111 20260504112233\r\n")
     })

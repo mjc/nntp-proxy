@@ -38,7 +38,7 @@ fn auth_credentials_strategy() -> impl Strategy<Value = (String, String)> {
 
 /// Helper to setup a test environment
 async fn setup_test_proxy() -> Result<(u16, u16, tokio::task::AbortHandle)> {
-    // Find available ports
+    // Bind listeners first so OS-assigned ports stay owned by these tests.
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
 
@@ -46,7 +46,7 @@ async fn setup_test_proxy() -> Result<(u16, u16, tokio::task::AbortHandle)> {
     let proxy_port = proxy_listener.local_addr()?.port();
 
     // Start mock backend with responses for all commands
-    let mock = MockNntpServer::new(backend_port)
+    let mock = MockNntpServer::new()
         .with_name("Test Backend")
         .on_command("HELP", "100 Help text\r\n")
         .on_command("DATE", "111 20251120120000\r\n")

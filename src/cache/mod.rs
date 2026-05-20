@@ -37,6 +37,7 @@ use smallvec::SmallVec;
 /// Hot-path code should hand off one of these owned forms directly instead of
 /// flattening into a fresh `Vec<u8>` before spawning cache work.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum CacheIngestResponse {
     Owned(Box<[u8]>),
     Pooled(crate::pool::PooledBuffer),
@@ -354,12 +355,6 @@ impl UnifiedCache {
         Self::Availability(AvailabilityIndex::with_ttl(ttl))
     }
 
-    /// Create a disabled availability index that retains no entries.
-    #[must_use]
-    pub(crate) fn availability_disabled(ttl: std::time::Duration) -> Self {
-        Self::Availability(AvailabilityIndex::disabled(ttl))
-    }
-
     /// Create a memory-only cache
     #[must_use]
     pub fn memory(capacity: u64, ttl: std::time::Duration) -> Self {
@@ -371,6 +366,19 @@ impl UnifiedCache {
         Ok(Self::Hybrid(HybridArticleCache::new(config).await?))
     }
 
+    /// Returns true when successful backend responses update positive
+    /// availability metadata.
+    #[must_use]
+    pub const fn records_backend_has_status(&self) -> bool {
+        !matches!(self, Self::Availability(_))
+    }
+
+    /// Returns true when this cache stores response payloads.
+    #[must_use]
+    pub const fn stores_payload_responses(&self) -> bool {
+        !matches!(self, Self::Availability(_))
+    }
+
     /// Get an article from the cache
     pub async fn get(&self, message_id: &MessageId<'_>) -> Option<CachedArticle> {
         match self {
@@ -379,14 +387,14 @@ impl UnifiedCache {
             Self::Hybrid(cache) => cache
                 .get(message_id)
                 .await
-                .map(|entry| entry.to_cached_article()),
+                .map(hybrid_codec::DiskCachedArticle::into_cached_article),
         }
     }
 
     /// Get an article from a validated request message-id string (`<...>`).
     ///
-    /// Memory cache hits avoid rebuilding a `MessageId`; hybrid cache still uses
-    /// the typed wrapper because its disk key path owns `String`s internally.
+    /// Memory and hybrid cache hits avoid rebuilding a `MessageId` by looking up
+    /// the stripped cache key directly.
     pub async fn get_request_message_id(&self, message_id: &str) -> Option<CachedArticle> {
         match self {
             Self::Availability(index) => index.get_request_message_id(message_id),
@@ -395,11 +403,11 @@ impl UnifiedCache {
                 cache.get_by_cache_key(key).await
             }
             Self::Hybrid(cache) => {
-                let message_id = MessageId::from_borrowed(message_id).ok()?;
+                let key = message_id.strip_prefix('<')?.strip_suffix('>')?;
                 cache
-                    .get(&message_id)
+                    .get_by_cache_key(key)
                     .await
-                    .map(|entry| entry.to_cached_article())
+                    .map(hybrid_codec::DiskCachedArticle::into_cached_article)
             }
         }
     }

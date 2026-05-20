@@ -8,31 +8,29 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::{Duration, timeout};
 
-use crate::test_helpers::{MockNntpServer, create_test_server_config, wait_for_server};
+use crate::test_helpers::{
+    MockNntpServer, create_test_server_config, spawn_test_proxy_on_listener, wait_for_server,
+};
 use nntp_proxy::{Config, NntpProxy, RoutingMode};
 
 /// Helper to setup proxy with specific routing mode
 async fn setup_proxy_with_mode(
     routing_mode: RoutingMode,
 ) -> Result<(u16, u16, tokio::task::AbortHandle)> {
-    // Find available ports
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
-    drop(backend_listener);
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
-    let proxy_port = proxy_listener.local_addr()?.port();
 
     // Start mock backend
-    let mock = MockNntpServer::new(backend_port)
+    let mock = MockNntpServer::new()
         .with_name("Test Backend")
         .on_command("HELP", "100 Help text\r\n.\r\n")
         .on_command("DATE", "111 20251120120000\r\n")
         .on_command("LIST", "215 List follows\r\n.\r\n")
         .on_command("QUIT", "205 Goodbye\r\n")
         .on_command("GROUP alt.test", "211 100 1 100 alt.test\r\n")
-        .spawn();
-    wait_for_server(&format!("127.0.0.1:{backend_port}"), 20).await?;
+        .spawn_on_listener(backend_listener);
 
     // Create and start proxy
     let config = Config {
@@ -46,16 +44,7 @@ async fn setup_proxy_with_mode(
 
     let proxy = NntpProxy::new(config, routing_mode).await?;
 
-    tokio::spawn(async move {
-        loop {
-            if let Ok((stream, addr)) = proxy_listener.accept().await {
-                let proxy_clone = proxy.clone();
-                tokio::spawn(async move {
-                    let _ = proxy_clone.handle_client(stream, addr.into()).await;
-                });
-            }
-        }
-    });
+    let proxy_port = spawn_test_proxy_on_listener(proxy, proxy_listener, false);
 
     wait_for_server(&format!("127.0.0.1:{proxy_port}"), 20).await?;
 

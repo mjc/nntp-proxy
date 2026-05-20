@@ -42,8 +42,8 @@ async fn test_capabilities_before_auth_advertises_authinfo_not_backend_extension
         "caps-backend",
         "alice",
         "wonderland",
-        |port| {
-            MockNntpServer::new(port)
+        |_port| {
+            MockNntpServer::new()
                 .with_name("CapsBackend")
                 .on_command("CAPABILITIES", BACKEND_CAPABILITIES)
         },
@@ -63,8 +63,8 @@ async fn test_capabilities_after_auth_omits_authinfo() -> Result<()> {
         "caps-backend",
         "alice",
         "wonderland",
-        |port| {
-            MockNntpServer::new(port)
+        |_port| {
+            MockNntpServer::new()
                 .with_name("CapsBackend")
                 .on_command("CAPABILITIES", BACKEND_CAPABILITIES)
         },

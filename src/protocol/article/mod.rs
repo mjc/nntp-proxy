@@ -1,7 +1,7 @@
 //! Article parsing and validation
 //!
-//! Provides zero-copy parsing of NNTP article responses (ARTICLE, HEAD, BODY, STAT)
-//! with comprehensive validation of structure and format.
+//! Provides zero-copy parsing of complete NNTP article responses
+//! (ARTICLE, HEAD, BODY, STAT) with validation of semantic structure.
 
 mod error;
 mod headers;
@@ -42,12 +42,12 @@ impl<'a> Article<'a> {
     /// Parse NNTP article response with optional yEnc validation
     ///
     /// # Arguments
-    /// * `buf` - Raw response bytes
+    /// * `buf` - Complete response bytes from the session response reader.
     /// * `validate_yenc` - Whether to validate yEnc structure/checksums
     ///
     /// # Errors
     /// Returns `ParseError` when the NNTP response status line, message metadata,
-    /// headers, body framing, or optional yEnc validation fails.
+    /// headers, body structure, or optional yEnc validation fails.
     pub fn parse(buf: &'a [u8], validate_yenc: bool) -> Result<Self, ParseError> {
         // Parse status code from first line
         let status_code = parse_status_code(buf)?;
@@ -81,9 +81,7 @@ impl<'a> Article<'a> {
         // Body starts after blank line (\r\n\r\n is 4 bytes)
         let body_start = separator_pos + 4;
 
-        // Find terminator
-        let terminator_start = find_terminator(buf, body_start)?;
-        let body_data = &buf[body_start..terminator_start];
+        let body_data = &buf[body_start..];
 
         // Validate yenc if enabled and present
         if validate_yenc && body_data.starts_with(b"=ybegin") {
@@ -108,20 +106,12 @@ impl<'a> Article<'a> {
 
         let (message_id, article_number) = parse_first_line(first_line)?;
 
-        // Headers start after first line
         let content_start = first_line_end + 2;
-
-        // HEAD must NOT have a blank line separator (that would indicate body)
-        // Check for \r\n\r\n before the terminator
         if find_blank_line(buf, content_start).is_ok() {
             return Err(ParseError::UnexpectedBody);
         }
 
-        // Find terminator (headers end at terminator)
-        let terminator_start = find_terminator(buf, content_start)?;
-
-        // Headers are between content_start and terminator
-        let headers_data = &buf[content_start..terminator_start];
+        let headers_data = &buf[content_start..];
         let headers = Some(Headers::parse(headers_data)?);
 
         Ok(Article {
@@ -140,12 +130,8 @@ impl<'a> Article<'a> {
 
         let (message_id, article_number) = parse_first_line(first_line)?;
 
-        // Body starts immediately after first line (no headers)
         let body_start = first_line_end + 2;
-
-        // Find terminator
-        let terminator_start = find_terminator(buf, body_start)?;
-        let body_data = &buf[body_start..terminator_start];
+        let body_data = &buf[body_start..];
 
         // Validate yenc if enabled and present
         if validate_yenc && body_data.starts_with(b"=ybegin") {
@@ -170,16 +156,9 @@ impl<'a> Article<'a> {
 
         let (message_id, article_number) = parse_first_line(first_line)?;
 
-        // STAT has no content - verify terminator immediately follows
         let content_start = first_line_end + 2;
-
-        // For STAT, there might not be a terminator, or it's at the end
-        // Check if we have more data
         if content_start < buf.len() {
-            // Verify it's the terminator
-            if !buf[content_start..].starts_with(b".\r\n") {
-                return Err(ParseError::UnexpectedBody);
-            }
+            return Err(ParseError::UnexpectedBody);
         }
 
         Ok(Article {
@@ -312,26 +291,6 @@ fn find_blank_line(buf: &[u8], start: usize) -> Result<usize, ParseError> {
     Err(ParseError::MissingSeparator)
 }
 
-/// Find multiline terminator (.\r\n)
-fn find_terminator(buf: &[u8], start: usize) -> Result<usize, ParseError> {
-    use crate::session::tail_buffer::{TailBuffer, TerminatorStatus};
-
-    // Empty body: terminator immediately follows blank line separator
-    if buf.get(start..).is_some_and(|s| s.starts_with(b".\r\n")) {
-        return Ok(start);
-    }
-
-    // Use TailBuffer (SIMD-accelerated via memchr) to find \r\n.\r\n
-    match TailBuffer::default().detect_terminator(&buf[start..]) {
-        TerminatorStatus::FoundAt(rel_pos) => {
-            // rel_pos is the end of the 5-byte terminator within buf[start..]
-            // Return position of '.' = 3 bytes before end of terminator
-            Ok(start + rel_pos - 3)
-        }
-        TerminatorStatus::NotFound => Err(ParseError::MissingTerminator),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,19 +310,11 @@ mod tests {
     }
 
     #[test]
-    fn test_find_terminator() {
-        let buf = b"Body content\r\n.\r\n";
-        let pos = find_terminator(buf, 0).unwrap();
-        assert_eq!(&buf[pos..pos + 3], b".\r\n");
-    }
-
-    #[test]
     fn test_parse_article_220() {
         let buf = b"220 100 <test@example.com> article\r\n\
                     Subject: Test\r\n\
                     \r\n\
-                    Body content\r\n\
-                    .\r\n";
+                    Body content\r\n";
 
         let article = Article::try_from(&buf[..]).unwrap();
         assert_eq!(article.message_id.as_str(), "<test@example.com>");
@@ -378,8 +329,7 @@ mod tests {
         let buf = b"222 100 <test@example.com> body\r\n\
                     =ybegin line=128 size=12 name=test.txt\r\n\
                     r\x8f\x96\x96\x99VJ\xa3o\x98\x8dK\r\n\
-                    =yend size=12 crc32=0337ab3d\r\n\
-                    .\r\n";
+                    =yend size=12 crc32=0337ab3d\r\n";
 
         let article = Article::parse(&buf[..], true).unwrap();
         let decoded = article.decode();
@@ -393,8 +343,7 @@ mod tests {
     #[test]
     fn test_decode_non_yenc_returns_none() {
         let buf = b"222 100 <test@example.com> body\r\n\
-                    This is plain text, not yenc\r\n\
-                    .\r\n";
+                    This is plain text, not yenc\r\n";
 
         let article = Article::parse(&buf[..], false).unwrap();
         let decoded = article.decode();
@@ -404,8 +353,7 @@ mod tests {
 
     #[test]
     fn test_decode_no_body_returns_none() {
-        let buf = b"223 100 <test@example.com>\r\n\
-                    .\r\n";
+        let buf = b"223 100 <test@example.com>\r\n";
 
         let article = Article::parse(&buf[..], false).unwrap();
         let decoded = article.decode();

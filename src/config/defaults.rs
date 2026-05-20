@@ -61,11 +61,11 @@ pub const fn cache_ttl() -> Duration {
 
 /// Default for caching article bodies in explicit `[cache]` sections.
 ///
-/// Preserve the long-standing default of full article-body caching when `[cache]`
-/// is present and `store_article_bodies` is omitted.
+/// Availability-only mode is the default; set `store_article_bodies = true`
+/// explicitly when you want full body caching.
 #[inline]
 pub const fn cache_articles() -> bool {
-    true
+    false
 }
 
 /// Default for adaptive availability prechecking (false = disabled)
@@ -183,24 +183,6 @@ pub const fn disk_cache_shards() -> usize {
 #[inline]
 pub const fn backend_idle_timeout() -> Duration {
     crate::constants::duration_polyfill::from_minutes(10)
-}
-
-/// Default for backend pipelining (enabled)
-#[inline]
-pub const fn enable_pipelining() -> bool {
-    true
-}
-
-/// Default pipeline queue depth
-#[inline]
-pub const fn pipeline_queue_depth() -> usize {
-    1000
-}
-
-/// Default pipeline batch size
-#[inline]
-pub const fn pipeline_batch_size() -> usize {
-    4
 }
 
 /// Default connection replacement cooldown (30 seconds)

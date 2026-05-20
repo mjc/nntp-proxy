@@ -388,10 +388,12 @@ where
         CommandAction::InterceptCapabilities => {
             // RFC 4643 §3.1: CAPABILITIES must be accessible before authentication.
             // Auth is enabled and client is not yet authenticated → include AUTHINFO.
-            use crate::protocol::CAPABILITIES_WITH_AUTHINFO;
-            client_write.write_all(CAPABILITIES_WITH_AUTHINFO).await?;
+            use crate::session::response_buffer::CAPABILITIES_WITH_AUTHINFO_RESPONSE;
+            client_write
+                .write_all(CAPABILITIES_WITH_AUTHINFO_RESPONSE)
+                .await?;
             Ok(AuthHandlerResult::Rejected {
-                bytes_written: CAPABILITIES_WITH_AUTHINFO.len() as u64,
+                bytes_written: CAPABILITIES_WITH_AUTHINFO_RESPONSE.len() as u64,
             })
         }
         CommandAction::InterceptAuth(auth_action) => {

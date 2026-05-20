@@ -14,6 +14,7 @@ pub mod edge_cases;
 pub mod least_loaded;
 pub mod load_tracking;
 pub mod modes;
+pub mod per_command_pool;
 pub mod retry_430;
 pub mod round_robin;
 pub mod stale_connection;

@@ -21,8 +21,7 @@ pub use article::{Article, HeaderIter, Headers, ParseError, yenc};
 pub(crate) use request::{
     MAX_COMMAND_LINE_OCTETS, RequestCacheArticleNumber, RequestCacheAvailability,
     RequestCacheEntryMetadata, RequestCachePayloadKind, RequestCacheStatus, RequestCacheTier,
-    RequestCacheTimestampMillis, RequestResponseMetadata, ResponsePayloadLen,
-    request_kind_expects_multiline,
+    RequestCacheTimestampMillis, RequestResponseMetadata, request_kind_has_response_body,
 };
 pub use request::{
     RequestContext, RequestKind, RequestRouteClass, RequestWireLen, ResponseWireLen,
@@ -39,10 +38,9 @@ pub use commands::{
 pub use responses::{
     AUTH_ACCEPTED, AUTH_ALREADY_AUTHENTICATED, AUTH_FAILED, AUTH_OUT_OF_SEQUENCE, AUTH_REQUIRED,
     AUTH_REQUIRED_FOR_COMMAND, AUTH_UNKNOWN_SUBCOMMAND, BACKEND_ERROR, BACKEND_UNAVAILABLE,
-    CAPABILITIES_WITH_AUTHINFO, CAPABILITIES_WITHOUT_AUTHINFO, COMMAND_SYNTAX_ERROR_RESPONSE,
-    COMMAND_TOO_LONG, CONNECTION_CLOSING, CRLF, GOODBYE, MIN_RESPONSE_LENGTH, NO_SUCH_ARTICLE,
-    POSTING_NOT_PERMITTED, PROXY_GREETING_PCR, TERMINATOR_TAIL_SIZE, error_response, greeting,
-    greeting_readonly, ok_response, response,
+    COMMAND_SYNTAX_ERROR_RESPONSE, COMMAND_TOO_LONG, CONNECTION_CLOSING, CRLF, GOODBYE,
+    MIN_RESPONSE_LENGTH, NO_SUCH_ARTICLE, POSTING_NOT_PERMITTED, PROXY_GREETING_PCR,
+    error_response, greeting, greeting_readonly, ok_response, response,
 };
 
 /// Send NNTP proxy greeting to a client

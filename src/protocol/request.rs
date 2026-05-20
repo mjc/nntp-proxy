@@ -105,21 +105,19 @@ impl From<usize> for ResponseWireLen {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct ResponsePayloadLen(usize);
 
+#[cfg(test)]
 impl ResponsePayloadLen {
     #[must_use]
     pub(crate) const fn new(value: usize) -> Self {
         Self(value)
     }
-
-    #[must_use]
-    pub(crate) const fn get(self) -> usize {
-        self.0
-    }
 }
 
+#[cfg(test)]
 impl From<usize> for ResponsePayloadLen {
     fn from(value: usize) -> Self {
         Self::new(value)
@@ -139,6 +137,7 @@ impl RequestResponseMetadata {
     }
 
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) const fn status(self) -> StatusCode {
         self.status
     }
@@ -597,6 +596,7 @@ impl RequestContext {
 
     #[inline]
     #[must_use]
+    #[cfg(test)]
     pub(crate) const fn response_payload_len(&self) -> Option<ResponsePayloadLen> {
         match &self.response_payload {
             Some(response) => Some(ResponsePayloadLen::new(response.len())),
@@ -605,6 +605,7 @@ impl RequestContext {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn complete_backend_response(
         &mut self,
         backend_id: BackendId,
@@ -617,6 +618,7 @@ impl RequestContext {
     }
 
     #[inline]
+    #[allow(dead_code)]
     pub(crate) fn take_response_payload(&mut self) -> Option<crate::pool::ChunkedResponse> {
         self.response_payload.take()
     }
@@ -646,16 +648,6 @@ impl RequestContext {
             offset = end;
             matches
         }))
-    }
-
-    #[inline]
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) const fn response_payload_is_empty(&self) -> Option<bool> {
-        match &self.response_payload {
-            Some(response) => Some(response.is_empty()),
-            None => None,
-        }
     }
 
     #[inline]
@@ -768,13 +760,13 @@ impl RequestContext {
     }
 
     #[must_use]
-    pub fn expects_multiline_response(&self, status: StatusCode) -> bool {
-        request_kind_expects_multiline(self.kind, status)
+    pub fn has_response_body(&self, status: StatusCode) -> bool {
+        request_kind_has_response_body(self.kind, status)
     }
 }
 
 #[must_use]
-pub(crate) fn request_kind_expects_multiline(kind: RequestKind, status: StatusCode) -> bool {
+pub(crate) fn request_kind_has_response_body(kind: RequestKind, status: StatusCode) -> bool {
     let code = status.as_u16();
     if status.is_error() {
         return false;
@@ -793,7 +785,7 @@ pub(crate) fn request_kind_expects_multiline(kind: RequestKind, status: StatusCo
             | (RequestKind::Hdr | RequestKind::Xhdr, 225)
             | (RequestKind::NewNews, 230)
             | (RequestKind::NewGroups, 231)
-    ) || matches!(kind, RequestKind::Unknown) && status_implies_multiline(code)
+    ) || matches!(kind, RequestKind::Unknown) && status_implies_response_body(code)
 }
 
 fn trim_line_end(mut line: &[u8]) -> &[u8] {
@@ -949,7 +941,7 @@ fn find_message_id(args: &[u8]) -> Option<(usize, usize)> {
     Some((start, end))
 }
 
-const fn status_implies_multiline(code: u16) -> bool {
+const fn status_implies_response_body(code: u16) -> bool {
     matches!(
         code,
         codes::HELP_TEXT
@@ -1391,17 +1383,15 @@ mod tests {
     }
 
     #[test]
-    fn request_context_derives_multiline_response_expectation() {
+    fn request_context_derives_response_body_expectation() {
         let group = request_context(b"GROUP alt.test\r\n");
         let listgroup = request_context(b"LISTGROUP alt.test\r\n");
         let unknown = request_context(b"XFEATURE TEST\r\n");
-        assert!(!group.expects_multiline_response(StatusCode::new(211)));
-        assert!(listgroup.expects_multiline_response(StatusCode::new(211)));
-        assert!(
-            !request_context(b"ARTICLE <x@y>\r\n").expects_multiline_response(StatusCode::new(430))
-        );
-        assert!(unknown.expects_multiline_response(StatusCode::new(282)));
-        assert!(unknown.expects_multiline_response(StatusCode::new(288)));
-        assert!(!unknown.expects_multiline_response(StatusCode::new(281)));
+        assert!(!group.has_response_body(StatusCode::new(211)));
+        assert!(listgroup.has_response_body(StatusCode::new(211)));
+        assert!(!request_context(b"ARTICLE <x@y>\r\n").has_response_body(StatusCode::new(430)));
+        assert!(unknown.has_response_body(StatusCode::new(282)));
+        assert!(unknown.has_response_body(StatusCode::new(288)));
+        assert!(!unknown.has_response_body(StatusCode::new(281)));
     }
 }

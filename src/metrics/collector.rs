@@ -134,6 +134,14 @@ impl MetricsCollector {
         if let Some(mut entry) = self.inner.store.user_metrics.get_mut(key) {
             update(&mut entry);
         }
+        let pruned = self.inner.store.prune_user_metrics();
+        if pruned > 0 {
+            tracing::warn!(
+                pruned,
+                retained_users = self.inner.store.user_metrics.len(),
+                "Pruned inactive user metrics after new user insertion"
+            );
+        }
     }
 
     /// Create a new metrics collector
@@ -150,6 +158,14 @@ impl MetricsCollector {
     /// The store contains all cumulative counters that were saved to disk.
     /// Live gauges (`active_connections`, `health_status`) start at zero.
     pub fn with_store(store: MetricsStore) -> Self {
+        let pruned = store.prune_user_metrics();
+        if pruned > 0 {
+            tracing::warn!(
+                pruned,
+                retained_users = store.user_metrics.len(),
+                "Pruned restored user metrics before building collector"
+            );
+        }
         let num_backends = store.backend_stores.len();
         let backend_metrics = (0..num_backends)
             .map(|_| BackendMetrics::default())

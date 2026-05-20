@@ -735,11 +735,7 @@ mod tests {
 
     #[tokio::test]
     async fn reader_session_reports_retry_for_disconnected_listener() {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test port");
-        let addr = listener.local_addr().expect("local addr");
-        drop(listener);
+        let addr = "127.0.0.1:1".parse().unwrap();
 
         let (state_tx, _state_rx) = watch::channel(AttachedDashboard::connecting(addr));
         let (_log_tail_tx, log_tail_rx) = watch::channel(REMOTE_DASHBOARD_LOG_LINE_LIMIT);

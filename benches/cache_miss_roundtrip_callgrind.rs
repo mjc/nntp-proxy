@@ -20,7 +20,6 @@ supported! {
         Callgrind, LibraryBenchmarkConfig, library_benchmark, library_benchmark_group, main,
     };
     use nntp_proxy::config::{Cache, Config, Server};
-    use nntp_proxy::session::tail_buffer::{TailBuffer, TerminatorStatus};
     use nntp_proxy::types::{CacheCapacity, MaxConnections, Port};
     use nntp_proxy::{NntpProxy, RoutingMode};
     use std::hint::black_box;
@@ -51,7 +50,6 @@ supported! {
                 Server::builder("127.0.0.1", Port::try_new(backend_port).unwrap())
                 .name("bench-backend")
                 .max_connections(MaxConnections::try_new(4).unwrap())
-                .backend_pipelining(true)
                 .build()
                 .unwrap(),
             ],
@@ -142,6 +140,7 @@ supported! {
     struct BenchClient {
         stream: TcpStream,
         response_buffer: Box<[u8]>,
+        response_len: usize,
     }
 
     impl BenchClient {
@@ -163,6 +162,7 @@ supported! {
             Self {
                 stream,
                 response_buffer: vec![0; body_len + 512].into_boxed_slice(),
+                response_len: article_response(body_len).len(),
             }
         }
 
@@ -191,7 +191,7 @@ supported! {
 
         async fn article_roundtrip(&mut self) -> usize {
             self.stream.write_all(b"ARTICLE <bench@example.com>\r\n").await.unwrap();
-            read_multiline_into(&mut self.stream, &mut self.response_buffer).await
+            read_exact_response_into(&mut self.stream, &mut self.response_buffer, self.response_len).await
         }
     }
 
@@ -206,21 +206,14 @@ supported! {
         }
     }
 
-    async fn read_multiline_into(stream: &mut TcpStream, buffer: &mut [u8]) -> usize {
+    async fn read_exact_response_into(stream: &mut TcpStream, buffer: &mut [u8], expected: usize) -> usize {
         let mut total = 0usize;
-        let mut tail = TailBuffer::default();
-        loop {
+        while total < expected {
             let n = stream.read(&mut buffer[total..]).await.unwrap();
             assert_ne!(n, 0, "proxy closed during benchmark response");
-            let chunk = &buffer[total..total + n];
-            match tail.detect_terminator(chunk) {
-                TerminatorStatus::FoundAt(pos) => return total + pos,
-                TerminatorStatus::NotFound => {
-                    total += n;
-                    tail.update(chunk);
-                }
-            }
+            total += n;
         }
+        total
     }
 
     struct BenchHarness {

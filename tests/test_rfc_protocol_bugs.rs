@@ -38,7 +38,7 @@ async fn test_overlong_first_command_returns_501_and_continues() -> Result<()> {
     let proxy_port = proxy_listener.local_addr()?.port();
 
     // Start a minimal mock backend
-    let _backend = MockNntpServer::new(backend_port)
+    let _backend = MockNntpServer::new()
         .with_name("TestBackend")
         .on_command("LIST", "215 list follows\r\n.\r\n")
         .spawn_on_listener(backend_listener);
@@ -112,7 +112,7 @@ async fn test_overlong_command_uses_501_not_500() -> Result<()> {
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_port = proxy_listener.local_addr()?.port();
 
-    let _backend = MockNntpServer::new(backend_port)
+    let _backend = MockNntpServer::new()
         .with_name("TestBackend501")
         .spawn_on_listener(backend_listener);
 
