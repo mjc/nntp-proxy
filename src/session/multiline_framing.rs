@@ -167,7 +167,7 @@ enum FramedMultilineChunk {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FramedSingleLineChunk {
+pub(crate) struct FramedSingleLineChunk {
     response: Range<usize>,
     next_response_input: Range<usize>,
 }
@@ -210,12 +210,6 @@ impl FramedSingleLineChunk {
         response.push_buffer_range(old, self.response.clone());
         Ok(())
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FramedResponseChunk {
-    SingleLine(FramedSingleLineChunk),
-    Multiline(CompleteMultilineWireChunk),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -272,25 +266,212 @@ pub(crate) enum FramingError {
     Io,
 }
 
-pub(crate) struct InitialResponseWrite<'a, W> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResponseWarning {
+    ShortResponse { bytes: usize, min: usize },
+    InvalidResponse,
+    UnusualStatusCode(u16),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ResponseStatusParse {
+    status_code: Option<crate::protocol::StatusCode>,
+    warnings: smallvec::SmallVec<[ResponseWarning; 0]>,
+}
+
+#[must_use]
+fn parse_response_status(chunk: &[u8]) -> ResponseStatusParse {
+    let mut warnings = smallvec::SmallVec::new();
+
+    if chunk.len() < crate::protocol::MIN_RESPONSE_LENGTH {
+        warnings.push(ResponseWarning::ShortResponse {
+            bytes: chunk.len(),
+            min: crate::protocol::MIN_RESPONSE_LENGTH,
+        });
+    }
+
+    let status_code = crate::protocol::StatusCode::parse(chunk);
+    if let Some(code) = status_code {
+        let raw_code = code.as_u16();
+        if raw_code == 0 || raw_code >= 600 {
+            warnings.push(ResponseWarning::UnusualStatusCode(raw_code));
+        }
+    } else {
+        warnings.push(ResponseWarning::InvalidResponse);
+    }
+
+    ResponseStatusParse {
+        status_code,
+        warnings,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ResponseFrame {
+    SingleLine {
+        status: crate::protocol::StatusCode,
+        framed: FramedSingleLineChunk,
+    },
+    Multiline {
+        status: crate::protocol::StatusCode,
+    },
+}
+
+impl ResponseFrame {
+    fn parse(
+        request: &crate::protocol::RequestContext,
+        buffer: &crate::pool::PooledBuffer,
+    ) -> Result<Self, ResponseReadError> {
+        Self::parse_bytes(request, &buffer[..buffer.initialized()])
+    }
+
+    fn parse_bytes(
+        request: &crate::protocol::RequestContext,
+        chunk: &[u8],
+    ) -> Result<Self, ResponseReadError> {
+        let Some(status_line_end) = status_line_len(chunk) else {
+            return Err(ResponseReadError::Incomplete);
+        };
+        let parsed = parse_response_status(chunk);
+        let Some(status) = parsed.status_code else {
+            return Err(ResponseReadError::Invalid(parsed.warnings));
+        };
+        if request.has_response_body(status) {
+            return Ok(Self::Multiline { status });
+        }
+
+        Ok(Self::SingleLine {
+            status,
+            framed: FramedSingleLineChunk {
+                response: 0..status_line_end,
+                next_response_input: status_line_end..chunk.len(),
+            },
+        })
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) const fn status_code(&self) -> crate::protocol::StatusCode {
+        match self {
+            Self::SingleLine { status, .. } | Self::Multiline { status } => *status,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn single_line_bytes<'a>(&self, buffer: &'a [u8]) -> Option<&'a [u8]> {
+        match self {
+            Self::SingleLine { framed, .. } => Some(&buffer[framed.response.clone()]),
+            Self::Multiline { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn complete_single_line_bytes<'a>(&self, buffer: &'a [u8]) -> Option<&'a [u8]> {
+        match self {
+            Self::SingleLine { framed, .. } if framed.next_response_input.is_empty() => {
+                Some(&buffer[framed.response.clone()])
+            }
+            Self::SingleLine { .. } | Self::Multiline { .. } => None,
+        }
+    }
+}
+
+pub(crate) fn response_status(
+    request: &crate::protocol::RequestContext,
+    buffer: &crate::pool::PooledBuffer,
+) -> Result<crate::protocol::StatusCode, ResponseReadError> {
+    ResponseFrame::parse(request, buffer).map(|frame| frame.status_code())
+}
+
+pub(crate) fn single_line_response_bytes<'a>(
+    request: &crate::protocol::RequestContext,
+    bytes: &'a [u8],
+) -> Result<Option<&'a [u8]>, ResponseReadError> {
+    ResponseFrame::parse_bytes(request, bytes).map(|frame| frame.single_line_bytes(bytes))
+}
+
+pub(crate) fn complete_single_line_response_bytes<'a>(
+    request: &crate::protocol::RequestContext,
+    bytes: &'a [u8],
+) -> Result<Option<&'a [u8]>, ResponseReadError> {
+    ResponseFrame::parse_bytes(request, bytes).map(|frame| frame.complete_single_line_bytes(bytes))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ResponseReadError {
+    Incomplete,
+    Invalid(smallvec::SmallVec<[ResponseWarning; 0]>),
+}
+
+impl ResponseReadError {
+    pub(crate) fn log_warnings(
+        &self,
+        buffer: &[u8],
+        client_addr: impl std::fmt::Display,
+        backend_id: crate::types::BackendId,
+    ) {
+        if let Self::Invalid(warnings) = self {
+            log_response_warnings(warnings, buffer, client_addr, backend_id);
+        }
+    }
+}
+
+pub(crate) fn log_response_warnings(
+    warnings: &[ResponseWarning],
+    buffer: &[u8],
+    client_addr: impl std::fmt::Display,
+    backend_id: crate::types::BackendId,
+) {
+    use tracing::warn;
+
+    for warning in warnings {
+        match warning {
+            ResponseWarning::ShortResponse { bytes, min } => {
+                warn!(
+                    "Client {} got short response from backend {:?} ({} bytes < {} min): {:02x?}",
+                    client_addr, backend_id, bytes, min, buffer
+                );
+            }
+            ResponseWarning::InvalidResponse => {
+                warn!(
+                    client = %client_addr,
+                    backend = ?backend_id,
+                    first_bytes_hex = %crate::session::backend::format_hex_preview(buffer, 256),
+                    first_bytes_utf8 = %String::from_utf8_lossy(&buffer[..buffer.len().min(256)]),
+                    "Backend returned invalid response"
+                );
+            }
+            ResponseWarning::UnusualStatusCode(code) => {
+                warn!(
+                    client = %client_addr,
+                    backend = ?backend_id,
+                    status_code = code,
+                    first_bytes_hex = %crate::session::backend::format_hex_preview(buffer, 256),
+                    first_bytes_utf8 = %String::from_utf8_lossy(&buffer[..buffer.len().min(256)]),
+                    "Backend returned unusual status code"
+                );
+            }
+        }
+    }
+}
+
+pub(crate) struct ResponseWrite<'a, W> {
     pub(crate) request: &'a crate::protocol::RequestContext,
-    pub(crate) status: crate::protocol::StatusCode,
     pub(crate) io_buffer: &'a mut crate::pool::PooledBuffer,
     pub(crate) conn: &'a mut crate::stream::ConnectionStream,
     pub(crate) writer: &'a mut W,
     pub(crate) backend_id: crate::types::BackendId,
 }
 
-impl<W> InitialResponseWrite<'_, W>
+impl<W> ResponseWrite<'_, W>
 where
     W: AsyncWrite + Unpin,
 {
     pub(crate) async fn write(
         self,
     ) -> Result<u64, crate::session::response_buffer::ResponseTransferError> {
-        let InitialResponseWrite {
+        let ResponseWrite {
             request,
-            status,
             io_buffer,
             conn,
             writer,
@@ -298,16 +479,14 @@ where
         } = self;
         let mut framer = MultilineFramer::default();
         let initial_len = io_buffer.initialized();
+        let frame = ResponseFrame::parse(request, io_buffer).map_err(|err| {
+            crate::session::response_buffer::ResponseTransferError::Io(anyhow::anyhow!(
+                "Failed to frame prefetched response: {err:?}"
+            ))
+        })?;
 
-        if !request.has_response_body(status) {
-            let Some(FramedResponseChunk::SingleLine(response)) =
-                framer.frame_initial_response(request, status, &io_buffer[..initial_len])
-            else {
-                return Err(crate::session::response_buffer::ResponseTransferError::Io(
-                    anyhow::anyhow!("Initial single-line response missing status line ending"),
-                ));
-            };
-            return response
+        if let ResponseFrame::SingleLine { framed, .. } = &frame {
+            return framed
                 .write_from(writer, &io_buffer[..initial_len], conn)
                 .await;
         }
@@ -355,7 +534,7 @@ pub(crate) struct IsolatedMultilineResponse<'a> {
 }
 
 impl<'a> IsolatedMultilineResponse<'a> {
-    pub(crate) const fn from_initial_read(
+    pub(crate) const fn new(
         conn: &'a mut crate::stream::ConnectionStream,
         io_buffer: &'a mut crate::pool::PooledBuffer,
     ) -> Self {
@@ -476,9 +655,8 @@ impl<'a> IsolatedMultilineResponse<'a> {
     }
 }
 
-pub(crate) struct InitialResponseCapture<'a> {
+pub(crate) struct ResponseCapture<'a> {
     request: &'a crate::protocol::RequestContext,
-    status: crate::protocol::StatusCode,
     io_buffer: &'a mut crate::pool::PooledBuffer,
     conn: &'a mut crate::stream::ConnectionStream,
     response: &'a mut crate::pool::ChunkedResponse,
@@ -486,10 +664,9 @@ pub(crate) struct InitialResponseCapture<'a> {
     backend_id: crate::types::BackendId,
 }
 
-impl<'a> InitialResponseCapture<'a> {
+impl<'a> ResponseCapture<'a> {
     pub(crate) const fn from_buffer(
         request: &'a crate::protocol::RequestContext,
-        status: crate::protocol::StatusCode,
         io_buffer: &'a mut crate::pool::PooledBuffer,
         conn: &'a mut crate::stream::ConnectionStream,
         response: &'a mut crate::pool::ChunkedResponse,
@@ -498,7 +675,6 @@ impl<'a> InitialResponseCapture<'a> {
     ) -> Self {
         Self {
             request,
-            status,
             io_buffer,
             conn,
             response,
@@ -510,9 +686,8 @@ impl<'a> InitialResponseCapture<'a> {
     pub(crate) async fn capture(
         self,
     ) -> Result<(), crate::session::response_buffer::ResponseTransferError> {
-        let InitialResponseCapture {
+        let ResponseCapture {
             request,
-            status,
             io_buffer,
             conn,
             response,
@@ -522,16 +697,14 @@ impl<'a> InitialResponseCapture<'a> {
         let mut framer = MultilineFramer::default();
         let initial_len = io_buffer.initialized();
         let mut complete = false;
+        let frame = ResponseFrame::parse(request, io_buffer).map_err(|err| {
+            crate::session::response_buffer::ResponseTransferError::Io(anyhow::anyhow!(
+                "Failed to frame prefetched response: {err:?}"
+            ))
+        })?;
 
         response.clear();
-        if !request.has_response_body(status) {
-            let Some(FramedResponseChunk::SingleLine(framed)) =
-                framer.frame_initial_response(request, status, &io_buffer[..initial_len])
-            else {
-                return Err(crate::session::response_buffer::ResponseTransferError::Io(
-                    anyhow::anyhow!("Initial single-line response missing status line ending"),
-                ));
-            };
+        if let ResponseFrame::SingleLine { framed, .. } = &frame {
             return framed.push_from_buffer(io_buffer, conn, response, pool);
         }
 
@@ -584,29 +757,6 @@ impl MultilineFramer {
         chunk: &[u8],
     ) -> Result<FramedMultilineChunk, FramingError> {
         self.split_chunk(chunk, PackedPendingBytesPolicy::Reject)
-    }
-
-    #[must_use]
-    fn frame_initial_response(
-        &mut self,
-        request: &crate::protocol::RequestContext,
-        status: crate::protocol::StatusCode,
-        chunk: &[u8],
-    ) -> Option<FramedResponseChunk> {
-        if request.has_response_body(status) {
-            return match self.frame_multiline_chunk(chunk) {
-                FramedMultilineChunk::Complete(response) => {
-                    Some(FramedResponseChunk::Multiline(response))
-                }
-                FramedMultilineChunk::Incomplete(_) => None,
-            };
-        }
-
-        let end = status_line_len(chunk)?;
-        Some(FramedResponseChunk::SingleLine(FramedSingleLineChunk {
-            response: 0..end,
-            next_response_input: end..chunk.len(),
-        }))
     }
 
     /// Update tail with the last bytes from a chunk

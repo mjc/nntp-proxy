@@ -214,11 +214,10 @@ mod tests {
         crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2)
     }
 
-    async fn buffer_initial_read_for_test(
+    async fn buffer_response_for_test(
         conn: &mut crate::stream::ConnectionStream,
         first_chunk: &[u8],
         request_line: &[u8],
-        status_code: u16,
         pool: &crate::pool::BufferPool,
     ) -> Result<crate::pool::ChunkedResponse, ResponseTransferError> {
         let request = crate::protocol::RequestContext::parse(request_line)
@@ -226,9 +225,8 @@ mod tests {
         let mut io_buffer = pool.acquire();
         io_buffer.copy_from_slice(first_chunk);
         let mut captured = crate::pool::ChunkedResponse::default();
-        crate::session::multiline_framing::InitialResponseCapture::from_buffer(
+        crate::session::multiline_framing::ResponseCapture::from_buffer(
             &request,
-            crate::protocol::StatusCode::new(status_code),
             &mut io_buffer,
             conn,
             &mut captured,
@@ -262,15 +260,10 @@ mod tests {
         let pool = make_pool();
         let mut conn = mock_backend_conn(vec![]).await;
 
-        let captured = buffer_initial_read_for_test(
-            &mut conn,
-            response,
-            b"ARTICLE <test@example>\r\n",
-            220,
-            &pool,
-        )
-        .await
-        .unwrap();
+        let captured =
+            buffer_response_for_test(&mut conn, response, b"ARTICLE <test@example>\r\n", &pool)
+                .await
+                .unwrap();
 
         assert_eq!(captured.to_vec(), response);
     }
@@ -281,21 +274,16 @@ mod tests {
         let pool = make_pool();
         let mut conn = mock_backend_conn(vec![]).await;
 
-        let captured = buffer_initial_read_for_test(
-            &mut conn,
-            response,
-            b"ARTICLE <test@example>\r\n",
-            220,
-            &pool,
-        )
-        .await
-        .unwrap();
+        let captured =
+            buffer_response_for_test(&mut conn, response, b"ARTICLE <test@example>\r\n", &pool)
+                .await
+                .unwrap();
 
         assert_eq!(captured.to_vec(), response);
     }
 
     #[tokio::test]
-    async fn buffered_multiline_response_preserves_next_reply_from_initial_read() {
+    async fn buffered_multiline_response_preserves_next_reply_from_prefill() {
         let first_response = b"220 Article follows\r\nLine 1\r\n.\r\n";
         let next_reply = b"223 0 <next@example>\r\n";
         let mut combined = Vec::from(first_response.as_slice());
@@ -304,15 +292,10 @@ mod tests {
         let pool = make_pool();
         let mut conn = mock_backend_conn(vec![]).await;
 
-        let captured = buffer_initial_read_for_test(
-            &mut conn,
-            &combined,
-            b"ARTICLE <test@example>\r\n",
-            220,
-            &pool,
-        )
-        .await
-        .unwrap();
+        let captured =
+            buffer_response_for_test(&mut conn, &combined, b"ARTICLE <test@example>\r\n", &pool)
+                .await
+                .unwrap();
 
         assert_eq!(captured.to_vec(), first_response);
         assert!(conn.has_pending_bytes());
@@ -326,15 +309,10 @@ mod tests {
         let pool = make_pool();
         let mut conn = mock_backend_conn(vec![tail_chunk]).await;
 
-        let captured = buffer_initial_read_for_test(
-            &mut conn,
-            first_chunk,
-            b"ARTICLE <test@example>\r\n",
-            220,
-            &pool,
-        )
-        .await
-        .unwrap();
+        let captured =
+            buffer_response_for_test(&mut conn, first_chunk, b"ARTICLE <test@example>\r\n", &pool)
+                .await
+                .unwrap();
 
         assert_eq!(captured.to_vec(), b"220 Article follows\r\nLine 1\r\n.\r\n");
         assert!(conn.has_pending_bytes());
@@ -356,15 +334,10 @@ mod tests {
         let pool = make_pool();
         let mut conn = mock_backend_conn(vec![expected_response[header.len()..].to_vec()]).await;
 
-        let captured = buffer_initial_read_for_test(
-            &mut conn,
-            header,
-            b"ARTICLE <test@example>\r\n",
-            220,
-            &pool,
-        )
-        .await
-        .expect("large multiline response should buffer successfully");
+        let captured =
+            buffer_response_for_test(&mut conn, header, b"ARTICLE <test@example>\r\n", &pool)
+                .await
+                .expect("large multiline response should buffer successfully");
 
         assert_eq!(captured.to_vec(), expected_response);
     }
@@ -388,9 +361,8 @@ mod tests {
         let request = crate::protocol::RequestContext::parse(b"ARTICLE <test@example>\r\n")
             .expect("valid request");
 
-        crate::session::multiline_framing::InitialResponseCapture::from_buffer(
+        crate::session::multiline_framing::ResponseCapture::from_buffer(
             &request,
-            crate::protocol::StatusCode::new(220),
             &mut io_buffer,
             &mut conn,
             &mut captured,
@@ -420,15 +392,10 @@ mod tests {
             crate::pool::BufferPool::new(crate::types::BufferSize::try_new(4096).unwrap(), 2);
         let mut conn = mock_backend_conn(vec![second_chunk]).await;
 
-        let err = buffer_initial_read_for_test(
-            &mut conn,
-            first_chunk,
-            b"ARTICLE <test@example>\r\n",
-            220,
-            &pool,
-        )
-        .await
-        .unwrap_err();
+        let err =
+            buffer_response_for_test(&mut conn, first_chunk, b"ARTICLE <test@example>\r\n", &pool)
+                .await
+                .unwrap_err();
 
         assert!(matches!(err, ResponseTransferError::BackendEof { .. }));
         assert!(!conn.has_pending_bytes());
@@ -443,15 +410,10 @@ mod tests {
         let mut request = crate::protocol::RequestContext::parse(b"STAT <test@example>\r\n")
             .expect("valid request line");
 
-        let captured = buffer_initial_read_for_test(
-            &mut conn,
-            response,
-            b"STAT <test@example>\r\n",
-            223,
-            &pool,
-        )
-        .await
-        .unwrap();
+        let captured =
+            buffer_response_for_test(&mut conn, response, b"STAT <test@example>\r\n", &pool)
+                .await
+                .unwrap();
         request.complete_backend_response(
             backend_id,
             crate::protocol::StatusCode::new(223),
@@ -472,14 +434,9 @@ mod tests {
         let pool = make_pool();
         let mut conn = mock_backend_conn(vec![]).await;
 
-        let result = buffer_initial_read_for_test(
-            &mut conn,
-            partial,
-            b"ARTICLE <test@example>\r\n",
-            220,
-            &pool,
-        )
-        .await;
+        let result =
+            buffer_response_for_test(&mut conn, partial, b"ARTICLE <test@example>\r\n", &pool)
+                .await;
         assert!(
             matches!(result, Err(ResponseTransferError::BackendEof { .. })),
             "EOF before complete response must be BackendEof"
@@ -492,15 +449,10 @@ mod tests {
         let combined = b"430 No article with that message-id\r\n223 0 <next@example>\r\n";
         let mut conn = mock_backend_conn(vec![]).await;
 
-        let buffered = buffer_initial_read_for_test(
-            &mut conn,
-            combined,
-            b"ARTICLE <test@example>\r\n",
-            430,
-            &pool,
-        )
-        .await
-        .expect("430 article miss should stay single-line");
+        let buffered =
+            buffer_response_for_test(&mut conn, combined, b"ARTICLE <test@example>\r\n", &pool)
+                .await
+                .expect("430 article miss should stay single-line");
 
         assert_eq!(
             buffered.to_vec(),
@@ -515,11 +467,10 @@ mod tests {
         let pool = make_pool();
         let mut conn = mock_backend_conn(vec![]).await;
 
-        let result = buffer_initial_read_for_test(
+        let result = buffer_response_for_test(
             &mut conn,
             b"220 Article follows\r\nbody\r\n.\r\n223 0 <next@example>\r\n",
             b"ARTICLE <test@example>\r\n",
-            220,
             &pool,
         )
         .await;
@@ -534,15 +485,10 @@ mod tests {
         let combined = b"223 0 <test@example>\r\n430 No article with that message-id\r\n";
         let mut conn = mock_backend_conn(vec![]).await;
 
-        let buffered = buffer_initial_read_for_test(
-            &mut conn,
-            combined,
-            b"STAT <test@example>\r\n",
-            223,
-            &pool,
-        )
-        .await
-        .expect("single-line response should buffer cleanly");
+        let buffered =
+            buffer_response_for_test(&mut conn, combined, b"STAT <test@example>\r\n", &pool)
+                .await
+                .expect("single-line response should buffer cleanly");
 
         assert_eq!(buffered.to_vec(), b"223 0 <test@example>\r\n");
         assert!(conn.has_pending_bytes());
@@ -561,15 +507,10 @@ mod tests {
             let combined = b"223 0 <test@example>\r\n430 No article with that message-id\r\n";
             let mut conn = mock_backend_conn(vec![]).await;
 
-            let buffered = buffer_initial_read_for_test(
-                &mut conn,
-                combined,
-                b"STAT <test@example>\r\n",
-                223,
-                &pool,
-            )
-            .await
-            .expect("single-line response should buffer cleanly");
+            let buffered =
+                buffer_response_for_test(&mut conn, combined, b"STAT <test@example>\r\n", &pool)
+                    .await
+                    .expect("single-line response should buffer cleanly");
 
             assert_eq!(buffered.to_vec(), b"223 0 <test@example>\r\n");
         }
@@ -591,15 +532,10 @@ mod tests {
         let pool = make_pool();
         let mut conn = mock_backend_conn(vec![later_chunk]).await;
 
-        let captured = buffer_initial_read_for_test(
-            &mut conn,
-            first_chunk,
-            b"ARTICLE <test@example>\r\n",
-            220,
-            &pool,
-        )
-        .await
-        .unwrap();
+        let captured =
+            buffer_response_for_test(&mut conn, first_chunk, b"ARTICLE <test@example>\r\n", &pool)
+                .await
+                .unwrap();
 
         assert_eq!(captured.to_vec(), b"220 Article follows\r\nLine 1\r\n.\r\n");
         assert!(conn.has_pending_bytes());

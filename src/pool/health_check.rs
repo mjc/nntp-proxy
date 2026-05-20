@@ -185,6 +185,7 @@ where
 {
     let mut response_buf = [0u8; HEALTH_CHECK_BUFFER_SIZE];
     let mut total = 0usize;
+    let request = crate::protocol::RequestContext::from_verb_args(b"DATE", b"");
 
     loop {
         if total == response_buf.len() {
@@ -204,14 +205,22 @@ where
 
         total += n;
 
-        match crate::session::backend::single_line_read(&response_buf[..total]) {
-            crate::session::backend::SingleLineRead::Complete { len } => {
-                return Ok(String::from_utf8_lossy(&response_buf[..len]).into_owned());
+        match crate::session::multiline_framing::complete_single_line_response_bytes(
+            &request,
+            &response_buf[..total],
+        ) {
+            Ok(line) => {
+                let Some(line) = line else {
+                    return Err(HealthCheckError::UnexpectedData);
+                };
+                return Ok(String::from_utf8_lossy(line).into_owned());
             }
-            crate::session::backend::SingleLineRead::CompleteWithQueuedData => {
-                return Err(HealthCheckError::UnexpectedData);
+            Err(crate::session::multiline_framing::ResponseReadError::Incomplete) => {}
+            Err(crate::session::multiline_framing::ResponseReadError::Invalid(_)) => {
+                return Err(HealthCheckError::UnexpectedResponse(
+                    String::from_utf8_lossy(&response_buf[..total]).into_owned(),
+                ));
             }
-            crate::session::backend::SingleLineRead::Incomplete => {}
         }
     }
 }

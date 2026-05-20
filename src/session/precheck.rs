@@ -142,20 +142,18 @@ async fn execute_backend_query(
     let response = if should_sample_backend_timing() {
         backend::send_request_timed(&mut **conn, request, &mut buffer)
             .await
-            .map(|(response, ttfb, send, recv)| (response, Some((ttfb, send, recv))))
+            .map(|(ttfb, send, recv)| Some((ttfb, send, recv)))
     } else {
         backend::send_request(&mut **conn, request, &mut buffer)
             .await
-            .map(|response| (response, None))
+            .map(|()| None)
     };
 
     // Use shared backend request execution with sampled timing
     match response {
-        Ok((cmd_response, timings)) => {
-            let Some(status_code) = cmd_response.status_code() else {
-                // Invalid response - conn drops → remove_with_cooldown
-                return Err(());
-            };
+        Ok(timings) => {
+            let status_code = crate::session::multiline_framing::response_status(request, &buffer)
+                .map_err(|_| ())?;
 
             let response =
                 build_precheck_hit(deps, request, status_code, &mut conn, &mut buffer).await?;
@@ -184,8 +182,12 @@ async fn build_precheck_hit(
     }
 
     if deps.cache_articles {
+        let response =
+            crate::session::multiline_framing::single_line_response_bytes(request, buffer)
+                .map_err(|_| ())?
+                .ok_or(())?;
         Ok(PrecheckHit::Payload(
-            crate::cache::CacheIngestResponse::from(&buffer[..buffer.initialized()]),
+            crate::cache::CacheIngestResponse::from(response),
         ))
     } else {
         Ok(PrecheckHit::Availability(status_code))
@@ -203,21 +205,15 @@ async fn read_complete_precheck_hit(
         .then(crate::pool::ChunkedResponse::default);
 
     if let Some(response) = &mut response {
-        crate::session::multiline_framing::IsolatedMultilineResponse::from_initial_read(
-            conn.as_mut(),
-            buffer,
-        )
-        .capture_chunked(&deps.buffer_pool, response)
-        .await
-        .map_err(|_| ())?;
+        crate::session::multiline_framing::IsolatedMultilineResponse::new(conn.as_mut(), buffer)
+            .capture_chunked(&deps.buffer_pool, response)
+            .await
+            .map_err(|_| ())?;
     } else {
-        crate::session::multiline_framing::IsolatedMultilineResponse::from_initial_read(
-            conn.as_mut(),
-            buffer,
-        )
-        .observe()
-        .await
-        .map_err(|_| ())?;
+        crate::session::multiline_framing::IsolatedMultilineResponse::new(conn.as_mut(), buffer)
+            .observe()
+            .await
+            .map_err(|_| ())?;
     }
 
     if let Some(response) = response {

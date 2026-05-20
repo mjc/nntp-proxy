@@ -42,6 +42,14 @@ pub struct DeadpoolConnectionProvider {
     is_shutting_down: Arc<std::sync::atomic::AtomicBool>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DeadpoolStatusCounts {
+    pub available: usize,
+    pub size: usize,
+    pub max_size: usize,
+    pub waiting: usize,
+}
+
 /// Builder for constructing `DeadpoolConnectionProvider` instances
 ///
 /// Provides a fluent API for creating connection providers with optional TLS configuration.
@@ -522,6 +530,16 @@ impl DeadpoolConnectionProvider {
         }
     }
 
+    /// Remove a connection without temporarily reducing pool size.
+    ///
+    /// Use this when the connection cannot be safely returned to the pool, but
+    /// the backend did not fail. For example, a client disconnect can leave
+    /// unread backend response bytes in flight, making the socket dirty without
+    /// implying that replacement connections should be throttled.
+    pub fn remove_without_cooldown(&self, conn: managed::Object<TcpManager>) {
+        shutdown_and_drop(conn);
+    }
+
     /// Remove a broken connection and temporarily reduce pool size.
     ///
     /// Gives the backend time to release the old connection's slot before
@@ -542,17 +560,13 @@ impl DeadpoolConnectionProvider {
     /// would be a use-after-move error.
     pub fn remove_with_cooldown(&self, conn: managed::Object<TcpManager>) {
         if self.is_shutting_down.load(Ordering::Acquire) {
-            let _ = socket2::SockRef::from(conn.underlying_tcp_stream())
-                .shutdown(std::net::Shutdown::Both);
-            drop(conn);
+            shutdown_and_drop(conn);
             return;
         }
 
         // If cooldown is disabled (None or zero duration), just shut down and drop
         let Some(cooldown) = self.replacement_cooldown.filter(|d| !d.is_zero()) else {
-            let _ = socket2::SockRef::from(conn.underlying_tcp_stream())
-                .shutdown(std::net::Shutdown::Both);
-            drop(conn);
+            shutdown_and_drop(conn);
             return;
         };
 
@@ -564,9 +578,7 @@ impl DeadpoolConnectionProvider {
         let current = self.active_cooldowns.load(Ordering::Acquire);
         if current >= max_reduction {
             // Already at max reduction — just shut down and drop without further cooldown
-            let _ = socket2::SockRef::from(conn.underlying_tcp_stream())
-                .shutdown(std::net::Shutdown::Both);
-            drop(conn);
+            shutdown_and_drop(conn);
             return;
         }
 
@@ -634,6 +646,17 @@ impl DeadpoolConnectionProvider {
     #[inline]
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    #[must_use]
+    pub fn status_counts(&self) -> DeadpoolStatusCounts {
+        let status = self.pool.status();
+        DeadpoolStatusCounts {
+            available: status.available,
+            size: status.size,
+            max_size: status.max_size,
+            waiting: status.waiting,
+        }
     }
 
     /// Get the backend host this pool connects to
@@ -825,6 +848,10 @@ where
 /// defeating the cooldown.
 fn resize_then_drop(pool: &Pool, conn: managed::Object<TcpManager>, new_max: usize) {
     pool.resize(new_max);
+    shutdown_and_drop(conn);
+}
+
+fn shutdown_and_drop(conn: managed::Object<TcpManager>) {
     let _ = socket2::SockRef::from(conn.underlying_tcp_stream()).shutdown(std::net::Shutdown::Both);
     drop(conn);
 }
@@ -1212,6 +1239,22 @@ mod tests {
         provider.remove_with_cooldown(conn);
 
         // With cooldown disabled, max_size should NOT be reduced
+        assert_eq!(provider.pool.status().max_size, max_size);
+        assert_eq!(provider.active_cooldowns.load(Ordering::Acquire), 0);
+    }
+
+    /// Verify explicit no-cooldown removal closes a dirty connection without
+    /// reducing capacity even when replacement cooldown is configured.
+    #[tokio::test]
+    async fn test_remove_without_cooldown_preserves_pool_size() {
+        let addr = spawn_mock_nntp_server().await;
+        let cooldown = std::time::Duration::from_secs(10);
+        let max_size = 4;
+        let provider = provider_with_cooldown(addr, max_size, Some(cooldown));
+
+        let conn = provider.get_pooled_connection().await.unwrap();
+        provider.remove_without_cooldown(conn);
+
         assert_eq!(provider.pool.status().max_size, max_size);
         assert_eq!(provider.active_cooldowns.load(Ordering::Acquire), 0);
     }

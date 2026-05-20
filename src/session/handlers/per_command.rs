@@ -24,7 +24,7 @@ use crate::command::{CommandAction, CommandHandler};
 use crate::constants::buffer::READER_CAPACITY;
 use crate::router::BackendSelector;
 use crate::session::SessionError;
-use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
+use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
 /// Result of executing a routing decision
 enum CommandResult {
@@ -79,10 +79,32 @@ struct ProcessCommandParams<'a> {
     backend_to_client_bytes: &'a mut BackendToClientBytes,
 }
 
+#[derive(Default)]
+struct BatchBackendConnection {
+    conn: Option<(BackendId, crate::pool::ConnectionGuard)>,
+}
+
+impl BatchBackendConnection {
+    fn slot(&mut self) -> &mut Option<(BackendId, crate::pool::ConnectionGuard)> {
+        &mut self.conn
+    }
+
+    fn release(&mut self) {
+        if let Some((_backend_id, conn)) = self.conn.take() {
+            let _ = conn.release();
+        }
+    }
+}
+
+impl Drop for BatchBackendConnection {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 struct PerCommandLoopState {
     client_to_backend_bytes: ClientToBackendBytes,
     backend_to_client_bytes: BackendToClientBytes,
-    backend_connection: Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
     auth_username: Option<String>,
     skip_auth_check: bool,
 }
@@ -92,7 +114,6 @@ impl PerCommandLoopState {
         Self {
             client_to_backend_bytes: ClientToBackendBytes::zero(),
             backend_to_client_bytes: BackendToClientBytes::zero(),
-            backend_connection: None,
             auth_username: None,
             skip_auth_check,
         }
@@ -102,12 +123,6 @@ impl PerCommandLoopState {
         TransferMetrics {
             client_to_backend: self.client_to_backend_bytes,
             backend_to_client: self.backend_to_client_bytes,
-        }
-    }
-
-    fn release_backend_connection(&mut self) {
-        if let Some((_backend_id, conn)) = self.backend_connection.take() {
-            let _ = conn.release();
         }
     }
 }
@@ -445,7 +460,6 @@ impl ClientSession {
                 BatchLoopAction::Continue => {}
                 BatchLoopAction::Break => break,
                 BatchLoopAction::SwitchToStateful(target) => {
-                    state.release_backend_connection();
                     return self
                         .switch_batch_to_stateful(
                             client_reader,
@@ -459,7 +473,6 @@ impl ClientSession {
             }
         }
 
-        state.release_backend_connection();
         self.metrics.user_connection_closed(self.username());
         Ok(state.transfer_metrics())
     }
@@ -495,17 +508,30 @@ impl ClientSession {
         state: &mut PerCommandLoopState,
         batch: &mut crate::session::handlers::pipeline::RequestBatch,
     ) -> Result<BatchLoopAction, SessionError> {
+        let mut backend_connection = BatchBackendConnection::default();
         if let Some(action) = self.handle_batch_rejections(batch, client_writer).await? {
             return Ok(action);
         }
 
         match self
-            .process_pipelineable_batch(router, client_writer, state, batch)
+            .process_pipelineable_batch(
+                router,
+                client_writer,
+                state,
+                batch,
+                &mut backend_connection,
+            )
             .await?
         {
             BatchLoopAction::Continue => {
-                self.handle_trailing_command(router, client_writer, state, batch)
-                    .await
+                self.handle_trailing_command(
+                    router,
+                    client_writer,
+                    state,
+                    batch,
+                    &mut backend_connection,
+                )
+                .await
             }
             action => Ok(action),
         }
@@ -554,6 +580,7 @@ impl ClientSession {
         client_writer: &crate::session::SharedClientWriter,
         _state: &mut PerCommandLoopState,
         batch: &mut crate::session::handlers::pipeline::RequestBatch,
+        backend_connection: &mut BatchBackendConnection,
     ) -> Result<BatchLoopAction, SessionError> {
         let batch_size = batch.len();
         if batch_size == 0 {
@@ -567,7 +594,7 @@ impl ClientSession {
         }
 
         let action = self
-            .process_pipelineable_commands(router, client_writer, _state, batch)
+            .process_pipelineable_commands(router, client_writer, _state, batch, backend_connection)
             .await?;
         if !matches!(action, BatchLoopAction::Continue) {
             return Ok(action);
@@ -584,6 +611,7 @@ impl ClientSession {
         client_writer: &crate::session::SharedClientWriter,
         state: &mut PerCommandLoopState,
         batch: &mut crate::session::handlers::pipeline::RequestBatch,
+        backend_connection: &mut BatchBackendConnection,
     ) -> Result<BatchLoopAction, SessionError> {
         let batch_size = batch.len();
 
@@ -609,7 +637,7 @@ impl ClientSession {
                     skip_auth_check: state.skip_auth_check,
                     router,
                     client_writer,
-                    backend_connection: &mut state.backend_connection,
+                    backend_connection: backend_connection.slot(),
                     auth_username: &mut state.auth_username,
                     client_to_backend_bytes: state.client_to_backend_bytes,
                     backend_to_client_bytes: &mut state.backend_to_client_bytes,
@@ -637,6 +665,7 @@ impl ClientSession {
         client_writer: &crate::session::SharedClientWriter,
         state: &mut PerCommandLoopState,
         batch: &mut crate::session::handlers::pipeline::RequestBatch,
+        backend_connection: &mut BatchBackendConnection,
     ) -> Result<BatchLoopAction, SessionError> {
         if batch.is_trailing_oversized() {
             warn!(
@@ -687,7 +716,7 @@ impl ClientSession {
                 skip_auth_check: state.skip_auth_check,
                 router,
                 client_writer,
-                backend_connection: &mut state.backend_connection,
+                backend_connection: backend_connection.slot(),
                 auth_username: &mut state.auth_username,
                 client_to_backend_bytes: state.client_to_backend_bytes,
                 backend_to_client_bytes: &mut state.backend_to_client_bytes,

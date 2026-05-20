@@ -106,6 +106,23 @@ impl ConnectionGuard {
             .expect("ConnectionGuard::release() called on consumed guard")
     }
 
+    /// Close and remove the connection without applying replacement cooldown.
+    ///
+    /// Use this when the socket is dirty from a client-side abort, but the
+    /// backend did not fail and should not have its pool capacity reduced.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the guard has already been consumed.
+    pub fn retire_without_cooldown(mut self) {
+        self.released = true;
+        let conn = self
+            .conn
+            .take()
+            .expect("ConnectionGuard::retire_without_cooldown() called on consumed guard");
+        self.provider.remove_without_cooldown(conn);
+    }
+
     /// Get mutable reference to the connection
     ///
     /// # Panics
@@ -126,6 +143,16 @@ impl ConnectionGuard {
         self.conn
             .as_ref()
             .expect("ConnectionGuard already consumed")
+    }
+
+    #[must_use]
+    pub fn connection_type(&self) -> &'static str {
+        self.get().connection_type()
+    }
+
+    #[must_use]
+    pub fn pending_bytes_len(&self) -> usize {
+        self.get().pending_bytes_len()
     }
 }
 

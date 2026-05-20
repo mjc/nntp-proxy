@@ -245,6 +245,9 @@ impl ClientSession {
                         self.client_addr,
                         request.message_id_value()
                     );
+                    let msg_id = request.message_id_value();
+                    self.sync_availability_if_needed(msg_id.as_ref(), &availability)
+                        .await;
                     return Err(e);
                 }
                 Err(SessionError::Backend(e)) => {

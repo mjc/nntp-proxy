@@ -145,21 +145,21 @@ impl NntpClient {
             .context("Failed to get connection from pool")?;
         let mut buffer = self.buffer_pool.acquire();
 
-        let response = send_request(&mut *conn, &request, &mut buffer).await?;
+        send_request(&mut *conn, &request, &mut buffer).await?;
+        let status_code = crate::session::multiline_framing::response_status(&request, &buffer)
+            .map_err(|_| anyhow::anyhow!("Invalid STAT response"))?;
 
-        Self::parse_stat_response(response.status_code())
+        Self::parse_stat_response(status_code)
     }
 
     /// Parse STAT response code into existence check
     #[inline]
-    fn parse_stat_response(status_code: Option<crate::protocol::StatusCode>) -> Result<bool> {
-        status_code
-            .ok_or_else(|| anyhow::anyhow!("Invalid STAT response"))
-            .and_then(|code| match code.as_u16() {
-                223 => Ok(true),  // Article exists
-                430 => Ok(false), // No such article
-                _ => anyhow::bail!("Unexpected STAT response: {code}"),
-            })
+    fn parse_stat_response(status_code: crate::protocol::StatusCode) -> Result<bool> {
+        match status_code.as_u16() {
+            223 => Ok(true),  // Article exists
+            430 => Ok(false), // No such article
+            code => anyhow::bail!("Unexpected STAT response: {code}"),
+        }
     }
 
     /// Internal: fetch response into `PooledBuffer`
@@ -175,14 +175,12 @@ impl NntpClient {
             .context("Failed to get connection from pool")?;
         let mut io_buffer = self.buffer_pool.acquire();
 
-        let response = send_request(&mut *conn, &request, &mut io_buffer).await?;
+        send_request(&mut *conn, &request, &mut io_buffer).await?;
+        let status_code = crate::session::multiline_framing::response_status(&request, &io_buffer)
+            .map_err(|_| anyhow::anyhow!("Invalid response from server"))?;
 
-        // Validate response - early return on errors
-        Self::validate_response(&response)?;
+        Self::validate_response(status_code)?;
 
-        let status_code = response
-            .status_code()
-            .expect("validate_response returned Ok with parsed status");
         if request.has_response_body(status_code) {
             return self.fetch_complete_response(conn, io_buffer).await;
         }
@@ -198,13 +196,12 @@ impl NntpClient {
         // Use a capture buffer as the accumulator: pooled, can grow beyond io_buffer
         // capacity without panicking, returned to pool on drop.
         let mut capture = self.buffer_pool.acquire_capture();
-        if let Err(err) =
-            crate::session::multiline_framing::IsolatedMultilineResponse::from_initial_read(
-                &mut conn,
-                &mut io_buffer,
-            )
-            .capture_into(&mut capture)
-            .await
+        if let Err(err) = crate::session::multiline_framing::IsolatedMultilineResponse::new(
+            &mut conn,
+            &mut io_buffer,
+        )
+        .capture_into(&mut capture)
+        .await
         {
             self.conn_pool.remove_with_cooldown(conn);
             return Err(err);
@@ -214,15 +211,12 @@ impl NntpClient {
 
     /// Validate NNTP response status code
     #[inline]
-    fn validate_response(response: &crate::session::backend::BackendResponseStatus) -> Result<()> {
-        response
-            .status_code()
-            .ok_or_else(|| anyhow::anyhow!("Invalid response from server"))
-            .and_then(|code| match code.as_u16() {
-                430 => anyhow::bail!("Article not found (430)"),
-                code if code >= 400 => anyhow::bail!("Server error: {code}"),
-                _ => Ok(()),
-            })
+    fn validate_response(status_code: crate::protocol::StatusCode) -> Result<()> {
+        match status_code.as_u16() {
+            430 => anyhow::bail!("Article not found (430)"),
+            code if code >= 400 => anyhow::bail!("Server error: {code}"),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -234,22 +228,19 @@ mod tests {
     fn test_parse_stat_response_success() {
         use crate::protocol::StatusCode;
         // Article exists (223)
-        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"223")).unwrap());
+        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"223").unwrap()).unwrap());
 
         // Article not found (430)
-        assert!(!NntpClient::parse_stat_response(StatusCode::parse(b"430")).unwrap());
+        assert!(!NntpClient::parse_stat_response(StatusCode::parse(b"430").unwrap()).unwrap());
     }
 
     #[test]
     fn test_parse_stat_response_errors() {
         use crate::protocol::StatusCode;
-        // No status code
-        assert!(NntpClient::parse_stat_response(None).is_err());
-
         // Unexpected codes
-        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"500")).is_err());
-        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"200")).is_err());
-        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"400")).is_err());
+        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"500").unwrap()).is_err());
+        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"200").unwrap()).is_err());
+        assert!(NntpClient::parse_stat_response(StatusCode::parse(b"400").unwrap()).is_err());
     }
 
     async fn spawn_fetch_test_server(
@@ -424,11 +415,9 @@ mod tests {
         io_buffer: &mut PooledBuffer,
         capture: &mut PooledBuffer,
     ) -> Result<()> {
-        crate::session::multiline_framing::IsolatedMultilineResponse::from_initial_read(
-            conn, io_buffer,
-        )
-        .capture_into(capture)
-        .await
+        crate::session::multiline_framing::IsolatedMultilineResponse::new(conn, io_buffer)
+            .capture_into(capture)
+            .await
     }
 
     /// Verify the session response reader captures the complete response when it all
