@@ -4,17 +4,39 @@
 //! creation of optimized TCP/TLS connections to NNTP servers.
 
 use deadpool::managed;
+use std::collections::VecDeque;
 use std::io;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
+use tokio::sync::Mutex;
+use tokio::sync::Notify;
+use tokio::sync::RwLock;
 
 use crate::connection_error::ConnectionError;
-use crate::protocol::{authinfo_pass, authinfo_user};
+use crate::protocol::{RequestContext, authinfo_pass, authinfo_user};
 use crate::stream::ConnectionStream;
 use crate::tls::{TlsConfig, TlsManager};
 
 /// Type alias for the deadpool connection pool
 pub type Pool = managed::Pool<TcpManager>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompressionSupport {
+    Supported,
+    Unsupported,
+}
+
+#[derive(Debug, Default)]
+enum CompressionSupportState {
+    #[default]
+    Unknown,
+    Probing(Arc<Notify>),
+    Supported,
+    Unsupported,
+}
 
 /// Optional settings for [`TcpManager`] construction
 ///
@@ -66,12 +88,15 @@ pub struct TcpManager {
     pub(crate) tls_config: TlsConfig,
     /// Cached TLS manager with pre-loaded certificates (avoids base64 decode overhead)
     pub(crate) tls_manager: Option<Arc<TlsManager>>,
+    resolved_socket_addrs: Arc<RwLock<Option<Arc<[SocketAddr]>>>>,
+    next_resolved_socket_addr: Arc<AtomicUsize>,
     pub(crate) recv_buffer_size: usize,
     pub(crate) send_buffer_size: usize,
     /// Wire compression mode: None = auto-detect, Some(true) = require, Some(false) = disable
     pub(crate) compress: Option<bool>,
     /// Compression level (0-9). None = fast (level 1).
     pub(crate) compress_level: Option<u32>,
+    compression_support: Arc<Mutex<CompressionSupportState>>,
     /// Whether to send MODE READER after authentication (RFC 3977 §5.3)
     pub(crate) send_mode_reader: bool,
 }
@@ -84,6 +109,104 @@ impl TcpManager {
                 format!("{label} socket buffer size {size} exceeds u32::MAX"),
             ))
         })
+    }
+
+    fn ip_literal_socket_addr(&self) -> Option<SocketAddr> {
+        self.host
+            .parse::<IpAddr>()
+            .ok()
+            .map(|ip| SocketAddr::new(ip, self.port))
+    }
+
+    async fn resolve_socket_addrs(&self) -> Result<Arc<[SocketAddr]>, ConnectionError> {
+        if let Some(socket_addr) = self.ip_literal_socket_addr() {
+            return Ok(Arc::from([socket_addr]));
+        }
+
+        if let Some(addrs) = self.resolved_socket_addrs.read().await.as_ref() {
+            if addrs.is_empty() {
+                return Err(ConnectionError::DnsNoAddresses {
+                    address: format!("{}:{}", self.host, self.port),
+                });
+            }
+            return Ok(addrs.clone());
+        }
+
+        let mut cached_addrs = self.resolved_socket_addrs.write().await;
+        if let Some(addrs) = cached_addrs.as_ref() {
+            if addrs.is_empty() {
+                return Err(ConnectionError::DnsNoAddresses {
+                    address: format!("{}:{}", self.host, self.port),
+                });
+            }
+            return Ok(addrs.clone());
+        }
+
+        let addrs = tokio::net::lookup_host((self.host.as_str(), self.port))
+            .await?
+            .collect::<Vec<_>>();
+        if addrs.is_empty() {
+            return Err(ConnectionError::DnsNoAddresses {
+                address: format!("{}:{}", self.host, self.port),
+            });
+        }
+
+        let addrs: Arc<[SocketAddr]> = Arc::from(addrs);
+        *cached_addrs = Some(addrs.clone());
+        Ok(addrs)
+    }
+
+    async fn refresh_socket_addrs(&self) -> Result<Arc<[SocketAddr]>, ConnectionError> {
+        if let Some(socket_addr) = self.ip_literal_socket_addr() {
+            return Ok(Arc::from([socket_addr]));
+        }
+
+        let addrs = tokio::net::lookup_host((self.host.as_str(), self.port))
+            .await?
+            .collect::<Vec<_>>();
+        if addrs.is_empty() {
+            return Err(ConnectionError::DnsNoAddresses {
+                address: format!("{}:{}", self.host, self.port),
+            });
+        }
+
+        let addrs: Arc<[SocketAddr]> = Arc::from(addrs);
+        *self.resolved_socket_addrs.write().await = Some(addrs.clone());
+        Ok(addrs)
+    }
+
+    fn is_ipv6_network_unreachable(socket_addr: SocketAddr, error: &ConnectionError) -> bool {
+        socket_addr.is_ipv6()
+            && matches!(
+                error,
+                ConnectionError::IoError(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable
+                    )
+            )
+    }
+
+    async fn remove_cached_ipv6_socket_addrs(&self) {
+        let mut cached_addrs = self.resolved_socket_addrs.write().await;
+        let Some(addrs) = cached_addrs.as_ref() else {
+            return;
+        };
+
+        let ipv4_addrs = addrs
+            .iter()
+            .copied()
+            .filter(SocketAddr::is_ipv4)
+            .collect::<Vec<_>>();
+        if ipv4_addrs.len() == addrs.len() {
+            return;
+        }
+
+        *cached_addrs = if ipv4_addrs.is_empty() {
+            None
+        } else {
+            Some(Arc::<[SocketAddr]>::from(ipv4_addrs))
+        };
     }
 
     /// Create a new `TcpManager` with optional TLS configuration
@@ -122,24 +245,21 @@ impl TcpManager {
             password: options.password,
             tls_config,
             tls_manager,
+            resolved_socket_addrs: Arc::new(RwLock::new(None)),
+            next_resolved_socket_addr: Arc::new(AtomicUsize::new(0)),
             recv_buffer_size: options.recv_buffer_size,
             send_buffer_size: options.send_buffer_size,
             compress: options.compress,
             compress_level: options.compress_level,
+            compression_support: Arc::new(Mutex::new(CompressionSupportState::Unknown)),
             send_mode_reader: options.send_mode_reader,
         })
     }
 
-    /// Create an optimized connection (TCP or TLS)
-    pub(crate) async fn create_optimized_stream(
+    async fn connect_socket_addr(
         &self,
-    ) -> Result<ConnectionStream, ConnectionError> {
-        // Resolve hostname
-        let addr = format!("{}:{}", self.host, self.port);
-        let Some(socket_addr) = tokio::net::lookup_host(&addr).await?.next() else {
-            return Err(ConnectionError::DnsNoAddresses { address: addr });
-        };
-
+        socket_addr: SocketAddr,
+    ) -> Result<TcpStream, ConnectionError> {
         // Create tokio TcpSocket (non-blocking from the start)
         let socket = if socket_addr.is_ipv4() {
             tokio::net::TcpSocket::new_v4()?
@@ -167,6 +287,84 @@ impl TcpManager {
             .with_interval(std::time::Duration::from_secs(10));
         sock_ref.set_tcp_keepalive(&keepalive)?;
         sock_ref.set_tcp_nodelay(true)?;
+
+        Ok(tcp_stream)
+    }
+
+    async fn create_connected_tcp_stream(&self) -> Result<TcpStream, ConnectionError> {
+        let addrs = self.resolve_socket_addrs().await?;
+        let last_error = match self.try_resolved_socket_addrs(&addrs).await {
+            Ok(tcp_stream) => return Ok(tcp_stream),
+            Err(last_error) => last_error,
+        };
+
+        if self.ip_literal_socket_addr().is_some() {
+            return Err(
+                last_error.unwrap_or_else(|| ConnectionError::DnsNoAddresses {
+                    address: format!("{}:{}", self.host, self.port),
+                }),
+            );
+        }
+
+        tracing::debug!(
+            backend = %self.name,
+            host = %self.host,
+            "All cached backend socket addresses failed; refreshing DNS before final connect pass"
+        );
+
+        let addrs = self.refresh_socket_addrs().await?;
+        self.try_resolved_socket_addrs(&addrs)
+            .await
+            .map_err(|last_error| {
+                last_error.unwrap_or_else(|| ConnectionError::DnsNoAddresses {
+                    address: format!("{}:{}", self.host, self.port),
+                })
+            })
+    }
+
+    async fn try_resolved_socket_addrs(
+        &self,
+        addrs: &[SocketAddr],
+    ) -> Result<TcpStream, Option<ConnectionError>> {
+        let start = self
+            .next_resolved_socket_addr
+            .fetch_add(1, Ordering::Relaxed)
+            % addrs.len();
+        let mut last_error = None;
+
+        let mut remaining_addrs = (0..addrs.len())
+            .map(|offset| addrs[(start + offset) % addrs.len()])
+            .collect::<VecDeque<_>>();
+
+        while let Some(socket_addr) = remaining_addrs.pop_front() {
+            match self.connect_socket_addr(socket_addr).await {
+                Ok(tcp_stream) => return Ok(tcp_stream),
+                Err(error) => {
+                    if Self::is_ipv6_network_unreachable(socket_addr, &error) {
+                        self.remove_cached_ipv6_socket_addrs().await;
+                        remaining_addrs.retain(SocketAddr::is_ipv4);
+                    }
+
+                    tracing::debug!(
+                        backend = %self.name,
+                        host = %self.host,
+                        socket_addr = %socket_addr,
+                        error = %error,
+                        "Backend socket address connect failed; trying next resolved address"
+                    );
+                    last_error = Some(error);
+                }
+            }
+        }
+
+        Err(last_error)
+    }
+
+    /// Create an optimized connection (TCP or TLS)
+    pub(crate) async fn create_optimized_stream(
+        &self,
+    ) -> Result<ConnectionStream, ConnectionError> {
+        let tcp_stream = self.create_connected_tcp_stream().await?;
 
         // Perform TLS handshake if enabled
         if self.tls_config.use_tls {
@@ -197,20 +395,54 @@ impl TcpManager {
 // ============================================================================
 
 impl TcpManager {
+    /// Read one single-line setup reply using the same backend reply framing
+    /// facade as normal commands.
+    ///
+    /// Connection setup commands are not on the hot article path, but they must
+    /// still tolerate split TCP reads and must not open another place that
+    /// reasons about response line boundaries.
+    async fn read_backend_setup_reply(
+        stream: &mut ConnectionStream,
+        request: &RequestContext,
+        buffer: &mut [u8],
+    ) -> Result<String, ConnectionError> {
+        match crate::session::backend::read_single_line_reply(stream, request, buffer).await {
+            Ok(reply) => Ok(reply),
+            Err(
+                crate::session::backend::SingleLineReplyReadError::Full { bytes_read }
+                | crate::session::backend::SingleLineReplyReadError::Invalid { bytes_read },
+            ) => Err(ConnectionError::IoError(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid or truncated backend setup reply: {}",
+                    String::from_utf8_lossy(&buffer[..bytes_read]).trim_end()
+                ),
+            ))),
+            Err(crate::session::backend::SingleLineReplyReadError::Io(err)) => Err(err.into()),
+            Err(crate::session::backend::SingleLineReplyReadError::Closed) => {
+                Err(ConnectionError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "backend closed while reading setup reply",
+                )))
+            }
+        }
+    }
+
     /// Read and validate the NNTP server greeting.
     async fn consume_greeting(
         &self,
         stream: &mut ConnectionStream,
         buffer: &mut [u8],
     ) -> Result<(), ConnectionError> {
-        let n = stream.read(buffer).await?;
-        let greeting = &buffer[..n];
-        let greeting_str = String::from_utf8_lossy(greeting);
+        let request = RequestContext::from_verb_args(b"MODE", b"READER");
+        let greeting = Self::read_backend_setup_reply(stream, &request, buffer).await?;
 
-        if !crate::protocol::StatusCode::parse(greeting).is_some_and(|code| code.is_greeting()) {
+        if !crate::protocol::StatusCode::parse(greeting.as_bytes())
+            .is_some_and(|code| code.is_greeting())
+        {
             return Err(ConnectionError::InvalidGreeting {
                 backend: self.name.clone(),
-                greeting: greeting_str.trim().to_string(),
+                greeting: greeting.trim().to_string(),
             });
         }
 
@@ -230,14 +462,16 @@ impl TcpManager {
         stream.write_all(b"MODE READER\r\n").await?;
         stream.flush().await?;
 
-        let n = stream.read(buffer).await?;
-        let response = &buffer[..n];
+        let request = RequestContext::from_verb_args(b"MODE", b"READER");
+        let response = Self::read_backend_setup_reply(stream, &request, buffer).await?;
 
         // RFC 3977 §5.3: 200 = reader mode + posting allowed, 201 = reader mode + posting not permitted
-        if response.len() >= 3 && (response.starts_with(b"200") || response.starts_with(b"201")) {
+        if crate::protocol::StatusCode::parse(response.as_bytes())
+            .is_some_and(|code| matches!(code.as_u16(), 200 | 201))
+        {
             tracing::debug!(
                 backend = %self.name,
-                response = %String::from_utf8_lossy(&response[..n]).trim(),
+                response = %response.trim(),
                 "MODE READER accepted"
             );
             return Ok(());
@@ -245,7 +479,7 @@ impl TcpManager {
 
         Err(ConnectionError::InvalidGreeting {
             backend: self.name.clone(),
-            greeting: String::from_utf8_lossy(response).trim().to_string(),
+            greeting: response.trim().to_string(),
         })
     }
 
@@ -262,36 +496,129 @@ impl TcpManager {
             return Ok(false);
         }
 
+        if self.compress == Some(true) {
+            return self
+                .probe_compression_with_timeout(stream, buffer)
+                .await
+                .map(|support| matches!(support, CompressionSupport::Supported));
+        }
+
+        loop {
+            let probe_waiter = {
+                let mut cached_support = self.compression_support.lock().await;
+                match &*cached_support {
+                    CompressionSupportState::Unsupported => {
+                        tracing::debug!(
+                            backend = %self.name,
+                            "Skipping COMPRESS DEFLATE; backend previously reported it unsupported"
+                        );
+                        return Ok(false);
+                    }
+                    CompressionSupportState::Supported => {
+                        drop(cached_support);
+                        return self
+                            .probe_compression_with_timeout(stream, buffer)
+                            .await
+                            .map(|support| matches!(support, CompressionSupport::Supported));
+                    }
+                    CompressionSupportState::Probing(notify) => Some(notify.clone()),
+                    CompressionSupportState::Unknown => {
+                        let notify = Arc::new(Notify::new());
+                        *cached_support = CompressionSupportState::Probing(notify);
+                        None
+                    }
+                }
+            };
+
+            if let Some(notify) = probe_waiter {
+                notify.notified().await;
+                continue;
+            }
+
+            let support = self.probe_compression_with_timeout(stream, buffer).await;
+            let mut cached_support = self.compression_support.lock().await;
+            let notify = match std::mem::take(&mut *cached_support) {
+                CompressionSupportState::Probing(notify) => notify,
+                state => {
+                    *cached_support = state;
+                    return support.map(|support| matches!(support, CompressionSupport::Supported));
+                }
+            };
+
+            match support {
+                Ok(CompressionSupport::Supported) => {
+                    *cached_support = CompressionSupportState::Supported;
+                    notify.notify_waiters();
+                    return Ok(true);
+                }
+                Ok(CompressionSupport::Unsupported) => {
+                    *cached_support = CompressionSupportState::Unsupported;
+                    notify.notify_waiters();
+                    return Ok(false);
+                }
+                Err(err) => {
+                    *cached_support = CompressionSupportState::Unknown;
+                    notify.notify_waiters();
+                    return Err(err);
+                }
+            }
+        }
+    }
+
+    async fn probe_compression_with_timeout(
+        &self,
+        stream: &mut ConnectionStream,
+        buffer: &mut [u8],
+    ) -> Result<CompressionSupport, ConnectionError> {
+        tokio::time::timeout(
+            crate::constants::timeout::CONNECTION,
+            self.probe_compression(stream, buffer),
+        )
+        .await
+        .map_err(|_| {
+            ConnectionError::IoError(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out negotiating COMPRESS DEFLATE",
+            ))
+        })?
+    }
+
+    async fn probe_compression(
+        &self,
+        stream: &mut ConnectionStream,
+        buffer: &mut [u8],
+    ) -> Result<CompressionSupport, ConnectionError> {
         stream.write_all(crate::protocol::COMPRESS_DEFLATE).await?;
         stream.flush().await?;
 
-        let n = stream.read(buffer).await?;
-        let response = &buffer[..n];
-        let response_str = String::from_utf8_lossy(response);
+        let request = RequestContext::from_verb_args(b"COMPRESS", b"DEFLATE");
+        let response = Self::read_backend_setup_reply(stream, &request, buffer).await?;
 
         // 206 = Compression active
-        if response.len() >= 3 && &response[..3] == b"206" {
+        if crate::protocol::StatusCode::parse(response.as_bytes())
+            .is_some_and(|code| code.as_u16() == 206)
+        {
             tracing::debug!(
                 backend = %self.name,
                 "COMPRESS DEFLATE negotiated successfully"
             );
-            return Ok(true);
+            return Ok(CompressionSupport::Supported);
         }
 
         if self.compress == Some(true) {
             return Err(ConnectionError::CompressionRequired {
                 backend: self.name.clone(),
-                response: response_str.trim().to_string(),
+                response: response.trim().to_string(),
             });
         }
 
         // Auto mode: compression not supported, continue without it
         tracing::debug!(
             backend = %self.name,
-            response = %response_str.trim(),
+            response = %response.trim(),
             "COMPRESS DEFLATE not supported, continuing without compression"
         );
-        Ok(false)
+        Ok(CompressionSupport::Unsupported)
     }
 
     /// Perform AUTHINFO USER/PASS handshake if credentials are configured.
@@ -305,11 +632,10 @@ impl TcpManager {
         };
 
         authinfo_user(username).write_wire_to(stream).await?;
-        let n = stream.read(buffer).await?;
-        let response = &buffer[..n];
-        let response_str = String::from_utf8_lossy(response);
+        let user_request = authinfo_user(username);
+        let response = Self::read_backend_setup_reply(stream, &user_request, buffer).await?;
 
-        if crate::protocol::StatusCode::parse(response)
+        if crate::protocol::StatusCode::parse(response.as_bytes())
             .is_some_and(|code| code.requires_auth_credentials())
         {
             // Password required
@@ -320,25 +646,26 @@ impl TcpManager {
             };
 
             authinfo_pass(password).write_wire_to(stream).await?;
-            let n = stream.read(buffer).await?;
-            let response = &buffer[..n];
-            let response_str = String::from_utf8_lossy(response);
+            let pass_request = authinfo_pass(password);
+            let response = Self::read_backend_setup_reply(stream, &pass_request, buffer).await?;
 
-            if !crate::protocol::StatusCode::parse(response)
+            if !crate::protocol::StatusCode::parse(response.as_bytes())
                 .is_some_and(|code| code.is_auth_accepted())
             {
                 // Check for 482 (connection limit exceeded) before generic auth failure
-                if crate::protocol::StatusCode::parse(response).is_some_and(|c| c.as_u16() == 482) {
+                if crate::protocol::StatusCode::parse(response.as_bytes())
+                    .is_some_and(|c| c.as_u16() == 482)
+                {
                     tracing::error!(
                         backend = %self.name,
                         host = %self.host,
                         port = self.port,
-                        response = %response_str.trim(),
+                        response = %response.trim(),
                         "Backend connection limit exceeded"
                     );
                     return Err(ConnectionError::ConnectionLimitExceeded {
                         backend: self.name.clone(),
-                        response: response_str.trim().to_string(),
+                        response: response.trim().to_string(),
                     });
                 }
 
@@ -347,12 +674,12 @@ impl TcpManager {
                     self.name,
                     self.host,
                     self.port,
-                    response_str.trim(),
+                    response.trim(),
                     username
                 );
                 return Err(ConnectionError::AuthenticationFailed {
                     backend: self.name.clone(),
-                    response: response_str.trim().to_string(),
+                    response: response.trim().to_string(),
                 });
             }
             tracing::debug!(
@@ -362,12 +689,12 @@ impl TcpManager {
                 self.port,
                 username
             );
-        } else if !crate::protocol::StatusCode::parse(response)
+        } else if !crate::protocol::StatusCode::parse(response.as_bytes())
             .is_some_and(|code| code.is_auth_accepted())
         {
             return Err(ConnectionError::UnexpectedAuthResponse {
                 backend: self.name.clone(),
-                response: response_str.trim().to_string(),
+                response: response.trim().to_string(),
             });
         }
 
@@ -426,6 +753,8 @@ impl managed::Manager for TcpManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
 
     #[test]
     fn test_socket_buffer_size_u32_rejects_oversized_values() {
@@ -477,6 +806,141 @@ mod tests {
         assert_eq!(manager.name, "SecureServer");
         assert!(manager.username.is_none());
         assert!(manager.password.is_none());
+    }
+
+    #[test]
+    fn ip_literal_socket_addr_parses_ipv4_without_dns() {
+        let manager = TcpManager::new(
+            "127.0.0.1".to_string(),
+            119,
+            "IpBackend".to_string(),
+            TcpManagerOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            manager.ip_literal_socket_addr(),
+            Some(SocketAddr::from(([127, 0, 0, 1], 119)))
+        );
+    }
+
+    #[test]
+    fn ip_literal_socket_addr_parses_ipv6_without_dns() {
+        let manager = TcpManager::new(
+            "::1".to_string(),
+            563,
+            "IpBackend".to_string(),
+            TcpManagerOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            manager.ip_literal_socket_addr(),
+            Some(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 563)))
+        );
+    }
+
+    #[test]
+    fn ip_literal_socket_addr_leaves_hostnames_for_dns() {
+        let manager = TcpManager::new(
+            "news.example.com".to_string(),
+            119,
+            "DnsBackend".to_string(),
+            TcpManagerOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!(manager.ip_literal_socket_addr(), None);
+    }
+
+    #[test]
+    fn ipv6_network_unreachable_matches_error_kind_only_for_ipv6() {
+        let ipv6_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 563));
+        let ipv4_addr = SocketAddr::from(([127, 0, 0, 1], 563));
+        let error = ConnectionError::IoError(io::Error::new(
+            io::ErrorKind::NetworkUnreachable,
+            "network unreachable",
+        ));
+
+        assert!(TcpManager::is_ipv6_network_unreachable(ipv6_addr, &error));
+        assert!(!TcpManager::is_ipv6_network_unreachable(ipv4_addr, &error));
+    }
+
+    #[tokio::test]
+    async fn remove_cached_ipv6_socket_addrs_keeps_only_ipv4_addresses() {
+        let manager = TcpManager::new(
+            "test.example.com".to_string(),
+            563,
+            "DnsBackend".to_string(),
+            TcpManagerOptions::default(),
+        )
+        .unwrap();
+        let ipv6_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 563));
+        let ipv4_addr = SocketAddr::from(([127, 0, 0, 1], 563));
+        *manager.resolved_socket_addrs.write().await = Some(Arc::from([ipv6_addr, ipv4_addr]));
+
+        manager.remove_cached_ipv6_socket_addrs().await;
+
+        let cached_addrs = manager
+            .resolved_socket_addrs
+            .read()
+            .await
+            .as_ref()
+            .expect("cached addresses should remain initialized")
+            .clone();
+        assert_eq!(&*cached_addrs, &[ipv4_addr]);
+    }
+
+    #[tokio::test]
+    async fn remove_cached_ipv6_socket_addrs_clears_ipv6_only_cache() {
+        let manager = TcpManager::new(
+            "test.example.com".to_string(),
+            563,
+            "DnsBackend".to_string(),
+            TcpManagerOptions::default(),
+        )
+        .unwrap();
+        let ipv6_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 563));
+        *manager.resolved_socket_addrs.write().await = Some(Arc::from([ipv6_addr]));
+
+        manager.remove_cached_ipv6_socket_addrs().await;
+
+        assert!(
+            manager.resolved_socket_addrs.read().await.is_none(),
+            "IPv6-only cached address list should be cleared instead of retained as an empty cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_connected_tcp_stream_refreshes_dns_after_cached_addresses_fail() {
+        let live_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live_listener.local_addr().unwrap();
+        let stale_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stale_addr = stale_listener.local_addr().unwrap();
+        drop(stale_listener);
+
+        let manager = TcpManager::new(
+            "localhost".to_string(),
+            live_addr.port(),
+            "DnsBackend".to_string(),
+            TcpManagerOptions::default(),
+        )
+        .unwrap();
+        *manager.resolved_socket_addrs.write().await = Some(Arc::from([stale_addr]));
+
+        let accept = tokio::spawn(async move { live_listener.accept().await.unwrap() });
+        let stream = manager.create_connected_tcp_stream().await.unwrap();
+        let _accepted = accept.await.unwrap();
+
+        assert_eq!(stream.peer_addr().unwrap(), live_addr);
+        let cached_addrs = manager
+            .resolved_socket_addrs
+            .read()
+            .await
+            .as_ref()
+            .expect("successful refresh should update cached addresses")
+            .clone();
+        assert!(cached_addrs.contains(&live_addr));
     }
 
     #[test]
@@ -547,6 +1011,14 @@ mod tests {
         assert_eq!(cloned.name, manager.name);
         assert_eq!(cloned.username, manager.username);
         assert_eq!(cloned.password, manager.password);
+        assert!(Arc::ptr_eq(
+            &cloned.resolved_socket_addrs,
+            &manager.resolved_socket_addrs
+        ));
+        assert!(Arc::ptr_eq(
+            &cloned.next_resolved_socket_addr,
+            &manager.next_resolved_socket_addr
+        ));
     }
 
     #[test]
@@ -567,6 +1039,37 @@ mod tests {
         assert!(debug_str.contains("TcpManager"));
         assert!(debug_str.contains("news.example.com"));
         assert!(debug_str.contains("119"));
+    }
+
+    #[tokio::test]
+    async fn create_optimized_stream_tries_next_resolved_address_after_connect_error() {
+        let unavailable_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let unavailable_addr = unavailable_listener.local_addr().unwrap();
+        drop(unavailable_listener);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let available_addr = listener.local_addr().unwrap();
+        let accept_task = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+        });
+
+        let manager = TcpManager::new(
+            "test.example.com".to_string(),
+            available_addr.port(),
+            "FallbackBackend".to_string(),
+            TcpManagerOptions::default(),
+        )
+        .unwrap();
+        *manager.resolved_socket_addrs.write().await =
+            Some(Arc::from([unavailable_addr, available_addr]));
+
+        let stream = manager
+            .create_optimized_stream()
+            .await
+            .expect("second resolved address should be tried after first connect error");
+
+        assert_eq!(stream.connection_type(), "TCP");
+        accept_task.await.unwrap();
     }
 
     #[test]
@@ -618,5 +1121,141 @@ mod tests {
 
         // Should fail because cert file doesn't exist
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn mode_reader_negotiation_reads_split_setup_reply() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut command = [0u8; 13];
+            stream.read_exact(&mut command).await.unwrap();
+            assert_eq!(&command, b"MODE READER\r\n");
+            stream.write_all(b"20").await.unwrap();
+            stream.write_all(b"0 Posting allowed\r\n").await.unwrap();
+        });
+
+        let manager = TcpManager::new(
+            addr.ip().to_string(),
+            addr.port(),
+            "SplitSetup".to_string(),
+            TcpManagerOptions::default(),
+        )
+        .unwrap();
+        let tcp_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = ConnectionStream::plain(tcp_stream);
+        let mut buffer = [0u8; 64];
+
+        manager
+            .negotiate_mode_reader(&mut stream, &mut buffer)
+            .await
+            .expect("split MODE READER setup reply should be accepted");
+    }
+
+    #[tokio::test]
+    async fn compression_negotiation_reads_split_unsupported_reply() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut command = [0u8; 18];
+            stream.read_exact(&mut command).await.unwrap();
+            assert_eq!(&command, crate::protocol::COMPRESS_DEFLATE);
+            stream.write_all(b"50").await.unwrap();
+            stream.write_all(b"0 Not supported\r\n").await.unwrap();
+        });
+
+        let manager = TcpManager::new(
+            addr.ip().to_string(),
+            addr.port(),
+            "SplitCompression".to_string(),
+            TcpManagerOptions {
+                compress: None,
+                ..TcpManagerOptions::default()
+            },
+        )
+        .unwrap();
+        let tcp_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = ConnectionStream::plain(tcp_stream);
+        let mut buffer = [0u8; 64];
+
+        let enabled = manager
+            .negotiate_compression(&mut stream, &mut buffer)
+            .await
+            .expect("split unsupported compression reply should be accepted");
+
+        assert!(!enabled);
+    }
+
+    #[tokio::test]
+    async fn auto_compression_serializes_and_remembers_unsupported_backend() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let compress_commands = Arc::new(AtomicUsize::new(0));
+        let server_commands = compress_commands.clone();
+
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let server_commands = server_commands.clone();
+                tokio::spawn(async move {
+                    let mut command = [0u8; 18];
+                    let read = tokio::time::timeout(
+                        std::time::Duration::from_millis(100),
+                        stream.read_exact(&mut command),
+                    )
+                    .await;
+                    if read.is_err() {
+                        return;
+                    }
+                    read.unwrap().unwrap();
+                    if command == crate::protocol::COMPRESS_DEFLATE {
+                        server_commands.fetch_add(1, Ordering::SeqCst);
+                        stream.write_all(b"500 Not supported\r\n").await.unwrap();
+                    }
+                });
+            }
+        });
+
+        let manager = TcpManager::new(
+            addr.ip().to_string(),
+            addr.port(),
+            "CachedUnsupportedCompression".to_string(),
+            TcpManagerOptions {
+                compress: None,
+                ..TcpManagerOptions::default()
+            },
+        )
+        .unwrap();
+
+        let mut tasks = Vec::new();
+        for _ in 0..2 {
+            let manager = manager.clone();
+            tasks.push(tokio::spawn(async move {
+                let tcp_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+                let mut stream = ConnectionStream::plain(tcp_stream);
+                let mut buffer = [0u8; 64];
+
+                let enabled = manager
+                    .negotiate_compression(&mut stream, &mut buffer)
+                    .await
+                    .expect("unsupported compression should fall back in auto mode");
+
+                assert!(!enabled);
+            }));
+        }
+
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert_eq!(
+            compress_commands.load(Ordering::SeqCst),
+            1,
+            "auto mode should remember unsupported COMPRESS DEFLATE"
+        );
     }
 }

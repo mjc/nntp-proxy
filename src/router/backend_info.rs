@@ -209,13 +209,14 @@ impl BackendInfo {
         #[allow(clippy::cast_precision_loss)]
         // This relative load score is display/ranking data, not exact accounting.
         // Ratio comparisons do not require exact integer preservation.
-        let max_conns = self.provider.max_size() as f64;
+        let status = self.provider.status_counts();
+        let max_conns = status.max_size as f64;
         if max_conns > 0.0 {
+            let checked_out = status.size.saturating_sub(status.available);
             #[allow(clippy::cast_precision_loss)]
             // Pending counts only feed the relative load score.
-            // Pending counts only feed the relative load score.
-            let pending = self.pending_count.get() as f64;
-            LoadRatio::new(pending / max_conns)
+            let active = self.pending_count.get().max(checked_out) as f64;
+            LoadRatio::new(active / max_conns)
         } else {
             LoadRatio::MAX
         }
