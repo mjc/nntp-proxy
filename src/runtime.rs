@@ -8,6 +8,8 @@
 use crate::types::ThreadCount;
 use anyhow::{Context, Result};
 
+const TOKIO_WORKER_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+
 /// Runtime configuration
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -74,6 +76,7 @@ impl RuntimeConfig {
             );
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(self.worker_threads)
+                .thread_stack_size(TOKIO_WORKER_THREAD_STACK_SIZE)
                 .enable_all()
                 .build()?
         };
