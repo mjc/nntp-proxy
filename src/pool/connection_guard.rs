@@ -68,11 +68,12 @@ const _SALVAGE_NO_LOOP: () = {
     assert_no_timeout_loop(1, MAX_CONNECTION_SALVAGE_MS);
 };
 
-/// RAII guard for pooled connections
+/// RAII guard for pooled connections.
 ///
-/// Automatically calls `remove_with_cooldown` on drop unless the connection is
-/// explicitly released via `release()`. This ensures all broken connections are
-/// cleaned up consistently, applying the cooldown logic regardless of call site.
+/// Automatically removes an unreleased connection from the pool on drop. Drop
+/// applies replacement cooldown because unreleased guards represent unknown or
+/// backend-error state. Use `retire_without_cooldown` for known client-side
+/// dirty sockets that should not throttle backend replacement.
 ///
 /// Follows the same pattern as `CommandGuard` from `src/router/mod.rs`.
 pub struct ConnectionGuard {
@@ -82,7 +83,7 @@ pub struct ConnectionGuard {
 }
 
 impl ConnectionGuard {
-    /// Create a new guard (calls `remove_with_cooldown` on drop unless released)
+    /// Create a new guard (removes from pool on drop unless released).
     pub const fn new(conn: Object<TcpManager>, provider: DeadpoolConnectionProvider) -> Self {
         Self {
             conn: Some(conn),
@@ -123,6 +124,24 @@ impl ConnectionGuard {
         self.provider.remove_without_cooldown(conn);
     }
 
+    /// Close and remove the connection, applying replacement cooldown.
+    ///
+    /// Use this only when the backend connection itself failed or is known to be
+    /// in a backend-error state. Client-side disconnects and local dirty-socket
+    /// retirement should use `retire_without_cooldown`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the guard has already been consumed.
+    pub fn retire_with_cooldown(mut self) {
+        self.released = true;
+        let conn = self
+            .conn
+            .take()
+            .expect("ConnectionGuard::retire_with_cooldown() called on consumed guard");
+        self.provider.remove_with_cooldown(conn);
+    }
+
     /// Get mutable reference to the connection
     ///
     /// # Panics
@@ -154,6 +173,16 @@ impl ConnectionGuard {
     pub fn pending_bytes_len(&self) -> usize {
         self.get().pending_bytes_len()
     }
+
+    #[must_use]
+    pub fn provider_status_counts(&self) -> crate::pool::provider::DeadpoolStatusCounts {
+        self.provider.status_counts()
+    }
+
+    #[must_use]
+    pub fn provider_name(&self) -> &str {
+        self.provider.name()
+    }
 }
 
 impl Drop for ConnectionGuard {
@@ -166,8 +195,6 @@ impl Drop for ConnectionGuard {
                 pending_bytes = conn.pending_bytes_len(),
                 "ConnectionGuard dropping unreleased pooled connection; removing backend connection with cooldown"
             );
-            // Unconditional: remove_with_cooldown handles socket shutdown and
-            // optional pool-size reduction (when a replacement_cooldown is configured).
             self.provider.remove_with_cooldown(conn);
         }
     }
@@ -342,9 +369,9 @@ mod tests {
 
     /// Invariant: drop without `release()` removes the connection from the pool.
     ///
-    /// `remove_with_cooldown` shuts down the socket; pool recycle detects EOF
+    /// The guard shuts down the socket; pool recycle detects EOF
     /// and discards it; next `get()` creates a fresh TCP connection.
-    /// This is the path taken on backend errors and unknown connection state.
+    /// Unknown/backend-error drop paths apply replacement cooldown.
     #[tokio::test]
     async fn drop_without_release_forces_new_connection() {
         let (port, accept_count) = spawn_greeting_server().await;
@@ -354,7 +381,7 @@ mod tests {
         let conn = provider.get_pooled_connection().await.unwrap();
         assert_eq!(accept_count.load(Ordering::SeqCst), 1);
 
-        // Drop without release → remove_with_cooldown → socket shut down
+        // Drop without release → socket shut down
         let guard = ConnectionGuard::new(conn, provider.clone());
         drop(guard);
 

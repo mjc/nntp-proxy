@@ -1071,7 +1071,7 @@ mod tests {
 
     #[test]
     fn test_server_builder_with_replacement_cooldown() {
-        let cooldown = Duration::from_secs(30);
+        let cooldown = Duration::from_secs(31);
         let server = Server::builder("localhost", Port::try_new(119).unwrap())
             .replacement_cooldown(cooldown)
             .build()
