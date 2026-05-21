@@ -14,7 +14,7 @@ TLS, cache behavior, and live metrics in one place.
 - Backend availability is tracked when the configured cache capacity can hold the fixed availability index; `[cache].store_article_bodies` is false by default and only controls whether full article bodies are cached too.
 - RAM article-cache hits measured 5.16 GB/s on a Ryzen 9 5950X.
 - A hot-cache path with a 256 MB in-memory article cache and disk cache on SSD measured 2.58 GB/s on the same system.
-- Current 100GB cache-miss spot checks average 3791.23 MiB/s at `1/1/1` and 8336.03 MiB/s at `4/8/8` on the same system.
+- Current 100GB cache-miss spot checks (10 runs) measured 3887.81 MiB/s mean at `1/1/1` and 8927.02 MiB/s mean at `4/8/8` on the same system.
 - Allocation-conscious hot paths: borrowed request slices, preallocated buffer pools, and allocation-free cache key lookup in the steady state.
 - Optional terminal dashboard with persisted metrics across restarts.
 - TOML config, environment-based backend configuration, and CLI overrides.
@@ -218,7 +218,7 @@ Common server fields:
 | `tls_verify_cert` | no | true | Keep true in production. |
 | `tls_cert_path` | no | - | Additional PEM CA certificate. |
 | `connection_keepalive` | no | - | Send `DATE` on idle backend connections every N seconds. |
-| `replacement_cooldown` | no | 30 | Wait this many seconds before replacing an actively removed connection; set `0` to disable. |
+| `replacement_cooldown` | no | 30 | Wait this many seconds before replacing a connection removed after backend error; set `0` to disable. |
 | `health_check_max_per_cycle` | no | 10 | Maximum connections to check per health-check cycle. |
 | `health_check_pool_timeout` | no | 2 | Seconds to wait when acquiring a connection for health checking. |
 | `compress` | no | auto | RFC 8054 backend `COMPRESS DEFLATE`: omit to auto-detect, `true` to require, `false` to disable. |
@@ -306,7 +306,7 @@ The current hot paths are designed to avoid avoidable heap work:
 
 - RAM article-cache hits measured 5.16 GB/s on a Ryzen 9 5950X.
 - With a 256 MB in-memory article cache and disk cache on SSD, the hot-cache path measured 2.58 GB/s on the same system.
-- Current 100GB cache-miss spot checks average 3791.23 MiB/s at `1/1/1` and 8336.03 MiB/s at `4/8/8` on the same system.
+- Current 100GB cache-miss spot checks (10 runs) measured 3887.81 MiB/s mean at `1/1/1` and 8927.02 MiB/s mean at `4/8/8` on the same system.
 - Backend request forwarding uses parsed request slices instead of rebuilding command strings.
 - The main I/O and capture buffers are preallocated and prefaulted at startup.
 - Buffer acquisition is allocation-free while the configured pools have capacity; exhaustion intentionally falls back to allocating and logs that fact.
@@ -316,8 +316,52 @@ Current 100GB proxy-in-the-middle cache-miss spot checks:
 
 | Shape | Mean MiB/s | Median MiB/s | Stdev | Min | Max | Notes |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `1/1/1` | 3791.23 | 3798.88 | 127.00 | 3571.56 | 3963.27 | 10 runs, 1 MiB proxy I/O buffers |
-| `4/8/8` | 8336.03 | 8447.14 | 277.84 | 7770.93 | 8615.41 | 10 runs, 1 MiB proxy I/O buffers |
+| `1/1/1` | 3887.81 | 3958.31 | 235.09 | 3502.35 | 4158.97 | 10 runs, 1 MiB proxy I/O buffers |
+| `4/8/8` | 8927.02 | 8938.30 | 131.05 | 8730.79 | 9089.32 | 10 runs, 1 MiB proxy I/O buffers |
+
+Current 20GiB cache-miss tuning sweep, complete with one run for each of 256
+settings (client threads fixed at 4):
+
+Practical guidance: most installs should start with `1/1/n`: one proxy thread,
+one client-facing connection shape, and `n` backends for however many providers
+the operator pays for. Then benchmark each provider repeatedly to find the right
+backend connection count. Bigger is not always better, and the best backend
+connection count can vary by provider.
+
+The rest of this table is absolute-throughput tuning for hosts with enough
+network to care, roughly 10Gbit/s and above. In this single-run sweep, the
+`1/1/1` row is within about 6% of the best row in the whole sweep, and the best
+1-proxy-thread rows are within about 1% of the highest 8-proxy-thread row. Do
+not treat high proxy thread counts as a default recommendation unless repeated
+runs show that the extra complexity buys a durable gain on the target host.
+In these tables, backend connection counts are per configured backend.
+
+| Situation | Proxy threads | Client connections | Per-backend max connections | Pipeline depth | MiB/s | Notes |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Default starting point | 1 | 1 | 1 | 16 | 4365.19 | Smallest fast measured shape; scale backend count to paid providers |
+| One client connection, tuned | 1 | 1 | 8 | 64 | 4437.58 | Provider/backend tuning example; bigger connection counts need measurement |
+| Several client connections | 1 | 4 | 8 | 8 | 4500.60 | Best 1-proxy-thread row for 4 client connections |
+| Many client connections | 1 | 16 | 8 | 8 | 4498.74 | Extra client connections did not materially beat 4 connections |
+| Single-run ceiling | 2 | 1 | 1 | 32 | 4639.53 | Highest row in this sweep; not the default recommendation |
+
+Pipeline-depth summary:
+
+| Pipeline depth | Rows | Best `1/1/1` MiB/s | Best 1-proxy-thread shape | Best 1-proxy-thread MiB/s | Best observed shape | Best observed MiB/s |
+| ---: | ---: | ---: | --- | ---: | --- | ---: |
+| 8 | 64 | 1578.31 | `1/4/8` | 4500.60 | `8/8/8` | 4535.93 |
+| 16 | 64 | 4365.19 | `1/4/8` | 4429.79 | `8/1/16` | 4469.16 |
+| 32 | 64 | 3542.11 | `1/16/16` | 4482.53 | `2/1/1` | 4639.53 |
+| 64 | 64 | 4117.74 | `1/1/8` | 4437.58 | `4/1/8` | 4438.71 |
+
+Backend connection sweep for `pipeline_depth=8` rows (MiB/s, higher is better;
+cells are best with one proxy thread):
+
+| Client connections | Backend 1 | Backend 4 | Backend 8 | Backend 16 | Best backend |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 1578 | 1579 | 1574 | 1593 | 16 |
+| 4 | 3550 | 4176 | 4501 | 4447 | 8 |
+| 8 | 3094 | 4055 | 4495 | 4331 | 8 |
+| 16 | 4284 | 4296 | 4499 | 4187 | 8 |
 
 Instrumented system-level `perf` runs are lower and should be used only for
 attribution, not throughput claims:
