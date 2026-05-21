@@ -134,6 +134,19 @@ impl NntpProxyBuilder {
 
         let memory = self.config.memory.clone();
         let buffer_count = self.buffer_count.unwrap_or(memory.buffer_pool_count);
+        let backend_connection_capacity = self
+            .config
+            .servers
+            .iter()
+            .map(|server| server.max_connections.get())
+            .sum::<usize>();
+        if buffer_count < backend_connection_capacity {
+            warn!(
+                buffer_pool_count = buffer_count,
+                backend_connection_capacity,
+                "Buffer pool count is below backend connection capacity; exhausted pools will use visible fallback allocations"
+            );
+        }
 
         // Create deadpool connection providers for each server
         let connection_providers: Result<Vec<DeadpoolConnectionProvider>> = self
@@ -465,6 +478,21 @@ mod tests {
 
         assert_eq!(proxy.servers().len(), 3);
         // Pool size and count are used internally but not exposed for verification
+    }
+
+    #[test]
+    fn test_builder_keeps_configured_buffer_pool_count_as_hard_cap() {
+        let mut config = create_test_config();
+        config.memory.buffer_pool_count = 4;
+        config.servers[0].max_connections = crate::types::MaxConnections::try_new(40).unwrap();
+        config.servers[1].max_connections = crate::types::MaxConnections::try_new(50).unwrap();
+        config.servers[2].max_connections = crate::types::MaxConnections::try_new(50).unwrap();
+
+        let proxy = NntpProxyBuilder::new(config)
+            .build_sync()
+            .expect("Failed to build proxy");
+
+        assert_eq!(proxy.buffer_pool().stats().2, 4);
     }
 
     #[test]

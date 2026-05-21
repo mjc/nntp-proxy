@@ -526,7 +526,8 @@ pub struct Server {
     )]
     pub connection_keepalive: Option<Duration>,
     /// How long to wait before replacing an actively-removed connection.
-    /// Prevents backend connection limit exceeded (482) errors from connection churn.
+    /// This can damp backend connection churn after repeated failures, but it
+    /// also temporarily reduces pool capacity on backend-error removals.
     /// Default: 30 seconds. Set to 0 to disable.
     #[serde(
         with = "option_duration_serde",
@@ -1054,6 +1055,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(server.connection_keepalive, Some(keepalive));
+    }
+
+    #[test]
+    fn test_server_builder_default_replacement_cooldown() {
+        let server = Server::builder("localhost", Port::try_new(119).unwrap())
+            .build()
+            .unwrap();
+
+        assert_eq!(
+            server.replacement_cooldown,
+            super::defaults::replacement_cooldown_option()
+        );
+    }
+
+    #[test]
+    fn test_server_builder_with_replacement_cooldown() {
+        let cooldown = Duration::from_secs(30);
+        let server = Server::builder("localhost", Port::try_new(119).unwrap())
+            .replacement_cooldown(cooldown)
+            .build()
+            .unwrap();
+
+        assert_eq!(server.replacement_cooldown, Some(cooldown));
     }
 
     #[test]
