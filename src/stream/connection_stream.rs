@@ -325,6 +325,10 @@ impl ConnectionStream {
         buffer: crate::pool::PooledBuffer,
         range: Range<usize>,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            range.start <= range.end,
+            "pending pooled range start exceeds end"
+        );
         let len = range.len();
         if len == 0 {
             return Ok(());
@@ -690,6 +694,28 @@ mod tests {
             err.to_string()
                 .contains(&MAX_PENDING_BACKEND_BYTES.to_string())
         );
+        assert_eq!(conn.pending_bytes_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_queue_pooled_pending_bytes_rejects_backwards_range() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
+
+        let pool =
+            crate::pool::BufferPool::new(crate::types::BufferSize::try_new(1024).unwrap(), 1);
+        let mut pending = pool.acquire();
+        pending.copy_from_slice(b"pooled");
+
+        let mut conn = ConnectionStream::plain(server_stream);
+        let err = conn
+            .queue_pooled_pending_bytes_first(pending, 5..2)
+            .unwrap_err();
+        assert!(err.to_string().contains("range start exceeds end"));
         assert_eq!(conn.pending_bytes_len(), 0);
     }
 

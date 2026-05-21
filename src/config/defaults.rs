@@ -96,8 +96,8 @@ pub const fn buffer_pool_size() -> usize {
 }
 
 /// Default number of buffers in the main buffer pool
-/// Sized for ~50 concurrent connections with single buffer per connection
-/// Total memory: 50 × 1MiB = 50MiB
+/// Sized for ~100 concurrent connections with single buffer per connection
+/// Total memory: 100 × 1MiB = 100MiB
 #[inline]
 #[must_use]
 pub const fn buffer_pool_count() -> usize {
@@ -185,18 +185,16 @@ pub const fn backend_idle_timeout() -> Duration {
     crate::constants::duration_polyfill::from_minutes(10)
 }
 
-/// Default connection replacement cooldown (30 seconds)
+/// Default connection replacement cooldown.
 #[inline]
 pub const fn replacement_cooldown() -> Duration {
     Duration::from_secs(30)
 }
 
-/// Default connection replacement cooldown option (Some(30 seconds))
+/// Default connection replacement cooldown option.
 #[inline]
 #[allow(clippy::unnecessary_wraps)] // Config defaults model an optional field even when the default is always present.
 pub const fn replacement_cooldown_option() -> Option<Duration> {
-    // This mirrors optional config fields and keeps the default plumbing
-    // uniform even though the default itself is always present.
     Some(replacement_cooldown())
 }
 

@@ -42,10 +42,10 @@ pub mod buffer {
     pub const POOL: usize = 1024 * 1024;
 
     /// Default number of buffers in the buffer pool
-    /// Sized for ~50 concurrent streaming connections
-    /// Total memory: 50 × 1MiB = 50MiB
+    /// Sized for ~100 concurrent streaming connections
+    /// Total memory: 100 × 1MiB = 100MiB
     /// This is a conservative default; increase via config for higher concurrency
-    pub const POOL_COUNT: usize = 50;
+    pub const POOL_COUNT: usize = 100;
 
     /// Size of each capture buffer (1 MiB, page-aligned).
     ///
@@ -292,8 +292,8 @@ mod tests {
         // Calculate total pool memory
         let total_memory = buffer::POOL * buffer::POOL_COUNT;
 
-        // Should be exactly 50MiB (50 buffers × 1MiB)
-        let expected_mb = 50;
+        // Should be exactly 100MiB (100 buffers x 1MiB)
+        let expected_mb = 100;
         let actual_mb = total_memory / (1024 * 1024);
 
         assert_eq!(
