@@ -9,12 +9,14 @@
 //! - [`cache_operations`]: Cache lookups, upserts, and tier helpers
 
 use crate::protocol::{
-    AUTH_REQUIRED_FOR_COMMAND, RequestContext, RequestResponseMetadata, StatusCode, codes,
+    AUTH_REQUIRED_FOR_COMMAND, RequestContext, RequestKind, RequestResponseMetadata, StatusCode,
+    codes,
 };
 use crate::session::common;
 use crate::session::routing::{CommandRoutingDecision, decide_request_routing};
 use crate::session::{ClientSession, connection};
 use anyhow::Result;
+use futures::{StreamExt, stream::FuturesUnordered};
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -24,7 +26,12 @@ use crate::command::{CommandAction, CommandHandler};
 use crate::constants::buffer::READER_CAPACITY;
 use crate::router::BackendSelector;
 use crate::session::SessionError;
+use crate::session::handlers::article_retry::OrderedPipelineGate;
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
+
+fn safe_command_log_label(request: &RequestContext) -> String {
+    String::from_utf8_lossy(request.verb()).into_owned()
+}
 
 /// Result of executing a routing decision
 enum CommandResult {
@@ -337,11 +344,7 @@ impl ClientSession {
             "Client {} decision: InterceptCapabilities",
             self.client_addr
         );
-        let capabilities = if skip_auth_check {
-            crate::session::response_buffer::CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE
-        } else {
-            crate::session::response_buffer::CAPABILITIES_WITH_AUTHINFO_RESPONSE
-        };
+        let capabilities = crate::session::backend::capabilities_response(!skip_auth_check);
         let mut client_write = client_writer.lock().await;
         client_write.write_all(capabilities).await?;
         record_local_response(request, codes::CAPABILITY_LIST, capabilities);
@@ -615,6 +618,12 @@ impl ClientSession {
     ) -> Result<BatchLoopAction, SessionError> {
         let batch_size = batch.len();
 
+        if self.can_process_ordered_large_transfer_batch(router, batch, state) {
+            return self
+                .process_ordered_large_transfer_batch(router, client_writer, state, batch)
+                .await;
+        }
+
         for i in 0..batch_size {
             let request = batch.context(i);
             debug!(
@@ -659,6 +668,91 @@ impl ClientSession {
         Ok(BatchLoopAction::Continue)
     }
 
+    fn can_process_ordered_large_transfer_batch(
+        &self,
+        router: &Arc<BackendSelector>,
+        batch: &crate::session::handlers::pipeline::RequestBatch,
+        state: &PerCommandLoopState,
+    ) -> bool {
+        if router.backend_count() <= 1
+            || batch.len() <= 1
+            || self.cache_articles
+            || self.adaptive_precheck
+        {
+            return false;
+        }
+
+        let skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
+        (0..batch.len()).all(|i| {
+            let request = batch.context(i);
+            request.is_large_transfer()
+                && decide_request_routing(
+                    request,
+                    skip_auth_check,
+                    self.auth_handler.is_enabled(),
+                    self.mode_state.routing_mode(),
+                ) == CommandRoutingDecision::Forward
+        })
+    }
+
+    async fn process_ordered_large_transfer_batch(
+        &self,
+        router: &Arc<BackendSelector>,
+        client_writer: &crate::session::SharedClientWriter,
+        state: &mut PerCommandLoopState,
+        batch: &crate::session::handlers::pipeline::RequestBatch,
+    ) -> Result<BatchLoopAction, SessionError> {
+        let batch_size = batch.len();
+        let order = Arc::new(OrderedPipelineGate::new());
+        let mut futures = FuturesUnordered::new();
+
+        state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
+        for i in 0..batch_size {
+            let request = batch.context(i);
+            debug!(
+                "Client {} dispatching ordered pipeline request {} of {}: kind={:?}, verb={:?}",
+                self.client_addr,
+                i + 1,
+                batch_size,
+                request.kind(),
+                request.verb()
+            );
+            state.client_to_backend_bytes = state
+                .client_to_backend_bytes
+                .add(request.request_wire_len().get());
+
+            futures.push(self.execute_ordered_large_transfer_request(
+                router.clone(),
+                request,
+                client_writer.clone(),
+                order.clone(),
+                i,
+            ));
+        }
+
+        let mut first_error = None;
+        while let Some(result) = futures.next().await {
+            match result {
+                Ok(result) => {
+                    state.backend_to_client_bytes = state
+                        .backend_to_client_bytes
+                        .add_u64(result.backend_to_client_bytes.as_u64());
+                }
+                Err(err) => {
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                }
+            }
+        }
+
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+
+        Ok(BatchLoopAction::Continue)
+    }
+
     async fn handle_trailing_command(
         &self,
         router: &Arc<BackendSelector>,
@@ -696,12 +790,13 @@ impl ClientSession {
         let Some(trailing_context) = batch.trailing_context() else {
             return Ok(BatchLoopAction::Continue);
         };
-        debug!(
-            "Client {} trailing non-pipelineable {:?}: {:?}",
-            self.client_addr,
-            trailing_context.kind(),
-            trailing_context.verb()
-        );
+        if !matches!(trailing_context.kind(), RequestKind::AuthInfo) {
+            debug!(
+                "Client {} trailing non-pipelineable {}",
+                self.client_addr,
+                safe_command_log_label(trailing_context)
+            );
+        }
         state.client_to_backend_bytes = state
             .client_to_backend_bytes
             .add(trailing_context.request_wire_len().get());
@@ -790,6 +885,13 @@ mod tests {
                 crate::protocol::CONNECTION_CLOSING.len()
             ))
         );
+    }
+
+    #[test]
+    fn safe_command_log_label_formats_plain_verb() {
+        let request = RequestContext::parse(b"GROUP alt.test\r\n").expect("valid request");
+
+        assert_eq!(super::safe_command_log_label(&request), "GROUP");
     }
 
     #[test]

@@ -43,6 +43,74 @@ fn test_tier_zero_selected_first() {
 }
 
 #[test]
+fn test_tier_zero_selected_first_without_availability_filter() {
+    let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
+
+    selector.add_backend(
+        BackendId::from_index(0),
+        ServerName::try_new("backup".to_string()).unwrap(),
+        create_backend("backup", 10),
+        1,
+    );
+    selector.add_backend(
+        BackendId::from_index(1),
+        ServerName::try_new("primary".to_string()).unwrap(),
+        create_backend("primary", 10),
+        0,
+    );
+
+    let backend = selector
+        .route_without_availability(ClientId::new())
+        .unwrap();
+    assert_eq!(
+        backend.as_index(),
+        1,
+        "Tier 1 must not be selected while tier 0 exists, even without article availability"
+    );
+}
+
+#[test]
+fn test_tier_one_unused_without_availability_until_tier_zero_is_loaded() {
+    let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
+
+    selector.add_backend(
+        BackendId::from_index(0),
+        ServerName::try_new("tier0-a".to_string()).unwrap(),
+        create_backend("tier0-a", 10),
+        0,
+    );
+    selector.add_backend(
+        BackendId::from_index(1),
+        ServerName::try_new("tier0-b".to_string()).unwrap(),
+        create_backend("tier0-b", 10),
+        0,
+    );
+    selector.add_backend(
+        BackendId::from_index(2),
+        ServerName::try_new("tier1".to_string()).unwrap(),
+        create_backend("tier1", 100),
+        1,
+    );
+
+    let mut counts = [0; 3];
+    for _ in 0..40 {
+        let backend = selector
+            .route_without_availability(ClientId::new())
+            .unwrap();
+        counts[backend.as_index()] += 1;
+    }
+
+    assert!(
+        counts[0] > 0 && counts[1] > 0,
+        "Tier 0 backends should receive all no-availability traffic: {counts:?}"
+    );
+    assert_eq!(
+        counts[2], 0,
+        "Tier 1 must remain idle while tier 0 is eligible"
+    );
+}
+
+#[test]
 fn test_tier_escalation_on_430() {
     let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
 

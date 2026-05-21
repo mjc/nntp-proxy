@@ -70,16 +70,14 @@ impl ClientSession {
                 }
             }
             AuthenticatedStatefulAction::InterceptCapabilities => {
-                use crate::session::response_buffer::CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE;
+                let capabilities =
+                    crate::session::backend::capabilities_without_authinfo_response();
                 if state.has_pending_backend_replies() {
-                    state.push_deferred_reply(CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE.to_vec());
+                    state.push_deferred_reply(capabilities.to_vec());
                 } else {
-                    client_write
-                        .write_all(CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE)
-                        .await?;
+                    client_write.write_all(capabilities).await?;
                     client_write.flush().await?;
-                    state
-                        .add_backend_to_client(CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE.len() as u64);
+                    state.add_backend_to_client(capabilities.len() as u64);
                 }
             }
             AuthenticatedStatefulAction::Reject(response) => {
@@ -154,7 +152,7 @@ impl ClientSession {
             }
         };
 
-        // Wrap in guard — removes from pool on any error
+        // Wrap in guard — unreleased connections are removed from the pool.
         let mut conn_guard = crate::pool::ConnectionGuard::new(backend_conn, provider.clone());
 
         // Split streams
@@ -177,7 +175,7 @@ impl ClientSession {
         // H2: Only return connection to pool on success
         if result.is_ok() {
             let _conn = conn_guard.release();
-        } // else: guard drops → removes broken connection
+        } // else: guard drops → removes connection without replacement cooldown
 
         result.map_err(crate::session::SessionError::from)
     }

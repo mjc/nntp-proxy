@@ -81,12 +81,16 @@ async fn spawn_counting_stat_backend() -> Result<CountingBackend> {
 }
 
 async fn spawn_single_slot_per_command_proxy(backend_port: u16) -> Result<u16> {
+    spawn_per_command_proxy(backend_port, 1).await
+}
+
+async fn spawn_per_command_proxy(backend_port: u16, max_connections: usize) -> Result<u16> {
     let config = Config {
         servers: vec![create_test_server_config_with_max_connections(
             "127.0.0.1",
             backend_port,
             "CountingBackend",
-            1,
+            max_connections,
         )],
         cache: Some(Cache {
             adaptive_precheck: false,
@@ -152,6 +156,34 @@ async fn per_command_reuses_backend_connection_inside_one_pipeline_batch() -> Re
         backend.accepts.load(Ordering::SeqCst),
         accepts_before_commands + 1,
         "pipelined commands in one batch should reuse one backend connection"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn per_command_pipeline_uses_idle_pool_capacity_before_reusing_connection() -> Result<()> {
+    let backend = spawn_counting_stat_backend().await?;
+    wait_for_server(&format!("127.0.0.1:{}", backend.port), 20).await?;
+    let proxy_port = spawn_per_command_proxy(backend.port, 2).await?;
+    wait_for_server(&format!("127.0.0.1:{proxy_port}"), 20).await?;
+    let accepts_before_commands = backend.accepts.load(Ordering::SeqCst);
+
+    let mut client = connect_and_read_greeting(proxy_port).await?;
+    client
+        .write_all(b"STAT <first@example.com>\r\nSTAT <second@example.com>\r\n")
+        .await?;
+
+    let first = crate::test_helpers::read_line_from_stream(&mut client, "first STAT").await?;
+    let second = crate::test_helpers::read_line_from_stream(&mut client, "second STAT").await?;
+
+    assert!(first.starts_with("223"), "first STAT got {first:?}");
+    assert!(second.starts_with("223"), "second STAT got {second:?}");
+    assert_eq!(backend.stat_requests.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        backend.accepts.load(Ordering::SeqCst),
+        accepts_before_commands + 2,
+        "pipelined commands should use another backend connection before reusing a checked-out one"
     );
 
     Ok(())
