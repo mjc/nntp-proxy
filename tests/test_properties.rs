@@ -594,7 +594,7 @@ proptest! {
         let client_id = nntp_proxy::types::ClientId::new();
 
         // Routing with zero backends should return an error
-        let result = selector.route(client_id);
+        let result = selector.route_without_availability(client_id);
         prop_assert!(result.is_err(),
             "route with zero backends should return error");
     }
@@ -631,7 +631,7 @@ proptest! {
         let mut count1 = 0usize;
         for _ in 0..num_requests {
             let client_id = nntp_proxy::types::ClientId::new();
-            if let Ok(id) = selector.route(client_id) {
+            if let Ok(id) = selector.route_without_availability(client_id) {
                 if id == id0 { count0 += 1; }
                 if id == id1 { count1 += 1; }
                 // Complete immediately so pending counts don't accumulate

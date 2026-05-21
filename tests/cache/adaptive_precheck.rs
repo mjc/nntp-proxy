@@ -5,7 +5,7 @@
 
 use crate::test_helpers::{MockNntpServer, create_test_server_config, wait_for_server};
 use anyhow::Result;
-use nntp_proxy::{Cache, Config, NntpProxy, RoutingMode};
+use nntp_proxy::{Cache, Config, NntpProxy, RoutingMode, Server};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -29,6 +29,17 @@ fn create_config_with_precheck(backend_port: u16, adaptive_precheck: bool) -> Co
         }),
         ..Default::default()
     }
+}
+
+fn create_tiered_server_config(backend_port: u16, name: &str, tier: u8) -> Server {
+    Server::builder(
+        "127.0.0.1",
+        nntp_proxy::types::Port::try_new(backend_port).unwrap(),
+    )
+    .name(name)
+    .tier(tier)
+    .build()
+    .unwrap()
 }
 
 /// Helper to setup proxy and return `proxy_port`
@@ -246,6 +257,117 @@ async fn test_head_precheck_first_response_wins() -> Result<()> {
     assert!(
         response.starts_with("221"),
         "Expected 221 response, got: {response}"
+    );
+
+    Ok(())
+}
+
+/// Test adaptive precheck does not query tier 1 when tier 0 has the article.
+#[tokio::test]
+async fn test_precheck_stays_in_tier_zero_when_found() -> Result<()> {
+    async fn spawn_counting_head_server(
+        response: &'static [u8],
+        counter: Arc<AtomicUsize>,
+        notify: Option<Arc<Notify>>,
+    ) -> Result<u16> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let port = listener.local_addr()?.port();
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let counter = counter.clone();
+                let notify = notify.clone();
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stream);
+                    reader
+                        .get_mut()
+                        .write_all(b"200 Mock Server Ready\r\n")
+                        .await
+                        .ok();
+
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                let cmd = line.trim();
+                                if cmd.starts_with("HEAD") {
+                                    counter.fetch_add(1, Ordering::SeqCst);
+                                    if let Some(notify) = &notify {
+                                        notify.notify_one();
+                                    }
+                                    reader.get_mut().write_all(response).await.ok();
+                                } else if cmd.starts_with("QUIT") {
+                                    reader.get_mut().write_all(b"205 Goodbye\r\n").await.ok();
+                                    break;
+                                } else {
+                                    reader.get_mut().write_all(b"200 OK\r\n").await.ok();
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        Ok(port)
+    }
+
+    let tier0_count = Arc::new(AtomicUsize::new(0));
+    let tier1_count = Arc::new(AtomicUsize::new(0));
+    let tier1_probe = Arc::new(Notify::new());
+    let tier0_port = spawn_counting_head_server(
+        b"221 0 <test@example.com>\r\nSubject: Tier 0\r\n\r\n.\r\n",
+        tier0_count.clone(),
+        None,
+    )
+    .await?;
+    let tier1_port = spawn_counting_head_server(
+        b"221 0 <test@example.com>\r\nSubject: Tier 1\r\n\r\n.\r\n",
+        tier1_count.clone(),
+        Some(tier1_probe.clone()),
+    )
+    .await?;
+
+    let config = Config {
+        servers: vec![
+            create_tiered_server_config(tier0_port, "tier0", 0),
+            create_tiered_server_config(tier1_port, "tier1", 1),
+        ],
+        cache: Some(Cache {
+            store_article_bodies: false,
+            adaptive_precheck: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let proxy_port = setup_proxy_with_config(config, RoutingMode::PerCommand).await?;
+    let mut client = TcpStream::connect(format!("127.0.0.1:{proxy_port}")).await?;
+    let mut buf = vec![0u8; 4096];
+
+    timeout(Duration::from_secs(1), client.read(&mut buf)).await??;
+    client.write_all(b"HEAD <test@example.com>\r\n").await?;
+    let n = timeout(Duration::from_secs(1), client.read(&mut buf)).await??;
+    let response = String::from_utf8_lossy(&buf[..n]);
+
+    assert!(
+        response.contains("Tier 0"),
+        "Expected tier 0 response, got: {response}"
+    );
+
+    assert!(
+        timeout(Duration::from_millis(100), tier1_probe.notified())
+            .await
+            .is_err(),
+        "precheck must not query tier 1 after tier 0 succeeds"
+    );
+    assert_eq!(tier0_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        tier1_count.load(Ordering::SeqCst),
+        0,
+        "precheck must not query tier 1 after tier 0 succeeds"
     );
 
     Ok(())

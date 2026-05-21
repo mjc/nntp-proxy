@@ -287,6 +287,19 @@ pub(crate) async fn capture_response(
     .await
 }
 
+/// Observe and drain one backend response without retaining its bytes.
+///
+/// This is for retry/control paths that must consume the backend response to
+/// keep the connection reusable but do not need ownership of the response body.
+pub(crate) async fn observe_response(
+    request: &RequestContext,
+    buffer: &mut PooledBuffer,
+    conn: &mut crate::stream::ConnectionStream,
+    backend_id: crate::types::BackendId,
+) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
+    crate::session::multiline_framing::observe_response(request, buffer, conn, backend_id).await
+}
+
 /// Capture an isolated multiline response into a single pooled capture buffer.
 ///
 /// Used by client and precheck paths that issue commands outside the normal

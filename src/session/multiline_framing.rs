@@ -136,6 +136,19 @@ impl CompleteMultilineWireChunk {
         response.push_buffer_range(old, self.response.clone());
         Ok(())
     }
+
+    fn observe_from_buffer(
+        &self,
+        io_buffer: &crate::pool::PooledBuffer,
+        conn: &mut crate::stream::ConnectionStream,
+        total_len: usize,
+    ) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
+        if self.next_response_input.start < total_len {
+            conn.queue_pending_bytes_first(&io_buffer[self.next_response_input.clone()])
+                .map_err(crate::session::response_transfer::ResponseTransferError::Io)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -301,6 +314,19 @@ impl FramedSingleLineChunk {
                 .map_err(crate::session::response_transfer::ResponseTransferError::Io)?;
         }
         response.push_buffer_range(old, self.response.clone());
+        Ok(())
+    }
+
+    fn observe_from_buffer(
+        &self,
+        io_buffer: &crate::pool::PooledBuffer,
+        conn: &mut crate::stream::ConnectionStream,
+    ) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
+        let total_len = io_buffer.initialized();
+        if self.next_response_input.start < total_len {
+            conn.queue_pending_bytes_first(&io_buffer[self.next_response_input.clone()])
+                .map_err(crate::session::response_transfer::ResponseTransferError::Io)?;
+        }
         Ok(())
     }
 }
@@ -833,12 +859,35 @@ pub(crate) async fn capture_response(
     .await
 }
 
+pub(crate) async fn observe_response(
+    request: &crate::protocol::RequestContext,
+    io_buffer: &mut crate::pool::PooledBuffer,
+    conn: &mut crate::stream::ConnectionStream,
+    backend_id: crate::types::BackendId,
+) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
+    ResponseObserver {
+        request,
+        io_buffer,
+        conn,
+        backend_id,
+    }
+    .observe()
+    .await
+}
+
 struct ResponseCapture<'a> {
     request: &'a crate::protocol::RequestContext,
     io_buffer: &'a mut crate::pool::PooledBuffer,
     conn: &'a mut crate::stream::ConnectionStream,
     response: &'a mut crate::pool::ChunkedResponse,
     pool: &'a crate::pool::BufferPool,
+    backend_id: crate::types::BackendId,
+}
+
+struct ResponseObserver<'a> {
+    request: &'a crate::protocol::RequestContext,
+    io_buffer: &'a mut crate::pool::PooledBuffer,
+    conn: &'a mut crate::stream::ConnectionStream,
     backend_id: crate::types::BackendId,
 }
 
@@ -985,6 +1034,46 @@ impl<'a> ResponseCapture<'a> {
             };
         }
         Ok(())
+    }
+}
+
+impl<'a> ResponseObserver<'a> {
+    async fn observe(self) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
+        let ResponseObserver {
+            request,
+            io_buffer,
+            conn,
+            backend_id,
+        } = self;
+        let mut framer = MultilineFramer::default();
+        let initial_len = io_buffer.initialized();
+        let frame = ResponseFrame::parse(request, io_buffer).map_err(|err| {
+            crate::session::response_transfer::ResponseTransferError::Io(anyhow::anyhow!(
+                "Failed to frame response: {err:?}"
+            ))
+        })?;
+
+        if let ResponseFrame::SingleLine { framed, .. } = &frame {
+            return framed.observe_from_buffer(io_buffer, conn);
+        }
+
+        match framer.frame_initial_multiline_chunk(&io_buffer[..initial_len]) {
+            FramedMultilineChunk::Complete(framed) => {
+                framed.observe_from_buffer(io_buffer, conn, initial_len)
+            }
+            FramedMultilineChunk::Incomplete(incomplete) => {
+                let bytes_received = incomplete.response.len() as u64;
+                consume_remaining_multiline_response(
+                    &mut framer,
+                    incomplete,
+                    io_buffer,
+                    conn,
+                    backend_id,
+                    bytes_received,
+                )
+                .await
+            }
+        }
     }
 }
 
