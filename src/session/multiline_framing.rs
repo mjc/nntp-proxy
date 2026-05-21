@@ -1,7 +1,12 @@
-//! Multiline response framing for tracking terminators across chunk boundaries
+//! Multiline and single-line backend response framing.
 //!
-//! Used to detect NNTP terminators that span across chunk boundaries.
+//! This is the only module that may inspect NNTP response boundaries. Callers
+//! provide the request context plus bytes read from the backend, and receive
+//! typed operations such as write, capture, observe, or ordered client writes.
+//! If a response is incomplete, the same framer state is fed the next backend
+//! buffer until it can produce a typed complete or incomplete response chunk.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ops::Range;
 
@@ -29,48 +34,45 @@ enum PackedPendingBytesPolicy {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct CompleteMultilinePayloadSplit {
+struct CompleteMultilinePayloadSplit {
     body: Range<usize>,
     terminator: Range<usize>,
 }
 
 impl CompleteMultilinePayloadSplit {
     #[must_use]
-    pub(crate) const fn new(body: Range<usize>, terminator: Range<usize>) -> Self {
+    const fn new(body: Range<usize>, terminator: Range<usize>) -> Self {
         Self { body, terminator }
     }
 
     #[must_use]
-    pub(crate) fn body(&self) -> Range<usize> {
+    fn body(&self) -> Range<usize> {
         self.body.clone()
     }
 
     #[must_use]
     #[cfg(test)]
-    pub(crate) fn terminator(&self) -> Range<usize> {
+    fn terminator(&self) -> Range<usize> {
         self.terminator.clone()
     }
 }
 
-/// Helper for tracking the last few bytes of streamed data
+/// Complete multiline frame result for the current backend buffer.
 ///
-/// Used to detect terminators that span across chunk boundaries.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The ranges remain private to this module so callers cannot make their own
+/// response-boundary decisions after framing.
+#[derive(Debug, PartialEq, Eq)]
 struct CompleteMultilineWireChunk {
     response: Range<usize>,
     next_response_input: Range<usize>,
 }
 
 impl CompleteMultilineWireChunk {
-    pub(crate) fn extend_capture_from(
-        &self,
-        source: &[u8],
-        capture: &mut crate::pool::PooledBuffer,
-    ) {
+    fn extend_capture_from(&self, source: &[u8], capture: &mut crate::pool::PooledBuffer) {
         capture.extend_from_slice(&source[self.response.clone()]);
     }
 
-    pub(crate) fn push_isolated_buffer_to(
+    fn push_isolated_buffer_to(
         &self,
         response: &mut crate::pool::ChunkedResponse,
         pool: &crate::pool::BufferPool,
@@ -80,120 +82,42 @@ impl CompleteMultilineWireChunk {
         response.push_buffer_range(old, self.response.clone());
     }
 
-    pub(crate) async fn write_from<W>(
+    fn queue_next_response_input(
         &self,
-        writer: &mut W,
         buffer: &[u8],
         conn: &mut crate::stream::ConnectionStream,
-    ) -> Result<u64, crate::session::response_buffer::ResponseTransferError>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        let response = &buffer[self.response.clone()];
+    ) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
         if self.next_response_input.start < buffer.len() {
             conn.queue_pending_bytes_first(&buffer[self.next_response_input.clone()])
-                .map_err(crate::session::response_buffer::ResponseTransferError::Io)?;
+                .map_err(crate::session::response_transfer::ResponseTransferError::Io)?;
         }
-        writer
-            .write_all(response)
-            .await
-            .map_err(crate::session::response_buffer::ResponseTransferError::ClientDisconnect)?;
-        crate::pool::buffer::record_non_owned_response_write_chunk(response.len());
-        Ok(response.len() as u64)
-    }
-
-    pub(crate) fn push_from_buffer(
-        &self,
-        io_buffer: &mut crate::pool::PooledBuffer,
-        conn: &mut crate::stream::ConnectionStream,
-        response: &mut crate::pool::ChunkedResponse,
-        pool: &crate::pool::BufferPool,
-        total_len: usize,
-    ) -> Result<(), crate::session::response_buffer::ResponseTransferError> {
-        let old = std::mem::replace(io_buffer, pool.acquire());
-        if self.next_response_input.start < total_len {
-            conn.queue_pending_bytes_first(&old[self.next_response_input.clone()])
-                .map_err(crate::session::response_buffer::ResponseTransferError::Io)?;
-        }
-        response.push_buffer_range(old, self.response.clone());
         Ok(())
     }
-}
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct IncompleteMultilineWireChunk {
-    response: Range<usize>,
-}
-
-impl IncompleteMultilineWireChunk {
     async fn write_from<W>(
         &self,
         writer: &mut W,
-        source: &[u8],
-    ) -> Result<u64, crate::session::response_buffer::ResponseTransferError>
-    where
-        W: AsyncWrite + Unpin,
-    {
-        let response = &source[self.response.clone()];
-        writer.write_all(response).await.map_err(
-            crate::session::response_buffer::ResponseTransferError::ClientDisconnectBeforeResponseComplete,
-        )?;
-        crate::pool::buffer::record_non_owned_response_write_chunk(response.len());
-        Ok(response.len() as u64)
-    }
-
-    pub(crate) fn extend_capture_from(
-        &self,
-        source: &[u8],
-        capture: &mut crate::pool::PooledBuffer,
-    ) {
-        capture.extend_from_slice(&source[self.response.clone()]);
-    }
-
-    pub(crate) fn push_buffer_to(
-        &self,
-        response: &mut crate::pool::ChunkedResponse,
-        pool: &crate::pool::BufferPool,
-        buffer: &mut crate::pool::PooledBuffer,
-    ) {
-        let old = std::mem::replace(buffer, pool.acquire());
-        response.push_buffer_range(old, self.response.clone());
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FramedMultilineChunk {
-    Complete(CompleteMultilineWireChunk),
-    Incomplete(IncompleteMultilineWireChunk),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FramedSingleLineChunk {
-    response: Range<usize>,
-    next_response_input: Range<usize>,
-}
-
-impl FramedSingleLineChunk {
-    pub(crate) async fn write_from<W>(
-        &self,
-        writer: &mut W,
-        buffer: &[u8],
+        io_buffer: &mut crate::pool::PooledBuffer,
         conn: &mut crate::stream::ConnectionStream,
-    ) -> Result<u64, crate::session::response_buffer::ResponseTransferError>
+        pool: &crate::pool::BufferPool,
+        total_len: usize,
+    ) -> Result<u64, crate::session::response_transfer::ResponseTransferError>
     where
         W: AsyncWrite + Unpin,
     {
-        let response = &buffer[self.response.clone()];
-        if self.next_response_input.start < buffer.len() {
-            conn.queue_pending_bytes_first(&buffer[self.next_response_input.clone()])
-                .map_err(crate::session::response_buffer::ResponseTransferError::Io)?;
-        }
+        let response = &io_buffer[..total_len][self.response.clone()];
         writer
             .write_all(response)
             .await
-            .map_err(crate::session::response_buffer::ResponseTransferError::ClientDisconnect)?;
+            .map_err(crate::session::response_transfer::ResponseTransferError::ClientDisconnect)?;
         crate::pool::buffer::record_non_owned_response_write_chunk(response.len());
-        Ok(response.len() as u64)
+        let response_len = response.len() as u64;
+        if self.next_response_input.start < total_len {
+            let old = std::mem::replace(io_buffer, pool.acquire());
+            conn.queue_pooled_pending_bytes_first(old, self.next_response_input.clone())
+                .map_err(crate::session::response_transfer::ResponseTransferError::Io)?;
+        }
+        Ok(response_len)
     }
 
     fn push_from_buffer(
@@ -202,12 +126,179 @@ impl FramedSingleLineChunk {
         conn: &mut crate::stream::ConnectionStream,
         response: &mut crate::pool::ChunkedResponse,
         pool: &crate::pool::BufferPool,
-    ) -> Result<(), crate::session::response_buffer::ResponseTransferError> {
+        total_len: usize,
+    ) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
+        let old = std::mem::replace(io_buffer, pool.acquire());
+        if self.next_response_input.start < total_len {
+            conn.queue_pending_bytes_first(&old[self.next_response_input.clone()])
+                .map_err(crate::session::response_transfer::ResponseTransferError::Io)?;
+        }
+        response.push_buffer_range(old, self.response.clone());
+        Ok(())
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct IncompleteMultilineWireChunk {
+    response: Range<usize>,
+}
+
+impl IncompleteMultilineWireChunk {
+    #[allow(clippy::too_many_arguments)]
+    async fn write_and_consume_response<W>(
+        self,
+        writer: &mut W,
+        current_len: usize,
+        framer: &mut MultilineFramer,
+        io_buffer: &mut crate::pool::PooledBuffer,
+        conn: &mut crate::stream::ConnectionStream,
+        pool: &crate::pool::BufferPool,
+        backend_id: crate::types::BackendId,
+    ) -> Result<u64, crate::session::response_transfer::ResponseTransferError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let mut bytes_received = 0;
+        let bytes_written = {
+            let response = &io_buffer[..current_len][self.response.clone()];
+            bytes_received += response.len() as u64;
+            if let Err(e) = writer.write_all(response).await {
+                consume_remaining_multiline_response(
+                    framer,
+                    self,
+                    io_buffer,
+                    conn,
+                    backend_id,
+                    bytes_received,
+                )
+                .await?;
+                return Err(
+                    crate::session::response_transfer::ResponseTransferError::ClientDisconnect(e),
+                );
+            }
+            crate::pool::buffer::record_non_owned_response_write_chunk(response.len());
+            response.len() as u64
+        };
+
+        let mut bytes_written = bytes_written;
+        let mut continuation = Some(self);
+        loop {
+            let n = io_buffer.read_from(conn).await.map_err(|e| {
+                crate::session::response_transfer::ResponseTransferError::Io(
+                    anyhow::Error::from(e).context("Failed to read remaining response body"),
+                )
+            })?;
+            if n == 0 {
+                return Err(
+                    crate::session::response_transfer::ResponseTransferError::BackendEof {
+                        backend_id,
+                        bytes_received,
+                    },
+                );
+            }
+            let prior = continuation
+                .take()
+                .expect("incomplete response continuation must be consumed by the framer");
+            match framer.frame_next_multiline_chunk(prior, &io_buffer[..n]) {
+                FramedMultilineChunk::Complete(complete) => {
+                    return complete
+                        .write_from(writer, io_buffer, conn, pool, n)
+                        .await
+                        .map(|bytes| bytes_written + bytes);
+                }
+                FramedMultilineChunk::Incomplete(incomplete) => {
+                    let response = &io_buffer[incomplete.response.clone()];
+                    bytes_received += response.len() as u64;
+                    if let Err(e) = writer.write_all(response).await {
+                        consume_remaining_multiline_response(
+                            framer,
+                            incomplete,
+                            io_buffer,
+                            conn,
+                            backend_id,
+                            bytes_received,
+                        )
+                        .await?;
+                        return Err(
+                            crate::session::response_transfer::ResponseTransferError::ClientDisconnect(
+                                e,
+                            ),
+                        );
+                    }
+                    crate::pool::buffer::record_non_owned_response_write_chunk(response.len());
+                    bytes_written += response.len() as u64;
+                    continuation = Some(incomplete);
+                }
+            }
+        }
+    }
+
+    fn extend_capture_from(&self, source: &[u8], capture: &mut crate::pool::PooledBuffer) {
+        capture.extend_from_slice(&source[self.response.clone()]);
+    }
+
+    fn push_buffer_to(
+        &self,
+        response: &mut crate::pool::ChunkedResponse,
+        pool: &crate::pool::BufferPool,
+        buffer: &mut crate::pool::PooledBuffer,
+    ) {
+        let old = std::mem::replace(buffer, pool.acquire());
+        response.push_buffer_range(old, self.response.clone());
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum FramedMultilineChunk {
+    Complete(CompleteMultilineWireChunk),
+    Incomplete(IncompleteMultilineWireChunk),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FramedSingleLineChunk {
+    response: Range<usize>,
+    next_response_input: Range<usize>,
+}
+
+impl FramedSingleLineChunk {
+    async fn write_from<W>(
+        &self,
+        writer: &mut W,
+        io_buffer: &mut crate::pool::PooledBuffer,
+        conn: &mut crate::stream::ConnectionStream,
+        pool: &crate::pool::BufferPool,
+        total_len: usize,
+    ) -> Result<u64, crate::session::response_transfer::ResponseTransferError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let response = &io_buffer[..total_len][self.response.clone()];
+        writer
+            .write_all(response)
+            .await
+            .map_err(crate::session::response_transfer::ResponseTransferError::ClientDisconnect)?;
+        crate::pool::buffer::record_non_owned_response_write_chunk(response.len());
+        let response_len = response.len() as u64;
+        if self.next_response_input.start < total_len {
+            let old = std::mem::replace(io_buffer, pool.acquire());
+            conn.queue_pooled_pending_bytes_first(old, self.next_response_input.clone())
+                .map_err(crate::session::response_transfer::ResponseTransferError::Io)?;
+        }
+        Ok(response_len)
+    }
+
+    fn push_from_buffer(
+        &self,
+        io_buffer: &mut crate::pool::PooledBuffer,
+        conn: &mut crate::stream::ConnectionStream,
+        response: &mut crate::pool::ChunkedResponse,
+        pool: &crate::pool::BufferPool,
+    ) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
         let total_len = io_buffer.initialized();
         let old = std::mem::replace(io_buffer, pool.acquire());
         if self.next_response_input.start < total_len {
             conn.queue_pending_bytes_first(&old[self.next_response_input.clone()])
-                .map_err(crate::session::response_buffer::ResponseTransferError::Io)?;
+                .map_err(crate::session::response_transfer::ResponseTransferError::Io)?;
         }
         response.push_buffer_range(old, self.response.clone());
         Ok(())
@@ -232,13 +323,119 @@ impl FramedResponseForRequest {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BackendReplyBytes<'a> {
+enum BackendReplyBytes<'a> {
     CompletedTrackedReply(&'a [u8]),
     ForwardUntracked(&'a [u8]),
 }
 
+#[derive(Debug)]
+enum OrderedResponse {
+    Backend,
+    Local(Vec<u8>),
+}
+
+/// Request-aware ordering layer for pipelined backend bytes and local replies.
+///
+/// It wraps the private reply tracker so stateful session code can enqueue
+/// expected backend replies and local deferred replies without seeing response
+/// boundary details.
 #[derive(Default, Debug)]
-pub(crate) struct BackendReplyTracker {
+pub(crate) struct BackendResponseOrder {
+    inner: BackendReplyTracker,
+    ordered: VecDeque<OrderedResponse>,
+}
+
+impl BackendResponseOrder {
+    /// Register that the next backend bytes should contain a reply for `kind`.
+    pub(crate) fn push_request(&mut self, kind: crate::protocol::RequestKind) {
+        self.inner.push_request(kind);
+        self.ordered.push_back(OrderedResponse::Backend);
+    }
+
+    /// Whether at least one registered backend reply still needs backend bytes.
+    #[inline]
+    pub(crate) fn has_pending_backend_replies(&self) -> bool {
+        self.ordered
+            .iter()
+            .any(|reply| matches!(reply, OrderedResponse::Backend))
+    }
+
+    /// Queue a local reply that must be written only after earlier backend
+    /// replies have been framed and forwarded.
+    pub(crate) fn push_deferred_reply(&mut self, reply: impl Into<Vec<u8>>) {
+        self.ordered.push_back(OrderedResponse::Local(reply.into()));
+    }
+
+    /// Whether local replies are waiting behind backend replies.
+    #[inline]
+    pub(crate) fn has_deferred_replies(&self) -> bool {
+        self.ordered
+            .iter()
+            .any(|reply| matches!(reply, OrderedResponse::Local(_)))
+    }
+
+    /// Whether a local reply is blocked behind an earlier backend reply.
+    pub(crate) fn should_drain_backend_replies(&self) -> bool {
+        let has_deferred_reply_behind_front = self
+            .ordered
+            .iter()
+            .skip(1)
+            .any(|reply| matches!(reply, OrderedResponse::Local(_)));
+
+        matches!(self.ordered.front(), Some(OrderedResponse::Backend))
+            && has_deferred_reply_behind_front
+    }
+
+    /// Remove local replies that are ready before the next backend reply.
+    pub(crate) fn take_ready_deferred_replies(&mut self) -> Vec<Vec<u8>> {
+        let mut replies = Vec::new();
+        while let Some(OrderedResponse::Local(_)) = self.ordered.front() {
+            let Some(OrderedResponse::Local(reply)) = self.ordered.pop_front() else {
+                break;
+            };
+            replies.push(reply);
+        }
+        replies
+    }
+
+    /// Convert raw backend bytes into ordered client writes.
+    ///
+    /// Returned borrowed slices are already complete responses for their
+    /// registered requests; any local replies unblocked by those responses are
+    /// returned as owned buffers in the same order.
+    pub(crate) fn client_writes_for_backend_read<'a>(
+        &mut self,
+        backend_read: &'a [u8],
+    ) -> Vec<Cow<'a, [u8]>> {
+        let mut writes = Vec::new();
+
+        for reply in self.take_ready_deferred_replies() {
+            writes.push(Cow::Owned(reply));
+        }
+
+        for reply in self.inner.accept_backend_bytes(backend_read) {
+            match reply {
+                BackendReplyBytes::CompletedTrackedReply(bytes) => {
+                    writes.push(Cow::Borrowed(bytes));
+                    if matches!(self.ordered.front(), Some(OrderedResponse::Backend)) {
+                        self.ordered.pop_front();
+                    }
+                    for reply in self.take_ready_deferred_replies() {
+                        writes.push(Cow::Owned(reply));
+                    }
+                }
+                BackendReplyBytes::ForwardUntracked(bytes) => {
+                    writes.push(Cow::Borrowed(bytes));
+                }
+            }
+        }
+
+        writes
+    }
+}
+
+#[derive(Default, Debug)]
+struct BackendReplyTracker {
     pending: VecDeque<PendingRequestFrame>,
 }
 
@@ -256,7 +453,7 @@ enum PendingRequestFrameState {
 }
 
 #[derive(Default, Debug)]
-pub struct MultilineFramer {
+struct MultilineFramer {
     data: [u8; TERMINATOR_TAIL_SIZE],
     len: usize,
 }
@@ -269,7 +466,7 @@ pub(crate) enum FramingError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ResponseWarning {
+pub(crate) enum ResponseWarning {
     ShortResponse { bytes: usize, min: usize },
     InvalidResponse,
     UnusualStatusCode(u16),
@@ -350,7 +547,19 @@ impl ResponseFrame {
             },
         })
     }
+}
 
+pub(crate) enum BackendResponseRead {
+    SingleLine {
+        status: crate::protocol::StatusCode,
+        response: Range<usize>,
+    },
+    Multiline {
+        status: crate::protocol::StatusCode,
+    },
+}
+
+impl BackendResponseRead {
     #[inline]
     #[must_use]
     pub(crate) const fn status_code(&self) -> crate::protocol::StatusCode {
@@ -360,43 +569,40 @@ impl ResponseFrame {
     }
 
     #[must_use]
-    pub(crate) fn single_line_bytes<'a>(&self, buffer: &'a [u8]) -> Option<&'a [u8]> {
+    pub(crate) fn single_line_bytes<'a>(
+        &self,
+        buffer: &'a crate::pool::PooledBuffer,
+    ) -> Option<&'a [u8]> {
         match self {
-            Self::SingleLine { framed, .. } => Some(&buffer[framed.response.clone()]),
+            Self::SingleLine { response, .. } => Some(&buffer[response.clone()]),
             Self::Multiline { .. } => None,
         }
     }
-
-    #[must_use]
-    pub(crate) fn complete_single_line_bytes<'a>(&self, buffer: &'a [u8]) -> Option<&'a [u8]> {
-        match self {
-            Self::SingleLine { framed, .. } if framed.next_response_input.is_empty() => {
-                Some(&buffer[framed.response.clone()])
-            }
-            Self::SingleLine { .. } | Self::Multiline { .. } => None,
-        }
-    }
 }
 
-pub(crate) fn response_status(
+pub(crate) fn backend_response_read(
     request: &crate::protocol::RequestContext,
     buffer: &crate::pool::PooledBuffer,
-) -> Result<crate::protocol::StatusCode, ResponseReadError> {
-    ResponseFrame::parse(request, buffer).map(|frame| frame.status_code())
+) -> Result<BackendResponseRead, ResponseReadError> {
+    ResponseFrame::parse(request, buffer).map(|frame| match frame {
+        ResponseFrame::SingleLine { status, framed } => BackendResponseRead::SingleLine {
+            status,
+            response: framed.response,
+        },
+        ResponseFrame::Multiline { status } => BackendResponseRead::Multiline { status },
+    })
 }
 
-pub(crate) fn single_line_response_bytes<'a>(
+pub(crate) fn unpacked_single_line_response<'a>(
     request: &crate::protocol::RequestContext,
     bytes: &'a [u8],
 ) -> Result<Option<&'a [u8]>, ResponseReadError> {
-    ResponseFrame::parse_bytes(request, bytes).map(|frame| frame.single_line_bytes(bytes))
-}
-
-pub(crate) fn complete_single_line_response_bytes<'a>(
-    request: &crate::protocol::RequestContext,
-    bytes: &'a [u8],
-) -> Result<Option<&'a [u8]>, ResponseReadError> {
-    ResponseFrame::parse_bytes(request, bytes).map(|frame| frame.complete_single_line_bytes(bytes))
+    ResponseFrame::parse_bytes(request, bytes).map(|frame| match frame {
+        ResponseFrame::SingleLine { framed, .. } if framed.next_response_input.is_empty() => {
+            Some(&bytes[framed.response])
+        }
+        ResponseFrame::SingleLine { .. } | ResponseFrame::Multiline { .. } => None,
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -418,7 +624,7 @@ impl ResponseReadError {
     }
 }
 
-pub(crate) fn log_response_warnings(
+fn log_response_warnings(
     warnings: &[ResponseWarning],
     buffer: &[u8],
     client_addr: impl std::fmt::Display,
@@ -457,40 +663,60 @@ pub(crate) fn log_response_warnings(
     }
 }
 
-pub(crate) struct IsolatedMultilineResponse<'a> {
+pub(crate) async fn capture_isolated_multiline_response(
+    conn: &mut crate::stream::ConnectionStream,
+    io_buffer: &mut crate::pool::PooledBuffer,
+    capture: &mut crate::pool::PooledBuffer,
+) -> anyhow::Result<()> {
+    IsolatedMultilineResponse { conn, io_buffer }
+        .capture_into(capture)
+        .await
+}
+
+pub(crate) async fn observe_isolated_multiline_response(
+    conn: &mut crate::stream::ConnectionStream,
+    io_buffer: &mut crate::pool::PooledBuffer,
+) -> Result<(), FramingError> {
+    IsolatedMultilineResponse { conn, io_buffer }
+        .observe()
+        .await
+}
+
+pub(crate) async fn capture_isolated_multiline_response_chunked(
+    conn: &mut crate::stream::ConnectionStream,
+    io_buffer: &mut crate::pool::PooledBuffer,
+    pool: &crate::pool::BufferPool,
+    response: &mut crate::pool::ChunkedResponse,
+) -> Result<(), FramingError> {
+    IsolatedMultilineResponse { conn, io_buffer }
+        .capture_chunked(pool, response)
+        .await
+}
+
+struct IsolatedMultilineResponse<'a> {
     conn: &'a mut crate::stream::ConnectionStream,
     io_buffer: &'a mut crate::pool::PooledBuffer,
 }
 
 impl<'a> IsolatedMultilineResponse<'a> {
-    pub(crate) const fn new(
-        conn: &'a mut crate::stream::ConnectionStream,
-        io_buffer: &'a mut crate::pool::PooledBuffer,
-    ) -> Self {
-        Self { conn, io_buffer }
-    }
-
-    pub(crate) async fn capture_into(
-        self,
-        capture: &mut crate::pool::PooledBuffer,
-    ) -> anyhow::Result<()> {
+    async fn capture_into(self, capture: &mut crate::pool::PooledBuffer) -> anyhow::Result<()> {
         let mut framer = MultilineFramer::default();
         let initial_len = self.io_buffer.initialized();
-        let mut complete = match framer
-            .frame_isolated_multiline_chunk(&self.io_buffer[..initial_len])
+        let mut continuation = match framer
+            .frame_initial_isolated_multiline_chunk(&self.io_buffer[..initial_len])
             .map_err(isolated_multiline_error)?
         {
             FramedMultilineChunk::Complete(complete) => {
                 complete.extend_capture_from(&self.io_buffer[..initial_len], capture);
-                true
+                None
             }
             FramedMultilineChunk::Incomplete(incomplete) => {
                 incomplete.extend_capture_from(&self.io_buffer[..initial_len], capture);
-                false
+                Some(incomplete)
             }
         };
 
-        while !complete {
+        while let Some(prior) = continuation.take() {
             let n = self
                 .io_buffer
                 .read_from(self.conn)
@@ -499,32 +725,33 @@ impl<'a> IsolatedMultilineResponse<'a> {
             if n == 0 {
                 anyhow::bail!("Backend closed connection before complete multiline response");
             }
-            complete = match framer
-                .frame_isolated_multiline_chunk(&self.io_buffer[..n])
+            continuation = match framer
+                .frame_next_isolated_multiline_chunk(prior, &self.io_buffer[..n])
                 .map_err(isolated_multiline_error)?
             {
                 FramedMultilineChunk::Complete(complete) => {
                     complete.extend_capture_from(&self.io_buffer[..n], capture);
-                    true
+                    None
                 }
                 FramedMultilineChunk::Incomplete(incomplete) => {
                     incomplete.extend_capture_from(&self.io_buffer[..n], capture);
-                    false
+                    Some(incomplete)
                 }
             };
         }
         Ok(())
     }
 
-    pub(crate) async fn observe(self) -> Result<(), FramingError> {
+    async fn observe(self) -> Result<(), FramingError> {
         let mut framer = MultilineFramer::default();
         let initial_len = self.io_buffer.initialized();
-        let mut complete = matches!(
-            framer.frame_isolated_multiline_chunk(&self.io_buffer[..initial_len])?,
-            FramedMultilineChunk::Complete(_)
-        );
+        let mut continuation =
+            match framer.frame_initial_isolated_multiline_chunk(&self.io_buffer[..initial_len])? {
+                FramedMultilineChunk::Complete(_) => None,
+                FramedMultilineChunk::Incomplete(incomplete) => Some(incomplete),
+            };
 
-        while !complete {
+        while let Some(prior) = continuation.take() {
             let n = self
                 .io_buffer
                 .read_from(self.conn)
@@ -533,34 +760,35 @@ impl<'a> IsolatedMultilineResponse<'a> {
             if n == 0 {
                 return Err(FramingError::BackendEof);
             }
-            complete = matches!(
-                framer.frame_isolated_multiline_chunk(&self.io_buffer[..n])?,
-                FramedMultilineChunk::Complete(_)
-            );
+            continuation =
+                match framer.frame_next_isolated_multiline_chunk(prior, &self.io_buffer[..n])? {
+                    FramedMultilineChunk::Complete(_) => None,
+                    FramedMultilineChunk::Incomplete(incomplete) => Some(incomplete),
+                };
         }
         Ok(())
     }
 
-    pub(crate) async fn capture_chunked(
+    async fn capture_chunked(
         self,
         pool: &crate::pool::BufferPool,
         response: &mut crate::pool::ChunkedResponse,
     ) -> Result<(), FramingError> {
         let mut framer = MultilineFramer::default();
         let initial_len = self.io_buffer.initialized();
-        let mut complete =
-            match framer.frame_isolated_multiline_chunk(&self.io_buffer[..initial_len])? {
+        let mut continuation =
+            match framer.frame_initial_isolated_multiline_chunk(&self.io_buffer[..initial_len])? {
                 FramedMultilineChunk::Complete(complete) => {
                     complete.push_isolated_buffer_to(response, pool, self.io_buffer);
-                    true
+                    None
                 }
                 FramedMultilineChunk::Incomplete(incomplete) => {
                     incomplete.push_buffer_to(response, pool, self.io_buffer);
-                    false
+                    Some(incomplete)
                 }
             };
 
-        while !complete {
+        while let Some(prior) = continuation.take() {
             let n = self
                 .io_buffer
                 .read_from(self.conn)
@@ -569,22 +797,43 @@ impl<'a> IsolatedMultilineResponse<'a> {
             if n == 0 {
                 return Err(FramingError::BackendEof);
             }
-            complete = match framer.frame_isolated_multiline_chunk(&self.io_buffer[..n])? {
-                FramedMultilineChunk::Complete(complete) => {
-                    complete.push_isolated_buffer_to(response, pool, self.io_buffer);
-                    true
-                }
-                FramedMultilineChunk::Incomplete(incomplete) => {
-                    incomplete.push_buffer_to(response, pool, self.io_buffer);
-                    false
-                }
-            };
+            continuation =
+                match framer.frame_next_isolated_multiline_chunk(prior, &self.io_buffer[..n])? {
+                    FramedMultilineChunk::Complete(complete) => {
+                        complete.push_isolated_buffer_to(response, pool, self.io_buffer);
+                        None
+                    }
+                    FramedMultilineChunk::Incomplete(incomplete) => {
+                        incomplete.push_buffer_to(response, pool, self.io_buffer);
+                        Some(incomplete)
+                    }
+                };
         }
         Ok(())
     }
 }
 
-pub(crate) struct ResponseCapture<'a> {
+pub(crate) async fn capture_response(
+    request: &crate::protocol::RequestContext,
+    io_buffer: &mut crate::pool::PooledBuffer,
+    conn: &mut crate::stream::ConnectionStream,
+    response: &mut crate::pool::ChunkedResponse,
+    pool: &crate::pool::BufferPool,
+    backend_id: crate::types::BackendId,
+) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
+    ResponseCapture {
+        request,
+        io_buffer,
+        conn,
+        response,
+        pool,
+        backend_id,
+    }
+    .capture()
+    .await
+}
+
+struct ResponseCapture<'a> {
     request: &'a crate::protocol::RequestContext,
     io_buffer: &'a mut crate::pool::PooledBuffer,
     conn: &'a mut crate::stream::ConnectionStream,
@@ -593,101 +842,90 @@ pub(crate) struct ResponseCapture<'a> {
     backend_id: crate::types::BackendId,
 }
 
-pub(crate) struct ResponseWrite<'a, W> {
-    pub(crate) request: &'a crate::protocol::RequestContext,
-    pub(crate) io_buffer: &'a mut crate::pool::PooledBuffer,
-    pub(crate) conn: &'a mut crate::stream::ConnectionStream,
-    pub(crate) writer: &'a mut W,
-    pub(crate) backend_id: crate::types::BackendId,
-}
-
-impl<W> ResponseWrite<'_, W>
+pub(crate) async fn write_response<W>(
+    request: &crate::protocol::RequestContext,
+    io_buffer: &mut crate::pool::PooledBuffer,
+    conn: &mut crate::stream::ConnectionStream,
+    writer: &mut W,
+    pool: &crate::pool::BufferPool,
+    backend_id: crate::types::BackendId,
+) -> Result<u64, crate::session::response_transfer::ResponseTransferError>
 where
     W: AsyncWrite + Unpin,
 {
-    pub(crate) async fn write(
-        self,
-    ) -> Result<u64, crate::session::response_buffer::ResponseTransferError> {
-        let ResponseWrite {
-            request,
-            io_buffer,
-            conn,
-            writer,
-            backend_id,
-        } = self;
-        let mut framer = MultilineFramer::default();
-        let initial_len = io_buffer.initialized();
-        let frame = ResponseFrame::parse(request, io_buffer).map_err(|err| {
-            crate::session::response_buffer::ResponseTransferError::Io(anyhow::anyhow!(
-                "Failed to frame prefetched response: {err:?}"
-            ))
-        })?;
+    let mut framer = MultilineFramer::default();
+    let initial_len = io_buffer.initialized();
+    let frame = ResponseFrame::parse(request, io_buffer).map_err(|err| {
+        crate::session::response_transfer::ResponseTransferError::Io(anyhow::anyhow!(
+            "Failed to frame response: {err:?}"
+        ))
+    })?;
 
-        if let ResponseFrame::SingleLine { framed, .. } = &frame {
-            return framed
-                .write_from(writer, &io_buffer[..initial_len], conn)
-                .await;
+    if let ResponseFrame::SingleLine { framed, .. } = &frame {
+        return framed
+            .write_from(writer, io_buffer, conn, pool, initial_len)
+            .await;
+    }
+
+    match framer.frame_initial_multiline_chunk(&io_buffer[..initial_len]) {
+        FramedMultilineChunk::Complete(complete) => {
+            complete
+                .write_from(writer, io_buffer, conn, pool, initial_len)
+                .await
         }
-
-        let mut bytes_written = 0u64;
-        let mut current_len = initial_len;
-        loop {
-            let (bytes, complete) = match framer.frame_multiline_chunk(&io_buffer[..current_len]) {
-                FramedMultilineChunk::Complete(complete) => complete
-                    .write_from(writer, &io_buffer[..current_len], conn)
-                    .await
-                    .map(|bytes| (bytes, true))?,
-                FramedMultilineChunk::Incomplete(incomplete) => incomplete
-                    .write_from(writer, &io_buffer[..current_len])
-                    .await
-                    .map(|bytes| (bytes, false))?,
-            };
-            bytes_written += bytes;
-            if complete {
-                return Ok(bytes_written);
-            }
-
-            current_len = match io_buffer.read_from(conn).await.map_err(|e| {
-                crate::session::response_buffer::ResponseTransferError::Io(
-                    anyhow::Error::from(e).context("Failed to read remaining response body"),
+        FramedMultilineChunk::Incomplete(incomplete) => {
+            incomplete
+                .write_and_consume_response(
+                    writer,
+                    initial_len,
+                    &mut framer,
+                    io_buffer,
+                    conn,
+                    pool,
+                    backend_id,
                 )
-            })? {
-                0 => {
-                    return Err(
-                        crate::session::response_buffer::ResponseTransferError::BackendEof {
-                            backend_id,
-                            bytes_received: bytes_written,
-                        },
-                    );
-                }
-                n => n,
-            };
+                .await
+        }
+    }
+}
+
+async fn consume_remaining_multiline_response(
+    framer: &mut MultilineFramer,
+    mut prior: IncompleteMultilineWireChunk,
+    io_buffer: &mut crate::pool::PooledBuffer,
+    conn: &mut crate::stream::ConnectionStream,
+    backend_id: crate::types::BackendId,
+    mut bytes_received: u64,
+) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
+    loop {
+        let n = io_buffer.read_from(conn).await.map_err(|e| {
+            crate::session::response_transfer::ResponseTransferError::Io(
+                anyhow::Error::from(e).context("Failed to read remaining response body"),
+            )
+        })?;
+        if n == 0 {
+            return Err(
+                crate::session::response_transfer::ResponseTransferError::BackendEof {
+                    backend_id,
+                    bytes_received,
+                },
+            );
+        }
+        match framer.frame_next_multiline_chunk(prior, &io_buffer[..n]) {
+            FramedMultilineChunk::Complete(complete) => {
+                complete.queue_next_response_input(&io_buffer[..n], conn)?;
+                return Ok(());
+            }
+            FramedMultilineChunk::Incomplete(incomplete) => {
+                bytes_received += incomplete.response.len() as u64;
+                prior = incomplete;
+            }
         }
     }
 }
 
 impl<'a> ResponseCapture<'a> {
-    pub(crate) const fn from_buffer(
-        request: &'a crate::protocol::RequestContext,
-        io_buffer: &'a mut crate::pool::PooledBuffer,
-        conn: &'a mut crate::stream::ConnectionStream,
-        response: &'a mut crate::pool::ChunkedResponse,
-        pool: &'a crate::pool::BufferPool,
-        backend_id: crate::types::BackendId,
-    ) -> Self {
-        Self {
-            request,
-            io_buffer,
-            conn,
-            response,
-            pool,
-            backend_id,
-        }
-    }
-
-    pub(crate) async fn capture(
-        self,
-    ) -> Result<(), crate::session::response_buffer::ResponseTransferError> {
+    async fn capture(self) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
         let ResponseCapture {
             request,
             io_buffer,
@@ -698,10 +936,9 @@ impl<'a> ResponseCapture<'a> {
         } = self;
         let mut framer = MultilineFramer::default();
         let initial_len = io_buffer.initialized();
-        let mut complete = false;
         let frame = ResponseFrame::parse(request, io_buffer).map_err(|err| {
-            crate::session::response_buffer::ResponseTransferError::Io(anyhow::anyhow!(
-                "Failed to frame prefetched response: {err:?}"
+            crate::session::response_transfer::ResponseTransferError::Io(anyhow::anyhow!(
+                "Failed to frame response: {err:?}"
             ))
         })?;
 
@@ -710,52 +947,72 @@ impl<'a> ResponseCapture<'a> {
             return framed.push_from_buffer(io_buffer, conn, response, pool);
         }
 
-        match framer.frame_multiline_chunk(&io_buffer[..initial_len]) {
+        let mut continuation = match framer.frame_initial_multiline_chunk(&io_buffer[..initial_len])
+        {
             FramedMultilineChunk::Complete(framed) => {
                 framed.push_from_buffer(io_buffer, conn, response, pool, initial_len)?;
-                complete = true;
+                None
             }
             FramedMultilineChunk::Incomplete(incomplete) => {
                 incomplete.push_buffer_to(response, pool, io_buffer);
+                Some(incomplete)
             }
-        }
+        };
 
-        while !complete {
+        while let Some(prior) = continuation.take() {
             let n = io_buffer.read_from(conn).await.map_err(|e| {
-                crate::session::response_buffer::ResponseTransferError::Io(
+                crate::session::response_transfer::ResponseTransferError::Io(
                     anyhow::Error::from(e).context("Failed to read remaining response body"),
                 )
             })?;
             if n == 0 {
                 return Err(
-                    crate::session::response_buffer::ResponseTransferError::BackendEof {
+                    crate::session::response_transfer::ResponseTransferError::BackendEof {
                         backend_id,
                         bytes_received: response.len() as u64,
                     },
                 );
             }
-            match framer.frame_multiline_chunk(&io_buffer[..n]) {
+            continuation = match framer.frame_next_multiline_chunk(prior, &io_buffer[..n]) {
                 FramedMultilineChunk::Complete(framed) => {
                     framed.push_from_buffer(io_buffer, conn, response, pool, n)?;
-                    complete = true;
+                    None
                 }
                 FramedMultilineChunk::Incomplete(incomplete) => {
                     incomplete.push_buffer_to(response, pool, io_buffer);
+                    Some(incomplete)
                 }
-            }
+            };
         }
         Ok(())
     }
 }
 
 impl MultilineFramer {
-    fn frame_multiline_chunk(&mut self, chunk: &[u8]) -> FramedMultilineChunk {
+    fn frame_initial_multiline_chunk(&mut self, chunk: &[u8]) -> FramedMultilineChunk {
         self.split_chunk(chunk, PackedPendingBytesPolicy::AllowIfStatusPrefix)
             .expect("pending bytes policy cannot reject trailing bytes")
     }
 
-    fn frame_isolated_multiline_chunk(
+    fn frame_next_multiline_chunk(
         &mut self,
+        _continuation: IncompleteMultilineWireChunk,
+        chunk: &[u8],
+    ) -> FramedMultilineChunk {
+        self.split_chunk(chunk, PackedPendingBytesPolicy::AllowIfStatusPrefix)
+            .expect("pending bytes policy cannot reject trailing bytes")
+    }
+
+    fn frame_initial_isolated_multiline_chunk(
+        &mut self,
+        chunk: &[u8],
+    ) -> Result<FramedMultilineChunk, FramingError> {
+        self.split_chunk(chunk, PackedPendingBytesPolicy::Reject)
+    }
+
+    fn frame_next_isolated_multiline_chunk(
+        &mut self,
+        _continuation: IncompleteMultilineWireChunk,
         chunk: &[u8],
     ) -> Result<FramedMultilineChunk, FramingError> {
         self.split_chunk(chunk, PackedPendingBytesPolicy::Reject)
@@ -885,7 +1142,7 @@ impl MultilineFramer {
 }
 
 impl BackendReplyTracker {
-    pub(crate) fn push_request(&mut self, kind: crate::protocol::RequestKind) {
+    fn push_request(&mut self, kind: crate::protocol::RequestKind) {
         self.pending.push_back(PendingRequestFrame {
             kind,
             state: PendingRequestFrameState::AwaitingStatusLine,
@@ -893,7 +1150,7 @@ impl BackendReplyTracker {
         });
     }
 
-    pub(crate) fn accept_backend_bytes<'a>(
+    fn accept_backend_bytes<'a>(
         &mut self,
         chunk: &'a [u8],
     ) -> smallvec::SmallVec<[BackendReplyBytes<'a>; 4]> {
@@ -1025,9 +1282,7 @@ fn isolated_multiline_error(err: FramingError) -> anyhow::Error {
 }
 
 #[must_use]
-pub(crate) fn complete_multiline_payload_split(
-    payload: &[u8],
-) -> Option<CompleteMultilinePayloadSplit> {
+fn complete_multiline_payload_split(payload: &[u8]) -> Option<CompleteMultilinePayloadSplit> {
     if payload == b".\r\n" {
         return Some(CompleteMultilinePayloadSplit::new(0..0, 0..3));
     }
@@ -1049,12 +1304,12 @@ pub(crate) fn complete_multiline_payload_split(
 }
 
 #[must_use]
-pub(crate) fn complete_multiline_payload_body(payload: &[u8]) -> Option<&[u8]> {
+fn complete_multiline_payload_body(payload: &[u8]) -> Option<&[u8]> {
     complete_multiline_payload_split(payload).map(|split| &payload[split.body()])
 }
 
 #[must_use]
-pub(crate) fn complete_response_body(payload: &[u8]) -> Option<&[u8]> {
+pub(crate) fn captured_multiline_payload_body(payload: &[u8]) -> Option<&[u8]> {
     complete_multiline_payload_body(payload)
 }
 
@@ -1156,10 +1411,13 @@ fn find_spanning_terminator(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::response_transfer::ResponseTransferError;
+    use crate::types::BufferSize;
     use std::io;
     use std::pin::Pin;
     use std::task::{Context, Poll};
-    use tokio::io::AsyncWrite;
+    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+    use tokio::net::TcpListener;
 
     const EXHAUSTIVE_BYTES: [u8; 4] = [b'\r', b'\n', b'.', b'x'];
 
@@ -1186,8 +1444,12 @@ mod tests {
         }
     }
 
+    fn make_pool() -> crate::pool::BufferPool {
+        crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2)
+    }
+
     async fn loopback_connection_stream() -> crate::stream::ConnectionStream {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind loopback listener");
         let addr = listener.local_addr().expect("loopback addr");
@@ -1199,6 +1461,537 @@ mod tests {
         let (server, _) = listener.accept().await.expect("accept loopback client");
         let _client = client.await.expect("client task");
         crate::stream::ConnectionStream::plain(server)
+    }
+
+    async fn capture_response_for_test(
+        conn: &mut crate::stream::ConnectionStream,
+        first_chunk: &[u8],
+        request_line: &[u8],
+        pool: &crate::pool::BufferPool,
+    ) -> Result<crate::pool::ChunkedResponse, ResponseTransferError> {
+        let request = crate::protocol::RequestContext::parse(request_line)
+            .expect("test request should parse");
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(first_chunk);
+        let mut captured = crate::pool::ChunkedResponse::default();
+        capture_response(
+            &request,
+            &mut io_buffer,
+            conn,
+            &mut captured,
+            pool,
+            crate::types::BackendId::from_index(1),
+        )
+        .await?;
+        Ok(captured)
+    }
+
+    async fn mock_backend_conn(chunks: Vec<Vec<u8>>) -> crate::stream::ConnectionStream {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for chunk in chunks {
+                stream.write_all(&chunk).await.unwrap();
+            }
+            stream.shutdown().await.unwrap();
+        });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        crate::stream::ConnectionStream::plain(stream)
+    }
+
+    #[tokio::test]
+    async fn capture_response_returns_complete_multiline_response() {
+        let response = b"220 Article follows\r\nLine 1\r\nLine 2\r\n.\r\n";
+        let pool = make_pool();
+        let mut conn = mock_backend_conn(vec![]).await;
+
+        let captured =
+            capture_response_for_test(&mut conn, response, b"ARTICLE <test@example>\r\n", &pool)
+                .await
+                .unwrap();
+
+        assert_eq!(captured.to_vec(), response);
+    }
+
+    #[tokio::test]
+    async fn capture_response_handles_empty_multiline_body() {
+        let response = b"220 0 Article follows\r\n.\r\n";
+        let pool = make_pool();
+        let mut conn = mock_backend_conn(vec![]).await;
+
+        let captured =
+            capture_response_for_test(&mut conn, response, b"ARTICLE <test@example>\r\n", &pool)
+                .await
+                .unwrap();
+
+        assert_eq!(captured.to_vec(), response);
+    }
+
+    #[tokio::test]
+    async fn capture_response_preserves_queued_next_reply_from_same_read() {
+        let first_response = b"220 Article follows\r\nLine 1\r\n.\r\n";
+        let next_reply = b"223 0 <next@example>\r\n";
+        let mut combined = Vec::from(first_response.as_slice());
+        combined.extend_from_slice(next_reply);
+
+        let pool = make_pool();
+        let mut conn = mock_backend_conn(vec![]).await;
+
+        let captured =
+            capture_response_for_test(&mut conn, &combined, b"ARTICLE <test@example>\r\n", &pool)
+                .await
+                .unwrap();
+
+        assert_eq!(captured.to_vec(), first_response);
+        assert!(conn.has_pending_bytes());
+        assert_eq!(conn.pending_bytes_len(), next_reply.len());
+    }
+
+    #[tokio::test]
+    async fn capture_response_preserves_queued_next_reply_from_later_read() {
+        let first_chunk = b"220 Article follows\r\nLine 1\r\n";
+        let tail_chunk = b".\r\n223 0 <next@example>\r\n".to_vec();
+
+        let pool = make_pool();
+        let mut conn = mock_backend_conn(vec![tail_chunk]).await;
+
+        let captured =
+            capture_response_for_test(&mut conn, first_chunk, b"ARTICLE <test@example>\r\n", &pool)
+                .await
+                .unwrap();
+
+        assert_eq!(captured.to_vec(), b"220 Article follows\r\nLine 1\r\n.\r\n");
+        assert!(conn.has_pending_bytes());
+    }
+
+    #[tokio::test]
+    async fn capture_response_handles_large_article_across_chunks() {
+        let header = b"220 Article follows\r\n";
+        let mut body = Vec::new();
+        for i in 0..1000 {
+            body.extend_from_slice(format!("Line {i}\r\n").as_bytes());
+        }
+
+        let mut expected_response = Vec::new();
+        expected_response.extend_from_slice(header);
+        expected_response.extend_from_slice(&body);
+        expected_response.extend_from_slice(b".\r\n");
+
+        let pool = make_pool();
+        let mut conn = mock_backend_conn(vec![expected_response[header.len()..].to_vec()]).await;
+
+        let captured =
+            capture_response_for_test(&mut conn, header, b"ARTICLE <test@example>\r\n", &pool)
+                .await
+                .expect("large multiline response should capture successfully");
+
+        assert_eq!(captured.to_vec(), expected_response);
+    }
+
+    #[tokio::test]
+    async fn capture_response_moves_scratch_buffers_across_chunks() {
+        let header = b"220 Article follows\r\n";
+        let mut body_chunk = vec![b'x'; 94];
+        body_chunk.extend_from_slice(b"\r\n");
+        let mut expected_response = Vec::new();
+        expected_response.extend_from_slice(header);
+        expected_response.extend_from_slice(&body_chunk);
+        expected_response.extend_from_slice(b".\r\n");
+
+        let pool = crate::pool::BufferPool::new(BufferSize::try_new(64).unwrap(), 2)
+            .with_capture_pool(64, 4);
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(header);
+        let mut captured = crate::pool::ChunkedResponse::default();
+        let mut conn = mock_backend_conn(vec![body_chunk.clone(), b".\r\n".to_vec()]).await;
+        let request = crate::protocol::RequestContext::parse(b"ARTICLE <test@example>\r\n")
+            .expect("valid request");
+
+        capture_response(
+            &request,
+            &mut io_buffer,
+            &mut conn,
+            &mut captured,
+            &pool,
+            crate::types::BackendId::from_index(1),
+        )
+        .await
+        .expect("multiline response capture should succeed");
+
+        assert_eq!(captured.to_vec(), expected_response);
+        assert_eq!(
+            pool.available_buffers(),
+            0,
+            "captured multiline response should hold pooled read buffers instead of copying into capture buffers"
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_response_errors_on_full_buffer_mid_response() {
+        let first_chunk = b"220 Article follows\r\nLong body content here";
+        let expected_tail = b" more body\r\n.\r\n";
+        let mut second_chunk = expected_tail.to_vec();
+        second_chunk.resize(4096, b'X');
+
+        let pool =
+            crate::pool::BufferPool::new(crate::types::BufferSize::try_new(4096).unwrap(), 2);
+        let mut conn = mock_backend_conn(vec![second_chunk]).await;
+
+        let err =
+            capture_response_for_test(&mut conn, first_chunk, b"ARTICLE <test@example>\r\n", &pool)
+                .await
+                .unwrap_err();
+
+        assert!(matches!(err, ResponseTransferError::BackendEof { .. }));
+        assert!(!conn.has_pending_bytes());
+    }
+
+    #[tokio::test]
+    async fn capture_response_completes_request_context() {
+        let response = b"223 0 <test@example>\r\n";
+        let pool = make_pool();
+        let mut conn = mock_backend_conn(vec![]).await;
+        let backend_id = crate::types::BackendId::from_index(1);
+        let mut request = crate::protocol::RequestContext::parse(b"STAT <test@example>\r\n")
+            .expect("valid request line");
+
+        let captured =
+            capture_response_for_test(&mut conn, response, b"STAT <test@example>\r\n", &pool)
+                .await
+                .unwrap();
+        request.complete_backend_response(
+            backend_id,
+            crate::protocol::StatusCode::new(223),
+            captured,
+        );
+
+        assert_eq!(
+            request.response_status(),
+            Some(crate::protocol::StatusCode::new(223))
+        );
+        assert_eq!(request.backend_id(), Some(backend_id));
+        assert_eq!(request.response_payload_eq(response), Some(true));
+    }
+
+    #[tokio::test]
+    async fn capture_response_errors_on_truncated_multiline_response() {
+        let partial = b"220 Article follows\r\nIncomplete body\r\n";
+        let pool = make_pool();
+        let mut conn = mock_backend_conn(vec![]).await;
+
+        let result =
+            capture_response_for_test(&mut conn, partial, b"ARTICLE <test@example>\r\n", &pool)
+                .await;
+
+        assert!(matches!(
+            result,
+            Err(ResponseTransferError::BackendEof { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn article_430_response_is_captured_as_single_line() {
+        let pool = make_pool();
+        let combined = b"430 No article with that message-id\r\n223 0 <next@example>\r\n";
+        let mut conn = mock_backend_conn(vec![]).await;
+
+        let captured =
+            capture_response_for_test(&mut conn, combined, b"ARTICLE <test@example>\r\n", &pool)
+                .await
+                .expect("430 article miss should stay single-line");
+
+        assert_eq!(
+            captured.to_vec(),
+            b"430 No article with that message-id\r\n"
+        );
+        assert!(conn.has_pending_bytes());
+        assert_eq!(conn.pending_bytes_len(), b"223 0 <next@example>\r\n".len());
+    }
+
+    #[tokio::test]
+    async fn capture_response_handles_complete_article_with_queued_pending_bytes() {
+        let pool = make_pool();
+        let mut conn = mock_backend_conn(vec![]).await;
+
+        let result = capture_response_for_test(
+            &mut conn,
+            b"220 Article follows\r\nbody\r\n.\r\n223 0 <next@example>\r\n",
+            b"ARTICLE <test@example>\r\n",
+            &pool,
+        )
+        .await;
+
+        assert!(result.is_ok());
+        assert!(conn.has_pending_bytes());
+    }
+
+    #[tokio::test]
+    async fn single_line_capture_preserves_next_reply() {
+        let pool = make_pool();
+        let combined = b"223 0 <test@example>\r\n430 No article with that message-id\r\n";
+        let mut conn = mock_backend_conn(vec![]).await;
+
+        let captured =
+            capture_response_for_test(&mut conn, combined, b"STAT <test@example>\r\n", &pool)
+                .await
+                .expect("single-line response should capture cleanly");
+
+        assert_eq!(captured.to_vec(), b"223 0 <test@example>\r\n");
+        assert!(conn.has_pending_bytes());
+        assert_eq!(
+            conn.pending_bytes_len(),
+            b"430 No article with that message-id\r\n".len()
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_response_keeps_single_line_queued_reply_out_of_pool_buffers() {
+        let pool = crate::pool::BufferPool::new(crate::types::BufferSize::try_new(64).unwrap(), 2);
+        assert_eq!(pool.available_buffers(), 2);
+
+        {
+            let combined = b"223 0 <test@example>\r\n430 No article with that message-id\r\n";
+            let mut conn = mock_backend_conn(vec![]).await;
+
+            let captured =
+                capture_response_for_test(&mut conn, combined, b"STAT <test@example>\r\n", &pool)
+                    .await
+                    .expect("single-line response should capture cleanly");
+
+            assert_eq!(captured.to_vec(), b"223 0 <test@example>\r\n");
+        }
+
+        assert_eq!(pool.available_buffers(), 2);
+    }
+
+    #[tokio::test]
+    async fn capture_response_preserves_queued_next_reply_across_boundary() {
+        let first_chunk = b"220 Article follows\r\nLine 1\r\n.";
+        let second_response = b"220 Next follows\r\nLine 2\r\n.\r\n";
+        let mut later_chunk = b"\r\n".to_vec();
+        later_chunk.extend_from_slice(second_response);
+
+        let pool = make_pool();
+        let mut conn = mock_backend_conn(vec![later_chunk]).await;
+
+        let captured =
+            capture_response_for_test(&mut conn, first_chunk, b"ARTICLE <test@example>\r\n", &pool)
+                .await
+                .unwrap();
+
+        assert_eq!(captured.to_vec(), b"220 Article follows\r\nLine 1\r\n.\r\n");
+        assert!(conn.has_pending_bytes());
+    }
+
+    #[tokio::test]
+    async fn complete_multiline_write_queues_packed_suffix_without_copying_bytes() {
+        crate::pool::buffer::reset_hot_path_allocation_metrics();
+        let chunk = b"220 article\r\nbody\r\n.\r\n223 0 <next>\r\n";
+        let response_len = b"220 article\r\nbody\r\n.\r\n".len();
+        let framed = CompleteMultilineWireChunk {
+            response: 0..response_len,
+            next_response_input: response_len..chunk.len(),
+        };
+        let pool = make_pool();
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(chunk);
+        let mut conn = loopback_connection_stream().await;
+        let mut writer = Vec::new();
+
+        let written = framed
+            .write_from(&mut writer, &mut io_buffer, &mut conn, &pool, chunk.len())
+            .await
+            .expect("complete response should write");
+
+        assert_eq!(written, response_len as u64);
+        assert_eq!(writer, &chunk[..response_len]);
+        assert_eq!(conn.pending_bytes_len(), b"223 0 <next>\r\n".len());
+        let metrics = crate::pool::buffer::hot_path_allocation_metrics_snapshot();
+        assert_eq!(metrics.pending_backend_byte_heap_fallbacks, 0);
+    }
+
+    #[tokio::test]
+    async fn single_line_write_queues_packed_suffix_without_copying_bytes() {
+        crate::pool::buffer::reset_hot_path_allocation_metrics();
+        let chunk = b"223 0 <first>\r\n223 0 <next>\r\n";
+        let response_len = b"223 0 <first>\r\n".len();
+        let framed = FramedSingleLineChunk {
+            response: 0..response_len,
+            next_response_input: response_len..chunk.len(),
+        };
+        let pool = make_pool();
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(chunk);
+        let mut conn = loopback_connection_stream().await;
+        let mut writer = Vec::new();
+
+        let written = framed
+            .write_from(&mut writer, &mut io_buffer, &mut conn, &pool, chunk.len())
+            .await
+            .expect("single-line response should write");
+
+        assert_eq!(written, response_len as u64);
+        assert_eq!(writer, &chunk[..response_len]);
+        assert_eq!(conn.pending_bytes_len(), b"223 0 <next>\r\n".len());
+        let metrics = crate::pool::buffer::hot_path_allocation_metrics_snapshot();
+        assert_eq!(metrics.pending_backend_byte_heap_fallbacks, 0);
+    }
+
+    #[tokio::test]
+    async fn write_response_complete_multiline_queues_packed_suffix_as_pooled_input() {
+        let first_response = b"220 article\r\nbody\r\n.\r\n";
+        let next_response = b"223 0 <next>\r\n";
+        let mut chunk = Vec::from(first_response.as_slice());
+        chunk.extend_from_slice(next_response);
+
+        let pool = make_pool();
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(&chunk);
+        let request = crate::protocol::RequestContext::parse(b"ARTICLE <test@example>\r\n")
+            .expect("valid request");
+        let mut conn = loopback_connection_stream().await;
+        let mut writer = Vec::new();
+
+        let written = write_response(
+            &request,
+            &mut io_buffer,
+            &mut conn,
+            &mut writer,
+            &pool,
+            crate::types::BackendId::from_index(1),
+        )
+        .await
+        .expect("complete multiline response should write");
+
+        assert_eq!(written, first_response.len() as u64);
+        assert_eq!(writer, first_response);
+        assert_eq!(conn.pending_bytes_len(), next_response.len());
+        assert_eq!(
+            pool.available_buffers(),
+            0,
+            "packed suffix should hold the original pooled read buffer"
+        );
+
+        let mut pending = vec![0; next_response.len()];
+        conn.read_exact(&mut pending).await.unwrap();
+        assert_eq!(pending, next_response);
+        assert_eq!(
+            pool.available_buffers(),
+            1,
+            "draining pooled pending input should return the original buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_response_single_line_queues_packed_suffix_as_pooled_input() {
+        let first_response = b"223 0 <first>\r\n";
+        let next_response = b"223 0 <next>\r\n";
+        let mut chunk = Vec::from(first_response.as_slice());
+        chunk.extend_from_slice(next_response);
+
+        let pool = make_pool();
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(&chunk);
+        let request = crate::protocol::RequestContext::parse(b"STAT <test@example>\r\n")
+            .expect("valid request");
+        let mut conn = loopback_connection_stream().await;
+        let mut writer = Vec::new();
+
+        let written = write_response(
+            &request,
+            &mut io_buffer,
+            &mut conn,
+            &mut writer,
+            &pool,
+            crate::types::BackendId::from_index(1),
+        )
+        .await
+        .expect("single-line response should write");
+
+        assert_eq!(written, first_response.len() as u64);
+        assert_eq!(writer, first_response);
+        assert_eq!(conn.pending_bytes_len(), next_response.len());
+        assert_eq!(
+            pool.available_buffers(),
+            0,
+            "packed suffix should hold the original pooled read buffer"
+        );
+
+        let mut pending = vec![0; next_response.len()];
+        conn.read_exact(&mut pending).await.unwrap();
+        assert_eq!(pending, next_response);
+        assert_eq!(
+            pool.available_buffers(),
+            1,
+            "draining pooled pending input should return the original buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_multiline_client_error_consumes_backend_response_boundary() {
+        let pool = make_pool();
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(b"220 article\r\n");
+        let mut conn = mock_backend_conn(vec![b"body\r\n.\r\n223 0 <next>\r\n".to_vec()]).await;
+        let request = crate::protocol::RequestContext::parse(b"ARTICLE <test@example>\r\n")
+            .expect("valid request");
+        let mut writer = FailingWriter;
+
+        let err = write_response(
+            &request,
+            &mut io_buffer,
+            &mut conn,
+            &mut writer,
+            &pool,
+            crate::types::BackendId::from_index(1),
+        )
+        .await;
+
+        assert!(matches!(
+            err,
+            Err(ResponseTransferError::ClientDisconnect(_))
+        ));
+        assert_eq!(conn.pending_bytes_len(), b"223 0 <next>\r\n".len());
+    }
+
+    #[test]
+    fn backend_response_order_releases_deferred_reply_after_tracked_reply() {
+        let request = crate::protocol::RequestContext::parse(b"DATE\r\n").expect("valid request");
+        let mut order = BackendResponseOrder::default();
+        order.push_request(request.kind());
+        order.push_deferred_reply(b"205 Goodbye\r\n".to_vec());
+
+        assert!(order.has_pending_backend_replies());
+        assert!(order.has_deferred_replies());
+        assert!(order.should_drain_backend_replies());
+
+        let writes = order.client_writes_for_backend_read(b"111 20260520120000\r\n");
+
+        assert_eq!(writes.len(), 2);
+        assert_eq!(&writes[0][..], b"111 20260520120000\r\n");
+        assert_eq!(&writes[1][..], b"205 Goodbye\r\n");
+        assert!(!order.has_pending_backend_replies());
+        assert!(!order.has_deferred_replies());
+    }
+
+    #[test]
+    fn backend_response_order_splits_packed_multiline_and_single_line_replies() {
+        let help = crate::protocol::RequestContext::parse(b"HELP\r\n").expect("valid request");
+        let date = crate::protocol::RequestContext::parse(b"DATE\r\n").expect("valid request");
+        let mut order = BackendResponseOrder::default();
+        order.push_request(help.kind());
+        order.push_request(date.kind());
+
+        let backend_read = b"100 Help follows\r\nfirst line\r\n.\r\n111 20260520120000\r\n";
+        let writes = order.client_writes_for_backend_read(backend_read);
+
+        assert_eq!(writes.len(), 2);
+        assert_eq!(&writes[0][..], b"100 Help follows\r\nfirst line\r\n.\r\n");
+        assert_eq!(&writes[1][..], b"111 20260520120000\r\n");
+        assert!(!order.has_pending_backend_replies());
     }
 
     fn for_each_critical_byte_sequence(max_len: usize, f: &mut impl FnMut(&[u8])) {
@@ -1290,6 +2083,18 @@ mod tests {
             "PrefetchedMultiline",
             "PrefetchedResponse",
             "from_prefetched",
+            "response_buffer",
+            "response_transfer::CAPABILITIES",
+            "response_transfer::cached_response_completion",
+            "response_transfer::complete_response_body",
+            "single_line_response_bytes",
+            "complete_single_line_response_bytes",
+            "backend_response_bytes",
+            "ResponseCapture::",
+            "IsolatedMultilineResponse",
+            "BackendReplyTracker",
+            "BackendReplyBytes",
+            "OrderedResponse",
             "capture_prefetched_multiline_source",
             "stash_leftover",
             "pop_leftover",
@@ -1484,46 +2289,6 @@ mod tests {
                 next_response_input: b".\r\n".len()..b".\r\n".len(),
             }))
         );
-    }
-
-    #[tokio::test]
-    async fn complete_multiline_write_preserves_packed_suffix_before_client_error() {
-        let chunk = b"220 article\r\nbody\r\n.\r\n223 0 <next>\r\n";
-        let response_len = b"220 article\r\nbody\r\n.\r\n".len();
-        let framed = CompleteMultilineWireChunk {
-            response: 0..response_len,
-            next_response_input: response_len..chunk.len(),
-        };
-        let mut conn = loopback_connection_stream().await;
-        let mut writer = FailingWriter;
-
-        let err = framed.write_from(&mut writer, chunk, &mut conn).await;
-
-        assert!(matches!(
-            err,
-            Err(crate::session::response_buffer::ResponseTransferError::ClientDisconnect(_))
-        ));
-        assert_eq!(conn.pending_bytes_len(), b"223 0 <next>\r\n".len());
-    }
-
-    #[tokio::test]
-    async fn single_line_write_preserves_packed_suffix_before_client_error() {
-        let chunk = b"223 0 <first>\r\n223 0 <next>\r\n";
-        let response_len = b"223 0 <first>\r\n".len();
-        let framed = FramedSingleLineChunk {
-            response: 0..response_len,
-            next_response_input: response_len..chunk.len(),
-        };
-        let mut conn = loopback_connection_stream().await;
-        let mut writer = FailingWriter;
-
-        let err = framed.write_from(&mut writer, chunk, &mut conn).await;
-
-        assert!(matches!(
-            err,
-            Err(crate::session::response_buffer::ResponseTransferError::ClientDisconnect(_))
-        ));
-        assert_eq!(conn.pending_bytes_len(), b"223 0 <next>\r\n".len());
     }
 
     #[test]

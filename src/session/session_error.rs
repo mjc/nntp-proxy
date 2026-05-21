@@ -67,14 +67,13 @@ impl From<anyhow::Error> for SessionError {
     }
 }
 
-/// Convert buffered-response errors to `SessionError`, preserving the disconnect signal.
-impl From<crate::session::response_buffer::ResponseTransferError> for SessionError {
-    fn from(e: crate::session::response_buffer::ResponseTransferError) -> Self {
+/// Convert response-transfer errors to `SessionError`, preserving the disconnect signal.
+impl From<crate::session::response_transfer::ResponseTransferError> for SessionError {
+    fn from(e: crate::session::response_transfer::ResponseTransferError) -> Self {
         match e {
-            crate::session::response_buffer::ResponseTransferError::ClientDisconnect(io_err)
-            | crate::session::response_buffer::ResponseTransferError::ClientDisconnectBeforeResponseComplete(
-                io_err,
-            ) => Self::ClientDisconnect(io_err),
+            crate::session::response_transfer::ResponseTransferError::ClientDisconnect(io_err) => {
+                Self::ClientDisconnect(io_err)
+            }
             other => Self::Backend(other.into_anyhow()),
         }
     }
@@ -116,7 +115,7 @@ mod tests {
     fn client_disconnect_from_response_transfer_error() {
         let io_err = std::io::Error::from(ErrorKind::BrokenPipe);
         let response_transfer_err =
-            crate::session::response_buffer::ResponseTransferError::ClientDisconnect(io_err);
+            crate::session::response_transfer::ResponseTransferError::ClientDisconnect(io_err);
         let e = SessionError::from(response_transfer_err);
         assert!(matches!(e, SessionError::ClientDisconnect(_)));
     }
@@ -124,7 +123,7 @@ mod tests {
     #[test]
     fn backend_from_response_transfer_backend_eof() {
         let response_transfer_err =
-            crate::session::response_buffer::ResponseTransferError::BackendEof {
+            crate::session::response_transfer::ResponseTransferError::BackendEof {
                 backend_id: crate::types::BackendId::from_index(0),
                 bytes_received: 100,
             };

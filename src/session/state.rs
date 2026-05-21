@@ -6,7 +6,7 @@
 use std::borrow::Cow;
 
 use crate::protocol::RequestKind;
-use crate::session::response_buffer::BackendResponseOrder;
+use crate::session::backend::BackendResponseOrder;
 use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
