@@ -54,3 +54,32 @@ let suffix = &buf[end..];
 ```
 
 If a change seems to need any of that, the design is wrong. Move the behavior into `MultilineFramer` and expose a higher-level operation such as write, capture, cache ingest, or ordered response emission.
+
+## Preserve Retry Tier Semantics
+
+Do not route ARTICLE/BODY/HEAD retry attempts to a lower-priority tier just
+because the preferred tier is saturated, has waiters, or looks slower in a
+profile. Tier escalation is only allowed after every eligible backend in the
+current tier has actually returned the article-missing response for that
+request and has been recorded missing in `ArticleAvailability`.
+
+Throughput work on the retry path must preserve that invariant. Optimize
+connection reuse, buffering, lock lifetime, request pipelining, and selection
+inside the current eligible tier; do not use pool pressure as a reason to skip
+ahead to tier 1+ before tier 0 has all 430s.
+
+## Perf Data Parsing
+
+When inspecting `perf.data`, prefer the repo helper:
+
+```sh
+nix develop -c scripts/parse_perfdata perf.data
+```
+
+It shells out to `perf script -i <file>` and emits the thread, function, edge,
+timeline, and category summaries agents usually need for profile triage. It also
+still accepts piped `perf script` output:
+
+```sh
+nix develop -c sh -lc 'perf script -i perf.data | scripts/parse_perfdata -'
+```
