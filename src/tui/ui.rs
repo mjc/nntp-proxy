@@ -1,15 +1,15 @@
 //! TUI rendering and layout
 
-use crate::formatting::format_bytes;
+use crate::formatting::format_bytes_into;
 use crate::tui::RemoteDashboardStatus;
 use crate::tui::constants::{chart, layout, styles, text};
 use crate::tui::dashboard::{
     BufferPoolStats, DashboardMetrics, DashboardState, DashboardUserStats,
 };
 use crate::tui::helpers::{
-    build_chart_data, calculate_chart_bounds, connection_failure_color, create_sparkline,
-    error_count_color, error_rate_color, format_error_rate, format_summary_throughput,
-    format_throughput_label, health_indicator,
+    build_chart_data, calculate_chart_bounds, connection_failure_color, create_sparkline_text,
+    error_count_color, error_rate_color, format_summary_throughput, format_throughput_label,
+    health_indicator,
 };
 use arrayvec::ArrayString;
 use ratatui::{
@@ -19,9 +19,15 @@ use ratatui::{
     style::{Color, Modifier, Style, Stylize},
     symbols,
     text::{Line, Span},
-    widgets::{Axis, Block, Chart, Dataset, GraphType, List, ListItem, Paragraph, Wrap},
+    widgets::{Axis, Block, Chart, Dataset, GraphType, Paragraph, Wrap},
 };
+use std::collections::VecDeque;
 use std::fmt::Write as _;
+
+#[cfg(test)]
+use crate::formatting::format_bytes;
+#[cfg(test)]
+use crate::tui::helpers::{create_sparkline, format_error_rate};
 
 #[allow(clippy::cast_precision_loss)] // Chart labels and percentages are presentation-only values.
 const fn counter_as_f64(value: u64) -> f64 {
@@ -80,12 +86,52 @@ pub(crate) fn render_ui(
     view_mode_override: Option<crate::tui::app::ViewMode>,
     show_details_override: Option<bool>,
 ) {
+    render_ui_with_logs(
+        f,
+        state,
+        LogSource::Snapshot(&state.log_lines),
+        attached_ui_stats,
+        remote_status,
+        view_mode_override,
+        show_details_override,
+    );
+}
+
+pub(crate) fn render_local_ui(
+    f: &mut Frame,
+    state: &DashboardState,
+    log_buffer: &crate::tui::log_capture::LogBuffer,
+    attached_ui_stats: Option<&crate::tui::SystemStats>,
+    remote_status: Option<&RemoteDashboardStatus>,
+    view_mode_override: Option<crate::tui::app::ViewMode>,
+    show_details_override: Option<bool>,
+) {
+    render_ui_with_logs(
+        f,
+        state,
+        LogSource::Buffer(log_buffer),
+        attached_ui_stats,
+        remote_status,
+        view_mode_override,
+        show_details_override,
+    );
+}
+
+fn render_ui_with_logs(
+    f: &mut Frame,
+    state: &DashboardState,
+    log_source: LogSource<'_>,
+    attached_ui_stats: Option<&crate::tui::SystemStats>,
+    remote_status: Option<&RemoteDashboardStatus>,
+    view_mode_override: Option<crate::tui::app::ViewMode>,
+    show_details_override: Option<bool>,
+) {
     let view_mode = view_mode_override.unwrap_or(state.view_mode);
     let show_details = show_details_override.unwrap_or(state.show_details);
 
     if let Some(chunks) = dashboard_fullscreen_chunks(view_mode, f.area()) {
         render_title(f, chunks[0], &state.metrics, remote_status);
-        render_logs(f, chunks[1], &state.log_lines, show_details);
+        render_logs(f, chunks[1], log_source, show_details);
         render_footer(f, chunks[2]);
         return;
     }
@@ -96,7 +142,7 @@ pub(crate) fn render_ui(
             render_title(f, title, &state.metrics, remote_status);
             render_summary(f, summary, state, attached_ui_stats, show_details);
             render_backends(f, backends, state, show_details);
-            render_logs(f, logs, &state.log_lines, show_details);
+            render_logs(f, logs, log_source, show_details);
             render_footer(f, footer);
         }
         DashboardMainChunks::WithoutLogs([title, summary, backends, footer]) => {
@@ -108,6 +154,12 @@ pub(crate) fn render_ui(
     }
 }
 
+#[derive(Clone, Copy)]
+enum LogSource<'a> {
+    Snapshot(&'a [String]),
+    Buffer(&'a crate::tui::log_capture::LogBuffer),
+}
+
 pub(crate) fn render_attached_ui(
     f: &mut Frame,
     state: &DashboardState,
@@ -117,7 +169,12 @@ pub(crate) fn render_attached_ui(
 ) {
     if let Some(chunks) = dashboard_fullscreen_chunks(view_mode, f.area()) {
         render_title_lines(f, chunks[0], &render_cache.title_lines);
-        render_logs(f, chunks[1], &state.log_lines, show_details);
+        render_logs(
+            f,
+            chunks[1],
+            LogSource::Snapshot(&state.log_lines),
+            show_details,
+        );
         render_footer(f, chunks[2]);
         return;
     }
@@ -128,7 +185,7 @@ pub(crate) fn render_attached_ui(
             render_title_lines(f, title, &render_cache.title_lines);
             render_summary(f, summary, state, None, show_details);
             render_backends(f, backends, state, show_details);
-            render_logs(f, logs, &state.log_lines, show_details);
+            render_logs(f, logs, LogSource::Snapshot(&state.log_lines), show_details);
             render_footer(f, footer);
         }
         DashboardMainChunks::WithoutLogs([title, summary, backends, footer]) => {
@@ -785,14 +842,14 @@ fn render_app_summary_panel(
         Style::default().fg(styles::VALUE_PRIMARY),
     );
 
-    let stateful = metrics.stateful_sessions.to_string();
+    let stateful = count_usize_text(metrics.stateful_sessions);
     render_label_value_row(
         buffer,
         inner,
         &mut row,
         right,
         "Stateful Sessions: ",
-        &stateful,
+        stateful.as_str(),
         Style::default().fg(session_color(metrics.stateful_sessions)),
     );
 
@@ -812,16 +869,16 @@ fn render_app_summary_panel(
             (&ui_cpu, Style::default().fg(cpu_color(ui_stats.cpu_usage))),
         );
 
-        let proxy_mem = format_bytes(system_stats.memory_bytes);
-        let ui_mem = format_bytes(ui_stats.memory_bytes);
+        let proxy_mem = bytes_text(system_stats.memory_bytes);
+        let ui_mem = bytes_text(ui_stats.memory_bytes);
         render_dual_value_row(
             buffer,
             inner,
             &mut row,
             right,
             "Memory (proxy, UI): ",
-            (&proxy_mem, Style::default().fg(styles::VALUE_INFO)),
-            (&ui_mem, Style::default().fg(styles::VALUE_INFO)),
+            (proxy_mem.as_str(), Style::default().fg(styles::VALUE_INFO)),
+            (ui_mem.as_str(), Style::default().fg(styles::VALUE_INFO)),
         );
     } else {
         let cpu = percent_text(system_stats.cpu_usage);
@@ -835,14 +892,14 @@ fn render_app_summary_panel(
             Style::default().fg(cpu_color(system_stats.cpu_usage)),
         );
 
-        let mem = format_bytes(system_stats.memory_bytes);
+        let mem = bytes_text(system_stats.memory_bytes);
         render_label_value_row(
             buffer,
             inner,
             &mut row,
             right,
             "Memory: ",
-            &mem,
+            mem.as_str(),
             Style::default().fg(styles::VALUE_INFO),
         );
     }
@@ -970,24 +1027,24 @@ fn render_cache_summary_panel(f: &mut Frame, area: Rect, metrics: &DashboardMetr
             &hit_rate,
             Style::default().fg(hit_rate_color(metrics.cache_hit_rate)),
         );
-        let written = format_bytes(disk.bytes_written);
+        let written = bytes_text(disk.bytes_written);
         render_label_value_row(
             buffer,
             inner,
             &mut row,
             right,
             "Disk Written: ",
-            &written,
+            written.as_str(),
             Style::default().fg(non_zero_color(disk.bytes_written)),
         );
-        let read = format_bytes(disk.bytes_read);
+        let read = bytes_text(disk.bytes_read);
         render_label_value_row(
             buffer,
             inner,
             &mut row,
             right,
             "Disk Read: ",
-            &read,
+            read.as_str(),
             Style::default().fg(non_zero_color(disk.bytes_read)),
         );
         let mut hits = ArrayString::<48>::new();
@@ -1001,35 +1058,35 @@ fn render_cache_summary_panel(f: &mut Frame, area: Rect, metrics: &DashboardMetr
             &hits,
             Style::default().fg(non_zero_color(disk.disk_hits)),
         );
-        let io_count = disk.write_ios.to_string();
+        let io_count = count_text(disk.write_ios);
         render_label_value_row(
             buffer,
             inner,
             &mut row,
             right,
             "Write I/Os: ",
-            &io_count,
+            io_count.as_str(),
             Style::default().fg(styles::VALUE_NEUTRAL),
         );
     } else {
-        let entries = metrics.cache_entries.to_string();
+        let entries = count_text(metrics.cache_entries);
         render_label_value_row(
             buffer,
             inner,
             &mut row,
             right,
             "Entries: ",
-            &entries,
+            entries.as_str(),
             Style::default().fg(entries_color(metrics.cache_entries)),
         );
-        let size = format_bytes(metrics.cache_size_bytes);
+        let size = bytes_text(metrics.cache_size_bytes);
         render_label_value_row(
             buffer,
             inner,
             &mut row,
             right,
             "Size: ",
-            &size,
+            size.as_str(),
             Style::default().fg(styles::VALUE_NEUTRAL),
         );
         render_label_value_row(
@@ -1047,7 +1104,7 @@ fn render_cache_summary_panel(f: &mut Frame, area: Rect, metrics: &DashboardMetr
 fn render_transfer_summary_panel(f: &mut Frame, area: Rect, state: &DashboardState) {
     let (client_to_backend, backend_to_client) =
         format_summary_throughput(state.latest_client_throughput());
-    let total = format_bytes(state.metrics.total_bytes());
+    let total = bytes_text(state.metrics.total_bytes());
 
     let block = bordered_block("Data Transfer", styles::BORDER_NORMAL);
     let inner = block.inner(area);
@@ -1086,7 +1143,7 @@ fn render_transfer_summary_panel(f: &mut Frame, area: Rect, state: &DashboardSta
         &mut row,
         right,
         "Total: ",
-        &total,
+        total.as_str(),
         Style::default().fg(styles::VALUE_PRIMARY),
     );
 }
@@ -1337,38 +1394,6 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
         let y = inner.top().saturating_add(row);
         let (health_icon, health_color) = health_indicator(backend.health_status);
         let error_rate = backend_stats.error_rate_percent();
-        let error_text = format_error_rate(error_rate);
-        let address = format!("{}:{}", server.host, server.port.get());
-        let share_text = state
-            .backend_traffic_share(i)
-            .map(|share| format!(" ({share:.1}% share)"));
-        let cmd_per_sec = backend
-            .latest_throughput()
-            .and_then(super::app::ThroughputPoint::commands_per_sec)
-            .map_or_else(
-                || text::DEFAULT_CMD_RATE.to_string(),
-                |cps| format!("{:.0}", cps.get()),
-            );
-        let ttfb = backend_stats
-            .average_ttfb_ms()
-            .map_or_else(|| "N/A".to_string(), |ms| format!("{ms:.1}ms"));
-        let sent = format_bytes(backend_stats.bytes_sent.as_u64());
-        let received = format_bytes(backend_stats.bytes_received.as_u64());
-        let avg_size = backend_stats
-            .average_article_size()
-            .map_or_else(|| "N/A".to_string(), format_bytes);
-        let error_counts = format!(
-            "4xx:{} 5xx:{}",
-            backend_stats.errors_4xx.get(),
-            backend_stats.errors_5xx.get()
-        );
-        let failures = backend_stats.connection_failures.get().to_string();
-        let used_max = format!(
-            "{}/{}",
-            backend.active_connections,
-            server.max_connections.get()
-        );
-        let article_count = backend_stats.article_count.get().to_string();
 
         let mut x = inner.left();
         write_part(
@@ -1397,7 +1422,7 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
             &mut x,
             y,
             right,
-            &error_text,
+            error_rate_text(error_rate).as_str(),
             Style::default().fg(error_rate_color(error_rate)),
         );
         row = row.saturating_add(1);
@@ -1413,16 +1438,48 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
             &mut x,
             y,
             right,
-            &address,
+            server.host.as_str(),
             Style::default().fg(styles::LABEL),
         );
-        if let Some(ref share_text) = share_text {
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            ":",
+            Style::default().fg(styles::LABEL),
+        );
+        write_fmt_part::<16>(
+            buffer,
+            &mut x,
+            y,
+            right,
+            format_args!("{}", server.port.get()),
+            Style::default().fg(styles::LABEL),
+        );
+        if let Some(share) = state.backend_traffic_share(i) {
             write_part(
                 buffer,
                 &mut x,
                 y,
                 right,
-                share_text,
+                " (",
+                Style::default().fg(Color::Cyan),
+            );
+            write_fmt_part::<16>(
+                buffer,
+                &mut x,
+                y,
+                right,
+                format_args!("{share:.1}"),
+                Style::default().fg(Color::Cyan),
+            );
+            write_part(
+                buffer,
+                &mut x,
+                y,
+                right,
+                "% share)",
                 Style::default().fg(Color::Cyan),
             );
         }
@@ -1446,7 +1503,8 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
             &mut x,
             y,
             right,
-            &used_max,
+            connections_used_max_text(backend.active_connections, server.max_connections.get())
+                .as_str(),
             Style::default().fg(styles::VALUE_SECONDARY),
         );
         write_part(
@@ -1457,14 +1515,28 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
             " | Cmd/s: ",
             Style::default().fg(styles::LABEL),
         );
-        write_part(
-            buffer,
-            &mut x,
-            y,
-            right,
-            &cmd_per_sec,
-            Style::default().fg(styles::VALUE_INFO),
-        );
+        if let Some(cps) = backend
+            .latest_throughput()
+            .and_then(super::app::ThroughputPoint::commands_per_sec)
+        {
+            write_fmt_part::<16>(
+                buffer,
+                &mut x,
+                y,
+                right,
+                format_args!("{:.0}", cps.get()),
+                Style::default().fg(styles::VALUE_INFO),
+            );
+        } else {
+            write_part(
+                buffer,
+                &mut x,
+                y,
+                right,
+                text::DEFAULT_CMD_RATE,
+                Style::default().fg(styles::VALUE_INFO),
+            );
+        }
         write_part(
             buffer,
             &mut x,
@@ -1473,14 +1545,25 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
             " | TTFB: ",
             Style::default().fg(styles::LABEL),
         );
-        write_part(
-            buffer,
-            &mut x,
-            y,
-            right,
-            &ttfb,
-            Style::default().fg(styles::VALUE_INFO),
-        );
+        if let Some(ms) = backend_stats.average_ttfb_ms() {
+            write_fmt_part::<24>(
+                buffer,
+                &mut x,
+                y,
+                right,
+                format_args!("{ms:.1}ms"),
+                Style::default().fg(styles::VALUE_INFO),
+            );
+        } else {
+            write_part(
+                buffer,
+                &mut x,
+                y,
+                right,
+                "N/A",
+                Style::default().fg(styles::VALUE_INFO),
+            );
+        }
         row = row.saturating_add(1);
 
         if row >= inner.height {
@@ -1503,7 +1586,7 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
             &mut x,
             y,
             right,
-            &sent,
+            bytes_text(backend_stats.bytes_sent.as_u64()).as_str(),
             Style::default().fg(styles::VALUE_PRIMARY),
         );
         write_part(buffer, &mut x, y, right, "  ", Style::default());
@@ -1521,7 +1604,7 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
             &mut x,
             y,
             right,
-            &received,
+            bytes_text(backend_stats.bytes_received.as_u64()).as_str(),
             Style::default().fg(styles::VALUE_NEUTRAL),
         );
         row = row.saturating_add(1);
@@ -1539,14 +1622,25 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
             "  Avg Article: ",
             Style::default().fg(styles::LABEL),
         );
-        write_part(
-            buffer,
-            &mut x,
-            y,
-            right,
-            &avg_size,
-            Style::default().fg(styles::VALUE_INFO),
-        );
+        if let Some(avg_size) = backend_stats.average_article_size() {
+            write_part(
+                buffer,
+                &mut x,
+                y,
+                right,
+                bytes_text(avg_size).as_str(),
+                Style::default().fg(styles::VALUE_INFO),
+            );
+        } else {
+            write_part(
+                buffer,
+                &mut x,
+                y,
+                right,
+                "N/A",
+                Style::default().fg(styles::VALUE_INFO),
+            );
+        }
         write_part(
             buffer,
             &mut x,
@@ -1560,7 +1654,7 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
             &mut x,
             y,
             right,
-            &article_count,
+            count_text(backend_stats.article_count.get()).as_str(),
             Style::default().fg(styles::VALUE_NEUTRAL),
         );
         row = row.saturating_add(1);
@@ -1583,7 +1677,11 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
             &mut x,
             y,
             right,
-            &error_counts,
+            error_counts_text(
+                backend_stats.errors_4xx.get(),
+                backend_stats.errors_5xx.get(),
+            )
+            .as_str(),
             Style::default().fg(error_count_color(!backend_stats.errors.is_zero())),
         );
         write_part(
@@ -1599,7 +1697,7 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
             &mut x,
             y,
             right,
-            &failures,
+            count_text(backend_stats.connection_failures.get()).as_str(),
             Style::default().fg(connection_failure_color(
                 backend_stats.connection_failures.get(),
             )),
@@ -1611,15 +1709,7 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
             let mut x = inner.left();
             let pending = state.backend_pending_count(i);
             let stateful = state.backend_stateful_count(i);
-            let detail_text = backend_details_text(pending, stateful);
-            write_part(
-                buffer,
-                &mut x,
-                y,
-                right,
-                &detail_text,
-                Style::default().fg(styles::LABEL),
-            );
+            write_backend_details(buffer, &mut x, y, right, pending, stateful);
             row = row.saturating_add(1);
         }
 
@@ -1639,6 +1729,123 @@ fn write_part(buffer: &mut Buffer, x: &mut u16, y: u16, right: u16, text: &str, 
     *x = next_x;
 }
 
+fn write_fmt_part<const CAP: usize>(
+    buffer: &mut Buffer,
+    x: &mut u16,
+    y: u16,
+    right: u16,
+    args: std::fmt::Arguments<'_>,
+    style: Style,
+) {
+    let mut text = ArrayString::<CAP>::new();
+    let _ = text.write_fmt(args);
+    write_part(buffer, x, y, right, text.as_str(), style);
+}
+
+fn error_rate_text(rate: f64) -> ArrayString<24> {
+    let mut text = ArrayString::<24>::new();
+    match rate {
+        r if r > 5.0 => {
+            let _ = write!(&mut text, " ⚠ {r:.1}%");
+        }
+        r if r > 0.0 => {
+            let _ = write!(&mut text, " {r:.1}%");
+        }
+        _ => {}
+    }
+    text
+}
+
+fn bytes_text(bytes: u64) -> ArrayString<32> {
+    let mut text = ArrayString::<32>::new();
+    let _ = format_bytes_into(&mut text, bytes);
+    text
+}
+
+fn count_text(count: u64) -> ArrayString<32> {
+    let mut text = ArrayString::<32>::new();
+    let _ = write!(&mut text, "{count}");
+    text
+}
+
+fn count_usize_text(count: usize) -> ArrayString<32> {
+    let mut text = ArrayString::<32>::new();
+    let _ = write!(&mut text, "{count}");
+    text
+}
+
+fn connections_used_max_text(used: usize, max: usize) -> ArrayString<32> {
+    let mut text = ArrayString::<32>::new();
+    let _ = write!(&mut text, "{used}/{max}");
+    text
+}
+
+fn error_counts_text(errors_4xx: u64, errors_5xx: u64) -> ArrayString<48> {
+    let mut text = ArrayString::<48>::new();
+    let _ = write!(&mut text, "4xx:{errors_4xx} 5xx:{errors_5xx}");
+    text
+}
+
+fn write_backend_details(
+    buffer: &mut Buffer,
+    x: &mut u16,
+    y: u16,
+    right: u16,
+    pending: usize,
+    stateful: usize,
+) {
+    let style = Style::default().fg(styles::LABEL);
+
+    if stateful > 0 {
+        write_part(buffer, x, y, right, "  Stateful: ", style);
+        write_fmt_part::<32>(buffer, x, y, right, format_args!("{stateful}"), style);
+        write_part(buffer, x, y, right, " | ", style);
+    }
+
+    write_part(buffer, x, y, right, "  Pending: ", style);
+    write_fmt_part::<32>(buffer, x, y, right, format_args!("{pending}"), style);
+}
+
+fn user_name_text(username: &str) -> ArrayString<64> {
+    const MAX_LEN: usize = 12;
+    const TRUNCATE_AT: usize = 9;
+
+    let mut text = ArrayString::<64>::new();
+    if username.len() > MAX_LEN {
+        for ch in username.chars().take(TRUNCATE_AT) {
+            text.push(ch);
+        }
+        text.push_str("...");
+    } else {
+        text.push_str(username);
+        for _ in username.len()..MAX_LEN {
+            text.push(' ');
+        }
+    }
+    text
+}
+
+fn active_connections_text(count: usize) -> ArrayString<16> {
+    let mut text = ArrayString::<16>::new();
+    let _ = write!(&mut text, "{count:>5}");
+    text
+}
+
+fn padded_bytes_text(bytes: u64) -> ArrayString<32> {
+    let bytes = bytes_text(bytes);
+    let mut text = ArrayString::<32>::new();
+    let _ = write!(&mut text, "{:>8}", bytes.as_str());
+    text
+}
+
+fn rate_text(prefix: &str, bytes_per_sec: u64) -> ArrayString<40> {
+    let bytes = bytes_text(bytes_per_sec);
+    let mut text = ArrayString::<40>::new();
+    let _ = write!(&mut text, "{prefix}{}/s", bytes.as_str());
+    text
+}
+
+#[cfg(test)]
 fn backend_details_text(pending: usize, stateful: usize) -> String {
     let mut text = String::new();
 
@@ -1752,6 +1959,14 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
     let max_throughput_rounded = calculate_chart_bounds(max_throughput);
     let max_label = format_throughput_label(max_throughput_rounded);
 
+    fn dataset_name<'a>(backend_name: &'a str, direction: &'static str) -> Line<'a> {
+        Line::from(vec![
+            Span::raw(backend_name),
+            Span::raw(" "),
+            Span::raw(direction),
+        ])
+    }
+
     // Build datasets directly from pre-computed chart data
     let datasets: Vec<Dataset> = chart_data
         .iter()
@@ -1762,7 +1977,7 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
             if !data.sent_points_as_tuples().is_empty() {
                 ds.push(
                     Dataset::default()
-                        .name(format!("{} {}", data.name, text::ARROW_UP))
+                        .name(dataset_name(&data.name, text::ARROW_UP))
                         .marker(symbols::Marker::Braille)
                         .graph_type(GraphType::Line)
                         .style(Style::default().fg(data.color))
@@ -1774,7 +1989,7 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
             if !data.recv_points_as_tuples().is_empty() {
                 ds.push(
                     Dataset::default()
-                        .name(format!("{} {}", data.name, text::ARROW_DOWN))
+                        .name(dataset_name(&data.name, text::ARROW_DOWN))
                         .marker(symbols::Marker::Braille)
                         .graph_type(GraphType::Line)
                         .style(Style::default().fg(data.color).add_modifier(Modifier::BOLD))
@@ -1845,7 +2060,7 @@ fn footer_help_line() -> Line<'static> {
 }
 
 /// Render recent log messages
-fn render_logs(f: &mut Frame, area: Rect, log_lines: &[String], show_details: bool) {
+fn render_logs(f: &mut Frame, area: Rect, log_source: LogSource<'_>, show_details: bool) {
     let visible_lines = area.height.saturating_sub(2) as usize;
     let fetch_count = if show_details {
         visible_lines * 3
@@ -1853,6 +2068,23 @@ fn render_logs(f: &mut Frame, area: Rect, log_lines: &[String], show_details: bo
         visible_lines
     };
 
+    match log_source {
+        LogSource::Snapshot(log_lines) => {
+            render_snapshot_logs(f, area, log_lines, fetch_count, show_details);
+        }
+        LogSource::Buffer(log_buffer) => {
+            render_buffer_logs(f, area, log_buffer, fetch_count, show_details);
+        }
+    }
+}
+
+fn render_snapshot_logs(
+    f: &mut Frame,
+    area: Rect,
+    log_lines: &[String],
+    fetch_count: usize,
+    show_details: bool,
+) {
     if show_details {
         let paragraph = Paragraph::new(recent_log_text_lines(log_lines, fetch_count))
             .style(Style::default().fg(Color::Gray))
@@ -1886,6 +2118,51 @@ fn render_logs(f: &mut Frame, area: Rect, log_lines: &[String], show_details: bo
             inner.width,
         );
     }
+}
+
+fn render_buffer_logs(
+    f: &mut Frame,
+    area: Rect,
+    log_buffer: &crate::tui::log_capture::LogBuffer,
+    fetch_count: usize,
+    show_details: bool,
+) {
+    let _ = log_buffer.with_recent_lines(fetch_count, |lines, skip| {
+        if show_details {
+            let paragraph = Paragraph::new(recent_log_text_lines_from_deque(lines, skip))
+                .style(Style::default().fg(Color::Gray))
+                .block(bordered_block(" Recent Logs ", styles::BORDER_ACTIVE))
+                .wrap(Wrap { trim: false });
+            f.render_widget(paragraph, area);
+            return;
+        }
+
+        let block = bordered_block(" Recent Logs ", styles::BORDER_ACTIVE);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+
+        if inner.width == 0 || inner.height == 0 {
+            return;
+        }
+
+        for (row, line) in lines
+            .iter()
+            .skip(skip)
+            .take(inner.height as usize)
+            .enumerate()
+        {
+            let rendered = Line::from(Span::styled(
+                line.as_str(),
+                Style::default().fg(Color::Gray),
+            ));
+            f.buffer_mut().set_line(
+                inner.left(),
+                inner.top().saturating_add(row as u16),
+                &rendered,
+                inner.width,
+            );
+        }
+    });
 }
 
 fn render_block_lines(
@@ -1932,73 +2209,126 @@ fn recent_log_text_lines(lines: &[String], count: usize) -> Vec<Line<'_>> {
         .collect()
 }
 
+fn recent_log_text_lines_from_deque(lines: &VecDeque<String>, skip: usize) -> Vec<Line<'_>> {
+    lines
+        .iter()
+        .skip(skip)
+        .map(|line| Line::from(line.as_str()))
+        .collect()
+}
+
 /// Render per-user statistics panel
 fn render_user_stats(f: &mut Frame, area: Rect, top_users: &[DashboardUserStats]) {
-    /// Truncate username to fit display width
-    fn format_username(username: &str) -> String {
-        const MAX_LEN: usize = 12;
-        const TRUNCATE_AT: usize = 9;
-        if username.len() > MAX_LEN {
-            let truncated: String = username.chars().take(TRUNCATE_AT).collect();
-            format!("{truncated}...")
-        } else {
-            format!("{username:<MAX_LEN$}")
-        }
-    }
-
-    /// Create user stat lines
-    fn user_stat_lines(user: &DashboardUserStats, sparkline: String) -> Vec<Line<'static>> {
-        vec![
-            Line::from(vec![
-                format_username(&user.username).fg(Color::Cyan),
-                " ".into(),
-                sparkline.fg(Color::Blue),
-                " ".into(),
-                format!("{:>5}", user.active_connections).fg(Color::Green),
-            ]),
-            Line::from(vec![
-                "  ↑".into(),
-                format!("{:>8}", format_bytes(user.bytes_sent.as_u64())).fg(Color::Blue),
-                "  ↓".into(),
-                format!("{:>8}", format_bytes(user.bytes_received.as_u64())).fg(Color::Magenta),
-            ]),
-            Line::from(vec![
-                "  Rate: ".into(),
-                format!("↑{}/s", format_bytes(user.bytes_sent_per_sec.get())).fg(Color::Cyan),
-                " ".into(),
-                format!("↓{}/s", format_bytes(user.bytes_received_per_sec.get())).fg(Color::Yellow),
-            ]),
-        ]
-    }
-
     let max_total = top_users.iter().map(|u| u.total_bytes()).max().unwrap_or(1);
+    let block = bordered_block(" Top Users ", styles::BORDER_ACTIVE);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-    // Header row
-    let header = ListItem::new(Line::from(vec![
-        "User".fg(Color::Yellow).bold(),
-        "  ".into(),
-        "Bandwidth".fg(Color::Yellow).bold(),
-        "       ".into(),
-        "Conns".fg(Color::Yellow).bold(),
-    ]));
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
 
-    // User rows - functional map
-    let user_items: Vec<ListItem> = top_users
-        .iter()
-        .map(|user| {
-            let sparkline = create_sparkline(user.total_bytes(), max_total);
-            ListItem::new(user_stat_lines(user, sparkline))
-        })
-        .collect();
+    let right = inner.left().saturating_add(inner.width);
+    let buffer = f.buffer_mut();
+    let mut row = 0u16;
 
-    // Combine header + users
-    let items = std::iter::once(header)
-        .chain(user_items)
-        .collect::<Vec<_>>();
+    let header_style = Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    let y = inner.top();
+    let mut x = inner.left();
+    write_part(buffer, &mut x, y, right, "User", header_style);
+    write_part(buffer, &mut x, y, right, "  ", Style::default());
+    write_part(buffer, &mut x, y, right, "Bandwidth", header_style);
+    write_part(buffer, &mut x, y, right, "       ", Style::default());
+    write_part(buffer, &mut x, y, right, "Conns", header_style);
+    row = row.saturating_add(1);
 
-    let list = List::new(items).block(bordered_block(" Top Users ", styles::BORDER_ACTIVE));
+    for user in top_users {
+        if row >= inner.height {
+            break;
+        }
 
-    f.render_widget(list, area);
+        let y = inner.top().saturating_add(row);
+        let mut x = inner.left();
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            user_name_text(&user.username).as_str(),
+            Style::default().fg(Color::Cyan),
+        );
+        write_part(buffer, &mut x, y, right, " ", Style::default());
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            create_sparkline_text(user.total_bytes(), max_total).as_str(),
+            Style::default().fg(Color::Blue),
+        );
+        write_part(buffer, &mut x, y, right, " ", Style::default());
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            active_connections_text(user.active_connections).as_str(),
+            Style::default().fg(Color::Green),
+        );
+        row = row.saturating_add(1);
+
+        if row >= inner.height {
+            break;
+        }
+        let y = inner.top().saturating_add(row);
+        let mut x = inner.left();
+        write_part(buffer, &mut x, y, right, "  ↑", Style::default());
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            padded_bytes_text(user.bytes_sent.as_u64()).as_str(),
+            Style::default().fg(Color::Blue),
+        );
+        write_part(buffer, &mut x, y, right, "  ↓", Style::default());
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            padded_bytes_text(user.bytes_received.as_u64()).as_str(),
+            Style::default().fg(Color::Magenta),
+        );
+        row = row.saturating_add(1);
+
+        if row >= inner.height {
+            break;
+        }
+        let y = inner.top().saturating_add(row);
+        let mut x = inner.left();
+        write_part(buffer, &mut x, y, right, "  Rate: ", Style::default());
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            rate_text(text::ARROW_UP, user.bytes_sent_per_sec.get()).as_str(),
+            Style::default().fg(Color::Cyan),
+        );
+        write_part(buffer, &mut x, y, right, " ", Style::default());
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            rate_text(text::ARROW_DOWN, user.bytes_received_per_sec.get()).as_str(),
+            Style::default().fg(Color::Yellow),
+        );
+        row = row.saturating_add(1);
+    }
 }
 
 #[cfg(test)]
@@ -2284,6 +2614,33 @@ mod tests {
         assert!(details.contains("Stateful: 1"));
         assert!(details.contains("Pending: 4"));
         assert!(!details.contains('%'));
+    }
+
+    #[test]
+    fn backend_stack_formatters_match_owned_display_text() {
+        assert_eq!(error_rate_text(0.0).as_str(), format_error_rate(0.0));
+        assert_eq!(error_rate_text(1.2).as_str(), format_error_rate(1.2));
+        assert_eq!(error_rate_text(7.8).as_str(), format_error_rate(7.8));
+        assert_eq!(bytes_text(29_312_178).as_str(), format_bytes(29_312_178));
+        assert_eq!(count_text(42).as_str(), "42");
+        assert_eq!(count_usize_text(42).as_str(), "42");
+        assert_eq!(connections_used_max_text(3, 10).as_str(), "3/10");
+        assert_eq!(error_counts_text(4, 5).as_str(), "4xx:4 5xx:5");
+    }
+
+    #[test]
+    fn user_stats_stack_formatters_match_owned_display_text() {
+        assert_eq!(user_name_text("alice").as_str(), format!("{:<12}", "alice"));
+        assert_eq!(user_name_text("averylongusername").as_str(), "averylong...");
+        assert_eq!(active_connections_text(7).as_str(), format!("{:>5}", 7));
+        assert_eq!(
+            padded_bytes_text(29_312_178).as_str(),
+            format!("{:>8}", format_bytes(29_312_178))
+        );
+        assert_eq!(
+            rate_text(text::ARROW_UP, 1024).as_str(),
+            format!("{}{}/s", text::ARROW_UP, format_bytes(1024))
+        );
     }
 
     #[test]

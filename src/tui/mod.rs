@@ -45,7 +45,6 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
-const LOCAL_TUI_LOG_LINE_LIMIT: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RemoteDashboardStatus {
@@ -267,28 +266,30 @@ where
                 if handle_local_tui_action(action, app) {
                     break;
                 }
-                terminal.draw(|f| {
-                    ui::render_ui(
-                        f,
-                        &renderable_dashboard_state(app),
-                        None,
-                        None,
-                        None,
-                        None,
+                    terminal.draw(|f| {
+                        ui::render_local_ui(
+                            f,
+                            &renderable_dashboard_state(app),
+                            app.log_buffer(),
+                            None,
+                            None,
+                            None,
+                            None,
                     )
                 })?;
             }
             // Update timer - check for events only on ticks to reduce overhead
             _ = update_interval.tick() => {
-                app.update();
-                terminal.draw(|f| {
-                    ui::render_ui(
-                        f,
-                        &renderable_dashboard_state(app),
-                        None,
-                        None,
-                        None,
-                        None,
+                    app.update();
+                    terminal.draw(|f| {
+                        ui::render_local_ui(
+                            f,
+                            &renderable_dashboard_state(app),
+                            app.log_buffer(),
+                            None,
+                            None,
+                            None,
+                            None,
                     )
                 })?;
             }
@@ -299,7 +300,7 @@ where
 }
 
 fn renderable_dashboard_state(app: &TuiApp) -> DashboardState {
-    app.snapshot_state_with_log_limit(Some(LOCAL_TUI_LOG_LINE_LIMIT))
+    app.snapshot_state_with_log_limit(Some(0))
 }
 
 async fn run_attached_app<B: ratatui::backend::Backend>(
@@ -769,9 +770,9 @@ mod tests {
     }
 
     #[test]
-    fn renderable_dashboard_state_limits_local_log_tail() {
+    fn renderable_dashboard_state_leaves_logs_for_direct_local_rendering() {
         let log_buffer = LogBuffer::new();
-        for i in 0..(LOCAL_TUI_LOG_LINE_LIMIT + 10) {
+        for i in 0..300 {
             log_buffer.push(format!("line {i}"));
         }
 
@@ -790,9 +791,11 @@ mod tests {
 
         let state = renderable_dashboard_state(&app);
 
-        assert_eq!(state.log_lines.len(), LOCAL_TUI_LOG_LINE_LIMIT);
-        assert_eq!(state.log_lines.first().map(String::as_str), Some("line 10"));
-        assert_eq!(state.log_lines.last().map(String::as_str), Some("line 265"));
+        assert!(state.log_lines.is_empty());
+        assert_eq!(
+            app.log_buffer().recent_lines(1).first().map(String::as_str),
+            Some("line 299")
+        );
     }
 
     #[test]

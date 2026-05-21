@@ -1,5 +1,6 @@
 //! TUI rendering helper functions
 
+use arrayvec::ArrayString;
 use ratatui::style::Color;
 
 use super::constants::{BACKEND_COLORS, throughput};
@@ -31,8 +32,15 @@ const SPARKLINE_WIDTH: usize = 15;
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss
 )]
+#[cfg(test)]
 #[must_use]
 pub fn create_sparkline(value: u64, max_value: u64) -> String {
+    create_sparkline_text(value, max_value).to_string()
+}
+
+/// Create a text-based sparkline bar without heap allocation.
+#[must_use]
+pub fn create_sparkline_text(value: u64, max_value: u64) -> ArrayString<64> {
     let filled = if max_value > 0 {
         // Sparkline width is tiny and purely visual, so approximate float math is
         // sufficient and keeping the cast local makes the display tradeoff explicit.
@@ -41,7 +49,16 @@ pub fn create_sparkline(value: u64, max_value: u64) -> String {
         0
     };
 
-    "█".repeat(filled.min(SPARKLINE_WIDTH)) + &"░".repeat(SPARKLINE_WIDTH.saturating_sub(filled))
+    let filled = filled.min(SPARKLINE_WIDTH);
+    let empty = SPARKLINE_WIDTH.saturating_sub(filled);
+    let mut bar = ArrayString::<64>::new();
+    for _ in 0..filled {
+        bar.push_str("█");
+    }
+    for _ in 0..empty {
+        bar.push_str("░");
+    }
+    bar
 }
 
 // ============================================================================
@@ -208,6 +225,7 @@ pub const fn health_indicator(
 }
 
 /// Format error rate with warning icon if critical
+#[cfg(test)]
 #[must_use]
 pub fn format_error_rate(rate: f64) -> String {
     match rate {
@@ -447,6 +465,16 @@ mod tests {
         let bar = create_sparkline(50, 0);
         // Should be all empty when max is 0
         assert_eq!(bar, "░".repeat(SPARKLINE_WIDTH));
+    }
+
+    #[test]
+    fn create_sparkline_text_matches_owned_sparkline() {
+        for (value, max_value) in [(0, 100), (50, 100), (100, 100), (50, 0)] {
+            assert_eq!(
+                create_sparkline_text(value, max_value).as_str(),
+                create_sparkline(value, max_value)
+            );
+        }
     }
 
     // ========================================================================

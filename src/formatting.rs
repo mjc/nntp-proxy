@@ -1,5 +1,7 @@
 //! Log formatting utilities
 
+use std::fmt;
+
 #[allow(clippy::cast_precision_loss)] // Human-readable byte formatting is approximate by design.
 const fn bytes_as_f64_for_display(bytes: u64) -> f64 {
     // Human-readable log output is approximate by design; exact byte counts are
@@ -11,6 +13,14 @@ const fn bytes_as_f64_for_display(bytes: u64) -> f64 {
 #[inline]
 #[must_use]
 pub fn format_bytes(bytes: u64) -> String {
+    let mut output = String::new();
+    format_bytes_into(&mut output, bytes).expect("writing to String cannot fail");
+    output
+}
+
+/// Write bytes in human-readable format using IEC units (KiB, MiB, GiB).
+#[inline]
+pub fn format_bytes_into(output: &mut impl fmt::Write, bytes: u64) -> fmt::Result {
     const KIB: u64 = 1024;
     const MIB: u64 = KIB * 1024;
     const GIB: u64 = MIB * 1024;
@@ -23,17 +33,37 @@ pub fn format_bytes(bytes: u64) -> String {
     const PIB_F64: f64 = TIB_F64 * 1024.0;
 
     if bytes >= PIB {
-        format!("{:.2} PiB", bytes_as_f64_for_display(bytes) / PIB_F64)
+        write!(
+            output,
+            "{:.2} PiB",
+            bytes_as_f64_for_display(bytes) / PIB_F64
+        )
     } else if bytes >= TIB {
-        format!("{:.2} TiB", bytes_as_f64_for_display(bytes) / TIB_F64)
+        write!(
+            output,
+            "{:.2} TiB",
+            bytes_as_f64_for_display(bytes) / TIB_F64
+        )
     } else if bytes >= GIB {
-        format!("{:.2} GiB", bytes_as_f64_for_display(bytes) / GIB_F64)
+        write!(
+            output,
+            "{:.2} GiB",
+            bytes_as_f64_for_display(bytes) / GIB_F64
+        )
     } else if bytes >= MIB {
-        format!("{:.2} MiB", bytes_as_f64_for_display(bytes) / MIB_F64)
+        write!(
+            output,
+            "{:.2} MiB",
+            bytes_as_f64_for_display(bytes) / MIB_F64
+        )
     } else if bytes >= KIB {
-        format!("{:.2} KiB", bytes_as_f64_for_display(bytes) / KIB_F64)
+        write!(
+            output,
+            "{:.2} KiB",
+            bytes_as_f64_for_display(bytes) / KIB_F64
+        )
     } else {
-        format!("{bytes} B")
+        write!(output, "{bytes} B")
     }
 }
 
@@ -88,6 +118,27 @@ mod tests {
         assert_eq!(format_bytes(1_048_576), "1.00 MiB");
         assert_eq!(format_bytes(29_312_178), "27.95 MiB");
         assert_eq!(format_bytes(1_073_741_824), "1.00 GiB");
+    }
+
+    #[test]
+    fn format_bytes_into_matches_owned_formatter() {
+        let cases = [
+            0,
+            512,
+            1024,
+            1536,
+            1_048_576,
+            29_312_178,
+            1_073_741_824,
+            1_099_511_627_776,
+            1_125_899_906_842_624,
+        ];
+
+        for bytes in cases {
+            let mut output = String::new();
+            format_bytes_into(&mut output, bytes).unwrap();
+            assert_eq!(output, format_bytes(bytes));
+        }
     }
 
     #[test]
