@@ -84,7 +84,7 @@ impl MetricsSnapshot {
     /// Update backend active connections from pool status
     ///
     /// Populates `active_connections` for each backend by querying the connection pool.
-    /// Active connections = `max_size` - available connections.
+    /// Active connections = created connections - available connections.
     ///
     /// This is a fluent method for functional composition: `snapshot.with_pool_status(router)`
     #[must_use]
@@ -97,9 +97,10 @@ impl MetricsSnapshot {
         for stats in backend_stats {
             if let Some(provider) = router.backend_provider(stats.backend_id) {
                 let pool_status = provider.status();
-                // Active = checked out connections = max - available
+                // Active = checked out connections. Deadpool grows lazily, so
+                // unopened capacity must not be counted as active work.
                 let active = pool_status
-                    .max_size
+                    .created
                     .get()
                     .saturating_sub(pool_status.available.get());
                 stats.active_connections = ActiveConnections::new(active);
@@ -509,6 +510,39 @@ mod tests {
         assert_eq!(healthy, 0);
         assert_eq!(degraded, 0);
         assert_eq!(down, 0);
+    }
+
+    #[test]
+    fn with_pool_status_does_not_count_unopened_capacity_as_active() {
+        use crate::pool::DeadpoolConnectionProvider;
+        use crate::router::BackendSelector;
+        use crate::types::{BackendId, ServerName};
+
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", 9)
+            .name("unused")
+            .max_connections(50)
+            .build()
+            .expect("provider should build without connecting");
+
+        let mut router = BackendSelector::new();
+        router.add_backend(
+            BackendId::from_index(0),
+            ServerName::try_new("unused".to_string()).unwrap(),
+            provider,
+            1,
+        );
+
+        let snapshot = MetricsSnapshot {
+            backend_stats: vec![BackendStats {
+                backend_id: BackendId::from_index(0),
+                ..Default::default()
+            }]
+            .into(),
+            ..Default::default()
+        }
+        .with_pool_status(&router);
+
+        assert_eq!(snapshot.backend_stats[0].active_connections.get(), 0);
     }
 
     #[test]

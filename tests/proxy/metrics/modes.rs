@@ -50,10 +50,10 @@ fn test_metrics_with_pool_status_standard_mode() {
         nntp_proxy::metrics::CommandCount::new(0)
     ); // Not counted in standard mode
 
-    // Pool utilization should work
+    // Pool utilization should show checked-out connections, not unopened capacity.
     let pool_status = provider.status();
     let expected_active = pool_status
-        .max_size
+        .created
         .get()
         .saturating_sub(pool_status.available.get());
     assert_eq!(
@@ -133,16 +133,16 @@ fn test_metrics_with_pool_status_per_command_mode() {
     assert_eq!(snapshot.backend_stats[0].bytes_sent, BytesSent::new(100));
     assert_eq!(snapshot.backend_stats[1].bytes_sent, BytesSent::new(50));
 
-    // Pool utilization should work for both backends
+    // Pool utilization should show checked-out connections, not unopened capacity.
     let status1 = provider1.status();
     let status2 = provider2.status();
 
     let expected_active1 = status1
-        .max_size
+        .created
         .get()
         .saturating_sub(status1.available.get());
     let expected_active2 = status2
-        .max_size
+        .created
         .get()
         .saturating_sub(status2.available.get());
 
@@ -210,10 +210,10 @@ fn test_metrics_with_pool_status_hybrid_mode() {
         BytesReceived::new(5400)
     );
 
-    // Pool utilization should work
+    // Pool utilization should show checked-out connections, not unopened capacity.
     let pool_status = provider.status();
     let expected_active = pool_status
-        .max_size
+        .created
         .get()
         .saturating_sub(pool_status.available.get());
     assert_eq!(
@@ -277,10 +277,10 @@ fn test_all_modes_show_meaningful_metrics() {
             "{mode_name} should track bytes received"
         );
 
-        // 2. Pool utilization (active connections)
+        // 2. Pool utilization (checked-out connections)
         let pool_status = provider.status();
         let expected_active = pool_status
-            .max_size
+            .created
             .get()
             .saturating_sub(pool_status.available.get());
         assert_eq!(
