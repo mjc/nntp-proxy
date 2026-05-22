@@ -132,10 +132,10 @@ type OrderedLargeTransferAttemptData = (
     crate::pool::PooledBuffer,
 );
 
-// Keep the prepared attempt inline to avoid allocating in the successful retry path.
-#[allow(clippy::large_enum_variant)]
-enum OrderedLargeTransferAttempt {
-    Prepared(OrderedLargeTransferAttemptData),
+type OrderedLargeTransferAttempt =
+    Result<Option<OrderedLargeTransferAttemptData>, OrderedLargeTransferNoAttempt>;
+
+enum OrderedLargeTransferNoAttempt {
     BackendUnavailable,
     NoRetryableBackend,
 }
@@ -492,10 +492,10 @@ impl ClientSession {
                 }
             };
 
-            let (backend_id, guard, mut conn, status_code, buffer) = match attempt {
-                OrderedLargeTransferAttempt::Prepared(attempt) => attempt,
-                OrderedLargeTransferAttempt::BackendUnavailable => continue,
-                OrderedLargeTransferAttempt::NoRetryableBackend => {
+            let Some((backend_id, guard, mut conn, status_code, buffer)) = (match attempt {
+                Ok(attempt) => attempt,
+                Err(OrderedLargeTransferNoAttempt::BackendUnavailable) => continue,
+                Err(OrderedLargeTransferNoAttempt::NoRetryableBackend) => {
                     let msg_id = request.message_id_value();
                     self.sync_availability_if_needed(msg_id.as_ref(), &availability)
                         .await;
@@ -532,6 +532,8 @@ impl ClientSession {
                         }
                     }
                 }
+            }) else {
+                continue;
             };
 
             if let Some(missing) =
@@ -672,7 +674,7 @@ impl ClientSession {
                     msg_id = ?request.message_id_value(),
                     "No eligible backend available for ordered pipeline attempt"
                 );
-                return Ok(OrderedLargeTransferAttempt::NoRetryableBackend);
+                return Ok(Err(OrderedLargeTransferNoAttempt::NoRetryableBackend));
             }
         };
         let guard = crate::router::CommandGuard::new(router.clone(), backend_id);
@@ -683,7 +685,7 @@ impl ClientSession {
             RetryAttemptKind::OrderedPipeline,
         ) else {
             *unavailable_backends |= backend_id.availability_bit();
-            return Ok(OrderedLargeTransferAttempt::BackendUnavailable);
+            return Ok(Err(OrderedLargeTransferNoAttempt::BackendUnavailable));
         };
         let mut state = ArticleAttemptState {
             availability,
@@ -707,20 +709,14 @@ impl ClientSession {
                     error = %err,
                     "Ordered pipeline backend attempt failed; trying next eligible backend"
                 );
-                return Ok(OrderedLargeTransferAttempt::BackendUnavailable);
+                return Ok(Err(OrderedLargeTransferNoAttempt::BackendUnavailable));
             }
             Err(err) => return Err(err),
         }) else {
-            return Ok(OrderedLargeTransferAttempt::BackendUnavailable);
+            return Ok(Ok(None));
         };
 
-        Ok(OrderedLargeTransferAttempt::Prepared((
-            backend_id,
-            guard,
-            conn,
-            status_code,
-            buffer,
-        )))
+        Ok(Ok(Some((backend_id, guard, conn, status_code, buffer))))
     }
 
     /// Load article availability from cache or create fresh tracker
