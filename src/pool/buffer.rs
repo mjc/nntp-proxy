@@ -1,13 +1,15 @@
 use crate::types::BufferSize;
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use crossbeam::queue::ArrayQueue;
 use smallvec::SmallVec;
+use std::future::poll_fn;
 use std::ops::{Deref, Range};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tracing::{debug, info};
 
 /// A pooled buffer that automatically returns to the pool when dropped
@@ -105,9 +107,7 @@ impl PooledBuffer {
         R: AsyncRead + Unpin,
     {
         self.buffer.clear();
-        let limit = self.read_limit();
-        let n = reader.take(limit as u64).read_buf(&mut self.buffer).await?;
-        Ok(n)
+        self.read_into_spare(reader, self.read_limit()).await
     }
 
     /// Read more data at the current initialized offset, accumulating bytes.
@@ -124,8 +124,27 @@ impl PooledBuffer {
         R: AsyncRead + Unpin,
     {
         let limit = self.read_limit().saturating_sub(self.buffer.len());
-        let n = reader.take(limit as u64).read_buf(&mut self.buffer).await?;
-        Ok(n)
+        self.read_into_spare(reader, limit).await
+    }
+
+    async fn read_into_spare<R>(&mut self, reader: &mut R, limit: usize) -> std::io::Result<usize>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let spare = self.buffer.spare_capacity_mut();
+        let read_len = limit.min(spare.len());
+        if read_len == 0 {
+            return Ok(0);
+        }
+
+        let mut read_buf = ReadBuf::uninit(&mut spare[..read_len]);
+        poll_fn(|cx| Pin::new(&mut *reader).poll_read(cx, &mut read_buf)).await?;
+        let read = read_buf.filled().len();
+        // SAFETY: `poll_read` initialized exactly `read` bytes in the spare slice.
+        unsafe {
+            self.buffer.advance_mut(read);
+        }
+        Ok(read)
     }
 
     /// Copy data into buffer and mark as initialized
