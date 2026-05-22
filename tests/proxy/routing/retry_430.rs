@@ -6,9 +6,10 @@
 
 use anyhow::Result;
 use nntp_proxy::RoutingMode;
+use tokio::io::AsyncWriteExt;
 
 use crate::test_helpers::{
-    MockNntpServer, connect_and_read_greeting, create_test_config,
+    MockNntpServer, connect_and_read_greeting, create_test_config, read_line_from_stream,
     send_article_read_multiline_response, send_command_read_line, setup_proxy_with_backends,
     spawn_proxy_with_config, spawn_single_backend_proxy,
 };
@@ -274,6 +275,67 @@ async fn test_retry_tier_transient_exhaustion_returns_reply_and_keeps_session_op
     assert!(
         date.starts_with("111"),
         "session should remain usable after transient tier exhaustion, got: {date}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_ordered_retry_transient_exhaustion_returns_in_order_replies() -> Result<()> {
+    let (bad0_port, _bad0) = MockNntpServer::new()
+        .with_name("OrderedBadTier0A")
+        .on_command("DATE", "111 20251203120000\r\n")
+        .on_command("ARTICLE", "not a status line\r\n")
+        .spawn_on_random_port()
+        .await?;
+    let (bad1_port, _bad1) = MockNntpServer::new()
+        .with_name("OrderedBadTier0B")
+        .on_command("DATE", "111 20251203120000\r\n")
+        .on_command("ARTICLE", "also not a status line\r\n")
+        .spawn_on_random_port()
+        .await?;
+    let (tier1_port, _tier1) = MockNntpServer::new()
+        .with_name("OrderedTier1ShouldNotBeUsed")
+        .on_command("DATE", "111 20251203120000\r\n")
+        .on_command(
+            "ARTICLE",
+            "220 0 <test@example.com>\r\nSubject: Backup\r\n\r\nBody\r\n.\r\n",
+        )
+        .spawn_on_random_port()
+        .await?;
+
+    let mut config = create_test_config(vec![
+        (bad0_port, "OrderedBadTier0A"),
+        (bad1_port, "OrderedBadTier0B"),
+        (tier1_port, "OrderedTier1ShouldNotBeUsed"),
+    ]);
+    config.servers[2].tier = 1;
+    let proxy_port = spawn_proxy_with_config(config, RoutingMode::PerCommand).await?;
+
+    let mut client = connect_and_read_greeting(proxy_port).await?;
+    client
+        .write_all(
+            b"ARTICLE <ordered-transient-a@example.com>\r\nARTICLE <ordered-transient-b@example.com>\r\n",
+        )
+        .await?;
+    client.flush().await?;
+
+    let first = read_line_from_stream(&mut client, "first ordered transient ARTICLE").await?;
+    let second = read_line_from_stream(&mut client, "second ordered transient ARTICLE").await?;
+
+    assert!(
+        first.starts_with("503"),
+        "first ordered transient exhaustion should return 503, got: {first}"
+    );
+    assert!(
+        second.starts_with("503"),
+        "second ordered transient exhaustion should return 503, got: {second}"
+    );
+
+    let date = send_command_read_line(&mut client, "DATE").await?;
+    assert!(
+        date.starts_with("111"),
+        "session should remain usable after ordered transient exhaustion, got: {date}"
     );
 
     Ok(())

@@ -124,6 +124,22 @@ pub(super) struct OrderedLargeTransferResult {
     pub(super) backend_to_client_bytes: BackendToClientBytes,
 }
 
+type OrderedLargeTransferAttemptData = (
+    crate::types::BackendId,
+    crate::router::CommandGuard,
+    crate::pool::ConnectionGuard,
+    crate::protocol::StatusCode,
+    crate::pool::PooledBuffer,
+);
+
+// Keep the prepared attempt inline to avoid allocating in the successful retry path.
+#[allow(clippy::large_enum_variant)]
+enum OrderedLargeTransferAttempt {
+    Prepared(OrderedLargeTransferAttemptData),
+    BackendUnavailable,
+    NoRetryableBackend,
+}
+
 impl ClientSession {
     /// Route a single request to a backend and execute it
     ///
@@ -238,32 +254,31 @@ impl ClientSession {
         };
 
         let deps = self.precheck_deps(router);
+        let Some(response) = precheck::precheck(&deps, request, &msg_id).await else {
+            return Ok(false);
+        };
+
         let mut client_write = io.client_writer.lock().await;
-        let bytes_written =
-            if let Some(response) = precheck::precheck(&deps, request, &msg_id).await {
-                match response {
-                    precheck::PrecheckResponse::Cached(entry) => {
-                        if let Some(write) = write_cached_article_response(
-                            &mut *client_write,
-                            &entry,
-                            request.kind(),
-                            msg_id.as_str(),
-                        )
-                        .await
-                        .map_err(|e| SessionError::from(anyhow::Error::from(e)))?
-                        {
-                            write.wire_len.get()
-                        } else {
-                            return Ok(false);
-                        }
-                    }
-                    precheck::PrecheckResponse::Direct(response) => {
-                        Self::write_precheck_direct_response(&mut *client_write, response).await?
-                    }
+        let bytes_written = match response {
+            precheck::PrecheckResponse::Cached(entry) => {
+                if let Some(write) = write_cached_article_response(
+                    &mut *client_write,
+                    &entry,
+                    request.kind(),
+                    msg_id.as_str(),
+                )
+                .await
+                .map_err(|e| SessionError::from(anyhow::Error::from(e)))?
+                {
+                    write.wire_len.get()
+                } else {
+                    return Ok(false);
                 }
-            } else {
-                return Ok(false);
-            };
+            }
+            precheck::PrecheckResponse::Direct(response) => {
+                Self::write_precheck_direct_response(&mut *client_write, response).await?
+            }
+        };
         *io.backend_to_client_bytes = io.backend_to_client_bytes.add(bytes_written);
         Ok(true)
     }
@@ -309,6 +324,10 @@ impl ClientSession {
     {
         client_write
             .write_all(crate::protocol::BACKEND_ERROR)
+            .await
+            .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+        client_write
+            .flush()
             .await
             .map(|()| crate::protocol::BACKEND_ERROR.len())
             .map_err(|e| SessionError::from(anyhow::Error::from(e)))
@@ -473,8 +492,46 @@ impl ClientSession {
                 }
             };
 
-            let Some((backend_id, guard, mut conn, status_code, buffer)) = attempt else {
-                continue;
+            let (backend_id, guard, mut conn, status_code, buffer) = match attempt {
+                OrderedLargeTransferAttempt::Prepared(attempt) => attempt,
+                OrderedLargeTransferAttempt::BackendUnavailable => continue,
+                OrderedLargeTransferAttempt::NoRetryableBackend => {
+                    let msg_id = request.message_id_value();
+                    self.sync_availability_if_needed(msg_id.as_ref(), &availability)
+                        .await;
+                    Self::release_cached_backend_connection(&mut backend_connection);
+
+                    let turn = order.wait_turn(order_index).await;
+                    if order.is_failed() {
+                        turn.advance();
+                        return Err(SessionError::Backend(anyhow::anyhow!(
+                            "ordered pipeline request aborted after earlier slot error"
+                        )));
+                    }
+                    let bytes_written = {
+                        let mut client_write = client_writer.lock().await;
+                        Self::write_backend_error_response(&mut *client_write).await
+                    };
+                    match bytes_written {
+                        Ok(bytes_written) => {
+                            backend_to_client_bytes = backend_to_client_bytes.add(bytes_written);
+                            turn.advance();
+                            return Ok(OrderedLargeTransferResult {
+                                additional_client_to_backend_bytes: client_to_backend_bytes
+                                    .saturating_sub(
+                                        ClientToBackendBytes::zero()
+                                            .add(request.request_wire_len().get()),
+                                    ),
+                                backend_to_client_bytes,
+                            });
+                        }
+                        Err(err) => {
+                            turn.fail_and_advance();
+                            order.fail();
+                            return Err(err);
+                        }
+                    }
+                }
             };
 
             if let Some(missing) =
@@ -600,16 +657,7 @@ impl ClientSession {
         client_to_backend_bytes: &mut ClientToBackendBytes,
         backend_connection: &mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
         unavailable_backends: &mut u8,
-    ) -> Result<
-        Option<(
-            crate::types::BackendId,
-            crate::router::CommandGuard,
-            crate::pool::ConnectionGuard,
-            crate::protocol::StatusCode,
-            crate::pool::PooledBuffer,
-        )>,
-        SessionError,
-    > {
+    ) -> Result<OrderedLargeTransferAttempt, SessionError> {
         let backend_id = match router.route_with_availability_suppressing(
             self.client_id,
             Some(availability),
@@ -624,7 +672,7 @@ impl ClientSession {
                     msg_id = ?request.message_id_value(),
                     "No eligible backend available for ordered pipeline attempt"
                 );
-                return Err(SessionError::Backend(anyhow::anyhow!(err)));
+                return Ok(OrderedLargeTransferAttempt::NoRetryableBackend);
             }
         };
         let guard = crate::router::CommandGuard::new(router.clone(), backend_id);
@@ -635,10 +683,7 @@ impl ClientSession {
             RetryAttemptKind::OrderedPipeline,
         ) else {
             *unavailable_backends |= backend_id.availability_bit();
-            return Err(SessionError::Backend(anyhow::anyhow!(
-                "selected backend had no provider: {:?}",
-                backend_id
-            )));
+            return Ok(OrderedLargeTransferAttempt::BackendUnavailable);
         };
         let mut state = ArticleAttemptState {
             availability,
@@ -662,14 +707,20 @@ impl ClientSession {
                     error = %err,
                     "Ordered pipeline backend attempt failed; trying next eligible backend"
                 );
-                return Ok(None);
+                return Ok(OrderedLargeTransferAttempt::BackendUnavailable);
             }
             Err(err) => return Err(err),
         }) else {
-            return Ok(None);
+            return Ok(OrderedLargeTransferAttempt::BackendUnavailable);
         };
 
-        Ok(Some((backend_id, guard, conn, status_code, buffer)))
+        Ok(OrderedLargeTransferAttempt::Prepared((
+            backend_id,
+            guard,
+            conn,
+            status_code,
+            buffer,
+        )))
     }
 
     /// Load article availability from cache or create fresh tracker
