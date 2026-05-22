@@ -268,6 +268,25 @@ impl ClientSession {
             .map_err(|e| SessionError::from(anyhow::Error::from(e)))
     }
 
+    async fn write_backend_error_response<W>(client_write: &mut W) -> Result<usize, SessionError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        client_write
+            .write_all(crate::protocol::BACKEND_ERROR)
+            .await
+            .map(|()| crate::protocol::BACKEND_ERROR.len())
+            .map_err(|e| SessionError::from(anyhow::Error::from(e)))
+    }
+
+    fn release_cached_backend_connection(
+        backend_connection: &mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
+    ) {
+        if let Some((_backend_id, conn)) = backend_connection.take() {
+            let _ = conn.release();
+        }
+    }
+
     async fn execute_article_retry_loop(
         &self,
         router: &Arc<BackendSelector>,
@@ -328,9 +347,12 @@ impl ClientSession {
                     let msg_id = request.message_id_value();
                     self.sync_availability_if_needed(msg_id.as_ref(), &availability)
                         .await;
-                    return Err(SessionError::Backend(anyhow::anyhow!(
-                        "no retryable backend available for article request without exhausting the current tier"
-                    )));
+                    let bytes_written = {
+                        let mut client_write = io.client_writer.lock().await;
+                        Self::write_backend_error_response(&mut *client_write).await?
+                    };
+                    *io.backend_to_client_bytes = io.backend_to_client_bytes.add(bytes_written);
+                    return Ok(());
                 }
                 Err(e @ SessionError::ClientDisconnect(_)) => {
                     debug!(
@@ -409,6 +431,7 @@ impl ClientSession {
             {
                 Ok(attempt) => attempt,
                 Err(err) => {
+                    Self::release_cached_backend_connection(&mut backend_connection);
                     let turn = order.wait_turn(order_index).await;
                     turn.fail_and_advance();
                     return Err(err);
@@ -493,9 +516,7 @@ impl ClientSession {
             guard.complete();
             self.sync_availability_if_needed(msg_id.as_ref(), &availability)
                 .await;
-            if let Some((_backend_id, conn)) = backend_connection.take() {
-                let _ = conn.release();
-            }
+            Self::release_cached_backend_connection(&mut backend_connection);
             backend_to_client_bytes = backend_to_client_bytes.add(response.wire_len().get());
             return Ok(OrderedLargeTransferResult {
                 additional_client_to_backend_bytes: client_to_backend_bytes.saturating_sub(
@@ -527,9 +548,7 @@ impl ClientSession {
             turn.advance();
         }
 
-        if let Some((_backend_id, conn)) = backend_connection.take() {
-            let _ = conn.release();
-        }
+        Self::release_cached_backend_connection(&mut backend_connection);
 
         Ok(OrderedLargeTransferResult {
             additional_client_to_backend_bytes: client_to_backend_bytes

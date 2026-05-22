@@ -8,8 +8,9 @@ use anyhow::Result;
 use nntp_proxy::RoutingMode;
 
 use crate::test_helpers::{
-    MockNntpServer, connect_and_read_greeting, send_article_read_multiline_response,
-    setup_proxy_with_backends, spawn_single_backend_proxy,
+    MockNntpServer, connect_and_read_greeting, create_test_config,
+    send_article_read_multiline_response, send_command_read_line, setup_proxy_with_backends,
+    spawn_proxy_with_config, spawn_single_backend_proxy,
 };
 
 #[tokio::test]
@@ -224,6 +225,56 @@ async fn test_430_retry_retires_connection_with_queued_backend_bytes() -> Result
         "stale queued backend bytes must not satisfy the next ARTICLE, got {second_status:?}"
     );
     assert!(second_body.is_empty(), "430 response should have no body");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_retry_tier_transient_exhaustion_returns_reply_and_keeps_session_open() -> Result<()> {
+    let (bad0_port, _bad0) = MockNntpServer::new()
+        .with_name("BadTier0A")
+        .on_command("DATE", "111 20251203120000\r\n")
+        .on_command("ARTICLE", "not a status line\r\n")
+        .spawn_on_random_port()
+        .await?;
+    let (bad1_port, _bad1) = MockNntpServer::new()
+        .with_name("BadTier0B")
+        .on_command("DATE", "111 20251203120000\r\n")
+        .on_command("ARTICLE", "also not a status line\r\n")
+        .spawn_on_random_port()
+        .await?;
+    let (tier1_port, _tier1) = MockNntpServer::new()
+        .with_name("Tier1ShouldNotBeUsed")
+        .on_command("DATE", "111 20251203120000\r\n")
+        .on_command(
+            "ARTICLE",
+            "220 0 <test@example.com>\r\nSubject: Backup\r\n\r\nBody\r\n.\r\n",
+        )
+        .spawn_on_random_port()
+        .await?;
+
+    let mut config = create_test_config(vec![
+        (bad0_port, "BadTier0A"),
+        (bad1_port, "BadTier0B"),
+        (tier1_port, "Tier1ShouldNotBeUsed"),
+    ]);
+    config.servers[2].tier = 1;
+    let proxy_port = spawn_proxy_with_config(config, RoutingMode::PerCommand).await?;
+
+    let mut client = connect_and_read_greeting(proxy_port).await?;
+    let (status, body) =
+        send_article_read_multiline_response(&mut client, "<transient@example.com>").await?;
+    assert!(
+        status.starts_with("503"),
+        "transient tier exhaustion should return a command reply, got: {status}"
+    );
+    assert!(body.is_empty(), "503 response should not have a body");
+
+    let date = send_command_read_line(&mut client, "DATE").await?;
+    assert!(
+        date.starts_with("111"),
+        "session should remain usable after transient tier exhaustion, got: {date}"
+    );
 
     Ok(())
 }
