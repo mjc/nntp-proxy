@@ -83,11 +83,21 @@ async fn run_proxy(
         let _ = runtime::load_availability_from_disk(proxy.cache(), path);
     }
 
-    let listener = runtime::bind_listener(&launch.host, launch.port, launch.routing_mode).await?;
+    let listener =
+        match runtime::bind_listener(&launch.host, launch.port, launch.routing_mode).await {
+            Ok(listener) => listener,
+            Err(err) => {
+                shutdown_startup_tui(tui_handle, tui_shutdown_tx).await;
+                return Err(err);
+            }
+        };
 
     // Prewarm connections BEFORE accepting clients (must complete first to avoid exceeding limits)
     info!("Prewarming connection pools...");
-    proxy.prewarm_connections().await?;
+    if let Err(err) = proxy.prewarm_connections().await {
+        shutdown_startup_tui(tui_handle, tui_shutdown_tx).await;
+        return Err(err);
+    }
     info!("Connection pools ready, accepting clients");
 
     runtime::spawn_stats_flusher(proxy.connection_stats());
@@ -104,7 +114,13 @@ async fn run_proxy(
     runtime::spawn_tokio_runtime_metrics_logger();
 
     let (dashboard_handle, dashboard_shutdown_tx) =
-        launch_dashboard_publisher(args.common.tui_listen, &proxy, log_buffer).await?;
+        match launch_dashboard_publisher(args.common.tui_listen, &proxy, log_buffer).await {
+            Ok(handles) => handles,
+            Err(err) => {
+                shutdown_startup_tui(tui_handle, tui_shutdown_tx).await;
+                return Err(err);
+            }
+        };
     let error_tui_shutdown_tx = tui_shutdown_tx.clone();
     let error_dashboard_shutdown_tx = dashboard_shutdown_tx.clone();
     spawn_signal_forwarder(shutdown_tx, tui_shutdown_tx, dashboard_shutdown_tx);
@@ -139,6 +155,23 @@ async fn run_proxy(
     }
 
     accept_result
+}
+
+async fn shutdown_startup_tui(
+    tui_handle: Option<TuiHandle>,
+    tui_shutdown_tx: Option<mpsc::Sender<()>>,
+) {
+    if let Some(tx) = tui_shutdown_tx {
+        let _ = tx.send(()).await;
+    }
+    if let Some(handle) = tui_handle
+        && let Err(err) = handle.await
+    {
+        warn!(
+            "TUI task failed while shutting down after startup error: {}",
+            err
+        );
+    }
 }
 
 async fn build_proxy(
