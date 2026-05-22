@@ -34,6 +34,13 @@ impl PrecheckHit {
     }
 }
 
+// Keep the direct response inline to avoid allocating on adaptive precheck hits.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum PrecheckResponse {
+    Cached(CachedArticle),
+    Direct(crate::cache::CacheIngestResponse),
+}
+
 /// Result of querying a backend for an article.
 #[derive(Debug)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
@@ -195,13 +202,9 @@ async fn execute_backend_query(
                 conn.retire_with_cooldown();
                 return Err(());
             };
-            let single_line_payload = if deps.cache_articles {
-                response
-                    .single_line_bytes(&buffer)
-                    .map(crate::cache::CacheIngestResponse::from)
-            } else {
-                None
-            };
+            let single_line_payload = response
+                .single_line_bytes(&buffer)
+                .map(crate::cache::CacheIngestResponse::from);
 
             let response = build_precheck_hit(
                 deps,
@@ -465,16 +468,16 @@ fn summarize(results: Vec<QueryResult>) -> (Option<(BackendId, PrecheckHit)>, Ar
 /// complete in background to update availability.
 ///
 /// Skips backend queries entirely if we already have a complete article cached.
-pub async fn precheck(
+pub(crate) async fn precheck(
     deps: &PrecheckDeps<'_>,
     request: &RequestContext,
     msg_id: &MessageId<'_>,
-) -> Option<CachedArticle> {
+) -> Option<PrecheckResponse> {
     // Check cache first - if we have a complete article, return it immediately
     if let Some(cached) = deps.cache.get(msg_id).await
         && cached.is_complete_article()
     {
-        return Some(cached);
+        return Some(PrecheckResponse::Cached(cached));
     }
 
     let owned = deps.clone_deps();
@@ -488,13 +491,38 @@ pub async fn precheck(
             // incorrectly caching an article as "higher tier" (longer TTL) even if a lower-tier
             // backend also has it but responded slower. Using tier 0 conservatively ensures
             // we don't overestimate TTL. Regular routing will discover higher-tier availability.
-            let tier = crate::cache::ttl::CacheTier::new(0);
-            // Move data into upsert, then retrieve the entry via cache.get().
-            // The lookup is sub-microsecond vs 750KB memcpy from cloning.
-            if data.will_update_cache(&owned.cache) {
-                cache_precheck_hit(&owned.cache, msg_id.to_owned(), backend_id, data, tier).await;
+            match data {
+                PrecheckHit::Payload(response) => {
+                    if owned.cache.stores_payload_responses() {
+                        let tier = crate::cache::ttl::CacheTier::new(0);
+                        cache_precheck_hit(
+                            &owned.cache,
+                            msg_id.to_owned(),
+                            backend_id,
+                            PrecheckHit::Payload(response),
+                            tier,
+                        )
+                        .await;
+                        owned.cache.get(msg_id).await.map(PrecheckResponse::Cached)
+                    } else {
+                        Some(PrecheckResponse::Direct(response))
+                    }
+                }
+                PrecheckHit::Availability(status_code) => {
+                    if owned.cache.records_backend_has_status() {
+                        let tier = crate::cache::ttl::CacheTier::new(0);
+                        cache_precheck_hit(
+                            &owned.cache,
+                            msg_id.to_owned(),
+                            backend_id,
+                            PrecheckHit::Availability(status_code),
+                            tier,
+                        )
+                        .await;
+                    }
+                    None
+                }
             }
-            owned.cache.get(msg_id).await
         }
         RacingQueryOutcome::Missing(availability) => {
             if availability.missing_bits() != 0 {

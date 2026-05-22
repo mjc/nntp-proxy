@@ -230,41 +230,76 @@ impl ClientSession {
         if !self.adaptive_precheck || !(request.is_stat() || request.is_head()) {
             return Ok(false);
         }
+        if request.is_head() && !self.cache_articles {
+            return Ok(false);
+        }
         let Some(msg_id) = request.message_id_value() else {
             return Ok(false);
         };
 
         let deps = self.precheck_deps(router);
         let mut client_write = io.client_writer.lock().await;
-        let bytes_written = if let Some(entry) = precheck::precheck(&deps, request, &msg_id).await {
-            if let Some(write) = write_cached_article_response(
-                &mut *client_write,
-                &entry,
-                request.kind(),
-                msg_id.as_str(),
-            )
-            .await
-            .map_err(|e| SessionError::from(anyhow::Error::from(e)))?
-            {
-                write.wire_len.get()
+        let bytes_written =
+            if let Some(response) = precheck::precheck(&deps, request, &msg_id).await {
+                match response {
+                    precheck::PrecheckResponse::Cached(entry) => {
+                        if let Some(write) = write_cached_article_response(
+                            &mut *client_write,
+                            &entry,
+                            request.kind(),
+                            msg_id.as_str(),
+                        )
+                        .await
+                        .map_err(|e| SessionError::from(anyhow::Error::from(e)))?
+                        {
+                            write.wire_len.get()
+                        } else {
+                            return Ok(false);
+                        }
+                    }
+                    precheck::PrecheckResponse::Direct(response) => {
+                        Self::write_precheck_direct_response(&mut *client_write, response).await?
+                    }
+                }
             } else {
-                Self::write_no_such_article_response(&mut *client_write).await?
-            }
-        } else {
-            Self::write_no_such_article_response(&mut *client_write).await?
-        };
+                return Ok(false);
+            };
         *io.backend_to_client_bytes = io.backend_to_client_bytes.add(bytes_written);
         Ok(true)
     }
 
-    async fn write_no_such_article_response<W>(client_write: &mut W) -> Result<usize, SessionError>
+    async fn write_precheck_direct_response<W>(
+        client_write: &mut W,
+        response: crate::cache::CacheIngestResponse,
+    ) -> Result<usize, SessionError>
     where
         W: AsyncWrite + Unpin,
     {
+        let len = response.len();
+        let write_result = match response {
+            crate::cache::CacheIngestResponse::Owned(buffer) => {
+                client_write.write_all(&buffer).await
+            }
+            crate::cache::CacheIngestResponse::Pooled(buffer) => {
+                client_write.write_all(buffer.as_ref()).await
+            }
+            crate::cache::CacheIngestResponse::Chunked(response) => {
+                for chunk in response.iter_chunks() {
+                    if let Err(err) = client_write.write_all(chunk).await {
+                        return Err(SessionError::from(anyhow::Error::from(err)));
+                    }
+                }
+                Ok(())
+            }
+            crate::cache::CacheIngestResponse::Inline(buffer) => {
+                client_write.write_all(buffer.as_slice()).await
+            }
+        };
+        write_result.map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
         client_write
-            .write_all(crate::protocol::NO_SUCH_ARTICLE)
+            .flush()
             .await
-            .map(|()| crate::protocol::NO_SUCH_ARTICLE.len())
+            .map(|()| len)
             .map_err(|e| SessionError::from(anyhow::Error::from(e)))
     }
 

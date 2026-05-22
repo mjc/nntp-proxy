@@ -2692,11 +2692,16 @@ mod tests {
         fn format_username(username: &str) -> String {
             const MAX_LEN: usize = 12;
             const TRUNCATE_AT: usize = 9;
-            if username.len() > MAX_LEN {
+            let char_count = username.chars().count();
+            if char_count > MAX_LEN {
                 let truncated: String = username.chars().take(TRUNCATE_AT).collect();
                 format!("{truncated}...")
             } else {
-                format!("{username:<MAX_LEN$}")
+                let mut text = String::from(username);
+                for _ in char_count..MAX_LEN {
+                    text.push(' ');
+                }
+                text
             }
         }
 
