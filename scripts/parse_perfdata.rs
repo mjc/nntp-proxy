@@ -1,10 +1,34 @@
 use std::collections::HashMap;
 use std::env;
-use std::io::{self, BufRead};
+use std::hash::{BuildHasherDefault, Hasher};
+use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
 
 type SymbolId = usize;
+type FastHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+
+#[derive(Default)]
+struct FxHasher {
+    hash: u64,
+}
+
+impl Hasher for FxHasher {
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = self.hash;
+        for byte in bytes {
+            hash = hash.rotate_left(5) ^ u64::from(*byte);
+            hash = hash.wrapping_mul(0x517c_c1b7_2722_0a95);
+        }
+        self.hash = hash;
+    }
+}
 
 fn main() {
     let config = Config::parse();
@@ -162,7 +186,7 @@ fn parse_perf_data(path: &str, max_stack: Option<usize>) -> Result<Report, Strin
         .take()
         .ok_or_else(|| "failed to capture perf script stdout".to_string())?;
 
-    let report = parse_perf_script(io::BufReader::new(stdout))?;
+    let report = parse_perf_script(BufReader::with_capacity(1024 * 1024, stdout))?;
     let status = child
         .wait()
         .map_err(|err| format!("failed waiting for perf script: {err}"))?;
@@ -205,21 +229,17 @@ fn parse_perf_script<R: BufRead>(mut reader: R) -> Result<Report, String> {
         }
 
         if line[0] != b'\t' && line[0] != b' ' {
-            if let Ok(text) = std::str::from_utf8(&line) {
-                if let Some((comm, tid, time)) = parse_header(text) {
-                    current_comm = Some(report.intern(comm));
-                    current_tid = tid;
-                    current_time = time;
-                    current_stack.clear();
-                }
+            if let Some((comm, tid, time)) = parse_header_bytes(&line) {
+                current_comm = Some(report.intern_bytes(comm));
+                current_tid = tid;
+                current_time = time;
+                current_stack.clear();
             }
             continue;
         }
 
-        if let Ok(text) = std::str::from_utf8(&line) {
-            if let Some(func) = parse_frame(text.trim()) {
-                current_stack.push(report.intern(func));
-            }
+        if let Some(func) = parse_frame_bytes(trim_ascii(&line)) {
+            current_stack.push(report.intern_bytes(func));
         }
     }
 
@@ -247,18 +267,24 @@ struct ThreadKey {
     comm: SymbolId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ThreadLeafKey {
+    thread: ThreadKey,
+    leaf: SymbolId,
+}
+
 #[derive(Default)]
 struct Report {
     total_samples: usize,
     symbols: Vec<String>,
-    symbol_ids: HashMap<String, SymbolId>,
+    symbol_ids: FastHashMap<String, SymbolId>,
     symbol_categories: Vec<Option<&'static str>>,
-    by_thread: HashMap<ThreadKey, usize>,
-    leaf_counts: HashMap<SymbolId, usize>,
-    per_thread_leaf: HashMap<ThreadKey, HashMap<SymbolId, usize>>,
-    edges: HashMap<(SymbolId, SymbolId), usize>,
-    categories: HashMap<&'static str, usize>,
-    tid_to_comm: HashMap<u32, SymbolId>,
+    by_thread: FastHashMap<ThreadKey, usize>,
+    leaf_counts: FastHashMap<SymbolId, usize>,
+    per_thread_leaf: FastHashMap<ThreadLeafKey, usize>,
+    edges: FastHashMap<u64, usize>,
+    categories: FastHashMap<&'static str, usize>,
+    tid_to_comm: FastHashMap<u32, SymbolId>,
     min_time: f64,
     max_time: f64,
     timeline_samples: Vec<TimelineSample>,
@@ -271,6 +297,13 @@ struct TimelineSample {
 }
 
 impl Report {
+    fn intern_bytes(&mut self, name: &[u8]) -> SymbolId {
+        let Ok(name) = std::str::from_utf8(name) else {
+            return self.intern("<invalid utf8>");
+        };
+        self.intern(name)
+    }
+
     fn intern(&mut self, name: &str) -> SymbolId {
         if let Some(id) = self.symbol_ids.get(name) {
             return *id;
@@ -321,15 +354,13 @@ impl Report {
 
         *self
             .per_thread_leaf
-            .entry(key)
-            .or_default()
-            .entry(leaf)
+            .entry(ThreadLeafKey { thread: key, leaf })
             .or_insert(0) += 1;
 
         for w in stack.windows(2) {
             let callee = w[0];
             let caller = w[1];
-            *self.edges.entry((caller, callee)).or_insert(0) += 1;
+            *self.edges.entry(pack_edge(caller, callee)).or_insert(0) += 1;
         }
 
         self.timeline_samples
@@ -337,60 +368,124 @@ impl Report {
     }
 }
 
-fn parse_header(line: &str) -> Option<(&str, u32, f64)> {
-    let first_colon = line.find(':')?;
-    let before_colon = line[..first_colon].trim_end();
+fn pack_edge(caller: SymbolId, callee: SymbolId) -> u64 {
+    ((caller as u64) << 32) | callee as u64
+}
 
-    let ts_space = before_colon.rfind(' ')?;
-    let ts_str = &before_colon[ts_space + 1..];
-    let time: f64 = ts_str.parse().ok()?;
+fn unpack_edge(edge: u64) -> (SymbolId, SymbolId) {
+    ((edge >> 32) as SymbolId, (edge & 0xffff_ffff) as SymbolId)
+}
 
-    let prefix = before_colon[..ts_space].trim_end();
-    let prefix = if prefix.ends_with(']') {
-        let bracket = prefix.rfind('[')?;
-        prefix[..bracket].trim_end()
+fn parse_header_bytes(line: &[u8]) -> Option<(&[u8], u32, f64)> {
+    let first_colon = memchr(line, b':')?;
+    let before_colon = trim_ascii_end(&line[..first_colon]);
+
+    let ts_space = memrchr(before_colon, b' ')?;
+    let time = parse_f64_ascii(&before_colon[ts_space + 1..])?;
+
+    let mut prefix = trim_ascii_end(&before_colon[..ts_space]);
+    if prefix.ends_with(b"]") {
+        let bracket = memrchr(prefix, b'[')?;
+        prefix = trim_ascii_end(&prefix[..bracket]);
+    }
+
+    let last_space = memrchr(prefix, b' ')?;
+    let comm = trim_ascii(&prefix[..last_space]);
+    let tid_bytes = &prefix[last_space + 1..];
+    let tid_bytes = if let Some(slash) = memchr(tid_bytes, b'/') {
+        &tid_bytes[slash + 1..]
     } else {
-        prefix
+        tid_bytes
     };
-
-    let last_space = prefix.rfind(' ')?;
-    let comm = prefix[..last_space].trim();
-    let tid_str = &prefix[last_space + 1..];
-
-    let tid = if let Some(slash) = tid_str.find('/') {
-        tid_str[slash + 1..].parse().ok()?
-    } else {
-        tid_str.parse().ok()?
-    };
+    let tid = parse_u32_ascii(tid_bytes)?;
 
     Some((comm, tid, time))
 }
 
-fn parse_frame(line: &str) -> Option<&str> {
-    let rest = line.split_once(' ')?.1.trim();
+fn parse_frame_bytes(line: &[u8]) -> Option<&[u8]> {
+    let first_space = memchr(line, b' ')?;
+    let mut rest = trim_ascii(&line[first_space + 1..]);
 
-    let func_part = if let Some(paren) = rest.rfind(" (") {
-        &rest[..paren]
+    if let Some(paren) = find_last_space_paren(rest) {
+        rest = &rest[..paren];
+    }
+
+    let func = if let Some(plus) = memrchr(rest, b'+') {
+        let after = &rest[plus + 1..];
+        if after.starts_with(b"0x") || after.iter().all(u8::is_ascii_hexdigit) {
+            &rest[..plus]
+        } else {
+            rest
+        }
     } else {
         rest
     };
 
-    let func = if let Some(plus) = func_part.rfind('+') {
-        let after = &func_part[plus + 1..];
-        if after.starts_with("0x") || after.chars().all(|c| c.is_ascii_hexdigit()) {
-            &func_part[..plus]
-        } else {
-            func_part
-        }
-    } else {
-        func_part
-    };
-
     if func.is_empty() {
-        return None;
+        None
+    } else {
+        Some(func)
     }
+}
 
-    Some(func)
+fn find_last_space_paren(bytes: &[u8]) -> Option<usize> {
+    let mut idx = bytes.len();
+    while idx >= 2 {
+        idx -= 1;
+        if bytes[idx] == b'(' && bytes[idx - 1] == b' ' {
+            return Some(idx - 1);
+        }
+    }
+    None
+}
+
+fn trim_ascii(bytes: &[u8]) -> &[u8] {
+    trim_ascii_end(trim_ascii_start(bytes))
+}
+
+fn trim_ascii_start(mut bytes: &[u8]) -> &[u8] {
+    while let Some((&first, rest)) = bytes.split_first() {
+        if !first.is_ascii_whitespace() {
+            break;
+        }
+        bytes = rest;
+    }
+    bytes
+}
+
+fn trim_ascii_end(mut bytes: &[u8]) -> &[u8] {
+    while let Some((&last, rest)) = bytes.split_last() {
+        if !last.is_ascii_whitespace() {
+            break;
+        }
+        bytes = rest;
+    }
+    bytes
+}
+
+fn memchr(bytes: &[u8], needle: u8) -> Option<usize> {
+    bytes.iter().position(|byte| *byte == needle)
+}
+
+fn memrchr(bytes: &[u8], needle: u8) -> Option<usize> {
+    bytes.iter().rposition(|byte| *byte == needle)
+}
+
+fn parse_u32_ascii(bytes: &[u8]) -> Option<u32> {
+    let mut value = 0u32;
+    let mut saw_digit = false;
+    for byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        saw_digit = true;
+        value = value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
+    }
+    saw_digit.then_some(value)
+}
+
+fn parse_f64_ascii(bytes: &[u8]) -> Option<f64> {
+    std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
 fn print_thread_breakdown(report: &Report) {
@@ -450,10 +545,11 @@ fn print_top_functions_per_thread(report: &Report, n: usize) {
     println!("═══ Top Functions Per Thread ═══");
 
     for (thread, thread_total) in threads.into_iter().take(8) {
-        let Some(leaf_counts) = report.per_thread_leaf.get(thread) else {
-            continue;
-        };
-        let mut funcs: Vec<_> = leaf_counts.iter().collect();
+        let mut funcs: Vec<_> = report
+            .per_thread_leaf
+            .iter()
+            .filter_map(|(key, count)| (key.thread == *thread).then_some((&key.leaf, count)))
+            .collect();
         funcs.sort_by(|a, b| b.1.cmp(a.1));
 
         println!(
@@ -484,14 +580,15 @@ fn print_callee_edges(report: &Report, n: usize) {
     println!("{:>7} {:>10}  {} → {}", "%", "samples", "Caller", "Callee");
     println!("{}", "-".repeat(120));
 
-    for ((caller, callee), count) in edge_list.iter().take(n) {
+    for (edge, count) in edge_list.iter().take(n) {
+        let (caller, callee) = unpack_edge(**edge);
         let pct = **count as f64 / report.total_samples as f64 * 100.0;
         println!(
             "{:>6.2}% {:>10}  {} → {}",
             pct,
             count,
-            truncate(report.symbol(*caller), 50),
-            truncate(report.symbol(*callee), 50)
+            truncate(report.symbol(caller), 50),
+            truncate(report.symbol(callee), 50)
         );
     }
 }
@@ -510,16 +607,16 @@ fn print_timeline(report: &Report, buckets: usize) {
     struct Bucket {
         start: f64,
         total: usize,
-        by_thread: HashMap<u32, usize>,
-        top_funcs: HashMap<SymbolId, usize>,
+        by_thread: FastHashMap<u32, usize>,
+        top_funcs: FastHashMap<SymbolId, usize>,
     }
 
     let mut bucket_vec: Vec<Bucket> = (0..buckets)
         .map(|i| Bucket {
             start: report.min_time + i as f64 * bucket_width,
             total: 0,
-            by_thread: HashMap::new(),
-            top_funcs: HashMap::new(),
+            by_thread: FastHashMap::default(),
+            top_funcs: FastHashMap::default(),
         })
         .collect();
 
@@ -600,8 +697,8 @@ fn print_timeline(report: &Report, buckets: usize) {
         second_half as f64 / report.total_samples as f64 * 100.0,
     );
 
-    let mut first_funcs: HashMap<SymbolId, usize> = HashMap::new();
-    let mut second_funcs: HashMap<SymbolId, usize> = HashMap::new();
+    let mut first_funcs: FastHashMap<SymbolId, usize> = FastHashMap::default();
+    let mut second_funcs: FastHashMap<SymbolId, usize> = FastHashMap::default();
 
     for sample in &report.timeline_samples {
         let idx = ((sample.time - report.min_time) / bucket_width) as usize;
@@ -636,8 +733,8 @@ fn print_timeline(report: &Report, buckets: usize) {
 
 fn print_phase_diff(
     report: &Report,
-    primary: &HashMap<SymbolId, usize>,
-    other: &HashMap<SymbolId, usize>,
+    primary: &FastHashMap<SymbolId, usize>,
+    other: &FastHashMap<SymbolId, usize>,
     primary_total: usize,
     other_total: usize,
     n: usize,
