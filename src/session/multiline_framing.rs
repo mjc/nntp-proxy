@@ -11,6 +11,7 @@ use std::collections::VecDeque;
 use std::ops::Range;
 
 use anyhow::Context;
+use smallvec::SmallVec;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
@@ -361,8 +362,11 @@ enum BackendReplyBytes<'a> {
 #[derive(Debug)]
 enum OrderedResponse {
     Backend,
-    Local(Vec<u8>),
+    Local(&'static [u8]),
 }
+
+pub(crate) type OrderedClientWrites<'a> = SmallVec<[Cow<'a, [u8]>; 4]>;
+pub(crate) type ReadyDeferredReplies = SmallVec<[&'static [u8]; 2]>;
 
 /// Request-aware ordering layer for pipelined backend bytes and local replies.
 ///
@@ -392,8 +396,8 @@ impl BackendResponseOrder {
 
     /// Queue a local reply that must be written only after earlier backend
     /// replies have been framed and forwarded.
-    pub(crate) fn push_deferred_reply(&mut self, reply: impl Into<Vec<u8>>) {
-        self.ordered.push_back(OrderedResponse::Local(reply.into()));
+    pub(crate) fn push_deferred_reply(&mut self, reply: &'static [u8]) {
+        self.ordered.push_back(OrderedResponse::Local(reply));
     }
 
     /// Whether local replies are waiting behind backend replies.
@@ -417,8 +421,8 @@ impl BackendResponseOrder {
     }
 
     /// Remove local replies that are ready before the next backend reply.
-    pub(crate) fn take_ready_deferred_replies(&mut self) -> Vec<Vec<u8>> {
-        let mut replies = Vec::new();
+    pub(crate) fn take_ready_deferred_replies(&mut self) -> ReadyDeferredReplies {
+        let mut replies = SmallVec::new();
         while let Some(OrderedResponse::Local(_)) = self.ordered.front() {
             let Some(OrderedResponse::Local(reply)) = self.ordered.pop_front() else {
                 break;
@@ -436,11 +440,11 @@ impl BackendResponseOrder {
     pub(crate) fn client_writes_for_backend_read<'a>(
         &mut self,
         backend_read: &'a [u8],
-    ) -> Vec<Cow<'a, [u8]>> {
-        let mut writes = Vec::new();
+    ) -> OrderedClientWrites<'a> {
+        let mut writes = SmallVec::new();
 
         for reply in self.take_ready_deferred_replies() {
-            writes.push(Cow::Owned(reply));
+            writes.push(Cow::Borrowed(reply));
         }
 
         for reply in self.inner.accept_backend_bytes(backend_read) {
@@ -451,7 +455,7 @@ impl BackendResponseOrder {
                         self.ordered.pop_front();
                     }
                     for reply in self.take_ready_deferred_replies() {
-                        writes.push(Cow::Owned(reply));
+                        writes.push(Cow::Borrowed(reply));
                     }
                 }
                 BackendReplyBytes::ForwardUntracked(bytes) => {
@@ -2059,7 +2063,7 @@ mod tests {
         let request = crate::protocol::RequestContext::parse(b"DATE\r\n").expect("valid request");
         let mut order = BackendResponseOrder::default();
         order.push_request(request.kind());
-        order.push_deferred_reply(b"205 Goodbye\r\n".to_vec());
+        order.push_deferred_reply(b"205 Goodbye\r\n");
 
         assert!(order.has_pending_backend_replies());
         assert!(order.has_deferred_replies());
@@ -2072,6 +2076,25 @@ mod tests {
         assert_eq!(&writes[1][..], b"205 Goodbye\r\n");
         assert!(!order.has_pending_backend_replies());
         assert!(!order.has_deferred_replies());
+    }
+
+    #[test]
+    fn backend_response_order_keeps_common_writes_inline_and_borrowed() {
+        let request = crate::protocol::RequestContext::parse(b"DATE\r\n").expect("valid request");
+        let mut order = BackendResponseOrder::default();
+        order.push_request(request.kind());
+        order.push_deferred_reply(b"205 Goodbye\r\n");
+
+        let writes = order.client_writes_for_backend_read(b"111 20260520120000\r\n");
+
+        assert!(
+            !writes.spilled(),
+            "normal ordered backend reads should not allocate a heap writes vec"
+        );
+        assert!(matches!(writes[0], std::borrow::Cow::Borrowed(_)));
+        assert!(matches!(writes[1], std::borrow::Cow::Borrowed(_)));
+        assert_eq!(&writes[0][..], b"111 20260520120000\r\n");
+        assert_eq!(&writes[1][..], b"205 Goodbye\r\n");
     }
 
     #[test]

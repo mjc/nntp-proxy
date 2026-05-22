@@ -3,10 +3,9 @@
 //! This module provides the `SessionLoopState` struct which encapsulates
 //! all mutable state needed during a session command loop.
 
-use std::borrow::Cow;
-
 use crate::protocol::RequestKind;
 use crate::session::backend::BackendResponseOrder;
+use crate::session::multiline_framing::{OrderedClientWrites, ReadyDeferredReplies};
 use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -198,13 +197,13 @@ impl SessionLoopState {
     pub(in crate::session) fn client_writes_for_backend_read<'a>(
         &mut self,
         backend_read: &'a [u8],
-    ) -> Vec<Cow<'a, [u8]>> {
+    ) -> OrderedClientWrites<'a> {
         self.backend_replies
             .client_writes_for_backend_read(backend_read)
     }
 
     /// Queue a local reply until earlier backend output has been sent.
-    pub fn push_deferred_reply(&mut self, reply: impl Into<Vec<u8>>) {
+    pub fn push_deferred_reply(&mut self, reply: &'static [u8]) {
         self.backend_replies.push_deferred_reply(reply);
     }
 
@@ -227,7 +226,7 @@ impl SessionLoopState {
 
     /// Drain deferred local replies that are ready at the front of the ordered queue.
     #[must_use]
-    pub fn take_ready_deferred_replies(&mut self) -> Vec<Vec<u8>> {
+    pub fn take_ready_deferred_replies(&mut self) -> ReadyDeferredReplies {
         self.backend_replies.take_ready_deferred_replies()
     }
 }
@@ -236,6 +235,7 @@ impl SessionLoopState {
 mod tests {
     use super::*;
     use crate::session::common::AuthHandlerResult;
+    use std::borrow::Cow;
 
     fn drain_backend_bytes(state: &mut SessionLoopState, bytes: &[u8]) -> Vec<Vec<u8>> {
         state
@@ -316,7 +316,7 @@ mod tests {
         state.mark_backend_request_sent(RequestKind::Date);
         assert!(state.has_pending_backend_replies());
 
-        state.push_deferred_reply(b"205 Goodbye\r\n".to_vec());
+        state.push_deferred_reply(b"205 Goodbye\r\n");
         assert!(state.take_ready_deferred_replies().is_empty());
 
         let rendered = drain_backend_bytes(&mut state, b"111 20260505120000\r\n");
@@ -331,13 +331,27 @@ mod tests {
     }
 
     #[test]
+    fn test_session_loop_state_ready_deferred_replies_stay_inline() {
+        let mut state = SessionLoopState::new(false);
+
+        state.push_deferred_reply(b"205 Goodbye\r\n");
+        let replies = state.take_ready_deferred_replies();
+
+        assert!(
+            !replies.spilled(),
+            "ready deferred replies should not allocate in the common case"
+        );
+        assert_eq!(replies.as_slice(), [b"205 Goodbye\r\n".as_slice()]);
+    }
+
+    #[test]
     fn test_session_loop_state_enters_backend_drain_mode_for_deferred_locals() {
         let mut state = SessionLoopState::new(false);
 
         assert_eq!(state.read_mode(), StatefulReadMode::Bidirectional);
 
         state.mark_backend_request_sent(RequestKind::Help);
-        state.push_deferred_reply(b"101 Capability list:\r\n.\r\n".to_vec());
+        state.push_deferred_reply(b"101 Capability list:\r\n.\r\n");
         assert_eq!(state.read_mode(), StatefulReadMode::DrainBackendReplies);
 
         drain_backend_bytes(&mut state, b"100 Help follows\r\n.\r\n");
@@ -375,10 +389,10 @@ mod tests {
     #[test]
     fn test_deferred_local_reply_flushes_before_later_backend_reply() {
         let mut state = SessionLoopState::new(false);
-        let deferred = b"101 Capability list:\r\n.\r\n".to_vec();
+        let deferred = b"101 Capability list:\r\n.\r\n";
 
         state.mark_backend_request_sent(RequestKind::Date);
-        state.push_deferred_reply(deferred.clone());
+        state.push_deferred_reply(deferred);
         state.mark_backend_request_sent(RequestKind::Date);
 
         let rendered = drain_backend_bytes(&mut state, b"111 20260505120000\r\n");
@@ -387,7 +401,10 @@ mod tests {
             "later backend replies must remain pending after the first one completes"
         );
         assert_eq!(state.read_mode(), StatefulReadMode::Bidirectional);
-        assert_eq!(rendered, vec![b"111 20260505120000\r\n".to_vec(), deferred]);
+        assert_eq!(
+            rendered,
+            vec![b"111 20260505120000\r\n".to_vec(), deferred.to_vec()]
+        );
 
         drain_backend_bytes(&mut state, b"111 20260505120001\r\n");
         assert!(!state.has_pending_backend_replies());
@@ -396,10 +413,10 @@ mod tests {
     #[test]
     fn test_client_writes_for_backend_read_orders_replies_around_deferred_reply() {
         let mut state = SessionLoopState::new(false);
-        let deferred = b"101 Capability list:\r\n.\r\n".to_vec();
+        let deferred = b"101 Capability list:\r\n.\r\n";
 
         state.mark_backend_request_sent(RequestKind::Date);
-        state.push_deferred_reply(deferred.clone());
+        state.push_deferred_reply(deferred);
         state.mark_backend_request_sent(RequestKind::Date);
 
         let rendered: Vec<Vec<u8>> = state
@@ -412,7 +429,7 @@ mod tests {
             rendered,
             vec![
                 b"111 20260505120000\r\n".to_vec(),
-                deferred,
+                deferred.to_vec(),
                 b"111 20260505120001\r\n".to_vec(),
             ]
         );

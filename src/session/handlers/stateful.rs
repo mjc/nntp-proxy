@@ -62,7 +62,7 @@ impl ClientSession {
             AuthenticatedStatefulAction::RejectAuthAlreadyAuthenticated => {
                 use crate::protocol::AUTH_ALREADY_AUTHENTICATED;
                 if state.has_pending_backend_replies() {
-                    state.push_deferred_reply(AUTH_ALREADY_AUTHENTICATED.to_vec());
+                    state.push_deferred_reply(AUTH_ALREADY_AUTHENTICATED);
                 } else {
                     client_write.write_all(AUTH_ALREADY_AUTHENTICATED).await?;
                     client_write.flush().await?;
@@ -73,7 +73,7 @@ impl ClientSession {
                 let capabilities =
                     crate::session::backend::capabilities_without_authinfo_response();
                 if state.has_pending_backend_replies() {
-                    state.push_deferred_reply(capabilities.to_vec());
+                    state.push_deferred_reply(capabilities);
                 } else {
                     client_write.write_all(capabilities).await?;
                     client_write.flush().await?;
@@ -82,7 +82,7 @@ impl ClientSession {
             }
             AuthenticatedStatefulAction::Reject(response) => {
                 if state.has_pending_backend_replies() {
-                    state.push_deferred_reply(response.as_bytes().to_vec());
+                    state.push_deferred_reply(response.as_bytes());
                 } else {
                     client_write.write_all(response.as_bytes()).await?;
                     client_write.flush().await?;
@@ -211,7 +211,7 @@ impl ClientSession {
             let replies = state.take_ready_deferred_replies();
             if !replies.is_empty() {
                 for reply in replies {
-                    client_write.write_all(&reply).await?;
+                    client_write.write_all(reply).await?;
                     state.add_backend_to_client(reply.len() as u64);
                 }
                 client_write.flush().await?;

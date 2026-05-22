@@ -29,8 +29,8 @@ use crate::session::SessionError;
 use crate::session::handlers::article_retry::OrderedPipelineGate;
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
-fn safe_command_log_label(request: &RequestContext) -> String {
-    String::from_utf8_lossy(request.verb()).into_owned()
+fn safe_command_log_label(request: &RequestContext) -> &str {
+    std::str::from_utf8(request.verb()).unwrap_or("<non-utf8-command>")
 }
 
 /// Result of executing a routing decision
