@@ -734,6 +734,9 @@ impl ClientSession {
         while let Some(result) = futures.next().await {
             match result {
                 Ok(result) => {
+                    state.client_to_backend_bytes = state
+                        .client_to_backend_bytes
+                        .add_u64(result.additional_client_to_backend_bytes.as_u64());
                     state.backend_to_client_bytes = state
                         .backend_to_client_bytes
                         .add_u64(result.backend_to_client_bytes.as_u64());

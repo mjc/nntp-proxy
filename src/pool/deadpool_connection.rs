@@ -521,7 +521,9 @@ impl TcpManager {
                             .await
                             .map(|support| matches!(support, CompressionSupport::Supported));
                     }
-                    CompressionSupportState::Probing(notify) => Some(notify.clone()),
+                    CompressionSupportState::Probing(notify) => {
+                        Some(notify.clone().notified_owned())
+                    }
                     CompressionSupportState::Unknown => {
                         let notify = Arc::new(Notify::new());
                         *cached_support = CompressionSupportState::Probing(notify);
@@ -530,8 +532,8 @@ impl TcpManager {
                 }
             };
 
-            if let Some(notify) = probe_waiter {
-                notify.notified().await;
+            if let Some(waiter) = probe_waiter {
+                waiter.await;
                 continue;
             }
 

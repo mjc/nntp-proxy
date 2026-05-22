@@ -295,9 +295,11 @@ pub(crate) async fn observe_response(
     request: &RequestContext,
     buffer: &mut PooledBuffer,
     conn: &mut crate::stream::ConnectionStream,
+    pool: &crate::pool::BufferPool,
     backend_id: crate::types::BackendId,
 ) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
-    crate::session::multiline_framing::observe_response(request, buffer, conn, backend_id).await
+    crate::session::multiline_framing::observe_response(request, buffer, conn, pool, backend_id)
+        .await
 }
 
 /// Capture an isolated multiline response into a single pooled capture buffer.

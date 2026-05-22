@@ -1811,14 +1811,15 @@ fn user_name_text(username: &str) -> ArrayString<64> {
     const TRUNCATE_AT: usize = 9;
 
     let mut text = ArrayString::<64>::new();
-    if username.len() > MAX_LEN {
+    let char_count = username.chars().count();
+    if char_count > MAX_LEN {
         for ch in username.chars().take(TRUNCATE_AT) {
             text.push(ch);
         }
         text.push_str("...");
     } else {
         text.push_str(username);
-        for _ in username.len()..MAX_LEN {
+        for _ in char_count..MAX_LEN {
             text.push(' ');
         }
     }

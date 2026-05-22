@@ -120,6 +120,7 @@ impl Drop for OrderedPipelineTurn<'_> {
 }
 
 pub(super) struct OrderedLargeTransferResult {
+    pub(super) additional_client_to_backend_bytes: ClientToBackendBytes,
     pub(super) backend_to_client_bytes: BackendToClientBytes,
 }
 
@@ -497,6 +498,9 @@ impl ClientSession {
             }
             backend_to_client_bytes = backend_to_client_bytes.add(response.wire_len().get());
             return Ok(OrderedLargeTransferResult {
+                additional_client_to_backend_bytes: client_to_backend_bytes.saturating_sub(
+                    ClientToBackendBytes::zero().add(request.request_wire_len().get()),
+                ),
                 backend_to_client_bytes,
             });
         }
@@ -528,6 +532,8 @@ impl ClientSession {
         }
 
         Ok(OrderedLargeTransferResult {
+            additional_client_to_backend_bytes: client_to_backend_bytes
+                .saturating_sub(ClientToBackendBytes::zero().add(request.request_wire_len().get())),
             backend_to_client_bytes,
         })
     }

@@ -139,12 +139,14 @@ impl CompleteMultilineWireChunk {
 
     fn observe_from_buffer(
         &self,
-        io_buffer: &crate::pool::PooledBuffer,
+        io_buffer: &mut crate::pool::PooledBuffer,
         conn: &mut crate::stream::ConnectionStream,
+        pool: &crate::pool::BufferPool,
         total_len: usize,
     ) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
         if self.next_response_input.start < total_len {
-            conn.queue_pending_bytes_first(&io_buffer[self.next_response_input.clone()])
+            let old = std::mem::replace(io_buffer, pool.acquire());
+            conn.queue_pooled_pending_bytes_first(old, self.next_response_input.clone())
                 .map_err(crate::session::response_transfer::ResponseTransferError::Io)?;
         }
         Ok(())
@@ -319,12 +321,14 @@ impl FramedSingleLineChunk {
 
     fn observe_from_buffer(
         &self,
-        io_buffer: &crate::pool::PooledBuffer,
+        io_buffer: &mut crate::pool::PooledBuffer,
         conn: &mut crate::stream::ConnectionStream,
+        pool: &crate::pool::BufferPool,
     ) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
         let total_len = io_buffer.initialized();
         if self.next_response_input.start < total_len {
-            conn.queue_pending_bytes_first(&io_buffer[self.next_response_input.clone()])
+            let old = std::mem::replace(io_buffer, pool.acquire());
+            conn.queue_pooled_pending_bytes_first(old, self.next_response_input.clone())
                 .map_err(crate::session::response_transfer::ResponseTransferError::Io)?;
         }
         Ok(())
@@ -863,12 +867,14 @@ pub(crate) async fn observe_response(
     request: &crate::protocol::RequestContext,
     io_buffer: &mut crate::pool::PooledBuffer,
     conn: &mut crate::stream::ConnectionStream,
+    pool: &crate::pool::BufferPool,
     backend_id: crate::types::BackendId,
 ) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
     ResponseObserver {
         request,
         io_buffer,
         conn,
+        pool,
         backend_id,
     }
     .observe()
@@ -888,6 +894,7 @@ struct ResponseObserver<'a> {
     request: &'a crate::protocol::RequestContext,
     io_buffer: &'a mut crate::pool::PooledBuffer,
     conn: &'a mut crate::stream::ConnectionStream,
+    pool: &'a crate::pool::BufferPool,
     backend_id: crate::types::BackendId,
 }
 
@@ -1043,6 +1050,7 @@ impl<'a> ResponseObserver<'a> {
             request,
             io_buffer,
             conn,
+            pool,
             backend_id,
         } = self;
         let mut framer = MultilineFramer::default();
@@ -1054,12 +1062,12 @@ impl<'a> ResponseObserver<'a> {
         })?;
 
         if let ResponseFrame::SingleLine { framed, .. } = &frame {
-            return framed.observe_from_buffer(io_buffer, conn);
+            return framed.observe_from_buffer(io_buffer, conn, pool);
         }
 
         match framer.frame_initial_multiline_chunk(&io_buffer[..initial_len]) {
             FramedMultilineChunk::Complete(framed) => {
-                framed.observe_from_buffer(io_buffer, conn, initial_len)
+                framed.observe_from_buffer(io_buffer, conn, pool, initial_len)
             }
             FramedMultilineChunk::Incomplete(incomplete) => {
                 let bytes_received = incomplete.response.len() as u64;

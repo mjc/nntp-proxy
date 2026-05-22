@@ -50,6 +50,37 @@ impl QueryResult {
     }
 }
 
+fn summarize_tier_results(results: &[QueryResult]) -> (bool, ArticleAvailability) {
+    let mut availability = ArticleAvailability::new();
+    let mut all_missing = !results.is_empty();
+
+    for result in results {
+        match result {
+            QueryResult::Missing(id) => {
+                availability.record_missing(*id);
+            }
+            QueryResult::Found(id, _) => {
+                availability.record_has(*id);
+                all_missing = false;
+            }
+            QueryResult::Error => {
+                all_missing = false;
+            }
+        }
+    }
+
+    (all_missing, availability)
+}
+
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
+#[allow(clippy::large_enum_variant)]
+enum RacingQueryOutcome {
+    Hit(BackendId, PrecheckHit),
+    Missing(ArticleAvailability),
+    Inconclusive(ArticleAvailability),
+}
+
 /// Shared dependencies for precheck operations.
 #[derive(Clone, Copy)]
 pub struct PrecheckDeps<'a> {
@@ -314,8 +345,9 @@ async fn query_all_backends_racing(
     deps: &OwnedDeps,
     request: &RequestContext,
     msg_id: &MessageId<'_>,
-) -> Option<(BackendId, PrecheckHit)> {
+) -> RacingQueryOutcome {
     let mut results = Vec::with_capacity(deps.router.backend_count().get());
+    let mut accumulated_availability = ArticleAvailability::new();
 
     for tier in deps.router.tiers() {
         let mut pending = spawn_backend_queries_for_tier(deps, request, tier);
@@ -339,7 +371,7 @@ async fn query_all_backends_racing(
                         availability.record_has(id);
                         cache.sync_availability(msg_id_owned, &availability).await;
                     });
-                    return Some((id, response));
+                    return RacingQueryOutcome::Hit(id, response);
                 }
                 _ => {
                     results.push(result);
@@ -347,22 +379,20 @@ async fn query_all_backends_racing(
             }
         }
 
-        let tier_results = &results[tier_results_start..];
-        let all_missing =
-            !tier_results.is_empty() && tier_results.iter().all(QueryResult::is_missing);
-        let (_, availability) = summarize(std::mem::take(&mut results));
+        let (all_missing, availability) = summarize_tier_results(&results[tier_results_start..]);
+        results.clear();
+        accumulated_availability.merge_from(&availability);
         if availability.missing_bits() != 0 {
             deps.cache
                 .sync_availability(msg_id.to_owned(), &availability)
                 .await;
         }
         if !all_missing {
-            return None;
+            return RacingQueryOutcome::Inconclusive(accumulated_availability);
         }
     }
 
-    // No tier produced a success.
-    None
+    RacingQueryOutcome::Missing(accumulated_availability)
 }
 
 async fn query_tier_backends(
@@ -448,25 +478,34 @@ pub async fn precheck(
     }
 
     let owned = deps.clone_deps();
-    let found = query_all_backends_racing(&owned, request, msg_id).await;
+    let outcome = query_all_backends_racing(&owned, request, msg_id).await;
 
     // Cache the found result and return it
-    if let Some((backend_id, data)) = found {
-        // NOTE: We intentionally use tier 0 for articles found via racing queries.
-        // Racing all backends can cause higher-tier backends to respond slightly faster,
-        // incorrectly caching an article as "higher tier" (longer TTL) even if a lower-tier
-        // backend also has it but responded slower. Using tier 0 conservatively ensures
-        // we don't overestimate TTL. Regular routing will discover higher-tier availability.
-        let tier = crate::cache::ttl::CacheTier::new(0);
-        // Move data into upsert, then retrieve the entry via cache.get().
-        // The lookup is sub-microsecond vs 750KB memcpy from cloning.
-        if data.will_update_cache(&owned.cache) {
-            cache_precheck_hit(&owned.cache, msg_id.to_owned(), backend_id, data, tier).await;
+    match outcome {
+        RacingQueryOutcome::Hit(backend_id, data) => {
+            // NOTE: We intentionally use tier 0 for articles found via racing queries.
+            // Racing all backends can cause higher-tier backends to respond slightly faster,
+            // incorrectly caching an article as "higher tier" (longer TTL) even if a lower-tier
+            // backend also has it but responded slower. Using tier 0 conservatively ensures
+            // we don't overestimate TTL. Regular routing will discover higher-tier availability.
+            let tier = crate::cache::ttl::CacheTier::new(0);
+            // Move data into upsert, then retrieve the entry via cache.get().
+            // The lookup is sub-microsecond vs 750KB memcpy from cloning.
+            if data.will_update_cache(&owned.cache) {
+                cache_precheck_hit(&owned.cache, msg_id.to_owned(), backend_id, data, tier).await;
+            }
+            owned.cache.get(msg_id).await
         }
-        owned.cache.get(msg_id).await
-    } else {
-        // No article found - availability is synced by background task
-        None
+        RacingQueryOutcome::Missing(availability) => {
+            if availability.missing_bits() != 0 {
+                owned
+                    .cache
+                    .sync_availability(msg_id.to_owned(), &availability)
+                    .await;
+            }
+            None
+        }
+        RacingQueryOutcome::Inconclusive(_availability) => None,
     }
 }
 
@@ -569,6 +608,30 @@ mod tests {
         let (found, avail) = summarize(vec![]);
         assert!(found.is_none());
         assert_eq!(avail.checked_bits(), 0);
+    }
+
+    #[test]
+    fn summarize_tier_results_requires_every_backend_to_miss() {
+        let (all_missing, availability) = summarize_tier_results(&[
+            QueryResult::Missing(BackendId::from_index(0)),
+            QueryResult::Missing(BackendId::from_index(1)),
+        ]);
+
+        assert!(all_missing);
+        assert!(availability.is_missing(BackendId::from_index(0)));
+        assert!(availability.is_missing(BackendId::from_index(1)));
+    }
+
+    #[test]
+    fn summarize_tier_results_treats_partial_missing_with_error_as_inconclusive() {
+        let (all_missing, availability) = summarize_tier_results(&[
+            QueryResult::Missing(BackendId::from_index(0)),
+            QueryResult::Error,
+        ]);
+
+        assert!(!all_missing);
+        assert!(availability.is_missing(BackendId::from_index(0)));
+        assert!(!availability.is_missing(BackendId::from_index(1)));
     }
 
     #[test]

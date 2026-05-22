@@ -1145,6 +1145,12 @@ impl BufferPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    fn hot_path_metrics_test_guard() -> MutexGuard<'static, ()> {
+        static GUARD: Mutex<()> = Mutex::new(());
+        GUARD.lock().expect("hot-path metrics test guard poisoned")
+    }
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
@@ -1347,6 +1353,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_try_acquire_reports_exhaustion_without_allocating() {
+        let _guard = hot_path_metrics_test_guard();
         reset_hot_path_allocation_metrics();
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
         let _held = pool.try_acquire().expect("preallocated buffer available");
@@ -1366,6 +1373,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_hold_metrics_record_regular_and_capture_drops() {
+        let _guard = hot_path_metrics_test_guard();
         reset_hot_path_allocation_metrics();
         let pool =
             BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8192, 1);

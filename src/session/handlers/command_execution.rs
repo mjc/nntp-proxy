@@ -392,9 +392,15 @@ impl ClientSession {
         request: &RequestContext,
         mut buffer: crate::pool::PooledBuffer,
     ) -> Result<(), SessionError> {
-        crate::session::backend::observe_response(request, &mut buffer, conn, backend_id)
-            .await
-            .map_err(SessionError::from)
+        crate::session::backend::observe_response(
+            request,
+            &mut buffer,
+            conn,
+            &self.buffer_pool,
+            backend_id,
+        )
+        .await
+        .map_err(SessionError::from)
     }
 
     fn handle_invalid_backend_response(
@@ -649,11 +655,12 @@ impl ClientSession {
                         pool_waiting = checkout_status.waiting,
                         connection_type = guard.connection_type(),
                         pending_bytes = guard.pending_bytes_len(),
-                        "Checking out another backend connection before reusing cached batch connection"
+                        "Checking out another backend connection before returning cached batch connection"
                     );
+                    let released = guard.release();
                     match provider.get_pooled_connection().await {
                         Ok(conn) => {
-                            let _ = guard.release();
+                            drop(released);
                             let checkout_status = provider.status_counts();
                             debug!(
                                 client = %self.client_addr,
@@ -679,11 +686,11 @@ impl ClientSession {
                                 msg_id = ?request.message_id_value(),
                                 pool = %provider.name(),
                                 error = %err,
-                                connection_type = guard.connection_type(),
-                                pending_bytes = guard.pending_bytes_len(),
+                                connection_type = released.connection_type(),
+                                pending_bytes = released.pending_bytes_len(),
                                 "Pool checkout failed; reusing cached batch connection for direct backend attempt"
                             );
-                            guard
+                            crate::pool::ConnectionGuard::new(released, provider.clone())
                         }
                     }
                 } else {
@@ -701,41 +708,24 @@ impl ClientSession {
                         pending_bytes = guard.pending_bytes_len(),
                         "Releasing cached batch connection because backend pool has idle capacity"
                     );
-                    match provider.get_pooled_connection().await {
-                        Ok(conn) => {
-                            let _ = guard.release();
-                            let checkout_status = provider.status_counts();
-                            debug!(
-                                client = %self.client_addr,
-                                backend = backend_id.as_index(),
-                                command_verb = ?request.verb(),
-                                msg_id = ?request.message_id_value(),
-                                pool = %provider.name(),
-                                pool_available = checkout_status.available,
-                                pool_size = checkout_status.size,
-                                pool_max_size = checkout_status.max_size,
-                                pool_waiting = checkout_status.waiting,
-                                connection_type = conn.connection_type(),
-                                pending_bytes = conn.pending_bytes_len(),
-                                "Pool checkout succeeded for direct backend attempt"
-                            );
-                            crate::pool::ConnectionGuard::new(conn, provider.clone())
-                        }
-                        Err(err) => {
-                            debug!(
-                                client = %self.client_addr,
-                                backend = backend_id.as_index(),
-                                command_verb = ?request.verb(),
-                                msg_id = ?request.message_id_value(),
-                                pool = %provider.name(),
-                                error = %err,
-                                connection_type = guard.connection_type(),
-                                pending_bytes = guard.pending_bytes_len(),
-                                "Pool checkout failed despite idle capacity; reusing cached batch connection for direct backend attempt"
-                            );
-                            guard
-                        }
-                    }
+                    let _ = guard.release();
+                    let conn = provider.get_pooled_connection().await?;
+                    let checkout_status = provider.status_counts();
+                    debug!(
+                        client = %self.client_addr,
+                        backend = backend_id.as_index(),
+                        command_verb = ?request.verb(),
+                        msg_id = ?request.message_id_value(),
+                        pool = %provider.name(),
+                        pool_available = checkout_status.available,
+                        pool_size = checkout_status.size,
+                        pool_max_size = checkout_status.max_size,
+                        pool_waiting = checkout_status.waiting,
+                        connection_type = conn.connection_type(),
+                        pending_bytes = conn.pending_bytes_len(),
+                        "Pool checkout succeeded for direct backend attempt"
+                    );
+                    crate::pool::ConnectionGuard::new(conn, provider.clone())
                 }
             }
             Some(cached) => {
