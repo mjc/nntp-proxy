@@ -356,7 +356,7 @@ use nntp_proxy::session::multiline_framing::MultilineFramer;
 
 **Performance testing:** Run `cargo bench` before and after performance-sensitive changes; accept no regressions.
 
-**Profiling scripts:** `scripts/parse_perfdata` (hotspot analysis) and `scripts/parse_flamegraph` (SVG flamegraph). Usage: `perf script 2>/dev/null | ./scripts/parse_perfdata`.
+**Profiling scripts:** `scripts/parse_perfdata` (direct perf.data hotspot analysis) and `scripts/parse_flamegraph` (SVG flamegraph). Usage: `./scripts/parse_perfdata perf.data`.
 
 ---
 

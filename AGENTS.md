@@ -76,10 +76,7 @@ When inspecting `perf.data`, prefer the repo helper:
 nix develop -c scripts/parse_perfdata perf.data
 ```
 
-It shells out to `perf script -i <file>` and emits the thread, function, edge,
-timeline, and category summaries agents usually need for profile triage. It also
-still accepts piped `perf script` output:
-
-```sh
-nix develop -c sh -lc 'perf script -i perf.data | scripts/parse_perfdata -'
-```
+It reads `perf.data` directly and emits the thread, instruction-pointer, edge,
+timeline, and category summaries agents usually need for profile triage. Do not
+replace it with a text-rendered parser; the point of this helper is to avoid
+waiting on perf's renderer for large callchains.

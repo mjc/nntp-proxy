@@ -1,12 +1,47 @@
 use std::collections::HashMap;
 use std::env;
+use std::fs::File;
 use std::hash::{BuildHasherDefault, Hasher};
-use std::io::{self, BufRead, BufReader};
-use std::path::Path;
-use std::process::{Command, Stdio};
+use std::io::{Read, Seek, SeekFrom};
 
 type SymbolId = usize;
 type FastHashMap<K, V> = HashMap<K, V, BuildHasherDefault<FxHasher>>;
+
+const PERF_MAGIC: &[u8; 8] = b"PERFILE2";
+const PERF_RECORD_COMM: u32 = 3;
+const PERF_RECORD_SAMPLE: u32 = 9;
+
+const PERF_SAMPLE_IP: u64 = 1 << 0;
+const PERF_SAMPLE_TID: u64 = 1 << 1;
+const PERF_SAMPLE_TIME: u64 = 1 << 2;
+const PERF_SAMPLE_ADDR: u64 = 1 << 3;
+const PERF_SAMPLE_READ: u64 = 1 << 4;
+const PERF_SAMPLE_CALLCHAIN: u64 = 1 << 5;
+const PERF_SAMPLE_ID: u64 = 1 << 6;
+const PERF_SAMPLE_CPU: u64 = 1 << 7;
+const PERF_SAMPLE_PERIOD: u64 = 1 << 8;
+const PERF_SAMPLE_STREAM_ID: u64 = 1 << 9;
+const PERF_SAMPLE_RAW: u64 = 1 << 10;
+const PERF_SAMPLE_BRANCH_STACK: u64 = 1 << 11;
+const PERF_SAMPLE_REGS_USER: u64 = 1 << 12;
+const PERF_SAMPLE_STACK_USER: u64 = 1 << 13;
+const PERF_SAMPLE_WEIGHT: u64 = 1 << 14;
+const PERF_SAMPLE_DATA_SRC: u64 = 1 << 15;
+const PERF_SAMPLE_IDENTIFIER: u64 = 1 << 16;
+const PERF_SAMPLE_TRANSACTION: u64 = 1 << 17;
+const PERF_SAMPLE_REGS_INTR: u64 = 1 << 18;
+const PERF_SAMPLE_PHYS_ADDR: u64 = 1 << 19;
+const PERF_SAMPLE_AUX: u64 = 1 << 20;
+const PERF_SAMPLE_CGROUP: u64 = 1 << 21;
+const PERF_SAMPLE_DATA_PAGE_SIZE: u64 = 1 << 22;
+const PERF_SAMPLE_CODE_PAGE_SIZE: u64 = 1 << 23;
+const PERF_SAMPLE_WEIGHT_STRUCT: u64 = 1 << 24;
+
+const PERF_FORMAT_TOTAL_TIME_ENABLED: u64 = 1 << 0;
+const PERF_FORMAT_TOTAL_TIME_RUNNING: u64 = 1 << 1;
+const PERF_FORMAT_ID: u64 = 1 << 2;
+const PERF_FORMAT_GROUP: u64 = 1 << 3;
+const PERF_FORMAT_LOST: u64 = 1 << 4;
 
 #[derive(Default)]
 struct FxHasher {
@@ -38,15 +73,7 @@ fn main() {
         return;
     }
 
-    let report = match config.input {
-        Input::Stdin => {
-            let stdin = io::stdin();
-            parse_perf_script(stdin.lock())
-        }
-        Input::PerfData(path) => parse_perf_data(&path, config.max_stack),
-    };
-
-    let report = match report {
+    let report = match parse_perf_data(&config.input, config.max_stack) {
         Ok(report) => report,
         Err(err) => {
             eprintln!("error: {err}");
@@ -55,7 +82,7 @@ fn main() {
     };
 
     if report.total_samples == 0 {
-        eprintln!("No samples parsed. Pass a perf.data file or pipe `perf script` output.");
+        eprintln!("No samples parsed from perf.data.");
         std::process::exit(1);
     }
 
@@ -74,14 +101,9 @@ fn main() {
 
 struct Config {
     program: String,
-    input: Input,
+    input: String,
     max_stack: Option<usize>,
     help: bool,
-}
-
-enum Input {
-    Stdin,
-    PerfData(String),
 }
 
 impl Config {
@@ -95,7 +117,7 @@ impl Config {
             if arg == "-h" || arg == "--help" {
                 return Self {
                     program,
-                    input: Input::Stdin,
+                    input: "perf.data".to_string(),
                     max_stack,
                     help: true,
                 };
@@ -116,7 +138,7 @@ impl Config {
                 continue;
             }
 
-            if arg.starts_with('-') && arg != "-" {
+            if arg.starts_with('-') {
                 eprintln!("unknown option: {arg}");
                 print_usage(&program);
                 std::process::exit(2);
@@ -129,15 +151,9 @@ impl Config {
             }
         }
 
-        let input = match input {
-            Some(input) if input == "-" => Input::Stdin,
-            Some(input) => Input::PerfData(input),
-            None => Input::Stdin,
-        };
-
         Self {
             program,
-            input,
+            input: input.unwrap_or_else(|| "perf.data".to_string()),
             max_stack,
             help: false,
         }
@@ -147,11 +163,9 @@ impl Config {
 fn print_usage(program: &str) {
     eprintln!("Usage:");
     eprintln!("  {program} [--max-stack N] [perf.data]");
-    eprintln!("  perf script -i perf.data | {program} -");
     eprintln!();
-    eprintln!("With a perf.data path, this runs `perf script -i <path>` and parses the stream.");
-    eprintln!("With no argument or `-`, this reads existing `perf script` output from stdin.");
-    eprintln!("Full stacks are parsed by default; --max-stack is only an explicit escape hatch.");
+    eprintln!("Reads Linux perf.data directly, without invoking perf's text renderer.");
+    eprintln!("Full callchains are parsed by default; --max-stack caps unusually large stacks.");
 }
 
 fn parse_max_stack(program: &str, value: &str) -> usize {
@@ -165,99 +179,327 @@ fn parse_max_stack(program: &str, value: &str) -> usize {
     }
 }
 
-fn parse_perf_data(path: &str, max_stack: Option<usize>) -> Result<Report, String> {
-    if !Path::new(path).is_file() {
-        return Err(format!("perf.data file not found: {path}"));
-    }
-
-    let mut command = Command::new("perf");
-    command.arg("script").arg("-i").arg(path);
-    if let Some(max_stack) = max_stack {
-        command.arg("--max-stack").arg(max_stack.to_string());
-    }
-
-    let mut child = command
-        .stdout(Stdio::piped())
-        .spawn()
-        .map_err(|err| format!("failed to run `perf script -i {path}`: {err}"))?;
-
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "failed to capture perf script stdout".to_string())?;
-
-    let report = parse_perf_script(BufReader::with_capacity(1024 * 1024, stdout))?;
-    let status = child
-        .wait()
-        .map_err(|err| format!("failed waiting for perf script: {err}"))?;
-
-    if !status.success() {
-        return Err(format!("perf script exited with {status}"));
-    }
-
-    Ok(report)
+#[derive(Clone, Copy)]
+struct PerfHeader {
+    attr_offset: u64,
+    attr_size: u64,
+    data_offset: u64,
+    data_size: u64,
 }
 
-fn parse_perf_script<R: BufRead>(mut reader: R) -> Result<Report, String> {
-    let mut report = Report::default();
-    let mut current_comm = None;
-    let mut current_tid = 0;
-    let mut current_time = 0.0;
-    let mut current_stack = Vec::with_capacity(96);
-    let mut line = Vec::with_capacity(256);
+#[derive(Clone, Copy)]
+struct PerfAttr {
+    sample_type: u64,
+    read_format: u64,
+    sample_regs_user: u64,
+    sample_regs_intr: u64,
+}
 
-    loop {
-        line.clear();
-        let len = reader
-            .read_until(b'\n', &mut line)
-            .map_err(|err| format!("failed reading perf script output: {err}"))?;
-        if len == 0 {
-            break;
+fn parse_perf_data(path: &str, max_stack: Option<usize>) -> Result<Report, String> {
+    let mut file = File::open(path).map_err(|err| format!("failed opening {path}: {err}"))?;
+    let header = read_header(&mut file)?;
+    let attr = read_first_attr(&mut file, header)?;
+    let mut report = Report::default();
+
+    file.seek(SeekFrom::Start(header.data_offset))
+        .map_err(|err| format!("failed seeking to perf data section: {err}"))?;
+
+    let mut remaining = header.data_size;
+    let mut record_header = [0u8; 8];
+    let mut payload = Vec::with_capacity(4096);
+    let mut stack = Vec::with_capacity(max_stack.unwrap_or(96).min(4096));
+
+    while remaining >= 8 {
+        file.read_exact(&mut record_header)
+            .map_err(|err| format!("failed reading record header: {err}"))?;
+        remaining -= 8;
+
+        let record_type = read_u32_at(&record_header, 0);
+        let record_size = u64::from(read_u16_at(&record_header, 6));
+        if record_size < 8 {
+            return Err(format!("invalid perf record size: {record_size}"));
         }
 
-        trim_line_end(&mut line);
+        let payload_size = record_size - 8;
+        if payload_size > remaining {
+            return Err(format!(
+                "perf record overruns data section: size={record_size} remaining={remaining}"
+            ));
+        }
 
-        if line.is_empty() {
-            if let Some(comm) = current_comm {
-                if !current_stack.is_empty() {
-                    report.add_sample(comm, current_tid, current_time, &current_stack);
+        payload.resize(payload_size as usize, 0);
+        file.read_exact(&mut payload)
+            .map_err(|err| format!("failed reading record payload: {err}"))?;
+        remaining -= payload_size;
+
+        match record_type {
+            PERF_RECORD_COMM => parse_comm_record(&payload, &mut report),
+            PERF_RECORD_SAMPLE => {
+                stack.clear();
+                if let Some(sample) = parse_sample_record(&payload, attr, max_stack, &mut stack) {
+                    let comm = report.comm_for_tid(sample.tid);
+                    report.add_sample(comm, sample.tid, sample.time, sample.stack);
                 }
             }
-            current_comm = None;
-            current_stack.clear();
-            continue;
-        }
-
-        if line[0] != b'\t' && line[0] != b' ' {
-            if let Some((comm, tid, time)) = parse_header_bytes(&line) {
-                current_comm = Some(report.intern_bytes(comm));
-                current_tid = tid;
-                current_time = time;
-                current_stack.clear();
-            }
-            continue;
-        }
-
-        if let Some(func) = parse_frame_bytes(trim_ascii(&line)) {
-            current_stack.push(report.intern_bytes(func));
-        }
-    }
-
-    if let Some(comm) = current_comm {
-        if !current_stack.is_empty() {
-            report.add_sample(comm, current_tid, current_time, &current_stack);
+            _ => {}
         }
     }
 
     Ok(report)
 }
 
-fn trim_line_end(line: &mut Vec<u8>) {
-    if line.last() == Some(&b'\n') {
-        line.pop();
+fn read_header(file: &mut File) -> Result<PerfHeader, String> {
+    let mut buf = [0u8; 104];
+    file.read_exact(&mut buf)
+        .map_err(|err| format!("failed reading perf header: {err}"))?;
+
+    if &buf[..8] != PERF_MAGIC {
+        return Err("not a PERFILE2 perf.data file".to_string());
     }
-    if line.last() == Some(&b'\r') {
-        line.pop();
+
+    let header_size = read_u64_at(&buf, 8);
+    if header_size < 104 {
+        return Err(format!("unsupported perf header size: {header_size}"));
+    }
+
+    Ok(PerfHeader {
+        attr_offset: read_u64_at(&buf, 24),
+        attr_size: read_u64_at(&buf, 32),
+        data_offset: read_u64_at(&buf, 40),
+        data_size: read_u64_at(&buf, 48),
+    })
+}
+
+fn read_first_attr(file: &mut File, header: PerfHeader) -> Result<PerfAttr, String> {
+    if header.attr_size < 112 {
+        return Err(format!("unsupported perf attr size: {}", header.attr_size));
+    }
+
+    let mut buf = vec![0u8; header.attr_size as usize];
+    file.seek(SeekFrom::Start(header.attr_offset))
+        .map_err(|err| format!("failed seeking to perf attrs: {err}"))?;
+    file.read_exact(&mut buf)
+        .map_err(|err| format!("failed reading perf attrs: {err}"))?;
+
+    Ok(PerfAttr {
+        sample_type: read_u64_at(&buf, 24),
+        read_format: read_u64_at(&buf, 32),
+        sample_regs_user: read_u64_at(&buf, 80),
+        sample_regs_intr: read_u64_at(&buf, 104),
+    })
+}
+
+struct Sample<'a> {
+    tid: u32,
+    time: f64,
+    stack: &'a [u64],
+}
+
+fn parse_sample_record<'a>(
+    payload: &[u8],
+    attr: PerfAttr,
+    max_stack: Option<usize>,
+    stack: &'a mut Vec<u64>,
+) -> Option<Sample<'a>> {
+    let mut cursor = Cursor::new(payload);
+    let mut tid = 0;
+    let mut time = 0.0;
+    let mut ip = None;
+
+    if attr.sample_type & PERF_SAMPLE_IDENTIFIER != 0 {
+        cursor.skip(8)?;
+    }
+    if attr.sample_type & PERF_SAMPLE_IP != 0 {
+        ip = Some(cursor.u64()?);
+    }
+    if attr.sample_type & PERF_SAMPLE_TID != 0 {
+        cursor.skip(4)?;
+        tid = cursor.u32()?;
+    }
+    if attr.sample_type & PERF_SAMPLE_TIME != 0 {
+        time = cursor.u64()? as f64 / 1_000_000_000.0;
+    }
+    if attr.sample_type & PERF_SAMPLE_ADDR != 0 {
+        cursor.skip(8)?;
+    }
+    if attr.sample_type & PERF_SAMPLE_ID != 0 {
+        cursor.skip(8)?;
+    }
+    if attr.sample_type & PERF_SAMPLE_STREAM_ID != 0 {
+        cursor.skip(8)?;
+    }
+    if attr.sample_type & PERF_SAMPLE_CPU != 0 {
+        cursor.skip(8)?;
+    }
+    if attr.sample_type & PERF_SAMPLE_PERIOD != 0 {
+        cursor.skip(8)?;
+    }
+    if attr.sample_type & PERF_SAMPLE_READ != 0 {
+        skip_read_format(&mut cursor, attr.read_format)?;
+    }
+    if attr.sample_type & PERF_SAMPLE_CALLCHAIN != 0 {
+        let nr = cursor.u64()? as usize;
+        let limit = max_stack.unwrap_or(nr).min(nr);
+        for index in 0..nr {
+            let frame = cursor.u64()?;
+            if index < limit && is_real_ip(frame) {
+                stack.push(frame);
+            }
+        }
+    } else if let Some(ip) = ip {
+        stack.push(ip);
+    }
+
+    if attr.sample_type & PERF_SAMPLE_RAW != 0 {
+        let len = cursor.u32()? as usize;
+        cursor.skip(align_8(len))?;
+    }
+    if attr.sample_type & PERF_SAMPLE_BRANCH_STACK != 0 {
+        let nr = cursor.u64()? as usize;
+        cursor.skip(nr.checked_mul(24)?)?;
+    }
+    if attr.sample_type & PERF_SAMPLE_REGS_USER != 0 {
+        skip_regs(&mut cursor, attr.sample_regs_user)?;
+    }
+    if attr.sample_type & PERF_SAMPLE_STACK_USER != 0 {
+        let size = cursor.u64()? as usize;
+        cursor.skip(size)?;
+        if size > 0 {
+            cursor.skip(8)?;
+        }
+    }
+    if attr.sample_type & PERF_SAMPLE_WEIGHT != 0 {
+        cursor.skip(8)?;
+    }
+    if attr.sample_type & PERF_SAMPLE_DATA_SRC != 0 {
+        cursor.skip(8)?;
+    }
+    if attr.sample_type & PERF_SAMPLE_TRANSACTION != 0 {
+        cursor.skip(8)?;
+    }
+    if attr.sample_type & PERF_SAMPLE_REGS_INTR != 0 {
+        skip_regs(&mut cursor, attr.sample_regs_intr)?;
+    }
+    if attr.sample_type & PERF_SAMPLE_PHYS_ADDR != 0 {
+        cursor.skip(8)?;
+    }
+    if attr.sample_type & PERF_SAMPLE_AUX != 0 {
+        let size = cursor.u64()? as usize;
+        cursor.skip(size)?;
+    }
+    if attr.sample_type & PERF_SAMPLE_CGROUP != 0 {
+        cursor.skip(8)?;
+    }
+    if attr.sample_type & PERF_SAMPLE_DATA_PAGE_SIZE != 0 {
+        cursor.skip(8)?;
+    }
+    if attr.sample_type & PERF_SAMPLE_CODE_PAGE_SIZE != 0 {
+        cursor.skip(8)?;
+    }
+    if attr.sample_type & PERF_SAMPLE_WEIGHT_STRUCT != 0 {
+        cursor.skip(8)?;
+    }
+
+    if stack.is_empty() {
+        return None;
+    }
+
+    Some(Sample { tid, time, stack })
+}
+
+fn is_real_ip(ip: u64) -> bool {
+    ip != 0 && ip < 0xffff_ffff_ffff_f000
+}
+
+fn skip_read_format(cursor: &mut Cursor<'_>, read_format: u64) -> Option<()> {
+    if read_format & PERF_FORMAT_GROUP != 0 {
+        let nr = cursor.u64()? as usize;
+        if read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 {
+            cursor.skip(8)?;
+        }
+        if read_format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 {
+            cursor.skip(8)?;
+        }
+        let mut fields_per_value = 1usize;
+        if read_format & PERF_FORMAT_ID != 0 {
+            fields_per_value += 1;
+        }
+        if read_format & PERF_FORMAT_LOST != 0 {
+            fields_per_value += 1;
+        }
+        cursor.skip(nr.checked_mul(fields_per_value)?.checked_mul(8)?)?;
+    } else {
+        cursor.skip(8)?;
+        if read_format & PERF_FORMAT_TOTAL_TIME_ENABLED != 0 {
+            cursor.skip(8)?;
+        }
+        if read_format & PERF_FORMAT_TOTAL_TIME_RUNNING != 0 {
+            cursor.skip(8)?;
+        }
+        if read_format & PERF_FORMAT_ID != 0 {
+            cursor.skip(8)?;
+        }
+        if read_format & PERF_FORMAT_LOST != 0 {
+            cursor.skip(8)?;
+        }
+    }
+
+    Some(())
+}
+
+fn skip_regs(cursor: &mut Cursor<'_>, mask: u64) -> Option<()> {
+    let abi = cursor.u64()?;
+    if abi != 0 {
+        cursor.skip(mask.count_ones() as usize * 8)?;
+    }
+    Some(())
+}
+
+fn parse_comm_record(payload: &[u8], report: &mut Report) {
+    if payload.len() < 8 {
+        return;
+    }
+
+    let tid = read_u32_at(payload, 4);
+    let name_bytes = &payload[8..];
+    let name_end = name_bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(name_bytes.len());
+    if name_end == 0 {
+        return;
+    }
+
+    let name = String::from_utf8_lossy(&name_bytes[..name_end]).into_owned();
+    let comm = report.intern(&name);
+    report.tid_to_comm.insert(tid, comm);
+}
+
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn skip(&mut self, len: usize) -> Option<()> {
+        self.offset = self.offset.checked_add(len)?;
+        (self.offset <= self.bytes.len()).then_some(())
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        let value = read_u32_at(self.bytes, self.offset);
+        self.skip(4)?;
+        Some(value)
+    }
+
+    fn u64(&mut self) -> Option<u64> {
+        let value = read_u64_at(self.bytes, self.offset);
+        self.skip(8)?;
+        Some(value)
     }
 }
 
@@ -297,13 +539,6 @@ struct TimelineSample {
 }
 
 impl Report {
-    fn intern_bytes(&mut self, name: &[u8]) -> SymbolId {
-        let Ok(name) = std::str::from_utf8(name) else {
-            return self.intern("<invalid utf8>");
-        };
-        self.intern(name)
-    }
-
     fn intern(&mut self, name: &str) -> SymbolId {
         if let Some(id) = self.symbol_ids.get(name) {
             return *id;
@@ -314,6 +549,11 @@ impl Report {
         self.symbol_categories.push(None);
         self.symbol_ids.insert(self.symbols[id].clone(), id);
         id
+    }
+
+    fn intern_ip(&mut self, ip: u64) -> SymbolId {
+        let name = format!("0x{ip:016x}");
+        self.intern(&name)
     }
 
     fn symbol(&self, id: SymbolId) -> &str {
@@ -330,10 +570,22 @@ impl Report {
         category
     }
 
-    fn add_sample(&mut self, comm: SymbolId, tid: u32, time: f64, stack: &[SymbolId]) {
-        let Some(&leaf) = stack.first() else {
+    fn comm_for_tid(&mut self, tid: u32) -> SymbolId {
+        if let Some(comm) = self.tid_to_comm.get(&tid) {
+            return *comm;
+        }
+
+        let name = format!("tid {tid}");
+        let comm = self.intern(&name);
+        self.tid_to_comm.insert(tid, comm);
+        comm
+    }
+
+    fn add_sample(&mut self, comm: SymbolId, tid: u32, time: f64, stack_ips: &[u64]) {
+        let Some(&leaf_ip) = stack_ips.first() else {
             return;
         };
+        let leaf = self.intern_ip(leaf_ip);
 
         if self.total_samples == 0 {
             self.min_time = time;
@@ -357,10 +609,11 @@ impl Report {
             .entry(ThreadLeafKey { thread: key, leaf })
             .or_insert(0) += 1;
 
-        for w in stack.windows(2) {
-            let callee = w[0];
-            let caller = w[1];
-            *self.edges.entry(pack_edge(caller, callee)).or_insert(0) += 1;
+        let mut previous = leaf;
+        for ip in &stack_ips[1..] {
+            let caller = self.intern_ip(*ip);
+            *self.edges.entry(pack_edge(caller, previous)).or_insert(0) += 1;
+            previous = caller;
         }
 
         self.timeline_samples
@@ -376,124 +629,12 @@ fn unpack_edge(edge: u64) -> (SymbolId, SymbolId) {
     ((edge >> 32) as SymbolId, (edge & 0xffff_ffff) as SymbolId)
 }
 
-fn parse_header_bytes(line: &[u8]) -> Option<(&[u8], u32, f64)> {
-    let first_colon = memchr(line, b':')?;
-    let before_colon = trim_ascii_end(&line[..first_colon]);
-
-    let ts_space = memrchr(before_colon, b' ')?;
-    let time = parse_f64_ascii(&before_colon[ts_space + 1..])?;
-
-    let mut prefix = trim_ascii_end(&before_colon[..ts_space]);
-    if prefix.ends_with(b"]") {
-        let bracket = memrchr(prefix, b'[')?;
-        prefix = trim_ascii_end(&prefix[..bracket]);
-    }
-
-    let last_space = memrchr(prefix, b' ')?;
-    let comm = trim_ascii(&prefix[..last_space]);
-    let tid_bytes = &prefix[last_space + 1..];
-    let tid_bytes = if let Some(slash) = memchr(tid_bytes, b'/') {
-        &tid_bytes[slash + 1..]
-    } else {
-        tid_bytes
-    };
-    let tid = parse_u32_ascii(tid_bytes)?;
-
-    Some((comm, tid, time))
-}
-
-fn parse_frame_bytes(line: &[u8]) -> Option<&[u8]> {
-    let first_space = memchr(line, b' ')?;
-    let mut rest = trim_ascii(&line[first_space + 1..]);
-
-    if let Some(paren) = find_last_space_paren(rest) {
-        rest = &rest[..paren];
-    }
-
-    let func = if let Some(plus) = memrchr(rest, b'+') {
-        let after = &rest[plus + 1..];
-        if after.starts_with(b"0x") || after.iter().all(u8::is_ascii_hexdigit) {
-            &rest[..plus]
-        } else {
-            rest
-        }
-    } else {
-        rest
-    };
-
-    if func.is_empty() {
-        None
-    } else {
-        Some(func)
-    }
-}
-
-fn find_last_space_paren(bytes: &[u8]) -> Option<usize> {
-    let mut idx = bytes.len();
-    while idx >= 2 {
-        idx -= 1;
-        if bytes[idx] == b'(' && bytes[idx - 1] == b' ' {
-            return Some(idx - 1);
-        }
-    }
-    None
-}
-
-fn trim_ascii(bytes: &[u8]) -> &[u8] {
-    trim_ascii_end(trim_ascii_start(bytes))
-}
-
-fn trim_ascii_start(mut bytes: &[u8]) -> &[u8] {
-    while let Some((&first, rest)) = bytes.split_first() {
-        if !first.is_ascii_whitespace() {
-            break;
-        }
-        bytes = rest;
-    }
-    bytes
-}
-
-fn trim_ascii_end(mut bytes: &[u8]) -> &[u8] {
-    while let Some((&last, rest)) = bytes.split_last() {
-        if !last.is_ascii_whitespace() {
-            break;
-        }
-        bytes = rest;
-    }
-    bytes
-}
-
-fn memchr(bytes: &[u8], needle: u8) -> Option<usize> {
-    bytes.iter().position(|byte| *byte == needle)
-}
-
-fn memrchr(bytes: &[u8], needle: u8) -> Option<usize> {
-    bytes.iter().rposition(|byte| *byte == needle)
-}
-
-fn parse_u32_ascii(bytes: &[u8]) -> Option<u32> {
-    let mut value = 0u32;
-    let mut saw_digit = false;
-    for byte in bytes {
-        if !byte.is_ascii_digit() {
-            return None;
-        }
-        saw_digit = true;
-        value = value.checked_mul(10)?.checked_add(u32::from(byte - b'0'))?;
-    }
-    saw_digit.then_some(value)
-}
-
-fn parse_f64_ascii(bytes: &[u8]) -> Option<f64> {
-    std::str::from_utf8(bytes).ok()?.parse().ok()
-}
-
 fn print_thread_breakdown(report: &Report) {
     let mut threads: Vec<_> = report.by_thread.iter().collect();
     threads.sort_by(|a, b| b.1.cmp(a.1));
 
     println!(
-        "═══ Thread Breakdown ({} total samples) ═══\n",
+        "=== Thread Breakdown ({} total samples) ===\n",
         report.total_samples
     );
     println!("{:>7} {:>10}  {:>7}  {}", "%", "samples", "tid", "comm");
@@ -515,8 +656,8 @@ fn print_top_functions(report: &Report, n: usize) {
     let mut funcs: Vec<_> = report.leaf_counts.iter().collect();
     funcs.sort_by(|a, b| b.1.cmp(a.1));
 
-    println!("═══ Top {} Functions (self/on-CPU time) ═══\n", n);
-    println!("{:>7} {:>10}  {}", "%", "samples", "Function");
+    println!("=== Top {} Functions (self/on-CPU time) ===\n", n);
+    println!("{:>7} {:>10}  {}", "%", "samples", "Instruction pointer");
     println!("{}", "-".repeat(100));
 
     let mut shown_pct = 0.0;
@@ -542,7 +683,7 @@ fn print_top_functions_per_thread(report: &Report, n: usize) {
     let mut threads: Vec<_> = report.by_thread.iter().collect();
     threads.sort_by(|a, b| b.1.cmp(a.1));
 
-    println!("═══ Top Functions Per Thread ═══");
+    println!("=== Top Functions Per Thread ===");
 
     for (thread, thread_total) in threads.into_iter().take(8) {
         let mut funcs: Vec<_> = report
@@ -553,12 +694,12 @@ fn print_top_functions_per_thread(report: &Report, n: usize) {
         funcs.sort_by(|a, b| b.1.cmp(a.1));
 
         println!(
-            "\n─── {} (tid {}, {} samples) ───\n",
+            "\n--- {} (tid {}, {} samples) ---\n",
             report.symbol(thread.comm),
             thread.tid,
             thread_total
         );
-        println!("{:>7} {:>10}  {}", "%", "samples", "Function");
+        println!("{:>7} {:>10}  {}", "%", "samples", "Instruction pointer");
 
         for (func, count) in funcs.iter().take(n) {
             let pct = **count as f64 / *thread_total as f64 * 100.0;
@@ -576,15 +717,15 @@ fn print_callee_edges(report: &Report, n: usize) {
     let mut edge_list: Vec<_> = report.edges.iter().collect();
     edge_list.sort_by(|a, b| b.1.cmp(a.1));
 
-    println!("═══ Top {} Caller → Callee Edges ═══\n", n);
-    println!("{:>7} {:>10}  {} → {}", "%", "samples", "Caller", "Callee");
+    println!("=== Top {} Caller -> Callee Edges ===\n", n);
+    println!("{:>7} {:>10}  {} -> {}", "%", "samples", "Caller", "Callee");
     println!("{}", "-".repeat(120));
 
     for (edge, count) in edge_list.iter().take(n) {
         let (caller, callee) = unpack_edge(**edge);
         let pct = **count as f64 / report.total_samples as f64 * 100.0;
         println!(
-            "{:>6.2}% {:>10}  {} → {}",
+            "{:>6.2}% {:>10}  {} -> {}",
             pct,
             count,
             truncate(report.symbol(caller), 50),
@@ -597,8 +738,8 @@ fn print_timeline(report: &Report, buckets: usize) {
     let duration = report.max_time - report.min_time;
 
     if duration <= 0.0 {
-        println!("═══ Timeline ═══\n");
-        println!("All samples at same timestamp — cannot bucket.");
+        println!("=== Timeline ===\n");
+        println!("All samples at same timestamp; cannot bucket.");
         return;
     }
 
@@ -621,302 +762,139 @@ fn print_timeline(report: &Report, buckets: usize) {
         .collect();
 
     for sample in &report.timeline_samples {
-        let idx = ((sample.time - report.min_time) / bucket_width) as usize;
-        let idx = idx.min(buckets - 1);
+        let idx = ((sample.time - report.min_time) / bucket_width)
+            .floor()
+            .min((buckets - 1) as f64) as usize;
         let bucket = &mut bucket_vec[idx];
         bucket.total += 1;
         *bucket.by_thread.entry(sample.tid).or_insert(0) += 1;
         *bucket.top_funcs.entry(sample.leaf).or_insert(0) += 1;
     }
 
-    let mut top_threads: Vec<_> = report
-        .by_thread
-        .iter()
-        .map(|(thread, count)| (thread.tid, *count))
-        .collect();
-    top_threads.sort_by(|a, b| b.1.cmp(&a.1));
-    let top_threads: Vec<u32> = top_threads.iter().take(6).map(|t| t.0).collect();
-
     println!(
-        "═══ Timeline ({:.1}s duration, {} buckets) ═══\n",
-        duration, buckets
+        "=== Timeline ({} buckets over {:.2}s) ===\n",
+        buckets, duration
     );
     println!(
-        "This shows sample distribution over time to distinguish cold (early) vs hot (late) phases.\n"
+        "{:>10}  {:>8}  {:>20}  {}",
+        "time", "samples", "top tid", "top instruction pointer"
     );
+    println!("{}", "-".repeat(90));
 
-    print!("{:>12} {:>8}", "Time(s)", "Samples");
-    for tid in &top_threads {
-        let name = report
-            .tid_to_comm
-            .get(tid)
-            .map(|comm| report.symbol(*comm))
-            .unwrap_or("?");
-        let label = if name.len() > 10 { &name[..10] } else { name };
-        print!("  {:>10}", label);
-    }
-    println!("  Top function");
-    println!("{}", "-".repeat(120));
+    for bucket in bucket_vec {
+        let top_tid = bucket
+            .by_thread
+            .iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(tid, count)| format!("{tid} ({count})"))
+            .unwrap_or_else(|| "-".to_string());
 
-    for bucket in &bucket_vec {
-        let offset = bucket.start - report.min_time;
-        print!(
-            "{:>8.1}-{:<3.1} {:>8}",
-            offset,
-            offset + bucket_width,
-            bucket.total
-        );
+        let top_func = bucket
+            .top_funcs
+            .iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(func, count)| format!("{} ({})", truncate(report.symbol(*func), 40), count))
+            .unwrap_or_else(|| "-".to_string());
 
-        for tid in &top_threads {
-            let count = bucket.by_thread.get(tid).copied().unwrap_or(0);
-            let pct = if bucket.total > 0 {
-                count as f64 / bucket.total as f64 * 100.0
-            } else {
-                0.0
-            };
-            print!("  {:>7.1}%  ", pct);
-        }
-
-        if let Some((func, _count)) = bucket.top_funcs.iter().max_by_key(|(_k, v)| *v) {
-            print!("  {}", truncate(report.symbol(*func), 40));
-        }
-
-        println!();
-    }
-
-    let mid = buckets / 2;
-    let first_half: usize = bucket_vec[..mid].iter().map(|b| b.total).sum();
-    let second_half: usize = bucket_vec[mid..].iter().map(|b| b.total).sum();
-
-    println!();
-    println!(
-        "First half: {} samples ({:.1}%), Second half: {} samples ({:.1}%)",
-        first_half,
-        first_half as f64 / report.total_samples as f64 * 100.0,
-        second_half,
-        second_half as f64 / report.total_samples as f64 * 100.0,
-    );
-
-    let mut first_funcs: FastHashMap<SymbolId, usize> = FastHashMap::default();
-    let mut second_funcs: FastHashMap<SymbolId, usize> = FastHashMap::default();
-
-    for sample in &report.timeline_samples {
-        let idx = ((sample.time - report.min_time) / bucket_width) as usize;
-        let idx = idx.min(buckets - 1);
-        if idx < mid {
-            *first_funcs.entry(sample.leaf).or_insert(0) += 1;
-        } else {
-            *second_funcs.entry(sample.leaf).or_insert(0) += 1;
-        }
-    }
-
-    println!("\nFunctions hotter in FIRST half (cold phase):");
-    print_phase_diff(
-        report,
-        &first_funcs,
-        &second_funcs,
-        first_half,
-        second_half,
-        10,
-    );
-
-    println!("\nFunctions hotter in SECOND half (hot/cached phase):");
-    print_phase_diff(
-        report,
-        &second_funcs,
-        &first_funcs,
-        second_half,
-        first_half,
-        10,
-    );
-}
-
-fn print_phase_diff(
-    report: &Report,
-    primary: &FastHashMap<SymbolId, usize>,
-    other: &FastHashMap<SymbolId, usize>,
-    primary_total: usize,
-    other_total: usize,
-    n: usize,
-) {
-    if primary_total == 0 || other_total == 0 {
-        println!("  (insufficient data)");
-        return;
-    }
-
-    let mut diffs: Vec<(SymbolId, f64, f64, f64)> = Vec::new();
-    for (&func, &count) in primary {
-        let pct_primary = count as f64 / primary_total as f64 * 100.0;
-        let pct_other = other.get(&func).copied().unwrap_or(0) as f64 / other_total as f64 * 100.0;
-        let diff = pct_primary - pct_other;
-        if diff > 0.1 {
-            diffs.push((func, pct_primary, pct_other, diff));
-        }
-    }
-    diffs.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
-
-    println!(
-        "{:>7} {:>7} {:>7}  {}",
-        "this%", "other%", "diff%", "Function"
-    );
-    for (func, pct_p, pct_o, diff) in diffs.iter().take(n) {
         println!(
-            "{:>6.2}% {:>6.2}% {:>+6.2}%  {}",
-            pct_p,
-            pct_o,
-            diff,
-            truncate(report.symbol(*func), 70)
+            "{:>9.2}s  {:>8}  {:>20}  {}",
+            bucket.start - report.min_time,
+            bucket.total,
+            top_tid,
+            top_func
         );
     }
 }
 
 fn print_category_summary(report: &Report) {
-    let mut cats: Vec<_> = report.categories.iter().collect();
-    cats.sort_by(|a, b| b.1.cmp(a.1));
+    let mut categories: Vec<_> = report.categories.iter().collect();
+    categories.sort_by(|a, b| b.1.cmp(a.1));
 
-    println!("═══ Category Summary (self time) ═══\n");
-    println!("{:>7} {:>10}  {}", "%", "samples", "Category");
-    println!("{}", "-".repeat(40));
+    println!("=== Category Summary (leaf/self samples) ===\n");
+    println!("{:>7} {:>10}  Category", "%", "samples");
+    println!("{}", "-".repeat(60));
 
-    for (cat, count) in cats {
+    for (category, count) in categories {
         let pct = *count as f64 / report.total_samples as f64 * 100.0;
-        println!("{:>6.2}% {:>10}  {}", pct, count, cat);
+        println!("{:>6.2}% {:>10}  {}", pct, count, category);
     }
 }
 
-fn categorize(name: &str) -> &'static str {
-    let lower = name.to_lowercase();
-
-    if lower.contains("foyer")
-        || lower.contains("hybrid_cache")
-        || lower.contains("hybridarticle")
-        || lower.contains("article_cache")
-        || lower.contains("unified_cache")
-        || lower.contains("cache::")
-        || lower.contains("moka")
-    {
-        return "Cache/Foyer";
-    }
-
-    if lower.contains("nntp")
-        || lower.contains("precheck")
-        || lower.contains("article_routing")
-        || lower.contains("client_session")
-        || lower.contains("backend_execution")
-        || lower.contains("command_guard")
-        || lower.contains("route_command")
-        || lower.contains("status_code")
-        || lower.contains("message_id")
-    {
-        return "NNTP Protocol";
-    }
-
-    if lower.contains("tls")
-        || lower.contains("ssl")
-        || lower.contains("rustls")
-        || lower.contains("aes")
-        || lower.contains("cipher")
-        || lower.contains("encrypt")
-        || lower.contains("decrypt")
-        || lower.contains("handshake")
-        || lower.contains("aws_lc")
-        || lower.contains("ring::")
-        || lower.contains("chacha")
-    {
-        return "TLS/Crypto";
-    }
-
-    if lower.contains("lz4")
-        || lower.contains("compress")
-        || lower.contains("decompress")
-        || lower.contains("zstd")
-    {
-        return "Compression";
-    }
-
-    if lower.contains("deadpool") || lower.contains("pool") || lower.contains("connection_provider")
-    {
-        return "Connection Pool";
-    }
-
-    if lower.contains("recv")
+fn categorize(func: &str) -> &'static str {
+    let lower = func.to_ascii_lowercase();
+    if lower.contains("syscall")
+        || lower.contains("recv")
         || lower.contains("send")
+        || lower.contains("epoll")
+        || lower.contains("read")
+        || lower.contains("write")
         || lower.contains("tcp")
         || lower.contains("socket")
-        || lower.contains("inet")
-        || lower.contains("skb")
-        || lower.contains("net_")
+        || lower.contains("0xffff")
     {
-        return "Network I/O";
-    }
-
-    if lower.contains("zfs")
-        || lower.contains("zpl")
-        || lower.contains("zil")
-        || lower.contains("vfs")
-        || lower.contains("write_all")
-        || lower.contains("ext4")
-        || lower.contains("xfs")
-        || lower.contains("btrfs")
-        || lower.contains("block_")
-        || lower.contains("io_uring")
-        || lower.contains("pread")
-        || lower.contains("pwrite")
+        "syscall/kernel/io"
+    } else if lower.contains("rustls")
+        || lower.contains("ring")
+        || lower.contains("crypto")
+        || lower.contains("encrypt")
+        || lower.contains("decrypt")
+        || lower.contains("tls")
     {
-        return "Disk I/O";
-    }
-
-    if lower.contains("futex")
-        || lower.contains("mutex")
-        || lower.contains("lock")
-        || lower.contains("rwlock")
-        || lower.contains("semaphore")
-        || lower.contains("parking_lot")
+        "tls/crypto"
+    } else if lower.contains("tokio")
+        || lower.contains("poll")
+        || lower.contains("wake")
+        || lower.contains("task")
+        || lower.contains("runtime")
     {
-        return "Locks/Futex";
-    }
-
-    if lower.contains("epoll") || lower.contains("poll") || lower.contains("mio") {
-        return "Event Loop";
-    }
-
-    if lower.contains("tokio") || lower.contains("runtime") {
-        return "Tokio Runtime";
-    }
-
-    if lower.contains("futures") || lower.contains("async") || lower.contains("waker") {
-        return "Async/Futures";
-    }
-
-    if lower.contains("schedule") || lower.contains("switch") || lower.contains("context") {
-        return "Scheduling";
-    }
-
-    if lower.contains("alloc")
+        "tokio/runtime"
+    } else if lower.contains("bytes")
+        || lower.contains("alloc")
         || lower.contains("malloc")
         || lower.contains("free")
-        || lower.contains("mmap")
-        || lower.contains("brk")
-        || lower.contains("jemalloc")
+        || lower.contains("memcpy")
+        || lower.contains("copy")
     {
-        return "Memory";
-    }
-
-    if name.starts_with("__x64_sys_")
-        || name.starts_with("syscall")
-        || name.starts_with("do_syscall")
-        || name.starts_with("entry_SYSCALL")
+        "allocation/copy"
+    } else if lower.contains("nntp_proxy")
+        || lower.contains("multiline")
+        || lower.contains("retry")
+        || lower.contains("article")
+        || lower.contains("backend")
+        || lower.contains("pool")
     {
-        return "Syscall";
+        "proxy logic"
+    } else {
+        "other"
     }
-
-    "Other"
 }
 
-fn truncate(s: &str, max: usize) -> &str {
+fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
-        s
+        s.to_string()
     } else {
-        &s[..max]
+        format!("{}...", &s[..max.saturating_sub(3)])
     }
+}
+
+fn align_8(len: usize) -> usize {
+    (len + 7) & !7
+}
+
+fn read_u16_at(bytes: &[u8], offset: usize) -> u16 {
+    let mut value = [0u8; 2];
+    value.copy_from_slice(&bytes[offset..offset + 2]);
+    u16::from_le_bytes(value)
+}
+
+fn read_u32_at(bytes: &[u8], offset: usize) -> u32 {
+    let mut value = [0u8; 4];
+    value.copy_from_slice(&bytes[offset..offset + 4]);
+    u32::from_le_bytes(value)
+}
+
+fn read_u64_at(bytes: &[u8], offset: usize) -> u64 {
+    let mut value = [0u8; 8];
+    value.copy_from_slice(&bytes[offset..offset + 8]);
+    u64::from_le_bytes(value)
 }
