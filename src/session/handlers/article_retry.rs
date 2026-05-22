@@ -141,6 +141,14 @@ enum OrderedLargeTransferNoAttempt {
 }
 
 impl ClientSession {
+    fn additional_ordered_retry_client_to_backend_bytes(
+        client_to_backend_bytes: ClientToBackendBytes,
+        initial_request_wire_len: usize,
+    ) -> ClientToBackendBytes {
+        client_to_backend_bytes
+            .saturating_sub(ClientToBackendBytes::zero().add(initial_request_wire_len))
+    }
+
     /// Route a single request to a backend and execute it
     ///
     /// This function is `pub(super)` to allow reuse of per-command routing logic by sibling handler modules
@@ -485,6 +493,9 @@ impl ClientSession {
             {
                 Ok(attempt) => attempt,
                 Err(err) => {
+                    let msg_id = request.message_id_value();
+                    self.sync_availability_if_needed(msg_id.as_ref(), &availability)
+                        .await;
                     Self::release_cached_backend_connection(&mut backend_connection);
                     let turn = order.wait_turn(order_index).await;
                     turn.fail_and_advance();
@@ -517,10 +528,10 @@ impl ClientSession {
                             backend_to_client_bytes = backend_to_client_bytes.add(bytes_written);
                             turn.advance();
                             return Ok(OrderedLargeTransferResult {
-                                additional_client_to_backend_bytes: client_to_backend_bytes
-                                    .saturating_sub(
-                                        ClientToBackendBytes::zero()
-                                            .add(request.request_wire_len().get()),
+                                additional_client_to_backend_bytes:
+                                    Self::additional_ordered_retry_client_to_backend_bytes(
+                                        client_to_backend_bytes,
+                                        request.request_wire_len().get(),
                                     ),
                                 backend_to_client_bytes,
                             });
@@ -564,6 +575,7 @@ impl ClientSession {
             let response = {
                 let turn = order.wait_turn(order_index).await;
                 if order.is_failed() {
+                    Self::release_cached_backend_connection(&mut backend_connection);
                     turn.advance();
                     return Err(SessionError::Backend(anyhow::anyhow!(
                         "ordered pipeline request aborted after earlier slot error"
@@ -598,10 +610,12 @@ impl ClientSession {
                     order.fail();
                     self.sync_availability_if_needed(msg_id.as_ref(), &availability)
                         .await;
+                    Self::release_cached_backend_connection(&mut backend_connection);
                     return Err(e);
                 }
                 Err(e) => {
                     order.fail();
+                    Self::release_cached_backend_connection(&mut backend_connection);
                     return Err(e);
                 }
             };
@@ -613,9 +627,11 @@ impl ClientSession {
             Self::release_cached_backend_connection(&mut backend_connection);
             backend_to_client_bytes = backend_to_client_bytes.add(response.wire_len().get());
             return Ok(OrderedLargeTransferResult {
-                additional_client_to_backend_bytes: client_to_backend_bytes.saturating_sub(
-                    ClientToBackendBytes::zero().add(request.request_wire_len().get()),
-                ),
+                additional_client_to_backend_bytes:
+                    Self::additional_ordered_retry_client_to_backend_bytes(
+                        client_to_backend_bytes,
+                        request.request_wire_len().get(),
+                    ),
                 backend_to_client_bytes,
             });
         }
@@ -626,6 +642,7 @@ impl ClientSession {
         {
             let turn = order.wait_turn(order_index).await;
             if order.is_failed() {
+                Self::release_cached_backend_connection(&mut backend_connection);
                 turn.advance();
                 return Err(SessionError::Backend(anyhow::anyhow!(
                     "ordered pipeline request aborted after earlier slot error"
@@ -637,6 +654,7 @@ impl ClientSession {
                 .await;
             if let Err(err) = response {
                 turn.fail_and_advance();
+                Self::release_cached_backend_connection(&mut backend_connection);
                 return Err(SessionError::from(err));
             }
             turn.advance();
@@ -645,8 +663,11 @@ impl ClientSession {
         Self::release_cached_backend_connection(&mut backend_connection);
 
         Ok(OrderedLargeTransferResult {
-            additional_client_to_backend_bytes: client_to_backend_bytes
-                .saturating_sub(ClientToBackendBytes::zero().add(request.request_wire_len().get())),
+            additional_client_to_backend_bytes:
+                Self::additional_ordered_retry_client_to_backend_bytes(
+                    client_to_backend_bytes,
+                    request.request_wire_len().get(),
+                ),
             backend_to_client_bytes,
         })
     }
@@ -901,5 +922,25 @@ mod tests {
             cache.get(&msg_id).await.is_none(),
             "sync_availability must not create a missing-only entry after a retry success"
         );
+    }
+
+    #[test]
+    fn ordered_retry_byte_delta_reports_only_extra_attempts() {
+        let delta = ClientSession::additional_ordered_retry_client_to_backend_bytes(
+            crate::types::ClientToBackendBytes::new(24),
+            8,
+        );
+
+        assert_eq!(delta.as_u64(), 16);
+    }
+
+    #[test]
+    fn ordered_retry_byte_delta_saturates_before_first_attempt() {
+        let delta = ClientSession::additional_ordered_retry_client_to_backend_bytes(
+            crate::types::ClientToBackendBytes::new(4),
+            8,
+        );
+
+        assert_eq!(delta.as_u64(), 0);
     }
 }
