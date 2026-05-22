@@ -149,6 +149,23 @@ impl ClientSession {
             .saturating_sub(ClientToBackendBytes::zero().add(initial_request_wire_len))
     }
 
+    fn finish_ordered_large_transfer_request(
+        backend_connection: &mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
+        client_to_backend_bytes: ClientToBackendBytes,
+        initial_request_wire_len: usize,
+        backend_to_client_bytes: BackendToClientBytes,
+    ) -> OrderedLargeTransferResult {
+        Self::release_cached_backend_connection(backend_connection);
+        OrderedLargeTransferResult {
+            additional_client_to_backend_bytes:
+                Self::additional_ordered_retry_client_to_backend_bytes(
+                    client_to_backend_bytes,
+                    initial_request_wire_len,
+                ),
+            backend_to_client_bytes,
+        }
+    }
+
     /// Route a single request to a backend and execute it
     ///
     /// This function is `pub(super)` to allow reuse of per-command routing logic by sibling handler modules
@@ -527,14 +544,12 @@ impl ClientSession {
                         Ok(bytes_written) => {
                             backend_to_client_bytes = backend_to_client_bytes.add(bytes_written);
                             turn.advance();
-                            return Ok(OrderedLargeTransferResult {
-                                additional_client_to_backend_bytes:
-                                    Self::additional_ordered_retry_client_to_backend_bytes(
-                                        client_to_backend_bytes,
-                                        request.request_wire_len().get(),
-                                    ),
+                            return Ok(Self::finish_ordered_large_transfer_request(
+                                &mut backend_connection,
+                                client_to_backend_bytes,
+                                request.request_wire_len().get(),
                                 backend_to_client_bytes,
-                            });
+                            ));
                         }
                         Err(err) => {
                             turn.fail_and_advance();
@@ -558,6 +573,9 @@ impl ClientSession {
                     .capture_suppressed_430_response(&mut conn, backend_id, request, buffer)
                     .await
                 {
+                    self.sync_availability_if_needed(msg_id.as_ref(), &availability)
+                        .await;
+                    Self::release_cached_backend_connection(&mut backend_connection);
                     let turn = order.wait_turn(order_index).await;
                     turn.fail_and_advance();
                     return Err(err);
@@ -577,6 +595,8 @@ impl ClientSession {
                 if order.is_failed() {
                     Self::release_cached_backend_connection(&mut backend_connection);
                     turn.advance();
+                    self.sync_availability_if_needed(msg_id.as_ref(), &availability)
+                        .await;
                     return Err(SessionError::Backend(anyhow::anyhow!(
                         "ordered pipeline request aborted after earlier slot error"
                     )));
@@ -615,6 +635,8 @@ impl ClientSession {
                 }
                 Err(e) => {
                     order.fail();
+                    self.sync_availability_if_needed(msg_id.as_ref(), &availability)
+                        .await;
                     Self::release_cached_backend_connection(&mut backend_connection);
                     return Err(e);
                 }
@@ -624,16 +646,13 @@ impl ClientSession {
             guard.complete();
             self.sync_availability_if_needed(msg_id.as_ref(), &availability)
                 .await;
-            Self::release_cached_backend_connection(&mut backend_connection);
             backend_to_client_bytes = backend_to_client_bytes.add(response.wire_len().get());
-            return Ok(OrderedLargeTransferResult {
-                additional_client_to_backend_bytes:
-                    Self::additional_ordered_retry_client_to_backend_bytes(
-                        client_to_backend_bytes,
-                        request.request_wire_len().get(),
-                    ),
+            return Ok(Self::finish_ordered_large_transfer_request(
+                &mut backend_connection,
+                client_to_backend_bytes,
+                request.request_wire_len().get(),
                 backend_to_client_bytes,
-            });
+            ));
         }
 
         let msg_id = request.message_id_value();
@@ -644,6 +663,8 @@ impl ClientSession {
             if order.is_failed() {
                 Self::release_cached_backend_connection(&mut backend_connection);
                 turn.advance();
+                self.sync_availability_if_needed(msg_id.as_ref(), &availability)
+                    .await;
                 return Err(SessionError::Backend(anyhow::anyhow!(
                     "ordered pipeline request aborted after earlier slot error"
                 )));
@@ -660,16 +681,12 @@ impl ClientSession {
             turn.advance();
         }
 
-        Self::release_cached_backend_connection(&mut backend_connection);
-
-        Ok(OrderedLargeTransferResult {
-            additional_client_to_backend_bytes:
-                Self::additional_ordered_retry_client_to_backend_bytes(
-                    client_to_backend_bytes,
-                    request.request_wire_len().get(),
-                ),
+        Ok(Self::finish_ordered_large_transfer_request(
+            &mut backend_connection,
+            client_to_backend_bytes,
+            request.request_wire_len().get(),
             backend_to_client_bytes,
-        })
+        ))
     }
 
     async fn prepare_ordered_large_transfer_attempt(
@@ -813,7 +830,7 @@ mod tests {
     use crate::cache::{ArticleAvailability, UnifiedCache};
     use crate::protocol::StatusCode;
     use crate::session::ClientSession;
-    use crate::types::{BackendId, MessageId};
+    use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes, MessageId};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::sync::mpsc;
@@ -942,5 +959,20 @@ mod tests {
         );
 
         assert_eq!(delta.as_u64(), 0);
+    }
+
+    #[test]
+    fn ordered_large_transfer_finish_reports_extra_upload_and_download_bytes() {
+        let mut backend_connection = None;
+        let result = ClientSession::finish_ordered_large_transfer_request(
+            &mut backend_connection,
+            ClientToBackendBytes::new(30),
+            10,
+            BackendToClientBytes::new(42),
+        );
+
+        assert_eq!(result.additional_client_to_backend_bytes.as_u64(), 20);
+        assert_eq!(result.backend_to_client_bytes.as_u64(), 42);
+        assert!(backend_connection.is_none());
     }
 }
