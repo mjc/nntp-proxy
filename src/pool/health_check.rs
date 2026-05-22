@@ -8,7 +8,7 @@
 use deadpool::managed;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 
 use crate::constants::pool::{
@@ -184,45 +184,27 @@ where
     C: AsyncRead + Unpin,
 {
     let mut response_buf = [0u8; HEALTH_CHECK_BUFFER_SIZE];
-    let mut total = 0usize;
     let request = crate::protocol::RequestContext::from_verb_args(b"DATE", b"");
 
-    loop {
-        if total == response_buf.len() {
-            return Err(HealthCheckError::UnexpectedResponse(
-                String::from_utf8_lossy(&response_buf).into_owned(),
-            ));
-        }
-
-        let n = conn
-            .read(&mut response_buf[total..])
-            .await
-            .map_err(HealthCheckError::ReadError)?;
-
-        if n == 0 {
-            return Err(HealthCheckError::ConnectionClosedDuringCheck);
-        }
-
-        total += n;
-
-        match crate::session::multiline_framing::complete_single_line_response_bytes(
-            &request,
-            &response_buf[..total],
-        ) {
-            Ok(line) => {
-                let Some(line) = line else {
-                    return Err(HealthCheckError::UnexpectedData);
-                };
-                return Ok(String::from_utf8_lossy(line).into_owned());
+    // Keep DATE response framing behind the backend facade. Health checks care
+    // only about the final reply string or the typed failure, never about
+    // partial line state.
+    crate::session::backend::read_single_line_reply(conn, &request, &mut response_buf)
+        .await
+        .map_err(|err| match err {
+            crate::session::backend::SingleLineReplyReadError::Full { bytes_read }
+            | crate::session::backend::SingleLineReplyReadError::Invalid { bytes_read } => {
+                HealthCheckError::UnexpectedResponse(
+                    String::from_utf8_lossy(&response_buf[..bytes_read]).into_owned(),
+                )
             }
-            Err(crate::session::multiline_framing::ResponseReadError::Incomplete) => {}
-            Err(crate::session::multiline_framing::ResponseReadError::Invalid(_)) => {
-                return Err(HealthCheckError::UnexpectedResponse(
-                    String::from_utf8_lossy(&response_buf[..total]).into_owned(),
-                ));
+            crate::session::backend::SingleLineReplyReadError::Io(err) => {
+                HealthCheckError::ReadError(err)
             }
-        }
-    }
+            crate::session::backend::SingleLineReplyReadError::Closed => {
+                HealthCheckError::ConnectionClosedDuringCheck
+            }
+        })
 }
 
 /// Application-level health check using DATE command
@@ -557,5 +539,19 @@ mod tests {
             "split DATE responses should be consumed fully"
         );
         assert_eq!(stream.written, DATE_COMMAND);
+    }
+
+    #[tokio::test]
+    async fn test_check_date_response_rejects_invalid_reply_bytes() {
+        let mut stream = ChunkedStream::new(vec![b"abc\r\n".to_vec()]);
+
+        let result = check_date_response(&mut stream).await;
+
+        match result {
+            Err(HealthCheckError::UnexpectedResponse(response)) => {
+                assert_eq!(response, "abc\r\n");
+            }
+            other => panic!("Expected invalid DATE response, got {other:?}"),
+        }
     }
 }

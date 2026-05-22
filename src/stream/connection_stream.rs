@@ -8,18 +8,86 @@ use smallvec::SmallVec;
 use crate::compression::DecompressStream;
 use crate::constants::buffer::MAX_PENDING_BACKEND_BYTES;
 use crate::tls::TlsStream;
-use std::io;
+use std::io::{self, IoSlice};
+use std::ops::Range;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 const PENDING_BACKEND_INLINE_BYTES: usize = 1024;
+const PENDING_BACKEND_INLINE_SEGMENTS: usize = 2;
 
 #[derive(Clone, Copy)]
 enum PendingByteOrder {
     Front,
     Back,
+}
+
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+enum PendingBackendInput {
+    Copied {
+        bytes: SmallVec<[u8; PENDING_BACKEND_INLINE_BYTES]>,
+        pos: usize,
+    },
+    Pooled {
+        buffer: crate::pool::PooledBuffer,
+        range: Range<usize>,
+        pos: usize,
+    },
+}
+
+impl PendingBackendInput {
+    fn copied(bytes: &[u8]) -> Self {
+        let mut copied = SmallVec::new();
+        if bytes.len() > PENDING_BACKEND_INLINE_BYTES {
+            crate::pool::buffer::record_pending_backend_byte_heap_fallback();
+        }
+        copied.extend_from_slice(bytes);
+        Self::Copied {
+            bytes: copied,
+            pos: 0,
+        }
+    }
+
+    const fn pooled(buffer: crate::pool::PooledBuffer, range: Range<usize>) -> Self {
+        Self::Pooled {
+            buffer,
+            range,
+            pos: 0,
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        match self {
+            Self::Copied { bytes, pos } => bytes.len().saturating_sub(*pos),
+            Self::Pooled { range, pos, .. } => range.len().saturating_sub(*pos),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.remaining() == 0
+    }
+
+    fn read_into(&mut self, buf: &mut ReadBuf<'_>) -> usize {
+        match self {
+            Self::Copied { bytes, pos } => {
+                let available = &bytes[*pos..];
+                let n = available.len().min(buf.remaining());
+                buf.put_slice(&available[..n]);
+                *pos += n;
+                n
+            }
+            Self::Pooled { buffer, range, pos } => {
+                let available = &buffer.as_ref()[range.start + *pos..range.end];
+                let n = available.len().min(buf.remaining());
+                buf.put_slice(&available[..n]);
+                *pos += n;
+                n
+            }
+        }
+    }
 }
 
 /// Trait for async streams that can be used for NNTP connections
@@ -46,12 +114,12 @@ enum ConnectionTransport {
 
 /// Unified stream type that can represent different connection types.
 ///
-/// The stream also owns a small pending bytes buffer used to preserve bytes that
-/// were already consumed from the socket but belong to the next NNTP response.
+/// The stream also owns pending backend input that was already consumed from
+/// the socket but belongs to the next NNTP response.
 #[derive(Debug)]
 pub struct ConnectionStream {
     transport: ConnectionTransport,
-    pending_bytes: SmallVec<[u8; PENDING_BACKEND_INLINE_BYTES]>,
+    pending_input: SmallVec<[PendingBackendInput; PENDING_BACKEND_INLINE_SEGMENTS]>,
 }
 
 fn ensure_pending_bytes_capacity(current: usize, additional: usize) -> anyhow::Result<()> {
@@ -92,7 +160,7 @@ impl ConnectionStream {
     fn new(transport: ConnectionTransport) -> Self {
         Self {
             transport,
-            pending_bytes: SmallVec::new(),
+            pending_input: SmallVec::new(),
         }
     }
 
@@ -118,7 +186,7 @@ impl ConnectionStream {
 
         Ok(Self {
             transport,
-            pending_bytes: self.pending_bytes,
+            pending_input: self.pending_input,
         })
     }
 
@@ -236,34 +304,65 @@ impl ConnectionStream {
 
         ensure_pending_bytes_capacity(self.pending_bytes_len(), bytes.len())?;
 
-        if self.pending_bytes.spilled()
-            || self.pending_bytes.len() + bytes.len() > PENDING_BACKEND_INLINE_BYTES
+        if self.pending_input.spilled()
+            || self.pending_input.len() >= PENDING_BACKEND_INLINE_SEGMENTS
         {
             crate::pool::buffer::record_pending_backend_byte_heap_fallback();
         }
+        let segment = PendingBackendInput::copied(bytes);
         match order {
-            PendingByteOrder::Back => self.pending_bytes.extend_from_slice(bytes),
-            PendingByteOrder::Front => {
-                let old = std::mem::take(&mut self.pending_bytes);
-                self.pending_bytes.extend_from_slice(bytes);
-                self.pending_bytes.extend_from_slice(&old);
-            }
+            PendingByteOrder::Back => self.pending_input.push(segment),
+            PendingByteOrder::Front => self.pending_input.insert(0, segment),
         }
+        Ok(())
+    }
+
+    /// Queue bytes already read into a pooled backend buffer ahead of any
+    /// retained bytes. The byte range is opaque to this type; response framing
+    /// decisions remain owned by the caller that installs the segment.
+    pub(crate) fn queue_pooled_pending_bytes_first(
+        &mut self,
+        buffer: crate::pool::PooledBuffer,
+        range: Range<usize>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            range.start <= range.end,
+            "pending pooled range start exceeds end"
+        );
+        let len = range.len();
+        if len == 0 {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            range.end <= buffer.initialized(),
+            "pending pooled range exceeds initialized buffer"
+        );
+        ensure_pending_bytes_capacity(self.pending_bytes_len(), len)?;
+        if self.pending_input.spilled()
+            || self.pending_input.len() >= PENDING_BACKEND_INLINE_SEGMENTS
+        {
+            crate::pool::buffer::record_pending_backend_byte_heap_fallback();
+        }
+        self.pending_input
+            .insert(0, PendingBackendInput::pooled(buffer, range));
         Ok(())
     }
 
     #[must_use]
     pub fn has_pending_bytes(&self) -> bool {
-        !self.pending_bytes.is_empty()
+        self.pending_input.iter().any(|segment| !segment.is_empty())
     }
 
     #[must_use]
     pub fn pending_bytes_len(&self) -> usize {
-        self.pending_bytes.len()
+        self.pending_input
+            .iter()
+            .map(PendingBackendInput::remaining)
+            .sum()
     }
 
     pub fn clear_pending_bytes(&mut self) {
-        self.pending_bytes.clear();
+        self.pending_input.clear();
     }
 }
 
@@ -273,10 +372,13 @@ impl AsyncRead for ConnectionStream {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        if !self.pending_bytes.is_empty() && buf.remaining() > 0 {
-            let n = self.pending_bytes.len().min(buf.remaining());
-            buf.put_slice(&self.pending_bytes[..n]);
-            self.pending_bytes.drain(0..n);
+        if let Some(front) = self.pending_input.first_mut()
+            && buf.remaining() > 0
+        {
+            front.read_into(buf);
+            if front.is_empty() {
+                self.pending_input.remove(0);
+            }
             return Poll::Ready(Ok(()));
         }
 
@@ -311,6 +413,34 @@ impl AsyncWrite for ConnectionStream {
         }
     }
 
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        match &mut self.transport {
+            ConnectionTransport::Plain(stream) => Pin::new(stream).poll_write_vectored(cx, bufs),
+            ConnectionTransport::Tls(stream) => {
+                Pin::new(stream.as_mut()).poll_write_vectored(cx, bufs)
+            }
+            ConnectionTransport::CompressedPlain(stream) => {
+                Pin::new(stream.as_mut()).poll_write_vectored(cx, bufs)
+            }
+            ConnectionTransport::CompressedTls(stream) => {
+                Pin::new(stream.as_mut()).poll_write_vectored(cx, bufs)
+            }
+        }
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        match &self.transport {
+            ConnectionTransport::Plain(stream) => stream.is_write_vectored(),
+            ConnectionTransport::Tls(stream) => stream.is_write_vectored(),
+            ConnectionTransport::CompressedPlain(stream) => stream.is_write_vectored(),
+            ConnectionTransport::CompressedTls(stream) => stream.is_write_vectored(),
+        }
+    }
+
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match &mut self.transport {
             ConnectionTransport::Plain(stream) => Pin::new(stream).poll_flush(cx),
@@ -339,7 +469,7 @@ impl AsyncWrite for ConnectionStream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     #[tokio::test]
     async fn test_connection_stream_plain_tcp() {
@@ -371,6 +501,20 @@ mod tests {
         fn assert_async_stream<T: AsyncStream>() {}
         assert_async_stream::<TcpStream>();
         assert_async_stream::<ConnectionStream>();
+    }
+
+    #[tokio::test]
+    async fn test_plain_connection_stream_preserves_vectored_write_support() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (_server_stream, _) = listener.accept().await.unwrap();
+        let client_stream = client_handle.await.unwrap();
+
+        let conn = ConnectionStream::plain(client_stream);
+
+        assert!(AsyncWrite::is_write_vectored(&conn));
     }
 
     #[tokio::test]
@@ -486,6 +630,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_pooled_pending_bytes_are_read_before_socket_without_copy_metric() {
+        crate::pool::buffer::reset_hot_path_allocation_metrics();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            client.write_all(b"socket").await.unwrap();
+            client
+        });
+
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
+
+        let pool =
+            crate::pool::BufferPool::new(crate::types::BufferSize::try_new(1024).unwrap(), 1);
+        let mut pending = pool.acquire();
+        pending.copy_from_slice(b"xxpooledyy");
+        assert_eq!(pool.available_buffers(), 0);
+
+        let mut conn = ConnectionStream::plain(server_stream);
+        conn.queue_pooled_pending_bytes_first(pending, 2..8)
+            .unwrap();
+        assert_eq!(conn.pending_bytes_len(), 6);
+        assert_eq!(
+            pool.available_buffers(),
+            0,
+            "queued pending input should retain the pooled allocation"
+        );
+
+        let mut buf = [0u8; 6];
+        conn.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pooled");
+        assert!(!conn.has_pending_bytes());
+        assert_eq!(
+            pool.available_buffers(),
+            1,
+            "fully consumed pending input should return the pooled allocation"
+        );
+
+        let metrics = crate::pool::buffer::hot_path_allocation_metrics_snapshot();
+        assert_eq!(metrics.pending_backend_byte_heap_fallbacks, 0);
+
+        let mut buf = [0u8; 6];
+        conn.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"socket");
+    }
+
+    #[tokio::test]
     async fn test_queue_pending_bytes_rejects_oversized_buffers() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -501,6 +694,28 @@ mod tests {
             err.to_string()
                 .contains(&MAX_PENDING_BACKEND_BYTES.to_string())
         );
+        assert_eq!(conn.pending_bytes_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_queue_pooled_pending_bytes_rejects_backwards_range() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
+
+        let pool =
+            crate::pool::BufferPool::new(crate::types::BufferSize::try_new(1024).unwrap(), 1);
+        let mut pending = pool.acquire();
+        pending.copy_from_slice(b"pooled");
+
+        let mut conn = ConnectionStream::plain(server_stream);
+        let err = conn
+            .queue_pooled_pending_bytes_first(pending, 5..2)
+            .unwrap_err();
+        assert!(err.to_string().contains("range start exceeds end"));
         assert_eq!(conn.pending_bytes_len(), 0);
     }
 

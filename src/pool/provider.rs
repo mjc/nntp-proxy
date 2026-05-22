@@ -25,7 +25,7 @@ use tracing::{debug, info, warn};
 #[derive(Debug, Clone)]
 pub struct DeadpoolConnectionProvider {
     pool: Pool,
-    name: String,
+    name: Arc<str>,
     /// Shutdown signal sender for background health check task.
     /// Stored to keep the channel alive - when dropped, the background task will terminate.
     /// Used by `shutdown()` method to gracefully stop health checks.
@@ -372,7 +372,7 @@ impl DeadpoolConnectionProvider {
 
         Self {
             pool,
-            name,
+            name: Arc::from(name),
             shutdown_tx: None,
             health_check_metrics: Arc::new(HealthCheckMetrics::new()),
             original_max_size: max_size,
@@ -461,7 +461,7 @@ impl DeadpoolConnectionProvider {
 
         Ok(Self {
             pool,
-            name: server.name.to_string(),
+            name: Arc::from(server.name.to_string()),
             shutdown_tx,
             health_check_metrics: metrics,
             original_max_size: max_size,
@@ -485,7 +485,7 @@ impl DeadpoolConnectionProvider {
             let err = match e {
                 deadpool::managed::PoolError::Backend(conn_err) => conn_err,
                 _other => ConnectionError::PoolExhausted {
-                    backend: self.name.clone(),
+                    backend: self.name.to_string(),
                     max_size: status.max_size,
                 },
             };
@@ -608,7 +608,7 @@ impl DeadpoolConnectionProvider {
                 active_cooldowns: Arc<std::sync::atomic::AtomicUsize>,
                 pool: Pool,
                 original_max: usize,
-                name: String,
+                name: Arc<str>,
             }
             impl Drop for CooldownGuard {
                 fn drop(&mut self) {
@@ -645,7 +645,7 @@ impl DeadpoolConnectionProvider {
     #[must_use]
     #[inline]
     pub fn name(&self) -> &str {
-        &self.name
+        self.name.as_ref()
     }
 
     #[must_use]
@@ -1162,7 +1162,7 @@ mod tests {
 
         DeadpoolConnectionProvider {
             pool,
-            name: format!("test-{}", addr.port()),
+            name: Arc::from(format!("test-{}", addr.port())),
             shutdown_tx: None,
             health_check_metrics: Arc::new(crate::pool::health_check::HealthCheckMetrics::new()),
             original_max_size: max_size,

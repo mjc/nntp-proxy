@@ -74,6 +74,9 @@ async fn run_proxy(
         .validate_dashboard_listen(&launch.host, launch.port)?;
 
     let proxy = build_proxy(config, launch.routing_mode, launch.metrics_store).await?;
+
+    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+
     if let Some(path) = launch.availability_path.as_ref() {
         let _ = runtime::load_availability_from_disk(proxy.cache(), path);
     }
@@ -98,11 +101,10 @@ async fn run_proxy(
     runtime::spawn_client_writer_lock_metrics_logger();
     runtime::spawn_tokio_runtime_metrics_logger();
 
-    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
-    let (tui_handle, tui_shutdown_tx) =
-        launch_tui(ui_mode, &proxy, log_buffer.clone(), shutdown_tx.clone());
     let (dashboard_handle, dashboard_shutdown_tx) =
-        launch_dashboard_publisher(args.common.tui_listen, &proxy, log_buffer).await?;
+        launch_dashboard_publisher(args.common.tui_listen, &proxy, log_buffer.clone()).await?;
+    let (tui_handle, tui_shutdown_tx) =
+        launch_tui(ui_mode, &proxy, log_buffer, shutdown_tx.clone());
     let error_tui_shutdown_tx = tui_shutdown_tx.clone();
     let error_dashboard_shutdown_tx = dashboard_shutdown_tx.clone();
     spawn_signal_forwarder(shutdown_tx, tui_shutdown_tx, dashboard_shutdown_tx);

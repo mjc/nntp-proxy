@@ -102,7 +102,7 @@ impl ClientSession {
             .await
             .context("Failed to acquire backend for stateful mode")?;
 
-        // Wrap connection in guard — removes from pool on any error
+        // Wrap connection in guard — unreleased connections are removed from the pool.
         let mut conn_guard = crate::pool::ConnectionGuard::new(pooled_conn, provider);
 
         // Start stateful session metrics tracking
@@ -149,7 +149,7 @@ impl ClientSession {
         // H1: Only return connection to pool on success
         if result.is_ok() {
             let _conn = conn_guard.release();
-        } // else: guard drops → removes broken connection from pool
+        } // else: guard drops -> removes connection with replacement cooldown
 
         // Metrics guard automatically ends session via Drop
         result.map_err(crate::session::SessionError::from)
@@ -175,7 +175,7 @@ impl ClientSession {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!(error::ROUTER_REQUIRED))?;
 
-        let backend_id = router.route(self.client_id)?;
+        let backend_id = router.route_without_availability(self.client_id)?;
 
         // Guard pending_count immediately — if get_pooled_connection fails,
         // the guard drops and decrements automatically

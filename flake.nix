@@ -95,6 +95,7 @@
         ]
         ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
           perf
+          heaptrack
           cargo-llvm-cov
           mold # Fast linker (Linux only)
         ];
@@ -188,6 +189,8 @@
           echo "   cargo bench       - Run benchmarks"
           ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
             echo "   perf              - Linux performance analysis tools"
+            echo "   heaptrack         - Heap allocation profiler"
+            echo "   heaptrack_print   - Analyze heaptrack captures"
           ''}
           echo ""
           echo "📊 Dependencies:"

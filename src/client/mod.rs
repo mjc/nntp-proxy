@@ -145,9 +145,10 @@ impl NntpClient {
             .context("Failed to get connection from pool")?;
         let mut buffer = self.buffer_pool.acquire();
 
-        send_request(&mut *conn, &request, &mut buffer).await?;
-        let status_code = crate::session::multiline_framing::response_status(&request, &buffer)
-            .map_err(|_| anyhow::anyhow!("Invalid STAT response"))?;
+        let response = send_request(&mut *conn, &request, &mut buffer).await?;
+        let Some(status_code) = response.status_code() else {
+            anyhow::bail!("Invalid STAT response");
+        };
 
         Self::parse_stat_response(status_code)
     }
@@ -175,32 +176,36 @@ impl NntpClient {
             .context("Failed to get connection from pool")?;
         let mut io_buffer = self.buffer_pool.acquire();
 
-        send_request(&mut *conn, &request, &mut io_buffer).await?;
-        let status_code = crate::session::multiline_framing::response_status(&request, &io_buffer)
-            .map_err(|_| anyhow::anyhow!("Invalid response from server"))?;
+        let response = send_request(&mut *conn, &request, &mut io_buffer).await?;
+        let Some(status_code) = response.status_code() else {
+            anyhow::bail!("Invalid response from server");
+        };
 
         Self::validate_response(status_code)?;
 
         if request.has_response_body(status_code) {
-            return self.fetch_complete_response(conn, io_buffer).await;
+            return self
+                .fetch_captured_multiline_response(conn, io_buffer)
+                .await;
         }
 
         Ok(io_buffer)
     }
 
-    async fn fetch_complete_response(
+    async fn fetch_captured_multiline_response(
         &self,
         mut conn: Object<TcpManager>,
         mut io_buffer: PooledBuffer,
     ) -> Result<PooledBuffer> {
-        // Use a capture buffer as the accumulator: pooled, can grow beyond io_buffer
-        // capacity without panicking, returned to pool on drop.
+        // This client helper is intentionally only an owner of the destination
+        // capture buffer. It delegates all multiline response completion and
+        // trailing-byte rejection to the backend/framer facade.
         let mut capture = self.buffer_pool.acquire_capture();
-        if let Err(err) = crate::session::multiline_framing::IsolatedMultilineResponse::new(
+        if let Err(err) = crate::session::backend::capture_complete_multiline_response(
             &mut conn,
             &mut io_buffer,
+            &mut capture,
         )
-        .capture_into(&mut capture)
         .await
         {
             self.conn_pool.remove_with_cooldown(conn);
@@ -410,20 +415,18 @@ mod tests {
         NntpClient::new(provider, buffer_pool)
     }
 
-    async fn capture_complete_response_for_test(
+    async fn capture_multiline_response_for_test(
         conn: &mut crate::stream::ConnectionStream,
         io_buffer: &mut PooledBuffer,
         capture: &mut PooledBuffer,
     ) -> Result<()> {
-        crate::session::multiline_framing::IsolatedMultilineResponse::new(conn, io_buffer)
-            .capture_into(capture)
-            .await
+        crate::session::backend::capture_complete_multiline_response(conn, io_buffer, capture).await
     }
 
     /// Verify the session response reader captures the complete response when it all
     /// arrives in the first pre-read buffer.
     #[tokio::test]
-    async fn test_complete_response_capture_single_read() {
+    async fn test_multiline_response_capture_single_read() {
         use crate::pool::BufferPool;
         use crate::types::BufferSize;
 
@@ -439,10 +442,10 @@ mod tests {
         let mut io_buffer = buffer_pool.acquire();
         let mut capture = buffer_pool.acquire_capture();
 
-        // Simulate send_request pre-reading the full first response chunk
+        // Simulate send_request reading a complete response into the buffer.
         io_buffer.read_from(&mut *conn).await.unwrap();
 
-        capture_complete_response_for_test(&mut conn, &mut io_buffer, &mut capture)
+        capture_multiline_response_for_test(&mut conn, &mut io_buffer, &mut capture)
             .await
             .unwrap();
 
@@ -456,7 +459,7 @@ mod tests {
     /// Read 4 ends in the middle of the response body end, exercising response capture
     /// response-reader state.
     #[tokio::test]
-    async fn test_complete_response_capture_multi_read_spanning_response_body_end() {
+    async fn test_multiline_response_capture_multi_read_spanning_body_end() {
         use crate::pool::BufferPool;
         use crate::types::BufferSize;
 
@@ -474,8 +477,8 @@ mod tests {
         let mut io_buffer = buffer_pool.acquire();
         let mut capture = buffer_pool.acquire_capture();
 
-        // No pre-loaded data; all bytes arrive via the framer loop.
-        capture_complete_response_for_test(&mut conn, &mut io_buffer, &mut capture)
+        // No response bytes have been read into the buffer yet.
+        capture_multiline_response_for_test(&mut conn, &mut io_buffer, &mut capture)
             .await
             .unwrap();
 
@@ -483,7 +486,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_complete_response_capture_errors_on_truncated_response() {
+    async fn test_multiline_response_capture_errors_on_truncated_response() {
         use crate::pool::BufferPool;
         use crate::types::BufferSize;
 
@@ -498,7 +501,7 @@ mod tests {
         let mut io_buffer = buffer_pool.acquire();
         let mut capture = buffer_pool.acquire_capture();
 
-        let err = capture_complete_response_for_test(&mut conn, &mut io_buffer, &mut capture)
+        let err = capture_multiline_response_for_test(&mut conn, &mut io_buffer, &mut capture)
             .await
             .unwrap_err();
 
@@ -510,7 +513,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_complete_response_capture_errors_on_extra_response_bytes() {
+    async fn test_multiline_response_capture_errors_on_extra_response_bytes() {
         use crate::pool::BufferPool;
         use crate::types::BufferSize;
 
@@ -528,7 +531,7 @@ mod tests {
         let mut capture = buffer_pool.acquire_capture();
         io_buffer.read_from(&mut *conn).await.unwrap();
 
-        let err = capture_complete_response_for_test(&mut conn, &mut io_buffer, &mut capture)
+        let err = capture_multiline_response_for_test(&mut conn, &mut io_buffer, &mut capture)
             .await
             .unwrap_err();
 
@@ -536,7 +539,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_head_reads_complete_response() {
+    async fn fetch_head_reads_multiline_response() {
         let response = b"221 0 <test@example.com>\r\nSubject: test\r\nFrom: tester\r\n\r\n.\r\n";
         let addr = spawn_fetch_test_server("HEAD <test@example.com>", response).await;
         let client = make_test_client(addr);
@@ -548,7 +551,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_body_reads_complete_response() {
+    async fn fetch_body_reads_multiline_response() {
         let response = b"222 0 <test@example.com>\r\nhello world\r\n.\r\n";
         let addr = spawn_fetch_test_server("BODY <test@example.com>", response).await;
         let client = make_test_client(addr);

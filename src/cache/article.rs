@@ -154,7 +154,7 @@ enum CachedResponseWirePayload<'a> {
 
 impl CachedResponseWire<'_> {
     fn response_completion() -> std::io::IoSlice<'static> {
-        crate::session::response_buffer::cached_response_completion()
+        crate::session::backend::cached_response_completion()
     }
 
     fn response_completion_len() -> usize {
@@ -655,7 +655,7 @@ pub(crate) fn parse_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPay
         return CachedPayload::AvailabilityOnly;
     };
     let article_number = parse_article_number(&buffer[..status_end]);
-    let Some(payload) = complete_response_body_for_status(code, &buffer[status_end..]) else {
+    let Some(payload) = captured_payload_body_for_status(code, &buffer[status_end..]) else {
         return match code {
             223 => CachedPayload::Stat { article_number },
             _ => CachedPayload::AvailabilityOnly,
@@ -664,11 +664,17 @@ pub(crate) fn parse_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPay
     payload_for_status(code, article_number, payload)
 }
 
-fn complete_response_body_for_status(code: u16, payload: &[u8]) -> Option<&[u8]> {
+/// Return semantic payload bytes for an already captured cache-ingest response.
+///
+/// ARTICLE/HEAD/BODY payloads arrive here only after the session framer has
+/// captured a complete response. Cache parsing delegates multiline payload body
+/// extraction back through the backend facade instead of performing response
+/// boundary checks locally.
+fn captured_payload_body_for_status(code: u16, payload: &[u8]) -> Option<&[u8]> {
     if !matches!(code, 220..=222) {
         return Some(payload);
     }
-    crate::session::response_buffer::complete_response_body(payload)
+    crate::session::backend::captured_multiline_payload_body(payload)
 }
 
 fn payload_for_status(

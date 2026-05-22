@@ -1,12 +1,15 @@
 use crate::types::BufferSize;
-use bytes::{Bytes, BytesMut};
-use crossbeam::queue::SegQueue;
+use bytes::{BufMut, Bytes, BytesMut};
+use crossbeam::queue::ArrayQueue;
 use smallvec::SmallVec;
+use std::future::poll_fn;
 use std::ops::{Deref, Range};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
+use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tracing::{debug, info};
 
 /// A pooled buffer that automatically returns to the pool when dropped
@@ -25,11 +28,41 @@ use tracing::{debug, info};
 /// ```
 pub struct PooledBuffer {
     buffer: BytesMut,
-    pool: Arc<SegQueue<BytesMut>>,
+    pool: Arc<ArrayQueue<BytesMut>>,
     pool_size: Arc<AtomicUsize>,
     max_pool_size: usize,
     expected_capacity: usize,
     writable_len: usize,
+    acquired_at: Instant,
+    source: PooledBufferSource,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PooledBufferKind {
+    Regular,
+    Capture,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PooledBufferSource {
+    kind: PooledBufferKind,
+    fallback: bool,
+}
+
+impl PooledBufferSource {
+    const fn regular(fallback: bool) -> Self {
+        Self {
+            kind: PooledBufferKind::Regular,
+            fallback,
+        }
+    }
+
+    const fn capture(fallback: bool) -> Self {
+        Self {
+            kind: PooledBufferKind::Capture,
+            fallback,
+        }
+    }
 }
 
 impl std::fmt::Debug for PooledBuffer {
@@ -74,16 +107,13 @@ impl PooledBuffer {
         R: AsyncRead + Unpin,
     {
         self.buffer.clear();
-        let limit = self.read_limit();
-        let n = reader.take(limit as u64).read_buf(&mut self.buffer).await?;
-        Ok(n)
+        self.read_into_spare(reader, self.read_limit()).await
     }
 
     /// Read more data at the current initialized offset, accumulating bytes.
     ///
     /// Unlike `read_from` which resets the buffer, this appends to existing data.
-    /// Used when a partial response needs more data (e.g., status code split
-    /// across TCP segments).
+    /// Used when a higher-level reader needs more bytes in the same allocation.
     ///
     /// Returns the number of NEW bytes read (not total).
     ///
@@ -94,8 +124,27 @@ impl PooledBuffer {
         R: AsyncRead + Unpin,
     {
         let limit = self.read_limit().saturating_sub(self.buffer.len());
-        let n = reader.take(limit as u64).read_buf(&mut self.buffer).await?;
-        Ok(n)
+        self.read_into_spare(reader, limit).await
+    }
+
+    async fn read_into_spare<R>(&mut self, reader: &mut R, limit: usize) -> std::io::Result<usize>
+    where
+        R: AsyncRead + Unpin,
+    {
+        let spare = self.buffer.spare_capacity_mut();
+        let read_len = limit.min(spare.len());
+        if read_len == 0 {
+            return Ok(0);
+        }
+
+        let mut read_buf = ReadBuf::uninit(&mut spare[..read_len]);
+        poll_fn(|cx| Pin::new(&mut *reader).poll_read(cx, &mut read_buf)).await?;
+        let read = read_buf.filled().len();
+        // SAFETY: `poll_read` initialized exactly `read` bytes in the spare slice.
+        unsafe {
+            self.buffer.advance_mut(read);
+        }
+        Ok(read)
     }
 
     /// Copy data into buffer and mark as initialized
@@ -185,6 +234,10 @@ impl AsRef<[u8]> for PooledBuffer {
 
 impl Drop for PooledBuffer {
     fn drop(&mut self) {
+        let held_micros = duration_micros_u64(self.acquired_at.elapsed());
+        record_buffer_hold(self.source, held_micros);
+        maybe_log_buffer_hold(self.source, held_micros, self.buffer.capacity());
+
         if self.buffer.capacity() != self.expected_capacity {
             debug!(
                 "Dropping resized pooled buffer instead of returning it to the pool (capacity {} != expected {})",
@@ -207,8 +260,14 @@ impl Drop for PooledBuffer {
             ) {
                 Ok(_) => {
                     let buffer = std::mem::take(&mut self.buffer);
-                    self.pool.push(buffer);
-                    return;
+                    match self.pool.push(buffer) {
+                        Ok(()) => return,
+                        Err(buffer) => {
+                            self.buffer = buffer;
+                            self.pool_size.fetch_sub(1, Ordering::Relaxed);
+                            return;
+                        }
+                    }
                 }
                 Err(new_size) => {
                     current_size = new_size;
@@ -223,6 +282,11 @@ impl Drop for PooledBuffer {
 ///
 /// This avoids reallocating or growing a single `Vec` on the hot path when
 /// a multiline response is larger than the typical capture size.
+///
+/// `ChunkedResponse` is storage only. It intentionally does not expose response
+/// boundary helpers such as prefix or terminator checks; callers that need to
+/// interpret backend bytes must go through the session framer/backend facade
+/// before putting data here.
 #[derive(Debug, Default)]
 pub struct ChunkedResponse {
     chunks: SmallVec<[ResponseChunk; 16]>,
@@ -246,11 +310,18 @@ struct ResponseWriteMetrics {
 #[derive(Debug, Default)]
 struct HotPathAllocationMetrics {
     regular_pool_fallback_allocations: AtomicUsize,
+    regular_pool_exhaustions: AtomicUsize,
     capture_pool_fallback_allocations: AtomicUsize,
     chunked_response_metadata_spills: AtomicUsize,
     pending_backend_byte_heap_fallbacks: AtomicUsize,
     non_owned_response_write_chunks: AtomicUsize,
     non_owned_response_write_bytes: AtomicUsize,
+    regular_pool_buffer_holds: AtomicUsize,
+    regular_pool_buffer_hold_micros_total: AtomicU64,
+    regular_pool_buffer_hold_micros_max: AtomicU64,
+    capture_pool_buffer_holds: AtomicUsize,
+    capture_pool_buffer_hold_micros_total: AtomicU64,
+    capture_pool_buffer_hold_micros_max: AtomicU64,
 }
 
 /// Snapshot of direct client write-path activity from `ChunkedResponse::write_all_to`.
@@ -272,11 +343,18 @@ pub struct ResponseWriteMetricsSnapshot {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HotPathAllocationMetricsSnapshot {
     pub regular_pool_fallback_allocations: usize,
+    pub regular_pool_exhaustions: usize,
     pub capture_pool_fallback_allocations: usize,
     pub chunked_response_metadata_spills: usize,
     pub pending_backend_byte_heap_fallbacks: usize,
     pub non_owned_response_write_chunks: usize,
     pub non_owned_response_write_bytes: usize,
+    pub regular_pool_buffer_holds: usize,
+    pub regular_pool_buffer_hold_micros_total: u64,
+    pub regular_pool_buffer_hold_micros_max: u64,
+    pub capture_pool_buffer_holds: usize,
+    pub capture_pool_buffer_hold_micros_total: u64,
+    pub capture_pool_buffer_hold_micros_max: u64,
 }
 
 fn response_write_metrics_enabled() -> bool {
@@ -292,6 +370,75 @@ fn response_write_metrics() -> &'static ResponseWriteMetrics {
 fn hot_path_allocation_metrics() -> &'static HotPathAllocationMetrics {
     static METRICS: OnceLock<HotPathAllocationMetrics> = OnceLock::new();
     METRICS.get_or_init(HotPathAllocationMetrics::default)
+}
+
+fn duration_micros_u64(duration: std::time::Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
+fn buffer_hold_log_threshold_micros() -> Option<u64> {
+    static THRESHOLD: OnceLock<Option<u64>> = OnceLock::new();
+    *THRESHOLD.get_or_init(|| {
+        std::env::var("NNTP_PROXY_BUFFER_HOLD_LOG_MS")
+            .ok()
+            .and_then(|value| {
+                let millis = value.parse::<u64>().ok()?;
+                if millis == 0 {
+                    None
+                } else {
+                    Some(millis.saturating_mul(1000))
+                }
+            })
+    })
+}
+
+fn record_buffer_hold(source: PooledBufferSource, held_micros: u64) {
+    let metrics = hot_path_allocation_metrics();
+    match source.kind {
+        PooledBufferKind::Regular => {
+            metrics
+                .regular_pool_buffer_holds
+                .fetch_add(1, Ordering::Relaxed);
+            metrics
+                .regular_pool_buffer_hold_micros_total
+                .fetch_add(held_micros, Ordering::Relaxed);
+            metrics
+                .regular_pool_buffer_hold_micros_max
+                .fetch_max(held_micros, Ordering::Relaxed);
+        }
+        PooledBufferKind::Capture => {
+            metrics
+                .capture_pool_buffer_holds
+                .fetch_add(1, Ordering::Relaxed);
+            metrics
+                .capture_pool_buffer_hold_micros_total
+                .fetch_add(held_micros, Ordering::Relaxed);
+            metrics
+                .capture_pool_buffer_hold_micros_max
+                .fetch_max(held_micros, Ordering::Relaxed);
+        }
+    }
+}
+
+fn maybe_log_buffer_hold(source: PooledBufferSource, held_micros: u64, capacity: usize) {
+    let Some(threshold) = buffer_hold_log_threshold_micros() else {
+        return;
+    };
+    if held_micros < threshold {
+        return;
+    }
+
+    let pool = match source.kind {
+        PooledBufferKind::Regular => "regular",
+        PooledBufferKind::Capture => "capture",
+    };
+    debug!(
+        pool,
+        fallback = source.fallback,
+        held_ms = held_micros / 1000,
+        capacity,
+        "Pooled buffer held longer than threshold"
+    );
 }
 
 pub(crate) fn record_pending_backend_byte_heap_fallback() {
@@ -317,6 +464,7 @@ pub fn hot_path_allocation_metrics_snapshot() -> HotPathAllocationMetricsSnapsho
         regular_pool_fallback_allocations: metrics
             .regular_pool_fallback_allocations
             .load(Ordering::Relaxed),
+        regular_pool_exhaustions: metrics.regular_pool_exhaustions.load(Ordering::Relaxed),
         capture_pool_fallback_allocations: metrics
             .capture_pool_fallback_allocations
             .load(Ordering::Relaxed),
@@ -332,6 +480,20 @@ pub fn hot_path_allocation_metrics_snapshot() -> HotPathAllocationMetricsSnapsho
         non_owned_response_write_bytes: metrics
             .non_owned_response_write_bytes
             .load(Ordering::Relaxed),
+        regular_pool_buffer_holds: metrics.regular_pool_buffer_holds.load(Ordering::Relaxed),
+        regular_pool_buffer_hold_micros_total: metrics
+            .regular_pool_buffer_hold_micros_total
+            .load(Ordering::Relaxed),
+        regular_pool_buffer_hold_micros_max: metrics
+            .regular_pool_buffer_hold_micros_max
+            .load(Ordering::Relaxed),
+        capture_pool_buffer_holds: metrics.capture_pool_buffer_holds.load(Ordering::Relaxed),
+        capture_pool_buffer_hold_micros_total: metrics
+            .capture_pool_buffer_hold_micros_total
+            .load(Ordering::Relaxed),
+        capture_pool_buffer_hold_micros_max: metrics
+            .capture_pool_buffer_hold_micros_max
+            .load(Ordering::Relaxed),
     }
 }
 
@@ -340,6 +502,7 @@ pub fn reset_hot_path_allocation_metrics() {
     metrics
         .regular_pool_fallback_allocations
         .store(0, Ordering::Relaxed);
+    metrics.regular_pool_exhaustions.store(0, Ordering::Relaxed);
     metrics
         .capture_pool_fallback_allocations
         .store(0, Ordering::Relaxed);
@@ -354,6 +517,24 @@ pub fn reset_hot_path_allocation_metrics() {
         .store(0, Ordering::Relaxed);
     metrics
         .non_owned_response_write_bytes
+        .store(0, Ordering::Relaxed);
+    metrics
+        .regular_pool_buffer_holds
+        .store(0, Ordering::Relaxed);
+    metrics
+        .regular_pool_buffer_hold_micros_total
+        .store(0, Ordering::Relaxed);
+    metrics
+        .regular_pool_buffer_hold_micros_max
+        .store(0, Ordering::Relaxed);
+    metrics
+        .capture_pool_buffer_holds
+        .store(0, Ordering::Relaxed);
+    metrics
+        .capture_pool_buffer_hold_micros_total
+        .store(0, Ordering::Relaxed);
+    metrics
+        .capture_pool_buffer_hold_micros_max
         .store(0, Ordering::Relaxed);
 }
 
@@ -429,32 +610,32 @@ struct ResponseChunk {
 #[derive(Debug)]
 enum ResponseChunkStorage {
     Pooled(PooledBuffer),
+    #[cfg(test)]
     SharedPooled(Arc<PooledBuffer>),
-    Shared(Bytes),
 }
 
 impl ResponseChunk {
     fn as_slice(&self) -> &[u8] {
         match &self.storage {
             ResponseChunkStorage::Pooled(buffer) => &buffer.as_ref()[self.range.clone()],
+            #[cfg(test)]
             ResponseChunkStorage::SharedPooled(buffer) => &buffer.as_ref()[self.range.clone()],
-            ResponseChunkStorage::Shared(bytes) => &bytes[self.range.clone()],
         }
     }
 
     fn initialized(&self) -> usize {
         match &self.storage {
             ResponseChunkStorage::Pooled(buffer) => buffer.initialized(),
+            #[cfg(test)]
             ResponseChunkStorage::SharedPooled(buffer) => buffer.initialized(),
-            ResponseChunkStorage::Shared(bytes) => bytes.len(),
         }
     }
 
     fn capacity(&self) -> usize {
         match &self.storage {
             ResponseChunkStorage::Pooled(buffer) => buffer.capacity(),
+            #[cfg(test)]
             ResponseChunkStorage::SharedPooled(buffer) => buffer.capacity(),
-            ResponseChunkStorage::Shared(bytes) => bytes.len(),
         }
     }
 
@@ -467,7 +648,8 @@ impl ResponseChunk {
     fn extend_from_slice(&mut self, data: &[u8]) {
         match &mut self.storage {
             ResponseChunkStorage::Pooled(buffer) => buffer.extend_from_slice(data),
-            ResponseChunkStorage::SharedPooled(_) | ResponseChunkStorage::Shared(_) => {
+            #[cfg(test)]
+            ResponseChunkStorage::SharedPooled(_) => {
                 panic!("cannot extend shared response chunk")
             }
         }
@@ -535,11 +717,12 @@ impl ChunkedResponse {
     /// Move a byte range from an initialized pooled buffer into this response.
     ///
     /// This avoids copying large backend reads into separate capture buffers.
+    /// The caller must pass only a range already produced by response framing.
     /// Later appends will allocate a fresh pooled chunk when this range does not
     /// end at the initialized length, so skipped bytes are never exposed.
     /// # Panics
     /// Panics if `range` is outside the buffer's initialized bytes.
-    pub fn push_buffer_range(&mut self, buffer: PooledBuffer, range: Range<usize>) {
+    pub(crate) fn push_buffer_range(&mut self, buffer: PooledBuffer, range: Range<usize>) {
         assert!(
             range.start <= range.end && range.end <= buffer.initialized(),
             "response range must be inside initialized buffer"
@@ -560,7 +743,12 @@ impl ChunkedResponse {
     ///
     /// # Panics
     /// Panics if `range` is outside the pooled buffer's initialized bytes.
-    pub fn push_shared_pooled_range(&mut self, buffer: Arc<PooledBuffer>, range: Range<usize>) {
+    #[cfg(test)]
+    pub(crate) fn push_shared_pooled_range(
+        &mut self,
+        buffer: Arc<PooledBuffer>,
+        range: Range<usize>,
+    ) {
         assert!(
             range.start <= range.end && range.end <= buffer.initialized(),
             "response range must be inside initialized pooled buffer"
@@ -573,27 +761,6 @@ impl ChunkedResponse {
         self.len += range.end - range.start;
         self.chunks.push(ResponseChunk {
             storage: ResponseChunkStorage::SharedPooled(buffer),
-            range,
-        });
-    }
-
-    /// Add a range from shared immutable bytes without copying.
-    ///
-    /// # Panics
-    /// Panics if `range` is outside the shared buffer.
-    pub fn push_shared_range(&mut self, bytes: Bytes, range: Range<usize>) {
-        assert!(
-            range.start <= range.end && range.end <= bytes.len(),
-            "response range must be inside shared buffer"
-        );
-        if self.chunks.len() == self.chunks.inline_size() {
-            hot_path_allocation_metrics()
-                .chunked_response_metadata_spills
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        self.len += range.end - range.start;
-        self.chunks.push(ResponseChunk {
-            storage: ResponseChunkStorage::Shared(bytes),
             range,
         });
     }
@@ -632,30 +799,6 @@ impl ChunkedResponse {
             out.extend_from_slice(chunk);
         }
         out
-    }
-
-    /// Returns true if buffered bytes begin with `prefix`.
-    #[must_use]
-    pub fn starts_with(&self, prefix: &[u8]) -> bool {
-        if prefix.len() > self.len {
-            return false;
-        }
-
-        let mut remaining = prefix;
-        for chunk in self.iter_chunks() {
-            if remaining.is_empty() {
-                return true;
-            }
-
-            let data = chunk;
-            let take = data.len().min(remaining.len());
-            if data[..take] != remaining[..take] {
-                return false;
-            }
-            remaining = &remaining[take..];
-        }
-
-        remaining.is_empty()
     }
 
     /// Write all buffered chunks to a sink in order.
@@ -701,16 +844,18 @@ impl ChunkedResponse {
     }
 }
 
-/// Lock-free buffer pool for reusing large I/O buffers
-/// Uses crossbeam's `SegQueue` for lock-free operations
+/// Lock-free buffer pool for reusing large I/O buffers.
+///
+/// Uses bounded `ArrayQueue`s so queue slots are allocated once at startup and
+/// buffer return does not allocate linked queue blocks on the forwarding path.
 #[derive(Debug, Clone)]
 pub struct BufferPool {
-    pool: Arc<SegQueue<BytesMut>>,
+    pool: Arc<ArrayQueue<BytesMut>>,
     buffer_size: BufferSize,
     max_pool_size: usize,
     pool_size: Arc<AtomicUsize>,
     // Capture buffer pool (for accumulating streaming data)
-    capture_pool: Arc<SegQueue<BytesMut>>,
+    capture_pool: Arc<ArrayQueue<BytesMut>>,
     capture_capacity: usize,
     max_capture_pool_size: usize,
     capture_pool_size: Arc<AtomicUsize>,
@@ -787,7 +932,7 @@ impl BufferPool {
     /// All buffers are pre-allocated at creation time for optimal performance.
     #[must_use]
     pub fn new(buffer_size: BufferSize, max_pool_size: usize) -> Self {
-        let pool = Arc::new(SegQueue::new());
+        let pool = Arc::new(ArrayQueue::new(max_pool_size.max(1)));
         let pool_size = Arc::new(AtomicUsize::new(0));
 
         // Pre-allocate all buffers at startup to eliminate allocation overhead
@@ -800,7 +945,8 @@ impl BufferPool {
 
         for _ in 0..max_pool_size {
             let buffer = Self::create_aligned_buffer(buffer_size.get());
-            pool.push(buffer);
+            pool.push(buffer)
+                .expect("fresh regular buffer pool queue has preallocated capacity");
             pool_size.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -812,7 +958,7 @@ impl BufferPool {
             max_pool_size,
             pool_size,
             // Initialize capture pool as empty (will be configured via with_capture_pool)
-            capture_pool: Arc::new(SegQueue::new()),
+            capture_pool: Arc::new(ArrayQueue::new(1)),
             capture_capacity: 0,
             max_capture_pool_size: 0,
             capture_pool_size: Arc::new(AtomicUsize::new(0)),
@@ -829,6 +975,9 @@ impl BufferPool {
     /// * `count` - Number of capture buffers to pre-allocate
     #[must_use]
     pub fn with_capture_pool(mut self, capacity: usize, count: usize) -> Self {
+        self.capture_pool = Arc::new(ArrayQueue::new(count.max(1)));
+        self.capture_pool_size = Arc::new(AtomicUsize::new(0));
+
         info!(
             "Pre-allocating {} capture buffers of {}KB each ({}MB total)",
             count,
@@ -840,7 +989,9 @@ impl BufferPool {
             let mut buffer = BytesMut::with_capacity(capacity);
             // Pre-fault all pages to map physical memory
             Self::prefault_pages(&mut buffer);
-            self.capture_pool.push(buffer);
+            self.capture_pool
+                .push(buffer)
+                .expect("fresh capture buffer pool queue has preallocated capacity");
             self.capture_pool_size.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -903,24 +1054,7 @@ impl BufferPool {
     ///
     /// The buffer may contain old bytes outside its logical length, but immutable
     /// access only exposes `BytesMut::len()` initialized bytes.
-    fn acquire_now(&self) -> PooledBuffer {
-        let buffer = self.pool.pop().map_or_else(
-            || {
-                hot_path_allocation_metrics()
-                    .regular_pool_fallback_allocations
-                    .fetch_add(1, Ordering::Relaxed);
-                // Create new page-aligned buffer for better DMA performance
-                Self::create_aligned_buffer(self.buffer_size.get())
-            },
-            |buffer| {
-                self.pool_size.fetch_sub(1, Ordering::Relaxed);
-                // Buffer from pool is logically empty and has the expected allocation
-                // capacity (enforced on return).
-                debug_assert_eq!(buffer.len(), 0);
-                buffer
-            },
-        );
-
+    fn wrap_regular_buffer(&self, buffer: BytesMut, fallback: bool) -> PooledBuffer {
         PooledBuffer {
             expected_capacity: buffer.capacity(),
             buffer,
@@ -928,11 +1062,54 @@ impl BufferPool {
             pool_size: Arc::clone(&self.pool_size),
             max_pool_size: self.max_pool_size,
             writable_len: self.buffer_size.get(),
+            acquired_at: Instant::now(),
+            source: PooledBufferSource::regular(fallback),
         }
+    }
+
+    fn acquire_now(&self) -> PooledBuffer {
+        self.pool.pop().map_or_else(
+            || {
+                hot_path_allocation_metrics()
+                    .regular_pool_fallback_allocations
+                    .fetch_add(1, Ordering::Relaxed);
+                // Create new page-aligned buffer for better DMA performance
+                self.wrap_regular_buffer(Self::create_aligned_buffer(self.buffer_size.get()), true)
+            },
+            |buffer| {
+                self.pool_size.fetch_sub(1, Ordering::Relaxed);
+                // Buffer from pool is logically empty and has the expected allocation
+                // capacity (enforced on return).
+                debug_assert_eq!(buffer.len(), 0);
+                self.wrap_regular_buffer(buffer, false)
+            },
+        )
     }
 
     pub fn acquire(&self) -> PooledBuffer {
         self.acquire_now()
+    }
+
+    /// Get a regular buffer only if one is already available in the pool.
+    ///
+    /// This is for strict proxy forwarding paths where falling back to a fresh
+    /// allocation would hide hot-path pressure. Pool exhaustion remains visible
+    /// through the separate exhaustion metric, but this method returns `None`
+    /// instead of allocating.
+    #[cfg(test)]
+    pub(crate) fn try_acquire(&self) -> Option<PooledBuffer> {
+        let buffer = self.pool.pop().map_or_else(
+            || {
+                hot_path_allocation_metrics()
+                    .regular_pool_exhaustions
+                    .fetch_add(1, Ordering::Relaxed);
+                None
+            },
+            Some,
+        )?;
+        self.pool_size.fetch_sub(1, Ordering::Relaxed);
+        debug_assert_eq!(buffer.len(), 0);
+        Some(self.wrap_regular_buffer(buffer, false))
     }
 
     /// Get a capture buffer from the capture pool
@@ -943,8 +1120,10 @@ impl BufferPool {
     /// Pages are pre-faulted to eliminate soft page faults during streaming,
     /// which profiling showed accounted for 96.75% of memmove time.
     pub(crate) fn acquire_capture_now(&self) -> PooledBuffer {
+        let mut fallback = false;
         let buffer = self.capture_pool.pop().map_or_else(
             || {
+                fallback = true;
                 hot_path_allocation_metrics()
                     .capture_pool_fallback_allocations
                     .fetch_add(1, Ordering::Relaxed);
@@ -973,6 +1152,8 @@ impl BufferPool {
             pool_size: Arc::clone(&self.capture_pool_size),
             max_pool_size: self.max_capture_pool_size,
             writable_len: 0,
+            acquired_at: Instant::now(),
+            source: PooledBufferSource::capture(fallback),
         }
     }
 
@@ -984,6 +1165,12 @@ impl BufferPool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    fn hot_path_metrics_test_guard() -> MutexGuard<'static, ()> {
+        static GUARD: Mutex<()> = Mutex::new(());
+        GUARD.lock().expect("hot-path metrics test guard poisoned")
+    }
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
@@ -1185,6 +1372,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_try_acquire_reports_exhaustion_without_allocating() {
+        let _guard = hot_path_metrics_test_guard();
+        reset_hot_path_allocation_metrics();
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
+        let _held = pool.try_acquire().expect("preallocated buffer available");
+
+        let before = hot_path_allocation_metrics_snapshot();
+
+        assert!(pool.try_acquire().is_none());
+
+        let after = hot_path_allocation_metrics_snapshot();
+        assert_eq!(
+            after.regular_pool_fallback_allocations,
+            before.regular_pool_fallback_allocations
+        );
+        assert!(after.regular_pool_exhaustions > before.regular_pool_exhaustions);
+        assert_eq!(pool.stats(), (0, 1, 1));
+    }
+
+    #[tokio::test]
+    async fn test_buffer_hold_metrics_record_regular_and_capture_drops() {
+        let _guard = hot_path_metrics_test_guard();
+        reset_hot_path_allocation_metrics();
+        let pool =
+            BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8192, 1);
+        let before = hot_path_allocation_metrics_snapshot();
+
+        drop(pool.acquire());
+        drop(pool.acquire_capture());
+
+        let after = hot_path_allocation_metrics_snapshot();
+        assert!(after.regular_pool_buffer_holds > before.regular_pool_buffer_holds);
+        assert!(after.capture_pool_buffer_holds > before.capture_pool_buffer_holds);
+    }
+
+    #[tokio::test]
     async fn test_oversized_capture_buffer_is_not_reused() {
         let pool =
             BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8192, 1);
@@ -1199,6 +1422,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_capture_pool_preallocates_configured_count() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 4);
+
+        let buffers = [
+            pool.acquire_capture(),
+            pool.acquire_capture(),
+            pool.acquire_capture(),
+            pool.acquire_capture(),
+        ];
+
+        assert_eq!(pool.capture_pool_size.load(Ordering::Relaxed), 0);
+        assert!(buffers.iter().all(|buffer| buffer.capacity() == 8));
+        drop(buffers);
+
+        assert_eq!(pool.capture_pool_size.load(Ordering::Relaxed), 4);
+    }
+
+    #[tokio::test]
     async fn test_chunked_response_helpers_without_flattening() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 4);
         let mut response = ChunkedResponse::default();
@@ -1207,7 +1448,6 @@ mod tests {
         let chunks: Vec<&[u8]> = response.iter_chunks().collect();
         assert!(chunks.len() > 1, "test requires multi-chunk buffering");
         assert_eq!(chunks.concat(), b"220 0 <id>\r\nBody\r\n.\r\n");
-        assert!(response.starts_with(b"220 0 "));
 
         let mut prefix = SmallVec::<[u8; 128]>::new();
         response.copy_prefix_into(12, &mut prefix);
@@ -1252,7 +1492,6 @@ mod tests {
         let first = response.first_chunk().expect("range chunk");
         assert_eq!(first.as_ptr(), expected_ptr);
         assert_eq!(first, b"220 0 <id>\r\nBody\r\n.\r\n");
-        assert!(response.starts_with(b"220 0 "));
     }
 
     #[tokio::test]

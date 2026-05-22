@@ -295,7 +295,7 @@ impl ClientSession {
         }
     }
 
-    fn buffered_complete_line<R>(reader: &tokio::io::BufReader<R>) -> bool
+    fn queued_complete_command_line<R>(reader: &tokio::io::BufReader<R>) -> bool
     where
         R: tokio::io::AsyncRead + Unpin,
     {
@@ -355,7 +355,7 @@ impl ClientSession {
 
         // Read more commands from the buffer (non-blocking)
         while batch_contexts.len() < MAX_PIPELINE_DEPTH {
-            if !Self::buffered_complete_line(reader)
+            if !Self::queued_complete_command_line(reader)
                 && !Self::refill_available_client_bytes(reader).await?
             {
                 break;
@@ -363,7 +363,7 @@ impl ClientSession {
             // Only proceed if the buffer has a complete line. If a nonblocking
             // refill found only a partial command, stop the batch so the next
             // outer-loop read can wait for the command to complete.
-            if !Self::buffered_complete_line(reader) {
+            if !Self::queued_complete_command_line(reader) {
                 break;
             }
 
@@ -562,7 +562,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_command_batch_reads_second_buffered_body_burst_after_first_batch() {
+    async fn read_command_batch_reads_second_queued_body_burst_after_first_batch() {
         let session = test_session();
         let (mut client, server) = tokio::io::duplex(4096);
         client
@@ -682,7 +682,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_command_batch_reads_second_buffered_article_burst_with_trailing_group() {
+    async fn read_command_batch_reads_second_queued_article_burst_with_trailing_group() {
         let session = test_session();
         let (mut client, server) = tokio::io::duplex(4096);
         client

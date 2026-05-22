@@ -8,6 +8,8 @@
 use crate::types::ThreadCount;
 use anyhow::{Context, Result};
 
+const TOKIO_WORKER_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+
 /// Runtime configuration
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -74,6 +76,7 @@ impl RuntimeConfig {
             );
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(self.worker_threads)
+                .thread_stack_size(TOKIO_WORKER_THREAD_STACK_SIZE)
                 .enable_all()
                 .build()?
         };
@@ -769,12 +772,23 @@ pub async fn run_accept_loop(
     use tracing::{error, info};
 
     let uses_per_command = routing_mode.supports_per_command_routing();
+    let mut client_tasks = tokio::task::JoinSet::new();
 
     loop {
         tokio::select! {
+            biased;
+
             _ = shutdown_rx.recv() => {
                 info!("Shutdown initiated, stopping accept loop");
                 break;
+            }
+
+            Some(join_result) = client_tasks.join_next(), if !client_tasks.is_empty() => {
+                if let Err(error) = join_result
+                    && !error.is_cancelled()
+                {
+                    error!("Client session task failed: {:?}", error);
+                }
             }
 
             accept_result = listener.accept() => {
@@ -797,14 +811,17 @@ pub async fn run_accept_loop(
                     }
                 };
 
-                #[cfg(tokio_unstable)]
-                tokio::task::Builder::new()
-                    .name("client-session")
-                    .spawn(client_task)?;
-
-                #[cfg(not(tokio_unstable))]
-                tokio::spawn(client_task);
+                client_tasks.spawn(client_task);
             }
+        }
+    }
+
+    client_tasks.abort_all();
+    while let Some(join_result) = client_tasks.join_next().await {
+        if let Err(error) = join_result
+            && !error.is_cancelled()
+        {
+            error!("Client session task failed during shutdown: {:?}", error);
         }
     }
 
@@ -1150,6 +1167,110 @@ mod tests {
 
         let err = format!("{err:#}");
         assert!(err.contains("Failed to bind NNTP proxy listener"));
+    }
+
+    #[tokio::test]
+    async fn test_accept_loop_aborts_active_clients_on_shutdown() {
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+
+        let proxy = Arc::new(
+            crate::NntpProxy::new_sync(
+                crate::create_default_config(),
+                crate::RoutingMode::PerCommand,
+            )
+            .unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+
+        let accept_loop = tokio::spawn(run_accept_loop(
+            proxy,
+            listener,
+            shutdown_rx,
+            crate::RoutingMode::PerCommand,
+        ));
+
+        let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut greeting = Vec::new();
+        let mut byte = [0; 1];
+        while !greeting.ends_with(b"\n") {
+            client.read_exact(&mut byte).await.unwrap();
+            greeting.push(byte[0]);
+        }
+        assert!(greeting.starts_with(b"200") || greeting.starts_with(b"201"));
+
+        shutdown_tx.send(()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), accept_loop)
+            .await
+            .expect("accept loop should stop promptly after shutdown")
+            .unwrap()
+            .unwrap();
+
+        let read_result =
+            tokio::time::timeout(std::time::Duration::from_secs(3), client.read(&mut byte))
+                .await
+                .expect("client socket should close when active session is aborted");
+        assert!(matches!(read_result, Ok(0) | Err(_)));
+    }
+
+    #[tokio::test]
+    async fn test_accept_loop_aborts_all_active_clients_and_closes_listener() {
+        use std::sync::Arc;
+        use tokio::io::AsyncReadExt;
+
+        let proxy = Arc::new(
+            crate::NntpProxy::new_sync(
+                crate::create_default_config(),
+                crate::RoutingMode::PerCommand,
+            )
+            .unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::mpsc::channel(1);
+
+        let accept_loop = tokio::spawn(run_accept_loop(
+            proxy,
+            listener,
+            shutdown_rx,
+            crate::RoutingMode::PerCommand,
+        ));
+
+        let mut clients = Vec::new();
+        for _ in 0..3 {
+            let mut client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut greeting = Vec::new();
+            let mut byte = [0; 1];
+            while !greeting.ends_with(b"\n") {
+                client.read_exact(&mut byte).await.unwrap();
+                greeting.push(byte[0]);
+            }
+            assert!(greeting.starts_with(b"200") || greeting.starts_with(b"201"));
+            clients.push(client);
+        }
+
+        shutdown_tx.send(()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), accept_loop)
+            .await
+            .expect("accept loop should stop promptly after shutdown")
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            tokio::net::TcpStream::connect(addr).await.is_err(),
+            "listener should be closed after accept-loop shutdown"
+        );
+
+        for mut client in clients {
+            let mut byte = [0; 1];
+            let read_result =
+                tokio::time::timeout(std::time::Duration::from_secs(3), client.read(&mut byte))
+                    .await
+                    .expect("client socket should close when session is aborted");
+            assert!(matches!(read_result, Ok(0) | Err(_)));
+        }
     }
 
     // Builder pattern tests
