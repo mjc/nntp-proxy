@@ -77,10 +77,10 @@ where
             request,
             &scratch[..total],
         ) {
-            Ok(Some(bytes)) => {
+            Ok(bytes) => {
                 return Ok(String::from_utf8_lossy(bytes).into_owned());
             }
-            Ok(None) | Err(crate::session::multiline_framing::ResponseReadError::Incomplete) => {}
+            Err(crate::session::multiline_framing::ResponseReadError::Incomplete) => {}
             Err(crate::session::multiline_framing::ResponseReadError::Invalid(_)) => {
                 return Err(SingleLineReplyReadError::Invalid { bytes_read: total });
             }
@@ -508,6 +508,23 @@ mod tests {
             SingleLineReplyReadError::Invalid { bytes_read: 5 }
         ));
         assert_eq!(&scratch[..5], b"abc\r\n");
+    }
+
+    #[tokio::test]
+    async fn read_single_line_reply_rejects_packed_trailing_bytes() {
+        let packed_reply = b"111 20260501173336\r\n222 next\r\n";
+        let mut stream = ChunkedStream::new(vec![packed_reply.to_vec()]);
+        let request = RequestContext::from_verb_args(b"DATE", b"");
+        let mut scratch = [0u8; 64];
+
+        let err = read_single_line_reply(&mut stream, &request, &mut scratch)
+            .await
+            .expect_err("packed setup reply must not wait for more bytes");
+
+        assert!(matches!(
+            err,
+            SingleLineReplyReadError::Invalid { bytes_read } if bytes_read == packed_reply.len()
+        ));
     }
 
     // ─── Hex preview tests ──────────────────────────────────────────────────

@@ -131,7 +131,6 @@ type BackendReadAttempt = (
 );
 
 enum BackendReadAttemptError {
-    BufferPoolExhausted,
     Backend(anyhow::Error),
 }
 
@@ -837,18 +836,6 @@ impl ClientSession {
 
         match result {
             Ok((read_status, buffer, timings)) => Ok((guard, read_status, buffer, timings)),
-            Err(BackendReadAttemptError::BufferPoolExhausted) => {
-                debug!(
-                    client = %self.client_addr,
-                    backend = backend_id.as_index(),
-                    command_verb = ?request.verb(),
-                    "Regular buffer pool exhausted on direct backend attempt; releasing backend connection"
-                );
-                let _ = guard.release();
-                Err(anyhow::anyhow!(
-                    "regular buffer pool exhausted on direct backend attempt"
-                ))
-            }
             Err(BackendReadAttemptError::Backend(e)) => {
                 debug!(
                     client = %self.client_addr,
@@ -876,10 +863,7 @@ impl ClientSession {
         self.metrics.record_command(backend_id);
         self.metrics.user_command(self.username());
 
-        let mut buffer = self
-            .buffer_pool
-            .try_acquire()
-            .ok_or(BackendReadAttemptError::BufferPoolExhausted)?;
+        let mut buffer = self.buffer_pool.acquire();
         let (response, timings) = if should_sample_backend_timing() {
             let (response, ttfb, send, recv) =
                 backend::send_request_timed(conn, request, &mut buffer)

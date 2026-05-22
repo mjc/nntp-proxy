@@ -630,12 +630,14 @@ pub(crate) fn backend_response_read(
 pub(crate) fn unpacked_single_line_response<'a>(
     request: &crate::protocol::RequestContext,
     bytes: &'a [u8],
-) -> Result<Option<&'a [u8]>, ResponseReadError> {
-    ResponseFrame::parse_bytes(request, bytes).map(|frame| match frame {
+) -> Result<&'a [u8], ResponseReadError> {
+    ResponseFrame::parse_bytes(request, bytes).and_then(|frame| match frame {
         ResponseFrame::SingleLine { framed, .. } if framed.next_response_input.is_empty() => {
-            Some(&bytes[framed.response])
+            Ok(&bytes[framed.response])
         }
-        ResponseFrame::SingleLine { .. } | ResponseFrame::Multiline { .. } => None,
+        ResponseFrame::SingleLine { .. } | ResponseFrame::Multiline { .. } => {
+            Err(ResponseReadError::Invalid(SmallVec::new()))
+        }
     })
 }
 

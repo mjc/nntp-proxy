@@ -1096,6 +1096,7 @@ impl BufferPool {
     /// allocation would hide hot-path pressure. Pool exhaustion remains visible
     /// through the separate exhaustion metric, but this method returns `None`
     /// instead of allocating.
+    #[cfg(test)]
     pub(crate) fn try_acquire(&self) -> Option<PooledBuffer> {
         let buffer = self.pool.pop().map_or_else(
             || {
