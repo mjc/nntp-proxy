@@ -1,12 +1,13 @@
 //! WebSocket transport for attached and headless dashboard modes.
 
 use crate::tui::TuiApp;
+use crate::tui::app::ThroughputPoint;
 use crate::tui::constants::chart;
 use crate::tui::dashboard::DashboardState;
 use crate::tui::log_capture::LogBuffer;
 use crate::tui::{AttachedDashboard, RemoteDashboardStatus};
 use anyhow::Context;
-use futures::{Sink, SinkExt, Stream, StreamExt, TryStreamExt, future};
+use futures::{Sink, SinkExt, Stream, StreamExt, future};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,7 +19,8 @@ use tracing::{info, warn};
 
 pub(crate) const REMOTE_DASHBOARD_LOG_LINE_LIMIT: usize = 8;
 pub(crate) const REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT: usize = 64;
-const REMOTE_DASHBOARD_HISTORY_LIMIT: usize = chart::HISTORY_POINT_COUNT;
+const REMOTE_DASHBOARD_SNAPSHOT_HISTORY_LIMIT: usize = 1;
+const ATTACHED_DASHBOARD_HISTORY_LIMIT: usize = chart::HISTORY_POINT_COUNT;
 const REMOTE_DASHBOARD_TOP_USER_LIMIT: usize = 5;
 
 #[allow(clippy::cast_precision_loss)]
@@ -32,11 +34,9 @@ fn dashboard_message(state: &DashboardState) -> anyhow::Result<Message> {
 
 fn dashboard_state_from_message(
     message: Result<Message, tokio_tungstenite::tungstenite::Error>,
-) -> Option<Arc<DashboardState>> {
+) -> Option<DashboardState> {
     match message {
-        Ok(Message::Binary(bytes)) => bincode::deserialize::<DashboardState>(bytes.as_ref())
-            .ok()
-            .map(Arc::new),
+        Ok(Message::Binary(bytes)) => bincode::deserialize::<DashboardState>(bytes.as_ref()).ok(),
         _ => None,
     }
 }
@@ -71,7 +71,7 @@ fn sanitize_log_tail_limit(lines: usize) -> usize {
 
 fn dashboard_source_stream(
     source: impl Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>,
-) -> impl Stream<Item = Arc<DashboardState>> {
+) -> impl Stream<Item = DashboardState> {
     source.filter_map(|message| async move { dashboard_state_from_message(message) })
 }
 
@@ -408,10 +408,53 @@ fn trim_remote_dashboard_state(state: &mut DashboardState) {
 fn remote_dashboard_state(app: &TuiApp) -> DashboardState {
     let mut state = app.snapshot_state_with_limits(
         Some(REMOTE_DASHBOARD_LOG_LINE_LIMIT),
-        Some(REMOTE_DASHBOARD_HISTORY_LIMIT),
+        Some(REMOTE_DASHBOARD_SNAPSHOT_HISTORY_LIMIT),
     );
     trim_remote_dashboard_state(&mut state);
     state
+}
+
+fn append_history_samples(
+    previous: &[ThroughputPoint],
+    incoming: &[ThroughputPoint],
+    limit: usize,
+) -> Vec<ThroughputPoint> {
+    let incoming_start = incoming.len().saturating_sub(limit);
+    let incoming = &incoming[incoming_start..];
+    let previous_limit = limit.saturating_sub(incoming.len());
+    let previous_start = previous.len().saturating_sub(previous_limit);
+    let previous = &previous[previous_start..];
+
+    let mut accumulated = Vec::with_capacity(previous.len() + incoming.len());
+    accumulated.extend_from_slice(previous);
+    accumulated.extend_from_slice(incoming);
+    accumulated
+}
+
+fn accumulate_dashboard_state(
+    previous: Option<&DashboardState>,
+    mut incoming: DashboardState,
+) -> DashboardState {
+    incoming.client_history = append_history_samples(
+        previous
+            .map(|state| state.client_history.as_slice())
+            .unwrap_or_default(),
+        &incoming.client_history,
+        ATTACHED_DASHBOARD_HISTORY_LIMIT,
+    );
+
+    for (idx, backend) in incoming.backend_views.iter_mut().enumerate() {
+        backend.history = append_history_samples(
+            previous
+                .and_then(|state| state.backend_views.get(idx))
+                .map(|backend| backend.history.as_slice())
+                .unwrap_or_default(),
+            &backend.history,
+            ATTACHED_DASHBOARD_HISTORY_LIMIT,
+        );
+    }
+
+    incoming
 }
 
 async fn forward_dashboard_states<S>(
@@ -421,21 +464,27 @@ async fn forward_dashboard_states<S>(
 where
     S: Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
 {
-    dashboard_source_stream(source)
-        .map(Ok::<Arc<DashboardState>, anyhow::Error>)
-        .try_fold(state_tx, |state_tx, state| async move {
-            let connect_addr = match &state_tx.borrow().status {
-                RemoteDashboardStatus::Connecting { target }
-                | RemoteDashboardStatus::Connected { target }
-                | RemoteDashboardStatus::Reconnecting { target, .. } => target.to_owned(),
-            };
-            state_tx
-                .send(AttachedDashboard::connected(connect_addr, Some(state)))
-                .map_err(|_| anyhow::anyhow!("attached dashboard state receiver dropped"))?;
-            Ok::<_, anyhow::Error>(state_tx)
-        })
-        .await
-        .map(|_| ())
+    let mut accumulated = state_tx.borrow().latest_state.clone();
+    let source = dashboard_source_stream(source);
+    futures::pin_mut!(source);
+
+    while let Some(snapshot) = source.next().await {
+        let connect_addr = match &state_tx.borrow().status {
+            RemoteDashboardStatus::Connecting { target }
+            | RemoteDashboardStatus::Connected { target }
+            | RemoteDashboardStatus::Reconnecting { target, .. } => target.to_owned(),
+        };
+        let state = Arc::new(accumulate_dashboard_state(accumulated.as_deref(), snapshot));
+        state_tx
+            .send(AttachedDashboard::connected(
+                connect_addr,
+                Some(state.clone()),
+            ))
+            .map_err(|_| anyhow::anyhow!("attached dashboard state receiver dropped"))?;
+        accumulated = Some(state);
+    }
+
+    Ok(())
 }
 
 fn retry_reason(outcome: &anyhow::Result<ReaderSessionOutcome>) -> String {
@@ -463,10 +512,10 @@ mod tests {
     use crate::metrics::MetricsCollector;
     use crate::router::BackendSelector;
     use crate::tui::app::{ThroughputPoint, ViewMode};
-    use crate::tui::dashboard::{BufferPoolStats, DashboardMetrics};
+    use crate::tui::dashboard::{BackendDisplay, BackendView, BufferPoolStats, DashboardMetrics};
     use crate::tui::{LogBuffer, TuiAppBuilder};
-    use crate::types::Port;
     use crate::types::tui::{HistorySize, Throughput, Timestamp};
+    use crate::types::{HostName, MaxConnections, Port, ServerName};
     use futures::{FutureExt, stream};
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -505,6 +554,40 @@ mod tests {
             show_details: false,
             log_lines: Vec::new(),
             buffer_pool: None,
+        }
+    }
+
+    fn dashboard_state_with_sample(idx: usize) -> DashboardState {
+        let sample = idx as f64;
+        DashboardState {
+            backend_views: vec![BackendView {
+                server: BackendDisplay {
+                    host: HostName::try_new("backend.example.com".to_string()).unwrap(),
+                    port: Port::try_new(119).unwrap(),
+                    name: ServerName::try_new("Backend".to_string()).unwrap(),
+                    max_connections: MaxConnections::try_new(10).unwrap(),
+                },
+                stats: crate::metrics::BackendStats::default(),
+                active_connections: 0,
+                health_status: crate::metrics::BackendHealthStatus::Healthy,
+                pending_count: 0,
+                load_ratio: None,
+                stateful_count: 0,
+                traffic_share: None,
+                history: vec![ThroughputPoint::new_backend(
+                    Timestamp::now(),
+                    Throughput::new(sample),
+                    Throughput::new(sample + 1.0),
+                    crate::types::tui::CommandsPerSecond::new(sample + 2.0),
+                )],
+            }],
+            client_history: vec![ThroughputPoint::new_client(
+                Timestamp::now(),
+                Throughput::new(sample),
+                Throughput::new(sample + 1.0),
+            )],
+            log_lines: vec![format!("line {idx}")],
+            ..empty_dashboard_state()
         }
     }
 
@@ -652,7 +735,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_dashboard_snapshot_limits_remote_logs_and_history() {
+    async fn publish_dashboard_snapshot_sends_only_latest_history_sample() {
         let metrics = MetricsCollector::new(1);
         let router = Arc::new(BackendSelector::new());
         let servers = create_test_servers(1);
@@ -682,11 +765,59 @@ mod tests {
         );
         assert_eq!(
             snapshot.client_history.len(),
-            REMOTE_DASHBOARD_HISTORY_LIMIT,
+            REMOTE_DASHBOARD_SNAPSHOT_HISTORY_LIMIT,
         );
         assert_eq!(
             snapshot.backend_views[0].history.len(),
-            REMOTE_DASHBOARD_HISTORY_LIMIT,
+            REMOTE_DASHBOARD_SNAPSHOT_HISTORY_LIMIT,
+        );
+    }
+
+    #[tokio::test]
+    async fn reader_accumulates_remote_history_on_attached_client() {
+        let connect_addr: SocketAddr = "127.0.0.1:8120".parse().unwrap();
+        let (state_tx, mut state_rx) = watch::channel(AttachedDashboard::connecting(connect_addr));
+
+        let source = stream::iter((0..80).map(|idx| {
+            Ok(Message::Binary(
+                bincode::serialize(&dashboard_state_with_sample(idx))
+                    .expect("serialize sample")
+                    .into(),
+            ))
+        }));
+
+        forward_dashboard_states(source, state_tx)
+            .await
+            .expect("forward dashboard states");
+
+        let observed =
+            wait_for_log_lines(&mut state_rx, &["line 79"], Duration::from_secs(3)).await;
+
+        assert_eq!(
+            observed.client_history.len(),
+            ATTACHED_DASHBOARD_HISTORY_LIMIT
+        );
+        assert_eq!(
+            observed.backend_views[0].history.len(),
+            ATTACHED_DASHBOARD_HISTORY_LIMIT,
+        );
+        assert_eq!(observed.client_history[0].sent_per_sec().get(), 20.0);
+        assert_eq!(
+            observed.backend_views[0].history[0].sent_per_sec().get(),
+            20.0,
+        );
+        assert_eq!(
+            observed.client_history.last().unwrap().sent_per_sec().get(),
+            79.0,
+        );
+        assert_eq!(
+            observed.backend_views[0]
+                .history
+                .last()
+                .unwrap()
+                .sent_per_sec()
+                .get(),
+            79.0,
         );
     }
 
