@@ -1,6 +1,7 @@
 //! WebSocket transport for attached and headless dashboard modes.
 
 use crate::tui::TuiApp;
+use crate::tui::constants::chart;
 use crate::tui::dashboard::DashboardState;
 use crate::tui::log_capture::LogBuffer;
 use crate::tui::{AttachedDashboard, RemoteDashboardStatus};
@@ -17,7 +18,7 @@ use tracing::{info, warn};
 
 pub(crate) const REMOTE_DASHBOARD_LOG_LINE_LIMIT: usize = 8;
 pub(crate) const REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT: usize = 64;
-const REMOTE_DASHBOARD_HISTORY_LIMIT: usize = 15;
+const REMOTE_DASHBOARD_HISTORY_LIMIT: usize = chart::HISTORY_POINT_COUNT;
 const REMOTE_DASHBOARD_TOP_USER_LIMIT: usize = 5;
 
 #[allow(clippy::cast_precision_loss)]
@@ -662,10 +663,10 @@ mod tests {
 
         let mut app = TuiAppBuilder::new(metrics, router, servers)
             .with_log_buffer(log_buffer)
-            .with_history_size(HistorySize::new(32))
+            .with_history_size(HistorySize::new(90))
             .build();
 
-        for _ in 0..20 {
+        for _ in 0..80 {
             app.update();
         }
 

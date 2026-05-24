@@ -46,6 +46,10 @@ use tokio::sync::mpsc;
 
 type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 
+pub struct StartupTuiSession {
+    terminal: Option<TuiTerminal>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RemoteDashboardStatus {
     Connecting {
@@ -185,6 +189,81 @@ async fn with_terminal_session<T>(
     result
 }
 
+/// Enter the alternate screen immediately and draw the normal dashboard shell.
+///
+/// The returned session owns the terminal until it is handed to the live local
+/// TUI. This keeps interactive launches from presenting a blank terminal while
+/// config loading, proxy construction, and connection prewarm run.
+///
+/// # Errors
+/// Returns terminal setup or draw errors.
+pub fn start_startup_tui_session() -> Result<StartupTuiSession> {
+    let mut terminal = setup_terminal()?;
+    install_terminal_panic_hook();
+    draw_initial_dashboard(&mut terminal)?;
+    Ok(StartupTuiSession {
+        terminal: Some(terminal),
+    })
+}
+
+fn install_terminal_panic_hook() {
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        original_hook(panic_info);
+    }));
+}
+
+fn draw_initial_dashboard<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) -> Result<()>
+where
+    B::Error: Send + Sync + 'static,
+{
+    terminal.draw(|f| ui::render_ui(f, &initial_dashboard_state(), None, None, None, None))?;
+    Ok(())
+}
+
+fn initial_dashboard_state() -> DashboardState {
+    DashboardState {
+        metrics: dashboard::DashboardMetrics::default(),
+        backend_views: Vec::new(),
+        top_users: Vec::new(),
+        client_history: Vec::new(),
+        system_stats: SystemStats::default(),
+        view_mode: ViewMode::Normal,
+        show_details: false,
+        log_lines: Vec::new(),
+        buffer_pool: None,
+    }
+}
+
+impl StartupTuiSession {
+    async fn run_tui(
+        mut self,
+        mut app: TuiApp,
+        shutdown_tx: mpsc::Sender<()>,
+        mut shutdown_rx: mpsc::Receiver<()>,
+    ) -> Result<()> {
+        let Some(mut terminal) = self.terminal.take() else {
+            return Ok(());
+        };
+
+        let result = run_app(&mut terminal, &mut app, &mut shutdown_rx).await;
+        restore_terminal(&mut terminal)?;
+
+        let _ = shutdown_tx.send(()).await;
+        result
+    }
+}
+
+impl Drop for StartupTuiSession {
+    fn drop(&mut self) {
+        if let Some(mut terminal) = self.terminal.take() {
+            let _ = restore_terminal(&mut terminal);
+        }
+    }
+}
+
 /// Run the TUI event loop
 ///
 /// This function takes ownership of the terminal and runs until the user presses 'q' or Ctrl+C,
@@ -216,6 +295,19 @@ pub async fn run_tui(
     let _ = shutdown_tx.send(()).await;
 
     result
+}
+
+/// Run the local TUI using a terminal session that was opened before startup.
+///
+/// # Errors
+/// Returns terminal drawing, input, shutdown, or restore errors.
+pub async fn run_tui_from_startup_session(
+    session: StartupTuiSession,
+    app: TuiApp,
+    shutdown_tx: mpsc::Sender<()>,
+    shutdown_rx: mpsc::Receiver<()>,
+) -> Result<()> {
+    session.run_tui(app, shutdown_tx, shutdown_rx).await
 }
 
 /// Run the TUI as a remote dashboard client connected to a headless publisher.

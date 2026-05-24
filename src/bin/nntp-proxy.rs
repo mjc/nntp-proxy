@@ -35,6 +35,12 @@ fn main() -> Result<()> {
             .block_on(tui::run_attached_tui(connect_addr));
     }
 
+    let startup_tui = if ui_mode == UiMode::Tui {
+        Some(tui::start_startup_tui_session()?)
+    } else {
+        None
+    };
+
     let (mut config, _) = runtime::load_and_log_config(args.common.config.as_str())?;
 
     // Apply CLI argument overrides to config
@@ -60,7 +66,7 @@ fn main() -> Result<()> {
     let threads = args.common.threads.or(Some(config.proxy.threads));
     RuntimeConfig::from_args(threads)
         .build_runtime()?
-        .block_on(run_proxy(args, config, ui_mode, log_buffer))
+        .block_on(run_proxy(args, config, ui_mode, log_buffer, startup_tui))
 }
 
 async fn run_proxy(
@@ -68,6 +74,7 @@ async fn run_proxy(
     config: nntp_proxy::config::Config,
     ui_mode: UiMode,
     log_buffer: Option<tui::LogBuffer>,
+    startup_tui: Option<tui::StartupTuiSession>,
 ) -> Result<()> {
     let launch = prepare_proxy_launch(&args, &config);
     args.common
@@ -75,18 +82,13 @@ async fn run_proxy(
 
     let proxy = build_proxy(config, launch.routing_mode, launch.metrics_store).await?;
 
-    let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>(1);
+    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
 
     if let Some(path) = launch.availability_path.as_ref() {
         let _ = runtime::load_availability_from_disk(proxy.cache(), path);
     }
 
     let listener = runtime::bind_listener(&launch.host, launch.port, launch.routing_mode).await?;
-
-    // Prewarm connections BEFORE accepting clients (must complete first to avoid exceeding limits)
-    info!("Prewarming connection pools...");
-    proxy.prewarm_connections().await?;
-    info!("Connection pools ready, accepting clients");
 
     runtime::spawn_stats_flusher(proxy.connection_stats());
     runtime::spawn_cache_stats_logger(&proxy);
@@ -103,29 +105,61 @@ async fn run_proxy(
 
     let (dashboard_handle, dashboard_shutdown_tx) =
         launch_dashboard_publisher(args.common.tui_listen, &proxy, log_buffer.clone()).await?;
-    let (tui_handle, tui_shutdown_tx) =
-        launch_tui(ui_mode, &proxy, log_buffer, shutdown_tx.clone());
+    let (tui_handle, tui_shutdown_tx) = launch_tui(
+        ui_mode,
+        &proxy,
+        log_buffer,
+        shutdown_tx.clone(),
+        startup_tui,
+    );
     let error_tui_shutdown_tx = tui_shutdown_tx.clone();
     let error_dashboard_shutdown_tx = dashboard_shutdown_tx.clone();
     spawn_signal_forwarder(shutdown_tx, tui_shutdown_tx, dashboard_shutdown_tx);
 
+    // Prewarm connections BEFORE accepting clients (must complete first to avoid exceeding limits).
+    // The TUI is already running so interactive launches draw immediately while prewarm proceeds.
+    info!("Prewarming connection pools...");
+    let prewarm_result = tokio::select! {
+        result = proxy.prewarm_connections() => result,
+        _ = shutdown_rx.recv() => {
+            info!("Shutdown requested before connection pools finished prewarming");
+            shutdown_background_tasks(
+                error_tui_shutdown_tx,
+                error_dashboard_shutdown_tx,
+                tui_handle,
+                dashboard_handle,
+            ).await?;
+            return Ok(());
+        }
+    };
+
+    if let Err(e) = prewarm_result {
+        if let Some(tx) = error_tui_shutdown_tx {
+            let _ = tx.send(()).await;
+        }
+        if let Some(tx) = error_dashboard_shutdown_tx {
+            let _ = tx.send(()).await;
+        }
+        if let Some(handle) = tui_handle {
+            handle.await?;
+        }
+        if let Some(handle) = dashboard_handle {
+            handle.await?;
+        }
+        return Err(e);
+    }
+    info!("Connection pools ready, accepting clients");
+
     let accept_result =
         runtime::run_accept_loop(proxy.clone(), listener, shutdown_rx, launch.routing_mode).await;
 
-    if let Some(tx) = error_tui_shutdown_tx {
-        let _ = tx.send(()).await;
-    }
-    if let Some(tx) = error_dashboard_shutdown_tx {
-        let _ = tx.send(()).await;
-    }
-
-    if let Some(handle) = tui_handle {
-        handle.await?;
-    }
-
-    if let Some(handle) = dashboard_handle {
-        handle.await?;
-    }
+    shutdown_background_tasks(
+        error_tui_shutdown_tx,
+        error_dashboard_shutdown_tx,
+        tui_handle,
+        dashboard_handle,
+    )
+    .await?;
 
     if let Err(e) = runtime::persist_runtime_state(
         &proxy,
@@ -139,6 +173,30 @@ async fn run_proxy(
     }
 
     accept_result
+}
+
+async fn shutdown_background_tasks(
+    tui_shutdown_tx: Option<mpsc::Sender<()>>,
+    dashboard_shutdown_tx: Option<mpsc::Sender<()>>,
+    tui_handle: Option<TuiHandle>,
+    dashboard_handle: Option<TuiHandle>,
+) -> Result<()> {
+    if let Some(tx) = tui_shutdown_tx {
+        let _ = tx.send(()).await;
+    }
+    if let Some(tx) = dashboard_shutdown_tx {
+        let _ = tx.send(()).await;
+    }
+
+    if let Some(handle) = tui_handle {
+        handle.await?;
+    }
+
+    if let Some(handle) = dashboard_handle {
+        handle.await?;
+    }
+
+    Ok(())
 }
 
 async fn build_proxy(
@@ -218,6 +276,7 @@ fn launch_tui(
     proxy: &Arc<NntpProxy>,
     log_buffer: Option<tui::LogBuffer>,
     shutdown_tx: mpsc::Sender<()>,
+    startup_tui: Option<tui::StartupTuiSession>,
 ) -> (Option<TuiHandle>, Option<mpsc::Sender<()>>) {
     if !ui_mode.uses_tui() {
         return (None, None);
@@ -235,7 +294,12 @@ fn launch_tui(
     let tui_app = build_dashboard_app(proxy, log_buffer);
     let handle = tokio::spawn(async move {
         info!("Initializing TUI dashboard...");
-        if let Err(e) = tui::run_tui(tui_app, shutdown_tx, tui_shutdown_rx).await {
+        let result = if let Some(session) = startup_tui {
+            tui::run_tui_from_startup_session(session, tui_app, shutdown_tx, tui_shutdown_rx).await
+        } else {
+            tui::run_tui(tui_app, shutdown_tx, tui_shutdown_rx).await
+        };
+        if let Err(e) = result {
             error!("TUI error: {}", e);
         }
         info!("TUI closed");

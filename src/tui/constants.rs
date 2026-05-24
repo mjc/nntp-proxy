@@ -24,7 +24,8 @@ pub mod layout {
 
 /// Chart configuration
 pub mod chart {
-    pub const HISTORY_POINTS: f64 = 60.0;
+    pub const HISTORY_POINT_COUNT: usize = 60;
+    pub const HISTORY_POINTS: f64 = HISTORY_POINT_COUNT as f64;
     pub const MIN_THROUGHPUT: f64 = 1_048_576.0; // 1 MiB/s
 
     pub const X_LABEL_0S: &str = "0s";
@@ -104,6 +105,7 @@ mod tests {
 
     #[test]
     fn test_chart_constants() {
+        assert_eq!(chart::HISTORY_POINT_COUNT, 60);
         assert_eq!(chart::HISTORY_POINTS, 60.0);
         assert_eq!(chart::MIN_THROUGHPUT, 1_048_576.0);
         assert_eq!(chart::X_LABEL_0S, "0s");
