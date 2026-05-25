@@ -10,15 +10,15 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// A pooled buffer that automatically returns to the pool when dropped
 ///
 /// # Safety and Initialized Bytes
 ///
-/// The backing allocation is pre-faulted and then kept logically empty until
-/// bytes are read or copied into it. `BytesMut::len()` is the initialized length,
-/// and immutable access only exposes that initialized portion.
+/// The backing allocation is kept logically empty until bytes are read or copied
+/// into it. `BytesMut::len()` is the initialized length, and immutable access
+/// only exposes that initialized portion.
 ///
 /// ## Usage
 /// ```ignore
@@ -30,11 +30,13 @@ pub struct PooledBuffer {
     buffer: BytesMut,
     pool: Arc<ArrayQueue<BytesMut>>,
     pool_size: Arc<AtomicUsize>,
+    allocated_count: Arc<AtomicUsize>,
     max_pool_size: usize,
     expected_capacity: usize,
     writable_len: usize,
     acquired_at: Instant,
     source: PooledBufferSource,
+    counts_toward_pool: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -178,9 +180,9 @@ impl PooledBuffer {
     ///
     /// # Performance
     ///
-    /// Capture buffers are pre-allocated with sufficient capacity (1 MiB by default) and
-    /// pages are pre-faulted. As long as total accumulated data fits within
-    /// capacity, this operation performs NO allocations or page faults.
+    /// Capture buffers are allocated with sufficient capacity (1 MiB by default).
+    /// As long as total accumulated data fits within capacity, this operation performs
+    /// no Rust heap allocation.
     ///
     /// If data exceeds capacity, the `BytesMut` will grow automatically (with allocation).
     /// This ensures complete data is always captured rather than truncating, which
@@ -244,10 +246,17 @@ impl Drop for PooledBuffer {
                 self.buffer.capacity(),
                 self.expected_capacity
             );
+            if self.counts_toward_pool {
+                self.allocated_count.fetch_sub(1, Ordering::Relaxed);
+            }
             return;
         }
 
         self.buffer.clear();
+
+        if !self.counts_toward_pool {
+            return;
+        }
 
         // Atomically return buffer to pool if pool is not full
         let mut current_size = self.pool_size.load(Ordering::Relaxed);
@@ -265,6 +274,7 @@ impl Drop for PooledBuffer {
                         Err(buffer) => {
                             self.buffer = buffer;
                             self.pool_size.fetch_sub(1, Ordering::Relaxed);
+                            self.allocated_count.fetch_sub(1, Ordering::Relaxed);
                             return;
                         }
                     }
@@ -275,6 +285,7 @@ impl Drop for PooledBuffer {
             }
         }
         // If pool is full, buffer is dropped
+        self.allocated_count.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -854,18 +865,20 @@ pub struct BufferPool {
     buffer_size: BufferSize,
     max_pool_size: usize,
     pool_size: Arc<AtomicUsize>,
+    allocated_count: Arc<AtomicUsize>,
     // Capture buffer pool (for accumulating streaming data)
     capture_pool: Arc<ArrayQueue<BytesMut>>,
     capture_capacity: usize,
     max_capture_pool_size: usize,
     capture_pool_size: Arc<AtomicUsize>,
+    capture_allocated_count: Arc<AtomicUsize>,
 }
 
 impl BufferPool {
     /// Create a page-aligned buffer for optimal DMA performance
     ///
     /// Returns a raw `BytesMut` that will be wrapped in `PooledBuffer` by `acquire()`.
-    /// The buffer is pre-faulted, then cleared before it enters the pool.
+    /// The buffer has a logical length of zero before it enters the pool.
     ///
     /// # Safety
     ///
@@ -879,37 +892,10 @@ impl BufferPool {
         let page_size = 4096;
         let aligned_size = size.div_ceil(page_size) * page_size;
 
-        let mut buffer = BytesMut::with_capacity(aligned_size);
-        Self::prefault_pages(&mut buffer);
-        buffer
+        BytesMut::with_capacity(aligned_size)
     }
 
-    /// Pre-fault pages by touching one byte per 4KB stride to map physical memory.
-    ///
-    /// This eliminates page faults during streaming by ensuring all pages are
-    /// resident in physical memory. Without this, the first write to each page
-    /// triggers a soft page fault (96.75% of memmove time in profiling).
-    ///
-    /// # Safety
-    ///
-    /// We write within the buffer's allocated capacity (not beyond it).
-    /// `write_volatile` touches one byte per 4KB page to trigger the OS page fault
-    /// at init time rather than during streaming I/O. We deliberately do NOT zero
-    /// the full allocation first; scratch buffers are filled via `read_buf` before
-    /// their bytes become part of the initialized slice.
-    fn prefault_pages(buf: &mut BytesMut) {
-        let cap = buf.capacity();
-        // SAFETY: We write within the buffer's allocated capacity. `BytesMut::with_capacity`
-        // reserves that storage even though the logical length remains zero.
-        unsafe {
-            let ptr = buf.as_mut_ptr();
-            for offset in (0..cap).step_by(4096) {
-                std::ptr::write_volatile(ptr.add(offset), 1);
-            }
-        }
-    }
-
-    /// Create a new buffer pool with pre-allocated buffers
+    /// Create a new lazy buffer pool
     ///
     /// # Arguments
     /// * `buffer_size` - Size of each buffer in bytes (must be non-zero)
@@ -917,88 +903,70 @@ impl BufferPool {
     ///
     /// # Design Philosophy
     ///
-    /// **Buffer pools are allocated ONCE at application boot**, providing a
-    /// zero-allocation hot path for I/O operations. This is a critical performance
+    /// **Buffer pool queue capacity is allocated once at application boot**. Backing
+    /// buffers are allocated lazily as clients/backend work first need them, then
+    /// returned to the pool for reuse. This is a critical performance
     /// optimization:
     ///
-    /// - **Boot time**: All buffers pre-allocated (one-time cost)
-    /// - **Runtime**: Zero allocations in hot path (acquire/release from pool)
+    /// - **Boot time**: Queue slots only; idle RSS stays small
+    /// - **Warm runtime**: Zero allocations in hot path (acquire/release from pool)
     /// - **Per-connection**: Buffers are borrowed and returned, never owned
     ///
     /// **IMPORTANT**: Do NOT create a `BufferPool` per-client, per-connection, or
     /// per-request. Create ONE pool at application startup and share it across
     /// all operations via Arc or static reference.
     ///
-    /// All buffers are pre-allocated at creation time for optimal performance.
+    /// Buffers are allocated on first use up to `max_pool_size`; allocations beyond
+    /// that remain visible through fallback metrics.
     #[must_use]
     pub fn new(buffer_size: BufferSize, max_pool_size: usize) -> Self {
         let pool = Arc::new(ArrayQueue::new(max_pool_size.max(1)));
         let pool_size = Arc::new(AtomicUsize::new(0));
+        let allocated_count = Arc::new(AtomicUsize::new(0));
 
-        // Pre-allocate all buffers at startup to eliminate allocation overhead
         info!(
-            "Pre-allocating {} buffers of {}KB each ({}MB total)",
+            "Creating lazy buffer pool for up to {} buffers of {}KB each ({}MB max resident after use)",
             max_pool_size,
             buffer_size.get() / 1024,
             (max_pool_size * buffer_size.get()) / (1024 * 1024)
         );
-
-        for _ in 0..max_pool_size {
-            let buffer = Self::create_aligned_buffer(buffer_size.get());
-            pool.push(buffer)
-                .expect("fresh regular buffer pool queue has preallocated capacity");
-            pool_size.fetch_add(1, Ordering::Relaxed);
-        }
-
-        info!("Buffer pool pre-allocation complete");
 
         Self {
             pool,
             buffer_size,
             max_pool_size,
             pool_size,
+            allocated_count,
             // Initialize capture pool as empty (will be configured via with_capture_pool)
             capture_pool: Arc::new(ArrayQueue::new(1)),
             capture_capacity: 0,
             max_capture_pool_size: 0,
             capture_pool_size: Arc::new(AtomicUsize::new(0)),
+            capture_allocated_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    /// Configure the capture buffer pool for pre-faulted accumulator buffers
+    /// Configure the capture buffer pool for accumulator buffers
     ///
     /// Capture buffers are used for accumulating streaming data (e.g., caching).
-    /// Pages are pre-faulted to eliminate soft page faults during streaming.
-    ///
     /// # Arguments
     /// * `capacity` - Size of each capture buffer in bytes (e.g., 1 MiB by default)
-    /// * `count` - Number of capture buffers to pre-allocate
+    /// * `count` - Maximum number of capture buffers to pool
     #[must_use]
     pub fn with_capture_pool(mut self, capacity: usize, count: usize) -> Self {
         self.capture_pool = Arc::new(ArrayQueue::new(count.max(1)));
         self.capture_pool_size = Arc::new(AtomicUsize::new(0));
+        self.capture_allocated_count = Arc::new(AtomicUsize::new(0));
 
         info!(
-            "Pre-allocating {} capture buffers of {}KB each ({}MB total)",
+            "Creating lazy capture buffer pool for up to {} buffers of {}KB each ({}MB max resident after use)",
             count,
             capacity / 1024,
             (count * capacity) / (1024 * 1024)
         );
 
-        for _ in 0..count {
-            let mut buffer = BytesMut::with_capacity(capacity);
-            // Pre-fault all pages to map physical memory
-            Self::prefault_pages(&mut buffer);
-            self.capture_pool
-                .push(buffer)
-                .expect("fresh capture buffer pool queue has preallocated capacity");
-            self.capture_pool_size.fetch_add(1, Ordering::Relaxed);
-        }
-
         self.capture_capacity = capacity;
         self.max_capture_pool_size = count;
-
-        info!("Capture buffer pool pre-allocation complete");
 
         self
     }
@@ -1026,7 +994,9 @@ impl BufferPool {
     /// Get the number of buffers currently in use
     #[must_use]
     pub fn buffers_in_use(&self) -> usize {
-        self.max_pool_size.saturating_sub(self.available_buffers())
+        self.allocated_count
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.available_buffers())
     }
 
     /// Get buffer pool statistics (available, in-use, total)
@@ -1041,11 +1011,12 @@ impl BufferPool {
     ///
     /// Returns a `PooledBuffer` that automatically returns to the pool when dropped.
     ///
-    /// # Performance: Zero-Allocation Hot Path
+    /// # Performance: Warm Zero-Allocation Hot Path
     ///
-    /// When the pool was created with sufficient `max_pool_size`, this method
-    /// performs ZERO allocations - it just pops from the lock-free queue.
-    /// This is the critical hot path for I/O operations.
+    /// This method allocates lazily until the pool reaches `max_pool_size`.
+    /// Once buffers have been created and returned, reuse just pops from the
+    /// lock-free queue. This keeps idle RSS low while preserving the warm
+    /// zero-allocation forwarding path.
     ///
     /// Only if the pool is exhausted (all buffers in use) will a new buffer
     /// be allocated. Size the pool appropriately to avoid this fallback.
@@ -1054,34 +1025,89 @@ impl BufferPool {
     ///
     /// The buffer may contain old bytes outside its logical length, but immutable
     /// access only exposes `BytesMut::len()` initialized bytes.
-    fn wrap_regular_buffer(&self, buffer: BytesMut, fallback: bool) -> PooledBuffer {
+    fn wrap_regular_buffer(
+        &self,
+        buffer: BytesMut,
+        fallback: bool,
+        counts_toward_pool: bool,
+    ) -> PooledBuffer {
         PooledBuffer {
             expected_capacity: buffer.capacity(),
             buffer,
             pool: Arc::clone(&self.pool),
             pool_size: Arc::clone(&self.pool_size),
+            allocated_count: Arc::clone(&self.allocated_count),
             max_pool_size: self.max_pool_size,
             writable_len: self.buffer_size.get(),
             acquired_at: Instant::now(),
             source: PooledBufferSource::regular(fallback),
+            counts_toward_pool,
         }
+    }
+
+    fn try_reserve_regular_slot(&self) -> bool {
+        let mut allocated = self.allocated_count.load(Ordering::Relaxed);
+        while allocated < self.max_pool_size {
+            match self.allocated_count.compare_exchange_weak(
+                allocated,
+                allocated + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(new_allocated) => allocated = new_allocated,
+            }
+        }
+        false
+    }
+
+    fn try_reserve_capture_slot(&self) -> bool {
+        let mut allocated = self.capture_allocated_count.load(Ordering::Relaxed);
+        while allocated < self.max_capture_pool_size {
+            match self.capture_allocated_count.compare_exchange_weak(
+                allocated,
+                allocated + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(new_allocated) => allocated = new_allocated,
+            }
+        }
+        false
     }
 
     fn acquire_now(&self) -> PooledBuffer {
         self.pool.pop().map_or_else(
             || {
+                if self.try_reserve_regular_slot() {
+                    return self.wrap_regular_buffer(
+                        Self::create_aligned_buffer(self.buffer_size.get()),
+                        false,
+                        true,
+                    );
+                }
+
                 hot_path_allocation_metrics()
                     .regular_pool_fallback_allocations
                     .fetch_add(1, Ordering::Relaxed);
-                // Create new page-aligned buffer for better DMA performance
-                self.wrap_regular_buffer(Self::create_aligned_buffer(self.buffer_size.get()), true)
+                warn!(
+                    max_pool_size = self.max_pool_size,
+                    buffer_size = self.buffer_size.get(),
+                    "Regular buffer pool exhausted; allocating fallback buffer"
+                );
+                self.wrap_regular_buffer(
+                    Self::create_aligned_buffer(self.buffer_size.get()),
+                    true,
+                    false,
+                )
             },
             |buffer| {
                 self.pool_size.fetch_sub(1, Ordering::Relaxed);
                 // Buffer from pool is logically empty and has the expected allocation
                 // capacity (enforced on return).
                 debug_assert_eq!(buffer.len(), 0);
-                self.wrap_regular_buffer(buffer, false)
+                self.wrap_regular_buffer(buffer, false, true)
             },
         )
     }
@@ -1109,37 +1135,43 @@ impl BufferPool {
         )?;
         self.pool_size.fetch_sub(1, Ordering::Relaxed);
         debug_assert_eq!(buffer.len(), 0);
-        Some(self.wrap_regular_buffer(buffer, false))
+        Some(self.wrap_regular_buffer(buffer, false, true))
     }
 
     /// Get a capture buffer from the capture pool
     ///
-    /// Returns a `PooledBuffer` backed by a pre-faulted capture buffer.
+    /// Returns a `PooledBuffer` backed by a pooled capture buffer.
     /// Used for accumulating streaming data (e.g., caching articles).
-    ///
-    /// Pages are pre-faulted to eliminate soft page faults during streaming,
-    /// which profiling showed accounted for 96.75% of memmove time.
     pub(crate) fn acquire_capture_now(&self) -> PooledBuffer {
         let mut fallback = false;
+        let mut counts_toward_pool = true;
         let buffer = self.capture_pool.pop().map_or_else(
             || {
-                fallback = true;
-                hot_path_allocation_metrics()
-                    .capture_pool_fallback_allocations
-                    .fetch_add(1, Ordering::Relaxed);
-                // Pool exhausted - allocate and pre-fault new buffer
                 let capacity = if self.capture_capacity > 0 {
                     self.capture_capacity
                 } else {
                     self.buffer_size.get()
                 };
-                let mut buffer = BytesMut::with_capacity(capacity);
-                Self::prefault_pages(&mut buffer);
-                buffer
+
+                if self.try_reserve_capture_slot() {
+                    return BytesMut::with_capacity(capacity);
+                }
+
+                fallback = true;
+                counts_toward_pool = false;
+                hot_path_allocation_metrics()
+                    .capture_pool_fallback_allocations
+                    .fetch_add(1, Ordering::Relaxed);
+                warn!(
+                    max_pool_size = self.max_capture_pool_size,
+                    capacity, "Capture buffer pool exhausted; allocating fallback buffer"
+                );
+                // Pool exhausted - allocate a visible fallback buffer.
+                BytesMut::with_capacity(capacity)
             },
             |mut buffer| {
                 self.capture_pool_size.fetch_sub(1, Ordering::Relaxed);
-                // Clear but keep capacity (pages stay mapped)
+                // Clear but keep capacity for reuse.
                 buffer.clear();
                 buffer
             },
@@ -1150,10 +1182,12 @@ impl BufferPool {
             buffer,
             pool: Arc::clone(&self.capture_pool),
             pool_size: Arc::clone(&self.capture_pool_size),
+            allocated_count: Arc::clone(&self.capture_allocated_count),
             max_pool_size: self.max_capture_pool_size,
             writable_len: 0,
             acquired_at: Instant::now(),
             source: PooledBufferSource::capture(fallback),
+            counts_toward_pool,
         }
     }
 
@@ -1177,7 +1211,9 @@ mod tests {
     async fn test_buffer_pool_creation() {
         let pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 10);
 
-        // Pool should pre-allocate buffers
+        assert_eq!(pool.stats(), (0, 0, 10));
+
+        // Pool should lazily allocate buffers on first use.
         let buffer1 = pool.acquire();
         assert_eq!(buffer1.capacity(), 8192);
         assert_eq!(buffer1.initialized(), 0); // No bytes initialized yet
@@ -1357,7 +1393,7 @@ mod tests {
     async fn test_buffer_pool_exhaustion() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 2);
 
-        // Get all pre-allocated buffers
+        // Lazily allocate all pool-owned buffers.
         let buf1 = pool.acquire();
         let buf2 = pool.acquire();
 
@@ -1376,7 +1412,14 @@ mod tests {
         let _guard = hot_path_metrics_test_guard();
         reset_hot_path_allocation_metrics();
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
-        let _held = pool.try_acquire().expect("preallocated buffer available");
+
+        assert!(pool.try_acquire().is_none());
+        {
+            let buffer = pool.acquire();
+            assert_eq!(buffer.capacity(), 4096);
+        }
+
+        let _held = pool.try_acquire().expect("warmed buffer available");
 
         let before = hot_path_allocation_metrics_snapshot();
 
@@ -1422,8 +1465,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_capture_pool_preallocates_configured_count() {
+    async fn test_capture_pool_lazily_allocates_configured_count() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 4);
+
+        assert_eq!(pool.capture_pool_size.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.capture_allocated_count.load(Ordering::Relaxed), 0);
 
         let buffers = [
             pool.acquire_capture(),
@@ -1433,6 +1479,7 @@ mod tests {
         ];
 
         assert_eq!(pool.capture_pool_size.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.capture_allocated_count.load(Ordering::Relaxed), 4);
         assert!(buffers.iter().all(|buffer| buffer.capacity() == 8));
         drop(buffers);
 
@@ -1510,7 +1557,7 @@ mod tests {
         assert_eq!(first, b"220 0 <id>\r\nBody\r\n.\r\n");
         drop(response);
         drop(shared);
-        assert_eq!(pool.available_buffers(), 2);
+        assert_eq!(pool.available_buffers(), 1);
     }
 
     #[tokio::test]

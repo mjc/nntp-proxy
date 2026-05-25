@@ -1853,7 +1853,7 @@ mod tests {
     #[tokio::test]
     async fn capture_response_keeps_single_line_queued_reply_out_of_pool_buffers() {
         let pool = crate::pool::BufferPool::new(crate::types::BufferSize::try_new(64).unwrap(), 2);
-        assert_eq!(pool.available_buffers(), 2);
+        assert_eq!(pool.stats(), (0, 0, 2));
 
         {
             let combined = b"223 0 <test@example>\r\n430 No article with that message-id\r\n";
@@ -1867,7 +1867,7 @@ mod tests {
             assert_eq!(captured.to_vec(), b"223 0 <test@example>\r\n");
         }
 
-        assert_eq!(pool.available_buffers(), 2);
+        assert_eq!(pool.stats(), (2, 0, 2));
     }
 
     #[tokio::test]
