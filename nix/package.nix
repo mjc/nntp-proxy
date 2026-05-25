@@ -1,18 +1,9 @@
 {
   pkgs,
+  craneLib,
   cargoToml,
-  rustVersion,
 }:
 let
-  rustToolchain = pkgs.rust-bin.stable.${rustVersion}.default.override {
-    extensions = ["rust-src" "rust-analyzer" "llvm-tools-preview"];
-  };
-
-  rustPlatform = pkgs.makeRustPlatform {
-    cargo = rustToolchain;
-    rustc = rustToolchain;
-  };
-
   cargoTargetEnvPrefix =
     if pkgs.stdenv.hostPlatform.system == "x86_64-linux" then "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU"
     else if pkgs.stdenv.hostPlatform.system == "aarch64-linux" then "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU"
@@ -26,16 +17,14 @@ let
     "x86_64-darwin"
     "aarch64-darwin"
   ];
-in
-  rustPlatform.buildRustPackage (
+  src = craneLib.cleanCargoSource ../.;
+
+  commonArgs =
     {
       pname = cargoToml.package.name;
       version = cargoToml.package.version;
-      src = ../.;
-
-      cargoLock = {
-        lockFile = ../Cargo.lock;
-      };
+      inherit src;
+      strictDeps = true;
 
       nativeBuildInputs = with pkgs; [
         pkg-config
@@ -53,6 +42,24 @@ in
 
       cargoBuildFlags = ["--bin" "nntp-proxy"];
 
+      OPENSSL_DIR = "${pkgs.openssl.dev}";
+      OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
+      PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig";
+    }
+    // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+      # Match the dev-shell linker setup for packaged builds without forcing
+      # non-portable CPU tuning into release artifacts.
+      "${cargoTargetEnvPrefix}_LINKER" = "clang";
+      "${cargoTargetEnvPrefix}_RUSTFLAGS" = "-C link-arg=-fuse-ld=mold";
+    };
+
+  cargoArtifacts = craneLib.buildDepsOnly commonArgs;
+in
+  craneLib.buildPackage (
+    commonArgs
+    // {
+      inherit cargoArtifacts;
+
       postInstall = ''
         cat > "$out/bin/nntp-proxy-tui" <<'EOF'
         #!/bin/sh
@@ -67,10 +74,6 @@ in
         chmod +x "$out/bin/nntp-proxy-tui"
       '';
 
-      OPENSSL_DIR = "${pkgs.openssl.dev}";
-      OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
-      PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig";
-
       meta = with pkgs.lib; {
         description = cargoToml.package.description;
         homepage = cargoToml.package.homepage;
@@ -78,11 +81,5 @@ in
         mainProgram = cargoToml.package.name;
         platforms = supportedPlatforms;
       };
-    }
-    // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
-      # Match the dev-shell linker setup for packaged builds without forcing
-      # non-portable CPU tuning into release artifacts.
-      "${cargoTargetEnvPrefix}_LINKER" = "clang";
-      "${cargoTargetEnvPrefix}_RUSTFLAGS" = "-C link-arg=-fuse-ld=mold";
     }
   )
