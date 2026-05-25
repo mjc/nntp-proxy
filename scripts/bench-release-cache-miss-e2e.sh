@@ -45,6 +45,8 @@ CLIENT_COMMAND_MIX=${CLIENT_COMMAND_MIX:-article}
 REPEAT_COUNT=${REPEAT_COUNT:-1}
 PROFILE_UPSTREAM=${PROFILE_UPSTREAM:-0}
 PROFILE_MEASURED=${PROFILE_MEASURED:-0}
+PROFILE_MEASURED_HEAP=${PROFILE_MEASURED_HEAP:-0}
+PROFILE_EVENT=${PROFILE_EVENT:-cpu-clock}
 PROFILE_FREQ=${PROFILE_FREQ:-997}
 TOKIO_CONSOLE=${TOKIO_CONSOLE:-0}
 TOKIO_CONSOLE_PROCESS=${TOKIO_CONSOLE_PROCESS:-measured}
@@ -74,6 +76,7 @@ UPSTREAM_LOG="$WORK_DIR/upstream.log"
 MEASURED_LOG="$WORK_DIR/measured.log"
 
 MEASURED_PIDS=()
+MEASURED_WRAPPER_PIDS=()
 MEASURED_PORTS=()
 UPSTREAM_PID=""
 MEASURED_PID=""
@@ -153,18 +156,44 @@ PY
 
 sum_proc_ticks() {
     python3 - "$@" <<'PY'
+import pathlib
 import sys
 
 total = 0
 for pid in sys.argv[1:]:
+    task_dir = pathlib.Path("/proc") / pid / "task"
     try:
-        stat = open(f"/proc/{pid}/stat", "r", encoding="utf-8").read()
+        stat_paths = list(task_dir.glob("*/stat"))
     except OSError:
-        continue
-    rest = stat[stat.rfind(") ") + 2 :].split()
-    total += int(rest[11]) + int(rest[12])
+        stat_paths = []
+
+    if not stat_paths:
+        stat_paths = [pathlib.Path("/proc") / pid / "stat"]
+
+    for stat_path in stat_paths:
+        try:
+            stat = stat_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        rest = stat[stat.rfind(") ") + 2 :].split()
+        total += int(rest[11]) + int(rest[12])
 
 print(total)
+PY
+}
+
+proc_tids_csv() {
+    python3 - "$1" <<'PY'
+import pathlib
+import sys
+
+task_dir = pathlib.Path("/proc") / sys.argv[1] / "task"
+try:
+    tids = sorted(path.name for path in task_dir.iterdir() if path.name.isdigit())
+except OSError:
+    tids = [sys.argv[1]]
+
+print(",".join(tids))
 PY
 }
 
@@ -227,6 +256,17 @@ run_with_optional_taskset() {
         taskset -c "$cpu_list" "$@"
     else
         "$@"
+    fi
+}
+
+run_with_optional_taskset_exec() {
+    local cpu_list="$1"
+    shift
+
+    if [ -n "$cpu_list" ]; then
+        exec taskset -c "$cpu_list" "$@"
+    else
+        exec "$@"
     fi
 }
 
@@ -299,7 +339,7 @@ start_upstream() {
     UPSTREAM_PORT=$(reserve_port)
 
     echo "Using flake-provided nntpbench backend at $NNTPBENCH_BIN"
-    run_with_optional_taskset "$UPSTREAM_TASKSET" "$NNTPBENCH_BIN" server \
+    run_with_optional_taskset_exec "$UPSTREAM_TASKSET" "$NNTPBENCH_BIN" server \
         --listen "$HOST:$UPSTREAM_PORT" \
         --body-bytes "$NNTPBENCH_BODY_BYTES" \
         --article-bytes "$NNTPBENCH_ARTICLE_BYTES" \
@@ -317,9 +357,15 @@ start_upstream() {
 stop_measured_processes() {
     if [ "${#MEASURED_PIDS[@]}" -gt 0 ]; then
         kill "${MEASURED_PIDS[@]}" 2>/dev/null || true
-        wait "${MEASURED_PIDS[@]}" 2>/dev/null || true
+        if [ "${#MEASURED_WRAPPER_PIDS[@]}" -eq 0 ]; then
+            wait "${MEASURED_PIDS[@]}" 2>/dev/null || true
+        fi
+    fi
+    if [ "${#MEASURED_WRAPPER_PIDS[@]}" -gt 0 ]; then
+        wait "${MEASURED_WRAPPER_PIDS[@]}" 2>/dev/null || true
     fi
     MEASURED_PIDS=()
+    MEASURED_WRAPPER_PIDS=()
     MEASURED_PORTS=()
     MEASURED_PID=""
 }
@@ -382,11 +428,16 @@ start_measured_shards() {
     local repeat_index="$4"
 
     MEASURED_PIDS=()
+    MEASURED_WRAPPER_PIDS=()
     MEASURED_PORTS=()
 
     if [ "$SHARDED_MEASURED_INSTANCES" -gt 1 ]; then
         if [ "$PROFILE_MEASURED" = "1" ]; then
             echo "PROFILE_MEASURED is not supported with SHARDED_MEASURED_INSTANCES > 1" >&2
+            exit 1
+        fi
+        if [ "$PROFILE_MEASURED_HEAP" = "1" ]; then
+            echo "PROFILE_MEASURED_HEAP is not supported with SHARDED_MEASURED_INSTANCES > 1" >&2
             exit 1
         fi
 
@@ -429,22 +480,49 @@ start_measured_shards() {
         if [ "$PROXY_CLI_MODE" != "legacy" ]; then
             proxy_cmd+=(--ui headless)
         fi
+        if [ "$PROFILE_MEASURED_HEAP" = "1" ]; then
+            proxy_cmd=(heaptrack --record-only -o "$WORK_DIR/measured-heap-$threads-$backend_connections-$clients-repeat-$repeat_index-shard-$shard_index" "${proxy_cmd[@]}")
+        fi
 
         if [ "${#measured_env[@]}" -gt 0 ]; then
             (
                 export "${measured_env[@]}"
-                run_with_optional_taskset "$MEASURED_TASKSET" "${proxy_cmd[@]}"
+                run_with_optional_taskset_exec "$MEASURED_TASKSET" "${proxy_cmd[@]}"
             ) >"$shard_log" 2>&1 &
         else
-            run_with_optional_taskset "$MEASURED_TASKSET" "${proxy_cmd[@]}" >"$shard_log" 2>&1 &
+            run_with_optional_taskset_exec "$MEASURED_TASKSET" "${proxy_cmd[@]}" >"$shard_log" 2>&1 &
         fi
-        MEASURED_PIDS+=("$!")
+        local launched_pid="$!"
+        if [ "$PROFILE_MEASURED_HEAP" = "1" ]; then
+            MEASURED_WRAPPER_PIDS+=("$launched_pid")
+        else
+            MEASURED_PIDS+=("$launched_pid")
+        fi
     done
 
     local shard_port
     for shard_port in "${MEASURED_PORTS[@]}"; do
         wait_for_port "$HOST" "$shard_port" 60
     done
+
+    if [ "$PROFILE_MEASURED_HEAP" = "1" ]; then
+        local wrapper_pid
+        for wrapper_pid in "${MEASURED_WRAPPER_PIDS[@]}"; do
+            local child_pid=""
+            for _ in $(seq 1 50); do
+                child_pid=$(pgrep -P "$wrapper_pid" -f 'nntp-proxy' | head -1 || true)
+                if [ -n "$child_pid" ]; then
+                    break
+                fi
+                sleep 0.1
+            done
+            if [ -z "$child_pid" ]; then
+                echo "Could not find heaptrack child process for wrapper $wrapper_pid" >&2
+                exit 1
+            fi
+            MEASURED_PIDS+=("$child_pid")
+        done
+    fi
     MEASURED_PID="${MEASURED_PIDS[0]}"
 }
 
@@ -539,7 +617,7 @@ PY
             --stats-interval-secs 0
             --csv
         )
-        run_with_optional_taskset "$CLIENT_TASKSET" "${cmd[@]}" >"$run_dir/client-$process_idx.csv" &
+        run_with_optional_taskset_exec "$CLIENT_TASKSET" "${cmd[@]}" >"$run_dir/client-$process_idx.csv" &
         pids+=("$!")
         offset=$((offset + process_clients))
     done
@@ -595,7 +673,7 @@ run_direct_upstream_matrix() {
 
         if [ "$PROFILE_UPSTREAM" = "1" ]; then
             rm -f "$perf_upstream_data" "$perf_upstream_report"
-            perf record -F "$PROFILE_FREQ" -g -p "$UPSTREAM_PID" -o "$perf_upstream_data" -- sleep 3600 >"$WORK_DIR/upstream-direct-perf.log" 2>&1 &
+            perf record -e "$PROFILE_EVENT" -F "$PROFILE_FREQ" -g -t "$(proc_tids_csv "$UPSTREAM_PID")" -o "$perf_upstream_data" -- sleep 3600 >"$WORK_DIR/upstream-direct-perf.log" 2>&1 &
             perf_upstream_pid=$!
             sleep 0.2
         fi
@@ -639,7 +717,7 @@ run_measured_scenario() {
     local perf_upstream_report="$WORK_DIR/upstream-perf-$threads-$backend_connections-$clients-repeat-$repeat_index.txt"
     if [ "$PROFILE_UPSTREAM" = "1" ]; then
         rm -f "$perf_upstream_data" "$perf_upstream_report"
-        perf record -F "$PROFILE_FREQ" -g -p "$UPSTREAM_PID" -o "$perf_upstream_data" -- sleep 3600 >"$WORK_DIR/upstream-perf.log" 2>&1 &
+        perf record -e "$PROFILE_EVENT" -F "$PROFILE_FREQ" -g -t "$(proc_tids_csv "$UPSTREAM_PID")" -o "$perf_upstream_data" -- sleep 3600 >"$WORK_DIR/upstream-perf.log" 2>&1 &
         perf_upstream_pid=$!
         sleep 0.2
     fi
@@ -649,7 +727,7 @@ run_measured_scenario() {
     local perf_measured_report="$WORK_DIR/measured-perf-$threads-$backend_connections-$clients-repeat-$repeat_index.txt"
     if [ "$PROFILE_MEASURED" = "1" ]; then
         rm -f "$perf_measured_data" "$perf_measured_report"
-        perf record -F "$PROFILE_FREQ" -g -p "$MEASURED_PID" -o "$perf_measured_data" -- sleep 3600 >"$WORK_DIR/measured-perf.log" 2>&1 &
+        perf record -e "$PROFILE_EVENT" -F "$PROFILE_FREQ" -g -t "$(proc_tids_csv "$MEASURED_PID")" -o "$perf_measured_data" -- sleep 3600 >"$WORK_DIR/measured-perf.log" 2>&1 &
         perf_measured_pid=$!
         sleep 0.2
     fi

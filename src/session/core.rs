@@ -85,9 +85,23 @@ pub struct ClientSessionBuilder {
     auth_handler: Arc<AuthHandler>,
     metrics: MetricsCollector,
     connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
-    cache: Arc<crate::cache::UnifiedCache>,
+    cache: BuilderCache,
     cache_articles: bool,
     adaptive_precheck: bool,
+}
+
+enum BuilderCache {
+    DefaultAvailability,
+    Shared(Arc<crate::cache::UnifiedCache>),
+}
+
+impl BuilderCache {
+    fn into_cache(self) -> Arc<crate::cache::UnifiedCache> {
+        match self {
+            Self::DefaultAvailability => ClientSession::default_cache(),
+            Self::Shared(cache) => cache,
+        }
+    }
 }
 
 impl ClientSessionBuilder {
@@ -133,7 +147,7 @@ impl ClientSessionBuilder {
     /// Add article cache to this session (always present for backend availability tracking)
     #[must_use]
     pub fn with_cache(mut self, cache: Arc<crate::cache::UnifiedCache>) -> Self {
-        self.cache = cache;
+        self.cache = BuilderCache::Shared(cache);
         self
     }
 
@@ -181,7 +195,7 @@ impl ClientSessionBuilder {
             auth_state: AuthState::new(),
             metrics: self.metrics,
             connection_stats: self.connection_stats,
-            cache: self.cache,
+            cache: self.cache.into_cache(),
             cache_articles: self.cache_articles,
             adaptive_precheck: self.adaptive_precheck,
         }
@@ -243,9 +257,7 @@ impl ClientSession {
             auth_state: AuthState::new(),
             metrics,
             connection_stats: None,
-            cache: Arc::new(crate::cache::UnifiedCache::availability(
-                std::time::Duration::MAX,
-            )),
+            cache: Self::default_cache(),
             cache_articles: false,
             adaptive_precheck: false,
         }
@@ -287,9 +299,7 @@ impl ClientSession {
             auth_handler,
             metrics,
             connection_stats: None,
-            cache: Arc::new(crate::cache::UnifiedCache::availability(
-                std::time::Duration::MAX,
-            )),
+            cache: BuilderCache::DefaultAvailability,
             cache_articles: false,
             adaptive_precheck: false,
         }
