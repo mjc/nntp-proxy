@@ -12,7 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Websocket-attached TUI for headless mode** ([#67](https://github.com/mjc/nntp-proxy/pull/67))
   - Added a headless dashboard publisher via `--tui-listen IP:PORT` and a read-only attached TUI client via `--tui-attach IP:PORT`.
   - Attached dashboards reconnect automatically, keep the last good snapshot on disconnect, and show proxy CPU/memory alongside local TUI CPU/memory.
-  - Dashboard publish/attach mode is loopback-only and uses a redacted dashboard payload instead of exposing full backend configuration.
+  - Dashboard publish/attach mode is intended for localhost-only use and should not be exposed directly to a network. It uses a redacted dashboard payload instead of exposing full backend configuration.
 
 - **RFC 8054 backend wire compression** ([#53](https://github.com/mjc/nntp-proxy/pull/53))
   - Added `COMPRESS DEFLATE` negotiation for proxy-to-backend links with configurable compression mode and level.
@@ -41,9 +41,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Existing deployments with a `[cache]` section that omitted `store_article_bodies` will switch from full article-body caching to availability-only tracking after upgrade.
   - Operators who rely on memory or disk article-body cache hits should set `store_article_bodies = true` explicitly. `[cache.disk]` only stores article bodies when body caching is enabled.
 
-- **Substantial architecture refactor since 0.4.0**
-  - Reworked the proxy around typed request/context plumbing, explicit cache metadata, backend pipeline queues, persisted metrics and availability state, config migration helpers, and corrected pooled-connection read-ahead handling.
-  - The current tree is a broad redesign of routing, caching, persistence, and operator-facing runtime behavior compared to 0.4.0, not just an incremental feature release.
+- **Near-complete internal rewrite since 0.4.0**
+  - Rebuilt the proxy internals around typed request contexts, request-scoped response metadata, explicit cache metadata, backend pipeline queues, framer-owned multiline response handling, pooled-buffer forwarding, persisted metrics, persisted availability state, and config migration helpers.
+  - The public goal is still the same NNTP proxy, but the routing, caching, response forwarding, connection lifecycle, persistence, dashboard/runtime, and operator-facing configuration paths are substantially new compared to 0.4.0.
 
 - **Configuration and CLI naming refresh**
   - Reorganized config around `[routing]`, `[memory]`, `[cache]`, and `[health_check]` with clearer canonical names such as `article_cache_capacity`, `article_cache_ttl_secs`, and `store_article_bodies`.
@@ -59,6 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Typed cache and routing internals** ([#60](https://github.com/mjc/nntp-proxy/pull/60))
   - Reworked cache lookup, cache upsert, pipeline completion, backend response accounting, and metrics recording around typed request and cache metadata.
   - Reworked cache response generation and ingestion to use borrowed bytes and typed cache parts, reducing copying on cache hits.
+
+- **Response forwarding and framing ownership** ([#69](https://github.com/mjc/nntp-proxy/pull/69), [#71](https://github.com/mjc/nntp-proxy/pull/71))
+  - Reworked ARTICLE/BODY/HEAD forwarding around range-backed response views, framer-owned multiline response emission, and borrowed direct response writes.
+  - Centralized multiline response boundary handling in `MultilineFramer` so callers no longer need to reason about terminator offsets or suffix bytes.
+  - Reworked pooled response buffers and scratch buffers so large pass-through responses can stay on the borrowed-buffer path instead of being flattened into owned response objects.
 
 ### Fixed
 
@@ -87,6 +92,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Tightened message-ID routing to require a single exact validated token and restored multiline fallback for unknown extension commands.
   - Routed full-buffer multiline terminator detection through `MultilineFramer` and guarded availability bit generation with `BackendId::availability_bit()`.
 
+- **Large-transfer forwarding, retry cleanup, and remote TUI history** ([#68](https://github.com/mjc/nntp-proxy/pull/68), [#71](https://github.com/mjc/nntp-proxy/pull/71))
+  - Restored shared large-transfer pipelining and stabilized pipelined response forwarding.
+  - Fixed ordered retry cleanup accounting and tightened connection retirement/state tracking around backend lifecycle transitions.
+  - Fixed remote TUI startup and graph history so attached clients accumulate their own history instead of depending on server-side graph state.
+
 ### Performance
 
 - **End-to-end proxy-in-the-middle matrix baseline**
@@ -113,6 +123,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Coalesced typed request writes, reused response buffers, pooled capture/scratch buffers, reduced repeated message-ID wrapping, and skipped unnecessary timing reads on untimed backend paths.
   - Cache-hit profiling drove vectored response writes: the 64 KiB native cache-hit sample improved from about 34.1 us / 1.92 GiB/s to about 28.3 us / 2.32 GiB/s after coalescing cached response writes, before later cache-hit refinements.
   - Reworked terminator scanning around the multiline framing path, `memmem`, and dot-first scans so multiline response validation is both safer and cheaper.
+
+- **Borrowed forwarding and buffer-pool reductions** ([#69](https://github.com/mjc/nntp-proxy/pull/69), [#71](https://github.com/mjc/nntp-proxy/pull/71))
+  - Added range-backed forwarding so response slices can reference pooled read buffers without materializing a full owned response.
+  - Reduced direct-response and ordered-response allocations, tuned pooled buffer handling, read pooled buffers without a `Take` adapter, and made buffer pools lazy.
+  - Added fast `perf.data` parser tooling and refreshed benchmark documentation for the large cache-miss path.
 
 - **Disk-cache and availability-index performance**
   - Tuned foyer disk-cache behavior with higher parallelism, better block sizing, direct cache-entry construction on precheck paths, configurable compression codecs, and cold invalidation of old disk formats.
