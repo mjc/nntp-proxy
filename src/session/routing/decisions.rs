@@ -46,7 +46,11 @@ pub fn decide_request_routing(
                 }
             }
             RequestRouteClass::Stateful if routing_mode == RoutingMode::Hybrid => {
-                CommandRoutingDecision::SwitchToStateful
+                if is_authenticated || !auth_enabled {
+                    CommandRoutingDecision::SwitchToStateful
+                } else {
+                    CommandRoutingDecision::RequireAuth
+                }
             }
             RequestRouteClass::Stateful | RequestRouteClass::Reject => {
                 CommandRoutingDecision::Reject
@@ -129,6 +133,35 @@ mod tests {
         // Also works when not authenticated
         assert_eq!(
             decide_command_routing("XOVER 1-100", false, false, RoutingMode::Hybrid),
+            CommandRoutingDecision::SwitchToStateful
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_hybrid_stateful_requires_auth_when_enabled() {
+        assert_eq!(
+            decide_command_routing("GROUP alt.test", false, true, RoutingMode::Hybrid),
+            CommandRoutingDecision::RequireAuth
+        );
+        assert_eq!(
+            decide_command_routing("XOVER 1-100", false, true, RoutingMode::Hybrid),
+            CommandRoutingDecision::RequireAuth
+        );
+        assert_eq!(
+            decide_command_routing("GROUP alt.test", true, true, RoutingMode::Hybrid),
+            CommandRoutingDecision::SwitchToStateful
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_hybrid_unknown_extensions_require_auth_when_enabled() {
+        let request = RequestContext::parse(b"XFOO arg\r\n").expect("valid request line");
+        assert_eq!(
+            decide_request_routing(&request, false, true, RoutingMode::Hybrid),
+            CommandRoutingDecision::RequireAuth
+        );
+        assert_eq!(
+            decide_request_routing(&request, true, true, RoutingMode::Hybrid),
             CommandRoutingDecision::SwitchToStateful
         );
     }
@@ -244,6 +277,10 @@ mod tests {
         assert_eq!(
             decide_request_routing(&request, true, false, RoutingMode::Hybrid),
             CommandRoutingDecision::SwitchToStateful
+        );
+        assert_eq!(
+            decide_request_routing(&request, false, true, RoutingMode::Hybrid),
+            CommandRoutingDecision::RequireAuth
         );
         assert_eq!(
             decide_request_routing(&request, true, false, RoutingMode::PerCommand),

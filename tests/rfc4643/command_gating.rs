@@ -17,6 +17,8 @@ async fn spawn_auth_gating_client(mode: RoutingMode) -> Result<RfcTestClient> {
         MockNntpServer::new()
             .with_name("AuthGatingBackend")
             .on_command("DATE", "111 20260504112233\r\n")
+            .on_command("GROUP alt.test", "211 100 1 100 alt.test\r\n")
+            .on_command("XFOO", "200 extension ok\r\n")
     })
     .await
 }
@@ -35,6 +37,46 @@ async fn test_unauthenticated_date_is_gated_until_authentication_across_modes() 
         client.authenticate(USERNAME, PASSWORD).await?;
         client.expect_status("DATE", "111").await?;
     }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_hybrid_stateful_command_is_gated_until_authentication() -> Result<()> {
+    let mut client = spawn_auth_gating_client(RoutingMode::Hybrid).await?;
+
+    client.expect_status("GROUP alt.test", "480").await?;
+
+    client.authenticate(USERNAME, PASSWORD).await?;
+    client.expect_status("GROUP alt.test", "211").await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_hybrid_unknown_extension_is_gated_until_authentication() -> Result<()> {
+    let mut client = spawn_auth_gating_client(RoutingMode::Hybrid).await?;
+
+    client.expect_status("XFOO arg", "480").await?;
+
+    client.authenticate(USERNAME, PASSWORD).await?;
+    client.expect_status("XFOO arg", "200").await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_auth_username_survives_intervening_hybrid_stateful_command() -> Result<()> {
+    let mut client = spawn_auth_gating_client(RoutingMode::Hybrid).await?;
+
+    client
+        .expect_status(&format!("AUTHINFO USER {USERNAME}"), "381")
+        .await?;
+    client.expect_status("GROUP alt.test", "480").await?;
+    client
+        .expect_status(&format!("AUTHINFO PASS {PASSWORD}"), "281")
+        .await?;
+    client.expect_status("GROUP alt.test", "211").await?;
 
     Ok(())
 }
