@@ -14,7 +14,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
-use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
+use tokio_tungstenite::{
+    accept_async_with_config, connect_async_with_config,
+    tungstenite::{Message, protocol::WebSocketConfig},
+};
 use tracing::{info, warn};
 
 pub(crate) const REMOTE_DASHBOARD_LOG_LINE_LIMIT: usize = 8;
@@ -22,21 +25,31 @@ pub(crate) const REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT: usize = 64;
 const REMOTE_DASHBOARD_SNAPSHOT_HISTORY_LIMIT: usize = 1;
 const ATTACHED_DASHBOARD_HISTORY_LIMIT: usize = chart::HISTORY_POINT_COUNT;
 const REMOTE_DASHBOARD_TOP_USER_LIMIT: usize = 5;
+const DASHBOARD_WEBSOCKET_MAX_MESSAGE_BYTES: usize = 1024 * 1024;
+
+fn dashboard_websocket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(DASHBOARD_WEBSOCKET_MAX_MESSAGE_BYTES))
+        .max_frame_size(Some(DASHBOARD_WEBSOCKET_MAX_MESSAGE_BYTES))
+}
 
 #[allow(clippy::cast_precision_loss)]
 fn dashboard_message(state: &DashboardState) -> anyhow::Result<Message> {
-    Ok(Message::Binary(
-        bincode::serialize(state)
-            .context("failed to serialize dashboard state")?
-            .into(),
-    ))
+    let payload = postcard::to_allocvec(state).context("failed to serialize dashboard state")?;
+    anyhow::ensure!(
+        payload.len() <= DASHBOARD_WEBSOCKET_MAX_MESSAGE_BYTES,
+        "dashboard state snapshot exceeds websocket message limit"
+    );
+    Ok(Message::Binary(payload.into()))
 }
 
 fn dashboard_state_from_message(
     message: Result<Message, tokio_tungstenite::tungstenite::Error>,
 ) -> Option<DashboardState> {
     match message {
-        Ok(Message::Binary(bytes)) => bincode::deserialize::<DashboardState>(bytes.as_ref()).ok(),
+        Ok(Message::Binary(bytes)) if bytes.len() <= DASHBOARD_WEBSOCKET_MAX_MESSAGE_BYTES => {
+            postcard::from_bytes::<DashboardState>(bytes.as_ref()).ok()
+        }
         _ => None,
     }
 }
@@ -55,7 +68,7 @@ fn dashboard_client_request_from_message(
     message: Result<Message, tokio_tungstenite::tungstenite::Error>,
 ) -> Option<DashboardClientRequest> {
     match message {
-        Ok(Message::Text(text)) => {
+        Ok(Message::Text(text)) if text.len() <= DASHBOARD_WEBSOCKET_MAX_MESSAGE_BYTES => {
             serde_json::from_str::<DashboardClientRequest>(text.as_str()).ok()
         }
         _ => None,
@@ -156,7 +169,7 @@ async fn handle_dashboard_client(
         dashboard_peer_label(peer_addr)
     );
 
-    let ws_stream = accept_async(stream).await?;
+    let ws_stream = accept_async_with_config(stream, Some(dashboard_websocket_config())).await?;
     let (sink, source) = ws_stream.split();
     let (log_tail_tx, log_tail_rx) = watch::channel(REMOTE_DASHBOARD_LOG_LINE_LIMIT);
 
@@ -343,13 +356,14 @@ async fn dashboard_reader_session(
     mut log_tail_rx: watch::Receiver<usize>,
 ) -> anyhow::Result<ReaderSessionOutcome> {
     let connect_addr = dashboard_target_from_ws_url(ws_url)?;
-    let (ws_stream, _) = match connect_async(ws_url).await {
-        Ok(connection) => connection,
-        Err(err) => {
-            warn!("Failed to connect attached dashboard client to {ws_url}: {err}");
-            return Ok(ReaderSessionOutcome::RetryAfterDelay);
-        }
-    };
+    let (ws_stream, _) =
+        match connect_async_with_config(ws_url, Some(dashboard_websocket_config()), false).await {
+            Ok(connection) => connection,
+            Err(err) => {
+                warn!("Failed to connect attached dashboard client to {ws_url}: {err}");
+                return Ok(ReaderSessionOutcome::RetryAfterDelay);
+            }
+        };
 
     info!("Attached dashboard websocket connected to {ws_url}");
     let last_snapshot = state_tx.borrow().latest_state.clone();
@@ -519,6 +533,7 @@ mod tests {
     use futures::{FutureExt, stream};
     use std::sync::Arc;
     use tokio::sync::mpsc;
+    use tokio_tungstenite::accept_async;
 
     fn create_test_servers(count: usize) -> Arc<[Server]> {
         (0..count)
@@ -591,13 +606,21 @@ mod tests {
         }
     }
 
+    fn encode_dashboard_state(state: &DashboardState) -> Vec<u8> {
+        postcard::to_allocvec(state).expect("serialize dashboard state")
+    }
+
+    fn decode_dashboard_state(bytes: &[u8]) -> DashboardState {
+        postcard::from_bytes::<DashboardState>(bytes).expect("deserialize dashboard state")
+    }
+
     #[test]
     fn dashboard_state_from_message_parses_binary_frames() {
         let state = DashboardState {
             log_lines: vec!["hello".to_string()],
             ..empty_dashboard_state()
         };
-        let message = Message::Binary(bincode::serialize(&state).unwrap().into());
+        let message = Message::Binary(encode_dashboard_state(&state).into());
 
         let parsed = dashboard_state_from_message(Ok(message)).expect("state should parse");
         assert_eq!(parsed.log_lines, vec!["hello".to_string()]);
@@ -628,6 +651,13 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_state_from_message_rejects_oversized_binary_frames() {
+        let payload = vec![b' '; DASHBOARD_WEBSOCKET_MAX_MESSAGE_BYTES + 1];
+
+        assert!(dashboard_state_from_message(Ok(Message::Binary(payload.into()))).is_none());
+    }
+
+    #[test]
     fn dashboard_client_request_round_trips() {
         let message = dashboard_client_request_message(DashboardClientRequest::SetLogTail {
             lines: REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT,
@@ -643,6 +673,13 @@ mod tests {
                 lines: REMOTE_DASHBOARD_FULLSCREEN_LOG_LINE_LIMIT
             }
         );
+    }
+
+    #[test]
+    fn dashboard_client_request_from_message_rejects_oversized_text_frames() {
+        let payload = " ".repeat(DASHBOARD_WEBSOCKET_MAX_MESSAGE_BYTES + 1);
+
+        assert!(dashboard_client_request_from_message(Ok(Message::Text(payload.into()))).is_none());
     }
 
     #[test]
@@ -780,9 +817,7 @@ mod tests {
 
         let source = stream::iter((0..80).map(|idx| {
             Ok(Message::Binary(
-                bincode::serialize(&dashboard_state_with_sample(idx))
-                    .expect("serialize sample")
-                    .into(),
+                encode_dashboard_state(&dashboard_state_with_sample(idx)).into(),
             ))
         }));
 
@@ -937,8 +972,7 @@ mod tests {
         let Message::Binary(bytes) = message else {
             panic!("expected binary frame");
         };
-        let state = bincode::deserialize::<DashboardState>(bytes.as_ref())
-            .expect("deserialize dashboard state");
+        let state = decode_dashboard_state(bytes.as_ref());
 
         assert_eq!(state.backend_views.len(), 1);
         assert_eq!(state.view_mode, ViewMode::Normal);
@@ -982,14 +1016,8 @@ mod tests {
         second.show_details = true;
 
         let source = stream::iter(vec![
-            Ok(Message::Binary(
-                bincode::serialize(&first).expect("serialize first").into(),
-            )),
-            Ok(Message::Binary(
-                bincode::serialize(&second)
-                    .expect("serialize second")
-                    .into(),
-            )),
+            Ok(Message::Binary(encode_dashboard_state(&first).into())),
+            Ok(Message::Binary(encode_dashboard_state(&second).into())),
         ]);
 
         forward_dashboard_states(source, state_tx)
@@ -1035,11 +1063,9 @@ mod tests {
             ..empty_dashboard_state()
         };
 
-        ws.send(Message::Binary(
-            bincode::serialize(&good).expect("serialize good").into(),
-        ))
-        .await
-        .expect("send good state");
+        ws.send(Message::Binary(encode_dashboard_state(&good).into()))
+            .await
+            .expect("send good state");
 
         let observed = wait_for_log_lines(&mut state_rx, &["good"], Duration::from_secs(3)).await;
         assert_eq!(observed.log_lines, vec!["good".to_string()]);
@@ -1093,9 +1119,7 @@ mod tests {
             ..empty_dashboard_state()
         };
         first_ws
-            .send(Message::Binary(
-                bincode::serialize(&first).expect("serialize first").into(),
-            ))
+            .send(Message::Binary(encode_dashboard_state(&first).into()))
             .await
             .expect("send first state");
 
@@ -1159,11 +1183,7 @@ mod tests {
             ..empty_dashboard_state()
         };
         second_ws
-            .send(Message::Binary(
-                bincode::serialize(&second)
-                    .expect("serialize second")
-                    .into(),
-            ))
+            .send(Message::Binary(encode_dashboard_state(&second).into()))
             .await
             .expect("send second state");
 
@@ -1208,8 +1228,7 @@ mod tests {
         let Message::Binary(bytes) = message else {
             panic!("expected binary frame");
         };
-        let tailored =
-            bincode::deserialize::<DashboardState>(bytes.as_ref()).expect("deserialize state");
+        let tailored = decode_dashboard_state(bytes.as_ref());
 
         assert_eq!(
             tailored.log_lines.len(),
