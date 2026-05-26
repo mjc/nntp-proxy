@@ -1,8 +1,8 @@
 //! Callgrind benchmarks for the real cache-miss proxy roundtrip path.
 //!
 //! These benches drive a client socket through a live per-command proxy with
-//! metadata-only cache enabled, so each `ARTICLE` request still buffers through the
-//! backend while paying the request/cache/routing fixed costs of the miss path.
+//! metadata-only cache enabled or no configured cache, so each `ARTICLE` request still buffers
+//! through the backend while paying the request/cache/routing fixed costs of the miss path.
 //!
 //! Run with: `cargo bench --bench cache_miss_roundtrip_callgrind`
 
@@ -44,7 +44,7 @@ supported! {
         TcpListener::bind("127.0.0.1:0").await.unwrap()
     }
 
-    fn bench_config(backend_port: u16) -> Config {
+    fn bench_config(backend_port: u16, cache: Option<Cache>) -> Config {
         Config {
             servers: vec![
                 Server::builder("127.0.0.1", Port::try_new(backend_port).unwrap())
@@ -53,7 +53,7 @@ supported! {
                 .build()
                 .unwrap(),
             ],
-            cache: Some(metadata_only_cache()),
+            cache,
             ..Default::default()
         }
     }
@@ -166,14 +166,14 @@ supported! {
             }
         }
 
-        async fn start_proxy(body_len: usize) -> Self {
+        async fn start_proxy(body_len: usize, cache: Option<Cache>) -> Self {
             let backend_listener = bind_localhost().await;
             let backend_port = backend_listener.local_addr().unwrap().port();
             spawn_backend(backend_listener, article_response(body_len).into());
 
             let proxy_listener = bind_localhost().await;
             let proxy_addr = proxy_listener.local_addr().unwrap();
-            let proxy = NntpProxy::new(bench_config(backend_port), RoutingMode::PerCommand)
+            let proxy = NntpProxy::new(bench_config(backend_port, cache), RoutingMode::PerCommand)
                 .await
                 .unwrap();
             spawn_proxy(proxy_listener, proxy);
@@ -221,10 +221,18 @@ supported! {
         client: BenchClient,
     }
 
-    fn setup_proxy_roundtrip(body_len: usize) -> BenchHarness {
+    fn setup_proxy_roundtrip(body_len: usize, cache: Option<Cache>) -> BenchHarness {
         let rt = Builder::new_current_thread().enable_all().build().unwrap();
-        let client = rt.block_on(BenchClient::start_proxy(body_len));
+        let client = rt.block_on(BenchClient::start_proxy(body_len, cache));
         BenchHarness { rt, client }
+    }
+
+    fn setup_no_configured_cache_roundtrip(body_len: usize) -> BenchHarness {
+        setup_proxy_roundtrip(body_len, None)
+    }
+
+    fn setup_metadata_only_cache_roundtrip(body_len: usize) -> BenchHarness {
+        setup_proxy_roundtrip(body_len, Some(metadata_only_cache()))
     }
 
     fn setup_direct_backend_roundtrip(body_len: usize) -> BenchHarness {
@@ -234,9 +242,16 @@ supported! {
     }
 
     #[library_benchmark]
-    #[bench::article_64k(args = (ARTICLE_64K), setup = setup_proxy_roundtrip)]
-    #[bench::article_768k(args = (ARTICLE_768K), setup = setup_proxy_roundtrip)]
-    fn run_cache_miss_roundtrip(mut harness: BenchHarness) -> usize {
+    #[bench::article_64k(args = (ARTICLE_64K), setup = setup_no_configured_cache_roundtrip)]
+    #[bench::article_768k(args = (ARTICLE_768K), setup = setup_no_configured_cache_roundtrip)]
+    fn run_no_configured_cache_roundtrip(mut harness: BenchHarness) -> usize {
+        black_box(harness.rt.block_on(harness.client.article_roundtrip()))
+    }
+
+    #[library_benchmark]
+    #[bench::article_64k(args = (ARTICLE_64K), setup = setup_metadata_only_cache_roundtrip)]
+    #[bench::article_768k(args = (ARTICLE_768K), setup = setup_metadata_only_cache_roundtrip)]
+    fn run_metadata_only_cache_roundtrip(mut harness: BenchHarness) -> usize {
         black_box(harness.rt.block_on(harness.client.article_roundtrip()))
     }
 
@@ -249,7 +264,10 @@ supported! {
 
     library_benchmark_group!(
         name = cache_miss_roundtrip;
-        benchmarks = run_cache_miss_roundtrip, run_direct_backend_roundtrip
+        benchmarks =
+            run_no_configured_cache_roundtrip,
+            run_metadata_only_cache_roundtrip,
+            run_direct_backend_roundtrip
     );
 
     main!(
