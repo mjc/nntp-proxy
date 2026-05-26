@@ -3,15 +3,35 @@ name = "nntp-proxy"
 version = "0.5.0"
 edition = "2024"
 rust-version = "1.88"
-description = "High-performance NNTP proxy server with connection pooling and authentication"
+description = "NNTP proxy server with per-command backend multiplexing, caching, metrics, and TUI dashboard"
 license = "MIT"
 repository = "https://github.com/mjc/nntp-proxy"
 documentation = "https://docs.rs/nntp-proxy"
 homepage = "https://github.com/mjc/nntp-proxy"
-keywords = ["nntp", "proxy", "server", "networking", "usenet"]
-categories = ["network-programming", "web-programming"]
+keywords = ["nntp", "proxy", "server", "usenet", "multiplexing"]
+categories = [
+    "network-programming",
+    "command-line-utilities",
+    "caching",
+    "config",
+    "asynchronous",
+]
 authors = ["Mika Cohen <mjc@kernel.org>"]
 readme = "README.md"
+include = [
+    "/Cargo.lock",
+    "/Cargo.toml",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/README.md",
+    "/benches/**",
+    "/cache-config.example.toml",
+    "/config.example.toml",
+    "/config.minimal.toml",
+    "/docs/**",
+    "/src/**",
+    "/tests/**",
+]
 
 [[bin]]
 name = "nntp-proxy"
