@@ -99,6 +99,7 @@ async fn test_tcp_alive_check_unexpected_data() -> Result<()> {
 
     let stream = TcpStream::connect(addr).await?;
     sent_rx.await?;
+    stream.readable().await?;
 
     let mut conn_stream = ConnectionStream::plain(stream);
 

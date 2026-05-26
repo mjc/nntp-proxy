@@ -63,10 +63,11 @@ use super::ttl;
 const HYBRID_CACHE_NAME: &str = "nntp-article-cache-v3";
 
 /// Check available disk space at the given path using df command
-fn check_available_space(path: &Path) -> Option<u64> {
+fn check_available_space(_path: &Path) -> Option<u64> {
     // Try to use statfs on Linux/Unix
     #[cfg(unix)]
     {
+        let path = _path;
         // Get filesystem stats using a known working approach
         // We'll create a temp file to trigger actual space check
         if let Ok(temp_file) = std::fs::OpenOptions::new()

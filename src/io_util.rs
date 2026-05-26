@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
+#[cfg(unix)]
+use std::fs;
 use std::future::poll_fn;
 use std::io::{Error, ErrorKind, IoSlice};
+use std::path::Path;
 use std::pin::Pin;
-use std::{fs, path::Path};
 
 pub async fn write_all_vectored<W>(
     writer: &mut W,
