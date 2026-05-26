@@ -268,12 +268,18 @@ impl TcpManager {
         };
 
         // Pre-connect options (buffer sizes, reuse)
-        socket.set_recv_buffer_size(Self::socket_buffer_size_u32(
-            self.recv_buffer_size,
-            "receive",
-        )?)?;
-        socket
-            .set_send_buffer_size(Self::socket_buffer_size_u32(self.send_buffer_size, "send")?)?;
+        if self.recv_buffer_size > 0 {
+            socket.set_recv_buffer_size(Self::socket_buffer_size_u32(
+                self.recv_buffer_size,
+                "receive",
+            )?)?;
+        }
+        if self.send_buffer_size > 0 {
+            socket.set_send_buffer_size(Self::socket_buffer_size_u32(
+                self.send_buffer_size,
+                "send",
+            )?)?;
+        }
         socket.set_reuseaddr(true)?;
 
         // Async connect — does NOT block the tokio worker thread

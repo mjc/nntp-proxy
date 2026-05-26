@@ -42,6 +42,20 @@ CLIENT_PROCESSES=${CLIENT_PROCESSES:-1}
 CLIENT_THREADS=${CLIENT_THREADS:-4}
 CLIENT_PIPELINE_DEPTH=${CLIENT_PIPELINE_DEPTH:-32}
 CLIENT_COMMAND_MIX=${CLIENT_COMMAND_MIX:-article}
+case "$(uname -s)" in
+    Darwin)
+        DEFAULT_SOCKET_BUFFER_SIZE=0
+        ;;
+    *)
+        DEFAULT_SOCKET_BUFFER_SIZE=16777216
+        ;;
+esac
+CLIENT_SOCKET_RECV_BUFFER=${CLIENT_SOCKET_RECV_BUFFER:-$DEFAULT_SOCKET_BUFFER_SIZE}
+CLIENT_SOCKET_SEND_BUFFER=${CLIENT_SOCKET_SEND_BUFFER:-$DEFAULT_SOCKET_BUFFER_SIZE}
+UPSTREAM_SOCKET_RECV_BUFFER=${UPSTREAM_SOCKET_RECV_BUFFER:-$DEFAULT_SOCKET_BUFFER_SIZE}
+UPSTREAM_SOCKET_SEND_BUFFER=${UPSTREAM_SOCKET_SEND_BUFFER:-$DEFAULT_SOCKET_BUFFER_SIZE}
+PROXY_SOCKET_RECV_BUFFER_SIZE=${PROXY_SOCKET_RECV_BUFFER_SIZE:-$DEFAULT_SOCKET_BUFFER_SIZE}
+PROXY_SOCKET_SEND_BUFFER_SIZE=${PROXY_SOCKET_SEND_BUFFER_SIZE:-$DEFAULT_SOCKET_BUFFER_SIZE}
 REPEAT_COUNT=${REPEAT_COUNT:-1}
 PROFILE_UPSTREAM=${PROFILE_UPSTREAM:-0}
 PROFILE_MEASURED=${PROFILE_MEASURED:-0}
@@ -345,6 +359,8 @@ start_upstream() {
         --article-bytes "$NNTPBENCH_ARTICLE_BYTES" \
         --max-connections "$NNTPBENCH_MAX_CONNECTIONS" \
         --max-pipeline-depth "$NNTPBENCH_MAX_PIPELINE_DEPTH" \
+        --socket-recv-buffer "$UPSTREAM_SOCKET_RECV_BUFFER" \
+        --socket-send-buffer "$UPSTREAM_SOCKET_SEND_BUFFER" \
         --stats-interval-secs 0 \
         >"$UPSTREAM_LOG" 2>&1 &
     UPSTREAM_PID=$!
@@ -404,8 +420,8 @@ backend_selection = "least-loaded"
 adaptive_precheck = false
 
 [memory]
-socket_recv_buffer_size = 16777216
-socket_send_buffer_size = 16777216
+socket_recv_buffer_size = $PROXY_SOCKET_RECV_BUFFER_SIZE
+socket_send_buffer_size = $PROXY_SOCKET_SEND_BUFFER_SIZE
 buffer_pool_size = 1048576
 buffer_pool_count = 128
 capture_pool_size = 1048576
@@ -553,8 +569,8 @@ run_client_load() {
             --threads "$CLIENT_THREADS"
             --pipeline-depth "$CLIENT_PIPELINE_DEPTH"
             --command-mix "$CLIENT_COMMAND_MIX"
-            --socket-recv-buffer 16777216
-            --socket-send-buffer 16777216
+            --socket-recv-buffer "$CLIENT_SOCKET_RECV_BUFFER"
+            --socket-send-buffer "$CLIENT_SOCKET_SEND_BUFFER"
             --stats-interval-secs 0
             --csv
         )
@@ -612,8 +628,8 @@ PY
             --client-offset "$offset"
             --total-clients "$clients"
             --command-mix "$CLIENT_COMMAND_MIX"
-            --socket-recv-buffer 16777216
-            --socket-send-buffer 16777216
+            --socket-recv-buffer "$CLIENT_SOCKET_RECV_BUFFER"
+            --socket-send-buffer "$CLIENT_SOCKET_SEND_BUFFER"
             --stats-interval-secs 0
             --csv
         )

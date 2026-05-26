@@ -43,13 +43,17 @@ fn apply_core_optimizations(
     recv_buffer_size: usize,
     send_buffer_size: usize,
 ) -> Result<()> {
-    sock_ref
-        .set_recv_buffer_size(recv_buffer_size)
-        .context("Failed to set TCP receive buffer size")?;
+    if recv_buffer_size > 0 {
+        sock_ref
+            .set_recv_buffer_size(recv_buffer_size)
+            .context("Failed to set TCP receive buffer size")?;
+    }
 
-    sock_ref
-        .set_send_buffer_size(send_buffer_size)
-        .context("Failed to set TCP send buffer size")?;
+    if send_buffer_size > 0 {
+        sock_ref
+            .set_send_buffer_size(send_buffer_size)
+            .context("Failed to set TCP send buffer size")?;
+    }
 
     sock_ref
         .set_linger(Some(LINGER_TIMEOUT))
@@ -481,10 +485,11 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
 
-        // Zero buffer sizes are technically allowed, though not recommended
+        // Zero buffer sizes leave the OS defaults in place.
         let optimizer = TcpOptimizer::with_buffer_sizes(&stream, 0, 0);
         assert_eq!(optimizer.recv_buffer_size, 0);
         assert_eq!(optimizer.send_buffer_size, 0);
+        optimizer.optimize().unwrap();
     }
 
     #[tokio::test]

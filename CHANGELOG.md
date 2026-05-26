@@ -107,7 +107,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Ran current 100GiB cache-miss e2e spot checks with `nntpbench` client -> `nntp-proxy` -> `nntpbench` server.
   - On a Ryzen 9 5950X, direct upstream measured 11307.07 MiB/s. Proxy `1/1/1` measured 4712.73 MiB/s mean over 10 runs, and proxy `4/8/8` measured 10019.26 MiB/s mean over 10 runs.
   - On an Apple M1 with 16 GiB RAM, direct upstream measured 7557.08 MiB/s. Proxy `1/1/1` measured 3208.73 MiB/s mean over 10 runs, and proxy `4/8/8` measured 3856.64 MiB/s mean over 10 runs.
-  - Ran a current 10GiB default matrix across 112 points (`threads=1 2 4 8`, `backend_connections=1 2 4 8 16 32 64`, `clients=1 4 8 16`, client threads fixed at 4, pipeline depth fixed at 32). The best point was 11004.94 MiB/s at `8/8/4`; the best one-proxy-thread row was 6235.59 MiB/s at `1/2/16`.
+  - Ran current 10GiB default matrices across 112 points (`threads=1 2 4 8`, `backend_connections=1 2 4 8 16 32 64`, `clients=1 4 8 16`, client threads fixed at 4, pipeline depth fixed at 32). On a Ryzen 9 5950X, the best point was 11004.94 MiB/s at `8/8/4`; the best one-proxy-thread row was 6235.59 MiB/s at `1/2/16`. On an Apple M1 with 16 GiB RAM and OS-default Darwin socket buffers, the best point was 6004.22 MiB/s at `2/2/4`; the best one-proxy-thread row was 5404.49 MiB/s at `1/2/16`.
+  - Made the release cache-miss benchmark harness pick Darwin-safe socket-buffer defaults and allow client, upstream, and proxy socket buffer sizes to be overridden independently.
 
 - **Major large-article throughput and CPU-efficiency improvement since 0.4.0**
   - The proxy hot path was rebuilt around byte-oriented typed requests, request-scoped response metadata, pooled buffers, and cache responses that can be written without flattening payloads into temporary `Vec`s.
