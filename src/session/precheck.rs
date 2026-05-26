@@ -766,13 +766,56 @@ mod tests {
         addr
     }
 
-    #[tokio::test]
-    async fn query_backend_returns_error_on_truncated_response_body() {
-        use crate::pool::DeadpoolConnectionProvider;
-        use crate::router::BackendSelector;
-        use crate::types::{BackendId, ServerName};
+    async fn spawn_large_article_precheck_server() -> std::net::SocketAddr {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
 
-        let addr = spawn_truncated_precheck_server().await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut stream, _)) = listener.accept().await {
+                    tokio::spawn(async move {
+                        let _ = stream.write_all(b"200 mock\r\n").await;
+                        let mut reader = BufReader::new(stream);
+                        let mut command = Vec::new();
+                        loop {
+                            command.clear();
+                            if reader.read_until(b'\n', &mut command).await.is_err() {
+                                return;
+                            }
+                            if command.starts_with(b"ARTICLE ") {
+                                break;
+                            }
+                            let response = if command.starts_with(b"DATE") {
+                                b"111 20260526120000\r\n".as_slice()
+                            } else {
+                                b"200 mock setup complete\r\n".as_slice()
+                            };
+                            if reader.get_mut().write_all(response).await.is_err() {
+                                return;
+                            }
+                        }
+                        let oversized_payload = vec![b'x'; 4 * 1024 * 1024 + 1];
+                        let stream = reader.get_mut();
+                        let _ = stream.write_all(b"220 0 <test@example.com>\r\n").await;
+                        let _ = stream.write_all(&oversized_payload).await;
+                        let _ = stream.write_all(b"\r\n.\r\n").await;
+                    });
+                }
+            }
+        });
+
+        addr
+    }
+
+    fn selector_with_backend(
+        addr: std::net::SocketAddr,
+        max_connections: usize,
+    ) -> (BackendSelector, BackendId) {
+        use crate::pool::DeadpoolConnectionProvider;
+        use crate::types::ServerName;
 
         let mut selector = BackendSelector::new();
         let backend_id = BackendId::from_index(0);
@@ -780,7 +823,7 @@ mod tests {
             "127.0.0.1".to_string(),
             addr.port(),
             "test".to_string(),
-            2,
+            max_connections,
             None,
             None,
         );
@@ -790,6 +833,14 @@ mod tests {
             provider,
             0,
         );
+        (selector, backend_id)
+    }
+
+    #[tokio::test]
+    async fn query_backend_returns_error_on_truncated_response_body() {
+        let addr = spawn_truncated_precheck_server().await;
+
+        let (selector, backend_id) = selector_with_backend(addr, 2);
 
         let deps = OwnedDeps {
             router: Arc::new(selector),
@@ -807,28 +858,9 @@ mod tests {
 
     #[tokio::test]
     async fn query_backend_returns_error_on_extra_precheck_response() {
-        use crate::pool::DeadpoolConnectionProvider;
-        use crate::router::BackendSelector;
-        use crate::types::{BackendId, ServerName};
-
         let addr = spawn_extra_response_precheck_server().await;
 
-        let mut selector = BackendSelector::new();
-        let backend_id = BackendId::from_index(0);
-        let provider = DeadpoolConnectionProvider::new(
-            "127.0.0.1".to_string(),
-            addr.port(),
-            "test".to_string(),
-            2,
-            None,
-            None,
-        );
-        selector.add_backend(
-            backend_id,
-            ServerName::try_new("test-server".to_string()).unwrap(),
-            provider,
-            0,
-        );
+        let (selector, backend_id) = selector_with_backend(addr, 2);
 
         let deps = OwnedDeps {
             router: Arc::new(selector),
@@ -842,6 +874,29 @@ mod tests {
             RequestContext::parse(b"ARTICLE <test@example.com>\r\n").expect("valid request line");
         let result = query_backend(&deps, backend_id, &request).await;
         assert_eq!(result, QueryResult::Error);
+    }
+
+    #[tokio::test]
+    async fn query_backend_treats_oversized_precheck_hit_as_availability() {
+        let addr = spawn_large_article_precheck_server().await;
+        let (selector, backend_id) = selector_with_backend(addr, 1);
+
+        let deps = OwnedDeps {
+            router: Arc::new(selector),
+            cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
+            buffer_pool: BufferPool::new(BufferSize::try_new(65536).unwrap(), 2),
+            metrics: MetricsCollector::new(1),
+            cache_articles: true,
+        };
+
+        let request =
+            RequestContext::parse(b"ARTICLE <test@example.com>\r\n").expect("valid request line");
+        let result = query_backend(&deps, backend_id, &request).await;
+
+        assert_eq!(
+            result,
+            QueryResult::Found(backend_id, PrecheckHit::Availability(StatusCode::new(220)))
+        );
     }
 
     #[tokio::test]

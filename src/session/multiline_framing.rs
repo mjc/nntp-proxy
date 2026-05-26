@@ -2198,6 +2198,73 @@ mod tests {
         assert_eq!(writer.bytes, response);
     }
 
+    #[tokio::test]
+    async fn isolated_optional_chunked_capture_drains_after_limit_without_retention() {
+        let first = b"220 Article follows\r\n1234567890\r\n";
+        let rest = b"tail\r\n.\r\n";
+        let pool = make_pool();
+        let mut conn = mock_backend_conn(vec![rest.to_vec()]).await;
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(first);
+        let mut captured = crate::pool::ChunkedResponse::default();
+
+        let retained = IsolatedMultilineResponse {
+            conn: &mut conn,
+            io_buffer: &mut io_buffer,
+        }
+        .capture_chunked_optional(&pool, &mut captured, first.len() - 1)
+        .await
+        .expect("oversized isolated response should drain cleanly");
+
+        assert!(!retained);
+        assert!(captured.is_empty());
+        assert!(!conn.has_pending_bytes());
+    }
+
+    #[tokio::test]
+    async fn isolated_optional_chunked_capture_retains_exact_limit_response() {
+        let response = b"220 Article follows\r\n1234567890\r\n.\r\n";
+        let pool = make_pool();
+        let mut conn = mock_backend_conn(vec![]).await;
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(response);
+        let mut captured = crate::pool::ChunkedResponse::default();
+
+        let retained = IsolatedMultilineResponse {
+            conn: &mut conn,
+            io_buffer: &mut io_buffer,
+        }
+        .capture_chunked_optional(&pool, &mut captured, response.len())
+        .await
+        .expect("boundary-sized isolated response should capture cleanly");
+
+        assert!(retained);
+        assert_eq!(captured.to_vec(), response);
+        assert!(!conn.has_pending_bytes());
+    }
+
+    #[tokio::test]
+    async fn isolated_optional_chunked_capture_complete_oversized_response_is_not_retained() {
+        let response = b"220 Article follows\r\n1234567890\r\n.\r\n";
+        let pool = make_pool();
+        let mut conn = mock_backend_conn(vec![]).await;
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(response);
+        let mut captured = crate::pool::ChunkedResponse::default();
+
+        let retained = IsolatedMultilineResponse {
+            conn: &mut conn,
+            io_buffer: &mut io_buffer,
+        }
+        .capture_chunked_optional(&pool, &mut captured, response.len() - 1)
+        .await
+        .expect("complete oversized isolated response should drain cleanly");
+
+        assert!(!retained);
+        assert!(captured.is_empty());
+        assert!(!conn.has_pending_bytes());
+    }
+
     async fn mock_backend_conn(chunks: Vec<Vec<u8>>) -> crate::stream::ConnectionStream {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
