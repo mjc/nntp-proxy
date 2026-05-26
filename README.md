@@ -12,8 +12,8 @@ TLS, cache behavior, and live metrics in one place.
 - Plain NNTP listener only for clients; intended for trusted LAN/VPN/segmented-network deployment rather than direct internet exposure.
 - Optional article-body caching plus lightweight availability tracking.
 - Backend availability is tracked when the configured cache capacity can hold the fixed availability index; `[cache].store_article_bodies` is false by default and only controls whether full article bodies are cached too.
-- RAM article-cache hits measured 5.16 GB/s on a Ryzen 9 5950X.
-- A hot-cache path with a 256 MB in-memory article cache and disk cache on SSD measured 2.58 GB/s on the same system.
+- Current cached-response writer benches generate ARTICLE hits in 94.23 ns mean, with HEAD/BODY/STAT derived hits all under 80 ns mean.
+- Current single-connection local socket benches measured 366.6 MB/s mean for 788 KiB memory-cache hits and 349.9 MB/s mean for metadata-only cache misses.
 - Current 100GiB cache-miss e2e spot checks measured 4712.73 MiB/s mean at `1/1/1` and 10019.26 MiB/s mean at `4/8/8`; the direct-upstream baseline was 11307.07 MiB/s on the same system.
 - Allocation-conscious hot paths: borrowed request slices, lazy reusable buffer pools, and allocation-free cache key lookup in the steady state.
 - Optional terminal dashboard with persisted metrics across restarts.
@@ -304,14 +304,42 @@ password = "reader-password"
 
 The current hot paths are designed to avoid avoidable heap work:
 
-- RAM article-cache hits measured 5.16 GB/s on a Ryzen 9 5950X.
-- With a 256 MB in-memory article cache and disk cache on SSD, the hot-cache path measured 2.58 GB/s on the same system.
+- Current cached-response writer benches generate ARTICLE hits in 94.23 ns mean, with HEAD/BODY/STAT derived hits all under 80 ns mean.
+- Current single-connection local socket benches measured 366.6 MB/s mean for 788 KiB memory-cache hits and 349.9 MB/s mean for metadata-only cache misses.
 - Current 100GiB cache-miss e2e spot checks measured 4712.73 MiB/s mean at `1/1/1` and 10019.26 MiB/s mean at `4/8/8`; the direct-upstream baseline was 11307.07 MiB/s on the same system.
 - On an Apple M1 with 16 GiB RAM, the same 100GiB cache-miss e2e shapes measured 3208.73 MiB/s mean at `1/1/1` and 3856.64 MiB/s mean at `4/8/8`; the direct-upstream baseline was 7557.08 MiB/s.
 - Backend request forwarding uses parsed request slices instead of rebuilding command strings.
 - The main I/O and capture buffer pools allocate buffers lazily on first use and then reuse them.
 - Buffer acquisition is allocation-free after warmup while the configured pools have capacity; exhaustion intentionally falls back to allocating and logs that fact.
 - Article-cache lookup uses borrowed `&str` keys against `Arc<str>` cache keys, avoiding per-lookup key allocation.
+
+Current cached-response writer benches:
+
+| Cached response | Mean time |
+| --- | ---: |
+| ARTICLE from cached ARTICLE | 94.23 ns |
+| HEAD from cached ARTICLE | 78.26 ns |
+| BODY from cached ARTICLE | 77.34 ns |
+| STAT from cached ARTICLE | 56.77 ns |
+| Availability-only entry returns no payload | 3.408 ns |
+| Missing entry returns no payload | 3.480 ns |
+
+Current single-connection local socket roundtrip benches:
+
+| Path | Article size | Mean MB/s |
+| --- | ---: | ---: |
+| Backend roundtrip | 64 KiB | 31.04 |
+| Backend roundtrip | 768 KiB | 338.3 |
+| Backend roundtrip | 788 KiB | 350.2 |
+| Backend roundtrip | 1536 KiB | 596.5 |
+| Memory-cache hit | 64 KiB | 31.33 |
+| Memory-cache hit | 768 KiB | 329.5 |
+| Memory-cache hit | 788 KiB | 366.6 |
+| Memory-cache hit | 1536 KiB | 694.0 |
+| Metadata-only cache miss | 64 KiB | 31.01 |
+| Metadata-only cache miss | 768 KiB | 340.1 |
+| Metadata-only cache miss | 788 KiB | 349.9 |
+| Metadata-only cache miss | 1536 KiB | 620.2 |
 
 Current 100GiB cache-miss e2e spot checks on a Ryzen 9 5950X:
 
