@@ -67,6 +67,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Oversized article cache-retention handling**
+  - Full article/body/head cache retention now stops owning payload data once a response exceeds the cache section size limit, streams the response through to the client, and skips cache insertion for that response.
+  - Disk-cache section encoding now rejects sections above the same limit during writes as well as reads.
+
 - **Article retry fallback behavior** ([#67](https://github.com/mjc/nntp-proxy/pull/67))
   - `ARTICLE`/`BODY` requests that are already known missing across eligible backends now return `430` instead of disconnecting the client.
   - This also fixes the pipelined batch path so cached-missing article requests fail with protocol responses instead of dropping the session.

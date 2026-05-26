@@ -945,7 +945,7 @@ impl ClientSession {
                             params,
                         )
                         .await?;
-                    (bytes, Some(response))
+                    (bytes, response)
                 }
             };
 
@@ -967,6 +967,7 @@ impl ClientSession {
                 self.maybe_cache_upsert_buffer(msg_id, response.into(), backend_id);
             }
             (CacheAction::TrackAvailability, Some(msg_id), _)
+            | (CacheAction::CaptureArticle, Some(msg_id), None)
                 if !params.request.cache_records_backend_has_article(backend_id) =>
             {
                 self.spawn_cache_upsert_availability(
@@ -1022,31 +1023,29 @@ impl ClientSession {
         backend_id: BackendId,
         mut backend_bytes: crate::pool::PooledBuffer,
         params: ResponseWriteParams<'_>,
-    ) -> Result<(u64, crate::pool::ChunkedResponse), ResponseTransferError>
+    ) -> Result<(u64, Option<crate::pool::ChunkedResponse>), ResponseTransferError>
     where
         W: AsyncWrite + Unpin,
     {
         let mut captured = crate::pool::ChunkedResponse::default();
-        // Payload caching explicitly owns a complete response, but the capture
-        // itself still goes through the backend facade so response splitting
-        // remains centralized.
-        crate::session::backend::capture_response(
-            params.request,
-            &mut backend_bytes,
-            pooled_conn,
-            &mut captured,
-            &self.buffer_pool,
-            backend_id,
-        )
-        .await?;
-        self.log_body_response_captured(backend_id, params, captured.len());
+        // Payload caching owns responses only while they stay within the
+        // framer-owned retention limit. Larger responses are streamed through
+        // without cache insertion so normal delivery and backend reuse can
+        // continue.
+        let (bytes_written, retained) =
+            crate::session::backend::write_response_with_optional_capture(
+                params.request,
+                &mut backend_bytes,
+                pooled_conn,
+                client_write,
+                &mut captured,
+                &self.buffer_pool,
+                backend_id,
+            )
+            .await?;
         drop(backend_bytes);
-        captured
-            .write_all_to(client_write)
-            .await
-            .map_err(classify_response_write_err)?;
-        self.log_body_response_written(backend_id, params, captured.len());
-        if let Some(msg_id_ref) = params.msg_id {
+        self.log_body_response_written(backend_id, params, bytes_written as usize);
+        if retained && let Some(msg_id_ref) = params.msg_id {
             debug!(
                 "Client {} caching full article for {} ({} bytes captured)",
                 self.client_addr,
@@ -1054,24 +1053,18 @@ impl ClientSession {
                 captured.len()
             );
         }
-        Ok((captured.len() as u64, captured))
-    }
-
-    fn log_body_response_captured(
-        &self,
-        backend_id: BackendId,
-        params: ResponseWriteParams<'_>,
-        response_len: usize,
-    ) {
-        if matches!(params.request.kind(), RequestKind::Body) {
+        if retained {
+            Ok((bytes_written, Some(captured)))
+        } else {
             debug!(
                 client = %self.client_addr,
                 backend = backend_id.as_index(),
                 command_verb = ?params.request.verb(),
                 status_code = params.status_code.as_u16(),
-                response_len,
-                "Captured BODY response for direct client delivery"
+                bytes_written,
+                "Response exceeded retention limit; streamed without cache insertion"
             );
+            Ok((bytes_written, None))
         }
     }
 
@@ -1673,6 +1666,57 @@ mod tests {
             .expect("client response should be readable")
             .expect("client read should succeed");
         assert_eq!(written, good_response);
+    }
+
+    #[tokio::test]
+    async fn uncaptured_article_cache_action_records_availability() {
+        let addr: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 4);
+        let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
+        let metrics = MetricsCollector::new(1);
+        let cache = Arc::new(crate::cache::UnifiedCache::memory(
+            1000,
+            Duration::from_secs(60),
+        ));
+        let session = crate::session::ClientSession::builder(
+            ClientAddress::from(addr),
+            buffer_pool,
+            auth_handler,
+            metrics,
+        )
+        .with_cache(cache)
+        .with_cache_articles(true)
+        .build();
+        let backend_id = BackendId::from_index(0);
+        let request = request_context(b"ARTICLE <large@example.com>\r\n");
+        let msg_id = crate::types::MessageId::new("<large@example.com>".to_string()).unwrap();
+
+        session.apply_cache_action(
+            crate::session::routing::CacheAction::CaptureArticle,
+            ResponseWriteParams {
+                request: &request,
+                msg_id: Some(&msg_id),
+                status_code: StatusCode::new(220),
+            },
+            backend_id,
+            None,
+        );
+
+        let cached = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(cached) = session.cache.get(&msg_id).await {
+                    break cached;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("availability update should be recorded");
+
+        assert_eq!(cached.status_code(), StatusCode::new(220));
+        assert_eq!(cached.payload_len().get(), 0);
+        assert!(cached.has_availability_info());
+        assert!(cached.availability().any_backend_has_article());
     }
 
     #[tokio::test]
