@@ -860,12 +860,10 @@ impl<'a> IsolatedMultilineResponse<'a> {
         {
             FramedMultilineChunk::Complete(complete) => {
                 complete.extend_capture_from(&self.io_buffer[..initial_len], capture);
-                ensure_capture_len(capture.len()).map_err(isolated_multiline_error)?;
                 None
             }
             FramedMultilineChunk::Incomplete(incomplete) => {
                 incomplete.extend_capture_from(&self.io_buffer[..initial_len], capture);
-                ensure_capture_len(capture.len()).map_err(isolated_multiline_error)?;
                 Some(incomplete)
             }
         };
@@ -885,12 +883,10 @@ impl<'a> IsolatedMultilineResponse<'a> {
             {
                 FramedMultilineChunk::Complete(complete) => {
                     complete.extend_capture_from(&self.io_buffer[..n], capture);
-                    ensure_capture_len(capture.len()).map_err(isolated_multiline_error)?;
                     None
                 }
                 FramedMultilineChunk::Incomplete(incomplete) => {
                     incomplete.extend_capture_from(&self.io_buffer[..n], capture);
-                    ensure_capture_len(capture.len()).map_err(isolated_multiline_error)?;
                     Some(incomplete)
                 }
             };
@@ -1876,6 +1872,7 @@ fn isolated_multiline_error(err: FramingError) -> anyhow::Error {
     }
 }
 
+#[cfg(test)]
 fn ensure_capture_len(len: usize) -> Result<(), FramingError> {
     ensure_capture_len_with_limit(len, MAX_CAPTURED_MULTILINE_RESPONSE_BYTES)
 }

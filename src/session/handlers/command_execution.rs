@@ -976,6 +976,16 @@ impl ClientSession {
                     self.tier_for_backend(backend_id),
                 );
             }
+            (CacheAction::CaptureArticle, Some(msg_id), None)
+                if !params.request.cache_records_backend_has_article(backend_id) =>
+            {
+                self.spawn_cache_upsert_availability(
+                    msg_id,
+                    params.status_code,
+                    backend_id,
+                    self.tier_for_backend(backend_id),
+                );
+            }
             (CacheAction::TrackStat, msg_id, _) => {
                 self.maybe_cache_upsert_buffer(
                     msg_id,
@@ -1614,6 +1624,57 @@ mod tests {
             .expect("client response should be readable")
             .expect("client read should succeed");
         assert_eq!(written, good_response);
+    }
+
+    #[tokio::test]
+    async fn uncaptured_article_cache_action_records_availability() {
+        let addr: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 4);
+        let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
+        let metrics = MetricsCollector::new(1);
+        let cache = Arc::new(crate::cache::UnifiedCache::memory(
+            1000,
+            Duration::from_secs(60),
+        ));
+        let session = crate::session::ClientSession::builder(
+            ClientAddress::from(addr),
+            buffer_pool,
+            auth_handler,
+            metrics,
+        )
+        .with_cache(cache)
+        .with_cache_articles(true)
+        .build();
+        let backend_id = BackendId::from_index(0);
+        let request = request_context(b"ARTICLE <large@example.com>\r\n");
+        let msg_id = crate::types::MessageId::new("<large@example.com>".to_string()).unwrap();
+
+        session.apply_cache_action(
+            crate::session::routing::CacheAction::CaptureArticle,
+            ResponseWriteParams {
+                request: &request,
+                msg_id: Some(&msg_id),
+                status_code: StatusCode::new(220),
+            },
+            backend_id,
+            None,
+        );
+
+        let cached = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(cached) = session.cache.get(&msg_id).await {
+                    break cached;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("availability update should be recorded");
+
+        assert_eq!(cached.status_code(), StatusCode::new(220));
+        assert_eq!(cached.payload_len().get(), 0);
+        assert!(cached.has_availability_info());
+        assert!(cached.availability().any_backend_has_article());
     }
 
     #[tokio::test]

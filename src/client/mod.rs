@@ -561,4 +561,20 @@ mod tests {
 
         assert_eq!(&buffer[..], response);
     }
+
+    #[tokio::test]
+    async fn fetch_body_reads_multiline_response_above_retention_limit() {
+        let mut response = Vec::with_capacity((4 * 1024 * 1024) + 64);
+        response.extend_from_slice(b"222 0 <large@example.com>\r\n");
+        response.extend(std::iter::repeat_n(b'x', 4 * 1024 * 1024));
+        response.extend_from_slice(b"\r\n.\r\n");
+        let response: &'static [u8] = Box::leak(response.into_boxed_slice());
+        let addr = spawn_fetch_test_server("BODY <large@example.com>", response).await;
+        let client = make_test_client(addr);
+        let msg_id = crate::types::MessageId::new("<large@example.com>".to_string()).unwrap();
+
+        let buffer = client.fetch_body(&msg_id).await.unwrap();
+
+        assert_eq!(&buffer[..], response);
+    }
 }
