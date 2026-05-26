@@ -307,18 +307,30 @@ The current hot paths are designed to avoid avoidable heap work:
 - RAM article-cache hits measured 5.16 GB/s on a Ryzen 9 5950X.
 - With a 256 MB in-memory article cache and disk cache on SSD, the hot-cache path measured 2.58 GB/s on the same system.
 - Current 100GiB cache-miss e2e spot checks measured 4712.73 MiB/s mean at `1/1/1` and 10019.26 MiB/s mean at `4/8/8`; the direct-upstream baseline was 11307.07 MiB/s on the same system.
+- On an Apple M1 with 16 GiB RAM, the same 100GiB cache-miss e2e shapes measured 3208.73 MiB/s mean at `1/1/1` and 3856.64 MiB/s mean at `4/8/8`; the direct-upstream baseline was 7557.08 MiB/s.
 - Backend request forwarding uses parsed request slices instead of rebuilding command strings.
 - The main I/O and capture buffer pools allocate buffers lazily on first use and then reuse them.
 - Buffer acquisition is allocation-free after warmup while the configured pools have capacity; exhaustion intentionally falls back to allocating and logs that fact.
 - Article-cache lookup uses borrowed `&str` keys against `Arc<str>` cache keys, avoiding per-lookup key allocation.
 
-Current 100GiB cache-miss e2e spot checks:
+Current 100GiB cache-miss e2e spot checks on a Ryzen 9 5950X:
 
 | Shape | Runs | Mean MiB/s | Median MiB/s | Min | Max | Notes |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
 | Direct upstream `-/0/8` | 1 | 11307.07 | 11307.07 | 11307.07 | 11307.07 | No proxy, 8 client connections, pipeline depth 32 |
 | Proxy `1/1/1` | 10 | 4712.73 | 4690.46 | 4465.91 | 4930.83 | 1 proxy thread, 1 client connection, 1 backend connection, pipeline depth 32 |
 | Proxy `4/8/8` | 10 | 10019.26 | 10054.19 | 9471.35 | 10438.91 | 4 proxy threads, 8 client connections, 8 backend connections, pipeline depth 32 |
+
+Current 100GiB cache-miss e2e spot checks on an Apple M1 with 16 GiB RAM,
+running on AC power. These Darwin runs used OS-default socket buffers because
+the 16 MiB nntpbench socket buffers used on the Ryzen host hit `ENOBUFS` on
+macOS:
+
+| Shape | Runs | Mean MiB/s | Median MiB/s | Min | Max | Notes |
+| --- | ---: | ---: | ---: | ---: | ---: | --- |
+| Direct upstream `-/0/8` | 1 | 7557.08 | 7557.08 | 7557.08 | 7557.08 | No proxy, 8 client connections, pipeline depth 32 |
+| Proxy `1/1/1` | 10 | 3208.73 | 3197.19 | 2992.52 | 3492.82 | 1 proxy thread, 1 client connection, 1 backend connection, pipeline depth 32 |
+| Proxy `4/8/8` | 10 | 3856.64 | 3850.47 | 3728.93 | 4073.03 | 4 proxy threads, 8 client connections, 8 backend connections, pipeline depth 32 |
 
 Current 10GiB cache-miss default matrix, complete with one run for each of 112
 settings (`threads=1 2 4 8`, `backend_connections=1 2 4 8 16 32 64`,
