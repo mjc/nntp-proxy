@@ -12,7 +12,102 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::{debug, error, warn};
 
-use crate::constants::buffer::{COMMAND, READER_CAPACITY};
+use crate::constants::buffer::READER_CAPACITY;
+
+enum StatefulClientLine {
+    Eof,
+    Oversized,
+    Invalid,
+    Ready,
+}
+
+#[derive(Debug)]
+struct StatefulCommandReader {
+    line_buf: [u8; crate::protocol::MAX_COMMAND_LINE_OCTETS],
+    line_len: usize,
+    draining_oversized: bool,
+    parsed_request: Option<RequestContext>,
+}
+
+impl StatefulCommandReader {
+    const fn new() -> Self {
+        Self {
+            line_buf: [0; crate::protocol::MAX_COMMAND_LINE_OCTETS],
+            line_len: 0,
+            draining_oversized: false,
+            parsed_request: None,
+        }
+    }
+
+    fn take_request(&mut self) -> Option<RequestContext> {
+        self.parsed_request.take()
+    }
+
+    async fn read_next<R>(
+        &mut self,
+        reader: &mut BufReader<R>,
+    ) -> std::io::Result<StatefulClientLine>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        loop {
+            let available = reader.fill_buf().await?;
+            if available.is_empty() {
+                if self.draining_oversized {
+                    self.draining_oversized = false;
+                    return Ok(StatefulClientLine::Oversized);
+                }
+                if self.line_len == 0 {
+                    return Ok(StatefulClientLine::Eof);
+                }
+
+                self.parsed_request = RequestContext::parse(&self.line_buf[..self.line_len]);
+                self.line_len = 0;
+                return Ok(if self.parsed_request.is_some() {
+                    StatefulClientLine::Ready
+                } else {
+                    StatefulClientLine::Invalid
+                });
+            }
+
+            let newline = memchr::memchr(b'\n', available);
+            let take = newline.map_or(available.len(), |pos| pos + 1);
+
+            if self.draining_oversized {
+                reader.consume(take);
+                if newline.is_some() {
+                    self.draining_oversized = false;
+                    return Ok(StatefulClientLine::Oversized);
+                }
+                continue;
+            }
+
+            if self.line_len + take > crate::protocol::MAX_COMMAND_LINE_OCTETS {
+                reader.consume(take);
+                self.line_len = 0;
+                if newline.is_some() {
+                    return Ok(StatefulClientLine::Oversized);
+                }
+                self.draining_oversized = true;
+                continue;
+            }
+
+            self.line_buf[self.line_len..self.line_len + take].copy_from_slice(&available[..take]);
+            reader.consume(take);
+            self.line_len += take;
+
+            if newline.is_some() {
+                self.parsed_request = RequestContext::parse(&self.line_buf[..self.line_len]);
+                self.line_len = 0;
+                return Ok(if self.parsed_request.is_some() {
+                    StatefulClientLine::Ready
+                } else {
+                    StatefulClientLine::Invalid
+                });
+            }
+        }
+    }
+}
 
 enum AuthenticatedStatefulAction {
     Forward,
@@ -198,11 +293,9 @@ impl ClientSession {
         BR: tokio::io::AsyncRead + Unpin,
         BW: tokio::io::AsyncWrite + Unpin,
     {
-        let mut line = Vec::with_capacity(COMMAND);
+        let mut command_reader = StatefulCommandReader::new();
 
         loop {
-            line.clear();
-
             // Periodic metrics flush
             if state.check_and_maybe_flush_metrics() {
                 state.flush_byte_deltas(&self.metrics, backend_id, self.username());
@@ -238,27 +331,30 @@ impl ClientSession {
 
             tokio::select! {
                 // Client → Backend
-                result = client_reader.read_until(b'\n', &mut line) => {
+                result = command_reader.read_next(&mut client_reader) => {
                     match result {
-                        Ok(0) => break, // Client disconnected
-                        Ok(_) => {
-                            if line.len() > crate::protocol::MAX_COMMAND_LINE_OCTETS {
-                                use crate::protocol::COMMAND_TOO_LONG;
-                                client_write.write_all(COMMAND_TOO_LONG).await?;
-                                client_write.flush().await?;
-                                state.add_backend_to_client(COMMAND_TOO_LONG.len() as u64);
-                                continue;
-                            }
-                            let Some(request) = RequestContext::parse(&line) else {
-                                client_write
-                                    .write_all(crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE)
-                                    .await?;
-                                client_write.flush().await?;
-                                state.add_backend_to_client(
-                                    crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE.len() as u64,
-                                );
-                                continue;
-                            };
+                        Ok(StatefulClientLine::Eof) => break, // Client disconnected
+                        Ok(StatefulClientLine::Oversized) => {
+                            use crate::protocol::COMMAND_TOO_LONG;
+                            client_write.write_all(COMMAND_TOO_LONG).await?;
+                            client_write.flush().await?;
+                            state.add_backend_to_client(COMMAND_TOO_LONG.len() as u64);
+                            continue;
+                        }
+                        Ok(StatefulClientLine::Invalid) => {
+                            client_write
+                                .write_all(crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE)
+                                .await?;
+                            client_write.flush().await?;
+                            state.add_backend_to_client(
+                                crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE.len() as u64,
+                            );
+                            continue;
+                        }
+                        Ok(StatefulClientLine::Ready) => {
+                            let request = command_reader
+                                .take_request()
+                                .expect("ready command should have parsed request");
                             state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
 
                             if state.skip_auth_check {
@@ -322,7 +418,7 @@ impl ClientSession {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use tokio::io::{AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     use crate::auth::AuthHandler;
     use crate::metrics::MetricsCollector;
@@ -542,6 +638,136 @@ mod tests {
 
         assert_eq!(captured_rx.await.unwrap(), command);
         assert_eq!(result.client_to_backend.as_u64(), command.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn stateful_command_reader_rejects_oversized_line_without_buffer_growth() {
+        let (mut client, proxy_client) = tokio::io::duplex(2048);
+        let oversized = vec![b'x'; crate::protocol::MAX_COMMAND_LINE_OCTETS + 100];
+
+        client.write_all(&oversized).await.unwrap();
+        client.write_all(b"\nDATE\r\n").await.unwrap();
+
+        let mut reader = BufReader::new(proxy_client);
+        let mut command_reader = super::StatefulCommandReader::new();
+
+        assert!(matches!(
+            command_reader.read_next(&mut reader).await.unwrap(),
+            super::StatefulClientLine::Oversized
+        ));
+
+        let line = command_reader.read_next(&mut reader).await.unwrap();
+        let super::StatefulClientLine::Ready = line else {
+            panic!("expected DATE request after oversized line");
+        };
+        let request = command_reader
+            .take_request()
+            .expect("ready line should have request");
+        assert_eq!(request.kind(), crate::protocol::RequestKind::Date);
+    }
+
+    #[tokio::test]
+    async fn stateful_command_reader_drains_oversized_line_across_reads() {
+        let (mut client, proxy_client) = tokio::io::duplex(64);
+        let mut reader = BufReader::new(proxy_client);
+        let mut command_reader = super::StatefulCommandReader::new();
+
+        let writer = tokio::spawn(async move {
+            client
+                .write_all(&vec![b'x'; crate::protocol::MAX_COMMAND_LINE_OCTETS + 1])
+                .await
+                .unwrap();
+            client.write_all(b"still oversized").await.unwrap();
+            client.write_all(b"\nHELP\r\n").await.unwrap();
+        });
+
+        assert!(matches!(
+            command_reader.read_next(&mut reader).await.unwrap(),
+            super::StatefulClientLine::Oversized
+        ));
+
+        let line = command_reader.read_next(&mut reader).await.unwrap();
+        let super::StatefulClientLine::Ready = line else {
+            panic!("expected HELP request after drained oversized line");
+        };
+        let request = command_reader
+            .take_request()
+            .expect("ready line should have request");
+        assert_eq!(request.kind(), crate::protocol::RequestKind::Help);
+        writer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stateful_loop_rejects_oversized_command_then_handles_next_command() {
+        let session = test_session();
+        let backend_id = BackendId::from_index(0);
+        let state = SessionLoopState::new(false);
+
+        let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
+        let (backend_end, proxy_backend_end) = tokio::io::duplex(4096);
+
+        let backend = tokio::spawn(async move {
+            let (backend_read, mut backend_write) = tokio::io::split(backend_end);
+            let mut reader = BufReader::new(backend_read);
+            let mut line = String::new();
+
+            while reader.read_line(&mut line).await.unwrap() > 0 {
+                if line.eq_ignore_ascii_case("DATE\r\n") {
+                    backend_write
+                        .write_all(b"111 20260526101010\r\n")
+                        .await
+                        .unwrap();
+                    break;
+                }
+                line.clear();
+            }
+        });
+
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
+        let client_reader = BufReader::new(proxy_client_read);
+        let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
+
+        let session_task = tokio::spawn(async move {
+            session
+                .run_stateful_proxy_loop(
+                    client_reader,
+                    proxy_client_write,
+                    backend_read,
+                    backend_write,
+                    state,
+                    backend_id,
+                )
+                .await
+                .unwrap()
+        });
+
+        let oversized = vec![b'x'; crate::protocol::MAX_COMMAND_LINE_OCTETS + 100];
+        client_end.write_all(&oversized).await.unwrap();
+        client_end.write_all(b"\r\nDATE\r\n").await.unwrap();
+
+        let mut client_reader = BufReader::new(client_end);
+        let mut line = String::new();
+
+        client_reader.read_line(&mut line).await.unwrap();
+        assert_eq!(line, "501 Command too long\r\n");
+
+        line.clear();
+        client_reader.read_line(&mut line).await.unwrap();
+        assert_eq!(line, "111 20260526101010\r\n");
+
+        drop(client_reader);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), session_task)
+            .await
+            .expect("stateful loop timed out")
+            .unwrap();
+
+        backend.await.unwrap();
+        assert_eq!(result.client_to_backend.as_u64(), b"DATE\r\n".len() as u64);
+        assert!(
+            result.backend_to_client.as_u64()
+                >= (crate::protocol::COMMAND_TOO_LONG.len() + "111 20260526101010\r\n".len())
+                    as u64
+        );
     }
 
     #[tokio::test]
