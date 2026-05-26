@@ -697,6 +697,7 @@ mod tests {
         assert_eq!(conn.pending_bytes_len(), 0);
     }
 
+    #[allow(clippy::reversed_empty_ranges)]
     #[tokio::test]
     async fn test_queue_pooled_pending_bytes_rejects_backwards_range() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

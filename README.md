@@ -76,7 +76,6 @@ Connect a client to `localhost:8119` unless you changed `[proxy].port`.
 
 `routing.mode` controls how client sessions use backend connections:
 
-- **Current temporary behavior:** the runtime currently forces `per-command` mode even if the CLI or config requests `hybrid` or `stateful`. Keep those settings as documentation for the intended steady state, but expect the launched proxy to log and run in `per-command` mode for now.
 - `hybrid`: default. Stateless commands use pooled per-command routing until a stateful command appears; then the session switches to a dedicated backend connection.
 - `stateful`: one client session maps to one backend connection for the session lifetime.
 - `per-command`: each supported command can use a different backend; group-context commands are rejected.
@@ -104,7 +103,7 @@ Per-command mode rejects commands that depend on selected group or current artic
 - `XHDR`
 - `HDR`
 
-Once hybrid/stateful routing is re-enabled, use `hybrid` unless every client is known to be message-ID only.
+Use `hybrid` unless every client is known to be message-ID only.
 
 ## Configuration
 
