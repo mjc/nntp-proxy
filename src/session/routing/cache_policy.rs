@@ -90,7 +90,7 @@ pub fn determine_cache_action_for_request(
         CacheAction::CaptureArticle
     } else if has_response_body && should_track_availability(response_code, has_message_id) {
         CacheAction::TrackAvailability
-    } else if response_code.as_u16() == 223 {
+    } else if cache_articles && response_code.as_u16() == 223 {
         CacheAction::TrackStat
     } else {
         CacheAction::None
@@ -251,10 +251,14 @@ mod tests {
 
     #[test]
     fn test_determine_cache_action_track_stat() {
-        // Track STAT (223) as availability-only metadata.
+        // Track STAT (223) only when payload caching can retain the synthetic hit.
+        assert_eq!(
+            determine_cache_action("STAT <test@example.com>", 223, true, true),
+            CacheAction::TrackStat
+        );
         assert_eq!(
             determine_cache_action("STAT <test@example.com>", 223, false, true),
-            CacheAction::TrackStat
+            CacheAction::None
         );
     }
 

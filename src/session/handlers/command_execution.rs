@@ -976,7 +976,9 @@ impl ClientSession {
                     self.tier_for_backend(backend_id),
                 );
             }
-            (CacheAction::TrackStat, msg_id, _) => {
+            (CacheAction::TrackStat, msg_id, _)
+                if self.cache_articles && self.cache.stores_payload_responses() =>
+            {
                 self.maybe_cache_upsert_buffer(
                     msg_id,
                     crate::cache::CacheIngestResponse::from(b"223\r\n".as_slice()),
@@ -985,6 +987,7 @@ impl ClientSession {
             }
             (CacheAction::None, _, _)
             | (CacheAction::TrackAvailability, _, _)
+            | (CacheAction::TrackStat, _, _)
             | (CacheAction::CaptureArticle, _, None) => {}
         }
     }
@@ -1170,12 +1173,15 @@ mod tests {
     use super::ResponseWriteParams;
     use super::classify_response_write_err;
     use crate::auth::AuthHandler;
-    use crate::cache::ArticleAvailability;
+    use crate::cache::{ArticleAvailability, UnifiedCache};
     use crate::metrics::MetricsCollector;
     use crate::pool::{BufferPool, ConnectionGuard, DeadpoolConnectionProvider};
     use crate::protocol::{RequestContext, RequestResponseMetadata, ResponseWireLen, StatusCode};
     use crate::router::BackendSelector;
-    use crate::types::{BackendId, BufferSize, ClientAddress, ClientToBackendBytes, ServerName};
+    use crate::session::routing::CacheAction;
+    use crate::types::{
+        BackendId, BufferSize, ClientAddress, ClientToBackendBytes, MessageId, ServerName,
+    };
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1200,6 +1206,25 @@ mod tests {
             auth_handler,
             metrics,
         )
+        .build()
+    }
+
+    fn test_session_with_cache(
+        cache: Arc<UnifiedCache>,
+        cache_articles: bool,
+    ) -> crate::session::ClientSession {
+        let addr: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 4);
+        let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
+        let metrics = MetricsCollector::new(1);
+        crate::session::ClientSession::builder(
+            ClientAddress::from(addr),
+            buffer_pool,
+            auth_handler,
+            metrics,
+        )
+        .with_cache(cache)
+        .with_cache_articles(cache_articles)
         .build()
     }
 
@@ -1518,6 +1543,32 @@ mod tests {
         assert_eq!(article_commands.load(Ordering::SeqCst), 1);
 
         drop(held_writer);
+    }
+
+    #[tokio::test]
+    async fn track_stat_does_not_store_payload_when_article_cache_disabled() {
+        let cache = Arc::new(UnifiedCache::memory(1024, Duration::from_secs(60)));
+        let session = test_session_with_cache(cache.clone(), false);
+        let request = request_context(b"STAT <stat-disabled@example.com>\r\n");
+        let msg_id =
+            MessageId::new("<stat-disabled@example.com>".to_string()).expect("valid message id");
+
+        session.apply_cache_action(
+            CacheAction::TrackStat,
+            ResponseWriteParams {
+                request: &request,
+                msg_id: Some(&msg_id),
+                status_code: StatusCode::new(223),
+            },
+            BackendId::from_index(0),
+            None,
+        );
+        tokio::task::yield_now().await;
+
+        assert!(
+            cache.get(&msg_id).await.is_none(),
+            "disabled article caching must not retain synthetic STAT payload entries"
+        );
     }
 
     #[tokio::test]
