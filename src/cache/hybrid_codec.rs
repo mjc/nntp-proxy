@@ -31,7 +31,7 @@ const NO_ARTICLE_NUMBER: u64 = u64::MAX;
 struct CachedSectionLen(u32);
 
 impl CachedSectionLen {
-    const MAX: usize = 100 * 1024 * 1024;
+    const MAX: usize = 4 * 1024 * 1024;
 
     fn try_from_usize(value: usize) -> foyer::Result<Self> {
         if value > Self::MAX {

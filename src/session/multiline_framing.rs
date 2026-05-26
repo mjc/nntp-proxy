@@ -16,7 +16,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
 const TERMINATOR_TAIL_SIZE: usize = 4;
-const MAX_CAPTURED_MULTILINE_RESPONSE_BYTES: usize = 100 * 1024 * 1024;
+const MAX_CAPTURED_MULTILINE_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
 #[must_use]
 pub(crate) fn cached_response_completion() -> std::io::IoSlice<'static> {
@@ -248,6 +248,53 @@ impl IncompleteMultilineWireChunk {
                 }
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn write_current_and_after<W>(
+        self,
+        writer: &mut W,
+        current_len: usize,
+        framer: &mut MultilineFramer,
+        io_buffer: &mut crate::pool::PooledBuffer,
+        conn: &mut crate::stream::ConnectionStream,
+        pool: &crate::pool::BufferPool,
+        backend_id: crate::types::BackendId,
+        mut bytes_written: u64,
+        mut bytes_received: u64,
+    ) -> Result<u64, crate::session::response_transfer::ResponseTransferError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let response = &io_buffer[..current_len][self.response.clone()];
+        bytes_received += response.len() as u64;
+        if let Err(e) = writer.write_all(response).await {
+            consume_remaining_multiline_response(
+                framer,
+                self,
+                io_buffer,
+                conn,
+                backend_id,
+                bytes_received,
+            )
+            .await?;
+            return Err(
+                crate::session::response_transfer::ResponseTransferError::ClientDisconnect(e),
+            );
+        }
+        crate::pool::buffer::record_non_owned_response_write_chunk(response.len());
+        bytes_written += response.len() as u64;
+        self.write_after_current_chunk(
+            writer,
+            framer,
+            io_buffer,
+            conn,
+            pool,
+            backend_id,
+            bytes_written,
+            bytes_received,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1204,6 +1251,25 @@ where
         Ok(bytes)
     }
 
+    async fn flush_unretained_prefix_before_complete(
+        writer: &mut W,
+        response: &mut crate::pool::ChunkedResponse,
+        framed: &CompleteMultilineWireChunk,
+        io_buffer: &mut crate::pool::PooledBuffer,
+        conn: &mut crate::stream::ConnectionStream,
+        pool: &crate::pool::BufferPool,
+        total_len: usize,
+    ) -> Result<u64, crate::session::response_transfer::ResponseTransferError> {
+        match Self::flush_unretained_prefix(writer, response).await {
+            Ok(bytes_written) => Ok(bytes_written),
+            Err(crate::session::response_transfer::ResponseTransferError::ClientDisconnect(e)) => {
+                framed.observe_from_buffer(io_buffer, conn, pool, total_len)?;
+                Err(crate::session::response_transfer::ResponseTransferError::ClientDisconnect(e))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn flush_unretained_prefix_or_drain(
         writer: &mut W,
@@ -1234,6 +1300,16 @@ where
             }
             Err(e) => Err(e),
         }
+    }
+
+    #[inline]
+    fn would_exceed_retention(
+        response: &crate::pool::ChunkedResponse,
+        next_len: usize,
+        retention_limit: usize,
+    ) -> bool {
+        ensure_capture_len_with_limit(response.len().saturating_add(next_len), retention_limit)
+            .is_err()
     }
 
     async fn capture_and_write(
@@ -1270,21 +1346,35 @@ where
         let mut continuation = match framer.frame_initial_multiline_chunk(&io_buffer[..initial_len])
         {
             FramedMultilineChunk::Complete(framed) => {
+                if Self::would_exceed_retention(response, framed.response.len(), retention_limit) {
+                    let bytes_written = Self::flush_unretained_prefix_before_complete(
+                        writer,
+                        response,
+                        &framed,
+                        io_buffer,
+                        conn,
+                        pool,
+                        initial_len,
+                    )
+                    .await?;
+                    let current = framed
+                        .write_from(writer, io_buffer, conn, pool, initial_len)
+                        .await?;
+                    return Ok((bytes_written + current, false));
+                }
                 framed.push_from_buffer(io_buffer, conn, response, pool, initial_len)?;
-                let retained =
-                    ensure_capture_len_with_limit(response.len(), retention_limit).is_ok();
                 let bytes = response.len() as u64;
                 response.write_all_to(writer).await.map_err(
                     crate::session::response_transfer::ResponseTransferError::ClientDisconnect,
                 )?;
-                if !retained {
-                    response.clear();
-                }
-                return Ok((bytes, retained));
+                return Ok((bytes, true));
             }
             FramedMultilineChunk::Incomplete(incomplete) => {
-                incomplete.push_buffer_to(response, pool, io_buffer);
-                if ensure_capture_len_with_limit(response.len(), retention_limit).is_err() {
+                if Self::would_exceed_retention(
+                    response,
+                    incomplete.response.len(),
+                    retention_limit,
+                ) {
                     let (bytes_written, incomplete) = Self::flush_unretained_prefix_or_drain(
                         writer,
                         response,
@@ -1297,8 +1387,9 @@ where
                     .await?;
                     let bytes_received = bytes_written;
                     let total = incomplete
-                        .write_after_current_chunk(
+                        .write_current_and_after(
                             writer,
+                            initial_len,
                             &mut framer,
                             io_buffer,
                             conn,
@@ -1310,6 +1401,7 @@ where
                         .await?;
                     return Ok((total, false));
                 }
+                incomplete.push_buffer_to(response, pool, io_buffer);
                 Some(incomplete)
             }
         };
@@ -1330,21 +1422,31 @@ where
             }
             continuation = match framer.frame_next_multiline_chunk(prior, &io_buffer[..n]) {
                 FramedMultilineChunk::Complete(framed) => {
+                    if Self::would_exceed_retention(
+                        response,
+                        framed.response.len(),
+                        retention_limit,
+                    ) {
+                        let bytes_written = Self::flush_unretained_prefix_before_complete(
+                            writer, response, &framed, io_buffer, conn, pool, n,
+                        )
+                        .await?;
+                        let current = framed.write_from(writer, io_buffer, conn, pool, n).await?;
+                        return Ok((bytes_written + current, false));
+                    }
                     framed.push_from_buffer(io_buffer, conn, response, pool, n)?;
-                    let retained =
-                        ensure_capture_len_with_limit(response.len(), retention_limit).is_ok();
                     let bytes = response.len() as u64;
                     response.write_all_to(writer).await.map_err(
                         crate::session::response_transfer::ResponseTransferError::ClientDisconnect,
                     )?;
-                    if !retained {
-                        response.clear();
-                    }
-                    return Ok((bytes, retained));
+                    return Ok((bytes, true));
                 }
                 FramedMultilineChunk::Incomplete(incomplete) => {
-                    incomplete.push_buffer_to(response, pool, io_buffer);
-                    if ensure_capture_len_with_limit(response.len(), retention_limit).is_err() {
+                    if Self::would_exceed_retention(
+                        response,
+                        incomplete.response.len(),
+                        retention_limit,
+                    ) {
                         let (bytes_written, incomplete) = Self::flush_unretained_prefix_or_drain(
                             writer,
                             response,
@@ -1357,8 +1459,9 @@ where
                         .await?;
                         let bytes_received = bytes_written;
                         let total = incomplete
-                            .write_after_current_chunk(
+                            .write_current_and_after(
                                 writer,
+                                n,
                                 &mut framer,
                                 io_buffer,
                                 conn,
@@ -1370,6 +1473,7 @@ where
                             .await?;
                         return Ok((total, false));
                     }
+                    incomplete.push_buffer_to(response, pool, io_buffer);
                     Some(incomplete)
                 }
             };
