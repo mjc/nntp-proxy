@@ -34,6 +34,12 @@ impl CachedSectionLen {
     const MAX: usize = 100 * 1024 * 1024;
 
     fn try_from_usize(value: usize) -> foyer::Result<Self> {
+        if value > Self::MAX {
+            return Err(foyer::Error::io_error(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Cached article section too large: {value} bytes"),
+            )));
+        }
         let len = u32::try_from(value).map_err(|_| {
             foyer::Error::io_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -674,12 +680,13 @@ mod tests {
     #[test]
     fn test_cached_section_len_rejects_oversized_sections() {
         assert_eq!(
-            CachedSectionLen::try_from_usize(u32::MAX as usize)
+            CachedSectionLen::try_from_usize(CachedSectionLen::MAX)
                 .unwrap()
                 .get(),
-            u32::MAX
+            CachedSectionLen::MAX as u32
         );
-        assert!(CachedSectionLen::try_from_usize(u32::MAX as usize + 1).is_err());
+        assert!(CachedSectionLen::try_from_usize(CachedSectionLen::MAX + 1).is_err());
+        assert!(CachedSectionLen::from_wire((CachedSectionLen::MAX + 1) as u32).is_err());
     }
 
     // =========================================================================
