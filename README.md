@@ -14,8 +14,8 @@ TLS, cache behavior, and live metrics in one place.
 - Backend availability is tracked when the configured cache capacity can hold the fixed availability index; `[cache].store_article_bodies` is false by default and only controls whether full article bodies are cached too.
 - RAM article-cache hits measured 5.16 GB/s on a Ryzen 9 5950X.
 - A hot-cache path with a 256 MB in-memory article cache and disk cache on SSD measured 2.58 GB/s on the same system.
-- Current 100GB cache-miss spot checks (10 runs) measured 3887.81 MiB/s mean at `1/1/1` and 8927.02 MiB/s mean at `4/8/8` on the same system.
-- Allocation-conscious hot paths: borrowed request slices, preallocated buffer pools, and allocation-free cache key lookup in the steady state.
+- Current 100GiB cache-miss e2e spot checks measured 4712.73 MiB/s mean at `1/1/1` and 10019.26 MiB/s mean at `4/8/8`; the direct-upstream baseline was 11307.07 MiB/s on the same system.
+- Allocation-conscious hot paths: borrowed request slices, lazy reusable buffer pools, and allocation-free cache key lookup in the steady state.
 - Optional terminal dashboard with persisted metrics across restarts.
 - TOML config, environment-based backend configuration, and CLI overrides.
 
@@ -306,21 +306,23 @@ The current hot paths are designed to avoid avoidable heap work:
 
 - RAM article-cache hits measured 5.16 GB/s on a Ryzen 9 5950X.
 - With a 256 MB in-memory article cache and disk cache on SSD, the hot-cache path measured 2.58 GB/s on the same system.
-- Current 100GB cache-miss spot checks (10 runs) measured 3887.81 MiB/s mean at `1/1/1` and 8927.02 MiB/s mean at `4/8/8` on the same system.
+- Current 100GiB cache-miss e2e spot checks measured 4712.73 MiB/s mean at `1/1/1` and 10019.26 MiB/s mean at `4/8/8`; the direct-upstream baseline was 11307.07 MiB/s on the same system.
 - Backend request forwarding uses parsed request slices instead of rebuilding command strings.
-- The main I/O and capture buffers are preallocated and prefaulted at startup.
-- Buffer acquisition is allocation-free while the configured pools have capacity; exhaustion intentionally falls back to allocating and logs that fact.
+- The main I/O and capture buffer pools allocate buffers lazily on first use and then reuse them.
+- Buffer acquisition is allocation-free after warmup while the configured pools have capacity; exhaustion intentionally falls back to allocating and logs that fact.
 - Article-cache lookup uses borrowed `&str` keys against `Arc<str>` cache keys, avoiding per-lookup key allocation.
 
-Current 100GB proxy-in-the-middle cache-miss spot checks:
+Current 100GiB cache-miss e2e spot checks:
 
-| Shape | Mean MiB/s | Median MiB/s | Stdev | Min | Max | Notes |
+| Shape | Runs | Mean MiB/s | Median MiB/s | Min | Max | Notes |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| `1/1/1` | 3887.81 | 3958.31 | 235.09 | 3502.35 | 4158.97 | 10 runs, 1 MiB proxy I/O buffers |
-| `4/8/8` | 8927.02 | 8938.30 | 131.05 | 8730.79 | 9089.32 | 10 runs, 1 MiB proxy I/O buffers |
+| Direct upstream `-/0/8` | 1 | 11307.07 | 11307.07 | 11307.07 | 11307.07 | No proxy, 8 client connections, pipeline depth 32 |
+| Proxy `1/1/1` | 10 | 4712.73 | 4690.46 | 4465.91 | 4930.83 | 1 proxy thread, 1 client connection, 1 backend connection, pipeline depth 32 |
+| Proxy `4/8/8` | 10 | 10019.26 | 10054.19 | 9471.35 | 10438.91 | 4 proxy threads, 8 client connections, 8 backend connections, pipeline depth 32 |
 
-Current 20GiB cache-miss tuning sweep, complete with one run for each of 256
-settings (client threads fixed at 4):
+Current 10GiB cache-miss default matrix, complete with one run for each of 112
+settings (`threads=1 2 4 8`, `backend_connections=1 2 4 8 16 32 64`,
+`clients=1 4 8 16`, client threads fixed at 4, pipeline depth fixed at 32):
 
 Practical guidance: most installs should start with `1/1/n`: one proxy thread,
 one client-facing connection shape, and `n` backends for however many providers
@@ -330,46 +332,41 @@ connection count can vary by provider.
 
 The rest of this table is absolute-throughput tuning for hosts with enough
 network to care, roughly 10Gbit/s and above. In this single-run sweep, the
-`1/1/1` row is within about 6% of the best row in the whole sweep, and the best
-1-proxy-thread rows are within about 1% of the highest 8-proxy-thread row. Do
-not treat high proxy thread counts as a default recommendation unless repeated
-runs show that the extra complexity buys a durable gain on the target host.
-In these tables, backend connection counts are per configured backend.
+best several-client rows are around 10-11 GiB/s, while the smallest fast shape
+still stays near 4.8 GiB/s. Do not treat high proxy thread counts as a default
+recommendation unless repeated runs show that the extra complexity buys a durable
+gain on the target host. In these tables, backend connection counts are per
+configured backend.
 
 | Situation | Proxy threads | Client connections | Per-backend max connections | Pipeline depth | MiB/s | Notes |
 | --- | ---: | ---: | ---: | ---: | ---: | --- |
-| Default starting point | 1 | 1 | 1 | 16 | 4365.19 | Smallest fast measured shape; scale backend count to paid providers |
-| One client connection, tuned | 1 | 1 | 8 | 64 | 4437.58 | Provider/backend tuning example; bigger connection counts need measurement |
-| Several client connections | 1 | 4 | 8 | 8 | 4500.60 | Best 1-proxy-thread row for 4 client connections |
-| Many client connections | 1 | 16 | 8 | 8 | 4498.74 | Extra client connections did not materially beat 4 connections |
-| Single-run ceiling | 2 | 1 | 1 | 32 | 4639.53 | Highest row in this sweep; not the default recommendation |
+| Smallest fast shape | 1 | 1 | 1 | 32 | 4797.65 | Scale backend count to paid providers |
+| One client connection, tuned | 1 | 1 | 4 | 32 | 5117.08 | Best 1-proxy-thread row for one client connection |
+| Several client connections, one proxy thread | 1 | 4 | 64 | 32 | 6015.25 | Best 1-proxy-thread row for four client connections |
+| Many client connections, one proxy thread | 1 | 16 | 2 | 32 | 6235.59 | Best 1-proxy-thread row for sixteen client connections |
+| Single-run ceiling | 8 | 4 | 8 | 32 | 11004.94 | Highest row in this sweep; not the default recommendation |
 
-Pipeline-depth summary:
+Best observed row by proxy thread count:
 
-| Pipeline depth | Rows | Best `1/1/1` MiB/s | Best 1-proxy-thread shape | Best 1-proxy-thread MiB/s | Best observed shape | Best observed MiB/s |
-| ---: | ---: | ---: | --- | ---: | --- | ---: |
-| 8 | 64 | 1578.31 | `1/4/8` | 4500.60 | `8/8/8` | 4535.93 |
-| 16 | 64 | 4365.19 | `1/4/8` | 4429.79 | `8/1/16` | 4469.16 |
-| 32 | 64 | 3542.11 | `1/16/16` | 4482.53 | `2/1/1` | 4639.53 |
-| 64 | 64 | 4117.74 | `1/1/8` | 4437.58 | `4/1/8` | 4438.71 |
+| Proxy threads | Best shape | Best MiB/s | Mean across rows |
+| ---: | --- | ---: | ---: |
+| 1 | `1/2/16` | 6235.59 | 4954.63 |
+| 2 | `2/16/8` | 10688.49 | 7832.05 |
+| 4 | `4/4/4` | 10535.46 | 7744.88 |
+| 8 | `8/8/4` | 11004.94 | 7939.23 |
 
-Backend connection sweep for `pipeline_depth=8` rows (MiB/s, higher is better;
-cells are best with one proxy thread):
+Backend connection sweep for `pipeline_depth=32` rows (MiB/s, higher is better;
+cells are with one proxy thread):
 
-| Client connections | Backend 1 | Backend 4 | Backend 8 | Backend 16 | Best backend |
-| ---: | ---: | ---: | ---: | ---: | ---: |
-| 1 | 1578 | 1579 | 1574 | 1593 | 16 |
-| 4 | 3550 | 4176 | 4501 | 4447 | 8 |
-| 8 | 3094 | 4055 | 4495 | 4331 | 8 |
-| 16 | 4284 | 4296 | 4499 | 4187 | 8 |
+| Client connections | Backend 1 | Backend 2 | Backend 4 | Backend 8 | Backend 16 | Backend 32 | Backend 64 | Best backend |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 1 | 4798 | 4450 | 5117 | 4758 | 4830 | 4665 | 4891 | 4 |
+| 4 | 4538 | 5849 | 5379 | 5322 | 5128 | 4867 | 6015 | 64 |
+| 8 | 4593 | 5706 | 4979 | 5320 | 4578 | 4614 | 5386 | 2 |
+| 16 | 5185 | 6236 | 4105 | 6036 | 3664 | 3481 | 4240 | 2 |
 
-Instrumented system-level `perf` runs are lower and should be used only for
-attribution, not throughput claims:
-
-| Shape | MiB/s | Elapsed s | Samples |
-| --- | ---: | ---: | ---: |
-| `1/1/1` | 2677.42 | 38.2457 | 35K |
-| `4/8/8` | 8460.52 | 12.1034 | 28K |
+Instrumented `perf` and heaptrack runs should be used for attribution, not
+throughput claims; they materially change scheduling and absolute speed.
 
 This is not an unconditional "zero allocations everywhere" claim. TLS handshakes, connection setup, logging, metrics snapshots, pool exhaustion, and oversized capture buffers can allocate. The steady-state forwarding/cache-hit path is the part intentionally kept allocation-free where the configured pools are sized correctly.
 
