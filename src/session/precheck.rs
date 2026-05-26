@@ -258,14 +258,19 @@ async fn read_complete_precheck_hit(
         .then(crate::pool::ChunkedResponse::default);
 
     if let Some(response) = &mut response {
-        crate::session::backend::capture_complete_multiline_response_chunked(
-            conn.as_mut(),
-            buffer,
-            &deps.buffer_pool,
-            response,
-        )
-        .await
-        .map_err(|_| ())?;
+        let retained =
+            crate::session::backend::capture_complete_multiline_response_chunked_optional(
+                conn.as_mut(),
+                buffer,
+                &deps.buffer_pool,
+                response,
+            )
+            .await
+            .map_err(|_| ())?;
+        if !retained {
+            response.clear();
+            return Ok(PrecheckHit::Availability(status_code));
+        }
     } else {
         crate::session::backend::observe_complete_multiline_response(conn.as_mut(), buffer)
             .await

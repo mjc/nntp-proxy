@@ -319,14 +319,15 @@ pub(crate) async fn capture_complete_multiline_response(
         .await
 }
 
-/// Capture an isolated multiline response into chunked pooled storage.
-pub(crate) async fn capture_complete_multiline_response_chunked(
+/// Capture an isolated multiline response into chunked pooled storage while it
+/// remains within the framer-owned retention limit.
+pub(crate) async fn capture_complete_multiline_response_chunked_optional(
     conn: &mut crate::stream::ConnectionStream,
     buffer: &mut PooledBuffer,
     pool: &crate::pool::BufferPool,
     response: &mut crate::pool::ChunkedResponse,
-) -> anyhow::Result<()> {
-    crate::session::multiline_framing::capture_isolated_multiline_response_chunked(
+) -> anyhow::Result<bool> {
+    crate::session::multiline_framing::capture_isolated_multiline_response_chunked_optional(
         conn, buffer, pool, response,
     )
     .await

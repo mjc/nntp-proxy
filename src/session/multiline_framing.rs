@@ -834,14 +834,14 @@ pub(crate) async fn observe_isolated_multiline_response(
         .await
 }
 
-pub(crate) async fn capture_isolated_multiline_response_chunked(
+pub(crate) async fn capture_isolated_multiline_response_chunked_optional(
     conn: &mut crate::stream::ConnectionStream,
     io_buffer: &mut crate::pool::PooledBuffer,
     pool: &crate::pool::BufferPool,
     response: &mut crate::pool::ChunkedResponse,
-) -> Result<(), FramingError> {
+) -> Result<bool, FramingError> {
     IsolatedMultilineResponse { conn, io_buffer }
-        .capture_chunked(pool, response)
+        .capture_chunked_optional(pool, response, MAX_CAPTURED_MULTILINE_RESPONSE_BYTES)
         .await
 }
 
@@ -925,23 +925,40 @@ impl<'a> IsolatedMultilineResponse<'a> {
         Ok(())
     }
 
-    async fn capture_chunked(
+    async fn capture_chunked_optional(
         self,
         pool: &crate::pool::BufferPool,
         response: &mut crate::pool::ChunkedResponse,
-    ) -> Result<(), FramingError> {
+        retention_limit: usize,
+    ) -> Result<bool, FramingError> {
         let mut framer = MultilineFramer::default();
         let initial_len = self.io_buffer.initialized();
         let mut continuation =
             match framer.frame_initial_isolated_multiline_chunk(&self.io_buffer[..initial_len])? {
                 FramedMultilineChunk::Complete(complete) => {
+                    if capture_would_exceed_limit(
+                        response.len(),
+                        complete.response.len(),
+                        retention_limit,
+                    ) {
+                        response.clear();
+                        return Ok(false);
+                    }
                     complete.push_isolated_buffer_to(response, pool, self.io_buffer);
-                    ensure_capture_len(response.len())?;
                     None
                 }
                 FramedMultilineChunk::Incomplete(incomplete) => {
+                    if capture_would_exceed_limit(
+                        response.len(),
+                        incomplete.response.len(),
+                        retention_limit,
+                    ) {
+                        response.clear();
+                        return self
+                            .drain_after_optional_capture_limit(&mut framer, incomplete)
+                            .await;
+                    }
                     incomplete.push_buffer_to(response, pool, self.io_buffer);
-                    ensure_capture_len(response.len())?;
                     Some(incomplete)
                 }
             };
@@ -958,18 +975,57 @@ impl<'a> IsolatedMultilineResponse<'a> {
             continuation =
                 match framer.frame_next_isolated_multiline_chunk(prior, &self.io_buffer[..n])? {
                     FramedMultilineChunk::Complete(complete) => {
+                        if capture_would_exceed_limit(
+                            response.len(),
+                            complete.response.len(),
+                            retention_limit,
+                        ) {
+                            response.clear();
+                            return Ok(false);
+                        }
                         complete.push_isolated_buffer_to(response, pool, self.io_buffer);
-                        ensure_capture_len(response.len())?;
                         None
                     }
                     FramedMultilineChunk::Incomplete(incomplete) => {
+                        if capture_would_exceed_limit(
+                            response.len(),
+                            incomplete.response.len(),
+                            retention_limit,
+                        ) {
+                            response.clear();
+                            return self
+                                .drain_after_optional_capture_limit(&mut framer, incomplete)
+                                .await;
+                        }
                         incomplete.push_buffer_to(response, pool, self.io_buffer);
-                        ensure_capture_len(response.len())?;
                         Some(incomplete)
                     }
                 };
         }
-        Ok(())
+        Ok(true)
+    }
+
+    async fn drain_after_optional_capture_limit(
+        self,
+        framer: &mut MultilineFramer,
+        mut continuation: IncompleteMultilineWireChunk,
+    ) -> Result<bool, FramingError> {
+        loop {
+            let n = self
+                .io_buffer
+                .read_from(self.conn)
+                .await
+                .map_err(|_| FramingError::Io)?;
+            if n == 0 {
+                return Err(FramingError::BackendEof);
+            }
+            match framer.frame_next_isolated_multiline_chunk(continuation, &self.io_buffer[..n])? {
+                FramedMultilineChunk::Complete(_) => return Ok(false),
+                FramedMultilineChunk::Incomplete(incomplete) => {
+                    continuation = incomplete;
+                }
+            }
+        }
     }
 }
 
@@ -1829,6 +1885,10 @@ fn ensure_capture_len_with_limit(len: usize, max: usize) -> Result<(), FramingEr
         return Err(FramingError::CapturedResponseTooLarge { bytes: len, max });
     }
     Ok(())
+}
+
+fn capture_would_exceed_limit(current_len: usize, next_len: usize, max: usize) -> bool {
+    ensure_capture_len_with_limit(current_len.saturating_add(next_len), max).is_err()
 }
 
 #[must_use]
