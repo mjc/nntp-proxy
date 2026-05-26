@@ -100,17 +100,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Performance
 
 - **End-to-end proxy-in-the-middle matrix baseline**
-  - Ran a 10x `nntpbench` client -> `nntp-proxy` -> `nntpbench` server matrix across 112 points and 1,120 total runs.
-  - The overall mean was 6045.19 MiB/s, with the best point at 10579.84 MiB/s for 4 proxy threads, 8 backend connections, and 8 clients. That is about 1.28x the `v0.4.0` matrix mean.
+  - Ran current 100GiB cache-miss e2e spot checks with `nntpbench` client -> `nntp-proxy` -> `nntpbench` server.
+  - On a Ryzen 9 5950X, direct upstream measured 11307.07 MiB/s. Proxy `1/1/1` measured 4712.73 MiB/s mean over 10 runs, and proxy `4/8/8` measured 10019.26 MiB/s mean over 10 runs.
+  - On an Apple M1 with 16 GiB RAM, direct upstream measured 7557.08 MiB/s. Proxy `1/1/1` measured 3208.73 MiB/s mean over 10 runs, and proxy `4/8/8` measured 3856.64 MiB/s mean over 10 runs.
+  - Ran a current 10GiB default matrix across 112 points (`threads=1 2 4 8`, `backend_connections=1 2 4 8 16 32 64`, `clients=1 4 8 16`, client threads fixed at 4, pipeline depth fixed at 32). The best point was 11004.94 MiB/s at `8/8/4`; the best one-proxy-thread row was 6235.59 MiB/s at `1/2/16`.
 
 - **Major large-article throughput and CPU-efficiency improvement since 0.4.0**
   - The proxy hot path was rebuilt around byte-oriented typed requests, request-scoped response metadata, pooled buffers, and cache responses that can be written without flattening payloads into temporary `Vec`s.
-  - In local testing on a Ryzen 9 5950X, current builds stayed below roughly 16% of one core while sustaining about 50 MiB/s, and were usually in the single-digit percentages.
+  - Current cached-response writer benches generate ARTICLE hits in 94.23 ns mean, with HEAD/BODY/STAT derived hits all under 80 ns mean.
+  - Current single-connection local socket benches measured 366.6 MB/s mean for 788 KiB memory-cache hits and 349.9 MB/s mean for metadata-only cache misses.
   - The most important path is large article cache-miss handling, where the proxy still has to route the request, read the backend multiline response, validate framing, update cache/availability metadata, and stream the response back to the client.
-  - Cache-miss round-trip benchmarks for 768 KiB articles were roughly 190-210 us in repeated Divan runs.
-  - Cache-hit benchmarks are secondary but still useful for warm-cache throughput: local native cache-hit benchmarks for 768 KiB articles measured about 80 us and near 9-10 GiB/s in the benchmark harness.
-  - Smaller 64 KiB article benchmarks are mostly useful as fixed-overhead checks; they measured low tens of microseconds for cache-miss round trips and roughly 13-15 us for cache hits.
-  - Backend round-trip `ARTICLE` 64 KiB benchmarking was rerun on a less-busy machine at about 34.9 us mean, about 1.88 GiB/s.
+  - Single-connection local socket roundtrip benches measured backend roundtrip at 350.2 MB/s for 788 KiB articles and 596.5 MB/s for 1536 KiB articles; memory-cache hits measured 366.6 MB/s and 694.0 MB/s for those same sizes.
   - Large sequential article fetches benefit most from backend command pipelining, response batching, fewer request re-parses, fewer atomics per request, and reduced connection churn.
 
 - **Cache-hit and cache-miss hot paths rewritten** ([#60](https://github.com/mjc/nntp-proxy/pull/60), [#61](https://github.com/mjc/nntp-proxy/pull/61))
