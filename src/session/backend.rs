@@ -12,7 +12,7 @@
 //! should not rebuild command strings after request validation.
 
 use anyhow::Result;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::pool::PooledBuffer;
 use crate::protocol::RequestContext;
@@ -273,16 +273,20 @@ where
 /// This is used for payload cache ingestion and other paths that explicitly need
 /// ownership of the complete response. It still delegates all response boundary
 /// detection to the framer.
-pub(crate) async fn capture_response(
+pub(crate) async fn write_response_with_optional_capture<W>(
     request: &RequestContext,
     buffer: &mut PooledBuffer,
     conn: &mut crate::stream::ConnectionStream,
+    writer: &mut W,
     captured: &mut crate::pool::ChunkedResponse,
     pool: &crate::pool::BufferPool,
     backend_id: crate::types::BackendId,
-) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
-    crate::session::multiline_framing::capture_response(
-        request, buffer, conn, captured, pool, backend_id,
+) -> Result<(u64, bool), crate::session::response_transfer::ResponseTransferError>
+where
+    W: AsyncWrite + Unpin,
+{
+    crate::session::multiline_framing::write_response_with_optional_capture(
+        request, buffer, conn, writer, captured, pool, backend_id,
     )
     .await
 }

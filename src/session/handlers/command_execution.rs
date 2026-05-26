@@ -945,7 +945,7 @@ impl ClientSession {
                             params,
                         )
                         .await?;
-                    (bytes, Some(response))
+                    (bytes, response)
                 }
             };
 
@@ -1019,31 +1019,29 @@ impl ClientSession {
         backend_id: BackendId,
         mut backend_bytes: crate::pool::PooledBuffer,
         params: ResponseWriteParams<'_>,
-    ) -> Result<(u64, crate::pool::ChunkedResponse), ResponseTransferError>
+    ) -> Result<(u64, Option<crate::pool::ChunkedResponse>), ResponseTransferError>
     where
         W: AsyncWrite + Unpin,
     {
         let mut captured = crate::pool::ChunkedResponse::default();
-        // Payload caching explicitly owns a complete response, but the capture
-        // itself still goes through the backend facade so response splitting
-        // remains centralized.
-        crate::session::backend::capture_response(
-            params.request,
-            &mut backend_bytes,
-            pooled_conn,
-            &mut captured,
-            &self.buffer_pool,
-            backend_id,
-        )
-        .await?;
-        self.log_body_response_captured(backend_id, params, captured.len());
+        // Payload caching owns responses only while they stay within the
+        // framer-owned retention limit. Larger responses are streamed through
+        // without cache insertion so normal delivery and backend reuse can
+        // continue.
+        let (bytes_written, retained) =
+            crate::session::backend::write_response_with_optional_capture(
+                params.request,
+                &mut backend_bytes,
+                pooled_conn,
+                client_write,
+                &mut captured,
+                &self.buffer_pool,
+                backend_id,
+            )
+            .await?;
         drop(backend_bytes);
-        captured
-            .write_all_to(client_write)
-            .await
-            .map_err(classify_response_write_err)?;
-        self.log_body_response_written(backend_id, params, captured.len());
-        if let Some(msg_id_ref) = params.msg_id {
+        self.log_body_response_written(backend_id, params, bytes_written as usize);
+        if retained && let Some(msg_id_ref) = params.msg_id {
             debug!(
                 "Client {} caching full article for {} ({} bytes captured)",
                 self.client_addr,
@@ -1051,24 +1049,18 @@ impl ClientSession {
                 captured.len()
             );
         }
-        Ok((captured.len() as u64, captured))
-    }
-
-    fn log_body_response_captured(
-        &self,
-        backend_id: BackendId,
-        params: ResponseWriteParams<'_>,
-        response_len: usize,
-    ) {
-        if matches!(params.request.kind(), RequestKind::Body) {
+        if retained {
+            Ok((bytes_written, Some(captured)))
+        } else {
             debug!(
                 client = %self.client_addr,
                 backend = backend_id.as_index(),
                 command_verb = ?params.request.verb(),
                 status_code = params.status_code.as_u16(),
-                response_len,
-                "Captured BODY response for direct client delivery"
+                bytes_written,
+                "Response exceeded retention limit; streamed without cache insertion"
             );
+            Ok((bytes_written, None))
         }
     }
 
