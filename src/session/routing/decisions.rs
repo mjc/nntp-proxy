@@ -53,7 +53,11 @@ pub fn decide_request_routing(
                 }
             }
             RequestRouteClass::Stateful | RequestRouteClass::Reject => {
-                CommandRoutingDecision::Reject
+                if auth_enabled && !is_authenticated {
+                    CommandRoutingDecision::RequireAuth
+                } else {
+                    CommandRoutingDecision::Reject
+                }
             }
             RequestRouteClass::Local => CommandRoutingDecision::Reject,
         },
@@ -171,6 +175,35 @@ mod tests {
         // Per-command mode should reject stateful commands
         assert_eq!(
             decide_command_routing("GROUP alt.test", true, false, RoutingMode::PerCommand),
+            CommandRoutingDecision::Reject
+        );
+    }
+
+    #[test]
+    fn test_decide_routing_requires_auth_before_rejecting_unsupported_commands() {
+        for mode in [
+            RoutingMode::PerCommand,
+            RoutingMode::Hybrid,
+            RoutingMode::Stateful,
+        ] {
+            assert_eq!(
+                decide_command_routing("POST", false, true, mode),
+                CommandRoutingDecision::RequireAuth,
+                "POST should be auth-gated before command policy is revealed in {mode:?}"
+            );
+            assert_eq!(
+                decide_command_routing("STARTTLS", false, true, mode),
+                CommandRoutingDecision::RequireAuth,
+                "STARTTLS should be auth-gated before command policy is revealed in {mode:?}"
+            );
+        }
+
+        assert_eq!(
+            decide_command_routing("POST", true, true, RoutingMode::PerCommand),
+            CommandRoutingDecision::Reject
+        );
+        assert_eq!(
+            decide_command_routing("STARTTLS", true, true, RoutingMode::Stateful),
             CommandRoutingDecision::Reject
         );
     }

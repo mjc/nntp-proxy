@@ -54,6 +54,18 @@ async fn test_hybrid_stateful_command_is_gated_until_authentication() -> Result<
 }
 
 #[tokio::test]
+async fn test_stateful_command_is_gated_until_authentication_in_stateful_mode() -> Result<()> {
+    let mut client = spawn_auth_gating_client(RoutingMode::Stateful).await?;
+
+    client.expect_status("GROUP alt.test", "480").await?;
+
+    client.authenticate(USERNAME, PASSWORD).await?;
+    client.expect_status("GROUP alt.test", "211").await?;
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_hybrid_unknown_extension_is_gated_until_authentication() -> Result<()> {
     let mut client = spawn_auth_gating_client(RoutingMode::Hybrid).await?;
 
@@ -61,6 +73,26 @@ async fn test_hybrid_unknown_extension_is_gated_until_authentication() -> Result
 
     client.authenticate(USERNAME, PASSWORD).await?;
     client.expect_status("XFOO arg", "200").await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_unsupported_commands_are_gated_before_policy_rejection() -> Result<()> {
+    for mode in [
+        RoutingMode::PerCommand,
+        RoutingMode::Hybrid,
+        RoutingMode::Stateful,
+    ] {
+        let mut client = spawn_auth_gating_client(mode).await?;
+
+        client.expect_status("POST", "480").await?;
+        client.expect_status("STARTTLS", "480").await?;
+
+        client.authenticate(USERNAME, PASSWORD).await?;
+        client.expect_status("POST", "440").await?;
+        client.expect_status("STARTTLS", "503").await?;
+    }
 
     Ok(())
 }

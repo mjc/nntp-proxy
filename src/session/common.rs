@@ -377,7 +377,7 @@ where
 
     let action = CommandHandler::classify_request(request);
     match action {
-        CommandAction::ForwardStateless => {
+        CommandAction::ForwardStateless | CommandAction::Reject(_) => {
             // Reject all non-auth commands before authentication
             use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
             client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
@@ -427,13 +427,6 @@ where
                     })
                 }
             }
-        }
-        CommandAction::Reject(response) => {
-            // Send rejection response inline
-            client_write.write_all(response.as_bytes()).await?;
-            Ok(AuthHandlerResult::Rejected {
-                bytes_written: response.len() as u64,
-            })
         }
     }
 }
