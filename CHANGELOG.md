@@ -103,46 +103,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
-- **End-to-end proxy-in-the-middle matrix baseline**
-  - Ran current 100GiB cache-miss e2e spot checks with `nntpbench` client -> `nntp-proxy` -> `nntpbench` server.
-  - On a Ryzen 9 5950X, direct upstream measured 11307.07 MiB/s. Proxy `1/1/1` measured 4712.73 MiB/s mean over 10 runs, and proxy `4/8/8` measured 10019.26 MiB/s mean over 10 runs.
-  - On an Apple M1 with 16 GiB RAM, direct upstream measured 7557.08 MiB/s. Proxy `1/1/1` measured 3208.73 MiB/s mean over 10 runs, and proxy `4/8/8` measured 3856.64 MiB/s mean over 10 runs.
-  - Ran current 10GiB default matrices across 112 points (`threads=1 2 4 8`, `backend_connections=1 2 4 8 16 32 64`, `clients=1 4 8 16`, client threads fixed at 4, pipeline depth fixed at 32). On a Ryzen 9 5950X, the best point was 11004.94 MiB/s at `8/8/4`; the best one-proxy-thread row was 6235.59 MiB/s at `1/2/16`. On an Apple M1 with 16 GiB RAM and OS-default Darwin socket buffers, the best point was 6004.22 MiB/s at `2/2/4`; the best one-proxy-thread row was 5404.49 MiB/s at `1/2/16`.
-  - Made the release cache-miss benchmark harness pick Darwin-safe socket-buffer defaults and allow client, upstream, and proxy socket buffer sizes to be overridden independently.
-
-- **Major large-article throughput and CPU-efficiency improvement since 0.4.0**
-  - The proxy hot path was rebuilt around byte-oriented typed requests, request-scoped response metadata, pooled buffers, and cache responses that can be written without flattening payloads into temporary `Vec`s.
-  - Current cached-response writer benches generate ARTICLE hits in 94.23 ns mean, with HEAD/BODY/STAT derived hits all under 80 ns mean.
-  - Current single-connection local socket benches measured 366.6 MB/s mean for 788 KiB memory-cache hits and 349.9 MB/s mean for metadata-only cache misses.
-  - The most important path is large article cache-miss handling, where the proxy still has to route the request, read the backend multiline response, validate framing, update cache/availability metadata, and stream the response back to the client.
-  - Single-connection local socket roundtrip benches measured backend roundtrip at 350.2 MB/s for 788 KiB articles and 596.5 MB/s for 1536 KiB articles; memory-cache hits measured 366.6 MB/s and 694.0 MB/s for those same sizes.
-  - Large sequential article fetches benefit most from backend command pipelining, response batching, fewer request re-parses, fewer atomics per request, and reduced connection churn.
-
-- **Cache-hit and cache-miss hot paths rewritten** ([#60](https://github.com/mjc/nntp-proxy/pull/60), [#61](https://github.com/mjc/nntp-proxy/pull/61))
-  - Cache entries now carry typed status, payload-shape, response-length, backend, tier, and availability metadata so routing, cache lookup, metrics, and response generation do not rediscover the same facts repeatedly.
-  - Cache-hit serving now uses borrowed payload sections, vectored writes, boxed/shared slices, typed wire lengths, and request-kind-aware response rendering to avoid avoidable allocations and copies.
-  - Cache-miss and ingestion paths now parse chunked backend responses directly from bytes, hand off owned multiline chunks where useful, avoid scratch-buffer zero-fill, and avoid redundant availability and TTL bookkeeping.
-
-- **Pipeline, routing, and backend I/O reductions** ([#55](https://github.com/mjc/nntp-proxy/pull/55), [#58](https://github.com/mjc/nntp-proxy/pull/58), [#60](https://github.com/mjc/nntp-proxy/pull/60))
-  - Added backend pipeline workers and FIFO completion queues so sequential `ARTICLE`/`BODY`/`HEAD`/`STAT` requests can be batched while preserving client response order.
-  - Coalesced typed request writes, reused response buffers, pooled capture/scratch buffers, reduced repeated message-ID wrapping, and skipped unnecessary timing reads on untimed backend paths.
-  - Cache-hit profiling drove vectored response writes: the 64 KiB native cache-hit sample improved from about 34.1 us / 1.92 GiB/s to about 28.3 us / 2.32 GiB/s after coalescing cached response writes, before later cache-hit refinements.
-  - Reworked terminator scanning around the multiline framing path, `memmem`, and dot-first scans so multiline response validation is both safer and cheaper.
-
-- **Borrowed forwarding and buffer-pool reductions** ([#69](https://github.com/mjc/nntp-proxy/pull/69), [#71](https://github.com/mjc/nntp-proxy/pull/71))
-  - Added range-backed forwarding so response slices can reference pooled read buffers without materializing a full owned response.
-  - Reduced direct-response and ordered-response allocations, tuned pooled buffer handling, read pooled buffers without a `Take` adapter, and made buffer pools lazy.
-  - Added fast `perf.data` parser tooling and refreshed benchmark documentation for the large cache-miss path.
-
-- **Disk-cache and availability-index performance**
-  - Tuned foyer disk-cache behavior with higher parallelism, better block sizing, direct cache-entry construction on precheck paths, configurable compression codecs, and cold invalidation of old disk formats.
-  - Added a compact availability-only negative index so known missing articles can be retained without storing article bodies or repeatedly querying every backend.
-  - Added adaptive availability sharding and guarded sync paths so availability persistence work is skipped when there is nothing meaningful to write.
-
-- **Benchmark coverage and measurement cleanup** ([#60](https://github.com/mjc/nntp-proxy/pull/60), [#61](https://github.com/mjc/nntp-proxy/pull/61))
-  - Added or refreshed benchmark suites for request parsing/serialization, cache ingest, cache lookup, cache response generation, router selection, end-to-end proxy behavior, streaming round-trips, and multiline-framing boundary handling.
-  - Added realistic article-size cases, drained end-to-end response reads, cache-miss metadata-only cases, and in-memory streaming round-trip benchmarks.
-  - Corrected the cache-miss callgrind harness so instruction-count comparisons reflect normal benchmark setup.
+- Large cache-miss forwarding now reaches multi-GiB/s throughput while using much less transient memory than the old full-response buffering path. With one client connection, one proxy thread, and one backend connection, current release checks measured 4.60 GiB/s on the Ryzen 9 5950X system and 3.13 GiB/s on the Apple M1 system; see [release benchmarks](docs/RELEASE_BENCHMARKS.md) for the full matrices.
+- Per-command direct forwarding and cache-hit serving are now built around borrowed buffers and vectored writes, so the steady-state hot path is intended to be allocation-free after buffer-pool warmup when configured pools have capacity. Stateful mode, payload retention/cache ingest, connection setup, logging, metrics snapshots, pool exhaustion, and oversized-retention fallbacks can still allocate.
+- Sequential article fetches benefit from backend command pipelining, response batching, fewer request re-parses, and reduced connection churn.
 
 ### Testing
 
