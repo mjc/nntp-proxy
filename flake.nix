@@ -3,6 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    crane.url = "github:ipetkov/crane";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
@@ -13,6 +14,7 @@
   outputs = {
     self,
     nixpkgs,
+    crane,
     flake-utils,
     rust-overlay,
   }: let
@@ -29,6 +31,8 @@
       rustToolchain = pkgs.rust-bin.stable.${rustVersion}.default.override {
         extensions = ["rust-src" "rust-analyzer" "llvm-tools-preview"];
       };
+
+      craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
       # Nightly toolchain for tools that require it (cargo-udeps)
       rustNightlyForUdeps = pkgs.rust-bin.nightly.latest.default;
@@ -129,7 +133,7 @@
         else if system == "aarch64-darwin" then "CARGO_TARGET_AARCH64_APPLE_DARWIN"
         else throw "Unsupported system: ${system}";
       package = import ./nix/package.nix {
-        inherit pkgs cargoToml rustVersion;
+        inherit pkgs craneLib cargoToml;
       };
     in {
       apps.default = flake-utils.lib.mkApp {
