@@ -967,16 +967,7 @@ impl ClientSession {
                 self.maybe_cache_upsert_buffer(msg_id, response.into(), backend_id);
             }
             (CacheAction::TrackAvailability, Some(msg_id), _)
-                if !params.request.cache_records_backend_has_article(backend_id) =>
-            {
-                self.spawn_cache_upsert_availability(
-                    msg_id,
-                    params.status_code,
-                    backend_id,
-                    self.tier_for_backend(backend_id),
-                );
-            }
-            (CacheAction::CaptureArticle, Some(msg_id), None)
+            | (CacheAction::CaptureArticle, Some(msg_id), None)
                 if !params.request.cache_records_backend_has_article(backend_id) =>
             {
                 self.spawn_cache_upsert_availability(
