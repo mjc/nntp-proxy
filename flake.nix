@@ -136,9 +136,13 @@
         inherit pkgs craneLib cargoToml;
       };
     in {
-      apps.default = flake-utils.lib.mkApp {
-        drv = package;
-      };
+      apps.default =
+        (flake-utils.lib.mkApp {
+          drv = package;
+        })
+        // {
+          meta = package.meta;
+        };
 
       devShells.default = pkgs.mkShell {
         nativeBuildInputs = basicNativeBuildInputs;

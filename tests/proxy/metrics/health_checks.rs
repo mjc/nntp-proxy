@@ -67,6 +67,7 @@ async fn test_tcp_alive_check_closed_connection() -> Result<()> {
 
     let stream = TcpStream::connect(addr).await?;
     closed_rx.await?;
+    stream.readable().await?;
 
     let mut conn_stream = ConnectionStream::plain(stream);
 
