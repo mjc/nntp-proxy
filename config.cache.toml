@@ -1,5 +1,6 @@
-# Cache-focused NNTP Proxy configuration
-# Use this with nntp-proxy; caching is built in and the same binary handles dashboard/headless UI modes.
+# NNTP Proxy — Cache Configuration
+# Use this as a starting point when you want article caching enabled.
+# Caching is built into the main binary; no separate process needed.
 
 # Backend NNTP servers
 [[servers]]
@@ -19,6 +20,7 @@ tls_verify_cert = true
 
 # Routing configuration
 [routing]
+# Routing mode: "hybrid" (default), "per-command", or "stateful"
 mode = "hybrid"
 backend_selection = "least-loaded"
 adaptive_precheck = false

@@ -105,15 +105,12 @@ pub struct CommonArgs {
     #[arg(long, env = "NNTP_PROXY_HOST", help_heading = "Network")]
     pub host: Option<String>,
 
-    /// Routing mode: stateful, per-command, or hybrid
+    /// Routing mode (hybrid by default): stateful, per-command, or hybrid
     ///
     /// - stateful: 1:1 mode, each client gets a dedicated backend connection
     /// - per-command: Each command can use a different backend (stateless only)
-    /// - hybrid: Starts in per-command mode, auto-switches to stateful on first stateful command
-    ///
-    /// Temporary note: the current runtime forces per-command mode even when another
-    /// routing mode is requested. Keep setting this explicitly so configs stay ready
-    /// for hybrid/stateful re-enablement.
+    /// - hybrid: Starts in per-command mode, then switches to a dedicated backend
+    ///   when the client sends a stateful command
     #[arg(
         short = 'm',
         long = "routing-mode",
@@ -732,6 +729,22 @@ mod tests {
         assert!(help.contains("--headless"));
         assert!(help.contains("--tui-listen <IP:PORT>"));
         assert!(help.contains("--tui-attach <IP:PORT>"));
+    }
+
+    #[test]
+    fn test_help_describes_live_routing_modes() {
+        let mut command = CommonArgs::command();
+        let mut help = Vec::new();
+        command.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+        let normalized_help = help.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        assert!(normalized_help.contains("--routing-mode <ROUTING_MODE>"));
+        assert!(normalized_help.contains("Routing mode (hybrid by default)"));
+        assert!(normalized_help.contains("stateful: 1:1 mode"));
+        assert!(normalized_help.contains("per-command: Each command"));
+        assert!(normalized_help.contains("hybrid: Starts in per-command mode"));
+        assert!(!normalized_help.contains("forces per-command mode"));
     }
 
     // Helper to create default args for testing

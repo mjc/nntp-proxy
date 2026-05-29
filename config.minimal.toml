@@ -3,8 +3,8 @@
 
 # Defaults:
 # - Binds to 0.0.0.0:8119
-# - Hybrid routing mode (automatic per-command to stateful switching)
-# - Availability-only article cache mode
+# - Hybrid routing mode by default
+# - Availability-only article tracking by default; add a [cache] section to store article bodies
 # - Default transport memory settings
 # - No client authentication
 # - Max 10 connections per backend

@@ -9,7 +9,6 @@ services:
     environment:
       # Proxy configuration (these match the CLI/env args in src/args.rs)
       NNTP_PROXY_PORT: 8119
-      NNTP_PROXY_ROUTING_MODE: hybrid  # Options: stateful, per-command, hybrid
       # NNTP_PROXY_THREADS: 4  # Optional: worker threads (default: 1, use 0 for CPU cores)
       RUST_LOG: info  # Log level: trace, debug, info, warn, error
       
@@ -75,7 +74,6 @@ services:
       - "8120:8119"
     environment:
       NNTP_PROXY_PORT: 8119
-      NNTP_PROXY_ROUTING_MODE: hybrid
       RUST_LOG: info
       
       # -----------------------------------------------------------------------------
