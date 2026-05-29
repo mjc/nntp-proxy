@@ -103,7 +103,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
-- Large cache-miss forwarding now reaches multi-GiB/s throughput while using much less transient memory than the old full-response buffering path. With one client connection, one proxy thread, and one backend connection, current release checks measured 4.60 GiB/s on the Ryzen 9 5950X system and 3.13 GiB/s on the Apple M1 system; see [release benchmarks](docs/RELEASE_BENCHMARKS.md) for the full matrices.
+- Large cache-miss forwarding now reaches multi-GiB/s throughput while using much less transient memory than the old full-response buffering path. With one client connection, one proxy thread, and one backend connection, current release checks measured 4.60 GiB/s on the Ryzen 9 5950X system and 3.13 GiB/s on the Apple M1 system; see [release benchmarks](docs/archive/release-benchmarks.md) for the archived note and regeneration pointers.
 - Per-command direct forwarding and cache-hit serving are now built around borrowed buffers and vectored writes, so the steady-state hot path is intended to be allocation-free after buffer-pool warmup when configured pools have capacity. Stateful mode, payload retention/cache ingest, connection setup, logging, metrics snapshots, pool exhaustion, and oversized-retention fallbacks can still allocate.
 - Sequential article fetches benefit from backend command pipelining, response batching, fewer request re-parses, and reduced connection churn.
 

@@ -1,0 +1,78 @@
+classDiagram
+    class NntpProxy {
+        +router: BackendSelector
+        +providers: Vec~DeadpoolConnectionProvider~
+        +buffer_pool: BufferPool
+        +metrics: MetricsCollector
+        +cache: Option~ArticleCache~
+        +handle_client()
+    }
+    
+    class ClientSession {
+        +client_id: ClientId
+        +mode_state: ModeState
+        +auth_state: AuthState
+        +router: BackendSelector
+        +handle_per_command_routing()
+        +handle_stateful_session()
+    }
+    
+    class BackendSelector {
+        +backends: Vec~BackendInfo~
+        +strategy: SelectionStrategy
+        +route_command()
+        +add_backend()
+    }
+    
+    class DeadpoolConnectionProvider {
+        +pool: Pool~TcpManager~
+        +host: HostName
+        +port: Port
+        +get_pooled_connection()
+    }
+    
+    class NntpCommand {
+        <<enumeration>>
+        ArticleByMessageId
+        ArticleByNumber
+        Group
+        Quit
+        +parse(cmd: &str)
+        +is_stateful()
+    }
+    
+    class ConnectionStream {
+        <<enumeration>>
+        Plain(TcpStream)
+        Tls(TlsStream)
+        +is_encrypted()
+    }
+    
+    class ModeState {
+        +mode: SessionMode
+        +routing_mode: RoutingMode
+        +switch_to_stateful()
+    }
+    
+    class SessionMode {
+        <<enumeration>>
+        PerCommand
+        Stateful
+    }
+    
+    class RoutingMode {
+        <<enumeration>>
+        Stateful
+        PerCommand
+        Hybrid
+    }
+
+    NntpProxy --> ClientSession : creates
+    NntpProxy --> BackendSelector : owns
+    NntpProxy --> DeadpoolConnectionProvider : owns many
+    ClientSession --> ModeState : has
+    ClientSession --> BackendSelector : references
+    BackendSelector --> DeadpoolConnectionProvider : routes to
+    DeadpoolConnectionProvider --> ConnectionStream : provides
+    ModeState --> SessionMode : tracks
+    ModeState --> RoutingMode : configured with

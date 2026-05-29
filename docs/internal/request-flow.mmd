@@ -1,0 +1,37 @@
+sequenceDiagram
+    participant C as Client
+    participant P as NntpProxy
+    participant S as ClientSession
+    participant CL as Classifier
+    participant R as Router
+    participant Pool as ConnectionPool
+    participant B as Backend
+
+    C->>P: TCP Connect
+    P->>S: Create Session
+    P->>C: 200 Ready
+    
+    loop Commands
+        C->>S: ARTICLE <msg-id>
+        S->>CL: parse(command)
+        CL-->>S: NntpCommand::ArticleByMessageId
+        
+        alt Per-Command Mode
+            S->>R: route_command()
+            R-->>S: BackendId(0)
+            S->>Pool: get_pooled_connection()
+            Pool-->>S: ConnectionStream
+            S->>B: Forward Command
+            B-->>S: 220 + Article
+            S->>C: Stream Response
+            S->>Pool: Return Connection
+        else Stateful Mode
+            S->>B: Forward (dedicated)
+            B-->>S: Response
+            S->>C: Forward
+        end
+    end
+    
+    C->>S: QUIT
+    S->>C: 205 Goodbye
+    S->>P: Session Complete

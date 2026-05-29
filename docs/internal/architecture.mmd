@@ -1,0 +1,80 @@
+flowchart TB
+    subgraph External["External"]
+        Client["NNTP Client"]
+        Backend1["Backend Server 1"]
+        Backend2["Backend Server 2"]
+        BackendN["Backend Server N"]
+    end
+
+    subgraph Proxy["NntpProxy (proxy.rs)"]
+        direction TB
+        Accept["Accept Loop<br/>(runtime.rs)"]
+        
+        subgraph Session["ClientSession (session/)"]
+            AuthHandler["AuthHandler<br/>(auth/)"]
+            ModeState["ModeState<br/>Hybrid/Stateful/PerCommand"]
+            
+            subgraph Handlers["Session Handlers"]
+                HybridH["hybrid.rs"]
+                StatefulH["stateful.rs"]
+                PerCommandH["per_command.rs"]
+            end
+        end
+        
+        subgraph Command["Command Processing"]
+            Classifier["NntpCommand::parse()<br/>(classifier.rs)"]
+            Handler["CommandHandler<br/>(handler.rs)"]
+        end
+        
+        subgraph Router["BackendSelector (router/)"]
+            RoundRobin["Round Robin"]
+            WeightedRR["Weighted RR"]
+            LeastLoaded["Least Loaded"]
+        end
+        
+        subgraph Pool["Connection Pool (pool/)"]
+            Deadpool["DeadpoolConnectionProvider"]
+            BufferPool["BufferPool"]
+            HealthCheck["Health Checker"]
+        end
+        
+        subgraph Protocol["Protocol (protocol/)"]
+            Response["NntpResponse"]
+            StatusCode["StatusCode"]
+            Article["Article Parser"]
+        end
+        
+        Cache["ArticleCache<br/>(cache/)"]
+        Metrics["MetricsCollector<br/>(metrics/)"]
+        TLS["TlsManager<br/>(tls.rs)"]
+    end
+
+    Client -->|TCP/TLS| Accept
+    Accept --> Session
+    Session --> AuthHandler
+    AuthHandler -->|Authenticated| ModeState
+    ModeState -->|Hybrid| HybridH
+    ModeState -->|Stateful| StatefulH
+    ModeState -->|PerCommand| PerCommandH
+    
+    HybridH --> Classifier
+    StatefulH --> Classifier
+    PerCommandH --> Classifier
+    
+    Classifier --> Handler
+    Handler -->|Route| Router
+    
+    Router --> Pool
+    Pool -->|Get Connection| Deadpool
+    Deadpool -->|Plain| Backend1
+    Deadpool -->|TLS| TLS
+    TLS --> Backend2
+    
+    Pool --> HealthCheck
+    HealthCheck -.->|Monitor| Backend1
+    HealthCheck -.->|Monitor| Backend2
+    HealthCheck -.->|Monitor| BackendN
+    
+    Protocol --> Session
+    Cache -.->|Cache Hit| Session
+    Metrics -.->|Record| Session
