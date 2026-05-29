@@ -1,0 +1,154 @@
+# NNTP Proxy — Full Configuration Reference
+#
+# Every available option with comments. Sections are ordered from general proxy
+# behavior to concrete identities and backend endpoints.
+#
+
+# Proxy Server Settings
+[proxy]
+# Host/IP to bind to (default: 0.0.0.0 - all interfaces)
+host = "0.0.0.0"
+# Port to listen on (default: 8119)
+# Can be overridden with --port or NNTP_PROXY_PORT
+port = 8119
+# Worker threads (default: 1, use 0 for CPU cores)
+threads = 1
+# Validate yEnc structure and checksums (default: true)
+# Disable for better performance if you trust your backends
+validate_yenc = true
+# Minimum log level for debug.log file (default: "warn")
+# Options: "error", "warn", "info", "debug", "trace"
+log_file_level = "warn"
+# Optional stats persistence path used by the TUI dashboard
+# stats_file = "/var/lib/nntp-proxy/stats.json"
+
+# Routing Configuration
+[routing]
+# Routing mode: "hybrid" (default), "per-command", or "stateful"
+mode = "hybrid"
+# Backend selection strategy: "least-loaded" (default) or "weighted-round-robin"
+backend_selection = "least-loaded"
+# Enable adaptive availability prechecking for STAT/HEAD commands
+adaptive_precheck = false
+
+# Memory Configuration
+# These settings affect transport buffers and buffer pools, not article storage.
+[memory]
+# TCP socket buffers for client and backend connections
+socket_recv_buffer_size = 16777216
+socket_send_buffer_size = 16777216
+# Pooled streaming buffers
+buffer_pool_size = 1048576
+buffer_pool_count = 100
+# Capture buffers used by cache ingest/response assembly
+capture_pool_size = 1048576
+capture_pool_count = 16
+
+# Article Cache Configuration
+[cache]
+# Hot in-memory article cache capacity
+# Supports: "1gb", "500mb", "64mb", or raw bytes
+article_cache_capacity = "256mb"
+# Time-to-live for the article cache, in seconds
+article_cache_ttl_secs = 3600
+# Set true to store article bodies in memory and enable the disk tier below.
+store_article_bodies = true
+# Optional persistence file for the availability-only index when store_article_bodies = false
+# availability_index_path = "/var/cache/nntp-proxy/availability.idx"
+
+# Disk Cache Configuration (optional)
+# When configured, evicted articles spill from memory to disk.
+# Use an SSD/NVMe device for the disk tier.
+[cache.disk]
+path = "/var/cache/nntp-proxy/articles"
+capacity = "10gb"
+# Options: "lz4" (default), "zstd", or "none"
+compression = "lz4"
+# Number of shards for concurrent disk access
+shards = 4
+
+# Health Check Configuration
+[health_check]
+# Interval and timeout are in seconds
+interval = 30
+timeout = 5
+unhealthy_threshold = 3
+
+# Client Authentication Configuration
+# Place auth near the concrete server entries. It is optional.
+#
+# Custom greeting:
+[client_auth]
+greeting = "200 NNTP Proxy ready"
+
+# Users:
+[[client_auth.users]]
+username = "clientusername"
+password = "client password"
+#
+# [[client_auth.users]]
+# username = "bob"
+# password = "password456"
+
+[[servers]]
+host = "news.example.com"
+port = 119
+name = "Example News Server 1"
+# Optional backend authentication
+# username = "your_username"
+# password = "your_password"
+max_connections = 20
+# Lower tier numbers are tried first. Higher tiers are fallback/archive servers.
+tier = 0
+# Optional keep-alive interval in seconds
+# connection_keepalive = 60
+use_tls = false
+tls_verify_cert = true
+# Wire compression for backend connections (RFC 8054 COMPRESS DEFLATE)
+# Omit for auto-detect (default), true to require, false to disable
+# compress = true
+# compress_level = 1
+# How long to wait before replacing a removed connection (seconds, default: 30)
+# Damps connection churn after repeated backend failures. Set to 0 to disable.
+# replacement_cooldown = 30
+# Clear idle connections after this many seconds of proxy-wide inactivity (default: 600)
+# Prevents stale connections accumulating overnight. Set to 0 to disable.
+# backend_idle_timeout = 600
+
+[[servers]]
+host = "nntp.example.org"
+port = 119
+name = "Example News Server 2"
+username = "testuser"
+password = "testpass"
+max_connections = 10
+tier = 1
+connection_keepalive = 60
+use_tls = false
+tls_verify_cert = true
+
+[[servers]]
+host = "secure-news.example.com"
+port = 563
+name = "Secure News Server"
+username = "premium_user"
+password = "secure_password"
+max_connections = 15
+tier = 5
+connection_keepalive = 120
+use_tls = true
+tls_verify_cert = true
+# Optional custom CA certificate
+# tls_cert_path = "/path/to/ca-cert.pem"
+
+[[servers]]
+host = "archive.example.com"
+port = 563
+name = "Archive Server"
+username = "archive_user"
+password = "archive_pass"
+max_connections = 2
+tier = 10
+connection_keepalive = 120
+use_tls = true
+tls_verify_cert = true

@@ -288,7 +288,7 @@ fn test_config_example_is_valid() -> Result<()> {
 /// Test cache config example is valid
 #[test]
 fn test_cache_config_example_is_valid() -> Result<()> {
-    let toml = std::fs::read_to_string("cache-config.example.toml")?;
+    let toml = std::fs::read_to_string("config.cache.toml")?;
     let config: Config = toml::from_str(&toml)?;
     config.validate()?;
 
