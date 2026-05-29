@@ -27,11 +27,13 @@ include = [
     "/benches/**",
     "/config.example.toml",
     "/config.cache.toml",
+    "/config.full.toml",
     "/config.minimal.toml",
     "/docs/**",
     "/src/**",
     "/tests/**",
 ]
+default-run = "nntp-proxy"
 
 [[bin]]
 name = "nntp-proxy"

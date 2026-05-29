@@ -52,7 +52,6 @@ EXPOSE 8119
 # Environment variables
 # Proxy settings
 ENV NNTP_PROXY_PORT=8119 \
-    NNTP_PROXY_ROUTING_MODE=hybrid \
     NNTP_PROXY_CONFIG=/etc/nntp-proxy/config.toml \
     RUST_LOG=info
 
