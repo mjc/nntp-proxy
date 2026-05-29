@@ -262,11 +262,7 @@ impl NntpProxy {
     /// Get display name for current routing mode
     #[inline]
     pub(super) fn routing_mode_display_name(&self) -> &'static str {
-        if self.cache.entry_count() > 0 {
-            "caching"
-        } else {
-            "per-command"
-        }
+        self.routing_mode.short_name()
     }
 
     /// Finalize stateful session with metrics and cleanup
@@ -361,7 +357,7 @@ impl NntpProxy {
         use crate::session::SessionMode;
         match (session_mode, self.routing_mode) {
             (SessionMode::PerCommand, _) => "per-command",
-            (SessionMode::Stateful, RoutingMode::Stateful) => "standard",
+            (SessionMode::Stateful, RoutingMode::Stateful) => "stateful",
             (SessionMode::Stateful, RoutingMode::Hybrid) => "hybrid",
             (SessionMode::Stateful, _) => "stateful",
         }
@@ -472,12 +468,12 @@ mod tests {
     }
 
     #[test]
-    fn test_session_mode_label_stateful_standard() {
+    fn test_session_mode_label_stateful() {
         let config = create_test_config();
         let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
 
         let label = proxy.session_mode_label(SessionMode::Stateful);
-        assert_eq!(label, "standard");
+        assert_eq!(label, "stateful");
     }
 
     #[test]
@@ -490,12 +486,17 @@ mod tests {
     }
 
     #[test]
-    fn test_routing_mode_display_name_caching() {
+    fn test_routing_mode_display_name_matches_configured_mode() {
         let config = create_test_config();
-        let proxy = NntpProxy::new_sync(config, RoutingMode::PerCommand).unwrap();
 
-        // Empty cache (default 0 capacity) should return "per-command"
-        assert_eq!(proxy.routing_mode_display_name(), "per-command");
+        let per_command = NntpProxy::new_sync(config.clone(), RoutingMode::PerCommand).unwrap();
+        assert_eq!(per_command.routing_mode_display_name(), "per-command");
+
+        let hybrid = NntpProxy::new_sync(config.clone(), RoutingMode::Hybrid).unwrap();
+        assert_eq!(hybrid.routing_mode_display_name(), "hybrid");
+
+        let stateful = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
+        assert_eq!(stateful.routing_mode_display_name(), "stateful");
     }
 
     #[test]
@@ -645,7 +646,7 @@ mod tests {
         let _empty_cache = Arc::new(crate::cache::UnifiedCache::availability(
             std::time::Duration::MAX,
         ));
-        assert_eq!(proxy.routing_mode_display_name(), "per-command");
+        assert_eq!(proxy.routing_mode_display_name(), "hybrid");
     }
 
     #[test]
@@ -702,7 +703,7 @@ mod tests {
 
         // Stateful mode
         let proxy = NntpProxy::new_sync(config.clone(), RoutingMode::Stateful).unwrap();
-        assert_eq!(proxy.session_mode_label(SessionMode::Stateful), "standard");
+        assert_eq!(proxy.session_mode_label(SessionMode::Stateful), "stateful");
 
         // Hybrid mode
         let proxy = NntpProxy::new_sync(config, RoutingMode::Hybrid).unwrap();
