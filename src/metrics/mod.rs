@@ -22,6 +22,7 @@
 mod backend_stats;
 mod collector;
 mod connection_stats;
+pub mod exporter;
 mod snapshot;
 pub mod store;
 pub mod types;
