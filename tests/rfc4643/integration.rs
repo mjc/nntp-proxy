@@ -206,6 +206,7 @@ async fn test_config_auth_round_trip() {
             }],
             greeting: Some("Custom Auth Required".to_string()),
         },
+        ..Default::default()
     };
 
     // Verify config

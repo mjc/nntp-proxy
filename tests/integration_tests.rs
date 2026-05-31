@@ -811,6 +811,7 @@ async fn start_tiered_proxy(servers: Vec<Server>) -> Result<u16> {
         health_check: HealthCheck::default(),
         cache: None,
         client_auth: ClientAuth::default(),
+        ..Default::default()
     };
     let proxy_port = spawn_proxy_with_config(config, RoutingMode::PerCommand).await?;
     Ok(proxy_port)

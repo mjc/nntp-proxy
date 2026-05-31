@@ -301,6 +301,7 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
         health_check: HealthCheck::default(),
         cache: None,
         client_auth: ClientAuth::default(),
+        ..Default::default()
     }
 }
 
@@ -1001,6 +1002,7 @@ pub fn create_test_config_with_auth(
             }],
             greeting: None,
         },
+        ..Default::default()
     }
 }
 
