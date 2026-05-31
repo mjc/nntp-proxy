@@ -16,8 +16,15 @@
 use std::borrow::Cow;
 use std::fmt::Write as _;
 
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 use crate::metrics::MetricsSnapshot;
 use crate::metrics::types::BackendHealthStatus;
+
+/// Prometheus 0.0.4 text exposition content type.
+const METRICS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+/// Upper bound on bytes read while scanning for the request line (loopback-only endpoint).
+const MAX_REQUEST_BYTES: usize = 4096;
 
 /// Map backend health to a stable numeric gauge value.
 const fn health_value(status: BackendHealthStatus) -> u8 {
@@ -427,6 +434,76 @@ fn parse_request_target(request_line: &[u8]) -> RequestTarget {
     }
 }
 
+/// Write a minimal HTTP/1.1 response and close the connection.
+async fn write_response<W>(
+    writer: &mut W,
+    status: &str,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let header = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    writer.write_all(header.as_bytes()).await?;
+    writer.write_all(body).await?;
+    writer.flush().await?;
+    Ok(())
+}
+
+/// Serve one `GET /metrics` request over `stream`.
+///
+/// Reads up to the first newline (bounded by [`MAX_REQUEST_BYTES`]) to obtain the
+/// request line, then renders and writes the response. `render_body` is only
+/// invoked for a matched `GET /metrics` so non-metrics requests never snapshot.
+pub(crate) async fn serve_connection<S, F>(stream: &mut S, render_body: F) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    F: FnOnce() -> String,
+{
+    let mut buf = [0u8; MAX_REQUEST_BYTES];
+    let mut filled = 0usize;
+    loop {
+        let n = stream.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            break;
+        }
+        filled += n;
+        if buf[..filled].contains(&b'\n') || filled == buf.len() {
+            break;
+        }
+    }
+    let first_line = buf[..filled].split(|&b| b == b'\n').next().unwrap_or(&[]);
+
+    match parse_request_target(first_line) {
+        RequestTarget::Metrics => {
+            let body = render_body();
+            write_response(stream, "200 OK", METRICS_CONTENT_TYPE, body.as_bytes()).await
+        }
+        RequestTarget::NotFound => {
+            write_response(
+                stream,
+                "404 Not Found",
+                "text/plain; charset=utf-8",
+                b"not found\n",
+            )
+            .await
+        }
+        RequestTarget::BadRequest => {
+            write_response(
+                stream,
+                "400 Bad Request",
+                "text/plain; charset=utf-8",
+                b"bad request\n",
+            )
+            .await
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,5 +635,72 @@ mod tests {
     fn malformed_request_line_is_bad_request() {
         assert_eq!(parse_request_target(b"GET"), RequestTarget::BadRequest);
         assert_eq!(parse_request_target(b""), RequestTarget::BadRequest);
+    }
+
+    #[tokio::test]
+    async fn serve_connection_returns_metrics_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let task = tokio::spawn(async move {
+            serve_connection(&mut server, || "nntp_demo 1\n".to_string())
+                .await
+                .unwrap();
+        });
+        client
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        let resp = String::from_utf8(resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK\r\n"), "got: {resp}");
+        assert!(resp.contains("Content-Type: text/plain; version=0.0.4"));
+        assert!(resp.contains("\r\n\r\nnntp_demo 1\n"));
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_connection_404_does_not_render() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let task = tokio::spawn(async move {
+            serve_connection(&mut server, || unreachable!("render must not run for 404"))
+                .await
+                .unwrap();
+        });
+        client
+            .write_all(b"GET /nope HTTP/1.1\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        let resp = String::from_utf8(resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 404 Not Found"), "got: {resp}");
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_connection_over_real_tcp() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            serve_connection(&mut sock, || "nntp_tcp 1\n".to_string())
+                .await
+                .unwrap();
+        });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        client
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp = Vec::new();
+        client.read_to_end(&mut resp).await.unwrap();
+        let resp = String::from_utf8(resp).unwrap();
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "got: {resp}");
+        assert!(resp.contains("nntp_tcp 1"));
+        server.await.unwrap();
     }
 }
