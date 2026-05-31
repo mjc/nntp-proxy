@@ -398,6 +398,35 @@ pub(crate) fn render_prometheus(snapshot: &MetricsSnapshot, server_names: &[Stri
     out
 }
 
+/// Routing outcome for an HTTP request line.
+#[derive(Debug, PartialEq, Eq)]
+enum RequestTarget {
+    Metrics,
+    NotFound,
+    BadRequest,
+}
+
+/// Parse the first line of an HTTP request (`METHOD SP TARGET SP VERSION`).
+fn parse_request_target(request_line: &[u8]) -> RequestTarget {
+    let Ok(text) = std::str::from_utf8(request_line) else {
+        return RequestTarget::BadRequest;
+    };
+    let line = text.trim_end_matches(['\r', '\n']);
+    let mut parts = line.split(' ');
+    let (Some(method), Some(target)) = (parts.next(), parts.next()) else {
+        return RequestTarget::BadRequest;
+    };
+    if method.is_empty() || target.is_empty() {
+        return RequestTarget::BadRequest;
+    }
+    let path = target.split('?').next().unwrap_or(target);
+    if method == "GET" && path == "/metrics" {
+        RequestTarget::Metrics
+    } else {
+        RequestTarget::NotFound
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,5 +528,35 @@ mod tests {
         let out = render_prometheus(&MetricsSnapshot::default(), &[]);
         assert!(out.contains("nntp_connections_total 0"));
         assert!(out.contains("nntp_pipeline_batches_total 0"));
+    }
+
+    #[test]
+    fn parses_get_metrics() {
+        assert_eq!(
+            parse_request_target(b"GET /metrics HTTP/1.1"),
+            RequestTarget::Metrics
+        );
+        assert_eq!(
+            parse_request_target(b"GET /metrics?x=1 HTTP/1.1"),
+            RequestTarget::Metrics
+        );
+    }
+
+    #[test]
+    fn unknown_path_or_method_is_not_found() {
+        assert_eq!(
+            parse_request_target(b"GET /healthz HTTP/1.1"),
+            RequestTarget::NotFound
+        );
+        assert_eq!(
+            parse_request_target(b"POST /metrics HTTP/1.1"),
+            RequestTarget::NotFound
+        );
+    }
+
+    #[test]
+    fn malformed_request_line_is_bad_request() {
+        assert_eq!(parse_request_target(b"GET"), RequestTarget::BadRequest);
+        assert_eq!(parse_request_target(b""), RequestTarget::BadRequest);
     }
 }
