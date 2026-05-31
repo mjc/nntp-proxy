@@ -152,3 +152,11 @@ tier = 10
 connection_keepalive = 120
 use_tls = true
 tls_verify_cert = true
+
+# Prometheus /metrics exporter (read-only). Disabled by default.
+# When enabled, a local scraper (e.g. VictoriaMetrics vmagent) can pull
+# proxy/per-backend/cache/pipeline metrics. Bind to loopback unless the
+# scraper runs on another host.
+[metrics]
+enabled = false
+listen = "127.0.0.1:9101"
