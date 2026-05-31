@@ -68,6 +68,10 @@ runtime.rs
   - This is where ~all the logic and tests live.
 
 - **`spawn_metrics_exporter(...)`** — thin shell.
+  - Captures what `snapshot()` needs: the `MetricsCollector`, the cache handle
+    (`Option<Arc<UnifiedCache>>` — see §7), the `BackendSelector` (for pool status + name
+    resolution), and the bind address. Per scrape it computes:
+    `collector.snapshot(cache.as_deref()).with_pool_status(&router)`.
   - Binds a `tokio::net::TcpListener` on the configured address.
   - Accept loop; each accepted socket is handled on its own spawned task. Reads the HTTP
     request line (and drains headers up to `\r\n\r\n`), matches
@@ -133,14 +137,14 @@ the same `ttfb_count` value. This is documented in each metric's `# HELP`.
 |---|---|---|
 | `nntp_cache_entries` | gauge | `cache_entries` |
 | `nntp_cache_size_bytes` | gauge | `cache_size_bytes` |
-| `nntp_cache_hit_rate` | gauge | `cache_hit_rate` (emitted as ratio `0..1` — see §7) |
+| `nntp_cache_hit_rate` | gauge | `cache_hit_rate` ÷ 100 → ratio `0..1` (source is a percentage — see §7) |
 
 Disk tier — **emitted only when `snapshot.disk_cache.is_some()`** (hybrid cache mode):
 
 | Metric | Type | Source field |
 |---|---|---|
 | `nntp_cache_disk_hits_total` | counter | `disk_hits` |
-| `nntp_cache_disk_hit_rate` | gauge | `disk_hit_rate` (ratio `0..1` — see §7) |
+| `nntp_cache_disk_hit_rate` | gauge | `disk_hit_rate` ÷ 100 → ratio `0..1` (source is a percentage — see §7) |
 | `nntp_cache_disk_capacity_bytes` | gauge | `disk_capacity` |
 | `nntp_cache_disk_bytes_written_total` | counter | `bytes_written` |
 | `nntp_cache_disk_bytes_read_total` | counter | `bytes_read` |
@@ -185,16 +189,32 @@ listen  = "127.0.0.1:9101"    # default; loopback-only for the same-host topolog
 - Wired in `runtime.rs` next to `spawn_metrics_saver`; the task is added to the same
   shutdown/lifecycle handling as the other background tasks.
 
-## 7. Implementation notes to verify during build
+## 7. Implementation facts (resolved against the code)
 
-- **Cache hit-rate unit:** `cache_hit_rate` and `disk_hit_rate` are `f64`. Confirm against
-  `collector.rs` whether they are a fraction (`0..1`) or a percentage (`0..100`). The
-  renderer must emit a **ratio `0..1`**; if the snapshot stores a percentage, divide by
-  100 in the renderer. Pin this with a unit test once confirmed.
-- **Cache fields populated?** `cache_entries` / `cache_size_bytes` / `cache_hit_rate` are
-  `#[serde(skip)]` and filled at snapshot time. Confirm `snapshot()` populates them in the
-  proxy's run path; if they are only filled on a specific code path, gate their emission
-  the same way `disk_cache` is gated (`Option`/presence check) rather than emitting `0`.
+- **Cache hit-rate unit — RESOLVED: percentage.** `UnifiedCache::hit_rate()`
+  (`src/cache/mod.rs:534`), the availability index (`availability_index.rs:682`), and
+  `HybridCacheStats::hit_rate()`/`disk_hit_rate()` (`hybrid.rs:562,573`) all compute
+  `(hits / total) * 100.0`, i.e. **0..100**. The renderer therefore divides
+  `cache_hit_rate` and `disk_hit_rate` by `100.0` to emit Prometheus ratios `0..1`. Pin
+  with a unit test (e.g. snapshot `hit_rate = 42.0` → output `0.42`).
+- **Cache fields populated — RESOLVED: only when a cache is passed.**
+  `MetricsCollector::snapshot(cache: Option<&UnifiedCache>)` (`collector.rs:464`) →
+  `snapshot_with_cache` (`collector.rs:474`). With `cache = None` the four cache fields
+  default to `(0, 0, 0.0, None)` (`collector.rs:505`); with `Some`, they come from
+  `cache.display_stats()` (`entry_count`, `size_bytes`, `hit_rate`, optional `disk`).
+  Therefore the exporter **must thread the cache handle** into its spawn and call
+  `snapshot(Some(&cache))`. `disk_cache` is `Some` only in hybrid mode → gate
+  `nntp_cache_disk_*` on `disk_cache.is_some()` (as designed). The three base cache
+  gauges are always emitted (they read `0` when no cache is configured, which is correct).
+- **Snapshot call shape — RESOLVED.** `snapshot()` does **not** include per-backend
+  active-connection counts; those come from `MetricsSnapshot::with_pool_status(&router)`
+  (`snapshot.rs:91`), which fills `BackendStats.active_connections` from pool status. Full
+  exporter call: `collector.snapshot(cache.as_deref()).with_pool_status(&router)`.
+- **Backend names — RESOLVED: not in the snapshot.** `BackendStats` carries only
+  `backend_id`, no name (`with_pool_status` does not add one). The exporter builds a
+  `Vec<ServerName>` indexed by backend id at spawn time (from the router's per-backend
+  provider name / the configured server list) and passes it to `render_prometheus` for the
+  `backend="<name>"` label; missing/out-of-range indices fall back to the numeric id.
 - **Exact accessors:** use the existing typed getters (`.get()`, `.as_u64()`) — do not add
   parallel accessors.
 
