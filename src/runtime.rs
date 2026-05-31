@@ -990,6 +990,58 @@ pub fn spawn_metrics_saver(
     });
 }
 
+/// Spawn the read-only Prometheus `/metrics` exporter.
+///
+/// Binds `listen` and answers `GET /metrics` with the current metrics snapshot
+/// in Prometheus text format. Intended for a local scraper (e.g. vmagent) on a
+/// loopback address; gated by the `[metrics]` config section (the caller only
+/// invokes this when enabled). Bind failures are logged and the task exits — the
+/// proxy keeps running without the exporter.
+pub fn spawn_metrics_exporter(
+    proxy: &std::sync::Arc<crate::NntpProxy>,
+    listen: std::net::SocketAddr,
+    server_names: Vec<String>,
+) {
+    use std::sync::Arc;
+
+    let proxy = Arc::clone(proxy);
+    tokio::spawn(async move {
+        let listener = match tokio::net::TcpListener::bind(listen).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                tracing::warn!("Metrics exporter failed to bind {listen}: {e}");
+                return;
+            }
+        };
+        tracing::info!("Metrics exporter listening on http://{listen}/metrics");
+        loop {
+            let socket = match listener.accept().await {
+                Ok((socket, _peer)) => socket,
+                Err(e) => {
+                    tracing::warn!("Metrics exporter accept error: {e}");
+                    continue;
+                }
+            };
+            let proxy = Arc::clone(&proxy);
+            let names = server_names.clone();
+            tokio::spawn(async move {
+                let mut socket = socket;
+                let result = crate::metrics::exporter::serve_connection(&mut socket, || {
+                    let snapshot = proxy
+                        .metrics()
+                        .snapshot(Some(proxy.cache()))
+                        .with_pool_status(proxy.router());
+                    crate::metrics::exporter::render_prometheus(&snapshot, &names)
+                })
+                .await;
+                if let Err(e) = result {
+                    tracing::debug!("Metrics exporter connection error: {e}");
+                }
+            });
+        }
+    });
+}
+
 /// Spawn background task to periodically save availability state to disk.
 ///
 /// Saves every 30 seconds when the proxy uses the dedicated availability index.

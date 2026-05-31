@@ -10,8 +10,6 @@
 
 // micros->seconds conversion casts u64 to f64; values are presentation timings.
 #![allow(clippy::cast_precision_loss)]
-// Items are intentionally forward-declared; consumers are wired in later tasks.
-#![allow(dead_code)]
 
 use std::borrow::Cow;
 use std::fmt::Write as _;
