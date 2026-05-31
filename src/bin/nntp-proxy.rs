@@ -97,6 +97,9 @@ async fn run_proxy(
         launch.stats_path.clone(),
         launch.server_names.clone(),
     );
+    if launch.metrics_enabled {
+        runtime::spawn_metrics_exporter(&proxy, launch.metrics_listen, launch.server_names.clone());
+    }
     runtime::spawn_availability_saver(&proxy, launch.availability_path.clone());
     runtime::spawn_idle_connection_clearer(&proxy);
     runtime::spawn_response_write_metrics_logger();
@@ -221,6 +224,8 @@ struct ProxyLaunch {
     availability_path: Option<PathBuf>,
     server_names: Vec<String>,
     metrics_store: Option<MetricsStore>,
+    metrics_enabled: bool,
+    metrics_listen: std::net::SocketAddr,
 }
 
 /// Resolve the runtime launch parameters from CLI arguments and config.
@@ -243,6 +248,8 @@ fn prepare_proxy_launch(args: &Args, config: &nntp_proxy::config::Config) -> Pro
         .map(|s| s.name.as_ref().to_string())
         .collect();
     let metrics_store = runtime::load_metrics_from_disk(&stats_path, &server_names);
+    let metrics_enabled = config.metrics.enabled;
+    let metrics_listen = config.metrics.listen;
 
     ProxyLaunch {
         routing_mode,
@@ -252,6 +259,8 @@ fn prepare_proxy_launch(args: &Args, config: &nntp_proxy::config::Config) -> Pro
         availability_path,
         server_names,
         metrics_store,
+        metrics_enabled,
+        metrics_listen,
     }
 }
 
@@ -414,5 +423,7 @@ mod tests {
         assert_eq!(launch.port.get(), 9120);
         assert_eq!(launch.server_names, vec!["Primary".to_string()]);
         assert!(launch.metrics_store.is_none());
+        assert!(!launch.metrics_enabled);
+        assert_eq!(launch.metrics_listen, "127.0.0.1:9101".parse().unwrap());
     }
 }
