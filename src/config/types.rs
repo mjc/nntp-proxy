@@ -115,6 +115,9 @@ pub struct Config {
     /// Proxy server settings
     #[serde(default)]
     pub proxy: Proxy,
+    /// Prometheus `/metrics` exporter settings
+    #[serde(default)]
+    pub metrics: Metrics,
     /// Routing configuration
     #[serde(default)]
     pub routing: Routing,
@@ -193,6 +196,25 @@ impl Default for Proxy {
             backend_selection: BackendSelectionStrategy::default(),
             buffer_pool_count: defaults::buffer_pool_count(),
             capture_pool_count: defaults::capture_pool_count(),
+        }
+    }
+}
+
+/// Prometheus `/metrics` exporter settings (`[metrics]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Metrics {
+    /// Enable the read-only Prometheus `/metrics` HTTP endpoint (default: false).
+    pub enabled: bool,
+    /// Address the exporter binds (default: 127.0.0.1:9101, loopback-only).
+    pub listen: std::net::SocketAddr,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: std::net::SocketAddr::from(([127, 0, 0, 1], 9101)),
         }
     }
 }
@@ -1184,5 +1206,27 @@ mod tests {
         "#;
         let disk_cache: DiskCache = toml::from_str(toml).unwrap();
         assert_eq!(disk_cache.compression, CompressionCodec::None);
+    }
+
+    #[test]
+    fn metrics_section_defaults_when_absent() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(!config.metrics.enabled);
+        assert_eq!(
+            config.metrics.listen,
+            std::net::SocketAddr::from(([127, 0, 0, 1], 9101))
+        );
+    }
+
+    #[test]
+    fn metrics_section_parses_overrides() {
+        let toml = r#"
+[metrics]
+enabled = true
+listen = "0.0.0.0:9999"
+"#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.metrics.enabled);
+        assert_eq!(config.metrics.listen, "0.0.0.0:9999".parse().unwrap());
     }
 }
