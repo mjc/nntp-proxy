@@ -384,50 +384,6 @@ async fn test_retry_on_immediate_connection_failure() -> Result<()> {
     Ok(())
 }
 
-/// Test that `merge_from` respects NNTP semantics: 430 is authoritative
-///
-/// NNTP servers NEVER give false negatives (430 is always truthful).
-/// NNTP servers CAN give false positives (2xx might be corrupt/incomplete).
-/// Therefore: 430 (missing) ALWAYS overrides previous "has" state.
-#[test]
-fn test_availability_merge_430_overrides_has() {
-    use nntp_proxy::cache::ArticleAvailability;
-    use nntp_proxy::types::BackendId;
-
-    let mut cache_state = ArticleAvailability::new();
-    let b0 = BackendId::from_index(0);
-    let b1 = BackendId::from_index(1);
-
-    // Backend 0 previously returned success (might be false positive)
-    cache_state.record_has(
-        &nntp_proxy::cache::ArticleAvailability::new()
-            .eligible_backend(b0)
-            .expect("backend should be eligible"),
-    );
-    assert!(!cache_state.is_missing(b0));
-
-    // Later, backend 0 returns 430 (AUTHORITATIVE - article is NOT there)
-    let mut new_result = ArticleAvailability::new();
-    new_result.record_missing(b0);
-    new_result.record_missing(b1);
-
-    // Merge new result into cache
-    cache_state.merge_from(&new_result);
-
-    // CRITICAL: 430 is authoritative, so backend 0 MUST be marked missing
-    // The previous "has" state was unreliable (possible false positive)
-    assert!(
-        cache_state.is_missing(b0),
-        "Backend 0 MUST be marked missing - 430 is authoritative"
-    );
-
-    // Backend 1 should also be marked missing
-    assert!(
-        cache_state.is_missing(b1),
-        "Backend 1 should be marked missing"
-    );
-}
-
 /// Test that 430 cache entries are authoritative and persist
 ///
 /// NNTP SEMANTICS: 430 is authoritative, so cache entries with 430 should NOT
@@ -435,7 +391,8 @@ fn test_availability_merge_430_overrides_has() {
 /// The cache correctly maintains 430 state until TTL expiry.
 #[tokio::test]
 async fn test_430_cache_is_authoritative() -> Result<()> {
-    use nntp_proxy::cache::{ArticleAvailability, UnifiedCache};
+    use nntp_proxy::cache::{ArticleAvailability, UnifiedCache, ttl};
+    use nntp_proxy::protocol::StatusCode;
     use nntp_proxy::router::BackendCount;
     use nntp_proxy::types::{BackendId, MessageId};
 
@@ -452,23 +409,31 @@ async fn test_430_cache_is_authoritative() -> Result<()> {
 
     // Verify all exhausted
     let cached = cache.get(&msg_id).await.unwrap();
-    assert!(cached.all_backends_exhausted(BackendCount::new(2)));
+    assert!(cached.all_backends_exhausted(
+        BackendCount::try_new(2).expect("test backend count fits availability bitmap")
+    ));
 
-    // Try to claim backend 0 "has" the article (unreliable 2xx response)
-    let mut avail = ArticleAvailability::new();
-    avail.record_has(
-        &nntp_proxy::cache::ArticleAvailability::new()
-            .eligible_backend(BackendId::from_index(0))
-            .expect("backend should be eligible"),
-    );
-
-    cache.sync_availability(msg_id.clone(), &avail).await;
+    // Try to claim backend 0 "has" the article (unreliable 2xx response).
+    let positive = ArticleAvailability::new()
+        .eligible_backend(BackendId::from_index(0))
+        .expect("backend should be eligible")
+        .positive_observation();
+    cache
+        .record_backend_has_status(
+            msg_id.clone(),
+            StatusCode::new(223),
+            positive,
+            ttl::CacheTier::new(0),
+        )
+        .await;
 
     // CRITICAL: 430 is authoritative, so the cache should STILL show backend 0 as missing
-    // The "has" from sync_availability is unreliable and should NOT override 430
+    // The "has" fact is unreliable and should NOT override 430.
     let updated = cache.get(&msg_id).await.unwrap();
     assert!(
-        updated.all_backends_exhausted(BackendCount::new(2)),
+        updated.all_backends_exhausted(
+            BackendCount::try_new(2).expect("test backend count fits availability bitmap")
+        ),
         "430 is authoritative - 'has' should NOT override cached 430"
     );
     assert!(

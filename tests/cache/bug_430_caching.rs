@@ -69,7 +69,9 @@ async fn test_multiple_430s_update_same_entry() {
 
     // All backends exhausted
     assert!(
-        entry.all_backends_exhausted(BackendCount::new(2)),
+        entry.all_backends_exhausted(
+            BackendCount::try_new(2).expect("test backend count fits availability bitmap")
+        ),
         "All backends should be exhausted"
     );
 }

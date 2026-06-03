@@ -418,9 +418,6 @@ impl ClientSession {
                         .expect("successful direct attempt records response metadata");
                     *io.backend_to_client_bytes =
                         io.backend_to_client_bytes.add(response.wire_len().get());
-                    let msg_id = request.message_id_value();
-                    self.sync_availability_if_needed(msg_id.as_ref(), &availability)
-                        .await;
                     return Ok(());
                 }
                 Ok(BackendAttemptResult::ArticleNotFound { missing }) => {
@@ -432,9 +429,6 @@ impl ClientSession {
                 }
                 Ok(BackendAttemptResult::BackendUnavailable) => {}
                 Ok(BackendAttemptResult::NoRetryableBackend) => {
-                    let msg_id = request.message_id_value();
-                    self.sync_availability_if_needed(msg_id.as_ref(), &availability)
-                        .await;
                     let bytes_written = {
                         let mut client_write = io.client_writer.lock().await;
                         Self::write_backend_error_response(&mut *client_write).await?
@@ -448,9 +442,6 @@ impl ClientSession {
                         self.client_addr,
                         request.message_id_value()
                     );
-                    let msg_id = request.message_id_value();
-                    self.sync_availability_if_needed(msg_id.as_ref(), &availability)
-                        .await;
                     return Err(e);
                 }
                 Err(SessionError::Backend(e)) => {
@@ -468,9 +459,6 @@ impl ClientSession {
             self.client_addr,
             request.message_id_value()
         );
-        let msg_id = request.message_id_value();
-        self.sync_availability_if_needed(msg_id.as_ref(), &availability)
-            .await;
         {
             let mut client_write = io.client_writer.lock().await;
             self.send_430_to_client(&mut *client_write, io.backend_to_client_bytes)
@@ -519,9 +507,6 @@ impl ClientSession {
             {
                 Ok(attempt) => attempt,
                 Err(err) => {
-                    let msg_id = request.message_id_value();
-                    self.sync_availability_if_needed(msg_id.as_ref(), &availability)
-                        .await;
                     Self::release_cached_backend_connection(&mut backend_connection);
                     let turn = order.wait_turn(order_index).await;
                     turn.fail_and_advance();
@@ -533,9 +518,6 @@ impl ClientSession {
                 Ok(attempt) => attempt,
                 Err(OrderedLargeTransferNoAttempt::BackendUnavailable) => continue,
                 Err(OrderedLargeTransferNoAttempt::NoRetryableBackend) => {
-                    let msg_id = request.message_id_value();
-                    self.sync_availability_if_needed(msg_id.as_ref(), &availability)
-                        .await;
                     Self::release_cached_backend_connection(&mut backend_connection);
 
                     let turn = order.wait_turn(order_index).await;
@@ -583,8 +565,6 @@ impl ClientSession {
                         .capture_suppressed_430_response(&mut conn, backend_id, request, buffer)
                         .await
                     {
-                        self.sync_availability_if_needed(msg_id.as_ref(), &availability)
-                            .await;
                         Self::release_cached_backend_connection(&mut backend_connection);
                         let turn = order.wait_turn(order_index).await;
                         turn.fail_and_advance();
@@ -607,8 +587,6 @@ impl ClientSession {
                 if order.is_failed() {
                     Self::release_cached_backend_connection(&mut backend_connection);
                     turn.advance();
-                    self.sync_availability_if_needed(msg_id.as_ref(), &availability)
-                        .await;
                     return Err(SessionError::Backend(anyhow::anyhow!(
                         "ordered pipeline request aborted after earlier slot error"
                     )));
@@ -640,24 +618,17 @@ impl ClientSession {
                 Ok(response) => response,
                 Err(e @ SessionError::ClientDisconnect(_)) => {
                     order.fail();
-                    self.sync_availability_if_needed(msg_id.as_ref(), &availability)
-                        .await;
                     Self::release_cached_backend_connection(&mut backend_connection);
                     return Err(e);
                 }
                 Err(e) => {
                     order.fail();
-                    self.sync_availability_if_needed(msg_id.as_ref(), &availability)
-                        .await;
                     Self::release_cached_backend_connection(&mut backend_connection);
                     return Err(e);
                 }
             };
 
-            Self::record_successful_availability(&backend, status_code, &mut availability);
             guard.complete();
-            self.sync_availability_if_needed(msg_id.as_ref(), &availability)
-                .await;
             backend_to_client_bytes = backend_to_client_bytes.add(response.wire_len().get());
             return Ok(Self::finish_ordered_large_transfer_request(
                 &mut backend_connection,
@@ -667,16 +638,11 @@ impl ClientSession {
             ));
         }
 
-        let msg_id = request.message_id_value();
-        self.sync_availability_if_needed(msg_id.as_ref(), &availability)
-            .await;
         {
             let turn = order.wait_turn(order_index).await;
             if order.is_failed() {
                 Self::release_cached_backend_connection(&mut backend_connection);
                 turn.advance();
-                self.sync_availability_if_needed(msg_id.as_ref(), &availability)
-                    .await;
                 return Err(SessionError::Backend(anyhow::anyhow!(
                     "ordered pipeline request aborted after earlier slot error"
                 )));
@@ -807,33 +773,6 @@ impl ClientSession {
         // these counted to understand backend article distribution
         self.metrics.record_error_4xx(backend_id);
     }
-
-    pub(super) fn record_successful_availability(
-        backend: &EligibleArticleBackend,
-        status_code: crate::protocol::StatusCode,
-        availability: &mut crate::cache::ArticleAvailability,
-    ) {
-        if status_code.is_success() {
-            availability.record_has(backend);
-        }
-    }
-
-    /// Sync availability to cache if a message ID is present.
-    pub(super) async fn sync_availability_if_needed(
-        &self,
-        msg_id: Option<&crate::types::MessageId<'_>>,
-        availability: &crate::cache::ArticleAvailability,
-    ) {
-        if availability.missing_bits() == 0 {
-            return;
-        }
-
-        if let Some(msg_id_ref) = msg_id {
-            self.cache
-                .sync_availability(msg_id_ref.clone(), availability)
-                .await;
-        }
-    }
 }
 
 #[cfg(test)]
@@ -901,67 +840,36 @@ mod tests {
         second.advance();
     }
 
-    #[test]
-    fn successful_availability_records_backend_has_article() {
-        let mut availability = ArticleAvailability::new();
-        let backend_id = BackendId::from_index(2);
-
-        ClientSession::record_successful_availability(
-            &crate::cache::ArticleAvailability::new()
-                .eligible_backend(backend_id)
-                .expect("backend should be eligible"),
-            StatusCode::new(222),
-            &mut availability,
-        );
-
-        assert_eq!(availability.checked_bits(), 0b0000_0100);
-        assert_eq!(availability.missing_bits(), 0);
-        assert!(availability.any_backend_has_article());
-    }
-
-    #[test]
-    fn non_success_availability_does_not_record_has_article() {
-        let mut availability = ArticleAvailability::new();
-
-        ClientSession::record_successful_availability(
-            &crate::cache::ArticleAvailability::new()
-                .eligible_backend(BackendId::from_index(1))
-                .expect("backend should be eligible"),
-            StatusCode::new(430),
-            &mut availability,
-        );
-
-        assert_eq!(availability.checked_bits(), 0);
-        assert_eq!(availability.missing_bits(), 0);
-        assert!(!availability.any_backend_has_article());
-    }
-
     #[tokio::test]
-    async fn successful_availability_sync_preserves_missing_backend_without_payload() {
+    async fn status_fact_preserves_missing_backend_without_payload() {
         let cache = UnifiedCache::memory(1_000_000, Duration::from_secs(60));
         let msg_id = MessageId::from_borrowed("<ordered-success@example.com>").unwrap();
-        let mut availability = ArticleAvailability::new();
-        availability.record_missing(BackendId::from_index(0));
 
-        ClientSession::record_successful_availability(
-            &crate::cache::ArticleAvailability::new()
-                .eligible_backend(BackendId::from_index(1))
-                .expect("backend should be eligible"),
-            StatusCode::new(222),
-            &mut availability,
-        );
-        cache.sync_availability(msg_id.clone(), &availability).await;
+        cache
+            .record_backend_missing(msg_id.clone(), BackendId::from_index(0))
+            .await;
+        cache
+            .record_backend_has_status(
+                msg_id.clone(),
+                StatusCode::new(222),
+                ArticleAvailability::new()
+                    .eligible_backend(BackendId::from_index(1))
+                    .expect("backend should be eligible")
+                    .positive_observation(),
+                crate::cache::ttl::CacheTier::new(0),
+            )
+            .await;
         cache.sync().await;
 
         let entry = cache
             .get(&msg_id)
             .await
-            .expect("sync_availability must preserve mixed success/missing availability");
-        assert_eq!(entry.status_code(), StatusCode::new(223));
+            .expect("cache facts must preserve mixed success/missing availability");
+        assert_eq!(entry.status_code(), StatusCode::new(222));
         assert_eq!(entry.payload_len().get(), 0);
         assert!(!entry.should_try_backend(BackendId::from_index(0)));
         assert!(entry.should_try_backend(BackendId::from_index(1)));
-        assert!(entry.availability().any_backend_has_article());
+        assert_eq!(entry.availability().missing_bits(), 0b0000_0001);
     }
 
     #[test]

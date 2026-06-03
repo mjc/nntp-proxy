@@ -12,7 +12,6 @@ use crate::router::BackendCount;
 use crate::types::{BackendId, MessageId};
 use moka::Entry;
 use moka::future::Cache;
-use moka::ops::compute::Op;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -480,7 +479,7 @@ impl CachedArticle {
         RequestCacheEntryMetadata::new(
             self.status_code,
             RequestCacheAvailability::from_bits(
-                availability.checked_bits(),
+                availability.missing_bits(),
                 availability.missing_bits(),
             ),
             RequestCacheTier::new(self.tier.get()),
@@ -510,11 +509,6 @@ impl CachedArticle {
         self.backend_availability.record_missing(backend_id);
     }
 
-    /// Record that a backend successfully provided this article
-    pub fn record_backend_has(&mut self, backend: ArticleBackendHasArticle) {
-        self.backend_availability.record_observed_has(backend);
-    }
-
     /// Check if all backends have been tried and none have the article
     #[must_use]
     pub fn all_backends_exhausted(&self, total_backends: BackendCount) -> bool {
@@ -523,9 +517,7 @@ impl CachedArticle {
 
     /// Check if this cache entry has useful availability information
     ///
-    /// Returns true if at least one backend has been tried (marked as missing or has article).
-    /// If false, we haven't tried any backends yet and should run precheck instead of
-    /// serving from cache.
+    /// Returns true if at least one backend has returned authoritative 430.
     #[inline]
     #[must_use]
     pub const fn has_availability_info(&self) -> bool {
@@ -892,12 +884,9 @@ impl ArticleCache {
             }
 
             entry.inserted_at = ttl::CacheTimestampMillis::now();
-            entry.record_backend_has(backend);
             entry
         } else {
-            let mut entry = new_entry_template.clone();
-            entry.record_backend_has(backend);
-            entry
+            new_entry_template.clone()
         }
     }
 
@@ -918,7 +907,6 @@ impl ArticleCache {
             entry.payload = CachedPayload::AvailabilityOnly;
         }
         entry.inserted_at = ttl::CacheTimestampMillis::now();
-        entry.record_backend_has(backend);
         entry
     }
 
@@ -937,37 +925,18 @@ impl ArticleCache {
         }
     }
 
-    fn compute_availability_update(
-        maybe_entry: Option<Entry<Arc<str>, CachedArticle>>,
-        availability: ArticleAvailability,
-    ) -> Op<CachedArticle> {
-        if let Some(existing) = maybe_entry {
-            let mut entry = existing.into_value();
-            entry.backend_availability.merge_from(&availability);
-            Op::Put(entry)
-        } else {
-            let mut entry = if availability.any_backend_has_article() {
-                CachedArticle::availability_only(StatusCode::new(223), ttl::CacheTier::new(0))
-            } else {
-                CachedArticle::missing(ttl::CacheTier::new(0))
-            };
-            entry.backend_availability = availability;
-            Op::Put(entry)
-        }
-    }
-
     /// Upsert cache entry (insert or update) - ATOMIC OPERATION
     ///
     /// Uses moka's `entry().and_upsert_with()` for atomic get-modify-store.
     /// This eliminates the race condition of separate `get()` + `insert()` calls
     /// and provides key-level locking for concurrent operations.
     ///
-    /// If entry exists: updates the entry and marks backend as having the article
+    /// If entry exists: updates the entry while preserving authoritative missing facts
     /// If entry doesn't exist: inserts new entry
     ///
     /// The tier is stored with the entry for tier-aware TTL calculation.
     ///
-    /// CRITICAL: Always re-insert to refresh TTL, and mark backend as having the article.
+    /// CRITICAL: Always re-insert to refresh TTL while preserving negative availability.
     pub async fn upsert_ingest(
         &self,
         message_id: MessageId<'_>,
@@ -1050,48 +1019,6 @@ impl ArticleCache {
         }
     }
 
-    /// Sync availability state from local tracker to cache - ATOMIC OPERATION
-    ///
-    /// Uses moka's `entry().and_compute_with()` for atomic get-modify-store.
-    /// This eliminates the race condition of separate `get()` + `insert()` calls
-    /// and provides key-level locking for concurrent operations.
-    ///
-    /// This is called ONCE at the end of a retry loop to persist all the
-    /// backends that returned 430 during this request. Much more efficient
-    /// than calling `record_backend_missing` for each backend individually.
-    ///
-    /// If any backend successfully provided the article, creates a status-only
-    /// availability entry when no payload entry exists yet. This preserves same-request
-    /// 430s even if the success-side cache update races with this sync.
-    pub async fn sync_availability(
-        &self,
-        message_id: MessageId<'_>,
-        availability: &ArticleAvailability,
-    ) {
-        // Only sync if we actually tried some backends
-        if availability.checked_bits() == 0 {
-            return;
-        }
-
-        let key: Arc<str> = message_id.without_brackets().into();
-        let availability = *availability; // Copy for the closure
-        let misses = &self.misses;
-
-        // Use atomic compute - allows us to conditionally insert/update
-        let result = self
-            .cache
-            .entry(key)
-            .and_compute_with(move |maybe_entry| {
-                std::future::ready(Self::compute_availability_update(maybe_entry, availability))
-            })
-            .await;
-
-        // Track misses for new entries
-        if matches!(result, moka::ops::compute::CompResult::Inserted(_)) {
-            misses.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
     /// Get cache statistics
     #[must_use]
     pub fn stats(&self) -> CacheStats {
@@ -1166,6 +1093,11 @@ pub struct CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn backend_count(count: usize) -> crate::router::BackendCount {
+        crate::router::BackendCount::try_new(count)
+            .expect("test backend count fits availability bitmap")
+    }
     use crate::types::MessageId;
     use futures::executor::block_on;
     use std::io::IoSlice;
@@ -1692,20 +1624,19 @@ mod tests {
 
     #[test]
     fn test_cached_article_all_backends_exhausted() {
-        use crate::router::BackendCount;
         let backend0 = BackendId::from_index(0);
         let backend1 = BackendId::from_index(1);
         let mut entry = create_test_cached_article("<test@example.com>");
 
         // Not all exhausted yet
-        assert!(!entry.all_backends_exhausted(BackendCount::new(2)));
+        assert!(!entry.all_backends_exhausted(backend_count(2)));
 
         // Record both as missing
         entry.record_backend_missing(backend0);
         entry.record_backend_missing(backend1);
 
         // Now all 2 backends are exhausted
-        assert!(entry.all_backends_exhausted(BackendCount::new(2)));
+        assert!(entry.all_backends_exhausted(backend_count(2)));
     }
 
     #[tokio::test]
@@ -1953,9 +1884,8 @@ mod tests {
         assert!(!entry.should_try_backend(BackendId::from_index(1)));
 
         // Verify all backends exhausted
-        use crate::router::BackendCount;
         assert!(
-            entry.all_backends_exhausted(BackendCount::new(2)),
+            entry.all_backends_exhausted(backend_count(2)),
             "All backends should be exhausted"
         );
     }

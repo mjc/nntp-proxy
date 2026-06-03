@@ -254,7 +254,8 @@ mod tests {
             crate::protocol::RequestCachePayloadKind::AvailabilityOnly
         );
         assert_eq!(entry.payload_len().get(), 0);
-        assert!(entry.has_availability_info());
+        assert!(!entry.has_availability_info());
+        assert_eq!(entry.availability().missing_bits(), 0);
         assert!(entry.should_try_backend(backend_id));
     }
 }
@@ -467,19 +468,6 @@ impl UnifiedCache {
                     .record_has_status(message_id, status_code, backend, tier)
                     .await;
             }
-        }
-    }
-
-    /// Sync availability information for an article
-    pub async fn sync_availability(
-        &self,
-        message_id: MessageId<'_>,
-        availability: &ArticleAvailability,
-    ) {
-        match self {
-            Self::Availability(index) => index.sync_availability(&message_id, availability),
-            Self::Memory(cache) => cache.sync_availability(message_id, availability).await,
-            Self::Hybrid(cache) => cache.sync_availability(message_id, availability).await,
         }
     }
 

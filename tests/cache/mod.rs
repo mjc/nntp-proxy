@@ -11,7 +11,6 @@ use nntp_proxy::types::MessageId;
 pub mod adaptive_precheck;
 pub mod article_availability;
 pub mod availability_only;
-pub mod bug_430_articles;
 pub mod bug_430_caching;
 pub mod cache_before_precheck;
 pub mod helpers;

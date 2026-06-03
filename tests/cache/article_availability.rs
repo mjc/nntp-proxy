@@ -9,7 +9,7 @@ fn backend(index: usize) -> BackendId {
 }
 
 fn count(count: usize) -> BackendCount {
-    BackendCount::new(count)
+    BackendCount::try_new(count).expect("test backend count fits availability bitmap")
 }
 
 fn availability_with_missing(backends: &[usize]) -> ArticleAvailability {

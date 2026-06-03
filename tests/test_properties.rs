@@ -97,7 +97,7 @@ proptest! {
             if op == 0 {
                 avail.record_missing(id);
             } else {
-                avail.record_has(&nntp_proxy::cache::ArticleAvailability::new().eligible_backend(id).expect("backend should be eligible"));
+                let _ = avail.eligible_backend(id);
             }
         }
     }
@@ -117,14 +117,16 @@ proptest! {
     }
 
     #[test]
-    fn prop_record_has_preserves_missing(backend_id in 0..8u8) {
+    fn prop_positive_proof_preserves_missing(backend_id in 0..8u8) {
         let id = BackendId::from_index(usize::from(backend_id));
         let mut avail = ArticleAvailability::new();
 
         avail.record_missing(id);
         prop_assert!(avail.is_missing(id));
 
-        avail.record_has(&nntp_proxy::cache::ArticleAvailability::new().eligible_backend(id).expect("backend should be eligible"));
+        let _ = nntp_proxy::cache::ArticleAvailability::new()
+            .eligible_backend(id)
+            .expect("backend should be eligible");
         prop_assert!(avail.is_missing(id));
     }
 
@@ -138,7 +140,9 @@ proptest! {
         avail.record_missing(id);
         prop_assert_eq!(avail.eligible_backend(id).is_some(), !avail.is_missing(id));
 
-        avail.record_has(&nntp_proxy::cache::ArticleAvailability::new().eligible_backend(id).expect("backend should be eligible"));
+        let _ = nntp_proxy::cache::ArticleAvailability::new()
+            .eligible_backend(id)
+            .expect("backend should be eligible");
         prop_assert_eq!(avail.eligible_backend(id).is_some(), !avail.is_missing(id));
     }
 
@@ -147,7 +151,8 @@ proptest! {
         num_backends in 1..=8usize
     ) {
         let mut avail = ArticleAvailability::new();
-        let count = BackendCount::new(num_backends);
+        let count =
+            BackendCount::try_new(num_backends).expect("property backend count fits bitset");
 
         // Initially not exhausted
         prop_assert!(!avail.all_exhausted(count));

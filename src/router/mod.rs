@@ -94,11 +94,6 @@ impl SuppressedBackends {
     }
 
     pub fn suppress(&mut self, backend_id: BackendId) {
-        let index = backend_id.as_index();
-        debug_assert!(
-            index < usize::BITS as usize,
-            "backend index exceeds suppression bitmap"
-        );
         self.bits |= backend_id.availability_bit();
     }
 
@@ -219,36 +214,57 @@ enum SelectionStrategy {
     LeastLoaded(LeastLoaded),
 }
 
-/// Number of backend servers in the router
-#[nutype(derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Display, From, AsRef
-))]
+/// Number of backend servers in the router.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BackendCount(usize);
 
 impl PartialEq<usize> for BackendCount {
     fn eq(&self, other: &usize) -> bool {
-        self.into_inner() == *other
+        self.0 == *other
     }
 }
 
 impl PartialOrd<usize> for BackendCount {
     fn partial_cmp(&self, other: &usize) -> Option<CmpOrdering> {
-        self.into_inner().partial_cmp(other)
+        self.0.partial_cmp(other)
+    }
+}
+
+impl std::fmt::Display for BackendCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 
 impl BackendCount {
+    /// Maximum backend count that fits the article availability bitmap.
+    pub const MAX: usize = BackendId::MAX_COUNT;
+
     /// Zero backends
     #[must_use]
-    pub fn zero() -> Self {
-        Self::new(0)
+    pub const fn zero() -> Self {
+        Self(0)
+    }
+
+    /// Construct a bounded backend count from a raw length.
+    #[must_use]
+    pub const fn try_new(count: usize) -> Option<Self> {
+        if count <= Self::MAX {
+            Some(Self(count))
+        } else {
+            None
+        }
     }
 
     /// Get the inner usize value
     #[inline]
     #[must_use]
-    pub fn get(&self) -> usize {
-        self.into_inner()
+    pub const fn get(self) -> usize {
+        self.0
+    }
+
+    fn from_router_len(count: usize) -> Self {
+        Self::try_new(count).expect("router backend count exceeds availability bitmap")
     }
 }
 
@@ -873,7 +889,7 @@ impl BackendSelector {
     #[must_use]
     #[inline]
     pub fn backend_count(&self) -> BackendCount {
-        BackendCount::new(self.backends.len())
+        BackendCount::from_router_len(self.backends.len())
     }
 
     /// Get total weight (sum of all `max_connections`)
@@ -1227,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    fn transient_suppression_handles_backend_indexes_beyond_availability_bits() {
+    fn transient_suppression_handles_backend_index_at_legacy_u8_boundary() {
         let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
         for index in 0..10 {
             selector.add_backend(

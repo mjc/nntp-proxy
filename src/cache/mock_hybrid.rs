@@ -71,16 +71,11 @@ impl MockHybridCache {
                 return;
             }
             if existing.payload_len() > entry_len {
-                // Just update availability
-                let mut updated = existing.clone();
-                updated.record_backend_has(backend);
-                storage.insert(key, updated);
                 return;
             }
-            entry.availability.merge_from(&existing.availability());
+            entry.availability = existing.availability();
         }
 
-        entry.record_backend_has(backend);
         storage.insert(key, entry);
     }
 

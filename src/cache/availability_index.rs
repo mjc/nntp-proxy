@@ -6,7 +6,7 @@
 //! are pushed down by storing a keyed 64-bit fingerprint plus a keyed 16-bit
 //! confirmation tag per slot.
 
-use super::{ArticleAvailability, CachedArticle, ttl};
+use super::{CachedArticle, ttl};
 use crate::io_util::atomic_replace_file;
 use crate::types::{BackendId, MessageId};
 use anyhow::{Context, Result};
@@ -542,14 +542,6 @@ impl AvailabilityIndex {
         self.insert_missing_bits(message_id.without_brackets(), backend_id.availability_bit());
     }
 
-    pub fn sync_availability(
-        &self,
-        message_id: &MessageId<'_>,
-        availability: &ArticleAvailability,
-    ) {
-        self.insert_missing_bits(message_id.without_brackets(), availability.missing_bits());
-    }
-
     pub fn load_from_path(&self, path: &Path) -> Result<bool> {
         if !path.exists() {
             return Ok(false);
@@ -1002,26 +994,6 @@ mod tests {
     #[cfg(debug_assertions)]
     fn record_missing_cannot_receive_out_of_range_backend() {
         assert!(BackendId::try_from_index(usize::BITS as usize).is_none());
-    }
-
-    #[test]
-    fn sync_availability_persists_only_missing_bits() {
-        let index = AvailabilityIndex::with_test_capacity(test_capacity_for(16, 2));
-        let msg_id = MessageId::from_borrowed("<mixed@example.com>").unwrap();
-        let mut availability = ArticleAvailability::new();
-        availability.record_missing(BackendId::from_index(0));
-        availability.record_has(
-            &crate::cache::ArticleAvailability::new()
-                .eligible_backend(BackendId::from_index(1))
-                .expect("backend should be eligible"),
-        );
-
-        index.sync_availability(&msg_id, &availability);
-
-        let cached = index.get(&msg_id).expect("negative availability");
-        assert_eq!(cached.availability().checked_bits(), 0b0000_0001);
-        assert_eq!(cached.availability().missing_bits(), 0b0000_0001);
-        assert!(cached.should_try_backend(BackendId::from_index(1)));
     }
 
     #[test]

@@ -285,8 +285,6 @@ impl ClientSession {
         {
             Ok(response) => response,
             Err(e @ SessionError::ClientDisconnect(_)) => {
-                self.sync_availability_if_needed(msg_id.as_ref(), state.availability)
-                    .await;
                 return Err(e);
             }
             Err(e) => {
@@ -294,7 +292,6 @@ impl ClientSession {
                 return Err(e);
             }
         };
-        Self::record_successful_availability(&backend, status_code, state.availability);
         guard.complete();
         request.record_backend_response(backend_id, response);
         Ok(BackendAttemptResult::Success)
@@ -1663,8 +1660,8 @@ mod tests {
 
         assert_eq!(cached.status_code(), StatusCode::new(223));
         assert_eq!(cached.payload_len().get(), 0);
-        assert!(cached.has_availability_info());
-        assert!(cached.availability().any_backend_has_article());
+        assert!(!cached.has_availability_info());
+        assert_eq!(cached.availability().missing_bits(), 0);
     }
 
     #[tokio::test]
@@ -1796,7 +1793,7 @@ mod tests {
         assert!(matches!(second, BackendAttemptResult::Success));
         assert_eq!(bad_article_commands.load(Ordering::SeqCst), 1);
         assert_eq!(good_article_commands.load(Ordering::SeqCst), 1);
-        assert_eq!(availability.checked_bits(), 0b0000_0010);
+        assert_eq!(availability.checked_bits(), 0);
         assert_eq!(availability.missing_bits(), 0);
         assert_eq!(request.backend_id(), Some(BackendId::from_index(1)));
 
@@ -1915,8 +1912,8 @@ mod tests {
 
         assert_eq!(cached.status_code(), StatusCode::new(220));
         assert_eq!(cached.payload_len().get(), 0);
-        assert!(cached.has_availability_info());
-        assert!(cached.availability().any_backend_has_article());
+        assert!(!cached.has_availability_info());
+        assert_eq!(cached.availability().missing_bits(), 0);
     }
 
     #[tokio::test]
@@ -2047,9 +2044,9 @@ mod tests {
             .expect("successful attempt should not fail");
         assert!(matches!(result, BackendAttemptResult::Success));
         assert_eq!(article_commands.load(Ordering::SeqCst), 1);
-        assert_eq!(availability.checked_bits(), 0b0000_0001);
+        assert_eq!(availability.checked_bits(), 0);
         assert_eq!(availability.missing_bits(), 0);
-        assert!(availability.any_backend_has_article());
+        assert_eq!(request.backend_id(), Some(BackendId::from_index(0)));
 
         let mut written = vec![0; response.len()];
         tokio::time::timeout(Duration::from_secs(1), client_read.read_exact(&mut written))

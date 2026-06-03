@@ -6,7 +6,7 @@
 //! - `CachedArticle::cached_response_for()` including STAT synthesis
 //! - `DiskCache` configuration defaults and validation
 
-use nntp_proxy::cache::{ArticleAvailability, ArticleCache, AvailabilityIndex, UnifiedCache};
+use nntp_proxy::cache::{ArticleCache, AvailabilityIndex, UnifiedCache};
 use nntp_proxy::protocol::RequestKind;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
@@ -109,7 +109,7 @@ async fn test_unified_cache_availability_record_missing() {
 }
 
 #[tokio::test]
-async fn test_unified_cache_sync_availability() {
+async fn test_unified_cache_record_missing_preserves_existing_article() {
     let cache = UnifiedCache::memory(100_000, Duration::from_secs(60));
     let msg_id = MessageId::from_str_or_wrap("test@example.com").unwrap();
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
@@ -128,12 +128,9 @@ async fn test_unified_cache_sync_availability() {
         )
         .await;
 
-    // Create availability with backend 1 marked as missing
-    let mut availability = ArticleAvailability::new();
-    availability.record_missing(BackendId::from_index(1));
-
-    // Sync availability
-    cache.sync_availability(msg_id.clone(), &availability).await;
+    cache
+        .record_backend_missing(msg_id.clone(), BackendId::from_index(1))
+        .await;
 
     // Verify backend 1 is now marked as missing
     let result = cache.get(&msg_id).await.unwrap();
@@ -143,18 +140,12 @@ async fn test_unified_cache_sync_availability() {
 }
 
 #[tokio::test]
-async fn test_unified_cache_availability_sync_persists_only_missing_bits() {
+async fn test_unified_cache_availability_records_only_missing_facts() {
     let cache = UnifiedCache::availability(std::time::Duration::MAX);
     let msg_id = MessageId::from_str_or_wrap("test@example.com").unwrap();
-    let mut availability = ArticleAvailability::new();
-    availability.record_missing(BackendId::from_index(1));
-    availability.record_has(
-        &nntp_proxy::cache::ArticleAvailability::new()
-            .eligible_backend(BackendId::from_index(2))
-            .expect("backend should be eligible"),
-    );
-
-    cache.sync_availability(msg_id.clone(), &availability).await;
+    cache
+        .record_backend_missing(msg_id.clone(), BackendId::from_index(1))
+        .await;
 
     let result = cache.get(&msg_id).await.expect("availability entry");
     assert!(!result.should_try_backend(BackendId::from_index(1)));

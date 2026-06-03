@@ -69,15 +69,6 @@ impl ClientSession {
         let availability = cached.availability();
         request.record_cache_entry_metadata(cache_entry_metadata(&cached, &availability));
 
-        if !cached.has_availability_info() {
-            debug!(
-                "Cache entry exists for {} but no availability info (missing=0) - running precheck",
-                request.message_id().unwrap_or("<invalid>")
-            );
-            request.record_cache_status(RequestCacheStatus::PartialHit);
-            return Ok(CacheLookupResult::PartialHit);
-        }
-
         debug!(
             "Client {} cache HIT for {} (cache_articles={})",
             self.client_addr,
@@ -383,14 +374,14 @@ mod tests {
         assert_eq!(
             request
                 .cache_availability()
-                .expect("cache hit records availability")
+                .expect("cache hit records cache metadata")
                 .checked_bits(),
-            0b0000_0001
+            0
         );
         assert_eq!(
             request
                 .cache_availability()
-                .expect("cache hit records availability")
+                .expect("cache hit records cache metadata")
                 .missing_bits(),
             0
         );
@@ -409,11 +400,9 @@ mod tests {
     async fn partial_cache_hit_records_availability_on_request_context() {
         let session = test_session();
         let msg_id = MessageId::new("<partial@example>".to_string()).expect("valid message id");
-        let mut availability = ArticleAvailability::new();
-        availability.record_missing(BackendId::from_index(0));
         session
             .cache
-            .sync_availability(msg_id.clone(), &availability)
+            .record_backend_missing(msg_id.clone(), BackendId::from_index(0))
             .await;
         let expected_timestamp = session
             .cache

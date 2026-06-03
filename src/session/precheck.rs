@@ -68,12 +68,6 @@ enum TierQuerySummary {
 }
 
 impl TierQuerySummary {
-    const fn availability(&self) -> &ArticleAvailability {
-        match self {
-            Self::Exhausted(availability) | Self::Inconclusive(availability) => availability,
-        }
-    }
-
     const fn is_exhausted(&self) -> bool {
         matches!(self, Self::Exhausted(_))
     }
@@ -88,8 +82,7 @@ fn summarize_tier_results(results: &[QueryResult]) -> TierQuerySummary {
             QueryResult::Missing(id) => {
                 availability.record_missing(*id);
             }
-            QueryResult::Found(id, _) => {
-                availability.record_observed_has(*id);
+            QueryResult::Found(_, _) => {
                 exhausted = false;
             }
             QueryResult::Error => {
@@ -110,8 +103,8 @@ fn summarize_tier_results(results: &[QueryResult]) -> TierQuerySummary {
 #[allow(clippy::large_enum_variant)]
 enum RacingQueryOutcome {
     Hit(ArticleBackendHasArticle, PrecheckHit),
-    Missing(ArticleAvailability),
-    Inconclusive(ArticleAvailability),
+    Missing,
+    Inconclusive,
 }
 
 /// Shared dependencies for precheck operations.
@@ -165,6 +158,21 @@ async fn cache_precheck_hit(
                 .record_backend_has_status(msg_id, status_code, backend, tier)
                 .await;
         }
+    }
+}
+
+async fn record_precheck_result(
+    cache: &UnifiedCache,
+    msg_id: MessageId<'static>,
+    result: QueryResult,
+) -> Option<(ArticleBackendHasArticle, PrecheckHit)> {
+    match result {
+        QueryResult::Found(backend, hit) => Some((backend, hit)),
+        QueryResult::Missing(backend_id) => {
+            cache.record_backend_missing(msg_id, backend_id).await;
+            None
+        }
+        QueryResult::Error => None,
     }
 }
 
@@ -392,7 +400,6 @@ async fn query_all_backends_racing(
     initial_availability: &ArticleAvailability,
 ) -> RacingQueryOutcome {
     let mut results = Vec::with_capacity(deps.router.backend_count().get());
-    let mut accumulated_availability = ArticleAvailability::new();
 
     for tier in deps.router.tiers() {
         let mut pending = spawn_backend_queries_for_tier(deps, request, tier, initial_availability);
@@ -408,37 +415,41 @@ async fn query_all_backends_racing(
                     let msg_id_owned = msg_id.to_owned();
                     tokio::spawn(async move {
                         while let Some(result) = pending.next().await {
-                            if let Ok(result) = result {
-                                results.push(result);
-                            }
+                            let Ok(result) = result else {
+                                continue;
+                            };
+                            let Some((backend, hit)) =
+                                record_precheck_result(&cache, msg_id_owned.clone(), result).await
+                            else {
+                                continue;
+                            };
+                            let tier = crate::cache::ttl::CacheTier::new(0);
+                            cache_precheck_hit(&cache, msg_id_owned.clone(), backend, hit, tier)
+                                .await;
                         }
-                        let (_, mut availability) = summarize(results);
-                        availability.record_observed_has(id);
-                        cache.sync_availability(msg_id_owned, &availability).await;
                     });
                     return RacingQueryOutcome::Hit(id, response);
                 }
-                _ => {
-                    results.push(result);
+                QueryResult::Missing(backend_id) => {
+                    deps.cache
+                        .record_backend_missing(msg_id.to_owned(), backend_id)
+                        .await;
+                    results.push(QueryResult::Missing(backend_id));
+                }
+                QueryResult::Error => {
+                    results.push(QueryResult::Error);
                 }
             }
         }
 
         let tier_summary = summarize_tier_results(&results[tier_results_start..]);
         results.clear();
-        let availability = tier_summary.availability();
-        accumulated_availability.merge_from(availability);
-        if availability.missing_bits() != 0 {
-            deps.cache
-                .sync_availability(msg_id.to_owned(), availability)
-                .await;
-        }
         if !tier_summary.is_exhausted() {
-            return RacingQueryOutcome::Inconclusive(accumulated_availability);
+            return RacingQueryOutcome::Inconclusive;
         }
     }
 
-    RacingQueryOutcome::Missing(accumulated_availability)
+    RacingQueryOutcome::Missing
 }
 
 async fn query_tier_backends(
@@ -481,6 +492,7 @@ fn spawn_backend_queries_for_tier(
 /// # NNTP Semantics
 /// 430 responses are authoritative (never false negatives), 2xx are not.
 /// See `crate::cache::article` module docs for full explanation.
+#[cfg(test)]
 fn summarize(
     results: Vec<QueryResult>,
 ) -> (
@@ -493,7 +505,6 @@ fn summarize(
     for r in results {
         match r {
             QueryResult::Found(id, response) => {
-                availability.record_observed_has(id);
                 if found.is_none() {
                     found = Some((id, response));
                 }
@@ -576,16 +587,7 @@ pub(crate) async fn precheck(
                 }
             }
         }
-        RacingQueryOutcome::Missing(availability) => {
-            if availability.missing_bits() != 0 {
-                owned
-                    .cache
-                    .sync_availability(msg_id.to_owned(), &availability)
-                    .await;
-            }
-            None
-        }
-        RacingQueryOutcome::Inconclusive(_availability) => None,
+        RacingQueryOutcome::Missing | RacingQueryOutcome::Inconclusive => None,
     }
 }
 
@@ -614,7 +616,21 @@ pub fn spawn_background_precheck(
             .map(|entry| entry.to_availability(owned.router.backend_count()))
             .unwrap_or_default();
         let results = query_all_backends(&owned, &request, &availability).await;
-        let (found, availability) = summarize(results);
+        let mut found = None;
+
+        for result in results {
+            if let Some((backend_id, data)) =
+                record_precheck_result(&owned.cache, msg_id.to_owned(), result).await
+            {
+                if found.is_none() {
+                    found = Some((backend_id, data));
+                } else {
+                    let tier = crate::cache::ttl::CacheTier::new(0);
+                    cache_precheck_hit(&owned.cache, msg_id.to_owned(), backend_id, data, tier)
+                        .await;
+                }
+            }
+        }
 
         if let Some((backend_id, data)) = found {
             // NOTE: We intentionally use tier 0 for articles found via background precheck.
@@ -625,7 +641,6 @@ pub fn spawn_background_precheck(
                 cache_precheck_hit(&owned.cache, msg_id.to_owned(), backend_id, data, tier).await;
             }
         }
-        owned.cache.sync_availability(msg_id, &availability).await;
     });
 }
 
@@ -704,6 +719,37 @@ mod tests {
         let (found, avail) = summarize(vec![]);
         assert!(found.is_none());
         assert_eq!(avail.checked_bits(), 0);
+    }
+
+    #[tokio::test]
+    async fn record_precheck_result_records_missing_fact_immediately() {
+        let cache = UnifiedCache::memory(100, Duration::from_secs(60));
+        let msg_id = MessageId::from_borrowed("<precheck-missing@example.com>").unwrap();
+
+        let found = record_precheck_result(
+            &cache,
+            msg_id.to_owned(),
+            QueryResult::Missing(BackendId::from_index(0)),
+        )
+        .await;
+
+        assert!(found.is_none());
+        let cached = cache
+            .get(&msg_id)
+            .await
+            .expect("missing result should update authoritative availability");
+        assert!(!cached.should_try_backend(BackendId::from_index(0)));
+    }
+
+    #[tokio::test]
+    async fn record_precheck_result_does_not_record_transport_error_as_missing() {
+        let cache = UnifiedCache::memory(100, Duration::from_secs(60));
+        let msg_id = MessageId::from_borrowed("<precheck-error@example.com>").unwrap();
+
+        let found = record_precheck_result(&cache, msg_id.to_owned(), QueryResult::Error).await;
+
+        assert!(found.is_none());
+        assert!(cache.get(&msg_id).await.is_none());
     }
 
     #[test]

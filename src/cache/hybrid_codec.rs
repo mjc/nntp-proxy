@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::mem::size_of;
 
 use super::article::{CachedArticleNumber, CachedPayload, parse_payload};
-use super::availability::{ArticleAvailability, ArticleBackendHasArticle};
+use super::availability::ArticleAvailability;
 use super::ttl;
 
 #[cfg(test)]
@@ -524,16 +524,10 @@ impl DiskCachedArticle {
         self.availability.record_missing(backend_id);
     }
 
-    /// Record that a backend successfully provided this article
-    pub(crate) fn record_backend_has(&mut self, backend: ArticleBackendHasArticle) {
-        self.availability.record_observed_has(backend);
-    }
-
     /// Record successful backend availability without storing response payload bytes.
     pub(super) fn record_backend_has_status(
         &mut self,
         status_code: CacheableStatusCode,
-        backend: ArticleBackendHasArticle,
         tier: ttl::CacheTier,
     ) {
         if !self.is_complete_article() {
@@ -542,7 +536,6 @@ impl DiskCachedArticle {
             self.tier = tier;
         }
         self.timestamp = ttl::CacheTimestampMillis::now();
-        self.record_backend_has(backend);
     }
 
     /// Check if this cache entry contains a complete article (220) or body (222)
@@ -740,12 +733,6 @@ mod tests {
         );
         assert_eq!(entry.status_code().as_u16(), 220);
 
-        entry.record_backend_has(
-            crate::cache::ArticleAvailability::new()
-                .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible")
-                .positive_observation(),
-        );
         assert!(entry.should_try_backend(BackendId::from_index(0)));
         assert!(entry.should_try_backend(BackendId::from_index(1)));
 
@@ -1063,12 +1050,6 @@ mod tests {
     #[test]
     fn test_code_encode_decode_preserves_availability() {
         let mut entry = disk_cached_article_from_ingest_bytes(b"220 ok\r\n").unwrap();
-        entry.record_backend_has(
-            crate::cache::ArticleAvailability::new()
-                .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible")
-                .positive_observation(),
-        );
         entry.record_backend_missing(BackendId::from_index(2));
 
         let mut encoded = Vec::new();
