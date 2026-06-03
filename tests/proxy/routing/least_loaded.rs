@@ -30,19 +30,19 @@ fn test_least_loaded_basic() {
 
     // First request can go to either backend when both are empty.
     let backend1 = selector
-        .route_without_availability(ClientId::new())
+        .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
         .unwrap();
     assert!(backend1.as_index() <= 1);
 
     // Second request should go to the other backend.
     let backend2 = selector
-        .route_without_availability(ClientId::new())
+        .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
         .unwrap();
     assert_ne!(backend2, backend1);
 
     // Third request is another equal-load tie.
     let backend3 = selector
-        .route_without_availability(ClientId::new())
+        .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
         .unwrap();
     assert!(backend3.as_index() <= 1);
 
@@ -54,7 +54,7 @@ fn test_least_loaded_basic() {
 
     // Next request should go to backend 1 (ratio 0/10 vs backend 0's 1/10).
     let backend4 = selector
-        .route_without_availability(ClientId::new())
+        .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
         .unwrap();
     assert_eq!(backend4.as_index(), 1);
 }
@@ -82,7 +82,7 @@ fn test_least_loaded_unequal_capacity() {
     let mut counts = [0; 2];
     for _ in 0..15 {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -127,7 +127,7 @@ fn test_concurrent_least_loaded_fills_tier_capacity_without_overshoot() {
         handles.push(thread::spawn(move || {
             barrier.wait();
             selector
-                .route_without_availability(ClientId::new())
+                .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
                 .unwrap()
                 .as_index()
         }));
@@ -170,7 +170,10 @@ fn test_initial_article_probe_uses_capacity_fair_distribution_despite_retry_load
     let mut counts = [0usize; 2];
     for _ in 0..90 {
         let backend = selector
-            .route_with_availability(ClientId::new(), Some(&availability))
+            .route(
+                nntp_proxy::router::RouteRequest::new(ClientId::new())
+                    .with_availability(&availability),
+            )
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -202,7 +205,7 @@ fn test_least_loaded_respects_pending_counts() {
     // Route 10 requests - they should distribute evenly (both start at 0)
     for _ in 0..10 {
         selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
     }
 
@@ -228,7 +231,7 @@ fn test_least_loaded_respects_pending_counts() {
     // Now backend 0 has 2 pending, backend 1 has 5 pending
     // Next request should go to backend 0 (ratio 2/10 = 0.2 vs 5/10 = 0.5)
     let backend = selector
-        .route_without_availability(ClientId::new())
+        .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
         .unwrap();
     assert_eq!(
         backend.as_index(),
@@ -313,7 +316,7 @@ async fn test_least_loaded_counts_checked_out_pool_connections() {
 
     assert_eq!(
         selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap()
             .as_index(),
         0,
@@ -337,7 +340,7 @@ fn test_least_loaded_single_backend() {
     // All requests should go to the only backend
     for _ in 0..20 {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         assert_eq!(backend.as_index(), 0);
     }
@@ -361,7 +364,7 @@ fn test_least_loaded_load_balancing_fairness() {
     let mut counts = [0; 3];
     for _ in 0..30 {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
     }

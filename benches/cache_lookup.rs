@@ -8,7 +8,7 @@
 //! Run with: cargo bench --bench `cache_lookup`
 
 use divan::{Bencher, black_box};
-use nntp_proxy::cache::{ArticleAvailability, UnifiedCache};
+use nntp_proxy::cache::{ArticleAvailability, EligibleArticleBackend, UnifiedCache};
 use nntp_proxy::router::BackendCount;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::sync::Arc;
@@ -18,12 +18,18 @@ fn main() {
     divan::main();
 }
 
+fn eligible(backend_id: BackendId) -> EligibleArticleBackend {
+    ArticleAvailability::new()
+        .eligible_backend(backend_id)
+        .expect("benchmark backend should be eligible")
+}
+
 // =============================================================================
 // ArticleAvailability bitset operations
 // =============================================================================
 
 mod availability {
-    use super::{ArticleAvailability, BackendCount, BackendId, Bencher, black_box};
+    use super::{ArticleAvailability, BackendCount, BackendId, Bencher, black_box, eligible};
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
     fn record_missing(bencher: Bencher) {
@@ -90,7 +96,7 @@ mod availability {
         bencher.bench(|| {
             let mut avail = ArticleAvailability::new();
             for i in 0..4u8 {
-                avail.record_has(BackendId::from_index(i as usize));
+                avail.record_has(eligible(BackendId::from_index(i as usize)));
             }
             black_box(avail)
         });
@@ -104,6 +110,7 @@ mod availability {
 mod unified_cache {
     use super::{
         Arc, ArticleAvailability, BackendId, Bencher, Duration, MessageId, UnifiedCache, black_box,
+        eligible,
     };
 
     fn make_cache() -> Arc<UnifiedCache> {
@@ -136,7 +143,7 @@ mod unified_cache {
                 .upsert_ingest(
                     msg_id.to_owned(),
                     b"220 0 <hit@example.com>\r\nSubject: test\r\n\r\nbody\r\n.\r\n".to_vec(),
-                    BackendId::from_index(0),
+                    eligible(BackendId::from_index(0)),
                     0.into(),
                 )
                 .await;
@@ -164,7 +171,7 @@ mod unified_cache {
                         .upsert_ingest(
                             msg_id.to_owned(),
                             data.clone(),
-                            BackendId::from_index(0),
+                            eligible(BackendId::from_index(0)),
                             0.into(),
                         )
                         .await;
@@ -178,7 +185,7 @@ mod unified_cache {
         let cache = make_cache();
         let mut avail = ArticleAvailability::new();
         avail.record_missing(BackendId::from_index(0));
-        avail.record_has(BackendId::from_index(1));
+        avail.record_has(eligible(BackendId::from_index(1)));
 
         bencher.bench(|| {
             rt.block_on(async {
@@ -190,7 +197,9 @@ mod unified_cache {
 }
 
 mod availability_cache {
-    use super::{Arc, ArticleAvailability, BackendId, Bencher, MessageId, UnifiedCache, black_box};
+    use super::{
+        Arc, ArticleAvailability, BackendId, Bencher, MessageId, UnifiedCache, black_box, eligible,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn make_cache() -> Arc<UnifiedCache> {
@@ -248,7 +257,7 @@ mod availability_cache {
         let next_id = AtomicU64::new(0);
         let mut availability = ArticleAvailability::new();
         availability.record_missing(BackendId::from_index(0));
-        availability.record_has(BackendId::from_index(1));
+        availability.record_has(eligible(BackendId::from_index(1)));
 
         bencher.bench(|| {
             let id = next_id.fetch_add(1, Ordering::Relaxed);

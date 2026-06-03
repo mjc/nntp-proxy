@@ -24,7 +24,7 @@ pub mod ttl;
 mod mock_hybrid;
 
 pub use article::{ArticleCache, CachedArticle};
-pub use availability::{ArticleAvailability, BackendStatus, MAX_BACKENDS};
+pub use availability::{ArticleAvailability, BackendStatus, EligibleArticleBackend, MAX_BACKENDS};
 pub use availability_index::AvailabilityIndex;
 pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
 
@@ -229,12 +229,15 @@ mod tests {
         let cache = UnifiedCache::memory(1000, std::time::Duration::from_secs(60));
         let msg_id = MessageId::new("<typed-availability@example>".to_string()).unwrap();
         let backend_id = BackendId::from_index(1);
+        let backend = ArticleAvailability::new()
+            .eligible_backend(backend_id)
+            .expect("backend should be eligible");
 
         cache
             .record_backend_has_status(
                 msg_id.clone(),
                 StatusCode::new(220),
-                backend_id,
+                backend,
                 ttl::CacheTier::new(2),
             )
             .await;
@@ -412,25 +415,41 @@ impl UnifiedCache {
         }
     }
 
+    /// Store a successful article response for an eligible backend.
+    ///
+    /// ```compile_fail
+    /// use nntp_proxy::cache::{ttl, CacheIngestResponse, UnifiedCache};
+    /// use nntp_proxy::types::{BackendId, MessageId};
+    ///
+    /// async fn cannot_store_success_for_raw_backend(
+    ///     cache: &UnifiedCache,
+    ///     msg_id: MessageId<'static>,
+    /// ) {
+    ///     cache
+    ///         .upsert_ingest(
+    ///             msg_id,
+    ///             CacheIngestResponse::from(Vec::new()),
+    ///             BackendId::from_index(0),
+    ///             ttl::CacheTier::new(0),
+    ///         )
+    ///         .await;
+    /// }
+    /// ```
     pub async fn upsert_ingest(
         &self,
         message_id: MessageId<'_>,
         buffer: impl Into<CacheIngestResponse>,
-        backend_id: BackendId,
+        backend: EligibleArticleBackend,
         tier: ttl::CacheTier,
     ) {
         let buffer = buffer.into();
         match self {
             Self::Availability(_) => {}
             Self::Memory(cache) => {
-                cache
-                    .upsert_ingest(message_id, buffer, backend_id, tier)
-                    .await;
+                cache.upsert_ingest(message_id, buffer, backend, tier).await;
             }
             Self::Hybrid(cache) => {
-                cache
-                    .upsert_ingest(message_id, buffer, backend_id, tier)
-                    .await;
+                cache.upsert_ingest(message_id, buffer, backend, tier).await;
             }
         }
     }
@@ -449,19 +468,19 @@ impl UnifiedCache {
         &self,
         message_id: MessageId<'_>,
         status_code: StatusCode,
-        backend_id: BackendId,
+        backend: EligibleArticleBackend,
         tier: ttl::CacheTier,
     ) {
         match self {
             Self::Availability(_) => {}
             Self::Memory(cache) => {
                 cache
-                    .record_backend_has_status(message_id, status_code, backend_id, tier)
+                    .record_backend_has_status(message_id, status_code, backend, tier)
                     .await;
             }
             Self::Hybrid(cache) => {
                 cache
-                    .record_has_status(message_id, status_code, backend_id, tier)
+                    .record_has_status(message_id, status_code, backend, tier)
                     .await;
             }
         }

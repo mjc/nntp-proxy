@@ -46,7 +46,7 @@ fn test_add_multiple_backends() {
 fn test_no_backends_fails() {
     let router = BackendSelector::new();
     let client_id = ClientId::new();
-    let result = router.route_without_availability(client_id);
+    let result = router.route(nntp_proxy::router::RouteRequest::new(client_id));
 
     assert!(result.is_err());
 }

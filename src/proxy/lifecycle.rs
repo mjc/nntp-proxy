@@ -206,7 +206,9 @@ impl NntpProxy {
         self.record_connection_opened();
 
         let client_id = types::ClientId::new();
-        let backend_id = self.router.route_without_availability(client_id)?;
+        let backend_id = self
+            .router
+            .route(crate::router::RouteRequest::new(client_id))?;
         let server_idx = backend_id.as_index();
 
         self.log_routing_selection(client_addr, backend_id, &self.servers[server_idx]);

@@ -175,7 +175,7 @@ impl ClientSession {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!(error::ROUTER_REQUIRED))?;
 
-        let backend_id = router.route_without_availability(self.client_id)?;
+        let backend_id = router.route(crate::router::RouteRequest::new(self.client_id))?;
 
         // Guard pending_count immediately — if get_pooled_connection fails,
         // the guard drops and decrements automatically

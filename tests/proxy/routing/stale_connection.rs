@@ -399,7 +399,11 @@ fn test_availability_merge_430_overrides_has() {
     let b1 = BackendId::from_index(1);
 
     // Backend 0 previously returned success (might be false positive)
-    cache_state.record_has(b0);
+    cache_state.record_has(
+        nntp_proxy::cache::ArticleAvailability::new()
+            .eligible_backend(b0)
+            .expect("backend should be eligible"),
+    );
     assert!(!cache_state.is_missing(b0));
 
     // Later, backend 0 returns 430 (AUTHORITATIVE - article is NOT there)
@@ -452,7 +456,11 @@ async fn test_430_cache_is_authoritative() -> Result<()> {
 
     // Try to claim backend 0 "has" the article (unreliable 2xx response)
     let mut avail = ArticleAvailability::new();
-    avail.record_has(BackendId::from_index(0));
+    avail.record_has(
+        nntp_proxy::cache::ArticleAvailability::new()
+            .eligible_backend(BackendId::from_index(0))
+            .expect("backend should be eligible"),
+    );
 
     cache.sync_availability(msg_id.clone(), &avail).await;
 

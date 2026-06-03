@@ -15,7 +15,7 @@ use foyer::Code;
 use std::io::{Read, Write};
 
 use super::article::{CachedArticleNumber, CachedPayload, parse_payload};
-use super::availability::ArticleAvailability;
+use super::availability::{ArticleAvailability, EligibleArticleBackend};
 use super::ttl;
 
 const DISK_ENTRY_MAGIC_V3: u32 = 0x4e50_4333; // "NPC3"
@@ -495,15 +495,15 @@ impl DiskCachedArticle {
     }
 
     /// Record that a backend successfully provided this article
-    pub(crate) fn record_backend_has(&mut self, backend_id: BackendId) {
-        self.availability.record_has(backend_id);
+    pub(crate) fn record_backend_has(&mut self, backend: EligibleArticleBackend) {
+        self.availability.record_has(backend);
     }
 
     /// Record successful backend availability without storing response payload bytes.
     pub(super) fn record_backend_has_status(
         &mut self,
         status_code: CacheableStatusCode,
-        backend_id: BackendId,
+        backend: EligibleArticleBackend,
         tier: ttl::CacheTier,
     ) {
         if !self.is_complete_article() {
@@ -512,7 +512,7 @@ impl DiskCachedArticle {
             self.tier = tier;
         }
         self.timestamp = ttl::CacheTimestampMillis::now();
-        self.record_backend_has(backend_id);
+        self.record_backend_has(backend);
     }
 
     /// Check if this cache entry contains a complete article (220) or body (222)
@@ -532,7 +532,6 @@ impl DiskCachedArticle {
     /// Get backend availability as `ArticleAvailability` struct
     #[inline]
     #[must_use]
-    #[cfg(test)]
     pub(crate) const fn availability(&self) -> ArticleAvailability {
         self.availability
     }
@@ -711,7 +710,11 @@ mod tests {
         );
         assert_eq!(entry.status_code().as_u16(), 220);
 
-        entry.record_backend_has(BackendId::from_index(0));
+        entry.record_backend_has(
+            crate::cache::ArticleAvailability::new()
+                .eligible_backend(BackendId::from_index(0))
+                .expect("backend should be eligible"),
+        );
         assert!(entry.should_try_backend(BackendId::from_index(0)));
         assert!(entry.should_try_backend(BackendId::from_index(1)));
 
@@ -1007,7 +1010,11 @@ mod tests {
     #[test]
     fn test_code_encode_decode_preserves_availability() {
         let mut entry = disk_cached_article_from_ingest_bytes(b"220 ok\r\n").unwrap();
-        entry.record_backend_has(BackendId::from_index(0));
+        entry.record_backend_has(
+            crate::cache::ArticleAvailability::new()
+                .eligible_backend(BackendId::from_index(0))
+                .expect("backend should be eligible"),
+        );
         entry.record_backend_missing(BackendId::from_index(2));
 
         let mut encoded = Vec::new();

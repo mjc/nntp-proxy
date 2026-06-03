@@ -33,7 +33,9 @@ fn test_tier_zero_selected_first() {
 
     // Despite being added second, tier 0 should be selected first
     let backend = selector
-        .route_with_availability(ClientId::new(), Some(&availability))
+        .route(
+            nntp_proxy::router::RouteRequest::new(ClientId::new()).with_availability(&availability),
+        )
         .unwrap();
     assert_eq!(
         backend.as_index(),
@@ -60,7 +62,7 @@ fn test_tier_zero_selected_first_without_availability_filter() {
     );
 
     let backend = selector
-        .route_without_availability(ClientId::new())
+        .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
         .unwrap();
     assert_eq!(
         backend.as_index(),
@@ -95,7 +97,7 @@ fn test_tier_one_unused_without_availability_until_tier_zero_is_loaded() {
     let mut counts = [0; 3];
     for _ in 0..40 {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -141,7 +143,9 @@ fn test_tier_escalation_on_430() {
 
     // Now routing should select tier 1 backend
     let backend = selector
-        .route_with_availability(ClientId::new(), Some(&availability))
+        .route(
+            nntp_proxy::router::RouteRequest::new(ClientId::new()).with_availability(&availability),
+        )
         .unwrap();
     assert_eq!(
         backend.as_index(),
@@ -182,7 +186,10 @@ fn test_within_tier_load_balancing() {
     let mut counts = [0; 3];
     for _ in 0..100 {
         let backend = selector
-            .route_with_availability(ClientId::new(), Some(&availability))
+            .route(
+                nntp_proxy::router::RouteRequest::new(ClientId::new())
+                    .with_availability(&availability),
+            )
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -237,7 +244,9 @@ fn test_partial_tier_exhaustion() {
 
     // Should still select from tier 0 (the remaining one)
     let backend = selector
-        .route_with_availability(ClientId::new(), Some(&availability))
+        .route(
+            nntp_proxy::router::RouteRequest::new(ClientId::new()).with_availability(&availability),
+        )
         .unwrap();
     assert_eq!(
         backend.as_index(),
@@ -281,7 +290,9 @@ fn test_multiple_tiers() {
 
     // Should escalate to tier 2
     let backend = selector
-        .route_with_availability(ClientId::new(), Some(&availability))
+        .route(
+            nntp_proxy::router::RouteRequest::new(ClientId::new()).with_availability(&availability),
+        )
         .unwrap();
     assert_eq!(
         backend.as_index(),
@@ -335,7 +346,10 @@ fn test_tiered_weighted_round_robin() {
     let mut counts = [0; 3];
     for _ in 0..400 {
         let backend = selector
-            .route_with_availability(ClientId::new(), Some(&availability))
+            .route(
+                nntp_proxy::router::RouteRequest::new(ClientId::new())
+                    .with_availability(&availability),
+            )
             .unwrap();
         counts[backend.as_index()] += 1;
     }

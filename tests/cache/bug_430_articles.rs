@@ -21,6 +21,13 @@ use std::time::Duration;
 
 use super::article_response_bytes;
 
+fn mark_has(availability: &mut ArticleAvailability, backend_id: BackendId) {
+    let backend = availability
+        .eligible_backend(backend_id)
+        .expect("backend should be eligible");
+    availability.record_has(backend);
+}
+
 /// Test that `sync_availability` does NOT create a missing entry when a backend has the article
 #[tokio::test]
 async fn test_sync_availability_does_not_create_430_metadata_only_when_backend_has_article()
@@ -30,7 +37,7 @@ async fn test_sync_availability_does_not_create_430_metadata_only_when_backend_h
 
     // Simulate the scenario: backend 0 has the article
     let mut availability = ArticleAvailability::new();
-    availability.record_has(BackendId::from_index(0));
+    mark_has(&mut availability, BackendId::from_index(0));
 
     // Call sync_availability when NO cache entry exists yet
     // (simulating the race where upsert hasn't completed)
@@ -66,7 +73,7 @@ async fn test_race_condition_upsert_vs_sync_availability() -> Result<()> {
 
     // Simulate the race: sync_availability runs BEFORE upsert
     let mut availability = ArticleAvailability::new();
-    availability.record_has(BackendId::from_index(0));
+    mark_has(&mut availability, BackendId::from_index(0));
 
     // sync_availability runs first (no entry yet)
     cache.sync_availability(msg_id.clone(), &availability).await;
@@ -77,7 +84,9 @@ async fn test_race_condition_upsert_vs_sync_availability() -> Result<()> {
         .upsert_ingest(
             msg_id.clone(),
             article_data.clone(),
-            BackendId::from_index(0),
+            nntp_proxy::cache::ArticleAvailability::new()
+                .eligible_backend(BackendId::from_index(0))
+                .expect("backend should be eligible"),
             0.into(),
         )
         .await;
@@ -108,14 +117,16 @@ async fn test_second_request_gets_article_not_430() -> Result<()> {
         .upsert_ingest(
             msg_id.clone(),
             article_data.clone(),
-            BackendId::from_index(0),
+            nntp_proxy::cache::ArticleAvailability::new()
+                .eligible_backend(BackendId::from_index(0))
+                .expect("backend should be eligible"),
             0.into(),
         )
         .await;
 
     // Simulate sync_availability being called after (shouldn't corrupt)
     let mut availability = ArticleAvailability::new();
-    availability.record_has(BackendId::from_index(0));
+    mark_has(&mut availability, BackendId::from_index(0));
     cache.sync_availability(msg_id.clone(), &availability).await;
 
     // Second request: should get the article
@@ -158,7 +169,7 @@ fn test_any_backend_has_article_basic() {
     );
 
     // Record backend 1 as having it
-    availability.record_has(BackendId::from_index(1));
+    mark_has(&mut availability, BackendId::from_index(1));
     assert!(
         availability.any_backend_has_article(),
         "After recording has, should have a backend with article"
@@ -181,16 +192,16 @@ fn test_any_backend_has_article_multiple_backends() {
     );
 
     // Mark backend 3 as having it
-    availability.record_has(BackendId::from_index(3));
+    mark_has(&mut availability, BackendId::from_index(3));
     assert!(
         availability.any_backend_has_article(),
         "One backend has it should return true"
     );
 }
 
-/// Test that recording has clears missing bit
+/// Test that missing backends cannot produce success tokens
 #[test]
-fn test_record_has_clears_missing() {
+fn test_eligible_backend_returns_none_for_missing() {
     let mut availability = ArticleAvailability::new();
 
     // First record as missing
@@ -198,10 +209,14 @@ fn test_record_has_clears_missing() {
     assert!(availability.is_missing(BackendId::from_index(0)));
     assert!(!availability.any_backend_has_article());
 
-    // Now record as has - should clear the missing bit
-    availability.record_has(BackendId::from_index(0));
-    assert!(!availability.is_missing(BackendId::from_index(0)));
-    assert!(availability.any_backend_has_article());
+    assert!(
+        availability
+            .eligible_backend(BackendId::from_index(0))
+            .is_none(),
+        "missing backend must not produce an eligibility token"
+    );
+    assert!(availability.is_missing(BackendId::from_index(0)));
+    assert!(!availability.any_backend_has_article());
 }
 
 /// Test `sync_availability` with mixed availability (some have, some missing)
@@ -213,7 +228,7 @@ async fn test_sync_availability_mixed_results() -> Result<()> {
     // Simulate: backend 0 returned 430, backend 1 has it
     let mut availability = ArticleAvailability::new();
     availability.record_missing(BackendId::from_index(0));
-    availability.record_has(BackendId::from_index(1));
+    mark_has(&mut availability, BackendId::from_index(1));
 
     // sync_availability should NOT create missing entry because backend 1 has it
     cache.sync_availability(msg_id.clone(), &availability).await;
@@ -333,7 +348,14 @@ async fn test_concurrent_upsert_and_sync() -> Result<()> {
         let article_data =
             b"220 0 <concurrent@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         cache1
-            .upsert_ingest(msg_id1, article_data, BackendId::from_index(0), 0.into())
+            .upsert_ingest(
+                msg_id1,
+                article_data,
+                nntp_proxy::cache::ArticleAvailability::new()
+                    .eligible_backend(BackendId::from_index(0))
+                    .expect("backend should be eligible"),
+                0.into(),
+            )
             .await;
     });
 
@@ -345,7 +367,7 @@ async fn test_concurrent_upsert_and_sync() -> Result<()> {
     let sync_task = tokio::spawn(async move {
         barrier2.wait().await;
         let mut availability = ArticleAvailability::new();
-        availability.record_has(BackendId::from_index(0));
+        mark_has(&mut availability, BackendId::from_index(0));
         cache2.sync_availability(msg_id2, &availability).await;
     });
 
@@ -373,7 +395,7 @@ async fn test_metadata_only_not_served_as_article() -> Result<()> {
 
     // Simulate STAT precheck creating a metadata-only response
     let mut availability = ArticleAvailability::new();
-    availability.record_has(BackendId::from_index(0));
+    mark_has(&mut availability, BackendId::from_index(0));
 
     // First, put a 223 metadata-only response in the cache (as if from STAT precheck)
     // We'll use upsert with a metadata-only response-like buffer to simulate this
@@ -381,7 +403,9 @@ async fn test_metadata_only_not_served_as_article() -> Result<()> {
         .upsert_ingest(
             msg_id.clone(),
             b"223\r\n".to_vec(),
-            BackendId::from_index(0),
+            nntp_proxy::cache::ArticleAvailability::new()
+                .eligible_backend(BackendId::from_index(0))
+                .expect("backend should be eligible"),
             0.into(),
         )
         .await;
@@ -412,7 +436,9 @@ async fn test_precheck_metadata_only_then_article_request() -> Result<()> {
         .upsert_ingest(
             msg_id.clone(),
             b"223\r\n".to_vec(),
-            BackendId::from_index(0),
+            nntp_proxy::cache::ArticleAvailability::new()
+                .eligible_backend(BackendId::from_index(0))
+                .expect("backend should be eligible"),
             0.into(),
         )
         .await;
@@ -436,7 +462,9 @@ async fn test_precheck_metadata_only_then_article_request() -> Result<()> {
         .upsert_ingest(
             msg_id.clone(),
             real_article.clone(),
-            BackendId::from_index(0),
+            nntp_proxy::cache::ArticleAvailability::new()
+                .eligible_backend(BackendId::from_index(0))
+                .expect("backend should be eligible"),
             0.into(),
         )
         .await;

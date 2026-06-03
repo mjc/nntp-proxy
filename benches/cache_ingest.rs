@@ -3,14 +3,20 @@
 //! Run with: cargo bench --bench cache_ingest
 
 use divan::{Bencher, black_box};
-use nntp_proxy::cache::ArticleCache;
 use nntp_proxy::cache::CacheIngestResponse;
+use nntp_proxy::cache::{ArticleAvailability, ArticleCache, EligibleArticleBackend};
 use nntp_proxy::pool::{BufferPool, ChunkedResponse};
 use nntp_proxy::types::{BackendId, BufferSize, MessageId};
 use std::time::Duration;
 
 fn main() {
     divan::main();
+}
+
+fn eligible(backend_id: BackendId) -> EligibleArticleBackend {
+    ArticleAvailability::new()
+        .eligible_backend(backend_id)
+        .expect("benchmark backend should be eligible")
 }
 
 fn article_response(body_len: usize) -> Vec<u8> {
@@ -30,7 +36,7 @@ const MISSING_RESPONSE: &[u8] = b"430 No article\r\n";
 mod ingest {
     use super::{
         ArticleCache, BODY_RESPONSE, BackendId, Bencher, Duration, HEAD_RESPONSE, MISSING_RESPONSE,
-        MessageId, STAT_RESPONSE, article_response, black_box,
+        MessageId, STAT_RESPONSE, article_response, black_box, eligible,
     };
 
     macro_rules! bench_ingest {
@@ -49,7 +55,7 @@ mod ingest {
                                 .upsert_ingest(
                                     msg_id,
                                     black_box(bytes.as_slice()),
-                                    BackendId::from_index(0),
+                                    eligible(BackendId::from_index(0)),
                                     0.into(),
                                 )
                                 .await;
@@ -71,6 +77,7 @@ mod ingest {
 mod cache_upsert {
     use super::{
         ArticleCache, BackendId, Bencher, Duration, MessageId, article_response, black_box,
+        eligible,
     };
 
     #[divan::bench(sample_count = 100, sample_size = 50)]
@@ -88,7 +95,7 @@ mod cache_upsert {
                         .upsert_ingest(
                             msg_id,
                             black_box(bytes.as_slice()),
-                            BackendId::from_index(0),
+                            eligible(BackendId::from_index(0)),
                             0.into(),
                         )
                         .await;
@@ -100,7 +107,7 @@ mod cache_upsert {
 mod chunked_ingest {
     use super::{
         ArticleCache, BackendId, Bencher, BufferPool, BufferSize, CacheIngestResponse,
-        ChunkedResponse, Duration, MessageId, article_response, black_box,
+        ChunkedResponse, Duration, MessageId, article_response, black_box, eligible,
     };
 
     fn chunked_response(bytes: &[u8]) -> ChunkedResponse {
@@ -132,7 +139,7 @@ mod chunked_ingest {
                                 .upsert_ingest(
                                     msg_id,
                                     CacheIngestResponse::Chunked(black_box(chunked)),
-                                    BackendId::from_index(0),
+                                    eligible(BackendId::from_index(0)),
                                     0.into(),
                                 )
                                 .await;

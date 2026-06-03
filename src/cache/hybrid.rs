@@ -51,9 +51,11 @@ use foyer::{
     BlockEngineConfig, DeviceBuilder, FsDeviceBuilder, HybridCache, HybridCacheBuilder,
     HybridCachePolicy, LruConfig, PsyncIoEngineConfig, RecoverMode, Source, Spawner,
 };
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 use super::availability::ArticleAvailability;
@@ -131,6 +133,7 @@ pub struct HybridArticleCache {
     config: HybridCacheConfig,
     /// Base TTL in milliseconds (used for tier-aware expiration via `effective_ttl`)
     ttl_millis: ttl::CacheTtlMillis,
+    mutation_locks: Vec<Mutex<()>>,
 }
 
 impl std::fmt::Debug for HybridArticleCache {
@@ -298,7 +301,14 @@ impl HybridArticleCache {
             disk_hits: AtomicU64::new(0),
             config,
             ttl_millis,
+            mutation_locks: (0..16).map(|_| Mutex::new(())).collect(),
         })
+    }
+
+    fn mutation_lock(&self, key: &str) -> &Mutex<()> {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        &self.mutation_locks[hasher.finish() as usize % self.mutation_locks.len()]
     }
 
     /// Get an article from the cache
@@ -362,11 +372,12 @@ impl HybridArticleCache {
         &self,
         message_id: MessageId<'_>,
         buffer: impl Into<super::CacheIngestResponse>,
-        backend_id: BackendId,
+        backend: super::EligibleArticleBackend,
         tier: super::ttl::CacheTier,
     ) {
         let buffer = buffer.into();
         let key = message_id.without_brackets().to_string();
+        let _mutation_guard = self.mutation_lock(&key).lock().await;
         let buffer_len = buffer.len();
         let Some(mut entry) = DiskCachedArticle::from_ingest_response_with_tier(buffer, tier)
         else {
@@ -375,13 +386,23 @@ impl HybridArticleCache {
         };
         let entry_len = entry.payload_len();
 
+        let mut existing_availability = None;
+
         // Check for existing entry - don't overwrite larger semantic payloads with smaller ones.
         if let Ok(Some(existing)) = self.cache.get(&key).await {
+            existing_availability = Some(existing.value().availability());
             let existing_len = existing.value().payload_len();
-            if existing_len > entry_len {
+            let existing_complete = existing.value().is_complete_article();
+            let new_complete = entry.is_complete_article();
+            let keep_existing = match (existing_complete, new_complete) {
+                (true, false) => true,
+                (false, true) => false,
+                (true, true) | (false, false) => existing_len > entry_len,
+            };
+            if keep_existing {
                 // Existing entry is larger - just update availability info and refresh TTL
                 let mut updated = existing.value().clone();
-                updated.record_backend_has(backend_id);
+                updated.record_backend_has(backend);
                 // Refresh timestamp on successful upsert to extend tier-aware TTL
                 updated.timestamp = ttl::CacheTimestampMillis::now();
                 self.cache.insert(key.clone(), updated);
@@ -395,7 +416,10 @@ impl HybridArticleCache {
             }
         }
 
-        entry.record_backend_has(backend_id);
+        if let Some(availability) = existing_availability {
+            entry.availability.merge_from(&availability);
+        }
+        entry.record_backend_has(backend);
         self.cache.insert(key.clone(), entry);
         debug!(msg_id = %key, stored_bytes = entry_len.get(), tier = tier.get(), "Hybrid cache upsert");
     }
@@ -403,6 +427,7 @@ impl HybridArticleCache {
     /// Record that a backend doesn't have an article (430 response)
     pub async fn record_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
         let key = message_id.without_brackets().to_string();
+        let _mutation_guard = self.mutation_lock(&key).lock().await;
 
         // Get existing entry or create a typed missing entry.
         let entry = if let Ok(Some(existing)) = self.cache.get(&key).await {
@@ -423,7 +448,7 @@ impl HybridArticleCache {
         &self,
         message_id: MessageId<'_>,
         status_code: StatusCode,
-        backend_id: BackendId,
+        backend: super::EligibleArticleBackend,
         tier: super::ttl::CacheTier,
     ) {
         let Ok(cacheable_status) = CacheableStatusCode::try_from(status_code.as_u16()) else {
@@ -436,13 +461,14 @@ impl HybridArticleCache {
         };
 
         let key = message_id.without_brackets().to_string();
+        let _mutation_guard = self.mutation_lock(&key).lock().await;
         let entry = if let Ok(Some(existing)) = self.cache.get(&key).await {
             let mut updated = existing.value().clone();
-            updated.record_backend_has_status(cacheable_status, backend_id, tier);
+            updated.record_backend_has_status(cacheable_status, backend, tier);
             updated
         } else {
             let mut entry = DiskCachedArticle::availability_only(cacheable_status, tier);
-            entry.record_backend_has(backend_id);
+            entry.record_backend_has(backend);
             entry
         };
 
@@ -455,9 +481,9 @@ impl HybridArticleCache {
     /// backends that returned 430 during this request. Much more efficient
     /// than calling `record_missing` for each backend individually.
     ///
-    /// IMPORTANT: Only creates a missing entry if ALL checked backends returned 430.
-    /// If any backend successfully provided the article, we skip creating an entry
-    /// (the actual article will be cached via upsert, which may race with this call).
+    /// If any backend successfully provided the article, creates a status-only
+    /// availability entry when no payload entry exists yet. This preserves same-request
+    /// 430s even if the success-side cache update races with this sync.
     pub async fn sync_availability(
         &self,
         message_id: MessageId<'_>,
@@ -469,8 +495,9 @@ impl HybridArticleCache {
         }
 
         let key = message_id.without_brackets().to_string();
+        let _mutation_guard = self.mutation_lock(&key).lock().await;
 
-        // Get existing entry or conditionally create a missing entry.
+        // Get existing entry or conditionally create an availability entry.
         let updated_entry = match self.cache.get(&key).await {
             Ok(Some(existing)) => {
                 // Merge availability into existing entry
@@ -479,18 +506,17 @@ impl HybridArticleCache {
                 Some(entry)
             }
             _ => {
-                // No existing entry - only create a missing entry if all checked backends returned 430.
-                if availability.any_backend_has_article() {
-                    // A backend successfully provided the article.
-                    // Don't create a missing entry - let upsert() handle it with the real article data.
-                    None
+                let mut entry = if availability.any_backend_has_article() {
+                    DiskCachedArticle::availability_only(
+                        super::hybrid_codec::CacheableStatusCode::Stat,
+                        super::ttl::CacheTier::new(0),
+                    )
                 } else {
-                    // All checked backends returned 430 - create typed missing entry.
-                    let mut entry = DiskCachedArticle::missing(super::ttl::CacheTier::new(0));
-                    entry.availability = *availability;
-                    self.misses.fetch_add(1, Ordering::Relaxed);
-                    Some(entry)
-                }
+                    DiskCachedArticle::missing(super::ttl::CacheTier::new(0))
+                };
+                entry.availability = *availability;
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                Some(entry)
             }
         };
 
@@ -577,6 +603,10 @@ impl HybridArticleCache {
     /// background tasks. Safe with any tokio runtime flavor.
     pub async fn new_memory_only(memory_capacity: u64) -> anyhow::Result<Self> {
         use foyer::NoopIoEngineConfig;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        static TEST_CACHE_ID: AtomicU64 = AtomicU64::new(0);
+        let cache_id = TEST_CACHE_ID.fetch_add(1, Ordering::Relaxed);
 
         let memory_capacity_usize: usize = memory_capacity
             .try_into()
@@ -585,7 +615,7 @@ impl HybridArticleCache {
         // NoopIoEngineConfig + no with_engine_config() call → foyer uses NoopEngineConfig,
         // which is completely synchronous and never spawns background flusher/reclaimer tasks.
         let builder = HybridCacheBuilder::new()
-            .with_name("nntp-article-cache-test")
+            .with_name(format!("nntp-article-cache-test-{cache_id}"))
             .with_policy(HybridCachePolicy::WriteOnEviction)
             .memory(memory_capacity_usize)
             .with_shards(1)
@@ -614,6 +644,7 @@ impl HybridArticleCache {
             disk_hits: AtomicU64::new(0),
             config,
             ttl_millis: ttl::CacheTtlMillis::new(3600 * 1000), // 1 hour in milliseconds
+            mutation_locks: (0..16).map(|_| Mutex::new(())).collect(),
         })
     }
 }
@@ -639,7 +670,14 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<test123@example.com>").unwrap();
         let buffer = b"220 0 <test123@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         cache
-            .upsert_ingest(msg_id, buffer.clone(), BackendId::from_index(0), 0.into())
+            .upsert_ingest(
+                msg_id,
+                buffer.clone(),
+                crate::cache::ArticleAvailability::new()
+                    .eligible_backend(BackendId::from_index(0))
+                    .expect("backend should be eligible"),
+                0.into(),
+            )
             .await;
 
         // Retrieve it
@@ -680,6 +718,152 @@ mod tests {
             "missing hybrid cache entries must not retain response payload bytes"
         );
         assert!(!entry.should_try_backend(BackendId::from_index(0)));
+        assert!(entry.should_try_backend(BackendId::from_index(1)));
+
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_cached_430_prevents_same_backend_success_token() {
+        let cache = HybridArticleCache::new_memory_only(1024 * 1024)
+            .await
+            .unwrap();
+        let msg_id = MessageId::from_borrowed("<hybrid-permanent-missing@example.com>").unwrap();
+        let backend = BackendId::from_index(0);
+
+        cache.record_missing(msg_id, backend).await;
+
+        let msg_id = MessageId::from_borrowed("<hybrid-permanent-missing@example.com>").unwrap();
+        let entry = cache.get(&msg_id).await.unwrap();
+        assert!(
+            entry.availability().eligible_backend(backend).is_none(),
+            "cached 430 must not produce an eligible success token"
+        );
+
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_sync_mixed_availability_creates_status_only_entry() {
+        let cache = HybridArticleCache::new_memory_only(1024 * 1024)
+            .await
+            .unwrap();
+        let msg_id = MessageId::from_borrowed("<mixed@example.com>").unwrap();
+        let mut availability = ArticleAvailability::new();
+        availability.record_missing(BackendId::from_index(0));
+        availability.record_has(
+            crate::cache::ArticleAvailability::new()
+                .eligible_backend(BackendId::from_index(1))
+                .expect("backend should be eligible"),
+        );
+
+        cache.sync_availability(msg_id, &availability).await;
+
+        let msg_id = MessageId::from_borrowed("<mixed@example.com>").unwrap();
+        let entry = cache
+            .get(&msg_id)
+            .await
+            .expect("mixed availability should create a status-only entry");
+        assert_eq!(entry.status_code(), StatusCode::new(223));
+        assert_eq!(entry.payload_len().get(), 0);
+        assert!(!entry.should_try_backend(BackendId::from_index(0)));
+        assert!(entry.should_try_backend(BackendId::from_index(1)));
+
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_sync_availability_preserves_existing_payload() {
+        let cache = HybridArticleCache::new_memory_only(1024 * 1024)
+            .await
+            .unwrap();
+        let msg_id = MessageId::from_borrowed("<mixed-payload@example.com>").unwrap();
+        let buffer =
+            b"220 0 <mixed-payload@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
+        cache
+            .upsert_ingest(
+                msg_id,
+                buffer.clone(),
+                crate::cache::ArticleAvailability::new()
+                    .eligible_backend(BackendId::from_index(1))
+                    .expect("backend should be eligible"),
+                0.into(),
+            )
+            .await;
+
+        let msg_id = MessageId::from_borrowed("<mixed-payload@example.com>").unwrap();
+        let mut availability = ArticleAvailability::new();
+        availability.record_missing(BackendId::from_index(0));
+        availability.record_has(
+            crate::cache::ArticleAvailability::new()
+                .eligible_backend(BackendId::from_index(1))
+                .expect("backend should be eligible"),
+        );
+
+        cache.sync_availability(msg_id, &availability).await;
+
+        let msg_id = MessageId::from_borrowed("<mixed-payload@example.com>").unwrap();
+        let entry = cache
+            .get(&msg_id)
+            .await
+            .expect("payload entry should remain cached");
+        let response = entry
+            .cached_response_for(crate::protocol::RequestKind::Article, msg_id.as_str())
+            .expect("availability sync must not replace payload with status-only entry");
+        let mut rendered = Vec::with_capacity(response.wire_len().get());
+        response.write_to(&mut rendered).await.unwrap();
+        assert_eq!(rendered, buffer);
+        assert!(!entry.should_try_backend(BackendId::from_index(0)));
+        assert!(entry.should_try_backend(BackendId::from_index(1)));
+
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_complete_payload_replaces_larger_metadata() {
+        let cache = HybridArticleCache::new_memory_only(1024 * 1024)
+            .await
+            .unwrap();
+        let msg_id = MessageId::from_borrowed("<complete-replaces-metadata@example.com>").unwrap();
+        let head = b"221 0 <complete-replaces-metadata@example.com>\r\nSubject: A very long header value that should not block a later body\r\nX-Test: metadata only\r\n.\r\n".to_vec();
+        let body = b"222 0 <complete-replaces-metadata@example.com>\r\nbody\r\n.\r\n".to_vec();
+
+        cache
+            .upsert_ingest(
+                msg_id,
+                head,
+                crate::cache::ArticleAvailability::new()
+                    .eligible_backend(BackendId::from_index(0))
+                    .expect("backend should be eligible"),
+                0.into(),
+            )
+            .await;
+
+        let msg_id = MessageId::from_borrowed("<complete-replaces-metadata@example.com>").unwrap();
+        cache
+            .upsert_ingest(
+                msg_id,
+                body.clone(),
+                crate::cache::ArticleAvailability::new()
+                    .eligible_backend(BackendId::from_index(1))
+                    .expect("backend should be eligible"),
+                0.into(),
+            )
+            .await;
+
+        let msg_id = MessageId::from_borrowed("<complete-replaces-metadata@example.com>").unwrap();
+        let entry = cache
+            .get(&msg_id)
+            .await
+            .expect("body entry should be cached");
+        assert!(entry.is_complete_article());
+        assert!(
+            entry
+                .cached_response_for(crate::protocol::RequestKind::Body, msg_id.as_str())
+                .is_some(),
+            "complete body response should replace larger metadata-only HEAD"
+        );
+        assert!(entry.should_try_backend(BackendId::from_index(0)));
         assert!(entry.should_try_backend(BackendId::from_index(1)));
 
         cache.close().await.unwrap();

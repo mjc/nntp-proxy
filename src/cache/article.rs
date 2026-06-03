@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use super::availability::ArticleAvailability;
+use super::availability::{ArticleAvailability, EligibleArticleBackend};
 use super::ttl;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -511,8 +511,8 @@ impl CachedArticle {
     }
 
     /// Record that a backend successfully provided this article
-    pub fn record_backend_has(&mut self, backend_id: BackendId) {
-        self.backend_availability.record_has(backend_id);
+    pub fn record_backend_has(&mut self, backend: EligibleArticleBackend) {
+        self.backend_availability.record_has(backend);
     }
 
     /// Check if all backends have been tried and none have the article
@@ -867,7 +867,7 @@ impl ArticleCache {
     fn merge_ingest_entry(
         maybe_entry: Option<Entry<Arc<str>, CachedArticle>>,
         new_entry_template: &CachedArticle,
-        backend_id: BackendId,
+        backend: EligibleArticleBackend,
     ) -> CachedArticle {
         if let Some(existing) = maybe_entry {
             let mut entry = existing.into_value();
@@ -889,11 +889,11 @@ impl ArticleCache {
             }
 
             entry.inserted_at = ttl::CacheTimestampMillis::now();
-            entry.record_backend_has(backend_id);
+            entry.record_backend_has(backend);
             entry
         } else {
             let mut entry = new_entry_template.clone();
-            entry.record_backend_has(backend_id);
+            entry.record_backend_has(backend);
             entry
         }
     }
@@ -902,7 +902,7 @@ impl ArticleCache {
         maybe_entry: Option<Entry<Arc<str>, CachedArticle>>,
         new_entry_template: &CachedArticle,
         status_code: StatusCode,
-        backend_id: BackendId,
+        backend: EligibleArticleBackend,
         tier: ttl::CacheTier,
     ) -> CachedArticle {
         let mut entry = maybe_entry.map_or_else(|| new_entry_template.clone(), Entry::into_value);
@@ -912,7 +912,7 @@ impl ArticleCache {
             entry.payload = CachedPayload::AvailabilityOnly;
         }
         entry.inserted_at = ttl::CacheTimestampMillis::now();
-        entry.record_backend_has(backend_id);
+        entry.record_backend_has(backend);
         entry
     }
 
@@ -939,10 +939,12 @@ impl ArticleCache {
             let mut entry = existing.into_value();
             entry.backend_availability.merge_from(&availability);
             Op::Put(entry)
-        } else if availability.any_backend_has_article() {
-            Op::Nop
         } else {
-            let mut entry = CachedArticle::missing(ttl::CacheTier::new(0));
+            let mut entry = if availability.any_backend_has_article() {
+                CachedArticle::availability_only(StatusCode::new(223), ttl::CacheTier::new(0))
+            } else {
+                CachedArticle::missing(ttl::CacheTier::new(0))
+            };
             entry.backend_availability = availability;
             Op::Put(entry)
         }
@@ -964,7 +966,7 @@ impl ArticleCache {
         &self,
         message_id: MessageId<'_>,
         buffer: impl Into<super::CacheIngestResponse>,
-        backend_id: BackendId,
+        backend: EligibleArticleBackend,
         tier: ttl::CacheTier,
     ) {
         let buffer = buffer.into();
@@ -979,7 +981,7 @@ impl ArticleCache {
                 std::future::ready(Self::merge_ingest_entry(
                     maybe_entry,
                     &new_entry_template,
-                    backend_id,
+                    backend,
                 ))
             })
             .await;
@@ -990,7 +992,7 @@ impl ArticleCache {
         &self,
         message_id: MessageId<'_>,
         status_code: StatusCode,
-        backend_id: BackendId,
+        backend: EligibleArticleBackend,
         tier: ttl::CacheTier,
     ) {
         let key: Arc<str> = message_id.without_brackets().into();
@@ -1003,7 +1005,7 @@ impl ArticleCache {
                     maybe_entry,
                     &new_entry_template,
                     status_code,
-                    backend_id,
+                    backend,
                     tier,
                 ))
             })
@@ -1052,9 +1054,9 @@ impl ArticleCache {
     /// backends that returned 430 during this request. Much more efficient
     /// than calling `record_backend_missing` for each backend individually.
     ///
-    /// IMPORTANT: Only creates a missing entry if ALL checked backends returned 430.
-    /// If any backend successfully provided the article, we skip creating an entry
-    /// (the actual article will be cached via upsert, which may race with this call).
+    /// If any backend successfully provided the article, creates a status-only
+    /// availability entry when no payload entry exists yet. This preserves same-request
+    /// 430s even if the success-side cache update races with this sync.
     pub async fn sync_availability(
         &self,
         message_id: MessageId<'_>,
@@ -1391,6 +1393,9 @@ mod tests {
         let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
         let msg_id = MessageId::from_str_or_wrap("test@example.com").unwrap();
         let backend_id = BackendId::from_index(0);
+        let backend = crate::cache::ArticleAvailability::new()
+            .eligible_backend(backend_id)
+            .expect("backend should be eligible");
         let complete = format!(
             "222 0 <test@example.com>\r\n{}\r\n.\r\n",
             "X".repeat(750_000)
@@ -1400,7 +1405,7 @@ mod tests {
             .upsert_ingest(
                 msg_id.clone(),
                 complete.as_bytes().to_vec(),
-                backend_id,
+                backend,
                 0.into(),
             )
             .await;
@@ -1408,7 +1413,7 @@ mod tests {
             .upsert_ingest(
                 msg_id.clone(),
                 b"222 0 <test@example.com>\r\n".to_vec(),
-                backend_id,
+                backend,
                 0.into(),
             )
             .await;
@@ -1426,6 +1431,9 @@ mod tests {
         let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
         let msg_id = MessageId::from_str_or_wrap("test@example.com").unwrap();
         let backend_id = BackendId::from_index(0);
+        let backend = crate::cache::ArticleAvailability::new()
+            .eligible_backend(backend_id)
+            .expect("backend should be eligible");
         let complete = format!(
             "222 0 <test@example.com>\r\n{}\r\n.\r\n",
             "X".repeat(750_000)
@@ -1435,7 +1443,7 @@ mod tests {
             .upsert_ingest(
                 msg_id.clone(),
                 b"222 0 <test@example.com>\r\n".to_vec(),
-                backend_id,
+                backend,
                 0.into(),
             )
             .await;
@@ -1452,7 +1460,7 @@ mod tests {
             .upsert_ingest(
                 msg_id.clone(),
                 complete.as_bytes().to_vec(),
-                backend_id,
+                backend,
                 0.into(),
             )
             .await;
@@ -1759,7 +1767,9 @@ mod tests {
             .upsert_ingest(
                 msgid.clone(),
                 buffer.clone(),
-                BackendId::from_index(0),
+                crate::cache::ArticleAvailability::new()
+                    .eligible_backend(BackendId::from_index(0))
+                    .expect("backend should be eligible"),
                 0.into(),
             )
             .await;
@@ -1786,7 +1796,9 @@ mod tests {
             .upsert_ingest(
                 msgid.clone(),
                 buffer.clone(),
-                BackendId::from_index(0),
+                crate::cache::ArticleAvailability::new()
+                    .eligible_backend(BackendId::from_index(0))
+                    .expect("backend should be eligible"),
                 0.into(),
             )
             .await;
@@ -1796,7 +1808,9 @@ mod tests {
             .upsert_ingest(
                 msgid.clone(),
                 buffer.clone(),
-                BackendId::from_index(1),
+                crate::cache::ArticleAvailability::new()
+                    .eligible_backend(BackendId::from_index(1))
+                    .expect("backend should be eligible"),
                 0.into(),
             )
             .await;
@@ -1825,6 +1839,20 @@ mod tests {
         // Backend 0 should still be tried, backend 1 should not
         assert!(retrieved.should_try_backend(BackendId::from_index(0)));
         assert!(!retrieved.should_try_backend(BackendId::from_index(1)));
+    }
+
+    #[tokio::test]
+    async fn cached_430_prevents_same_backend_success_token() {
+        let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
+        let msgid = MessageId::from_borrowed("<permanent-missing@example.com>").unwrap();
+        let backend = BackendId::from_index(0);
+
+        cache.record_backend_missing(msgid.clone(), backend).await;
+        let retrieved = cache.get(&msgid).await.unwrap();
+        assert!(
+            retrieved.availability().eligible_backend(backend).is_none(),
+            "cached 430 must not produce an eligible success token"
+        );
     }
 
     /// CRITICAL BUG FIX TEST: `record_backend_missing` must create cache entries
@@ -1944,7 +1972,14 @@ mod tests {
         let original_payload_size = b"Subject: Test2".len() + b"Body2".len();
 
         cache
-            .upsert_ingest(msgid.clone(), buffer, BackendId::from_index(0), 0.into())
+            .upsert_ingest(
+                msgid.clone(),
+                buffer,
+                crate::cache::ArticleAvailability::new()
+                    .eligible_backend(BackendId::from_index(0))
+                    .expect("backend should be eligible"),
+                0.into(),
+            )
             .await;
         cache.sync().await;
 

@@ -64,7 +64,7 @@ fn test_weighted_distribution_equal_weights() {
     let mut counts = [0; 2];
     for _ in 0..100 {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -109,7 +109,7 @@ fn test_weighted_distribution_unequal_weights() {
     let mut counts = [0; 2];
     for _ in 0..900 {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -162,7 +162,7 @@ fn test_weighted_distribution_three_backends() {
     let mut counts = [0; 3];
     for _ in 0..600 {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -214,7 +214,7 @@ fn test_weighted_real_world_scenario() {
 
     for _ in 0..total_requests {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -263,7 +263,7 @@ fn test_weighted_extreme_imbalance() {
     let mut counts = [0; 2];
     for _ in 0..1000 {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -305,7 +305,7 @@ fn test_weighted_consistency_across_runs() {
         let mut counts = [0; 2];
         for _ in 0..1000 {
             let backend = selector
-                .route_without_availability(ClientId::new())
+                .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
                 .unwrap();
             counts[backend.as_index()] += 1;
         }
@@ -340,7 +340,7 @@ fn test_zero_weight_backend_handled() {
     assert_eq!(selector.total_weight(), 0);
 
     // Should fail gracefully when routing
-    let result = selector.route_without_availability(ClientId::new());
+    let result = selector.route(nntp_proxy::router::RouteRequest::new(ClientId::new()));
     assert!(result.is_err());
 }
 
@@ -366,7 +366,7 @@ fn test_mixed_zero_and_nonzero_weights() {
     // All requests should go to the non-zero backend
     for _ in 0..100 {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         assert_eq!(backend.as_index(), 1);
     }
@@ -397,7 +397,7 @@ fn test_weighted_with_varying_pool_sizes() {
 
     for _ in 0..num_requests {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -435,7 +435,7 @@ fn test_weighted_single_backend() {
     // All requests should go to the only backend
     for _ in 0..100 {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         assert_eq!(backend.as_index(), 0);
     }
@@ -468,7 +468,7 @@ fn test_weighted_distribution_precision() {
 
     for _ in 0..num_requests {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
     }

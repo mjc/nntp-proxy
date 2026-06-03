@@ -4,6 +4,7 @@
 //! and tier-aware cache operations.
 
 use crate::cache::ArticleAvailability;
+use crate::cache::EligibleArticleBackend;
 use crate::cache::ttl::CacheTier;
 use crate::protocol::{
     RequestCacheEntryMetadata, RequestCacheStatus, RequestContext, RequestKind,
@@ -148,7 +149,7 @@ impl ClientSession {
         &self,
         msg_id: &crate::types::MessageId<'_>,
         buffer: crate::cache::CacheIngestResponse,
-        backend_id: crate::types::BackendId,
+        backend: EligibleArticleBackend,
         tier: CacheTier,
     ) {
         if !self.cache.stores_payload_responses() {
@@ -159,7 +160,7 @@ impl ClientSession {
         let msg_id_owned = msg_id.to_owned();
         tokio::spawn(async move {
             cache_clone
-                .upsert_ingest(msg_id_owned, buffer, backend_id, tier)
+                .upsert_ingest(msg_id_owned, buffer, backend, tier)
                 .await;
         });
     }
@@ -169,7 +170,7 @@ impl ClientSession {
         &self,
         msg_id: &crate::types::MessageId<'_>,
         status_code: StatusCode,
-        backend_id: crate::types::BackendId,
+        backend: EligibleArticleBackend,
         tier: CacheTier,
     ) {
         if !self.cache.records_backend_has_status() {
@@ -180,7 +181,7 @@ impl ClientSession {
         let msg_id_owned = msg_id.to_owned();
         tokio::spawn(async move {
             cache_clone
-                .record_backend_has_status(msg_id_owned, status_code, backend_id, tier)
+                .record_backend_has_status(msg_id_owned, status_code, backend, tier)
                 .await;
         });
     }
@@ -348,7 +349,9 @@ mod tests {
             .upsert_ingest(
                 msg_id.clone(),
                 expected.to_vec(),
-                BackendId::from_index(0),
+                crate::cache::ArticleAvailability::new()
+                    .eligible_backend(BackendId::from_index(0))
+                    .expect("backend should be eligible"),
                 0.into(),
             )
             .await;

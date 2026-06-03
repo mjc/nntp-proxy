@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::cache::{ArticleAvailability, CachedArticle, UnifiedCache};
+use crate::cache::{ArticleAvailability, CachedArticle, EligibleArticleBackend, UnifiedCache};
 use crate::metrics::MetricsCollector;
 use crate::pool::BufferPool;
 use crate::protocol::{RequestContext, StatusCode};
@@ -46,20 +46,32 @@ pub(crate) enum PrecheckResponse {
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum QueryResult {
-    Found(BackendId, PrecheckHit),
+    Found(EligibleArticleBackend, PrecheckHit),
     Missing(BackendId),
     Error,
 }
 
-impl QueryResult {
-    const fn is_missing(&self) -> bool {
-        matches!(self, Self::Missing(_))
+#[derive(Debug, PartialEq, Eq)]
+enum TierQuerySummary {
+    Exhausted(ArticleAvailability),
+    Inconclusive(ArticleAvailability),
+}
+
+impl TierQuerySummary {
+    const fn availability(&self) -> &ArticleAvailability {
+        match self {
+            Self::Exhausted(availability) | Self::Inconclusive(availability) => availability,
+        }
+    }
+
+    const fn is_exhausted(&self) -> bool {
+        matches!(self, Self::Exhausted(_))
     }
 }
 
-fn summarize_tier_results(results: &[QueryResult]) -> (bool, ArticleAvailability) {
+fn summarize_tier_results(results: &[QueryResult]) -> TierQuerySummary {
     let mut availability = ArticleAvailability::new();
-    let mut all_missing = !results.is_empty();
+    let mut exhausted = true;
 
     for result in results {
         match result {
@@ -68,22 +80,26 @@ fn summarize_tier_results(results: &[QueryResult]) -> (bool, ArticleAvailability
             }
             QueryResult::Found(id, _) => {
                 availability.record_has(*id);
-                all_missing = false;
+                exhausted = false;
             }
             QueryResult::Error => {
-                all_missing = false;
+                exhausted = false;
             }
         }
     }
 
-    (all_missing, availability)
+    if exhausted {
+        TierQuerySummary::Exhausted(availability)
+    } else {
+        TierQuerySummary::Inconclusive(availability)
+    }
 }
 
 #[derive(Debug)]
 #[cfg_attr(test, derive(PartialEq, Eq))]
 #[allow(clippy::large_enum_variant)]
 enum RacingQueryOutcome {
-    Hit(BackendId, PrecheckHit),
+    Hit(EligibleArticleBackend, PrecheckHit),
     Missing(ArticleAvailability),
     Inconclusive(ArticleAvailability),
 }
@@ -122,7 +138,7 @@ impl PrecheckDeps<'_> {
 async fn cache_precheck_hit(
     cache: &UnifiedCache,
     msg_id: MessageId<'static>,
-    backend_id: BackendId,
+    backend: EligibleArticleBackend,
     hit: PrecheckHit,
     tier: crate::cache::ttl::CacheTier,
 ) {
@@ -132,11 +148,11 @@ async fn cache_precheck_hit(
 
     match hit {
         PrecheckHit::Payload(data) => {
-            cache.upsert_ingest(msg_id, data, backend_id, tier).await;
+            cache.upsert_ingest(msg_id, data, backend, tier).await;
         }
         PrecheckHit::Availability(status_code) => {
             cache
-                .record_backend_has_status(msg_id, status_code, backend_id, tier)
+                .record_backend_has_status(msg_id, status_code, backend, tier)
                 .await;
         }
     }
@@ -144,9 +160,10 @@ async fn cache_precheck_hit(
 
 async fn query_backend(
     deps: &OwnedDeps,
-    backend_id: BackendId,
+    backend: EligibleArticleBackend,
     request: &RequestContext,
 ) -> QueryResult {
+    let backend_id = backend.backend_id();
     let Some(provider) = deps.router.backend_provider(backend_id) else {
         return QueryResult::Error;
     };
@@ -156,7 +173,7 @@ async fn query_backend(
 
     // Retry once on backend error (fresh connection on second attempt)
     let query_result: QueryResult = crate::session::retry::retry_once!(
-        execute_backend_query(deps, provider, backend_id, request).await,
+        execute_backend_query(deps, provider, backend, request).await,
         backend = backend_id.as_index()
     )
     .unwrap_or(QueryResult::Error);
@@ -174,9 +191,10 @@ async fn query_backend(
 async fn execute_backend_query(
     deps: &OwnedDeps,
     provider: &crate::pool::DeadpoolConnectionProvider,
-    backend_id: BackendId,
+    backend: EligibleArticleBackend,
     request: &RequestContext,
 ) -> Result<QueryResult, ()> {
+    let backend_id = backend.backend_id();
     let Ok(conn_raw) = provider.get_pooled_connection().await else {
         return Ok(QueryResult::Error);
     };
@@ -216,7 +234,7 @@ async fn execute_backend_query(
             )
             .await?;
 
-            let result = classify_precheck_result(deps, backend_id, status_code, timings, response);
+            let result = classify_precheck_result(deps, backend, status_code, timings, response);
 
             let _ = conn.release(); // response received; connection healthy, return to pool
             Ok(result)
@@ -288,11 +306,12 @@ async fn read_complete_precheck_hit(
 
 fn classify_precheck_result(
     deps: &OwnedDeps,
-    backend_id: BackendId,
+    backend: EligibleArticleBackend,
     status_code: StatusCode,
     timings: Option<(u64, u64, u64)>,
     response: PrecheckHit,
 ) -> QueryResult {
+    let backend_id = backend.backend_id();
     deps.metrics.record_command(backend_id);
     if let Some((ttfb, send, recv)) = timings {
         deps.metrics.record_ttfb_micros(backend_id, ttfb);
@@ -305,7 +324,7 @@ fn classify_precheck_result(
                 backend = backend_id.as_index(),
                 "precheck recording command to metrics"
             );
-            QueryResult::Found(backend_id, response)
+            QueryResult::Found(backend, response)
         }
         430 => {
             deps.metrics.record_error_4xx(backend_id);
@@ -327,19 +346,22 @@ fn classify_precheck_result(
 }
 
 /// Query backends tier by tier, collecting results as they arrive.
-async fn query_all_backends(deps: &OwnedDeps, request: &RequestContext) -> Vec<QueryResult> {
+async fn query_all_backends(
+    deps: &OwnedDeps,
+    request: &RequestContext,
+    availability: &ArticleAvailability,
+) -> Vec<QueryResult> {
     let mut results = Vec::with_capacity(deps.router.backend_count().get());
 
     for tier in deps.router.tiers() {
-        let tier_results = query_tier_backends(deps, request, tier).await;
+        let tier_results = query_tier_backends(deps, request, tier, availability).await;
         let found = tier_results
             .iter()
             .any(|result| matches!(result, QueryResult::Found(_, _)));
-        let all_missing =
-            !tier_results.is_empty() && tier_results.iter().all(QueryResult::is_missing);
+        let tier_exhausted = summarize_tier_results(&tier_results).is_exhausted();
         results.extend(tier_results);
 
-        if found || !all_missing {
+        if found || !tier_exhausted {
             break;
         }
     }
@@ -353,12 +375,13 @@ async fn query_all_backends_racing(
     deps: &OwnedDeps,
     request: &RequestContext,
     msg_id: &MessageId<'_>,
+    initial_availability: &ArticleAvailability,
 ) -> RacingQueryOutcome {
     let mut results = Vec::with_capacity(deps.router.backend_count().get());
     let mut accumulated_availability = ArticleAvailability::new();
 
     for tier in deps.router.tiers() {
-        let mut pending = spawn_backend_queries_for_tier(deps, request, tier);
+        let mut pending = spawn_backend_queries_for_tier(deps, request, tier, initial_availability);
         let tier_results_start = results.len();
 
         while let Some(result) = pending.next().await {
@@ -387,15 +410,16 @@ async fn query_all_backends_racing(
             }
         }
 
-        let (all_missing, availability) = summarize_tier_results(&results[tier_results_start..]);
+        let tier_summary = summarize_tier_results(&results[tier_results_start..]);
         results.clear();
-        accumulated_availability.merge_from(&availability);
+        let availability = tier_summary.availability();
+        accumulated_availability.merge_from(availability);
         if availability.missing_bits() != 0 {
             deps.cache
-                .sync_availability(msg_id.to_owned(), &availability)
+                .sync_availability(msg_id.to_owned(), availability)
                 .await;
         }
-        if !all_missing {
+        if !tier_summary.is_exhausted() {
             return RacingQueryOutcome::Inconclusive(accumulated_availability);
         }
     }
@@ -407,8 +431,9 @@ async fn query_tier_backends(
     deps: &OwnedDeps,
     request: &RequestContext,
     tier: u8,
+    availability: &ArticleAvailability,
 ) -> Vec<QueryResult> {
-    let mut pending = spawn_backend_queries_for_tier(deps, request, tier);
+    let mut pending = spawn_backend_queries_for_tier(deps, request, tier, availability);
     let mut results = Vec::new();
 
     while let Some(result) = pending.next().await {
@@ -424,13 +449,15 @@ fn spawn_backend_queries_for_tier(
     deps: &OwnedDeps,
     request: &RequestContext,
     tier: u8,
+    availability: &ArticleAvailability,
 ) -> FuturesUnordered<tokio::task::JoinHandle<QueryResult>> {
     deps.router
         .backend_ids_in_tier(tier)
-        .map(|id| {
+        .filter_map(|id| availability.eligible_backend(id))
+        .map(|backend| {
             let deps = deps.clone();
             let request = request.clone();
-            tokio::spawn(async move { query_backend(&deps, id, &request).await })
+            tokio::spawn(async move { query_backend(&deps, backend, &request).await })
         })
         .collect()
 }
@@ -440,7 +467,12 @@ fn spawn_backend_queries_for_tier(
 /// # NNTP Semantics
 /// 430 responses are authoritative (never false negatives), 2xx are not.
 /// See `crate::cache::article` module docs for full explanation.
-fn summarize(results: Vec<QueryResult>) -> (Option<(BackendId, PrecheckHit)>, ArticleAvailability) {
+fn summarize(
+    results: Vec<QueryResult>,
+) -> (
+    Option<(EligibleArticleBackend, PrecheckHit)>,
+    ArticleAvailability,
+) {
     let mut availability = ArticleAvailability::new();
     let mut found = None;
 
@@ -477,6 +509,7 @@ pub(crate) async fn precheck(
     deps: &PrecheckDeps<'_>,
     request: &RequestContext,
     msg_id: &MessageId<'_>,
+    availability: &ArticleAvailability,
 ) -> Option<PrecheckResponse> {
     // Check cache first - if we have a complete article, return it immediately
     if let Some(cached) = deps.cache.get(msg_id).await
@@ -486,11 +519,11 @@ pub(crate) async fn precheck(
     }
 
     let owned = deps.clone_deps();
-    let outcome = query_all_backends_racing(&owned, request, msg_id).await;
+    let outcome = query_all_backends_racing(&owned, request, msg_id, availability).await;
 
     // Cache the found result and return it
     match outcome {
-        RacingQueryOutcome::Hit(backend_id, data) => {
+        RacingQueryOutcome::Hit(backend, data) => {
             // NOTE: We intentionally use tier 0 for articles found via racing queries.
             // Racing all backends can cause higher-tier backends to respond slightly faster,
             // incorrectly caching an article as "higher tier" (longer TTL) even if a lower-tier
@@ -503,7 +536,7 @@ pub(crate) async fn precheck(
                         cache_precheck_hit(
                             &owned.cache,
                             msg_id.to_owned(),
-                            backend_id,
+                            backend,
                             PrecheckHit::Payload(response),
                             tier,
                         )
@@ -519,7 +552,7 @@ pub(crate) async fn precheck(
                         cache_precheck_hit(
                             &owned.cache,
                             msg_id.to_owned(),
-                            backend_id,
+                            backend,
                             PrecheckHit::Availability(status_code),
                             tier,
                         )
@@ -560,7 +593,13 @@ pub fn spawn_background_precheck(
             return;
         }
 
-        let results = query_all_backends(&owned, &request).await;
+        let availability = owned
+            .cache
+            .get(&msg_id)
+            .await
+            .map(|entry| entry.to_availability(owned.router.backend_count()))
+            .unwrap_or_default();
+        let results = query_all_backends(&owned, &request, &availability).await;
         let (found, availability) = summarize(results);
 
         if let Some((backend_id, data)) = found {
@@ -588,6 +627,12 @@ mod tests {
     use crate::router::BackendSelector;
     use crate::types::BufferSize;
 
+    fn eligible(backend_id: BackendId) -> EligibleArticleBackend {
+        ArticleAvailability::new()
+            .eligible_backend(backend_id)
+            .expect("backend should be eligible")
+    }
+
     fn test_owned_deps(num_backends: usize) -> OwnedDeps {
         OwnedDeps {
             router: Arc::new(BackendSelector::new()),
@@ -603,11 +648,11 @@ mod tests {
         let results = vec![
             QueryResult::Missing(BackendId::from_index(0)),
             QueryResult::Found(
-                BackendId::from_index(1),
+                eligible(BackendId::from_index(1)),
                 PrecheckHit::Payload(b"first".to_vec().into()),
             ),
             QueryResult::Found(
-                BackendId::from_index(2),
+                eligible(BackendId::from_index(2)),
                 PrecheckHit::Payload(b"second".to_vec().into()),
             ),
         ];
@@ -615,7 +660,7 @@ mod tests {
         assert_eq!(
             found,
             Some((
-                BackendId::from_index(1),
+                eligible(BackendId::from_index(1)),
                 PrecheckHit::Payload(crate::cache::CacheIngestResponse::from(b"first".to_vec()))
             ))
         );
@@ -644,25 +689,39 @@ mod tests {
     }
 
     #[test]
+    fn summarize_tier_results_treats_empty_tier_as_exhausted() {
+        let summary = summarize_tier_results(&[]);
+
+        assert!(matches!(
+            summary,
+            TierQuerySummary::Exhausted(availability) if availability.checked_bits() == 0
+        ));
+    }
+
+    #[test]
     fn summarize_tier_results_requires_every_backend_to_miss() {
-        let (all_missing, availability) = summarize_tier_results(&[
+        let summary = summarize_tier_results(&[
             QueryResult::Missing(BackendId::from_index(0)),
             QueryResult::Missing(BackendId::from_index(1)),
         ]);
 
-        assert!(all_missing);
+        let TierQuerySummary::Exhausted(availability) = summary else {
+            panic!("all-missing tier should be exhausted");
+        };
         assert!(availability.is_missing(BackendId::from_index(0)));
         assert!(availability.is_missing(BackendId::from_index(1)));
     }
 
     #[test]
     fn summarize_tier_results_treats_partial_missing_with_error_as_inconclusive() {
-        let (all_missing, availability) = summarize_tier_results(&[
+        let summary = summarize_tier_results(&[
             QueryResult::Missing(BackendId::from_index(0)),
             QueryResult::Error,
         ]);
 
-        assert!(!all_missing);
+        let TierQuerySummary::Inconclusive(availability) = summary else {
+            panic!("tier with backend error should be inconclusive");
+        };
         assert!(availability.is_missing(BackendId::from_index(0)));
         assert!(!availability.is_missing(BackendId::from_index(1)));
     }
@@ -674,7 +733,7 @@ mod tests {
 
         let result = classify_precheck_result(
             &deps,
-            backend_id,
+            eligible(backend_id),
             StatusCode::new(412),
             Some((11, 22, 33)),
             PrecheckHit::Availability(StatusCode::new(412)),
@@ -697,7 +756,7 @@ mod tests {
 
         let result = classify_precheck_result(
             &deps,
-            backend_id,
+            eligible(backend_id),
             StatusCode::new(502),
             None,
             PrecheckHit::Availability(StatusCode::new(502)),
@@ -852,7 +911,7 @@ mod tests {
 
         let request =
             RequestContext::parse(b"ARTICLE <test@example.com>\r\n").expect("valid request line");
-        let result = query_backend(&deps, backend_id, &request).await;
+        let result = query_backend(&deps, eligible(backend_id), &request).await;
         assert_eq!(result, QueryResult::Error);
     }
 
@@ -872,7 +931,7 @@ mod tests {
 
         let request =
             RequestContext::parse(b"ARTICLE <test@example.com>\r\n").expect("valid request line");
-        let result = query_backend(&deps, backend_id, &request).await;
+        let result = query_backend(&deps, eligible(backend_id), &request).await;
         assert_eq!(result, QueryResult::Error);
     }
 
@@ -891,11 +950,14 @@ mod tests {
 
         let request =
             RequestContext::parse(b"ARTICLE <test@example.com>\r\n").expect("valid request line");
-        let result = query_backend(&deps, backend_id, &request).await;
+        let result = query_backend(&deps, eligible(backend_id), &request).await;
 
         assert_eq!(
             result,
-            QueryResult::Found(backend_id, PrecheckHit::Availability(StatusCode::new(220)))
+            QueryResult::Found(
+                eligible(backend_id),
+                PrecheckHit::Availability(StatusCode::new(220))
+            )
         );
     }
 
@@ -910,7 +972,7 @@ mod tests {
         cache_precheck_hit(
             &cache,
             msg_id.to_owned(),
-            backend_id,
+            eligible(backend_id),
             PrecheckHit::Availability(StatusCode::new(223)),
             crate::cache::ttl::CacheTier::new(0),
         )

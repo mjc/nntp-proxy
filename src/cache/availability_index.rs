@@ -1000,7 +1000,11 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<mixed@example.com>").unwrap();
         let mut availability = ArticleAvailability::new();
         availability.record_missing(BackendId::from_index(0));
-        availability.record_has(BackendId::from_index(1));
+        availability.record_has(
+            crate::cache::ArticleAvailability::new()
+                .eligible_backend(BackendId::from_index(1))
+                .expect("backend should be eligible"),
+        );
 
         index.sync_availability(&msg_id, &availability);
 

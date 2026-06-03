@@ -95,7 +95,9 @@ fn test_excessive_complete_command_calls() {
     );
 
     // Route one command
-    router.route_without_availability(client_id).unwrap();
+    router
+        .route(nntp_proxy::router::RouteRequest::new(client_id))
+        .unwrap();
     assert_eq!(router.backend_load(backend_id).map(|c| c.get()), Some(1));
 
     // Complete it once
@@ -132,7 +134,9 @@ fn test_large_number_of_backends() {
 
     // Route 1000 commands
     for _ in 0..1000 {
-        let backend_id = router.route_without_availability(client_id).unwrap();
+        let backend_id = router
+            .route(nntp_proxy::router::RouteRequest::new(client_id))
+            .unwrap();
         assert!(backend_id.as_index() < 100);
     }
 }
@@ -172,7 +176,9 @@ fn test_single_backend_round_robin() {
 
     // All commands should route to the same backend
     for _ in 0..10 {
-        let selected = router.route_without_availability(client_id).unwrap();
+        let selected = router
+            .route(nntp_proxy::router::RouteRequest::new(client_id))
+            .unwrap();
         assert_eq!(selected, backend_id);
     }
 }
@@ -224,7 +230,9 @@ fn test_concurrent_route_calls() {
             let router_clone = Arc::clone(&router_arc);
             std::thread::spawn(move || {
                 let client_id = ClientId::new();
-                router_clone.route_without_availability(client_id).unwrap()
+                router_clone
+                    .route(nntp_proxy::router::RouteRequest::new(client_id))
+                    .unwrap()
             })
         })
         .collect();
@@ -316,11 +324,15 @@ fn test_wrap_around_with_large_counter() {
 
     // Route enough commands to potentially overflow smaller counter types
     for _ in 0..10000 {
-        let backend_id = router.route_without_availability(client_id).unwrap();
+        let backend_id = router
+            .route(nntp_proxy::router::RouteRequest::new(client_id))
+            .unwrap();
         assert!(backend_id.as_index() < 2);
     }
 
     // Should still work correctly after many iterations
-    let backend = router.route_without_availability(client_id).unwrap();
+    let backend = router
+        .route(nntp_proxy::router::RouteRequest::new(client_id))
+        .unwrap();
     assert!(backend.as_index() < 2);
 }

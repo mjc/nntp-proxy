@@ -6,8 +6,8 @@
 //!
 //! # NNTP Response Semantics (CRITICAL)
 //!
-//! **430 "No Such Article" is AUTHORITATIVE** - NNTP servers NEVER give false negatives.
-//! If a server returns 430, the article is definitively not present on that server.
+//! **430 "No Such Article" is AUTHORITATIVE** - once a backend returns 430 for
+//! a cache entry, that backend stays missing for the lifetime of that entry.
 //!
 //! **2xx success responses are UNRELIABLE** - servers CAN give false positives.
 //! A server might return 220/222/223 but then provide corrupt or incomplete data.
@@ -32,6 +32,31 @@ pub enum BackendStatus {
     Missing,
     /// Backend was checked and has the article
     HasArticle,
+}
+
+/// A backend that is known to be eligible for an article attempt.
+///
+/// This is intentionally not constructible outside this module. Code that sends
+/// an article request to a backend or records a positive article observation must
+/// first prove the backend was not already known missing by asking
+/// [`ArticleAvailability`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EligibleArticleBackend {
+    backend_id: BackendId,
+}
+
+impl EligibleArticleBackend {
+    #[inline]
+    #[must_use]
+    pub const fn backend_id(self) -> BackendId {
+        self.backend_id
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn as_index(self) -> usize {
+        self.backend_id.as_index()
+    }
 }
 
 /// Track which backends have (or don't have) a specific article
@@ -84,12 +109,10 @@ impl ArticleAvailability {
         }
     }
 
-    /// Record that a backend returned 430 (doesn't have the article)
+    /// Record that a backend returned 430 (doesn't have the article).
     ///
-    /// # NNTP Semantics
-    /// **430 is AUTHORITATIVE** - this is a definitive "no". Once marked missing,
-    /// the backend should not be retried for this article until cache TTL expires.
-    /// See module-level docs for full explanation.
+    /// Once marked missing, the backend should not be retried for this cache entry.
+    /// Later positive observations do not clear the missing bit.
     ///
     /// # Panics (debug builds only)
     /// Panics if `backend_id` >= 8. Config validation enforces max 8 backends.
@@ -101,21 +124,17 @@ impl ArticleAvailability {
         self
     }
 
-    /// Record that a backend returned a success response (2xx) for this article
+    /// Record that a backend returned a success response (2xx) for this article.
     ///
-    /// # NNTP Semantics Warning
-    /// **2xx responses are UNRELIABLE** - servers can give false positives.
-    /// This clears the missing bit for fresh `ArticleAvailability` instances,
-    /// but when merged via `merge_from()`, existing 430s take precedence.
-    /// See module-level docs for full explanation.
+    /// This marks the backend as checked. It deliberately does not clear an
+    /// existing missing bit: within a live cache entry, 430 state is permanent.
     ///
     /// # Panics (debug builds only)
     /// Panics if `backend_id` >= 8. Config validation enforces max 8 backends.
     #[inline]
-    pub fn record_has(&mut self, backend_id: BackendId) -> &mut Self {
-        let mask = backend_id.availability_bit();
+    pub fn record_has(&mut self, backend: EligibleArticleBackend) -> &mut Self {
+        let mask = backend.backend_id.availability_bit();
         self.checked |= mask; // Mark as checked
-        self.missing &= !mask; // Clear missing bit (has the article)
         self
     }
 
@@ -126,8 +145,8 @@ impl ArticleAvailability {
     ///
     /// # NNTP Semantics (CRITICAL)
     ///
-    /// **430 responses are AUTHORITATIVE** - NNTP servers NEVER give false negatives.
-    /// If a server says "no such article" (430), the article is definitively not there.
+    /// **430 responses are AUTHORITATIVE** - once a live cache entry records a
+    /// 430 for a backend, later success observations do not clear it.
     ///
     /// **2xx responses are UNRELIABLE** - servers CAN give false positives.
     /// A server might claim to have an article but return corrupt data, or the
@@ -163,6 +182,14 @@ impl ArticleAvailability {
     #[must_use]
     pub fn should_try(&self, backend_id: BackendId) -> bool {
         !self.is_missing(backend_id)
+    }
+
+    /// Return an article-attempt token only if this backend is not known missing.
+    #[inline]
+    #[must_use]
+    pub fn eligible_backend(&self, backend_id: BackendId) -> Option<EligibleArticleBackend> {
+        self.should_try(backend_id)
+            .then_some(EligibleArticleBackend { backend_id })
     }
 
     /// Get the raw missing bitset for debugging
@@ -321,7 +348,8 @@ mod tests {
         assert!(!avail.any_backend_has_article());
 
         // Record b1 as having it - now one has it
-        avail.record_has(b1);
+        let b1_eligible = avail.eligible_backend(b1).unwrap();
+        avail.record_has(b1_eligible);
         assert!(avail.any_backend_has_article());
 
         // Record b1 as missing (overwrite) - none have it again
@@ -330,7 +358,7 @@ mod tests {
     }
 
     #[test]
-    fn test_record_has_clears_missing_bit() {
+    fn missing_backend_is_not_eligible_for_record_has() {
         let mut avail = ArticleAvailability::new();
         let b0 = BackendId::from_index(0);
 
@@ -339,10 +367,7 @@ mod tests {
         assert!(avail.is_missing(b0));
         assert!(!avail.any_backend_has_article());
 
-        // Now mark as has - should clear missing
-        avail.record_has(b0);
-        assert!(!avail.is_missing(b0));
-        assert!(avail.any_backend_has_article());
+        assert!(avail.eligible_backend(b0).is_none());
     }
 
     #[test]
@@ -356,7 +381,8 @@ mod tests {
         let b1 = BackendId::from_index(1);
 
         // Previous request got success from backend 0 (might be false positive)
-        cache_entry.record_has(b0);
+        let b0_eligible = cache_entry.eligible_backend(b0).unwrap();
+        cache_entry.record_has(b0_eligible);
         assert!(!cache_entry.is_missing(b0));
         assert!(cache_entry.any_backend_has_article());
 
@@ -421,7 +447,8 @@ mod tests {
 
         // New request claims success from backend 0 (but 2xx is unreliable!)
         let mut new_fetch = ArticleAvailability::new();
-        new_fetch.record_has(b0);
+        let b0_eligible = new_fetch.eligible_backend(b0).unwrap();
+        new_fetch.record_has(b0_eligible);
 
         // Merge new fetch into cache
         cache_state.merge_from(&new_fetch);

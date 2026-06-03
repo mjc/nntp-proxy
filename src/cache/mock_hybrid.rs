@@ -71,12 +71,18 @@ impl MockHybridCache {
         {
             // Just update availability
             let mut updated = existing.clone();
-            updated.record_backend_has(backend_id);
+            if let Some(backend) = updated.availability().eligible_backend(backend_id) {
+                updated.record_backend_has(backend);
+            }
             storage.insert(key, updated);
             return;
         }
 
-        entry.record_backend_has(backend_id);
+        let backend = entry
+            .availability()
+            .eligible_backend(backend_id)
+            .expect("new mock entry should be eligible");
+        entry.record_backend_has(backend);
         storage.insert(key, entry);
     }
 

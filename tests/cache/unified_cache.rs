@@ -60,7 +60,14 @@ async fn test_unified_cache_memory_upsert_and_get() {
     let backend_id = BackendId::from_index(0);
 
     cache
-        .upsert_ingest(msg_id.clone(), buffer.clone(), backend_id, 0.into())
+        .upsert_ingest(
+            msg_id.clone(),
+            buffer.clone(),
+            nntp_proxy::cache::ArticleAvailability::new()
+                .eligible_backend(backend_id)
+                .expect("backend should be eligible"),
+            0.into(),
+        )
         .await;
 
     let result = cache.get(&msg_id).await;
@@ -112,7 +119,14 @@ async fn test_unified_cache_sync_availability() {
 
     // First insert an article
     cache
-        .upsert_ingest(msg_id.clone(), buffer.clone(), backend_id, 0.into())
+        .upsert_ingest(
+            msg_id.clone(),
+            buffer.clone(),
+            nntp_proxy::cache::ArticleAvailability::new()
+                .eligible_backend(backend_id)
+                .expect("backend should be eligible"),
+            0.into(),
+        )
         .await;
 
     // Create availability with backend 1 marked as missing
@@ -135,7 +149,11 @@ async fn test_unified_cache_availability_sync_persists_only_missing_bits() {
     let msg_id = MessageId::from_str_or_wrap("test@example.com").unwrap();
     let mut availability = ArticleAvailability::new();
     availability.record_missing(BackendId::from_index(1));
-    availability.record_has(BackendId::from_index(2));
+    availability.record_has(
+        nntp_proxy::cache::ArticleAvailability::new()
+            .eligible_backend(BackendId::from_index(2))
+            .expect("backend should be eligible"),
+    );
 
     cache.sync_availability(msg_id.clone(), &availability).await;
 
@@ -167,7 +185,14 @@ async fn test_unified_cache_weighted_size() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
 
     cache
-        .upsert_ingest(msg_id.clone(), buffer, BackendId::from_index(0), 0.into())
+        .upsert_ingest(
+            msg_id.clone(),
+            buffer,
+            nntp_proxy::cache::ArticleAvailability::new()
+                .eligible_backend(BackendId::from_index(0))
+                .expect("backend should be eligible"),
+            0.into(),
+        )
         .await;
 
     // Run pending tasks to ensure moka updates its internal state
@@ -266,8 +291,16 @@ fn test_availability_from_bits_roundtrip() {
     let mut original = ArticleAvailability::new();
     original.record_missing(BackendId::from_index(0));
     original.record_missing(BackendId::from_index(2));
-    original.record_has(BackendId::from_index(1));
-    original.record_has(BackendId::from_index(3));
+    original.record_has(
+        nntp_proxy::cache::ArticleAvailability::new()
+            .eligible_backend(BackendId::from_index(1))
+            .expect("backend should be eligible"),
+    );
+    original.record_has(
+        nntp_proxy::cache::ArticleAvailability::new()
+            .eligible_backend(BackendId::from_index(3))
+            .expect("backend should be eligible"),
+    );
 
     let checked = original.checked_bits();
     let missing = original.missing_bits();

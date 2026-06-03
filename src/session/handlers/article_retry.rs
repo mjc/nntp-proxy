@@ -4,7 +4,8 @@
 //! to skip backends that have already returned 430 for a given article.
 
 use crate::cache::ArticleAvailability;
-use crate::router::BackendSelector;
+use crate::cache::EligibleArticleBackend;
+use crate::router::{BackendSelector, SuppressedBackends};
 use crate::session::ClientSession;
 use crate::session::SessionError;
 use crate::session::handlers::cache_operations::{
@@ -125,7 +126,7 @@ pub(super) struct OrderedLargeTransferResult {
 }
 
 type OrderedLargeTransferAttemptData = (
-    crate::types::BackendId,
+    EligibleArticleBackend,
     crate::router::CommandGuard,
     crate::pool::ConnectionGuard,
     crate::protocol::StatusCode,
@@ -249,7 +250,10 @@ impl ClientSession {
             ),
             None => None,
         };
-        if self.try_adaptive_precheck(router, request, io).await? {
+        if self
+            .try_adaptive_precheck(router, request, io, availability.as_ref())
+            .await?
+        {
             return Ok(PreparedRequest::Served);
         }
 
@@ -267,6 +271,7 @@ impl ClientSession {
         router: &Arc<BackendSelector>,
         request: &RequestContext,
         io: &mut RequestExecutionIo<'_>,
+        availability: Option<&ArticleAvailability>,
     ) -> Result<bool, SessionError> {
         if !self.adaptive_precheck || !(request.is_stat() || request.is_head()) {
             return Ok(false);
@@ -277,9 +282,12 @@ impl ClientSession {
         let Some(msg_id) = request.message_id_value() else {
             return Ok(false);
         };
+        let Some(availability) = availability else {
+            return Ok(false);
+        };
 
         let deps = self.precheck_deps(router);
-        let Some(response) = precheck::precheck(&deps, request, &msg_id).await else {
+        let Some(response) = precheck::precheck(&deps, request, &msg_id, availability).await else {
             return Ok(false);
         };
 
@@ -381,7 +389,7 @@ impl ClientSession {
         );
 
         let mut availability = availability.unwrap_or_default();
-        let mut unavailable_backends = 0;
+        let mut unavailable_backends = SuppressedBackends::empty();
         debug!(
             "Client {} availability routing: missing_bits={:08b}, backend_count={}",
             self.client_addr,
@@ -415,7 +423,8 @@ impl ClientSession {
                         .await;
                     return Ok(());
                 }
-                Ok(BackendAttemptResult::ArticleNotFound { backend_id }) => {
+                Ok(BackendAttemptResult::ArticleNotFound { missing }) => {
+                    let backend_id = missing.backend_id();
                     debug!(
                         "Client {} backend {:?} returned 430 during retry",
                         self.client_addr, backend_id
@@ -494,7 +503,7 @@ impl ClientSession {
         let mut backend_connection = None;
         let mut client_to_backend_bytes = ClientToBackendBytes::zero();
         let mut backend_to_client_bytes = BackendToClientBytes::zero();
-        let mut unavailable_backends = 0;
+        let mut unavailable_backends = SuppressedBackends::empty();
 
         while !availability.all_exhausted(router.backend_count()) {
             let attempt = match self
@@ -520,7 +529,7 @@ impl ClientSession {
                 }
             };
 
-            let Some((backend_id, guard, mut conn, status_code, buffer)) = (match attempt {
+            let Some((backend, guard, mut conn, status_code, buffer)) = (match attempt {
                 Ok(attempt) => attempt,
                 Err(OrderedLargeTransferNoAttempt::BackendUnavailable) => continue,
                 Err(OrderedLargeTransferNoAttempt::NoRetryableBackend) => {
@@ -561,9 +570,10 @@ impl ClientSession {
             }) else {
                 continue;
             };
+            let backend_id = backend.backend_id();
 
             if let Some(missing) =
-                AuthoritativeArticleMissing::from_status_code(backend_id, status_code)
+                AuthoritativeArticleMissing::from_status_code(backend, status_code)
             {
                 self.record_authoritative_article_missing(missing, &mut availability);
                 if let Some(msg_id) = request.message_id_value() {
@@ -606,7 +616,7 @@ impl ClientSession {
                     .write_successful_backend_response(
                         conn,
                         &mut *client_write,
-                        backend_id,
+                        backend,
                         buffer,
                         ResponseWriteParams {
                             request,
@@ -642,7 +652,7 @@ impl ClientSession {
                 }
             };
 
-            Self::record_successful_availability(backend_id, status_code, &mut availability);
+            Self::record_successful_availability(backend, status_code, &mut availability);
             guard.complete();
             self.sync_availability_if_needed(msg_id.as_ref(), &availability)
                 .await;
@@ -696,14 +706,13 @@ impl ClientSession {
         availability: &mut crate::cache::ArticleAvailability,
         client_to_backend_bytes: &mut ClientToBackendBytes,
         backend_connection: &mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
-        unavailable_backends: &mut u8,
+        unavailable_backends: &mut SuppressedBackends,
     ) -> Result<OrderedLargeTransferAttempt, SessionError> {
-        let backend_id = match router.route_with_availability_suppressing(
-            self.client_id,
-            Some(availability),
-            *unavailable_backends,
-        ) {
-            Ok(backend_id) => backend_id,
+        let route_request = crate::router::RouteRequest::new(self.client_id)
+            .with_availability(availability)
+            .suppressing_backends(unavailable_backends.clone());
+        let backend = match router.route(route_request) {
+            Ok(backend) => backend,
             Err(err) => {
                 debug!(
                     client = %self.client_addr,
@@ -715,14 +724,15 @@ impl ClientSession {
                 return Ok(Err(OrderedLargeTransferNoAttempt::NoRetryableBackend));
             }
         };
+        let backend_id = backend.backend_id();
         let guard = crate::router::CommandGuard::new(router.clone(), backend_id);
         let Some(provider) = self.retry_backend_provider(
             router,
-            backend_id,
+            backend,
             request,
             RetryAttemptKind::OrderedPipeline,
         ) else {
-            *unavailable_backends |= backend_id.availability_bit();
+            unavailable_backends.suppress(backend_id);
             return Ok(Err(OrderedLargeTransferNoAttempt::BackendUnavailable));
         };
         let mut state = ArticleAttemptState {
@@ -732,16 +742,16 @@ impl ClientSession {
             unavailable_backends,
         };
         let prepared = self
-            .prepare_backend_attempt(provider, backend_id, request, &mut state)
+            .prepare_backend_attempt(provider, backend, request, &mut state)
             .await;
         let Some((conn, status_code, buffer)) = (match prepared {
             Ok(prepared) => prepared,
             Err(SessionError::Backend(err)) => {
-                *state.unavailable_backends |= backend_id.availability_bit();
+                state.unavailable_backends.suppress(backend_id);
                 debug!(
                     client = %self.client_addr,
                     backend = backend_id.as_index(),
-                    unavailable_backends = format_args!("{:08b}", *state.unavailable_backends),
+                    unavailable_backends = format_args!("{:08b}", state.unavailable_backends.bits()),
                     command_verb = ?request.verb(),
                     msg_id = ?request.message_id_value(),
                     error = %err,
@@ -754,7 +764,7 @@ impl ClientSession {
             return Ok(Ok(None));
         };
 
-        Ok(Ok(Some((backend_id, guard, conn, status_code, buffer))))
+        Ok(Ok(Some((backend, guard, conn, status_code, buffer))))
     }
 
     /// Load article availability from cache or create fresh tracker
@@ -797,12 +807,12 @@ impl ClientSession {
     }
 
     pub(super) fn record_successful_availability(
-        backend_id: crate::types::BackendId,
+        backend: EligibleArticleBackend,
         status_code: crate::protocol::StatusCode,
         availability: &mut crate::cache::ArticleAvailability,
     ) {
         if status_code.is_success() {
-            availability.record_has(backend_id);
+            availability.record_has(backend);
         }
     }
 
@@ -895,7 +905,9 @@ mod tests {
         let backend_id = BackendId::from_index(2);
 
         ClientSession::record_successful_availability(
-            backend_id,
+            crate::cache::ArticleAvailability::new()
+                .eligible_backend(backend_id)
+                .expect("backend should be eligible"),
             StatusCode::new(222),
             &mut availability,
         );
@@ -910,7 +922,9 @@ mod tests {
         let mut availability = ArticleAvailability::new();
 
         ClientSession::record_successful_availability(
-            BackendId::from_index(1),
+            crate::cache::ArticleAvailability::new()
+                .eligible_backend(BackendId::from_index(1))
+                .expect("backend should be eligible"),
             StatusCode::new(430),
             &mut availability,
         );
@@ -921,24 +935,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_availability_prevents_sync_from_creating_missing_only_entry() {
-        let cache = UnifiedCache::memory(100, Duration::from_secs(60));
+    async fn successful_availability_sync_preserves_missing_backend_without_payload() {
+        let cache = UnifiedCache::memory(1_000_000, Duration::from_secs(60));
         let msg_id = MessageId::from_borrowed("<ordered-success@example.com>").unwrap();
         let mut availability = ArticleAvailability::new();
         availability.record_missing(BackendId::from_index(0));
 
         ClientSession::record_successful_availability(
-            BackendId::from_index(1),
+            crate::cache::ArticleAvailability::new()
+                .eligible_backend(BackendId::from_index(1))
+                .expect("backend should be eligible"),
             StatusCode::new(222),
             &mut availability,
         );
         cache.sync_availability(msg_id.clone(), &availability).await;
         cache.sync().await;
 
-        assert!(
-            cache.get(&msg_id).await.is_none(),
-            "sync_availability must not create a missing-only entry after a retry success"
-        );
+        let entry = cache
+            .get(&msg_id)
+            .await
+            .expect("sync_availability must preserve mixed success/missing availability");
+        assert_eq!(entry.status_code(), StatusCode::new(223));
+        assert_eq!(entry.payload_len().get(), 0);
+        assert!(!entry.should_try_backend(BackendId::from_index(0)));
+        assert!(entry.should_try_backend(BackendId::from_index(1)));
+        assert!(entry.availability().any_backend_has_article());
     }
 
     #[test]

@@ -97,7 +97,7 @@ proptest! {
             if op == 0 {
                 avail.record_missing(id);
             } else {
-                avail.record_has(id);
+                avail.record_has(nntp_proxy::cache::ArticleAvailability::new().eligible_backend(id).expect("backend should be eligible"));
             }
         }
     }
@@ -117,15 +117,15 @@ proptest! {
     }
 
     #[test]
-    fn prop_record_has_clears_missing(backend_id in 0..8u8) {
+    fn prop_record_has_preserves_missing(backend_id in 0..8u8) {
         let id = BackendId::from_index(usize::from(backend_id));
         let mut avail = ArticleAvailability::new();
 
         avail.record_missing(id);
         prop_assert!(avail.is_missing(id));
 
-        avail.record_has(id);
-        prop_assert!(!avail.is_missing(id));
+        avail.record_has(nntp_proxy::cache::ArticleAvailability::new().eligible_backend(id).expect("backend should be eligible"));
+        prop_assert!(avail.is_missing(id));
     }
 
     #[test]
@@ -140,8 +140,8 @@ proptest! {
         avail.record_missing(id);
         prop_assert_eq!(avail.should_try(id), !avail.is_missing(id));
 
-        // After record_has, back to original
-        avail.record_has(id);
+        // After record_has, still inverted because missing is permanent
+        avail.record_has(nntp_proxy::cache::ArticleAvailability::new().eligible_backend(id).expect("backend should be eligible"));
         prop_assert_eq!(avail.should_try(id), !avail.is_missing(id));
     }
 
@@ -594,7 +594,7 @@ proptest! {
         let client_id = nntp_proxy::types::ClientId::new();
 
         // Routing with zero backends should return an error
-        let result = selector.route_without_availability(client_id);
+        let result = selector.route(nntp_proxy::router::RouteRequest::new(client_id));
         prop_assert!(result.is_err(),
             "route with zero backends should return error");
     }
@@ -631,7 +631,7 @@ proptest! {
         let mut count1 = 0usize;
         for _ in 0..num_requests {
             let client_id = nntp_proxy::types::ClientId::new();
-            if let Ok(id) = selector.route_without_availability(client_id) {
+            if let Ok(id) = selector.route(nntp_proxy::router::RouteRequest::new(client_id)) {
                 if id == id0 { count0 += 1; }
                 if id == id1 { count1 += 1; }
                 // Complete immediately so pending counts don't accumulate
