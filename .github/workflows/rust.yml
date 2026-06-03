@@ -94,6 +94,7 @@ jobs:
       with:
         report_type: test_results
         token: ${{ secrets.CODECOV_TOKEN }}
+        fail_ci_if_error: false
 
     - name: Archive coverage results
       uses: actions/upload-artifact@v7
