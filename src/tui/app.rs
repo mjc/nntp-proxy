@@ -1533,7 +1533,6 @@ mod tests {
         );
         let backend_id = crate::types::BackendId::from_index(0);
         router.add_backend(
-            backend_id,
             crate::types::ServerName::try_new("Backend".to_string()).unwrap(),
             provider,
             0,

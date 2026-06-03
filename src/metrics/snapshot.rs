@@ -526,7 +526,6 @@ mod tests {
 
         let mut router = BackendSelector::new();
         router.add_backend(
-            BackendId::from_index(0),
             ServerName::try_new("unused".to_string()).unwrap(),
             provider,
             1,

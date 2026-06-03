@@ -57,10 +57,7 @@ async fn upsert_tier(cache: &ArticleCache, message_id: MessageId<'_>, tier: u8, 
         .upsert_ingest(
             message_id.clone(),
             article_bytes(message_id.as_str(), body),
-            nntp_proxy::cache::ArticleAvailability::new()
-                .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible")
-                .positive_observation(),
+            BackendId::from_index(0),
             tier.into(),
         )
         .await;
@@ -343,10 +340,7 @@ async fn test_cache_upsert_updates_tier_with_larger_buffer() {
         .upsert_ingest(
             msg_id.clone(),
             buffer_large,
-            nntp_proxy::cache::ArticleAvailability::new()
-                .eligible_backend(BackendId::from_index(1))
-                .expect("backend should be eligible")
-                .positive_observation(),
+            BackendId::from_index(1),
             2.into(),
         )
         .await;
@@ -368,10 +362,7 @@ async fn test_cache_upsert_keeps_tier_without_replacement() {
         .upsert_ingest(
             msg_id.clone(),
             buffer.clone(),
-            nntp_proxy::cache::ArticleAvailability::new()
-                .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible")
-                .positive_observation(),
+            BackendId::from_index(0),
             5.into(),
         )
         .await;
@@ -380,15 +371,7 @@ async fn test_cache_upsert_keeps_tier_without_replacement() {
 
     // Upsert with same-sized buffer (doesn't trigger replacement)
     cache
-        .upsert_ingest(
-            msg_id.clone(),
-            buffer,
-            nntp_proxy::cache::ArticleAvailability::new()
-                .eligible_backend(BackendId::from_index(1))
-                .expect("backend should be eligible")
-                .positive_observation(),
-            2.into(),
-        )
+        .upsert_ingest(msg_id.clone(), buffer, BackendId::from_index(1), 2.into())
         .await;
 
     // Tier should NOT be updated because buffer wasn't replaced

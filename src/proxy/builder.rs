@@ -15,7 +15,7 @@ use crate::config::{Config, Memory, RoutingMode, Server};
 use crate::metrics::{ConnectionStatsAggregator, MetricsCollector};
 use crate::pool::{BufferPool, DeadpoolConnectionProvider};
 use crate::router;
-use crate::types::{self, BufferSize};
+use crate::types::BufferSize;
 
 use super::NntpProxy;
 
@@ -185,23 +185,22 @@ impl NntpProxyBuilder {
 
         let backend_strategy = self.config.routing.backend_selection;
         let cache_config = self.config.cache;
+        let backend_count = router::BackendCount::try_new(self.config.servers.len())
+            .expect("config validation bounds backend count");
         let servers: Arc<[Server]> = self.config.servers.into();
 
         let router = Arc::new({
-            use types::BackendId;
-            connection_providers.iter().enumerate().fold(
-                router::BackendSelector::with_strategy(backend_strategy),
-                |mut r, (idx, provider)| {
-                    let backend_id = BackendId::from_index(idx);
-                    r.add_backend(
-                        backend_id,
-                        servers[idx].name.clone(),
-                        provider.clone(),
-                        servers[idx].tier,
-                    );
-                    r
-                },
-            )
+            let mut r = router::BackendSelector::with_strategy(backend_strategy);
+            for (idx, provider) in connection_providers.iter().enumerate() {
+                let backend_id = r.add_backend(
+                    servers[idx].name.clone(),
+                    provider.clone(),
+                    servers[idx].tier,
+                );
+                debug_assert_eq!(backend_id.as_index(), idx);
+            }
+            debug_assert_eq!(r.backend_count(), backend_count);
+            r
         });
 
         let auth_handler = {

@@ -23,7 +23,7 @@ fn availability_with_missing(backends: &[usize]) -> ArticleAvailability {
 fn assert_should_try(avail: ArticleAvailability, cases: &[(usize, bool)]) {
     for (backend_index, should_try) in cases {
         assert_eq!(
-            avail.eligible_backend(backend(*backend_index)).is_some(),
+            !avail.is_missing(backend(*backend_index)),
             *should_try,
             "backend {backend_index}"
         );
@@ -65,21 +65,21 @@ fn test_should_try_tracks_missing_backends() {
 #[test]
 fn test_record_missing_is_idempotent_and_encoded_as_bitset() {
     let mut avail = ArticleAvailability::new();
-    assert_eq!(avail.as_usize(), 0b0000_0000);
+    assert_eq!(avail.missing_bits(), 0b0000_0000);
 
     avail.record_missing(backend(0));
-    assert_eq!(avail.as_usize(), 0b0000_0001);
+    assert_eq!(avail.missing_bits(), 0b0000_0001);
 
     avail.record_missing(backend(1));
-    assert_eq!(avail.as_usize(), 0b0000_0011);
+    assert_eq!(avail.missing_bits(), 0b0000_0011);
 
     avail.record_missing(backend(3));
     avail.record_missing(backend(3));
-    assert_eq!(avail.as_usize(), 0b0000_1011);
-    assert!(avail.eligible_backend(backend(3)).is_none());
+    assert_eq!(avail.missing_bits(), 0b0000_1011);
+    assert!(avail.is_missing(backend(3)));
 
     avail.record_missing(backend(7));
-    assert_eq!(avail.as_usize(), 0b1000_1011);
+    assert_eq!(avail.missing_bits(), 0b1000_1011);
 }
 
 #[test]
@@ -113,7 +113,7 @@ fn test_retry_loop_simulations() {
     let mut attempts = Vec::new();
     for backend_index in [0, 1] {
         let backend = backend(backend_index);
-        assert!(exhausted.eligible_backend(backend).is_some());
+        assert!(!exhausted.is_missing(backend));
         attempts.push(backend);
         exhausted.record_missing(backend);
     }
@@ -123,10 +123,10 @@ fn test_retry_loop_simulations() {
     let mut found = ArticleAvailability::new();
     for backend_index in [0, 1] {
         let backend = backend(backend_index);
-        assert!(found.eligible_backend(backend).is_some());
+        assert!(!found.is_missing(backend));
         found.record_missing(backend);
     }
-    assert!(found.eligible_backend(backend(2)).is_some());
+    assert!(!found.is_missing(backend(2)));
     assert!(!found.all_exhausted(count(4)));
     assert_should_try(found, &[(0, false), (1, false), (2, true), (3, true)]);
 }
@@ -138,7 +138,7 @@ fn test_round_robin_and_cached_availability_skip_missing_backends() {
     let tried = [0, 1, 2, 3, 0]
         .into_iter()
         .map(backend)
-        .filter(|&backend| avail.eligible_backend(backend).is_some())
+        .filter(|&backend| !avail.is_missing(backend))
         .collect::<Vec<_>>();
     assert_eq!(tried, vec![backend(0), backend(2), backend(0)]);
 
@@ -156,7 +156,7 @@ fn test_round_robin_and_cached_availability_skip_missing_backends() {
     assert_eq!(
         (0..6)
             .map(backend)
-            .filter(|&backend| avail.eligible_backend(backend).is_some())
+            .filter(|&backend| !avail.is_missing(backend))
             .collect::<Vec<_>>(),
         vec![backend(0), backend(2), backend(4)]
     );
@@ -171,5 +171,5 @@ fn test_all_exhausted_supports_nine_backends() {
 #[test]
 fn test_backend_id_eight_is_supported() {
     let avail = availability_with_missing(&[8]);
-    assert!(avail.eligible_backend(backend(8)).is_none());
+    assert!(avail.is_missing(backend(8)));
 }

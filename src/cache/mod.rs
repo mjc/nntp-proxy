@@ -24,10 +24,7 @@ pub mod ttl;
 mod mock_hybrid;
 
 pub use article::{ArticleCache, CachedArticle};
-pub use availability::{
-    ArticleAvailability, ArticleBackendHasArticle, BackendStatus, EligibleArticleBackend,
-    MAX_BACKENDS,
-};
+pub use availability::{ArticleAvailability, BackendStatus, MAX_BACKENDS};
 pub use availability_index::AvailabilityIndex;
 pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
 
@@ -232,15 +229,13 @@ mod tests {
         let cache = UnifiedCache::memory(1000, std::time::Duration::from_secs(60));
         let msg_id = MessageId::new("<typed-availability@example>".to_string()).unwrap();
         let backend_id = BackendId::from_index(1);
-        let backend = ArticleAvailability::new()
-            .eligible_backend(backend_id)
-            .expect("backend should be eligible");
+        let backend = backend_id;
 
         cache
             .record_backend_has_status(
                 msg_id.clone(),
                 StatusCode::new(220),
-                backend.positive_observation(),
+                backend,
                 ttl::CacheTier::new(2),
             )
             .await;
@@ -424,7 +419,7 @@ impl UnifiedCache {
         &self,
         message_id: MessageId<'_>,
         buffer: impl Into<CacheIngestResponse>,
-        backend: ArticleBackendHasArticle,
+        backend: BackendId,
         tier: ttl::CacheTier,
     ) {
         let buffer = buffer.into();
@@ -453,7 +448,7 @@ impl UnifiedCache {
         &self,
         message_id: MessageId<'_>,
         status_code: StatusCode,
-        backend: ArticleBackendHasArticle,
+        backend: BackendId,
         tier: ttl::CacheTier,
     ) {
         match self {

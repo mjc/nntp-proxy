@@ -8,7 +8,7 @@
 //! Run with: cargo bench --bench `cache_lookup`
 
 use divan::{Bencher, black_box};
-use nntp_proxy::cache::{ArticleAvailability, ArticleBackendHasArticle, UnifiedCache};
+use nntp_proxy::cache::{ArticleAvailability, UnifiedCache};
 use nntp_proxy::router::BackendCount;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::sync::Arc;
@@ -16,13 +16,6 @@ use std::time::Duration;
 
 fn main() {
     divan::main();
-}
-
-fn observed_backend(backend_id: BackendId) -> ArticleBackendHasArticle {
-    ArticleAvailability::new()
-        .eligible_backend(backend_id)
-        .expect("benchmark backend should be eligible")
-        .positive_observation()
 }
 
 // =============================================================================
@@ -44,21 +37,19 @@ mod availability {
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
-    fn eligible_backend_all_available(bencher: Bencher) {
+    fn is_missing_all_available(bencher: Bencher) {
         let avail = ArticleAvailability::new();
         bencher.bench(|| {
             let mut result = true;
             for i in 0..8u8 {
-                result &= black_box(&avail)
-                    .eligible_backend(BackendId::from_index(i as usize))
-                    .is_some();
+                result &= !black_box(&avail).is_missing(BackendId::from_index(i as usize));
             }
             black_box(result)
         });
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
-    fn eligible_backend_partially_exhausted(bencher: Bencher) {
+    fn is_missing_partially_exhausted(bencher: Bencher) {
         let mut avail = ArticleAvailability::new();
         // Mark backends 0-3 as missing (half exhausted)
         for i in 0..4u8 {
@@ -67,9 +58,7 @@ mod availability {
         bencher.bench(|| {
             let mut result = true;
             for i in 0..8u8 {
-                result &= black_box(&avail)
-                    .eligible_backend(BackendId::from_index(i as usize))
-                    .is_some();
+                result &= !black_box(&avail).is_missing(BackendId::from_index(i as usize));
             }
             black_box(result)
         });
@@ -102,9 +91,7 @@ mod availability {
 // =============================================================================
 
 mod unified_cache {
-    use super::{
-        Arc, BackendId, Bencher, Duration, MessageId, UnifiedCache, black_box, observed_backend,
-    };
+    use super::{Arc, BackendId, Bencher, Duration, MessageId, UnifiedCache, black_box};
 
     fn make_cache() -> Arc<UnifiedCache> {
         Arc::new(UnifiedCache::memory(
@@ -136,7 +123,7 @@ mod unified_cache {
                 .upsert_ingest(
                     msg_id.to_owned(),
                     b"220 0 <hit@example.com>\r\nSubject: test\r\n\r\nbody\r\n.\r\n".to_vec(),
-                    observed_backend(BackendId::from_index(0)),
+                    BackendId::from_index(0),
                     0.into(),
                 )
                 .await;
@@ -164,7 +151,7 @@ mod unified_cache {
                         .upsert_ingest(
                             msg_id.to_owned(),
                             data.clone(),
-                            observed_backend(BackendId::from_index(0)),
+                            BackendId::from_index(0),
                             0.into(),
                         )
                         .await;

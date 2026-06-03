@@ -161,11 +161,6 @@ impl RequestCacheAvailability {
     }
 
     #[must_use]
-    pub(crate) const fn checked_bits(self) -> usize {
-        self.checked
-    }
-
-    #[must_use]
     pub(crate) const fn missing_bits(self) -> usize {
         self.missing
     }

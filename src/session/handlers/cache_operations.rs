@@ -4,7 +4,6 @@
 //! and tier-aware cache operations.
 
 use crate::cache::ArticleAvailability;
-use crate::cache::ArticleBackendHasArticle;
 use crate::cache::ttl::CacheTier;
 use crate::protocol::{
     RequestCacheEntryMetadata, RequestCacheStatus, RequestContext, RequestKind,
@@ -140,7 +139,7 @@ impl ClientSession {
         &self,
         msg_id: &crate::types::MessageId<'_>,
         buffer: crate::cache::CacheIngestResponse,
-        backend: ArticleBackendHasArticle,
+        backend: BackendId,
         tier: CacheTier,
     ) {
         if !self.cache.stores_payload_responses() {
@@ -161,7 +160,7 @@ impl ClientSession {
         &self,
         msg_id: &crate::types::MessageId<'_>,
         status_code: StatusCode,
-        backend: ArticleBackendHasArticle,
+        backend: BackendId,
         tier: CacheTier,
     ) {
         if !self.cache.records_backend_has_status() {
@@ -340,10 +339,7 @@ mod tests {
             .upsert_ingest(
                 msg_id.clone(),
                 expected.to_vec(),
-                crate::cache::ArticleAvailability::new()
-                    .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible")
-                    .positive_observation(),
+                BackendId::from_index(0),
                 0.into(),
             )
             .await;
@@ -375,16 +371,10 @@ mod tests {
             request
                 .cache_availability()
                 .expect("cache hit records cache metadata")
-                .checked_bits(),
-            0
-        );
-        assert_eq!(
-            request
-                .cache_availability()
-                .expect("cache hit records cache metadata")
                 .missing_bits(),
             0
         );
+        assert!(!request.cache_records_backend_has_article(BackendId::from_index(0)));
         assert_eq!(
             request.cache_article_number(),
             Some(RequestCacheArticleNumber::new(0))
@@ -413,7 +403,6 @@ mod tests {
 
         let mut router = BackendSelector::new();
         router.add_backend(
-            BackendId::from_index(0),
             ServerName::try_new("partial-backend".to_string()).expect("server name"),
             DeadpoolConnectionProvider::new(
                 "127.0.0.1".to_string(),
@@ -453,10 +442,11 @@ mod tests {
         );
         assert_eq!(request.cache_article_number(), None);
         assert_eq!(
-            request
-                .cache_availability()
-                .map(|availability| { (availability.checked_bits(), availability.missing_bits()) }),
-            Some((0b0000_0001, 0b0000_0001))
+            request.cache_availability().map(|availability| (
+                availability.missing_bits(),
+                availability.backend_has_article(BackendId::from_index(0))
+            )),
+            Some((0b0000_0001, false))
         );
         assert_eq!(metrics, BackendToClientBytes::zero());
     }

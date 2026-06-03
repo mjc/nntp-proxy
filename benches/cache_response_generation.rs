@@ -8,9 +8,7 @@
 
 use divan::{Bencher, black_box};
 use futures::executor::block_on;
-use nntp_proxy::cache::{
-    ArticleAvailability, ArticleBackendHasArticle, ArticleCache, CachedArticle,
-};
+use nntp_proxy::cache::{ArticleCache, CachedArticle};
 use nntp_proxy::protocol::RequestKind;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
@@ -29,13 +27,6 @@ This is the benchmark body.\r\n\
 It has multiple lines.\r\n\
 .\r\n";
 
-fn observed_backend(backend_id: BackendId) -> ArticleBackendHasArticle {
-    ArticleAvailability::new()
-        .eligible_backend(backend_id)
-        .expect("benchmark backend should be eligible")
-        .positive_observation()
-}
-
 fn cached_article() -> CachedArticle {
     cache_entry_from_bytes(ARTICLE_RESPONSE)
 }
@@ -49,7 +40,7 @@ fn cache_entry_from_bytes(response: impl AsRef<[u8]>) -> CachedArticle {
             .upsert_ingest(
                 msg_id.clone(),
                 response.as_ref(),
-                observed_backend(BackendId::from_index(0)),
+                BackendId::from_index(0),
                 0.into(),
             )
             .await;

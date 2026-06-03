@@ -3,9 +3,8 @@
 //! Handles executing commands on individual backends, including connection retry,
 //! response validation, and writing backend responses to clients.
 
-use crate::cache::{ArticleBackendHasArticle, EligibleArticleBackend};
 use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata, StatusCode};
-use crate::router::{BackendSelector, CommandGuard, SuppressedBackends};
+use crate::router::{ArticleBackend, BackendSelector, CommandGuard, SuppressedBackends};
 use crate::session::SessionError;
 use crate::session::response_transfer::{ResponseConnectionReuse, ResponseTransferError};
 use crate::session::retry::retry_once;
@@ -76,9 +75,9 @@ pub(super) struct AuthoritativeArticleMissing {
 
 impl AuthoritativeArticleMissing {
     pub(super) fn from_status_code(
-        backend: EligibleArticleBackend,
+        backend: ArticleBackend,
         status_code: StatusCode,
-    ) -> Result<Self, EligibleArticleBackend> {
+    ) -> Result<Self, ArticleBackend> {
         if status_code.as_u16() == 430 {
             Ok(Self {
                 backend_id: backend.backend_id(),
@@ -174,7 +173,7 @@ impl ClientSession {
     pub(super) fn retry_backend_provider<'a>(
         &self,
         router: &'a BackendSelector,
-        backend: &EligibleArticleBackend,
+        backend: &ArticleBackend,
         request: &RequestContext,
         attempt: RetryAttemptKind,
     ) -> Option<&'a crate::pool::DeadpoolConnectionProvider> {
@@ -301,7 +300,7 @@ impl ClientSession {
         &self,
         conn: crate::pool::ConnectionGuard,
         client_writer: &crate::session::SharedClientWriter,
-        backend: &EligibleArticleBackend,
+        backend: &ArticleBackend,
         buffer: crate::pool::PooledBuffer,
         params: ResponseWriteParams<'_>,
         backend_connection: &mut Option<(BackendId, crate::pool::ConnectionGuard)>,
@@ -321,7 +320,7 @@ impl ClientSession {
     pub(super) async fn prepare_backend_attempt(
         &self,
         provider: &crate::pool::DeadpoolConnectionProvider,
-        backend: &EligibleArticleBackend,
+        backend: &ArticleBackend,
         request: &RequestContext,
         state: &mut ArticleAttemptState<'_>,
     ) -> Result<PreparedBackendAttempt, SessionError> {
@@ -458,7 +457,7 @@ impl ClientSession {
         &self,
         mut conn: crate::pool::ConnectionGuard,
         client_write: &mut W,
-        backend: &EligibleArticleBackend,
+        backend: &ArticleBackend,
         backend_bytes: crate::pool::PooledBuffer,
         params: ResponseWriteParams<'_>,
         backend_connection: Option<&mut Option<(BackendId, crate::pool::ConnectionGuard)>>,
@@ -832,7 +831,7 @@ impl ClientSession {
     async fn execute_backend_attempt(
         &self,
         provider: &crate::pool::DeadpoolConnectionProvider,
-        backend: &EligibleArticleBackend,
+        backend: &ArticleBackend,
         request: &RequestContext,
         backend_connection: &mut Option<(BackendId, crate::pool::ConnectionGuard)>,
     ) -> Result<ExecutedBackendAttempt> {
@@ -876,7 +875,7 @@ impl ClientSession {
     async fn execute_and_read_response(
         &self,
         conn: &mut crate::stream::ConnectionStream,
-        backend: &EligibleArticleBackend,
+        backend: &ArticleBackend,
         request: &RequestContext,
     ) -> Result<BackendReadAttempt, BackendReadAttemptError> {
         let backend_id = backend.backend_id();
@@ -915,7 +914,7 @@ impl ClientSession {
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
         client_write: &mut W,
-        backend: &EligibleArticleBackend,
+        backend: &ArticleBackend,
         backend_bytes: crate::pool::PooledBuffer,
         params: ResponseWriteParams<'_>,
     ) -> Result<u64, ResponseTransferError>
@@ -939,10 +938,10 @@ impl ClientSession {
         );
 
         let backend_after_write = if matches!(cache_action, CacheAction::TrackAvailability) {
-            self.apply_cache_action(cache_action, params, backend.positive_observation(), None);
+            self.apply_cache_action(cache_action, params, backend_id, None);
             None
         } else {
-            Some(backend.positive_observation())
+            Some(backend_id)
         };
 
         let (bytes_written, captured) =
@@ -983,10 +982,10 @@ impl ClientSession {
         &self,
         cache_action: CacheAction,
         params: ResponseWriteParams<'_>,
-        backend: ArticleBackendHasArticle,
+        backend: BackendId,
         captured: Option<crate::pool::ChunkedResponse>,
     ) {
-        let backend_id = backend.backend_id();
+        let backend_id = backend;
         match (cache_action, params.msg_id, captured) {
             (CacheAction::CaptureArticle, msg_id, Some(response)) => {
                 self.maybe_cache_upsert_buffer(msg_id, response.into(), backend);
@@ -1156,10 +1155,10 @@ impl ClientSession {
         &self,
         msg_id: Option<&crate::types::MessageId<'_>>,
         data: crate::cache::CacheIngestResponse,
-        backend: ArticleBackendHasArticle,
+        backend: BackendId,
     ) {
         if let Some(msg_id_ref) = msg_id {
-            let backend_id = backend.backend_id();
+            let backend_id = backend;
             let tier = self.tier_for_backend(backend_id);
             self.spawn_cache_upsert_buffer(msg_id_ref, data, backend, tier);
         }
@@ -1206,7 +1205,7 @@ mod tests {
     use crate::metrics::MetricsCollector;
     use crate::pool::{BufferPool, ConnectionGuard, DeadpoolConnectionProvider};
     use crate::protocol::{RequestContext, StatusCode};
-    use crate::router::{BackendSelector, SuppressedBackends};
+    use crate::router::{ArticleBackend, BackendSelector, SuppressedBackends};
     use crate::session::SessionError;
     use crate::session::routing::CacheAction;
     use crate::types::{
@@ -1220,9 +1219,9 @@ mod tests {
     use tokio::io::AsyncWrite;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-    fn eligible(backend_id: BackendId) -> crate::cache::EligibleArticleBackend {
-        ArticleAvailability::new()
-            .eligible_backend(backend_id)
+    fn eligible(backend_id: BackendId) -> ArticleBackend {
+        let availability = ArticleAvailability::new();
+        ArticleBackend::from_availability(backend_id, &availability)
             .expect("backend should be eligible")
     }
     use tokio::net::{TcpListener, TcpStream};
@@ -1431,7 +1430,6 @@ mod tests {
     fn router_with_backend(provider: DeadpoolConnectionProvider) -> Arc<BackendSelector> {
         let mut router = BackendSelector::new();
         router.add_backend(
-            BackendId::from_index(0),
             ServerName::try_new("backend-0".to_string()).unwrap(),
             provider,
             0,
@@ -1445,7 +1443,6 @@ mod tests {
         let mut router = BackendSelector::new();
         for (index, (provider, tier)) in backends.into_iter().enumerate() {
             router.add_backend(
-                BackendId::from_index(index),
                 ServerName::try_new(format!("backend-{index}")).unwrap(),
                 provider,
                 tier,
@@ -1568,7 +1565,7 @@ mod tests {
             )
             .is_err()
         );
-        assert_eq!(availability.checked_bits(), 0);
+        assert_eq!(availability.missing_bits(), 0);
         assert_eq!(availability.missing_bits(), 0);
 
         let missing = AuthoritativeArticleMissing::from_status_code(
@@ -1578,7 +1575,7 @@ mod tests {
         .expect("430 is authoritative article-missing");
         session.record_authoritative_article_missing(&missing, &mut availability);
 
-        assert_eq!(availability.checked_bits(), 0b0000_0001);
+        assert_eq!(availability.missing_bits(), 0b0000_0001);
         assert_eq!(availability.missing_bits(), 0b0000_0001);
     }
 
@@ -1640,10 +1637,7 @@ mod tests {
                 msg_id: Some(&msg_id),
                 status_code: StatusCode::new(223),
             },
-            crate::cache::ArticleAvailability::new()
-                .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible")
-                .positive_observation(),
+            BackendId::from_index(0),
             None,
         );
 
@@ -1698,7 +1692,7 @@ mod tests {
 
         assert!(matches!(result, BackendAttemptResult::BackendUnavailable));
         assert_eq!(article_commands.load(Ordering::SeqCst), 1);
-        assert_eq!(availability.checked_bits(), 0);
+        assert_eq!(availability.missing_bits(), 0);
         assert_eq!(availability.missing_bits(), 0);
         assert_eq!(unavailable_backends.bits(), 0b0000_0001);
     }
@@ -1735,7 +1729,7 @@ mod tests {
         .expect("connection failure should be handled as unavailable");
 
         assert!(matches!(result, BackendAttemptResult::BackendUnavailable));
-        assert_eq!(availability.checked_bits(), 0);
+        assert_eq!(availability.missing_bits(), 0);
         assert_eq!(availability.missing_bits(), 0);
         assert_eq!(unavailable_backends.bits(), 0b0000_0001);
     }
@@ -1782,7 +1776,7 @@ mod tests {
             .await
             .expect("invalid response should be handled");
         assert!(matches!(first, BackendAttemptResult::BackendUnavailable));
-        assert_eq!(state.availability.checked_bits(), 0);
+        assert_eq!(state.availability.missing_bits(), 0);
         assert_eq!(state.availability.missing_bits(), 0);
         assert_eq!(state.unavailable_backends.bits(), 0b0000_0001);
 
@@ -1793,7 +1787,7 @@ mod tests {
         assert!(matches!(second, BackendAttemptResult::Success));
         assert_eq!(bad_article_commands.load(Ordering::SeqCst), 1);
         assert_eq!(good_article_commands.load(Ordering::SeqCst), 1);
-        assert_eq!(availability.checked_bits(), 0);
+        assert_eq!(availability.missing_bits(), 0);
         assert_eq!(availability.missing_bits(), 0);
         assert_eq!(request.backend_id(), Some(BackendId::from_index(1)));
 
@@ -1848,7 +1842,7 @@ mod tests {
             .try_backend_for_article(&router, &mut request, &client_writer, &mut state)
             .await;
         assert!(matches!(first, Err(SessionError::Backend(_))));
-        assert_eq!(state.availability.checked_bits(), 0);
+        assert_eq!(state.availability.missing_bits(), 0);
         assert_eq!(state.availability.missing_bits(), 0);
         assert_eq!(state.unavailable_backends.bits(), 0b0000_0001);
 
@@ -1892,10 +1886,7 @@ mod tests {
                 msg_id: Some(&msg_id),
                 status_code: StatusCode::new(220),
             },
-            crate::cache::ArticleAvailability::new()
-                .eligible_backend(backend_id)
-                .expect("backend should be eligible")
-                .positive_observation(),
+            backend_id,
             None,
         );
 
@@ -1982,7 +1973,7 @@ mod tests {
         assert_eq!(bad0_article_commands.load(Ordering::SeqCst), 1);
         assert_eq!(bad1_article_commands.load(Ordering::SeqCst), 1);
         assert_eq!(backup_article_commands.load(Ordering::SeqCst), 0);
-        assert_eq!(availability.checked_bits(), 0);
+        assert_eq!(availability.missing_bits(), 0);
         assert_eq!(availability.missing_bits(), 0);
     }
 
@@ -2044,7 +2035,7 @@ mod tests {
             .expect("successful attempt should not fail");
         assert!(matches!(result, BackendAttemptResult::Success));
         assert_eq!(article_commands.load(Ordering::SeqCst), 1);
-        assert_eq!(availability.checked_bits(), 0);
+        assert_eq!(availability.missing_bits(), 0);
         assert_eq!(availability.missing_bits(), 0);
         assert_eq!(request.backend_id(), Some(BackendId::from_index(0)));
 
@@ -2077,9 +2068,7 @@ mod tests {
             .write_successful_backend_response(
                 guard,
                 &mut client_write,
-                &crate::cache::ArticleAvailability::new()
-                    .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible"),
+                &eligible(BackendId::from_index(0)),
                 backend_bytes,
                 ResponseWriteParams {
                     request: &request,
@@ -2126,9 +2115,7 @@ mod tests {
             .write_successful_backend_response(
                 guard,
                 &mut client_write,
-                &crate::cache::ArticleAvailability::new()
-                    .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible"),
+                &eligible(BackendId::from_index(0)),
                 backend_bytes,
                 ResponseWriteParams {
                     request: &request,

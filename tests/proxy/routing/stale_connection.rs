@@ -391,7 +391,7 @@ async fn test_retry_on_immediate_connection_failure() -> Result<()> {
 /// The cache correctly maintains 430 state until TTL expiry.
 #[tokio::test]
 async fn test_430_cache_is_authoritative() -> Result<()> {
-    use nntp_proxy::cache::{ArticleAvailability, UnifiedCache, ttl};
+    use nntp_proxy::cache::{UnifiedCache, ttl};
     use nntp_proxy::protocol::StatusCode;
     use nntp_proxy::router::BackendCount;
     use nntp_proxy::types::{BackendId, MessageId};
@@ -414,10 +414,7 @@ async fn test_430_cache_is_authoritative() -> Result<()> {
     ));
 
     // Try to claim backend 0 "has" the article (unreliable 2xx response).
-    let positive = ArticleAvailability::new()
-        .eligible_backend(BackendId::from_index(0))
-        .expect("backend should be eligible")
-        .positive_observation();
+    let positive = BackendId::from_index(0);
     cache
         .record_backend_has_status(
             msg_id.clone(),

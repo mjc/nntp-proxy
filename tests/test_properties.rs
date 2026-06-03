@@ -97,7 +97,7 @@ proptest! {
             if op == 0 {
                 avail.record_missing(id);
             } else {
-                let _ = avail.eligible_backend(id);
+                let _ = avail.is_missing(id);
             }
         }
     }
@@ -117,33 +117,30 @@ proptest! {
     }
 
     #[test]
-    fn prop_positive_proof_preserves_missing(backend_id in 0..8u8) {
+    fn prop_success_observation_preserves_missing(backend_id in 0..8u8) {
         let id = BackendId::from_index(usize::from(backend_id));
         let mut avail = ArticleAvailability::new();
 
         avail.record_missing(id);
         prop_assert!(avail.is_missing(id));
 
-        let _ = nntp_proxy::cache::ArticleAvailability::new()
-            .eligible_backend(id)
-            .expect("backend should be eligible");
+        let fresh = ArticleAvailability::new();
+        prop_assert!(!fresh.is_missing(id));
         prop_assert!(avail.is_missing(id));
     }
 
     #[test]
-    fn prop_eligibility_inverse_of_is_missing(backend_id in 0..8u8) {
+    fn prop_missing_is_sticky_and_idempotent(backend_id in 0..8u8) {
         let id = BackendId::from_index(usize::from(backend_id));
         let mut avail = ArticleAvailability::new();
 
-        prop_assert_eq!(avail.eligible_backend(id).is_some(), !avail.is_missing(id));
+        prop_assert!(!avail.is_missing(id));
 
         avail.record_missing(id);
-        prop_assert_eq!(avail.eligible_backend(id).is_some(), !avail.is_missing(id));
+        prop_assert!(avail.is_missing(id));
 
-        let _ = nntp_proxy::cache::ArticleAvailability::new()
-            .eligible_backend(id)
-            .expect("backend should be eligible");
-        prop_assert_eq!(avail.eligible_backend(id).is_some(), !avail.is_missing(id));
+        avail.record_missing(id);
+        prop_assert!(avail.is_missing(id));
     }
 
     #[test]
@@ -572,17 +569,16 @@ proptest! {
         let mut selector = nntp_proxy::router::BackendSelector::new();
 
         for i in 0..num_backends {
-            let id = nntp_proxy::types::BackendId::from_index(i);
             let provider = nntp_proxy::pool::DeadpoolConnectionProvider::new(
                 "localhost".to_string(), 119, format!("test-{i}"), 10, None, None
             );
-            selector.add_backend(
-                id,
+            let id = selector.add_backend(
                 nntp_proxy::types::ServerName::try_new(format!("server-{i}")).unwrap(),
                 provider,
                 0,
             );
 
+            prop_assert_eq!(id, nntp_proxy::types::BackendId::from_index(i));
             prop_assert_eq!(selector.backend_count().get(), i + 1,
                 "Backend count should be {} after adding {} backends", i + 1, i + 1);
         }
@@ -618,12 +614,10 @@ proptest! {
         );
 
         selector.add_backend(
-            id0,
             nntp_proxy::types::ServerName::try_new("server-0".to_string()).unwrap(),
             provider0, 0,
         );
         selector.add_backend(
-            id1,
             nntp_proxy::types::ServerName::try_new("server-1".to_string()).unwrap(),
             provider1, 0,
         );

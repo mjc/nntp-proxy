@@ -10,7 +10,6 @@ fn test_backend_load_tracking() {
     let provider = create_test_provider();
 
     router.add_backend(
-        backend_id,
         ServerName::try_new("test".to_string()).unwrap(),
         provider,
         0, // tier

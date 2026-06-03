@@ -16,13 +16,11 @@ fn test_least_loaded_basic() {
 
     // Add two backends with equal capacity
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("backend0".to_string()).unwrap(),
         create_backend("backend0", 10),
         0, // tier
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("backend1".to_string()).unwrap(),
         create_backend("backend1", 10),
         0, // tier
@@ -66,13 +64,11 @@ fn test_least_loaded_unequal_capacity() {
     // Backend 0: 10 connections (small)
     // Backend 1: 50 connections (large)
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("small".to_string()).unwrap(),
         create_backend("small", 10),
         0, // tier
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("large".to_string()).unwrap(),
         create_backend("large", 50),
         0, // tier
@@ -105,13 +101,11 @@ fn test_concurrent_least_loaded_fills_tier_capacity_without_overshoot() {
     let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
 
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("tier0-40".to_string()).unwrap(),
         create_backend("tier0-40", 40),
         0,
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("tier0-50".to_string()).unwrap(),
         create_backend("tier0-50", 50),
         0,
@@ -150,13 +144,11 @@ fn test_initial_article_probe_uses_capacity_fair_distribution_despite_retry_load
     let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
 
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("tier0-40".to_string()).unwrap(),
         create_backend("tier0-40", 40),
         0,
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("tier0-50".to_string()).unwrap(),
         create_backend("tier0-50", 50),
         0,
@@ -190,13 +182,11 @@ fn test_least_loaded_respects_pending_counts() {
     let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
 
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("backend0".to_string()).unwrap(),
         create_backend("backend0", 10),
         0, // tier
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("backend1".to_string()).unwrap(),
         create_backend("backend1", 10),
         0, // tier
@@ -302,13 +292,11 @@ async fn test_least_loaded_counts_checked_out_pool_connections() {
     let held_backend1 = backend1.get_pooled_connection().await.unwrap();
 
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("backend0".to_string()).unwrap(),
         backend0,
         0,
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("backend1".to_string()).unwrap(),
         backend1,
         0,
@@ -331,7 +319,6 @@ fn test_least_loaded_single_backend() {
     let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
 
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("only".to_string()).unwrap(),
         create_backend("only", 10),
         0, // tier
@@ -353,7 +340,6 @@ fn test_least_loaded_load_balancing_fairness() {
     // Three backends with equal capacity
     for i in 0..3 {
         selector.add_backend(
-            BackendId::from_index(i),
             ServerName::try_new(format!("backend-{i}")).unwrap(),
             create_backend(&format!("backend-{i}"), 10),
             0, // tier

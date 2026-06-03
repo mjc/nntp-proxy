@@ -42,10 +42,7 @@ async fn test_cache_hit() -> Result<()> {
         .upsert_ingest(
             msgid.clone(),
             buffer.clone(),
-            nntp_proxy::cache::ArticleAvailability::new()
-                .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible")
-                .positive_observation(),
+            BackendId::from_index(0),
             0.into(),
         )
         .await;
@@ -83,15 +80,7 @@ async fn test_multiple_cache_entries() -> Result<()> {
         let msgid = MessageId::from_borrowed(&msg_str).unwrap();
         let buffer = format!("220 Body {i}\r\n.\r\n").into_bytes();
         cache
-            .upsert_ingest(
-                msgid,
-                buffer,
-                nntp_proxy::cache::ArticleAvailability::new()
-                    .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible")
-                    .positive_observation(),
-                0.into(),
-            )
+            .upsert_ingest(msgid, buffer, BackendId::from_index(0), 0.into())
             .await;
     }
 
@@ -121,15 +110,7 @@ async fn test_cache_ttl_expiration() -> Result<()> {
 
     // Insert article
     cache
-        .upsert_ingest(
-            msgid.clone(),
-            buffer,
-            nntp_proxy::cache::ArticleAvailability::new()
-                .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible")
-                .positive_observation(),
-            0.into(),
-        )
+        .upsert_ingest(msgid.clone(), buffer, BackendId::from_index(0), 0.into())
         .await;
 
     // Should be in cache immediately
@@ -151,15 +132,7 @@ async fn test_cache_capacity_limit() -> Result<()> {
         let msgid = MessageId::from_borrowed(&msg_str).unwrap();
         let buffer = format!("220 Body {i}\r\n.\r\n").into_bytes();
         cache
-            .upsert_ingest(
-                msgid,
-                buffer,
-                nntp_proxy::cache::ArticleAvailability::new()
-                    .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible")
-                    .positive_observation(),
-                0.into(),
-            )
+            .upsert_ingest(msgid, buffer, BackendId::from_index(0), 0.into())
             .await;
     }
 
@@ -192,15 +165,7 @@ async fn test_cache_different_message_id_formats() -> Result<()> {
         let msgid = MessageId::from_borrowed(msg_str).unwrap();
         let buffer = format!("220 {msg_str}\r\n.\r\n").into_bytes();
         cache
-            .upsert_ingest(
-                msgid.clone(),
-                buffer,
-                nntp_proxy::cache::ArticleAvailability::new()
-                    .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible")
-                    .positive_observation(),
-                0.into(),
-            )
+            .upsert_ingest(msgid.clone(), buffer, BackendId::from_index(0), 0.into())
             .await;
 
         // Verify retrievable
@@ -230,15 +195,7 @@ async fn test_cache_stats() -> Result<()> {
         // Put valid status code at start
         buffer[0..3].copy_from_slice(b"220");
         cache
-            .upsert_ingest(
-                msgid,
-                buffer,
-                nntp_proxy::cache::ArticleAvailability::new()
-                    .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible")
-                    .positive_observation(),
-                0.into(),
-            )
+            .upsert_ingest(msgid, buffer, BackendId::from_index(0), 0.into())
             .await;
     }
 
@@ -261,15 +218,7 @@ async fn test_zero_allocation_lookup() -> Result<()> {
     let buffer = b"220 Body\r\n.\r\n".to_vec();
 
     cache
-        .upsert_ingest(
-            msgid1,
-            buffer,
-            nntp_proxy::cache::ArticleAvailability::new()
-                .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible")
-                .positive_observation(),
-            0.into(),
-        )
+        .upsert_ingest(msgid1, buffer, BackendId::from_index(0), 0.into())
         .await;
 
     // Create different MessageId instance with same content

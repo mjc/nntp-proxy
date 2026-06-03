@@ -33,57 +33,6 @@ pub enum BackendStatus {
     Missing,
 }
 
-/// A backend that is known to be eligible for an article attempt.
-///
-/// This is intentionally not constructible outside this module. Code that sends
-/// an article request to a backend or records a positive article observation must
-/// first prove the backend was not already known missing by asking
-/// [`ArticleAvailability`].
-#[derive(Debug, PartialEq, Eq)]
-pub struct EligibleArticleBackend {
-    backend_id: BackendId,
-}
-
-impl EligibleArticleBackend {
-    #[inline]
-    #[must_use]
-    pub const fn backend_id(&self) -> BackendId {
-        self.backend_id
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn as_index(&self) -> usize {
-        self.backend_id.as_index()
-    }
-
-    #[inline]
-    #[must_use]
-    pub const fn positive_observation(&self) -> ArticleBackendHasArticle {
-        ArticleBackendHasArticle {
-            backend_id: self.backend_id,
-        }
-    }
-}
-
-/// Proof that a backend produced a positive article response.
-///
-/// This token is intentionally not accepted by request execution. It can be
-/// copied into async cache updates without duplicating the executable
-/// [`EligibleArticleBackend`] retry token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ArticleBackendHasArticle {
-    backend_id: BackendId,
-}
-
-impl ArticleBackendHasArticle {
-    #[inline]
-    #[must_use]
-    pub const fn backend_id(self) -> BackendId {
-        self.backend_id
-    }
-}
-
 /// Track which backends are known not to have a specific article.
 ///
 /// Uses a `usize` bitset to track which backends returned authoritative 430.
@@ -155,27 +104,10 @@ impl ArticleAvailability {
         !self.is_missing(backend_id)
     }
 
-    /// Return an article-attempt token only if this backend is not known missing.
-    #[inline]
-    #[must_use]
-    pub fn eligible_backend(&self, backend_id: BackendId) -> Option<EligibleArticleBackend> {
-        self.should_try(backend_id)
-            .then_some(EligibleArticleBackend { backend_id })
-    }
-
     /// Get the raw missing bitset for debugging
     #[inline]
     #[must_use]
     pub const fn missing_bits(&self) -> usize {
-        self.missing
-    }
-
-    /// Get the checked bitset for compatibility with existing cache metadata.
-    ///
-    /// Missing is the only checked state represented here.
-    #[inline]
-    #[must_use]
-    pub const fn checked_bits(&self) -> usize {
         self.missing
     }
 
@@ -194,22 +126,10 @@ impl ArticleAvailability {
         self.missing & expected_missing == expected_missing
     }
 
-    /// Get the underlying bitset value (for debugging)
+    /// Reconstruct from stored negative bits.
     #[inline]
     #[must_use]
-    pub const fn as_usize(&self) -> usize {
-        self.missing
-    }
-
-    /// Reconstruct from raw bitset values (used for deserialization)
-    ///
-    /// # Safety
-    /// The caller must ensure the bits represent valid backend states.
-    /// This is primarily used when deserializing from disk cache.
-    #[inline]
-    #[must_use]
-    pub(crate) const fn from_bits(checked: usize, missing: usize) -> Self {
-        let _ = checked;
+    pub(crate) const fn from_missing_bits(missing: usize) -> Self {
         Self { missing }
     }
 
@@ -281,11 +201,11 @@ mod tests {
         avail.record_missing(b0);
         assert!(avail.is_missing(b0));
 
-        assert!(avail.eligible_backend(b0).is_none());
+        assert!(avail.is_missing(b0));
     }
 
     #[test]
-    fn positive_proof_does_not_change_availability() {
+    fn success_observation_does_not_change_availability() {
         let mut cache_state = ArticleAvailability::new();
         let b0 = BackendId::from_index(0);
         let b1 = BackendId::from_index(1);
@@ -296,9 +216,7 @@ mod tests {
         assert!(cache_state.is_missing(b1));
 
         let fresh = ArticleAvailability::new();
-        let _positive_proof = fresh
-            .eligible_backend(b0)
-            .expect("backend is eligible before a 430");
+        assert!(!fresh.is_missing(b0));
 
         assert_eq!(cache_state.missing_bits(), 0b11);
     }

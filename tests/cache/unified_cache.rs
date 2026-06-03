@@ -57,15 +57,7 @@ async fn test_unified_cache_memory_upsert_and_get() {
     let backend_id = BackendId::from_index(0);
 
     cache
-        .upsert_ingest(
-            msg_id.clone(),
-            buffer.clone(),
-            nntp_proxy::cache::ArticleAvailability::new()
-                .eligible_backend(backend_id)
-                .expect("backend should be eligible")
-                .positive_observation(),
-            0.into(),
-        )
+        .upsert_ingest(msg_id.clone(), buffer.clone(), backend_id, 0.into())
         .await;
 
     let result = cache.get(&msg_id).await;
@@ -117,15 +109,7 @@ async fn test_unified_cache_record_missing_preserves_existing_article() {
 
     // First insert an article
     cache
-        .upsert_ingest(
-            msg_id.clone(),
-            buffer.clone(),
-            nntp_proxy::cache::ArticleAvailability::new()
-                .eligible_backend(backend_id)
-                .expect("backend should be eligible")
-                .positive_observation(),
-            0.into(),
-        )
+        .upsert_ingest(msg_id.clone(), buffer.clone(), backend_id, 0.into())
         .await;
 
     cache
@@ -150,7 +134,7 @@ async fn test_unified_cache_availability_records_only_missing_facts() {
     let result = cache.get(&msg_id).await.expect("availability entry");
     assert!(!result.should_try_backend(BackendId::from_index(1)));
     assert!(result.should_try_backend(BackendId::from_index(2)));
-    assert_eq!(result.availability().checked_bits(), 0b0000_0010);
+    assert_eq!(result.availability().missing_bits(), 0b0000_0010);
     assert_eq!(result.availability().missing_bits(), 0b0000_0010);
 }
 
@@ -178,10 +162,7 @@ async fn test_unified_cache_weighted_size() {
         .upsert_ingest(
             msg_id.clone(),
             buffer,
-            nntp_proxy::cache::ArticleAvailability::new()
-                .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible")
-                .positive_observation(),
+            nntp_proxy::types::BackendId::from_index(0),
             0.into(),
         )
         .await;

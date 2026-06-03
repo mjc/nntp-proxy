@@ -9,14 +9,13 @@ fn test_round_robin_selection() {
 
     // Add 3 backends with equal pool sizes for predictable distribution
     for i in 0..3 {
-        let backend_id = BackendId::from_index(i);
         let provider = create_test_provider(); // Creates backend with 2 connections
-        router.add_backend(
-            backend_id,
+        let backend_id = router.add_backend(
             ServerName::try_new(format!("backend-{i}")).unwrap(),
             provider,
             0, // tier
         );
+        assert_eq!(backend_id, BackendId::from_index(i));
     }
 
     // Total weight = 3 * 2 = 6
@@ -54,7 +53,6 @@ fn test_load_balancing_fairness() {
     // Add 3 backends with equal weights
     for i in 0..3 {
         router.add_backend(
-            BackendId::from_index(i),
             ServerName::try_new(format!("backend-{i}")).unwrap(),
             create_test_provider(), // 2 connections each
             0,                      // tier

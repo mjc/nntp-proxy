@@ -4,8 +4,7 @@
 //! to skip backends that have already returned 430 for a given article.
 
 use crate::cache::ArticleAvailability;
-use crate::cache::EligibleArticleBackend;
-use crate::router::{BackendSelector, SuppressedBackends};
+use crate::router::{ArticleBackend, BackendSelector, SuppressedBackends};
 use crate::session::ClientSession;
 use crate::session::SessionError;
 use crate::session::handlers::cache_operations::{
@@ -126,7 +125,7 @@ pub(super) struct OrderedLargeTransferResult {
 }
 
 type OrderedLargeTransferAttemptData = (
-    EligibleArticleBackend,
+    ArticleBackend,
     crate::router::CommandGuard,
     crate::pool::ConnectionGuard,
     crate::protocol::StatusCode,
@@ -263,7 +262,7 @@ impl ClientSession {
     const fn request_cache_availability(
         availability: crate::protocol::RequestCacheAvailability,
     ) -> ArticleAvailability {
-        ArticleAvailability::from_bits(availability.checked_bits(), availability.missing_bits())
+        ArticleAvailability::from_missing_bits(availability.missing_bits())
     }
 
     async fn try_adaptive_precheck(
@@ -748,8 +747,12 @@ impl ClientSession {
                 .await
                 .map(|entry| {
                     let avail = entry.to_availability(backend_count);
-                    debug!("Client {} loaded availability for {}: checked_bits={:08b}, missing_bits={:08b}",
-                        self.client_addr, msg_id_ref, avail.checked_bits(), avail.missing_bits());
+                    debug!(
+                        "Client {} loaded availability for {}: missing_bits={:08b}",
+                        self.client_addr,
+                        msg_id_ref,
+                        avail.missing_bits()
+                    );
                     avail
                 })
                 .unwrap_or_default(),
@@ -778,8 +781,8 @@ impl ClientSession {
 #[cfg(test)]
 mod tests {
     use super::OrderedPipelineGate;
-    use crate::cache::{ArticleAvailability, UnifiedCache};
-    use crate::protocol::StatusCode;
+    use crate::cache::UnifiedCache;
+    use crate::protocol::{RequestCacheAvailability, StatusCode};
     use crate::session::ClientSession;
     use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes, MessageId};
     use std::sync::Arc;
@@ -852,10 +855,7 @@ mod tests {
             .record_backend_has_status(
                 msg_id.clone(),
                 StatusCode::new(222),
-                ArticleAvailability::new()
-                    .eligible_backend(BackendId::from_index(1))
-                    .expect("backend should be eligible")
-                    .positive_observation(),
+                BackendId::from_index(1),
                 crate::cache::ttl::CacheTier::new(0),
             )
             .await;
@@ -870,6 +870,18 @@ mod tests {
         assert!(!entry.should_try_backend(BackendId::from_index(0)));
         assert!(entry.should_try_backend(BackendId::from_index(1)));
         assert_eq!(entry.availability().missing_bits(), 0b0000_0001);
+    }
+
+    #[test]
+    fn request_cache_availability_discards_positive_checked_bits_for_retry() {
+        let availability = ClientSession::request_cache_availability(
+            RequestCacheAvailability::from_bits(0b0000_0110, 0b0000_0010),
+        );
+
+        assert!(availability.should_try(BackendId::from_index(0)));
+        assert!(!availability.should_try(BackendId::from_index(1)));
+        assert!(availability.should_try(BackendId::from_index(2)));
+        assert_eq!(availability.missing_bits(), 0b0000_0010);
     }
 
     #[test]

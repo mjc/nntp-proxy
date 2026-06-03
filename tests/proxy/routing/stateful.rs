@@ -19,7 +19,6 @@ fn test_stateful_connection_reservation() {
     );
 
     router.add_backend(
-        backend_id,
         ServerName::try_new("test-backend".to_string()).unwrap(),
         provider,
         0, // tier
@@ -49,7 +48,6 @@ fn test_stateful_connection_concurrent_access() {
     let backend_id = BackendId::from_index(0);
 
     router.add_backend(
-        backend_id,
         ServerName::try_new("test-backend".to_string()).unwrap(),
         create_test_provider(),
         0, // tier
@@ -87,10 +85,6 @@ fn test_stateful_connection_concurrent_access() {
 fn test_stateful_connection_multiple_backends() {
     let mut router = BackendSelector::new();
 
-    // Add multiple backends
-    let backend1 = BackendId::from_index(0);
-    let backend2 = BackendId::from_index(1);
-
     // Create test providers with max_connections = 3 (so max stateful = 2 each)
     let provider1 = DeadpoolConnectionProvider::new(
         "localhost".to_string(),
@@ -109,14 +103,12 @@ fn test_stateful_connection_multiple_backends() {
         None,
     );
 
-    router.add_backend(
-        backend1,
+    let backend1 = router.add_backend(
         ServerName::try_new("backend-1".to_string()).unwrap(),
         provider1,
         0, // tier
     );
-    router.add_backend(
-        backend2,
+    let backend2 = router.add_backend(
         ServerName::try_new("backend-2".to_string()).unwrap(),
         provider2,
         0, // tier
@@ -173,7 +165,6 @@ fn test_stateful_reservation_edge_cases() {
     );
 
     router.add_backend(
-        backend_id,
         ServerName::try_new("test-backend".to_string()).unwrap(),
         provider,
         0, // tier

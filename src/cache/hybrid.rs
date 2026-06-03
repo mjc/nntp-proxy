@@ -61,7 +61,7 @@ use tracing::{debug, info, warn};
 use super::hybrid_codec::{CacheableStatusCode, DiskCachedArticle};
 use super::ttl;
 
-const HYBRID_CACHE_NAME: &str = "nntp-article-cache-v3";
+const HYBRID_CACHE_NAME: &str = "nntp-article-cache-v4";
 
 /// Check available disk space at the given path using df command
 fn check_available_space(_path: &Path) -> Option<u64> {
@@ -310,6 +310,12 @@ impl HybridArticleCache {
         &self.mutation_locks[hasher.finish() as usize % self.mutation_locks.len()]
     }
 
+    async fn get_fresh_entry_for_mutation(&self, key: &str) -> Option<DiskCachedArticle> {
+        let existing = self.cache.get(key).await.ok()??;
+        let entry = existing.value().clone();
+        (!entry.is_expired(self.ttl_millis)).then_some(entry)
+    }
+
     /// Get an article from the cache
     ///
     /// Checks memory first, then disk. Returns None if not found in either tier.
@@ -371,7 +377,7 @@ impl HybridArticleCache {
         &self,
         message_id: MessageId<'_>,
         buffer: impl Into<super::CacheIngestResponse>,
-        backend: super::ArticleBackendHasArticle,
+        backend: super::BackendId,
         tier: super::ttl::CacheTier,
     ) {
         let buffer = buffer.into();
@@ -388,19 +394,13 @@ impl HybridArticleCache {
         let mut existing_availability = None;
 
         // Check for existing entry - don't overwrite larger semantic payloads with smaller ones.
-        if let Ok(Some(existing)) = self.cache.get(&key).await
-            && !existing.value().is_expired(self.ttl_millis)
-        {
-            let existing_value = existing.value();
-            existing_availability = Some(existing_value.availability());
-            if existing_value
-                .availability()
-                .is_missing(backend.backend_id())
-            {
+        if let Some(existing) = self.get_fresh_entry_for_mutation(&key).await {
+            existing_availability = Some(existing.availability());
+            if existing.availability().is_missing(backend) {
                 return;
             }
-            let existing_len = existing_value.payload_len();
-            let existing_complete = existing_value.is_complete_article();
+            let existing_len = existing.payload_len();
+            let existing_complete = existing.is_complete_article();
             let new_complete = entry.is_complete_article();
             let keep_existing = match (existing_complete, new_complete) {
                 (true, false) => true,
@@ -409,7 +409,7 @@ impl HybridArticleCache {
             };
             if keep_existing {
                 // Existing entry is larger - refresh TTL without changing negative availability.
-                let mut updated = existing_value.clone();
+                let mut updated = existing;
                 updated.timestamp = ttl::CacheTimestampMillis::now();
                 self.cache.insert(key.clone(), updated);
                 debug!(
@@ -435,8 +435,8 @@ impl HybridArticleCache {
         let _mutation_guard = self.mutation_lock(&key).lock().await;
 
         // Get existing entry or create a typed missing entry.
-        let entry = if let Ok(Some(existing)) = self.cache.get(&key).await {
-            let mut updated = existing.value().clone();
+        let entry = if let Some(existing) = self.get_fresh_entry_for_mutation(&key).await {
+            let mut updated = existing;
             updated.record_backend_missing(backend_id);
             updated
         } else {
@@ -453,7 +453,7 @@ impl HybridArticleCache {
         &self,
         message_id: MessageId<'_>,
         status_code: StatusCode,
-        backend: super::ArticleBackendHasArticle,
+        backend: super::BackendId,
         tier: super::ttl::CacheTier,
     ) {
         let Ok(cacheable_status) = CacheableStatusCode::try_from(status_code.as_u16()) else {
@@ -467,17 +467,11 @@ impl HybridArticleCache {
 
         let key = message_id.without_brackets().to_string();
         let _mutation_guard = self.mutation_lock(&key).lock().await;
-        let entry = if let Ok(Some(existing)) = self.cache.get(&key).await
-            && !existing.value().is_expired(self.ttl_millis)
-        {
-            if existing
-                .value()
-                .availability()
-                .is_missing(backend.backend_id())
-            {
+        let entry = if let Some(existing) = self.get_fresh_entry_for_mutation(&key).await {
+            if existing.availability().is_missing(backend) {
                 return;
             }
-            let mut updated = existing.value().clone();
+            let mut updated = existing;
             updated.record_backend_has_status(cacheable_status, tier);
             updated
         } else {
@@ -619,7 +613,7 @@ mod tests {
 
     #[test]
     fn hybrid_cache_name_cold_invalidates_old_disk_formats() {
-        assert_eq!(HYBRID_CACHE_NAME, "nntp-article-cache-v3");
+        assert_eq!(HYBRID_CACHE_NAME, "nntp-article-cache-v4");
     }
 
     #[tokio::test]
@@ -632,15 +626,7 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<test123@example.com>").unwrap();
         let buffer = b"220 0 <test123@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         cache
-            .upsert_ingest(
-                msg_id,
-                buffer.clone(),
-                crate::cache::ArticleAvailability::new()
-                    .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible")
-                    .positive_observation(),
-                0.into(),
-            )
+            .upsert_ingest(msg_id, buffer.clone(), BackendId::from_index(0), 0.into())
             .await;
 
         // Retrieve it
@@ -702,22 +688,12 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<hybrid-permanent-missing@example.com>").unwrap();
         let entry = cache.get(&msg_id).await.unwrap();
         assert!(
-            entry.availability().eligible_backend(backend).is_none(),
+            entry.availability().is_missing(backend),
             "cached 430 must not produce an eligible success token"
         );
 
         let msg_id = MessageId::from_borrowed("<hybrid-permanent-missing@example.com>").unwrap();
-        cache
-            .upsert_ingest(
-                msg_id,
-                buffer,
-                crate::cache::ArticleAvailability::new()
-                    .eligible_backend(backend)
-                    .expect("fresh availability can still mint a token")
-                    .positive_observation(),
-                0.into(),
-            )
-            .await;
+        cache.upsert_ingest(msg_id, buffer, backend, 0.into()).await;
 
         let msg_id = MessageId::from_borrowed("<hybrid-permanent-missing@example.com>").unwrap();
         let entry = cache.get(&msg_id).await.unwrap();
@@ -745,15 +721,7 @@ mod tests {
             b"220 0 <expired-missing-upsert@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n"
                 .to_vec();
         cache
-            .upsert_ingest(
-                msg_id,
-                buffer.clone(),
-                crate::cache::ArticleAvailability::new()
-                    .eligible_backend(backend)
-                    .expect("fresh request state can prove this backend was eligible")
-                    .positive_observation(),
-                0.into(),
-            )
+            .upsert_ingest(msg_id, buffer.clone(), backend, 0.into())
             .await;
 
         let msg_id = MessageId::from_borrowed("<expired-missing-upsert@example.com>").unwrap();
@@ -790,10 +758,7 @@ mod tests {
             .record_has_status(
                 msg_id,
                 StatusCode::new(223),
-                crate::cache::ArticleAvailability::new()
-                    .eligible_backend(backend)
-                    .expect("fresh request state can prove this backend was eligible")
-                    .positive_observation(),
+                backend,
                 super::ttl::CacheTier::new(0),
             )
             .await;
@@ -811,6 +776,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_hybrid_record_missing_replaces_expired_entry() {
+        let cache = HybridArticleCache::new_memory_only(1024 * 1024)
+            .await
+            .unwrap();
+        let msg_id = MessageId::from_borrowed("<expired-record-missing@example.com>").unwrap();
+        let key = msg_id.without_brackets().to_string();
+        let backend = BackendId::from_index(0);
+        let mut expired = DiskCachedArticle::from_ingest_response_with_tier(
+            b"220 0 <expired-record-missing@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n"
+                .as_slice()
+                .into(),
+            super::ttl::CacheTier::new(0),
+        )
+        .expect("valid cache entry");
+        expired.timestamp = super::ttl::CacheTimestampMillis::new(0);
+        cache.cache.insert(key, expired);
+
+        cache.record_missing(msg_id, backend).await;
+
+        let msg_id = MessageId::from_borrowed("<expired-record-missing@example.com>").unwrap();
+        let entry = cache
+            .get(&msg_id)
+            .await
+            .expect("fresh missing fact should replace expired payload");
+        assert_eq!(entry.status_code(), StatusCode::new(430));
+        assert!(!entry.should_try_backend(backend));
+        assert_eq!(entry.payload_len().get(), 0);
+
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_hybrid_records_mixed_availability_facts() {
         let cache = HybridArticleCache::new_memory_only(1024 * 1024)
             .await
@@ -822,10 +819,7 @@ mod tests {
             .record_has_status(
                 msg_id,
                 StatusCode::new(223),
-                crate::cache::ArticleAvailability::new()
-                    .eligible_backend(BackendId::from_index(1))
-                    .expect("backend should be eligible")
-                    .positive_observation(),
+                BackendId::from_index(1),
                 super::ttl::CacheTier::new(0),
             )
             .await;
@@ -852,15 +846,7 @@ mod tests {
         let buffer =
             b"220 0 <mixed-payload@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         cache
-            .upsert_ingest(
-                msg_id,
-                buffer.clone(),
-                crate::cache::ArticleAvailability::new()
-                    .eligible_backend(BackendId::from_index(1))
-                    .expect("backend should be eligible")
-                    .positive_observation(),
-                0.into(),
-            )
+            .upsert_ingest(msg_id, buffer.clone(), BackendId::from_index(1), 0.into())
             .await;
 
         let msg_id = MessageId::from_borrowed("<mixed-payload@example.com>").unwrap();
@@ -893,28 +879,12 @@ mod tests {
         let body = b"222 0 <complete-replaces-metadata@example.com>\r\nbody\r\n.\r\n".to_vec();
 
         cache
-            .upsert_ingest(
-                msg_id,
-                head,
-                crate::cache::ArticleAvailability::new()
-                    .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible")
-                    .positive_observation(),
-                0.into(),
-            )
+            .upsert_ingest(msg_id, head, BackendId::from_index(0), 0.into())
             .await;
 
         let msg_id = MessageId::from_borrowed("<complete-replaces-metadata@example.com>").unwrap();
         cache
-            .upsert_ingest(
-                msg_id,
-                body.clone(),
-                crate::cache::ArticleAvailability::new()
-                    .eligible_backend(BackendId::from_index(1))
-                    .expect("backend should be eligible")
-                    .positive_observation(),
-                0.into(),
-            )
+            .upsert_ingest(msg_id, body.clone(), BackendId::from_index(1), 0.into())
             .await;
 
         let msg_id = MessageId::from_borrowed("<complete-replaces-metadata@example.com>").unwrap();

@@ -5,7 +5,7 @@
 //! runtime issues.
 
 use super::hybrid_codec::DiskCachedArticle;
-use super::{ArticleBackendHasArticle, CacheIngestResponse, HybridCacheStats};
+use super::{CacheIngestResponse, HybridCacheStats};
 use crate::types::{BackendId, MessageId};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -51,7 +51,7 @@ impl MockHybridCache {
         &self,
         message_id: &MessageId<'_>,
         buffer: impl Into<CacheIngestResponse>,
-        backend: ArticleBackendHasArticle,
+        backend: BackendId,
     ) {
         let buffer = buffer.into();
         let key = message_id.without_brackets().to_string();
@@ -67,7 +67,7 @@ impl MockHybridCache {
 
         // Check for existing entry - don't overwrite larger semantic payloads with smaller ones.
         if let Some(existing) = storage.get(&key) {
-            if existing.availability().is_missing(backend.backend_id()) {
+            if existing.availability().is_missing(backend) {
                 return;
             }
             if existing.payload_len() > entry_len {
@@ -160,26 +160,19 @@ mod tests {
         }
     }
 
-    fn observed_backend(index: usize) -> ArticleBackendHasArticle {
-        crate::cache::ArticleAvailability::new()
-            .eligible_backend(BackendId::from_index(index))
-            .expect("backend should be eligible")
-            .positive_observation()
-    }
-
     #[tokio::test]
     async fn upsert_keeps_existing_semantic_payload_over_longer_metadata_only_response() {
         let cache = MockHybridCache::new(1024);
         cache.upsert_ingest(
             &msg_id(),
             b"220 1 <mock-hybrid@example>\r\nH: V\r\n\r\nBody\r\n.\r\n".as_slice(),
-            observed_backend(0),
+            BackendId::from_index(0),
         );
 
         cache.upsert_ingest(
             &msg_id(),
             b"220 1 <mock-hybrid@example> long status line without payload\r\n".as_slice(),
-            observed_backend(1),
+            BackendId::from_index(1),
         );
 
         let entry = cache.get(&msg_id()).expect("entry remains cached");
@@ -199,7 +192,7 @@ mod tests {
         let message_id = msgid("<test@example.com>");
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n";
 
-        cache.upsert_ingest(&message_id, buffer.as_slice(), observed_backend(0));
+        cache.upsert_ingest(&message_id, buffer.as_slice(), BackendId::from_index(0));
 
         assert_article(
             &cache.get(&message_id).expect("Entry should exist"),
@@ -220,7 +213,7 @@ mod tests {
         let message_id = msgid("<borrowed@example.com>");
         let buffer = b"220 0 <borrowed@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n";
 
-        cache.upsert_ingest(&message_id, buffer.as_slice(), observed_backend(0));
+        cache.upsert_ingest(&message_id, buffer.as_slice(), BackendId::from_index(0));
 
         assert_article(
             &cache.get(&message_id).expect("cached entry"),
@@ -255,12 +248,16 @@ mod tests {
 
         let large_buffer =
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nLarge body content here\r\n.\r\n";
-        cache.upsert_ingest(&message_id, large_buffer.as_slice(), observed_backend(0));
+        cache.upsert_ingest(
+            &message_id,
+            large_buffer.as_slice(),
+            BackendId::from_index(0),
+        );
 
         cache.upsert_ingest(
             &message_id,
             b"223 0 <test@example.com>\r\n".as_slice(),
-            observed_backend(1),
+            BackendId::from_index(1),
         );
 
         let entry = cache.get(&message_id).unwrap();
@@ -296,7 +293,7 @@ mod tests {
         cache.upsert_ingest(
             &message_id,
             b"220 0 <avail@example.com>\r\nBody\r\n.\r\n".as_slice(),
-            observed_backend(0),
+            BackendId::from_index(0),
         );
 
         cache.record_missing(&message_id, BackendId::from_index(1));
@@ -316,7 +313,7 @@ mod tests {
         cache.upsert_ingest(
             &message_id,
             b"220 0 <test@example.com>\r\n.\r\n".as_slice(),
-            observed_backend(0),
+            BackendId::from_index(0),
         );
 
         MockHybridCache::close();
