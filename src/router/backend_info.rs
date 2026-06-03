@@ -79,6 +79,15 @@ impl PendingCount {
         self.0.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Increment the pending count only if it still matches the observed value.
+    #[inline]
+    #[must_use]
+    pub fn try_increment_from(&self, observed: usize) -> bool {
+        self.0
+            .compare_exchange(observed, observed + 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
     /// Decrement the pending count
     #[inline]
     pub fn decrement(&self) {

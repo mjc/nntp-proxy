@@ -2,6 +2,7 @@
 //!
 //! Tests lock-free metrics collection, recording, and snapshot generation.
 
+use nntp_proxy::cache::MAX_BACKENDS;
 use nntp_proxy::constants::user::ANONYMOUS;
 use nntp_proxy::metrics::{BackendHealthStatus, MetricsCollector};
 use nntp_proxy::types::{BackendId, MetricsBytes, Unrecorded};
@@ -588,18 +589,18 @@ fn test_zero_backends() {
 /// Test large number of backends
 #[test]
 fn test_large_number_of_backends() {
-    let collector = MetricsCollector::new(100);
-    assert_eq!(collector.num_backends(), 100);
+    let collector = MetricsCollector::new(MAX_BACKENDS);
+    assert_eq!(collector.num_backends(), MAX_BACKENDS);
 
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.backend_stats.len(), 100);
+    assert_eq!(snapshot.backend_stats.len(), MAX_BACKENDS);
 }
 
 /// Test recording to invalid backend is graceful
 #[test]
 fn test_invalid_backend_graceful() {
     let collector = MetricsCollector::new(1);
-    let invalid_backend = BackendId::from_index(99);
+    let invalid_backend = BackendId::from_index(2);
 
     // These should not panic
     collector.record_command(invalid_backend);

@@ -842,7 +842,7 @@ mod tests {
     #[test]
     fn test_out_of_bounds_backend_id_is_noop() {
         let collector = MetricsCollector::new(2);
-        let bad_id = BackendId::from_index(99);
+        let bad_id = BackendId::from_index(2);
 
         // All these should silently no-op (not panic)
         collector.record_command(bad_id);

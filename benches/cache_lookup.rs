@@ -37,19 +37,19 @@ mod availability {
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
-    fn should_try_all_available(bencher: Bencher) {
+    fn is_missing_all_available(bencher: Bencher) {
         let avail = ArticleAvailability::new();
         bencher.bench(|| {
             let mut result = true;
             for i in 0..8u8 {
-                result &= black_box(&avail).should_try(BackendId::from_index(i as usize));
+                result &= !black_box(&avail).is_missing(BackendId::from_index(i as usize));
             }
             black_box(result)
         });
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
-    fn should_try_partially_exhausted(bencher: Bencher) {
+    fn is_missing_partially_exhausted(bencher: Bencher) {
         let mut avail = ArticleAvailability::new();
         // Mark backends 0-3 as missing (half exhausted)
         for i in 0..4u8 {
@@ -58,7 +58,7 @@ mod availability {
         bencher.bench(|| {
             let mut result = true;
             for i in 0..8u8 {
-                result &= black_box(&avail).should_try(BackendId::from_index(i as usize));
+                result &= !black_box(&avail).is_missing(BackendId::from_index(i as usize));
             }
             black_box(result)
         });
@@ -71,7 +71,7 @@ mod availability {
         for i in 0..3u8 {
             avail.record_missing(BackendId::from_index(i as usize));
         }
-        let count = BackendCount::new(4);
+        let count = BackendCount::try_new(4).expect("test backend count fits availability bitmap");
         bencher.bench(|| black_box(black_box(&avail).all_exhausted(black_box(count))));
     }
 
@@ -81,19 +81,8 @@ mod availability {
         for i in 0..4u8 {
             avail.record_missing(BackendId::from_index(i as usize));
         }
-        let count = BackendCount::new(4);
+        let count = BackendCount::try_new(4).expect("test backend count fits availability bitmap");
         bencher.bench(|| black_box(black_box(&avail).all_exhausted(black_box(count))));
-    }
-
-    #[divan::bench(sample_count = 1000, sample_size = 1000)]
-    fn record_has(bencher: Bencher) {
-        bencher.bench(|| {
-            let mut avail = ArticleAvailability::new();
-            for i in 0..4u8 {
-                avail.record_has(BackendId::from_index(i as usize));
-            }
-            black_box(avail)
-        });
     }
 }
 
@@ -102,9 +91,7 @@ mod availability {
 // =============================================================================
 
 mod unified_cache {
-    use super::{
-        Arc, ArticleAvailability, BackendId, Bencher, Duration, MessageId, UnifiedCache, black_box,
-    };
+    use super::{Arc, BackendId, Bencher, Duration, MessageId, UnifiedCache, black_box};
 
     fn make_cache() -> Arc<UnifiedCache> {
         Arc::new(UnifiedCache::memory(
@@ -173,24 +160,23 @@ mod unified_cache {
     }
 
     #[divan::bench(sample_count = 100, sample_size = 100)]
-    fn sync_availability(bencher: Bencher) {
+    fn record_backend_missing(bencher: Bencher) {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let cache = make_cache();
-        let mut avail = ArticleAvailability::new();
-        avail.record_missing(BackendId::from_index(0));
-        avail.record_has(BackendId::from_index(1));
 
         bencher.bench(|| {
             rt.block_on(async {
-                let msg_id = MessageId::from_borrowed("<sync@test.com>").unwrap();
-                cache.sync_availability(msg_id.to_owned(), &avail).await;
+                let msg_id = MessageId::from_borrowed("<missing@test.com>").unwrap();
+                cache
+                    .record_backend_missing(msg_id.to_owned(), BackendId::from_index(0))
+                    .await;
             });
         });
     }
 }
 
 mod availability_cache {
-    use super::{Arc, ArticleAvailability, BackendId, Bencher, MessageId, UnifiedCache, black_box};
+    use super::{Arc, BackendId, Bencher, MessageId, UnifiedCache, black_box};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn make_cache() -> Arc<UnifiedCache> {
@@ -238,25 +224,6 @@ mod availability_cache {
                     .await;
                 black_box(());
             });
-        });
-    }
-
-    #[divan::bench(sample_count = 1000, sample_size = 1000)]
-    fn sync_availability(bencher: Bencher) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let cache = make_cache();
-        let next_id = AtomicU64::new(0);
-        let mut availability = ArticleAvailability::new();
-        availability.record_missing(BackendId::from_index(0));
-        availability.record_has(BackendId::from_index(1));
-
-        bencher.bench(|| {
-            let id = next_id.fetch_add(1, Ordering::Relaxed);
-            let msg_id = MessageId::new(format!("<sync-{id}@example.com>")).unwrap();
-            rt.block_on(async {
-                cache.sync_availability(msg_id, &availability).await;
-                black_box(())
-            })
         });
     }
 }

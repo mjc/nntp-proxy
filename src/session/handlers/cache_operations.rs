@@ -68,15 +68,6 @@ impl ClientSession {
         let availability = cached.availability();
         request.record_cache_entry_metadata(cache_entry_metadata(&cached, &availability));
 
-        if !cached.has_availability_info() {
-            debug!(
-                "Cache entry exists for {} but no availability info (missing=0) - running precheck",
-                request.message_id().unwrap_or("<invalid>")
-            );
-            request.record_cache_status(RequestCacheStatus::PartialHit);
-            return Ok(CacheLookupResult::PartialHit);
-        }
-
         debug!(
             "Client {} cache HIT for {} (cache_articles={})",
             self.client_addr,
@@ -148,7 +139,7 @@ impl ClientSession {
         &self,
         msg_id: &crate::types::MessageId<'_>,
         buffer: crate::cache::CacheIngestResponse,
-        backend_id: crate::types::BackendId,
+        backend: BackendId,
         tier: CacheTier,
     ) {
         if !self.cache.stores_payload_responses() {
@@ -159,7 +150,7 @@ impl ClientSession {
         let msg_id_owned = msg_id.to_owned();
         tokio::spawn(async move {
             cache_clone
-                .upsert_ingest(msg_id_owned, buffer, backend_id, tier)
+                .upsert_ingest(msg_id_owned, buffer, backend, tier)
                 .await;
         });
     }
@@ -169,7 +160,7 @@ impl ClientSession {
         &self,
         msg_id: &crate::types::MessageId<'_>,
         status_code: StatusCode,
-        backend_id: crate::types::BackendId,
+        backend: BackendId,
         tier: CacheTier,
     ) {
         if !self.cache.records_backend_has_status() {
@@ -180,7 +171,7 @@ impl ClientSession {
         let msg_id_owned = msg_id.to_owned();
         tokio::spawn(async move {
             cache_clone
-                .record_backend_has_status(msg_id_owned, status_code, backend_id, tier)
+                .record_backend_has_status(msg_id_owned, status_code, backend, tier)
                 .await;
         });
     }
@@ -379,17 +370,11 @@ mod tests {
         assert_eq!(
             request
                 .cache_availability()
-                .expect("cache hit records availability")
-                .checked_bits(),
-            0b0000_0001
-        );
-        assert_eq!(
-            request
-                .cache_availability()
-                .expect("cache hit records availability")
+                .expect("cache hit records cache metadata")
                 .missing_bits(),
             0
         );
+        assert!(!request.cache_records_backend_has_article(BackendId::from_index(0)));
         assert_eq!(
             request.cache_article_number(),
             Some(RequestCacheArticleNumber::new(0))
@@ -405,11 +390,9 @@ mod tests {
     async fn partial_cache_hit_records_availability_on_request_context() {
         let session = test_session();
         let msg_id = MessageId::new("<partial@example>".to_string()).expect("valid message id");
-        let mut availability = ArticleAvailability::new();
-        availability.record_missing(BackendId::from_index(0));
         session
             .cache
-            .sync_availability(msg_id.clone(), &availability)
+            .record_backend_missing(msg_id.clone(), BackendId::from_index(0))
             .await;
         let expected_timestamp = session
             .cache
@@ -420,7 +403,6 @@ mod tests {
 
         let mut router = BackendSelector::new();
         router.add_backend(
-            BackendId::from_index(0),
             ServerName::try_new("partial-backend".to_string()).expect("server name"),
             DeadpoolConnectionProvider::new(
                 "127.0.0.1".to_string(),
@@ -460,10 +442,11 @@ mod tests {
         );
         assert_eq!(request.cache_article_number(), None);
         assert_eq!(
-            request
-                .cache_availability()
-                .map(|availability| { (availability.checked_bits(), availability.missing_bits()) }),
-            Some((0b0000_0001, 0b0000_0001))
+            request.cache_availability().map(|availability| (
+                availability.missing_bits(),
+                availability.backend_has_article(BackendId::from_index(0))
+            )),
+            Some((0b0000_0001, false))
         );
         assert_eq!(metrics, BackendToClientBytes::zero());
     }

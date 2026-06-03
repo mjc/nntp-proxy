@@ -97,7 +97,7 @@ proptest! {
             if op == 0 {
                 avail.record_missing(id);
             } else {
-                avail.record_has(id);
+                let _ = avail.is_missing(id);
             }
         }
     }
@@ -117,32 +117,30 @@ proptest! {
     }
 
     #[test]
-    fn prop_record_has_clears_missing(backend_id in 0..8u8) {
+    fn prop_success_observation_preserves_missing(backend_id in 0..8u8) {
         let id = BackendId::from_index(usize::from(backend_id));
         let mut avail = ArticleAvailability::new();
 
         avail.record_missing(id);
         prop_assert!(avail.is_missing(id));
 
-        avail.record_has(id);
-        prop_assert!(!avail.is_missing(id));
+        let fresh = ArticleAvailability::new();
+        prop_assert!(!fresh.is_missing(id));
+        prop_assert!(avail.is_missing(id));
     }
 
     #[test]
-    fn prop_should_try_inverse_of_is_missing(backend_id in 0..8u8) {
+    fn prop_missing_is_sticky_and_idempotent(backend_id in 0..8u8) {
         let id = BackendId::from_index(usize::from(backend_id));
         let mut avail = ArticleAvailability::new();
 
-        // Initially should_try is true, is_missing is false
-        prop_assert_eq!(avail.should_try(id), !avail.is_missing(id));
+        prop_assert!(!avail.is_missing(id));
 
-        // After record_missing, inverted
         avail.record_missing(id);
-        prop_assert_eq!(avail.should_try(id), !avail.is_missing(id));
+        prop_assert!(avail.is_missing(id));
 
-        // After record_has, back to original
-        avail.record_has(id);
-        prop_assert_eq!(avail.should_try(id), !avail.is_missing(id));
+        avail.record_missing(id);
+        prop_assert!(avail.is_missing(id));
     }
 
     #[test]
@@ -150,7 +148,8 @@ proptest! {
         num_backends in 1..=8usize
     ) {
         let mut avail = ArticleAvailability::new();
-        let count = BackendCount::new(num_backends);
+        let count =
+            BackendCount::try_new(num_backends).expect("property backend count fits bitset");
 
         // Initially not exhausted
         prop_assert!(!avail.all_exhausted(count));
@@ -570,17 +569,16 @@ proptest! {
         let mut selector = nntp_proxy::router::BackendSelector::new();
 
         for i in 0..num_backends {
-            let id = nntp_proxy::types::BackendId::from_index(i);
             let provider = nntp_proxy::pool::DeadpoolConnectionProvider::new(
                 "localhost".to_string(), 119, format!("test-{i}"), 10, None, None
             );
-            selector.add_backend(
-                id,
+            let id = selector.add_backend(
                 nntp_proxy::types::ServerName::try_new(format!("server-{i}")).unwrap(),
                 provider,
                 0,
             );
 
+            prop_assert_eq!(id, nntp_proxy::types::BackendId::from_index(i));
             prop_assert_eq!(selector.backend_count().get(), i + 1,
                 "Backend count should be {} after adding {} backends", i + 1, i + 1);
         }
@@ -594,7 +592,7 @@ proptest! {
         let client_id = nntp_proxy::types::ClientId::new();
 
         // Routing with zero backends should return an error
-        let result = selector.route_without_availability(client_id);
+        let result = selector.route(nntp_proxy::router::RouteRequest::new(client_id));
         prop_assert!(result.is_err(),
             "route with zero backends should return error");
     }
@@ -616,12 +614,10 @@ proptest! {
         );
 
         selector.add_backend(
-            id0,
             nntp_proxy::types::ServerName::try_new("server-0".to_string()).unwrap(),
             provider0, 0,
         );
         selector.add_backend(
-            id1,
             nntp_proxy::types::ServerName::try_new("server-1".to_string()).unwrap(),
             provider1, 0,
         );
@@ -631,7 +627,7 @@ proptest! {
         let mut count1 = 0usize;
         for _ in 0..num_requests {
             let client_id = nntp_proxy::types::ClientId::new();
-            if let Ok(id) = selector.route_without_availability(client_id) {
+            if let Ok(id) = selector.route(nntp_proxy::router::RouteRequest::new(client_id)) {
                 if id == id0 { count0 += 1; }
                 if id == id1 { count1 += 1; }
                 // Complete immediately so pending counts don't accumulate

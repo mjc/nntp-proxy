@@ -464,9 +464,8 @@ async fn test_availability_works_in_hybrid_mode() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_maximum_backends_bitset_limit() -> Result<()> {
-    // Test with maximum supported backends (8 = sizeof(u8) bits)
-    // This tests the bitset limit
+async fn test_backend_availability_supports_more_than_eight_backends() -> Result<()> {
+    // This used to stop at 8 when availability was encoded in a u8.
     let (proxy_port, _backend_ports, _mock_handles) = setup_proxy_with_backends(
         vec![
             ("Backend1", false),
@@ -476,7 +475,8 @@ async fn test_maximum_backends_bitset_limit() -> Result<()> {
             ("Backend5", false),
             ("Backend6", false),
             ("Backend7", false),
-            ("Backend8", true), // Only last one has it
+            ("Backend8", false),
+            ("Backend9", true), // Only last one has it
         ],
         RoutingMode::PerCommand,
     )
@@ -489,7 +489,7 @@ async fn test_maximum_backends_bitset_limit() -> Result<()> {
 
     assert!(
         status.starts_with("220"),
-        "Should find article on 8th backend"
+        "Should find article on 9th backend"
     );
     assert!(!body.is_empty());
 

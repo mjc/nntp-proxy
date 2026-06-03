@@ -6,7 +6,7 @@
 //! are pushed down by storing a keyed 64-bit fingerprint plus a keyed 16-bit
 //! confirmation tag per slot.
 
-use super::{ArticleAvailability, CachedArticle, availability::MAX_BACKENDS, ttl};
+use super::{CachedArticle, ttl};
 use crate::io_util::atomic_replace_file;
 use crate::types::{BackendId, MessageId};
 use anyhow::{Context, Result};
@@ -23,11 +23,13 @@ use twox_hash::XxHash64;
 const DEFAULT_GENERATIONS: usize = 2;
 const BLOCK_SLOTS: usize = 2;
 const FIXED_ARTICLE_CAPACITY: usize = 256 * 1024;
-const ALL_BACKEND_BITS: u8 = ((1u16 << MAX_BACKENDS) - 1) as u8;
-const PERSISTENCE_MAGIC: &[u8; 8] = b"ANEGSIM2";
+const ALL_BACKEND_BITS: usize = usize::MAX;
+const PERSISTENCE_MAGIC: &[u8; 8] = b"ANEGSIM4";
 const LEGACY_PERSISTENCE_MAGIC_V1: &[u8; 8] = b"ANEGIDX1";
 const LEGACY_PERSISTENCE_MAGIC_V2: &[u8; 8] = b"ANEGIDX2";
 const LEGACY_PERSISTENCE_MAGIC_V3: &[u8; 8] = b"ANEGSIM1";
+const LEGACY_PERSISTENCE_MAGIC_V4: &[u8; 8] = b"ANEGSIM2";
+const LEGACY_PERSISTENCE_MAGIC_V5: &[u8; 8] = b"ANEGSIM3";
 
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -36,7 +38,7 @@ static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
 struct Block {
     hashes: [u64; BLOCK_SLOTS],
     tags: [u16; BLOCK_SLOTS],
-    missing: [u8; BLOCK_SLOTS],
+    missing: [usize; BLOCK_SLOTS],
 }
 
 type SlotMatchMask = u8;
@@ -44,9 +46,9 @@ const FIXED_TOTAL_BLOCKS: usize = FIXED_ARTICLE_CAPACITY / BLOCK_SLOTS;
 const FIXED_CAPACITY_BYTES: u64 = (FIXED_TOTAL_BLOCKS * size_of::<Block>()) as u64;
 
 impl Block {
-    fn missing_bits(&self, hash: u64, tag: u16) -> u8 {
+    fn missing_bits(&self, hash: u64, tag: u16) -> usize {
         let mut matched = matching_slots(&self.hashes, &self.tags, hash, tag);
-        let mut missing_bits = 0u8;
+        let mut missing_bits = 0usize;
 
         while matched != 0 {
             let slot = matched.trailing_zeros() as usize;
@@ -57,7 +59,7 @@ impl Block {
         missing_bits
     }
 
-    fn insert(&mut self, hash: u64, tag: u16, missing_bits: u8, victim: usize) -> InsertOutcome {
+    fn insert(&mut self, hash: u64, tag: u16, missing_bits: usize, victim: usize) -> InsertOutcome {
         debug_assert_ne!(hash, 0, "fingerprint slots use 0 as the empty sentinel");
 
         let existing = matching_slots(&self.hashes, &self.tags, hash, tag);
@@ -127,7 +129,7 @@ impl Generation {
 struct PersistedEntry {
     hash: u64,
     tag: u16,
-    missing: u8,
+    missing: usize,
     inserted_at: u64,
 }
 
@@ -284,7 +286,7 @@ impl FilterState {
             };
         }
 
-        let mut missing_bits = 0u8;
+        let mut missing_bits = 0usize;
         for generation_index in self.active_generation_indices() {
             missing_bits |=
                 self.generations[generation_index].blocks[block_index].missing_bits(hash, tag);
@@ -304,7 +306,7 @@ impl FilterState {
         &mut self,
         hash: u64,
         tag: u16,
-        missing_bits: u8,
+        missing_bits: usize,
         block_index: usize,
         victim: usize,
         now: u64,
@@ -424,7 +426,7 @@ impl FilterState {
 
 #[derive(Clone, Copy, Debug, Default)]
 struct LookupResult {
-    missing_bits: u8,
+    missing_bits: usize,
     evicted: usize,
     empty_after: bool,
 }
@@ -540,14 +542,6 @@ impl AvailabilityIndex {
         self.insert_missing_bits(message_id.without_brackets(), backend_id.availability_bit());
     }
 
-    pub fn sync_availability(
-        &self,
-        message_id: &MessageId<'_>,
-        availability: &ArticleAvailability,
-    ) {
-        self.insert_missing_bits(message_id.without_brackets(), availability.missing_bits());
-    }
-
     pub fn load_from_path(&self, path: &Path) -> Result<bool> {
         if !path.exists() {
             return Ok(false);
@@ -615,14 +609,14 @@ impl AvailabilityIndex {
 
         let mut bytes = Vec::with_capacity(
             16 + snapshot.entries.len()
-                * (size_of::<u64>() + size_of::<u16>() + 1 + size_of::<u64>()),
+                * (size_of::<u64>() + size_of::<u16>() + size_of::<u64>() + size_of::<u64>()),
         );
         bytes.extend_from_slice(PERSISTENCE_MAGIC);
         bytes.extend_from_slice(&(snapshot.entries.len() as u64).to_le_bytes());
         for entry in snapshot.entries {
             bytes.extend_from_slice(&entry.hash.to_le_bytes());
             bytes.extend_from_slice(&entry.tag.to_le_bytes());
-            bytes.push(entry.missing);
+            bytes.extend_from_slice(&availability_bits_to_wire(entry.missing)?.to_le_bytes());
             bytes.extend_from_slice(&entry.inserted_at.to_le_bytes());
         }
 
@@ -738,7 +732,7 @@ impl AvailabilityIndex {
         }
     }
 
-    fn insert_missing_bits(&self, key: &str, missing_bits: u8) {
+    fn insert_missing_bits(&self, key: &str, missing_bits: usize) {
         if key.is_empty() || missing_bits == 0 || self.ttl.get() == 0 {
             return;
         }
@@ -781,6 +775,8 @@ fn parse_entries(data: &[u8]) -> Result<Vec<PersistedEntry>> {
     if magic == LEGACY_PERSISTENCE_MAGIC_V1
         || magic == LEGACY_PERSISTENCE_MAGIC_V2
         || magic == LEGACY_PERSISTENCE_MAGIC_V3
+        || magic == LEGACY_PERSISTENCE_MAGIC_V4
+        || magic == LEGACY_PERSISTENCE_MAGIC_V5
     {
         return Ok(Vec::new());
     }
@@ -795,10 +791,7 @@ fn parse_entries(data: &[u8]) -> Result<Vec<PersistedEntry>> {
     for _ in 0..entry_count {
         let hash = read_u64(data, &mut cursor)?;
         let tag = read_u16(data, &mut cursor)?;
-        let missing = *data
-            .get(cursor)
-            .ok_or_else(|| anyhow::anyhow!("truncated availability missing bits"))?;
-        cursor += 1;
+        let missing = availability_bits_from_wire(read_u64(data, &mut cursor)?)?;
         let inserted_at = read_u64(data, &mut cursor)?;
         entries.push(PersistedEntry {
             hash,
@@ -825,6 +818,14 @@ fn read_u16(data: &[u8], cursor: &mut usize) -> Result<u16> {
         .ok_or_else(|| anyhow::anyhow!("truncated u16 field"))?;
     *cursor += size_of::<u16>();
     Ok(u16::from_le_bytes(bytes.try_into().unwrap()))
+}
+
+fn availability_bits_to_wire(bits: usize) -> Result<u64> {
+    u64::try_from(bits).context("availability bitmap exceeds u64 wire format")
+}
+
+fn availability_bits_from_wire(bits: u64) -> Result<usize> {
+    usize::try_from(bits).context("availability bitmap exceeds usize on this target")
 }
 
 fn hash_key(bytes: &[u8]) -> (u64, u16) {
@@ -870,6 +871,7 @@ fn matching_slots(
 
 #[cfg(test)]
 mod tests {
+    use super::super::availability::MAX_BACKENDS;
     use super::*;
     use tempfile::TempDir;
 
@@ -893,7 +895,11 @@ mod tests {
         for entry in entries {
             bytes.extend_from_slice(&entry.hash.to_le_bytes());
             bytes.extend_from_slice(&entry.tag.to_le_bytes());
-            bytes.push(entry.missing);
+            bytes.extend_from_slice(
+                &availability_bits_to_wire(entry.missing)
+                    .unwrap()
+                    .to_le_bytes(),
+            );
             bytes.extend_from_slice(&entry.inserted_at.to_le_bytes());
         }
 
@@ -972,42 +978,22 @@ mod tests {
     }
 
     #[test]
-    fn record_missing_supports_highest_backend_bit() {
+    fn record_missing_supports_backend_eight_bit() {
         let index = AvailabilityIndex::with_test_capacity(test_capacity_for(16, 2));
         let msg_id = MessageId::from_borrowed("<highest@example.com>").unwrap();
-        let backend_id = BackendId::from_index(7);
+        let backend_id = BackendId::from_index(8);
 
         index.record_backend_missing(&msg_id, backend_id);
 
         let cached = index.get(&msg_id).expect("negative entry");
-        assert_eq!(cached.availability().missing_bits(), 0b1000_0000);
+        assert_eq!(cached.availability().missing_bits(), 0b1_0000_0000);
         assert!(!cached.should_try_backend(backend_id));
     }
 
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "Backend index 8 exceeds MAX_BACKENDS")]
-    fn record_missing_panics_for_out_of_range_backend() {
-        let index = AvailabilityIndex::with_test_capacity(test_capacity_for(8, 2));
-        let msg_id = MessageId::from_borrowed("<panic@example.com>").unwrap();
-
-        index.record_backend_missing(&msg_id, BackendId::from_index(8));
-    }
-
-    #[test]
-    fn sync_availability_persists_only_missing_bits() {
-        let index = AvailabilityIndex::with_test_capacity(test_capacity_for(16, 2));
-        let msg_id = MessageId::from_borrowed("<mixed@example.com>").unwrap();
-        let mut availability = ArticleAvailability::new();
-        availability.record_missing(BackendId::from_index(0));
-        availability.record_has(BackendId::from_index(1));
-
-        index.sync_availability(&msg_id, &availability);
-
-        let cached = index.get(&msg_id).expect("negative availability");
-        assert_eq!(cached.availability().checked_bits(), 0b0000_0001);
-        assert_eq!(cached.availability().missing_bits(), 0b0000_0001);
-        assert!(cached.should_try_backend(BackendId::from_index(1)));
+    fn record_missing_cannot_receive_out_of_range_backend() {
+        assert!(BackendId::try_from_index(usize::BITS as usize).is_none());
     }
 
     #[test]

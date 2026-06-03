@@ -11,17 +11,16 @@ fn test_router_creation() {
 #[test]
 fn test_add_backend() {
     let mut router = BackendSelector::new();
-    let backend_id = BackendId::from_index(0);
     let provider = create_test_provider();
 
-    router.add_backend(
-        backend_id,
+    let backend_id = router.add_backend(
         ServerName::try_new("test-backend".to_string()).unwrap(),
         provider,
         0, // tier
     );
 
     assert_eq!(router.backend_count(), 1);
+    assert_eq!(backend_id, BackendId::from_index(0));
 }
 
 #[test]
@@ -29,14 +28,13 @@ fn test_add_multiple_backends() {
     let mut router = BackendSelector::new();
 
     for i in 0..3 {
-        let backend_id = BackendId::from_index(i);
         let provider = create_test_provider();
-        router.add_backend(
-            backend_id,
+        let backend_id = router.add_backend(
             ServerName::try_new(format!("backend-{i}")).unwrap(),
             provider,
             0, // tier
         );
+        assert_eq!(backend_id, BackendId::from_index(i));
     }
 
     assert_eq!(router.backend_count(), 3);
@@ -46,7 +44,7 @@ fn test_add_multiple_backends() {
 fn test_no_backends_fails() {
     let router = BackendSelector::new();
     let client_id = ClientId::new();
-    let result = router.route_without_availability(client_id);
+    let result = router.route(nntp_proxy::router::RouteRequest::new(client_id));
 
     assert!(result.is_err());
 }
@@ -58,7 +56,6 @@ fn test_get_backend_provider() {
     let provider = create_test_provider();
 
     router.add_backend(
-        backend_id,
         ServerName::try_new("test".to_string()).unwrap(),
         provider,
         0, // tier
@@ -67,6 +64,6 @@ fn test_get_backend_provider() {
     let retrieved = router.backend_provider(backend_id);
     assert!(retrieved.is_some());
 
-    let fake_id = BackendId::from_index(999);
+    let fake_id = BackendId::from_index(1);
     assert!(router.backend_provider(fake_id).is_none());
 }

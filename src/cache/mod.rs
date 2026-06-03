@@ -229,12 +229,13 @@ mod tests {
         let cache = UnifiedCache::memory(1000, std::time::Duration::from_secs(60));
         let msg_id = MessageId::new("<typed-availability@example>".to_string()).unwrap();
         let backend_id = BackendId::from_index(1);
+        let backend = backend_id;
 
         cache
             .record_backend_has_status(
                 msg_id.clone(),
                 StatusCode::new(220),
-                backend_id,
+                backend,
                 ttl::CacheTier::new(2),
             )
             .await;
@@ -248,7 +249,8 @@ mod tests {
             crate::protocol::RequestCachePayloadKind::AvailabilityOnly
         );
         assert_eq!(entry.payload_len().get(), 0);
-        assert!(entry.has_availability_info());
+        assert!(!entry.has_availability_info());
+        assert_eq!(entry.availability().missing_bits(), 0);
         assert!(entry.should_try_backend(backend_id));
     }
 }
@@ -412,25 +414,22 @@ impl UnifiedCache {
         }
     }
 
+    /// Store a successful article response for an eligible backend.
     pub async fn upsert_ingest(
         &self,
         message_id: MessageId<'_>,
         buffer: impl Into<CacheIngestResponse>,
-        backend_id: BackendId,
+        backend: BackendId,
         tier: ttl::CacheTier,
     ) {
         let buffer = buffer.into();
         match self {
             Self::Availability(_) => {}
             Self::Memory(cache) => {
-                cache
-                    .upsert_ingest(message_id, buffer, backend_id, tier)
-                    .await;
+                cache.upsert_ingest(message_id, buffer, backend, tier).await;
             }
             Self::Hybrid(cache) => {
-                cache
-                    .upsert_ingest(message_id, buffer, backend_id, tier)
-                    .await;
+                cache.upsert_ingest(message_id, buffer, backend, tier).await;
             }
         }
     }
@@ -449,34 +448,21 @@ impl UnifiedCache {
         &self,
         message_id: MessageId<'_>,
         status_code: StatusCode,
-        backend_id: BackendId,
+        backend: BackendId,
         tier: ttl::CacheTier,
     ) {
         match self {
             Self::Availability(_) => {}
             Self::Memory(cache) => {
                 cache
-                    .record_backend_has_status(message_id, status_code, backend_id, tier)
+                    .record_backend_has_status(message_id, status_code, backend, tier)
                     .await;
             }
             Self::Hybrid(cache) => {
                 cache
-                    .record_has_status(message_id, status_code, backend_id, tier)
+                    .record_has_status(message_id, status_code, backend, tier)
                     .await;
             }
-        }
-    }
-
-    /// Sync availability information for an article
-    pub async fn sync_availability(
-        &self,
-        message_id: MessageId<'_>,
-        availability: &ArticleAvailability,
-    ) {
-        match self {
-            Self::Availability(index) => index.sync_availability(&message_id, availability),
-            Self::Memory(cache) => cache.sync_availability(message_id, availability).await,
-            Self::Hybrid(cache) => cache.sync_availability(message_id, availability).await,
         }
     }
 

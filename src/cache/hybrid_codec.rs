@@ -6,19 +6,26 @@
 //! # Wire Format
 //!
 //! ```text
-//! [magic:u32][status:u16][checked:u8][missing:u8][timestamp:u64][tier:u8][payload-kind:u8]...
+//! [magic:u32][status:u16][missing:u64][timestamp:u64][tier:u8][payload-kind:u8]...
 //! ```
 
 use crate::protocol::StatusCode;
 use crate::types::BackendId;
 use foyer::Code;
 use std::io::{Read, Write};
+use std::mem::size_of;
 
 use super::article::{CachedArticleNumber, CachedPayload, parse_payload};
 use super::availability::ArticleAvailability;
 use super::ttl;
 
-const DISK_ENTRY_MAGIC_V3: u32 = 0x4e50_4333; // "NPC3"
+#[cfg(test)]
+const DISK_ENTRY_MAGIC_V3: u32 = 0x4e50_4333; // "NPC3": legacy u8 availability bitmaps.
+#[cfg(test)]
+const DISK_ENTRY_MAGIC_V4: u32 = 0x4e50_4334; // "NPC4": legacy usize availability bitmaps.
+#[cfg(test)]
+const DISK_ENTRY_MAGIC_V5: u32 = 0x4e50_4335; // "NPC5": legacy checked + missing bitmaps.
+const DISK_ENTRY_MAGIC_V6: u32 = 0x4e50_4336; // "NPC6"
 const PAYLOAD_MISSING: u8 = 0;
 const PAYLOAD_AVAILABILITY_ONLY: u8 = 1;
 const PAYLOAD_ARTICLE: u8 = 2;
@@ -119,12 +126,12 @@ impl TryFrom<u16> for CacheableStatusCode {
 /// Implements foyer's Code trait manually for efficient serialization:
 /// - Pre-allocates buffer on decode (no vec resizing)
 /// - Simple binary format:
-///   [magic:u32][status:u16][checked:u8][missing:u8][timestamp:u64][tier:u8][typed-payload]
+///   [magic:u32][status:u16][missing:u64][timestamp:u64][tier:u8][typed-payload]
 #[derive(Clone, Debug)]
 pub struct DiskCachedArticle {
     /// Validated NNTP status code — only cacheable codes are representable
     status_code: CacheableStatusCode,
-    /// Backend availability tracking (checked/missing bitsets)
+    /// Backend availability tracking (authoritative missing bitset)
     pub(super) availability: ArticleAvailability,
     /// Unix timestamp when availability info was last updated (milliseconds since epoch)
     /// Used to expire stale availability-only entries (missing articles, STAT responses)
@@ -140,16 +147,13 @@ pub struct DiskCachedArticle {
 impl Code for DiskCachedArticle {
     fn encode(&self, writer: &mut impl Write) -> foyer::Result<()> {
         writer
-            .write_all(&DISK_ENTRY_MAGIC_V3.to_le_bytes())
+            .write_all(&DISK_ENTRY_MAGIC_V6.to_le_bytes())
             .map_err(foyer::Error::io_error)?;
         writer
             .write_all(&self.status_code.as_u16().to_le_bytes())
             .map_err(foyer::Error::io_error)?;
         writer
-            .write_all(&[
-                self.availability.checked_bits(),
-                self.availability.missing_bits(),
-            ])
+            .write_all(&availability_bits_to_wire(self.availability.missing_bits())?.to_le_bytes())
             .map_err(foyer::Error::io_error)?;
         writer
             .write_all(&self.timestamp.get().to_le_bytes())
@@ -167,7 +171,7 @@ impl Code for DiskCachedArticle {
             .read_exact(&mut magic)
             .map_err(foyer::Error::io_error)?;
         let magic = u32::from_le_bytes(magic);
-        if magic != DISK_ENTRY_MAGIC_V3 {
+        if magic != DISK_ENTRY_MAGIC_V6 {
             return Err(foyer::Error::io_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "old hybrid cache entry format",
@@ -189,10 +193,11 @@ impl Code for DiskCachedArticle {
             ))
         })?;
 
-        // Read header: checked + missing
-        let mut header = [0u8; 2];
+        // ArticleAvailability is negative-only: 430 facts are authoritative,
+        // positive observations remain request-cache metadata.
+        let mut missing_bytes = [0u8; size_of::<u64>()];
         reader
-            .read_exact(&mut header)
+            .read_exact(&mut missing_bytes)
             .map_err(foyer::Error::io_error)?;
 
         // Read timestamp
@@ -213,7 +218,9 @@ impl Code for DiskCachedArticle {
 
         Ok(Self {
             status_code,
-            availability: ArticleAvailability::from_bits(header[0], header[1]),
+            availability: ArticleAvailability::from_missing_bits(availability_bits_from_wire(
+                u64::from_le_bytes(missing_bytes),
+            )?),
             timestamp,
             tier,
             payload,
@@ -221,8 +228,26 @@ impl Code for DiskCachedArticle {
     }
 
     fn estimated_size(&self) -> usize {
-        4 + 2 + 2 + 8 + 1 + encoded_payload_size(&self.payload)
+        4 + 2 + size_of::<u64>() + 8 + 1 + encoded_payload_size(&self.payload)
     }
+}
+
+fn availability_bits_to_wire(bits: usize) -> foyer::Result<u64> {
+    u64::try_from(bits).map_err(|_| {
+        foyer::Error::io_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "availability bitmap exceeds u64 wire format",
+        ))
+    })
+}
+
+fn availability_bits_from_wire(bits: u64) -> foyer::Result<usize> {
+    usize::try_from(bits).map_err(|_| {
+        foyer::Error::io_error(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "availability bitmap exceeds usize on this target",
+        ))
+    })
 }
 
 fn encode_payload(writer: &mut impl Write, payload: &CachedPayload) -> foyer::Result<()> {
@@ -494,16 +519,10 @@ impl DiskCachedArticle {
         self.availability.record_missing(backend_id);
     }
 
-    /// Record that a backend successfully provided this article
-    pub(crate) fn record_backend_has(&mut self, backend_id: BackendId) {
-        self.availability.record_has(backend_id);
-    }
-
     /// Record successful backend availability without storing response payload bytes.
     pub(super) fn record_backend_has_status(
         &mut self,
         status_code: CacheableStatusCode,
-        backend_id: BackendId,
         tier: ttl::CacheTier,
     ) {
         if !self.is_complete_article() {
@@ -512,7 +531,6 @@ impl DiskCachedArticle {
             self.tier = tier;
         }
         self.timestamp = ttl::CacheTimestampMillis::now();
-        self.record_backend_has(backend_id);
     }
 
     /// Check if this cache entry contains a complete article (220) or body (222)
@@ -532,7 +550,6 @@ impl DiskCachedArticle {
     /// Get backend availability as `ArticleAvailability` struct
     #[inline]
     #[must_use]
-    #[cfg(test)]
     pub(crate) const fn availability(&self) -> ArticleAvailability {
         self.availability
     }
@@ -711,7 +728,6 @@ mod tests {
         );
         assert_eq!(entry.status_code().as_u16(), 220);
 
-        entry.record_backend_has(BackendId::from_index(0));
         assert!(entry.should_try_backend(BackendId::from_index(0)));
         assert!(entry.should_try_backend(BackendId::from_index(1)));
 
@@ -978,14 +994,48 @@ mod tests {
     #[test]
     fn test_code_decode_rejects_invalid_status() {
         let mut buf = Vec::new();
+        buf.extend_from_slice(&DISK_ENTRY_MAGIC_V6.to_le_bytes());
         buf.extend_from_slice(&999u16.to_le_bytes());
-        buf.extend_from_slice(&[0u8; 2]);
+        buf.extend_from_slice(&0u64.to_le_bytes());
         buf.extend_from_slice(&0u64.to_le_bytes());
         buf.push(0);
         buf.extend_from_slice(&5u32.to_le_bytes());
         buf.extend_from_slice(b"hello");
 
         let result = DiskCachedArticle::decode(&mut buf.as_slice());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_code_decode_rejects_legacy_u8_bitmap_magic() {
+        let entry = disk_cached_article_from_ingest_bytes(b"220 article\r\n").unwrap();
+        let mut encoded = Vec::new();
+        entry.encode(&mut encoded).unwrap();
+        encoded[..4].copy_from_slice(&DISK_ENTRY_MAGIC_V3.to_le_bytes());
+
+        let result = DiskCachedArticle::decode(&mut encoded.as_slice());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_code_decode_rejects_legacy_usize_bitmap_magic() {
+        let entry = disk_cached_article_from_ingest_bytes(b"220 article\r\n").unwrap();
+        let mut encoded = Vec::new();
+        entry.encode(&mut encoded).unwrap();
+        encoded[..4].copy_from_slice(&DISK_ENTRY_MAGIC_V4.to_le_bytes());
+
+        let result = DiskCachedArticle::decode(&mut encoded.as_slice());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_code_decode_rejects_legacy_checked_bitmap_magic() {
+        let entry = disk_cached_article_from_ingest_bytes(b"220 article\r\n").unwrap();
+        let mut encoded = Vec::new();
+        entry.encode(&mut encoded).unwrap();
+        encoded[..4].copy_from_slice(&DISK_ENTRY_MAGIC_V5.to_le_bytes());
+
+        let result = DiskCachedArticle::decode(&mut encoded.as_slice());
         assert!(result.is_err());
     }
 
@@ -1007,7 +1057,6 @@ mod tests {
     #[test]
     fn test_code_encode_decode_preserves_availability() {
         let mut entry = disk_cached_article_from_ingest_bytes(b"220 ok\r\n").unwrap();
-        entry.record_backend_has(BackendId::from_index(0));
         entry.record_backend_missing(BackendId::from_index(2));
 
         let mut encoded = Vec::new();
@@ -1022,7 +1071,7 @@ mod tests {
     #[test]
     fn test_code_estimated_size() {
         let entry = disk_cached_article_from_ingest_bytes(b"220 article\r\n").unwrap();
-        let expected = 4 + 2 + 2 + 8 + 1 + 1;
+        let expected = 4 + 2 + size_of::<u64>() + 8 + 1 + 1;
         assert_eq!(entry.estimated_size(), expected);
     }
 
@@ -1343,12 +1392,6 @@ mod tests {
         let mut reader = std::io::Cursor::new(buffer);
         let decoded = DiskCachedArticle::decode(&mut reader).unwrap();
 
-        // Compare the bitset representation
-        assert_eq!(
-            entry.availability.checked_bits(),
-            decoded.availability.checked_bits(),
-            "Checked bits mismatch"
-        );
         assert_eq!(
             entry.availability.missing_bits(),
             decoded.availability.missing_bits(),

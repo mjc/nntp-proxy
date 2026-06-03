@@ -4,12 +4,9 @@
 //! - `UnifiedCache` enum dispatch (memory vs hybrid)
 //! - `CacheStatsProvider` trait implementations
 //! - `CachedArticle::cached_response_for()` including STAT synthesis
-//! - `ArticleAvailability::from_bits()`
 //! - `DiskCache` configuration defaults and validation
 
-use nntp_proxy::cache::{
-    ArticleAvailability, ArticleCache, AvailabilityIndex, BackendStatus, UnifiedCache,
-};
+use nntp_proxy::cache::{ArticleCache, AvailabilityIndex, UnifiedCache};
 use nntp_proxy::protocol::RequestKind;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
@@ -104,7 +101,7 @@ async fn test_unified_cache_availability_record_missing() {
 }
 
 #[tokio::test]
-async fn test_unified_cache_sync_availability() {
+async fn test_unified_cache_record_missing_preserves_existing_article() {
     let cache = UnifiedCache::memory(100_000, Duration::from_secs(60));
     let msg_id = MessageId::from_str_or_wrap("test@example.com").unwrap();
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
@@ -115,12 +112,9 @@ async fn test_unified_cache_sync_availability() {
         .upsert_ingest(msg_id.clone(), buffer.clone(), backend_id, 0.into())
         .await;
 
-    // Create availability with backend 1 marked as missing
-    let mut availability = ArticleAvailability::new();
-    availability.record_missing(BackendId::from_index(1));
-
-    // Sync availability
-    cache.sync_availability(msg_id.clone(), &availability).await;
+    cache
+        .record_backend_missing(msg_id.clone(), BackendId::from_index(1))
+        .await;
 
     // Verify backend 1 is now marked as missing
     let result = cache.get(&msg_id).await.unwrap();
@@ -130,19 +124,17 @@ async fn test_unified_cache_sync_availability() {
 }
 
 #[tokio::test]
-async fn test_unified_cache_availability_sync_persists_only_missing_bits() {
+async fn test_unified_cache_availability_records_only_missing_facts() {
     let cache = UnifiedCache::availability(std::time::Duration::MAX);
     let msg_id = MessageId::from_str_or_wrap("test@example.com").unwrap();
-    let mut availability = ArticleAvailability::new();
-    availability.record_missing(BackendId::from_index(1));
-    availability.record_has(BackendId::from_index(2));
-
-    cache.sync_availability(msg_id.clone(), &availability).await;
+    cache
+        .record_backend_missing(msg_id.clone(), BackendId::from_index(1))
+        .await;
 
     let result = cache.get(&msg_id).await.expect("availability entry");
     assert!(!result.should_try_backend(BackendId::from_index(1)));
     assert!(result.should_try_backend(BackendId::from_index(2)));
-    assert_eq!(result.availability().checked_bits(), 0b0000_0010);
+    assert_eq!(result.availability().missing_bits(), 0b0000_0010);
     assert_eq!(result.availability().missing_bits(), 0b0000_0010);
 }
 
@@ -167,7 +159,12 @@ async fn test_unified_cache_weighted_size() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
 
     cache
-        .upsert_ingest(msg_id.clone(), buffer, BackendId::from_index(0), 0.into())
+        .upsert_ingest(
+            msg_id.clone(),
+            buffer,
+            nntp_proxy::types::BackendId::from_index(0),
+            0.into(),
+        )
         .await;
 
     // Run pending tasks to ensure moka updates its internal state
@@ -205,92 +202,6 @@ async fn test_cache_stats_provider_unified_cache_memory() {
 
     assert_eq!(stats.entry_count, 0);
     assert!(stats.disk.is_none()); // Memory-only cache has no disk stats
-}
-
-// ============================================================================
-// ArticleAvailability::from_bits() Tests
-// ============================================================================
-
-#[test]
-fn test_availability_from_bits_empty() {
-    let avail = ArticleAvailability::from_bits(0, 0);
-    assert!(!avail.has_availability_info());
-
-    // All backends should be "unknown" (not yet checked)
-    for i in 0..8 {
-        assert_eq!(
-            avail.status(BackendId::from_index(i)),
-            BackendStatus::Unknown
-        );
-    }
-}
-
-#[test]
-fn test_availability_from_bits_some_missing() {
-    // checked=0b00000011, missing=0b00000001 means:
-    // - backend 0: checked and missing (430)
-    // - backend 1: checked and has article
-    let avail = ArticleAvailability::from_bits(0b0000_0011, 0b0000_0001);
-
-    assert!(avail.has_availability_info());
-    assert_eq!(
-        avail.status(BackendId::from_index(0)),
-        BackendStatus::Missing
-    );
-    assert_eq!(
-        avail.status(BackendId::from_index(1)),
-        BackendStatus::HasArticle
-    );
-    assert_eq!(
-        avail.status(BackendId::from_index(2)),
-        BackendStatus::Unknown
-    );
-}
-
-#[test]
-fn test_availability_from_bits_all_missing() {
-    // All 8 backends checked and missing
-    let avail = ArticleAvailability::from_bits(0xFF, 0xFF);
-
-    for i in 0..8 {
-        assert_eq!(
-            avail.status(BackendId::from_index(i)),
-            BackendStatus::Missing
-        );
-        assert!(avail.is_missing(BackendId::from_index(i)));
-    }
-}
-
-#[test]
-fn test_availability_from_bits_roundtrip() {
-    let mut original = ArticleAvailability::new();
-    original.record_missing(BackendId::from_index(0));
-    original.record_missing(BackendId::from_index(2));
-    original.record_has(BackendId::from_index(1));
-    original.record_has(BackendId::from_index(3));
-
-    let checked = original.checked_bits();
-    let missing = original.missing_bits();
-
-    let reconstructed = ArticleAvailability::from_bits(checked, missing);
-
-    // Should be equivalent
-    assert_eq!(
-        reconstructed.status(BackendId::from_index(0)),
-        original.status(BackendId::from_index(0))
-    );
-    assert_eq!(
-        reconstructed.status(BackendId::from_index(1)),
-        original.status(BackendId::from_index(1))
-    );
-    assert_eq!(
-        reconstructed.status(BackendId::from_index(2)),
-        original.status(BackendId::from_index(2))
-    );
-    assert_eq!(
-        reconstructed.status(BackendId::from_index(3)),
-        original.status(BackendId::from_index(3))
-    );
 }
 
 // ============================================================================

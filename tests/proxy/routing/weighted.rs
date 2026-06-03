@@ -15,7 +15,6 @@ fn test_total_weight_accumulation() {
     assert_eq!(selector.total_weight(), 0);
 
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("backend1".to_string()).unwrap(),
         create_backend("backend1", 20),
         0, // tier
@@ -23,7 +22,6 @@ fn test_total_weight_accumulation() {
     assert_eq!(selector.total_weight(), 20);
 
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("backend2".to_string()).unwrap(),
         create_backend("backend2", 30),
         0, // tier
@@ -31,7 +29,6 @@ fn test_total_weight_accumulation() {
     assert_eq!(selector.total_weight(), 50);
 
     selector.add_backend(
-        BackendId::from_index(2),
         ServerName::try_new("backend3".to_string()).unwrap(),
         create_backend("backend3", 50),
         0, // tier
@@ -45,13 +42,11 @@ fn test_weighted_distribution_equal_weights() {
 
     // Two backends with equal pool sizes (10 each)
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("backend0".to_string()).unwrap(),
         create_backend("backend0", 10),
         0, // tier
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("backend1".to_string()).unwrap(),
         create_backend("backend1", 10),
         0, // tier
@@ -64,7 +59,7 @@ fn test_weighted_distribution_equal_weights() {
     let mut counts = [0; 2];
     for _ in 0..100 {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -91,13 +86,11 @@ fn test_weighted_distribution_unequal_weights() {
     // Backend 1: 50 connections
     // Total: 90, so backend 0 gets 40/90 = 44.4%, backend 1 gets 50/90 = 55.6%
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("small".to_string()).unwrap(),
         create_backend("small", 40),
         0, // tier
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("large".to_string()).unwrap(),
         create_backend("large", 50),
         0, // tier
@@ -109,7 +102,7 @@ fn test_weighted_distribution_unequal_weights() {
     let mut counts = [0; 2];
     for _ in 0..900 {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -138,19 +131,16 @@ fn test_weighted_distribution_three_backends() {
     // Backend 1: 20 connections (20/60 = 33.3%)
     // Backend 2: 30 connections (30/60 = 50.0%)
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("small".to_string()).unwrap(),
         create_backend("small", 10),
         0, // tier
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("medium".to_string()).unwrap(),
         create_backend("medium", 20),
         0, // tier
     );
     selector.add_backend(
-        BackendId::from_index(2),
         ServerName::try_new("large".to_string()).unwrap(),
         create_backend("large", 30),
         0, // tier
@@ -162,7 +152,7 @@ fn test_weighted_distribution_three_backends() {
     let mut counts = [0; 3];
     for _ in 0..600 {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -194,13 +184,11 @@ fn test_weighted_real_world_scenario() {
     // usenet.farm: 40 connections
     // NewsDemon: 50 connections
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("usenet.farm".to_string()).unwrap(),
         create_backend("usenet.farm", 40),
         0, // tier
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("NewsDemon".to_string()).unwrap(),
         create_backend("NewsDemon", 50),
         0, // tier
@@ -214,7 +202,7 @@ fn test_weighted_real_world_scenario() {
 
     for _ in 0..total_requests {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -245,13 +233,11 @@ fn test_weighted_extreme_imbalance() {
 
     // Extreme case: 1 vs 99 connections
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("tiny".to_string()).unwrap(),
         create_backend("tiny", 1),
         0, // tier
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("huge".to_string()).unwrap(),
         create_backend("huge", 99),
         0, // tier
@@ -263,7 +249,7 @@ fn test_weighted_extreme_imbalance() {
     let mut counts = [0; 2];
     for _ in 0..1000 {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -288,13 +274,11 @@ fn test_weighted_consistency_across_runs() {
     let mut selector = BackendSelector::new();
 
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("b0".to_string()).unwrap(),
         create_backend("b0", 30),
         0, // tier
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("b1".to_string()).unwrap(),
         create_backend("b1", 70),
         0, // tier
@@ -305,7 +289,7 @@ fn test_weighted_consistency_across_runs() {
         let mut counts = [0; 2];
         for _ in 0..1000 {
             let backend = selector
-                .route_without_availability(ClientId::new())
+                .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
                 .unwrap();
             counts[backend.as_index()] += 1;
         }
@@ -331,7 +315,6 @@ fn test_zero_weight_backend_handled() {
 
     // Add a backend with 0 max_connections (edge case)
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("zero".to_string()).unwrap(),
         create_backend("zero", 0),
         0, // tier
@@ -340,7 +323,7 @@ fn test_zero_weight_backend_handled() {
     assert_eq!(selector.total_weight(), 0);
 
     // Should fail gracefully when routing
-    let result = selector.route_without_availability(ClientId::new());
+    let result = selector.route(nntp_proxy::router::RouteRequest::new(ClientId::new()));
     assert!(result.is_err());
 }
 
@@ -349,13 +332,11 @@ fn test_mixed_zero_and_nonzero_weights() {
     let mut selector = BackendSelector::new();
 
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("zero".to_string()).unwrap(),
         create_backend("zero", 0),
         0, // tier
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("normal".to_string()).unwrap(),
         create_backend("normal", 10),
         0, // tier
@@ -366,7 +347,7 @@ fn test_mixed_zero_and_nonzero_weights() {
     // All requests should go to the non-zero backend
     for _ in 0..100 {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         assert_eq!(backend.as_index(), 1);
     }
@@ -382,7 +363,6 @@ fn test_weighted_with_varying_pool_sizes() {
 
     for (i, &size) in pool_sizes.iter().enumerate() {
         selector.add_backend(
-            BackendId::from_index(i),
             ServerName::try_new(format!("backend-{i}")).unwrap(),
             create_backend(&format!("backend-{i}"), size),
             0, // tier
@@ -397,7 +377,7 @@ fn test_weighted_with_varying_pool_sizes() {
 
     for _ in 0..num_requests {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -424,7 +404,6 @@ fn test_weighted_single_backend() {
     let mut selector = BackendSelector::new();
 
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("only".to_string()).unwrap(),
         create_backend("only", 42),
         0, // tier
@@ -435,7 +414,7 @@ fn test_weighted_single_backend() {
     // All requests should go to the only backend
     for _ in 0..100 {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         assert_eq!(backend.as_index(), 0);
     }
@@ -447,13 +426,11 @@ fn test_weighted_distribution_precision() {
 
     // Use prime numbers to test for modulo bias
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("b0".to_string()).unwrap(),
         create_backend("b0", 13),
         0, // tier
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("b1".to_string()).unwrap(),
         create_backend("b1", 17),
         0, // tier
@@ -468,7 +445,7 @@ fn test_weighted_distribution_precision() {
 
     for _ in 0..num_requests {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
     }

@@ -1,5 +1,6 @@
 //! Router edge case and error handling integration tests
 
+use nntp_proxy::cache::MAX_BACKENDS;
 use nntp_proxy::pool::DeadpoolConnectionProvider;
 use nntp_proxy::router::BackendSelector;
 use nntp_proxy::types::{BackendId, ClientId, ServerName};
@@ -20,14 +21,13 @@ fn test_complete_command_on_wrong_backend() {
     let backend_id = BackendId::from_index(0);
 
     router.add_backend(
-        backend_id,
         ServerName::try_new("test".to_string()).unwrap(),
         super::create_test_provider(),
         0, // tier
     );
 
     // Complete command on non-existent backend (different ID)
-    let wrong_id = BackendId::from_index(999);
+    let wrong_id = BackendId::from_index(1);
     router.complete_command(wrong_id);
 
     // Should not affect the real backend
@@ -37,7 +37,7 @@ fn test_complete_command_on_wrong_backend() {
 #[test]
 fn test_backend_load_for_nonexistent_backend() {
     let router = BackendSelector::new();
-    let backend_id = BackendId::from_index(999);
+    let backend_id = BackendId::from_index(1);
 
     assert_eq!(router.backend_load(backend_id), None);
 }
@@ -45,7 +45,7 @@ fn test_backend_load_for_nonexistent_backend() {
 #[test]
 fn test_stateful_count_for_nonexistent_backend() {
     let router = BackendSelector::new();
-    let backend_id = BackendId::from_index(999);
+    let backend_id = BackendId::from_index(1);
 
     assert_eq!(router.stateful_count(backend_id), None);
 }
@@ -56,7 +56,6 @@ fn test_release_stateful_when_count_is_zero() {
     let backend_id = BackendId::from_index(0);
 
     router.add_backend(
-        backend_id,
         ServerName::try_new("test".to_string()).unwrap(),
         super::create_test_provider(),
         0, // tier
@@ -75,7 +74,7 @@ fn test_release_stateful_when_count_is_zero() {
 #[test]
 fn test_release_stateful_on_nonexistent_backend() {
     let router = BackendSelector::new();
-    let backend_id = BackendId::from_index(999);
+    let backend_id = BackendId::from_index(1);
 
     // Should not panic
     router.release_stateful(backend_id);
@@ -88,14 +87,15 @@ fn test_excessive_complete_command_calls() {
     let backend_id = BackendId::from_index(0);
 
     router.add_backend(
-        backend_id,
         ServerName::try_new("test".to_string()).unwrap(),
         super::create_test_provider(),
         0, // tier
     );
 
     // Route one command
-    router.route_without_availability(client_id).unwrap();
+    router
+        .route(nntp_proxy::router::RouteRequest::new(client_id))
+        .unwrap();
     assert_eq!(router.backend_load(backend_id).map(|c| c.get()), Some(1));
 
     // Complete it once
@@ -114,26 +114,25 @@ fn test_excessive_complete_command_calls() {
 }
 
 #[test]
-fn test_large_number_of_backends() {
+fn test_maximum_bitmap_width_backends() {
     let mut router = BackendSelector::new();
     let client_id = ClientId::new();
 
-    // Add 100 backends
-    for i in 0..100 {
+    for i in 0..MAX_BACKENDS {
         router.add_backend(
-            BackendId::from_index(i),
             ServerName::try_new(format!("backend-{i}")).unwrap(),
             super::create_test_provider(),
             0, // tier
         );
     }
 
-    assert_eq!(router.backend_count(), 100);
+    assert_eq!(router.backend_count(), MAX_BACKENDS);
 
-    // Route 1000 commands
     for _ in 0..1000 {
-        let backend_id = router.route_without_availability(client_id).unwrap();
-        assert!(backend_id.as_index() < 100);
+        let backend_id = router
+            .route(nntp_proxy::router::RouteRequest::new(client_id))
+            .unwrap();
+        assert!(backend_id.as_index() < MAX_BACKENDS);
     }
 }
 
@@ -143,7 +142,6 @@ fn test_backend_provider_retrieval() {
     let backend_id = BackendId::from_index(0);
 
     router.add_backend(
-        backend_id,
         ServerName::try_new("test".to_string()).unwrap(),
         super::create_test_provider(),
         0, // tier
@@ -164,7 +162,6 @@ fn test_single_backend_round_robin() {
     let backend_id = BackendId::from_index(0);
 
     router.add_backend(
-        backend_id,
         ServerName::try_new("solo".to_string()).unwrap(),
         super::create_test_provider(),
         0, // tier
@@ -172,7 +169,9 @@ fn test_single_backend_round_robin() {
 
     // All commands should route to the same backend
     for _ in 0..10 {
-        let selected = router.route_without_availability(client_id).unwrap();
+        let selected = router
+            .route(nntp_proxy::router::RouteRequest::new(client_id))
+            .unwrap();
         assert_eq!(selected, backend_id);
     }
 }
@@ -193,7 +192,6 @@ fn test_stateful_acquisition_with_max_connections_1() {
     );
 
     router.add_backend(
-        backend_id,
         ServerName::try_new("minimal-backend".to_string()).unwrap(),
         provider,
         0, // tier
@@ -211,7 +209,6 @@ fn test_concurrent_route_calls() {
     // Add 3 backends
     for i in 0..3 {
         router.add_backend(
-            BackendId::from_index(i),
             ServerName::try_new(format!("backend-{i}")).unwrap(),
             super::create_test_provider(),
             0, // tier
@@ -224,7 +221,9 @@ fn test_concurrent_route_calls() {
             let router_clone = Arc::clone(&router_arc);
             std::thread::spawn(move || {
                 let client_id = ClientId::new();
-                router_clone.route_without_availability(client_id).unwrap()
+                router_clone
+                    .route(nntp_proxy::router::RouteRequest::new(client_id))
+                    .unwrap()
             })
         })
         .collect();
@@ -275,7 +274,6 @@ fn test_stateful_acquire_release_interleaved() {
     );
 
     router.add_backend(
-        backend_id,
         ServerName::try_new("test".to_string()).unwrap(),
         provider,
         0, // tier
@@ -307,7 +305,6 @@ fn test_wrap_around_with_large_counter() {
     // Add 2 backends
     for i in 0..2 {
         router.add_backend(
-            BackendId::from_index(i),
             ServerName::try_new(format!("backend-{i}")).unwrap(),
             super::create_test_provider(),
             0, // tier
@@ -316,11 +313,15 @@ fn test_wrap_around_with_large_counter() {
 
     // Route enough commands to potentially overflow smaller counter types
     for _ in 0..10000 {
-        let backend_id = router.route_without_availability(client_id).unwrap();
+        let backend_id = router
+            .route(nntp_proxy::router::RouteRequest::new(client_id))
+            .unwrap();
         assert!(backend_id.as_index() < 2);
     }
 
     // Should still work correctly after many iterations
-    let backend = router.route_without_availability(client_id).unwrap();
+    let backend = router
+        .route(nntp_proxy::router::RouteRequest::new(client_id))
+        .unwrap();
     assert!(backend.as_index() < 2);
 }

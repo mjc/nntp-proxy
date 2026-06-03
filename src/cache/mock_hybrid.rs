@@ -51,7 +51,7 @@ impl MockHybridCache {
         &self,
         message_id: &MessageId<'_>,
         buffer: impl Into<CacheIngestResponse>,
-        backend_id: BackendId,
+        backend: BackendId,
     ) {
         let buffer = buffer.into();
         let key = message_id.without_brackets().to_string();
@@ -66,17 +66,16 @@ impl MockHybridCache {
         let entry_len = entry.payload_len();
 
         // Check for existing entry - don't overwrite larger semantic payloads with smaller ones.
-        if let Some(existing) = storage.get(&key)
-            && existing.payload_len() > entry_len
-        {
-            // Just update availability
-            let mut updated = existing.clone();
-            updated.record_backend_has(backend_id);
-            storage.insert(key, updated);
-            return;
+        if let Some(existing) = storage.get(&key) {
+            if existing.availability().is_missing(backend) {
+                return;
+            }
+            if existing.payload_len() > entry_len {
+                return;
+            }
+            entry.availability = existing.availability();
         }
 
-        entry.record_backend_has(backend_id);
         storage.insert(key, entry);
     }
 

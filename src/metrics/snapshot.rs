@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn test_backend_by_id_out_of_range() {
         let snapshot = create_test_snapshot();
-        let backend = snapshot.backend(BackendId::from_index(99));
+        let backend = snapshot.backend(BackendId::from_index(2));
         assert!(backend.is_none());
     }
 
@@ -526,7 +526,6 @@ mod tests {
 
         let mut router = BackendSelector::new();
         router.add_backend(
-            BackendId::from_index(0),
             ServerName::try_new("unused".to_string()).unwrap(),
             provider,
             1,

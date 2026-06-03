@@ -3,7 +3,7 @@
 //! Measures hot-path router operations:
 //! - `route` with weighted round-robin strategy
 //! - `route` with least-loaded strategy
-//! - `route_with_availability` (partially exhausted)
+//! - availability-aware `route(RouteRequest::...)` (partially exhausted)
 //! - `complete_command` throughput
 //!
 //! Run with: cargo bench --bench `router_selection`
@@ -11,7 +11,7 @@
 use divan::{Bencher, black_box};
 use nntp_proxy::config::BackendSelectionStrategy;
 use nntp_proxy::pool::DeadpoolConnectionProvider;
-use nntp_proxy::router::BackendSelector;
+use nntp_proxy::router::{BackendSelector, RouteRequest};
 use nntp_proxy::types::{BackendId, ClientId, ServerName};
 use std::sync::Arc;
 
@@ -35,7 +35,6 @@ fn make_router(strategy: BackendSelectionStrategy, num_backends: usize) -> Arc<B
     for i in 0..num_backends {
         let name = format!("backend-{i}");
         selector.add_backend(
-            BackendId::from_index(i),
             ServerName::try_new(name).unwrap(),
             make_provider(10),
             u8::try_from(i / 2).expect("benchmark tier fits in u8"), // Tier 0 for first 2, tier 1 for next 2, etc.
@@ -49,7 +48,9 @@ fn make_router(strategy: BackendSelectionStrategy, num_backends: usize) -> Arc<B
 // =============================================================================
 
 mod weighted_round_robin {
-    use super::{BackendSelectionStrategy, Bencher, ClientId, black_box, make_router};
+    use super::{
+        BackendSelectionStrategy, Bencher, ClientId, RouteRequest, black_box, make_router,
+    };
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn route_2_backends(bencher: Bencher) {
@@ -57,7 +58,7 @@ mod weighted_round_robin {
         let client_id = ClientId::new();
         bencher.bench(|| {
             let id = router
-                .route_without_availability(black_box(client_id))
+                .route(RouteRequest::new(black_box(client_id)))
                 .unwrap();
             router.complete_command(id);
             black_box(id)
@@ -70,7 +71,7 @@ mod weighted_round_robin {
         let client_id = ClientId::new();
         bencher.bench(|| {
             let id = router
-                .route_without_availability(black_box(client_id))
+                .route(RouteRequest::new(black_box(client_id)))
                 .unwrap();
             router.complete_command(id);
             black_box(id)
@@ -83,7 +84,7 @@ mod weighted_round_robin {
         let client_id = ClientId::new();
         bencher.bench(|| {
             let id = router
-                .route_without_availability(black_box(client_id))
+                .route(RouteRequest::new(black_box(client_id)))
                 .unwrap();
             router.complete_command(id);
             black_box(id)
@@ -96,7 +97,9 @@ mod weighted_round_robin {
 // =============================================================================
 
 mod least_loaded {
-    use super::{BackendSelectionStrategy, Bencher, ClientId, black_box, make_router};
+    use super::{
+        BackendSelectionStrategy, Bencher, ClientId, RouteRequest, black_box, make_router,
+    };
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
     fn route_2_backends(bencher: Bencher) {
@@ -104,7 +107,7 @@ mod least_loaded {
         let client_id = ClientId::new();
         bencher.bench(|| {
             let id = router
-                .route_without_availability(black_box(client_id))
+                .route(RouteRequest::new(black_box(client_id)))
                 .unwrap();
             router.complete_command(id);
             black_box(id)
@@ -117,7 +120,7 @@ mod least_loaded {
         let client_id = ClientId::new();
         bencher.bench(|| {
             let id = router
-                .route_without_availability(black_box(client_id))
+                .route(RouteRequest::new(black_box(client_id)))
                 .unwrap();
             router.complete_command(id);
             black_box(id)
@@ -130,7 +133,10 @@ mod least_loaded {
 // =============================================================================
 
 mod availability_routing {
-    use super::{BackendId, BackendSelectionStrategy, Bencher, ClientId, black_box, make_router};
+    use super::{
+        BackendId, BackendSelectionStrategy, Bencher, ClientId, RouteRequest, black_box,
+        make_router,
+    };
     use nntp_proxy::cache::ArticleAvailability;
 
     #[divan::bench(sample_count = 1000, sample_size = 100)]
@@ -139,11 +145,11 @@ mod availability_routing {
         let client_id = ClientId::new();
         let avail = ArticleAvailability::new(); // Fresh, nothing exhausted
         bencher.bench(|| {
-            let id = router
-                .route_with_availability(black_box(client_id), Some(black_box(&avail)))
+            let backend = router
+                .route(RouteRequest::new(black_box(client_id)).with_availability(black_box(&avail)))
                 .unwrap();
-            router.complete_command(id);
-            black_box(id)
+            router.complete_command(backend.backend_id());
+            black_box(backend)
         });
     }
 
@@ -156,11 +162,11 @@ mod availability_routing {
         avail.record_missing(BackendId::from_index(0));
         avail.record_missing(BackendId::from_index(1));
         bencher.bench(|| {
-            let id = router
-                .route_with_availability(black_box(client_id), Some(black_box(&avail)))
+            let backend = router
+                .route(RouteRequest::new(black_box(client_id)).with_availability(black_box(&avail)))
                 .unwrap();
-            router.complete_command(id);
-            black_box(id)
+            router.complete_command(backend.backend_id());
+            black_box(backend)
         });
     }
 }
@@ -190,7 +196,9 @@ mod complete_command {
 // =============================================================================
 
 mod contention {
-    use super::{BackendSelectionStrategy, Bencher, ClientId, black_box, make_router};
+    use super::{
+        BackendSelectionStrategy, Bencher, ClientId, RouteRequest, black_box, make_router,
+    };
 
     #[divan::bench(sample_count = 100, sample_size = 100, threads = [1, 2, 4, 8])]
     fn route_and_complete(bencher: Bencher) {
@@ -198,7 +206,7 @@ mod contention {
         let client_id = ClientId::new();
         bencher.bench(|| {
             let id = router
-                .route_without_availability(black_box(client_id))
+                .route(RouteRequest::new(black_box(client_id)))
                 .unwrap();
             router.complete_command(id);
             black_box(id)

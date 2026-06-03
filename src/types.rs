@@ -30,7 +30,7 @@ pub use pool::{
 pub use protocol::MessageId;
 pub use validated::{ConfigPath, HostName, Password, ServerName, Username, ValidationError};
 
-use nutype::nutype;
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 use uuid::Uuid;
 
@@ -70,55 +70,71 @@ impl fmt::Display for ClientId {
     }
 }
 
-/// Unique identifier for a backend server
-#[nutype(derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    From,
-    Serialize,
-    Deserialize
-))]
+/// Unique identifier for a backend server.
+///
+/// Backend IDs are bounded by the availability bitmap width. Constructing a
+/// backend outside that range is not a valid internal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 pub struct BackendId(usize);
 
 impl BackendId {
+    pub const MAX_COUNT: usize = usize::BITS as usize;
+
     /// Create a backend ID from an index
     #[inline]
     #[must_use]
     pub fn from_index(index: usize) -> Self {
-        Self::new(index)
+        Self::try_from_index(index).unwrap_or_else(|| {
+            panic!(
+                "Backend index {index} exceeds maximum backend count ({})",
+                Self::MAX_COUNT
+            )
+        })
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn try_from_index(index: usize) -> Option<Self> {
+        if index < Self::MAX_COUNT {
+            Some(Self(index))
+        } else {
+            None
+        }
     }
 
     /// Get the backend index
     #[inline]
     #[must_use]
-    pub fn as_index(&self) -> usize {
-        self.into_inner()
+    pub const fn as_index(&self) -> usize {
+        self.0
     }
 
-    /// Get this backend's bit within the u8 availability bitset.
-    ///
-    /// `ArticleAvailability` and request-cache availability are encoded as `u8`
-    /// bitsets, so only backend indexes `0..8` are representable.
+    /// Get this backend's bit within the availability bitset.
     #[inline]
     #[must_use]
-    pub(crate) fn availability_bit(self) -> u8 {
-        let idx = self.as_index();
-        u32::try_from(idx)
-            .ok()
-            .and_then(|shift| 1u8.checked_shl(shift))
-            .unwrap_or_else(|| panic!("Backend index {idx} exceeds MAX_BACKENDS"))
+    pub(crate) fn availability_bit(self) -> usize {
+        1usize << self.as_index()
     }
 }
 
 impl fmt::Display for BackendId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Backend({})", self.into_inner())
+        write!(f, "Backend({})", self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for BackendId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let index = usize::deserialize(deserializer)?;
+        Self::try_from_index(index).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "backend index {index} exceeds maximum backend count ({})",
+                Self::MAX_COUNT
+            ))
+        })
     }
 }
 
@@ -223,14 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn test_backend_id_from_usize() {
-        let id: BackendId = 42.into();
-        assert_eq!(id.as_index(), 42);
-    }
-
-    #[test]
     fn test_backend_id_const_fn() {
-        // Note: from_index is no longer const (nutype limitation)
         let id = BackendId::from_index(10);
         assert_eq!(id.as_index(), 10);
     }
@@ -245,12 +254,12 @@ mod tests {
     fn test_backend_id_availability_bit() {
         assert_eq!(BackendId::from_index(0).availability_bit(), 0b0000_0001);
         assert_eq!(BackendId::from_index(7).availability_bit(), 0b1000_0000);
+        assert_eq!(BackendId::from_index(8).availability_bit(), 0b1_0000_0000);
     }
 
     #[test]
-    #[should_panic(expected = "Backend index 8 exceeds MAX_BACKENDS")]
-    fn test_backend_id_availability_bit_panics_when_index_exceeds_bitset() {
-        let _ = BackendId::from_index(8).availability_bit();
+    fn test_backend_id_rejects_index_outside_bitset() {
+        assert!(BackendId::try_from_index(usize::BITS as usize).is_none());
     }
 
     #[test]
@@ -313,9 +322,9 @@ mod tests {
     }
 
     #[test]
-    fn test_backend_id_large_index() {
-        let id = BackendId::from_index(usize::MAX);
-        assert_eq!(id.as_index(), usize::MAX);
+    #[should_panic(expected = "exceeds maximum backend count")]
+    fn test_backend_id_from_index_panics_for_out_of_range_index() {
+        let _ = BackendId::from_index(usize::MAX);
     }
 
     #[test]

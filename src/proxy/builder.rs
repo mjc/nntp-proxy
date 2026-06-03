@@ -15,7 +15,7 @@ use crate::config::{Config, Memory, RoutingMode, Server};
 use crate::metrics::{ConnectionStatsAggregator, MetricsCollector};
 use crate::pool::{BufferPool, DeadpoolConnectionProvider};
 use crate::router;
-use crate::types::{self, BufferSize};
+use crate::types::BufferSize;
 
 use super::NntpProxy;
 
@@ -131,6 +131,7 @@ impl NntpProxyBuilder {
         if self.config.servers.is_empty() {
             anyhow::bail!("No servers configured in configuration");
         }
+        self.config.validate()?;
 
         let memory = self.config.memory.clone();
         let buffer_count = self.buffer_count.unwrap_or(memory.buffer_pool_count);
@@ -184,23 +185,22 @@ impl NntpProxyBuilder {
 
         let backend_strategy = self.config.routing.backend_selection;
         let cache_config = self.config.cache;
+        let backend_count = router::BackendCount::try_new(self.config.servers.len())
+            .expect("config validation bounds backend count");
         let servers: Arc<[Server]> = self.config.servers.into();
 
         let router = Arc::new({
-            use types::BackendId;
-            connection_providers.iter().enumerate().fold(
-                router::BackendSelector::with_strategy(backend_strategy),
-                |mut r, (idx, provider)| {
-                    let backend_id = BackendId::from_index(idx);
-                    r.add_backend(
-                        backend_id,
-                        servers[idx].name.clone(),
-                        provider.clone(),
-                        servers[idx].tier,
-                    );
-                    r
-                },
-            )
+            let mut r = router::BackendSelector::with_strategy(backend_strategy);
+            for (idx, provider) in connection_providers.iter().enumerate() {
+                let backend_id = r.add_backend(
+                    servers[idx].name.clone(),
+                    provider.clone(),
+                    servers[idx].tier,
+                );
+                debug_assert_eq!(backend_id.as_index(), idx);
+            }
+            debug_assert_eq!(r.backend_count(), backend_count);
+            r
         });
 
         let auth_handler = {
@@ -578,6 +578,37 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("No servers configured")
+        );
+    }
+
+    #[test]
+    fn test_builder_rejects_servers_beyond_availability_bitmap() {
+        let base = create_test_config();
+        let mut config = Config {
+            servers: (0..=crate::cache::MAX_BACKENDS)
+                .map(|index| {
+                    let mut server = base.servers[0].clone();
+                    server.name =
+                        crate::types::ServerName::try_new(format!("server-{index}")).unwrap();
+                    server
+                })
+                .collect(),
+            ..base
+        };
+        config.memory.buffer_pool_count = config
+            .servers
+            .iter()
+            .map(|server| server.max_connections.get())
+            .sum();
+
+        let result = NntpProxyBuilder::new(config).build_sync();
+
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("article availability uses a usize bitmap")
         );
     }
 }

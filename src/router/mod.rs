@@ -12,7 +12,7 @@
 //!
 //! ```no_run
 //! use nntp_proxy::router::BackendSelector;
-//! use nntp_proxy::types::{BackendId, ClientId, ServerName};
+//! use nntp_proxy::types::{ClientId, ServerName};
 //! # use nntp_proxy::pool::DeadpoolConnectionProvider;
 //!
 //! let mut selector = BackendSelector::new();
@@ -20,7 +20,6 @@
 //! #     "localhost".to_string(), 119, "test".to_string(), 10, None, None
 //! # );
 //! selector.add_backend(
-//!     BackendId::from_index(0),
 //!     ServerName::try_new("server1".to_string()).unwrap(),
 //!     provider,
 //!     0, // tier (lower = higher priority)
@@ -28,7 +27,9 @@
 //!
 //! // Route a command
 //! let client_id = ClientId::new();
-//! let backend_id = selector.route_without_availability(client_id).unwrap();
+//! let backend_id = selector
+//!     .route(nntp_proxy::router::RouteRequest::new(client_id))
+//!     .unwrap();
 //!
 //! // After command completes
 //! selector.complete_command(backend_id);
@@ -40,9 +41,9 @@ mod strategies;
 use anyhow::Result;
 use nutype::nutype;
 use std::cmp::Ordering as CmpOrdering;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::cache::ArticleAvailability;
 use crate::config::BackendSelectionStrategy;
@@ -53,6 +54,189 @@ use strategies::{LeastLoaded, WeightedRoundRobin};
 use backend_info::BackendInfo;
 pub use backend_info::{LoadRatio, PendingCount, StatefulCount};
 
+mod route_mode {
+    pub trait Sealed {}
+}
+
+struct SelectedBackend<'a> {
+    backend: &'a BackendInfo,
+    pending_snapshot: Option<usize>,
+}
+
+/// Builder for selecting a backend.
+#[derive(Debug, Clone)]
+pub struct RouteRequest<'a, Mode = RawRoute> {
+    _client_id: ClientId,
+    suppressed_backends: SuppressedBackends,
+    mode: Mode,
+    _lifetime: std::marker::PhantomData<&'a ()>,
+}
+
+/// Transient backend suppressions for a single retry loop.
+///
+/// This is intentionally distinct from article availability. Suppression means
+/// "do not pick this backend again for this in-flight request because its pool
+/// or connection failed"; it does not mean the backend lacks the article.
+///
+/// Keep this as a fixed bitmap. Real deployments have a small number of Usenet
+/// backends, and a dynamic set here would only add overhead to a hot retry path.
+/// This is deliberately the same fixed bitmap width as `ArticleAvailability`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SuppressedBackends {
+    bits: usize,
+}
+
+impl SuppressedBackends {
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self { bits: 0 }
+    }
+
+    pub fn suppress(&mut self, backend_id: BackendId) {
+        self.bits |= backend_id.availability_bit();
+    }
+
+    #[must_use]
+    pub fn contains(self, backend_id: BackendId) -> bool {
+        self.bits & backend_id.availability_bit() != 0
+    }
+
+    #[must_use]
+    pub const fn bits(self) -> usize {
+        self.bits
+    }
+}
+
+/// Routing without article availability state.
+#[derive(Debug, Clone, Copy)]
+pub struct RawRoute;
+
+/// Routing for article commands with availability state.
+#[derive(Debug, Clone, Copy)]
+pub struct ArticleRoute<'a> {
+    availability: &'a ArticleAvailability,
+}
+
+/// Backend selected through article availability routing.
+///
+/// Article execution accepts this type instead of raw `BackendId`, so a caller
+/// must route with current `ArticleAvailability` before it can issue an article
+/// request to a backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArticleBackend {
+    backend_id: BackendId,
+}
+
+impl ArticleBackend {
+    #[inline]
+    #[must_use]
+    pub(crate) fn from_availability(
+        backend_id: BackendId,
+        availability: &ArticleAvailability,
+    ) -> Option<Self> {
+        availability
+            .should_try(backend_id)
+            .then_some(Self { backend_id })
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn backend_id(self) -> BackendId {
+        self.backend_id
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn as_index(self) -> usize {
+        self.backend_id.as_index()
+    }
+}
+
+impl RouteRequest<'_, RawRoute> {
+    #[must_use]
+    pub fn new(client_id: ClientId) -> Self {
+        Self {
+            _client_id: client_id,
+            suppressed_backends: SuppressedBackends::empty(),
+            mode: RawRoute,
+            _lifetime: std::marker::PhantomData,
+        }
+    }
+
+    #[must_use]
+    pub fn with_availability(
+        self,
+        availability: &ArticleAvailability,
+    ) -> RouteRequest<'_, ArticleRoute<'_>> {
+        RouteRequest {
+            _client_id: self._client_id,
+            suppressed_backends: self.suppressed_backends,
+            mode: ArticleRoute { availability },
+            _lifetime: std::marker::PhantomData,
+        }
+    }
+
+    #[must_use]
+    pub fn suppressing_backends(mut self, suppressed_backends: SuppressedBackends) -> Self {
+        self.suppressed_backends = suppressed_backends;
+        self
+    }
+}
+
+impl RouteRequest<'_, ArticleRoute<'_>> {
+    #[must_use]
+    pub fn suppressing_backends(mut self, suppressed_backends: SuppressedBackends) -> Self {
+        self.suppressed_backends = suppressed_backends;
+        self
+    }
+}
+
+#[doc(hidden)]
+pub trait RouteMode: route_mode::Sealed {
+    type Output;
+
+    fn availability<'r>(request: &'r RouteRequest<'_, Self>) -> Option<&'r ArticleAvailability>
+    where
+        Self: Sized;
+
+    fn output(request: &RouteRequest<'_, Self>, backend_id: BackendId) -> Result<Self::Output>
+    where
+        Self: Sized;
+}
+
+impl RouteMode for RawRoute {
+    type Output = BackendId;
+
+    fn availability<'r>(_request: &'r RouteRequest<'_, Self>) -> Option<&'r ArticleAvailability> {
+        None
+    }
+
+    fn output(_request: &RouteRequest<'_, Self>, backend_id: BackendId) -> Result<Self::Output> {
+        Ok(backend_id)
+    }
+}
+
+impl route_mode::Sealed for RawRoute {}
+
+impl RouteMode for ArticleRoute<'_> {
+    type Output = ArticleBackend;
+
+    fn availability<'r>(request: &'r RouteRequest<'_, Self>) -> Option<&'r ArticleAvailability> {
+        Some(request.mode.availability)
+    }
+
+    fn output(request: &RouteRequest<'_, Self>, backend_id: BackendId) -> Result<Self::Output> {
+        ArticleBackend::from_availability(backend_id, request.mode.availability).ok_or_else(|| {
+            anyhow::anyhow!(
+                "selected backend {} is no longer eligible for article routing",
+                backend_id.as_index()
+            )
+        })
+    }
+}
+
+impl route_mode::Sealed for ArticleRoute<'_> {}
+
 /// Selection strategy enum that holds either strategy type
 #[derive(Debug)]
 enum SelectionStrategy {
@@ -60,36 +244,62 @@ enum SelectionStrategy {
     LeastLoaded(LeastLoaded),
 }
 
-/// Number of backend servers in the router
-#[nutype(derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Display, From, AsRef
-))]
+/// Number of backend servers in the router.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BackendCount(usize);
 
 impl PartialEq<usize> for BackendCount {
     fn eq(&self, other: &usize) -> bool {
-        self.into_inner() == *other
+        self.0 == *other
     }
 }
 
 impl PartialOrd<usize> for BackendCount {
     fn partial_cmp(&self, other: &usize) -> Option<CmpOrdering> {
-        self.into_inner().partial_cmp(other)
+        self.0.partial_cmp(other)
+    }
+}
+
+impl std::fmt::Display for BackendCount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 
 impl BackendCount {
+    /// Maximum backend count that fits the article availability bitmap.
+    pub const MAX: usize = BackendId::MAX_COUNT;
+
     /// Zero backends
     #[must_use]
-    pub fn zero() -> Self {
-        Self::new(0)
+    pub const fn zero() -> Self {
+        Self(0)
+    }
+
+    /// Construct a bounded backend count from a raw length.
+    #[must_use]
+    pub const fn try_new(count: usize) -> Option<Self> {
+        if count <= Self::MAX {
+            Some(Self(count))
+        } else {
+            None
+        }
     }
 
     /// Get the inner usize value
     #[inline]
     #[must_use]
-    pub fn get(&self) -> usize {
-        self.into_inner()
+    pub const fn get(self) -> usize {
+        self.0
+    }
+
+    /// Iterate every valid backend ID in this bounded count.
+    pub fn backend_ids(self) -> impl ExactSizeIterator<Item = BackendId> {
+        (0..self.0).map(BackendId::from_index)
+    }
+
+    fn from_router_len(count: usize) -> Self {
+        Self::try_new(count).expect("router backend count exceeds availability bitmap")
     }
 }
 
@@ -214,8 +424,8 @@ impl Drop for CommandGuard {
 /// # Examples
 ///
 /// ```no_run
-/// # use nntp_proxy::router::BackendSelector;
-/// # use nntp_proxy::types::{BackendId, ClientId, ServerName};
+/// # use nntp_proxy::router::{BackendSelector, RouteRequest};
+/// # use nntp_proxy::types::{ClientId, ServerName};
 /// # use nntp_proxy::pool::DeadpoolConnectionProvider;
 /// let mut selector = BackendSelector::new();
 ///
@@ -223,14 +433,13 @@ impl Drop for CommandGuard {
 /// #     "localhost".to_string(), 119, "test".to_string(), 10, None, None
 /// # );
 /// selector.add_backend(
-///     BackendId::from_index(0),
 ///     ServerName::try_new("backend-1".to_string()).unwrap(),
 ///     provider,
 ///     0, // tier (lower = higher priority)
 /// );
 ///
 /// // Route commands without article availability filtering
-/// let backend = selector.route_without_availability(ClientId::new())?;
+/// let backend = selector.route(RouteRequest::new(ClientId::new()))?;
 /// # Ok::<(), anyhow::Error>(())
 /// ```
 #[derive(Debug)]
@@ -241,8 +450,6 @@ pub struct BackendSelector {
     strategy: SelectionStrategy,
     /// H4: Pre-computed sorted unique tiers (avoids Vec allocation in hot path)
     sorted_tiers: smallvec::SmallVec<[u8; 4]>,
-    /// Serializes backend selection with the matching pending-count increment.
-    selection_lock: Mutex<()>,
     /// Capacity-fair probe counter for the first availability-aware article attempt.
     initial_article_probe_counter: AtomicUsize,
 }
@@ -310,7 +517,6 @@ impl BackendSelector {
             backends: Vec::with_capacity(4),
             strategy: selection_strategy,
             sorted_tiers: smallvec::SmallVec::new(),
-            selection_lock: Mutex::new(()),
             initial_article_probe_counter: AtomicUsize::new(0),
         }
     }
@@ -318,17 +524,19 @@ impl BackendSelector {
     /// Add a backend server to the router
     ///
     /// # Arguments
-    /// * `backend_id` - Unique identifier for this backend
     /// * `name` - Human-readable name for logging
     /// * `provider` - Connection pool provider
     /// * `tier` - Server tier (lower = higher priority, 0 is highest)
+    ///
+    /// Returns the assigned `BackendId`. Each proxy port owns one router;
+    /// production setup adds servers in config order, so backend IDs stay contiguous.
     pub fn add_backend(
         &mut self,
-        backend_id: BackendId,
         name: ServerName,
         provider: DeadpoolConnectionProvider,
         tier: u8,
-    ) {
+    ) -> BackendId {
+        let backend_id = BackendId::from_index(self.backends.len());
         let max_connections = provider.max_size();
 
         // Update strategy-specific state
@@ -374,6 +582,8 @@ impl BackendSelector {
             self.sorted_tiers.push(tier);
             self.sorted_tiers.sort_unstable();
         }
+
+        backend_id
     }
 
     /// Select the next backend using the configured strategy with tier-aware prioritization
@@ -388,15 +598,15 @@ impl BackendSelector {
     fn select_backend(
         &self,
         availability: Option<&ArticleAvailability>,
-        suppressed_backends: u8,
-    ) -> Option<&BackendInfo> {
+        suppressed_backends: &SuppressedBackends,
+    ) -> Option<SelectedBackend<'_>> {
         if self.backends.is_empty() {
             return None;
         }
 
         // Availability check closure
         let is_available = |backend: &&BackendInfo| {
-            (suppressed_backends == 0 || backend.id.availability_bit() & suppressed_backends == 0)
+            !suppressed_backends.contains(backend.id)
                 && availability.is_none_or(|avail| avail.should_try(backend.id))
         };
 
@@ -423,24 +633,32 @@ impl BackendSelector {
             let tier_filter = |b: &&BackendInfo| b.tier == tier && is_available(b);
 
             let selected = if availability
-                .is_some_and(|avail| !self.availability_checked_in_tier(avail, tier))
+                .is_some_and(|avail| !self.availability_missing_in_tier(avail, tier))
             {
                 self.select_capacity_weighted(tier_filter)
+                    .map(|backend| SelectedBackend {
+                        backend,
+                        pending_snapshot: None,
+                    })
             } else {
                 self.select_weighted(tier_filter)
             };
             if tracing::enabled!(tracing::Level::DEBUG) {
-                self.debug_log_selection_candidates(tier, availability, selected.map(|b| b.id));
+                self.debug_log_selection_candidates(
+                    tier,
+                    availability,
+                    selected.as_ref().map(|selected| selected.backend.id),
+                );
             }
 
-            if let Some(backend) = selected {
+            if let Some(selected) = selected {
                 tracing::debug!(
-                    backend_id = backend.id.as_index(),
-                    backend_name = backend.name.as_str(),
+                    backend_id = selected.backend.id.as_index(),
+                    backend_name = selected.backend.name.as_str(),
                     tier = tier,
                     "Selected backend"
                 );
-                return Some(backend);
+                return Some(selected);
             }
 
             if availability.is_some()
@@ -451,7 +669,7 @@ impl BackendSelector {
             {
                 tracing::debug!(
                     tier = tier,
-                    suppressed_backends = format_args!("{suppressed_backends:08b}"),
+                    suppressed_backends = format_args!("{:08b}", suppressed_backends.bits()),
                     "No selectable backend remains in current tier after transient suppressions"
                 );
                 return None;
@@ -465,9 +683,9 @@ impl BackendSelector {
         None
     }
 
-    fn availability_checked_in_tier(&self, availability: &ArticleAvailability, tier: u8) -> bool {
+    fn availability_missing_in_tier(&self, availability: &ArticleAvailability, tier: u8) -> bool {
         self.backends.iter().any(|backend| {
-            backend.tier == tier && availability.checked_bits() & backend.id.availability_bit() != 0
+            backend.tier == tier && availability.missing_bits() & backend.id.availability_bit() != 0
         })
     }
 
@@ -511,7 +729,6 @@ impl BackendSelector {
         availability: Option<&ArticleAvailability>,
         selected_backend: Option<BackendId>,
     ) {
-        let availability_checked_bits = availability.map_or(0, ArticleAvailability::checked_bits);
         let availability_missing_bits = availability.map_or(0, ArticleAvailability::missing_bits);
 
         for backend in self.backends.iter().filter(|backend| backend.tier == tier) {
@@ -532,7 +749,6 @@ impl BackendSelector {
                 tier,
                 selected = selected_backend == Some(backend.id),
                 should_try = availability.is_none_or(|avail| avail.should_try(backend.id)),
-                availability_checked_bits,
                 availability_missing_bits,
                 pending,
                 checked_out,
@@ -548,8 +764,21 @@ impl BackendSelector {
         }
     }
 
+    #[allow(clippy::cast_precision_loss)]
+    fn backend_load_ratio_with_pending(backend: &BackendInfo, pending: usize) -> LoadRatio {
+        let status = backend.provider.status_counts();
+        let max_conns = status.max_size as f64;
+        if max_conns > 0.0 {
+            let checked_out = status.size.saturating_sub(status.available);
+            let active = pending.max(checked_out) as f64;
+            LoadRatio::new(active / max_conns)
+        } else {
+            LoadRatio::MAX
+        }
+    }
+
     /// Select a backend using weighted round-robin from backends matching the filter
-    fn select_weighted<F>(&self, filter: F) -> Option<&BackendInfo>
+    fn select_weighted<F>(&self, filter: F) -> Option<SelectedBackend<'_>>
     where
         F: Fn(&&BackendInfo) -> bool,
     {
@@ -584,27 +813,38 @@ impl BackendSelector {
                         // Fallback: first backend matching filter
                         self.backends.iter().find(&filter)
                     })
+                    .map(|backend| SelectedBackend {
+                        backend,
+                        pending_snapshot: None,
+                    })
             }
             SelectionStrategy::LeastLoaded(least_loaded) => {
-                let mut selected: Option<&BackendInfo> = None;
+                let mut selected: Option<SelectedBackend<'_>> = None;
                 let mut selected_load = LoadRatio::MAX;
                 let mut ties = 0usize;
 
                 for backend in self.backends.iter().filter(&filter) {
-                    let load = backend.load_ratio();
+                    let pending_snapshot = backend.pending_count.get();
+                    let load = Self::backend_load_ratio_with_pending(backend, pending_snapshot);
                     match load
                         .partial_cmp(&selected_load)
                         .unwrap_or(std::cmp::Ordering::Greater)
                     {
                         std::cmp::Ordering::Less => {
-                            selected = Some(backend);
+                            selected = Some(SelectedBackend {
+                                backend,
+                                pending_snapshot: Some(pending_snapshot),
+                            });
                             selected_load = load;
                             ties = 1;
                         }
                         std::cmp::Ordering::Equal => {
                             ties += 1;
                             if least_loaded.should_replace_tie(ties) {
-                                selected = Some(backend);
+                                selected = Some(SelectedBackend {
+                                    backend,
+                                    pending_snapshot: Some(pending_snapshot),
+                                });
                             }
                         }
                         std::cmp::Ordering::Greater => {}
@@ -616,80 +856,48 @@ impl BackendSelector {
         }
     }
 
-    /// Select a backend for a client request without article availability filtering.
+    /// Select a backend for a client request.
     ///
     /// # Errors
-    /// Returns an error when no backend is currently eligible for routing.
-    pub fn route_without_availability(&self, client_id: ClientId) -> Result<BackendId> {
-        self.route_with_availability(client_id, None)
+    /// Returns an error when no backend remains eligible.
+    pub fn route<Mode: RouteMode>(&self, request: RouteRequest<'_, Mode>) -> Result<Mode::Output> {
+        self.route_selected_backend(&request)
     }
 
-    /// Select a backend for a client request, optionally filtering by availability.
-    ///
-    /// # Errors
-    /// Returns an error when no backend remains eligible after applying the
-    /// optional availability filter.
-    pub fn route_with_availability(
+    fn route_selected_backend<Mode: RouteMode>(
         &self,
-        _client_id: ClientId,
-        availability: Option<&ArticleAvailability>,
-    ) -> Result<BackendId> {
-        if self.should_serialize_selection(availability) {
-            let _selection_guard = self.selection_lock.lock().unwrap_or_else(|poisoned| {
-                warn!("Backend selector lock was poisoned; continuing with recovered state");
-                poisoned.into_inner()
-            });
-            return self.route_selected_backend(availability, 0);
+        request: &RouteRequest<'_, Mode>,
+    ) -> Result<Mode::Output> {
+        loop {
+            let availability = Mode::availability(request);
+            let selected = self
+                .select_backend(availability, &request.suppressed_backends)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "No backends available for routing (total backends: {})",
+                        self.backends.len()
+                    )
+                })?;
+            let backend = selected.backend;
+            let output = Mode::output(request, backend.id)?;
+
+            let reserved = if let Some(observed) = selected.pending_snapshot {
+                backend.pending_count.try_increment_from(observed)
+            } else {
+                backend.pending_count.increment();
+                true
+            };
+            if !reserved {
+                continue;
+            }
+
+            debug!(
+                "Selected backend {:?} ({}) for command",
+                backend.id, backend.name
+            );
+
+            return Ok(output);
         }
-
-        self.route_selected_backend(availability, 0)
-    }
-
-    pub(crate) fn route_with_availability_suppressing(
-        &self,
-        _client_id: ClientId,
-        availability: Option<&ArticleAvailability>,
-        suppressed_backends: u8,
-    ) -> Result<BackendId> {
-        if self.should_serialize_selection(availability) {
-            let _selection_guard = self.selection_lock.lock().unwrap_or_else(|poisoned| {
-                warn!("Backend selector lock was poisoned; continuing with recovered state");
-                poisoned.into_inner()
-            });
-            return self.route_selected_backend(availability, suppressed_backends);
-        }
-
-        self.route_selected_backend(availability, suppressed_backends)
-    }
-
-    fn should_serialize_selection(&self, availability: Option<&ArticleAvailability>) -> bool {
-        matches!(self.strategy, SelectionStrategy::LeastLoaded(_))
-            && availability.is_none_or(|avail| avail.checked_bits() != 0)
-    }
-
-    fn route_selected_backend(
-        &self,
-        availability: Option<&ArticleAvailability>,
-        suppressed_backends: u8,
-    ) -> Result<BackendId> {
-        let backend = self
-            .select_backend(availability, suppressed_backends)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No backends available for routing (total backends: {})",
-                    self.backends.len()
-                )
-            })?;
-
-        // Increment pending count for load tracking
-        backend.pending_count.increment();
-
-        debug!(
-            "Selected backend {:?} ({}) for command",
-            backend.id, backend.name
-        );
-
-        Ok(backend.id)
     }
 
     /// Mark a command as complete, decrementing the pending count
@@ -717,7 +925,7 @@ impl BackendSelector {
     #[must_use]
     #[inline]
     pub fn backend_count(&self) -> BackendCount {
-        BackendCount::new(self.backends.len())
+        BackendCount::from_router_len(self.backends.len())
     }
 
     /// Get total weight (sum of all `max_connections`)
@@ -843,6 +1051,14 @@ impl BackendSelector {
 mod tests {
     use super::*;
 
+    fn suppressed(backends: &[BackendId]) -> SuppressedBackends {
+        let mut suppressed = SuppressedBackends::empty();
+        for backend in backends {
+            suppressed.suppress(*backend);
+        }
+        suppressed
+    }
+
     fn make_router_with_backend() -> (Arc<BackendSelector>, BackendId) {
         let mut selector = BackendSelector::new();
         let backend_id = BackendId::from_index(0);
@@ -855,12 +1071,27 @@ mod tests {
             None,
         );
         selector.add_backend(
-            backend_id,
             ServerName::try_new("test-server".to_string()).unwrap(),
             provider,
             0,
         );
         (Arc::new(selector), backend_id)
+    }
+
+    #[test]
+    fn backend_count_iterates_only_constructible_backend_ids() {
+        let count = BackendCount::try_new(3).expect("count fits availability bitmap");
+        let ids: Vec<_> = count.backend_ids().collect();
+
+        assert_eq!(
+            ids,
+            vec![
+                BackendId::from_index(0),
+                BackendId::from_index(1),
+                BackendId::from_index(2)
+            ]
+        );
+        assert_eq!(BackendCount::try_new(BackendCount::MAX + 1), None);
     }
 
     #[test]
@@ -915,22 +1146,10 @@ mod tests {
     }
 
     #[test]
-    fn selection_lock_is_only_needed_for_load_based_routing() {
-        let weighted = BackendSelector::with_strategy(BackendSelectionStrategy::WeightedRoundRobin);
-        assert!(!weighted.should_serialize_selection(None));
-        assert!(!weighted.should_serialize_selection(Some(&ArticleAvailability::new())));
-
-        let least_loaded = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
-        assert!(least_loaded.should_serialize_selection(None));
-        assert!(!least_loaded.should_serialize_selection(Some(&ArticleAvailability::new())));
-    }
-
-    #[test]
     fn transient_suppression_can_try_same_tier_without_escalating() {
         let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
-        for (index, name, tier) in [(0, "tier0-a", 0), (1, "tier0-b", 0), (2, "tier1", 1)] {
+        for (name, tier) in [("tier0-a", 0), ("tier0-b", 0), ("tier1", 1)] {
             selector.add_backend(
-                BackendId::from_index(index),
                 ServerName::try_new(name.to_string()).unwrap(),
                 crate::pool::DeadpoolConnectionProvider::new(
                     "localhost".to_string(),
@@ -946,20 +1165,22 @@ mod tests {
 
         let availability = ArticleAvailability::new();
         let backend = selector
-            .route_with_availability_suppressing(
-                ClientId::new(),
-                Some(&availability),
-                BackendId::from_index(0).availability_bit(),
+            .route(
+                RouteRequest::new(ClientId::new())
+                    .with_availability(&availability)
+                    .suppressing_backends(suppressed(&[BackendId::from_index(0)])),
             )
             .unwrap();
 
-        assert_eq!(backend, BackendId::from_index(1));
+        assert_eq!(backend.backend_id(), BackendId::from_index(1));
 
-        let exhausted_tier0 = selector.route_with_availability_suppressing(
-            ClientId::new(),
-            Some(&availability),
-            BackendId::from_index(0).availability_bit()
-                | BackendId::from_index(1).availability_bit(),
+        let exhausted_tier0 = selector.route(
+            RouteRequest::new(ClientId::new())
+                .with_availability(&availability)
+                .suppressing_backends(suppressed(&[
+                    BackendId::from_index(0),
+                    BackendId::from_index(1),
+                ])),
         );
         assert!(
             exhausted_tier0.is_err(),
@@ -970,13 +1191,12 @@ mod tests {
     #[test]
     fn first_probe_selection_is_tier_local() {
         let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
-        for (index, name, tier, max_connections) in [
-            (0, "tier0", 0, 10),
-            (1, "tier1-small", 1, 1),
-            (2, "tier1-large", 1, 10),
+        for (name, tier, max_connections) in [
+            ("tier0", 0, 10),
+            ("tier1-small", 1, 1),
+            ("tier1-large", 1, 10),
         ] {
             selector.add_backend(
-                BackendId::from_index(index),
                 ServerName::try_new(name.to_string()).unwrap(),
                 crate::pool::DeadpoolConnectionProvider::new(
                     "localhost".to_string(),
@@ -994,11 +1214,11 @@ mod tests {
         let mut availability = ArticleAvailability::new();
         availability.record_missing(BackendId::from_index(0));
         let backend = selector
-            .route_with_availability(ClientId::new(), Some(&availability))
+            .route(RouteRequest::new(ClientId::new()).with_availability(&availability))
             .unwrap();
 
         assert_eq!(
-            backend,
+            backend.backend_id(),
             BackendId::from_index(1),
             "first probe in newly eligible tier should be capacity-fair, not biased by load"
         );
@@ -1007,9 +1227,8 @@ mod tests {
     #[test]
     fn transient_suppression_does_not_block_escalation_after_real_430s() {
         let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
-        for (index, name, tier) in [(0, "tier0-a", 0), (1, "tier0-b", 0), (2, "tier1", 1)] {
+        for (name, tier) in [("tier0-a", 0), ("tier0-b", 0), ("tier1", 1)] {
             selector.add_backend(
-                BackendId::from_index(index),
                 ServerName::try_new(name.to_string()).unwrap(),
                 crate::pool::DeadpoolConnectionProvider::new(
                     "localhost".to_string(),
@@ -1028,15 +1247,15 @@ mod tests {
         availability.record_missing(BackendId::from_index(1));
 
         let backend = selector
-            .route_with_availability_suppressing(
-                ClientId::new(),
-                Some(&availability),
-                BackendId::from_index(0).availability_bit(),
+            .route(
+                RouteRequest::new(ClientId::new())
+                    .with_availability(&availability)
+                    .suppressing_backends(suppressed(&[BackendId::from_index(0)])),
             )
             .unwrap();
 
         assert_eq!(
-            backend,
+            backend.backend_id(),
             BackendId::from_index(2),
             "tier escalation is allowed after tier 0 has authoritative 430s"
         );
@@ -1047,7 +1266,6 @@ mod tests {
         let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
         for index in 0..12 {
             selector.add_backend(
-                BackendId::from_index(index),
                 ServerName::try_new(format!("backend-{index}")).unwrap(),
                 crate::pool::DeadpoolConnectionProvider::new(
                     "localhost".to_string(),
@@ -1062,12 +1280,44 @@ mod tests {
         }
 
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(crate::router::RouteRequest::new(ClientId::new()))
             .unwrap();
 
         assert!(
             backend.as_index() < 12,
             "routing without suppression must not touch the 8-backend availability bitset"
         );
+    }
+
+    #[test]
+    fn transient_suppression_handles_backend_index_at_legacy_u8_boundary() {
+        let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
+        for index in 0..10 {
+            selector.add_backend(
+                ServerName::try_new(format!("backend-{index}")).unwrap(),
+                crate::pool::DeadpoolConnectionProvider::new(
+                    "localhost".to_string(),
+                    119,
+                    format!("backend-{index}"),
+                    10,
+                    None,
+                    None,
+                ),
+                0,
+            );
+        }
+
+        let mut suppressed = SuppressedBackends::empty();
+        suppressed.suppress(BackendId::from_index(8));
+        for index in 0..8 {
+            selector.mark_backend_pending(BackendId::from_index(index));
+        }
+        selector.mark_backend_pending(BackendId::from_index(9));
+
+        let selected = selector
+            .route(RouteRequest::new(ClientId::new()).suppressing_backends(suppressed))
+            .unwrap();
+
+        assert_ne!(selected, BackendId::from_index(8));
     }
 }

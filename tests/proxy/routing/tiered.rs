@@ -14,7 +14,6 @@ fn test_tier_zero_selected_first() {
 
     // Add tier 1 backend first
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("backup".to_string()).unwrap(),
         create_backend("backup", 10),
         1, // tier 1 (backup)
@@ -22,7 +21,6 @@ fn test_tier_zero_selected_first() {
 
     // Add tier 0 backend second
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("primary".to_string()).unwrap(),
         create_backend("primary", 10),
         0, // tier 0 (primary)
@@ -33,7 +31,9 @@ fn test_tier_zero_selected_first() {
 
     // Despite being added second, tier 0 should be selected first
     let backend = selector
-        .route_with_availability(ClientId::new(), Some(&availability))
+        .route(
+            nntp_proxy::router::RouteRequest::new(ClientId::new()).with_availability(&availability),
+        )
         .unwrap();
     assert_eq!(
         backend.as_index(),
@@ -47,20 +47,18 @@ fn test_tier_zero_selected_first_without_availability_filter() {
     let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
 
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("backup".to_string()).unwrap(),
         create_backend("backup", 10),
         1,
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("primary".to_string()).unwrap(),
         create_backend("primary", 10),
         0,
     );
 
     let backend = selector
-        .route_without_availability(ClientId::new())
+        .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
         .unwrap();
     assert_eq!(
         backend.as_index(),
@@ -74,19 +72,16 @@ fn test_tier_one_unused_without_availability_until_tier_zero_is_loaded() {
     let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
 
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("tier0-a".to_string()).unwrap(),
         create_backend("tier0-a", 10),
         0,
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("tier0-b".to_string()).unwrap(),
         create_backend("tier0-b", 10),
         0,
     );
     selector.add_backend(
-        BackendId::from_index(2),
         ServerName::try_new("tier1".to_string()).unwrap(),
         create_backend("tier1", 100),
         1,
@@ -95,7 +90,7 @@ fn test_tier_one_unused_without_availability_until_tier_zero_is_loaded() {
     let mut counts = [0; 3];
     for _ in 0..40 {
         let backend = selector
-            .route_without_availability(ClientId::new())
+            .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -116,19 +111,16 @@ fn test_tier_escalation_on_430() {
 
     // Add two tier 0 backends and one tier 1 backend
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("primary-1".to_string()).unwrap(),
         create_backend("primary-1", 10),
         0, // tier 0
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("primary-2".to_string()).unwrap(),
         create_backend("primary-2", 10),
         0, // tier 0
     );
     selector.add_backend(
-        BackendId::from_index(2),
         ServerName::try_new("backup".to_string()).unwrap(),
         create_backend("backup", 10),
         1, // tier 1
@@ -141,7 +133,9 @@ fn test_tier_escalation_on_430() {
 
     // Now routing should select tier 1 backend
     let backend = selector
-        .route_with_availability(ClientId::new(), Some(&availability))
+        .route(
+            nntp_proxy::router::RouteRequest::new(ClientId::new()).with_availability(&availability),
+        )
         .unwrap();
     assert_eq!(
         backend.as_index(),
@@ -156,13 +150,11 @@ fn test_within_tier_load_balancing() {
 
     // Add two backends in tier 0
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("tier0-a".to_string()).unwrap(),
         create_backend("tier0-a", 10),
         0,
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("tier0-b".to_string()).unwrap(),
         create_backend("tier0-b", 10),
         0,
@@ -170,7 +162,6 @@ fn test_within_tier_load_balancing() {
 
     // Add one backend in tier 1 (should not be used)
     selector.add_backend(
-        BackendId::from_index(2),
         ServerName::try_new("tier1".to_string()).unwrap(),
         create_backend("tier1", 10),
         1,
@@ -182,7 +173,10 @@ fn test_within_tier_load_balancing() {
     let mut counts = [0; 3];
     for _ in 0..100 {
         let backend = selector
-            .route_with_availability(ClientId::new(), Some(&availability))
+            .route(
+                nntp_proxy::router::RouteRequest::new(ClientId::new())
+                    .with_availability(&availability),
+            )
             .unwrap();
         counts[backend.as_index()] += 1;
     }
@@ -211,13 +205,11 @@ fn test_partial_tier_exhaustion() {
 
     // Add two tier 0 backends
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("primary-1".to_string()).unwrap(),
         create_backend("primary-1", 10),
         0,
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("primary-2".to_string()).unwrap(),
         create_backend("primary-2", 10),
         0,
@@ -225,7 +217,6 @@ fn test_partial_tier_exhaustion() {
 
     // Add tier 1 backend
     selector.add_backend(
-        BackendId::from_index(2),
         ServerName::try_new("backup".to_string()).unwrap(),
         create_backend("backup", 10),
         1,
@@ -237,7 +228,9 @@ fn test_partial_tier_exhaustion() {
 
     // Should still select from tier 0 (the remaining one)
     let backend = selector
-        .route_with_availability(ClientId::new(), Some(&availability))
+        .route(
+            nntp_proxy::router::RouteRequest::new(ClientId::new()).with_availability(&availability),
+        )
         .unwrap();
     assert_eq!(
         backend.as_index(),
@@ -252,7 +245,6 @@ fn test_multiple_tiers() {
 
     // Tier 0: primary
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("primary".to_string()).unwrap(),
         create_backend("primary", 10),
         0,
@@ -260,7 +252,6 @@ fn test_multiple_tiers() {
 
     // Tier 1: secondary
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("secondary".to_string()).unwrap(),
         create_backend("secondary", 10),
         1,
@@ -268,7 +259,6 @@ fn test_multiple_tiers() {
 
     // Tier 2: tertiary
     selector.add_backend(
-        BackendId::from_index(2),
         ServerName::try_new("tertiary".to_string()).unwrap(),
         create_backend("tertiary", 10),
         2,
@@ -281,7 +271,9 @@ fn test_multiple_tiers() {
 
     // Should escalate to tier 2
     let backend = selector
-        .route_with_availability(ClientId::new(), Some(&availability))
+        .route(
+            nntp_proxy::router::RouteRequest::new(ClientId::new()).with_availability(&availability),
+        )
         .unwrap();
     assert_eq!(
         backend.as_index(),
@@ -309,13 +301,11 @@ fn test_tiered_weighted_round_robin() {
 
     // Tier 0: two backends with different weights
     selector.add_backend(
-        BackendId::from_index(0),
         ServerName::try_new("tier0-small".to_string()).unwrap(),
         create_backend("tier0-small", 10), // weight 10
         0,
     );
     selector.add_backend(
-        BackendId::from_index(1),
         ServerName::try_new("tier0-large".to_string()).unwrap(),
         create_backend("tier0-large", 30), // weight 30
         0,
@@ -323,7 +313,6 @@ fn test_tiered_weighted_round_robin() {
 
     // Tier 1: should not be used
     selector.add_backend(
-        BackendId::from_index(2),
         ServerName::try_new("tier1".to_string()).unwrap(),
         create_backend("tier1", 100),
         1,
@@ -335,7 +324,10 @@ fn test_tiered_weighted_round_robin() {
     let mut counts = [0; 3];
     for _ in 0..400 {
         let backend = selector
-            .route_with_availability(ClientId::new(), Some(&availability))
+            .route(
+                nntp_proxy::router::RouteRequest::new(ClientId::new())
+                    .with_availability(&availability),
+            )
             .unwrap();
         counts[backend.as_index()] += 1;
     }

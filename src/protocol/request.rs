@@ -150,23 +150,18 @@ impl RequestResponseMetadata {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct RequestCacheAvailability {
-    checked: u8,
-    missing: u8,
+    checked: usize,
+    missing: usize,
 }
 
 impl RequestCacheAvailability {
     #[must_use]
-    pub(crate) const fn from_bits(checked: u8, missing: u8) -> Self {
+    pub(crate) const fn from_bits(checked: usize, missing: usize) -> Self {
         Self { checked, missing }
     }
 
     #[must_use]
-    pub(crate) const fn checked_bits(self) -> u8 {
-        self.checked
-    }
-
-    #[must_use]
-    pub(crate) const fn missing_bits(self) -> u8 {
+    pub(crate) const fn missing_bits(self) -> usize {
         self.missing
     }
 
@@ -1259,20 +1254,17 @@ mod tests {
     }
 
     #[test]
-    fn request_cache_availability_detects_highest_backend_bit() {
-        let availability = RequestCacheAvailability::from_bits(0b1000_0000, 0);
+    fn request_cache_availability_detects_backend_eight_bit() {
+        let availability = RequestCacheAvailability::from_bits(0b1_0000_0000, 0);
 
-        assert!(availability.backend_has_article(BackendId::from_index(7)));
-        assert!(!availability.backend_has_article(BackendId::from_index(6)));
+        assert!(availability.backend_has_article(BackendId::from_index(8)));
+        assert!(!availability.backend_has_article(BackendId::from_index(7)));
     }
 
     #[test]
     #[cfg(debug_assertions)]
-    #[should_panic(expected = "Backend index 8 exceeds MAX_BACKENDS")]
-    fn request_cache_availability_panics_for_out_of_range_backend() {
-        let availability = RequestCacheAvailability::from_bits(0, 0);
-
-        let _ = availability.backend_has_article(BackendId::from_index(8));
+    fn request_cache_availability_cannot_receive_out_of_range_backend() {
+        assert!(BackendId::try_from_index(usize::BITS as usize).is_none());
     }
 
     #[test]

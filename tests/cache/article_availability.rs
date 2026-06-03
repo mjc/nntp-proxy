@@ -9,7 +9,7 @@ fn backend(index: usize) -> BackendId {
 }
 
 fn count(count: usize) -> BackendCount {
-    BackendCount::new(count)
+    BackendCount::try_new(count).expect("test backend count fits availability bitmap")
 }
 
 fn availability_with_missing(backends: &[usize]) -> ArticleAvailability {
@@ -23,7 +23,7 @@ fn availability_with_missing(backends: &[usize]) -> ArticleAvailability {
 fn assert_should_try(avail: ArticleAvailability, cases: &[(usize, bool)]) {
     for (backend_index, should_try) in cases {
         assert_eq!(
-            avail.should_try(backend(*backend_index)),
+            !avail.is_missing(backend(*backend_index)),
             *should_try,
             "backend {backend_index}"
         );
@@ -65,21 +65,21 @@ fn test_should_try_tracks_missing_backends() {
 #[test]
 fn test_record_missing_is_idempotent_and_encoded_as_bitset() {
     let mut avail = ArticleAvailability::new();
-    assert_eq!(avail.as_u8(), 0b0000_0000);
+    assert_eq!(avail.missing_bits(), 0b0000_0000);
 
     avail.record_missing(backend(0));
-    assert_eq!(avail.as_u8(), 0b0000_0001);
+    assert_eq!(avail.missing_bits(), 0b0000_0001);
 
     avail.record_missing(backend(1));
-    assert_eq!(avail.as_u8(), 0b0000_0011);
+    assert_eq!(avail.missing_bits(), 0b0000_0011);
 
     avail.record_missing(backend(3));
     avail.record_missing(backend(3));
-    assert_eq!(avail.as_u8(), 0b0000_1011);
-    assert!(!avail.should_try(backend(3)));
+    assert_eq!(avail.missing_bits(), 0b0000_1011);
+    assert!(avail.is_missing(backend(3)));
 
     avail.record_missing(backend(7));
-    assert_eq!(avail.as_u8(), 0b1000_1011);
+    assert_eq!(avail.missing_bits(), 0b1000_1011);
 }
 
 #[test]
@@ -113,7 +113,7 @@ fn test_retry_loop_simulations() {
     let mut attempts = Vec::new();
     for backend_index in [0, 1] {
         let backend = backend(backend_index);
-        assert!(exhausted.should_try(backend));
+        assert!(!exhausted.is_missing(backend));
         attempts.push(backend);
         exhausted.record_missing(backend);
     }
@@ -123,10 +123,10 @@ fn test_retry_loop_simulations() {
     let mut found = ArticleAvailability::new();
     for backend_index in [0, 1] {
         let backend = backend(backend_index);
-        assert!(found.should_try(backend));
+        assert!(!found.is_missing(backend));
         found.record_missing(backend);
     }
-    assert!(found.should_try(backend(2)));
+    assert!(!found.is_missing(backend(2)));
     assert!(!found.all_exhausted(count(4)));
     assert_should_try(found, &[(0, false), (1, false), (2, true), (3, true)]);
 }
@@ -138,7 +138,7 @@ fn test_round_robin_and_cached_availability_skip_missing_backends() {
     let tried = [0, 1, 2, 3, 0]
         .into_iter()
         .map(backend)
-        .filter(|&backend| avail.should_try(backend))
+        .filter(|&backend| !avail.is_missing(backend))
         .collect::<Vec<_>>();
     assert_eq!(tried, vec![backend(0), backend(2), backend(0)]);
 
@@ -156,23 +156,20 @@ fn test_round_robin_and_cached_availability_skip_missing_backends() {
     assert_eq!(
         (0..6)
             .map(backend)
-            .filter(|&backend| avail.should_try(backend))
+            .filter(|&backend| !avail.is_missing(backend))
             .collect::<Vec<_>>(),
         vec![backend(0), backend(2), backend(4)]
     );
 }
 
 #[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "Backend count 9 exceeds MAX_BACKENDS")]
-fn test_all_exhausted_panics_with_nine_backends() {
+fn test_all_exhausted_supports_nine_backends() {
     let avail = availability_with_missing(&(0..8).collect::<Vec<_>>());
-    let _ = avail.all_exhausted(count(9));
+    assert!(!avail.all_exhausted(count(9)));
 }
 
 #[test]
-#[cfg(debug_assertions)]
-#[should_panic(expected = "Backend index 8 exceeds MAX_BACKENDS")]
-fn test_backend_id_out_of_range_panics() {
-    let _ = availability_with_missing(&[8]);
+fn test_backend_id_eight_is_supported() {
+    let avail = availability_with_missing(&[8]);
+    assert!(avail.is_missing(backend(8)));
 }
