@@ -59,7 +59,8 @@ async fn upsert_tier(cache: &ArticleCache, message_id: MessageId<'_>, tier: u8, 
             article_bytes(message_id.as_str(), body),
             nntp_proxy::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible"),
+                .expect("backend should be eligible")
+                .positive_observation(),
             tier.into(),
         )
         .await;
@@ -344,7 +345,8 @@ async fn test_cache_upsert_updates_tier_with_larger_buffer() {
             buffer_large,
             nntp_proxy::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(1))
-                .expect("backend should be eligible"),
+                .expect("backend should be eligible")
+                .positive_observation(),
             2.into(),
         )
         .await;
@@ -368,7 +370,8 @@ async fn test_cache_upsert_keeps_tier_without_replacement() {
             buffer.clone(),
             nntp_proxy::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible"),
+                .expect("backend should be eligible")
+                .positive_observation(),
             5.into(),
         )
         .await;
@@ -382,7 +385,8 @@ async fn test_cache_upsert_keeps_tier_without_replacement() {
             buffer,
             nntp_proxy::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(1))
-                .expect("backend should be eligible"),
+                .expect("backend should be eligible")
+                .positive_observation(),
             2.into(),
         )
         .await;

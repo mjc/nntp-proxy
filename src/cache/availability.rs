@@ -43,7 +43,7 @@ pub enum BackendStatus {
 /// an article request to a backend or records a positive article observation must
 /// first prove the backend was not already known missing by asking
 /// [`ArticleAvailability`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct EligibleArticleBackend {
     backend_id: BackendId,
 }
@@ -59,6 +59,32 @@ impl EligibleArticleBackend {
     #[must_use]
     pub fn as_index(&self) -> usize {
         self.backend_id.as_index()
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn positive_observation(&self) -> ArticleBackendHasArticle {
+        ArticleBackendHasArticle {
+            backend_id: self.backend_id,
+        }
+    }
+}
+
+/// Proof that a backend produced a positive article response.
+///
+/// This token is intentionally not accepted by request execution. It can be
+/// copied into async cache updates without duplicating the executable
+/// [`EligibleArticleBackend`] retry token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArticleBackendHasArticle {
+    backend_id: BackendId,
+}
+
+impl ArticleBackendHasArticle {
+    #[inline]
+    #[must_use]
+    pub const fn backend_id(self) -> BackendId {
+        self.backend_id
     }
 }
 
@@ -131,9 +157,18 @@ impl ArticleAvailability {
     /// existing missing bit: within a live cache entry, 430 state is permanent.
     ///
     #[inline]
-    pub fn record_has(&mut self, backend: EligibleArticleBackend) -> &mut Self {
+    pub fn record_has(&mut self, backend: &EligibleArticleBackend) -> &mut Self {
         let mask = backend.backend_id.availability_bit();
         self.checked |= mask; // Mark as checked
+        self
+    }
+
+    /// Record a positive article observation that has already passed through
+    /// the retry eligibility path.
+    #[inline]
+    pub fn record_observed_has(&mut self, backend: ArticleBackendHasArticle) -> &mut Self {
+        let mask = backend.backend_id.availability_bit();
+        self.checked |= mask;
         self
     }
 
@@ -328,7 +363,7 @@ mod tests {
 
         // Record b1 as having it - now one has it
         let b1_eligible = avail.eligible_backend(b1).unwrap();
-        avail.record_has(b1_eligible);
+        avail.record_has(&b1_eligible);
         assert!(avail.any_backend_has_article());
 
         // Record b1 as missing (overwrite) - none have it again
@@ -361,7 +396,7 @@ mod tests {
 
         // Previous request got success from backend 0 (might be false positive)
         let b0_eligible = cache_entry.eligible_backend(b0).unwrap();
-        cache_entry.record_has(b0_eligible);
+        cache_entry.record_has(&b0_eligible);
         assert!(!cache_entry.is_missing(b0));
         assert!(cache_entry.any_backend_has_article());
 
@@ -427,7 +462,7 @@ mod tests {
         // New request claims success from backend 0 (but 2xx is unreliable!)
         let mut new_fetch = ArticleAvailability::new();
         let b0_eligible = new_fetch.eligible_backend(b0).unwrap();
-        new_fetch.record_has(b0_eligible);
+        new_fetch.record_has(&b0_eligible);
 
         // Merge new fetch into cache
         cache_state.merge_from(&new_fetch);

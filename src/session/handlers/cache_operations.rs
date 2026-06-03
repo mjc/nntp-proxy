@@ -4,7 +4,7 @@
 //! and tier-aware cache operations.
 
 use crate::cache::ArticleAvailability;
-use crate::cache::EligibleArticleBackend;
+use crate::cache::ArticleBackendHasArticle;
 use crate::cache::ttl::CacheTier;
 use crate::protocol::{
     RequestCacheEntryMetadata, RequestCacheStatus, RequestContext, RequestKind,
@@ -149,7 +149,7 @@ impl ClientSession {
         &self,
         msg_id: &crate::types::MessageId<'_>,
         buffer: crate::cache::CacheIngestResponse,
-        backend: EligibleArticleBackend,
+        backend: ArticleBackendHasArticle,
         tier: CacheTier,
     ) {
         if !self.cache.stores_payload_responses() {
@@ -170,7 +170,7 @@ impl ClientSession {
         &self,
         msg_id: &crate::types::MessageId<'_>,
         status_code: StatusCode,
-        backend: EligibleArticleBackend,
+        backend: ArticleBackendHasArticle,
         tier: CacheTier,
     ) {
         if !self.cache.records_backend_has_status() {
@@ -351,7 +351,8 @@ mod tests {
                 expected.to_vec(),
                 crate::cache::ArticleAvailability::new()
                     .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible"),
+                    .expect("backend should be eligible")
+                    .positive_observation(),
                 0.into(),
             )
             .await;

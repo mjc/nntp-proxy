@@ -97,7 +97,7 @@ proptest! {
             if op == 0 {
                 avail.record_missing(id);
             } else {
-                avail.record_has(nntp_proxy::cache::ArticleAvailability::new().eligible_backend(id).expect("backend should be eligible"));
+                avail.record_has(&nntp_proxy::cache::ArticleAvailability::new().eligible_backend(id).expect("backend should be eligible"));
             }
         }
     }
@@ -124,7 +124,7 @@ proptest! {
         avail.record_missing(id);
         prop_assert!(avail.is_missing(id));
 
-        avail.record_has(nntp_proxy::cache::ArticleAvailability::new().eligible_backend(id).expect("backend should be eligible"));
+        avail.record_has(&nntp_proxy::cache::ArticleAvailability::new().eligible_backend(id).expect("backend should be eligible"));
         prop_assert!(avail.is_missing(id));
     }
 
@@ -138,7 +138,7 @@ proptest! {
         avail.record_missing(id);
         prop_assert_eq!(avail.eligible_backend(id).is_some(), !avail.is_missing(id));
 
-        avail.record_has(nntp_proxy::cache::ArticleAvailability::new().eligible_backend(id).expect("backend should be eligible"));
+        avail.record_has(&nntp_proxy::cache::ArticleAvailability::new().eligible_backend(id).expect("backend should be eligible"));
         prop_assert_eq!(avail.eligible_backend(id).is_some(), !avail.is_missing(id));
     }
 

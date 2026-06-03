@@ -572,32 +572,34 @@ impl ClientSession {
             };
             let backend_id = backend.backend_id();
 
-            if let Some(missing) =
-                AuthoritativeArticleMissing::from_status_code(&backend, status_code)
+            let backend = match AuthoritativeArticleMissing::from_status_code(backend, status_code)
             {
-                self.record_authoritative_article_missing(&missing, &mut availability);
-                if let Some(msg_id) = request.message_id_value() {
-                    self.cache.record_backend_missing(msg_id, backend_id).await;
+                Ok(missing) => {
+                    self.record_authoritative_article_missing(&missing, &mut availability);
+                    if let Some(msg_id) = request.message_id_value() {
+                        self.cache.record_backend_missing(msg_id, backend_id).await;
+                    }
+                    if let Err(err) = self
+                        .capture_suppressed_430_response(&mut conn, backend_id, request, buffer)
+                        .await
+                    {
+                        self.sync_availability_if_needed(msg_id.as_ref(), &availability)
+                            .await;
+                        Self::release_cached_backend_connection(&mut backend_connection);
+                        let turn = order.wait_turn(order_index).await;
+                        turn.fail_and_advance();
+                        return Err(err);
+                    }
+                    self.release_or_reuse_connection(
+                        conn,
+                        backend_id,
+                        request,
+                        Some(&mut backend_connection),
+                    );
+                    continue;
                 }
-                if let Err(err) = self
-                    .capture_suppressed_430_response(&mut conn, backend_id, request, buffer)
-                    .await
-                {
-                    self.sync_availability_if_needed(msg_id.as_ref(), &availability)
-                        .await;
-                    Self::release_cached_backend_connection(&mut backend_connection);
-                    let turn = order.wait_turn(order_index).await;
-                    turn.fail_and_advance();
-                    return Err(err);
-                }
-                self.release_or_reuse_connection(
-                    conn,
-                    backend_id,
-                    request,
-                    Some(&mut backend_connection),
-                );
-                continue;
-            }
+                Err(backend) => backend,
+            };
 
             let msg_id = request.message_id_value();
             let response = {
@@ -616,7 +618,7 @@ impl ClientSession {
                     .write_successful_backend_response(
                         conn,
                         &mut *client_write,
-                        backend.clone(),
+                        &backend,
                         buffer,
                         ResponseWriteParams {
                             request,
@@ -652,7 +654,7 @@ impl ClientSession {
                 }
             };
 
-            Self::record_successful_availability(backend.clone(), status_code, &mut availability);
+            Self::record_successful_availability(&backend, status_code, &mut availability);
             guard.complete();
             self.sync_availability_if_needed(msg_id.as_ref(), &availability)
                 .await;
@@ -807,7 +809,7 @@ impl ClientSession {
     }
 
     pub(super) fn record_successful_availability(
-        backend: EligibleArticleBackend,
+        backend: &EligibleArticleBackend,
         status_code: crate::protocol::StatusCode,
         availability: &mut crate::cache::ArticleAvailability,
     ) {
@@ -905,7 +907,7 @@ mod tests {
         let backend_id = BackendId::from_index(2);
 
         ClientSession::record_successful_availability(
-            crate::cache::ArticleAvailability::new()
+            &crate::cache::ArticleAvailability::new()
                 .eligible_backend(backend_id)
                 .expect("backend should be eligible"),
             StatusCode::new(222),
@@ -922,7 +924,7 @@ mod tests {
         let mut availability = ArticleAvailability::new();
 
         ClientSession::record_successful_availability(
-            crate::cache::ArticleAvailability::new()
+            &crate::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(1))
                 .expect("backend should be eligible"),
             StatusCode::new(430),
@@ -942,7 +944,7 @@ mod tests {
         availability.record_missing(BackendId::from_index(0));
 
         ClientSession::record_successful_availability(
-            crate::cache::ArticleAvailability::new()
+            &crate::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(1))
                 .expect("backend should be eligible"),
             StatusCode::new(222),

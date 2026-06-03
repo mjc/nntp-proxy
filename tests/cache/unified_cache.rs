@@ -62,7 +62,8 @@ async fn test_unified_cache_memory_upsert_and_get() {
             buffer.clone(),
             nntp_proxy::cache::ArticleAvailability::new()
                 .eligible_backend(backend_id)
-                .expect("backend should be eligible"),
+                .expect("backend should be eligible")
+                .positive_observation(),
             0.into(),
         )
         .await;
@@ -121,7 +122,8 @@ async fn test_unified_cache_sync_availability() {
             buffer.clone(),
             nntp_proxy::cache::ArticleAvailability::new()
                 .eligible_backend(backend_id)
-                .expect("backend should be eligible"),
+                .expect("backend should be eligible")
+                .positive_observation(),
             0.into(),
         )
         .await;
@@ -147,7 +149,7 @@ async fn test_unified_cache_availability_sync_persists_only_missing_bits() {
     let mut availability = ArticleAvailability::new();
     availability.record_missing(BackendId::from_index(1));
     availability.record_has(
-        nntp_proxy::cache::ArticleAvailability::new()
+        &nntp_proxy::cache::ArticleAvailability::new()
             .eligible_backend(BackendId::from_index(2))
             .expect("backend should be eligible"),
     );
@@ -187,7 +189,8 @@ async fn test_unified_cache_weighted_size() {
             buffer,
             nntp_proxy::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible"),
+                .expect("backend should be eligible")
+                .positive_observation(),
             0.into(),
         )
         .await;

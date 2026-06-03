@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::mem::size_of;
 
 use super::article::{CachedArticleNumber, CachedPayload, parse_payload};
-use super::availability::{ArticleAvailability, EligibleArticleBackend};
+use super::availability::{ArticleAvailability, ArticleBackendHasArticle};
 use super::ttl;
 
 #[cfg(test)]
@@ -525,15 +525,15 @@ impl DiskCachedArticle {
     }
 
     /// Record that a backend successfully provided this article
-    pub(crate) fn record_backend_has(&mut self, backend: EligibleArticleBackend) {
-        self.availability.record_has(backend);
+    pub(crate) fn record_backend_has(&mut self, backend: ArticleBackendHasArticle) {
+        self.availability.record_observed_has(backend);
     }
 
     /// Record successful backend availability without storing response payload bytes.
     pub(super) fn record_backend_has_status(
         &mut self,
         status_code: CacheableStatusCode,
-        backend: EligibleArticleBackend,
+        backend: ArticleBackendHasArticle,
         tier: ttl::CacheTier,
     ) {
         if !self.is_complete_article() {
@@ -743,7 +743,8 @@ mod tests {
         entry.record_backend_has(
             crate::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible"),
+                .expect("backend should be eligible")
+                .positive_observation(),
         );
         assert!(entry.should_try_backend(BackendId::from_index(0)));
         assert!(entry.should_try_backend(BackendId::from_index(1)));
@@ -1065,7 +1066,8 @@ mod tests {
         entry.record_backend_has(
             crate::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible"),
+                .expect("backend should be eligible")
+                .positive_observation(),
         );
         entry.record_backend_missing(BackendId::from_index(2));
 

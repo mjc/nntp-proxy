@@ -372,7 +372,7 @@ impl HybridArticleCache {
         &self,
         message_id: MessageId<'_>,
         buffer: impl Into<super::CacheIngestResponse>,
-        backend: super::EligibleArticleBackend,
+        backend: super::ArticleBackendHasArticle,
         tier: super::ttl::CacheTier,
     ) {
         let buffer = buffer.into();
@@ -455,7 +455,7 @@ impl HybridArticleCache {
         &self,
         message_id: MessageId<'_>,
         status_code: StatusCode,
-        backend: super::EligibleArticleBackend,
+        backend: super::ArticleBackendHasArticle,
         tier: super::ttl::CacheTier,
     ) {
         let Ok(cacheable_status) = CacheableStatusCode::try_from(status_code.as_u16()) else {
@@ -689,7 +689,8 @@ mod tests {
                 buffer.clone(),
                 crate::cache::ArticleAvailability::new()
                     .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible"),
+                    .expect("backend should be eligible")
+                    .positive_observation(),
                 0.into(),
             )
             .await;
@@ -764,7 +765,8 @@ mod tests {
                 buffer,
                 crate::cache::ArticleAvailability::new()
                     .eligible_backend(backend)
-                    .expect("fresh availability can still mint a token"),
+                    .expect("fresh availability can still mint a token")
+                    .positive_observation(),
                 0.into(),
             )
             .await;
@@ -787,7 +789,7 @@ mod tests {
         let mut availability = ArticleAvailability::new();
         availability.record_missing(BackendId::from_index(0));
         availability.record_has(
-            crate::cache::ArticleAvailability::new()
+            &crate::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(1))
                 .expect("backend should be eligible"),
         );
@@ -821,7 +823,8 @@ mod tests {
                 buffer.clone(),
                 crate::cache::ArticleAvailability::new()
                     .eligible_backend(BackendId::from_index(1))
-                    .expect("backend should be eligible"),
+                    .expect("backend should be eligible")
+                    .positive_observation(),
                 0.into(),
             )
             .await;
@@ -830,7 +833,7 @@ mod tests {
         let mut availability = ArticleAvailability::new();
         availability.record_missing(BackendId::from_index(0));
         availability.record_has(
-            crate::cache::ArticleAvailability::new()
+            &crate::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(1))
                 .expect("backend should be eligible"),
         );
@@ -869,7 +872,8 @@ mod tests {
                 head,
                 crate::cache::ArticleAvailability::new()
                     .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible"),
+                    .expect("backend should be eligible")
+                    .positive_observation(),
                 0.into(),
             )
             .await;
@@ -881,7 +885,8 @@ mod tests {
                 body.clone(),
                 crate::cache::ArticleAvailability::new()
                     .eligible_backend(BackendId::from_index(1))
-                    .expect("backend should be eligible"),
+                    .expect("backend should be eligible")
+                    .positive_observation(),
                 0.into(),
             )
             .await;

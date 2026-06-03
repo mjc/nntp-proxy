@@ -44,7 +44,8 @@ async fn test_cache_hit() -> Result<()> {
             buffer.clone(),
             nntp_proxy::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible"),
+                .expect("backend should be eligible")
+                .positive_observation(),
             0.into(),
         )
         .await;
@@ -87,7 +88,8 @@ async fn test_multiple_cache_entries() -> Result<()> {
                 buffer,
                 nntp_proxy::cache::ArticleAvailability::new()
                     .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible"),
+                    .expect("backend should be eligible")
+                    .positive_observation(),
                 0.into(),
             )
             .await;
@@ -124,7 +126,8 @@ async fn test_cache_ttl_expiration() -> Result<()> {
             buffer,
             nntp_proxy::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible"),
+                .expect("backend should be eligible")
+                .positive_observation(),
             0.into(),
         )
         .await;
@@ -153,7 +156,8 @@ async fn test_cache_capacity_limit() -> Result<()> {
                 buffer,
                 nntp_proxy::cache::ArticleAvailability::new()
                     .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible"),
+                    .expect("backend should be eligible")
+                    .positive_observation(),
                 0.into(),
             )
             .await;
@@ -193,7 +197,8 @@ async fn test_cache_different_message_id_formats() -> Result<()> {
                 buffer,
                 nntp_proxy::cache::ArticleAvailability::new()
                     .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible"),
+                    .expect("backend should be eligible")
+                    .positive_observation(),
                 0.into(),
             )
             .await;
@@ -230,7 +235,8 @@ async fn test_cache_stats() -> Result<()> {
                 buffer,
                 nntp_proxy::cache::ArticleAvailability::new()
                     .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible"),
+                    .expect("backend should be eligible")
+                    .positive_observation(),
                 0.into(),
             )
             .await;
@@ -260,7 +266,8 @@ async fn test_zero_allocation_lookup() -> Result<()> {
             buffer,
             nntp_proxy::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible"),
+                .expect("backend should be eligible")
+                .positive_observation(),
             0.into(),
         )
         .await;

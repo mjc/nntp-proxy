@@ -1011,7 +1011,7 @@ mod tests {
         let mut availability = ArticleAvailability::new();
         availability.record_missing(BackendId::from_index(0));
         availability.record_has(
-            crate::cache::ArticleAvailability::new()
+            &crate::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(1))
                 .expect("backend should be eligible"),
         );

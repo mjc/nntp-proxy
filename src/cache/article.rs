@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use super::availability::{ArticleAvailability, EligibleArticleBackend};
+use super::availability::{ArticleAvailability, ArticleBackendHasArticle};
 use super::ttl;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -511,8 +511,8 @@ impl CachedArticle {
     }
 
     /// Record that a backend successfully provided this article
-    pub fn record_backend_has(&mut self, backend: EligibleArticleBackend) {
-        self.backend_availability.record_has(backend);
+    pub fn record_backend_has(&mut self, backend: ArticleBackendHasArticle) {
+        self.backend_availability.record_observed_has(backend);
     }
 
     /// Check if all backends have been tried and none have the article
@@ -867,7 +867,7 @@ impl ArticleCache {
     fn merge_ingest_entry(
         maybe_entry: Option<Entry<Arc<str>, CachedArticle>>,
         new_entry_template: &CachedArticle,
-        backend: EligibleArticleBackend,
+        backend: ArticleBackendHasArticle,
     ) -> CachedArticle {
         if let Some(existing) = maybe_entry {
             let mut entry = existing.into_value();
@@ -905,7 +905,7 @@ impl ArticleCache {
         maybe_entry: Option<Entry<Arc<str>, CachedArticle>>,
         new_entry_template: &CachedArticle,
         status_code: StatusCode,
-        backend: EligibleArticleBackend,
+        backend: ArticleBackendHasArticle,
         tier: ttl::CacheTier,
     ) -> CachedArticle {
         let mut entry = maybe_entry.map_or_else(|| new_entry_template.clone(), Entry::into_value);
@@ -972,7 +972,7 @@ impl ArticleCache {
         &self,
         message_id: MessageId<'_>,
         buffer: impl Into<super::CacheIngestResponse>,
-        backend: EligibleArticleBackend,
+        backend: ArticleBackendHasArticle,
         tier: ttl::CacheTier,
     ) {
         let buffer = buffer.into();
@@ -998,7 +998,7 @@ impl ArticleCache {
         &self,
         message_id: MessageId<'_>,
         status_code: StatusCode,
-        backend: EligibleArticleBackend,
+        backend: ArticleBackendHasArticle,
         tier: ttl::CacheTier,
     ) {
         let key: Arc<str> = message_id.without_brackets().into();
@@ -1411,15 +1411,18 @@ mod tests {
             .upsert_ingest(
                 msg_id.clone(),
                 complete.as_bytes().to_vec(),
-                backend.clone(),
+                backend.positive_observation(),
                 0.into(),
             )
             .await;
+        let backend = crate::cache::ArticleAvailability::new()
+            .eligible_backend(backend_id)
+            .expect("backend should be eligible");
         cache
             .upsert_ingest(
                 msg_id.clone(),
                 b"222 0 <test@example.com>\r\n".to_vec(),
-                backend.clone(),
+                backend.positive_observation(),
                 0.into(),
             )
             .await;
@@ -1449,7 +1452,7 @@ mod tests {
             .upsert_ingest(
                 msg_id.clone(),
                 b"222 0 <test@example.com>\r\n".to_vec(),
-                backend.clone(),
+                backend.positive_observation(),
                 0.into(),
             )
             .await;
@@ -1462,11 +1465,14 @@ mod tests {
                 .is_none()
         );
 
+        let backend = crate::cache::ArticleAvailability::new()
+            .eligible_backend(backend_id)
+            .expect("backend should be eligible");
         cache
             .upsert_ingest(
                 msg_id.clone(),
                 complete.as_bytes().to_vec(),
-                backend,
+                backend.positive_observation(),
                 0.into(),
             )
             .await;
@@ -1775,7 +1781,8 @@ mod tests {
                 buffer.clone(),
                 crate::cache::ArticleAvailability::new()
                     .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible"),
+                    .expect("backend should be eligible")
+                    .positive_observation(),
                 0.into(),
             )
             .await;
@@ -1804,7 +1811,8 @@ mod tests {
                 buffer.clone(),
                 crate::cache::ArticleAvailability::new()
                     .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible"),
+                    .expect("backend should be eligible")
+                    .positive_observation(),
                 0.into(),
             )
             .await;
@@ -1816,7 +1824,8 @@ mod tests {
                 buffer.clone(),
                 crate::cache::ArticleAvailability::new()
                     .eligible_backend(BackendId::from_index(1))
-                    .expect("backend should be eligible"),
+                    .expect("backend should be eligible")
+                    .positive_observation(),
                 0.into(),
             )
             .await;
@@ -1868,7 +1877,8 @@ mod tests {
                 buffer,
                 crate::cache::ArticleAvailability::new()
                     .eligible_backend(backend)
-                    .expect("fresh availability can still mint a token"),
+                    .expect("fresh availability can still mint a token")
+                    .positive_observation(),
                 0.into(),
             )
             .await;
@@ -2005,7 +2015,8 @@ mod tests {
                 buffer,
                 crate::cache::ArticleAvailability::new()
                     .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible"),
+                    .expect("backend should be eligible")
+                    .positive_observation(),
                 0.into(),
             )
             .await;

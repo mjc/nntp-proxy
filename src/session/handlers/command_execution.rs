@@ -3,7 +3,7 @@
 //! Handles executing commands on individual backends, including connection retry,
 //! response validation, and writing backend responses to clients.
 
-use crate::cache::EligibleArticleBackend;
+use crate::cache::{ArticleBackendHasArticle, EligibleArticleBackend};
 use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata, StatusCode};
 use crate::router::{BackendSelector, CommandGuard, SuppressedBackends};
 use crate::session::SessionError;
@@ -44,18 +44,6 @@ pub(super) enum BackendAttemptResult {
     NoRetryableBackend,
 }
 
-impl BackendAttemptResult {
-    #[must_use]
-    const fn success(
-        request: &mut RequestContext,
-        backend: EligibleArticleBackend,
-        response: RequestResponseMetadata,
-    ) -> Self {
-        request.record_backend_response(backend.backend_id(), response);
-        Self::Success
-    }
-}
-
 /// Mutable state for an article backend attempt loop
 ///
 /// Groups the mutable parameters that track retry state across
@@ -82,23 +70,26 @@ impl RetryAttemptKind {
     }
 }
 
-#[derive(Clone)]
 pub(super) struct AuthoritativeArticleMissing {
-    backend: EligibleArticleBackend,
+    backend_id: BackendId,
 }
 
 impl AuthoritativeArticleMissing {
     pub(super) fn from_status_code(
-        backend: &EligibleArticleBackend,
+        backend: EligibleArticleBackend,
         status_code: StatusCode,
-    ) -> Option<Self> {
-        (status_code.as_u16() == 430).then_some(Self {
-            backend: backend.clone(),
-        })
+    ) -> Result<Self, EligibleArticleBackend> {
+        if status_code.as_u16() == 430 {
+            Ok(Self {
+                backend_id: backend.backend_id(),
+            })
+        } else {
+            Err(backend)
+        }
     }
 
     pub(super) const fn backend_id(&self) -> BackendId {
-        self.backend.backend_id()
+        self.backend_id
     }
 }
 
@@ -250,36 +241,38 @@ impl ClientSession {
             return Ok(BackendAttemptResult::BackendUnavailable);
         };
 
-        if let Some(missing) = AuthoritativeArticleMissing::from_status_code(&backend, status_code)
-        {
-            debug!(
-                client = %self.client_addr,
-                backend = backend_id.as_index(),
-                command_verb = ?request.verb(),
-                msg_id = ?request.message_id_value(),
-                "Direct backend attempt returned 430 before writing response"
-            );
-            self.record_authoritative_article_missing(&missing, state.availability);
-            if let Some(msg_id) = request.message_id_value() {
-                self.cache.record_backend_missing(msg_id, backend_id).await;
+        let backend = match AuthoritativeArticleMissing::from_status_code(backend, status_code) {
+            Ok(missing) => {
+                debug!(
+                    client = %self.client_addr,
+                    backend = backend_id.as_index(),
+                    command_verb = ?request.verb(),
+                    msg_id = ?request.message_id_value(),
+                    "Direct backend attempt returned 430 before writing response"
+                );
+                self.record_authoritative_article_missing(&missing, state.availability);
+                if let Some(msg_id) = request.message_id_value() {
+                    self.cache.record_backend_missing(msg_id, backend_id).await;
+                }
+                self.capture_suppressed_430_response(&mut conn, backend_id, request, buffer)
+                    .await?;
+                self.release_or_reuse_connection(
+                    conn,
+                    backend_id,
+                    request,
+                    Some(state.backend_connection),
+                );
+                return Ok(BackendAttemptResult::ArticleNotFound { missing });
             }
-            self.capture_suppressed_430_response(&mut conn, backend_id, request, buffer)
-                .await?;
-            self.release_or_reuse_connection(
-                conn,
-                backend_id,
-                request,
-                Some(state.backend_connection),
-            );
-            return Ok(BackendAttemptResult::ArticleNotFound { missing });
-        }
+            Err(backend) => backend,
+        };
 
         let msg_id = request.message_id_value();
         let response = match self
             .write_successful_retry_response(
                 conn,
                 client_writer,
-                backend.clone(),
+                &backend,
                 buffer,
                 ResponseWriteParams {
                     request,
@@ -301,16 +294,17 @@ impl ClientSession {
                 return Err(e);
             }
         };
-        Self::record_successful_availability(backend.clone(), status_code, state.availability);
+        Self::record_successful_availability(&backend, status_code, state.availability);
         guard.complete();
-        Ok(BackendAttemptResult::success(request, backend, response))
+        request.record_backend_response(backend_id, response);
+        Ok(BackendAttemptResult::Success)
     }
 
     async fn write_successful_retry_response(
         &self,
         conn: crate::pool::ConnectionGuard,
         client_writer: &crate::session::SharedClientWriter,
-        backend: EligibleArticleBackend,
+        backend: &EligibleArticleBackend,
         buffer: crate::pool::PooledBuffer,
         params: ResponseWriteParams<'_>,
         backend_connection: &mut Option<(BackendId, crate::pool::ConnectionGuard)>,
@@ -467,7 +461,7 @@ impl ClientSession {
         &self,
         mut conn: crate::pool::ConnectionGuard,
         client_write: &mut W,
-        backend: EligibleArticleBackend,
+        backend: &EligibleArticleBackend,
         backend_bytes: crate::pool::PooledBuffer,
         params: ResponseWriteParams<'_>,
         backend_connection: Option<&mut Option<(BackendId, crate::pool::ConnectionGuard)>>,
@@ -859,7 +853,7 @@ impl ClientSession {
             "Sending request to backend and waiting for classifiable response bytes"
         );
         let result = self
-            .execute_and_read_response(&mut guard, backend_id, request)
+            .execute_and_read_response(&mut guard, backend, request)
             .await;
 
         match result {
@@ -885,9 +879,10 @@ impl ClientSession {
     async fn execute_and_read_response(
         &self,
         conn: &mut crate::stream::ConnectionStream,
-        backend_id: crate::types::BackendId,
+        backend: &EligibleArticleBackend,
         request: &RequestContext,
     ) -> Result<BackendReadAttempt, BackendReadAttemptError> {
+        let backend_id = backend.backend_id();
         self.metrics.record_command(backend_id);
         self.metrics.user_command(self.username());
 
@@ -923,7 +918,7 @@ impl ClientSession {
         &self,
         pooled_conn: &mut deadpool::managed::Object<crate::pool::deadpool_connection::TcpManager>,
         client_write: &mut W,
-        backend: EligibleArticleBackend,
+        backend: &EligibleArticleBackend,
         backend_bytes: crate::pool::PooledBuffer,
         params: ResponseWriteParams<'_>,
     ) -> Result<u64, ResponseTransferError>
@@ -946,9 +941,12 @@ impl ClientSession {
             cache_action
         );
 
-        if matches!(cache_action, CacheAction::TrackAvailability) {
-            self.apply_cache_action(cache_action, params, &backend, None);
-        }
+        let backend_after_write = if matches!(cache_action, CacheAction::TrackAvailability) {
+            self.apply_cache_action(cache_action, params, backend.positive_observation(), None);
+            None
+        } else {
+            Some(backend.positive_observation())
+        };
 
         let (bytes_written, captured) =
             match ResponseRetention::for_request(params.request, cache_action) {
@@ -978,8 +976,8 @@ impl ClientSession {
                 }
             };
 
-        if !matches!(cache_action, CacheAction::TrackAvailability) {
-            self.apply_cache_action(cache_action, params, &backend, captured);
+        if let Some(backend) = backend_after_write {
+            self.apply_cache_action(cache_action, params, backend, captured);
         }
         Ok(bytes_written)
     }
@@ -988,13 +986,13 @@ impl ClientSession {
         &self,
         cache_action: CacheAction,
         params: ResponseWriteParams<'_>,
-        backend: &EligibleArticleBackend,
+        backend: ArticleBackendHasArticle,
         captured: Option<crate::pool::ChunkedResponse>,
     ) {
         let backend_id = backend.backend_id();
         match (cache_action, params.msg_id, captured) {
             (CacheAction::CaptureArticle, msg_id, Some(response)) => {
-                self.maybe_cache_upsert_buffer(msg_id, response.into(), backend.clone());
+                self.maybe_cache_upsert_buffer(msg_id, response.into(), backend);
             }
             (CacheAction::TrackAvailability, Some(msg_id), _)
             | (CacheAction::CaptureArticle, Some(msg_id), None)
@@ -1003,7 +1001,7 @@ impl ClientSession {
                 self.spawn_cache_upsert_availability(
                     msg_id,
                     params.status_code,
-                    backend.clone(),
+                    backend,
                     self.tier_for_backend(backend_id),
                 );
             }
@@ -1013,7 +1011,7 @@ impl ClientSession {
                 self.maybe_cache_upsert_buffer(
                     msg_id,
                     crate::cache::CacheIngestResponse::from(b"223\r\n".as_slice()),
-                    backend.clone(),
+                    backend,
                 );
             }
             (CacheAction::TrackStat, Some(msg_id), _)
@@ -1022,7 +1020,7 @@ impl ClientSession {
                 self.spawn_cache_upsert_availability(
                     msg_id,
                     params.status_code,
-                    backend.clone(),
+                    backend,
                     self.tier_for_backend(backend_id),
                 );
             }
@@ -1161,7 +1159,7 @@ impl ClientSession {
         &self,
         msg_id: Option<&crate::types::MessageId<'_>>,
         data: crate::cache::CacheIngestResponse,
-        backend: EligibleArticleBackend,
+        backend: ArticleBackendHasArticle,
     ) {
         if let Some(msg_id_ref) = msg_id {
             let backend_id = backend.backend_id();
@@ -1210,7 +1208,7 @@ mod tests {
     use crate::cache::{ArticleAvailability, UnifiedCache};
     use crate::metrics::MetricsCollector;
     use crate::pool::{BufferPool, ConnectionGuard, DeadpoolConnectionProvider};
-    use crate::protocol::{RequestContext, RequestResponseMetadata, ResponseWireLen, StatusCode};
+    use crate::protocol::{RequestContext, StatusCode};
     use crate::router::{BackendSelector, SuppressedBackends};
     use crate::session::SessionError;
     use crate::session::routing::CacheAction;
@@ -1509,35 +1507,6 @@ mod tests {
     }
 
     #[test]
-    fn backend_attempt_success_records_success() {
-        let backend_id = BackendId::from_index(1);
-        let backend = crate::cache::ArticleAvailability::new()
-            .eligible_backend(backend_id)
-            .expect("backend should be eligible");
-        let response = RequestResponseMetadata::new(StatusCode::new(220), ResponseWireLen::new(42));
-        let mut request = request_context(b"ARTICLE <test@example.com>\r\n");
-        let result = BackendAttemptResult::success(&mut request, backend, response);
-
-        assert!(matches!(result, BackendAttemptResult::Success));
-    }
-
-    #[test]
-    fn backend_attempt_success_records_request_context() {
-        let backend_id = BackendId::from_index(1);
-        let backend = crate::cache::ArticleAvailability::new()
-            .eligible_backend(backend_id)
-            .expect("backend should be eligible");
-        let response = RequestResponseMetadata::new(StatusCode::new(220), ResponseWireLen::new(42));
-        let mut request = request_context(b"ARTICLE <test@example.com>\r\n");
-
-        let result = BackendAttemptResult::success(&mut request, backend, response);
-
-        assert!(matches!(result, BackendAttemptResult::Success));
-        assert_eq!(request.backend_id(), Some(backend_id));
-        assert_eq!(request.response_metadata(), Some(response));
-    }
-
-    #[test]
     fn owned_response_timeout_is_terminal_client_disconnect() {
         let err = std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out");
         let classified = classify_response_write_err(err);
@@ -1561,34 +1530,31 @@ mod tests {
     fn authoritative_article_missing_only_classifies_430() {
         let backend_id = BackendId::from_index(2);
         let missing = AuthoritativeArticleMissing::from_status_code(
-            &eligible(backend_id),
+            eligible(backend_id),
             StatusCode::new(430),
         );
-        assert_eq!(
-            missing.map(|missing| missing.backend_id()),
-            Some(backend_id)
-        );
+        assert_eq!(missing.map(|missing| missing.backend_id()), Ok(backend_id));
 
         assert!(
             AuthoritativeArticleMissing::from_status_code(
-                &eligible(backend_id),
+                eligible(backend_id),
                 StatusCode::new(400)
             )
-            .is_none()
+            .is_err()
         );
         assert!(
             AuthoritativeArticleMissing::from_status_code(
-                &eligible(backend_id),
+                eligible(backend_id),
                 StatusCode::new(500)
             )
-            .is_none()
+            .is_err()
         );
         assert!(
             AuthoritativeArticleMissing::from_status_code(
-                &eligible(backend_id),
+                eligible(backend_id),
                 StatusCode::new(222)
             )
-            .is_none()
+            .is_err()
         );
     }
 
@@ -1600,16 +1566,16 @@ mod tests {
 
         assert!(
             AuthoritativeArticleMissing::from_status_code(
-                &eligible(backend_id),
+                eligible(backend_id),
                 StatusCode::new(503)
             )
-            .is_none()
+            .is_err()
         );
         assert_eq!(availability.checked_bits(), 0);
         assert_eq!(availability.missing_bits(), 0);
 
         let missing = AuthoritativeArticleMissing::from_status_code(
-            &eligible(backend_id),
+            eligible(backend_id),
             StatusCode::new(430),
         )
         .expect("430 is authoritative article-missing");
@@ -1677,9 +1643,10 @@ mod tests {
                 msg_id: Some(&msg_id),
                 status_code: StatusCode::new(223),
             },
-            &crate::cache::ArticleAvailability::new()
+            crate::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible"),
+                .expect("backend should be eligible")
+                .positive_observation(),
             None,
         );
 
@@ -1928,9 +1895,10 @@ mod tests {
                 msg_id: Some(&msg_id),
                 status_code: StatusCode::new(220),
             },
-            &crate::cache::ArticleAvailability::new()
+            crate::cache::ArticleAvailability::new()
                 .eligible_backend(backend_id)
-                .expect("backend should be eligible"),
+                .expect("backend should be eligible")
+                .positive_observation(),
             None,
         );
 
@@ -2112,7 +2080,7 @@ mod tests {
             .write_successful_backend_response(
                 guard,
                 &mut client_write,
-                crate::cache::ArticleAvailability::new()
+                &crate::cache::ArticleAvailability::new()
                     .eligible_backend(BackendId::from_index(0))
                     .expect("backend should be eligible"),
                 backend_bytes,
@@ -2161,7 +2129,7 @@ mod tests {
             .write_successful_backend_response(
                 guard,
                 &mut client_write,
-                crate::cache::ArticleAvailability::new()
+                &crate::cache::ArticleAvailability::new()
                     .eligible_backend(BackendId::from_index(0))
                     .expect("backend should be eligible"),
                 backend_bytes,

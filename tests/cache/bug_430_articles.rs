@@ -25,7 +25,7 @@ fn mark_has(availability: &mut ArticleAvailability, backend_id: BackendId) {
     let backend = availability
         .eligible_backend(backend_id)
         .expect("backend should be eligible");
-    availability.record_has(backend);
+    availability.record_has(&backend);
 }
 
 /// Test that `sync_availability` does NOT create a missing entry when a backend has the article
@@ -86,7 +86,8 @@ async fn test_race_condition_upsert_vs_sync_availability() -> Result<()> {
             article_data.clone(),
             nntp_proxy::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible"),
+                .expect("backend should be eligible")
+                .positive_observation(),
             0.into(),
         )
         .await;
@@ -119,7 +120,8 @@ async fn test_second_request_gets_article_not_430() -> Result<()> {
             article_data.clone(),
             nntp_proxy::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible"),
+                .expect("backend should be eligible")
+                .positive_observation(),
             0.into(),
         )
         .await;
@@ -353,7 +355,8 @@ async fn test_concurrent_upsert_and_sync() -> Result<()> {
                 article_data,
                 nntp_proxy::cache::ArticleAvailability::new()
                     .eligible_backend(BackendId::from_index(0))
-                    .expect("backend should be eligible"),
+                    .expect("backend should be eligible")
+                    .positive_observation(),
                 0.into(),
             )
             .await;
@@ -405,7 +408,8 @@ async fn test_metadata_only_not_served_as_article() -> Result<()> {
             b"223\r\n".to_vec(),
             nntp_proxy::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible"),
+                .expect("backend should be eligible")
+                .positive_observation(),
             0.into(),
         )
         .await;
@@ -438,7 +442,8 @@ async fn test_precheck_metadata_only_then_article_request() -> Result<()> {
             b"223\r\n".to_vec(),
             nntp_proxy::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible"),
+                .expect("backend should be eligible")
+                .positive_observation(),
             0.into(),
         )
         .await;
@@ -464,7 +469,8 @@ async fn test_precheck_metadata_only_then_article_request() -> Result<()> {
             real_article.clone(),
             nntp_proxy::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(0))
-                .expect("backend should be eligible"),
+                .expect("backend should be eligible")
+                .positive_observation(),
             0.into(),
         )
         .await;
