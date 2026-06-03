@@ -82,20 +82,22 @@ impl RetryAttemptKind {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct AuthoritativeArticleMissing {
     backend: EligibleArticleBackend,
 }
 
 impl AuthoritativeArticleMissing {
     pub(super) fn from_status_code(
-        backend: EligibleArticleBackend,
+        backend: &EligibleArticleBackend,
         status_code: StatusCode,
     ) -> Option<Self> {
-        (status_code.as_u16() == 430).then_some(Self { backend })
+        (status_code.as_u16() == 430).then_some(Self {
+            backend: backend.clone(),
+        })
     }
 
-    pub(super) const fn backend_id(self) -> BackendId {
+    pub(super) const fn backend_id(&self) -> BackendId {
         self.backend.backend_id()
     }
 }
@@ -181,7 +183,7 @@ impl ClientSession {
     pub(super) fn retry_backend_provider<'a>(
         &self,
         router: &'a BackendSelector,
-        backend: EligibleArticleBackend,
+        backend: &EligibleArticleBackend,
         request: &RequestContext,
         attempt: RetryAttemptKind,
     ) -> Option<&'a crate::pool::DeadpoolConnectionProvider> {
@@ -213,7 +215,7 @@ impl ClientSession {
     ) -> Result<BackendAttemptResult, SessionError> {
         let route_request = crate::router::RouteRequest::new(self.client_id)
             .with_availability(state.availability)
-            .suppressing_backends(state.unavailable_backends.clone());
+            .suppressing_backends(*state.unavailable_backends);
         let backend = match router.route(route_request) {
             Ok(backend) => backend,
             Err(err) => {
@@ -236,19 +238,20 @@ impl ClientSession {
         );
         let guard = CommandGuard::new(router.clone(), backend_id);
         let Some(provider) =
-            self.retry_backend_provider(router, backend, request, RetryAttemptKind::Direct)
+            self.retry_backend_provider(router, &backend, request, RetryAttemptKind::Direct)
         else {
             return Ok(BackendAttemptResult::BackendUnavailable);
         };
 
         let Some((mut conn, status_code, buffer)) = self
-            .prepare_backend_attempt(provider, backend, request, state)
+            .prepare_backend_attempt(provider, &backend, request, state)
             .await?
         else {
             return Ok(BackendAttemptResult::BackendUnavailable);
         };
 
-        if let Some(missing) = AuthoritativeArticleMissing::from_status_code(backend, status_code) {
+        if let Some(missing) = AuthoritativeArticleMissing::from_status_code(&backend, status_code)
+        {
             debug!(
                 client = %self.client_addr,
                 backend = backend_id.as_index(),
@@ -256,7 +259,7 @@ impl ClientSession {
                 msg_id = ?request.message_id_value(),
                 "Direct backend attempt returned 430 before writing response"
             );
-            self.record_authoritative_article_missing(missing, state.availability);
+            self.record_authoritative_article_missing(&missing, state.availability);
             if let Some(msg_id) = request.message_id_value() {
                 self.cache.record_backend_missing(msg_id, backend_id).await;
             }
@@ -276,7 +279,7 @@ impl ClientSession {
             .write_successful_retry_response(
                 conn,
                 client_writer,
-                backend,
+                backend.clone(),
                 buffer,
                 ResponseWriteParams {
                     request,
@@ -298,7 +301,7 @@ impl ClientSession {
                 return Err(e);
             }
         };
-        Self::record_successful_availability(backend, status_code, state.availability);
+        Self::record_successful_availability(backend.clone(), status_code, state.availability);
         guard.complete();
         Ok(BackendAttemptResult::success(request, backend, response))
     }
@@ -327,7 +330,7 @@ impl ClientSession {
     pub(super) async fn prepare_backend_attempt(
         &self,
         provider: &crate::pool::DeadpoolConnectionProvider,
-        backend: EligibleArticleBackend,
+        backend: &EligibleArticleBackend,
         request: &RequestContext,
         state: &mut ArticleAttemptState<'_>,
     ) -> Result<PreparedBackendAttempt, SessionError> {
@@ -838,7 +841,7 @@ impl ClientSession {
     async fn execute_backend_attempt(
         &self,
         provider: &crate::pool::DeadpoolConnectionProvider,
-        backend: EligibleArticleBackend,
+        backend: &EligibleArticleBackend,
         request: &RequestContext,
         backend_connection: &mut Option<(BackendId, crate::pool::ConnectionGuard)>,
     ) -> Result<ExecutedBackendAttempt> {
@@ -944,7 +947,7 @@ impl ClientSession {
         );
 
         if matches!(cache_action, CacheAction::TrackAvailability) {
-            self.apply_cache_action(cache_action, params, backend, None);
+            self.apply_cache_action(cache_action, params, &backend, None);
         }
 
         let (bytes_written, captured) =
@@ -976,7 +979,7 @@ impl ClientSession {
             };
 
         if !matches!(cache_action, CacheAction::TrackAvailability) {
-            self.apply_cache_action(cache_action, params, backend, captured);
+            self.apply_cache_action(cache_action, params, &backend, captured);
         }
         Ok(bytes_written)
     }
@@ -985,13 +988,13 @@ impl ClientSession {
         &self,
         cache_action: CacheAction,
         params: ResponseWriteParams<'_>,
-        backend: EligibleArticleBackend,
+        backend: &EligibleArticleBackend,
         captured: Option<crate::pool::ChunkedResponse>,
     ) {
         let backend_id = backend.backend_id();
         match (cache_action, params.msg_id, captured) {
             (CacheAction::CaptureArticle, msg_id, Some(response)) => {
-                self.maybe_cache_upsert_buffer(msg_id, response.into(), backend);
+                self.maybe_cache_upsert_buffer(msg_id, response.into(), backend.clone());
             }
             (CacheAction::TrackAvailability, Some(msg_id), _)
             | (CacheAction::CaptureArticle, Some(msg_id), None)
@@ -1000,7 +1003,7 @@ impl ClientSession {
                 self.spawn_cache_upsert_availability(
                     msg_id,
                     params.status_code,
-                    backend,
+                    backend.clone(),
                     self.tier_for_backend(backend_id),
                 );
             }
@@ -1010,7 +1013,7 @@ impl ClientSession {
                 self.maybe_cache_upsert_buffer(
                     msg_id,
                     crate::cache::CacheIngestResponse::from(b"223\r\n".as_slice()),
-                    backend,
+                    backend.clone(),
                 );
             }
             (CacheAction::TrackStat, Some(msg_id), _)
@@ -1019,7 +1022,7 @@ impl ClientSession {
                 self.spawn_cache_upsert_availability(
                     msg_id,
                     params.status_code,
-                    backend,
+                    backend.clone(),
                     self.tier_for_backend(backend_id),
                 );
             }
@@ -1558,31 +1561,31 @@ mod tests {
     fn authoritative_article_missing_only_classifies_430() {
         let backend_id = BackendId::from_index(2);
         let missing = AuthoritativeArticleMissing::from_status_code(
-            eligible(backend_id),
+            &eligible(backend_id),
             StatusCode::new(430),
         );
         assert_eq!(
-            missing.map(AuthoritativeArticleMissing::backend_id),
+            missing.map(|missing| missing.backend_id()),
             Some(backend_id)
         );
 
         assert!(
             AuthoritativeArticleMissing::from_status_code(
-                eligible(backend_id),
+                &eligible(backend_id),
                 StatusCode::new(400)
             )
             .is_none()
         );
         assert!(
             AuthoritativeArticleMissing::from_status_code(
-                eligible(backend_id),
+                &eligible(backend_id),
                 StatusCode::new(500)
             )
             .is_none()
         );
         assert!(
             AuthoritativeArticleMissing::from_status_code(
-                eligible(backend_id),
+                &eligible(backend_id),
                 StatusCode::new(222)
             )
             .is_none()
@@ -1597,7 +1600,7 @@ mod tests {
 
         assert!(
             AuthoritativeArticleMissing::from_status_code(
-                eligible(backend_id),
+                &eligible(backend_id),
                 StatusCode::new(503)
             )
             .is_none()
@@ -1606,11 +1609,11 @@ mod tests {
         assert_eq!(availability.missing_bits(), 0);
 
         let missing = AuthoritativeArticleMissing::from_status_code(
-            eligible(backend_id),
+            &eligible(backend_id),
             StatusCode::new(430),
         )
         .expect("430 is authoritative article-missing");
-        session.record_authoritative_article_missing(missing, &mut availability);
+        session.record_authoritative_article_missing(&missing, &mut availability);
 
         assert_eq!(availability.checked_bits(), 0b0000_0001);
         assert_eq!(availability.missing_bits(), 0b0000_0001);
@@ -1674,7 +1677,7 @@ mod tests {
                 msg_id: Some(&msg_id),
                 status_code: StatusCode::new(223),
             },
-            crate::cache::ArticleAvailability::new()
+            &crate::cache::ArticleAvailability::new()
                 .eligible_backend(BackendId::from_index(0))
                 .expect("backend should be eligible"),
             None,
@@ -1925,7 +1928,7 @@ mod tests {
                 msg_id: Some(&msg_id),
                 status_code: StatusCode::new(220),
             },
-            crate::cache::ArticleAvailability::new()
+            &crate::cache::ArticleAvailability::new()
                 .eligible_backend(backend_id)
                 .expect("backend should be eligible"),
             None,

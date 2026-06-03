@@ -14,14 +14,17 @@
 //!
 //! **Therefore: 430 (missing) ALWAYS takes precedence over "has" state.**
 //!
-//! **BACKEND LIMIT**: Maximum 8 backends supported due to u8 bitset optimization.
-//! This limit is enforced at config validation time.
+//! Availability uses `usize` bitmaps, so local retry checks remain compact while
+//! allowing the backend count to grow with the target word size.
 
 use crate::router::BackendCount;
 use crate::types::BackendId;
 
-/// Maximum number of backends supported by `ArticleAvailability` bitset
-pub const MAX_BACKENDS: usize = 8;
+/// Maximum number of backends supported by `ArticleAvailability` bitset.
+///
+/// This is deliberately a fixed `usize` bitmap. It used to be u8; it is wider
+/// now because I am tired of being harassed by shitty robots about 8 backends.
+pub const MAX_BACKENDS: usize = BackendId::MAX_COUNT;
 
 /// Status of a backend for a specific article
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,7 +43,7 @@ pub enum BackendStatus {
 /// an article request to a backend or records a positive article observation must
 /// first prove the backend was not already known missing by asking
 /// [`ArticleAvailability`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EligibleArticleBackend {
     backend_id: BackendId,
 }
@@ -48,20 +51,20 @@ pub struct EligibleArticleBackend {
 impl EligibleArticleBackend {
     #[inline]
     #[must_use]
-    pub const fn backend_id(self) -> BackendId {
+    pub const fn backend_id(&self) -> BackendId {
         self.backend_id
     }
 
     #[inline]
     #[must_use]
-    pub fn as_index(self) -> usize {
+    pub fn as_index(&self) -> usize {
         self.backend_id.as_index()
     }
 }
 
 /// Track which backends have (or don't have) a specific article
 ///
-/// Uses two u8 bitsets to track availability across up to 8 backends:
+/// Uses two `usize` bitsets to track availability:
 /// - `checked`: Which backends we've queried (attempted to fetch from)
 /// - `missing`: Which backends returned 430 (don't have this article)
 ///
@@ -93,9 +96,9 @@ impl EligibleArticleBackend {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArticleAvailability {
     /// Bitset of backends we've checked (tried to fetch from)
-    checked: u8,
+    checked: usize,
     /// Bitset of backends that DON'T have this article (returned 430)
-    missing: u8, // u8 supports up to 8 backends (plenty for NNTP)
+    missing: usize,
 }
 
 impl ArticleAvailability {
@@ -114,8 +117,6 @@ impl ArticleAvailability {
     /// Once marked missing, the backend should not be retried for this cache entry.
     /// Later positive observations do not clear the missing bit.
     ///
-    /// # Panics (debug builds only)
-    /// Panics if `backend_id` >= 8. Config validation enforces max 8 backends.
     #[inline]
     pub fn record_missing(&mut self, backend_id: BackendId) -> &mut Self {
         let mask = backend_id.availability_bit();
@@ -129,8 +130,6 @@ impl ArticleAvailability {
     /// This marks the backend as checked. It deliberately does not clear an
     /// existing missing bit: within a live cache entry, 430 state is permanent.
     ///
-    /// # Panics (debug builds only)
-    /// Panics if `backend_id` >= 8. Config validation enforces max 8 backends.
     #[inline]
     pub fn record_has(&mut self, backend: EligibleArticleBackend) -> &mut Self {
         let mask = backend.backend_id.availability_bit();
@@ -164,8 +163,6 @@ impl ArticleAvailability {
 
     /// Check if a backend is known to be missing (returned 430)
     ///
-    /// # Panics (debug builds only)
-    /// Panics if `backend_id` >= 8. Config validation enforces max 8 backends.
     #[inline]
     #[must_use]
     pub fn is_missing(&self, backend_id: BackendId) -> bool {
@@ -176,11 +173,9 @@ impl ArticleAvailability {
     ///
     /// Returns `true` if backend might have the article (not yet marked missing).
     ///
-    /// # Panics (debug builds only)
-    /// Panics if `backend_id` >= 8. Config validation enforces max 8 backends.
     #[inline]
     #[must_use]
-    pub fn should_try(&self, backend_id: BackendId) -> bool {
+    pub(crate) fn should_try(&self, backend_id: BackendId) -> bool {
         !self.is_missing(backend_id)
     }
 
@@ -195,14 +190,14 @@ impl ArticleAvailability {
     /// Get the raw missing bitset for debugging
     #[inline]
     #[must_use]
-    pub const fn missing_bits(&self) -> u8 {
+    pub const fn missing_bits(&self) -> usize {
         self.missing
     }
 
     /// Get the raw checked bitset for debugging
     #[inline]
     #[must_use]
-    pub const fn checked_bits(&self) -> u8 {
+    pub const fn checked_bits(&self) -> usize {
         self.checked
     }
 
@@ -210,8 +205,6 @@ impl ArticleAvailability {
     ///
     /// Check if all backends have been tried and returned 430
     ///
-    /// # Panics (debug builds only)
-    /// Panics if `backend_count` > 8. Config validation enforces max 8 backends.
     #[inline]
     #[must_use]
     pub fn all_exhausted(&self, backend_count: BackendCount) -> bool {
@@ -222,31 +215,19 @@ impl ArticleAvailability {
         );
         let expected_missing = match count {
             0 => 0,
-            MAX_BACKENDS => u8::MAX,
-            n => 1u8
+            MAX_BACKENDS => usize::MAX,
+            n => 1usize
                 .checked_shl(n as u32)
                 .map(|mask| mask - 1)
-                .expect("backend count exceeds u8 availability bitset"),
+                .expect("backend count exceeds usize availability bitset"),
         };
         self.missing & expected_missing == expected_missing
-    }
-
-    /// Get an iterator over backends that should still be tried
-    ///
-    /// Returns backend IDs that haven't been marked missing yet.
-    pub fn available_backends(
-        &self,
-        backend_count: BackendCount,
-    ) -> impl Iterator<Item = BackendId> + '_ {
-        (0..backend_count.get().min(MAX_BACKENDS))
-            .map(BackendId::from_index)
-            .filter(move |&backend_id| self.should_try(backend_id))
     }
 
     /// Get the underlying bitset value (for debugging)
     #[inline]
     #[must_use]
-    pub const fn as_u8(&self) -> u8 {
+    pub const fn as_usize(&self) -> usize {
         self.missing
     }
 
@@ -257,7 +238,7 @@ impl ArticleAvailability {
     /// This is primarily used when deserializing from disk cache.
     #[inline]
     #[must_use]
-    pub const fn from_bits(checked: u8, missing: u8) -> Self {
+    pub(crate) const fn from_bits(checked: usize, missing: usize) -> Self {
         Self { checked, missing }
     }
 
@@ -286,8 +267,6 @@ impl ArticleAvailability {
 
     /// Query backend availability status
     ///
-    /// # Panics (debug builds only)
-    /// Panics if `backend_id` >= 8. Config validation enforces max 8 backends.
     #[inline]
     #[must_use]
     pub fn status(&self, backend_id: BackendId) -> BackendStatus {

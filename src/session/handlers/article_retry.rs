@@ -573,9 +573,9 @@ impl ClientSession {
             let backend_id = backend.backend_id();
 
             if let Some(missing) =
-                AuthoritativeArticleMissing::from_status_code(backend, status_code)
+                AuthoritativeArticleMissing::from_status_code(&backend, status_code)
             {
-                self.record_authoritative_article_missing(missing, &mut availability);
+                self.record_authoritative_article_missing(&missing, &mut availability);
                 if let Some(msg_id) = request.message_id_value() {
                     self.cache.record_backend_missing(msg_id, backend_id).await;
                 }
@@ -616,7 +616,7 @@ impl ClientSession {
                     .write_successful_backend_response(
                         conn,
                         &mut *client_write,
-                        backend,
+                        backend.clone(),
                         buffer,
                         ResponseWriteParams {
                             request,
@@ -652,7 +652,7 @@ impl ClientSession {
                 }
             };
 
-            Self::record_successful_availability(backend, status_code, &mut availability);
+            Self::record_successful_availability(backend.clone(), status_code, &mut availability);
             guard.complete();
             self.sync_availability_if_needed(msg_id.as_ref(), &availability)
                 .await;
@@ -710,7 +710,7 @@ impl ClientSession {
     ) -> Result<OrderedLargeTransferAttempt, SessionError> {
         let route_request = crate::router::RouteRequest::new(self.client_id)
             .with_availability(availability)
-            .suppressing_backends(unavailable_backends.clone());
+            .suppressing_backends(*unavailable_backends);
         let backend = match router.route(route_request) {
             Ok(backend) => backend,
             Err(err) => {
@@ -728,7 +728,7 @@ impl ClientSession {
         let guard = crate::router::CommandGuard::new(router.clone(), backend_id);
         let Some(provider) = self.retry_backend_provider(
             router,
-            backend,
+            &backend,
             request,
             RetryAttemptKind::OrderedPipeline,
         ) else {
@@ -742,7 +742,7 @@ impl ClientSession {
             unavailable_backends,
         };
         let prepared = self
-            .prepare_backend_attempt(provider, backend, request, &mut state)
+            .prepare_backend_attempt(provider, &backend, request, &mut state)
             .await;
         let Some((conn, status_code, buffer)) = (match prepared {
             Ok(prepared) => prepared,
@@ -794,7 +794,7 @@ impl ClientSession {
     /// Note: `complete_command` is handled by [`crate::router::CommandGuard`] RAII, not here.
     pub(super) fn record_authoritative_article_missing(
         &self,
-        missing: AuthoritativeArticleMissing,
+        missing: &AuthoritativeArticleMissing,
         availability: &mut crate::cache::ArticleAvailability,
     ) {
         let backend_id = missing.backend_id();

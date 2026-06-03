@@ -81,11 +81,10 @@ pub struct RouteRequest<'a, Mode = RawRoute> {
 ///
 /// Keep this as a fixed bitmap. Real deployments have a small number of Usenet
 /// backends, and a dynamic set here would only add overhead to a hot retry path.
-/// This is deliberately wider than `ArticleAvailability`'s u8 bitmap because
-/// transient router suppression is not persisted article availability state.
+/// This is deliberately the same fixed bitmap width as `ArticleAvailability`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SuppressedBackends {
-    bits: u64,
+    bits: usize,
 }
 
 impl SuppressedBackends {
@@ -97,20 +96,19 @@ impl SuppressedBackends {
     pub fn suppress(&mut self, backend_id: BackendId) {
         let index = backend_id.as_index();
         debug_assert!(
-            index < u64::BITS as usize,
+            index < usize::BITS as usize,
             "backend index exceeds suppression bitmap"
         );
-        self.bits |= 1u64.checked_shl(index as u32).unwrap_or(0);
+        self.bits |= backend_id.availability_bit();
     }
 
     #[must_use]
     pub fn contains(self, backend_id: BackendId) -> bool {
-        let index = backend_id.as_index();
-        self.bits & 1u64.checked_shl(index as u32).unwrap_or(0) != 0
+        self.bits & backend_id.availability_bit() != 0
     }
 
     #[must_use]
-    pub const fn bits(self) -> u64 {
+    pub const fn bits(self) -> usize {
         self.bits
     }
 }
@@ -143,7 +141,7 @@ impl RouteRequest<'_, RawRoute> {
     ) -> RouteRequest<'_, ArticleRoute<'_>> {
         RouteRequest {
             _client_id: self._client_id,
-            suppressed_backends: SuppressedBackends::empty(),
+            suppressed_backends: self.suppressed_backends,
             mode: ArticleRoute { availability },
             _lifetime: std::marker::PhantomData,
         }

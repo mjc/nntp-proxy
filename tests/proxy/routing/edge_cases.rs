@@ -1,5 +1,6 @@
 //! Router edge case and error handling integration tests
 
+use nntp_proxy::cache::MAX_BACKENDS;
 use nntp_proxy::pool::DeadpoolConnectionProvider;
 use nntp_proxy::router::BackendSelector;
 use nntp_proxy::types::{BackendId, ClientId, ServerName};
@@ -27,7 +28,7 @@ fn test_complete_command_on_wrong_backend() {
     );
 
     // Complete command on non-existent backend (different ID)
-    let wrong_id = BackendId::from_index(999);
+    let wrong_id = BackendId::from_index(1);
     router.complete_command(wrong_id);
 
     // Should not affect the real backend
@@ -37,7 +38,7 @@ fn test_complete_command_on_wrong_backend() {
 #[test]
 fn test_backend_load_for_nonexistent_backend() {
     let router = BackendSelector::new();
-    let backend_id = BackendId::from_index(999);
+    let backend_id = BackendId::from_index(1);
 
     assert_eq!(router.backend_load(backend_id), None);
 }
@@ -45,7 +46,7 @@ fn test_backend_load_for_nonexistent_backend() {
 #[test]
 fn test_stateful_count_for_nonexistent_backend() {
     let router = BackendSelector::new();
-    let backend_id = BackendId::from_index(999);
+    let backend_id = BackendId::from_index(1);
 
     assert_eq!(router.stateful_count(backend_id), None);
 }
@@ -75,7 +76,7 @@ fn test_release_stateful_when_count_is_zero() {
 #[test]
 fn test_release_stateful_on_nonexistent_backend() {
     let router = BackendSelector::new();
-    let backend_id = BackendId::from_index(999);
+    let backend_id = BackendId::from_index(1);
 
     // Should not panic
     router.release_stateful(backend_id);
@@ -116,12 +117,11 @@ fn test_excessive_complete_command_calls() {
 }
 
 #[test]
-fn test_large_number_of_backends() {
+fn test_maximum_bitmap_width_backends() {
     let mut router = BackendSelector::new();
     let client_id = ClientId::new();
 
-    // Add 100 backends
-    for i in 0..100 {
+    for i in 0..MAX_BACKENDS {
         router.add_backend(
             BackendId::from_index(i),
             ServerName::try_new(format!("backend-{i}")).unwrap(),
@@ -130,14 +130,13 @@ fn test_large_number_of_backends() {
         );
     }
 
-    assert_eq!(router.backend_count(), 100);
+    assert_eq!(router.backend_count(), MAX_BACKENDS);
 
-    // Route 1000 commands
     for _ in 0..1000 {
         let backend_id = router
             .route(nntp_proxy::router::RouteRequest::new(client_id))
             .unwrap();
-        assert!(backend_id.as_index() < 100);
+        assert!(backend_id.as_index() < MAX_BACKENDS);
     }
 }
 

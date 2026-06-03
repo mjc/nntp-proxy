@@ -7,6 +7,7 @@ use anyhow::Result;
 use std::time::Duration;
 
 use super::types::{Config, Server};
+use crate::cache::MAX_BACKENDS;
 use crate::constants::pool::{MAX_RECOMMENDED_KEEPALIVE_SECS, MIN_RECOMMENDED_KEEPALIVE_SECS};
 
 const MIN_RECOMMENDED_KEEPALIVE: Duration = Duration::from_secs(MIN_RECOMMENDED_KEEPALIVE_SECS);
@@ -19,7 +20,6 @@ impl Config {
     /// Most validations are now enforced by type system (`NonZero` types, validated strings, etc.)
     /// This checks remaining semantic constraints:
     /// - At least one server configured
-    /// - Maximum 8 servers (bitset limitation for article availability tracking)
     /// - Keep-alive intervals are in recommended ranges
     ///
     /// # Errors
@@ -31,10 +31,9 @@ impl Config {
             ));
         }
 
-        if self.servers.len() > 8 {
+        if self.servers.len() > MAX_BACKENDS {
             return Err(anyhow::anyhow!(
-                "Configuration cannot have more than 8 servers (current limitation: u8 bitset for article availability tracking). \
-                 Found {} servers. Consider running multiple proxy instances or file an issue if you need more backends.",
+                "Configuration cannot have more than {MAX_BACKENDS} servers because article availability uses a usize bitmap. Found {} servers.",
                 self.servers.len()
             ));
         }
@@ -142,20 +141,32 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_nine_servers_fails() {
+    fn test_validate_nine_servers_succeeds() {
         let config = Config {
             servers: (0..9)
                 .map(|i| create_test_server(&format!("server{i}"), None))
                 .collect(),
             ..Default::default()
         };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_more_than_bitmap_width_fails() {
+        let config = Config {
+            servers: (0..=MAX_BACKENDS)
+                .map(|i| create_test_server(&format!("server{i}"), None))
+                .collect(),
+            ..Default::default()
+        };
+
         let result = config.validate();
         assert!(result.is_err());
         assert!(
             result
                 .unwrap_err()
                 .to_string()
-                .contains("cannot have more than 8 servers")
+                .contains("article availability uses a usize bitmap")
         );
     }
 

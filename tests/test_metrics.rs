@@ -14,7 +14,7 @@ fn assert_f64_eq(actual: f64, expected: f64) {
 #[test]
 fn test_backend_stats_default() {
     let stats = BackendStats::default();
-    assert_eq!(stats.backend_id, BackendId::from(0));
+    assert_eq!(stats.backend_id, BackendId::from_index(0));
     assert_eq!(stats.total_commands.get(), 0);
     assert_eq!(stats.errors.get(), 0);
     assert_eq!(stats.active_connections.get(), 0);
@@ -167,7 +167,7 @@ fn test_health_status_conversion() {
 #[test]
 fn test_backend_stats_with_realistic_values() {
     let mut stats = BackendStats {
-        backend_id: BackendId::from(0),
+        backend_id: BackendId::from_index(0),
         ..Default::default()
     };
     stats.total_commands = CommandCount::new(1000);
@@ -217,7 +217,7 @@ fn test_user_stats_structure() {
 #[test]
 fn test_metrics_snapshot_with_multiple_backends() {
     let stats1 = BackendStats {
-        backend_id: BackendId::from(0),
+        backend_id: BackendId::from_index(0),
         total_commands: CommandCount::new(100),
         bytes_sent: BytesSent::new(1000),
         bytes_received: BytesReceived::new(10000),
@@ -225,7 +225,7 @@ fn test_metrics_snapshot_with_multiple_backends() {
     };
 
     let stats2 = BackendStats {
-        backend_id: BackendId::from(1),
+        backend_id: BackendId::from_index(1),
         total_commands: CommandCount::new(50),
         bytes_sent: BytesSent::new(500),
         bytes_received: BytesReceived::new(5000),
@@ -244,8 +244,14 @@ fn test_metrics_snapshot_with_multiple_backends() {
     };
 
     assert_eq!(snapshot.backend_stats.len(), 2);
-    assert_eq!(snapshot.backend_stats[0].backend_id, BackendId::from(0));
-    assert_eq!(snapshot.backend_stats[1].backend_id, BackendId::from(1));
+    assert_eq!(
+        snapshot.backend_stats[0].backend_id,
+        BackendId::from_index(0)
+    );
+    assert_eq!(
+        snapshot.backend_stats[1].backend_id,
+        BackendId::from_index(1)
+    );
     assert_eq!(snapshot.total_bytes(), 16500);
     assert_f64_eq(snapshot.throughput_bps(), 165.0);
 }

@@ -391,6 +391,13 @@ impl HybridArticleCache {
         // Check for existing entry - don't overwrite larger semantic payloads with smaller ones.
         if let Ok(Some(existing)) = self.cache.get(&key).await {
             existing_availability = Some(existing.value().availability());
+            if existing
+                .value()
+                .availability()
+                .is_missing(backend.backend_id())
+            {
+                return;
+            }
             let existing_len = existing.value().payload_len();
             let existing_complete = existing.value().is_complete_article();
             let new_complete = entry.is_complete_article();
@@ -463,6 +470,13 @@ impl HybridArticleCache {
         let key = message_id.without_brackets().to_string();
         let _mutation_guard = self.mutation_lock(&key).lock().await;
         let entry = if let Ok(Some(existing)) = self.cache.get(&key).await {
+            if existing
+                .value()
+                .availability()
+                .is_missing(backend.backend_id())
+            {
+                return;
+            }
             let mut updated = existing.value().clone();
             updated.record_backend_has_status(cacheable_status, backend, tier);
             updated
@@ -730,6 +744,9 @@ mod tests {
             .unwrap();
         let msg_id = MessageId::from_borrowed("<hybrid-permanent-missing@example.com>").unwrap();
         let backend = BackendId::from_index(0);
+        let buffer =
+            b"220 0 <hybrid-permanent-missing@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n"
+                .to_vec();
 
         cache.record_missing(msg_id, backend).await;
 
@@ -739,6 +756,24 @@ mod tests {
             entry.availability().eligible_backend(backend).is_none(),
             "cached 430 must not produce an eligible success token"
         );
+
+        let msg_id = MessageId::from_borrowed("<hybrid-permanent-missing@example.com>").unwrap();
+        cache
+            .upsert_ingest(
+                msg_id,
+                buffer,
+                crate::cache::ArticleAvailability::new()
+                    .eligible_backend(backend)
+                    .expect("fresh availability can still mint a token"),
+                0.into(),
+            )
+            .await;
+
+        let msg_id = MessageId::from_borrowed("<hybrid-permanent-missing@example.com>").unwrap();
+        let entry = cache.get(&msg_id).await.unwrap();
+        assert_eq!(entry.status_code(), StatusCode::new(430));
+        assert!(!entry.should_try_backend(backend));
+        assert_eq!(entry.payload_len().get(), 0);
 
         cache.close().await.unwrap();
     }

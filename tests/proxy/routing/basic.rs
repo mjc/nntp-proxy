@@ -67,6 +67,6 @@ fn test_get_backend_provider() {
     let retrieved = router.backend_provider(backend_id);
     assert!(retrieved.is_some());
 
-    let fake_id = BackendId::from_index(999);
+    let fake_id = BackendId::from_index(1);
     assert!(router.backend_provider(fake_id).is_none());
 }

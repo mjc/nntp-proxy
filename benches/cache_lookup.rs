@@ -43,19 +43,21 @@ mod availability {
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
-    fn should_try_all_available(bencher: Bencher) {
+    fn eligible_backend_all_available(bencher: Bencher) {
         let avail = ArticleAvailability::new();
         bencher.bench(|| {
             let mut result = true;
             for i in 0..8u8 {
-                result &= black_box(&avail).should_try(BackendId::from_index(i as usize));
+                result &= black_box(&avail)
+                    .eligible_backend(BackendId::from_index(i as usize))
+                    .is_some();
             }
             black_box(result)
         });
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
-    fn should_try_partially_exhausted(bencher: Bencher) {
+    fn eligible_backend_partially_exhausted(bencher: Bencher) {
         let mut avail = ArticleAvailability::new();
         // Mark backends 0-3 as missing (half exhausted)
         for i in 0..4u8 {
@@ -64,7 +66,9 @@ mod availability {
         bencher.bench(|| {
             let mut result = true;
             for i in 0..8u8 {
-                result &= black_box(&avail).should_try(BackendId::from_index(i as usize));
+                result &= black_box(&avail)
+                    .eligible_backend(BackendId::from_index(i as usize))
+                    .is_some();
             }
             black_box(result)
         });

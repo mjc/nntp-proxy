@@ -148,7 +148,7 @@ fn test_stateful_connection_multiple_backends() {
 #[test]
 fn test_stateful_connection_invalid_backend() {
     let router = BackendSelector::new();
-    let invalid_backend = BackendId::from_index(999);
+    let invalid_backend = BackendId::from_index(1);
 
     // Operations on non-existent backend should handle gracefully
     assert!(!router.try_acquire_stateful(invalid_backend));

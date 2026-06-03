@@ -129,20 +129,17 @@ proptest! {
     }
 
     #[test]
-    fn prop_should_try_inverse_of_is_missing(backend_id in 0..8u8) {
+    fn prop_eligibility_inverse_of_is_missing(backend_id in 0..8u8) {
         let id = BackendId::from_index(usize::from(backend_id));
         let mut avail = ArticleAvailability::new();
 
-        // Initially should_try is true, is_missing is false
-        prop_assert_eq!(avail.should_try(id), !avail.is_missing(id));
+        prop_assert_eq!(avail.eligible_backend(id).is_some(), !avail.is_missing(id));
 
-        // After record_missing, inverted
         avail.record_missing(id);
-        prop_assert_eq!(avail.should_try(id), !avail.is_missing(id));
+        prop_assert_eq!(avail.eligible_backend(id).is_some(), !avail.is_missing(id));
 
-        // After record_has, still inverted because missing is permanent
         avail.record_has(nntp_proxy::cache::ArticleAvailability::new().eligible_backend(id).expect("backend should be eligible"));
-        prop_assert_eq!(avail.should_try(id), !avail.is_missing(id));
+        prop_assert_eq!(avail.eligible_backend(id).is_some(), !avail.is_missing(id));
     }
 
     #[test]

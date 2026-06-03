@@ -113,7 +113,7 @@ impl From<(f64, f64)> for ChartPoint {
 /// Stack-allocated point vectors for typical history sizes (60 points = 60 seconds)
 pub type PointVec = SmallVec<[ChartPoint; 64]>;
 
-/// Stack-allocated chart data for typical backend counts (up to 8 backends)
+/// Stack-allocated chart data for typical backend counts.
 /// Most deployments have 1-4 backends, so this avoids heap allocation
 pub type ChartDataVec = SmallVec<[BackendChartData; 8]>;
 

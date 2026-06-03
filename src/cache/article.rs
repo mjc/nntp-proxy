@@ -378,7 +378,7 @@ impl CachedArticle {
     }
 
     #[must_use]
-    pub(crate) fn negative_only(missing_bits: u8) -> Self {
+    pub(crate) fn negative_only(missing_bits: usize) -> Self {
         Self {
             backend_availability: ArticleAvailability::from_bits(missing_bits, missing_bits),
             status_code: StatusCode::new(430),
@@ -871,6 +871,9 @@ impl ArticleCache {
     ) -> CachedArticle {
         if let Some(existing) = maybe_entry {
             let mut entry = existing.into_value();
+            if entry.backend_availability.is_missing(backend.backend_id()) {
+                return entry;
+            }
 
             let existing_complete = entry.is_complete_article();
             let new_complete = new_entry_template.is_complete_article();
@@ -906,6 +909,9 @@ impl ArticleCache {
         tier: ttl::CacheTier,
     ) -> CachedArticle {
         let mut entry = maybe_entry.map_or_else(|| new_entry_template.clone(), Entry::into_value);
+        if entry.backend_availability.is_missing(backend.backend_id()) {
+            return entry;
+        }
         if !entry.is_complete_article() {
             entry.status_code = status_code;
             entry.tier = tier;
@@ -1405,7 +1411,7 @@ mod tests {
             .upsert_ingest(
                 msg_id.clone(),
                 complete.as_bytes().to_vec(),
-                backend,
+                backend.clone(),
                 0.into(),
             )
             .await;
@@ -1413,7 +1419,7 @@ mod tests {
             .upsert_ingest(
                 msg_id.clone(),
                 b"222 0 <test@example.com>\r\n".to_vec(),
-                backend,
+                backend.clone(),
                 0.into(),
             )
             .await;
@@ -1443,7 +1449,7 @@ mod tests {
             .upsert_ingest(
                 msg_id.clone(),
                 b"222 0 <test@example.com>\r\n".to_vec(),
-                backend,
+                backend.clone(),
                 0.into(),
             )
             .await;
@@ -1846,12 +1852,34 @@ mod tests {
         let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
         let msgid = MessageId::from_borrowed("<permanent-missing@example.com>").unwrap();
         let backend = BackendId::from_index(0);
+        let buffer =
+            b"220 0 <permanent-missing@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
 
         cache.record_backend_missing(msgid.clone(), backend).await;
         let retrieved = cache.get(&msgid).await.unwrap();
         assert!(
             retrieved.availability().eligible_backend(backend).is_none(),
             "cached 430 must not produce an eligible success token"
+        );
+
+        cache
+            .upsert_ingest(
+                msgid.clone(),
+                buffer,
+                crate::cache::ArticleAvailability::new()
+                    .eligible_backend(backend)
+                    .expect("fresh availability can still mint a token"),
+                0.into(),
+            )
+            .await;
+
+        let retrieved = cache.get(&msgid).await.unwrap();
+        assert_eq!(retrieved.status_code(), StatusCode::new(430));
+        assert!(!retrieved.should_try_backend(backend));
+        assert!(
+            retrieved
+                .cached_response_for(RequestKind::Article, msgid.as_str())
+                .is_none()
         );
     }
 

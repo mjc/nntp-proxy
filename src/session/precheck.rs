@@ -79,7 +79,7 @@ fn summarize_tier_results(results: &[QueryResult]) -> TierQuerySummary {
                 availability.record_missing(*id);
             }
             QueryResult::Found(id, _) => {
-                availability.record_has(*id);
+                availability.record_has(id.clone());
                 exhausted = false;
             }
             QueryResult::Error => {
@@ -173,7 +173,7 @@ async fn query_backend(
 
     // Retry once on backend error (fresh connection on second attempt)
     let query_result: QueryResult = crate::session::retry::retry_once!(
-        execute_backend_query(deps, provider, backend, request).await,
+        execute_backend_query(deps, provider, backend.clone(), request).await,
         backend = backend_id.as_index()
     )
     .unwrap_or(QueryResult::Error);
@@ -392,6 +392,7 @@ async fn query_all_backends_racing(
                 QueryResult::Found(id, response) => {
                     let cache = deps.cache.clone();
                     let msg_id_owned = msg_id.to_owned();
+                    let id_for_sync = id.clone();
                     tokio::spawn(async move {
                         while let Some(result) = pending.next().await {
                             if let Ok(result) = result {
@@ -399,7 +400,7 @@ async fn query_all_backends_racing(
                             }
                         }
                         let (_, mut availability) = summarize(results);
-                        availability.record_has(id);
+                        availability.record_has(id_for_sync);
                         cache.sync_availability(msg_id_owned, &availability).await;
                     });
                     return RacingQueryOutcome::Hit(id, response);
@@ -479,7 +480,7 @@ fn summarize(
     for r in results {
         match r {
             QueryResult::Found(id, response) => {
-                availability.record_has(id);
+                availability.record_has(id.clone());
                 if found.is_none() {
                     found = Some((id, response));
                 }

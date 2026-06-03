@@ -34,8 +34,8 @@ fn test_metrics_with_pool_status_standard_mode() {
     );
 
     // Simulate stateful routing behavior: record bytes only
-    metrics.record_client_to_backend_bytes_for(BackendId::from(0), 1000);
-    metrics.record_backend_to_client_bytes_for(BackendId::from(0), 5000);
+    metrics.record_client_to_backend_bytes_for(BackendId::from_index(0), 1000);
+    metrics.record_backend_to_client_bytes_for(BackendId::from_index(0), 5000);
 
     let snapshot = metrics.snapshot(None).with_pool_status(&router);
 
@@ -106,17 +106,17 @@ fn test_metrics_with_pool_status_per_command_mode() {
     );
 
     // Simulate per-command mode: round-robin distribution
-    metrics.record_command(BackendId::from(0));
-    metrics.record_client_to_backend_bytes_for(BackendId::from(0), 50);
-    metrics.record_backend_to_client_bytes_for(BackendId::from(0), 1000);
+    metrics.record_command(BackendId::from_index(0));
+    metrics.record_client_to_backend_bytes_for(BackendId::from_index(0), 50);
+    metrics.record_backend_to_client_bytes_for(BackendId::from_index(0), 1000);
 
-    metrics.record_command(BackendId::from(1));
-    metrics.record_client_to_backend_bytes_for(BackendId::from(1), 50);
-    metrics.record_backend_to_client_bytes_for(BackendId::from(1), 1000);
+    metrics.record_command(BackendId::from_index(1));
+    metrics.record_client_to_backend_bytes_for(BackendId::from_index(1), 50);
+    metrics.record_backend_to_client_bytes_for(BackendId::from_index(1), 1000);
 
-    metrics.record_command(BackendId::from(0));
-    metrics.record_client_to_backend_bytes_for(BackendId::from(0), 50);
-    metrics.record_backend_to_client_bytes_for(BackendId::from(0), 1000);
+    metrics.record_command(BackendId::from_index(0));
+    metrics.record_client_to_backend_bytes_for(BackendId::from_index(0), 50);
+    metrics.record_backend_to_client_bytes_for(BackendId::from_index(0), 1000);
 
     let snapshot = metrics.snapshot(None).with_pool_status(&router);
 
@@ -184,18 +184,18 @@ fn test_metrics_with_pool_status_hybrid_mode() {
     );
 
     // Simulate hybrid mode: start with per-command
-    metrics.record_command(BackendId::from(0));
-    metrics.record_client_to_backend_bytes_for(BackendId::from(0), 50);
-    metrics.record_backend_to_client_bytes_for(BackendId::from(0), 200);
+    metrics.record_command(BackendId::from_index(0));
+    metrics.record_client_to_backend_bytes_for(BackendId::from_index(0), 50);
+    metrics.record_backend_to_client_bytes_for(BackendId::from_index(0), 200);
 
-    metrics.record_command(BackendId::from(0));
-    metrics.record_client_to_backend_bytes_for(BackendId::from(0), 50);
-    metrics.record_backend_to_client_bytes_for(BackendId::from(0), 200);
+    metrics.record_command(BackendId::from_index(0));
+    metrics.record_client_to_backend_bytes_for(BackendId::from_index(0), 50);
+    metrics.record_backend_to_client_bytes_for(BackendId::from_index(0), 200);
 
     // Switch to stateful (GROUP command) - bytes continue accumulating
-    metrics.record_command(BackendId::from(0));
-    metrics.record_client_to_backend_bytes_for(BackendId::from(0), 100);
-    metrics.record_backend_to_client_bytes_for(BackendId::from(0), 5000);
+    metrics.record_command(BackendId::from_index(0));
+    metrics.record_client_to_backend_bytes_for(BackendId::from_index(0), 100);
+    metrics.record_backend_to_client_bytes_for(BackendId::from_index(0), 5000);
 
     let snapshot = metrics.snapshot(None).with_pool_status(&router);
 
@@ -254,12 +254,12 @@ fn test_all_modes_show_meaningful_metrics() {
         );
 
         // Record some activity
-        metrics.record_client_to_backend_bytes_for(BackendId::from(0), 1000);
-        metrics.record_backend_to_client_bytes_for(BackendId::from(0), 5000);
+        metrics.record_client_to_backend_bytes_for(BackendId::from_index(0), 1000);
+        metrics.record_backend_to_client_bytes_for(BackendId::from_index(0), 5000);
 
         if matches!(mode, RoutingMode::PerCommand | RoutingMode::Hybrid) {
             // These modes track commands
-            metrics.record_command(BackendId::from(0));
+            metrics.record_command(BackendId::from_index(0));
         }
 
         let snapshot = metrics.snapshot(None).with_pool_status(&router);

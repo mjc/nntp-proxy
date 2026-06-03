@@ -34,7 +34,7 @@ struct StatsFile {
     version: u32,
     saved_at: String, // ISO 8601 timestamp
     global: PersistedGlobal,
-    backends: SmallVec<[PersistedBackend; 8]>, // Stack-allocated for ≤8 backends
+    backends: SmallVec<[PersistedBackend; 8]>, // Stack-allocated for typical backend counts
     users: SmallVec<[PersistedUser; 4]>,       // Stack-allocated for ≤4 users
     pipeline: PersistedPipeline,
 }

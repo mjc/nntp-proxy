@@ -4,12 +4,9 @@
 //! - `UnifiedCache` enum dispatch (memory vs hybrid)
 //! - `CacheStatsProvider` trait implementations
 //! - `CachedArticle::cached_response_for()` including STAT synthesis
-//! - `ArticleAvailability::from_bits()`
 //! - `DiskCache` configuration defaults and validation
 
-use nntp_proxy::cache::{
-    ArticleAvailability, ArticleCache, AvailabilityIndex, BackendStatus, UnifiedCache,
-};
+use nntp_proxy::cache::{ArticleAvailability, ArticleCache, AvailabilityIndex, UnifiedCache};
 use nntp_proxy::protocol::RequestKind;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
@@ -230,100 +227,6 @@ async fn test_cache_stats_provider_unified_cache_memory() {
 
     assert_eq!(stats.entry_count, 0);
     assert!(stats.disk.is_none()); // Memory-only cache has no disk stats
-}
-
-// ============================================================================
-// ArticleAvailability::from_bits() Tests
-// ============================================================================
-
-#[test]
-fn test_availability_from_bits_empty() {
-    let avail = ArticleAvailability::from_bits(0, 0);
-    assert!(!avail.has_availability_info());
-
-    // All backends should be "unknown" (not yet checked)
-    for i in 0..8 {
-        assert_eq!(
-            avail.status(BackendId::from_index(i)),
-            BackendStatus::Unknown
-        );
-    }
-}
-
-#[test]
-fn test_availability_from_bits_some_missing() {
-    // checked=0b00000011, missing=0b00000001 means:
-    // - backend 0: checked and missing (430)
-    // - backend 1: checked and has article
-    let avail = ArticleAvailability::from_bits(0b0000_0011, 0b0000_0001);
-
-    assert!(avail.has_availability_info());
-    assert_eq!(
-        avail.status(BackendId::from_index(0)),
-        BackendStatus::Missing
-    );
-    assert_eq!(
-        avail.status(BackendId::from_index(1)),
-        BackendStatus::HasArticle
-    );
-    assert_eq!(
-        avail.status(BackendId::from_index(2)),
-        BackendStatus::Unknown
-    );
-}
-
-#[test]
-fn test_availability_from_bits_all_missing() {
-    // All 8 backends checked and missing
-    let avail = ArticleAvailability::from_bits(0xFF, 0xFF);
-
-    for i in 0..8 {
-        assert_eq!(
-            avail.status(BackendId::from_index(i)),
-            BackendStatus::Missing
-        );
-        assert!(avail.is_missing(BackendId::from_index(i)));
-    }
-}
-
-#[test]
-fn test_availability_from_bits_roundtrip() {
-    let mut original = ArticleAvailability::new();
-    original.record_missing(BackendId::from_index(0));
-    original.record_missing(BackendId::from_index(2));
-    original.record_has(
-        nntp_proxy::cache::ArticleAvailability::new()
-            .eligible_backend(BackendId::from_index(1))
-            .expect("backend should be eligible"),
-    );
-    original.record_has(
-        nntp_proxy::cache::ArticleAvailability::new()
-            .eligible_backend(BackendId::from_index(3))
-            .expect("backend should be eligible"),
-    );
-
-    let checked = original.checked_bits();
-    let missing = original.missing_bits();
-
-    let reconstructed = ArticleAvailability::from_bits(checked, missing);
-
-    // Should be equivalent
-    assert_eq!(
-        reconstructed.status(BackendId::from_index(0)),
-        original.status(BackendId::from_index(0))
-    );
-    assert_eq!(
-        reconstructed.status(BackendId::from_index(1)),
-        original.status(BackendId::from_index(1))
-    );
-    assert_eq!(
-        reconstructed.status(BackendId::from_index(2)),
-        original.status(BackendId::from_index(2))
-    );
-    assert_eq!(
-        reconstructed.status(BackendId::from_index(3)),
-        original.status(BackendId::from_index(3))
-    );
 }
 
 // ============================================================================
