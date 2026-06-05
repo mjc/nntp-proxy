@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.1] - 2026-06-05
+
+### Fixed
+
+- Fixed `ARTICLE`/`BODY`/`HEAD` retry routing so a backend that returned `430` for an article is not retried for that article.
+- Preserved tier semantics for article retries: higher tiers are only eligible after every eligible backend in the current tier has returned an authoritative article-missing response.
+- Reworked article availability tracking to store only authoritative negative facts, keeping cache mutation and precheck behavior aligned with NNTP `430` semantics.
+- Restored current routing mode help and startup reporting for `hybrid`, `per-command`, and `stateful` modes.
+
+### Changed
+
+- Added bounded backend-count handling for availability bitmaps and cleaned up availability-related metrics/tests around the supported backend limit.
+- Cleaned up default runtime packaging by selecting `nntp-proxy` as the default Cargo run target and removing redundant Docker routing-mode overrides.
+
+### Docs
+
+- Reorganized operator documentation into focused getting-started, configuration, caching, operations, routing, and TCP tuning guides.
+- Reworked example configs: `config.example.toml` is now the typical setup, `config.full.toml` is the full reference, and `config.cache.toml` replaces the old cache-focused example.
+
 ## [0.5.0] - 2026-05-26
 
 ### Added
@@ -534,6 +553,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Docker support
   - Development documentation
 
+[0.5.1]: https://github.com/mjc/nntp-proxy/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/mjc/nntp-proxy/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mjc/nntp-proxy/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mjc/nntp-proxy/compare/v0.2.3...v0.3.0
