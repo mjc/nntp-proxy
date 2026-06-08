@@ -6,15 +6,15 @@
 use deadpool::managed;
 use std::collections::VecDeque;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
-use tokio::sync::RwLock;
 
+use super::dns::DnsCache;
 use crate::connection_error::ConnectionError;
 use crate::protocol::{RequestContext, authinfo_pass, authinfo_user};
 use crate::stream::ConnectionStream;
@@ -88,7 +88,7 @@ pub struct TcpManager {
     pub(crate) tls_config: TlsConfig,
     /// Cached TLS manager with pre-loaded certificates (avoids base64 decode overhead)
     pub(crate) tls_manager: Option<Arc<TlsManager>>,
-    resolved_socket_addrs: Arc<RwLock<Option<Arc<[SocketAddr]>>>>,
+    dns_cache: DnsCache,
     next_resolved_socket_addr: Arc<AtomicUsize>,
     pub(crate) recv_buffer_size: usize,
     pub(crate) send_buffer_size: usize,
@@ -111,68 +111,12 @@ impl TcpManager {
         })
     }
 
-    fn ip_literal_socket_addr(&self) -> Option<SocketAddr> {
-        self.host
-            .parse::<IpAddr>()
-            .ok()
-            .map(|ip| SocketAddr::new(ip, self.port))
-    }
-
     async fn resolve_socket_addrs(&self) -> Result<Arc<[SocketAddr]>, ConnectionError> {
-        if let Some(socket_addr) = self.ip_literal_socket_addr() {
-            return Ok(Arc::from([socket_addr]));
-        }
-
-        if let Some(addrs) = self.resolved_socket_addrs.read().await.as_ref() {
-            if addrs.is_empty() {
-                return Err(ConnectionError::DnsNoAddresses {
-                    address: format!("{}:{}", self.host, self.port),
-                });
-            }
-            return Ok(addrs.clone());
-        }
-
-        let mut cached_addrs = self.resolved_socket_addrs.write().await;
-        if let Some(addrs) = cached_addrs.as_ref() {
-            if addrs.is_empty() {
-                return Err(ConnectionError::DnsNoAddresses {
-                    address: format!("{}:{}", self.host, self.port),
-                });
-            }
-            return Ok(addrs.clone());
-        }
-
-        let addrs = tokio::net::lookup_host((self.host.as_str(), self.port))
-            .await?
-            .collect::<Vec<_>>();
-        if addrs.is_empty() {
-            return Err(ConnectionError::DnsNoAddresses {
-                address: format!("{}:{}", self.host, self.port),
-            });
-        }
-
-        let addrs: Arc<[SocketAddr]> = Arc::from(addrs);
-        *cached_addrs = Some(addrs.clone());
-        Ok(addrs)
+        self.dns_cache.resolve_socket_addrs().await
     }
 
     async fn refresh_socket_addrs(&self) -> Result<Arc<[SocketAddr]>, ConnectionError> {
-        if let Some(socket_addr) = self.ip_literal_socket_addr() {
-            return Ok(Arc::from([socket_addr]));
-        }
-
-        let addrs = tokio::net::lookup_host((self.host.as_str(), self.port))
-            .await?
-            .collect::<Vec<_>>();
-        if addrs.is_empty() {
-            return Err(ConnectionError::DnsNoAddresses {
-                address: format!("{}:{}", self.host, self.port),
-            });
-        }
-
-        let addrs: Arc<[SocketAddr]> = Arc::from(addrs);
-        *self.resolved_socket_addrs.write().await = Some(addrs.clone());
-        Ok(addrs)
+        self.dns_cache.refresh_socket_addrs().await
     }
 
     fn is_ipv6_network_unreachable(socket_addr: SocketAddr, error: &ConnectionError) -> bool {
@@ -185,28 +129,6 @@ impl TcpManager {
                         io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable
                     )
             )
-    }
-
-    async fn remove_cached_ipv6_socket_addrs(&self) {
-        let mut cached_addrs = self.resolved_socket_addrs.write().await;
-        let Some(addrs) = cached_addrs.as_ref() else {
-            return;
-        };
-
-        let ipv4_addrs = addrs
-            .iter()
-            .copied()
-            .filter(SocketAddr::is_ipv4)
-            .collect::<Vec<_>>();
-        if ipv4_addrs.len() == addrs.len() {
-            return;
-        }
-
-        *cached_addrs = if ipv4_addrs.is_empty() {
-            None
-        } else {
-            Some(Arc::<[SocketAddr]>::from(ipv4_addrs))
-        };
     }
 
     /// Create a new `TcpManager` with optional TLS configuration
@@ -237,6 +159,8 @@ impl TcpManager {
             None => (TlsConfig::default(), None),
         };
 
+        let dns_cache = DnsCache::new(host.clone(), port, name.clone())?;
+
         Ok(Self {
             host,
             port,
@@ -245,7 +169,7 @@ impl TcpManager {
             password: options.password,
             tls_config,
             tls_manager,
-            resolved_socket_addrs: Arc::new(RwLock::new(None)),
+            dns_cache,
             next_resolved_socket_addr: Arc::new(AtomicUsize::new(0)),
             recv_buffer_size: options.recv_buffer_size,
             send_buffer_size: options.send_buffer_size,
@@ -304,7 +228,7 @@ impl TcpManager {
             Err(last_error) => last_error,
         };
 
-        if self.ip_literal_socket_addr().is_some() {
+        if self.dns_cache.is_ip_literal() {
             return Err(
                 last_error.unwrap_or_else(|| ConnectionError::DnsNoAddresses {
                     address: format!("{}:{}", self.host, self.port),
@@ -347,7 +271,7 @@ impl TcpManager {
                 Ok(tcp_stream) => return Ok(tcp_stream),
                 Err(error) => {
                     if Self::is_ipv6_network_unreachable(socket_addr, &error) {
-                        self.remove_cached_ipv6_socket_addrs().await;
+                        self.dns_cache.remove_cached_ipv6_socket_addrs().await;
                         remaining_addrs.retain(SocketAddr::is_ipv4);
                     }
 
@@ -760,6 +684,7 @@ impl managed::Manager for TcpManager {
 
 #[cfg(test)]
 mod tests {
+    use super::super::dns::dns_cache_entry;
     use super::*;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
@@ -826,10 +751,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            manager.ip_literal_socket_addr(),
-            Some(SocketAddr::from(([127, 0, 0, 1], 119)))
-        );
+        assert!(manager.dns_cache.is_ip_literal());
     }
 
     #[test]
@@ -842,10 +764,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(
-            manager.ip_literal_socket_addr(),
-            Some(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 563)))
-        );
+        assert!(manager.dns_cache.is_ip_literal());
     }
 
     #[test]
@@ -858,7 +777,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(manager.ip_literal_socket_addr(), None);
+        assert!(!manager.dns_cache.is_ip_literal());
     }
 
     #[test]
@@ -875,48 +794,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_cached_ipv6_socket_addrs_keeps_only_ipv4_addresses() {
+    async fn create_connected_tcp_stream_uses_unexpired_cache_when_dns_is_unavailable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = listener.local_addr().unwrap();
+
         let manager = TcpManager::new(
-            "test.example.com".to_string(),
-            563,
+            "ttl-test.invalid".to_string(),
+            live_addr.port(),
             "DnsBackend".to_string(),
             TcpManagerOptions::default(),
         )
         .unwrap();
-        let ipv6_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 563));
-        let ipv4_addr = SocketAddr::from(([127, 0, 0, 1], 563));
-        *manager.resolved_socket_addrs.write().await = Some(Arc::from([ipv6_addr, ipv4_addr]));
+        manager
+            .dns_cache
+            .set_cached_entry_for_test(Some(dns_cache_entry(
+                Arc::from([live_addr]),
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+            )))
+            .await;
 
-        manager.remove_cached_ipv6_socket_addrs().await;
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let stream = manager.create_connected_tcp_stream().await.unwrap();
+        let _accepted = accept.await.unwrap();
 
-        let cached_addrs = manager
-            .resolved_socket_addrs
-            .read()
-            .await
-            .as_ref()
-            .expect("cached addresses should remain initialized")
-            .clone();
-        assert_eq!(&*cached_addrs, &[ipv4_addr]);
+        assert_eq!(stream.peer_addr().unwrap(), live_addr);
     }
 
     #[tokio::test]
-    async fn remove_cached_ipv6_socket_addrs_clears_ipv6_only_cache() {
+    async fn create_connected_tcp_stream_uses_expired_cache_when_dns_is_unavailable() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = listener.local_addr().unwrap();
+
         let manager = TcpManager::new(
-            "test.example.com".to_string(),
-            563,
+            "ttl-test.invalid".to_string(),
+            live_addr.port(),
             "DnsBackend".to_string(),
             TcpManagerOptions::default(),
         )
         .unwrap();
-        let ipv6_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 563));
-        *manager.resolved_socket_addrs.write().await = Some(Arc::from([ipv6_addr]));
+        manager
+            .dns_cache
+            .set_cached_entry_for_test(Some(dns_cache_entry(
+                Arc::from([live_addr]),
+                std::time::Instant::now() - std::time::Duration::from_secs(1),
+            )))
+            .await;
 
-        manager.remove_cached_ipv6_socket_addrs().await;
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let stream = manager.create_connected_tcp_stream().await.unwrap();
+        let _accepted = accept.await.unwrap();
 
-        assert!(
-            manager.resolved_socket_addrs.read().await.is_none(),
-            "IPv6-only cached address list should be cleared instead of retained as an empty cache"
-        );
+        assert_eq!(stream.peer_addr().unwrap(), live_addr);
     }
 
     #[tokio::test]
@@ -934,7 +862,13 @@ mod tests {
             TcpManagerOptions::default(),
         )
         .unwrap();
-        *manager.resolved_socket_addrs.write().await = Some(Arc::from([stale_addr]));
+        manager
+            .dns_cache
+            .set_cached_entry_for_test(Some(dns_cache_entry(
+                Arc::from([stale_addr]),
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+            )))
+            .await;
 
         let accept = tokio::spawn(async move { live_listener.accept().await.unwrap() });
         let stream = manager.create_connected_tcp_stream().await.unwrap();
@@ -942,11 +876,11 @@ mod tests {
 
         assert_eq!(stream.peer_addr().unwrap(), live_addr);
         let cached_addrs = manager
-            .resolved_socket_addrs
-            .read()
+            .dns_cache
+            .cached_entry_for_test()
             .await
-            .as_ref()
             .expect("successful refresh should update cached addresses")
+            .addrs
             .clone();
         assert!(cached_addrs.contains(&live_addr));
     }
@@ -1019,10 +953,7 @@ mod tests {
         assert_eq!(cloned.name, manager.name);
         assert_eq!(cloned.username, manager.username);
         assert_eq!(cloned.password, manager.password);
-        assert!(Arc::ptr_eq(
-            &cloned.resolved_socket_addrs,
-            &manager.resolved_socket_addrs
-        ));
+        assert!(cloned.dns_cache.shares_cache_with(&manager.dns_cache));
         assert!(Arc::ptr_eq(
             &cloned.next_resolved_socket_addr,
             &manager.next_resolved_socket_addr
@@ -1068,8 +999,13 @@ mod tests {
             TcpManagerOptions::default(),
         )
         .unwrap();
-        *manager.resolved_socket_addrs.write().await =
-            Some(Arc::from([unavailable_addr, available_addr]));
+        manager
+            .dns_cache
+            .set_cached_entry_for_test(Some(dns_cache_entry(
+                Arc::from([unavailable_addr, available_addr]),
+                std::time::Instant::now() + std::time::Duration::from_secs(60),
+            )))
+            .await;
 
         let stream = manager
             .create_optimized_stream()
