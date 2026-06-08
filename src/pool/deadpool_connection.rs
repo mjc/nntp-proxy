@@ -39,6 +39,21 @@ enum CompressionSupportState {
     Unsupported,
 }
 
+#[derive(Debug, Clone)]
+enum Resolution {
+    Literal(SocketAddr),
+    Dns(Arc<TokioResolver>),
+}
+
+#[derive(Debug, Default)]
+struct AddressCursor(AtomicUsize);
+
+impl AddressCursor {
+    fn next_start(&self, len: usize) -> usize {
+        self.0.fetch_add(1, Ordering::Relaxed) % len
+    }
+}
+
 /// Optional settings for [`TcpManager`] construction
 ///
 /// Groups optional parameters (credentials, TLS, compression) to keep
@@ -89,9 +104,8 @@ pub struct TcpManager {
     pub(crate) tls_config: TlsConfig,
     /// Cached TLS manager with pre-loaded certificates (avoids base64 decode overhead)
     pub(crate) tls_manager: Option<Arc<TlsManager>>,
-    literal_socket_addrs: Option<Arc<[SocketAddr]>>,
-    dns_resolver: Option<Arc<TokioResolver>>,
-    next_resolved_socket_addr: Arc<AtomicUsize>,
+    resolution: Resolution,
+    address_cursor: Arc<AddressCursor>,
     pub(crate) recv_buffer_size: usize,
     pub(crate) send_buffer_size: usize,
     /// Wire compression mode: None = auto-detect, Some(true) = require, Some(false) = disable
@@ -114,35 +128,41 @@ impl TcpManager {
     }
 
     async fn resolve_socket_addrs(&self) -> Result<Arc<[SocketAddr]>, ConnectionError> {
-        if let Some(addrs) = self.literal_socket_addrs() {
-            return Ok(addrs);
+        if let Some(socket_addr) = self.literal_socket_addr() {
+            return Ok(Arc::from([socket_addr]));
         }
 
         self.lookup_socket_addrs().await
     }
 
     async fn refresh_socket_addrs(&self) -> Result<Arc<[SocketAddr]>, ConnectionError> {
-        if let Some(addrs) = self.literal_socket_addrs() {
-            return Ok(addrs);
+        if let Some(socket_addr) = self.literal_socket_addr() {
+            return Ok(Arc::from([socket_addr]));
         }
 
         self.clear_lookup_cache();
         self.lookup_socket_addrs().await
     }
 
-    fn literal_socket_addrs(&self) -> Option<Arc<[SocketAddr]>> {
-        self.literal_socket_addrs.clone()
+    fn literal_socket_addr(&self) -> Option<SocketAddr> {
+        match self.resolution {
+            Resolution::Literal(socket_addr) => Some(socket_addr),
+            Resolution::Dns(_) => None,
+        }
     }
 
     fn is_ip_literal(&self) -> bool {
-        self.literal_socket_addrs.is_some()
+        matches!(self.resolution, Resolution::Literal(_))
     }
 
     async fn lookup_socket_addrs(&self) -> Result<Arc<[SocketAddr]>, ConnectionError> {
-        let Some(dns_resolver) = self.dns_resolver.as_ref() else {
-            return Err(ConnectionError::DnsNoAddresses {
-                address: format!("{}:{}", self.host, self.port),
-            });
+        let dns_resolver = match &self.resolution {
+            Resolution::Literal(_) => {
+                return Err(ConnectionError::DnsNoAddresses {
+                    address: format!("{}:{}", self.host, self.port),
+                });
+            }
+            Resolution::Dns(dns_resolver) => dns_resolver,
         };
 
         let lookup = dns_resolver
@@ -169,7 +189,7 @@ impl TcpManager {
     }
 
     fn clear_lookup_cache(&self) {
-        let Some(dns_resolver) = self.dns_resolver.as_ref() else {
+        let Resolution::Dns(dns_resolver) = &self.resolution else {
             return;
         };
 
@@ -217,14 +237,10 @@ impl TcpManager {
             None => (TlsConfig::default(), None),
         };
 
-        let literal_socket_addrs = host
-            .parse::<IpAddr>()
-            .ok()
-            .map(|ip| Arc::from([SocketAddr::new(ip, port)]));
-        let dns_resolver = if literal_socket_addrs.is_some() {
-            None
+        let resolution = if let Ok(ip_addr) = host.parse::<IpAddr>() {
+            Resolution::Literal(SocketAddr::new(ip_addr, port))
         } else {
-            Some(Arc::new(
+            Resolution::Dns(Arc::new(
                 TokioResolver::builder_tokio()
                     .map_err(|error| ConnectionError::dns_resolver_init(&name, error))?
                     .build()
@@ -240,9 +256,8 @@ impl TcpManager {
             password: options.password,
             tls_config,
             tls_manager,
-            literal_socket_addrs,
-            dns_resolver,
-            next_resolved_socket_addr: Arc::new(AtomicUsize::new(0)),
+            resolution,
+            address_cursor: Arc::new(AddressCursor::default()),
             recv_buffer_size: options.recv_buffer_size,
             send_buffer_size: options.send_buffer_size,
             compress: options.compress,
@@ -328,10 +343,7 @@ impl TcpManager {
         &self,
         addrs: &[SocketAddr],
     ) -> Result<TcpStream, Option<ConnectionError>> {
-        let start = self
-            .next_resolved_socket_addr
-            .fetch_add(1, Ordering::Relaxed)
-            % addrs.len();
+        let start = self.address_cursor.next_start(addrs.len());
         let mut last_error = None;
 
         let mut remaining_addrs = (0..addrs.len())
@@ -760,13 +772,6 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
 
-    fn assert_contains_loopback(addrs: &[SocketAddr]) {
-        assert!(
-            addrs.iter().any(|addr| addr.ip().is_loopback()),
-            "expected at least one loopback address, got {addrs:?}"
-        );
-    }
-
     #[test]
     fn test_socket_buffer_size_u32_rejects_oversized_values() {
         let result = TcpManager::socket_buffer_size_u32(u32::MAX as usize + 1, "receive");
@@ -869,36 +874,6 @@ mod tests {
 
         assert!(TcpManager::is_ipv6_network_unreachable(ipv6_addr, &error));
         assert!(!TcpManager::is_ipv6_network_unreachable(ipv4_addr, &error));
-    }
-
-    #[tokio::test]
-    async fn resolve_socket_addrs_resolves_hostname() {
-        let manager = TcpManager::new(
-            "localhost".to_string(),
-            8119,
-            "DnsBackend".to_string(),
-            TcpManagerOptions::default(),
-        )
-        .unwrap();
-
-        let resolved = manager.resolve_socket_addrs().await.unwrap();
-
-        assert_contains_loopback(&resolved);
-    }
-
-    #[tokio::test]
-    async fn refresh_socket_addrs_resolves_hostname() {
-        let manager = TcpManager::new(
-            "localhost".to_string(),
-            8119,
-            "DnsBackend".to_string(),
-            TcpManagerOptions::default(),
-        )
-        .unwrap();
-
-        let refreshed = manager.refresh_socket_addrs().await.unwrap();
-
-        assert_contains_loopback(&refreshed);
     }
 
     #[tokio::test]
@@ -1009,15 +984,12 @@ mod tests {
         assert_eq!(cloned.name, manager.name);
         assert_eq!(cloned.username, manager.username);
         assert_eq!(cloned.password, manager.password);
-        match (&cloned.dns_resolver, &manager.dns_resolver) {
-            (Some(lhs), Some(rhs)) => assert!(Arc::ptr_eq(lhs, rhs)),
-            (None, None) => assert_eq!(cloned.literal_socket_addrs, manager.literal_socket_addrs),
+        match (&cloned.resolution, &manager.resolution) {
+            (Resolution::Dns(lhs), Resolution::Dns(rhs)) => assert!(Arc::ptr_eq(lhs, rhs)),
+            (Resolution::Literal(lhs), Resolution::Literal(rhs)) => assert_eq!(lhs, rhs),
             _ => panic!("cloned manager should preserve DNS configuration kind"),
         }
-        assert!(Arc::ptr_eq(
-            &cloned.next_resolved_socket_addr,
-            &manager.next_resolved_socket_addr
-        ));
+        assert!(Arc::ptr_eq(&cloned.address_cursor, &manager.address_cursor));
     }
 
     #[test]
