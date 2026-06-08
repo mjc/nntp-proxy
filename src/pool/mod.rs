@@ -6,7 +6,6 @@ pub mod buffer;
 pub mod connection_guard;
 pub mod connection_trait;
 pub mod deadpool_connection;
-mod dns;
 pub mod health_check;
 pub mod prewarming;
 pub mod provider;
