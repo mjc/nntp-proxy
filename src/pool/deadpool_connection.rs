@@ -271,7 +271,7 @@ impl TcpManager {
                 Ok(tcp_stream) => return Ok(tcp_stream),
                 Err(error) => {
                     if Self::is_ipv6_network_unreachable(socket_addr, &error) {
-                        self.dns_cache.remove_cached_ipv6_socket_addrs().await;
+                        self.dns_cache.remove_cached_ipv6_socket_addrs();
                         remaining_addrs.retain(SocketAddr::is_ipv4);
                     }
 
@@ -684,7 +684,6 @@ impl managed::Manager for TcpManager {
 
 #[cfg(test)]
 mod tests {
-    use super::super::dns::dns_cache_entry;
     use super::*;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
@@ -794,66 +793,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_connected_tcp_stream_uses_unexpired_cache_when_dns_is_unavailable() {
+    async fn create_connected_tcp_stream_resolves_hostname() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let live_addr = listener.local_addr().unwrap();
-
-        let manager = TcpManager::new(
-            "ttl-test.invalid".to_string(),
-            live_addr.port(),
-            "DnsBackend".to_string(),
-            TcpManagerOptions::default(),
-        )
-        .unwrap();
-        manager
-            .dns_cache
-            .set_cached_entry_for_test(Some(dns_cache_entry(
-                Arc::from([live_addr]),
-                std::time::Instant::now() + std::time::Duration::from_secs(60),
-            )))
-            .await;
-
-        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
-        let stream = manager.create_connected_tcp_stream().await.unwrap();
-        let _accepted = accept.await.unwrap();
-
-        assert_eq!(stream.peer_addr().unwrap(), live_addr);
-    }
-
-    #[tokio::test]
-    async fn create_connected_tcp_stream_uses_expired_cache_when_dns_is_unavailable() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let live_addr = listener.local_addr().unwrap();
-
-        let manager = TcpManager::new(
-            "ttl-test.invalid".to_string(),
-            live_addr.port(),
-            "DnsBackend".to_string(),
-            TcpManagerOptions::default(),
-        )
-        .unwrap();
-        manager
-            .dns_cache
-            .set_cached_entry_for_test(Some(dns_cache_entry(
-                Arc::from([live_addr]),
-                std::time::Instant::now() - std::time::Duration::from_secs(1),
-            )))
-            .await;
-
-        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
-        let stream = manager.create_connected_tcp_stream().await.unwrap();
-        let _accepted = accept.await.unwrap();
-
-        assert_eq!(stream.peer_addr().unwrap(), live_addr);
-    }
-
-    #[tokio::test]
-    async fn create_connected_tcp_stream_refreshes_dns_after_cached_addresses_fail() {
-        let live_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let live_addr = live_listener.local_addr().unwrap();
-        let stale_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let stale_addr = stale_listener.local_addr().unwrap();
-        drop(stale_listener);
 
         let manager = TcpManager::new(
             "localhost".to_string(),
@@ -862,27 +804,32 @@ mod tests {
             TcpManagerOptions::default(),
         )
         .unwrap();
-        manager
-            .dns_cache
-            .set_cached_entry_for_test(Some(dns_cache_entry(
-                Arc::from([stale_addr]),
-                std::time::Instant::now() + std::time::Duration::from_secs(60),
-            )))
-            .await;
 
-        let accept = tokio::spawn(async move { live_listener.accept().await.unwrap() });
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
         let stream = manager.create_connected_tcp_stream().await.unwrap();
         let _accepted = accept.await.unwrap();
 
         assert_eq!(stream.peer_addr().unwrap(), live_addr);
-        let cached_addrs = manager
-            .dns_cache
-            .cached_entry_for_test()
-            .await
-            .expect("successful refresh should update cached addresses")
-            .addrs
-            .clone();
-        assert!(cached_addrs.contains(&live_addr));
+    }
+
+    #[tokio::test]
+    async fn create_connected_tcp_stream_ip_literal_skips_dns() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = listener.local_addr().unwrap();
+
+        let manager = TcpManager::new(
+            live_addr.ip().to_string(),
+            live_addr.port(),
+            "IpBackend".to_string(),
+            TcpManagerOptions::default(),
+        )
+        .unwrap();
+
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let stream = manager.create_connected_tcp_stream().await.unwrap();
+        let _accepted = accept.await.unwrap();
+
+        assert_eq!(stream.peer_addr().unwrap(), live_addr);
     }
 
     #[test]
@@ -953,7 +900,7 @@ mod tests {
         assert_eq!(cloned.name, manager.name);
         assert_eq!(cloned.username, manager.username);
         assert_eq!(cloned.password, manager.password);
-        assert!(cloned.dns_cache.shares_cache_with(&manager.dns_cache));
+        assert!(cloned.dns_cache.shares_resolver_with(&manager.dns_cache));
         assert!(Arc::ptr_eq(
             &cloned.next_resolved_socket_addr,
             &manager.next_resolved_socket_addr
@@ -981,7 +928,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_optimized_stream_tries_next_resolved_address_after_connect_error() {
+    async fn try_resolved_socket_addrs_tries_next_address_after_connect_error() {
         let unavailable_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let unavailable_addr = unavailable_listener.local_addr().unwrap();
         drop(unavailable_listener);
@@ -999,20 +946,13 @@ mod tests {
             TcpManagerOptions::default(),
         )
         .unwrap();
-        manager
-            .dns_cache
-            .set_cached_entry_for_test(Some(dns_cache_entry(
-                Arc::from([unavailable_addr, available_addr]),
-                std::time::Instant::now() + std::time::Duration::from_secs(60),
-            )))
-            .await;
 
         let stream = manager
-            .create_optimized_stream()
+            .try_resolved_socket_addrs(&[unavailable_addr, available_addr])
             .await
             .expect("second resolved address should be tried after first connect error");
 
-        assert_eq!(stream.connection_type(), "TCP");
+        assert_eq!(stream.peer_addr().unwrap(), available_addr);
         accept_task.await.unwrap();
     }
 
