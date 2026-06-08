@@ -93,6 +93,7 @@ twox-hash = "2.1.2"
 rand = "0.10"  # Jittered backoff for stale-connection retries
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }  # RFC 8054 COMPRESS DEFLATE
 pin-project-lite = "0.2"  # Safe pin projection (already in dep tree via tokio)
+hickory-resolver = { version = "0.26", features = ["tokio", "system-config"] }  # DNS lookups with TTL-aware caching from system resolver config
 
 [dev-dependencies]
 tokio = { version = "1.52", features = ["test-util"] }  # Paused time for deterministic async tests

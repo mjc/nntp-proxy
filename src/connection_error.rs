@@ -1,5 +1,6 @@
 //! Connection error types for the NNTP proxy
 
+use std::error::Error as StdError;
 use std::io::ErrorKind;
 use thiserror::Error;
 
@@ -63,6 +64,28 @@ pub enum ConnectionError {
     #[error("No DNS addresses found for {address}")]
     DnsNoAddresses { address: String },
 
+    #[error("Failed to initialize DNS resolver for backend '{backend}': {source}")]
+    DnsResolverInit {
+        backend: String,
+        #[source]
+        source: Box<dyn StdError + Send + Sync>,
+    },
+
+    #[error("Failed to build DNS resolver for backend '{backend}': {source}")]
+    DnsResolverBuild {
+        backend: String,
+        #[source]
+        source: Box<dyn StdError + Send + Sync>,
+    },
+
+    #[error("Failed to resolve {address} for backend '{backend}': {source}")]
+    DnsLookup {
+        backend: String,
+        address: String,
+        #[source]
+        source: Box<dyn StdError + Send + Sync>,
+    },
+
     #[error("Password required but not configured for backend '{backend}'")]
     PasswordRequired { backend: String },
 
@@ -71,6 +94,40 @@ pub enum ConnectionError {
 
     #[error("Compression required but not supported by backend '{backend}': {response}")]
     CompressionRequired { backend: String, response: String },
+}
+
+impl ConnectionError {
+    pub fn dns_resolver_init(
+        backend: impl Into<String>,
+        source: impl StdError + Send + Sync + 'static,
+    ) -> Self {
+        Self::DnsResolverInit {
+            backend: backend.into(),
+            source: Box::new(source),
+        }
+    }
+
+    pub fn dns_resolver_build(
+        backend: impl Into<String>,
+        source: impl StdError + Send + Sync + 'static,
+    ) -> Self {
+        Self::DnsResolverBuild {
+            backend: backend.into(),
+            source: Box::new(source),
+        }
+    }
+
+    pub fn dns_lookup(
+        backend: impl Into<String>,
+        address: impl Into<String>,
+        source: impl StdError + Send + Sync + 'static,
+    ) -> Self {
+        Self::DnsLookup {
+            backend: backend.into(),
+            address: address.into(),
+            source: Box::new(source),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -166,5 +223,41 @@ mod tests {
         assert!(msg.contains("Connection limit exceeded"));
         assert!(msg.contains("news.example.com"));
         assert!(msg.contains("482"));
+    }
+
+    #[test]
+    fn test_dns_resolver_init_error() {
+        let err =
+            ConnectionError::dns_resolver_init("dns-backend", std::io::Error::other("bad config"));
+
+        let msg = err.to_string();
+        assert!(msg.contains("Failed to initialize DNS resolver"));
+        assert!(msg.contains("dns-backend"));
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn test_dns_resolver_build_error() {
+        let err =
+            ConnectionError::dns_resolver_build("dns-backend", std::io::Error::other("build"));
+
+        let msg = err.to_string();
+        assert!(msg.contains("Failed to build DNS resolver"));
+        assert!(msg.contains("dns-backend"));
+        assert!(err.source().is_some());
+    }
+
+    #[test]
+    fn test_dns_lookup_error() {
+        let err = ConnectionError::dns_lookup(
+            "dns-backend",
+            "example.com:119",
+            std::io::Error::other("lookup"),
+        );
+
+        let msg = err.to_string();
+        assert!(msg.contains("Failed to resolve example.com:119"));
+        assert!(msg.contains("dns-backend"));
+        assert!(err.source().is_some());
     }
 }
