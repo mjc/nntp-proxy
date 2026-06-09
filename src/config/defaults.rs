@@ -17,6 +17,13 @@ pub fn max_connections() -> MaxConnections {
     MaxConnections::try_new(10).expect("10 is non-zero")
 }
 
+/// Default for backend `stat_missing` probe mode (disabled).
+#[inline]
+#[must_use]
+pub const fn stat_missing() -> u8 {
+    0
+}
+
 /// Default health check interval
 #[inline]
 #[must_use]

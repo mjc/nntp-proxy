@@ -507,6 +507,11 @@ pub struct Server {
     /// Maximum number of concurrent connections to this server
     #[serde(default = "super::defaults::max_connections")]
     pub max_connections: MaxConnections,
+    /// Probe misses with `STAT` before `ARTICLE/BODY/HEAD` on this backend.
+    ///
+    /// `0` disables the probe (default). Non-zero enables it.
+    #[serde(default = "super::defaults::stat_missing")]
+    pub stat_missing: u8,
 
     /// Enable TLS/SSL for this backend connection
     #[serde(default)]
@@ -601,6 +606,7 @@ pub struct ServerBuilder {
     username: Option<String>,
     password: Option<String>,
     max_connections: Option<MaxConnections>,
+    stat_missing: u8,
     use_tls: bool,
     tls_verify_cert: bool,
     tls_cert_path: Option<String>,
@@ -629,6 +635,7 @@ impl ServerBuilder {
             username: None,
             password: None,
             max_connections: None,
+            stat_missing: super::defaults::stat_missing(),
             use_tls: false,
             tls_verify_cert: true, // Secure by default
             tls_cert_path: None,
@@ -668,6 +675,15 @@ impl ServerBuilder {
     #[must_use]
     pub const fn max_connections(mut self, max: MaxConnections) -> Self {
         self.max_connections = Some(max);
+        self
+    }
+
+    /// Enable/disable `STAT` pre-probe for article-missing retries.
+    ///
+    /// `0` disables probing; non-zero enables it.
+    #[must_use]
+    pub const fn stat_missing(mut self, stat_missing: u8) -> Self {
+        self.stat_missing = stat_missing;
         self
     }
 
@@ -794,6 +810,7 @@ impl ServerBuilder {
             username: self.username,
             password: self.password,
             max_connections,
+            stat_missing: self.stat_missing,
             use_tls: self.use_tls,
             tls_verify_cert: self.tls_verify_cert,
             tls_cert_path: self.tls_cert_path,
@@ -831,6 +848,11 @@ impl Server {
     #[must_use]
     pub fn builder(host: impl Into<String>, port: Port) -> ServerBuilder {
         ServerBuilder::new(host, port)
+    }
+
+    #[must_use]
+    pub const fn stat_missing_enabled(&self) -> bool {
+        self.stat_missing != 0
     }
 }
 
@@ -996,8 +1018,20 @@ mod tests {
         assert_eq!(server.port.get(), 119);
         assert_eq!(server.name.as_str(), "news.example.com:119");
         assert_eq!(server.max_connections.get(), 10);
+        assert_eq!(server.stat_missing, 0);
         assert!(!server.use_tls);
         assert!(server.tls_verify_cert); // Secure by default
+    }
+
+    #[test]
+    fn test_server_builder_with_stat_missing() {
+        let server = Server::builder("localhost", Port::try_new(119).unwrap())
+            .stat_missing(1)
+            .build()
+            .unwrap();
+
+        assert_eq!(server.stat_missing, 1);
+        assert!(server.stat_missing_enabled());
     }
 
     #[test]
