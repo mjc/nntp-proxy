@@ -78,6 +78,10 @@ fn debug_log_writer() -> (NonBlocking, WorkerGuard) {
     tracing_appender::non_blocking(file_appender)
 }
 
+fn stdout_log_writer() -> (NonBlocking, WorkerGuard) {
+    tracing_appender::non_blocking(std::io::stdout())
+}
+
 fn leak_guard(guard: WorkerGuard) {
     // SAFETY: Intentionally leak the WorkerGuard to keep the file appender
     // alive for the program lifetime. Drop would flush and close the writer.
@@ -86,11 +90,12 @@ fn leak_guard(guard: WorkerGuard) {
 
 fn init_headless_subscriber(capture_in_memory_logs: bool) -> Option<crate::tui::LogBuffer> {
     let log_buffer = capture_in_memory_logs.then(crate::tui::LogBuffer::new);
+    let (stdout_log, guard) = stdout_log_writer();
 
     let subscriber = tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
-                .with_writer(|| std::io::LineWriter::new(std::io::stdout()))
+                .with_writer(stdout_log)
                 .with_filter(env_filter()),
         )
         .with(tokio_console_layer());
@@ -109,6 +114,7 @@ fn init_headless_subscriber(capture_in_memory_logs: bool) -> Option<crate::tui::
         None => subscriber.init(),
     }
 
+    leak_guard(guard);
     log_buffer
 }
 
@@ -181,14 +187,14 @@ fn init_tui_subscriber(
 
 /// Initialize logging with dual output for legacy headless call sites.
 ///
-/// Headless mode logs to line-buffered stdout only.
+/// Headless mode logs to non-blocking stdout only.
 pub fn init_dual_logging(file_level: &str) {
     let _ = init_logging(UiMode::Headless, file_level, false, false);
 }
 
 /// Initialize logging for the unified binary.
 ///
-/// Headless mode logs to line-buffered stdout only.
+/// Headless mode logs to non-blocking stdout only.
 /// TUI mode logs to the in-memory TUI buffer and may also mirror to `debug.log`
 /// when explicitly enabled for local debugging sessions.
 #[must_use]
@@ -237,5 +243,10 @@ mod tests {
             false,
             false
         ));
+    }
+
+    #[test]
+    fn stdout_log_writer_is_constructible() {
+        let _ = stdout_log_writer();
     }
 }

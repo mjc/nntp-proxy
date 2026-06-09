@@ -29,6 +29,15 @@ use crate::session::SessionError;
 use crate::session::handlers::article_retry::OrderedPipelineGate;
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
+/// Ordered large-transfer pipelining is disabled due to sustained throughput regressions
+/// from long-lived regular buffer holds in the write path.
+enum OrderedLargeTransferPipelineState {
+    Disabled,
+}
+
+const ORDERED_LARGE_TRANSFER_PIPELINE_STATE: OrderedLargeTransferPipelineState =
+    OrderedLargeTransferPipelineState::Disabled;
+
 fn safe_command_log_label(request: &RequestContext) -> &str {
     std::str::from_utf8(request.verb()).unwrap_or("<non-utf8-command>")
 }
@@ -674,6 +683,13 @@ impl ClientSession {
         batch: &crate::session::handlers::pipeline::RequestBatch,
         state: &PerCommandLoopState,
     ) -> bool {
+        if matches!(
+            ORDERED_LARGE_TRANSFER_PIPELINE_STATE,
+            OrderedLargeTransferPipelineState::Disabled
+        ) {
+            return false;
+        }
+
         if router.backend_count() <= 1
             || batch.len() <= 1
             || self.cache_articles
@@ -933,5 +949,13 @@ mod tests {
             ),
             "Other errors should NOT be classified as client disconnect"
         );
+    }
+
+    #[test]
+    fn ordered_large_transfer_pipeline_is_disabled() {
+        assert!(matches!(
+            super::ORDERED_LARGE_TRANSFER_PIPELINE_STATE,
+            super::OrderedLargeTransferPipelineState::Disabled
+        ));
     }
 }

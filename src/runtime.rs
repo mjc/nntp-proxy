@@ -295,32 +295,20 @@ pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
     });
 }
 
-fn response_write_metrics_interval() -> Option<std::time::Duration> {
-    let raw = std::env::var_os("NNTP_PROXY_RESPONSE_WRITE_METRICS_SECS")?;
-    let raw = raw.to_string_lossy();
-    let secs = raw.parse::<u64>().ok()?;
-    (secs > 0).then(|| std::time::Duration::from_secs(secs))
-}
-
-fn client_writer_lock_metrics_interval() -> Option<std::time::Duration> {
-    let raw = std::env::var_os("NNTP_PROXY_CLIENT_WRITER_LOCK_METRICS_SECS")?;
-    let raw = raw.to_string_lossy();
-    let secs = raw.parse::<u64>().ok()?;
-    (secs > 0).then(|| std::time::Duration::from_secs(secs))
-}
-
 /// Spawn background task to periodically log `ChunkedResponse::write_all_to` activity.
 ///
-/// Enable this only for targeted profiling sessions:
-/// `NNTP_PROXY_RESPONSE_WRITE_METRICS_SECS=<seconds>`.
-pub fn spawn_response_write_metrics_logger() {
+/// Enable this via `proxy.response_write_metrics_secs` in config.
+pub fn spawn_response_write_metrics_logger(period: Option<std::time::Duration>) {
     use tracing::info;
 
-    let Some(period) = response_write_metrics_interval() else {
+    let Some(period) = period else {
+        crate::pool::buffer::set_response_write_metrics_enabled(false);
         return;
     };
+    crate::pool::buffer::set_response_write_metrics_enabled(true);
 
     let mut previous = crate::pool::buffer::response_write_metrics_snapshot();
+    let mut previous_alloc = crate::pool::buffer::hot_path_allocation_metrics_snapshot();
 
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(period);
@@ -366,21 +354,65 @@ pub fn spawn_response_write_metrics_logger() {
                 "Response write metrics"
             );
 
+            let current_alloc = crate::pool::buffer::hot_path_allocation_metrics_snapshot();
+            info!(
+                regular_pool_fallback_allocations_delta = current_alloc
+                    .regular_pool_fallback_allocations
+                    .saturating_sub(previous_alloc.regular_pool_fallback_allocations),
+                regular_pool_exhaustions_delta = current_alloc
+                    .regular_pool_exhaustions
+                    .saturating_sub(previous_alloc.regular_pool_exhaustions),
+                capture_pool_fallback_allocations_delta = current_alloc
+                    .capture_pool_fallback_allocations
+                    .saturating_sub(previous_alloc.capture_pool_fallback_allocations),
+                chunked_response_metadata_spills_delta = current_alloc
+                    .chunked_response_metadata_spills
+                    .saturating_sub(previous_alloc.chunked_response_metadata_spills),
+                pending_backend_byte_heap_fallbacks_delta = current_alloc
+                    .pending_backend_byte_heap_fallbacks
+                    .saturating_sub(previous_alloc.pending_backend_byte_heap_fallbacks),
+                non_owned_response_write_chunks_delta = current_alloc
+                    .non_owned_response_write_chunks
+                    .saturating_sub(previous_alloc.non_owned_response_write_chunks),
+                non_owned_response_write_bytes_delta = current_alloc
+                    .non_owned_response_write_bytes
+                    .saturating_sub(previous_alloc.non_owned_response_write_bytes),
+                regular_pool_buffer_holds_delta = current_alloc
+                    .regular_pool_buffer_holds
+                    .saturating_sub(previous_alloc.regular_pool_buffer_holds),
+                regular_pool_buffer_hold_micros_total_delta = current_alloc
+                    .regular_pool_buffer_hold_micros_total
+                    .saturating_sub(previous_alloc.regular_pool_buffer_hold_micros_total),
+                regular_pool_buffer_hold_micros_max =
+                    current_alloc.regular_pool_buffer_hold_micros_max,
+                capture_pool_buffer_holds_delta = current_alloc
+                    .capture_pool_buffer_holds
+                    .saturating_sub(previous_alloc.capture_pool_buffer_holds),
+                capture_pool_buffer_hold_micros_total_delta = current_alloc
+                    .capture_pool_buffer_hold_micros_total
+                    .saturating_sub(previous_alloc.capture_pool_buffer_hold_micros_total),
+                capture_pool_buffer_hold_micros_max =
+                    current_alloc.capture_pool_buffer_hold_micros_max,
+                "Hot path allocation metrics"
+            );
+
             previous = current;
+            previous_alloc = current_alloc;
         }
     });
 }
 
 /// Spawn background task to periodically log client-writer mutex contention.
 ///
-/// Enable this only for targeted profiling sessions:
-/// `NNTP_PROXY_CLIENT_WRITER_LOCK_METRICS_SECS=<seconds>`.
-pub fn spawn_client_writer_lock_metrics_logger() {
+/// Enable this via `proxy.client_writer_lock_metrics_secs` in config.
+pub fn spawn_client_writer_lock_metrics_logger(period: Option<std::time::Duration>) {
     use tracing::info;
 
-    let Some(period) = client_writer_lock_metrics_interval() else {
+    let Some(period) = period else {
+        crate::session::shared_client_writer::set_client_writer_lock_metrics_enabled(false);
         return;
     };
+    crate::session::shared_client_writer::set_client_writer_lock_metrics_enabled(true);
 
     let mut previous = crate::session::shared_client_writer::client_writer_lock_metrics_snapshot();
 
@@ -746,7 +778,11 @@ pub fn spawn_shutdown_handler(
         }
 
         // Notify listeners
-        let _ = shutdown_tx.send(()).await;
+        match shutdown_tx.try_send(()) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+        }
 
         // Close idle connections
         proxy.graceful_shutdown().await;
@@ -817,11 +853,35 @@ pub async fn run_accept_loop(
     }
 
     client_tasks.abort_all();
-    while let Some(join_result) = client_tasks.join_next().await {
-        if let Err(error) = join_result
-            && !error.is_cancelled()
-        {
-            error!("Client session task failed during shutdown: {:?}", error);
+    let drain_deadline =
+        tokio::time::Instant::now() + crate::constants::timeout::SHUTDOWN_TASK_DRAIN;
+    while !client_tasks.is_empty() {
+        let now = tokio::time::Instant::now();
+        if now >= drain_deadline {
+            error!(
+                remaining_tasks = client_tasks.len(),
+                "Timed out waiting for client tasks to drain during shutdown"
+            );
+            break;
+        }
+
+        let remaining = drain_deadline.saturating_duration_since(now);
+        match tokio::time::timeout(remaining, client_tasks.join_next()).await {
+            Ok(Some(join_result)) => {
+                if let Err(error) = join_result
+                    && !error.is_cancelled()
+                {
+                    error!("Client session task failed during shutdown: {:?}", error);
+                }
+            }
+            Ok(None) => break,
+            Err(_) => {
+                error!(
+                    remaining_tasks = client_tasks.len(),
+                    "Timed out waiting for client tasks to join during shutdown"
+                );
+                break;
+            }
         }
     }
 

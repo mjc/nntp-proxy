@@ -62,6 +62,7 @@ fn test_weighted_distribution_equal_weights() {
             .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
+        selector.complete_command(backend);
     }
 
     // Should be roughly 50/50 distribution (within 10% tolerance)
@@ -105,6 +106,7 @@ fn test_weighted_distribution_unequal_weights() {
             .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
+        selector.complete_command(backend);
     }
 
     // Backend 0 should get ~44.4% (400 out of 900)
@@ -155,6 +157,7 @@ fn test_weighted_distribution_three_backends() {
             .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
+        selector.complete_command(backend);
     }
 
     // Expected: 100, 200, 300 (allow 10% tolerance for smaller samples)
@@ -205,6 +208,7 @@ fn test_weighted_real_world_scenario() {
             .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
+        selector.complete_command(backend);
     }
 
     // usenet.farm should get 40/90 = 44.4% → ~400 requests
@@ -252,6 +256,7 @@ fn test_weighted_extreme_imbalance() {
             .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
+        selector.complete_command(backend);
     }
 
     // Tiny should get ~1% (10 out of 1000)
@@ -292,6 +297,7 @@ fn test_weighted_consistency_across_runs() {
                 .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
                 .unwrap();
             counts[backend.as_index()] += 1;
+            selector.complete_command(backend);
         }
 
         // Each run should produce ~30% and ~70% distribution
@@ -350,6 +356,7 @@ fn test_mixed_zero_and_nonzero_weights() {
             .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         assert_eq!(backend.as_index(), 1);
+        selector.complete_command(backend);
     }
 }
 
@@ -380,6 +387,7 @@ fn test_weighted_with_varying_pool_sizes() {
             .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
+        selector.complete_command(backend);
     }
 
     // Verify each backend gets approximately its weighted share
@@ -417,6 +425,7 @@ fn test_weighted_single_backend() {
             .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         assert_eq!(backend.as_index(), 0);
+        selector.complete_command(backend);
     }
 }
 
@@ -448,6 +457,7 @@ fn test_weighted_distribution_precision() {
             .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         counts[backend.as_index()] += 1;
+        selector.complete_command(backend);
     }
 
     // With perfect cycling, should get exactly 13N and 17N
