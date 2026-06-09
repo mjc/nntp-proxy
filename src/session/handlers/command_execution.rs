@@ -18,10 +18,12 @@ use anyhow::Result;
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::{debug, trace, warn};
 
 const BACKEND_TIMING_SAMPLE_MASK: u64 = 0x0f;
+const RETRY_STAT_SWEEP_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 static BACKEND_TIMING_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
@@ -360,37 +362,50 @@ impl ClientSession {
             let router = Arc::clone(router);
             let stat_request = stat_request.clone();
             probes.push(async move {
-                let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
-                let conn = match provider.get_pooled_connection().await {
-                    Ok(conn) => conn,
-                    Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
-                };
-                let mut conn = crate::pool::ConnectionGuard::new(conn, provider);
-                let mut buffer = self.buffer_pool.acquire();
-                let read =
-                    backend::send_request(&mut **conn.get_mut(), &stat_request, &mut buffer).await;
-                let status_code = match read {
-                    Ok(read) => read.status_code(),
-                    Err(_) => {
+                let probe = async {
+                    let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
+                    let conn = match provider.get_pooled_connection().await {
+                        Ok(conn) => conn,
+                        Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
+                    };
+                    let mut conn = crate::pool::ConnectionGuard::new(conn, provider);
+                    let mut buffer = self.buffer_pool.acquire();
+                    let read =
+                        backend::send_request(&mut **conn.get_mut(), &stat_request, &mut buffer)
+                            .await;
+                    let status_code = match read {
+                        Ok(read) => read.status_code(),
+                        Err(_) => {
+                            conn.retire_with_cooldown();
+                            return RetryStatProbeOutcome::Unavailable(backend_id);
+                        }
+                    };
+
+                    if self
+                        .capture_suppressed_430_response(
+                            &mut conn,
+                            backend_id,
+                            &stat_request,
+                            buffer,
+                        )
+                        .await
+                        .is_err()
+                    {
                         conn.retire_with_cooldown();
                         return RetryStatProbeOutcome::Unavailable(backend_id);
                     }
+                    let _ = conn.release();
+
+                    if status_code.is_some_and(|status| status.as_u16() == 430) {
+                        RetryStatProbeOutcome::Missing(backend_id)
+                    } else {
+                        RetryStatProbeOutcome::Present
+                    }
                 };
 
-                if self
-                    .capture_suppressed_430_response(&mut conn, backend_id, &stat_request, buffer)
-                    .await
-                    .is_err()
-                {
-                    conn.retire_with_cooldown();
-                    return RetryStatProbeOutcome::Unavailable(backend_id);
-                }
-                let _ = conn.release();
-
-                if status_code.is_some_and(|status| status.as_u16() == 430) {
-                    RetryStatProbeOutcome::Missing(backend_id)
-                } else {
-                    RetryStatProbeOutcome::Present
+                match tokio::time::timeout(RETRY_STAT_SWEEP_PROBE_TIMEOUT, probe).await {
+                    Ok(outcome) => outcome,
+                    Err(_) => RetryStatProbeOutcome::Unavailable(backend_id),
                 }
             });
         }

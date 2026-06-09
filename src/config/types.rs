@@ -235,19 +235,11 @@ impl Default for Routing {
 }
 
 /// Routing queue configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(default)]
 pub struct RoutingQueue {
     /// Queue-pressure based admission controls.
     pub backpressure: QueueBackpressure,
-}
-
-impl Default for RoutingQueue {
-    fn default() -> Self {
-        Self {
-            backpressure: QueueBackpressure::default(),
-        }
-    }
 }
 
 /// Per-connection queue backpressure settings.
