@@ -4,7 +4,7 @@
 //! response validation, and writing backend responses to clients.
 
 use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata, StatusCode};
-use crate::router::{ArticleBackend, BackendSelector, CommandGuard, SuppressedBackends};
+use crate::router::{ArticleBackend, BackendSelector, SuppressedBackends};
 use crate::session::SessionError;
 use crate::session::response_transfer::{ResponseConnectionReuse, ResponseTransferError};
 use crate::session::retry::retry_once;
@@ -15,10 +15,11 @@ use crate::session::routing::{
 use crate::session::{ClientSession, backend};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 
 const BACKEND_TIMING_SAMPLE_MASK: u64 = 0x0f;
 static BACKEND_TIMING_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -132,6 +133,12 @@ enum BackendReadAttemptError {
     Backend(anyhow::Error),
 }
 
+enum RetryStatProbeOutcome {
+    Missing(BackendId),
+    Present,
+    Unavailable(BackendId),
+}
+
 /// Any client write failure after the full backend response is already owned is terminal.
 ///
 /// The backend connection is already clean at this point, but the client may have received a
@@ -185,7 +192,7 @@ impl ClientSession {
         let backend_id = backend.backend_id();
         let provider = router.backend_provider(backend_id);
         if provider.is_none() {
-            debug!(
+            trace!(
                 client = %self.client_addr,
                 backend = backend_id.as_index(),
                 command_verb = ?request.verb(),
@@ -229,7 +236,7 @@ impl ClientSession {
             }
         };
         let backend_id = backend.backend_id();
-        debug!(
+        trace!(
             client = %self.client_addr,
             backend = backend_id.as_index(),
             command_verb = ?request.verb(),
@@ -237,7 +244,7 @@ impl ClientSession {
             missing_bits = format_args!("{:08b}", state.availability.missing_bits()),
             "Article retry selected backend for direct attempt"
         );
-        let guard = CommandGuard::new(router.clone(), backend_id);
+        let guard = BackendSelector::guard_for_routed_backend(router.clone(), backend_id);
         let Some(provider) =
             self.retry_backend_provider(router, &backend, request, RetryAttemptKind::Direct)
         else {
@@ -253,7 +260,7 @@ impl ClientSession {
 
         let backend = match AuthoritativeArticleMissing::from_status_code(backend, status_code) {
             Ok(missing) => {
-                debug!(
+                trace!(
                     client = %self.client_addr,
                     backend = backend_id.as_index(),
                     command_verb = ?request.verb(),
@@ -307,6 +314,106 @@ impl ClientSession {
         Ok(BackendAttemptResult::Success)
     }
 
+    pub(super) async fn parallel_retry_stat_sweep(
+        &self,
+        router: &Arc<BackendSelector>,
+        request: &RequestContext,
+        state: &mut ArticleAttemptState<'_>,
+    ) -> Result<(), SessionError> {
+        if !request.has_message_id()
+            || request.is_stat()
+            || !matches!(
+                request.kind(),
+                RequestKind::Article | RequestKind::Body | RequestKind::Head
+            )
+        {
+            return Ok(());
+        }
+
+        let Some(stat_request) = Self::stat_probe_request(request) else {
+            return Ok(());
+        };
+
+        let mut candidates = Vec::new();
+        for tier in router.tiers() {
+            for backend_id in router.backend_ids_in_tier(tier) {
+                if state.unavailable_backends.contains(backend_id)
+                    || !state.availability.should_try(backend_id)
+                {
+                    continue;
+                }
+                let Some(provider) = router.backend_provider(backend_id) else {
+                    continue;
+                };
+                if provider.stat_missing_enabled() {
+                    candidates.push((backend_id, provider.clone()));
+                }
+            }
+        }
+
+        if candidates.len() < 2 {
+            return Ok(());
+        }
+
+        let mut probes = FuturesUnordered::new();
+        for (backend_id, provider) in candidates {
+            let router = Arc::clone(router);
+            let stat_request = stat_request.clone();
+            probes.push(async move {
+                let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
+                let conn = match provider.get_pooled_connection().await {
+                    Ok(conn) => conn,
+                    Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
+                };
+                let mut conn = crate::pool::ConnectionGuard::new(conn, provider);
+                let mut buffer = self.buffer_pool.acquire();
+                let read =
+                    backend::send_request(&mut **conn.get_mut(), &stat_request, &mut buffer).await;
+                let status_code = match read {
+                    Ok(read) => read.status_code(),
+                    Err(_) => {
+                        conn.retire_with_cooldown();
+                        return RetryStatProbeOutcome::Unavailable(backend_id);
+                    }
+                };
+
+                if self
+                    .capture_suppressed_430_response(&mut conn, backend_id, &stat_request, buffer)
+                    .await
+                    .is_err()
+                {
+                    conn.retire_with_cooldown();
+                    return RetryStatProbeOutcome::Unavailable(backend_id);
+                }
+                let _ = conn.release();
+
+                if status_code.is_some_and(|status| status.as_u16() == 430) {
+                    RetryStatProbeOutcome::Missing(backend_id)
+                } else {
+                    RetryStatProbeOutcome::Present
+                }
+            });
+        }
+
+        while let Some(outcome) = probes.next().await {
+            match outcome {
+                RetryStatProbeOutcome::Missing(backend_id) => {
+                    let missing = AuthoritativeArticleMissing { backend_id };
+                    self.record_authoritative_article_missing(&missing, state.availability);
+                    if let Some(msg_id) = request.message_id_value() {
+                        self.cache.record_backend_missing(msg_id, backend_id).await;
+                    }
+                }
+                RetryStatProbeOutcome::Present => {}
+                RetryStatProbeOutcome::Unavailable(backend_id) => {
+                    state.unavailable_backends.suppress(backend_id);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     async fn write_successful_retry_response(
         &self,
         conn: crate::pool::ConnectionGuard,
@@ -338,7 +445,7 @@ impl ClientSession {
     ) -> Result<PreparedBackendAttempt, SessionError> {
         let backend_id = backend.backend_id();
         let request_wire_len = request.request_wire_len().get();
-        debug!(
+        trace!(
             client = %self.client_addr,
             backend = backend_id.as_index(),
             command_verb = ?request.verb(),
@@ -383,7 +490,7 @@ impl ClientSession {
             Some(status_code) => status_code,
             None => {
                 read_status.log_warnings(&buffer, self.client_addr, backend_id);
-                debug!(
+                trace!(
                     client = %self.client_addr,
                     backend = backend_id.as_index(),
                     command_verb = ?request.verb(),
@@ -404,7 +511,7 @@ impl ClientSession {
             }
         };
 
-        debug!(
+        trace!(
             client = %self.client_addr,
             backend = backend_id.as_index(),
             command_verb = ?request.verb(),
@@ -680,7 +787,7 @@ impl ClientSession {
             }
             Some(cached) => {
                 let (cached_backend_id, cached_conn) = cached;
-                debug!(
+                trace!(
                     client = %self.client_addr,
                     cached_backend = cached_backend_id.as_index(),
                     backend = backend_id.as_index(),
@@ -692,7 +799,7 @@ impl ClientSession {
                 );
                 let _ = cached_conn.release();
                 let checkout_status = provider.status_counts();
-                debug!(
+                trace!(
                     client = %self.client_addr,
                     backend = backend_id.as_index(),
                     command_verb = ?request.verb(),
@@ -706,7 +813,7 @@ impl ClientSession {
                 );
                 let conn = provider.get_pooled_connection().await?;
                 let checkout_status = provider.status_counts();
-                debug!(
+                trace!(
                     client = %self.client_addr,
                     backend = backend_id.as_index(),
                     command_verb = ?request.verb(),
@@ -724,7 +831,7 @@ impl ClientSession {
             }
             None => {
                 let checkout_status = provider.status_counts();
-                debug!(
+                trace!(
                     client = %self.client_addr,
                     backend = backend_id.as_index(),
                     command_verb = ?request.verb(),
@@ -738,7 +845,7 @@ impl ClientSession {
                 );
                 let conn = provider.get_pooled_connection().await?;
                 let checkout_status = provider.status_counts();
-                debug!(
+                trace!(
                     client = %self.client_addr,
                     backend = backend_id.as_index(),
                     command_verb = ?request.verb(),
@@ -774,7 +881,7 @@ impl ClientSession {
         let mut guard = self
             .checkout_direct_backend_connection(provider, backend_id, request, backend_connection)
             .await?;
-        debug!(
+        trace!(
             client = %self.client_addr,
             backend = backend_id.as_index(),
             command_verb = ?request.verb(),
@@ -1726,6 +1833,112 @@ mod tests {
             body_commands.load(Ordering::SeqCst),
             1,
             "first attempt should go directly to BODY/ARTICLE/HEAD without STAT probe"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_stat_sweep_marks_missing_across_multiple_backends() {
+        let session = test_session();
+        let (port0, stat0, body0) = spawn_stat_missing_probe_server().await;
+        let (port1, stat1, body1) = spawn_stat_missing_probe_server().await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+        ]);
+
+        let request = request_context(b"BODY <missing@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+        };
+
+        session
+            .parallel_retry_stat_sweep(&router, &request, &mut state)
+            .await
+            .expect("parallel retry STAT sweep should succeed");
+
+        assert!(availability.is_missing(BackendId::from_index(0)));
+        assert!(availability.is_missing(BackendId::from_index(1)));
+        assert_eq!(stat0.load(Ordering::SeqCst), 1);
+        assert_eq!(stat1.load(Ordering::SeqCst), 1);
+        assert_eq!(body0.load(Ordering::SeqCst), 0);
+        assert_eq!(body1.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn retry_stat_sweep_leaves_pending_counts_balanced() {
+        let session = test_session();
+        let (port0, _stat0, _body0) = spawn_stat_missing_probe_server().await;
+        let (port1, _stat1, _body1) = spawn_stat_missing_probe_server().await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+        ]);
+
+        let request = request_context(b"BODY <missing@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+        };
+
+        session
+            .parallel_retry_stat_sweep(&router, &request, &mut state)
+            .await
+            .expect("parallel retry STAT sweep should succeed");
+
+        assert_eq!(
+            router
+                .backend_load(BackendId::from_index(0))
+                .expect("backend 0 should exist")
+                .get(),
+            0
+        );
+        assert_eq!(
+            router
+                .backend_load(BackendId::from_index(1))
+                .expect("backend 1 should exist")
+                .get(),
+            0
         );
     }
 
