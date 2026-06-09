@@ -7,7 +7,7 @@ use std::ops::{Deref, Range};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tracing::{debug, info, warn};
@@ -369,8 +369,18 @@ pub struct HotPathAllocationMetricsSnapshot {
 }
 
 fn response_write_metrics_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("NNTP_PROXY_RESPONSE_WRITE_METRICS_SECS").is_some())
+    response_write_metrics_enabled_flag().load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_response_write_metrics_enabled(enabled: bool) {
+    response_write_metrics_enabled_flag().store(enabled, Ordering::Relaxed);
+}
+
+fn response_write_metrics_enabled_flag() -> &'static AtomicBool {
+    static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
+    ENABLED.get_or_init(|| {
+        AtomicBool::new(std::env::var_os("NNTP_PROXY_RESPONSE_WRITE_METRICS_SECS").is_some())
+    })
 }
 
 fn response_write_metrics() -> &'static ResponseWriteMetrics {
@@ -1205,6 +1215,13 @@ mod tests {
         static GUARD: Mutex<()> = Mutex::new(());
         GUARD.lock().expect("hot-path metrics test guard poisoned")
     }
+
+    fn response_write_metrics_test_guard() -> MutexGuard<'static, ()> {
+        static GUARD: Mutex<()> = Mutex::new(());
+        GUARD
+            .lock()
+            .expect("response-write metrics test guard poisoned")
+    }
     use tokio::io::AsyncWriteExt;
 
     #[tokio::test]
@@ -1448,6 +1465,17 @@ mod tests {
         let after = hot_path_allocation_metrics_snapshot();
         assert!(after.regular_pool_buffer_holds > before.regular_pool_buffer_holds);
         assert!(after.capture_pool_buffer_holds > before.capture_pool_buffer_holds);
+    }
+
+    #[test]
+    fn test_set_response_write_metrics_enabled_toggles_flag() {
+        let _guard = response_write_metrics_test_guard();
+        let was_enabled = super::response_write_metrics_enabled();
+
+        super::set_response_write_metrics_enabled(!was_enabled);
+        assert_eq!(super::response_write_metrics_enabled(), !was_enabled);
+
+        super::set_response_write_metrics_enabled(was_enabled);
     }
 
     #[tokio::test]
