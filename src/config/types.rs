@@ -507,9 +507,10 @@ pub struct Server {
     /// Maximum number of concurrent connections to this server
     #[serde(default = "super::defaults::max_connections")]
     pub max_connections: MaxConnections,
-    /// Probe misses with `STAT` before `ARTICLE/BODY/HEAD` on this backend.
+    /// Enable backend `STAT` probes for ARTICLE/BODY/HEAD miss handling.
     ///
-    /// `0` disables the probe (default). Non-zero enables it.
+    /// `0` disables probes (default). Non-zero enables retry-path probes and
+    /// async non-primary prefetch probes where applicable.
     #[serde(default = "super::defaults::stat_missing")]
     pub stat_missing: u8,
 
