@@ -2173,6 +2173,51 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn first_attempt_prefetch_respects_existing_availability_and_skips_known_missing_tier() {
+        let session = test_session();
+        let (port0, stat0, _body0) = spawn_stat_missing_probe_server().await;
+        let (port1, stat1, _body1) = spawn_stat_missing_probe_server().await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+        ]);
+
+        let request = request_context(b"BODY <already-missing@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        availability.record_missing(BackendId::from_index(1));
+
+        session.spawn_non_primary_tier_stat_prefetch(
+            &router,
+            &request,
+            &availability,
+            SuppressedBackends::empty(),
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        assert_eq!(stat0.load(Ordering::SeqCst), 0, "tier 0 must not be probed");
+        assert_eq!(
+            stat1.load(Ordering::SeqCst),
+            0,
+            "known-missing non-primary tier should be skipped by should_try gate"
+        );
+    }
+
     #[test]
     fn stat_missing_probe_requires_retry_state() {
         let request = request_context(b"BODY <missing@example.com>\r\n");

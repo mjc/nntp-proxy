@@ -187,8 +187,27 @@ impl ClientSession {
             client_to_backend_bytes,
             backend_to_client_bytes,
         };
+        let preloaded_availability = if request.message_id_value().is_some() {
+            Some(
+                self.load_article_availability(
+                    request.message_id_value().as_ref(),
+                    router.backend_count(),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        if let Some(availability) = preloaded_availability.as_ref() {
+            self.spawn_non_primary_tier_stat_prefetch(
+                &router,
+                request,
+                availability,
+                SuppressedBackends::empty(),
+            );
+        }
         let availability = match self
-            .prepare_request_execution(&router, request, &mut io)
+            .prepare_request_execution(&router, request, &mut io, preloaded_availability)
             .await?
         {
             PreparedRequest::Served => return Ok(()),
@@ -219,6 +238,7 @@ impl ClientSession {
         router: &Arc<BackendSelector>,
         request: &mut RequestContext,
         io: &mut RequestExecutionIo<'_>,
+        preloaded_availability: Option<ArticleAvailability>,
     ) -> Result<PreparedRequest, SessionError> {
         let availability = {
             let mut client_write = io.client_writer.lock().await;
@@ -238,16 +258,20 @@ impl ClientSession {
                 CacheLookupResult::Miss => None,
             }
         };
-        let availability = match availability {
-            Some(availability) => Some(availability),
-            None if request.message_id_value().is_some() => Some(
+        let availability = if let Some(availability) = availability {
+            Some(availability)
+        } else if let Some(availability) = preloaded_availability {
+            Some(availability)
+        } else if request.message_id_value().is_some() {
+            Some(
                 self.load_article_availability(
                     request.message_id_value().as_ref(),
                     router.backend_count(),
                 )
                 .await,
-            ),
-            None => None,
+            )
+        } else {
+            None
         };
         if self
             .try_adaptive_precheck(router, request, io, availability.as_ref())
@@ -390,7 +414,6 @@ impl ClientSession {
         let mut availability = availability.unwrap_or_default();
         let mut unavailable_backends = SuppressedBackends::empty();
         let mut is_retry_attempt = false;
-        let mut non_primary_tier_prefetch_started = false;
         let mut retry_stat_sweep_done = false;
         trace!(
             "Client {} availability routing: missing_bits={:08b}, backend_count={}",
@@ -400,16 +423,6 @@ impl ClientSession {
         );
 
         while !availability.all_exhausted(router.backend_count()) {
-            if !is_retry_attempt && !non_primary_tier_prefetch_started {
-                self.spawn_non_primary_tier_stat_prefetch(
-                    router,
-                    request,
-                    &availability,
-                    unavailable_backends,
-                );
-                non_primary_tier_prefetch_started = true;
-            }
-
             if is_retry_attempt && !retry_stat_sweep_done {
                 self.parallel_retry_stat_sweep(
                     router,
