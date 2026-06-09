@@ -414,6 +414,101 @@ impl ClientSession {
         Ok(())
     }
 
+    pub(super) fn spawn_non_primary_tier_stat_prefetch(
+        &self,
+        router: &Arc<BackendSelector>,
+        request: &RequestContext,
+        availability: &crate::cache::ArticleAvailability,
+        unavailable_backends: SuppressedBackends,
+    ) {
+        if !matches!(request.kind(), RequestKind::Article | RequestKind::Body)
+            || request.is_stat()
+            || !request.has_message_id()
+        {
+            return;
+        }
+
+        let Some(stat_request) = Self::stat_probe_request(request) else {
+            return;
+        };
+        let Some(msg_id_text) = request.message_id().map(str::to_owned) else {
+            return;
+        };
+
+        let mut candidates = Vec::new();
+        for tier in router.tiers().filter(|tier| *tier > 0) {
+            for backend_id in router.backend_ids_in_tier(tier) {
+                if unavailable_backends.contains(backend_id) || !availability.should_try(backend_id)
+                {
+                    continue;
+                }
+                let Some(provider) = router.backend_provider(backend_id) else {
+                    continue;
+                };
+                if provider.stat_missing_enabled() {
+                    candidates.push((backend_id, provider.clone()));
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return;
+        }
+
+        let router = Arc::clone(router);
+        let cache = Arc::clone(&self.cache);
+        let buffer_pool = self.buffer_pool.clone();
+        tokio::spawn(async move {
+            let mut probes = FuturesUnordered::new();
+            for (backend_id, provider) in candidates {
+                let router = Arc::clone(&router);
+                let cache = Arc::clone(&cache);
+                let stat_request = stat_request.clone();
+                let msg_id_text = msg_id_text.clone();
+                let buffer_pool = buffer_pool.clone();
+                probes.push(async move {
+                    let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
+                    let conn = match provider.get_pooled_connection().await {
+                        Ok(conn) => conn,
+                        Err(_) => return,
+                    };
+                    let mut conn = crate::pool::ConnectionGuard::new(conn, provider);
+                    let mut buffer = buffer_pool.acquire();
+                    let read =
+                        backend::send_request(&mut **conn.get_mut(), &stat_request, &mut buffer)
+                            .await;
+                    let status_code = match read {
+                        Ok(read) => read.status_code(),
+                        Err(_) => {
+                            conn.retire_with_cooldown();
+                            return;
+                        }
+                    };
+                    if crate::session::backend::observe_response(
+                        &stat_request,
+                        &mut buffer,
+                        &mut conn,
+                        &buffer_pool,
+                        backend_id,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        conn.retire_with_cooldown();
+                        return;
+                    }
+                    let _ = conn.release();
+
+                    if status_code.is_some_and(|status| status.as_u16() == 430)
+                        && let Ok(msg_id) = crate::types::MessageId::new(msg_id_text)
+                    {
+                        cache.record_backend_missing(msg_id, backend_id).await;
+                    }
+                });
+            }
+            while probes.next().await.is_some() {}
+        });
+    }
+
     async fn write_successful_retry_response(
         &self,
         conn: crate::pool::ConnectionGuard,
@@ -1936,6 +2031,91 @@ mod tests {
                 .expect("backend 1 should exist")
                 .get(),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn first_attempt_prefetches_stat_only_on_non_primary_tiers_with_stat_missing_enabled() {
+        let session = test_session();
+        let (port0, stat0, body0) = spawn_stat_missing_probe_server().await;
+        let (port1, stat1, body1) = spawn_stat_missing_probe_server().await;
+        let (port2, stat2, body2) = spawn_stat_missing_probe_server().await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port2)
+                    .max_connections(1)
+                    .stat_missing(false)
+                    .build()
+                    .unwrap(),
+                2,
+            ),
+        ]);
+
+        let request = request_context(b"BODY <missing@example.com>\r\n");
+        let availability = ArticleAvailability::new();
+        let unavailable_backends = SuppressedBackends::empty();
+
+        session.spawn_non_primary_tier_stat_prefetch(
+            &router,
+            &request,
+            &availability,
+            unavailable_backends,
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while stat1.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("upper-tier stat prefetch should complete");
+
+        assert_eq!(stat0.load(Ordering::SeqCst), 0, "tier 0 must not be probed");
+        assert_eq!(
+            stat1.load(Ordering::SeqCst),
+            1,
+            "tier >0 with stat_missing=1 is probed"
+        );
+        assert_eq!(
+            stat2.load(Ordering::SeqCst),
+            0,
+            "tier >0 with stat_missing=0 is skipped"
+        );
+        assert_eq!(body0.load(Ordering::SeqCst), 0);
+        assert_eq!(body1.load(Ordering::SeqCst), 0);
+        assert_eq!(body2.load(Ordering::SeqCst), 0);
+
+        let msg_id = MessageId::new("<missing@example.com>".to_string()).expect("valid message id");
+        let cached = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(cached) = session.cache.get(&msg_id).await {
+                    break cached;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("prefetch should update availability index");
+        let has_backend_1 = cached.availability().is_missing(BackendId::from_index(1));
+        assert!(
+            has_backend_1,
+            "tier-1 backend should be marked missing from STAT=430"
         );
     }
 
