@@ -179,7 +179,8 @@ impl ClientSession {
 
         // Guard pending_count immediately — if get_pooled_connection fails,
         // the guard drops and decrements automatically
-        let pending_guard = crate::router::CommandGuard::new(router.clone(), backend_id);
+        let pending_guard =
+            crate::router::BackendSelector::guard_for_routed_backend(router.clone(), backend_id);
 
         let provider = router
             .backend_provider(backend_id)
