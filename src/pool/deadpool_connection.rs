@@ -4,16 +4,18 @@
 //! creation of optimized TCP/TLS connections to NNTP servers.
 
 use deadpool::managed;
-use std::collections::VecDeque;
+use hickory_resolver::TokioResolver;
+use hickory_resolver::proto::rr::RecordType;
+use smallvec::SmallVec;
 use std::io;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
-use tokio::sync::RwLock;
 
 use crate::connection_error::ConnectionError;
 use crate::protocol::{RequestContext, authinfo_pass, authinfo_user};
@@ -22,6 +24,27 @@ use crate::tls::{TlsConfig, TlsManager};
 
 /// Type alias for the deadpool connection pool
 pub type Pool = managed::Pool<TcpManager>;
+
+/// Shared DNS resolver instance for all managers.
+static DNS_RESOLVER: OnceLock<TokioResolver> = OnceLock::new();
+static NEXT_ADDR_START: AtomicUsize = AtomicUsize::new(0);
+static NEXT_IPV4_ROTATION: AtomicUsize = AtomicUsize::new(0);
+
+/// Initialize or return the shared DNS resolver.
+fn dns_resolver() -> Result<&'static TokioResolver, ConnectionError> {
+    if let Some(resolver) = DNS_RESOLVER.get() {
+        return Ok(resolver);
+    }
+
+    let resolver = TokioResolver::builder_tokio()
+        .map_err(|error| ConnectionError::dns_resolver_init("global", error))?
+        .build()
+        .map_err(|error| ConnectionError::dns_resolver_build("global", error))?;
+    let _ = DNS_RESOLVER.set(resolver);
+    Ok(DNS_RESOLVER
+        .get()
+        .expect("DNS resolver should be initialized after set"))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompressionSupport {
@@ -88,8 +111,6 @@ pub struct TcpManager {
     pub(crate) tls_config: TlsConfig,
     /// Cached TLS manager with pre-loaded certificates (avoids base64 decode overhead)
     pub(crate) tls_manager: Option<Arc<TlsManager>>,
-    resolved_socket_addrs: Arc<RwLock<Option<Arc<[SocketAddr]>>>>,
-    next_resolved_socket_addr: Arc<AtomicUsize>,
     pub(crate) recv_buffer_size: usize,
     pub(crate) send_buffer_size: usize,
     /// Wire compression mode: None = auto-detect, Some(true) = require, Some(false) = disable
@@ -111,67 +132,47 @@ impl TcpManager {
         })
     }
 
-    fn ip_literal_socket_addr(&self) -> Option<SocketAddr> {
-        self.host
-            .parse::<IpAddr>()
-            .ok()
-            .map(|ip| SocketAddr::new(ip, self.port))
-    }
-
-    async fn resolve_socket_addrs(&self) -> Result<Arc<[SocketAddr]>, ConnectionError> {
-        if let Some(socket_addr) = self.ip_literal_socket_addr() {
-            return Ok(Arc::from([socket_addr]));
-        }
-
-        if let Some(addrs) = self.resolved_socket_addrs.read().await.as_ref() {
-            if addrs.is_empty() {
-                return Err(ConnectionError::DnsNoAddresses {
-                    address: format!("{}:{}", self.host, self.port),
-                });
-            }
-            return Ok(addrs.clone());
-        }
-
-        let mut cached_addrs = self.resolved_socket_addrs.write().await;
-        if let Some(addrs) = cached_addrs.as_ref() {
-            if addrs.is_empty() {
-                return Err(ConnectionError::DnsNoAddresses {
-                    address: format!("{}:{}", self.host, self.port),
-                });
-            }
-            return Ok(addrs.clone());
-        }
-
-        let addrs = tokio::net::lookup_host((self.host.as_str(), self.port))
-            .await?
-            .collect::<Vec<_>>();
+    async fn lookup_socket_addrs(&self) -> Result<SmallVec<[SocketAddr; 4]>, ConnectionError> {
+        let resolver = dns_resolver()?;
+        let lookup = resolver
+            .lookup_ip(self.host.as_str())
+            .await
+            .map_err(|error| {
+                ConnectionError::dns_lookup(
+                    &self.name,
+                    format!("{}:{}", self.host, self.port),
+                    error,
+                )
+            })?;
+        let mut addrs: SmallVec<[SocketAddr; 4]> = SmallVec::new();
+        addrs.extend(
+            lookup
+                .iter()
+                .map(|ip_addr| SocketAddr::new(ip_addr, self.port)),
+        );
         if addrs.is_empty() {
             return Err(ConnectionError::DnsNoAddresses {
                 address: format!("{}:{}", self.host, self.port),
             });
         }
 
-        let addrs: Arc<[SocketAddr]> = Arc::from(addrs);
-        *cached_addrs = Some(addrs.clone());
-        Ok(addrs)
-    }
-
-    async fn refresh_socket_addrs(&self) -> Result<Arc<[SocketAddr]>, ConnectionError> {
-        if let Some(socket_addr) = self.ip_literal_socket_addr() {
-            return Ok(Arc::from([socket_addr]));
+        let ipv4_positions: SmallVec<[usize; 4]> = addrs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, addr)| addr.is_ipv4().then_some(idx))
+            .collect();
+        if ipv4_positions.len() > 1 {
+            let shift = NEXT_IPV4_ROTATION.fetch_add(1, Ordering::Relaxed) % ipv4_positions.len();
+            if shift != 0 {
+                let mut rotated_ipv4: SmallVec<[SocketAddr; 4]> =
+                    ipv4_positions.iter().map(|&idx| addrs[idx]).collect();
+                rotated_ipv4.rotate_left(shift);
+                for (idx, addr) in ipv4_positions.into_iter().zip(rotated_ipv4) {
+                    addrs[idx] = addr;
+                }
+            }
         }
 
-        let addrs = tokio::net::lookup_host((self.host.as_str(), self.port))
-            .await?
-            .collect::<Vec<_>>();
-        if addrs.is_empty() {
-            return Err(ConnectionError::DnsNoAddresses {
-                address: format!("{}:{}", self.host, self.port),
-            });
-        }
-
-        let addrs: Arc<[SocketAddr]> = Arc::from(addrs);
-        *self.resolved_socket_addrs.write().await = Some(addrs.clone());
         Ok(addrs)
     }
 
@@ -185,28 +186,6 @@ impl TcpManager {
                         io::ErrorKind::NetworkUnreachable | io::ErrorKind::HostUnreachable
                     )
             )
-    }
-
-    async fn remove_cached_ipv6_socket_addrs(&self) {
-        let mut cached_addrs = self.resolved_socket_addrs.write().await;
-        let Some(addrs) = cached_addrs.as_ref() else {
-            return;
-        };
-
-        let ipv4_addrs = addrs
-            .iter()
-            .copied()
-            .filter(SocketAddr::is_ipv4)
-            .collect::<Vec<_>>();
-        if ipv4_addrs.len() == addrs.len() {
-            return;
-        }
-
-        *cached_addrs = if ipv4_addrs.is_empty() {
-            None
-        } else {
-            Some(Arc::<[SocketAddr]>::from(ipv4_addrs))
-        };
     }
 
     /// Create a new `TcpManager` with optional TLS configuration
@@ -245,8 +224,6 @@ impl TcpManager {
             password: options.password,
             tls_config,
             tls_manager,
-            resolved_socket_addrs: Arc::new(RwLock::new(None)),
-            next_resolved_socket_addr: Arc::new(AtomicUsize::new(0)),
             recv_buffer_size: options.recv_buffer_size,
             send_buffer_size: options.send_buffer_size,
             compress: options.compress,
@@ -261,7 +238,7 @@ impl TcpManager {
         socket_addr: SocketAddr,
     ) -> Result<TcpStream, ConnectionError> {
         // Create tokio TcpSocket (non-blocking from the start)
-        let socket = if socket_addr.is_ipv4() {
+        let connect_socket = if socket_addr.is_ipv4() {
             tokio::net::TcpSocket::new_v4()?
         } else {
             tokio::net::TcpSocket::new_v6()?
@@ -269,56 +246,50 @@ impl TcpManager {
 
         // Pre-connect options (buffer sizes, reuse)
         if self.recv_buffer_size > 0 {
-            socket.set_recv_buffer_size(Self::socket_buffer_size_u32(
+            connect_socket.set_recv_buffer_size(Self::socket_buffer_size_u32(
                 self.recv_buffer_size,
                 "receive",
             )?)?;
         }
         if self.send_buffer_size > 0 {
-            socket.set_send_buffer_size(Self::socket_buffer_size_u32(
+            connect_socket.set_send_buffer_size(Self::socket_buffer_size_u32(
                 self.send_buffer_size,
                 "send",
             )?)?;
         }
-        socket.set_reuseaddr(true)?;
+        connect_socket.set_reuseaddr(true)?;
 
         // Async connect — does NOT block the tokio worker thread
-        let tcp_stream = socket.connect(socket_addr).await?;
+        let tcp_stream = connect_socket.connect(socket_addr).await?;
 
         // Post-connect options via socket2::SockRef (keepalive with params, nodelay)
-        let sock_ref = socket2::SockRef::from(&tcp_stream);
-        sock_ref.set_keepalive(true)?;
+        let stream_socket = socket2::SockRef::from(&tcp_stream);
+        stream_socket.set_keepalive(true)?;
         let keepalive = socket2::TcpKeepalive::new()
             .with_time(crate::constants::duration_polyfill::from_minutes(1))
             .with_interval(std::time::Duration::from_secs(10));
-        sock_ref.set_tcp_keepalive(&keepalive)?;
-        sock_ref.set_tcp_nodelay(true)?;
+        stream_socket.set_tcp_keepalive(&keepalive)?;
+        stream_socket.set_tcp_nodelay(true)?;
 
         Ok(tcp_stream)
     }
 
     async fn create_connected_tcp_stream(&self) -> Result<TcpStream, ConnectionError> {
-        let addrs = self.resolve_socket_addrs().await?;
-        let last_error = match self.try_resolved_socket_addrs(&addrs).await {
-            Ok(tcp_stream) => return Ok(tcp_stream),
-            Err(last_error) => last_error,
-        };
-
-        if self.ip_literal_socket_addr().is_some() {
-            return Err(
-                last_error.unwrap_or_else(|| ConnectionError::DnsNoAddresses {
-                    address: format!("{}:{}", self.host, self.port),
-                }),
-            );
+        let addrs = self.lookup_socket_addrs().await?;
+        if let Ok(tcp_stream) = self.try_resolved_socket_addrs(&addrs).await {
+            return Ok(tcp_stream);
         }
 
         tracing::debug!(
             backend = %self.name,
             host = %self.host,
-            "All cached backend socket addresses failed; refreshing DNS before final connect pass"
+            "All resolved backend socket addresses failed; refreshing DNS before final connect pass"
         );
 
-        let addrs = self.refresh_socket_addrs().await?;
+        let resolver = dns_resolver()?;
+        resolver.clear_lookup_cache(self.host.as_str(), RecordType::A);
+        resolver.clear_lookup_cache(self.host.as_str(), RecordType::AAAA);
+        let addrs = self.lookup_socket_addrs().await?;
         self.try_resolved_socket_addrs(&addrs)
             .await
             .map_err(|last_error| {
@@ -332,23 +303,28 @@ impl TcpManager {
         &self,
         addrs: &[SocketAddr],
     ) -> Result<TcpStream, Option<ConnectionError>> {
-        let start = self
-            .next_resolved_socket_addr
-            .fetch_add(1, Ordering::Relaxed)
-            % addrs.len();
+        if addrs.is_empty() {
+            return Err(None);
+        }
+
         let mut last_error = None;
-
-        let mut remaining_addrs = (0..addrs.len())
-            .map(|offset| addrs[(start + offset) % addrs.len()])
-            .collect::<VecDeque<_>>();
-
-        while let Some(socket_addr) = remaining_addrs.pop_front() {
+        let mut skip_ipv6 = false;
+        let start = NEXT_ADDR_START.fetch_add(1, Ordering::Relaxed) % addrs.len();
+        for offset in 0..addrs.len() {
+            let socket_addr = addrs[(start + offset) % addrs.len()];
+            if skip_ipv6 && socket_addr.is_ipv6() {
+                continue;
+            }
             match self.connect_socket_addr(socket_addr).await {
                 Ok(tcp_stream) => return Ok(tcp_stream),
                 Err(error) => {
                     if Self::is_ipv6_network_unreachable(socket_addr, &error) {
-                        self.remove_cached_ipv6_socket_addrs().await;
-                        remaining_addrs.retain(SocketAddr::is_ipv4);
+                        let resolver = match dns_resolver() {
+                            Ok(r) => r,
+                            Err(e) => return Err(Some(e)),
+                        };
+                        resolver.clear_lookup_cache(self.host.as_str(), RecordType::AAAA);
+                        skip_ipv6 = true;
                     }
 
                     tracing::debug!(
@@ -761,6 +737,8 @@ impl managed::Manager for TcpManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
 
@@ -817,51 +795,6 @@ mod tests {
     }
 
     #[test]
-    fn ip_literal_socket_addr_parses_ipv4_without_dns() {
-        let manager = TcpManager::new(
-            "127.0.0.1".to_string(),
-            119,
-            "IpBackend".to_string(),
-            TcpManagerOptions::default(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            manager.ip_literal_socket_addr(),
-            Some(SocketAddr::from(([127, 0, 0, 1], 119)))
-        );
-    }
-
-    #[test]
-    fn ip_literal_socket_addr_parses_ipv6_without_dns() {
-        let manager = TcpManager::new(
-            "::1".to_string(),
-            563,
-            "IpBackend".to_string(),
-            TcpManagerOptions::default(),
-        )
-        .unwrap();
-
-        assert_eq!(
-            manager.ip_literal_socket_addr(),
-            Some(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 563)))
-        );
-    }
-
-    #[test]
-    fn ip_literal_socket_addr_leaves_hostnames_for_dns() {
-        let manager = TcpManager::new(
-            "news.example.com".to_string(),
-            119,
-            "DnsBackend".to_string(),
-            TcpManagerOptions::default(),
-        )
-        .unwrap();
-
-        assert_eq!(manager.ip_literal_socket_addr(), None);
-    }
-
-    #[test]
     fn ipv6_network_unreachable_matches_error_kind_only_for_ipv6() {
         let ipv6_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 563));
         let ipv4_addr = SocketAddr::from(([127, 0, 0, 1], 563));
@@ -875,57 +808,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_cached_ipv6_socket_addrs_keeps_only_ipv4_addresses() {
-        let manager = TcpManager::new(
-            "test.example.com".to_string(),
-            563,
-            "DnsBackend".to_string(),
-            TcpManagerOptions::default(),
-        )
-        .unwrap();
-        let ipv6_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 563));
-        let ipv4_addr = SocketAddr::from(([127, 0, 0, 1], 563));
-        *manager.resolved_socket_addrs.write().await = Some(Arc::from([ipv6_addr, ipv4_addr]));
-
-        manager.remove_cached_ipv6_socket_addrs().await;
-
-        let cached_addrs = manager
-            .resolved_socket_addrs
-            .read()
-            .await
-            .as_ref()
-            .expect("cached addresses should remain initialized")
-            .clone();
-        assert_eq!(&*cached_addrs, &[ipv4_addr]);
-    }
-
-    #[tokio::test]
-    async fn remove_cached_ipv6_socket_addrs_clears_ipv6_only_cache() {
-        let manager = TcpManager::new(
-            "test.example.com".to_string(),
-            563,
-            "DnsBackend".to_string(),
-            TcpManagerOptions::default(),
-        )
-        .unwrap();
-        let ipv6_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 563));
-        *manager.resolved_socket_addrs.write().await = Some(Arc::from([ipv6_addr]));
-
-        manager.remove_cached_ipv6_socket_addrs().await;
-
-        assert!(
-            manager.resolved_socket_addrs.read().await.is_none(),
-            "IPv6-only cached address list should be cleared instead of retained as an empty cache"
-        );
-    }
-
-    #[tokio::test]
-    async fn create_connected_tcp_stream_refreshes_dns_after_cached_addresses_fail() {
-        let live_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let live_addr = live_listener.local_addr().unwrap();
-        let stale_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let stale_addr = stale_listener.local_addr().unwrap();
-        drop(stale_listener);
+    async fn create_connected_tcp_stream_resolves_hostname() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = listener.local_addr().unwrap();
 
         let manager = TcpManager::new(
             "localhost".to_string(),
@@ -934,21 +819,32 @@ mod tests {
             TcpManagerOptions::default(),
         )
         .unwrap();
-        *manager.resolved_socket_addrs.write().await = Some(Arc::from([stale_addr]));
 
-        let accept = tokio::spawn(async move { live_listener.accept().await.unwrap() });
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
         let stream = manager.create_connected_tcp_stream().await.unwrap();
         let _accepted = accept.await.unwrap();
 
         assert_eq!(stream.peer_addr().unwrap(), live_addr);
-        let cached_addrs = manager
-            .resolved_socket_addrs
-            .read()
-            .await
-            .as_ref()
-            .expect("successful refresh should update cached addresses")
-            .clone();
-        assert!(cached_addrs.contains(&live_addr));
+    }
+
+    #[tokio::test]
+    async fn create_connected_tcp_stream_ip_literal_skips_dns() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = listener.local_addr().unwrap();
+
+        let manager = TcpManager::new(
+            live_addr.ip().to_string(),
+            live_addr.port(),
+            "IpBackend".to_string(),
+            TcpManagerOptions::default(),
+        )
+        .unwrap();
+
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let stream = manager.create_connected_tcp_stream().await.unwrap();
+        let _accepted = accept.await.unwrap();
+
+        assert_eq!(stream.peer_addr().unwrap(), live_addr);
     }
 
     #[test]
@@ -1019,14 +915,6 @@ mod tests {
         assert_eq!(cloned.name, manager.name);
         assert_eq!(cloned.username, manager.username);
         assert_eq!(cloned.password, manager.password);
-        assert!(Arc::ptr_eq(
-            &cloned.resolved_socket_addrs,
-            &manager.resolved_socket_addrs
-        ));
-        assert!(Arc::ptr_eq(
-            &cloned.next_resolved_socket_addr,
-            &manager.next_resolved_socket_addr
-        ));
     }
 
     #[test]
@@ -1043,14 +931,14 @@ mod tests {
         )
         .unwrap();
 
-        let debug_str = format!("{manager:?}");
-        assert!(debug_str.contains("TcpManager"));
-        assert!(debug_str.contains("news.example.com"));
-        assert!(debug_str.contains("119"));
+        let debug_output = format!("{manager:?}");
+        assert!(debug_output.contains("TcpManager"));
+        assert!(debug_output.contains("news.example.com"));
+        assert!(debug_output.contains("119"));
     }
 
     #[tokio::test]
-    async fn create_optimized_stream_tries_next_resolved_address_after_connect_error() {
+    async fn try_resolved_socket_addrs_tries_next_address_after_connect_error() {
         let unavailable_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let unavailable_addr = unavailable_listener.local_addr().unwrap();
         drop(unavailable_listener);
@@ -1068,15 +956,13 @@ mod tests {
             TcpManagerOptions::default(),
         )
         .unwrap();
-        *manager.resolved_socket_addrs.write().await =
-            Some(Arc::from([unavailable_addr, available_addr]));
 
         let stream = manager
-            .create_optimized_stream()
+            .try_resolved_socket_addrs(&[unavailable_addr, available_addr])
             .await
             .expect("second resolved address should be tried after first connect error");
 
-        assert_eq!(stream.connection_type(), "TCP");
+        assert_eq!(stream.peer_addr().unwrap(), available_addr);
         accept_task.await.unwrap();
     }
 
@@ -1101,10 +987,10 @@ mod tests {
         assert!(manager.tls_manager.is_some());
 
         // Verify TLS manager is an Arc (cheap clone)
-        let arc_clone = manager.tls_manager.as_ref().unwrap().clone();
+        let cloned_tls_manager = manager.tls_manager.as_ref().unwrap().clone();
         assert!(Arc::ptr_eq(
             manager.tls_manager.as_ref().unwrap(),
-            &arc_clone
+            &cloned_tls_manager
         ));
     }
 
