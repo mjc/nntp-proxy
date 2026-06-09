@@ -100,6 +100,9 @@ name = "Example News Server 1"
 max_connections = 20
 # Lower tier numbers are tried first. Higher tiers are fallback/archive servers.
 tier = 0
+# Probe misses with STAT before ARTICLE/BODY/HEAD (0 = disabled, non-zero = enabled).
+# Default is 0; this example enables it on all tiers.
+stat_missing = 1
 # Optional keep-alive interval in seconds
 # connection_keepalive = 60
 use_tls = false
@@ -123,6 +126,8 @@ username = "testuser"
 password = "testpass"
 max_connections = 10
 tier = 1
+# Common setup: enable STAT miss probes on fallback tiers.
+stat_missing = 1
 connection_keepalive = 60
 use_tls = false
 tls_verify_cert = true
@@ -135,6 +140,7 @@ username = "premium_user"
 password = "secure_password"
 max_connections = 15
 tier = 5
+stat_missing = 1
 connection_keepalive = 120
 use_tls = true
 tls_verify_cert = true
@@ -149,6 +155,7 @@ username = "archive_user"
 password = "archive_pass"
 max_connections = 2
 tier = 10
+stat_missing = 1
 connection_keepalive = 120
 use_tls = true
 tls_verify_cert = true
