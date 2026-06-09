@@ -509,8 +509,7 @@ pub struct Server {
     pub max_connections: MaxConnections,
     /// Enable backend `STAT` probes for ARTICLE/BODY/HEAD miss handling.
     ///
-    /// `0` disables probes (default). Non-zero enables retry-path probes and
-    /// async non-primary prefetch probes where applicable.
+    /// `0` disables probes (default). Non-zero enables retry-path probes.
     #[serde(default = "super::defaults::stat_missing")]
     pub stat_missing: u8,
 

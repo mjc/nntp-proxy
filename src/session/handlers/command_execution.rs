@@ -202,6 +202,7 @@ impl ClientSession {
         request: &mut RequestContext,
         client_writer: &crate::session::SharedClientWriter,
         state: &mut ArticleAttemptState<'_>,
+        is_retry_attempt: bool,
     ) -> Result<BackendAttemptResult, SessionError> {
         let route_request = crate::router::RouteRequest::new(self.client_id)
             .with_availability(state.availability)
@@ -234,7 +235,7 @@ impl ClientSession {
         };
 
         let Some((mut conn, status_code, buffer)) = self
-            .prepare_backend_attempt(provider, &backend, request, state)
+            .prepare_backend_attempt(provider, &backend, request, state, is_retry_attempt)
             .await?
         else {
             return Ok(BackendAttemptResult::BackendUnavailable);
@@ -323,6 +324,7 @@ impl ClientSession {
         backend: &ArticleBackend,
         request: &RequestContext,
         state: &mut ArticleAttemptState<'_>,
+        is_retry_attempt: bool,
     ) -> Result<PreparedBackendAttempt, SessionError> {
         let backend_id = backend.backend_id();
         let request_wire_len = request.request_wire_len().get();
@@ -340,7 +342,7 @@ impl ClientSession {
                 backend,
                 request,
                 state.backend_connection,
-                state.availability.has_availability_info(),
+                is_retry_attempt,
             )
             .await,
             client = self.client_addr,
@@ -982,6 +984,8 @@ impl ClientSession {
             return Ok((probe_response, probe_buffer, probe_timings));
         }
 
+        drop(probe_buffer);
+        let _ = probe_timings;
         self.execute_and_read_response(conn, backend, request).await
     }
 
@@ -1737,7 +1741,13 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            session.try_backend_for_article(&router, &mut request, &client_writer, &mut state),
+            session.try_backend_for_article(
+                &router,
+                &mut request,
+                &client_writer,
+                &mut state,
+                false,
+            ),
         )
         .await
         .expect("430 probe should not wait for the client writer lock")
@@ -1780,7 +1790,7 @@ mod tests {
         };
 
         let result = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state)
+            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, true)
             .await
             .expect("STAT 430 probe should be handled without transport error");
 
@@ -1823,7 +1833,7 @@ mod tests {
         };
 
         let result = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state)
+            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, false)
             .await
             .expect("first BODY attempt should complete without transport error");
 
@@ -1899,7 +1909,13 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            session.try_backend_for_article(&router, &mut request, &client_writer, &mut state),
+            session.try_backend_for_article(
+                &router,
+                &mut request,
+                &client_writer,
+                &mut state,
+                false,
+            ),
         )
         .await
         .expect("invalid response attempt should not hang")
@@ -1937,7 +1953,13 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            session.try_backend_for_article(&router, &mut request, &client_writer, &mut state),
+            session.try_backend_for_article(
+                &router,
+                &mut request,
+                &client_writer,
+                &mut state,
+                false,
+            ),
         )
         .await
         .expect("connection failure attempt should not hang")
@@ -1987,7 +2009,7 @@ mod tests {
         };
 
         let first = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state)
+            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, false)
             .await
             .expect("invalid response should be handled");
         assert!(matches!(first, BackendAttemptResult::BackendUnavailable));
@@ -1996,7 +2018,7 @@ mod tests {
         assert_eq!(state.unavailable_backends.bits(), 0b0000_0001);
 
         let second = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state)
+            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, true)
             .await
             .expect("same-tier retry should succeed");
         assert!(matches!(second, BackendAttemptResult::Success));
@@ -2054,7 +2076,7 @@ mod tests {
         };
 
         let first = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state)
+            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, false)
             .await;
         assert!(matches!(first, Err(SessionError::Backend(_))));
         assert_eq!(state.availability.missing_bits(), 0);
@@ -2062,7 +2084,7 @@ mod tests {
         assert_eq!(state.unavailable_backends.bits(), 0b0000_0001);
 
         let second = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state)
+            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, true)
             .await
             .expect("same-tier retry should continue after backend EOF");
         assert!(matches!(second, BackendAttemptResult::Success));
@@ -2170,7 +2192,7 @@ mod tests {
 
         for expected_mask in [0b0000_0001, 0b0000_0011] {
             let result = session
-                .try_backend_for_article(&router, &mut request, &client_writer, &mut state)
+                .try_backend_for_article(&router, &mut request, &client_writer, &mut state, true)
                 .await
                 .expect("invalid response should be handled");
             assert!(matches!(result, BackendAttemptResult::BackendUnavailable));
@@ -2178,7 +2200,7 @@ mod tests {
         }
 
         let exhausted = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state)
+            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, true)
             .await
             .expect("tier exhaustion should be reported without transport failure");
         assert!(matches!(
@@ -2222,6 +2244,7 @@ mod tests {
             &mut request,
             &client_writer,
             &mut state,
+            true,
         ));
         tokio::time::timeout(Duration::from_secs(1), async {
             while article_commands.load(Ordering::SeqCst) == 0 {

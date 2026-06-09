@@ -389,6 +389,7 @@ impl ClientSession {
 
         let mut availability = availability.unwrap_or_default();
         let mut unavailable_backends = SuppressedBackends::empty();
+        let mut is_retry_attempt = false;
         debug!(
             "Client {} availability routing: missing_bits={:08b}, backend_count={}",
             self.client_addr,
@@ -408,6 +409,7 @@ impl ClientSession {
                         backend_connection: io.backend_connection,
                         unavailable_backends: &mut unavailable_backends,
                     },
+                    is_retry_attempt,
                 )
                 .await;
             match attempt {
@@ -420,13 +422,16 @@ impl ClientSession {
                     return Ok(());
                 }
                 Ok(BackendAttemptResult::ArticleNotFound { missing }) => {
+                    is_retry_attempt = true;
                     let backend_id = missing.backend_id();
                     debug!(
                         "Client {} backend {:?} returned 430 during retry",
                         self.client_addr, backend_id
                     );
                 }
-                Ok(BackendAttemptResult::BackendUnavailable) => {}
+                Ok(BackendAttemptResult::BackendUnavailable) => {
+                    is_retry_attempt = true;
+                }
                 Ok(BackendAttemptResult::NoRetryableBackend) => {
                     let bytes_written = {
                         let mut client_write = io.client_writer.lock().await;
@@ -709,7 +714,7 @@ impl ClientSession {
             unavailable_backends,
         };
         let prepared = self
-            .prepare_backend_attempt(provider, &backend, request, &mut state)
+            .prepare_backend_attempt(provider, &backend, request, &mut state, true)
             .await;
         let Some((conn, status_code, buffer)) = (match prepared {
             Ok(prepared) => prepared,
