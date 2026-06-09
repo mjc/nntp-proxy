@@ -779,7 +779,10 @@ impl ClientSession {
         );
         let guard = match backend_connection.take() {
             Some((cached_backend_id, guard)) if cached_backend_id == backend_id => {
-                if Self::should_reuse_cached_batch_connection() {
+                let checkout_status = provider.status_counts();
+                let can_expand_or_use_idle = checkout_status.available > 0
+                    || checkout_status.size < checkout_status.max_size;
+                if Self::should_reuse_cached_batch_connection() && !can_expand_or_use_idle {
                     let checkout_status = provider.status_counts();
                     debug!(
                         client = %self.client_addr,
@@ -796,6 +799,39 @@ impl ClientSession {
                         "Reusing cached batch connection for direct backend attempt"
                     );
                     guard
+                } else if Self::should_reuse_cached_batch_connection() {
+                    debug!(
+                        client = %self.client_addr,
+                        backend = backend_id.as_index(),
+                        command_verb = ?request.verb(),
+                        msg_id = ?request.message_id_value(),
+                        pool = %provider.name(),
+                        pool_available = checkout_status.available,
+                        pool_size = checkout_status.size,
+                        pool_max_size = checkout_status.max_size,
+                        pool_waiting = checkout_status.waiting,
+                        connection_type = guard.connection_type(),
+                        pending_bytes = guard.pending_bytes_len(),
+                        "Using idle pool capacity before reusing cached batch connection"
+                    );
+                    *backend_connection = Some((cached_backend_id, guard));
+                    match provider.get_pooled_connection().await {
+                        Ok(conn) => crate::pool::ConnectionGuard::new(conn, provider.clone()),
+                        Err(err) => {
+                            debug!(
+                                client = %self.client_addr,
+                                backend = backend_id.as_index(),
+                                command_verb = ?request.verb(),
+                                msg_id = ?request.message_id_value(),
+                                error = %err,
+                                "Idle pool checkout failed; falling back to cached batch connection"
+                            );
+                            let (_, cached_guard) = backend_connection.take().expect(
+                                "cached backend connection should be present for fallback reuse",
+                            );
+                            cached_guard
+                        }
+                    }
                 } else {
                     unreachable!("cached batch connection reuse should remain enabled");
                 }
