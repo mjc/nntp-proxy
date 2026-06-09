@@ -50,6 +50,14 @@ pub struct StartupTuiSession {
     terminal: Option<TuiTerminal>,
 }
 
+fn notify_shutdown(tx: &mpsc::Sender<()>) {
+    match tx.try_send(()) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RemoteDashboardStatus {
     Connecting {
@@ -251,7 +259,7 @@ impl StartupTuiSession {
         let result = run_app(&mut terminal, &mut app, &mut shutdown_rx).await;
         restore_terminal(&mut terminal)?;
 
-        let _ = shutdown_tx.send(()).await;
+        notify_shutdown(&shutdown_tx);
         result
     }
 }
@@ -292,7 +300,7 @@ pub async fn run_tui(
     .await;
 
     // Signal shutdown when TUI exits
-    let _ = shutdown_tx.send(()).await;
+    notify_shutdown(&shutdown_tx);
 
     result
 }
