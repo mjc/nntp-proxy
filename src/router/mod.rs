@@ -688,7 +688,11 @@ impl BackendSelector {
                 );
             }
 
-            let tier_has_non_over_hard_backend = self.queue_backpressure_enabled
+            let use_capacity_weighted_initial_probe =
+                availability.is_some_and(|avail| !self.availability_missing_in_tier(avail, tier));
+
+            let tier_has_non_over_hard_backend = !use_capacity_weighted_initial_probe
+                && self.queue_backpressure_enabled
                 && self.backends.iter().any(|backend| {
                     if backend.tier != tier || !is_available(&backend) {
                         return false;
@@ -723,18 +727,12 @@ impl BackendSelector {
                 )
             };
 
-            let selected = if availability
-                .is_some_and(|avail| !self.availability_missing_in_tier(avail, tier))
-            {
-                match &self.strategy {
-                    SelectionStrategy::WeightedRoundRobin(_) => self
-                        .select_capacity_weighted(tier_filter)
-                        .map(|backend| SelectedBackend {
-                            backend,
-                            pending_snapshot: None,
-                        }),
-                    SelectionStrategy::LeastLoaded(_) => self.select_weighted(tier_filter),
-                }
+            let selected = if use_capacity_weighted_initial_probe {
+                self.select_capacity_weighted(tier_filter)
+                    .map(|backend| SelectedBackend {
+                        backend,
+                        pending_snapshot: None,
+                    })
             } else {
                 self.select_weighted(tier_filter)
             };
