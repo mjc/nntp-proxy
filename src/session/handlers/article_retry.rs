@@ -389,6 +389,7 @@ impl ClientSession {
 
         let mut availability = availability.unwrap_or_default();
         let mut unavailable_backends = SuppressedBackends::empty();
+        let mut is_retry_attempt = false;
         debug!(
             "Client {} availability routing: missing_bits={:08b}, backend_count={}",
             self.client_addr,
@@ -408,6 +409,7 @@ impl ClientSession {
                         backend_connection: io.backend_connection,
                         unavailable_backends: &mut unavailable_backends,
                     },
+                    is_retry_attempt,
                 )
                 .await;
             match attempt {
@@ -420,13 +422,16 @@ impl ClientSession {
                     return Ok(());
                 }
                 Ok(BackendAttemptResult::ArticleNotFound { missing }) => {
+                    is_retry_attempt = true;
                     let backend_id = missing.backend_id();
                     debug!(
                         "Client {} backend {:?} returned 430 during retry",
                         self.client_addr, backend_id
                     );
                 }
-                Ok(BackendAttemptResult::BackendUnavailable) => {}
+                Ok(BackendAttemptResult::BackendUnavailable) => {
+                    is_retry_attempt = true;
+                }
                 Ok(BackendAttemptResult::NoRetryableBackend) => {
                     let bytes_written = {
                         let mut client_write = io.client_writer.lock().await;
@@ -491,6 +496,7 @@ impl ClientSession {
         let mut client_to_backend_bytes = ClientToBackendBytes::zero();
         let mut backend_to_client_bytes = BackendToClientBytes::zero();
         let mut unavailable_backends = SuppressedBackends::empty();
+        let mut is_retry_attempt = false;
 
         while !availability.all_exhausted(router.backend_count()) {
             let attempt = match self
@@ -501,6 +507,7 @@ impl ClientSession {
                     &mut client_to_backend_bytes,
                     &mut backend_connection,
                     &mut unavailable_backends,
+                    is_retry_attempt,
                 )
                 .await
             {
@@ -515,7 +522,10 @@ impl ClientSession {
 
             let Some((backend, guard, mut conn, status_code, buffer)) = (match attempt {
                 Ok(attempt) => attempt,
-                Err(OrderedLargeTransferNoAttempt::BackendUnavailable) => continue,
+                Err(OrderedLargeTransferNoAttempt::BackendUnavailable) => {
+                    is_retry_attempt = true;
+                    continue;
+                }
                 Err(OrderedLargeTransferNoAttempt::NoRetryableBackend) => {
                     Self::release_cached_backend_connection(&mut backend_connection);
 
@@ -674,7 +684,13 @@ impl ClientSession {
         client_to_backend_bytes: &mut ClientToBackendBytes,
         backend_connection: &mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
         unavailable_backends: &mut SuppressedBackends,
+        is_retry_attempt: bool,
     ) -> Result<OrderedLargeTransferAttempt, SessionError> {
+        if let Some(delay) =
+            router.queue_backpressure_delay_for_article(availability, *unavailable_backends)
+        {
+            tokio::time::sleep(delay).await;
+        }
         let route_request = crate::router::RouteRequest::new(self.client_id)
             .with_availability(availability)
             .suppressing_backends(*unavailable_backends);
@@ -709,7 +725,7 @@ impl ClientSession {
             unavailable_backends,
         };
         let prepared = self
-            .prepare_backend_attempt(provider, &backend, request, &mut state)
+            .prepare_backend_attempt(provider, &backend, request, &mut state, is_retry_attempt)
             .await;
         let Some((conn, status_code, buffer)) = (match prepared {
             Ok(prepared) => prepared,

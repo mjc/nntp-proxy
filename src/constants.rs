@@ -165,6 +165,12 @@ pub mod timeout {
     /// Used to drain connections one at a time; should be near-instant if
     /// the connection is truly idle
     pub const SHUTDOWN_POOL_GET: Duration = Duration::from_millis(1);
+
+    /// Maximum time to wait for client session tasks to drain after shutdown begins
+    pub const SHUTDOWN_TASK_DRAIN: Duration = Duration::from_secs(5);
+
+    /// Maximum time to wait for UI background tasks to exit on shutdown
+    pub const SHUTDOWN_UI_TASK_JOIN: Duration = Duration::from_secs(3);
 }
 
 /// Connection pool constants

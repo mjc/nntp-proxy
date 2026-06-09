@@ -46,6 +46,21 @@ impl Config {
             "memory.socket_send_buffer_size",
             self.memory.socket_send_buffer_size,
         )?;
+        if self
+            .routing
+            .queue
+            .backpressure
+            .hard_waiters_per_connection_percent
+            < self
+                .routing
+                .queue
+                .backpressure
+                .soft_waiters_per_connection_percent
+        {
+            return Err(anyhow::anyhow!(
+                "routing.queue.backpressure.hard_waiters_per_connection_percent must be >= soft_waiters_per_connection_percent"
+            ));
+        }
 
         for server in &self.servers {
             validate_server(server);
@@ -215,6 +230,33 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("memory.socket_send_buffer_size")
+        );
+    }
+
+    #[test]
+    fn test_validate_backpressure_hard_less_than_soft_fails() {
+        let mut config = Config {
+            servers: vec![create_test_server("test", None)],
+            ..Default::default()
+        };
+        config
+            .routing
+            .queue
+            .backpressure
+            .soft_waiters_per_connection_percent = 60;
+        config
+            .routing
+            .queue
+            .backpressure
+            .hard_waiters_per_connection_percent = 50;
+
+        let result = config.validate();
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("hard_waiters_per_connection_percent")
         );
     }
 

@@ -222,9 +222,13 @@ impl BackendInfo {
         let max_conns = status.max_size as f64;
         if max_conns > 0.0 {
             let checked_out = status.size.saturating_sub(status.available);
+            let waiting = status.waiting;
             #[allow(clippy::cast_precision_loss)]
             // Pending counts only feed the relative load score.
-            let active = self.pending_count.get().max(checked_out) as f64;
+            let active = self
+                .pending_count
+                .get()
+                .max(checked_out.saturating_add(waiting)) as f64;
             LoadRatio::new(active / max_conns)
         } else {
             LoadRatio::MAX

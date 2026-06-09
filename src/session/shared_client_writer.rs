@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 #[derive(Debug, Default)]
 struct ClientWriterLockMetrics {
@@ -21,9 +21,16 @@ pub(crate) struct ClientWriterLockMetricsSnapshot {
 }
 
 fn client_writer_lock_metrics_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED
-        .get_or_init(|| std::env::var_os("NNTP_PROXY_CLIENT_WRITER_LOCK_METRICS_SECS").is_some())
+    client_writer_lock_metrics_enabled_flag().load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_client_writer_lock_metrics_enabled(enabled: bool) {
+    client_writer_lock_metrics_enabled_flag().store(enabled, Ordering::Relaxed);
+}
+
+fn client_writer_lock_metrics_enabled_flag() -> &'static AtomicBool {
+    static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
+    ENABLED.get_or_init(|| AtomicBool::new(false))
 }
 
 fn client_writer_lock_metrics() -> &'static ClientWriterLockMetrics {
@@ -87,5 +94,16 @@ impl SharedClientWriter {
             Ok(mutex) => Ok(mutex.into_inner()),
             Err(inner) => Err(Self { inner }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn writer_lock_metrics_flag_is_runtime_configurable() {
+        let was_enabled = super::client_writer_lock_metrics_enabled();
+        super::set_client_writer_lock_metrics_enabled(!was_enabled);
+        assert_eq!(super::client_writer_lock_metrics_enabled(), !was_enabled);
+        super::set_client_writer_lock_metrics_enabled(was_enabled);
     }
 }
