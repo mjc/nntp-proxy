@@ -198,14 +198,6 @@ impl ClientSession {
         } else {
             None
         };
-        if let Some(availability) = preloaded_availability.as_ref() {
-            self.spawn_non_primary_tier_stat_prefetch(
-                &router,
-                request,
-                availability,
-                SuppressedBackends::empty(),
-            );
-        }
         let availability = match self
             .prepare_request_execution(&router, request, &mut io, preloaded_availability)
             .await?
@@ -213,6 +205,14 @@ impl ClientSession {
             PreparedRequest::Served => return Ok(()),
             PreparedRequest::Continue { availability } => availability,
         };
+        if let Some(availability) = availability.as_ref() {
+            self.spawn_non_primary_tier_stat_prefetch(
+                &router,
+                request,
+                availability,
+                SuppressedBackends::empty(),
+            );
+        }
 
         self.execute_article_retry_loop(&router, request, availability, &mut io)
             .await
