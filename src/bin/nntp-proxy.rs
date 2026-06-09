@@ -3,6 +3,7 @@ use clap::Parser;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
@@ -77,6 +78,16 @@ async fn run_proxy(
     startup_tui: Option<tui::StartupTuiSession>,
 ) -> Result<()> {
     let launch = prepare_proxy_launch(&args, &config);
+    let response_write_metrics_period = config
+        .proxy
+        .response_write_metrics_secs
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs);
+    let client_writer_lock_metrics_period = config
+        .proxy
+        .client_writer_lock_metrics_secs
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs);
     args.common
         .validate_dashboard_listen(&launch.host, launch.port)?;
 
@@ -99,8 +110,8 @@ async fn run_proxy(
     );
     runtime::spawn_availability_saver(&proxy, launch.availability_path.clone());
     runtime::spawn_idle_connection_clearer(&proxy);
-    runtime::spawn_response_write_metrics_logger();
-    runtime::spawn_client_writer_lock_metrics_logger();
+    runtime::spawn_response_write_metrics_logger(response_write_metrics_period);
+    runtime::spawn_client_writer_lock_metrics_logger(client_writer_lock_metrics_period);
     runtime::spawn_tokio_runtime_metrics_logger();
 
     let (dashboard_handle, dashboard_shutdown_tx) =
@@ -135,10 +146,10 @@ async fn run_proxy(
 
     if let Err(e) = prewarm_result {
         if let Some(tx) = error_tui_shutdown_tx {
-            let _ = tx.send(()).await;
+            send_shutdown_signal(&tx);
         }
         if let Some(tx) = error_dashboard_shutdown_tx {
-            let _ = tx.send(()).await;
+            send_shutdown_signal(&tx);
         }
         if let Some(handle) = tui_handle {
             handle.await?;
@@ -182,18 +193,18 @@ async fn shutdown_background_tasks(
     dashboard_handle: Option<TuiHandle>,
 ) -> Result<()> {
     if let Some(tx) = tui_shutdown_tx {
-        let _ = tx.send(()).await;
+        send_shutdown_signal(&tx);
     }
     if let Some(tx) = dashboard_shutdown_tx {
-        let _ = tx.send(()).await;
+        send_shutdown_signal(&tx);
     }
 
     if let Some(handle) = tui_handle {
-        handle.await?;
+        await_ui_task_with_timeout(handle, "TUI").await?;
     }
 
     if let Some(handle) = dashboard_handle {
-        handle.await?;
+        await_ui_task_with_timeout(handle, "dashboard").await?;
     }
 
     Ok(())
@@ -352,13 +363,43 @@ fn spawn_signal_forwarder(
         info!("Shutdown signal received");
 
         if let Some(tx) = tui_shutdown_tx {
-            let _ = tx.send(()).await;
+            send_shutdown_signal(&tx);
         }
         if let Some(tx) = dashboard_shutdown_tx {
-            let _ = tx.send(()).await;
+            send_shutdown_signal(&tx);
         }
-        let _ = shutdown_tx.send(()).await;
+        send_shutdown_signal(&shutdown_tx);
     });
+}
+
+fn send_shutdown_signal(tx: &mpsc::Sender<()>) {
+    match tx.try_send(()) {
+        Ok(()) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {}
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+    }
+}
+
+async fn await_ui_task_with_timeout(handle: TuiHandle, label: &str) -> Result<()> {
+    match tokio::time::timeout(
+        nntp_proxy::constants::timeout::SHUTDOWN_UI_TASK_JOIN,
+        handle,
+    )
+    .await
+    {
+        Ok(join_result) => {
+            join_result?;
+            Ok(())
+        }
+        Err(_) => {
+            warn!(
+                task = label,
+                timeout_secs = nntp_proxy::constants::timeout::SHUTDOWN_UI_TASK_JOIN.as_secs(),
+                "Timed out waiting for UI task during shutdown"
+            );
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -367,6 +408,7 @@ mod tests {
     use nntp_proxy::config::Config;
     use nntp_proxy::types::Port;
     use std::path::PathBuf;
+    use tokio::sync::mpsc;
 
     fn test_common_args() -> CommonArgs {
         CommonArgs {
@@ -414,5 +456,15 @@ mod tests {
         assert_eq!(launch.port.get(), 9120);
         assert_eq!(launch.server_names, vec!["Primary".to_string()]);
         assert!(launch.metrics_store.is_none());
+    }
+
+    #[tokio::test]
+    async fn send_shutdown_signal_is_non_blocking_when_channel_is_full() {
+        let (tx, mut rx) = mpsc::channel::<()>(1);
+        tx.try_send(()).expect("fill channel");
+
+        send_shutdown_signal(&tx);
+
+        assert!(rx.recv().await.is_some());
     }
 }

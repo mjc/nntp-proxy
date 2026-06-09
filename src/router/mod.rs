@@ -43,6 +43,7 @@ use nutype::nutype;
 use std::cmp::Ordering as CmpOrdering;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tracing::{debug, info};
 
 use crate::cache::ArticleAvailability;
@@ -452,6 +453,14 @@ pub struct BackendSelector {
     sorted_tiers: smallvec::SmallVec<[u8; 4]>,
     /// Capacity-fair probe counter for the first availability-aware article attempt.
     initial_article_probe_counter: AtomicUsize,
+    /// Enable/disable per-connection queue-pressure filtering.
+    queue_backpressure_enabled: bool,
+    /// Soft threshold for queued requests per connection (percentage).
+    queue_backpressure_soft_waiters_per_connection_percent: u16,
+    /// Hard threshold for queued requests per connection (percentage).
+    queue_backpressure_hard_waiters_per_connection_percent: u16,
+    /// Delay to apply when all eligible backends in a tier are hard-saturated.
+    queue_backpressure_all_busy_sleep_ms: u64,
 }
 
 impl Default for BackendSelector {
@@ -461,6 +470,11 @@ impl Default for BackendSelector {
 }
 
 impl BackendSelector {
+    const DEFAULT_QUEUE_BACKPRESSURE_ENABLED: bool = true;
+    const DEFAULT_QUEUE_BACKPRESSURE_SOFT_WAITERS_PER_CONNECTION_PERCENT: u16 = 25;
+    const DEFAULT_QUEUE_BACKPRESSURE_HARD_WAITERS_PER_CONNECTION_PERCENT: u16 = 50;
+    const DEFAULT_QUEUE_BACKPRESSURE_ALL_BUSY_SLEEP_MS: u64 = 1;
+
     /// Find backend by ID
     ///
     /// Common helper to avoid repeating find logic across methods.
@@ -518,7 +532,36 @@ impl BackendSelector {
             strategy: selection_strategy,
             sorted_tiers: smallvec::SmallVec::new(),
             initial_article_probe_counter: AtomicUsize::new(0),
+            queue_backpressure_enabled: Self::DEFAULT_QUEUE_BACKPRESSURE_ENABLED,
+            queue_backpressure_soft_waiters_per_connection_percent:
+                Self::DEFAULT_QUEUE_BACKPRESSURE_SOFT_WAITERS_PER_CONNECTION_PERCENT,
+            queue_backpressure_hard_waiters_per_connection_percent:
+                Self::DEFAULT_QUEUE_BACKPRESSURE_HARD_WAITERS_PER_CONNECTION_PERCENT,
+            queue_backpressure_all_busy_sleep_ms:
+                Self::DEFAULT_QUEUE_BACKPRESSURE_ALL_BUSY_SLEEP_MS,
         }
+    }
+
+    /// Configure queue-pressure routing behavior.
+    #[must_use]
+    pub fn with_queue_backpressure(
+        mut self,
+        enabled: bool,
+        soft_waiters_per_connection_percent: u16,
+        hard_waiters_per_connection_percent: u16,
+        all_busy_sleep_ms: u64,
+    ) -> Self {
+        self.queue_backpressure_enabled = enabled;
+        self.queue_backpressure_soft_waiters_per_connection_percent =
+            soft_waiters_per_connection_percent;
+        self.queue_backpressure_hard_waiters_per_connection_percent =
+            if hard_waiters_per_connection_percent < soft_waiters_per_connection_percent {
+                soft_waiters_per_connection_percent
+            } else {
+                hard_waiters_per_connection_percent
+            };
+        self.queue_backpressure_all_busy_sleep_ms = all_busy_sleep_ms;
+        self
     }
 
     /// Add a backend server to the router
@@ -629,17 +672,53 @@ impl BackendSelector {
                 );
             }
 
+            let tier_has_non_over_hard_backend = self.queue_backpressure_enabled
+                && self.backends.iter().any(|backend| {
+                    if backend.tier != tier || !is_available(&backend) {
+                        return false;
+                    }
+                    let status = backend.provider.status_counts();
+                    let checked_out = status.size.saturating_sub(status.available);
+                    let pending = backend.pending_count.get();
+                    !self.exceeds_hard_queue_depth(
+                        pending,
+                        checked_out,
+                        status.waiting,
+                        status.max_size,
+                    )
+                });
+
             // Try to select from this specific tier
-            let tier_filter = |b: &&BackendInfo| b.tier == tier && is_available(b);
+            let tier_filter = |b: &&BackendInfo| {
+                if b.tier != tier || !is_available(b) {
+                    return false;
+                }
+                if !tier_has_non_over_hard_backend {
+                    return true;
+                }
+                let status = b.provider.status_counts();
+                let checked_out = status.size.saturating_sub(status.available);
+                let pending = b.pending_count.get();
+                !self.exceeds_hard_queue_depth(
+                    pending,
+                    checked_out,
+                    status.waiting,
+                    status.max_size,
+                )
+            };
 
             let selected = if availability
                 .is_some_and(|avail| !self.availability_missing_in_tier(avail, tier))
             {
-                self.select_capacity_weighted(tier_filter)
-                    .map(|backend| SelectedBackend {
-                        backend,
-                        pending_snapshot: None,
-                    })
+                match &self.strategy {
+                    SelectionStrategy::WeightedRoundRobin(_) => self
+                        .select_capacity_weighted(tier_filter)
+                        .map(|backend| SelectedBackend {
+                            backend,
+                            pending_snapshot: None,
+                        }),
+                    SelectionStrategy::LeastLoaded(_) => self.select_weighted(tier_filter),
+                }
             } else {
                 self.select_weighted(tier_filter)
             };
@@ -735,7 +814,8 @@ impl BackendSelector {
             let status = backend.provider.status_counts();
             let checked_out = status.size.saturating_sub(status.available);
             let pending = backend.pending_count.get();
-            let active_for_score = pending.max(checked_out);
+            let queue_depth = Self::queue_depth_for_score(pending, checked_out, status.waiting);
+            let active_for_score = Self::active_for_score(pending, checked_out, status.waiting);
             let load_ratio = if status.max_size > 0 {
                 active_for_score as f64 / status.max_size as f64
             } else {
@@ -752,6 +832,13 @@ impl BackendSelector {
                 availability_missing_bits,
                 pending,
                 checked_out,
+                queue_depth,
+                over_hard_backpressure = self.exceeds_hard_queue_depth(
+                    pending,
+                    checked_out,
+                    status.waiting,
+                    status.max_size
+                ),
                 active_for_score,
                 load_ratio,
                 pool_available = status.available,
@@ -764,16 +851,129 @@ impl BackendSelector {
         }
     }
 
+    /// Returns a short delay when the highest-priority eligible tier is fully hard-saturated.
+    #[must_use]
+    pub fn queue_backpressure_delay_for_article(
+        &self,
+        availability: &ArticleAvailability,
+        suppressed_backends: SuppressedBackends,
+    ) -> Option<Duration> {
+        if !self.queue_backpressure_enabled || self.queue_backpressure_all_busy_sleep_ms == 0 {
+            return None;
+        }
+
+        for &tier in &self.sorted_tiers {
+            let mut has_candidate = false;
+            let mut has_non_over_hard = false;
+            for backend in self.backends.iter().filter(|backend| backend.tier == tier) {
+                if suppressed_backends.contains(backend.id) || !availability.should_try(backend.id)
+                {
+                    continue;
+                }
+                has_candidate = true;
+                let status = backend.provider.status_counts();
+                let checked_out = status.size.saturating_sub(status.available);
+                let pending = backend.pending_count.get();
+                if !self.exceeds_hard_queue_depth(
+                    pending,
+                    checked_out,
+                    status.waiting,
+                    status.max_size,
+                ) {
+                    has_non_over_hard = true;
+                    break;
+                }
+            }
+
+            if has_candidate {
+                if has_non_over_hard {
+                    return None;
+                }
+                return Some(Duration::from_millis(
+                    self.queue_backpressure_all_busy_sleep_ms,
+                ));
+            }
+        }
+
+        None
+    }
+
+    #[inline]
+    fn queue_soft_pressure_penalty(
+        &self,
+        pending: usize,
+        checked_out: usize,
+        waiting: usize,
+        max_connections: usize,
+    ) -> usize {
+        if !self.queue_backpressure_enabled || max_connections == 0 {
+            return 0;
+        }
+        let queue_depth = Self::queue_depth_for_score(pending, checked_out, waiting);
+        let soft_limit = Self::queue_depth_limit(
+            max_connections,
+            self.queue_backpressure_soft_waiters_per_connection_percent,
+        );
+        queue_depth.saturating_sub(soft_limit)
+    }
+
+    #[inline]
+    fn exceeds_hard_queue_depth(
+        &self,
+        pending: usize,
+        checked_out: usize,
+        waiting: usize,
+        max_connections: usize,
+    ) -> bool {
+        if !self.queue_backpressure_enabled || max_connections == 0 {
+            return false;
+        }
+        let queue_depth = Self::queue_depth_for_score(pending, checked_out, waiting);
+        let hard_limit = Self::queue_depth_limit(
+            max_connections,
+            self.queue_backpressure_hard_waiters_per_connection_percent,
+        );
+        queue_depth > hard_limit
+    }
+
+    #[inline]
+    fn queue_depth_limit(max_connections: usize, per_connection_percent: u16) -> usize {
+        let product = max_connections.saturating_mul(usize::from(per_connection_percent));
+        (product + 99) / 100
+    }
+
+    #[inline]
+    const fn queue_depth_for_score(pending: usize, checked_out: usize, waiting: usize) -> usize {
+        Self::active_for_score(pending, checked_out, waiting).saturating_sub(checked_out)
+    }
+
     #[allow(clippy::cast_precision_loss)]
-    fn backend_load_ratio_with_pending(backend: &BackendInfo, pending: usize) -> LoadRatio {
+    fn backend_load_ratio_with_pending(&self, backend: &BackendInfo, pending: usize) -> LoadRatio {
         let status = backend.provider.status_counts();
         let max_conns = status.max_size as f64;
         if max_conns > 0.0 {
             let checked_out = status.size.saturating_sub(status.available);
-            let active = pending.max(checked_out) as f64;
+            let queue_penalty = self.queue_soft_pressure_penalty(
+                pending,
+                checked_out,
+                status.waiting,
+                status.max_size,
+            );
+            let waiting_for_score = status.waiting.saturating_add(queue_penalty);
+            let active = Self::active_for_score(pending, checked_out, waiting_for_score) as f64;
             LoadRatio::new(active / max_conns)
         } else {
             LoadRatio::MAX
+        }
+    }
+
+    #[inline]
+    const fn active_for_score(pending: usize, checked_out: usize, waiting: usize) -> usize {
+        let checked_out_with_waiters = checked_out.saturating_add(waiting);
+        if pending > checked_out_with_waiters {
+            pending
+        } else {
+            checked_out_with_waiters
         }
     }
 
@@ -825,7 +1025,7 @@ impl BackendSelector {
 
                 for backend in self.backends.iter().filter(&filter) {
                     let pending_snapshot = backend.pending_count.get();
-                    let load = Self::backend_load_ratio_with_pending(backend, pending_snapshot);
+                    let load = self.backend_load_ratio_with_pending(backend, pending_snapshot);
                     match load
                         .partial_cmp(&selected_load)
                         .unwrap_or(std::cmp::Ordering::Greater)
@@ -1219,8 +1419,70 @@ mod tests {
 
         assert_eq!(
             backend.backend_id(),
-            BackendId::from_index(1),
-            "first probe in newly eligible tier should be capacity-fair, not biased by load"
+            BackendId::from_index(2),
+            "least-loaded must honor load on the first probe in a newly eligible tier"
+        );
+    }
+
+    #[test]
+    fn active_for_score_accounts_for_pool_waiters() {
+        assert_eq!(BackendSelector::active_for_score(5, 40, 10), 50);
+        assert_eq!(BackendSelector::active_for_score(80, 40, 10), 80);
+        assert_eq!(
+            BackendSelector::active_for_score(0, usize::MAX, 1),
+            usize::MAX
+        );
+    }
+
+    #[test]
+    fn queue_depth_limit_scales_with_connection_count() {
+        assert_eq!(BackendSelector::queue_depth_limit(40, 25), 10);
+        assert_eq!(BackendSelector::queue_depth_limit(50, 25), 13);
+        assert_eq!(BackendSelector::queue_depth_limit(40, 50), 20);
+        assert_eq!(BackendSelector::queue_depth_limit(50, 50), 25);
+    }
+
+    #[test]
+    fn queue_depth_for_score_uses_pending_when_it_exceeds_pool_activity() {
+        assert_eq!(BackendSelector::queue_depth_for_score(20, 5, 2), 15);
+        assert_eq!(BackendSelector::queue_depth_for_score(3, 5, 2), 2);
+    }
+
+    #[test]
+    fn availability_routing_honors_least_loaded_when_no_missing_known() {
+        let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
+        for (name, max_connections) in [("tier0-a", 40), ("tier0-b", 50)] {
+            selector.add_backend(
+                ServerName::try_new(name.to_string()).unwrap(),
+                crate::pool::DeadpoolConnectionProvider::new(
+                    "localhost".to_string(),
+                    119,
+                    name.to_string(),
+                    max_connections,
+                    None,
+                    None,
+                ),
+                0,
+            );
+        }
+
+        // Simulate one backend already saturated while the other has headroom.
+        for _ in 0..75 {
+            selector.mark_backend_pending(BackendId::from_index(1));
+        }
+        for _ in 0..5 {
+            selector.mark_backend_pending(BackendId::from_index(0));
+        }
+
+        let availability = ArticleAvailability::new();
+        let backend = selector
+            .route(RouteRequest::new(ClientId::new()).with_availability(&availability))
+            .unwrap();
+
+        assert_eq!(
+            backend.backend_id(),
+            BackendId::from_index(0),
+            "availability routing should not bypass least-loaded when no misses are known"
         );
     }
 

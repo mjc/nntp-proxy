@@ -162,6 +162,12 @@ pub struct Proxy {
     /// Accepts tracing filter directives: "error", "warn", "info", "debug", "trace"
     #[serde(default = "super::defaults::log_file_level")]
     pub log_file_level: String,
+    /// Interval in seconds for response/hot-path metrics logging. `None` disables it.
+    #[serde(default = "super::defaults::response_write_metrics_secs")]
+    pub response_write_metrics_secs: Option<u64>,
+    /// Interval in seconds for client-writer lock contention logging. `None` disables it.
+    #[serde(default = "super::defaults::client_writer_lock_metrics_secs")]
+    pub client_writer_lock_metrics_secs: Option<u64>,
     /// Path to stats file for metric persistence (optional)
     /// When set, metrics are persisted to this file every 30 seconds and on shutdown
     /// Defaults to "stats.json" alongside the config file if not specified
@@ -188,6 +194,8 @@ impl Default for Proxy {
             threads: ThreadCount::default(),
             validate_yenc: true,
             log_file_level: defaults::log_file_level(),
+            response_write_metrics_secs: defaults::response_write_metrics_secs(),
+            client_writer_lock_metrics_secs: defaults::client_writer_lock_metrics_secs(),
             stats_file: None,
             routing_mode: RoutingMode::default(),
             backend_selection: BackendSelectionStrategy::default(),
@@ -210,6 +218,9 @@ pub struct Routing {
     /// Enable adaptive availability prechecking for STAT/HEAD commands (default: false)
     #[serde(default = "super::defaults::adaptive_precheck")]
     pub adaptive_precheck: bool,
+    /// Queue behavior for routing decisions.
+    #[serde(default)]
+    pub queue: RoutingQueue,
 }
 
 impl Default for Routing {
@@ -218,6 +229,54 @@ impl Default for Routing {
             routing_mode: RoutingMode::default(),
             backend_selection: BackendSelectionStrategy::default(),
             adaptive_precheck: defaults::adaptive_precheck(),
+            queue: RoutingQueue::default(),
+        }
+    }
+}
+
+/// Routing queue configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct RoutingQueue {
+    /// Queue-pressure based admission controls.
+    pub backpressure: QueueBackpressure,
+}
+
+impl Default for RoutingQueue {
+    fn default() -> Self {
+        Self {
+            backpressure: QueueBackpressure::default(),
+        }
+    }
+}
+
+/// Per-connection queue backpressure settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct QueueBackpressure {
+    /// Enable queue-pressure-aware backend filtering.
+    #[serde(default = "super::defaults::queue_backpressure_enabled")]
+    pub enabled: bool,
+    /// Soft queue-pressure threshold (queued requests per connection, percent).
+    #[serde(default = "super::defaults::queue_backpressure_soft_waiters_per_connection_percent")]
+    pub soft_waiters_per_connection_percent: u16,
+    /// Hard queue-pressure threshold (queued requests per connection, percent).
+    #[serde(default = "super::defaults::queue_backpressure_hard_waiters_per_connection_percent")]
+    pub hard_waiters_per_connection_percent: u16,
+    /// Sleep duration in milliseconds when all eligible backends in a tier are hard-saturated.
+    #[serde(default = "super::defaults::queue_backpressure_all_busy_sleep_ms")]
+    pub all_busy_sleep_ms: u64,
+}
+
+impl Default for QueueBackpressure {
+    fn default() -> Self {
+        Self {
+            enabled: defaults::queue_backpressure_enabled(),
+            soft_waiters_per_connection_percent:
+                defaults::queue_backpressure_soft_waiters_per_connection_percent(),
+            hard_waiters_per_connection_percent:
+                defaults::queue_backpressure_hard_waiters_per_connection_percent(),
+            all_busy_sleep_ms: defaults::queue_backpressure_all_busy_sleep_ms(),
         }
     }
 }
@@ -942,6 +1001,27 @@ mod tests {
             memory.capture_pool_count,
             crate::constants::buffer::CAPTURE_COUNT
         );
+    }
+
+    #[test]
+    fn test_routing_queue_backpressure_defaults() {
+        let routing = Routing::default();
+        assert!(routing.queue.backpressure.enabled);
+        assert_eq!(
+            routing
+                .queue
+                .backpressure
+                .soft_waiters_per_connection_percent,
+            25
+        );
+        assert_eq!(
+            routing
+                .queue
+                .backpressure
+                .hard_waiters_per_connection_percent,
+            50
+        );
+        assert_eq!(routing.queue.backpressure.all_busy_sleep_ms, 1);
     }
 
     // HealthCheck tests

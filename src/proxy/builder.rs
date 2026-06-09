@@ -182,6 +182,7 @@ impl NntpProxyBuilder {
         };
 
         let adaptive_precheck = self.config.routing.adaptive_precheck;
+        let queue_backpressure = self.config.routing.queue.backpressure.clone();
 
         let backend_strategy = self.config.routing.backend_selection;
         let cache_config = self.config.cache;
@@ -190,7 +191,13 @@ impl NntpProxyBuilder {
         let servers: Arc<[Server]> = self.config.servers.into();
 
         let router = Arc::new({
-            let mut r = router::BackendSelector::with_strategy(backend_strategy);
+            let mut r = router::BackendSelector::with_strategy(backend_strategy)
+                .with_queue_backpressure(
+                    queue_backpressure.enabled,
+                    queue_backpressure.soft_waiters_per_connection_percent,
+                    queue_backpressure.hard_waiters_per_connection_percent,
+                    queue_backpressure.all_busy_sleep_ms,
+                );
             for (idx, provider) in connection_providers.iter().enumerate() {
                 let backend_id = r.add_backend(
                     servers[idx].name.clone(),

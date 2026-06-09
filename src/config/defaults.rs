@@ -81,6 +81,34 @@ pub const fn adaptive_precheck() -> bool {
     false
 }
 
+/// Default routing queue backpressure toggle.
+#[inline]
+#[must_use]
+pub const fn queue_backpressure_enabled() -> bool {
+    true
+}
+
+/// Default soft queue-pressure limit per connection (percentage).
+#[inline]
+#[must_use]
+pub const fn queue_backpressure_soft_waiters_per_connection_percent() -> u16 {
+    25
+}
+
+/// Default hard queue-pressure limit per connection (percentage).
+#[inline]
+#[must_use]
+pub const fn queue_backpressure_hard_waiters_per_connection_percent() -> u16 {
+    50
+}
+
+/// Default delay (ms) before re-trying selection when all tier-local backends are overloaded.
+#[inline]
+#[must_use]
+pub const fn queue_backpressure_all_busy_sleep_ms() -> u64 {
+    1
+}
+
 /// Default socket receive buffer size
 #[inline]
 #[must_use]
@@ -209,4 +237,18 @@ pub const fn replacement_cooldown_option() -> Option<Duration> {
 #[inline]
 pub fn log_file_level() -> String {
     "warn".to_string()
+}
+
+/// Default disabled interval for response/hot-path metrics logger.
+#[inline]
+#[allow(clippy::unnecessary_wraps)] // Optional config field uses None as disabled default.
+pub const fn response_write_metrics_secs() -> Option<u64> {
+    None
+}
+
+/// Default disabled interval for client-writer lock metrics logger.
+#[inline]
+#[allow(clippy::unnecessary_wraps)] // Optional config field uses None as disabled default.
+pub const fn client_writer_lock_metrics_secs() -> Option<u64> {
+    None
 }

@@ -170,6 +170,11 @@ impl ResponseRetention {
 }
 
 impl ClientSession {
+    #[inline]
+    const fn should_reuse_cached_batch_connection() -> bool {
+        true
+    }
+
     pub(super) fn retry_backend_provider<'a>(
         &self,
         router: &'a BackendSelector,
@@ -204,6 +209,11 @@ impl ClientSession {
         state: &mut ArticleAttemptState<'_>,
         is_retry_attempt: bool,
     ) -> Result<BackendAttemptResult, SessionError> {
+        if let Some(delay) = router
+            .queue_backpressure_delay_for_article(state.availability, *state.unavailable_backends)
+        {
+            tokio::time::sleep(delay).await;
+        }
         let route_request = crate::router::RouteRequest::new(self.client_id)
             .with_availability(state.availability)
             .suppressing_backends(*state.unavailable_backends);
@@ -647,93 +657,7 @@ impl ClientSession {
         );
         let guard = match backend_connection.take() {
             Some((cached_backend_id, guard)) if cached_backend_id == backend_id => {
-                let checkout_status = provider.status_counts();
-                if checkout_status.available == 0
-                    && checkout_status.size >= checkout_status.max_size
-                {
-                    debug!(
-                        client = %self.client_addr,
-                        backend = backend_id.as_index(),
-                        command_verb = ?request.verb(),
-                        msg_id = ?request.message_id_value(),
-                        pool = %provider.name(),
-                        pool_available = checkout_status.available,
-                        pool_size = checkout_status.size,
-                        pool_max_size = checkout_status.max_size,
-                        pool_waiting = checkout_status.waiting,
-                        connection_type = guard.connection_type(),
-                        pending_bytes = guard.pending_bytes_len(),
-                        "Reusing backend connection for direct backend attempt because pool capacity is fully checked out"
-                    );
-                    guard
-                } else if checkout_status.available == 0 {
-                    debug!(
-                        client = %self.client_addr,
-                        backend = backend_id.as_index(),
-                        command_verb = ?request.verb(),
-                        msg_id = ?request.message_id_value(),
-                        pool = %provider.name(),
-                        pool_available = checkout_status.available,
-                        pool_size = checkout_status.size,
-                        pool_max_size = checkout_status.max_size,
-                        pool_waiting = checkout_status.waiting,
-                        connection_type = guard.connection_type(),
-                        pending_bytes = guard.pending_bytes_len(),
-                        "Checking out another backend connection before returning cached batch connection"
-                    );
-                    let released = guard.release();
-                    match provider.get_pooled_connection().await {
-                        Ok(conn) => {
-                            drop(released);
-                            let checkout_status = provider.status_counts();
-                            debug!(
-                                client = %self.client_addr,
-                                backend = backend_id.as_index(),
-                                command_verb = ?request.verb(),
-                                msg_id = ?request.message_id_value(),
-                                pool = %provider.name(),
-                                pool_available = checkout_status.available,
-                                pool_size = checkout_status.size,
-                                pool_max_size = checkout_status.max_size,
-                                pool_waiting = checkout_status.waiting,
-                                connection_type = conn.connection_type(),
-                                pending_bytes = conn.pending_bytes_len(),
-                                "Pool checkout succeeded for direct backend attempt"
-                            );
-                            crate::pool::ConnectionGuard::new(conn, provider.clone())
-                        }
-                        Err(err) => {
-                            debug!(
-                                client = %self.client_addr,
-                                backend = backend_id.as_index(),
-                                command_verb = ?request.verb(),
-                                msg_id = ?request.message_id_value(),
-                                pool = %provider.name(),
-                                error = %err,
-                                connection_type = released.connection_type(),
-                                pending_bytes = released.pending_bytes_len(),
-                                "Pool checkout failed; reusing cached batch connection for direct backend attempt"
-                            );
-                            crate::pool::ConnectionGuard::new(released, provider.clone())
-                        }
-                    }
-                } else {
-                    debug!(
-                        client = %self.client_addr,
-                        backend = backend_id.as_index(),
-                        command_verb = ?request.verb(),
-                        msg_id = ?request.message_id_value(),
-                        pool = %provider.name(),
-                        pool_available = checkout_status.available,
-                        pool_size = checkout_status.size,
-                        pool_max_size = checkout_status.max_size,
-                        pool_waiting = checkout_status.waiting,
-                        connection_type = guard.connection_type(),
-                        pending_bytes = guard.pending_bytes_len(),
-                        "Releasing cached batch connection because backend pool has idle capacity"
-                    );
-                    let _ = guard.release();
-                    let conn = provider.get_pooled_connection().await?;
+                if Self::should_reuse_cached_batch_connection() {
                     let checkout_status = provider.status_counts();
                     debug!(
                         client = %self.client_addr,
@@ -745,11 +669,13 @@ impl ClientSession {
                         pool_size = checkout_status.size,
                         pool_max_size = checkout_status.max_size,
                         pool_waiting = checkout_status.waiting,
-                        connection_type = conn.connection_type(),
-                        pending_bytes = conn.pending_bytes_len(),
-                        "Pool checkout succeeded for direct backend attempt"
+                        connection_type = guard.connection_type(),
+                        pending_bytes = guard.pending_bytes_len(),
+                        "Reusing cached batch connection for direct backend attempt"
                     );
-                    crate::pool::ConnectionGuard::new(conn, provider.clone())
+                    guard
+                } else {
+                    unreachable!("cached batch connection reuse should remain enabled");
                 }
             }
             Some(cached) => {
@@ -1765,7 +1691,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stat_missing_probe_short_circuits_body_fetch_on_430() {
+    async fn stat_missing_probe_is_skipped_on_first_attempt() {
         let session = test_session();
         let (port, stat_commands, body_commands) = spawn_stat_missing_probe_server().await;
         let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
@@ -1790,22 +1716,38 @@ mod tests {
         };
 
         let result = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, true)
+            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, false)
             .await
-            .expect("STAT 430 probe should be handled without transport error");
+            .expect("first attempt should be handled without transport error");
 
-        assert!(matches!(
-            result,
-            BackendAttemptResult::ArticleNotFound { missing }
-                if missing.backend_id() == BackendId::from_index(0)
-        ));
-        assert_eq!(stat_commands.load(Ordering::SeqCst), 1);
+        assert!(matches!(result, BackendAttemptResult::Success));
+        assert_eq!(stat_commands.load(Ordering::SeqCst), 0);
         assert_eq!(
             body_commands.load(Ordering::SeqCst),
-            0,
-            "BODY should not be sent when STAT probe returns 430"
+            1,
+            "first attempt should go directly to BODY/ARTICLE/HEAD without STAT probe"
         );
-        assert!(availability.is_missing(BackendId::from_index(0)));
+    }
+
+    #[test]
+    fn stat_missing_probe_requires_retry_state() {
+        let request = request_context(b"BODY <missing@example.com>\r\n");
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", 119)
+            .stat_missing(true)
+            .build()
+            .expect("provider should build");
+
+        assert!(!super::ClientSession::should_use_stat_missing_probe(
+            &provider, &request, false,
+        ));
+        assert!(super::ClientSession::should_use_stat_missing_probe(
+            &provider, &request, true,
+        ));
+    }
+
+    #[test]
+    fn direct_checkout_prefers_cached_batch_connection() {
+        assert!(super::ClientSession::should_reuse_cached_batch_connection());
     }
 
     #[tokio::test]
@@ -2190,9 +2132,15 @@ mod tests {
             unavailable_backends: &mut unavailable_backends,
         };
 
-        for expected_mask in [0b0000_0001, 0b0000_0011] {
+        for (index, expected_mask) in [0b0000_0001, 0b0000_0011].into_iter().enumerate() {
             let result = session
-                .try_backend_for_article(&router, &mut request, &client_writer, &mut state, true)
+                .try_backend_for_article(
+                    &router,
+                    &mut request,
+                    &client_writer,
+                    &mut state,
+                    index > 0,
+                )
                 .await
                 .expect("invalid response should be handled");
             assert!(matches!(result, BackendAttemptResult::BackendUnavailable));
