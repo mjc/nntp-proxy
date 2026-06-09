@@ -335,8 +335,14 @@ impl ClientSession {
             "Preparing direct backend attempt"
         );
         let (conn, read_status, buffer, timings) = match retry_once!(
-            self.execute_backend_attempt(provider, backend, request, state.backend_connection)
-                .await,
+            self.execute_backend_attempt(
+                provider,
+                backend,
+                request,
+                state.backend_connection,
+                state.availability.has_availability_info(),
+            )
+            .await,
             client = self.client_addr,
             backend = backend_id.as_index()
         ) {
@@ -834,6 +840,7 @@ impl ClientSession {
         backend: &ArticleBackend,
         request: &RequestContext,
         backend_connection: &mut Option<(BackendId, crate::pool::ConnectionGuard)>,
+        stat_probe_retry_only: bool,
     ) -> Result<ExecutedBackendAttempt> {
         let backend_id = backend.backend_id();
         let mut guard = self
@@ -850,7 +857,11 @@ impl ClientSession {
         );
         let result = self
             .execute_and_read_response_with_optional_stat_probe(
-                &mut guard, provider, backend, request,
+                &mut guard,
+                provider,
+                backend,
+                request,
+                stat_probe_retry_only,
             )
             .await;
 
@@ -912,8 +923,10 @@ impl ClientSession {
     fn should_use_stat_missing_probe(
         provider: &crate::pool::DeadpoolConnectionProvider,
         request: &RequestContext,
+        stat_probe_retry_only: bool,
     ) -> bool {
         provider.stat_missing_enabled()
+            && stat_probe_retry_only
             && request.has_message_id()
             && !request.is_stat()
             && matches!(
@@ -935,8 +948,9 @@ impl ClientSession {
         provider: &crate::pool::DeadpoolConnectionProvider,
         backend: &ArticleBackend,
         request: &RequestContext,
+        stat_probe_retry_only: bool,
     ) -> Result<BackendReadAttempt, BackendReadAttemptError> {
-        if !Self::should_use_stat_missing_probe(provider, request) {
+        if !Self::should_use_stat_missing_probe(provider, request, stat_probe_retry_only) {
             return self.execute_and_read_response(conn, backend, request).await;
         }
 
@@ -1754,6 +1768,7 @@ mod tests {
 
         let mut request = request_context(b"BODY <missing@example.com>\r\n");
         let mut availability = ArticleAvailability::new();
+        availability.record_missing(BackendId::from_index(1));
         let mut client_to_backend_bytes = ClientToBackendBytes::zero();
         let mut backend_connection = None;
         let mut unavailable_backends = SuppressedBackends::empty();
@@ -1781,6 +1796,45 @@ mod tests {
             "BODY should not be sent when STAT probe returns 430"
         );
         assert!(availability.is_missing(BackendId::from_index(0)));
+    }
+
+    #[tokio::test]
+    async fn first_attempt_skips_stat_missing_probe() {
+        let session = test_session();
+        let (port, stat_commands, body_commands) = spawn_stat_missing_probe_server().await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .stat_missing(true)
+            .build()
+            .unwrap();
+        let router = router_with_backend(provider);
+        let (client_writer, _client_read, _client_write) = shared_client_writer_pair().await;
+
+        let mut request = request_context(b"BODY <missing@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+        };
+
+        let result = session
+            .try_backend_for_article(&router, &mut request, &client_writer, &mut state)
+            .await
+            .expect("first BODY attempt should complete without transport error");
+
+        assert!(matches!(result, BackendAttemptResult::Success));
+        assert_eq!(
+            stat_commands.load(Ordering::SeqCst),
+            0,
+            "STAT probe is retry-only and should not run on first attempt"
+        );
+        assert_eq!(body_commands.load(Ordering::SeqCst), 1);
+        assert!(!availability.is_missing(BackendId::from_index(0)));
     }
 
     #[tokio::test]

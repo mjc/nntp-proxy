@@ -359,6 +359,12 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
             .unwrap_or_else(|_| panic!("Invalid tier in {tier_key}: '{tier_str}' (must be 0-255)"))
     });
 
+    let stat_missing_key = format!("NNTP_SERVER_{index}_STAT_MISSING");
+    let stat_missing = env
+        .get(&stat_missing_key)
+        .and_then(|value| value.parse::<u8>().ok())
+        .unwrap_or_else(defaults::stat_missing);
+
     Some(Server {
         host: crate::types::HostName::try_new(host.clone())
             .unwrap_or_else(|_| panic!("Invalid hostname in {host_key}: '{host}'")),
@@ -369,7 +375,7 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         username,
         password,
         max_connections,
-        stat_missing: defaults::stat_missing(),
+        stat_missing,
         use_tls,
         tls_verify_cert,
         tls_cert_path,
@@ -865,6 +871,26 @@ mod tests {
         let server = parse_server_from_env(0, &env).unwrap();
         assert!(server.use_tls);
         assert!(!server.tls_verify_cert);
+    }
+
+    #[test]
+    fn test_parse_server_from_env_stat_missing() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_0_STAT_MISSING", "3");
+
+        let server = parse_server_from_env(0, &env).unwrap();
+        assert_eq!(server.stat_missing, 3);
+    }
+
+    #[test]
+    fn test_parse_server_from_env_invalid_stat_missing_uses_default() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_0_STAT_MISSING", "not_a_number");
+
+        let server = parse_server_from_env(0, &env).unwrap();
+        assert_eq!(server.stat_missing, defaults::stat_missing());
     }
 
     #[test]
