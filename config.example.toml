@@ -35,6 +35,8 @@ username = "your_username"
 password = "your_password"
 max_connections = 20
 tier = 0
+# Probe misses with STAT before ARTICLE/BODY/HEAD on this backend (0=off, non-zero=on)
+stat_missing = 1
 use_tls = false
 tls_verify_cert = true
 
@@ -48,6 +50,8 @@ username = "your_username"
 password = "your_password"
 max_connections = 10
 tier = 1
+# Enable STAT miss probes on non-primary tiers to prefill availability while tier 0 fetch runs.
+stat_missing = 1
 connection_keepalive = 60
 use_tls = true
 tls_verify_cert = true

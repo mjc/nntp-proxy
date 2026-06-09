@@ -187,13 +187,32 @@ impl ClientSession {
             client_to_backend_bytes,
             backend_to_client_bytes,
         };
+        let preloaded_availability = if request.message_id_value().is_some() {
+            Some(
+                self.load_article_availability(
+                    request.message_id_value().as_ref(),
+                    router.backend_count(),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
         let availability = match self
-            .prepare_request_execution(&router, request, &mut io)
+            .prepare_request_execution(&router, request, &mut io, preloaded_availability)
             .await?
         {
             PreparedRequest::Served => return Ok(()),
             PreparedRequest::Continue { availability } => availability,
         };
+        if let Some(availability) = availability.as_ref() {
+            self.spawn_non_primary_tier_stat_prefetch(
+                &router,
+                request,
+                availability,
+                SuppressedBackends::empty(),
+            );
+        }
 
         self.execute_article_retry_loop(&router, request, availability, &mut io)
             .await
@@ -219,6 +238,7 @@ impl ClientSession {
         router: &Arc<BackendSelector>,
         request: &mut RequestContext,
         io: &mut RequestExecutionIo<'_>,
+        preloaded_availability: Option<ArticleAvailability>,
     ) -> Result<PreparedRequest, SessionError> {
         let availability = {
             let mut client_write = io.client_writer.lock().await;
@@ -238,16 +258,20 @@ impl ClientSession {
                 CacheLookupResult::Miss => None,
             }
         };
-        let availability = match availability {
-            Some(availability) => Some(availability),
-            None if request.message_id_value().is_some() => Some(
+        let availability = if let Some(availability) = availability {
+            Some(availability)
+        } else if let Some(availability) = preloaded_availability {
+            Some(availability)
+        } else if request.message_id_value().is_some() {
+            Some(
                 self.load_article_availability(
                     request.message_id_value().as_ref(),
                     router.backend_count(),
                 )
                 .await,
-            ),
-            None => None,
+            )
+        } else {
+            None
         };
         if self
             .try_adaptive_precheck(router, request, io, availability.as_ref())
