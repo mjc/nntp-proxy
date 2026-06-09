@@ -350,6 +350,7 @@ fn test_mixed_zero_and_nonzero_weights() {
             .route(nntp_proxy::router::RouteRequest::new(ClientId::new()))
             .unwrap();
         assert_eq!(backend.as_index(), 1);
+        selector.complete_command(backend);
     }
 }
 
