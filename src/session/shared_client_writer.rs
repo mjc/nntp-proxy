@@ -99,8 +99,18 @@ impl SharedClientWriter {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
+    fn metrics_flag_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
     #[test]
     fn writer_lock_metrics_flag_is_runtime_configurable() {
+        let _guard = metrics_flag_test_lock()
+            .lock()
+            .expect("metrics flag test lock should not be poisoned");
         let was_enabled = super::client_writer_lock_metrics_enabled();
         super::set_client_writer_lock_metrics_enabled(!was_enabled);
         assert_eq!(super::client_writer_lock_metrics_enabled(), !was_enabled);

@@ -187,14 +187,14 @@ fn init_tui_subscriber(
 
 /// Initialize logging with dual output for legacy headless call sites.
 ///
-/// Headless mode logs to line-buffered stdout only.
+/// Headless mode logs to non-blocking stdout only.
 pub fn init_dual_logging(file_level: &str) {
     let _ = init_logging(UiMode::Headless, file_level, false, false);
 }
 
 /// Initialize logging for the unified binary.
 ///
-/// Headless mode logs to line-buffered stdout only.
+/// Headless mode logs to non-blocking stdout only.
 /// TUI mode logs to the in-memory TUI buffer and may also mirror to `debug.log`
 /// when explicitly enabled for local debugging sessions.
 #[must_use]

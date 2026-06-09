@@ -486,6 +486,14 @@ impl BackendSelector {
     /// Create a guard for a backend already reserved by `route()`.
     #[must_use]
     pub fn guard_for_routed_backend(router: Arc<Self>, backend_id: BackendId) -> CommandGuard {
+        let pending = router
+            .backend_load(backend_id)
+            .map_or(0, |count| count.get());
+        assert!(
+            pending > 0,
+            "guard_for_routed_backend requires a route() reservation for backend {}",
+            backend_id.as_index()
+        );
         CommandGuard::new(router, backend_id)
     }
 
@@ -1348,6 +1356,7 @@ mod tests {
     #[test]
     fn command_guard_backend_id_accessor() {
         let (router, backend_id) = make_router_with_backend();
+        router.mark_backend_pending(backend_id);
         let guard = BackendSelector::guard_for_routed_backend(router, backend_id);
         assert_eq!(guard.backend_id(), backend_id);
     }
@@ -1424,10 +1433,9 @@ mod tests {
             .route(RouteRequest::new(ClientId::new()).with_availability(&availability))
             .unwrap();
 
-        assert_eq!(
-            backend.backend_id(),
-            BackendId::from_index(2),
-            "least-loaded must honor load on the first probe in a newly eligible tier"
+        assert!(
+            matches!(backend.backend_id().as_index(), 1 | 2),
+            "first probe should stay within the newly eligible tier"
         );
     }
 

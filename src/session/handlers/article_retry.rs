@@ -412,6 +412,9 @@ impl ClientSession {
                 )
                 .await?;
                 retry_stat_sweep_done = true;
+                if availability.all_exhausted(router.backend_count()) {
+                    break;
+                }
             }
 
             let attempt = self
