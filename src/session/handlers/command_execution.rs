@@ -202,6 +202,7 @@ impl ClientSession {
         request: &mut RequestContext,
         client_writer: &crate::session::SharedClientWriter,
         state: &mut ArticleAttemptState<'_>,
+        is_retry_attempt: bool,
     ) -> Result<BackendAttemptResult, SessionError> {
         let route_request = crate::router::RouteRequest::new(self.client_id)
             .with_availability(state.availability)
@@ -234,7 +235,7 @@ impl ClientSession {
         };
 
         let Some((mut conn, status_code, buffer)) = self
-            .prepare_backend_attempt(provider, &backend, request, state)
+            .prepare_backend_attempt(provider, &backend, request, state, is_retry_attempt)
             .await?
         else {
             return Ok(BackendAttemptResult::BackendUnavailable);
@@ -323,6 +324,7 @@ impl ClientSession {
         backend: &ArticleBackend,
         request: &RequestContext,
         state: &mut ArticleAttemptState<'_>,
+        is_retry_attempt: bool,
     ) -> Result<PreparedBackendAttempt, SessionError> {
         let backend_id = backend.backend_id();
         let request_wire_len = request.request_wire_len().get();
@@ -335,8 +337,14 @@ impl ClientSession {
             "Preparing direct backend attempt"
         );
         let (conn, read_status, buffer, timings) = match retry_once!(
-            self.execute_backend_attempt(provider, backend, request, state.backend_connection)
-                .await,
+            self.execute_backend_attempt(
+                provider,
+                backend,
+                request,
+                state.backend_connection,
+                is_retry_attempt,
+            )
+            .await,
             client = self.client_addr,
             backend = backend_id.as_index()
         ) {
@@ -834,6 +842,7 @@ impl ClientSession {
         backend: &ArticleBackend,
         request: &RequestContext,
         backend_connection: &mut Option<(BackendId, crate::pool::ConnectionGuard)>,
+        stat_probe_retry_only: bool,
     ) -> Result<ExecutedBackendAttempt> {
         let backend_id = backend.backend_id();
         let mut guard = self
@@ -849,7 +858,13 @@ impl ClientSession {
             "Sending request to backend and waiting for classifiable response bytes"
         );
         let result = self
-            .execute_and_read_response(&mut guard, backend, request)
+            .execute_and_read_response_with_optional_stat_probe(
+                &mut guard,
+                provider,
+                backend,
+                request,
+                stat_probe_retry_only,
+            )
             .await;
 
         match result {
@@ -904,6 +919,74 @@ impl ClientSession {
         );
 
         Ok((response, buffer, timings))
+    }
+
+    #[inline]
+    fn should_use_stat_missing_probe(
+        provider: &crate::pool::DeadpoolConnectionProvider,
+        request: &RequestContext,
+        stat_probe_retry_only: bool,
+    ) -> bool {
+        provider.stat_missing_enabled()
+            && stat_probe_retry_only
+            && request.has_message_id()
+            && !request.is_stat()
+            && matches!(
+                request.kind(),
+                RequestKind::Article | RequestKind::Body | RequestKind::Head
+            )
+    }
+
+    #[inline]
+    fn stat_probe_request(request: &RequestContext) -> Option<RequestContext> {
+        request
+            .has_message_id()
+            .then(|| RequestContext::from_verb_args(b"STAT", request.args()))
+    }
+
+    async fn execute_and_read_response_with_optional_stat_probe(
+        &self,
+        conn: &mut crate::stream::ConnectionStream,
+        provider: &crate::pool::DeadpoolConnectionProvider,
+        backend: &ArticleBackend,
+        request: &RequestContext,
+        stat_probe_retry_only: bool,
+    ) -> Result<BackendReadAttempt, BackendReadAttemptError> {
+        if !Self::should_use_stat_missing_probe(provider, request, stat_probe_retry_only) {
+            return self.execute_and_read_response(conn, backend, request).await;
+        }
+
+        let Some(stat_request) = Self::stat_probe_request(request) else {
+            return self.execute_and_read_response(conn, backend, request).await;
+        };
+
+        debug!(
+            client = %self.client_addr,
+            backend = backend.backend_id().as_index(),
+            command_verb = ?request.verb(),
+            msg_id = ?request.message_id_value(),
+            "Running STAT miss probe before backend article fetch"
+        );
+        let (probe_response, probe_buffer, probe_timings) = self
+            .execute_and_read_response(conn, backend, &stat_request)
+            .await?;
+        if probe_response
+            .status_code()
+            .is_some_and(|status| status.as_u16() == 430)
+        {
+            debug!(
+                client = %self.client_addr,
+                backend = backend.backend_id().as_index(),
+                command_verb = ?request.verb(),
+                msg_id = ?request.message_id_value(),
+                "STAT miss probe returned 430; skipping backend article fetch"
+            );
+            return Ok((probe_response, probe_buffer, probe_timings));
+        }
+
+        drop(probe_buffer);
+        let _ = probe_timings;
+        self.execute_and_read_response(conn, backend, request).await
     }
 
     /// Write response from backend to client and handle caching.
@@ -1354,6 +1437,59 @@ mod tests {
         (port, article_commands)
     }
 
+    async fn spawn_stat_missing_probe_server() -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stat_commands = Arc::new(AtomicUsize::new(0));
+        let body_commands = Arc::new(AtomicUsize::new(0));
+        let stat_count = Arc::clone(&stat_commands);
+        let body_count = Arc::clone(&body_commands);
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let stat_count = Arc::clone(&stat_count);
+                let body_count = Arc::clone(&body_count);
+                tokio::spawn(async move {
+                    let (read_half, mut write_half) = stream.into_split();
+                    let mut reader = BufReader::new(read_half);
+
+                    if write_half.write_all(b"200 Ready\r\n").await.is_err() {
+                        return;
+                    }
+
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                let cmd = line.trim().to_ascii_uppercase();
+                                if cmd.starts_with("MODE") {
+                                    let _ = write_half.write_all(b"200 Posting allowed\r\n").await;
+                                } else if cmd.starts_with("STAT ") {
+                                    stat_count.fetch_add(1, Ordering::SeqCst);
+                                    let _ = write_half.write_all(b"430 Missing\r\n").await;
+                                } else if cmd.starts_with("BODY") || cmd.starts_with("ARTICLE") {
+                                    body_count.fetch_add(1, Ordering::SeqCst);
+                                    let _ = write_half.write_all(
+                                        b"222 0 <found@example.com> body follows\r\npayload\r\n.\r\n",
+                                    ).await;
+                                } else if cmd.starts_with("QUIT") {
+                                    let _ = write_half.write_all(b"205 Goodbye\r\n").await;
+                                    break;
+                                } else {
+                                    let _ = write_half.write_all(b"200 OK\r\n").await;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        (port, stat_commands, body_commands)
+    }
+
     async fn spawn_article_response_then_close_server(
         response: &'static [u8],
     ) -> (u16, Arc<AtomicUsize>) {
@@ -1605,7 +1741,13 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            session.try_backend_for_article(&router, &mut request, &client_writer, &mut state),
+            session.try_backend_for_article(
+                &router,
+                &mut request,
+                &client_writer,
+                &mut state,
+                false,
+            ),
         )
         .await
         .expect("430 probe should not wait for the client writer lock")
@@ -1620,6 +1762,89 @@ mod tests {
         assert_eq!(article_commands.load(Ordering::SeqCst), 1);
 
         drop(held_writer);
+    }
+
+    #[tokio::test]
+    async fn stat_missing_probe_short_circuits_body_fetch_on_430() {
+        let session = test_session();
+        let (port, stat_commands, body_commands) = spawn_stat_missing_probe_server().await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .stat_missing(true)
+            .build()
+            .unwrap();
+        let router = router_with_backend(provider);
+        let (client_writer, _client_read, _client_write) = shared_client_writer_pair().await;
+
+        let mut request = request_context(b"BODY <missing@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        availability.record_missing(BackendId::from_index(1));
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+        };
+
+        let result = session
+            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, true)
+            .await
+            .expect("STAT 430 probe should be handled without transport error");
+
+        assert!(matches!(
+            result,
+            BackendAttemptResult::ArticleNotFound { missing }
+                if missing.backend_id() == BackendId::from_index(0)
+        ));
+        assert_eq!(stat_commands.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            body_commands.load(Ordering::SeqCst),
+            0,
+            "BODY should not be sent when STAT probe returns 430"
+        );
+        assert!(availability.is_missing(BackendId::from_index(0)));
+    }
+
+    #[tokio::test]
+    async fn first_attempt_skips_stat_missing_probe() {
+        let session = test_session();
+        let (port, stat_commands, body_commands) = spawn_stat_missing_probe_server().await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .stat_missing(true)
+            .build()
+            .unwrap();
+        let router = router_with_backend(provider);
+        let (client_writer, _client_read, _client_write) = shared_client_writer_pair().await;
+
+        let mut request = request_context(b"BODY <missing@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+        };
+
+        let result = session
+            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, false)
+            .await
+            .expect("first BODY attempt should complete without transport error");
+
+        assert!(matches!(result, BackendAttemptResult::Success));
+        assert_eq!(
+            stat_commands.load(Ordering::SeqCst),
+            0,
+            "STAT probe is retry-only and should not run on first attempt"
+        );
+        assert_eq!(body_commands.load(Ordering::SeqCst), 1);
+        assert!(!availability.is_missing(BackendId::from_index(0)));
     }
 
     #[tokio::test]
@@ -1684,7 +1909,13 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            session.try_backend_for_article(&router, &mut request, &client_writer, &mut state),
+            session.try_backend_for_article(
+                &router,
+                &mut request,
+                &client_writer,
+                &mut state,
+                false,
+            ),
         )
         .await
         .expect("invalid response attempt should not hang")
@@ -1722,7 +1953,13 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(1),
-            session.try_backend_for_article(&router, &mut request, &client_writer, &mut state),
+            session.try_backend_for_article(
+                &router,
+                &mut request,
+                &client_writer,
+                &mut state,
+                false,
+            ),
         )
         .await
         .expect("connection failure attempt should not hang")
@@ -1772,7 +2009,7 @@ mod tests {
         };
 
         let first = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state)
+            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, false)
             .await
             .expect("invalid response should be handled");
         assert!(matches!(first, BackendAttemptResult::BackendUnavailable));
@@ -1781,7 +2018,7 @@ mod tests {
         assert_eq!(state.unavailable_backends.bits(), 0b0000_0001);
 
         let second = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state)
+            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, true)
             .await
             .expect("same-tier retry should succeed");
         assert!(matches!(second, BackendAttemptResult::Success));
@@ -1839,7 +2076,7 @@ mod tests {
         };
 
         let first = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state)
+            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, false)
             .await;
         assert!(matches!(first, Err(SessionError::Backend(_))));
         assert_eq!(state.availability.missing_bits(), 0);
@@ -1847,7 +2084,7 @@ mod tests {
         assert_eq!(state.unavailable_backends.bits(), 0b0000_0001);
 
         let second = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state)
+            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, true)
             .await
             .expect("same-tier retry should continue after backend EOF");
         assert!(matches!(second, BackendAttemptResult::Success));
@@ -1955,7 +2192,7 @@ mod tests {
 
         for expected_mask in [0b0000_0001, 0b0000_0011] {
             let result = session
-                .try_backend_for_article(&router, &mut request, &client_writer, &mut state)
+                .try_backend_for_article(&router, &mut request, &client_writer, &mut state, true)
                 .await
                 .expect("invalid response should be handled");
             assert!(matches!(result, BackendAttemptResult::BackendUnavailable));
@@ -1963,7 +2200,7 @@ mod tests {
         }
 
         let exhausted = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state)
+            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, true)
             .await
             .expect("tier exhaustion should be reported without transport failure");
         assert!(matches!(
@@ -2007,6 +2244,7 @@ mod tests {
             &mut request,
             &client_writer,
             &mut state,
+            true,
         ));
         tokio::time::timeout(Duration::from_secs(1), async {
             while article_commands.load(Ordering::SeqCst) == 0 {
