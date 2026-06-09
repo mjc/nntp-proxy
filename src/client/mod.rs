@@ -37,13 +37,10 @@
 //! # fn process(_: &[u8]) {}
 //! ```
 
-use anyhow::{Context, Result};
-use deadpool::managed::Object;
-
-use crate::pool::deadpool_connection::TcpManager;
-use crate::pool::{BufferPool, DeadpoolConnectionProvider, PooledBuffer};
+use crate::pool::{BufferPool, ConnectionGuard, DeadpoolConnectionProvider, PooledBuffer};
 use crate::protocol::{RequestContext, article_request, body_request, head_request, stat_request};
-use crate::session::backend::send_request;
+use crate::session::backend::execute_request_classified;
+use anyhow::{Context, Result};
 
 /// Standalone NNTP client for fetching articles
 ///
@@ -140,12 +137,12 @@ impl NntpClient {
         let request = stat_request(message_id);
         let mut conn = self
             .conn_pool
-            .get_pooled_connection()
+            .checkout_connection_guard()
             .await
             .context("Failed to get connection from pool")?;
         let mut buffer = self.buffer_pool.acquire();
 
-        let response = send_request(&mut *conn, &request, &mut buffer).await?;
+        let response = execute_request_classified(&mut **conn, &request, &mut buffer).await?;
         let Some(status_code) = response.status_code() else {
             anyhow::bail!("Invalid STAT response");
         };
@@ -171,12 +168,12 @@ impl NntpClient {
     async fn fetch_response(&self, request: RequestContext) -> Result<PooledBuffer> {
         let mut conn = self
             .conn_pool
-            .get_pooled_connection()
+            .checkout_connection_guard()
             .await
             .context("Failed to get connection from pool")?;
         let mut io_buffer = self.buffer_pool.acquire();
 
-        let response = send_request(&mut *conn, &request, &mut io_buffer).await?;
+        let response = execute_request_classified(&mut **conn, &request, &mut io_buffer).await?;
         let Some(status_code) = response.status_code() else {
             anyhow::bail!("Invalid response from server");
         };
@@ -194,7 +191,7 @@ impl NntpClient {
 
     async fn fetch_captured_multiline_response(
         &self,
-        mut conn: Object<TcpManager>,
+        mut conn: ConnectionGuard,
         mut io_buffer: PooledBuffer,
     ) -> Result<PooledBuffer> {
         // This client helper is intentionally only an owner of the destination
@@ -208,9 +205,10 @@ impl NntpClient {
         )
         .await
         {
-            self.conn_pool.remove_with_cooldown(conn);
+            conn.retire_with_cooldown();
             return Err(err);
         }
+        let _ = conn.release();
         Ok(capture)
     }
 

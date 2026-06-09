@@ -495,7 +495,7 @@ impl DeadpoolConnectionProvider {
     /// # Errors
     /// Returns [`crate::connection_error::ConnectionError`] if deadpool cannot
     /// provide a healthy backend connection.
-    pub async fn get_pooled_connection(
+    pub(in crate::pool) async fn get_pooled_connection(
         &self,
     ) -> Result<managed::Object<TcpManager>, crate::connection_error::ConnectionError> {
         use crate::connection_error::ConnectionError;
@@ -519,6 +519,21 @@ impl DeadpoolConnectionProvider {
             );
             err
         })
+    }
+
+    /// Checkout a pooled connection wrapped in a `ConnectionGuard`.
+    ///
+    /// Callers outside `crate::pool` should use this entrypoint instead of accessing
+    /// raw pooled objects directly.
+    ///
+    /// # Errors
+    /// Returns [`crate::connection_error::ConnectionError`] when no healthy backend
+    /// connection can be acquired.
+    pub async fn checkout_connection_guard(
+        &self,
+    ) -> Result<crate::pool::ConnectionGuard, crate::connection_error::ConnectionError> {
+        let conn = self.get_pooled_connection().await?;
+        Ok(crate::pool::ConnectionGuard::new(conn, self.clone()))
     }
 
     #[must_use]
@@ -560,7 +575,7 @@ impl DeadpoolConnectionProvider {
     /// the backend did not fail. For example, a client disconnect can leave
     /// unread backend response bytes in flight, making the socket dirty without
     /// implying that replacement connections should be throttled.
-    pub fn remove_without_cooldown(&self, conn: managed::Object<TcpManager>) {
+    pub(crate) fn remove_without_cooldown(&self, conn: managed::Object<TcpManager>) {
         shutdown_and_drop(conn);
     }
 
@@ -582,7 +597,7 @@ impl DeadpoolConnectionProvider {
     /// either [`shutdown_and_drop`] or [`resize_then_drop`], so the caller cannot
     /// accidentally `drop(conn)` before `pool.resize()`. Any attempt to reorder
     /// would be a use-after-move error.
-    pub fn remove_with_cooldown(&self, conn: managed::Object<TcpManager>) {
+    pub(crate) fn remove_with_cooldown(&self, conn: managed::Object<TcpManager>) {
         if self.is_shutting_down.load(Ordering::Acquire) {
             shutdown_and_drop(conn);
             return;

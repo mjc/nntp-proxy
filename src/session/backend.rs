@@ -215,8 +215,7 @@ pub fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
 
 // ─── Command execution ──────────────────────────────────────────────────────
 
-/// Send a typed request and read enough bytes for backend response classification.
-pub(crate) async fn send_request<C>(
+pub(crate) async fn execute_request_classified<C>(
     conn: &mut C,
     request: &RequestContext,
     buffer: &mut PooledBuffer,
@@ -234,8 +233,7 @@ where
     read_until_backend_reply(conn, request, buffer).await
 }
 
-/// Send a typed request with timing measurements.
-pub(crate) async fn send_request_timed<C>(
+pub(crate) async fn execute_request_classified_timed<C>(
     conn: &mut C,
     request: &RequestContext,
     buffer: &mut PooledBuffer,
@@ -414,7 +412,7 @@ mod tests {
         let mut buffer = pool.acquire();
 
         let request = RequestContext::from_verb_args(b"DATE", b"");
-        let response = send_request(&mut stream, &request, &mut buffer)
+        let response = execute_request_classified(&mut stream, &request, &mut buffer)
             .await
             .expect("send_request should handle partial reads");
         let status_code = response
@@ -435,7 +433,7 @@ mod tests {
         let mut buffer = pool.acquire();
 
         let request = RequestContext::from_verb_args(b"DATE", b"");
-        let response = send_request(&mut stream, &request, &mut buffer)
+        let response = execute_request_classified(&mut stream, &request, &mut buffer)
             .await
             .expect("send_request should read through complete backend response");
         let status_code = response
@@ -457,7 +455,7 @@ mod tests {
         let mut buffer = pool.acquire();
 
         let request = RequestContext::from_verb_args(b"GROUP", b"alt.test");
-        let response = send_request(&mut stream, &request, &mut buffer)
+        let response = execute_request_classified(&mut stream, &request, &mut buffer)
             .await
             .expect("send_request should handle single-byte reads");
         let status_code = response

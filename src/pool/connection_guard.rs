@@ -84,7 +84,10 @@ pub struct ConnectionGuard {
 
 impl ConnectionGuard {
     /// Create a new guard (removes from pool on drop unless released).
-    pub const fn new(conn: Object<TcpManager>, provider: DeadpoolConnectionProvider) -> Self {
+    pub(crate) const fn new(
+        conn: Object<TcpManager>,
+        provider: DeadpoolConnectionProvider,
+    ) -> Self {
         Self {
             conn: Some(conn),
             provider,
@@ -100,7 +103,7 @@ impl ConnectionGuard {
     /// # Panics
     ///
     /// Panics if the guard has already been consumed (double-release).
-    pub fn release(mut self) -> Object<TcpManager> {
+    pub(crate) fn release(mut self) -> Object<TcpManager> {
         self.released = true;
         self.conn
             .take()
@@ -115,7 +118,7 @@ impl ConnectionGuard {
     /// # Panics
     ///
     /// Panics if the guard has already been consumed.
-    pub fn retire_without_cooldown(mut self) {
+    pub(crate) fn retire_without_cooldown(mut self) {
         self.released = true;
         let conn = self
             .conn
@@ -133,7 +136,7 @@ impl ConnectionGuard {
     /// # Panics
     ///
     /// Panics if the guard has already been consumed.
-    pub fn retire_with_cooldown(mut self) {
+    pub(crate) fn retire_with_cooldown(mut self) {
         self.released = true;
         let conn = self
             .conn
@@ -147,7 +150,7 @@ impl ConnectionGuard {
     /// # Panics
     ///
     /// Panics if the guard has already been consumed.
-    pub const fn get_mut(&mut self) -> &mut Object<TcpManager> {
+    pub(crate) const fn get_mut(&mut self) -> &mut Object<TcpManager> {
         self.conn
             .as_mut()
             .expect("ConnectionGuard already consumed")
@@ -158,29 +161,29 @@ impl ConnectionGuard {
     /// # Panics
     ///
     /// Panics if the guard has already been consumed.
-    pub const fn get(&self) -> &Object<TcpManager> {
+    pub(crate) const fn get(&self) -> &Object<TcpManager> {
         self.conn
             .as_ref()
             .expect("ConnectionGuard already consumed")
     }
 
     #[must_use]
-    pub fn connection_type(&self) -> &'static str {
+    pub(crate) fn connection_type(&self) -> &'static str {
         self.get().connection_type()
     }
 
     #[must_use]
-    pub fn pending_bytes_len(&self) -> usize {
+    pub(crate) fn pending_bytes_len(&self) -> usize {
         self.get().pending_bytes_len()
     }
 
     #[must_use]
-    pub fn provider_status_counts(&self) -> crate::pool::provider::DeadpoolStatusCounts {
+    pub(crate) fn provider_status_counts(&self) -> crate::pool::provider::DeadpoolStatusCounts {
         self.provider.status_counts()
     }
 
     #[must_use]
-    pub fn provider_name(&self) -> &str {
+    pub(crate) fn provider_name(&self) -> &str {
         self.provider.name()
     }
 }
@@ -229,7 +232,7 @@ impl std::ops::DerefMut for ConnectionGuard {
 /// # Arguments
 /// * `conn` - Pooled connection to verify
 /// * `provider` - Connection provider (used for `remove_with_cooldown` on failure)
-pub async fn salvage_with_health_check(
+pub(crate) async fn salvage_with_health_check(
     mut conn: Object<TcpManager>,
     provider: DeadpoolConnectionProvider,
 ) {

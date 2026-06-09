@@ -230,10 +230,10 @@ impl ClientSession {
         use crate::protocol::BACKEND_UNAVAILABLE;
 
         // Acquire backend connection
-        let backend_conn = match provider.get_pooled_connection().await {
-            Ok(conn) => {
+        let mut conn_guard = match provider.checkout_connection_guard().await {
+            Ok(conn_guard) => {
                 debug!(server = server_name, "Got pooled connection");
-                conn
+                conn_guard
             }
             Err(e) => {
                 error!(server = server_name, client = %self.client_addr, error = %e, "Failed to get pooled connection");
@@ -246,9 +246,6 @@ impl ClientSession {
                 )));
             }
         };
-
-        // Wrap in guard — unreleased connections are removed from the pool.
-        let mut conn_guard = crate::pool::ConnectionGuard::new(backend_conn, provider.clone());
 
         // Split streams
         let (client_read, client_write) = client_stream.split();

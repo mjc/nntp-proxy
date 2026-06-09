@@ -289,7 +289,7 @@ async fn test_least_loaded_counts_checked_out_pool_connections() {
     let backend0 = live_backend("backend0", backend0_port, 2);
     let backend1 = live_backend("backend1", backend1_port, 2);
 
-    let held_backend1 = backend1.get_pooled_connection().await.unwrap();
+    let held_backend1 = backend1.checkout_connection_guard().await.unwrap();
 
     selector.add_backend(
         ServerName::try_new("backend0".to_string()).unwrap(),

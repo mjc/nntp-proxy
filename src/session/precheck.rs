@@ -214,19 +214,18 @@ async fn execute_backend_query(
     request: &RequestContext,
 ) -> Result<QueryAttemptResult, ()> {
     let backend_id = backend.backend_id();
-    let Ok(conn_raw) = provider.get_pooled_connection().await else {
+    let Ok(mut conn) = provider.checkout_connection_guard().await else {
         return Ok(QueryAttemptResult::Error);
     };
-    let mut conn = crate::pool::ConnectionGuard::new(conn_raw, provider.clone());
 
     let mut buffer = deps.buffer_pool.acquire();
 
     let response = if should_sample_backend_timing() {
-        backend::send_request_timed(&mut **conn, request, &mut buffer)
+        backend::execute_request_classified_timed(&mut **conn, request, &mut buffer)
             .await
             .map(|(response, ttfb, send, recv)| (response, Some((ttfb, send, recv))))
     } else {
-        backend::send_request(&mut **conn, request, &mut buffer)
+        backend::execute_request_classified(&mut **conn, request, &mut buffer)
             .await
             .map(|response| (response, None))
     };
