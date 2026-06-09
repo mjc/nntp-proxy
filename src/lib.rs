@@ -31,6 +31,8 @@
 //! - **Per-command routing mode**: Each command is routed to a backend (round-robin),
 //!   but commands are still processed serially (NNTP is synchronous)
 
+#![allow(clippy::disallowed_methods)]
+
 // Module declarations
 pub mod args;
 pub mod auth;

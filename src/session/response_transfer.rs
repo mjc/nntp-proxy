@@ -12,6 +12,13 @@ pub(crate) enum ResponseTransferError {
     /// backend response and started writing it locally.
     ClientDisconnect(std::io::Error),
 
+    /// Client write failed after backend response ownership was already established.
+    ///
+    /// This is treated as terminal for backend-connection reuse to prevent
+    /// protocol desync when a partially-written client response races with
+    /// subsequent backend reuse.
+    ClientWrite(std::io::Error),
+
     /// Backend closed connection before sending a complete multiline response.
     BackendEof {
         backend_id: crate::types::BackendId,
@@ -28,15 +35,16 @@ impl ResponseTransferError {
     /// A plain client disconnect after a complete response has been captured is
     /// safe for connection reuse. Backend EOF and other I/O errors may leave
     /// unread bytes in flight and must retire it.
-    pub(crate) const fn must_remove_connection(&self) -> bool {
+    pub(super) const fn must_remove_connection(&self) -> bool {
         !matches!(self, Self::ClientDisconnect(_))
     }
 
     /// Convert the transfer outcome into an `anyhow` error for older call sites
     /// that still bubble untyped errors.
-    pub(crate) fn into_anyhow(self) -> anyhow::Error {
+    pub(super) fn into_anyhow(self) -> anyhow::Error {
         match self {
             Self::ClientDisconnect(io_err) => anyhow::Error::from(io_err),
+            Self::ClientWrite(io_err) => anyhow::Error::from(io_err),
             Self::Io(e) => e,
             Self::BackendEof {
                 backend_id,
@@ -53,6 +61,7 @@ impl std::fmt::Display for ResponseTransferError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ClientDisconnect(e) => write!(f, "client disconnected: {e}"),
+            Self::ClientWrite(e) => write!(f, "client write failed: {e}"),
             Self::BackendEof {
                 backend_id,
                 bytes_received,
@@ -70,6 +79,7 @@ impl std::error::Error for ResponseTransferError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::ClientDisconnect(e) => Some(e),
+            Self::ClientWrite(e) => Some(e),
             Self::BackendEof { .. } => None,
             Self::Io(e) => e.source(),
         }
@@ -77,7 +87,7 @@ impl std::error::Error for ResponseTransferError {
 }
 
 /// Reuse decision after a response transfer completed successfully.
-pub(crate) enum ResponseConnectionReuse {
+pub(super) enum ResponseConnectionReuse {
     /// No queued bytes remain on the connection.
     Reusable,
     /// Bytes are queued for the next response and the connection must stay on
@@ -88,7 +98,7 @@ pub(crate) enum ResponseConnectionReuse {
 /// Inspect a connection after response transfer without exposing the queued
 /// bytes themselves to the caller.
 #[must_use]
-pub(crate) fn connection_reuse_after_response(
+pub(super) fn connection_reuse_after_response(
     conn: &crate::pool::ConnectionGuard,
 ) -> ResponseConnectionReuse {
     if conn.has_pending_bytes() {
@@ -101,12 +111,16 @@ pub(crate) fn connection_reuse_after_response(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 
     #[test]
     fn response_transfer_error_pool_fate_matches_disconnect_semantics() {
         let disconnect = ResponseTransferError::ClientDisconnect(std::io::Error::from(
+            std::io::ErrorKind::BrokenPipe,
+        ));
+        let client_write = ResponseTransferError::ClientWrite(std::io::Error::from(
             std::io::ErrorKind::BrokenPipe,
         ));
         let eof = ResponseTransferError::BackendEof {
@@ -116,6 +130,7 @@ mod tests {
         let io = ResponseTransferError::Io(anyhow::anyhow!("backend dirty"));
 
         assert!(!disconnect.must_remove_connection());
+        assert!(client_write.must_remove_connection());
         assert!(eof.must_remove_connection());
         assert!(io.must_remove_connection());
     }

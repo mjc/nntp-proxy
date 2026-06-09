@@ -299,7 +299,7 @@ pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
 ///
 /// Enable this via `proxy.response_write_metrics_secs` in config.
 pub fn spawn_response_write_metrics_logger(period: Option<std::time::Duration>) {
-    use tracing::info;
+    use tracing::{debug, info};
 
     let Some(period) = period else {
         return;
@@ -353,7 +353,7 @@ pub fn spawn_response_write_metrics_logger(period: Option<std::time::Duration>) 
             );
 
             let current_alloc = crate::pool::buffer::hot_path_allocation_metrics_snapshot();
-            info!(
+            debug!(
                 regular_pool_fallback_allocations_delta = current_alloc
                     .regular_pool_fallback_allocations
                     .saturating_sub(previous_alloc.regular_pool_fallback_allocations),
@@ -404,7 +404,7 @@ pub fn spawn_response_write_metrics_logger(period: Option<std::time::Duration>) 
 ///
 /// Enable this via `proxy.client_writer_lock_metrics_secs` in config.
 pub fn spawn_client_writer_lock_metrics_logger(period: Option<std::time::Duration>) {
-    use tracing::info;
+    use tracing::debug;
 
     let Some(period) = period else {
         crate::session::shared_client_writer::set_client_writer_lock_metrics_enabled(false);
@@ -437,7 +437,7 @@ pub fn spawn_client_writer_lock_metrics_logger(period: Option<std::time::Duratio
                         .saturating_sub(previous.contended_locks) as u64)
             };
 
-            info!(
+            debug!(
                 requests_delta = requests_delta,
                 immediate_delta = current
                     .immediate_locks

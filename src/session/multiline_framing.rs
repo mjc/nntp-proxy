@@ -6,6 +6,8 @@
 //! If a response is incomplete, the same framer state is fed the next backend
 //! buffer until it can produce a typed complete or incomplete response chunk.
 
+#![allow(clippy::disallowed_methods)]
+
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -107,19 +109,16 @@ impl CompleteMultilineWireChunk {
     where
         W: AsyncWrite + Unpin,
     {
-        let response = &io_buffer[..total_len][self.response.clone()];
-        writer
-            .write_all(response)
-            .await
-            .map_err(crate::session::response_transfer::ResponseTransferError::ClientDisconnect)?;
-        crate::pool::buffer::record_non_owned_response_write_chunk(response.len());
-        let response_len = response.len() as u64;
-        if self.next_response_input.start < total_len {
-            let old = std::mem::replace(io_buffer, pool.acquire());
-            conn.queue_pooled_pending_bytes_first(old, self.next_response_input.clone())
-                .map_err(crate::session::response_transfer::ResponseTransferError::Io)?;
-        }
-        Ok(response_len)
+        write_response_chunk_preserving_suffix_on_error(
+            writer,
+            io_buffer,
+            conn,
+            pool,
+            total_len,
+            &self.response,
+            &self.next_response_input,
+        )
+        .await
     }
 
     fn push_from_buffer(
@@ -135,6 +134,7 @@ impl CompleteMultilineWireChunk {
             conn.queue_pending_bytes_first(&old[self.next_response_input.clone()])
                 .map_err(crate::session::response_transfer::ResponseTransferError::Io)?;
         }
+
         response.push_buffer_range(old, self.response.clone());
         Ok(())
     }
@@ -153,6 +153,46 @@ impl CompleteMultilineWireChunk {
         }
         Ok(())
     }
+}
+
+fn queue_packed_next_response_input(
+    io_buffer: &mut crate::pool::PooledBuffer,
+    conn: &mut crate::stream::ConnectionStream,
+    pool: &crate::pool::BufferPool,
+    next_response_input: &Range<usize>,
+    total_len: usize,
+) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
+    if next_response_input.start < total_len {
+        let old = std::mem::replace(io_buffer, pool.acquire());
+        conn.queue_pooled_pending_bytes_first(old, next_response_input.clone())
+            .map_err(crate::session::response_transfer::ResponseTransferError::Io)?;
+    }
+    Ok(())
+}
+
+async fn write_response_chunk_preserving_suffix_on_error<W>(
+    writer: &mut W,
+    io_buffer: &mut crate::pool::PooledBuffer,
+    conn: &mut crate::stream::ConnectionStream,
+    pool: &crate::pool::BufferPool,
+    total_len: usize,
+    response: &Range<usize>,
+    next_response_input: &Range<usize>,
+) -> Result<u64, crate::session::response_transfer::ResponseTransferError>
+where
+    W: AsyncWrite + Unpin,
+{
+    let chunk = &io_buffer[..total_len][response.clone()];
+    if let Err(err) = writer.write_all(chunk).await {
+        queue_packed_next_response_input(io_buffer, conn, pool, next_response_input, total_len)?;
+        return Err(
+            crate::session::response_transfer::ResponseTransferError::ClientDisconnect(err),
+        );
+    }
+    crate::pool::buffer::record_non_owned_response_write_chunk(chunk.len());
+    let chunk_len = chunk.len() as u64;
+    queue_packed_next_response_input(io_buffer, conn, pool, next_response_input, total_len)?;
+    Ok(chunk_len)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -403,19 +443,16 @@ impl FramedSingleLineChunk {
     where
         W: AsyncWrite + Unpin,
     {
-        let response = &io_buffer[..total_len][self.response.clone()];
-        writer
-            .write_all(response)
-            .await
-            .map_err(crate::session::response_transfer::ResponseTransferError::ClientDisconnect)?;
-        crate::pool::buffer::record_non_owned_response_write_chunk(response.len());
-        let response_len = response.len() as u64;
-        if self.next_response_input.start < total_len {
-            let old = std::mem::replace(io_buffer, pool.acquire());
-            conn.queue_pooled_pending_bytes_first(old, self.next_response_input.clone())
-                .map_err(crate::session::response_transfer::ResponseTransferError::Io)?;
-        }
-        Ok(response_len)
+        write_response_chunk_preserving_suffix_on_error(
+            writer,
+            io_buffer,
+            conn,
+            pool,
+            total_len,
+            &self.response,
+            &self.next_response_input,
+        )
+        .await
     }
 
     fn push_from_buffer(
@@ -1026,7 +1063,7 @@ impl<'a> IsolatedMultilineResponse<'a> {
 }
 
 #[cfg(test)]
-pub(crate) async fn capture_response(
+async fn capture_response(
     request: &crate::protocol::RequestContext,
     io_buffer: &mut crate::pool::PooledBuffer,
     conn: &mut crate::stream::ConnectionStream,
@@ -2617,6 +2654,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn complete_multiline_write_client_error_preserves_packed_suffix() {
+        let chunk = b"220 article\r\nbody\r\n.\r\n223 0 <next>\r\n";
+        let response_len = b"220 article\r\nbody\r\n.\r\n".len();
+        let framed = CompleteMultilineWireChunk {
+            response: 0..response_len,
+            next_response_input: response_len..chunk.len(),
+        };
+        let pool = make_pool();
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(chunk);
+        let mut conn = loopback_connection_stream().await;
+        let mut writer = FailingWriter;
+
+        let err = framed
+            .write_from(&mut writer, &mut io_buffer, &mut conn, &pool, chunk.len())
+            .await;
+
+        assert!(matches!(
+            err,
+            Err(ResponseTransferError::ClientDisconnect(_))
+        ));
+        assert_eq!(conn.pending_bytes_len(), b"223 0 <next>\r\n".len());
+    }
+
+    #[tokio::test]
+    async fn single_line_write_client_error_preserves_packed_suffix() {
+        let chunk = b"223 0 <first>\r\n223 0 <next>\r\n";
+        let response_len = b"223 0 <first>\r\n".len();
+        let framed = FramedSingleLineChunk {
+            response: 0..response_len,
+            next_response_input: response_len..chunk.len(),
+        };
+        let pool = make_pool();
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(chunk);
+        let mut conn = loopback_connection_stream().await;
+        let mut writer = FailingWriter;
+
+        let err = framed
+            .write_from(&mut writer, &mut io_buffer, &mut conn, &pool, chunk.len())
+            .await;
+
+        assert!(matches!(
+            err,
+            Err(ResponseTransferError::ClientDisconnect(_))
+        ));
+        assert_eq!(conn.pending_bytes_len(), b"223 0 <next>\r\n".len());
+    }
+
+    #[tokio::test]
+    async fn complete_multiline_split_boundaries_preserve_packed_suffix_on_write_error() {
+        let first_response = b"220 article\r\nbody\r\n.\r\n";
+        let next_response = b"223 0 <next>\r\n";
+        let pool = make_pool();
+
+        for split in 1..first_response.len() {
+            let initial = &first_response[..split];
+            let mut continuation = Vec::from(&first_response[split..]);
+            continuation.extend_from_slice(next_response);
+            let mut framer = MultilineFramer::default();
+            let prior = match framer.frame_initial_multiline_chunk(initial) {
+                FramedMultilineChunk::Incomplete(prior) => prior,
+                FramedMultilineChunk::Complete(_) => panic!("split={split} unexpectedly complete"),
+            };
+            let complete = match framer.frame_next_multiline_chunk(prior, &continuation) {
+                FramedMultilineChunk::Complete(complete) => complete,
+                FramedMultilineChunk::Incomplete(_) => {
+                    panic!("split={split} did not complete on continuation")
+                }
+            };
+
+            let mut io_buffer = pool.acquire();
+            io_buffer.copy_from_slice(&continuation);
+            let mut conn = loopback_connection_stream().await;
+            let mut writer = FailingWriter;
+
+            let err = complete
+                .write_from(
+                    &mut writer,
+                    &mut io_buffer,
+                    &mut conn,
+                    &pool,
+                    continuation.len(),
+                )
+                .await;
+
+            assert!(matches!(
+                err,
+                Err(ResponseTransferError::ClientDisconnect(_))
+            ));
+            assert_eq!(
+                conn.pending_bytes_len(),
+                next_response.len(),
+                "split={split}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn write_response_complete_multiline_queues_packed_suffix_as_pooled_input() {
         let first_response = b"220 article\r\nbody\r\n.\r\n";
         let next_response = b"223 0 <next>\r\n";
@@ -2941,6 +3077,22 @@ mod tests {
             violations.is_empty(),
             "raw multiline boundary scanner shapes escaped multiline_framing.rs:\n{}",
             violations.join("\n")
+        );
+    }
+
+    #[test]
+    fn framed_write_paths_use_shared_suffix_preservation_chokepoint() {
+        let source_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("session")
+            .join("multiline_framing.rs");
+        let source = std::fs::read_to_string(source_path).expect("read multiline_framing source");
+        let delegations = source
+            .match_indices("write_response_chunk_preserving_suffix_on_error(")
+            .count();
+        assert!(
+            delegations >= 3,
+            "single-line and complete-multiline write paths must delegate through the shared suffix-preservation helper"
         );
     }
 
