@@ -369,12 +369,6 @@ pub fn spawn_response_write_metrics_logger(period: Option<std::time::Duration>) 
                 pending_backend_byte_heap_fallbacks_delta = current_alloc
                     .pending_backend_byte_heap_fallbacks
                     .saturating_sub(previous_alloc.pending_backend_byte_heap_fallbacks),
-                non_owned_response_write_chunks_delta = current_alloc
-                    .non_owned_response_write_chunks
-                    .saturating_sub(previous_alloc.non_owned_response_write_chunks),
-                non_owned_response_write_bytes_delta = current_alloc
-                    .non_owned_response_write_bytes
-                    .saturating_sub(previous_alloc.non_owned_response_write_bytes),
                 regular_pool_buffer_holds_delta = current_alloc
                     .regular_pool_buffer_holds
                     .saturating_sub(previous_alloc.regular_pool_buffer_holds),
