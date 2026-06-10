@@ -103,7 +103,7 @@ impl ConnectionGuard {
     /// # Panics
     ///
     /// Panics if the guard has already been consumed (double-release).
-    pub(crate) fn complete_success(mut self) -> Object<TcpManager> {
+    pub fn complete_success(mut self) -> Object<TcpManager> {
         self.released = true;
         self.conn
             .take()
@@ -190,6 +190,10 @@ impl ConnectionGuard {
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
+        debug_assert!(
+            self.released,
+            "ConnectionGuard dropped without explicit finalize"
+        );
         if !self.released
             && let Some(conn) = self.conn.take()
         {
@@ -342,7 +346,7 @@ mod tests {
             .unwrap()
     }
 
-    /// Invariant: `release()` returns the connection to the pool.
+    /// Invariant: `complete_success()` returns the connection to the pool.
     ///
     /// Pool must reuse the connection without creating a new TCP connection.
     /// This is the path taken on success and on `ClientDisconnect` (backend was
@@ -356,7 +360,7 @@ mod tests {
         let conn = provider.get_pooled_connection().await.unwrap();
         assert_eq!(accept_count.load(Ordering::SeqCst), 1);
 
-        // release() returns conn to pool (no shutdown)
+        // complete_success() returns conn to pool (no shutdown)
         let guard = ConnectionGuard::new(conn, provider.clone());
         drop(guard.complete_success());
 
@@ -365,16 +369,17 @@ mod tests {
         assert_eq!(
             accept_count.load(Ordering::SeqCst),
             1,
-            "release() must return connection to pool; next get() must reuse it without \
+            "complete_success() must return connection to pool; next get() must reuse it without \
              creating a new TCP connection"
         );
     }
 
-    /// Invariant: drop without `release()` removes the connection from the pool.
+    /// Invariant: drop without `complete_success()` removes the connection from the pool.
     ///
     /// The guard shuts down the socket; pool recycle detects EOF
     /// and discards it; next `get()` creates a fresh TCP connection.
     /// Unknown/backend-error drop paths apply replacement cooldown.
+    #[cfg(not(debug_assertions))]
     #[tokio::test]
     async fn drop_without_release_forces_new_connection() {
         let (port, accept_count) = spawn_greeting_server().await;
@@ -403,9 +408,19 @@ mod tests {
         assert_eq!(
             accept_count.load(Ordering::SeqCst),
             2,
-            "drop without release() must remove connection; next get() must create \
+            "drop without complete_success() must remove connection; next get() must create \
              a new TCP connection"
         );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "ConnectionGuard dropped without explicit finalize")]
+    async fn drop_without_complete_success_panics_in_debug() {
+        let (port, _accept_count) = spawn_greeting_server().await;
+        let provider = make_provider(port);
+        let conn = provider.get_pooled_connection().await.unwrap();
+        let _guard = ConnectionGuard::new(conn, provider.clone());
     }
 
     // ─── salvage_with_health_check notes ────────────────────────────────────

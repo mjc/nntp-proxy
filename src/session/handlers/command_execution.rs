@@ -1559,6 +1559,14 @@ mod tests {
         RequestContext::parse(line).expect("valid request line")
     }
 
+    fn finalize_backend_connection(
+        backend_connection: &mut Option<(BackendId, crate::pool::ConnectionGuard)>,
+    ) {
+        if let Some((_backend_id, conn)) = backend_connection.take() {
+            let _ = conn.complete_success();
+        }
+    }
+
     fn test_session() -> crate::session::ClientSession {
         let addr: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 4);
@@ -2062,6 +2070,7 @@ mod tests {
         ));
         assert!(availability.is_missing(BackendId::from_index(0)));
         assert_eq!(article_commands.load(Ordering::SeqCst), 1);
+        finalize_backend_connection(&mut backend_connection);
 
         drop(held_writer);
     }
@@ -2102,6 +2111,7 @@ mod tests {
             1,
             "first attempt should go directly to BODY/ARTICLE/HEAD without STAT probe"
         );
+        finalize_backend_connection(&mut backend_connection);
     }
 
     #[tokio::test]
@@ -2417,6 +2427,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_attempt_skips_stat_missing_probe() {
+        let session = test_session();
+        let (port, stat_commands, body_commands) = spawn_stat_missing_probe_server().await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .stat_missing(true)
+            .build()
+            .unwrap();
+        let router = router_with_backend(provider);
+        let (client_writer, _client_read, _client_write) = shared_client_writer_pair().await;
+
+        let mut request = request_context(b"BODY <missing@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+        };
+
+        let result = session
+            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, false)
+            .await
+            .expect("first BODY attempt should complete without transport error");
+
+        assert!(matches!(result, BackendAttemptResult::Success));
+        assert_eq!(
+            stat_commands.load(Ordering::SeqCst),
+            0,
+            "STAT probe is retry-only and should not run on first attempt"
+        );
+        assert_eq!(body_commands.load(Ordering::SeqCst), 1);
+        assert!(!availability.is_missing(BackendId::from_index(0)));
+        finalize_backend_connection(&mut backend_connection);
+    }
+
+    #[tokio::test]
     async fn track_stat_records_availability_when_article_cache_disabled() {
         let cache = Arc::new(UnifiedCache::memory(1024, Duration::from_secs(60)));
         let session = test_session_with_cache(cache.clone(), false);
@@ -2596,6 +2646,7 @@ mod tests {
         assert_eq!(availability.missing_bits(), 0);
         assert_eq!(availability.missing_bits(), 0);
         assert_eq!(request.backend_id(), Some(BackendId::from_index(1)));
+        finalize_backend_connection(&mut backend_connection);
 
         let mut written = vec![0; good_response.len()];
         tokio::time::timeout(Duration::from_secs(1), client_read.read_exact(&mut written))
@@ -2660,6 +2711,7 @@ mod tests {
         assert_eq!(bad_article_commands.load(Ordering::SeqCst), 1);
         assert_eq!(good_article_commands.load(Ordering::SeqCst), 1);
         assert_eq!(request.backend_id(), Some(BackendId::from_index(1)));
+        finalize_backend_connection(&mut backend_connection);
     }
 
     #[tokio::test]
@@ -2787,6 +2839,7 @@ mod tests {
         assert_eq!(backup_article_commands.load(Ordering::SeqCst), 0);
         assert_eq!(availability.missing_bits(), 0);
         assert_eq!(availability.missing_bits(), 0);
+        finalize_backend_connection(&mut backend_connection);
     }
 
     #[tokio::test]
@@ -2858,6 +2911,7 @@ mod tests {
             .expect("client response should be readable")
             .expect("client read should succeed");
         assert_eq!(written, response);
+        finalize_backend_connection(&mut backend_connection);
     }
 
     #[tokio::test]
@@ -2899,7 +2953,8 @@ mod tests {
         ));
         assert_eq!(client_write.writes, b"223 0 <test@example.com> status\r\n");
 
-        let _reused = provider.checkout_connection_guard().await.unwrap();
+        let reused = provider.checkout_connection_guard().await.unwrap();
+        drop(reused.complete_success());
         assert_eq!(
             accept_count.load(Ordering::SeqCst),
             1,
@@ -2945,7 +3000,8 @@ mod tests {
             crate::session::SessionError::ClientDisconnect(_)
         ));
 
-        let _reused = provider.checkout_connection_guard().await.unwrap();
+        let reused = provider.checkout_connection_guard().await.unwrap();
+        drop(reused.complete_success());
         assert_eq!(
             accept_count.load(Ordering::SeqCst),
             1,
@@ -2993,7 +3049,8 @@ mod tests {
             crate::session::SessionError::ClientDisconnect(_)
         ));
 
-        let _replacement = provider.checkout_connection_guard().await.unwrap();
+        let replacement = provider.checkout_connection_guard().await.unwrap();
+        drop(replacement.complete_success());
         assert_eq!(
             accept_count.load(Ordering::SeqCst),
             2,
