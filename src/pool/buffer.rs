@@ -561,7 +561,7 @@ pub(crate) fn reset_response_write_metrics() {
     metrics.max_chunks_per_response.store(0, Ordering::Relaxed);
 }
 
-pub(crate) fn record_response_write_metrics(
+pub(crate) fn record_response_write_metrics_internal(
     chunk_count: usize,
     bytes_written: usize,
     tiny_chunks: usize,
@@ -838,7 +838,7 @@ impl ChunkedResponse {
     ///
     /// # Errors
     /// Returns any write error produced by the underlying async sink.
-    pub async fn write_all_to<W>(&self, writer: &mut W) -> std::io::Result<()>
+    pub async fn write_all_to_recording<W>(&self, writer: &mut W) -> std::io::Result<()>
     where
         W: AsyncWriteExt + Unpin,
     {

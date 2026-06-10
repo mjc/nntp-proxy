@@ -60,7 +60,7 @@ impl ResponseWriteStats {
     }
 
     fn record(self) {
-        crate::pool::buffer::record_response_write_metrics(
+        crate::pool::buffer::record_response_write_metrics_internal(
             self.chunk_count,
             self.bytes_written,
             self.tiny_chunks,
@@ -1396,7 +1396,7 @@ where
         let mut stats = ResponseWriteStats::default();
         stats.add_buffered_response(response);
         response
-            .write_all_to(writer)
+            .write_all_to_recording(writer)
             .await
             .map_err(crate::session::response_transfer::ResponseTransferError::ClientDisconnect)?;
         response.clear();
@@ -1490,7 +1490,7 @@ where
             framed.push_from_buffer(io_buffer, conn, response, pool)?;
             let mut stats = ResponseWriteStats::default();
             stats.add_buffered_response(response);
-            response.write_all_to(writer).await.map_err(
+            response.write_all_to_recording(writer).await.map_err(
                 crate::session::response_transfer::ResponseTransferError::ClientDisconnect,
             )?;
             stats.record();
@@ -1520,7 +1520,7 @@ where
                 framed.push_from_buffer(io_buffer, conn, response, pool, initial_len)?;
                 let mut stats = ResponseWriteStats::default();
                 stats.add_buffered_response(response);
-                response.write_all_to(writer).await.map_err(
+                response.write_all_to_recording(writer).await.map_err(
                     crate::session::response_transfer::ResponseTransferError::ClientDisconnect,
                 )?;
                 stats.record();
@@ -1596,7 +1596,7 @@ where
                     framed.push_from_buffer(io_buffer, conn, response, pool, n)?;
                     let mut stats = ResponseWriteStats::default();
                     stats.add_buffered_response(response);
-                    response.write_all_to(writer).await.map_err(
+                    response.write_all_to_recording(writer).await.map_err(
                         crate::session::response_transfer::ResponseTransferError::ClientDisconnect,
                     )?;
                     stats.record();
