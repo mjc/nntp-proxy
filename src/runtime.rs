@@ -299,7 +299,7 @@ pub fn spawn_cache_stats_logger(proxy: &std::sync::Arc<crate::NntpProxy>) {
 ///
 /// Enable this via `proxy.response_write_metrics_secs` in config.
 pub fn spawn_response_write_metrics_logger(period: Option<std::time::Duration>) {
-    use tracing::{debug, info};
+    use tracing::debug;
 
     let Some(period) = period else {
         return;
@@ -333,7 +333,7 @@ pub fn spawn_response_write_metrics_logger(period: Option<std::time::Duration>) 
                 .checked_div(responses_delta)
                 .unwrap_or(0);
 
-            info!(
+            debug!(
                 responses_delta = responses_delta,
                 single_chunk_delta = current
                     .single_chunk_responses
