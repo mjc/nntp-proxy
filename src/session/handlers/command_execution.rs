@@ -399,12 +399,9 @@ impl ClientSession {
                     Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
                 };
                 let mut buffer = self.buffer_pool.acquire();
-                let read = backend::execute_request_classified(
-                    &mut **conn,
-                    &stat_request,
-                    &mut buffer,
-                )
-                .await;
+                let read =
+                    backend::execute_request_classified(&mut **conn, &stat_request, &mut buffer)
+                        .await;
                 let status_code = match read {
                     Ok(read) => read.status_code(),
                     Err(_) => {
@@ -422,15 +419,6 @@ impl ClientSession {
                 )
                 .await
                 .is_err()
-                {
-                    conn.fail_backend();
-                    return RetryStatProbeOutcome::Unavailable(backend_id);
-                }
-
-                if self
-                    .capture_suppressed_430_response(&mut conn, backend_id, &stat_request, buffer)
-                    .await
-                    .is_err()
                 {
                     conn.fail_backend();
                     return RetryStatProbeOutcome::Unavailable(backend_id);
@@ -1213,48 +1201,6 @@ impl ClientSession {
             .then(|| RequestContext::from_verb_args(b"STAT", request.args()))
     }
 
-    async fn execute_and_read_response_with_optional_stat_probe(
-        &self,
-        conn: &mut crate::stream::ConnectionStream,
-        provider: &crate::pool::DeadpoolConnectionProvider,
-        backend: &ArticleBackend,
-        request: &RequestContext,
-        stat_probe_retry_only: bool,
-    ) -> Result<BackendReadAttempt, BackendReadAttemptError> {
-        if !Self::should_use_stat_missing_probe(provider, request, stat_probe_retry_only) {
-            return self.execute_and_read_response(conn, backend, request).await;
-        }
-
-        let Some(stat_request) = Self::stat_probe_request(request) else {
-            return self.execute_and_read_response(conn, backend, request).await;
-        };
-
-        debug!(
-            client = %self.client_addr,
-            backend = backend.backend_id().as_index(),
-            command_verb = ?request.verb(),
-            msg_id = ?request.message_id_value(),
-            "Running STAT miss probe before backend article fetch"
-        );
-        let (probe_response, probe_buffer, probe_timings) = self
-            .execute_and_read_response(conn, backend, &stat_request)
-            .await?;
-        if probe_response
-            .status_code()
-            .is_some_and(|status| status.as_u16() == 430)
-        {
-            debug!(
-                client = %self.client_addr,
-                backend = backend.backend_id().as_index(),
-                command_verb = ?request.verb(),
-                msg_id = ?request.message_id_value(),
-                "STAT miss probe returned 430; skipping backend article fetch"
-            );
-            return Ok((probe_response, probe_buffer, probe_timings));
-        }
-
-        self.execute_and_read_response(conn, backend, request).await
-    }
     /// Write response from backend to client and handle caching.
     ///
     /// Returns `ResponseTransferError` so callers can decide the connection's pool fate

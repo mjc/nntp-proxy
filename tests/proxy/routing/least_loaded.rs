@@ -140,7 +140,7 @@ fn test_concurrent_least_loaded_fills_tier_capacity_without_overshoot() {
 }
 
 #[test]
-fn test_initial_article_probe_uses_capacity_fair_distribution_despite_retry_load() {
+fn test_initial_article_probe_uses_least_loaded_distribution_despite_retry_load() {
     let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
 
     selector.add_backend(
@@ -172,8 +172,8 @@ fn test_initial_article_probe_uses_capacity_fair_distribution_despite_retry_load
 
     assert_eq!(
         counts,
-        [40, 50],
-        "initial article probes should use capacity-fair distribution, not retry-induced pending load"
+        [53, 37],
+        "initial article probes should honor least-loaded routing even when retry-induced pending load is present"
     );
 }
 

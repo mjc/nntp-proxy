@@ -368,6 +368,7 @@ fn response_write_metrics_enabled() -> bool {
     response_write_metrics_enabled_flag().load(Ordering::Relaxed)
 }
 
+#[cfg(test)]
 pub(crate) fn set_response_write_metrics_enabled(enabled: bool) {
     response_write_metrics_enabled_flag().store(enabled, Ordering::Relaxed);
 }
