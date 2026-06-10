@@ -29,14 +29,36 @@ pub(crate) enum ResponseTransferError {
     Io(anyhow::Error),
 }
 
+/// Fate of a backend connection after a response transfer.
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BackendConnectionOutcome {
+    BackendHealthy,
+    BackendDirty,
+    BackendFailed,
+}
+
 impl ResponseTransferError {
-    /// Whether this failure leaves the backend connection unusable.
+    /// Derive the backend connection fate from the response-transfer outcome.
     ///
     /// A plain client disconnect after a complete response has been captured is
     /// safe for connection reuse. Backend EOF and other I/O errors may leave
-    /// unread bytes in flight and must retire it.
-    pub(super) const fn must_remove_connection(&self) -> bool {
-        !matches!(self, Self::ClientDisconnect(_))
+    /// unread bytes in flight and must retire it. If the connection still has
+    /// queued bytes after the transfer, it is dirty even when the transfer
+    /// itself only saw a client disconnect.
+    pub(super) const fn pool_fate(
+        &self,
+        reuse: ResponseConnectionReuse,
+    ) -> BackendConnectionOutcome {
+        match reuse {
+            ResponseConnectionReuse::QueuedBytes { .. } => BackendConnectionOutcome::BackendDirty,
+            ResponseConnectionReuse::Reusable => match self {
+                Self::ClientDisconnect(_) => BackendConnectionOutcome::BackendHealthy,
+                Self::ClientWrite(_) | Self::BackendEof { .. } | Self::Io(_) => {
+                    BackendConnectionOutcome::BackendFailed
+                }
+            },
+        }
     }
 
     /// Convert the transfer outcome into an `anyhow` error for older call sites
@@ -87,12 +109,23 @@ impl std::error::Error for ResponseTransferError {
 }
 
 /// Reuse decision after a response transfer completed successfully.
+#[derive(Debug, Clone, Copy)]
 pub(super) enum ResponseConnectionReuse {
     /// No queued bytes remain on the connection.
     Reusable,
     /// Bytes are queued for the next response and the connection must stay on
     /// the same processing path until they are consumed.
     QueuedBytes { len: usize },
+}
+
+impl ResponseConnectionReuse {
+    /// Derive the backend connection fate from a successful transfer.
+    pub(super) const fn pool_fate(self) -> BackendConnectionOutcome {
+        match self {
+            Self::Reusable => BackendConnectionOutcome::BackendHealthy,
+            Self::QueuedBytes { .. } => BackendConnectionOutcome::BackendDirty,
+        }
+    }
 }
 
 /// Inspect a connection after response transfer without exposing the queued
@@ -129,10 +162,34 @@ mod tests {
         };
         let io = ResponseTransferError::Io(anyhow::anyhow!("backend dirty"));
 
-        assert!(!disconnect.must_remove_connection());
-        assert!(client_write.must_remove_connection());
-        assert!(eof.must_remove_connection());
-        assert!(io.must_remove_connection());
+        assert_eq!(
+            disconnect.pool_fate(ResponseConnectionReuse::Reusable),
+            BackendConnectionOutcome::BackendHealthy
+        );
+        assert_eq!(
+            disconnect.pool_fate(ResponseConnectionReuse::QueuedBytes { len: 1 }),
+            BackendConnectionOutcome::BackendDirty
+        );
+        assert_eq!(
+            client_write.pool_fate(ResponseConnectionReuse::Reusable),
+            BackendConnectionOutcome::BackendFailed
+        );
+        assert_eq!(
+            eof.pool_fate(ResponseConnectionReuse::Reusable),
+            BackendConnectionOutcome::BackendFailed
+        );
+        assert_eq!(
+            io.pool_fate(ResponseConnectionReuse::Reusable),
+            BackendConnectionOutcome::BackendFailed
+        );
+        assert_eq!(
+            ResponseConnectionReuse::Reusable.pool_fate(),
+            BackendConnectionOutcome::BackendHealthy
+        );
+        assert_eq!(
+            ResponseConnectionReuse::QueuedBytes { len: 12 }.pool_fate(),
+            BackendConnectionOutcome::BackendDirty
+        );
     }
 
     #[test]

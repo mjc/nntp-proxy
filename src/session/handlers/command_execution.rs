@@ -6,7 +6,9 @@
 use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata, StatusCode};
 use crate::router::{ArticleBackend, BackendSelector, SuppressedBackends};
 use crate::session::SessionError;
-use crate::session::response_transfer::{ResponseConnectionReuse, ResponseTransferError};
+use crate::session::response_transfer::{
+    BackendConnectionOutcome, ResponseConnectionReuse, ResponseTransferError,
+};
 use crate::session::retry::retry_once;
 use crate::session::routing::{
     CacheAction, MetricsAction, determine_cache_action_for_request,
@@ -780,36 +782,42 @@ impl ClientSession {
         request: &RequestContext,
         error: ResponseTransferError,
     ) -> SessionError {
-        if error.must_remove_connection() {
-            warn!(
-                client = %self.client_addr,
-                backend = backend_id.as_index(),
-                command_verb = ?request.verb(),
-                error = %error,
-                "Response write error, removing connection from pool"
-            );
-            self.metrics.record_error(backend_id);
-            self.metrics.user_error(self.username());
-            conn.fail_backend();
-        } else if let ResponseConnectionReuse::QueuedBytes { len } =
-            crate::session::response_transfer::connection_reuse_after_response(&conn)
-        {
-            warn!(
-                client = %self.client_addr,
-                backend = backend_id.as_index(),
-                command_verb = ?request.verb(),
-                queued_bytes = len,
-                "Response write left queued backend bytes; retiring connection"
-            );
-            conn.fail_client();
-        } else {
-            debug!(
-                client = %self.client_addr,
-                backend = backend_id.as_index(),
-                command_verb = ?request.verb(),
-                "Response write error left backend connection reusable; releasing it back to pool"
-            );
-            let _ = conn.complete_success();
+        let reuse = crate::session::response_transfer::connection_reuse_after_response(&conn);
+        match error.pool_fate(reuse) {
+            BackendConnectionOutcome::BackendFailed => {
+                warn!(
+                    client = %self.client_addr,
+                    backend = backend_id.as_index(),
+                    command_verb = ?request.verb(),
+                    error = %error,
+                    "Response write error, removing connection from pool"
+                );
+                self.metrics.record_error(backend_id);
+                self.metrics.user_error(self.username());
+                conn.fail_backend();
+            }
+            BackendConnectionOutcome::BackendDirty => {
+                let ResponseConnectionReuse::QueuedBytes { len } = reuse else {
+                    unreachable!("dirty backend fate requires queued bytes");
+                };
+                warn!(
+                    client = %self.client_addr,
+                    backend = backend_id.as_index(),
+                    command_verb = ?request.verb(),
+                    queued_bytes = len,
+                    "Response write left queued backend bytes; retiring connection"
+                );
+                conn.fail_client();
+            }
+            BackendConnectionOutcome::BackendHealthy => {
+                debug!(
+                    client = %self.client_addr,
+                    backend = backend_id.as_index(),
+                    command_verb = ?request.verb(),
+                    "Response write error left backend connection reusable; releasing it back to pool"
+                );
+                let _ = conn.complete_success();
+            }
         }
 
         SessionError::from(error)
@@ -822,50 +830,62 @@ impl ClientSession {
         request: &RequestContext,
         backend_connection: Option<&mut Option<(BackendId, crate::pool::ConnectionGuard)>>,
     ) {
-        if let ResponseConnectionReuse::QueuedBytes { len } =
-            crate::session::response_transfer::connection_reuse_after_response(&conn)
+        match crate::session::response_transfer::connection_reuse_after_response(&conn).pool_fate()
         {
-            warn!(
-                client = %self.client_addr,
-                backend = backend_id.as_index(),
-                command_verb = ?request.verb(),
-                msg_id = ?request.message_id_value(),
-                connection_type = conn.connection_type(),
-                pending_bytes = conn.pending_bytes_len(),
-                queued_bytes = len,
-                "Direct per-command response left queued backend bytes; retiring connection"
-            );
-            conn.fail_client();
-        } else if let Some(slot) = backend_connection
-            && slot.is_none()
-        {
-            let status = conn.provider_status_counts();
-            debug!(
-                client = %self.client_addr,
-                backend = backend_id.as_index(),
-                command_verb = ?request.verb(),
-                msg_id = ?request.message_id_value(),
-                connection_type = conn.connection_type(),
-                pending_bytes = conn.pending_bytes_len(),
-                pool = %conn.provider_name(),
-                pool_available = status.available,
-                pool_size = status.size,
-                pool_max_size = status.max_size,
-                pool_waiting = status.waiting,
-                "Direct per-command response finished cleanly; keeping backend connection for this client batch"
-            );
-            *slot = Some((backend_id, conn));
-        } else {
-            debug!(
-                client = %self.client_addr,
-                backend = backend_id.as_index(),
-                command_verb = ?request.verb(),
-                msg_id = ?request.message_id_value(),
-                connection_type = conn.connection_type(),
-                pending_bytes = conn.pending_bytes_len(),
-                "Direct per-command response finished cleanly; releasing backend connection"
-            );
-            let _ = conn.complete_success();
+            BackendConnectionOutcome::BackendDirty => {
+                let ResponseConnectionReuse::QueuedBytes { len } =
+                    crate::session::response_transfer::connection_reuse_after_response(&conn)
+                else {
+                    unreachable!("dirty backend fate requires queued bytes");
+                };
+                warn!(
+                    client = %self.client_addr,
+                    backend = backend_id.as_index(),
+                    command_verb = ?request.verb(),
+                    msg_id = ?request.message_id_value(),
+                    connection_type = conn.connection_type(),
+                    pending_bytes = conn.pending_bytes_len(),
+                    queued_bytes = len,
+                    "Direct per-command response left queued backend bytes; retiring connection"
+                );
+                conn.fail_client();
+            }
+            BackendConnectionOutcome::BackendHealthy => {
+                if let Some(slot) = backend_connection
+                    && slot.is_none()
+                {
+                    let status = conn.provider_status_counts();
+                    debug!(
+                        client = %self.client_addr,
+                        backend = backend_id.as_index(),
+                        command_verb = ?request.verb(),
+                        msg_id = ?request.message_id_value(),
+                        connection_type = conn.connection_type(),
+                        pending_bytes = conn.pending_bytes_len(),
+                        pool = %conn.provider_name(),
+                        pool_available = status.available,
+                        pool_size = status.size,
+                        pool_max_size = status.max_size,
+                        pool_waiting = status.waiting,
+                        "Direct per-command response finished cleanly; keeping backend connection for this client batch"
+                    );
+                    *slot = Some((backend_id, conn));
+                } else {
+                    debug!(
+                        client = %self.client_addr,
+                        backend = backend_id.as_index(),
+                        command_verb = ?request.verb(),
+                        msg_id = ?request.message_id_value(),
+                        connection_type = conn.connection_type(),
+                        pending_bytes = conn.pending_bytes_len(),
+                        "Direct per-command response finished cleanly; releasing backend connection"
+                    );
+                    let _ = conn.complete_success();
+                }
+            }
+            BackendConnectionOutcome::BackendFailed => unreachable!(
+                "successful per-command response reuse cannot produce failed backend fate"
+            ),
         }
     }
 
