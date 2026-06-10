@@ -575,7 +575,7 @@ impl DeadpoolConnectionProvider {
     /// the backend did not fail. For example, a client disconnect can leave
     /// unread backend response bytes in flight, making the socket dirty without
     /// implying that replacement connections should be throttled.
-    pub(crate) fn remove_without_cooldown(&self, conn: managed::Object<TcpManager>) {
+    pub(super) fn remove_without_cooldown(&self, conn: managed::Object<TcpManager>) {
         shutdown_and_drop(conn);
     }
 
@@ -597,7 +597,7 @@ impl DeadpoolConnectionProvider {
     /// either [`shutdown_and_drop`] or [`resize_then_drop`], so the caller cannot
     /// accidentally `drop(conn)` before `pool.resize()`. Any attempt to reorder
     /// would be a use-after-move error.
-    pub(crate) fn remove_with_cooldown(&self, conn: managed::Object<TcpManager>) {
+    pub(super) fn remove_with_cooldown(&self, conn: managed::Object<TcpManager>) {
         if self.is_shutting_down.load(Ordering::Acquire) {
             shutdown_and_drop(conn);
             return;
