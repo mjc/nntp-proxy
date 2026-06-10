@@ -95,7 +95,7 @@ impl ConnectionGuard {
         }
     }
 
-    /// Return connection to pool (healthy).
+    /// Return connection to pool after a successful exchange.
     ///
     /// Connection will be returned to the pool normally when the returned
     /// `Object` is dropped. The guard is consumed — no cleanup happens.
@@ -103,11 +103,11 @@ impl ConnectionGuard {
     /// # Panics
     ///
     /// Panics if the guard has already been consumed (double-release).
-    pub(crate) fn release(mut self) -> Object<TcpManager> {
+    pub(crate) fn complete_success(mut self) -> Object<TcpManager> {
         self.released = true;
         self.conn
             .take()
-            .expect("ConnectionGuard::release() called on consumed guard")
+            .expect("ConnectionGuard::complete_success() called on consumed guard")
     }
 
     /// Close and remove the connection without applying replacement cooldown.
@@ -118,12 +118,12 @@ impl ConnectionGuard {
     /// # Panics
     ///
     /// Panics if the guard has already been consumed.
-    pub(crate) fn retire_without_cooldown(mut self) {
+    pub(crate) fn fail_client(mut self) {
         self.released = true;
         let conn = self
             .conn
             .take()
-            .expect("ConnectionGuard::retire_without_cooldown() called on consumed guard");
+            .expect("ConnectionGuard::fail_client() called on consumed guard");
         self.provider.remove_without_cooldown(conn);
     }
 
@@ -136,12 +136,12 @@ impl ConnectionGuard {
     /// # Panics
     ///
     /// Panics if the guard has already been consumed.
-    pub(crate) fn retire_with_cooldown(mut self) {
+    pub(crate) fn fail_backend(mut self) {
         self.released = true;
         let conn = self
             .conn
             .take()
-            .expect("ConnectionGuard::retire_with_cooldown() called on consumed guard");
+            .expect("ConnectionGuard::fail_backend() called on consumed guard");
         self.provider.remove_with_cooldown(conn);
     }
 
@@ -258,19 +258,19 @@ mod tests {
     //
     // These tests verify two invariants that callers must rely on:
     //
-    //   1. `release()` returns the connection to pool — pool can reuse it without
+    //   1. `complete_success()` returns the connection to pool — pool can reuse it without
     //      creating a new TCP connection to the backend.
     //
-    //   2. drop without `release()` removes the connection — pool creates a fresh
+    //   2. drop without `complete_success()` removes the connection — pool creates a fresh
     //      TCP connection on the next `get()`.
     //
     // These invariants protect the A2 refactor: any call site that uses
-    // `ConnectionGuard` must call `release()` on "clean" paths (e.g. `ClientDisconnect`
+    // `ConnectionGuard` must call `complete_success()` on "clean" paths (e.g. `ClientDisconnect`
     // where the backend was drained successfully) and let the guard drop on
     // "dirty" paths (backend errors, unknown state).
     //
     // A buggy A2 that drops the guard on `ClientDisconnect` without calling
-    // `release()` would cause release_reuses_pool_connection to fail — the pool
+    // `complete_success()` would cause release_reuses_pool_connection to fail — the pool
     // would create a new TCP connection instead of reusing the existing one.
 
     use super::ConnectionGuard;
@@ -358,7 +358,7 @@ mod tests {
 
         // release() returns conn to pool (no shutdown)
         let guard = ConnectionGuard::new(conn, provider.clone());
-        drop(guard.release());
+        drop(guard.complete_success());
 
         // Second get — pool recycles the existing connection (no new TCP handshake)
         let _conn2 = provider.get_pooled_connection().await.unwrap();

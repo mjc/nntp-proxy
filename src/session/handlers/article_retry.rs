@@ -393,7 +393,7 @@ impl ClientSession {
         backend_connection: &mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
     ) {
         if let Some((_backend_id, conn)) = backend_connection.take() {
-            let _ = conn.release();
+            let _ = conn.complete_success();
         }
     }
 

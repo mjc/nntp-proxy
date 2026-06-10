@@ -100,16 +100,16 @@ impl BatchBackendConnection {
         &mut self.conn
     }
 
-    fn release(&mut self) {
+    fn complete_success(&mut self) {
         if let Some((_backend_id, conn)) = self.conn.take() {
-            let _ = conn.release();
+            let _ = conn.complete_success();
         }
     }
 }
 
 impl Drop for BatchBackendConnection {
     fn drop(&mut self) {
-        self.release();
+        self.complete_success();
     }
 }
 

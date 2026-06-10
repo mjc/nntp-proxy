@@ -406,7 +406,7 @@ impl ClientSession {
                 let status_code = match read {
                     Ok(read) => read.status_code(),
                     Err(_) => {
-                        conn.retire_with_cooldown();
+                        conn.fail_backend();
                         return RetryStatProbeOutcome::Unavailable(backend_id);
                     }
                 };
@@ -421,7 +421,7 @@ impl ClientSession {
                 .await
                 .is_err()
                 {
-                    conn.retire_with_cooldown();
+                    conn.fail_backend();
                     return RetryStatProbeOutcome::Unavailable(backend_id);
                 }
 
@@ -430,10 +430,10 @@ impl ClientSession {
                     .await
                     .is_err()
                 {
-                    conn.retire_with_cooldown();
+                    conn.fail_backend();
                     return RetryStatProbeOutcome::Unavailable(backend_id);
                 }
-                let _ = conn.release();
+                let _ = conn.complete_success();
 
                 if status_code.is_some_and(|status| status.as_u16() == 430) {
                     RetryStatProbeOutcome::Missing(backend_id)
@@ -529,7 +529,7 @@ impl ClientSession {
                     let status_code = match read {
                         Ok(read) => read.status_code(),
                         Err(_) => {
-                            conn.retire_with_cooldown();
+                            conn.fail_backend();
                             return;
                         }
                     };
@@ -543,10 +543,10 @@ impl ClientSession {
                     .await
                     .is_err()
                     {
-                        conn.retire_with_cooldown();
+                        conn.fail_backend();
                         return;
                     }
-                    let _ = conn.release();
+                    let _ = conn.complete_success();
 
                     if status_code.is_some_and(|status| status.as_u16() == 430)
                         && let Ok(msg_id) = crate::types::MessageId::new(msg_id_text)
@@ -693,7 +693,7 @@ impl ClientSession {
         );
         let request_kind = request.kind();
         let provider_for_salvage = provider.clone();
-        let conn_for_salvage = conn.release();
+        let conn_for_salvage = conn.complete_success();
         tokio::spawn(async move {
             tracing::debug!(
                 backend = ?backend_id,
@@ -790,7 +790,7 @@ impl ClientSession {
             );
             self.metrics.record_error(backend_id);
             self.metrics.user_error(self.username());
-            conn.retire_with_cooldown();
+            conn.fail_backend();
         } else if let ResponseConnectionReuse::QueuedBytes { len } =
             crate::session::response_transfer::connection_reuse_after_response(&conn)
         {
@@ -801,7 +801,7 @@ impl ClientSession {
                 queued_bytes = len,
                 "Response write left queued backend bytes; retiring connection"
             );
-            conn.retire_without_cooldown();
+            conn.fail_client();
         } else {
             debug!(
                 client = %self.client_addr,
@@ -809,7 +809,7 @@ impl ClientSession {
                 command_verb = ?request.verb(),
                 "Response write error left backend connection reusable; releasing it back to pool"
             );
-            let _ = conn.release();
+            let _ = conn.complete_success();
         }
 
         SessionError::from(error)
@@ -835,7 +835,7 @@ impl ClientSession {
                 queued_bytes = len,
                 "Direct per-command response left queued backend bytes; retiring connection"
             );
-            conn.retire_without_cooldown();
+            conn.fail_client();
         } else if let Some(slot) = backend_connection
             && slot.is_none()
         {
@@ -865,7 +865,7 @@ impl ClientSession {
                 pending_bytes = conn.pending_bytes_len(),
                 "Direct per-command response finished cleanly; releasing backend connection"
             );
-            let _ = conn.release();
+            let _ = conn.complete_success();
         }
     }
 
@@ -894,7 +894,7 @@ impl ClientSession {
         let guard = match backend_connection.take() {
             Some((cached_backend_id, mut guard)) if cached_backend_id == backend_id => {
                 if !self.cached_batch_connection_is_healthy(&mut guard, backend_id, request) {
-                    guard.retire_with_cooldown();
+                    guard.fail_backend();
                     let checkout_status = provider.status_counts();
                     trace!(
                         client = %self.client_addr,
@@ -973,7 +973,7 @@ impl ClientSession {
                     pending_bytes = cached_conn.pending_bytes_len(),
                     "Releasing cached backend connection before switching backend"
                 );
-                let _ = cached_conn.release();
+                let _ = cached_conn.complete_success();
                 let checkout_status = provider.status_counts();
                 trace!(
                     client = %self.client_addr,
@@ -1126,7 +1126,7 @@ impl ClientSession {
                     error = %e,
                     "Backend attempt failed before response completed; dropping pooled connection"
                 );
-                guard.retire_with_cooldown();
+                guard.fail_backend();
                 Err(e)
             }
         }
@@ -2407,7 +2407,7 @@ mod tests {
             )
             .await
             .expect("checkout should recover with a fresh pooled connection");
-        drop(guard.release());
+        drop(guard.complete_success());
 
         assert_eq!(
             accept_count.load(Ordering::SeqCst),

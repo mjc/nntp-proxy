@@ -266,7 +266,7 @@ impl ClientSession {
 
         // H2: Only return connection to pool on success
         if result.is_ok() {
-            let _conn = conn_guard.release();
+            let _conn = conn_guard.complete_success();
         } // else: guard drops -> removes connection with replacement cooldown
 
         result.map_err(crate::session::SessionError::from)

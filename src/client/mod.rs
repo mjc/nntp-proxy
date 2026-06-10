@@ -205,10 +205,10 @@ impl NntpClient {
         )
         .await
         {
-            conn.retire_with_cooldown();
+            conn.fail_backend();
             return Err(err);
         }
-        let _ = conn.release();
+        let _ = conn.complete_success();
         Ok(capture)
     }
 

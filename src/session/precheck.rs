@@ -235,7 +235,7 @@ async fn execute_backend_query(
         Ok((response, timings)) => {
             let Some(status_code) = response.status_code() else {
                 response.log_warnings(&buffer, "adaptive-precheck", backend_id);
-                conn.retire_with_cooldown();
+                conn.fail_backend();
                 return Err(());
             };
             let single_line_payload = response
@@ -254,11 +254,11 @@ async fn execute_backend_query(
 
             let result = classify_precheck_result(deps, backend, status_code, timings, response);
 
-            let _ = conn.release(); // response received; connection healthy, return to pool
+            let _ = conn.complete_success(); // response received; connection healthy, return to pool
             Ok(result)
         }
         Err(_) => {
-            conn.retire_with_cooldown();
+            conn.fail_backend();
             Err(())
         }
     }
