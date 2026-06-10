@@ -393,7 +393,7 @@ impl ClientSession {
         backend_connection: &mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
     ) {
         if let Some((_backend_id, conn)) = backend_connection.take() {
-            let _ = conn.release();
+            let _ = conn.complete_success();
         }
     }
 
@@ -623,9 +623,16 @@ impl ClientSession {
                     if let Some(msg_id) = request.message_id_value() {
                         self.cache.record_backend_missing(msg_id, backend_id).await;
                     }
-                    if let Err(err) = self
-                        .capture_suppressed_430_response(&mut conn, backend_id, request, buffer)
-                        .await
+                    let mut buffer = buffer;
+                    if let Err(err) = crate::session::backend::observe_response(
+                        request,
+                        &mut buffer,
+                        &mut conn,
+                        &self.buffer_pool,
+                        backend_id,
+                    )
+                    .await
+                    .map_err(SessionError::from)
                     {
                         Self::release_cached_backend_connection(&mut backend_connection);
                         let turn = order.wait_turn(order_index).await;

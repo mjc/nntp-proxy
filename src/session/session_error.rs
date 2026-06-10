@@ -74,12 +74,16 @@ impl From<crate::session::response_transfer::ResponseTransferError> for SessionE
             crate::session::response_transfer::ResponseTransferError::ClientDisconnect(io_err) => {
                 Self::ClientDisconnect(io_err)
             }
+            crate::session::response_transfer::ResponseTransferError::ClientWrite(io_err) => {
+                Self::ClientDisconnect(io_err)
+            }
             other => Self::Backend(other.into_anyhow()),
         }
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use std::io::ErrorKind;
@@ -129,5 +133,14 @@ mod tests {
             };
         let e = SessionError::from(response_transfer_err);
         assert!(matches!(e, SessionError::Backend(_)));
+    }
+
+    #[test]
+    fn client_disconnect_from_response_transfer_client_write() {
+        let io_err = std::io::Error::from(ErrorKind::BrokenPipe);
+        let response_transfer_err =
+            crate::session::response_transfer::ResponseTransferError::ClientWrite(io_err);
+        let e = SessionError::from(response_transfer_err);
+        assert!(matches!(e, SessionError::ClientDisconnect(_)));
     }
 }

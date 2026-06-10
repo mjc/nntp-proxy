@@ -1,0 +1,9 @@
+disallowed-methods = [
+  { path = "tokio::io::AsyncReadExt::read_to_end", reason = "Session response paths must use MultilineFramer-backed operations; read_to_end bypasses framing boundaries." },
+  { path = "tokio::io::AsyncReadExt::read_to_string", reason = "Session response paths must keep protocol framing byte-accurate; read_to_string bypasses framer boundaries." },
+  { path = "std::io::Read::read_to_end", reason = "Session response paths must stream through framer entrypoints instead of buffering whole responses." },
+  { path = "std::io::Read::read_to_string", reason = "Session response paths must not decode unframed bytes directly into strings." },
+  { path = "crate::pool::ChunkedResponse::write_all_to_recording", reason = "Only multiline_framing may use the recorded write helper; response write accounting must stay centralized." },
+  { path = "crate::pool::buffer::record_response_write_metrics_internal", reason = "Only multiline_framing may record response-write metrics; callers must not recreate the split accounting path." },
+  { path = "crate::session::response_transfer::ResponseTransferError::ClientDisconnect", reason = "Only multiline_framing may construct ClientDisconnect; response-write paths must use ClientWrite to force connection retirement." },
+]

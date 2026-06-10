@@ -100,16 +100,18 @@ impl BatchBackendConnection {
         &mut self.conn
     }
 
-    fn release(&mut self) {
+    fn complete_success(&mut self) {
         if let Some((_backend_id, conn)) = self.conn.take() {
-            let _ = conn.release();
+            let _ = conn.complete_success();
         }
     }
 }
 
 impl Drop for BatchBackendConnection {
     fn drop(&mut self) {
-        self.release();
+        if let Some((_backend_id, conn)) = self.conn.take() {
+            conn.fail_backend();
+        }
     }
 }
 
@@ -520,7 +522,7 @@ impl ClientSession {
             return Ok(action);
         }
 
-        match self
+        let action = match self
             .process_pipelineable_batch(
                 router,
                 client_writer,
@@ -538,10 +540,12 @@ impl ClientSession {
                     batch,
                     &mut backend_connection,
                 )
-                .await
+                .await?
             }
-            action => Ok(action),
-        }
+            action => action,
+        };
+        backend_connection.complete_success();
+        Ok(action)
     }
 
     async fn handle_batch_rejections(
@@ -876,7 +880,67 @@ impl ClientSession {
 
 #[cfg(test)]
 mod tests {
+    use crate::pool::DeadpoolConnectionProvider;
     use crate::protocol::{RequestContext, ResponseWireLen, StatusCode};
+    use crate::types::BackendId;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::TcpListener;
+    use tokio::time::Duration;
+
+    async fn spawn_greeting_server() -> (u16, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accept_count = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accept_count);
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let (read_half, mut write_half) = stream.into_split();
+                    let mut reader = BufReader::new(read_half);
+
+                    if write_half.write_all(b"200 Ready\r\n").await.is_err() {
+                        return;
+                    }
+
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                let cmd = line.trim().to_ascii_uppercase();
+                                if cmd == "COMPRESS DEFLATE" {
+                                    let _ = write_half.write_all(b"500 Not supported\r\n").await;
+                                } else if cmd.starts_with("MODE") {
+                                    let _ = write_half.write_all(b"200 Posting allowed\r\n").await;
+                                } else if cmd.starts_with("QUIT") {
+                                    let _ = write_half.write_all(b"205 Goodbye\r\n").await;
+                                    break;
+                                } else if cmd.starts_with("DATE") {
+                                    let _ = write_half.write_all(b"111 20240101000000\r\n").await;
+                                } else {
+                                    let _ = write_half.write_all(b"200 OK\r\n").await;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        (port, accept_count)
+    }
+
+    fn make_provider(port: u16) -> DeadpoolConnectionProvider {
+        DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(5)
+            .build()
+            .unwrap()
+    }
 
     #[test]
     fn local_response_records_typed_status_and_wire_len() {
@@ -903,6 +967,35 @@ mod tests {
         let request = RequestContext::parse(b"GROUP alt.test\r\n").expect("valid request");
 
         assert_eq!(super::safe_command_log_label(&request), "GROUP");
+    }
+
+    #[tokio::test]
+    async fn batch_connection_cancel_retirees_connection_on_drop() {
+        let (port, accept_count) = spawn_greeting_server().await;
+        let provider = make_provider(port);
+        let conn = provider.checkout_connection_guard().await.unwrap();
+        assert_eq!(accept_count.load(Ordering::SeqCst), 1);
+
+        let handle = tokio::spawn(async move {
+            let _batch = super::BatchBackendConnection {
+                conn: Some((BackendId::from_index(0), conn)),
+            };
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(_batch);
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.abort();
+        let _ = handle.await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let next = provider.checkout_connection_guard().await.unwrap();
+        drop(next.complete_success());
+        assert_eq!(
+            accept_count.load(Ordering::SeqCst),
+            2,
+            "timeout/cancel cleanup must retire the batch connection instead of returning it to the pool"
+        );
     }
 
     #[test]

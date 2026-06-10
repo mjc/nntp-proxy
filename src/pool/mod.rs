@@ -14,7 +14,8 @@ pub use buffer::{
     BufferPool, ChunkedResponse, HotPathAllocationMetricsSnapshot, PooledBuffer,
     hot_path_allocation_metrics_snapshot, reset_hot_path_allocation_metrics,
 };
-pub use connection_guard::{ConnectionGuard, salvage_with_health_check};
+pub(crate) use connection_guard::ConnectionGuard;
+pub(crate) use connection_guard::salvage_with_health_check;
 pub use connection_trait::{ConnectionProvider, PoolStatus};
 pub use health_check::{HealthCheckError, HealthCheckMetrics};
 pub use prewarming::prewarm_pools;

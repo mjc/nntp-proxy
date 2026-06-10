@@ -325,8 +325,6 @@ struct HotPathAllocationMetrics {
     capture_pool_fallback_allocations: AtomicUsize,
     chunked_response_metadata_spills: AtomicUsize,
     pending_backend_byte_heap_fallbacks: AtomicUsize,
-    non_owned_response_write_chunks: AtomicUsize,
-    non_owned_response_write_bytes: AtomicUsize,
     regular_pool_buffer_holds: AtomicUsize,
     regular_pool_buffer_hold_micros_total: AtomicU64,
     regular_pool_buffer_hold_micros_max: AtomicU64,
@@ -335,7 +333,7 @@ struct HotPathAllocationMetrics {
     capture_pool_buffer_hold_micros_max: AtomicU64,
 }
 
-/// Snapshot of direct client write-path activity from `ChunkedResponse::write_all_to`.
+/// Snapshot of logical response writes emitted to clients.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResponseWriteMetricsSnapshot {
     pub responses: usize,
@@ -358,8 +356,6 @@ pub struct HotPathAllocationMetricsSnapshot {
     pub capture_pool_fallback_allocations: usize,
     pub chunked_response_metadata_spills: usize,
     pub pending_backend_byte_heap_fallbacks: usize,
-    pub non_owned_response_write_chunks: usize,
-    pub non_owned_response_write_bytes: usize,
     pub regular_pool_buffer_holds: usize,
     pub regular_pool_buffer_hold_micros_total: u64,
     pub regular_pool_buffer_hold_micros_max: u64,
@@ -468,14 +464,17 @@ pub(crate) fn record_pending_backend_byte_heap_fallback() {
         .fetch_add(1, Ordering::Relaxed);
 }
 
-pub(crate) fn record_non_owned_response_write_chunk(bytes: usize) {
-    let metrics = hot_path_allocation_metrics();
-    metrics
-        .non_owned_response_write_chunks
-        .fetch_add(1, Ordering::Relaxed);
-    metrics
-        .non_owned_response_write_bytes
-        .fetch_add(bytes, Ordering::Relaxed);
+pub(crate) fn classify_response_write_chunk(bytes: usize) -> (usize, usize, usize, usize) {
+    let tiny_chunks = if bytes <= 256 { 1 } else { 0 };
+    let tiny_chunk_bytes = if bytes <= 256 { bytes } else { 0 };
+    let small_chunks = if bytes <= 4096 { 1 } else { 0 };
+    let small_chunk_bytes = if bytes <= 4096 { bytes } else { 0 };
+    (
+        tiny_chunks,
+        tiny_chunk_bytes,
+        small_chunks,
+        small_chunk_bytes,
+    )
 }
 
 #[must_use]
@@ -494,12 +493,6 @@ pub fn hot_path_allocation_metrics_snapshot() -> HotPathAllocationMetricsSnapsho
             .load(Ordering::Relaxed),
         pending_backend_byte_heap_fallbacks: metrics
             .pending_backend_byte_heap_fallbacks
-            .load(Ordering::Relaxed),
-        non_owned_response_write_chunks: metrics
-            .non_owned_response_write_chunks
-            .load(Ordering::Relaxed),
-        non_owned_response_write_bytes: metrics
-            .non_owned_response_write_bytes
             .load(Ordering::Relaxed),
         regular_pool_buffer_holds: metrics.regular_pool_buffer_holds.load(Ordering::Relaxed),
         regular_pool_buffer_hold_micros_total: metrics
@@ -534,12 +527,6 @@ pub fn reset_hot_path_allocation_metrics() {
         .pending_backend_byte_heap_fallbacks
         .store(0, Ordering::Relaxed);
     metrics
-        .non_owned_response_write_chunks
-        .store(0, Ordering::Relaxed);
-    metrics
-        .non_owned_response_write_bytes
-        .store(0, Ordering::Relaxed);
-    metrics
         .regular_pool_buffer_holds
         .store(0, Ordering::Relaxed);
     metrics
@@ -559,7 +546,22 @@ pub fn reset_hot_path_allocation_metrics() {
         .store(0, Ordering::Relaxed);
 }
 
-fn record_response_write_metrics(
+#[cfg(test)]
+pub(crate) fn reset_response_write_metrics() {
+    let metrics = response_write_metrics();
+    metrics.responses.store(0, Ordering::Relaxed);
+    metrics.single_chunk_responses.store(0, Ordering::Relaxed);
+    metrics.multi_chunk_responses.store(0, Ordering::Relaxed);
+    metrics.chunks_written.store(0, Ordering::Relaxed);
+    metrics.bytes_written.store(0, Ordering::Relaxed);
+    metrics.tiny_chunks.store(0, Ordering::Relaxed);
+    metrics.tiny_chunk_bytes.store(0, Ordering::Relaxed);
+    metrics.small_chunks.store(0, Ordering::Relaxed);
+    metrics.small_chunk_bytes.store(0, Ordering::Relaxed);
+    metrics.max_chunks_per_response.store(0, Ordering::Relaxed);
+}
+
+pub(crate) fn record_response_write_metrics_internal(
     chunk_count: usize,
     bytes_written: usize,
     tiny_chunks: usize,
@@ -603,6 +605,16 @@ fn record_response_write_metrics(
             .multi_chunk_responses
             .fetch_add(1, Ordering::Relaxed);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn response_write_metrics_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    use std::sync::Mutex;
+
+    static GUARD: Mutex<()> = Mutex::new(());
+    GUARD
+        .lock()
+        .expect("response-write metrics test guard poisoned")
 }
 
 #[must_use]
@@ -826,38 +838,10 @@ impl ChunkedResponse {
     ///
     /// # Errors
     /// Returns any write error produced by the underlying async sink.
-    pub async fn write_all_to<W>(&self, writer: &mut W) -> std::io::Result<()>
+    pub async fn write_all_to_recording<W>(&self, writer: &mut W) -> std::io::Result<()>
     where
         W: AsyncWriteExt + Unpin,
     {
-        if response_write_metrics_enabled() {
-            let mut chunk_count = 0usize;
-            let mut tiny_chunks = 0usize;
-            let mut tiny_chunk_bytes = 0usize;
-            let mut small_chunks = 0usize;
-            let mut small_chunk_bytes = 0usize;
-            for chunk in self.iter_chunks() {
-                chunk_count += 1;
-                let len = chunk.len();
-                if len <= 256 {
-                    tiny_chunks += 1;
-                    tiny_chunk_bytes += len;
-                }
-                if len <= 4096 {
-                    small_chunks += 1;
-                    small_chunk_bytes += len;
-                }
-            }
-            record_response_write_metrics(
-                chunk_count,
-                self.len,
-                tiny_chunks,
-                tiny_chunk_bytes,
-                small_chunks,
-                small_chunk_bytes,
-            );
-        }
-
         for chunk in self.iter_chunks() {
             writer.write_all(chunk).await?;
         }
@@ -1217,10 +1201,7 @@ mod tests {
     }
 
     fn response_write_metrics_test_guard() -> MutexGuard<'static, ()> {
-        static GUARD: Mutex<()> = Mutex::new(());
-        GUARD
-            .lock()
-            .expect("response-write metrics test guard poisoned")
+        super::response_write_metrics_test_guard()
     }
     use tokio::io::AsyncWriteExt;
 

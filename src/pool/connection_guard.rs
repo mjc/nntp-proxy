@@ -84,7 +84,10 @@ pub struct ConnectionGuard {
 
 impl ConnectionGuard {
     /// Create a new guard (removes from pool on drop unless released).
-    pub const fn new(conn: Object<TcpManager>, provider: DeadpoolConnectionProvider) -> Self {
+    pub(crate) const fn new(
+        conn: Object<TcpManager>,
+        provider: DeadpoolConnectionProvider,
+    ) -> Self {
         Self {
             conn: Some(conn),
             provider,
@@ -92,7 +95,7 @@ impl ConnectionGuard {
         }
     }
 
-    /// Return connection to pool (healthy).
+    /// Return connection to pool after a successful exchange.
     ///
     /// Connection will be returned to the pool normally when the returned
     /// `Object` is dropped. The guard is consumed — no cleanup happens.
@@ -100,11 +103,11 @@ impl ConnectionGuard {
     /// # Panics
     ///
     /// Panics if the guard has already been consumed (double-release).
-    pub fn release(mut self) -> Object<TcpManager> {
+    pub fn complete_success(mut self) -> Object<TcpManager> {
         self.released = true;
         self.conn
             .take()
-            .expect("ConnectionGuard::release() called on consumed guard")
+            .expect("ConnectionGuard::complete_success() called on consumed guard")
     }
 
     /// Close and remove the connection without applying replacement cooldown.
@@ -115,12 +118,12 @@ impl ConnectionGuard {
     /// # Panics
     ///
     /// Panics if the guard has already been consumed.
-    pub fn retire_without_cooldown(mut self) {
+    pub(crate) fn fail_client(mut self) {
         self.released = true;
         let conn = self
             .conn
             .take()
-            .expect("ConnectionGuard::retire_without_cooldown() called on consumed guard");
+            .expect("ConnectionGuard::fail_client() called on consumed guard");
         self.provider.remove_without_cooldown(conn);
     }
 
@@ -133,12 +136,12 @@ impl ConnectionGuard {
     /// # Panics
     ///
     /// Panics if the guard has already been consumed.
-    pub fn retire_with_cooldown(mut self) {
+    pub(crate) fn fail_backend(mut self) {
         self.released = true;
         let conn = self
             .conn
             .take()
-            .expect("ConnectionGuard::retire_with_cooldown() called on consumed guard");
+            .expect("ConnectionGuard::fail_backend() called on consumed guard");
         self.provider.remove_with_cooldown(conn);
     }
 
@@ -147,7 +150,7 @@ impl ConnectionGuard {
     /// # Panics
     ///
     /// Panics if the guard has already been consumed.
-    pub const fn get_mut(&mut self) -> &mut Object<TcpManager> {
+    pub(crate) const fn get_mut(&mut self) -> &mut Object<TcpManager> {
         self.conn
             .as_mut()
             .expect("ConnectionGuard already consumed")
@@ -158,35 +161,39 @@ impl ConnectionGuard {
     /// # Panics
     ///
     /// Panics if the guard has already been consumed.
-    pub const fn get(&self) -> &Object<TcpManager> {
+    pub(crate) const fn get(&self) -> &Object<TcpManager> {
         self.conn
             .as_ref()
             .expect("ConnectionGuard already consumed")
     }
 
     #[must_use]
-    pub fn connection_type(&self) -> &'static str {
+    pub(crate) fn connection_type(&self) -> &'static str {
         self.get().connection_type()
     }
 
     #[must_use]
-    pub fn pending_bytes_len(&self) -> usize {
+    pub(crate) fn pending_bytes_len(&self) -> usize {
         self.get().pending_bytes_len()
     }
 
     #[must_use]
-    pub fn provider_status_counts(&self) -> crate::pool::provider::DeadpoolStatusCounts {
+    pub(crate) fn provider_status_counts(&self) -> crate::pool::provider::DeadpoolStatusCounts {
         self.provider.status_counts()
     }
 
     #[must_use]
-    pub fn provider_name(&self) -> &str {
+    pub(crate) fn provider_name(&self) -> &str {
         self.provider.name()
     }
 }
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
+        debug_assert!(
+            self.released,
+            "ConnectionGuard dropped without explicit finalize"
+        );
         if !self.released
             && let Some(conn) = self.conn.take()
         {
@@ -229,7 +236,7 @@ impl std::ops::DerefMut for ConnectionGuard {
 /// # Arguments
 /// * `conn` - Pooled connection to verify
 /// * `provider` - Connection provider (used for `remove_with_cooldown` on failure)
-pub async fn salvage_with_health_check(
+pub(crate) async fn salvage_with_health_check(
     mut conn: Object<TcpManager>,
     provider: DeadpoolConnectionProvider,
 ) {
@@ -255,19 +262,19 @@ mod tests {
     //
     // These tests verify two invariants that callers must rely on:
     //
-    //   1. `release()` returns the connection to pool — pool can reuse it without
+    //   1. `complete_success()` returns the connection to pool — pool can reuse it without
     //      creating a new TCP connection to the backend.
     //
-    //   2. drop without `release()` removes the connection — pool creates a fresh
+    //   2. drop without `complete_success()` removes the connection — pool creates a fresh
     //      TCP connection on the next `get()`.
     //
     // These invariants protect the A2 refactor: any call site that uses
-    // `ConnectionGuard` must call `release()` on "clean" paths (e.g. `ClientDisconnect`
+    // `ConnectionGuard` must call `complete_success()` on "clean" paths (e.g. `ClientDisconnect`
     // where the backend was drained successfully) and let the guard drop on
     // "dirty" paths (backend errors, unknown state).
     //
     // A buggy A2 that drops the guard on `ClientDisconnect` without calling
-    // `release()` would cause release_reuses_pool_connection to fail — the pool
+    // `complete_success()` would cause release_reuses_pool_connection to fail — the pool
     // would create a new TCP connection instead of reusing the existing one.
 
     use super::ConnectionGuard;
@@ -339,7 +346,7 @@ mod tests {
             .unwrap()
     }
 
-    /// Invariant: `release()` returns the connection to the pool.
+    /// Invariant: `complete_success()` returns the connection to the pool.
     ///
     /// Pool must reuse the connection without creating a new TCP connection.
     /// This is the path taken on success and on `ClientDisconnect` (backend was
@@ -353,25 +360,26 @@ mod tests {
         let conn = provider.get_pooled_connection().await.unwrap();
         assert_eq!(accept_count.load(Ordering::SeqCst), 1);
 
-        // release() returns conn to pool (no shutdown)
+        // complete_success() returns conn to pool (no shutdown)
         let guard = ConnectionGuard::new(conn, provider.clone());
-        drop(guard.release());
+        drop(guard.complete_success());
 
         // Second get — pool recycles the existing connection (no new TCP handshake)
         let _conn2 = provider.get_pooled_connection().await.unwrap();
         assert_eq!(
             accept_count.load(Ordering::SeqCst),
             1,
-            "release() must return connection to pool; next get() must reuse it without \
+            "complete_success() must return connection to pool; next get() must reuse it without \
              creating a new TCP connection"
         );
     }
 
-    /// Invariant: drop without `release()` removes the connection from the pool.
+    /// Invariant: drop without `complete_success()` removes the connection from the pool.
     ///
     /// The guard shuts down the socket; pool recycle detects EOF
     /// and discards it; next `get()` creates a fresh TCP connection.
     /// Unknown/backend-error drop paths apply replacement cooldown.
+    #[cfg(not(debug_assertions))]
     #[tokio::test]
     async fn drop_without_release_forces_new_connection() {
         let (port, accept_count) = spawn_greeting_server().await;
@@ -400,9 +408,19 @@ mod tests {
         assert_eq!(
             accept_count.load(Ordering::SeqCst),
             2,
-            "drop without release() must remove connection; next get() must create \
+            "drop without complete_success() must remove connection; next get() must create \
              a new TCP connection"
         );
+    }
+
+    #[cfg(debug_assertions)]
+    #[tokio::test]
+    #[should_panic(expected = "ConnectionGuard dropped without explicit finalize")]
+    async fn drop_without_complete_success_panics_in_debug() {
+        let (port, _accept_count) = spawn_greeting_server().await;
+        let provider = make_provider(port);
+        let conn = provider.get_pooled_connection().await.unwrap();
+        let _guard = ConnectionGuard::new(conn, provider.clone());
     }
 
     // ─── salvage_with_health_check notes ────────────────────────────────────

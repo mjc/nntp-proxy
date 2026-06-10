@@ -47,6 +47,7 @@
 //! # fn example() -> anyhow::Result<()> {
 //! let addr: SocketAddr = "127.0.0.1:50000".parse()?;
 //! let buffer_pool = BufferPool::new(BufferSize::try_new(8192)?, 10);
+
 //! let router = Arc::new(BackendSelector::new());
 //! let auth = Arc::new(AuthHandler::new(None, None)?);
 //! let metrics = MetricsCollector::new(1);
@@ -163,6 +164,8 @@
 //!   - Routes command to backend
 //!   - Handles connection pool management
 //!   - Distinguishes backend errors from client disconnects
+
+#![deny(clippy::disallowed_methods)]
 
 pub mod auth_state;
 pub(crate) mod backend;

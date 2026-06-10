@@ -6,7 +6,9 @@
 use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata, StatusCode};
 use crate::router::{ArticleBackend, BackendSelector, SuppressedBackends};
 use crate::session::SessionError;
-use crate::session::response_transfer::{ResponseConnectionReuse, ResponseTransferError};
+use crate::session::response_transfer::{
+    BackendConnectionOutcome, ResponseConnectionReuse, ResponseTransferError,
+};
 use crate::session::retry::retry_once;
 use crate::session::routing::{
     CacheAction, MetricsAction, determine_cache_action_for_request,
@@ -25,7 +27,7 @@ const BACKEND_TIMING_SAMPLE_MASK: u64 = 0x0f;
 static BACKEND_TIMING_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
-pub fn should_sample_backend_timing() -> bool {
+pub(crate) fn should_sample_backend_timing() -> bool {
     BACKEND_TIMING_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed) & BACKEND_TIMING_SAMPLE_MASK == 0
 }
 
@@ -133,19 +135,24 @@ enum BackendReadAttemptError {
     Backend(anyhow::Error),
 }
 
+impl From<SessionError> for BackendReadAttemptError {
+    fn from(err: SessionError) -> Self {
+        Self::Backend(anyhow::Error::new(err))
+    }
+}
+
 enum RetryStatProbeOutcome {
     Missing(BackendId),
     Present,
     Unavailable(BackendId),
 }
 
-/// Any client write failure after the full backend response is already owned is terminal.
+/// Any client write failure after response ownership is established is terminal.
 ///
-/// The backend connection is already clean at this point, but the client may have received a
-/// partial prefix of the response. Retrying another backend on the same client socket would
-/// splice responses together and corrupt NNTP response ordering.
+/// This must retire the backend connection to prevent protocol desync from
+/// partially-written client responses.
 const fn classify_response_write_err(e: std::io::Error) -> ResponseTransferError {
-    ResponseTransferError::ClientDisconnect(e)
+    ResponseTransferError::ClientWrite(e)
 }
 
 const fn can_discard_response_after_write(
@@ -177,9 +184,28 @@ impl ResponseRetention {
 }
 
 impl ClientSession {
-    #[inline]
-    const fn should_reuse_cached_batch_connection() -> bool {
-        true
+    fn cached_batch_connection_is_healthy(
+        &self,
+        guard: &mut crate::pool::ConnectionGuard,
+        backend_id: BackendId,
+        request: &RequestContext,
+    ) -> bool {
+        match crate::pool::health_check::check_tcp_alive(guard) {
+            Ok(()) => true,
+            Err(err) => {
+                warn!(
+                    client = %self.client_addr,
+                    backend = backend_id.as_index(),
+                    command_verb = ?request.verb(),
+                    msg_id = ?request.message_id_value(),
+                    connection_type = guard.connection_type(),
+                    pending_bytes = guard.pending_bytes_len(),
+                    error = %err,
+                    "Cached batch connection failed pre-reuse health check; retiring it"
+                );
+                false
+            }
+        }
     }
 
     pub(super) fn retry_backend_provider<'a>(
@@ -251,7 +277,7 @@ impl ClientSession {
             return Ok(BackendAttemptResult::BackendUnavailable);
         };
 
-        let Some((mut conn, status_code, buffer)) = self
+        let Some((mut conn, status_code, mut buffer)) = self
             .prepare_backend_attempt(provider, &backend, request, state, is_retry_attempt)
             .await?
         else {
@@ -271,8 +297,15 @@ impl ClientSession {
                 if let Some(msg_id) = request.message_id_value() {
                     self.cache.record_backend_missing(msg_id, backend_id).await;
                 }
-                self.capture_suppressed_430_response(&mut conn, backend_id, request, buffer)
-                    .await?;
+                crate::session::backend::observe_response(
+                    request,
+                    &mut buffer,
+                    &mut conn,
+                    &self.buffer_pool,
+                    backend_id,
+                )
+                .await
+                .map_err(SessionError::from)?;
                 self.release_or_reuse_connection(
                     conn,
                     backend_id,
@@ -361,31 +394,48 @@ impl ClientSession {
             let stat_request = stat_request.clone();
             probes.push(async move {
                 let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
-                let conn = match provider.get_pooled_connection().await {
+                let mut conn = match provider.checkout_connection_guard().await {
                     Ok(conn) => conn,
                     Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
                 };
-                let mut conn = crate::pool::ConnectionGuard::new(conn, provider);
                 let mut buffer = self.buffer_pool.acquire();
-                let read =
-                    backend::send_request(&mut **conn.get_mut(), &stat_request, &mut buffer).await;
+                let read = backend::execute_request_classified(
+                    &mut **conn,
+                    &stat_request,
+                    &mut buffer,
+                )
+                .await;
                 let status_code = match read {
                     Ok(read) => read.status_code(),
                     Err(_) => {
-                        conn.retire_with_cooldown();
+                        conn.fail_backend();
                         return RetryStatProbeOutcome::Unavailable(backend_id);
                     }
                 };
+
+                if crate::session::backend::observe_response(
+                    &stat_request,
+                    &mut buffer,
+                    &mut conn,
+                    &self.buffer_pool,
+                    backend_id,
+                )
+                .await
+                .is_err()
+                {
+                    conn.fail_backend();
+                    return RetryStatProbeOutcome::Unavailable(backend_id);
+                }
 
                 if self
                     .capture_suppressed_430_response(&mut conn, backend_id, &stat_request, buffer)
                     .await
                     .is_err()
                 {
-                    conn.retire_with_cooldown();
+                    conn.fail_backend();
                     return RetryStatProbeOutcome::Unavailable(backend_id);
                 }
-                let _ = conn.release();
+                let _ = conn.complete_success();
 
                 if status_code.is_some_and(|status| status.as_u16() == 430) {
                     RetryStatProbeOutcome::Missing(backend_id)
@@ -467,19 +517,21 @@ impl ClientSession {
                 let buffer_pool = buffer_pool.clone();
                 probes.push(async move {
                     let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
-                    let conn = match provider.get_pooled_connection().await {
+                    let mut conn = match provider.checkout_connection_guard().await {
                         Ok(conn) => conn,
                         Err(_) => return,
                     };
-                    let mut conn = crate::pool::ConnectionGuard::new(conn, provider);
                     let mut buffer = buffer_pool.acquire();
-                    let read =
-                        backend::send_request(&mut **conn.get_mut(), &stat_request, &mut buffer)
-                            .await;
+                    let read = backend::execute_request_classified(
+                        &mut **conn,
+                        &stat_request,
+                        &mut buffer,
+                    )
+                    .await;
                     let status_code = match read {
                         Ok(read) => read.status_code(),
                         Err(_) => {
-                            conn.retire_with_cooldown();
+                            conn.fail_backend();
                             return;
                         }
                     };
@@ -493,10 +545,10 @@ impl ClientSession {
                     .await
                     .is_err()
                     {
-                        conn.retire_with_cooldown();
+                        conn.fail_backend();
                         return;
                     }
-                    let _ = conn.release();
+                    let _ = conn.complete_success();
 
                     if status_code.is_some_and(|status| status.as_u16() == 430)
                         && let Ok(msg_id) = crate::types::MessageId::new(msg_id_text)
@@ -620,24 +672,6 @@ impl ClientSession {
         Ok(Some((conn, status_code, buffer)))
     }
 
-    pub(super) async fn capture_suppressed_430_response(
-        &self,
-        conn: &mut crate::pool::ConnectionGuard,
-        backend_id: BackendId,
-        request: &RequestContext,
-        mut buffer: crate::pool::PooledBuffer,
-    ) -> Result<(), SessionError> {
-        crate::session::backend::observe_response(
-            request,
-            &mut buffer,
-            conn,
-            &self.buffer_pool,
-            backend_id,
-        )
-        .await
-        .map_err(SessionError::from)
-    }
-
     fn handle_invalid_backend_response(
         &self,
         backend_id: BackendId,
@@ -661,7 +695,7 @@ impl ClientSession {
         );
         let request_kind = request.kind();
         let provider_for_salvage = provider.clone();
-        let conn_for_salvage = conn.release();
+        let conn_for_salvage = conn.complete_success();
         tokio::spawn(async move {
             tracing::debug!(
                 backend = ?backend_id,
@@ -748,36 +782,42 @@ impl ClientSession {
         request: &RequestContext,
         error: ResponseTransferError,
     ) -> SessionError {
-        if error.must_remove_connection() {
-            warn!(
-                client = %self.client_addr,
-                backend = backend_id.as_index(),
-                command_verb = ?request.verb(),
-                error = %error,
-                "Response write error, removing connection from pool"
-            );
-            self.metrics.record_error(backend_id);
-            self.metrics.user_error(self.username());
-            conn.retire_with_cooldown();
-        } else if let ResponseConnectionReuse::QueuedBytes { len } =
-            crate::session::response_transfer::connection_reuse_after_response(&conn)
-        {
-            warn!(
-                client = %self.client_addr,
-                backend = backend_id.as_index(),
-                command_verb = ?request.verb(),
-                queued_bytes = len,
-                "Response write left queued backend bytes; retiring connection"
-            );
-            conn.retire_without_cooldown();
-        } else {
-            debug!(
-                client = %self.client_addr,
-                backend = backend_id.as_index(),
-                command_verb = ?request.verb(),
-                "Response write error left backend connection reusable; releasing it back to pool"
-            );
-            let _ = conn.release();
+        let reuse = crate::session::response_transfer::connection_reuse_after_response(&conn);
+        match error.pool_fate(reuse) {
+            BackendConnectionOutcome::BackendFailed => {
+                warn!(
+                    client = %self.client_addr,
+                    backend = backend_id.as_index(),
+                    command_verb = ?request.verb(),
+                    error = %error,
+                    "Response write error, removing connection from pool"
+                );
+                self.metrics.record_error(backend_id);
+                self.metrics.user_error(self.username());
+                conn.fail_backend();
+            }
+            BackendConnectionOutcome::BackendDirty => {
+                let ResponseConnectionReuse::QueuedBytes { len } = reuse else {
+                    unreachable!("dirty backend fate requires queued bytes");
+                };
+                warn!(
+                    client = %self.client_addr,
+                    backend = backend_id.as_index(),
+                    command_verb = ?request.verb(),
+                    queued_bytes = len,
+                    "Response write left queued backend bytes; retiring connection"
+                );
+                conn.fail_client();
+            }
+            BackendConnectionOutcome::BackendHealthy => {
+                debug!(
+                    client = %self.client_addr,
+                    backend = backend_id.as_index(),
+                    command_verb = ?request.verb(),
+                    "Response write error left backend connection reusable; releasing it back to pool"
+                );
+                let _ = conn.complete_success();
+            }
         }
 
         SessionError::from(error)
@@ -790,50 +830,62 @@ impl ClientSession {
         request: &RequestContext,
         backend_connection: Option<&mut Option<(BackendId, crate::pool::ConnectionGuard)>>,
     ) {
-        if let ResponseConnectionReuse::QueuedBytes { len } =
-            crate::session::response_transfer::connection_reuse_after_response(&conn)
+        match crate::session::response_transfer::connection_reuse_after_response(&conn).pool_fate()
         {
-            warn!(
-                client = %self.client_addr,
-                backend = backend_id.as_index(),
-                command_verb = ?request.verb(),
-                msg_id = ?request.message_id_value(),
-                connection_type = conn.connection_type(),
-                pending_bytes = conn.pending_bytes_len(),
-                queued_bytes = len,
-                "Direct per-command response left queued backend bytes; retiring connection"
-            );
-            conn.retire_without_cooldown();
-        } else if let Some(slot) = backend_connection
-            && slot.is_none()
-        {
-            let status = conn.provider_status_counts();
-            debug!(
-                client = %self.client_addr,
-                backend = backend_id.as_index(),
-                command_verb = ?request.verb(),
-                msg_id = ?request.message_id_value(),
-                connection_type = conn.connection_type(),
-                pending_bytes = conn.pending_bytes_len(),
-                pool = %conn.provider_name(),
-                pool_available = status.available,
-                pool_size = status.size,
-                pool_max_size = status.max_size,
-                pool_waiting = status.waiting,
-                "Direct per-command response finished cleanly; keeping backend connection for this client batch"
-            );
-            *slot = Some((backend_id, conn));
-        } else {
-            debug!(
-                client = %self.client_addr,
-                backend = backend_id.as_index(),
-                command_verb = ?request.verb(),
-                msg_id = ?request.message_id_value(),
-                connection_type = conn.connection_type(),
-                pending_bytes = conn.pending_bytes_len(),
-                "Direct per-command response finished cleanly; releasing backend connection"
-            );
-            let _ = conn.release();
+            BackendConnectionOutcome::BackendDirty => {
+                let ResponseConnectionReuse::QueuedBytes { len } =
+                    crate::session::response_transfer::connection_reuse_after_response(&conn)
+                else {
+                    unreachable!("dirty backend fate requires queued bytes");
+                };
+                warn!(
+                    client = %self.client_addr,
+                    backend = backend_id.as_index(),
+                    command_verb = ?request.verb(),
+                    msg_id = ?request.message_id_value(),
+                    connection_type = conn.connection_type(),
+                    pending_bytes = conn.pending_bytes_len(),
+                    queued_bytes = len,
+                    "Direct per-command response left queued backend bytes; retiring connection"
+                );
+                conn.fail_client();
+            }
+            BackendConnectionOutcome::BackendHealthy => {
+                if let Some(slot) = backend_connection
+                    && slot.is_none()
+                {
+                    let status = conn.provider_status_counts();
+                    debug!(
+                        client = %self.client_addr,
+                        backend = backend_id.as_index(),
+                        command_verb = ?request.verb(),
+                        msg_id = ?request.message_id_value(),
+                        connection_type = conn.connection_type(),
+                        pending_bytes = conn.pending_bytes_len(),
+                        pool = %conn.provider_name(),
+                        pool_available = status.available,
+                        pool_size = status.size,
+                        pool_max_size = status.max_size,
+                        pool_waiting = status.waiting,
+                        "Direct per-command response finished cleanly; keeping backend connection for this client batch"
+                    );
+                    *slot = Some((backend_id, conn));
+                } else {
+                    debug!(
+                        client = %self.client_addr,
+                        backend = backend_id.as_index(),
+                        command_verb = ?request.verb(),
+                        msg_id = ?request.message_id_value(),
+                        connection_type = conn.connection_type(),
+                        pending_bytes = conn.pending_bytes_len(),
+                        "Direct per-command response finished cleanly; releasing backend connection"
+                    );
+                    let _ = conn.complete_success();
+                }
+            }
+            BackendConnectionOutcome::BackendFailed => unreachable!(
+                "successful per-command response reuse cannot produce failed backend fate"
+            ),
         }
     }
 
@@ -845,6 +897,8 @@ impl ClientSession {
         backend_connection: &mut Option<(BackendId, crate::pool::ConnectionGuard)>,
     ) -> Result<crate::pool::ConnectionGuard> {
         let checkout_status = provider.status_counts();
+        let can_expand_or_use_idle =
+            checkout_status.available > 0 || checkout_status.size < checkout_status.max_size;
         debug!(
             client = %self.client_addr,
             backend = backend_id.as_index(),
@@ -858,8 +912,57 @@ impl ClientSession {
             "Starting pool checkout for direct backend attempt"
         );
         let guard = match backend_connection.take() {
-            Some((cached_backend_id, guard)) if cached_backend_id == backend_id => {
-                if Self::should_reuse_cached_batch_connection() {
+            Some((cached_backend_id, mut guard)) if cached_backend_id == backend_id => {
+                if !self.cached_batch_connection_is_healthy(&mut guard, backend_id, request) {
+                    guard.fail_backend();
+                    let checkout_status = provider.status_counts();
+                    trace!(
+                        client = %self.client_addr,
+                        backend = backend_id.as_index(),
+                        command_verb = ?request.verb(),
+                        msg_id = ?request.message_id_value(),
+                        pool = %provider.name(),
+                        pool_available = checkout_status.available,
+                        pool_size = checkout_status.size,
+                        pool_max_size = checkout_status.max_size,
+                        pool_waiting = checkout_status.waiting,
+                        "Requesting pooled connection after retiring unhealthy cached batch connection"
+                    );
+                    provider.checkout_connection_guard().await?
+                } else if can_expand_or_use_idle {
+                    debug!(
+                        client = %self.client_addr,
+                        backend = backend_id.as_index(),
+                        command_verb = ?request.verb(),
+                        msg_id = ?request.message_id_value(),
+                        pool = %provider.name(),
+                        pool_available = checkout_status.available,
+                        pool_size = checkout_status.size,
+                        pool_max_size = checkout_status.max_size,
+                        pool_waiting = checkout_status.waiting,
+                        connection_type = guard.connection_type(),
+                        pending_bytes = guard.pending_bytes_len(),
+                        "Using idle pool capacity before reusing cached batch connection"
+                    );
+                    *backend_connection = Some((cached_backend_id, guard));
+                    match provider.checkout_connection_guard().await {
+                        Ok(conn) => conn,
+                        Err(err) => {
+                            debug!(
+                                client = %self.client_addr,
+                                backend = backend_id.as_index(),
+                                command_verb = ?request.verb(),
+                                msg_id = ?request.message_id_value(),
+                                error = %err,
+                                "Idle pool checkout failed; falling back to cached batch connection"
+                            );
+                            let (_, cached_guard) = backend_connection.take().expect(
+                                "cached backend connection should be present for fallback reuse",
+                            );
+                            cached_guard
+                        }
+                    }
+                } else {
                     let checkout_status = provider.status_counts();
                     debug!(
                         client = %self.client_addr,
@@ -876,8 +979,6 @@ impl ClientSession {
                         "Reusing cached batch connection for direct backend attempt"
                     );
                     guard
-                } else {
-                    unreachable!("cached batch connection reuse should remain enabled");
                 }
             }
             Some(cached) => {
@@ -892,7 +993,7 @@ impl ClientSession {
                     pending_bytes = cached_conn.pending_bytes_len(),
                     "Releasing cached backend connection before switching backend"
                 );
-                let _ = cached_conn.release();
+                let _ = cached_conn.complete_success();
                 let checkout_status = provider.status_counts();
                 trace!(
                     client = %self.client_addr,
@@ -906,7 +1007,7 @@ impl ClientSession {
                     pool_waiting = checkout_status.waiting,
                     "Requesting pooled connection after backend switch"
                 );
-                let conn = provider.get_pooled_connection().await?;
+                let conn = provider.checkout_connection_guard().await?;
                 let checkout_status = provider.status_counts();
                 trace!(
                     client = %self.client_addr,
@@ -922,7 +1023,7 @@ impl ClientSession {
                     pending_bytes = conn.pending_bytes_len(),
                     "Pool checkout succeeded for direct backend attempt"
                 );
-                crate::pool::ConnectionGuard::new(conn, provider.clone())
+                conn
             }
             None => {
                 let checkout_status = provider.status_counts();
@@ -938,7 +1039,7 @@ impl ClientSession {
                     pool_waiting = checkout_status.waiting,
                     "Requesting pooled connection"
                 );
-                let conn = provider.get_pooled_connection().await?;
+                let conn = provider.checkout_connection_guard().await?;
                 let checkout_status = provider.status_counts();
                 trace!(
                     client = %self.client_addr,
@@ -954,7 +1055,7 @@ impl ClientSession {
                     pending_bytes = conn.pending_bytes_len(),
                     "Pool checkout succeeded for direct backend attempt"
                 );
-                crate::pool::ConnectionGuard::new(conn, provider.clone())
+                conn
             }
         };
         Ok(guard)
@@ -985,15 +1086,55 @@ impl ClientSession {
             pending_bytes = guard.pending_bytes_len(),
             "Sending request to backend and waiting for classifiable response bytes"
         );
-        let result = self
-            .execute_and_read_response_with_optional_stat_probe(
-                &mut guard,
-                provider,
-                backend,
-                request,
-                stat_probe_retry_only,
-            )
-            .await;
+        let result =
+            if Self::should_use_stat_missing_probe(provider, request, stat_probe_retry_only) {
+                if let Some(stat_request) = Self::stat_probe_request(request) {
+                    debug!(
+                        client = %self.client_addr,
+                        backend = backend.backend_id().as_index(),
+                        command_verb = ?request.verb(),
+                        msg_id = ?request.message_id_value(),
+                        "Running STAT miss probe before backend article fetch"
+                    );
+
+                    let (probe_response, mut probe_buffer, probe_timings) = self
+                        .execute_and_read_response(&mut guard, backend, &stat_request)
+                        .await
+                        .map_err(|BackendReadAttemptError::Backend(e)| e)?;
+                    if probe_response
+                        .status_code()
+                        .is_some_and(|status| status.as_u16() == 430)
+                    {
+                        debug!(
+                            client = %self.client_addr,
+                            backend = backend.backend_id().as_index(),
+                            command_verb = ?request.verb(),
+                            msg_id = ?request.message_id_value(),
+                            "STAT miss probe returned 430; skipping backend article fetch"
+                        );
+                        Ok((probe_response, probe_buffer, probe_timings))
+                    } else {
+                        crate::session::backend::observe_response(
+                            &stat_request,
+                            &mut probe_buffer,
+                            &mut guard,
+                            &self.buffer_pool,
+                            backend.backend_id(),
+                        )
+                        .await
+                        .map_err(SessionError::from)?;
+                        let _ = probe_timings;
+                        self.execute_and_read_response(&mut guard, backend, request)
+                            .await
+                    }
+                } else {
+                    self.execute_and_read_response(&mut guard, backend, request)
+                        .await
+                }
+            } else {
+                self.execute_and_read_response(&mut guard, backend, request)
+                    .await
+            };
 
         match result {
             Ok((read_status, buffer, timings)) => Ok((guard, read_status, buffer, timings)),
@@ -1005,7 +1146,7 @@ impl ClientSession {
                     error = %e,
                     "Backend attempt failed before response completed; dropping pooled connection"
                 );
-                guard.retire_with_cooldown();
+                guard.fail_backend();
                 Err(e)
             }
         }
@@ -1028,12 +1169,12 @@ impl ClientSession {
         let mut buffer = self.buffer_pool.acquire();
         let (response, timings) = if should_sample_backend_timing() {
             let (response, ttfb, send, recv) =
-                backend::send_request_timed(conn, request, &mut buffer)
+                backend::execute_request_classified_timed(conn, request, &mut buffer)
                     .await
                     .map_err(BackendReadAttemptError::Backend)?;
             (response, Some((ttfb, send, recv)))
         } else {
-            let response = backend::send_request(conn, request, &mut buffer)
+            let response = backend::execute_request_classified(conn, request, &mut buffer)
                 .await
                 .map_err(BackendReadAttemptError::Backend)?;
             (response, None)
@@ -1114,7 +1255,6 @@ impl ClientSession {
 
         self.execute_and_read_response(conn, backend, request).await
     }
-
     /// Write response from backend to client and handle caching.
     ///
     /// Returns `ResponseTransferError` so callers can decide the connection's pool fate
@@ -1412,7 +1552,7 @@ mod tests {
     use crate::auth::AuthHandler;
     use crate::cache::{ArticleAvailability, UnifiedCache};
     use crate::metrics::MetricsCollector;
-    use crate::pool::{BufferPool, ConnectionGuard, DeadpoolConnectionProvider};
+    use crate::pool::{BufferPool, DeadpoolConnectionProvider};
     use crate::protocol::{RequestContext, StatusCode};
     use crate::router::{ArticleBackend, BackendSelector, SuppressedBackends};
     use crate::session::SessionError;
@@ -1437,6 +1577,14 @@ mod tests {
 
     fn request_context(line: &[u8]) -> RequestContext {
         RequestContext::parse(line).expect("valid request line")
+    }
+
+    fn finalize_backend_connection(
+        backend_connection: &mut Option<(BackendId, crate::pool::ConnectionGuard)>,
+    ) {
+        if let Some((_backend_id, conn)) = backend_connection.take() {
+            let _ = conn.complete_success();
+        }
     }
 
     fn test_session() -> crate::session::ClientSession {
@@ -1616,6 +1764,62 @@ mod tests {
         (port, stat_commands, body_commands)
     }
 
+    async fn spawn_delayed_stat_missing_probe_server(
+        delay: Duration,
+    ) -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stat_commands = Arc::new(AtomicUsize::new(0));
+        let body_commands = Arc::new(AtomicUsize::new(0));
+        let stat_count = Arc::clone(&stat_commands);
+        let body_count = Arc::clone(&body_commands);
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let stat_count = Arc::clone(&stat_count);
+                let body_count = Arc::clone(&body_count);
+                tokio::spawn(async move {
+                    let (read_half, mut write_half) = stream.into_split();
+                    let mut reader = BufReader::new(read_half);
+
+                    if write_half.write_all(b"200 Ready\r\n").await.is_err() {
+                        return;
+                    }
+
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                let cmd = line.trim().to_ascii_uppercase();
+                                if cmd.starts_with("MODE") {
+                                    let _ = write_half.write_all(b"200 Posting allowed\r\n").await;
+                                } else if cmd.starts_with("STAT ") {
+                                    stat_count.fetch_add(1, Ordering::SeqCst);
+                                    tokio::time::sleep(delay).await;
+                                    let _ = write_half.write_all(b"430 Missing\r\n").await;
+                                } else if cmd.starts_with("BODY") || cmd.starts_with("ARTICLE") {
+                                    body_count.fetch_add(1, Ordering::SeqCst);
+                                    let _ = write_half.write_all(
+                                        b"222 0 <found@example.com> body follows\r\npayload\r\n.\r\n",
+                                    ).await;
+                                } else if cmd.starts_with("QUIT") {
+                                    let _ = write_half.write_all(b"205 Goodbye\r\n").await;
+                                    break;
+                                } else {
+                                    let _ = write_half.write_all(b"200 OK\r\n").await;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        (port, stat_commands, body_commands)
+    }
+
     async fn spawn_article_response_then_close_server(
         response: &'static [u8],
     ) -> (u16, Arc<AtomicUsize>) {
@@ -1768,7 +1972,7 @@ mod tests {
         let classified = classify_response_write_err(err);
         assert!(matches!(
             classified,
-            crate::session::response_transfer::ResponseTransferError::ClientDisconnect(_)
+            crate::session::response_transfer::ResponseTransferError::ClientWrite(_)
         ));
     }
 
@@ -1778,7 +1982,7 @@ mod tests {
         let classified = classify_response_write_err(err);
         assert!(matches!(
             classified,
-            crate::session::response_transfer::ResponseTransferError::ClientDisconnect(_)
+            crate::session::response_transfer::ResponseTransferError::ClientWrite(_)
         ));
     }
 
@@ -1886,6 +2090,7 @@ mod tests {
         ));
         assert!(availability.is_missing(BackendId::from_index(0)));
         assert_eq!(article_commands.load(Ordering::SeqCst), 1);
+        finalize_backend_connection(&mut backend_connection);
 
         drop(held_writer);
     }
@@ -1926,6 +2131,7 @@ mod tests {
             1,
             "first attempt should go directly to BODY/ARTICLE/HEAD without STAT probe"
         );
+        finalize_backend_connection(&mut backend_connection);
     }
 
     #[tokio::test]
@@ -2035,6 +2241,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retry_stat_sweep_marks_slow_430_backends_missing() {
+        let session = test_session();
+        let (slow_port, slow_stat, slow_body) =
+            spawn_delayed_stat_missing_probe_server(Duration::from_millis(350)).await;
+        let (fast_port, fast_stat, fast_body) = spawn_stat_missing_probe_server().await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", slow_port)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", fast_port)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+        ]);
+
+        let request = request_context(b"BODY <missing@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+        };
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            session.parallel_retry_stat_sweep(&router, &request, &mut state),
+        )
+        .await
+        .expect("parallel retry STAT sweep should not hang")
+        .expect("parallel retry STAT sweep should succeed");
+
+        assert!(
+            state.availability.is_missing(BackendId::from_index(0)),
+            "slow STAT=430 backend should still be classified as missing"
+        );
+        assert!(
+            state.availability.is_missing(BackendId::from_index(1)),
+            "fast STAT=430 backend should be classified as missing"
+        );
+        assert_eq!(
+            state.unavailable_backends.bits(),
+            0,
+            "authoritative 430 probes should not suppress backends as unavailable"
+        );
+        assert_eq!(slow_stat.load(Ordering::SeqCst), 1);
+        assert_eq!(fast_stat.load(Ordering::SeqCst), 1);
+        assert_eq!(slow_body.load(Ordering::SeqCst), 0);
+        assert_eq!(fast_body.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn first_attempt_prefetches_stat_only_on_non_primary_tiers_with_stat_missing_enabled() {
         let session = test_session();
         let (port0, stat0, body0) = spawn_stat_missing_probe_server().await;
@@ -2135,9 +2405,85 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn direct_checkout_prefers_cached_batch_connection() {
-        assert!(super::ClientSession::should_reuse_cached_batch_connection());
+    #[tokio::test]
+    async fn checkout_retires_unhealthy_cached_batch_connection_before_reuse() {
+        let session = test_session();
+        let (port, accept_count) = spawn_greeting_server().await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(2)
+            .build()
+            .unwrap();
+
+        let request = request_context(b"BODY <cached-health@example.com>\r\n");
+        let backend_id = BackendId::from_index(0);
+        let conn = provider
+            .checkout_connection_guard()
+            .await
+            .expect("initial pooled connection should be created");
+        let mut backend_connection = Some((backend_id, conn));
+        if let Some((_, cached_guard)) = backend_connection.as_mut() {
+            cached_guard
+                .get_mut()
+                .queue_pending_bytes(b"stale")
+                .expect("test should be able to inject queued bytes");
+        }
+
+        let guard = session
+            .checkout_direct_backend_connection(
+                &provider,
+                backend_id,
+                &request,
+                &mut backend_connection,
+            )
+            .await
+            .expect("checkout should recover with a fresh pooled connection");
+        drop(guard.complete_success());
+
+        assert_eq!(
+            accept_count.load(Ordering::SeqCst),
+            2,
+            "checkout should discard the dead cached connection and open a fresh one"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_attempt_skips_stat_missing_probe() {
+        let session = test_session();
+        let (port, stat_commands, body_commands) = spawn_stat_missing_probe_server().await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .stat_missing(true)
+            .build()
+            .unwrap();
+        let router = router_with_backend(provider);
+        let (client_writer, _client_read, _client_write) = shared_client_writer_pair().await;
+
+        let mut request = request_context(b"BODY <missing@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+        };
+
+        let result = session
+            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, false)
+            .await
+            .expect("first BODY attempt should complete without transport error");
+
+        assert!(matches!(result, BackendAttemptResult::Success));
+        assert_eq!(
+            stat_commands.load(Ordering::SeqCst),
+            0,
+            "STAT probe is retry-only and should not run on first attempt"
+        );
+        assert_eq!(body_commands.load(Ordering::SeqCst), 1);
+        assert!(!availability.is_missing(BackendId::from_index(0)));
+        finalize_backend_connection(&mut backend_connection);
     }
 
     #[tokio::test]
@@ -2320,6 +2666,7 @@ mod tests {
         assert_eq!(availability.missing_bits(), 0);
         assert_eq!(availability.missing_bits(), 0);
         assert_eq!(request.backend_id(), Some(BackendId::from_index(1)));
+        finalize_backend_connection(&mut backend_connection);
 
         let mut written = vec![0; good_response.len()];
         tokio::time::timeout(Duration::from_secs(1), client_read.read_exact(&mut written))
@@ -2384,6 +2731,7 @@ mod tests {
         assert_eq!(bad_article_commands.load(Ordering::SeqCst), 1);
         assert_eq!(good_article_commands.load(Ordering::SeqCst), 1);
         assert_eq!(request.backend_id(), Some(BackendId::from_index(1)));
+        finalize_backend_connection(&mut backend_connection);
     }
 
     #[tokio::test]
@@ -2511,6 +2859,7 @@ mod tests {
         assert_eq!(backup_article_commands.load(Ordering::SeqCst), 0);
         assert_eq!(availability.missing_bits(), 0);
         assert_eq!(availability.missing_bits(), 0);
+        finalize_backend_connection(&mut backend_connection);
     }
 
     #[tokio::test]
@@ -2582,6 +2931,7 @@ mod tests {
             .expect("client response should be readable")
             .expect("client read should succeed");
         assert_eq!(written, response);
+        finalize_backend_connection(&mut backend_connection);
     }
 
     #[tokio::test]
@@ -2592,10 +2942,10 @@ mod tests {
             .max_connections(5)
             .build()
             .unwrap();
-        let conn = provider.get_pooled_connection().await.unwrap();
+        let conn = provider.checkout_connection_guard().await.unwrap();
         assert_eq!(accept_count.load(Ordering::SeqCst), 1);
 
-        let guard = ConnectionGuard::new(conn, provider.clone());
+        let guard = conn;
         let request = request_context(b"STAT <test@example.com>\r\n");
         let mut client_write = FlushFailWriter::new();
         let mut backend_bytes = BufferPool::new(BufferSize::try_new(8192).unwrap(), 1).acquire();
@@ -2623,7 +2973,8 @@ mod tests {
         ));
         assert_eq!(client_write.writes, b"223 0 <test@example.com> status\r\n");
 
-        let _reused = provider.get_pooled_connection().await.unwrap();
+        let reused = provider.checkout_connection_guard().await.unwrap();
+        drop(reused.complete_success());
         assert_eq!(
             accept_count.load(Ordering::SeqCst),
             1,
@@ -2639,10 +2990,10 @@ mod tests {
             .max_connections(5)
             .build()
             .unwrap();
-        let conn = provider.get_pooled_connection().await.unwrap();
+        let conn = provider.checkout_connection_guard().await.unwrap();
         assert_eq!(accept_count.load(Ordering::SeqCst), 1);
 
-        let guard = ConnectionGuard::new(conn, provider.clone());
+        let guard = conn;
         let request = request_context(b"ARTICLE <test@example.com>\r\n");
         let mut client_write = WriteFailWriter;
         let mut backend_bytes = BufferPool::new(BufferSize::try_new(8192).unwrap(), 1).acquire();
@@ -2669,11 +3020,61 @@ mod tests {
             crate::session::SessionError::ClientDisconnect(_)
         ));
 
-        let _reused = provider.get_pooled_connection().await.unwrap();
+        let reused = provider.checkout_connection_guard().await.unwrap();
+        drop(reused.complete_success());
         assert_eq!(
             accept_count.load(Ordering::SeqCst),
             1,
             "client write failure after a complete framed response must not retire the backend connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn write_disconnect_with_packed_trailing_bytes_retires_backend_connection() {
+        let session = test_session();
+        let (port, accept_count) = spawn_greeting_server().await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(5)
+            .build()
+            .unwrap();
+        let conn = provider.checkout_connection_guard().await.unwrap();
+        assert_eq!(accept_count.load(Ordering::SeqCst), 1);
+
+        let guard = conn;
+        let request = request_context(b"ARTICLE <test@example.com>\r\n");
+        let mut client_write = WriteFailWriter;
+        let mut backend_bytes = BufferPool::new(BufferSize::try_new(8192).unwrap(), 1).acquire();
+        backend_bytes.copy_from_slice(
+            b"220 Article follows\r\nbody\r\n.\r\n223 0 <next@example.com> status\r\n",
+        );
+
+        let err = session
+            .write_successful_backend_response(
+                guard,
+                &mut client_write,
+                &eligible(BackendId::from_index(0)),
+                backend_bytes,
+                ResponseWriteParams {
+                    request: &request,
+                    msg_id: None,
+                    status_code: StatusCode::new(220),
+                },
+                None,
+            )
+            .await
+            .expect_err("packed trailing bytes plus client write failure must be terminal");
+
+        assert!(matches!(
+            err,
+            crate::session::SessionError::ClientDisconnect(_)
+        ));
+
+        let replacement = provider.checkout_connection_guard().await.unwrap();
+        drop(replacement.complete_success());
+        assert_eq!(
+            accept_count.load(Ordering::SeqCst),
+            2,
+            "client write failure with queued backend bytes must retire the connection"
         );
     }
 }
