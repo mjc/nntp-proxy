@@ -378,7 +378,7 @@ pub struct CommandGuard {
 
 impl CommandGuard {
     /// Create a new guard that will call `complete_command` on drop.
-    pub const fn new(router: Arc<BackendSelector>, backend_id: BackendId) -> Self {
+    const fn new(router: Arc<BackendSelector>, backend_id: BackendId) -> Self {
         Self {
             router,
             backend_id,
@@ -481,6 +481,22 @@ impl BackendSelector {
     #[inline]
     fn find_backend(&self, backend_id: BackendId) -> Option<&BackendInfo> {
         self.backends.iter().find(|b| b.id == backend_id)
+    }
+
+    /// Create a guard for a backend already reserved by `route()`.
+    #[must_use]
+    pub fn guard_for_routed_backend(router: Arc<Self>, backend_id: BackendId) -> CommandGuard {
+        CommandGuard::new(router, backend_id)
+    }
+
+    /// Create a guard for manually selected backend work.
+    ///
+    /// This increments `pending_count` before creating the guard, so the drop path
+    /// always has a matching decrement.
+    #[must_use]
+    pub fn guard_for_manual_backend(router: Arc<Self>, backend_id: BackendId) -> CommandGuard {
+        router.mark_backend_pending(backend_id);
+        CommandGuard::new(router, backend_id)
     }
 
     /// Get the tier for a backend
@@ -822,7 +838,7 @@ impl BackendSelector {
                 f64::MAX
             };
 
-            tracing::debug!(
+            tracing::trace!(
                 backend_id = backend.id.as_index(),
                 backend_name = backend.name.as_str(),
                 pool = %backend.provider.name(),
@@ -939,7 +955,7 @@ impl BackendSelector {
     #[inline]
     fn queue_depth_limit(max_connections: usize, per_connection_percent: u16) -> usize {
         let product = max_connections.saturating_mul(usize::from(per_connection_percent));
-        (product + 99) / 100
+        product.div_ceil(100)
     }
 
     #[inline]
@@ -1298,13 +1314,11 @@ mod tests {
     fn command_guard_decrements_on_drop() {
         let (router, backend_id) = make_router_with_backend();
 
-        // Simulate route incrementing the pending count.
-        router.mark_backend_pending(backend_id);
-        assert_eq!(router.backend_load(backend_id).unwrap().get(), 1);
-
-        // Guard should decrement on drop
+        // Manual guard increments on creation and decrements on drop.
+        assert_eq!(router.backend_load(backend_id).unwrap().get(), 0);
         {
-            let _guard = CommandGuard::new(router.clone(), backend_id);
+            let _guard = BackendSelector::guard_for_manual_backend(router.clone(), backend_id);
+            assert_eq!(router.backend_load(backend_id).unwrap().get(), 1);
         }
         assert_eq!(router.backend_load(backend_id).unwrap().get(), 0);
     }
@@ -1313,10 +1327,8 @@ mod tests {
     fn command_guard_explicit_complete() {
         let (router, backend_id) = make_router_with_backend();
 
-        router.mark_backend_pending(backend_id);
+        let guard = BackendSelector::guard_for_manual_backend(router.clone(), backend_id);
         assert_eq!(router.backend_load(backend_id).unwrap().get(), 1);
-
-        let guard = CommandGuard::new(router.clone(), backend_id);
         guard.complete();
         assert_eq!(router.backend_load(backend_id).unwrap().get(), 0);
     }
@@ -1325,12 +1337,9 @@ mod tests {
     fn command_guard_no_double_decrement() {
         let (router, backend_id) = make_router_with_backend();
 
-        // Start with pending count of 1
-        router.mark_backend_pending(backend_id);
-        assert_eq!(router.backend_load(backend_id).unwrap().get(), 1);
-
         // Explicit complete + drop should only decrement once
-        let guard = CommandGuard::new(router.clone(), backend_id);
+        let guard = BackendSelector::guard_for_manual_backend(router.clone(), backend_id);
+        assert_eq!(router.backend_load(backend_id).unwrap().get(), 1);
         guard.complete();
         // After complete(), count should be 0; drop should be a no-op
         assert_eq!(router.backend_load(backend_id).unwrap().get(), 0);
@@ -1341,7 +1350,7 @@ mod tests {
     #[test]
     fn command_guard_backend_id_accessor() {
         let (router, backend_id) = make_router_with_backend();
-        let guard = CommandGuard::new(router, backend_id);
+        let guard = BackendSelector::guard_for_routed_backend(router, backend_id);
         assert_eq!(guard.backend_id(), backend_id);
     }
 
