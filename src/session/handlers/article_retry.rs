@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::Notify;
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 use crate::protocol::RequestContext;
 use crate::session::precheck;
@@ -187,32 +187,13 @@ impl ClientSession {
             client_to_backend_bytes,
             backend_to_client_bytes,
         };
-        let preloaded_availability = if request.message_id_value().is_some() {
-            Some(
-                self.load_article_availability(
-                    request.message_id_value().as_ref(),
-                    router.backend_count(),
-                )
-                .await,
-            )
-        } else {
-            None
-        };
         let availability = match self
-            .prepare_request_execution(&router, request, &mut io, preloaded_availability)
+            .prepare_request_execution(&router, request, &mut io)
             .await?
         {
             PreparedRequest::Served => return Ok(()),
             PreparedRequest::Continue { availability } => availability,
         };
-        if let Some(availability) = availability.as_ref() {
-            self.spawn_non_primary_tier_stat_prefetch(
-                &router,
-                request,
-                availability,
-                SuppressedBackends::empty(),
-            );
-        }
 
         self.execute_article_retry_loop(&router, request, availability, &mut io)
             .await
@@ -238,7 +219,6 @@ impl ClientSession {
         router: &Arc<BackendSelector>,
         request: &mut RequestContext,
         io: &mut RequestExecutionIo<'_>,
-        preloaded_availability: Option<ArticleAvailability>,
     ) -> Result<PreparedRequest, SessionError> {
         let availability = {
             let mut client_write = io.client_writer.lock().await;
@@ -258,20 +238,16 @@ impl ClientSession {
                 CacheLookupResult::Miss => None,
             }
         };
-        let availability = if let Some(availability) = availability {
-            Some(availability)
-        } else if let Some(availability) = preloaded_availability {
-            Some(availability)
-        } else if request.message_id_value().is_some() {
-            Some(
+        let availability = match availability {
+            Some(availability) => Some(availability),
+            None if request.message_id_value().is_some() => Some(
                 self.load_article_availability(
                     request.message_id_value().as_ref(),
                     router.backend_count(),
                 )
                 .await,
-            )
-        } else {
-            None
+            ),
+            None => None,
         };
         if self
             .try_adaptive_precheck(router, request, io, availability.as_ref())
@@ -404,7 +380,7 @@ impl ClientSession {
         availability: Option<ArticleAvailability>,
         io: &mut RequestExecutionIo<'_>,
     ) -> Result<(), SessionError> {
-        trace!(
+        debug!(
             "Client {} starting availability routing for request kind={:?}, verb={:?}",
             self.client_addr,
             request.kind(),
@@ -414,8 +390,7 @@ impl ClientSession {
         let mut availability = availability.unwrap_or_default();
         let mut unavailable_backends = SuppressedBackends::empty();
         let mut is_retry_attempt = false;
-        let mut retry_stat_sweep_done = false;
-        trace!(
+        debug!(
             "Client {} availability routing: missing_bits={:08b}, backend_count={}",
             self.client_addr,
             availability.missing_bits(),
@@ -423,24 +398,6 @@ impl ClientSession {
         );
 
         while !availability.all_exhausted(router.backend_count()) {
-            if is_retry_attempt && !retry_stat_sweep_done {
-                self.parallel_retry_stat_sweep(
-                    router,
-                    request,
-                    &mut ArticleAttemptState {
-                        availability: &mut availability,
-                        client_to_backend_bytes: io.client_to_backend_bytes,
-                        backend_connection: io.backend_connection,
-                        unavailable_backends: &mut unavailable_backends,
-                    },
-                )
-                .await?;
-                retry_stat_sweep_done = true;
-                if availability.all_exhausted(router.backend_count()) {
-                    break;
-                }
-            }
-
             let attempt = self
                 .try_backend_for_article(
                     router,
@@ -467,7 +424,7 @@ impl ClientSession {
                 Ok(BackendAttemptResult::ArticleNotFound { missing }) => {
                     is_retry_attempt = true;
                     let backend_id = missing.backend_id();
-                    trace!(
+                    debug!(
                         "Client {} backend {:?} returned 430 during retry",
                         self.client_addr, backend_id
                     );
@@ -501,7 +458,7 @@ impl ClientSession {
             }
         }
 
-        trace!(
+        debug!(
             "Client {} all backends exhausted for {:?}, sending 430",
             self.client_addr,
             request.message_id_value()
@@ -546,12 +503,10 @@ impl ClientSession {
                 .prepare_ordered_large_transfer_attempt(
                     &router,
                     request,
-                    &mut ArticleAttemptState {
-                        availability: &mut availability,
-                        client_to_backend_bytes: &mut client_to_backend_bytes,
-                        backend_connection: &mut backend_connection,
-                        unavailable_backends: &mut unavailable_backends,
-                    },
+                    &mut availability,
+                    &mut client_to_backend_bytes,
+                    &mut backend_connection,
+                    &mut unavailable_backends,
                     is_retry_attempt,
                 )
                 .await
@@ -725,17 +680,20 @@ impl ClientSession {
         &self,
         router: &Arc<BackendSelector>,
         request: &RequestContext,
-        state: &mut ArticleAttemptState<'_>,
+        availability: &mut crate::cache::ArticleAvailability,
+        client_to_backend_bytes: &mut ClientToBackendBytes,
+        backend_connection: &mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
+        unavailable_backends: &mut SuppressedBackends,
         is_retry_attempt: bool,
     ) -> Result<OrderedLargeTransferAttempt, SessionError> {
-        if let Some(delay) = router
-            .queue_backpressure_delay_for_article(state.availability, *state.unavailable_backends)
+        if let Some(delay) =
+            router.queue_backpressure_delay_for_article(availability, *unavailable_backends)
         {
             tokio::time::sleep(delay).await;
         }
         let route_request = crate::router::RouteRequest::new(self.client_id)
-            .with_availability(state.availability)
-            .suppressing_backends(*state.unavailable_backends);
+            .with_availability(availability)
+            .suppressing_backends(*unavailable_backends);
         let backend = match router.route(route_request) {
             Ok(backend) => backend,
             Err(err) => {
@@ -750,19 +708,24 @@ impl ClientSession {
             }
         };
         let backend_id = backend.backend_id();
-        let guard =
-            crate::router::BackendSelector::guard_for_routed_backend(router.clone(), backend_id);
+        let guard = crate::router::CommandGuard::new(router.clone(), backend_id);
         let Some(provider) = self.retry_backend_provider(
             router,
             &backend,
             request,
             RetryAttemptKind::OrderedPipeline,
         ) else {
-            state.unavailable_backends.suppress(backend_id);
+            unavailable_backends.suppress(backend_id);
             return Ok(Err(OrderedLargeTransferNoAttempt::BackendUnavailable));
         };
+        let mut state = ArticleAttemptState {
+            availability,
+            client_to_backend_bytes,
+            backend_connection,
+            unavailable_backends,
+        };
         let prepared = self
-            .prepare_backend_attempt(provider, &backend, request, state, is_retry_attempt)
+            .prepare_backend_attempt(provider, &backend, request, &mut state, is_retry_attempt)
             .await;
         let Some((conn, status_code, buffer)) = (match prepared {
             Ok(prepared) => prepared,

@@ -235,11 +235,19 @@ impl Default for Routing {
 }
 
 /// Routing queue configuration.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct RoutingQueue {
     /// Queue-pressure based admission controls.
     pub backpressure: QueueBackpressure,
+}
+
+impl Default for RoutingQueue {
+    fn default() -> Self {
+        Self {
+            backpressure: QueueBackpressure::default(),
+        }
+    }
 }
 
 /// Per-connection queue backpressure settings.
@@ -558,9 +566,9 @@ pub struct Server {
     /// Maximum number of concurrent connections to this server
     #[serde(default = "super::defaults::max_connections")]
     pub max_connections: MaxConnections,
-    /// Enable backend `STAT` probes for ARTICLE/BODY/HEAD miss handling.
+    /// Probe misses with `STAT` before `ARTICLE/BODY/HEAD` on this backend.
     ///
-    /// `0` disables probes (default). Non-zero enables retry-path probes.
+    /// `0` disables the probe (default). Non-zero enables it.
     #[serde(default = "super::defaults::stat_missing")]
     pub stat_missing: u8,
 

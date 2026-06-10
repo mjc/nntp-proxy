@@ -378,7 +378,7 @@ pub struct CommandGuard {
 
 impl CommandGuard {
     /// Create a new guard that will call `complete_command` on drop.
-    const fn new(router: Arc<BackendSelector>, backend_id: BackendId) -> Self {
+    pub const fn new(router: Arc<BackendSelector>, backend_id: BackendId) -> Self {
         Self {
             router,
             backend_id,
@@ -481,30 +481,6 @@ impl BackendSelector {
     #[inline]
     fn find_backend(&self, backend_id: BackendId) -> Option<&BackendInfo> {
         self.backends.iter().find(|b| b.id == backend_id)
-    }
-
-    /// Create a guard for a backend already reserved by `route()`.
-    #[must_use]
-    pub fn guard_for_routed_backend(router: Arc<Self>, backend_id: BackendId) -> CommandGuard {
-        let pending = router
-            .backend_load(backend_id)
-            .map_or(0, |count| count.get());
-        assert!(
-            pending > 0,
-            "guard_for_routed_backend requires a route() reservation for backend {}",
-            backend_id.as_index()
-        );
-        CommandGuard::new(router, backend_id)
-    }
-
-    /// Create a guard for manually selected backend work.
-    ///
-    /// This increments `pending_count` before creating the guard, so the drop path
-    /// always has a matching decrement.
-    #[must_use]
-    pub fn guard_for_manual_backend(router: Arc<Self>, backend_id: BackendId) -> CommandGuard {
-        router.mark_backend_pending(backend_id);
-        CommandGuard::new(router, backend_id)
     }
 
     /// Get the tier for a backend
@@ -696,11 +672,7 @@ impl BackendSelector {
                 );
             }
 
-            let use_capacity_weighted_initial_probe =
-                availability.is_some_and(|avail| !self.availability_missing_in_tier(avail, tier));
-
-            let tier_has_non_over_hard_backend = !use_capacity_weighted_initial_probe
-                && self.queue_backpressure_enabled
+            let tier_has_non_over_hard_backend = self.queue_backpressure_enabled
                 && self.backends.iter().any(|backend| {
                     if backend.tier != tier || !is_available(&backend) {
                         return false;
@@ -735,12 +707,18 @@ impl BackendSelector {
                 )
             };
 
-            let selected = if use_capacity_weighted_initial_probe {
-                self.select_capacity_weighted(tier_filter)
-                    .map(|backend| SelectedBackend {
-                        backend,
-                        pending_snapshot: None,
-                    })
+            let selected = if availability
+                .is_some_and(|avail| !self.availability_missing_in_tier(avail, tier))
+            {
+                match &self.strategy {
+                    SelectionStrategy::WeightedRoundRobin(_) => self
+                        .select_capacity_weighted(tier_filter)
+                        .map(|backend| SelectedBackend {
+                            backend,
+                            pending_snapshot: None,
+                        }),
+                    SelectionStrategy::LeastLoaded(_) => self.select_weighted(tier_filter),
+                }
             } else {
                 self.select_weighted(tier_filter)
             };
@@ -844,7 +822,7 @@ impl BackendSelector {
                 f64::MAX
             };
 
-            tracing::trace!(
+            tracing::debug!(
                 backend_id = backend.id.as_index(),
                 backend_name = backend.name.as_str(),
                 pool = %backend.provider.name(),
@@ -961,7 +939,7 @@ impl BackendSelector {
     #[inline]
     fn queue_depth_limit(max_connections: usize, per_connection_percent: u16) -> usize {
         let product = max_connections.saturating_mul(usize::from(per_connection_percent));
-        product.div_ceil(100)
+        (product + 99) / 100
     }
 
     #[inline]
@@ -1320,11 +1298,13 @@ mod tests {
     fn command_guard_decrements_on_drop() {
         let (router, backend_id) = make_router_with_backend();
 
-        // Manual guard increments on creation and decrements on drop.
-        assert_eq!(router.backend_load(backend_id).unwrap().get(), 0);
+        // Simulate route incrementing the pending count.
+        router.mark_backend_pending(backend_id);
+        assert_eq!(router.backend_load(backend_id).unwrap().get(), 1);
+
+        // Guard should decrement on drop
         {
-            let _guard = BackendSelector::guard_for_manual_backend(router.clone(), backend_id);
-            assert_eq!(router.backend_load(backend_id).unwrap().get(), 1);
+            let _guard = CommandGuard::new(router.clone(), backend_id);
         }
         assert_eq!(router.backend_load(backend_id).unwrap().get(), 0);
     }
@@ -1333,8 +1313,10 @@ mod tests {
     fn command_guard_explicit_complete() {
         let (router, backend_id) = make_router_with_backend();
 
-        let guard = BackendSelector::guard_for_manual_backend(router.clone(), backend_id);
+        router.mark_backend_pending(backend_id);
         assert_eq!(router.backend_load(backend_id).unwrap().get(), 1);
+
+        let guard = CommandGuard::new(router.clone(), backend_id);
         guard.complete();
         assert_eq!(router.backend_load(backend_id).unwrap().get(), 0);
     }
@@ -1343,9 +1325,12 @@ mod tests {
     fn command_guard_no_double_decrement() {
         let (router, backend_id) = make_router_with_backend();
 
-        // Explicit complete + drop should only decrement once
-        let guard = BackendSelector::guard_for_manual_backend(router.clone(), backend_id);
+        // Start with pending count of 1
+        router.mark_backend_pending(backend_id);
         assert_eq!(router.backend_load(backend_id).unwrap().get(), 1);
+
+        // Explicit complete + drop should only decrement once
+        let guard = CommandGuard::new(router.clone(), backend_id);
         guard.complete();
         // After complete(), count should be 0; drop should be a no-op
         assert_eq!(router.backend_load(backend_id).unwrap().get(), 0);
@@ -1356,8 +1341,7 @@ mod tests {
     #[test]
     fn command_guard_backend_id_accessor() {
         let (router, backend_id) = make_router_with_backend();
-        router.mark_backend_pending(backend_id);
-        let guard = BackendSelector::guard_for_routed_backend(router, backend_id);
+        let guard = CommandGuard::new(router, backend_id);
         assert_eq!(guard.backend_id(), backend_id);
     }
 
@@ -1433,9 +1417,10 @@ mod tests {
             .route(RouteRequest::new(ClientId::new()).with_availability(&availability))
             .unwrap();
 
-        assert!(
-            matches!(backend.backend_id().as_index(), 1 | 2),
-            "first probe should stay within the newly eligible tier"
+        assert_eq!(
+            backend.backend_id(),
+            BackendId::from_index(2),
+            "least-loaded must honor load on the first probe in a newly eligible tier"
         );
     }
 

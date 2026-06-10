@@ -31,12 +31,7 @@ use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes, Transf
 
 /// Ordered large-transfer pipelining is disabled due to sustained throughput regressions
 /// from long-lived regular buffer holds in the write path.
-enum OrderedLargeTransferPipelineState {
-    Disabled,
-}
-
-const ORDERED_LARGE_TRANSFER_PIPELINE_STATE: OrderedLargeTransferPipelineState =
-    OrderedLargeTransferPipelineState::Disabled;
+const ORDERED_LARGE_TRANSFER_PIPELINE_ENABLED: bool = false;
 
 fn safe_command_log_label(request: &RequestContext) -> &str {
     std::str::from_utf8(request.verb()).unwrap_or("<non-utf8-command>")
@@ -683,10 +678,7 @@ impl ClientSession {
         batch: &crate::session::handlers::pipeline::RequestBatch,
         state: &PerCommandLoopState,
     ) -> bool {
-        if matches!(
-            ORDERED_LARGE_TRANSFER_PIPELINE_STATE,
-            OrderedLargeTransferPipelineState::Disabled
-        ) {
+        if !ORDERED_LARGE_TRANSFER_PIPELINE_ENABLED {
             return false;
         }
 
@@ -953,9 +945,6 @@ mod tests {
 
     #[test]
     fn ordered_large_transfer_pipeline_is_disabled() {
-        assert!(matches!(
-            super::ORDERED_LARGE_TRANSFER_PIPELINE_STATE,
-            super::OrderedLargeTransferPipelineState::Disabled
-        ));
+        assert!(!super::ORDERED_LARGE_TRANSFER_PIPELINE_ENABLED);
     }
 }

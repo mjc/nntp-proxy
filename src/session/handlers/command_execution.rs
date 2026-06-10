@@ -4,7 +4,7 @@
 //! response validation, and writing backend responses to clients.
 
 use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata, StatusCode};
-use crate::router::{ArticleBackend, BackendSelector, SuppressedBackends};
+use crate::router::{ArticleBackend, BackendSelector, CommandGuard, SuppressedBackends};
 use crate::session::SessionError;
 use crate::session::response_transfer::{ResponseConnectionReuse, ResponseTransferError};
 use crate::session::retry::retry_once;
@@ -15,15 +15,12 @@ use crate::session::routing::{
 use crate::session::{ClientSession, backend};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
-use futures::stream::{FuturesUnordered, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 const BACKEND_TIMING_SAMPLE_MASK: u64 = 0x0f;
-const RETRY_STAT_SWEEP_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 static BACKEND_TIMING_SAMPLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[inline]
@@ -135,12 +132,6 @@ enum BackendReadAttemptError {
     Backend(anyhow::Error),
 }
 
-enum RetryStatProbeOutcome {
-    Missing(BackendId),
-    Present,
-    Unavailable(BackendId),
-}
-
 /// Any client write failure after the full backend response is already owned is terminal.
 ///
 /// The backend connection is already clean at this point, but the client may have received a
@@ -194,7 +185,7 @@ impl ClientSession {
         let backend_id = backend.backend_id();
         let provider = router.backend_provider(backend_id);
         if provider.is_none() {
-            trace!(
+            debug!(
                 client = %self.client_addr,
                 backend = backend_id.as_index(),
                 command_verb = ?request.verb(),
@@ -238,7 +229,7 @@ impl ClientSession {
             }
         };
         let backend_id = backend.backend_id();
-        trace!(
+        debug!(
             client = %self.client_addr,
             backend = backend_id.as_index(),
             command_verb = ?request.verb(),
@@ -246,7 +237,7 @@ impl ClientSession {
             missing_bits = format_args!("{:08b}", state.availability.missing_bits()),
             "Article retry selected backend for direct attempt"
         );
-        let guard = BackendSelector::guard_for_routed_backend(router.clone(), backend_id);
+        let guard = CommandGuard::new(router.clone(), backend_id);
         let Some(provider) =
             self.retry_backend_provider(router, &backend, request, RetryAttemptKind::Direct)
         else {
@@ -262,7 +253,7 @@ impl ClientSession {
 
         let backend = match AuthoritativeArticleMissing::from_status_code(backend, status_code) {
             Ok(missing) => {
-                trace!(
+                debug!(
                     client = %self.client_addr,
                     backend = backend_id.as_index(),
                     command_verb = ?request.verb(),
@@ -316,216 +307,6 @@ impl ClientSession {
         Ok(BackendAttemptResult::Success)
     }
 
-    pub(super) async fn parallel_retry_stat_sweep(
-        &self,
-        router: &Arc<BackendSelector>,
-        request: &RequestContext,
-        state: &mut ArticleAttemptState<'_>,
-    ) -> Result<(), SessionError> {
-        if !request.has_message_id()
-            || request.is_stat()
-            || !matches!(
-                request.kind(),
-                RequestKind::Article | RequestKind::Body | RequestKind::Head
-            )
-        {
-            return Ok(());
-        }
-
-        let Some(stat_request) = Self::stat_probe_request(request) else {
-            return Ok(());
-        };
-
-        let mut candidates = Vec::new();
-        for tier in router.tiers() {
-            for backend_id in router.backend_ids_in_tier(tier) {
-                if state.unavailable_backends.contains(backend_id)
-                    || !state.availability.should_try(backend_id)
-                {
-                    continue;
-                }
-                let Some(provider) = router.backend_provider(backend_id) else {
-                    continue;
-                };
-                if provider.stat_missing_enabled() {
-                    candidates.push((backend_id, provider.clone()));
-                }
-            }
-        }
-
-        if candidates.len() < 2 {
-            return Ok(());
-        }
-
-        let mut probes = FuturesUnordered::new();
-        for (backend_id, provider) in candidates {
-            let router = Arc::clone(router);
-            let stat_request = stat_request.clone();
-            probes.push(async move {
-                let probe = async {
-                    let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
-                    let conn = match provider.get_pooled_connection().await {
-                        Ok(conn) => conn,
-                        Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
-                    };
-                    let mut conn = crate::pool::ConnectionGuard::new(conn, provider);
-                    let mut buffer = self.buffer_pool.acquire();
-                    let read =
-                        backend::send_request(&mut **conn.get_mut(), &stat_request, &mut buffer)
-                            .await;
-                    let status_code = match read {
-                        Ok(read) => read.status_code(),
-                        Err(_) => {
-                            conn.retire_with_cooldown();
-                            return RetryStatProbeOutcome::Unavailable(backend_id);
-                        }
-                    };
-
-                    if self
-                        .capture_suppressed_430_response(
-                            &mut conn,
-                            backend_id,
-                            &stat_request,
-                            buffer,
-                        )
-                        .await
-                        .is_err()
-                    {
-                        conn.retire_with_cooldown();
-                        return RetryStatProbeOutcome::Unavailable(backend_id);
-                    }
-                    let _ = conn.release();
-
-                    if status_code.is_some_and(|status| status.as_u16() == 430) {
-                        RetryStatProbeOutcome::Missing(backend_id)
-                    } else {
-                        RetryStatProbeOutcome::Present
-                    }
-                };
-
-                match tokio::time::timeout(RETRY_STAT_SWEEP_PROBE_TIMEOUT, probe).await {
-                    Ok(outcome) => outcome,
-                    Err(_) => RetryStatProbeOutcome::Unavailable(backend_id),
-                }
-            });
-        }
-
-        while let Some(outcome) = probes.next().await {
-            match outcome {
-                RetryStatProbeOutcome::Missing(backend_id) => {
-                    let missing = AuthoritativeArticleMissing { backend_id };
-                    self.record_authoritative_article_missing(&missing, state.availability);
-                    if let Some(msg_id) = request.message_id_value() {
-                        self.cache.record_backend_missing(msg_id, backend_id).await;
-                    }
-                }
-                RetryStatProbeOutcome::Present => {}
-                RetryStatProbeOutcome::Unavailable(backend_id) => {
-                    state.unavailable_backends.suppress(backend_id);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub(super) fn spawn_non_primary_tier_stat_prefetch(
-        &self,
-        router: &Arc<BackendSelector>,
-        request: &RequestContext,
-        availability: &crate::cache::ArticleAvailability,
-        unavailable_backends: SuppressedBackends,
-    ) {
-        if !matches!(
-            request.kind(),
-            RequestKind::Article | RequestKind::Body | RequestKind::Head
-        ) || request.is_stat()
-            || !request.has_message_id()
-        {
-            return;
-        }
-
-        let Some(stat_request) = Self::stat_probe_request(request) else {
-            return;
-        };
-        let Some(msg_id_text) = request.message_id().map(str::to_owned) else {
-            return;
-        };
-
-        let mut candidates = Vec::new();
-        for tier in router.tiers().filter(|tier| *tier > 0) {
-            for backend_id in router.backend_ids_in_tier(tier) {
-                if unavailable_backends.contains(backend_id) || !availability.should_try(backend_id)
-                {
-                    continue;
-                }
-                let Some(provider) = router.backend_provider(backend_id) else {
-                    continue;
-                };
-                if provider.stat_missing_enabled() {
-                    candidates.push((backend_id, provider.clone()));
-                }
-            }
-        }
-        if candidates.is_empty() {
-            return;
-        }
-
-        let router = Arc::clone(router);
-        let cache = Arc::clone(&self.cache);
-        let buffer_pool = self.buffer_pool.clone();
-        tokio::spawn(async move {
-            let mut probes = FuturesUnordered::new();
-            for (backend_id, provider) in candidates {
-                let router = Arc::clone(&router);
-                let cache = Arc::clone(&cache);
-                let stat_request = stat_request.clone();
-                let msg_id_text = msg_id_text.clone();
-                let buffer_pool = buffer_pool.clone();
-                probes.push(async move {
-                    let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
-                    let conn = match provider.get_pooled_connection().await {
-                        Ok(conn) => conn,
-                        Err(_) => return,
-                    };
-                    let mut conn = crate::pool::ConnectionGuard::new(conn, provider);
-                    let mut buffer = buffer_pool.acquire();
-                    let read =
-                        backend::send_request(&mut **conn.get_mut(), &stat_request, &mut buffer)
-                            .await;
-                    let status_code = match read {
-                        Ok(read) => read.status_code(),
-                        Err(_) => {
-                            conn.retire_with_cooldown();
-                            return;
-                        }
-                    };
-                    if crate::session::backend::observe_response(
-                        &stat_request,
-                        &mut buffer,
-                        &mut conn,
-                        &buffer_pool,
-                        backend_id,
-                    )
-                    .await
-                    .is_err()
-                    {
-                        conn.retire_with_cooldown();
-                        return;
-                    }
-                    let _ = conn.release();
-
-                    if status_code.is_some_and(|status| status.as_u16() == 430)
-                        && let Ok(msg_id) = crate::types::MessageId::new(msg_id_text)
-                    {
-                        cache.record_backend_missing(msg_id, backend_id).await;
-                    }
-                });
-            }
-            while probes.next().await.is_some() {}
-        });
-    }
-
     async fn write_successful_retry_response(
         &self,
         conn: crate::pool::ConnectionGuard,
@@ -557,7 +338,7 @@ impl ClientSession {
     ) -> Result<PreparedBackendAttempt, SessionError> {
         let backend_id = backend.backend_id();
         let request_wire_len = request.request_wire_len().get();
-        trace!(
+        debug!(
             client = %self.client_addr,
             backend = backend_id.as_index(),
             command_verb = ?request.verb(),
@@ -602,7 +383,7 @@ impl ClientSession {
             Some(status_code) => status_code,
             None => {
                 read_status.log_warnings(&buffer, self.client_addr, backend_id);
-                trace!(
+                debug!(
                     client = %self.client_addr,
                     backend = backend_id.as_index(),
                     command_verb = ?request.verb(),
@@ -623,7 +404,7 @@ impl ClientSession {
             }
         };
 
-        trace!(
+        debug!(
             client = %self.client_addr,
             backend = backend_id.as_index(),
             command_verb = ?request.verb(),
@@ -876,10 +657,7 @@ impl ClientSession {
         );
         let guard = match backend_connection.take() {
             Some((cached_backend_id, guard)) if cached_backend_id == backend_id => {
-                let checkout_status = provider.status_counts();
-                let can_expand_or_use_idle = checkout_status.available > 0
-                    || checkout_status.size < checkout_status.max_size;
-                if Self::should_reuse_cached_batch_connection() && !can_expand_or_use_idle {
+                if Self::should_reuse_cached_batch_connection() {
                     let checkout_status = provider.status_counts();
                     debug!(
                         client = %self.client_addr,
@@ -896,46 +674,13 @@ impl ClientSession {
                         "Reusing cached batch connection for direct backend attempt"
                     );
                     guard
-                } else if Self::should_reuse_cached_batch_connection() {
-                    debug!(
-                        client = %self.client_addr,
-                        backend = backend_id.as_index(),
-                        command_verb = ?request.verb(),
-                        msg_id = ?request.message_id_value(),
-                        pool = %provider.name(),
-                        pool_available = checkout_status.available,
-                        pool_size = checkout_status.size,
-                        pool_max_size = checkout_status.max_size,
-                        pool_waiting = checkout_status.waiting,
-                        connection_type = guard.connection_type(),
-                        pending_bytes = guard.pending_bytes_len(),
-                        "Using idle pool capacity before reusing cached batch connection"
-                    );
-                    *backend_connection = Some((cached_backend_id, guard));
-                    match provider.get_pooled_connection().await {
-                        Ok(conn) => crate::pool::ConnectionGuard::new(conn, provider.clone()),
-                        Err(err) => {
-                            debug!(
-                                client = %self.client_addr,
-                                backend = backend_id.as_index(),
-                                command_verb = ?request.verb(),
-                                msg_id = ?request.message_id_value(),
-                                error = %err,
-                                "Idle pool checkout failed; falling back to cached batch connection"
-                            );
-                            let (_, cached_guard) = backend_connection.take().expect(
-                                "cached backend connection should be present for fallback reuse",
-                            );
-                            cached_guard
-                        }
-                    }
                 } else {
                     unreachable!("cached batch connection reuse should remain enabled");
                 }
             }
             Some(cached) => {
                 let (cached_backend_id, cached_conn) = cached;
-                trace!(
+                debug!(
                     client = %self.client_addr,
                     cached_backend = cached_backend_id.as_index(),
                     backend = backend_id.as_index(),
@@ -947,7 +692,7 @@ impl ClientSession {
                 );
                 let _ = cached_conn.release();
                 let checkout_status = provider.status_counts();
-                trace!(
+                debug!(
                     client = %self.client_addr,
                     backend = backend_id.as_index(),
                     command_verb = ?request.verb(),
@@ -961,7 +706,7 @@ impl ClientSession {
                 );
                 let conn = provider.get_pooled_connection().await?;
                 let checkout_status = provider.status_counts();
-                trace!(
+                debug!(
                     client = %self.client_addr,
                     backend = backend_id.as_index(),
                     command_verb = ?request.verb(),
@@ -979,7 +724,7 @@ impl ClientSession {
             }
             None => {
                 let checkout_status = provider.status_counts();
-                trace!(
+                debug!(
                     client = %self.client_addr,
                     backend = backend_id.as_index(),
                     command_verb = ?request.verb(),
@@ -993,7 +738,7 @@ impl ClientSession {
                 );
                 let conn = provider.get_pooled_connection().await?;
                 let checkout_status = provider.status_counts();
-                trace!(
+                debug!(
                     client = %self.client_addr,
                     backend = backend_id.as_index(),
                     command_verb = ?request.verb(),
@@ -1029,7 +774,7 @@ impl ClientSession {
         let mut guard = self
             .checkout_direct_backend_connection(provider, backend_id, request, backend_connection)
             .await?;
-        trace!(
+        debug!(
             client = %self.client_addr,
             backend = backend_id.as_index(),
             command_verb = ?request.verb(),
@@ -1165,8 +910,6 @@ impl ClientSession {
             return Ok((probe_response, probe_buffer, probe_timings));
         }
 
-        drop(probe_buffer);
-        let _ = probe_timings;
         self.execute_and_read_response(conn, backend, request).await
     }
 
@@ -1959,7 +1702,6 @@ mod tests {
 
         let mut request = request_context(b"BODY <missing@example.com>\r\n");
         let mut availability = ArticleAvailability::new();
-        availability.record_missing(BackendId::from_index(1));
         let mut client_to_backend_bytes = ClientToBackendBytes::zero();
         let mut backend_connection = None;
         let mut unavailable_backends = SuppressedBackends::empty();
@@ -1984,287 +1726,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn retry_stat_sweep_marks_missing_across_multiple_backends() {
-        let session = test_session();
-        let (port0, stat0, body0) = spawn_stat_missing_probe_server().await;
-        let (port1, stat1, body1) = spawn_stat_missing_probe_server().await;
-        let router = router_with_tiered_backends([
-            (
-                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
-                    .max_connections(1)
-                    .stat_missing(true)
-                    .build()
-                    .unwrap(),
-                0,
-            ),
-            (
-                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
-                    .max_connections(1)
-                    .stat_missing(true)
-                    .build()
-                    .unwrap(),
-                1,
-            ),
-        ]);
-
-        let request = request_context(b"BODY <missing@example.com>\r\n");
-        let mut availability = ArticleAvailability::new();
-        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
-        let mut backend_connection = None;
-        let mut unavailable_backends = SuppressedBackends::empty();
-        let mut state = ArticleAttemptState {
-            availability: &mut availability,
-            client_to_backend_bytes: &mut client_to_backend_bytes,
-            backend_connection: &mut backend_connection,
-            unavailable_backends: &mut unavailable_backends,
-        };
-
-        session
-            .parallel_retry_stat_sweep(&router, &request, &mut state)
-            .await
-            .expect("parallel retry STAT sweep should succeed");
-
-        assert!(availability.is_missing(BackendId::from_index(0)));
-        assert!(availability.is_missing(BackendId::from_index(1)));
-        assert_eq!(stat0.load(Ordering::SeqCst), 1);
-        assert_eq!(stat1.load(Ordering::SeqCst), 1);
-        assert_eq!(body0.load(Ordering::SeqCst), 0);
-        assert_eq!(body1.load(Ordering::SeqCst), 0);
-    }
-
-    #[tokio::test]
-    async fn retry_stat_sweep_leaves_pending_counts_balanced() {
-        let session = test_session();
-        let (port0, _stat0, _body0) = spawn_stat_missing_probe_server().await;
-        let (port1, _stat1, _body1) = spawn_stat_missing_probe_server().await;
-        let router = router_with_tiered_backends([
-            (
-                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
-                    .max_connections(1)
-                    .stat_missing(true)
-                    .build()
-                    .unwrap(),
-                0,
-            ),
-            (
-                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
-                    .max_connections(1)
-                    .stat_missing(true)
-                    .build()
-                    .unwrap(),
-                1,
-            ),
-        ]);
-
-        let request = request_context(b"BODY <missing@example.com>\r\n");
-        let mut availability = ArticleAvailability::new();
-        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
-        let mut backend_connection = None;
-        let mut unavailable_backends = SuppressedBackends::empty();
-        let mut state = ArticleAttemptState {
-            availability: &mut availability,
-            client_to_backend_bytes: &mut client_to_backend_bytes,
-            backend_connection: &mut backend_connection,
-            unavailable_backends: &mut unavailable_backends,
-        };
-
-        session
-            .parallel_retry_stat_sweep(&router, &request, &mut state)
-            .await
-            .expect("parallel retry STAT sweep should succeed");
-
-        assert_eq!(
-            router
-                .backend_load(BackendId::from_index(0))
-                .expect("backend 0 should exist")
-                .get(),
-            0
-        );
-        assert_eq!(
-            router
-                .backend_load(BackendId::from_index(1))
-                .expect("backend 1 should exist")
-                .get(),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn first_attempt_prefetches_stat_only_on_non_primary_tiers_with_stat_missing_enabled() {
-        let session = test_session();
-        let (port0, stat0, body0) = spawn_stat_missing_probe_server().await;
-        let (port1, stat1, body1) = spawn_stat_missing_probe_server().await;
-        let (port2, stat2, body2) = spawn_stat_missing_probe_server().await;
-        let router = router_with_tiered_backends([
-            (
-                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
-                    .max_connections(1)
-                    .stat_missing(true)
-                    .build()
-                    .unwrap(),
-                0,
-            ),
-            (
-                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
-                    .max_connections(1)
-                    .stat_missing(true)
-                    .build()
-                    .unwrap(),
-                1,
-            ),
-            (
-                DeadpoolConnectionProvider::builder("127.0.0.1", port2)
-                    .max_connections(1)
-                    .stat_missing(false)
-                    .build()
-                    .unwrap(),
-                2,
-            ),
-        ]);
-
-        let request = request_context(b"BODY <missing@example.com>\r\n");
-        let availability = ArticleAvailability::new();
-        let unavailable_backends = SuppressedBackends::empty();
-
-        session.spawn_non_primary_tier_stat_prefetch(
-            &router,
-            &request,
-            &availability,
-            unavailable_backends,
-        );
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while stat1.load(Ordering::SeqCst) == 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("upper-tier stat prefetch should complete");
-
-        assert_eq!(stat0.load(Ordering::SeqCst), 0, "tier 0 must not be probed");
-        assert_eq!(
-            stat1.load(Ordering::SeqCst),
-            1,
-            "tier >0 with stat_missing=1 is probed"
-        );
-        assert_eq!(
-            stat2.load(Ordering::SeqCst),
-            0,
-            "tier >0 with stat_missing=0 is skipped"
-        );
-        assert_eq!(body0.load(Ordering::SeqCst), 0);
-        assert_eq!(body1.load(Ordering::SeqCst), 0);
-        assert_eq!(body2.load(Ordering::SeqCst), 0);
-
-        let msg_id = MessageId::new("<missing@example.com>".to_string()).expect("valid message id");
-        let cached = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                if let Some(cached) = session.cache.get(&msg_id).await {
-                    break cached;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("prefetch should update availability index");
-        let backend_1_missing = cached.availability().is_missing(BackendId::from_index(1));
-        assert!(
-            backend_1_missing,
-            "tier-1 backend should be marked missing from STAT=430"
-        );
-    }
-
-    #[tokio::test]
-    async fn first_attempt_prefetch_respects_existing_availability_and_skips_known_missing_tier() {
-        let session = test_session();
-        let (port0, stat0, _body0) = spawn_stat_missing_probe_server().await;
-        let (port1, stat1, _body1) = spawn_stat_missing_probe_server().await;
-        let router = router_with_tiered_backends([
-            (
-                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
-                    .max_connections(1)
-                    .stat_missing(true)
-                    .build()
-                    .unwrap(),
-                0,
-            ),
-            (
-                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
-                    .max_connections(1)
-                    .stat_missing(true)
-                    .build()
-                    .unwrap(),
-                1,
-            ),
-        ]);
-
-        let request = request_context(b"BODY <already-missing@example.com>\r\n");
-        let mut availability = ArticleAvailability::new();
-        availability.record_missing(BackendId::from_index(1));
-
-        session.spawn_non_primary_tier_stat_prefetch(
-            &router,
-            &request,
-            &availability,
-            SuppressedBackends::empty(),
-        );
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        assert_eq!(stat0.load(Ordering::SeqCst), 0, "tier 0 must not be probed");
-        assert_eq!(
-            stat1.load(Ordering::SeqCst),
-            0,
-            "known-missing non-primary tier should be skipped by should_try gate"
-        );
-    }
-
-    #[tokio::test]
-    async fn first_attempt_prefetches_stat_for_head_requests_on_non_primary_tiers() {
-        let session = test_session();
-        let (port0, stat0, _body0) = spawn_stat_missing_probe_server().await;
-        let (port1, stat1, _body1) = spawn_stat_missing_probe_server().await;
-        let router = router_with_tiered_backends([
-            (
-                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
-                    .max_connections(1)
-                    .stat_missing(true)
-                    .build()
-                    .unwrap(),
-                0,
-            ),
-            (
-                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
-                    .max_connections(1)
-                    .stat_missing(true)
-                    .build()
-                    .unwrap(),
-                1,
-            ),
-        ]);
-
-        let request = request_context(b"HEAD <missing@example.com>\r\n");
-        let availability = ArticleAvailability::new();
-        session.spawn_non_primary_tier_stat_prefetch(
-            &router,
-            &request,
-            &availability,
-            SuppressedBackends::empty(),
-        );
-
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while stat1.load(Ordering::SeqCst) == 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("HEAD prefetch should probe non-primary tier");
-
-        assert_eq!(stat0.load(Ordering::SeqCst), 0, "tier 0 must not be probed");
-        assert_eq!(stat1.load(Ordering::SeqCst), 1, "tier >0 should be probed");
-    }
-
     #[test]
     fn stat_missing_probe_requires_retry_state() {
         let request = request_context(b"BODY <missing@example.com>\r\n");
@@ -2284,45 +1745,6 @@ mod tests {
     #[test]
     fn direct_checkout_prefers_cached_batch_connection() {
         assert!(super::ClientSession::should_reuse_cached_batch_connection());
-    }
-
-    #[tokio::test]
-    async fn first_attempt_skips_stat_missing_probe() {
-        let session = test_session();
-        let (port, stat_commands, body_commands) = spawn_stat_missing_probe_server().await;
-        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
-            .max_connections(1)
-            .stat_missing(true)
-            .build()
-            .unwrap();
-        let router = router_with_backend(provider);
-        let (client_writer, _client_read, _client_write) = shared_client_writer_pair().await;
-
-        let mut request = request_context(b"BODY <missing@example.com>\r\n");
-        let mut availability = ArticleAvailability::new();
-        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
-        let mut backend_connection = None;
-        let mut unavailable_backends = SuppressedBackends::empty();
-        let mut state = ArticleAttemptState {
-            availability: &mut availability,
-            client_to_backend_bytes: &mut client_to_backend_bytes,
-            backend_connection: &mut backend_connection,
-            unavailable_backends: &mut unavailable_backends,
-        };
-
-        let result = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, false)
-            .await
-            .expect("first BODY attempt should complete without transport error");
-
-        assert!(matches!(result, BackendAttemptResult::Success));
-        assert_eq!(
-            stat_commands.load(Ordering::SeqCst),
-            0,
-            "STAT probe is retry-only and should not run on first attempt"
-        );
-        assert_eq!(body_commands.load(Ordering::SeqCst), 1);
-        assert!(!availability.is_missing(BackendId::from_index(0)));
     }
 
     #[tokio::test]
@@ -2728,7 +2150,7 @@ mod tests {
             &mut request,
             &client_writer,
             &mut state,
-            true,
+            false,
         ));
         tokio::time::timeout(Duration::from_secs(1), async {
             while article_commands.load(Ordering::SeqCst) == 0 {

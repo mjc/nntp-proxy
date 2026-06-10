@@ -46,20 +46,6 @@ impl Config {
             "memory.socket_send_buffer_size",
             self.memory.socket_send_buffer_size,
         )?;
-        validate_backpressure_percent(
-            "routing.queue.backpressure.soft_waiters_per_connection_percent",
-            self.routing
-                .queue
-                .backpressure
-                .soft_waiters_per_connection_percent,
-        )?;
-        validate_backpressure_percent(
-            "routing.queue.backpressure.hard_waiters_per_connection_percent",
-            self.routing
-                .queue
-                .backpressure
-                .hard_waiters_per_connection_percent,
-        )?;
         if self
             .routing
             .queue
@@ -88,16 +74,6 @@ fn validate_socket_buffer_size(field: &str, size: usize) -> Result<()> {
     if size > MAX_SOCKET_BUFFER_SIZE {
         return Err(anyhow::anyhow!(
             "{field} must be <= {MAX_SOCKET_BUFFER_SIZE} bytes because OS socket APIs accept u32 buffer sizes; found {size}"
-        ));
-    }
-
-    Ok(())
-}
-
-fn validate_backpressure_percent(field: &str, value: u16) -> Result<()> {
-    if value > 100 {
-        return Err(anyhow::anyhow!(
-            "{field} must be within 0..=100; found {value}"
         ));
     }
 
@@ -282,40 +258,6 @@ mod tests {
                 .to_string()
                 .contains("hard_waiters_per_connection_percent")
         );
-    }
-
-    #[test]
-    fn test_validate_backpressure_soft_over_100_fails() {
-        let mut config = Config {
-            servers: vec![create_test_server("test", None)],
-            ..Default::default()
-        };
-        config
-            .routing
-            .queue
-            .backpressure
-            .soft_waiters_per_connection_percent = 101;
-
-        let result = config.validate();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("0..=100"));
-    }
-
-    #[test]
-    fn test_validate_backpressure_hard_over_100_fails() {
-        let mut config = Config {
-            servers: vec![create_test_server("test", None)],
-            ..Default::default()
-        };
-        config
-            .routing
-            .queue
-            .backpressure
-            .hard_waiters_per_connection_percent = 101;
-
-        let result = config.validate();
-        assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("0..=100"));
     }
 
     #[test]

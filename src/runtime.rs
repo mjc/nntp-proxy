@@ -302,10 +302,8 @@ pub fn spawn_response_write_metrics_logger(period: Option<std::time::Duration>) 
     use tracing::info;
 
     let Some(period) = period else {
-        crate::pool::buffer::set_response_write_metrics_enabled(false);
         return;
     };
-    crate::pool::buffer::set_response_write_metrics_enabled(true);
 
     let mut previous = crate::pool::buffer::response_write_metrics_snapshot();
     let mut previous_alloc = crate::pool::buffer::hot_path_allocation_metrics_snapshot();
