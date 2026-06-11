@@ -16,6 +16,7 @@ services:
       NNTP_SERVER_0_HOST: news.example.com
       NNTP_SERVER_0_PORT: 119
       NNTP_SERVER_0_NAME: "Primary News Server"
+      NNTP_SERVER_0_STAT_MISSING: 1  # Probe 430s with STAT on backends that support it
       # NNTP_SERVER_0_USERNAME: your_username  # Optional: backend authentication
       # NNTP_SERVER_0_PASSWORD: your_password  # Optional: backend authentication
       # NNTP_SERVER_0_MAX_CONNECTIONS: 10      # Optional: max connections (default: 10)
@@ -87,18 +88,21 @@ services:
       NNTP_SERVER_0_HOST: news1.example.com
       NNTP_SERVER_0_PORT: 119
       NNTP_SERVER_0_NAME: "News Server 1"
+      NNTP_SERVER_0_STAT_MISSING: 1
       NNTP_SERVER_0_USERNAME: ${BACKEND_USER_0:-}
       NNTP_SERVER_0_PASSWORD: ${BACKEND_PASS_0:-}
       
       NNTP_SERVER_1_HOST: news2.example.com
       NNTP_SERVER_1_PORT: 119
       NNTP_SERVER_1_NAME: "News Server 2"
+      NNTP_SERVER_1_STAT_MISSING: 1
       NNTP_SERVER_1_USERNAME: ${BACKEND_USER_1:-}
       NNTP_SERVER_1_PASSWORD: ${BACKEND_PASS_1:-}
       
       NNTP_SERVER_2_HOST: news3.example.com
       NNTP_SERVER_2_PORT: 119
       NNTP_SERVER_2_NAME: "News Server 3"
+      NNTP_SERVER_2_STAT_MISSING: 1
       NNTP_SERVER_2_USERNAME: ${BACKEND_USER_2:-}
       NNTP_SERVER_2_PASSWORD: ${BACKEND_PASS_2:-}
     
