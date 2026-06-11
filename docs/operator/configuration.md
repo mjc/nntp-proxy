@@ -113,6 +113,7 @@ password = "reader-password"
 | `name` | required | Friendly name used in logs and the TUI |
 | `username` / `password` | unset | Backend auth |
 | `max_connections` | `10` | Per-backend pool size |
+| `stat_missing` | `0` | Probe missing articles with `STAT` before `ARTICLE`/`BODY`/`HEAD` on this backend. Enable it on backends that correctly return `430` to speed up retrying missing articles. |
 | `tier` | `0` | Lower tiers are preferred first |
 | `use_tls` | `false` | TLS to the backend |
 | `tls_verify_cert` | `true` | Keep enabled in production |
@@ -137,6 +138,7 @@ Currently supported backend environment fields:
 - `USERNAME`
 - `PASSWORD`
 - `MAX_CONNECTIONS`
+- `STAT_MISSING`
 - `USE_TLS`
 - `TLS_VERIFY_CERT`
 - `TLS_CERT_PATH`
