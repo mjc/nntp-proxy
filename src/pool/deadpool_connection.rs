@@ -12,6 +12,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -266,7 +267,7 @@ impl TcpManager {
         let stream_socket = socket2::SockRef::from(&tcp_stream);
         stream_socket.set_keepalive(true)?;
         let keepalive = socket2::TcpKeepalive::new()
-            .with_time(crate::constants::duration_polyfill::from_minutes(1))
+            .with_time(Duration::from_secs(60))
             .with_interval(std::time::Duration::from_secs(10));
         stream_socket.set_tcp_keepalive(&keepalive)?;
         stream_socket.set_tcp_nodelay(true)?;

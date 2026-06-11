@@ -53,7 +53,7 @@ fn bench_config(backend_port: u16, cache: Option<Cache>) -> Config {
 fn memory_cache() -> Cache {
     Cache {
         article_cache_capacity: CacheCapacity::try_new(32 * 1024 * 1024).unwrap(),
-        article_cache_ttl_secs: nntp_proxy::constants::duration_polyfill::from_minutes(5),
+        article_cache_ttl_secs: std::time::Duration::from_secs(300),
         store_article_bodies: true,
         adaptive_precheck: false,
         availability_index_path: None,

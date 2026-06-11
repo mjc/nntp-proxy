@@ -173,7 +173,7 @@ mod tests {
 
     #[test]
     fn large_timeout_one_day() {
-        let large = crate::constants::duration_polyfill::from_hours(24);
+        let large = Duration::from_secs(24 * 60 * 60);
         let timeout = CommandExecutionTimeout::new(large);
         assert_eq!(timeout.as_secs(), 86400);
     }

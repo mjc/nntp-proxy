@@ -443,7 +443,7 @@ mod tests {
         let mut config = create_test_config();
         config.cache = Some(Cache {
             article_cache_capacity: CacheCapacity::try_new(capacity).unwrap(),
-            article_cache_ttl_secs: crate::constants::duration_polyfill::from_minutes(1),
+            article_cache_ttl_secs: Duration::from_secs(60),
             store_article_bodies: false,
             adaptive_precheck: false,
             disk: None,
