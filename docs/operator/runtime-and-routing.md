@@ -12,8 +12,6 @@ Shorthands:
 - `--headless`
 - `--tui`
 
-`--no-tui` still exists as a hidden compatibility alias for headless mode.
-
 ## Dashboard attach/listen
 
 Headless mode can publish dashboard state over a loopback websocket:
