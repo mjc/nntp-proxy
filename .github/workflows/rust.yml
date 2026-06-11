@@ -37,6 +37,40 @@ env:
   RUST_MIN_STACK: 8388608
 
 jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Read Rust toolchain
+      id: rust-toolchain
+      run: |
+        channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+        if [ -z "$channel" ]; then
+          echo "Could not read channel from rust-toolchain.toml" >&2
+          exit 1
+        fi
+        echo "channel=$channel" >> "$GITHUB_OUTPUT"
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+
+    - name: Setup Rust cache
+      uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: "audit"
+        cache-on-failure: true
+
+    - name: Install cargo-audit
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-audit
+
+    - name: Audit dependencies
+      run: cargo audit
+
   test:
     runs-on: ubuntu-latest
     steps:
