@@ -7,9 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-06-10
+
+### Added
+
+- Added per-backend `stat_missing` retry probing, so backends that correctly answer `STAT` with `430` can help retry missing articles faster.
+
+### Changed
+
+- Wired response write metrics to runtime config and reduced response-metrics logging noise.
+
 ### Fixed
 
-- Backend DNS resolution now uses hickory’s TTL-aware caching behavior, with refreshed lookup handling that avoids unnecessary IPv4 cache clears on IPv6-unreachable failures.
+- Backend DNS lookups now respect TTL.
+- Hardened retry-path routing and guard handling around pending counts, capacity-weighted initial article probing, and idle-pool preference.
 
 ## [0.5.1] - 2026-06-05
 
@@ -560,6 +571,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Development documentation
 
 [0.5.1]: https://github.com/mjc/nntp-proxy/compare/v0.5.0...v0.5.1
+[0.5.2]: https://github.com/mjc/nntp-proxy/compare/v0.5.1...v0.5.2
 [0.5.0]: https://github.com/mjc/nntp-proxy/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mjc/nntp-proxy/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mjc/nntp-proxy/compare/v0.2.3...v0.3.0
