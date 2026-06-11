@@ -1,0 +1,51 @@
+[graph]
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+  # Transitive through foyer/iai-callgrind; no safe upgrade is available yet.
+  "RUSTSEC-2025-0141",
+  # Transitive through foyer; no safe upgrade is available yet.
+  "RUSTSEC-2024-0436",
+  # Transitive through iai-callgrind dev-dependency; no safe upgrade is available yet.
+  "RUSTSEC-2026-0173",
+  # Direct dependency retained until the PEM loading path migrates to rustls-pki-types::PemObject.
+  "RUSTSEC-2025-0134",
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Zlib",
+]
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

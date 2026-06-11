@@ -17,7 +17,7 @@ echo "Installing pre-commit hook..."
 cat > "$HOOK_FILE" << 'EOF'
 #!/bin/sh
 # Pre-commit hook for nntp-proxy
-# Runs cargo fmt and cargo clippy before allowing commits.
+# Runs the fast nntp-proxy quality gate before allowing commits.
 # If the repository has a Nix flake, prefer the dev shell for consistent tooling.
 
 set -e
@@ -32,25 +32,7 @@ if [ -z "${NNTP_PROXY_PRE_COMMIT_IN_NIX:-}" ] \
     exec nix develop -c env NNTP_PROXY_PRE_COMMIT_IN_NIX=1 "$0" "$@"
 fi
 
-echo "Running cargo fmt..."
-cargo fmt --check
-if [ $? -ne 0 ]; then
-    echo "❌ Code is not formatted. Run 'cargo fmt' to fix formatting."
-    exit 1
-fi
-echo "✅ Code is properly formatted"
-
-echo ""
-echo "Running cargo clippy..."
-cargo clippy --all-features -- -D warnings
-if [ $? -ne 0 ]; then
-    echo "❌ Clippy found issues. Fix them before committing."
-    exit 1
-fi
-echo "✅ No clippy warnings"
-
-echo ""
-echo "✅ All pre-commit checks passed!"
+scripts/quality-fast.sh
 EOF
 
 chmod +x "$HOOK_FILE"
@@ -58,8 +40,7 @@ chmod +x "$HOOK_FILE"
 echo "✅ Pre-commit hook installed successfully!"
 echo ""
 echo "The hook will run the following checks before each commit:"
-echo "  - cargo fmt --check (code formatting)"
-echo "  - cargo clippy --all-features (linting)"
+echo "  - scripts/quality-fast.sh"
 echo "  - nix develop -c ... when flake.nix and nix are available"
 echo ""
 echo "To bypass the hook temporarily, use: git commit --no-verify"

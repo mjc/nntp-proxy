@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: nntp-proxy-quality-fast
+        name: nntp-proxy quality-fast
+        entry: nix develop -c scripts/quality-fast.sh
+        language: system
+        pass_filenames: false
+        always_run: true
