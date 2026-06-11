@@ -2161,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "nntp-proxy"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "anyhow",
  "arrayvec",

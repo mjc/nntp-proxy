@@ -17,13 +17,14 @@ Keep the config ordered from general settings to concrete identities:
 
 1. `[proxy]`
 2. `[routing]`
-3. `[memory]`
-4. `[cache]`
-5. `[cache.disk]`
-6. `[health_check]`
-7. `[client_auth]`
-8. `[[client_auth.users]]`
-9. `[[servers]]`
+3. `[routing.queue.backpressure]`
+4. `[memory]`
+5. `[cache]`
+6. `[cache.disk]`
+7. `[health_check]`
+8. `[client_auth]`
+9. `[[client_auth.users]]`
+10. `[[servers]]`
 
 See [../../config.full.toml](../../config.full.toml) for a complete example.
 
@@ -38,6 +39,8 @@ See [../../config.full.toml](../../config.full.toml) for a complete example.
 | `threads` | `1` | Use `0` for CPU-count worker threads |
 | `validate_yenc` | `true` | Validate yEnc structure/checksums |
 | `log_file_level` | `"warn"` | Filter for the optional local `debug.log` appender |
+| `response_write_metrics_secs` | unset | Optional interval for response write metrics logging |
+| `client_writer_lock_metrics_secs` | unset | Optional interval for client-writer lock contention metrics logging |
 | `stats_file` | unset | If unset, metrics persistence defaults to `stats.json` next to the config file |
 
 ### `[routing]`
@@ -47,6 +50,15 @@ See [../../config.full.toml](../../config.full.toml) for a complete example.
 | `mode` | `hybrid` | `hybrid` is the default; `per-command` and `stateful` remain available explicit modes |
 | `backend_selection` | `least-loaded` | Or `weighted-round-robin` |
 | `adaptive_precheck` | `false` | Adaptive availability precheck for `STAT`/`HEAD` |
+
+### `[routing.queue.backpressure]`
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `enabled` | `true` | Enable queue-pressure-aware backend filtering |
+| `soft_waiters_per_connection_percent` | `25` | Penalize backends above this queued-requests-per-connection threshold |
+| `hard_waiters_per_connection_percent` | `50` | Filter backends above this threshold while alternatives exist in the tier |
+| `all_busy_sleep_ms` | `1` | Sleep before retrying when every eligible backend in the preferred tier is hard-saturated |
 
 ### `[memory]`
 
