@@ -98,6 +98,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: clippy
+          prefix-key: clippy-${{ runner.os }}-rust-${{ hashFiles('rust-toolchain.toml') }}-
           cache-on-failure: true
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -162,6 +163,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: dependencies
+          prefix-key: dependencies-${{ runner.os }}-rust-${{ hashFiles('rust-toolchain.toml') }}-
           cache-on-failure: true
       - uses: taiki-e/install-action@v2
         with:
@@ -193,6 +195,7 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: test-coverage
+          prefix-key: test-coverage-${{ runner.os }}-rust-${{ hashFiles('rust-toolchain.toml') }}-
           cache-on-failure: true
       - uses: taiki-e/install-action@v2
         with:
