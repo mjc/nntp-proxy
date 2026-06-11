@@ -77,7 +77,7 @@ impl From<crate::session::response_transfer::ResponseTransferError> for SessionE
             crate::session::response_transfer::ResponseTransferError::ClientWrite(io_err) => {
                 Self::ClientDisconnect(io_err)
             }
-            other => Self::Backend(other.into_anyhow()),
+            other => Self::Backend(anyhow::Error::new(other)),
         }
     }
 }
