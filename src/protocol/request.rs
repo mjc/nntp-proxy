@@ -137,12 +137,6 @@ impl RequestResponseMetadata {
     }
 
     #[must_use]
-    #[allow(dead_code)]
-    pub(crate) const fn status(self) -> StatusCode {
-        self.status
-    }
-
-    #[must_use]
     pub(crate) const fn wire_len(self) -> ResponseWireLen {
         self.wire_len
     }
@@ -600,7 +594,7 @@ impl RequestContext {
     }
 
     #[inline]
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) fn complete_backend_response(
         &mut self,
         backend_id: BackendId,
@@ -610,12 +604,6 @@ impl RequestContext {
         self.backend_id = Some(backend_id);
         self.response = Some(RequestResponseMetadata::new(status, response.len().into()));
         self.response_payload = Some(response);
-    }
-
-    #[inline]
-    #[allow(dead_code)]
-    pub(crate) fn take_response_payload(&mut self) -> Option<crate::pool::ChunkedResponse> {
-        self.response_payload.take()
     }
 
     #[inline]

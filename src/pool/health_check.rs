@@ -171,7 +171,7 @@ pub fn check_tcp_alive(
 ///
 /// This is a pure function extracted for testability.
 #[inline]
-pub(crate) fn validate_date_response(response: &str) -> Result<(), HealthCheckError> {
+fn validate_date_response(response: &str) -> Result<(), HealthCheckError> {
     if response.starts_with(EXPECTED_DATE_RESPONSE_PREFIX) {
         Ok(())
     } else {

@@ -167,22 +167,22 @@
 
 #![deny(clippy::disallowed_methods)]
 
-pub mod auth_state;
+mod auth_state;
 pub(crate) mod backend;
 pub(crate) mod common;
 pub(crate) mod connection;
-pub mod core;
-pub mod handlers;
-pub mod metrics_ext;
-pub mod mode_state;
+mod core;
+mod handlers;
+mod metrics_ext;
+mod mode_state;
 pub(crate) mod multiline_framing;
-pub mod precheck;
+mod precheck;
 pub(crate) mod response_transfer;
 pub(crate) mod retry;
 pub(crate) mod routing;
-pub mod session_error;
+mod session_error;
 pub(crate) mod shared_client_writer;
-pub mod state;
+mod state;
 
 pub use auth_state::AuthState;
 pub use backend::format_hex_preview;

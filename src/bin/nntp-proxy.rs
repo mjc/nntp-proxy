@@ -416,7 +416,6 @@ mod tests {
             ui: UiMode::Headless,
             tui: false,
             headless: false,
-            no_tui: false,
             tui_listen: None,
             tui_attach: None,
             port: None,

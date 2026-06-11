@@ -101,7 +101,7 @@ fn test_metrics_snapshot_total_bytes() {
         stateful_sessions: 2,
         client_to_backend_bytes: ClientToBackendBytes::new(1000),
         backend_to_client_bytes: BackendToClientBytes::new(5000),
-        uptime: nntp_proxy::constants::duration_polyfill::from_minutes(1),
+        uptime: std::time::Duration::from_secs(60),
         ..Default::default()
     };
 

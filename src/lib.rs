@@ -37,13 +37,13 @@
 pub mod args;
 pub mod auth;
 pub mod client;
-pub mod compression;
+mod compression;
 pub mod connection_error;
 pub mod formatting;
 mod io_util;
 pub mod logging;
 pub mod metrics;
-pub mod network;
+mod network;
 pub mod protocol;
 mod proxy;
 pub mod stream;

@@ -12,7 +12,6 @@ use tracing::{debug, info, warn};
 
 use crate::cache::UnifiedCache;
 use crate::config::RoutingMode;
-use crate::network::NetworkOptimizer;
 use crate::pool::ConnectionProvider;
 use crate::router;
 use crate::session::ClientSession;
@@ -250,13 +249,11 @@ impl NntpProxy {
     /// Apply TCP optimizations to client socket
     #[inline]
     pub(super) fn apply_tcp_optimizations(&self, client_stream: &TcpStream) {
-        use crate::network::TcpOptimizer;
-        TcpOptimizer::with_buffer_sizes(
+        crate::network::optimize_tcp_stream(
             client_stream,
             self.memory.socket_recv_buffer_size,
             self.memory.socket_send_buffer_size,
         )
-        .optimize()
         .map_err(|e| debug!("Failed to optimize client socket: {}", e))
         .ok();
     }
@@ -853,7 +850,7 @@ mod tests {
         for server in proxy.servers() {
             assert_eq!(
                 server.backend_idle_timeout,
-                crate::constants::duration_polyfill::from_minutes(10),
+                Duration::from_secs(600),
                 "Server '{}' should have default 10-minute backend_idle_timeout",
                 server.name.as_ref(),
             );
@@ -1002,7 +999,7 @@ mod tests {
                 Server::builder("server2.example.com", Port::try_new(119).unwrap())
                     .name("Long Timeout")
                     .max_connections(MaxConnections::try_new(2).unwrap())
-                    .backend_idle_timeout(crate::constants::duration_polyfill::from_hours(24)) // 24h
+                    .backend_idle_timeout(Duration::from_secs(24 * 60 * 60)) // 24h
                     .build()
                     .unwrap(),
             ],
@@ -1036,7 +1033,7 @@ mod tests {
                 Server::builder("server2.example.com", Port::try_new(119).unwrap())
                     .name("Long Timeout")
                     .max_connections(MaxConnections::try_new(2).unwrap())
-                    .backend_idle_timeout(crate::constants::duration_polyfill::from_hours(24))
+                    .backend_idle_timeout(Duration::from_secs(24 * 60 * 60))
                     .build()
                     .unwrap(),
             ],

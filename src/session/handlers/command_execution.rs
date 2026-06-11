@@ -1075,47 +1075,44 @@ impl ClientSession {
             "Sending request to backend and waiting for classifiable response bytes"
         );
         let result =
-            if Self::should_use_stat_missing_probe(provider, request, stat_probe_retry_only) {
-                if let Some(stat_request) = Self::stat_probe_request(request) {
+            if Self::should_use_stat_missing_probe(provider, request, stat_probe_retry_only)
+                && let Some(stat_request) = Self::stat_probe_request(request)
+            {
+                debug!(
+                    client = %self.client_addr,
+                    backend = backend.backend_id().as_index(),
+                    command_verb = ?request.verb(),
+                    msg_id = ?request.message_id_value(),
+                    "Running STAT miss probe before backend article fetch"
+                );
+
+                let (probe_response, mut probe_buffer, probe_timings) = self
+                    .execute_and_read_response(&mut guard, backend, &stat_request)
+                    .await
+                    .map_err(|BackendReadAttemptError::Backend(e)| e)?;
+                if probe_response
+                    .status_code()
+                    .is_some_and(|status| status.as_u16() == 430)
+                {
                     debug!(
                         client = %self.client_addr,
                         backend = backend.backend_id().as_index(),
                         command_verb = ?request.verb(),
                         msg_id = ?request.message_id_value(),
-                        "Running STAT miss probe before backend article fetch"
+                        "STAT miss probe returned 430; skipping backend article fetch"
                     );
-
-                    let (probe_response, mut probe_buffer, probe_timings) = self
-                        .execute_and_read_response(&mut guard, backend, &stat_request)
-                        .await
-                        .map_err(|BackendReadAttemptError::Backend(e)| e)?;
-                    if probe_response
-                        .status_code()
-                        .is_some_and(|status| status.as_u16() == 430)
-                    {
-                        debug!(
-                            client = %self.client_addr,
-                            backend = backend.backend_id().as_index(),
-                            command_verb = ?request.verb(),
-                            msg_id = ?request.message_id_value(),
-                            "STAT miss probe returned 430; skipping backend article fetch"
-                        );
-                        Ok((probe_response, probe_buffer, probe_timings))
-                    } else {
-                        crate::session::backend::observe_response(
-                            &stat_request,
-                            &mut probe_buffer,
-                            &mut guard,
-                            &self.buffer_pool,
-                            backend.backend_id(),
-                        )
-                        .await
-                        .map_err(SessionError::from)?;
-                        let _ = probe_timings;
-                        self.execute_and_read_response(&mut guard, backend, request)
-                            .await
-                    }
+                    Ok((probe_response, probe_buffer, probe_timings))
                 } else {
+                    crate::session::backend::observe_response(
+                        &stat_request,
+                        &mut probe_buffer,
+                        &mut guard,
+                        &self.buffer_pool,
+                        backend.backend_id(),
+                    )
+                    .await
+                    .map_err(SessionError::from)?;
+                    let _ = probe_timings;
                     self.execute_and_read_response(&mut guard, backend, request)
                         .await
                 }

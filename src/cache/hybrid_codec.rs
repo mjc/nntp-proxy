@@ -19,12 +19,6 @@ use super::article::{CachedArticleNumber, CachedPayload, parse_payload};
 use super::availability::ArticleAvailability;
 use super::ttl;
 
-#[cfg(test)]
-const DISK_ENTRY_MAGIC_V3: u32 = 0x4e50_4333; // "NPC3": legacy u8 availability bitmaps.
-#[cfg(test)]
-const DISK_ENTRY_MAGIC_V4: u32 = 0x4e50_4334; // "NPC4": legacy usize availability bitmaps.
-#[cfg(test)]
-const DISK_ENTRY_MAGIC_V5: u32 = 0x4e50_4335; // "NPC5": legacy checked + missing bitmaps.
 const DISK_ENTRY_MAGIC_V6: u32 = 0x4e50_4336; // "NPC6"
 const PAYLOAD_MISSING: u8 = 0;
 const PAYLOAD_AVAILABILITY_ONLY: u8 = 1;
@@ -1007,33 +1001,11 @@ mod tests {
     }
 
     #[test]
-    fn test_code_decode_rejects_legacy_u8_bitmap_magic() {
+    fn test_code_decode_rejects_non_current_magic() {
         let entry = disk_cached_article_from_ingest_bytes(b"220 article\r\n").unwrap();
         let mut encoded = Vec::new();
         entry.encode(&mut encoded).unwrap();
-        encoded[..4].copy_from_slice(&DISK_ENTRY_MAGIC_V3.to_le_bytes());
-
-        let result = DiskCachedArticle::decode(&mut encoded.as_slice());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_code_decode_rejects_legacy_usize_bitmap_magic() {
-        let entry = disk_cached_article_from_ingest_bytes(b"220 article\r\n").unwrap();
-        let mut encoded = Vec::new();
-        entry.encode(&mut encoded).unwrap();
-        encoded[..4].copy_from_slice(&DISK_ENTRY_MAGIC_V4.to_le_bytes());
-
-        let result = DiskCachedArticle::decode(&mut encoded.as_slice());
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_code_decode_rejects_legacy_checked_bitmap_magic() {
-        let entry = disk_cached_article_from_ingest_bytes(b"220 article\r\n").unwrap();
-        let mut encoded = Vec::new();
-        entry.encode(&mut encoded).unwrap();
-        encoded[..4].copy_from_slice(&DISK_ENTRY_MAGIC_V5.to_le_bytes());
+        encoded[..4].copy_from_slice(&0x4e50_4335u32.to_le_bytes());
 
         let result = DiskCachedArticle::decode(&mut encoded.as_slice());
         assert!(result.is_err());

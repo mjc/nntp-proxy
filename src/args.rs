@@ -66,12 +66,8 @@ pub struct CommonArgs {
     pub tui: bool,
 
     /// Shorthand for `--ui headless`.
-    #[arg(long, help_heading = "General", conflicts_with_all = ["ui", "tui", "no_tui"])]
+    #[arg(long, help_heading = "General", conflicts_with_all = ["ui", "tui"])]
     pub headless: bool,
-
-    /// Disable the terminal dashboard and run in headless mode.
-    #[arg(long, hide = true, help_heading = "General")]
-    pub no_tui: bool,
 
     /// Bind the dashboard websocket publisher to a free loopback IP:PORT distinct from the proxy listener.
     #[arg(
@@ -123,7 +119,6 @@ pub struct CommonArgs {
     /// Backend selection strategy
     #[arg(
         long = "backend-selection",
-        alias = "backend-strategy",
         value_enum,
         env = "NNTP_PROXY_BACKEND_SELECTION",
         help_heading = "Routing"
@@ -133,7 +128,6 @@ pub struct CommonArgs {
     /// Article cache capacity in memory (e.g., "64mb", "1gb")
     #[arg(
         long = "article-cache-capacity",
-        alias = "cache-capacity",
         env = "NNTP_PROXY_ARTICLE_CACHE_CAPACITY",
         help_heading = "Cache"
     )]
@@ -142,8 +136,6 @@ pub struct CommonArgs {
     /// Article cache TTL in seconds
     #[arg(
         long = "article-cache-ttl",
-        alias = "cache-ttl",
-        alias = "ttl-secs",
         env = "NNTP_PROXY_ARTICLE_CACHE_TTL_SECS",
         help_heading = "Cache"
     )]
@@ -152,8 +144,6 @@ pub struct CommonArgs {
     /// Store full article bodies in the article cache (true) or track availability only (false)
     #[arg(
         long = "store-article-bodies",
-        alias = "cache-articles",
-        alias = "store-articles",
         env = "NNTP_PROXY_STORE_ARTICLE_BODIES",
         help_heading = "Cache"
     )]
@@ -200,11 +190,9 @@ impl CommonArgs {
     }
 
     /// Get the effective UI/runtime mode.
-    ///
-    /// `--no-tui` remains as a hidden compatibility alias for headless mode.
     #[must_use]
     pub const fn effective_ui_mode(&self) -> UiMode {
-        if self.no_tui || self.headless {
+        if self.headless {
             UiMode::Headless
         } else if self.tui {
             UiMode::Tui
@@ -276,34 +264,6 @@ impl CommonArgs {
         Ok(())
     }
 
-    fn legacy_env_var<E>(env_get: &E, keys: &[&str]) -> Option<String>
-    where
-        E: Fn(&str) -> Option<String>,
-    {
-        keys.iter().find_map(|key| env_get(key))
-    }
-
-    fn env_bool<E>(env_get: &E, keys: &[&str]) -> Option<bool>
-    where
-        E: Fn(&str) -> Option<String>,
-    {
-        Self::legacy_env_var(env_get, keys)?.parse().ok()
-    }
-
-    fn env_u64<E>(env_get: &E, keys: &[&str]) -> Option<u64>
-    where
-        E: Fn(&str) -> Option<String>,
-    {
-        Self::legacy_env_var(env_get, keys)?.parse().ok()
-    }
-
-    fn env_cache_capacity<E>(env_get: &E, keys: &[&str]) -> Option<CacheCapacity>
-    where
-        E: Fn(&str) -> Option<String>,
-    {
-        Self::legacy_env_var(env_get, keys)?.parse().ok()
-    }
-
     fn apply_overrides_with_env<E>(&self, config: &mut Config, env_get: E)
     where
         E: Fn(&str) -> Option<String>,
@@ -318,13 +278,13 @@ impl CommonArgs {
 
         let article_cache_capacity = self
             .article_cache_capacity
-            .or_else(|| Self::env_cache_capacity(&env_get, &["NNTP_PROXY_CACHE_CAPACITY"]));
+            .or_else(|| env_get("NNTP_PROXY_ARTICLE_CACHE_CAPACITY")?.parse().ok());
         let article_cache_ttl_secs = self
             .article_cache_ttl_secs
-            .or_else(|| Self::env_u64(&env_get, &["NNTP_PROXY_CACHE_TTL"]));
+            .or_else(|| env_get("NNTP_PROXY_ARTICLE_CACHE_TTL_SECS")?.parse().ok());
         let store_article_bodies = self
             .store_article_bodies
-            .or_else(|| Self::env_bool(&env_get, &["NNTP_PROXY_CACHE_ARTICLES"]));
+            .or_else(|| env_get("NNTP_PROXY_STORE_ARTICLE_BODIES")?.parse().ok());
 
         // Cache overrides — create cache section if needed
         if article_cache_capacity.is_some()
@@ -507,7 +467,7 @@ mod tests {
     }
 
     #[test]
-    fn test_common_args_parse_primary_and_legacy_flags() {
+    fn test_common_args_parse_primary_flags() {
         let args = CommonArgs::parse_from([
             "nntp-proxy",
             "--ui",
@@ -533,31 +493,6 @@ mod tests {
         assert_eq!(args.article_cache_ttl_secs, Some(7200));
         assert_eq!(args.store_article_bodies, Some(true));
         assert_eq!(args.effective_ui_mode(), UiMode::Tui);
-
-        let legacy_args = CommonArgs::parse_from([
-            "nntp-proxy",
-            "--no-tui",
-            "--cache-capacity",
-            "256mb",
-            "--backend-strategy",
-            "weighted-round-robin",
-            "--cache-ttl",
-            "3600",
-            "--store-articles",
-            "false",
-        ]);
-
-        assert_eq!(
-            legacy_args.backend_selection,
-            Some(BackendSelectionStrategy::WeightedRoundRobin)
-        );
-        assert_eq!(
-            legacy_args.article_cache_capacity,
-            Some(CacheCapacity::try_new(256_000_000).unwrap())
-        );
-        assert_eq!(legacy_args.article_cache_ttl_secs, Some(3600));
-        assert_eq!(legacy_args.store_article_bodies, Some(false));
-        assert_eq!(legacy_args.effective_ui_mode(), UiMode::Headless);
     }
 
     #[test]
@@ -754,7 +689,6 @@ mod tests {
             ui: UiMode::Headless,
             tui: false,
             headless: false,
-            no_tui: false,
             tui_listen: None,
             tui_attach: None,
             port: None,
@@ -822,13 +756,13 @@ mod tests {
         assert_eq!(cache.article_cache_capacity.get(), 128 * 1024 * 1024);
         assert_eq!(
             cache.article_cache_ttl_secs,
-            crate::constants::duration_polyfill::from_hours(2)
+            Duration::from_secs(2 * 60 * 60)
         );
         assert!(!cache.store_article_bodies);
     }
 
     #[test]
-    fn test_apply_overrides_legacy_env_compat() {
+    fn test_apply_overrides_cache_env() {
         let args = default_args();
         let mut config = Config {
             cache: None,
@@ -836,9 +770,9 @@ mod tests {
         };
 
         args.apply_overrides_with_env(&mut config, |key| match key {
-            "NNTP_PROXY_CACHE_CAPACITY" => Some("128mb".to_string()),
-            "NNTP_PROXY_CACHE_TTL" => Some("7200".to_string()),
-            "NNTP_PROXY_CACHE_ARTICLES" => Some("false".to_string()),
+            "NNTP_PROXY_ARTICLE_CACHE_CAPACITY" => Some("128mb".to_string()),
+            "NNTP_PROXY_ARTICLE_CACHE_TTL_SECS" => Some("7200".to_string()),
+            "NNTP_PROXY_STORE_ARTICLE_BODIES" => Some("false".to_string()),
             _ => None,
         });
 
@@ -846,7 +780,7 @@ mod tests {
         assert_eq!(cache.article_cache_capacity.get(), 128_000_000);
         assert_eq!(
             cache.article_cache_ttl_secs,
-            crate::constants::duration_polyfill::from_hours(2)
+            Duration::from_secs(2 * 60 * 60)
         );
         assert!(!cache.store_article_bodies);
     }

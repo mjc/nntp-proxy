@@ -252,6 +252,7 @@ fn migrate_client_auth_users(config: &mut Config, raw: &toml::Value) -> bool {
 }
 
 fn migrate_legacy_config(config: &mut Config, raw: &toml::Value) -> bool {
+    // TODO(0.6): remove legacy schema migration after the 0.5 compatibility window.
     migrate_proxy_routing(config, raw)
         | migrate_proxy_memory(config, raw)
         | migrate_cache_precheck(config, raw)
@@ -758,7 +759,7 @@ mod tests {
         let server = parse_server_from_env(0, &env).unwrap();
         assert_eq!(
             server.connection_keepalive,
-            Some(crate::constants::duration_polyfill::from_minutes(5))
+            Some(std::time::Duration::from_secs(300))
         );
     }
 

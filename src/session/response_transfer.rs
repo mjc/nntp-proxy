@@ -60,23 +60,6 @@ impl ResponseTransferError {
             },
         }
     }
-
-    /// Convert the transfer outcome into an `anyhow` error for older call sites
-    /// that still bubble untyped errors.
-    pub(super) fn into_anyhow(self) -> anyhow::Error {
-        match self {
-            Self::ClientDisconnect(io_err) => anyhow::Error::from(io_err),
-            Self::ClientWrite(io_err) => anyhow::Error::from(io_err),
-            Self::Io(e) => e,
-            Self::BackendEof {
-                backend_id,
-                bytes_received,
-            } => anyhow::anyhow!(
-                "Backend {backend_id:?} closed connection before complete multiline response \
-                 ({bytes_received} bytes received)"
-            ),
-        }
-    }
 }
 
 impl std::fmt::Display for ResponseTransferError {
@@ -208,18 +191,5 @@ mod tests {
             backend_eof.to_string().contains("99 bytes received"),
             "display should include received byte count"
         );
-    }
-
-    #[test]
-    fn response_transfer_into_anyhow_keeps_backend_eof_context() {
-        let err = ResponseTransferError::BackendEof {
-            backend_id: crate::types::BackendId::from_index(3),
-            bytes_received: 7,
-        }
-        .into_anyhow();
-
-        let rendered = err.to_string();
-        assert!(rendered.contains("closed connection"));
-        assert!(rendered.contains("7 bytes received"));
     }
 }

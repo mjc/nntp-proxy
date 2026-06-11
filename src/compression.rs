@@ -170,27 +170,10 @@ impl<S> DecompressStream<S> {
         }
     }
 
-    /// Consume the wrapper, returning the inner stream.
-    pub fn into_inner(self) -> S {
-        self.inner
-    }
-
     /// Get a reference to the inner stream.
     #[inline]
     pub const fn get_ref(&self) -> &S {
         &self.inner
-    }
-
-    /// Get a mutable reference to the inner stream.
-    #[inline]
-    pub const fn get_mut(&mut self) -> &mut S {
-        &mut self.inner
-    }
-
-    /// Get bandwidth stats: (compressed bytes read from network, decompressed bytes delivered).
-    #[inline]
-    pub const fn bandwidth_stats(&self) -> (u64, u64) {
-        (self.bytes_compressed_in, self.bytes_decompressed_out)
     }
 }
 
@@ -420,19 +403,6 @@ mod tests {
 
         assert_eq!(output.len(), original.len());
         assert_eq!(output, original);
-    }
-
-    #[tokio::test]
-    async fn test_bandwidth_stats() {
-        let original = b"Test data for bandwidth tracking\r\n";
-        let (_tx, mut stream) = feed_compressed(original).await;
-
-        let mut output = Vec::new();
-        stream.read_to_end(&mut output).await.unwrap();
-
-        let (compressed_in, decompressed_out) = stream.bandwidth_stats();
-        assert!(compressed_in > 0);
-        assert_eq!(decompressed_out, original.len() as u64);
     }
 
     #[test]
