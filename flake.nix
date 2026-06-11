@@ -76,6 +76,7 @@
           cargo-deny
           cargo-audit
           shellcheck
+          actionlint
 
           # Testing & coverage
           cargo-tarpaulin
@@ -185,6 +186,7 @@
           echo "   cargo deny check  - Check dependencies for security/licenses"
           echo "   cargo audit       - Check for security vulnerabilities"
           echo "   shellcheck scripts/*.sh - Lint shell scripts"
+          echo "   actionlint        - Lint GitHub Actions workflows"
           echo ""
           echo "🧪 Testing & coverage:"
           echo "   cargo nextest run - Fast test runner"
