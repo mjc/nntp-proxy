@@ -67,10 +67,7 @@ impl MockHybridCache {
 
         // Check for existing entry - don't overwrite larger semantic payloads with smaller ones.
         if let Some(existing) = storage.get(&key) {
-            if existing.availability().is_missing(backend) {
-                return;
-            }
-            if existing.payload_len() > entry_len {
+            if existing.availability().is_missing(backend) || existing.payload_len() > entry_len {
                 return;
             }
             entry.availability = existing.availability();

@@ -88,26 +88,28 @@ fn validate_server(server: &Server) {
     // - max_connections cannot be 0 (NonZeroUsize via MaxConnections)
 
     // Warn if connection_keepalive is outside recommended range
-    if let Some(keepalive) = server.connection_keepalive {
-        if keepalive < MIN_RECOMMENDED_KEEPALIVE {
-            tracing::warn!(
-                "Server '{}' has connection_keepalive set to {:?} (< {:?}). \
-                 This may cause excessive health check traffic and connection churn. \
-                 Consider using at least {:?} or None to disable.",
-                server.name.as_str(),
-                keepalive,
-                MIN_RECOMMENDED_KEEPALIVE,
-                MIN_RECOMMENDED_KEEPALIVE
-            );
-        } else if keepalive > MAX_RECOMMENDED_KEEPALIVE {
-            tracing::warn!(
-                "Server '{}' has connection_keepalive set to {:?} (> {:?} / 5 minutes). \
-                 This may not detect stale connections quickly enough. Consider a lower value.",
-                server.name.as_str(),
-                keepalive,
-                MAX_RECOMMENDED_KEEPALIVE
-            );
-        }
+    if let Some(keepalive) = server.connection_keepalive
+        && keepalive < MIN_RECOMMENDED_KEEPALIVE
+    {
+        tracing::warn!(
+            "Server '{}' has connection_keepalive set to {:?} (< {:?}). \
+             This may cause excessive health check traffic and connection churn. \
+             Consider using at least {:?} or None to disable.",
+            server.name.as_str(),
+            keepalive,
+            MIN_RECOMMENDED_KEEPALIVE,
+            MIN_RECOMMENDED_KEEPALIVE
+        );
+    } else if let Some(keepalive) = server.connection_keepalive
+        && keepalive > MAX_RECOMMENDED_KEEPALIVE
+    {
+        tracing::warn!(
+            "Server '{}' has connection_keepalive set to {:?} (> {:?} / 5 minutes). \
+             This may not detect stale connections quickly enough. Consider a lower value.",
+            server.name.as_str(),
+            keepalive,
+            MAX_RECOMMENDED_KEEPALIVE
+        );
     }
 }
 
@@ -262,10 +264,7 @@ mod tests {
 
     #[test]
     fn test_validate_server_with_recommended_keepalive() {
-        let server = create_test_server(
-            "test",
-            Some(crate::constants::duration_polyfill::from_minutes(1)),
-        );
+        let server = create_test_server("test", Some(Duration::from_secs(60)));
         validate_server(&server);
     }
 
@@ -279,10 +278,7 @@ mod tests {
     #[test]
     fn test_validate_server_with_high_keepalive_warns() {
         // This should warn but not fail
-        let server = create_test_server(
-            "test",
-            Some(crate::constants::duration_polyfill::from_minutes(10)),
-        );
+        let server = create_test_server("test", Some(Duration::from_secs(600)));
         validate_server(&server);
     }
 
