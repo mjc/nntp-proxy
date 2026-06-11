@@ -95,6 +95,8 @@ jobs:
           toolchain: ${{ steps.rust-toolchain.outputs.channel }}
           components: clippy
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - name: Install mold
+        run: sudo apt-get update && sudo apt-get install -y mold
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: clippy
@@ -133,11 +135,12 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: actionlint,zizmor
+      - uses: rhysd/actionlint@v1.7.7
       - name: Run actionlint
         run: actionlint
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: zizmor
       - name: Run zizmor
         run: zizmor .github/workflows
 
@@ -192,6 +195,8 @@ jobs:
           toolchain: ${{ steps.rust-toolchain.outputs.channel }}
           components: llvm-tools-preview
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - name: Install mold
+        run: sudo apt-get update && sudo apt-get install -y mold
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: test-coverage
@@ -199,7 +204,7 @@ jobs:
           cache-on-failure: true
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov,cargo-nextest
 
       - name: Check Rust version pins
         run: ./scripts/check-rust-version.sh
