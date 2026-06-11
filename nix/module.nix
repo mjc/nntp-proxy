@@ -136,6 +136,7 @@ in {
               host = "news.example.com";
               port = 563;
               name = "Primary";
+              stat_missing = 1;
               use_tls = true;
               tls_verify_cert = true;
               max_connections = 20;

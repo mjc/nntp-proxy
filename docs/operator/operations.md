@@ -17,10 +17,13 @@ docker run -d \
   -e NNTP_SERVER_0_HOST=news.example.com \
   -e NNTP_SERVER_0_PORT=119 \
   -e NNTP_SERVER_0_NAME=Primary \
+  -e NNTP_SERVER_0_STAT_MISSING=1 \
   -e NNTP_SERVER_0_USERNAME="$BACKEND_USER" \
   -e NNTP_SERVER_0_PASSWORD="$BACKEND_PASS" \
   nntp-proxy
 ```
+
+Set `NNTP_SERVER_*_STAT_MISSING=1` on backends that correctly return `430` for missing articles if you want the proxy to prefetch those misses with `STAT`.
 
 The repository also includes [../../docker-compose.yml](../../docker-compose.yml).
 
