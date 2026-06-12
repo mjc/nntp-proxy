@@ -16,8 +16,20 @@ const TOKIO_WORKER_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 pub struct RuntimeConfig {
     /// Number of worker threads
     worker_threads: usize,
-    /// Whether to enable CPU pinning (Linux only)
-    enable_cpu_pinning: bool,
+    /// CPU pinning behavior
+    cpu_pinning: CpuPinning,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CpuPinning {
+    Enabled,
+    Disabled,
+}
+
+impl CpuPinning {
+    const fn is_enabled(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
 }
 
 impl RuntimeConfig {
@@ -32,14 +44,14 @@ impl RuntimeConfig {
 
         Self {
             worker_threads,
-            enable_cpu_pinning: true,
+            cpu_pinning: CpuPinning::Enabled,
         }
     }
 
     /// Disable CPU pinning
     #[must_use]
     pub const fn without_cpu_pinning(mut self) -> Self {
-        self.enable_cpu_pinning = false;
+        self.cpu_pinning = CpuPinning::Disabled;
         self
     }
 
@@ -65,9 +77,13 @@ impl RuntimeConfig {
     pub fn build_runtime(self) -> Result<tokio::runtime::Runtime> {
         let rt = if self.is_single_threaded() {
             tracing::info!("Starting NNTP proxy with single-threaded runtime");
-            tokio::runtime::Builder::new_current_thread()
+            let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
-                .build()?
+                .build()?;
+            if self.cpu_pinning.is_enabled() {
+                pin_current_thread_to_first_available_cpu(self.worker_threads);
+            }
+            rt
         } else {
             let num_cpus = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
             tracing::info!(
@@ -75,16 +91,19 @@ impl RuntimeConfig {
                 self.worker_threads,
                 num_cpus
             );
-            tokio::runtime::Builder::new_multi_thread()
+
+            let mut builder = tokio::runtime::Builder::new_multi_thread();
+            builder
                 .worker_threads(self.worker_threads)
                 .thread_stack_size(TOKIO_WORKER_THREAD_STACK_SIZE)
-                .enable_all()
-                .build()?
-        };
+                .enable_all();
 
-        if self.enable_cpu_pinning {
-            pin_to_cpu_cores(self.worker_threads);
-        }
+            if self.cpu_pinning.is_enabled() {
+                configure_worker_cpu_pinning(&mut builder, self.worker_threads);
+            }
+
+            builder.build()?
+        };
 
         Ok(rt)
     }
@@ -96,40 +115,116 @@ impl Default for RuntimeConfig {
     }
 }
 
-/// Pin current process to specific CPU cores for optimal performance
+/// Pin the current thread to one CPU core for more stable scheduler locality.
 ///
 /// This is a best-effort operation - failures are logged but not fatal.
 ///
 /// # Arguments
-/// * `num_cores` - Number of CPU cores to pin to (`0..num_cores`)
+/// * `core` - CPU core ID to pin the current thread to
 #[cfg(target_os = "linux")]
-fn pin_to_cpu_cores(num_cores: usize) {
-    use nix::sched::{CpuSet, sched_setaffinity};
-    use nix::unistd::Pid;
+fn pin_current_thread_to_cpu(core: usize) {
+    use rustix::thread::{gettid, sched_setaffinity};
 
-    let mut cpu_set = CpuSet::new();
-    for core in 0..num_cores {
-        let _ = cpu_set.set(core);
-    }
+    let cpu_set = build_single_cpu_affinity_set(core);
 
-    match sched_setaffinity(Pid::from_raw(0), &cpu_set) {
+    match sched_setaffinity(Some(gettid()), &cpu_set) {
         Ok(()) => {
-            tracing::info!(
-                "Successfully pinned process to {} CPU cores for optimal performance",
-                num_cores
-            );
+            tracing::info!("Successfully pinned thread to CPU core {core}");
         }
         Err(e) => {
             tracing::warn!(
-                "Failed to set CPU affinity: {}, continuing without pinning",
-                e
+                "Failed to pin thread to CPU core {core}: {e}, continuing without pinning"
             );
         }
     }
 }
 
+#[cfg(target_os = "linux")]
+fn build_single_cpu_affinity_set(core: usize) -> rustix::thread::CpuSet {
+    let mut cpu_set = rustix::thread::CpuSet::new();
+    cpu_set.set(core);
+    cpu_set
+}
+
+#[cfg(target_os = "linux")]
+fn pin_current_thread_to_first_available_cpu(requested_cores: usize) {
+    let cores = available_cpu_cores(requested_cores);
+    pin_current_thread_to_cpu(cores[0]);
+}
+
+#[cfg(target_os = "linux")]
+fn configure_worker_cpu_pinning(builder: &mut tokio::runtime::Builder, worker_threads: usize) {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    let cores = Arc::new(available_cpu_cores(worker_threads));
+    let next_worker = Arc::new(AtomicUsize::new(0));
+
+    builder.on_thread_start({
+        let cores = Arc::clone(&cores);
+        let next_worker = Arc::clone(&next_worker);
+        move || {
+            let worker_index = next_worker.fetch_add(1, Ordering::Relaxed);
+            let core = cores[worker_index % cores.len()];
+            pin_current_thread_to_cpu(core);
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn available_cpu_cores(requested_cores: usize) -> Vec<usize> {
+    use rustix::thread::{CpuSet, sched_getaffinity};
+
+    let requested_cores = requested_cores.max(1);
+
+    match sched_getaffinity(None) {
+        Ok(affinity) => cpu_cores_from_affinity(&affinity, requested_cores),
+        Err(error) => {
+            tracing::warn!(
+                "Failed to read CPU affinity mask: {error}, falling back to CPU IDs from zero"
+            );
+            (0..requested_cores.min(CpuSet::MAX_CPU)).collect()
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn cpu_cores_from_affinity(
+    affinity: &rustix::thread::CpuSet,
+    requested_cores: usize,
+) -> Vec<usize> {
+    let mut cores = Vec::with_capacity(requested_cores);
+
+    for core in 0..rustix::thread::CpuSet::MAX_CPU {
+        if affinity.is_set(core) {
+            cores.push(core);
+            if cores.len() == requested_cores {
+                break;
+            }
+        }
+    }
+
+    if cores.is_empty() {
+        cores.push(0);
+    }
+
+    cores
+}
+
 #[cfg(not(target_os = "linux"))]
-fn pin_to_cpu_cores(_num_cores: usize) {
+fn pin_current_thread_to_first_available_cpu(_requested_cores: usize) {
+    tracing::info!("CPU pinning not available on this platform");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn configure_worker_cpu_pinning(_builder: &mut tokio::runtime::Builder, _worker_threads: usize) {
+    tracing::info!("CPU pinning not available on this platform");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_current_thread_to_cpu(_core: usize) {
     tracing::info!("CPU pinning not available on this platform");
 }
 
@@ -1111,7 +1206,7 @@ mod tests {
         // Should default to single-threaded (1 thread)
         assert_eq!(config.worker_threads(), 1);
         assert!(config.is_single_threaded());
-        assert!(config.enable_cpu_pinning); // CPU pinning helps even with 1 thread
+        assert_eq!(config.cpu_pinning, CpuPinning::Enabled);
     }
 
     #[test]
@@ -1138,7 +1233,7 @@ mod tests {
         let config = RuntimeConfig::from_args(Some(thread_count));
 
         assert_eq!(config.worker_threads(), 8);
-        assert!(config.enable_cpu_pinning);
+        assert_eq!(config.cpu_pinning, CpuPinning::Enabled);
     }
 
     #[test]
@@ -1147,7 +1242,7 @@ mod tests {
         let config = RuntimeConfig::from_args(Some(thread_count)).without_cpu_pinning();
 
         assert_eq!(config.worker_threads(), 4);
-        assert!(!config.enable_cpu_pinning);
+        assert_eq!(config.cpu_pinning, CpuPinning::Disabled);
     }
 
     #[test]
@@ -1159,10 +1254,33 @@ mod tests {
         assert_eq!(config.worker_threads(), expected.worker_threads());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn test_pin_to_cpu_cores_non_fatal() {
-        // Should not panic even if pinning fails
-        pin_to_cpu_cores(1);
+    fn test_build_single_cpu_affinity_set_sets_requested_core() {
+        let cpu_set = build_single_cpu_affinity_set(4);
+
+        assert!(cpu_set.is_set(4));
+        assert!(!cpu_set.is_set(3));
+        assert!(!cpu_set.is_set(5));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_cpu_cores_from_affinity_uses_allowed_cpu_ids() {
+        let mut affinity = rustix::thread::CpuSet::new();
+        affinity.set(2);
+        affinity.set(4);
+        affinity.set(6);
+
+        assert_eq!(cpu_cores_from_affinity(&affinity, 2), vec![2, 4]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_cpu_cores_from_affinity_falls_back_when_mask_is_empty() {
+        let affinity = rustix::thread::CpuSet::new();
+
+        assert_eq!(cpu_cores_from_affinity(&affinity, 4), vec![0]);
     }
 
     // Edge case tests
@@ -1186,12 +1304,44 @@ mod tests {
     }
 
     #[test]
+    fn test_build_runtime_single_threaded_without_cpu_pinning() {
+        let rt = RuntimeConfig::from_args(Some(ThreadCount::new(1).unwrap()))
+            .without_cpu_pinning()
+            .build_runtime()
+            .unwrap();
+
+        let value = rt.block_on(async { 7usize });
+        assert_eq!(value, 7);
+    }
+
+    #[test]
+    fn test_build_runtime_multi_threaded_without_cpu_pinning() {
+        let rt = RuntimeConfig::from_args(Some(ThreadCount::new(2).unwrap()))
+            .without_cpu_pinning()
+            .build_runtime()
+            .unwrap();
+
+        let value = rt.block_on(async { tokio::task::spawn(async { 11usize }).await.unwrap() });
+        assert_eq!(value, 11);
+    }
+
+    #[test]
+    fn test_build_runtime_multi_threaded_with_cpu_pinning() {
+        let rt = RuntimeConfig::from_args(Some(ThreadCount::new(2).unwrap()))
+            .build_runtime()
+            .unwrap();
+
+        let value = rt.block_on(async { tokio::task::spawn(async { 13usize }).await.unwrap() });
+        assert_eq!(value, 13);
+    }
+
+    #[test]
     fn test_runtime_config_clone() {
         let config = RuntimeConfig::from_args(Some(ThreadCount::new(4).unwrap()));
         let cloned = config.clone();
 
         assert_eq!(cloned.worker_threads(), config.worker_threads());
-        assert_eq!(cloned.enable_cpu_pinning, config.enable_cpu_pinning);
+        assert_eq!(cloned.cpu_pinning, config.cpu_pinning);
     }
 
     #[test]
@@ -1201,7 +1351,7 @@ mod tests {
 
         assert!(debug_str.contains("RuntimeConfig"));
         assert!(debug_str.contains("worker_threads"));
-        assert!(debug_str.contains("enable_cpu_pinning"));
+        assert!(debug_str.contains("cpu_pinning"));
     }
 
     #[tokio::test]
@@ -1333,7 +1483,7 @@ mod tests {
             RuntimeConfig::from_args(Some(ThreadCount::new(4).unwrap())).without_cpu_pinning();
 
         assert_eq!(config.worker_threads(), 4);
-        assert!(!config.enable_cpu_pinning);
+        assert_eq!(config.cpu_pinning, CpuPinning::Disabled);
     }
 
     #[test]
@@ -1342,7 +1492,7 @@ mod tests {
             .without_cpu_pinning()
             .without_cpu_pinning(); // Idempotent
 
-        assert!(!config.enable_cpu_pinning);
+        assert_eq!(config.cpu_pinning, CpuPinning::Disabled);
     }
 
     // Getter tests
@@ -1371,41 +1521,6 @@ mod tests {
         assert!(!config.is_single_threaded());
     }
 
-    // CPU pinning platform-specific tests
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn test_pin_to_cpu_cores_linux_single_core() {
-        pin_to_cpu_cores(1);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn test_pin_to_cpu_cores_linux_multi_core() {
-        pin_to_cpu_cores(4);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn test_pin_to_cpu_cores_linux_zero_cores() {
-        // Edge case: 0 cores should still succeed (no-op)
-        pin_to_cpu_cores(0);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn test_pin_to_cpu_cores_linux_many_cores() {
-        // Try to pin to more cores than available - should not panic
-        pin_to_cpu_cores(1024);
-    }
-
-    #[test]
-    #[cfg(not(target_os = "linux"))]
-    fn test_pin_to_cpu_cores_non_linux() {
-        // Non-Linux platforms should gracefully no-op
-        pin_to_cpu_cores(4);
-    }
-
     // Default implementation tests
 
     #[test]
@@ -1417,10 +1532,7 @@ mod tests {
             default_config.worker_threads(),
             explicit_config.worker_threads()
         );
-        assert_eq!(
-            default_config.enable_cpu_pinning,
-            explicit_config.enable_cpu_pinning
-        );
+        assert_eq!(default_config.cpu_pinning, explicit_config.cpu_pinning);
     }
 
     #[test]
@@ -1432,7 +1544,7 @@ mod tests {
     #[test]
     fn test_default_has_cpu_pinning_enabled() {
         let config = RuntimeConfig::default();
-        assert!(config.enable_cpu_pinning);
+        assert_eq!(config.cpu_pinning, CpuPinning::Enabled);
     }
 
     // Configuration combination tests
@@ -1441,7 +1553,7 @@ mod tests {
     fn test_config_single_threaded_with_pinning() {
         let config = RuntimeConfig::from_args(Some(ThreadCount::new(1).unwrap()));
         assert!(config.is_single_threaded());
-        assert!(config.enable_cpu_pinning);
+        assert_eq!(config.cpu_pinning, CpuPinning::Enabled);
     }
 
     #[test]
@@ -1449,14 +1561,14 @@ mod tests {
         let config =
             RuntimeConfig::from_args(Some(ThreadCount::new(1).unwrap())).without_cpu_pinning();
         assert!(config.is_single_threaded());
-        assert!(!config.enable_cpu_pinning);
+        assert_eq!(config.cpu_pinning, CpuPinning::Disabled);
     }
 
     #[test]
     fn test_config_multi_threaded_with_pinning() {
         let config = RuntimeConfig::from_args(Some(ThreadCount::new(4).unwrap()));
         assert!(!config.is_single_threaded());
-        assert!(config.enable_cpu_pinning);
+        assert_eq!(config.cpu_pinning, CpuPinning::Enabled);
     }
 
     #[test]
@@ -1464,7 +1576,7 @@ mod tests {
         let config =
             RuntimeConfig::from_args(Some(ThreadCount::new(4).unwrap())).without_cpu_pinning();
         assert!(!config.is_single_threaded());
-        assert!(!config.enable_cpu_pinning);
+        assert_eq!(config.cpu_pinning, CpuPinning::Disabled);
     }
 
     // ========================================================================
