@@ -1,8 +1,8 @@
 //! Serializable dashboard state shared between local and attached TUI modes.
 
 use crate::metrics::{
-    BackendHealthStatus, BackendStats, CommandCount, DiskCacheStats, ErrorCount, MetricsSnapshot,
-    UserStats,
+    ActiveConnections, BackendHealthStatus, BackendStats, CommandCount, DiskCacheStats, ErrorCount,
+    MetricsSnapshot, UserStats,
 };
 use crate::tui::app::{ThroughputPoint, ViewMode};
 use crate::tui::system_stats::SystemStats;
@@ -34,7 +34,7 @@ pub struct BackendDisplay {
 pub struct BackendView {
     pub server: BackendDisplay,
     pub stats: BackendStats,
-    pub active_connections: usize,
+    pub active_connections: ActiveConnections,
     pub health_status: BackendHealthStatus,
     pub pending_count: usize,
     pub load_ratio: Option<f64>,
@@ -55,7 +55,7 @@ impl BackendView {
 pub struct RemoteBackendView {
     pub server: BackendDisplay,
     pub stats: BackendStats,
-    pub active_connections: usize,
+    pub active_connections: ActiveConnections,
     pub health_status: BackendHealthStatus,
     pub pending_count: usize,
     pub stateful_count: usize,
@@ -74,7 +74,7 @@ impl RemoteBackendView {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DashboardUserStats {
     pub username: String,
-    pub active_connections: usize,
+    pub active_connections: ActiveConnections,
     pub total_connections: TotalConnections,
     pub bytes_sent: BytesSent,
     pub bytes_received: BytesReceived,
@@ -89,7 +89,7 @@ impl DashboardUserStats {
     pub fn from_user_stats(user: &UserStats) -> Self {
         Self {
             username: user.username.clone(),
-            active_connections: user.active_connections,
+            active_connections: ActiveConnections::new(user.active_connections.get()),
             total_connections: user.total_connections,
             bytes_sent: user.bytes_sent,
             bytes_received: user.bytes_received,
@@ -112,7 +112,7 @@ impl DashboardUserStats {
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DashboardMetrics {
     pub total_connections: u64,
-    pub active_connections: usize,
+    pub active_connections: ActiveConnections,
     pub stateful_sessions: usize,
     pub client_to_backend_bytes: ClientToBackendBytes,
     pub backend_to_client_bytes: BackendToClientBytes,
@@ -134,7 +134,7 @@ impl DashboardMetrics {
     pub fn from_snapshot(snapshot: &MetricsSnapshot) -> Self {
         Self {
             total_connections: snapshot.total_connections,
-            active_connections: snapshot.active_connections,
+            active_connections: ActiveConnections::new(snapshot.active_connections),
             stateful_sessions: snapshot.stateful_sessions,
             client_to_backend_bytes: snapshot.client_to_backend_bytes,
             backend_to_client_bytes: snapshot.backend_to_client_bytes,
@@ -316,7 +316,7 @@ impl From<DashboardState> for RemoteDashboardState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::metrics::{BackendHealthStatus, BackendStats};
+    use crate::metrics::{BackendHealthStatus, BackendStats, UserActiveConnections};
     use crate::tui::app::{ThroughputPoint, ViewMode};
     use crate::types::Port;
     use crate::types::tui::{Throughput, Timestamp};
@@ -330,7 +330,7 @@ mod tests {
                 max_connections: MaxConnections::try_new(10).unwrap(),
             },
             stats: BackendStats::default(),
-            active_connections: 1,
+            active_connections: ActiveConnections::new(1),
             health_status: BackendHealthStatus::Healthy,
             pending_count: 2,
             load_ratio: Some(0.5),
@@ -407,5 +407,20 @@ mod tests {
                 .map(|point| point.sent_per_sec().get()),
             Some(latest_client.sent_per_sec().get())
         );
+    }
+
+    #[test]
+    fn dashboard_user_stats_keeps_live_and_lifetime_connections_separate() {
+        let user = crate::metrics::UserStats {
+            username: "alice".to_string(),
+            active_connections: UserActiveConnections::new(2),
+            total_connections: crate::types::TotalConnections::new(9),
+            ..Default::default()
+        };
+
+        let dashboard = DashboardUserStats::from_user_stats(&user);
+
+        assert_eq!(dashboard.active_connections.get(), 2);
+        assert_eq!(dashboard.total_connections.get(), 9);
     }
 }

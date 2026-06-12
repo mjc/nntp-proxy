@@ -388,33 +388,27 @@ impl MetricsCollector {
     // User metrics recording (functional update pattern)
 
     pub fn user_connection_opened(&self, username: Option<&str>) {
-        self.update_user_metrics(username, |m| {
-            m.active_connections += 1;
-            m.total_connections += 1;
-        });
+        self.update_user_metrics(username, UserMetrics::record_connection_opened);
     }
 
     pub fn user_connection_closed(&self, username: Option<&str>) {
-        let key = username.unwrap_or(crate::constants::user::ANONYMOUS);
-        if let Some(mut m) = self.inner.store.user_metrics.get_mut(key) {
-            m.active_connections = m.active_connections.saturating_sub(1);
-        }
+        self.update_user_metrics(username, UserMetrics::record_connection_closed);
     }
 
     pub fn user_bytes_sent(&self, username: Option<&str>, bytes: u64) {
-        self.update_user_metrics(username, |m| m.bytes_sent += bytes);
+        self.update_user_metrics(username, |m| m.record_bytes_sent(bytes));
     }
 
     pub fn user_bytes_received(&self, username: Option<&str>, bytes: u64) {
-        self.update_user_metrics(username, |m| m.bytes_received += bytes);
+        self.update_user_metrics(username, |m| m.record_bytes_received(bytes));
     }
 
     pub fn user_command(&self, username: Option<&str>) {
-        self.update_user_metrics(username, |m| m.total_commands += 1);
+        self.update_user_metrics(username, UserMetrics::record_command);
     }
 
     pub fn user_error(&self, username: Option<&str>) {
-        self.update_user_metrics(username, |m| m.errors += 1);
+        self.update_user_metrics(username, UserMetrics::record_error);
     }
 
     // Pipeline metrics
@@ -590,21 +584,25 @@ mod tests {
     fn test_user_metrics_new() {
         let metrics = UserMetrics::new("testuser".to_string());
         assert_eq!(metrics.username, "testuser");
-        assert_eq!(metrics.total_commands, 0);
-        assert_eq!(metrics.bytes_sent, 0);
-        assert_eq!(metrics.bytes_received, 0);
+        assert_eq!(metrics.total_connections.get(), 0);
+        assert_eq!(metrics.bytes_sent.as_u64(), 0);
+        assert_eq!(metrics.bytes_received.as_u64(), 0);
+        assert_eq!(metrics.total_commands.get(), 0);
+        assert_eq!(metrics.errors.get(), 0);
     }
 
     #[test]
     fn test_user_metrics_to_user_stats() {
         let mut metrics = UserMetrics::new("alice".to_string());
-        metrics.total_commands = 100;
-        metrics.bytes_sent = 5000;
-        metrics.bytes_received = 10000;
-        metrics.errors = 2;
+        metrics.total_connections = crate::types::TotalConnections::new(3);
+        metrics.bytes_sent = crate::types::BytesSent::new(5000);
+        metrics.bytes_received = crate::types::BytesReceived::new(10000);
+        metrics.total_commands = crate::metrics::types::CommandCount::new(100);
+        metrics.errors = crate::metrics::types::ErrorCount::new(2);
 
         let stats = metrics.to_user_stats();
         assert_eq!(stats.username, "alice");
+        assert_eq!(stats.total_connections.get(), 3);
         assert_eq!(stats.total_commands.get(), 100);
         assert_eq!(stats.bytes_sent.as_u64(), 5000);
         assert_eq!(stats.bytes_received.as_u64(), 10000);
@@ -703,6 +701,7 @@ mod tests {
         assert!(alice_stats.is_some());
 
         let stats = alice_stats.unwrap();
+        assert_eq!(stats.total_connections.get(), 1);
         assert_eq!(stats.bytes_sent.as_u64(), 1000);
         assert_eq!(stats.bytes_received.as_u64(), 2000);
         assert_eq!(stats.total_commands.get(), 1);

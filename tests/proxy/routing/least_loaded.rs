@@ -98,7 +98,10 @@ fn test_least_loaded_unequal_capacity() {
 
 #[test]
 fn test_concurrent_least_loaded_fills_tier_capacity_without_overshoot() {
-    let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
+    let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded)
+        // Disable queue backpressure so this test measures pure least-loaded distribution.
+        // Queue pressure should not influence how requests fill tier capacity.
+        .with_queue_backpressure(false, 0, 0, 0);
 
     selector.add_backend(
         ServerName::try_new("tier0-40".to_string()).unwrap(),

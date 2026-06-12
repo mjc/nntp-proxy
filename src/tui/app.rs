@@ -848,7 +848,7 @@ impl TuiApp {
                 max_connections: server.max_connections,
             },
             stats: stats.clone(),
-            active_connections: stats.active_connections.get(),
+            active_connections: stats.active_connections,
             health_status: stats.health_status,
             pending_count: self.backend_pending_count(backend_idx),
             load_ratio: self.backend_load_ratio(backend_idx),
@@ -876,7 +876,7 @@ impl TuiApp {
                 max_connections: server.max_connections,
             },
             stats: stats.clone(),
-            active_connections: stats.active_connections.get(),
+            active_connections: stats.active_connections,
             health_status: stats.health_status,
             pending_count: self.backend_pending_count(backend_idx),
             stateful_count: self.backend_stateful_count(backend_idx),
@@ -1471,7 +1471,7 @@ mod tests {
             uptime: Duration::from_secs(61),
             user_stats: vec![crate::metrics::UserStats {
                 username: "alice".to_string(),
-                active_connections: 2,
+                active_connections: crate::metrics::UserActiveConnections::new(2),
                 total_connections: crate::types::TotalConnections::new(9),
                 bytes_sent: crate::types::BytesSent::new(500),
                 bytes_received: crate::types::BytesReceived::new(700),
@@ -1505,7 +1505,7 @@ mod tests {
             serde_json::from_str(&json).expect("snapshot should deserialize");
 
         assert_eq!(decoded.metrics.total_connections, 42);
-        assert_eq!(decoded.metrics.active_connections, 3);
+        assert_eq!(decoded.metrics.active_connections.get(), 3);
         assert_eq!(decoded.metrics.stateful_sessions, 2);
         assert_eq!(decoded.metrics.cache_entries, 7);
         assert_eq!(decoded.metrics.cache_size_bytes, 8192);
@@ -1514,7 +1514,7 @@ mod tests {
         assert_eq!(decoded.metrics.pipeline_commands, 12);
         assert_eq!(decoded.top_users.len(), 1);
         assert_eq!(decoded.top_users[0].username, "alice");
-        assert_eq!(decoded.top_users[0].active_connections, 2);
+        assert_eq!(decoded.top_users[0].active_connections.get(), 2);
         assert_eq!(decoded.top_users[0].bytes_sent_per_sec.get(), 11);
         assert_eq!(decoded.top_users[0].bytes_received_per_sec.get(), 13);
     }

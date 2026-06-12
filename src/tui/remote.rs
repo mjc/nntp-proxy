@@ -583,7 +583,7 @@ mod tests {
                     max_connections: MaxConnections::try_new(10).unwrap(),
                 },
                 stats: crate::metrics::BackendStats::default(),
-                active_connections: 0,
+                active_connections: crate::metrics::ActiveConnections::new(0),
                 health_status: crate::metrics::BackendHealthStatus::Healthy,
                 pending_count: 0,
                 load_ratio: None,
@@ -864,7 +864,7 @@ mod tests {
             top_users: (0..10)
                 .map(|idx| crate::tui::dashboard::DashboardUserStats {
                     username: format!("user-{idx}"),
-                    active_connections: 0,
+                    active_connections: crate::metrics::ActiveConnections::new(0),
                     total_connections: crate::types::TotalConnections::new(0),
                     bytes_sent: crate::types::BytesSent::ZERO,
                     bytes_received: crate::types::BytesReceived::ZERO,

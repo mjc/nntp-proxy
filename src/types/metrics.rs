@@ -200,6 +200,13 @@ impl<D> AddAssign for ByteCounter<D> {
     }
 }
 
+impl<D> AddAssign<u64> for ByteCounter<D> {
+    #[inline]
+    fn add_assign(&mut self, other: u64) {
+        self.bytes += other;
+    }
+}
+
 impl<D> fmt::Display for ByteCounter<D> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} bytes", self.bytes)
@@ -383,7 +390,7 @@ mod tests {
 
     #[test]
     fn test_counter_display_with_unit_zero() {
-        let c = TotalConnections::new(0);
+        let c = TotalConnections::ZERO;
         assert_eq!(format!("{c}"), "0 connections");
     }
 
@@ -408,7 +415,7 @@ mod tests {
 
     #[test]
     fn test_counter_display_empty_unit_zero() {
-        let c = TimingMeasurementCount::new(0);
+        let c = TimingMeasurementCount::ZERO;
         assert_eq!(format!("{c}"), "0");
     }
 
@@ -439,6 +446,7 @@ mod tests {
     fn test_timing_measurement_count_default() {
         let c = TimingMeasurementCount::default();
         assert_eq!(c.get(), 0);
+        assert_eq!(TimingMeasurementCount::ZERO.get(), 0);
     }
 
     #[test]
@@ -495,41 +503,7 @@ mod tests {
 /// display with a unit suffix (e.g., "42 connections").
 macro_rules! define_counter {
     ($name:ident, $unit:expr) => {
-        #[repr(transparent)]
-        #[derive(
-            Debug,
-            Clone,
-            Copy,
-            PartialEq,
-            Eq,
-            PartialOrd,
-            Ord,
-            Default,
-            serde::Serialize,
-            serde::Deserialize,
-        )]
-        pub struct $name(u64);
-
-        impl $name {
-            pub const ZERO: Self = Self(0);
-
-            #[must_use]
-            pub const fn new(value: u64) -> Self {
-                Self(value)
-            }
-
-            #[must_use]
-            pub const fn get(&self) -> u64 {
-                self.0
-            }
-        }
-
-        impl From<u64> for $name {
-            #[inline]
-            fn from(value: u64) -> Self {
-                Self(value)
-            }
-        }
+        crate::count_newtype!($name, u64);
 
         impl fmt::Display for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

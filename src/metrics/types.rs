@@ -34,46 +34,35 @@ fn bytes_per_second_to_u64(bytes_delta: u64, seconds: f64) -> u64 {
 // Macros to reduce boilerplate
 // ============================================================================
 
-/// Define a simple u64-based counter newtype with mutation operations.
+/// Define a simple integer-based counter newtype with mutation operations.
 ///
-/// Used for internal counting that needs `increment()` and `saturating_sub()`.
-/// For display-oriented types with unit strings, see `types::metrics::define_counter!`.
+/// Used for internal counting that needs `increment()`, `add()`, and
+/// `saturating_sub()`.
 macro_rules! counter_type {
-    ($name:ident) => {
-        #[derive(
-            Debug,
-            Clone,
-            Copy,
-            PartialEq,
-            Eq,
-            PartialOrd,
-            Ord,
-            Default,
-            serde::Serialize,
-            serde::Deserialize,
-        )]
-        pub struct $name(u64);
+    ($name:ident, $ty:ty) => {
+        crate::count_newtype!($name, $ty);
 
         impl $name {
             #[inline]
-            pub const fn new(value: u64) -> Self {
-                Self(value)
-            }
-
-            #[inline]
-            pub const fn get(self) -> u64 {
-                self.0
-            }
-
-            #[inline]
             pub const fn increment(&mut self) {
                 self.0 += 1;
+            }
+
+            #[inline]
+            pub const fn add(&mut self, other: Self) {
+                self.0 += other.0;
             }
 
             #[must_use]
             #[inline]
             pub const fn saturating_sub(self, other: Self) -> Self {
                 Self(self.0.saturating_sub(other.0))
+            }
+
+            #[must_use]
+            #[inline]
+            pub const fn is_zero(self) -> bool {
+                self.0 == 0
             }
         }
 
@@ -88,31 +77,9 @@ macro_rules! counter_type {
 /// Define a microseconds-based timing newtype that can average to milliseconds
 macro_rules! timing_type {
     ($name:ident) => {
-        #[derive(
-            Debug,
-            Clone,
-            Copy,
-            PartialEq,
-            Eq,
-            PartialOrd,
-            Ord,
-            Default,
-            serde::Serialize,
-            serde::Deserialize,
-        )]
-        pub struct $name(u64);
+        crate::count_newtype!($name, u64);
 
         impl $name {
-            #[inline]
-            pub const fn new(micros: u64) -> Self {
-                Self(micros)
-            }
-
-            #[inline]
-            pub const fn get(self) -> u64 {
-                self.0
-            }
-
             #[inline]
             pub const fn add(&mut self, other: Self) {
                 self.0 += other.0;
@@ -191,99 +158,14 @@ impl From<BackendHealthStatus> for u8 {
 // Counts - Different types of things we count
 // ============================================================================
 
-counter_type!(CommandCount);
-counter_type!(FailureCount);
+counter_type!(CommandCount, u64);
+counter_type!(FailureCount, u64);
+counter_type!(ErrorCount, u64);
 
-/// Number of errors encountered
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
-)]
-pub struct ErrorCount(u64);
-
-impl ErrorCount {
-    #[inline]
-    #[must_use]
-    pub const fn new(count: u64) -> Self {
-        Self(count)
-    }
-
-    #[inline]
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-
-    #[inline]
-    pub const fn increment(&mut self) {
-        self.0 += 1;
-    }
-
-    #[inline]
-    pub const fn add(&mut self, other: Self) {
-        self.0 += other.0;
-    }
-
-    #[must_use]
-    #[inline]
-    pub const fn saturating_sub(self, other: Self) -> Self {
-        Self(self.0.saturating_sub(other.0))
-    }
-
-    #[must_use]
-    #[inline]
-    pub const fn is_zero(self) -> bool {
-        self.0 == 0
-    }
-}
-
-impl std::fmt::Display for ErrorCount {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-/// Number of articles retrieved
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
-)]
-pub struct ArticleCount(u64);
+// Number of articles retrieved
+counter_type!(ArticleCount, u64);
 
 impl ArticleCount {
-    #[inline]
-    #[must_use]
-    pub const fn new(count: u64) -> Self {
-        Self(count)
-    }
-
-    #[inline]
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-
-    #[inline]
-    pub const fn increment(&mut self) {
-        self.0 += 1;
-    }
-
     /// Calculate average bytes per article
     #[must_use]
     pub const fn average_bytes(self, total_bytes: u64) -> Option<u64> {
@@ -291,46 +173,13 @@ impl ArticleCount {
     }
 }
 
-impl std::fmt::Display for ArticleCount {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+// Number of active connections (non-zero validated)
+counter_type!(ActiveConnections, usize);
 
-/// Number of active connections (non-zero validated)
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
-)]
-pub struct ActiveConnections(usize);
-
-impl ActiveConnections {
-    #[inline]
-    #[must_use]
-    pub const fn new(count: usize) -> Self {
-        Self(count)
-    }
-
-    #[inline]
-    #[must_use]
-    pub const fn get(self) -> usize {
-        self.0
-    }
-}
-
-impl std::fmt::Display for ActiveConnections {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
+// Number of active connections for a single user. This is distinct from
+// cumulative `TotalConnections` so dashboard code cannot accidentally display
+// lifetime totals in place of live sessions.
+counter_type!(UserActiveConnections, usize);
 
 // ============================================================================
 // Time measurements - Different units and types of timing
@@ -340,34 +189,13 @@ timing_type!(TtfbMicros);
 timing_type!(SendMicros);
 timing_type!(RecvMicros);
 
-/// Time in microseconds (for precision timing)
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    Default,
-    serde::Serialize,
-    serde::Deserialize,
-)]
-pub struct Microseconds(u64);
+crate::count_newtype!(
+    /// Time in microseconds (for precision timing)
+    Microseconds,
+    u64
+);
 
 impl Microseconds {
-    #[inline]
-    #[must_use]
-    pub const fn new(micros: u64) -> Self {
-        Self(micros)
-    }
-
-    #[inline]
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-
     #[inline]
     pub const fn add(&mut self, other: Self) {
         self.0 += other.0;
@@ -404,31 +232,19 @@ impl OverheadMillis {
 // Rates - Different types of throughput measurements
 // ============================================================================
 
-/// Bytes per second transfer rate
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Default, serde::Serialize, serde::Deserialize,
-)]
-pub struct BytesPerSecond(u64);
+crate::count_newtype!(
+    /// Bytes per second transfer rate
+    BytesPerSecond,
+    u64
+);
 
 impl BytesPerSecond {
-    #[inline]
-    #[must_use]
-    pub const fn new(bps: u64) -> Self {
-        Self(bps)
-    }
-
-    #[inline]
-    #[must_use]
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-
     #[must_use]
     pub fn from_delta(bytes_delta: u64, seconds: f64) -> Self {
         if seconds > 0.0 {
             Self(bytes_per_second_to_u64(bytes_delta, seconds))
         } else {
-            Self(0)
+            Self::ZERO
         }
     }
 }
@@ -492,6 +308,7 @@ mod tests {
     fn test_command_count_default() {
         let count = CommandCount::default();
         assert_eq!(count.get(), 0);
+        assert_eq!(CommandCount::ZERO.get(), 0);
     }
 
     #[test]
@@ -532,7 +349,7 @@ mod tests {
 
     #[test]
     fn test_error_count_increment() {
-        let mut count = ErrorCount::new(0);
+        let mut count = ErrorCount::ZERO;
         count.increment();
         count.increment();
         assert_eq!(count.get(), 2);
@@ -540,7 +357,7 @@ mod tests {
 
     #[test]
     fn test_error_count_is_zero() {
-        let zero = ErrorCount::new(0);
+        let zero = ErrorCount::ZERO;
         let nonzero = ErrorCount::new(1);
 
         assert!(zero.is_zero());
@@ -570,7 +387,7 @@ mod tests {
 
     #[test]
     fn test_article_count_average_bytes_zero_articles() {
-        let count = ArticleCount::new(0);
+        let count = ArticleCount::ZERO;
         let avg = count.average_bytes(1000);
         assert_eq!(avg, None);
     }
@@ -593,6 +410,7 @@ mod tests {
     fn test_active_connections_default() {
         let active = ActiveConnections::default();
         assert_eq!(active.get(), 0);
+        assert_eq!(ActiveConnections::ZERO.get(), 0);
     }
 
     #[test]
@@ -751,7 +569,7 @@ mod tests {
     #[test]
     fn test_error_rate_percent_from_counts_zero_commands() {
         let errors = ErrorCount::new(10);
-        let commands = CommandCount::new(0);
+        let commands = CommandCount::ZERO;
         let rate = ErrorRatePercent::from_counts(errors, commands);
         assert_eq!(rate.get(), 0.0); // Avoid division by zero
     }
