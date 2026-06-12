@@ -16,11 +16,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Wired response write metrics to runtime config and reduced response-metrics logging noise.
+- Added queue backpressure routing configuration in `config.full.toml` and documented
+  `[routing.queue.backpressure]` in operator configuration docs.
 
 ### Fixed
 
 - Backend DNS lookups now respect TTL.
 - Hardened retry-path routing and guard handling around pending counts, capacity-weighted initial article probing, and idle-pool preference.
+
+### Docs
+
+- Documented the `stat_missing` backend option and routing behavior in operator docs.
+- Updated `docker-compose.yml`/`Dockerfile` examples and Nix module documentation
+  to cover `stat_missing` deployment usage.
+- Added release metadata/docs updates for v0.5.2 configuration fields such as
+  response write and client-writer lock contention metric intervals.
 
 ## [0.5.1] - 2026-06-05
 
