@@ -199,7 +199,7 @@ fn test_backend_stats_with_realistic_values() {
 fn test_user_stats_structure() {
     let user_stats = UserStats {
         username: "testuser".to_string(),
-        active_connections: 2,
+        active_connections: nntp_proxy::metrics::UserActiveConnections::new(2),
         total_connections: TotalConnections::new(10),
         bytes_sent: BytesSent::new(5000),
         bytes_received: BytesReceived::new(50000),
@@ -210,7 +210,7 @@ fn test_user_stats_structure() {
     };
 
     assert_eq!(user_stats.username, "testuser");
-    assert_eq!(user_stats.active_connections, 2);
+    assert_eq!(user_stats.active_connections.get(), 2);
     assert_eq!(user_stats.total_commands.get(), 100);
 }
 

@@ -333,7 +333,7 @@ fn test_user_connection_opened() {
         .iter()
         .find(|u| u.username == "user1")
         .unwrap();
-    assert_eq!(user1.active_connections, 2);
+    assert_eq!(user1.active_connections.get(), 2);
     assert_eq!(user1.total_connections.get(), 2);
 
     let user2 = snapshot
@@ -341,7 +341,7 @@ fn test_user_connection_opened() {
         .iter()
         .find(|u| u.username == "user2")
         .unwrap();
-    assert_eq!(user2.active_connections, 1);
+    assert_eq!(user2.active_connections.get(), 1);
     assert_eq!(user2.total_connections.get(), 1);
 }
 
@@ -359,7 +359,7 @@ fn test_user_connection_closed() {
         .iter()
         .find(|u| u.username == "user1")
         .unwrap();
-    assert_eq!(user1.active_connections, 2);
+    assert_eq!(user1.active_connections.get(), 2);
 
     collector.user_connection_closed(Some("user1"));
 
@@ -369,7 +369,7 @@ fn test_user_connection_closed() {
         .iter()
         .find(|u| u.username == "user1")
         .unwrap();
-    assert_eq!(user1.active_connections, 1);
+    assert_eq!(user1.active_connections.get(), 1);
     assert_eq!(user1.total_connections.get(), 2); // Total unchanged
 }
 
@@ -387,7 +387,7 @@ fn test_anonymous_user_tracking() {
         .iter()
         .find(|u| u.username == ANONYMOUS)
         .unwrap();
-    assert_eq!(anon.active_connections, 2);
+    assert_eq!(anon.active_connections.get(), 2);
     assert_eq!(anon.total_connections.get(), 2);
 }
 

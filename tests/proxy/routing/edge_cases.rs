@@ -204,7 +204,9 @@ fn test_stateful_acquisition_with_max_connections_1() {
 
 #[test]
 fn test_concurrent_route_calls() {
-    let mut router = BackendSelector::new();
+    // Disable queue backpressure so routing remains deterministic for this test.
+    // We only want to validate command distribution and avoid queue penalties.
+    let mut router = BackendSelector::new().with_queue_backpressure(false, 0, 0, 0);
 
     // Add 3 backends
     for i in 0..3 {

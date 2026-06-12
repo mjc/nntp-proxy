@@ -1,5 +1,6 @@
 //! Comprehensive tests for `UserStats` type and methods
 
+use nntp_proxy::metrics::UserActiveConnections;
 use nntp_proxy::metrics::UserStats;
 use nntp_proxy::metrics::types::{CommandCount, ErrorCount};
 use nntp_proxy::types::{BytesPerSecondRate, BytesReceived, BytesSent, TotalConnections};
@@ -16,7 +17,7 @@ fn test_user_stats_new() {
     let stats = UserStats::new("testuser");
 
     assert_eq!(stats.username, "testuser");
-    assert_eq!(stats.active_connections, 0);
+    assert_eq!(stats.active_connections.get(), 0);
     assert_eq!(stats.total_connections.get(), 0);
     assert_eq!(stats.bytes_sent.as_u64(), 0);
     assert_eq!(stats.bytes_received.as_u64(), 0);
@@ -37,7 +38,7 @@ fn test_user_stats_default() {
     let stats = UserStats::default();
 
     assert_eq!(stats.username, "");
-    assert_eq!(stats.active_connections, 0);
+    assert_eq!(stats.active_connections.get(), 0);
     assert_eq!(stats.total_connections.get(), 0);
     assert_eq!(stats.bytes_sent.as_u64(), 0);
     assert_eq!(stats.bytes_received.as_u64(), 0);
@@ -220,7 +221,7 @@ fn test_is_connected_no_connections() {
 fn test_is_connected_with_active_connection() {
     let stats = UserStats {
         username: "paul".to_string(),
-        active_connections: 1,
+        active_connections: UserActiveConnections::new(1),
         ..Default::default()
     };
 
@@ -231,7 +232,7 @@ fn test_is_connected_with_active_connection() {
 fn test_is_connected_with_multiple_connections() {
     let stats = UserStats {
         username: "quinn".to_string(),
-        active_connections: 5,
+        active_connections: UserActiveConnections::new(5),
         ..Default::default()
     };
 
@@ -242,7 +243,7 @@ fn test_is_connected_with_multiple_connections() {
 fn test_is_connected_past_connections_only() {
     let stats = UserStats {
         username: "rachel".to_string(),
-        active_connections: 0,
+        active_connections: UserActiveConnections::new(0),
         total_connections: TotalConnections::new(10), // Past connections
         ..Default::default()
     };
@@ -254,7 +255,7 @@ fn test_is_connected_past_connections_only() {
 fn test_user_stats_clone() {
     let stats1 = UserStats {
         username: "sam".to_string(),
-        active_connections: 3,
+        active_connections: UserActiveConnections::new(3),
         total_connections: TotalConnections::new(10),
         bytes_sent: BytesSent::new(5000),
         bytes_received: BytesReceived::new(50000),
@@ -281,7 +282,7 @@ fn test_user_stats_clone() {
 fn test_realistic_user_stats() {
     let stats = UserStats {
         username: "prod_user_123".to_string(),
-        active_connections: 2,
+        active_connections: UserActiveConnections::new(2),
         total_connections: TotalConnections::new(50),
         bytes_sent: BytesSent::new(1_024_000), // ~1 MB sent
         bytes_received: BytesReceived::new(50_240_000), // ~50 MB received
