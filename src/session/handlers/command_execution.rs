@@ -60,14 +60,12 @@ pub(super) struct ArticleAttemptState<'a> {
 #[derive(Clone, Copy)]
 pub(super) enum RetryAttemptKind {
     Direct,
-    OrderedPipeline,
 }
 
 impl RetryAttemptKind {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Direct => "direct retry",
-            Self::OrderedPipeline => "ordered pipeline retry",
         }
     }
 }

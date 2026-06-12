@@ -4,22 +4,19 @@
 //! to skip backends that have already returned 430 for a given article.
 
 use crate::cache::ArticleAvailability;
-use crate::router::{ArticleBackend, BackendSelector, SuppressedBackends};
+use crate::router::{BackendSelector, SuppressedBackends};
 use crate::session::ClientSession;
 use crate::session::SessionError;
 use crate::session::handlers::cache_operations::{
     CacheLookupResult, write_cached_article_response,
 };
 use crate::session::handlers::command_execution::{
-    ArticleAttemptState, AuthoritativeArticleMissing, BackendAttemptResult, ResponseWriteParams,
-    RetryAttemptKind,
+    ArticleAttemptState, AuthoritativeArticleMissing, BackendAttemptResult,
 };
 use crate::types::{BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::Notify;
 use tracing::{debug, trace, warn};
 
 use crate::protocol::RequestContext;
@@ -44,128 +41,7 @@ pub(super) enum PreparedRequest {
     },
 }
 
-pub(super) struct OrderedPipelineGate {
-    next: AtomicUsize,
-    failed: AtomicBool,
-    notify: Notify,
-}
-
-impl OrderedPipelineGate {
-    pub(super) fn new() -> Self {
-        Self {
-            next: AtomicUsize::new(0),
-            failed: AtomicBool::new(false),
-            notify: Notify::new(),
-        }
-    }
-
-    async fn wait_turn(&self, index: usize) -> OrderedPipelineTurn<'_> {
-        loop {
-            if self.next.load(Ordering::Acquire) == index {
-                return OrderedPipelineTurn {
-                    gate: self,
-                    advanced: false,
-                };
-            }
-
-            let notified = self.notify.notified();
-            if self.next.load(Ordering::Acquire) == index {
-                return OrderedPipelineTurn {
-                    gate: self,
-                    advanced: false,
-                };
-            }
-            notified.await;
-        }
-    }
-
-    fn advance(&self) {
-        self.next.fetch_add(1, Ordering::AcqRel);
-        self.notify.notify_waiters();
-    }
-
-    fn is_failed(&self) -> bool {
-        self.failed.load(Ordering::Acquire)
-    }
-
-    fn fail(&self) {
-        self.failed.store(true, Ordering::Release);
-    }
-}
-
-struct OrderedPipelineTurn<'a> {
-    gate: &'a OrderedPipelineGate,
-    advanced: bool,
-}
-
-impl OrderedPipelineTurn<'_> {
-    fn advance(mut self) {
-        self.advanced = true;
-        self.gate.advance();
-    }
-
-    fn fail_and_advance(mut self) {
-        self.advanced = true;
-        self.gate.fail();
-        self.gate.advance();
-    }
-}
-
-impl Drop for OrderedPipelineTurn<'_> {
-    fn drop(&mut self) {
-        if !self.advanced {
-            self.gate.advance();
-        }
-    }
-}
-
-pub(super) struct OrderedLargeTransferResult {
-    pub(super) additional_client_to_backend_bytes: ClientToBackendBytes,
-    pub(super) backend_to_client_bytes: BackendToClientBytes,
-}
-
-type OrderedLargeTransferAttemptData = (
-    ArticleBackend,
-    crate::router::CommandGuard,
-    crate::pool::ConnectionGuard,
-    crate::protocol::StatusCode,
-    crate::pool::PooledBuffer,
-);
-
-type OrderedLargeTransferAttempt =
-    Result<Option<OrderedLargeTransferAttemptData>, OrderedLargeTransferNoAttempt>;
-
-enum OrderedLargeTransferNoAttempt {
-    BackendUnavailable,
-    NoRetryableBackend,
-}
-
 impl ClientSession {
-    fn additional_ordered_retry_client_to_backend_bytes(
-        client_to_backend_bytes: ClientToBackendBytes,
-        initial_request_wire_len: usize,
-    ) -> ClientToBackendBytes {
-        client_to_backend_bytes
-            .saturating_sub(ClientToBackendBytes::zero().add(initial_request_wire_len))
-    }
-
-    fn finish_ordered_large_transfer_request(
-        backend_connection: &mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
-        client_to_backend_bytes: ClientToBackendBytes,
-        initial_request_wire_len: usize,
-        backend_to_client_bytes: BackendToClientBytes,
-    ) -> OrderedLargeTransferResult {
-        Self::release_cached_backend_connection(backend_connection);
-        OrderedLargeTransferResult {
-            additional_client_to_backend_bytes:
-                Self::additional_ordered_retry_client_to_backend_bytes(
-                    client_to_backend_bytes,
-                    initial_request_wire_len,
-                ),
-            backend_to_client_bytes,
-        }
-    }
-
     /// Route a single request to a backend and execute it
     ///
     /// This function is `pub(super)` to allow reuse of per-command routing logic by sibling handler modules
@@ -389,14 +265,6 @@ impl ClientSession {
             .map_err(|e| SessionError::from(anyhow::Error::from(e)))
     }
 
-    fn release_cached_backend_connection(
-        backend_connection: &mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
-    ) {
-        if let Some((_backend_id, conn)) = backend_connection.take() {
-            let _ = conn.complete_success();
-        }
-    }
-
     async fn execute_article_retry_loop(
         &self,
         router: &Arc<BackendSelector>,
@@ -523,285 +391,6 @@ impl ClientSession {
         Ok(())
     }
 
-    pub(super) async fn execute_ordered_large_transfer_request(
-        &self,
-        router: Arc<BackendSelector>,
-        request: &RequestContext,
-        client_writer: crate::session::SharedClientWriter,
-        order: Arc<OrderedPipelineGate>,
-        order_index: usize,
-    ) -> Result<OrderedLargeTransferResult, SessionError> {
-        debug!(
-            client = %self.client_addr,
-            order_index,
-            command_verb = ?request.verb(),
-            msg_id = ?request.message_id_value(),
-            "Starting ordered large-transfer pipeline request"
-        );
-
-        let msg_id = request.message_id_value();
-        let mut availability = self
-            .load_article_availability(msg_id.as_ref(), router.backend_count())
-            .await;
-        let mut backend_connection = None;
-        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
-        let mut backend_to_client_bytes = BackendToClientBytes::zero();
-        let mut unavailable_backends = SuppressedBackends::empty();
-        let mut is_retry_attempt = false;
-
-        while !availability.all_exhausted(router.backend_count()) {
-            let attempt = match self
-                .prepare_ordered_large_transfer_attempt(
-                    &router,
-                    request,
-                    &mut ArticleAttemptState {
-                        availability: &mut availability,
-                        client_to_backend_bytes: &mut client_to_backend_bytes,
-                        backend_connection: &mut backend_connection,
-                        unavailable_backends: &mut unavailable_backends,
-                    },
-                    is_retry_attempt,
-                )
-                .await
-            {
-                Ok(attempt) => attempt,
-                Err(err) => {
-                    Self::release_cached_backend_connection(&mut backend_connection);
-                    let turn = order.wait_turn(order_index).await;
-                    turn.fail_and_advance();
-                    return Err(err);
-                }
-            };
-
-            let Some((backend, guard, mut conn, status_code, buffer)) = (match attempt {
-                Ok(attempt) => attempt,
-                Err(OrderedLargeTransferNoAttempt::BackendUnavailable) => {
-                    is_retry_attempt = true;
-                    continue;
-                }
-                Err(OrderedLargeTransferNoAttempt::NoRetryableBackend) => {
-                    Self::release_cached_backend_connection(&mut backend_connection);
-
-                    let turn = order.wait_turn(order_index).await;
-                    if order.is_failed() {
-                        turn.advance();
-                        return Err(SessionError::Backend(anyhow::anyhow!(
-                            "ordered pipeline request aborted after earlier slot error"
-                        )));
-                    }
-                    let bytes_written = {
-                        let mut client_write = client_writer.lock().await;
-                        Self::write_backend_error_response(&mut *client_write).await
-                    };
-                    match bytes_written {
-                        Ok(bytes_written) => {
-                            backend_to_client_bytes = backend_to_client_bytes.add(bytes_written);
-                            turn.advance();
-                            return Ok(Self::finish_ordered_large_transfer_request(
-                                &mut backend_connection,
-                                client_to_backend_bytes,
-                                request.request_wire_len().get(),
-                                backend_to_client_bytes,
-                            ));
-                        }
-                        Err(err) => {
-                            turn.fail_and_advance();
-                            order.fail();
-                            return Err(err);
-                        }
-                    }
-                }
-            }) else {
-                continue;
-            };
-            let backend_id = backend.backend_id();
-
-            let backend = match AuthoritativeArticleMissing::from_status_code(backend, status_code)
-            {
-                Ok(missing) => {
-                    self.record_authoritative_article_missing(&missing, &mut availability);
-                    if let Some(msg_id) = request.message_id_value() {
-                        self.cache.record_backend_missing(msg_id, backend_id).await;
-                    }
-                    let mut buffer = buffer;
-                    if let Err(err) = crate::session::backend::observe_response(
-                        request,
-                        &mut buffer,
-                        &mut conn,
-                        &self.buffer_pool,
-                        backend_id,
-                    )
-                    .await
-                    .map_err(SessionError::from)
-                    {
-                        Self::release_cached_backend_connection(&mut backend_connection);
-                        let turn = order.wait_turn(order_index).await;
-                        turn.fail_and_advance();
-                        return Err(err);
-                    }
-                    self.release_or_reuse_connection(
-                        conn,
-                        backend_id,
-                        request,
-                        Some(&mut backend_connection),
-                    );
-                    continue;
-                }
-                Err(backend) => backend,
-            };
-
-            let msg_id = request.message_id_value();
-            let response = {
-                let turn = order.wait_turn(order_index).await;
-                if order.is_failed() {
-                    Self::release_cached_backend_connection(&mut backend_connection);
-                    turn.advance();
-                    return Err(SessionError::Backend(anyhow::anyhow!(
-                        "ordered pipeline request aborted after earlier slot error"
-                    )));
-                }
-                let mut client_write = client_writer.lock().await;
-                let response = self
-                    .write_successful_backend_response(
-                        conn,
-                        &mut *client_write,
-                        &backend,
-                        buffer,
-                        ResponseWriteParams {
-                            request,
-                            msg_id: msg_id.as_ref(),
-                            status_code,
-                        },
-                        Some(&mut backend_connection),
-                    )
-                    .await;
-                if response.is_err() {
-                    turn.fail_and_advance();
-                } else {
-                    turn.advance();
-                }
-                response
-            };
-
-            let response = match response {
-                Ok(response) => response,
-                Err(e @ SessionError::ClientDisconnect(_)) => {
-                    order.fail();
-                    Self::release_cached_backend_connection(&mut backend_connection);
-                    return Err(e);
-                }
-                Err(e) => {
-                    order.fail();
-                    Self::release_cached_backend_connection(&mut backend_connection);
-                    return Err(e);
-                }
-            };
-
-            guard.complete();
-            backend_to_client_bytes = backend_to_client_bytes.add(response.wire_len().get());
-            return Ok(Self::finish_ordered_large_transfer_request(
-                &mut backend_connection,
-                client_to_backend_bytes,
-                request.request_wire_len().get(),
-                backend_to_client_bytes,
-            ));
-        }
-
-        {
-            let turn = order.wait_turn(order_index).await;
-            if order.is_failed() {
-                Self::release_cached_backend_connection(&mut backend_connection);
-                turn.advance();
-                return Err(SessionError::Backend(anyhow::anyhow!(
-                    "ordered pipeline request aborted after earlier slot error"
-                )));
-            }
-            let mut client_write = client_writer.lock().await;
-            let response = self
-                .send_430_to_client(&mut *client_write, &mut backend_to_client_bytes)
-                .await;
-            if let Err(err) = response {
-                turn.fail_and_advance();
-                Self::release_cached_backend_connection(&mut backend_connection);
-                return Err(SessionError::from(err));
-            }
-            turn.advance();
-        }
-
-        Ok(Self::finish_ordered_large_transfer_request(
-            &mut backend_connection,
-            client_to_backend_bytes,
-            request.request_wire_len().get(),
-            backend_to_client_bytes,
-        ))
-    }
-
-    async fn prepare_ordered_large_transfer_attempt(
-        &self,
-        router: &Arc<BackendSelector>,
-        request: &RequestContext,
-        state: &mut ArticleAttemptState<'_>,
-        is_retry_attempt: bool,
-    ) -> Result<OrderedLargeTransferAttempt, SessionError> {
-        if let Some(delay) = router
-            .queue_backpressure_delay_for_article(state.availability, *state.unavailable_backends)
-        {
-            tokio::time::sleep(delay).await;
-        }
-        let route_request = crate::router::RouteRequest::new(self.client_id)
-            .with_availability(state.availability)
-            .suppressing_backends(*state.unavailable_backends);
-        let backend = match router.route(route_request) {
-            Ok(backend) => backend,
-            Err(err) => {
-                debug!(
-                    client = %self.client_addr,
-                    error = %err,
-                    command_verb = ?request.verb(),
-                    msg_id = ?request.message_id_value(),
-                    "No eligible backend available for ordered pipeline attempt"
-                );
-                return Ok(Err(OrderedLargeTransferNoAttempt::NoRetryableBackend));
-            }
-        };
-        let backend_id = backend.backend_id();
-        let guard =
-            crate::router::BackendSelector::guard_for_routed_backend(router.clone(), backend_id);
-        let Some(provider) = self.retry_backend_provider(
-            router,
-            &backend,
-            request,
-            RetryAttemptKind::OrderedPipeline,
-        ) else {
-            state.unavailable_backends.suppress(backend_id);
-            return Ok(Err(OrderedLargeTransferNoAttempt::BackendUnavailable));
-        };
-        let prepared = self
-            .prepare_backend_attempt(provider, &backend, request, state, is_retry_attempt)
-            .await;
-        let Some((conn, status_code, buffer)) = (match prepared {
-            Ok(prepared) => prepared,
-            Err(SessionError::Backend(err)) => {
-                state.unavailable_backends.suppress(backend_id);
-                debug!(
-                    client = %self.client_addr,
-                    backend = backend_id.as_index(),
-                    unavailable_backends = format_args!("{:08b}", state.unavailable_backends.bits()),
-                    command_verb = ?request.verb(),
-                    msg_id = ?request.message_id_value(),
-                    error = %err,
-                    "Ordered pipeline backend attempt failed; trying next eligible backend"
-                );
-                return Ok(Err(OrderedLargeTransferNoAttempt::BackendUnavailable));
-            }
-            Err(err) => return Err(err),
-        }) else {
-            return Ok(Ok(None));
-        };
-
-        Ok(Ok(Some((backend, guard, conn, status_code, buffer))))
-    }
-
     /// Load article availability from cache or create fresh tracker
     pub(super) async fn load_article_availability(
         &self,
@@ -848,68 +437,11 @@ impl ClientSession {
 
 #[cfg(test)]
 mod tests {
-    use super::OrderedPipelineGate;
     use crate::cache::UnifiedCache;
     use crate::protocol::{RequestCacheAvailability, StatusCode};
     use crate::session::ClientSession;
-    use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes, MessageId};
-    use std::sync::Arc;
+    use crate::types::{BackendId, MessageId};
     use std::time::Duration;
-    use tokio::sync::mpsc;
-
-    #[tokio::test]
-    async fn ordered_pipeline_gate_releases_waiters_in_index_order() {
-        let gate = Arc::new(OrderedPipelineGate::new());
-        let (tx, mut rx) = mpsc::unbounded_channel();
-
-        for index in [2, 0, 1] {
-            let gate = gate.clone();
-            let tx = tx.clone();
-            tokio::spawn(async move {
-                let turn = gate.wait_turn(index).await;
-                tx.send(index).expect("receiver should remain open");
-                turn.advance();
-            });
-        }
-        drop(tx);
-
-        assert_eq!(rx.recv().await, Some(0));
-        assert_eq!(rx.recv().await, Some(1));
-        assert_eq!(rx.recv().await, Some(2));
-        assert_eq!(rx.recv().await, None);
-    }
-
-    #[tokio::test]
-    async fn ordered_pipeline_gate_drop_advances_turn() {
-        let gate = Arc::new(OrderedPipelineGate::new());
-        let (tx, mut rx) = mpsc::unbounded_channel();
-
-        let first = gate.wait_turn(0).await;
-        let waiter = {
-            let gate = gate.clone();
-            tokio::spawn(async move {
-                let turn = gate.wait_turn(1).await;
-                tx.send(()).expect("receiver should remain open");
-                turn.advance();
-            })
-        };
-
-        drop(first);
-        assert_eq!(rx.recv().await, Some(()));
-        waiter.await.expect("waiter task should complete");
-    }
-
-    #[tokio::test]
-    async fn ordered_pipeline_gate_failure_is_visible_to_later_turns() {
-        let gate = Arc::new(OrderedPipelineGate::new());
-
-        let first = gate.wait_turn(0).await;
-        first.fail_and_advance();
-
-        let second = gate.wait_turn(1).await;
-        assert!(gate.is_failed());
-        second.advance();
-    }
 
     #[tokio::test]
     async fn status_fact_preserves_missing_backend_without_payload() {
@@ -950,40 +482,5 @@ mod tests {
         assert!(!availability.should_try(BackendId::from_index(1)));
         assert!(availability.should_try(BackendId::from_index(2)));
         assert_eq!(availability.missing_bits(), 0b0000_0010);
-    }
-
-    #[test]
-    fn ordered_retry_byte_delta_reports_only_extra_attempts() {
-        let delta = ClientSession::additional_ordered_retry_client_to_backend_bytes(
-            crate::types::ClientToBackendBytes::new(24),
-            8,
-        );
-
-        assert_eq!(delta.as_u64(), 16);
-    }
-
-    #[test]
-    fn ordered_retry_byte_delta_saturates_before_first_attempt() {
-        let delta = ClientSession::additional_ordered_retry_client_to_backend_bytes(
-            crate::types::ClientToBackendBytes::new(4),
-            8,
-        );
-
-        assert_eq!(delta.as_u64(), 0);
-    }
-
-    #[test]
-    fn ordered_large_transfer_finish_reports_extra_upload_and_download_bytes() {
-        let mut backend_connection = None;
-        let result = ClientSession::finish_ordered_large_transfer_request(
-            &mut backend_connection,
-            ClientToBackendBytes::new(30),
-            10,
-            BackendToClientBytes::new(42),
-        );
-
-        assert_eq!(result.additional_client_to_backend_bytes.as_u64(), 20);
-        assert_eq!(result.backend_to_client_bytes.as_u64(), 42);
-        assert!(backend_connection.is_none());
     }
 }

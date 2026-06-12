@@ -57,7 +57,7 @@ anyhow = "1.0"
 thiserror = "2.0"
 socket2 = { version = "0.6", features = ["all"] }  # Safe cross-platform socket operations
 crossbeam = { version = "0.8", features = ["alloc", "std"] }  # Lock-free data structures with minimal features
-nix = { version = "0.31", features = ["sched", "process"] }  # Low-level system calls for CPU pinning
+rustix = { version = "1.1", features = ["thread"] }  # Low-level system calls for CPU pinning
 deadpool = "0.13"
 memchr = { version = "2.8", features = ["libc"] }  # Fast byte searching with system optimizations
 uuid = { version = "1.23", features = ["v4"] }  # Unique IDs for request tracking

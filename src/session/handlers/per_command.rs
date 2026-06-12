@@ -16,7 +16,6 @@ use crate::session::common;
 use crate::session::routing::{CommandRoutingDecision, decide_request_routing};
 use crate::session::{ClientSession, connection};
 use anyhow::Result;
-use futures::{StreamExt, stream::FuturesUnordered};
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -26,12 +25,7 @@ use crate::command::{CommandAction, CommandHandler};
 use crate::constants::buffer::READER_CAPACITY;
 use crate::router::BackendSelector;
 use crate::session::SessionError;
-use crate::session::handlers::article_retry::OrderedPipelineGate;
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
-
-/// Ordered large-transfer pipelining is disabled due to sustained throughput regressions
-/// from long-lived regular buffer holds in the write path.
-const ORDERED_LARGE_TRANSFER_PIPELINE_ENABLED: bool = false;
 
 fn safe_command_log_label(request: &RequestContext) -> &str {
     std::str::from_utf8(request.verb()).unwrap_or("<non-utf8-command>")
@@ -625,13 +619,6 @@ impl ClientSession {
         backend_connection: &mut BatchBackendConnection,
     ) -> Result<BatchLoopAction, SessionError> {
         let batch_size = batch.len();
-
-        if self.can_process_ordered_large_transfer_batch(router, batch, state) {
-            return self
-                .process_ordered_large_transfer_batch(router, client_writer, state, batch)
-                .await;
-        }
-
         for i in 0..batch_size {
             let request = batch.context(i);
             debug!(
@@ -671,98 +658,6 @@ impl ClientSession {
                     ));
                 }
             }
-        }
-
-        Ok(BatchLoopAction::Continue)
-    }
-
-    fn can_process_ordered_large_transfer_batch(
-        &self,
-        router: &Arc<BackendSelector>,
-        batch: &crate::session::handlers::pipeline::RequestBatch,
-        state: &PerCommandLoopState,
-    ) -> bool {
-        if !ORDERED_LARGE_TRANSFER_PIPELINE_ENABLED {
-            return false;
-        }
-
-        if router.backend_count() <= 1
-            || batch.len() <= 1
-            || self.cache_articles
-            || self.adaptive_precheck
-        {
-            return false;
-        }
-
-        let skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
-        (0..batch.len()).all(|i| {
-            let request = batch.context(i);
-            request.is_large_transfer()
-                && decide_request_routing(
-                    request,
-                    skip_auth_check,
-                    self.auth_handler.is_enabled(),
-                    self.mode_state.routing_mode(),
-                ) == CommandRoutingDecision::Forward
-        })
-    }
-
-    async fn process_ordered_large_transfer_batch(
-        &self,
-        router: &Arc<BackendSelector>,
-        client_writer: &crate::session::SharedClientWriter,
-        state: &mut PerCommandLoopState,
-        batch: &crate::session::handlers::pipeline::RequestBatch,
-    ) -> Result<BatchLoopAction, SessionError> {
-        let batch_size = batch.len();
-        let order = Arc::new(OrderedPipelineGate::new());
-        let mut futures = FuturesUnordered::new();
-
-        state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
-        for i in 0..batch_size {
-            let request = batch.context(i);
-            debug!(
-                "Client {} dispatching ordered pipeline request {} of {}: kind={:?}, verb={:?}",
-                self.client_addr,
-                i + 1,
-                batch_size,
-                request.kind(),
-                request.verb()
-            );
-            state.client_to_backend_bytes = state
-                .client_to_backend_bytes
-                .add(request.request_wire_len().get());
-
-            futures.push(self.execute_ordered_large_transfer_request(
-                router.clone(),
-                request,
-                client_writer.clone(),
-                order.clone(),
-                i,
-            ));
-        }
-
-        let mut first_error = None;
-        while let Some(result) = futures.next().await {
-            match result {
-                Ok(result) => {
-                    state.client_to_backend_bytes = state
-                        .client_to_backend_bytes
-                        .add_u64(result.additional_client_to_backend_bytes.as_u64());
-                    state.backend_to_client_bytes = state
-                        .backend_to_client_bytes
-                        .add_u64(result.backend_to_client_bytes.as_u64());
-                }
-                Err(err) => {
-                    if first_error.is_none() {
-                        first_error = Some(err);
-                    }
-                }
-            }
-        }
-
-        if let Some(err) = first_error {
-            return Err(err);
         }
 
         Ok(BatchLoopAction::Continue)
@@ -1034,10 +929,5 @@ mod tests {
             ),
             "Other errors should NOT be classified as client disconnect"
         );
-    }
-
-    #[test]
-    fn ordered_large_transfer_pipeline_is_disabled() {
-        assert!(!super::ORDERED_LARGE_TRANSFER_PIPELINE_ENABLED);
     }
 }
