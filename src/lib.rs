@@ -33,6 +33,9 @@
 
 #![allow(clippy::disallowed_methods)]
 
+#[macro_use]
+mod macros;
+
 // Module declarations
 pub mod args;
 pub mod auth;

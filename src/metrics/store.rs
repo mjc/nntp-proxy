@@ -13,6 +13,10 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
+use crate::metrics::UserActiveConnections;
+use crate::metrics::types::{CommandCount, ErrorCount};
+use crate::types::{BytesReceived, BytesSent, TotalConnections};
+
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 
 /// Per-process monotonic counter — ensures concurrent saves use distinct temp file names.
@@ -203,12 +207,12 @@ pub struct MetricsStore {
 #[derive(Debug, Clone, Default)]
 pub struct UserMetrics {
     pub username: String,
-    pub active_connections: usize, // Not persisted (live gauge)
-    pub total_connections: u64,
-    pub bytes_sent: u64,
-    pub bytes_received: u64,
-    pub total_commands: u64,
-    pub errors: u64,
+    pub active_connections: UserActiveConnections, // Not persisted (live gauge)
+    pub total_connections: TotalConnections,
+    pub bytes_sent: BytesSent,
+    pub bytes_received: BytesReceived,
+    pub total_commands: CommandCount,
+    pub errors: ErrorCount,
 }
 
 impl UserMetrics {
@@ -216,27 +220,59 @@ impl UserMetrics {
     pub const fn new(username: String) -> Self {
         Self {
             username,
-            active_connections: 0,
-            total_connections: 0,
-            bytes_sent: 0,
-            bytes_received: 0,
-            total_commands: 0,
-            errors: 0,
+            active_connections: UserActiveConnections::ZERO,
+            total_connections: TotalConnections::ZERO,
+            bytes_sent: BytesSent::ZERO,
+            bytes_received: BytesReceived::ZERO,
+            total_commands: CommandCount::ZERO,
+            errors: ErrorCount::ZERO,
         }
+    }
+
+    #[inline]
+    pub fn record_connection_opened(&mut self) {
+        self.active_connections += 1;
+        self.total_connections += 1;
+    }
+
+    #[inline]
+    pub fn record_connection_closed(&mut self) {
+        self.active_connections = self
+            .active_connections
+            .saturating_sub(UserActiveConnections::new(1));
+    }
+
+    #[inline]
+    pub fn record_bytes_sent(&mut self, bytes: u64) {
+        self.bytes_sent += bytes;
+    }
+
+    #[inline]
+    pub fn record_bytes_received(&mut self, bytes: u64) {
+        self.bytes_received += bytes;
+    }
+
+    #[inline]
+    pub fn record_command(&mut self) {
+        self.total_commands += 1;
+    }
+
+    #[inline]
+    pub fn record_error(&mut self) {
+        self.errors += 1;
     }
 
     /// Convert to `UserStats` for snapshot (used by collector)
     pub(crate) fn to_user_stats(&self) -> crate::metrics::UserStats {
-        use crate::metrics::types::{CommandCount, ErrorCount};
-        use crate::types::{BytesPerSecondRate, BytesReceived, BytesSent, TotalConnections};
+        use crate::types::BytesPerSecondRate;
         crate::metrics::UserStats {
             username: self.username.clone(),
             active_connections: self.active_connections,
-            total_connections: TotalConnections::new(self.total_connections),
-            bytes_sent: BytesSent::new(self.bytes_sent),
-            bytes_received: BytesReceived::new(self.bytes_received),
-            total_commands: CommandCount::new(self.total_commands),
-            errors: ErrorCount::new(self.errors),
+            total_connections: self.total_connections,
+            bytes_sent: self.bytes_sent,
+            bytes_received: self.bytes_received,
+            total_commands: self.total_commands,
+            errors: self.errors,
             bytes_sent_per_sec: BytesPerSecondRate::ZERO,
             bytes_received_per_sec: BytesPerSecondRate::ZERO,
         }
@@ -245,26 +281,28 @@ impl UserMetrics {
     fn to_persisted(&self) -> PersistedUser {
         PersistedUser {
             username: self.username.clone(),
-            total_connections: self.total_connections,
-            bytes_sent: self.bytes_sent,
-            bytes_received: self.bytes_received,
-            total_commands: self.total_commands,
-            errors: self.errors,
+            total_connections: self.total_connections.get(),
+            bytes_sent: self.bytes_sent.as_u64(),
+            bytes_received: self.bytes_received.as_u64(),
+            total_commands: self.total_commands.get(),
+            errors: self.errors.get(),
         }
     }
 
     const fn restore_from(&mut self, persisted: &PersistedUser) {
-        self.total_connections = persisted.total_connections;
-        self.bytes_sent = persisted.bytes_sent;
-        self.bytes_received = persisted.bytes_received;
-        self.total_commands = persisted.total_commands;
-        self.errors = persisted.errors;
+        self.total_connections = TotalConnections::new(persisted.total_connections);
+        self.bytes_sent = BytesSent::new(persisted.bytes_sent);
+        self.bytes_received = BytesReceived::new(persisted.bytes_received);
+        self.total_commands = CommandCount::new(persisted.total_commands);
+        self.errors = ErrorCount::new(persisted.errors);
         // active_connections intentionally not restored (live gauge)
     }
 
     #[inline]
     const fn total_bytes(&self) -> u64 {
-        self.bytes_sent.saturating_add(self.bytes_received)
+        self.bytes_sent
+            .as_u64()
+            .saturating_add(self.bytes_received.as_u64())
     }
 }
 
@@ -496,11 +534,11 @@ impl MetricsStore {
                 let user = entry.value();
                 (
                     entry.key().clone(),
-                    user.active_connections > 0,
+                    user.active_connections.get() > 0,
                     user.total_bytes(),
-                    user.total_connections,
-                    user.total_commands,
-                    user.errors,
+                    user.total_connections.get(),
+                    user.total_commands.get(),
+                    user.errors.get(),
                 )
             })
             .collect::<Vec<_>>();
@@ -616,9 +654,9 @@ mod tests {
     #[test]
     fn test_user_metrics_roundtrip() {
         let mut user = UserMetrics::new("alice".to_string());
-        user.total_connections = 10;
-        user.bytes_sent = 1000;
-        user.active_connections = 5; // Live gauge, should not be persisted
+        user.total_connections = TotalConnections::new(10);
+        user.bytes_sent = BytesSent::new(1000);
+        user.active_connections = UserActiveConnections::new(5); // Live gauge, should not be persisted
 
         let persisted = user.to_persisted();
         assert_eq!(persisted.username, "alice");
@@ -628,9 +666,28 @@ mod tests {
         // Restore
         let mut new_user = UserMetrics::new("alice".to_string());
         new_user.restore_from(&persisted);
-        assert_eq!(new_user.total_connections, 10);
-        assert_eq!(new_user.bytes_sent, 1000);
-        assert_eq!(new_user.active_connections, 0); // Not restored
+        assert_eq!(new_user.total_connections, TotalConnections::new(10));
+        assert_eq!(new_user.bytes_sent, BytesSent::new(1000));
+        assert_eq!(new_user.active_connections, UserActiveConnections::ZERO); // Not restored
+    }
+
+    #[test]
+    fn test_user_metrics_record_helpers_use_typed_fields() {
+        let mut user = UserMetrics::new("typed".to_string());
+
+        user.record_connection_opened();
+        user.record_bytes_sent(150);
+        user.record_bytes_received(250);
+        user.record_command();
+        user.record_error();
+        user.record_connection_closed();
+
+        assert_eq!(user.active_connections, UserActiveConnections::ZERO);
+        assert_eq!(user.total_connections, TotalConnections::new(1));
+        assert_eq!(user.bytes_sent, BytesSent::new(150));
+        assert_eq!(user.bytes_received, BytesReceived::new(250));
+        assert_eq!(user.total_commands, CommandCount::new(1));
+        assert_eq!(user.errors, ErrorCount::new(1));
     }
 
     #[test]
@@ -651,7 +708,7 @@ mod tests {
         store.pipeline_batches.store(10, Ordering::Relaxed);
 
         let mut user = UserMetrics::new("bob".to_string());
-        user.total_connections = 5;
+        user.total_connections = TotalConnections::new(5);
         store.user_metrics.insert("bob".to_string(), user);
 
         // Save
@@ -679,7 +736,7 @@ mod tests {
         assert_eq!(loaded.pipeline_batches.load(Ordering::Relaxed), 10);
 
         let bob = loaded.user_metrics.get("bob").unwrap();
-        assert_eq!(bob.total_connections, 5);
+        assert_eq!(bob.total_connections, TotalConnections::new(5));
         drop(bob);
     }
 
@@ -688,20 +745,20 @@ mod tests {
         let store = MetricsStore::new(1);
 
         let mut active = UserMetrics::new("active".to_string());
-        active.active_connections = 1;
-        active.bytes_sent = 1;
+        active.active_connections = UserActiveConnections::new(1);
+        active.bytes_sent = BytesSent::new(1);
         store.user_metrics.insert("active".to_string(), active);
 
         let mut heavy = UserMetrics::new("heavy".to_string());
-        heavy.bytes_sent = 10_000;
+        heavy.bytes_sent = BytesSent::new(10_000);
         store.user_metrics.insert("heavy".to_string(), heavy);
 
         let mut medium = UserMetrics::new("medium".to_string());
-        medium.bytes_sent = 5_000;
+        medium.bytes_sent = BytesSent::new(5_000);
         store.user_metrics.insert("medium".to_string(), medium);
 
         let mut light = UserMetrics::new("light".to_string());
-        light.bytes_sent = 100;
+        light.bytes_sent = BytesSent::new(100);
         store.user_metrics.insert("light".to_string(), light);
 
         let removed = store.prune_user_metrics_to(2);
@@ -722,7 +779,7 @@ mod tests {
 
         for i in 0..(MAX_RETAINED_USER_METRICS + 16) {
             let mut user = UserMetrics::new(format!("user-{i:04}"));
-            user.bytes_sent = i as u64;
+            user.bytes_sent = BytesSent::new(i as u64);
             store.user_metrics.insert(user.username.clone(), user);
         }
 

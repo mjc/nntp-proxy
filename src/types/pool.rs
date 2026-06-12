@@ -1,6 +1,5 @@
 //! Connection pool metric newtypes
 
-use nutype::nutype;
 use std::fmt;
 
 #[allow(clippy::cast_precision_loss)] // Pool percentages are display values derived from exact usize counters.
@@ -10,26 +9,13 @@ const fn pool_count_as_f64(value: usize) -> f64 {
     value as f64
 }
 
-/// Macro to reduce boilerplate for pool connection count types.
-/// All pool types have the same `zero()` and `get()` implementations.
 macro_rules! pool_count_type {
     ($(#[$meta:meta])* $name:ident) => {
-        $(#[$meta])*
-        #[nutype(derive(
-            Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display, From
-        ))]
-        pub struct $name(usize);
+        crate::count_newtype!($(#[$meta])* $name, usize);
 
-        impl $name {
-            #[inline]
-            pub fn zero() -> Self {
-                Self::new(0)
-            }
-
-            #[inline]
-            #[must_use]
-            pub fn get(&self) -> usize {
-                self.into_inner()
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.0)
             }
         }
     };
@@ -142,7 +128,7 @@ mod tests {
         assert_eq!(available.get(), 5);
         assert_eq!(format!("{available}"), "5");
 
-        let zero = AvailableConnections::zero();
+        let zero = AvailableConnections::ZERO;
         assert_eq!(zero.get(), 0);
     }
 
@@ -159,7 +145,7 @@ mod tests {
         assert_eq!(created.get(), 25);
         assert_eq!(format!("{created}"), "25");
 
-        let zero = CreatedConnections::zero();
+        let zero = CreatedConnections::ZERO;
         assert_eq!(zero.get(), 0);
     }
 

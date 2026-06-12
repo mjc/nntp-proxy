@@ -1,5 +1,6 @@
 //! User statistics type and calculation methods
 
+use crate::metrics::UserActiveConnections;
 use crate::metrics::types::{CommandCount, ErrorCount};
 use crate::types::{BytesPerSecondRate, BytesReceived, BytesSent, TotalConnections};
 
@@ -15,7 +16,7 @@ const fn count_as_f64_for_rate(value: u64) -> f64 {
 pub struct UserStats {
     pub username: String,
     #[serde(skip, default)]
-    pub active_connections: usize,
+    pub active_connections: UserActiveConnections,
     pub total_connections: TotalConnections,
     pub bytes_sent: BytesSent,
     pub bytes_received: BytesReceived,
@@ -78,7 +79,7 @@ impl UserStats {
     #[must_use]
     #[inline]
     pub const fn is_connected(&self) -> bool {
-        self.active_connections > 0
+        self.active_connections.get() > 0
     }
 }
 
@@ -91,7 +92,7 @@ mod tests {
     fn test_user_stats_new() {
         let stats = UserStats::new("testuser");
         assert_eq!(stats.username, "testuser");
-        assert_eq!(stats.active_connections, 0);
+        assert_eq!(stats.active_connections.get(), 0);
         assert_eq!(stats.total_connections.get(), 0);
         assert_eq!(stats.bytes_sent.as_u64(), 0);
         assert_eq!(stats.bytes_received.as_u64(), 0);
@@ -172,7 +173,7 @@ mod tests {
     #[test]
     fn test_error_rate_percent_zero_commands() {
         let stats = UserStats {
-            total_commands: CommandCount::new(0),
+            total_commands: CommandCount::ZERO,
             errors: ErrorCount::new(10),
             ..Default::default()
         };
@@ -183,7 +184,7 @@ mod tests {
     fn test_error_rate_percent_no_errors() {
         let stats = UserStats {
             total_commands: CommandCount::new(100),
-            errors: ErrorCount::new(0),
+            errors: ErrorCount::ZERO,
             ..Default::default()
         };
         assert_eq!(stats.error_rate_percent(), 0.0);
@@ -236,7 +237,7 @@ mod tests {
     #[test]
     fn test_is_connected_active() {
         let stats = UserStats {
-            active_connections: 1,
+            active_connections: UserActiveConnections::new(1),
             ..Default::default()
         };
         assert!(stats.is_connected());
@@ -245,7 +246,7 @@ mod tests {
     #[test]
     fn test_is_connected_multiple() {
         let stats = UserStats {
-            active_connections: 5,
+            active_connections: UserActiveConnections::new(5),
             ..Default::default()
         };
         assert!(stats.is_connected());
@@ -261,7 +262,7 @@ mod tests {
     fn test_user_stats_default() {
         let stats = UserStats::default();
         assert_eq!(stats.username, "");
-        assert_eq!(stats.active_connections, 0);
+        assert_eq!(stats.active_connections.get(), 0);
         assert!(!stats.has_activity());
         assert!(!stats.is_connected());
     }
@@ -270,7 +271,7 @@ mod tests {
     fn test_user_stats_clone() {
         let stats = UserStats {
             username: "bob".to_string(),
-            active_connections: 2,
+            active_connections: UserActiveConnections::new(2),
             total_connections: TotalConnections::new(10),
             bytes_sent: BytesSent::new(1000),
             bytes_received: BytesReceived::new(2000),

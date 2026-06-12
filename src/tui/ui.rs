@@ -501,7 +501,7 @@ fn render_local_title_status_row(
     metrics: &DashboardMetrics,
 ) {
     let uptime = metrics.format_uptime();
-    let active = connections_text(metrics.active_connections);
+    let active = connections_text(metrics.active_connections.get());
     let total = connections_text_u64(metrics.total_connections);
 
     write_part(
@@ -1503,8 +1503,11 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
             &mut x,
             y,
             right,
-            connections_used_max_text(backend.active_connections, server.max_connections.get())
-                .as_str(),
+            connections_used_max_text(
+                backend.active_connections.get(),
+                server.max_connections.get(),
+            )
+            .as_str(),
             Style::default().fg(styles::VALUE_SECONDARY),
         );
         write_part(
@@ -2275,7 +2278,7 @@ fn render_user_stats(f: &mut Frame, area: Rect, top_users: &[DashboardUserStats]
             &mut x,
             y,
             right,
-            active_connections_text(user.active_connections).as_str(),
+            active_connections_text(user.active_connections.get()).as_str(),
             Style::default().fg(Color::Green),
         );
         row = row.saturating_add(1);
@@ -2343,7 +2346,7 @@ mod tests {
     fn user_stats(name: &str, total_bytes: u64) -> DashboardUserStats {
         DashboardUserStats {
             username: name.to_string(),
-            active_connections: 0,
+            active_connections: crate::metrics::ActiveConnections::new(0),
             total_connections: crate::types::TotalConnections::new(0),
             bytes_sent: crate::types::BytesSent::new(total_bytes),
             bytes_received: crate::types::BytesReceived::ZERO,
@@ -2410,7 +2413,7 @@ mod tests {
     fn attached_render_cache_prebuilds_remote_title_and_backend_strings() {
         let state = DashboardState {
             metrics: DashboardMetrics {
-                active_connections: 3,
+                active_connections: crate::metrics::ActiveConnections::new(3),
                 total_connections: 5,
                 ..DashboardMetrics::default()
             },
@@ -2678,7 +2681,7 @@ mod tests {
                 max_connections: MaxConnections::try_new(10).unwrap(),
             },
             stats: BackendStats::default(),
-            active_connections: 0,
+            active_connections: crate::metrics::ActiveConnections::new(0),
             health_status: BackendHealthStatus::Healthy,
             pending_count: 0,
             load_ratio: None,
@@ -2711,7 +2714,7 @@ mod tests {
                 " ".into(),
                 create_sparkline(user.total_bytes(), user.total_bytes()).fg(Color::Blue),
                 " ".into(),
-                format!("{:>5}", user.active_connections).fg(Color::Green),
+                format!("{:>5}", user.active_connections.get()).fg(Color::Green),
             ]),
             Line::from(vec![
                 "  ↑".into(),

@@ -35,20 +35,20 @@ impl Default for BackendStats {
     fn default() -> Self {
         Self {
             backend_id: BackendId::from_index(0),
-            active_connections: ActiveConnections::default(),
-            total_commands: CommandCount::default(),
+            active_connections: ActiveConnections::ZERO,
+            total_commands: CommandCount::ZERO,
             bytes_sent: BytesSent::ZERO,
             bytes_received: BytesReceived::ZERO,
-            errors: ErrorCount::default(),
-            errors_4xx: ErrorCount::default(),
-            errors_5xx: ErrorCount::default(),
+            errors: ErrorCount::ZERO,
+            errors_4xx: ErrorCount::ZERO,
+            errors_5xx: ErrorCount::ZERO,
             article_bytes_total: ArticleBytesTotal::ZERO,
-            article_count: ArticleCount::default(),
-            ttfb_micros_total: TtfbMicros::default(),
+            article_count: ArticleCount::ZERO,
+            ttfb_micros_total: TtfbMicros::ZERO,
             ttfb_count: TimingMeasurementCount::ZERO,
-            send_micros_total: SendMicros::default(),
-            recv_micros_total: RecvMicros::default(),
-            connection_failures: FailureCount::default(),
+            send_micros_total: SendMicros::ZERO,
+            recv_micros_total: RecvMicros::ZERO,
+            connection_failures: FailureCount::ZERO,
             health_status: BackendHealthStatus::Healthy,
         }
     }
@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn test_average_article_size_zero_articles() {
         let stats = BackendStats {
-            article_count: ArticleCount::new(0),
+            article_count: ArticleCount::ZERO,
             article_bytes_total: ArticleBytesTotal::new(1000),
             ..Default::default()
         };
@@ -207,7 +207,7 @@ mod tests {
     fn test_average_article_size_zero_bytes() {
         let stats = BackendStats {
             article_count: ArticleCount::new(10),
-            article_bytes_total: ArticleBytesTotal::new(0),
+            article_bytes_total: ArticleBytesTotal::ZERO,
             ..Default::default()
         };
         assert_eq!(stats.average_article_size(), Some(0));
@@ -226,7 +226,7 @@ mod tests {
     fn test_average_ttfb_ms_zero_count() {
         let stats = BackendStats {
             ttfb_micros_total: TtfbMicros::new(1000),
-            ttfb_count: TimingMeasurementCount::new(0),
+            ttfb_count: TimingMeasurementCount::ZERO,
             ..Default::default()
         };
         assert_eq!(stats.average_ttfb_ms(), None);
@@ -245,7 +245,7 @@ mod tests {
     fn test_average_send_ms_zero_count() {
         let stats = BackendStats {
             send_micros_total: SendMicros::new(1000),
-            ttfb_count: TimingMeasurementCount::new(0),
+            ttfb_count: TimingMeasurementCount::ZERO,
             ..Default::default()
         };
         assert_eq!(stats.average_send_ms(), None);
@@ -264,7 +264,7 @@ mod tests {
     fn test_average_recv_ms_zero_count() {
         let stats = BackendStats {
             recv_micros_total: RecvMicros::new(1000),
-            ttfb_count: TimingMeasurementCount::new(0),
+            ttfb_count: TimingMeasurementCount::ZERO,
             ..Default::default()
         };
         assert_eq!(stats.average_recv_ms(), None);
@@ -295,7 +295,7 @@ mod tests {
     #[test]
     fn test_error_rate_percent_zero_commands() {
         let stats = BackendStats {
-            total_commands: CommandCount::new(0),
+            total_commands: CommandCount::ZERO,
             errors: ErrorCount::new(10),
             ..Default::default()
         };
@@ -306,7 +306,7 @@ mod tests {
     fn test_error_rate_percent_no_errors() {
         let stats = BackendStats {
             total_commands: CommandCount::new(100),
-            errors: ErrorCount::new(0),
+            errors: ErrorCount::ZERO,
             ..Default::default()
         };
         assert_eq!(stats.error_rate_percent(), 0.0);

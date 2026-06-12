@@ -257,7 +257,7 @@ mod tests {
             ttfb_count: TimingMeasurementCount::new(10),
             send_micros_total: SendMicros::new(500),
             recv_micros_total: RecvMicros::new(1500),
-            connection_failures: FailureCount::new(0),
+            connection_failures: FailureCount::ZERO,
         };
 
         let backend2 = BackendStats {
