@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.5.2] - 2026-06-10
+## [0.5.2] - 2026-06-11
 
 ### Added
 
@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Wired response write metrics to runtime config and reduced response-metrics logging noise.
 - Added queue backpressure routing configuration in `config.full.toml` and documented
   `[routing.queue.backpressure]` in operator configuration docs.
+- Finalized v0.5.2 release metadata and config coverage, including response-write and
+  client-writer lock contention interval settings.
 
 ### Fixed
 
