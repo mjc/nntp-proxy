@@ -7,9 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-06-11
+
+### Added
+
+- Added per-backend `stat_missing` retry probing, so backends that correctly answer `STAT` with `430` can help retry missing articles faster.
+- Added runtime CPU pinning support for multi-threaded workloads via a new `CpuPinning` runtime mode, using worker-thread startup hooks so pinned threads are the ones running proxy work.
+- Added [`rustix`](https://docs.rs/rustix)-based affinity handling for Linux CPU pinning so we can remove the direct `nix` pinning dependency path.
+
+### Changed
+
+- Wired response write metrics to runtime config and reduced response-metrics logging noise.
+- Added queue backpressure routing configuration in `config.full.toml` and documented
+  `[routing.queue.backpressure]` in operator configuration docs.
+- Finalized v0.5.2 release metadata and config coverage, including response-write and
+  client-writer lock contention interval settings.
+- Removed legacy CLI compatibility aliases and aliases that are now obsolete after the cleanup pass: `--no-tui`, `--backend-strategy`, `--cache-capacity`, `--cache-ttl`, `--ttl-secs`, `--cache-articles`, `--store-articles`, and legacy `NNTP_PROXY_CACHE_*` env fallbacks.
+- Removed the dead ordered large-transfer pipeline path and associated retry gate/feature code now that it is permanently disabled.
+- Replaced visibility and internal API cleanup work from the Rust 1.88/private-first pass, including module privacy tightening and simplification of small conditional branches.
+- Replaced `ResponseTransferError::into_anyhow` and `duration_polyfill` with idiomatic Rust 1.88-safe error and duration handling at call sites.
+- Adopted private-first encapsulation by tightening crate module visibility where public re-exports already provide the intended external surface.
+
 ### Fixed
 
-- Backend DNS resolution now uses hickory’s TTL-aware caching behavior, with refreshed lookup handling that avoids unnecessary IPv4 cache clears on IPv6-unreachable failures.
+- Backend DNS lookups now respect TTL.
+- Hardened retry-path routing and guard handling around pending counts, capacity-weighted initial article probing, and idle-pool preference.
+- Fixed a user-active connection-count regression that could diverge from true active-session totals; the dashboard now consistently reports active sessions from typed user-metric counters.
+- Migrated user/session metric collection to typed newtypes (including `ZERO` constructors) and arithmetic helpers so typed counters are incremented at source and cannot be accidentally mixed.
+- Fixed metric and stats storage consistency by updating update paths to use typed metrics throughout collection, reducing drift in user gauges and totals.
+
+### Docs
+
+- Documented the `stat_missing` backend option and routing behavior in operator docs.
+- Updated `docker-compose.yml`/`Dockerfile` examples and Nix module documentation
+  to cover `stat_missing` deployment usage.
+- Added release metadata/docs updates for v0.5.2 configuration fields such as
+  response write and client-writer lock contention metric intervals.
+- Added documentation for cleanup and migration context from the maintenance PR stack
+  around private-first cleanup, deprecated options removal, and runtime pinning behavior.
 
 ## [0.5.1] - 2026-06-05
 
@@ -560,6 +595,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Development documentation
 
 [0.5.1]: https://github.com/mjc/nntp-proxy/compare/v0.5.0...v0.5.1
+[0.5.2]: https://github.com/mjc/nntp-proxy/compare/v0.5.1...v0.5.2
 [0.5.0]: https://github.com/mjc/nntp-proxy/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/mjc/nntp-proxy/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/mjc/nntp-proxy/compare/v0.2.3...v0.3.0
