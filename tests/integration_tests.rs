@@ -138,8 +138,8 @@ async fn test_round_robin_distribution() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn test_config_file_loading() -> Result<()> {
+#[test]
+fn test_config_file_loading() -> Result<()> {
     let config_content = r#"
 [[servers]]
 host = "test1.example.com"

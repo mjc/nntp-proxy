@@ -298,8 +298,8 @@ fn test_authinfo_pass_empty() {
 }
 
 /// Test buffer pool creation and usage
-#[tokio::test]
-async fn test_buffer_pool_basic_usage() {
+#[test]
+fn test_buffer_pool_basic_usage() {
     let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 2);
 
     // Get buffer
@@ -317,8 +317,8 @@ async fn test_buffer_pool_basic_usage() {
 }
 
 /// Test buffer pool with different sizes
-#[tokio::test]
-async fn test_buffer_pool_different_sizes() {
+#[test]
+fn test_buffer_pool_different_sizes() {
     let sizes = [1024, 4096, 8192, 16384];
 
     for size in &sizes {

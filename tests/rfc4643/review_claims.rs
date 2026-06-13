@@ -290,8 +290,8 @@ async fn test_uninit_buffer_pattern_is_safe() {
 }
 
 /// Test that the buffer pool pattern is sound even with multiple get/return cycles.
-#[tokio::test]
-async fn test_buffer_pool_safety_across_cycles() {
+#[test]
+fn test_buffer_pool_safety_across_cycles() {
     use crate::test_helpers::create_test_buffer_pool;
 
     let pool = create_test_buffer_pool();

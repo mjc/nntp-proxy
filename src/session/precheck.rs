@@ -592,18 +592,15 @@ pub fn spawn_background_precheck(
 ) {
     let owned = deps.clone_deps();
     tokio::spawn(async move {
-        // Check cache first - if we have a complete article, no need to query backends
-        if let Some(cached) = owned.cache.get(&msg_id).await
-            && cached.is_complete_article()
+        let cached = owned.cache.get(&msg_id).await;
+        if cached
+            .as_ref()
+            .is_some_and(|entry| entry.is_complete_article())
         {
-            // Already have full article cached - nothing to do
             return;
         }
 
-        let availability = owned
-            .cache
-            .get(&msg_id)
-            .await
+        let availability = cached
             .map(|entry| entry.to_availability(owned.router.backend_count()))
             .unwrap_or_default();
         let results = query_all_backends(&owned, &request, &availability).await;

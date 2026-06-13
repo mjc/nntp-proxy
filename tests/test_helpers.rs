@@ -1167,8 +1167,8 @@ mod tests {
         assert!(response.contains("100 help follows"));
     }
 
-    #[tokio::test]
-    async fn test_create_test_config() {
+    #[test]
+    fn test_create_test_config() {
         let config = create_test_config(vec![(19002, "server1"), (19003, "server2")]);
 
         assert_eq!(config.servers.len(), 2);

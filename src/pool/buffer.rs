@@ -1206,8 +1206,8 @@ mod tests {
     }
     use tokio::io::AsyncWriteExt;
 
-    #[tokio::test]
-    async fn test_buffer_pool_creation() {
+    #[test]
+    fn test_buffer_pool_creation() {
         let pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 10);
 
         assert_eq!(pool.stats(), (0, 0, 10));
@@ -1219,8 +1219,8 @@ mod tests {
         // Buffer automatically returned on drop
     }
 
-    #[tokio::test]
-    async fn test_acquire_starts_empty_with_stable_capacity() {
+    #[test]
+    fn test_acquire_starts_empty_with_stable_capacity() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
 
         let capacity = {
@@ -1304,8 +1304,8 @@ mod tests {
         assert_eq!(&*buffer, b"220 long");
     }
 
-    #[tokio::test]
-    async fn test_copy_from_slice_overwrites_and_allows_up_to_capacity() {
+    #[test]
+    fn test_copy_from_slice_overwrites_and_allows_up_to_capacity() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
         let mut buffer = pool.acquire();
         let capacity = buffer.capacity();
@@ -1320,9 +1320,9 @@ mod tests {
         assert_eq!(buffer.capacity(), capacity);
     }
 
-    #[tokio::test]
+    #[test]
     #[should_panic(expected = "data exceeds buffer capacity")]
-    async fn test_copy_from_slice_rejects_larger_than_capacity() {
+    fn test_copy_from_slice_rejects_larger_than_capacity() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
         let mut buffer = pool.acquire();
         let too_large = vec![b'X'; buffer.capacity() + 1];
@@ -1330,8 +1330,8 @@ mod tests {
         buffer.copy_from_slice(&too_large);
     }
 
-    #[tokio::test]
-    async fn test_clear_only_changes_initialized_length() {
+    #[test]
+    fn test_clear_only_changes_initialized_length() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
         let mut buffer = pool.acquire();
         let capacity = buffer.capacity();
@@ -1343,8 +1343,8 @@ mod tests {
         assert_eq!(buffer.capacity(), capacity);
     }
 
-    #[tokio::test]
-    async fn test_resized_buffers_are_discarded_instead_of_repooled() {
+    #[test]
+    fn test_resized_buffers_are_discarded_instead_of_repooled() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 1);
 
         let normal_capacity = {
@@ -1369,8 +1369,8 @@ mod tests {
         assert_eq!(capture.capacity(), 8);
     }
 
-    #[tokio::test]
-    async fn test_buffer_pool_get_and_return() {
+    #[test]
+    fn test_buffer_pool_get_and_return() {
         let pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 5);
 
         // Get a buffer
@@ -1388,8 +1388,8 @@ mod tests {
         assert_eq!(buffer2.capacity(), 4096);
     }
 
-    #[tokio::test]
-    async fn test_buffer_pool_exhaustion() {
+    #[test]
+    fn test_buffer_pool_exhaustion() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 2);
 
         // Lazily allocate all pool-owned buffers.
@@ -1406,8 +1406,8 @@ mod tests {
         drop(buf3);
     }
 
-    #[tokio::test]
-    async fn test_try_acquire_reports_exhaustion_without_allocating() {
+    #[test]
+    fn test_try_acquire_reports_exhaustion_without_allocating() {
         let _guard = hot_path_metrics_test_guard();
         reset_hot_path_allocation_metrics();
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
@@ -1433,8 +1433,8 @@ mod tests {
         assert_eq!(pool.stats(), (0, 1, 1));
     }
 
-    #[tokio::test]
-    async fn test_buffer_hold_metrics_record_regular_and_capture_drops() {
+    #[test]
+    fn test_buffer_hold_metrics_record_regular_and_capture_drops() {
         let _guard = hot_path_metrics_test_guard();
         reset_hot_path_allocation_metrics();
         let pool =
@@ -1460,8 +1460,8 @@ mod tests {
         super::set_response_write_metrics_enabled(was_enabled);
     }
 
-    #[tokio::test]
-    async fn test_oversized_capture_buffer_is_not_reused() {
+    #[test]
+    fn test_oversized_capture_buffer_is_not_reused() {
         let pool =
             BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8192, 1);
 
@@ -1474,8 +1474,8 @@ mod tests {
         assert_eq!(capture2.capacity(), 8192);
     }
 
-    #[tokio::test]
-    async fn test_capture_pool_lazily_allocates_configured_count() {
+    #[test]
+    fn test_capture_pool_lazily_allocates_configured_count() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 4);
 
         assert_eq!(pool.capture_pool_size.load(Ordering::Relaxed), 0);
@@ -1496,8 +1496,8 @@ mod tests {
         assert_eq!(pool.capture_pool_size.load(Ordering::Relaxed), 4);
     }
 
-    #[tokio::test]
-    async fn test_chunked_response_helpers_without_flattening() {
+    #[test]
+    fn test_chunked_response_helpers_without_flattening() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 4);
         let mut response = ChunkedResponse::default();
         response.extend_from_slice(&pool, b"220 0 <id>\r\nBody\r\n.\r\n");
@@ -1511,8 +1511,8 @@ mod tests {
         assert_eq!(&prefix[..], b"220 0 <id>\r\n");
     }
 
-    #[tokio::test]
-    async fn test_chunked_response_uses_more_capture_buffers_instead_of_growing_one() {
+    #[test]
+    fn test_chunked_response_uses_more_capture_buffers_instead_of_growing_one() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 4);
         let mut response = ChunkedResponse::default();
 
@@ -1525,8 +1525,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_chunked_response_copy_prefix_clamps_to_length() {
+    #[test]
+    fn test_chunked_response_copy_prefix_clamps_to_length() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(8, 4);
         let mut response = ChunkedResponse::default();
         response.extend_from_slice(&pool, b"430\r\n");
@@ -1536,8 +1536,8 @@ mod tests {
         assert_eq!(&prefix[..], b"430\r\n");
     }
 
-    #[tokio::test]
-    async fn test_chunked_response_can_own_range_without_copying() {
+    #[test]
+    fn test_chunked_response_can_own_range_without_copying() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 2);
         let mut buffer = pool.acquire();
         buffer.copy_from_slice(b"xx220 0 <id>\r\nBody\r\n.\r\nyy");
@@ -1551,8 +1551,8 @@ mod tests {
         assert_eq!(first, b"220 0 <id>\r\nBody\r\n.\r\n");
     }
 
-    #[tokio::test]
-    async fn test_chunked_response_can_share_pooled_range_without_copying() {
+    #[test]
+    fn test_chunked_response_can_share_pooled_range_without_copying() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 2);
         let mut buffer = pool.acquire();
         buffer.copy_from_slice(b"xx220 0 <id>\r\nBody\r\n.\r\nyy");
@@ -1570,8 +1570,8 @@ mod tests {
         assert_eq!(pool.available_buffers(), 1);
     }
 
-    #[tokio::test]
-    async fn test_freeze_detaches_bytes_from_pool_ownership() {
+    #[test]
+    fn test_freeze_detaches_bytes_from_pool_ownership() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
         let mut buffer = pool.acquire();
         buffer.copy_from_slice(b"223 0 <id>\r\n");
@@ -1613,8 +1613,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_buffer_alignment() {
+    #[test]
+    fn test_buffer_alignment() {
         let pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 1);
         let buffer = pool.acquire();
 
@@ -1624,8 +1624,8 @@ mod tests {
         assert_eq!(buffer.capacity() % 4096, 0);
     }
 
-    #[tokio::test]
-    async fn test_buffer_clear_and_resize() {
+    #[test]
+    fn test_buffer_clear_and_resize() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 2);
 
         let mut buffer = pool.acquire();
@@ -1644,8 +1644,8 @@ mod tests {
         // Note: buffer may contain previous bytes outside the initialized range.
     }
 
-    #[tokio::test]
-    async fn test_buffer_pool_max_size_enforcement() {
+    #[test]
+    fn test_buffer_pool_max_size_enforcement() {
         let pool = BufferPool::new(BufferSize::try_new(512).unwrap(), 3);
 
         // Get all buffers
@@ -1666,8 +1666,8 @@ mod tests {
         // (We can't directly test pool size, but the implementation handles it)
     }
 
-    #[tokio::test]
-    async fn test_buffer_wrong_size_not_returned() {
+    #[test]
+    fn test_buffer_wrong_size_not_returned() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 2);
 
         let buffer = pool.acquire();
@@ -1677,8 +1677,8 @@ mod tests {
         drop(buffer);
     }
 
-    #[tokio::test]
-    async fn test_buffer_pool_multiple_get_return_cycles() {
+    #[test]
+    fn test_buffer_pool_multiple_get_return_cycles() {
         let pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 5);
 
         // Do multiple get/return cycles
@@ -1702,8 +1702,8 @@ mod tests {
         // (Arc ensures shared ownership)
     }
 
-    #[tokio::test]
-    async fn test_different_buffer_sizes() {
+    #[test]
+    fn test_different_buffer_sizes() {
         let small_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 5);
         let medium_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 5);
         let large_pool = BufferPool::new(BufferSize::try_new(65536).unwrap(), 5);
@@ -1742,8 +1742,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn test_pooled_buffer_deref() {
+    #[test]
+    fn test_pooled_buffer_deref() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 5);
         let mut buffer = pool.acquire();
 
@@ -1758,8 +1758,8 @@ mod tests {
         assert_eq!(&*buffer, b"Hello");
     }
 
-    #[tokio::test]
-    async fn test_pooled_buffer_as_ref() {
+    #[test]
+    fn test_pooled_buffer_as_ref() {
         let pool = BufferPool::new(BufferSize::try_new(512).unwrap(), 5);
         let mut buffer = pool.acquire();
 
@@ -1771,8 +1771,8 @@ mod tests {
         assert_eq!(slice.len(), 9);
     }
 
-    #[tokio::test]
-    async fn test_copy_from_slice_updates_initialized() {
+    #[test]
+    fn test_copy_from_slice_updates_initialized() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 5);
         let mut buffer = pool.acquire();
 
@@ -1785,9 +1785,9 @@ mod tests {
         assert_eq!(buffer.initialized(), 11);
     }
 
-    #[tokio::test]
+    #[test]
     #[should_panic(expected = "data exceeds buffer capacity")]
-    async fn test_copy_from_slice_panic_on_overflow() {
+    fn test_copy_from_slice_panic_on_overflow() {
         let pool = BufferPool::new(BufferSize::try_new(10).unwrap(), 5);
         let mut buffer = pool.acquire();
 
@@ -1795,15 +1795,15 @@ mod tests {
         buffer.copy_from_slice(&too_large); // Should panic
     }
 
-    #[tokio::test]
-    async fn test_buffer_pool_debug() {
+    #[test]
+    fn test_buffer_pool_debug() {
         let pool = BufferPool::new(BufferSize::try_new(2048).unwrap(), 5);
         let debug_str = format!("{pool:?}");
         assert!(debug_str.contains("BufferPool"));
     }
 
-    #[tokio::test]
-    async fn test_buffer_initialized_tracking() {
+    #[test]
+    fn test_buffer_initialized_tracking() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 5);
         let mut buffer = pool.acquire();
 
@@ -1817,8 +1817,8 @@ mod tests {
         assert_eq!(&*buffer, b"Second write");
     }
 
-    #[tokio::test]
-    async fn test_buffer_capacity_vs_initialized() {
+    #[test]
+    fn test_buffer_capacity_vs_initialized() {
         let pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 5);
         let mut buffer = pool.acquire();
 
@@ -1833,8 +1833,8 @@ mod tests {
         assert_eq!(buffer.initialized(), 5);
     }
 
-    #[tokio::test]
-    async fn test_empty_slice_copy() {
+    #[test]
+    fn test_empty_slice_copy() {
         let pool = BufferPool::new(BufferSize::try_new(512).unwrap(), 5);
         let mut buffer = pool.acquire();
 
@@ -1844,8 +1844,8 @@ mod tests {
         assert_eq!(&*buffer, b"");
     }
 
-    #[tokio::test]
-    async fn test_buffer_reuse_preserves_capacity() {
+    #[test]
+    fn test_buffer_reuse_preserves_capacity() {
         let pool = BufferPool::new(BufferSize::try_new(2048).unwrap(), 5);
 
         {

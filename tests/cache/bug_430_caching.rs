@@ -77,8 +77,8 @@ async fn test_multiple_430s_update_same_entry() {
 }
 
 /// Test that 430 responses increment 4xx error metrics
-#[tokio::test]
-async fn test_430_increments_4xx_metrics() {
+#[test]
+fn test_430_increments_4xx_metrics() {
     let metrics = MetricsCollector::new(2); // 2 backends
 
     let backend_id = BackendId::from_index(0);

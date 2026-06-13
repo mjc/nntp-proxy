@@ -189,8 +189,8 @@ async fn test_auth_handler_integration() {
     assert!(auth_success); // Valid credentials
 }
 
-#[tokio::test]
-async fn test_config_auth_round_trip() {
+#[test]
+fn test_config_auth_round_trip() {
     // Create config with auth
     let config = Config {
         servers: vec![],

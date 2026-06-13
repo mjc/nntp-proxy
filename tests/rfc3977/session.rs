@@ -71,8 +71,8 @@ async fn test_auth_command_integration() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn test_auth_handler_validate() -> Result<()> {
+#[test]
+fn test_auth_handler_validate() -> Result<()> {
     let handler = AuthHandler::new(Some("user".to_string()), Some("pass".to_string()))?;
 
     assert!(handler.is_enabled());
@@ -83,8 +83,8 @@ async fn test_auth_handler_validate() -> Result<()> {
     Ok(())
 }
 
-#[tokio::test]
-async fn test_auth_handler_disabled() -> Result<()> {
+#[test]
+fn test_auth_handler_disabled() -> Result<()> {
     let handler = AuthHandler::new(None, None)?;
 
     assert!(!handler.is_enabled());

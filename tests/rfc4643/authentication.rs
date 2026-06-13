@@ -34,8 +34,8 @@ fn auth_handler(username: &str, password: &str) -> Arc<AuthHandler> {
     Arc::new(AuthHandler::new(Some(username.to_string()), Some(password.to_string())).unwrap())
 }
 
-#[tokio::test]
-async fn test_auth_handler_enabled_state() {
+#[test]
+fn test_auth_handler_enabled_state() {
     for (username, password, enabled) in [
         (None, None, false),
         (Some("user"), Some("pass"), true),
@@ -51,8 +51,8 @@ async fn test_auth_handler_enabled_state() {
     }
 }
 
-#[tokio::test]
-async fn test_auth_handler_validates_credentials() {
+#[test]
+fn test_auth_handler_validates_credentials() {
     let handler = auth_handler("alice", "secret123");
     for (username, password, valid) in [
         ("alice", "secret123", true),
@@ -64,8 +64,8 @@ async fn test_auth_handler_validates_credentials() {
     }
 }
 
-#[tokio::test]
-async fn test_auth_disabled_accepts_any_credentials() {
+#[test]
+fn test_auth_disabled_accepts_any_credentials() {
     let handler = AuthHandler::new(None, None).unwrap();
 
     assert!(handler.validate_credentials("anything", "works"));
@@ -73,8 +73,8 @@ async fn test_auth_disabled_accepts_any_credentials() {
     assert!(handler.validate_credentials("random", "stuff"));
 }
 
-#[tokio::test]
-async fn test_auth_handler_partial_config_disabled() {
+#[test]
+fn test_auth_handler_partial_config_disabled() {
     // Only username, no password - should be disabled
     let handler1 = AuthHandler::new(Some("user".to_string()), None).unwrap();
     assert!(!handler1.is_enabled());
@@ -84,8 +84,8 @@ async fn test_auth_handler_partial_config_disabled() {
     assert!(!handler2.is_enabled());
 }
 
-#[tokio::test]
-async fn test_auth_handler_empty_string_credentials() {
+#[test]
+fn test_auth_handler_empty_string_credentials() {
     // SECURITY: Empty credentials must be rejected, not silently disable auth
     let result = AuthHandler::new(Some(String::new()), Some(String::new()));
     assert!(
@@ -94,8 +94,8 @@ async fn test_auth_handler_empty_string_credentials() {
     );
 }
 
-#[tokio::test]
-async fn test_auth_handler_case_sensitive() {
+#[test]
+fn test_auth_handler_case_sensitive() {
     let handler = auth_handler("Alice", "Secret");
     for (username, password, valid) in [
         ("Alice", "Secret", true),
@@ -107,31 +107,31 @@ async fn test_auth_handler_case_sensitive() {
     }
 }
 
-#[tokio::test]
-async fn test_auth_handler_whitespace_in_credentials() {
+#[test]
+fn test_auth_handler_whitespace_in_credentials() {
     let handler = auth_handler("user name", "pass word");
 
     assert!(handler.validate_credentials("user name", "pass word"));
     assert!(!handler.validate_credentials("username", "password"));
 }
 
-#[tokio::test]
-async fn test_auth_handler_special_characters() {
+#[test]
+fn test_auth_handler_special_characters() {
     let handler = auth_handler("user@example.com", "p@$$w0rd!#%");
 
     assert!(handler.validate_credentials("user@example.com", "p@$$w0rd!#%"));
 }
 
-#[tokio::test]
-async fn test_auth_handler_unicode_credentials() {
+#[test]
+fn test_auth_handler_unicode_credentials() {
     let handler = auth_handler("用户", "密码");
 
     assert!(handler.validate_credentials("用户", "密码"));
     assert!(!handler.validate_credentials("user", "password"));
 }
 
-#[tokio::test]
-async fn test_auth_handler_debug_output() {
+#[test]
+fn test_auth_handler_debug_output() {
     for (handler, enabled) in [
         (auth_handler("supersecret", "topsecretpassword"), true),
         (Arc::new(AuthHandler::new(None, None).unwrap()), false),
@@ -144,8 +144,8 @@ async fn test_auth_handler_debug_output() {
     }
 }
 
-#[tokio::test]
-async fn test_auth_command_sequence_valid() {
+#[test]
+fn test_auth_command_sequence_valid() {
     for (command, expected, is_user) in [
         ("AUTHINFO USER alice\r\n", "alice", true),
         ("AUTHINFO PASS secret\r\n", "secret", false),
@@ -164,8 +164,8 @@ async fn test_auth_command_sequence_valid() {
     }
 }
 
-#[tokio::test]
-async fn test_auth_responses_are_valid_nntp() {
+#[test]
+fn test_auth_responses_are_valid_nntp() {
     let handler = auth_handler("user", "pass");
 
     for (response, prefix) in [
@@ -221,15 +221,15 @@ async fn test_reject_response_formatting() {
     assert!(response.ends_with("\r\n"));
 }
 
-#[tokio::test]
-async fn test_command_classification_for_stateless() {
+#[test]
+fn test_command_classification_for_stateless() {
     for command in ["ARTICLE <msgid@example.com>\r\n", "LIST\r\n"] {
         assert_eq!(classify(command), CommandAction::ForwardStateless);
     }
 }
 
-#[tokio::test]
-async fn test_session_with_auth_handler() {
+#[test]
+fn test_session_with_auth_handler() {
     use crate::test_helpers::{
         create_test_addr, create_test_auth_handler_with, create_test_buffer_pool,
     };
@@ -245,8 +245,8 @@ async fn test_session_with_auth_handler() {
     // Session should be created successfully with auth handler
 }
 
-#[tokio::test]
-async fn test_session_with_disabled_auth() {
+#[test]
+fn test_session_with_disabled_auth() {
     use crate::test_helpers::{
         create_test_addr, create_test_auth_handler_disabled, create_test_buffer_pool,
     };
@@ -262,8 +262,8 @@ async fn test_session_with_disabled_auth() {
     assert!(!auth_handler.is_enabled());
 }
 
-#[tokio::test]
-async fn test_config_client_auth_enabled_state() {
+#[test]
+fn test_config_client_auth_enabled_state() {
     use nntp_proxy::config::{ClientAuth, UserCredentials};
 
     for (config, enabled) in [
@@ -290,8 +290,8 @@ async fn test_config_client_auth_enabled_state() {
     }
 }
 
-#[tokio::test]
-async fn test_auth_handler_with_very_long_credentials() {
+#[test]
+fn test_auth_handler_with_very_long_credentials() {
     let long_user = "a".repeat(1000);
     let long_pass = "b".repeat(1000);
 
@@ -302,8 +302,8 @@ async fn test_auth_handler_with_very_long_credentials() {
     assert!(!handler.validate_credentials("short", &long_pass));
 }
 
-#[tokio::test]
-async fn test_multiple_auth_handlers_independent() {
+#[test]
+fn test_multiple_auth_handlers_independent() {
     let handler1 = auth_handler("user1", "pass1");
     let handler2 = auth_handler("user2", "pass2");
 
@@ -314,8 +314,8 @@ async fn test_multiple_auth_handlers_independent() {
     assert!(!handler2.validate_credentials("user1", "pass1"));
 }
 
-#[tokio::test]
-async fn test_auth_handler_clone_via_arc() {
+#[test]
+fn test_auth_handler_clone_via_arc() {
     use crate::test_helpers::create_test_auth_handler;
 
     let handler = create_test_auth_handler();
@@ -326,8 +326,8 @@ async fn test_auth_handler_clone_via_arc() {
     assert_eq!(Arc::strong_count(&handler), 2);
 }
 
-#[tokio::test]
-async fn test_session_builder_with_auth_handler() {
+#[test]
+fn test_session_builder_with_auth_handler() {
     use crate::test_helpers::{
         create_test_addr, create_test_auth_handler, create_test_buffer_pool,
     };
@@ -343,8 +343,8 @@ async fn test_session_builder_with_auth_handler() {
     assert!(!session.is_per_command_routing());
 }
 
-#[tokio::test]
-async fn test_session_builder_with_router_and_auth() {
+#[test]
+fn test_session_builder_with_router_and_auth() {
     use crate::test_helpers::{
         create_test_addr, create_test_auth_handler, create_test_buffer_pool, create_test_router,
     };
@@ -380,20 +380,20 @@ async fn test_proxy_creates_auth_handler_from_config() {
     assert!(!proxy.servers().is_empty());
 }
 
-#[tokio::test]
-async fn test_auth_with_empty_command() {
+#[test]
+fn test_auth_with_empty_command() {
     let _action = classify("");
     // Should be rejected or handled gracefully, not crash
 }
 
-#[tokio::test]
-async fn test_auth_with_whitespace_only_command() {
+#[test]
+fn test_auth_with_whitespace_only_command() {
     let _action = classify("   \r\n");
     // Should be handled gracefully
 }
 
-#[tokio::test]
-async fn test_auth_case_variations() {
+#[test]
+fn test_auth_case_variations() {
     for (command, is_user) in [
         ("AUTHINFO USER test\r\n", true),
         ("authinfo user test\r\n", true),
@@ -444,8 +444,8 @@ async fn test_concurrent_auth_handlers() {
     assert_eq!(incorrect, 50);
 }
 
-#[tokio::test]
-async fn test_auth_handler_response_consistency() {
+#[test]
+fn test_auth_handler_response_consistency() {
     let handler = auth_handler("user", "pass");
 
     // Call multiple times, should always return same static responses
@@ -455,8 +455,8 @@ async fn test_auth_handler_response_consistency() {
     }
 }
 
-#[tokio::test]
-async fn test_auth_with_newlines_in_credentials() {
+#[test]
+fn test_auth_with_newlines_in_credentials() {
     // Newlines in credentials should work (unlikely but valid)
     let handler = auth_handler("user\nname", "pass\nword");
 
@@ -464,8 +464,8 @@ async fn test_auth_with_newlines_in_credentials() {
     assert!(!handler.validate_credentials("username", "password"));
 }
 
-#[tokio::test]
-async fn test_auth_with_null_bytes_in_credentials() {
+#[test]
+fn test_auth_with_null_bytes_in_credentials() {
     // Null bytes in credentials (edge case)
     let handler = auth_handler("user\0name", "pass\0word");
 
