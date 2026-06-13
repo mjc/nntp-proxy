@@ -241,7 +241,6 @@ impl ClientSession {
                 self.client_addr,
                 auth_username.clone(),
                 self.mode_state.routing_mode(),
-                &self.metrics,
                 self.connection_stats(),
                 |username| self.set_username(username),
             );
@@ -476,7 +475,6 @@ impl ClientSession {
             }
         }
 
-        self.metrics.user_connection_closed(self.username());
         Ok(state.transfer_metrics())
     }
 

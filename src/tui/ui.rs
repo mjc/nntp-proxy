@@ -2447,6 +2447,25 @@ mod tests {
     }
 
     #[test]
+    fn title_lines_show_active_and_total_connections_separately() {
+        let metrics = DashboardMetrics {
+            active_connections: crate::metrics::ActiveConnections::new(3),
+            total_connections: 42,
+            ..DashboardMetrics::default()
+        };
+
+        let info_line = build_title_lines(&metrics, None)
+            .get(1)
+            .expect("title info line")
+            .to_string();
+
+        assert!(info_line.contains("Active:"));
+        assert!(info_line.contains("3 connections"));
+        assert!(info_line.contains("Total:"));
+        assert!(info_line.contains("42 connections"));
+    }
+
+    #[test]
     fn render_user_stats_uses_pre_sorted_users() {
         let users = [
             user_stats("bob", 30),
@@ -2645,6 +2664,30 @@ mod tests {
             rate_text(text::ARROW_UP, 1024).as_str(),
             format!("{}{}/s", text::ARROW_UP, format_bytes(1024))
         );
+    }
+
+    #[test]
+    fn user_stats_line_uses_live_active_connections_column() {
+        let user = DashboardUserStats {
+            username: "alice".to_string(),
+            active_connections: crate::metrics::ActiveConnections::new(7),
+            total_connections: crate::types::TotalConnections::new(99),
+            bytes_sent: crate::types::BytesSent::ZERO,
+            bytes_received: crate::types::BytesReceived::ZERO,
+            bytes_sent_per_sec: crate::types::BytesPerSecondRate::ZERO,
+            bytes_received_per_sec: crate::types::BytesPerSecondRate::ZERO,
+            total_commands: CommandCount::ZERO,
+            errors: ErrorCount::ZERO,
+        };
+
+        let first_line = user_stat_lines_for_test(&user)
+            .into_iter()
+            .next()
+            .expect("user line")
+            .to_string();
+
+        assert!(first_line.contains(&format!("{:>5}", 7)));
+        assert!(!first_line.contains(&format!("{:>5}", 99)));
     }
 
     #[test]
