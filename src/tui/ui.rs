@@ -502,7 +502,7 @@ fn render_local_title_status_row(
 ) {
     let uptime = metrics.format_uptime();
     let active = connections_text(metrics.active_connections.get());
-    let total = connections_text_u64(metrics.total_connections);
+    let total = connections_text_u64(metrics.total_connections.get());
 
     write_part(
         buffer,
@@ -710,7 +710,8 @@ fn build_title_lines(
                 "  |  Active: ".fg(styles::LABEL),
                 format!("{} connections", metrics.active_connections).fg(styles::VALUE_SECONDARY),
                 "  |  Total: ".fg(styles::LABEL),
-                format!("{} connections", metrics.total_connections).fg(styles::VALUE_NEUTRAL),
+                format!("{} connections", metrics.total_connections.get())
+                    .fg(styles::VALUE_NEUTRAL),
             ])
         },
         build_remote_title_status_line,
@@ -2414,7 +2415,7 @@ mod tests {
         let state = DashboardState {
             metrics: DashboardMetrics {
                 active_connections: crate::metrics::ActiveConnections::new(3),
-                total_connections: 5,
+                total_connections: crate::types::TotalConnections::new(5),
                 ..DashboardMetrics::default()
             },
             backend_views: Vec::new(),
@@ -2450,7 +2451,7 @@ mod tests {
     fn title_lines_show_active_and_total_connections_separately() {
         let metrics = DashboardMetrics {
             active_connections: crate::metrics::ActiveConnections::new(3),
-            total_connections: 42,
+            total_connections: crate::types::TotalConnections::new(42),
             ..DashboardMetrics::default()
         };
 

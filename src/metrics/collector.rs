@@ -511,8 +511,12 @@ impl MetricsCollector {
             });
 
         MetricsSnapshot {
-            total_connections: self.inner.store.total_connections.load(Ordering::Relaxed),
-            active_connections: self.inner.active_connections.load(Ordering::Relaxed),
+            total_connections: crate::types::TotalConnections::new(
+                self.inner.store.total_connections.load(Ordering::Relaxed),
+            ),
+            active_connections: super::types::ActiveConnections::new(
+                self.inner.active_connections.load(Ordering::Relaxed),
+            ),
             stateful_sessions: self.inner.stateful_sessions.load(Ordering::Relaxed),
             client_to_backend_bytes: ClientToBackendBytes::new(total_sent),
             backend_to_client_bytes: BackendToClientBytes::new(total_received),
@@ -657,20 +661,20 @@ mod tests {
     fn test_metrics_collector_connection_lifecycle() {
         let collector = MetricsCollector::new(1);
 
-        assert_eq!(collector.snapshot(None).active_connections, 0);
-        assert_eq!(collector.snapshot(None).total_connections, 0);
+        assert_eq!(collector.snapshot(None).active_connections.get(), 0);
+        assert_eq!(collector.snapshot(None).total_connections.get(), 0);
 
         collector.connection_opened();
-        assert_eq!(collector.snapshot(None).active_connections, 1);
-        assert_eq!(collector.snapshot(None).total_connections, 1);
+        assert_eq!(collector.snapshot(None).active_connections.get(), 1);
+        assert_eq!(collector.snapshot(None).total_connections.get(), 1);
 
         collector.connection_opened();
-        assert_eq!(collector.snapshot(None).active_connections, 2);
-        assert_eq!(collector.snapshot(None).total_connections, 2);
+        assert_eq!(collector.snapshot(None).active_connections.get(), 2);
+        assert_eq!(collector.snapshot(None).total_connections.get(), 2);
 
         collector.connection_closed();
-        assert_eq!(collector.snapshot(None).active_connections, 1);
-        assert_eq!(collector.snapshot(None).total_connections, 2);
+        assert_eq!(collector.snapshot(None).active_connections.get(), 1);
+        assert_eq!(collector.snapshot(None).total_connections.get(), 2);
     }
 
     #[test]

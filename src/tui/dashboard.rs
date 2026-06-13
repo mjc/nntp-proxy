@@ -111,7 +111,7 @@ impl DashboardUserStats {
 /// Serialized metrics used by the dashboard payload.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DashboardMetrics {
-    pub total_connections: u64,
+    pub total_connections: TotalConnections,
     pub active_connections: ActiveConnections,
     pub stateful_sessions: usize,
     pub client_to_backend_bytes: ClientToBackendBytes,
@@ -134,7 +134,7 @@ impl DashboardMetrics {
     pub fn from_snapshot(snapshot: &MetricsSnapshot) -> Self {
         Self {
             total_connections: snapshot.total_connections,
-            active_connections: ActiveConnections::new(snapshot.active_connections),
+            active_connections: snapshot.active_connections,
             stateful_sessions: snapshot.stateful_sessions,
             client_to_backend_bytes: snapshot.client_to_backend_bytes,
             backend_to_client_bytes: snapshot.backend_to_client_bytes,

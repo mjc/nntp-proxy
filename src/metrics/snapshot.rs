@@ -9,7 +9,7 @@
 // exact deterministic fixtures rather than fuzzy comparisons.
 
 use super::types::{ActiveConnections, BackendHealthStatus, ErrorRatePercent};
-use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
+use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes, TotalConnections};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -31,9 +31,9 @@ use super::UserStats;
 /// from O(backends) to O(1) per update.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct MetricsSnapshot {
-    pub total_connections: u64,
+    pub total_connections: TotalConnections,
     #[serde(skip, default)]
-    pub active_connections: usize,
+    pub active_connections: ActiveConnections,
     #[serde(skip, default)]
     pub stateful_sessions: usize,
     pub client_to_backend_bytes: ClientToBackendBytes,
@@ -280,8 +280,8 @@ mod tests {
         };
 
         MetricsSnapshot {
-            total_connections: 5,
-            active_connections: 5,
+            total_connections: TotalConnections::new(5),
+            active_connections: ActiveConnections::new(5),
             stateful_sessions: 2,
             client_to_backend_bytes: ClientToBackendBytes::new(1500),
             backend_to_client_bytes: BackendToClientBytes::new(3500),
@@ -547,8 +547,8 @@ mod tests {
     #[test]
     fn test_snapshot_default() {
         let snapshot = MetricsSnapshot::default();
-        assert_eq!(snapshot.total_connections, 0);
-        assert_eq!(snapshot.active_connections, 0);
+        assert_eq!(snapshot.total_connections, TotalConnections::ZERO);
+        assert_eq!(snapshot.active_connections, ActiveConnections::ZERO);
         assert_eq!(snapshot.stateful_sessions, 0);
         assert_eq!(snapshot.total_bytes(), 0);
         assert_eq!(snapshot.uptime, Duration::from_secs(0));

@@ -1046,8 +1046,14 @@ mod tests {
         let app = create_test_app(2);
 
         // Initial state checks
-        assert_eq!(app.snapshot().active_connections, 0);
-        assert_eq!(app.snapshot().total_connections, 0);
+        assert_eq!(
+            app.snapshot().active_connections,
+            crate::metrics::ActiveConnections::ZERO
+        );
+        assert_eq!(
+            app.snapshot().total_connections,
+            crate::types::TotalConnections::ZERO
+        );
         assert_eq!(app.snapshot().backend_stats.len(), 2);
         assert!(app.previous_snapshot.is_none());
         assert!(app.latest_client_throughput().is_none());
@@ -1463,8 +1469,8 @@ mod tests {
         let mut app = TuiAppBuilder::new(metrics, router, servers).build();
 
         app.snapshot = Arc::new(MetricsSnapshot {
-            total_connections: 42,
-            active_connections: 3,
+            total_connections: crate::types::TotalConnections::new(42),
+            active_connections: crate::metrics::ActiveConnections::new(3),
             stateful_sessions: 2,
             client_to_backend_bytes: crate::types::ClientToBackendBytes::new(100),
             backend_to_client_bytes: crate::types::BackendToClientBytes::new(250),
@@ -1504,7 +1510,10 @@ mod tests {
         let decoded: DashboardState =
             serde_json::from_str(&json).expect("snapshot should deserialize");
 
-        assert_eq!(decoded.metrics.total_connections, 42);
+        assert_eq!(
+            decoded.metrics.total_connections,
+            crate::types::TotalConnections::new(42)
+        );
         assert_eq!(decoded.metrics.active_connections.get(), 3);
         assert_eq!(decoded.metrics.stateful_sessions, 2);
         assert_eq!(decoded.metrics.cache_entries, 7);

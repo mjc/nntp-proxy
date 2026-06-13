@@ -24,32 +24,32 @@ fn test_connection_lifecycle() {
 
     // Initially zero
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.total_connections, 0);
-    assert_eq!(snapshot.active_connections, 0);
+    assert_eq!(snapshot.total_connections.get(), 0);
+    assert_eq!(snapshot.active_connections.get(), 0);
 
     // Open connection
     collector.connection_opened();
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.total_connections, 1);
-    assert_eq!(snapshot.active_connections, 1);
+    assert_eq!(snapshot.total_connections.get(), 1);
+    assert_eq!(snapshot.active_connections.get(), 1);
 
     // Open another
     collector.connection_opened();
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.total_connections, 2);
-    assert_eq!(snapshot.active_connections, 2);
+    assert_eq!(snapshot.total_connections.get(), 2);
+    assert_eq!(snapshot.active_connections.get(), 2);
 
     // Close one
     collector.connection_closed();
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.total_connections, 2); // Total stays
-    assert_eq!(snapshot.active_connections, 1); // Active decrements
+    assert_eq!(snapshot.total_connections.get(), 2); // Total stays
+    assert_eq!(snapshot.active_connections.get(), 1); // Active decrements
 
     // Close another
     collector.connection_closed();
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.total_connections, 2);
-    assert_eq!(snapshot.active_connections, 0);
+    assert_eq!(snapshot.total_connections.get(), 2);
+    assert_eq!(snapshot.active_connections.get(), 0);
 }
 
 /// Test stateful session tracking
