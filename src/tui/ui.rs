@@ -501,8 +501,8 @@ fn render_local_title_status_row(
     metrics: &DashboardMetrics,
 ) {
     let uptime = metrics.format_uptime();
-    let active = connections_text(metrics.active_connections.get());
-    let total = connections_text_u64(metrics.total_connections.get());
+    let active = connections_text(metrics.active_connections);
+    let total = connections_text(metrics.total_connections);
 
     write_part(
         buffer,
@@ -671,13 +671,7 @@ fn render_target_part(
     );
 }
 
-fn connections_text(count: usize) -> ArrayString<32> {
-    let mut value = ArrayString::<32>::new();
-    let _ = write!(&mut value, "{count} connections");
-    value
-}
-
-fn connections_text_u64(count: u64) -> ArrayString<32> {
+fn connections_text(count: impl std::fmt::Display) -> ArrayString<32> {
     let mut value = ArrayString::<32>::new();
     let _ = write!(&mut value, "{count} connections");
     value
@@ -710,8 +704,7 @@ fn build_title_lines(
                 "  |  Active: ".fg(styles::LABEL),
                 format!("{} connections", metrics.active_connections).fg(styles::VALUE_SECONDARY),
                 "  |  Total: ".fg(styles::LABEL),
-                format!("{} connections", metrics.total_connections.get())
-                    .fg(styles::VALUE_NEUTRAL),
+                format!("{} connections", metrics.total_connections).fg(styles::VALUE_NEUTRAL),
             ])
         },
         build_remote_title_status_line,

@@ -753,15 +753,8 @@ impl TuiApp {
         history_limit: Option<usize>,
     ) -> DashboardState {
         let buffer_pool = self.buffer_pool.as_ref().map(Self::snapshot_buffer_pool);
-        let mut metrics = DashboardMetrics::from_snapshot(self.snapshot.as_ref());
-        metrics.in_flight_requests = self
-            .servers
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| self.backend_pending_count(idx))
-            .sum();
         DashboardState {
-            metrics,
+            metrics: self.snapshot_metrics(),
             backend_views: self.snapshot_backend_views(history_limit),
             top_users: self.snapshot_top_users(),
             client_history: Self::snapshot_history_points(
@@ -784,15 +777,8 @@ impl TuiApp {
         history_limit: Option<usize>,
         top_user_limit: Option<usize>,
     ) -> RemoteDashboardState {
-        let mut metrics = DashboardMetrics::from_snapshot(self.snapshot.as_ref());
-        metrics.in_flight_requests = self
-            .servers
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| self.backend_pending_count(idx))
-            .sum();
         RemoteDashboardState {
-            metrics,
+            metrics: self.snapshot_metrics(),
             backend_views: self.snapshot_remote_backend_views(history_limit),
             top_users: self.snapshot_top_users_with_limit(top_user_limit),
             latest_client_throughput: self.client_history.latest().cloned(),
@@ -914,6 +900,17 @@ impl TuiApp {
         }
     }
 
+    fn snapshot_metrics(&self) -> DashboardMetrics {
+        let mut metrics = DashboardMetrics::from(self.snapshot.as_ref());
+        metrics.in_flight_requests = self
+            .servers
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| self.backend_pending_count(idx))
+            .sum();
+        metrics
+    }
+
     fn snapshot_top_users(&self) -> Vec<DashboardUserStats> {
         self.snapshot_top_users_with_limit(Some(10))
     }
@@ -926,7 +923,7 @@ impl TuiApp {
             .snapshot
             .user_stats
             .iter()
-            .map(DashboardUserStats::from_user_stats)
+            .map(DashboardUserStats::from)
             .collect::<Vec<_>>();
         top_users.sort_by_key(|user| std::cmp::Reverse(user.total_bytes()));
         if let Some(limit) = top_user_limit {

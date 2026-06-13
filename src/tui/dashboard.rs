@@ -87,6 +87,19 @@ pub struct DashboardUserStats {
 impl DashboardUserStats {
     #[must_use]
     pub fn from_user_stats(user: &UserStats) -> Self {
+        Self::from(user)
+    }
+
+    #[must_use]
+    pub const fn total_bytes(&self) -> u64 {
+        self.bytes_sent
+            .as_u64()
+            .saturating_add(self.bytes_received.as_u64())
+    }
+}
+
+impl From<&UserStats> for DashboardUserStats {
+    fn from(user: &UserStats) -> Self {
         Self {
             username: user.username.clone(),
             active_connections: ActiveConnections::new(user.active_connections.get()),
@@ -98,13 +111,6 @@ impl DashboardUserStats {
             total_commands: user.total_commands,
             errors: user.errors,
         }
-    }
-
-    #[must_use]
-    pub const fn total_bytes(&self) -> u64 {
-        self.bytes_sent
-            .as_u64()
-            .saturating_add(self.bytes_received.as_u64())
     }
 }
 
@@ -132,23 +138,7 @@ pub struct DashboardMetrics {
 impl DashboardMetrics {
     #[must_use]
     pub fn from_snapshot(snapshot: &MetricsSnapshot) -> Self {
-        Self {
-            total_connections: snapshot.total_connections,
-            active_connections: snapshot.active_connections,
-            stateful_sessions: snapshot.stateful_sessions,
-            client_to_backend_bytes: snapshot.client_to_backend_bytes,
-            backend_to_client_bytes: snapshot.backend_to_client_bytes,
-            uptime: snapshot.uptime,
-            cache_entries: snapshot.cache_entries,
-            cache_size_bytes: snapshot.cache_size_bytes,
-            cache_hit_rate: snapshot.cache_hit_rate,
-            disk_cache: snapshot.disk_cache,
-            pipeline_batches: snapshot.pipeline_batches,
-            pipeline_commands: snapshot.pipeline_commands,
-            pipeline_requests_queued: snapshot.pipeline_requests_queued,
-            pipeline_requests_completed: snapshot.pipeline_requests_completed,
-            in_flight_requests: 0,
-        }
+        Self::from(snapshot)
     }
 
     #[must_use]
@@ -170,6 +160,28 @@ impl DashboardMetrics {
     #[must_use]
     pub const fn total_bytes(&self) -> u64 {
         self.client_to_backend_bytes.as_u64() + self.backend_to_client_bytes.as_u64()
+    }
+}
+
+impl From<&MetricsSnapshot> for DashboardMetrics {
+    fn from(snapshot: &MetricsSnapshot) -> Self {
+        Self {
+            total_connections: snapshot.total_connections,
+            active_connections: snapshot.active_connections,
+            stateful_sessions: snapshot.stateful_sessions,
+            client_to_backend_bytes: snapshot.client_to_backend_bytes,
+            backend_to_client_bytes: snapshot.backend_to_client_bytes,
+            uptime: snapshot.uptime,
+            cache_entries: snapshot.cache_entries,
+            cache_size_bytes: snapshot.cache_size_bytes,
+            cache_hit_rate: snapshot.cache_hit_rate,
+            disk_cache: snapshot.disk_cache,
+            pipeline_batches: snapshot.pipeline_batches,
+            pipeline_commands: snapshot.pipeline_commands,
+            pipeline_requests_queued: snapshot.pipeline_requests_queued,
+            pipeline_requests_completed: snapshot.pipeline_requests_completed,
+            in_flight_requests: 0,
+        }
     }
 }
 
