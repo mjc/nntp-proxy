@@ -141,8 +141,8 @@ impl<const N: usize> From<&[u8; N]> for CacheIngestResponse {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn cache_ingest_response_equality_spans_storage_forms() {
+    #[test]
+    fn cache_ingest_response_equality_spans_storage_forms() {
         let bytes = b"220 0 <test@example.com>\r\nBody\r\n.\r\n";
         let pool =
             crate::pool::BufferPool::new(crate::types::BufferSize::try_new(1024).unwrap(), 1)
@@ -166,8 +166,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn cache_ingest_response_status_code_spans_storage_forms() {
+    #[test]
+    fn cache_ingest_response_status_code_spans_storage_forms() {
         let bytes = b"220 0 <test@example.com>\r\nBody\r\n.\r\n";
         let pool =
             crate::pool::BufferPool::new(crate::types::BufferSize::try_new(1024).unwrap(), 1)

@@ -2044,8 +2044,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_cached_article_clone() {
+    #[test]
+    fn test_cached_article_clone() {
         let article = create_test_cached_article("<test@example.com>");
 
         let cloned = article.clone();

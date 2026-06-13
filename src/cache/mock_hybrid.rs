@@ -157,8 +157,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn upsert_keeps_existing_semantic_payload_over_longer_metadata_only_response() {
+    #[test]
+    fn upsert_keeps_existing_semantic_payload_over_longer_metadata_only_response() {
         let cache = MockHybridCache::new(1024);
         cache.upsert_ingest(
             &msg_id(),
@@ -182,8 +182,8 @@ mod tests {
         assert!(entry.should_try_backend(BackendId::from_index(1)));
     }
 
-    #[tokio::test]
-    async fn basic_ops() -> Result<()> {
+    #[test]
+    fn basic_ops() -> Result<()> {
         let cache = MockHybridCache::new(1024 * 1024);
 
         let message_id = msgid("<test@example.com>");
@@ -204,8 +204,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn upsert_accepts_borrowed_backend_bytes() -> Result<()> {
+    #[test]
+    fn upsert_accepts_borrowed_backend_bytes() -> Result<()> {
         let cache = MockHybridCache::new(1024 * 1024);
         let message_id = msgid("<borrowed@example.com>");
         let buffer = b"220 0 <borrowed@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n";
@@ -221,8 +221,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn cache_miss_updates_stats() -> Result<()> {
+    #[test]
+    fn cache_miss_updates_stats() -> Result<()> {
         let cache = MockHybridCache::new(1024 * 1024);
 
         let message_id = msgid("<nonexistent@example.com>");
@@ -237,8 +237,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn upsert_preserves_larger_buffer() -> Result<()> {
+    #[test]
+    fn upsert_preserves_larger_buffer() -> Result<()> {
         let cache = MockHybridCache::new(1024 * 1024);
 
         let message_id = msgid("<test@example.com>");
@@ -264,8 +264,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn record_missing_creates_availability_entry() -> Result<()> {
+    #[test]
+    fn record_missing_creates_availability_entry() -> Result<()> {
         let cache = MockHybridCache::new(1024 * 1024);
 
         let message_id = msgid("<missing@example.com>");
@@ -281,8 +281,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn tracks_availability() -> Result<()> {
+    #[test]
+    fn tracks_availability() -> Result<()> {
         let cache = MockHybridCache::new(1024 * 1024);
 
         let message_id = msgid("<avail@example.com>");
@@ -302,8 +302,8 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn close_succeeds() -> Result<()> {
+    #[test]
+    fn close_succeeds() -> Result<()> {
         let cache = MockHybridCache::new(1024 * 1024);
 
         let message_id = msgid("<test@example.com>");

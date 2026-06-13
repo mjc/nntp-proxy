@@ -15,16 +15,16 @@ use super::article_response_bytes;
 // UnifiedCache Tests
 // ============================================================================
 
-#[tokio::test]
-async fn test_unified_cache_memory_construction() {
+#[test]
+fn test_unified_cache_memory_construction() {
     let cache = UnifiedCache::memory(1000, Duration::from_secs(60));
     assert!(!cache.is_hybrid());
     assert_eq!(cache.capacity(), 1000);
     assert_eq!(cache.entry_count(), 0);
 }
 
-#[tokio::test]
-async fn test_unified_cache_availability_construction() {
+#[test]
+fn test_unified_cache_availability_construction() {
     let cache = UnifiedCache::availability(std::time::Duration::MAX);
     assert!(!cache.is_hybrid());
     assert_eq!(cache.capacity(), AvailabilityIndex::new().capacity_bytes());
@@ -138,14 +138,14 @@ async fn test_unified_cache_availability_records_only_missing_facts() {
     assert_eq!(result.availability().missing_bits(), 0b0000_0010);
 }
 
-#[tokio::test]
-async fn test_unified_cache_is_hybrid_false_for_memory() {
+#[test]
+fn test_unified_cache_is_hybrid_false_for_memory() {
     let cache = UnifiedCache::memory(1000, Duration::from_secs(60));
     assert!(!cache.is_hybrid());
 }
 
-#[tokio::test]
-async fn test_unified_cache_hit_rate_initially_zero() {
+#[test]
+fn test_unified_cache_hit_rate_initially_zero() {
     let cache = UnifiedCache::memory(1000, Duration::from_secs(60));
     // Hit rate should be 0 (or NaN which displays as 0) when no operations
     let hit_rate = cache.hit_rate();
@@ -181,8 +181,8 @@ async fn test_unified_cache_weighted_size() {
 // CacheStatsProvider Tests
 // ============================================================================
 
-#[tokio::test]
-async fn test_cache_stats_provider_article_cache() {
+#[test]
+fn test_cache_stats_provider_article_cache() {
     use nntp_proxy::cache::CacheStatsProvider;
 
     let cache = ArticleCache::new(10000, Duration::from_secs(60));
@@ -193,8 +193,8 @@ async fn test_cache_stats_provider_article_cache() {
     assert!(stats.disk.is_none()); // Memory-only cache has no disk stats
 }
 
-#[tokio::test]
-async fn test_cache_stats_provider_unified_cache_memory() {
+#[test]
+fn test_cache_stats_provider_unified_cache_memory() {
     use nntp_proxy::cache::CacheStatsProvider;
 
     let cache = UnifiedCache::memory(10000, Duration::from_secs(60));
