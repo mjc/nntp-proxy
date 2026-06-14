@@ -83,10 +83,6 @@ where
         .handle_auth_command(auth_action, client_write, auth_username.as_deref())
         .await?;
 
-    if auth_success && let Some(ref username) = *auth_username {
-        auth_state.mark_authenticated(username.clone());
-    }
-
     let bytes_written = BackendToClientBytes::new(bytes as u64);
     let response = auth_response_metadata(auth_action, had_username, auth_success);
 
@@ -160,16 +156,16 @@ where
 
 /// Handle successful authentication with all side effects
 ///
-/// Sets username, records connection stats, updates metrics
+/// Moves the session's live user gauge from anonymous to the authenticated
+/// user, then records connection stats for aggregation.
 #[allow(clippy::needless_pass_by_value)] // The owned username is consumed as part of session state updates.
 pub fn on_authentication_success(
     client_id: crate::types::ClientId,
     client_addr: impl std::fmt::Display,
     username: Option<String>,
     routing_mode: crate::config::RoutingMode,
-    metrics: &crate::metrics::MetricsCollector,
     connection_stats: Option<&crate::metrics::ConnectionStatsAggregator>,
-    set_username_fn: impl FnOnce(Option<String>),
+    set_username_fn: impl FnOnce(String) -> crate::session::AuthenticationTransition,
 ) {
     use tracing::debug;
 
@@ -178,20 +174,34 @@ pub fn on_authentication_success(
     // logging without threading extra lifetimes through the handler chain.
     debug!("Client {} authenticated as: {:?}", client_addr, username);
 
-    // Store username in session
-    set_username_fn(username.clone());
+    let Some(username) = username else {
+        if let Some(stats) = connection_stats {
+            stats.record_session_connection(client_id, None, routing_mode.short_name());
+        }
+        debug!(
+            "Client {} authenticated without a username; keeping anonymous user gauge",
+            client_addr
+        );
+        return;
+    };
+
+    let transition = set_username_fn(username.clone());
 
     // Record connection for aggregation (after auth so we have username)
     if let Some(stats) = connection_stats {
-        stats.record_session_connection(client_id, username.as_deref(), routing_mode.short_name());
+        stats.record_session_connection(
+            client_id,
+            Some(username.as_str()),
+            routing_mode.short_name(),
+        );
     }
 
-    // Track user connection in metrics
-    metrics.user_connection_opened(username.as_deref());
-    debug!(
-        "Client {} opened connection for user: {:?}",
-        client_addr, username
-    );
+    if transition.is_new() {
+        debug!(
+            "Client {} moved connection to authenticated user: {}",
+            client_addr, username
+        );
+    }
 }
 
 #[cfg(test)]
@@ -352,7 +362,6 @@ pub struct AuthCheckContext<'a> {
     pub auth_handler: &'a std::sync::Arc<crate::auth::AuthHandler>,
     pub auth_state: &'a crate::session::AuthState,
     pub routing_mode: &'a crate::config::RoutingMode,
-    pub metrics: &'a crate::metrics::MetricsCollector,
     pub connection_stats: Option<&'a crate::metrics::ConnectionStatsAggregator>,
 }
 
@@ -368,7 +377,7 @@ pub async fn handle_stateful_auth_check<W>(
     auth_username: &mut Option<String>,
     ctx: &AuthCheckContext<'_>,
     client_addr: impl std::fmt::Display + Clone,
-    set_username_fn: impl FnOnce(Option<String>),
+    set_username_fn: impl FnOnce(String) -> crate::session::AuthenticationTransition,
 ) -> anyhow::Result<AuthHandlerResult>
 where
     W: AsyncWriteExt + Unpin,
@@ -411,7 +420,6 @@ where
                         client_addr,
                         auth_username.clone(),
                         *ctx.routing_mode,
-                        ctx.metrics,
                         ctx.connection_stats,
                         set_username_fn,
                     );

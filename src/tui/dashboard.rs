@@ -1,8 +1,10 @@
 //! Serializable dashboard state shared between local and attached TUI modes.
 
 use crate::metrics::{
-    ActiveConnections, BackendHealthStatus, BackendStats, CommandCount, DiskCacheStats, ErrorCount,
-    MetricsSnapshot, UserStats,
+    ActiveConnections, BackendHealthStatus, BackendStats, CacheEntries, CommandCount,
+    DiskCacheStats, ErrorCount, MetricsSnapshot, PendingRequests, PipelineBatches,
+    PipelineCommands, PipelineRequestsCompleted, PipelineRequestsQueued, StatefulSessions,
+    UserActiveConnections, UserStats,
 };
 use crate::tui::app::{ThroughputPoint, ViewMode};
 use crate::tui::system_stats::SystemStats;
@@ -10,14 +12,44 @@ use crate::types::{
     BackendToClientBytes, BytesPerSecondRate, BytesReceived, BytesSent, ClientToBackendBytes,
     HostName, MaxConnections, Port, ServerName, TotalConnections,
 };
+use arrayvec::ArrayString;
+use std::fmt;
+use std::fmt::Write as _;
 use std::time::Duration;
+
+macro_rules! buffer_count_type {
+    ($(#[$meta:meta])* $name:ident) => {
+        crate::count_newtype!($(#[$meta])* $name, usize);
+
+        impl fmt::Display for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, "{}", self.0)
+            }
+        }
+    };
+}
+
+buffer_count_type!(
+    /// Number of buffers available in the pool
+    AvailableBuffers
+);
+
+buffer_count_type!(
+    /// Number of buffers currently in use
+    InUseBuffers
+);
+
+buffer_count_type!(
+    /// Total number of buffers in the pool
+    TotalBuffers
+);
 
 /// Snapshot of the I/O buffer pool used by the summary panel.
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct BufferPoolStats {
-    pub available: usize,
-    pub in_use: usize,
-    pub total: usize,
+    pub available: AvailableBuffers,
+    pub in_use: InUseBuffers,
+    pub total: TotalBuffers,
 }
 
 /// A backend entry rendered in the backend list and chart panels.
@@ -36,9 +68,9 @@ pub struct BackendView {
     pub stats: BackendStats,
     pub active_connections: ActiveConnections,
     pub health_status: BackendHealthStatus,
-    pub pending_count: usize,
+    pub pending_count: PendingRequests,
     pub load_ratio: Option<f64>,
-    pub stateful_count: usize,
+    pub stateful_count: StatefulSessions,
     pub traffic_share: Option<f64>,
     pub history: Vec<ThroughputPoint>,
 }
@@ -57,8 +89,8 @@ pub struct RemoteBackendView {
     pub stats: BackendStats,
     pub active_connections: ActiveConnections,
     pub health_status: BackendHealthStatus,
-    pub pending_count: usize,
-    pub stateful_count: usize,
+    pub pending_count: PendingRequests,
+    pub stateful_count: StatefulSessions,
     pub traffic_share: Option<f64>,
     pub history: Vec<ThroughputPoint>,
 }
@@ -74,7 +106,7 @@ impl RemoteBackendView {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DashboardUserStats {
     pub username: String,
-    pub active_connections: ActiveConnections,
+    pub active_connections: UserActiveConnections,
     pub total_connections: TotalConnections,
     pub bytes_sent: BytesSent,
     pub bytes_received: BytesReceived,
@@ -87,17 +119,7 @@ pub struct DashboardUserStats {
 impl DashboardUserStats {
     #[must_use]
     pub fn from_user_stats(user: &UserStats) -> Self {
-        Self {
-            username: user.username.clone(),
-            active_connections: ActiveConnections::new(user.active_connections.get()),
-            total_connections: user.total_connections,
-            bytes_sent: user.bytes_sent,
-            bytes_received: user.bytes_received,
-            bytes_sent_per_sec: user.bytes_sent_per_sec,
-            bytes_received_per_sec: user.bytes_received_per_sec,
-            total_commands: user.total_commands,
-            errors: user.errors,
-        }
+        Self::from(user)
     }
 
     #[must_use]
@@ -108,33 +130,79 @@ impl DashboardUserStats {
     }
 }
 
+impl From<&UserStats> for DashboardUserStats {
+    fn from(user: &UserStats) -> Self {
+        Self {
+            username: user.username.clone(),
+            active_connections: user.active_connections,
+            total_connections: user.total_connections,
+            bytes_sent: user.bytes_sent,
+            bytes_received: user.bytes_received,
+            bytes_sent_per_sec: user.bytes_sent_per_sec,
+            bytes_received_per_sec: user.bytes_received_per_sec,
+            total_commands: user.total_commands,
+            errors: user.errors,
+        }
+    }
+}
+
 /// Serialized metrics used by the dashboard payload.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct DashboardMetrics {
-    pub total_connections: u64,
+    pub total_connections: TotalConnections,
     pub active_connections: ActiveConnections,
-    pub stateful_sessions: usize,
+    pub stateful_sessions: StatefulSessions,
     pub client_to_backend_bytes: ClientToBackendBytes,
     pub backend_to_client_bytes: BackendToClientBytes,
     pub uptime: Duration,
-    pub cache_entries: u64,
+    pub cache_entries: CacheEntries,
     pub cache_size_bytes: u64,
     pub cache_hit_rate: f64,
     pub disk_cache: Option<DiskCacheStats>,
-    pub pipeline_batches: u64,
-    pub pipeline_commands: u64,
-    pub pipeline_requests_queued: u64,
-    pub pipeline_requests_completed: u64,
+    pub pipeline_batches: PipelineBatches,
+    pub pipeline_commands: PipelineCommands,
+    pub pipeline_requests_queued: PipelineRequestsQueued,
+    pub pipeline_requests_completed: PipelineRequestsCompleted,
     #[serde(default)]
-    pub in_flight_requests: usize,
+    pub in_flight_requests: PendingRequests,
 }
 
 impl DashboardMetrics {
     #[must_use]
     pub fn from_snapshot(snapshot: &MetricsSnapshot) -> Self {
+        Self::from(snapshot)
+    }
+
+    #[must_use]
+    pub fn format_uptime(&self) -> ArrayString<24> {
+        let secs = self.uptime.as_secs();
+        let hours = secs / 3600;
+        let minutes = (secs % 3600) / 60;
+        let seconds = secs % 60;
+
+        let mut text = ArrayString::<24>::new();
+        if hours > 0 {
+            let _ = write!(&mut text, "{hours}h {minutes}m {seconds}s");
+        } else if minutes > 0 {
+            let _ = write!(&mut text, "{minutes}m {seconds}s");
+        } else {
+            let _ = write!(&mut text, "{seconds}s");
+        }
+
+        text
+    }
+
+    #[must_use]
+    pub const fn total_bytes(&self) -> u64 {
+        self.client_to_backend_bytes.as_u64() + self.backend_to_client_bytes.as_u64()
+    }
+}
+
+impl From<&MetricsSnapshot> for DashboardMetrics {
+    fn from(snapshot: &MetricsSnapshot) -> Self {
         Self {
             total_connections: snapshot.total_connections,
-            active_connections: ActiveConnections::new(snapshot.active_connections),
+            active_connections: snapshot.active_connections,
             stateful_sessions: snapshot.stateful_sessions,
             client_to_backend_bytes: snapshot.client_to_backend_bytes,
             backend_to_client_bytes: snapshot.backend_to_client_bytes,
@@ -147,29 +215,8 @@ impl DashboardMetrics {
             pipeline_commands: snapshot.pipeline_commands,
             pipeline_requests_queued: snapshot.pipeline_requests_queued,
             pipeline_requests_completed: snapshot.pipeline_requests_completed,
-            in_flight_requests: 0,
+            in_flight_requests: PendingRequests::ZERO,
         }
-    }
-
-    #[must_use]
-    pub fn format_uptime(&self) -> String {
-        let secs = self.uptime.as_secs();
-        let hours = secs / 3600;
-        let minutes = (secs % 3600) / 60;
-        let seconds = secs % 60;
-
-        if hours > 0 {
-            format!("{hours}h {minutes}m {seconds}s")
-        } else if minutes > 0 {
-            format!("{minutes}m {seconds}s")
-        } else {
-            format!("{seconds}s")
-        }
-    }
-
-    #[must_use]
-    pub const fn total_bytes(&self) -> u64 {
-        self.client_to_backend_bytes.as_u64() + self.backend_to_client_bytes.as_u64()
     }
 }
 
@@ -222,9 +269,9 @@ impl DashboardState {
     }
 
     #[must_use]
-    pub fn backend_pending_count(&self, backend_idx: usize) -> usize {
+    pub fn backend_pending_count(&self, backend_idx: usize) -> PendingRequests {
         self.backend_view(backend_idx)
-            .map_or(0, |view| view.pending_count)
+            .map_or(PendingRequests::ZERO, |view| view.pending_count)
     }
 
     #[must_use]
@@ -234,9 +281,9 @@ impl DashboardState {
     }
 
     #[must_use]
-    pub fn backend_stateful_count(&self, backend_idx: usize) -> usize {
+    pub fn backend_stateful_count(&self, backend_idx: usize) -> StatefulSessions {
         self.backend_view(backend_idx)
-            .map_or(0, |view| view.stateful_count)
+            .map_or(StatefulSessions::ZERO, |view| view.stateful_count)
     }
 
     #[must_use]
@@ -263,15 +310,15 @@ impl RemoteDashboardState {
     }
 
     #[must_use]
-    pub fn backend_pending_count(&self, backend_idx: usize) -> usize {
+    pub fn backend_pending_count(&self, backend_idx: usize) -> PendingRequests {
         self.backend_view(backend_idx)
-            .map_or(0, |view| view.pending_count)
+            .map_or(PendingRequests::ZERO, |view| view.pending_count)
     }
 
     #[must_use]
-    pub fn backend_stateful_count(&self, backend_idx: usize) -> usize {
+    pub fn backend_stateful_count(&self, backend_idx: usize) -> StatefulSessions {
         self.backend_view(backend_idx)
-            .map_or(0, |view| view.stateful_count)
+            .map_or(StatefulSessions::ZERO, |view| view.stateful_count)
     }
 
     #[must_use]
@@ -332,9 +379,9 @@ mod tests {
             stats: BackendStats::default(),
             active_connections: ActiveConnections::new(1),
             health_status: BackendHealthStatus::Healthy,
-            pending_count: 2,
+            pending_count: PendingRequests::new(2),
             load_ratio: Some(0.5),
-            stateful_count: 3,
+            stateful_count: StatefulSessions::new(3),
             traffic_share: Some(42.0),
             history: vec![ThroughputPoint::new_backend(
                 Timestamp::now(),
@@ -361,9 +408,9 @@ mod tests {
 
         assert!(state.latest_backend_throughput(1).is_none());
         assert!(state.throughput_history(1).is_none());
-        assert_eq!(state.backend_pending_count(1), 0);
+        assert_eq!(state.backend_pending_count(1), PendingRequests::ZERO);
         assert!(state.backend_load_ratio(1).is_none());
-        assert_eq!(state.backend_stateful_count(1), 0);
+        assert_eq!(state.backend_stateful_count(1), StatefulSessions::ZERO);
         assert!(state.backend_traffic_share(1).is_none());
     }
 
@@ -391,9 +438,9 @@ mod tests {
             show_details: true,
             log_lines: vec!["hello".to_string()],
             buffer_pool: Some(BufferPoolStats {
-                available: 1,
-                in_use: 2,
-                total: 3,
+                available: AvailableBuffers::new(1),
+                in_use: InUseBuffers::new(2),
+                total: TotalBuffers::new(3),
             }),
         };
 

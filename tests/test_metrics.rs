@@ -96,9 +96,9 @@ fn test_backend_stats_error_rate() {
 #[test]
 fn test_metrics_snapshot_total_bytes() {
     let snapshot = MetricsSnapshot {
-        total_connections: 10,
-        active_connections: 5,
-        stateful_sessions: 2,
+        total_connections: TotalConnections::new(10),
+        active_connections: ActiveConnections::new(5),
+        stateful_sessions: StatefulSessions::new(2),
         client_to_backend_bytes: ClientToBackendBytes::new(1000),
         backend_to_client_bytes: BackendToClientBytes::new(5000),
         uptime: std::time::Duration::from_secs(60),
@@ -111,9 +111,9 @@ fn test_metrics_snapshot_total_bytes() {
 #[test]
 fn test_metrics_snapshot_throughput() {
     let snapshot = MetricsSnapshot {
-        total_connections: 10,
-        active_connections: 5,
-        stateful_sessions: 2,
+        total_connections: TotalConnections::new(10),
+        active_connections: ActiveConnections::new(5),
+        stateful_sessions: StatefulSessions::new(2),
         client_to_backend_bytes: ClientToBackendBytes::new(2000),
         backend_to_client_bytes: BackendToClientBytes::new(8000),
         uptime: Duration::from_secs(10),
@@ -233,9 +233,9 @@ fn test_metrics_snapshot_with_multiple_backends() {
     };
 
     let snapshot = MetricsSnapshot {
-        total_connections: 20,
-        active_connections: 10,
-        stateful_sessions: 5,
+        total_connections: TotalConnections::new(20),
+        active_connections: ActiveConnections::new(10),
+        stateful_sessions: StatefulSessions::new(5),
         client_to_backend_bytes: ClientToBackendBytes::new(1500),
         backend_to_client_bytes: BackendToClientBytes::new(15000),
         uptime: Duration::from_secs(100),

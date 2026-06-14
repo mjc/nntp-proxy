@@ -4,7 +4,7 @@
 
 use nntp_proxy::cache::MAX_BACKENDS;
 use nntp_proxy::constants::user::ANONYMOUS;
-use nntp_proxy::metrics::{BackendHealthStatus, MetricsCollector};
+use nntp_proxy::metrics::{BackendHealthStatus, MetricsCollector, StatefulSessions};
 use nntp_proxy::types::{BackendId, MetricsBytes, Unrecorded};
 
 /// Test `MetricsCollector` creation
@@ -24,32 +24,32 @@ fn test_connection_lifecycle() {
 
     // Initially zero
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.total_connections, 0);
-    assert_eq!(snapshot.active_connections, 0);
+    assert_eq!(snapshot.total_connections.get(), 0);
+    assert_eq!(snapshot.active_connections.get(), 0);
 
     // Open connection
     collector.connection_opened();
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.total_connections, 1);
-    assert_eq!(snapshot.active_connections, 1);
+    assert_eq!(snapshot.total_connections.get(), 1);
+    assert_eq!(snapshot.active_connections.get(), 1);
 
     // Open another
     collector.connection_opened();
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.total_connections, 2);
-    assert_eq!(snapshot.active_connections, 2);
+    assert_eq!(snapshot.total_connections.get(), 2);
+    assert_eq!(snapshot.active_connections.get(), 2);
 
     // Close one
     collector.connection_closed();
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.total_connections, 2); // Total stays
-    assert_eq!(snapshot.active_connections, 1); // Active decrements
+    assert_eq!(snapshot.total_connections.get(), 2); // Total stays
+    assert_eq!(snapshot.active_connections.get(), 1); // Active decrements
 
     // Close another
     collector.connection_closed();
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.total_connections, 2);
-    assert_eq!(snapshot.active_connections, 0);
+    assert_eq!(snapshot.total_connections.get(), 2);
+    assert_eq!(snapshot.active_connections.get(), 0);
 }
 
 /// Test stateful session tracking
@@ -58,27 +58,27 @@ fn test_stateful_session_tracking() {
     let collector = MetricsCollector::new(1);
 
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.stateful_sessions, 0);
+    assert_eq!(snapshot.stateful_sessions, StatefulSessions::ZERO);
 
     // Start session
     collector.stateful_session_started();
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.stateful_sessions, 1);
+    assert_eq!(snapshot.stateful_sessions, StatefulSessions::new(1));
 
     // Start another
     collector.stateful_session_started();
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.stateful_sessions, 2);
+    assert_eq!(snapshot.stateful_sessions, StatefulSessions::new(2));
 
     // End one
     collector.stateful_session_ended();
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.stateful_sessions, 1);
+    assert_eq!(snapshot.stateful_sessions, StatefulSessions::new(1));
 
     // End another
     collector.stateful_session_ended();
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.stateful_sessions, 0);
+    assert_eq!(snapshot.stateful_sessions, StatefulSessions::ZERO);
 }
 
 /// Test command recording for backends

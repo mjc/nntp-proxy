@@ -6,6 +6,23 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
+/// Result of attempting to authenticate a session.
+#[must_use = "authentication transitions drive user connection gauge updates"]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticationTransition {
+    /// This call changed the session from unauthenticated to authenticated.
+    NewlyAuthenticated,
+    /// The session had already authenticated before this call.
+    AlreadyAuthenticated,
+}
+
+impl AuthenticationTransition {
+    #[must_use]
+    pub const fn is_new(self) -> bool {
+        matches!(self, Self::NewlyAuthenticated)
+    }
+}
+
 /// Represents the authentication state of a client session
 ///
 /// This type encapsulates the authentication status and username in a
@@ -20,13 +37,16 @@ use std::sync::{Arc, OnceLock};
 /// # Examples
 ///
 /// ```
-/// use nntp_proxy::session::AuthState;
+/// use nntp_proxy::session::{AuthState, AuthenticationTransition};
 ///
 /// let auth_state = AuthState::new();
 /// assert!(!auth_state.is_authenticated());
 ///
 /// // After authentication
-/// auth_state.mark_authenticated("user@example.com");
+/// assert_eq!(
+///     auth_state.mark_authenticated("user@example.com"),
+///     AuthenticationTransition::NewlyAuthenticated
+/// );
 /// assert!(auth_state.is_authenticated());
 /// assert_eq!(auth_state.username().unwrap(), "user@example.com");
 /// ```
@@ -52,7 +72,7 @@ impl AuthState {
     /// # Examples
     ///
     /// ```
-    /// use nntp_proxy::session::AuthState;
+    /// use nntp_proxy::session::{AuthState, AuthenticationTransition};
     ///
     /// let auth_state = AuthState::new();
     /// assert!(!auth_state.is_authenticated());
@@ -80,7 +100,10 @@ impl AuthState {
     /// let auth_state = AuthState::new();
     /// assert!(!auth_state.is_authenticated());
     ///
-    /// auth_state.mark_authenticated("alice");
+    /// assert_eq!(
+    ///     auth_state.mark_authenticated("alice"),
+    ///     AuthenticationTransition::NewlyAuthenticated
+    /// );
     /// assert!(auth_state.is_authenticated());
     /// ```
     #[inline]
@@ -98,29 +121,38 @@ impl AuthState {
     ///
     /// * `username` - The authenticated username
     ///
-    /// # Panics
+    /// # Returns
     ///
-    /// Panics if called multiple times with different usernames (implementation
-    /// detail of `OnceLock::set`).
+    /// Returns whether this call changed the session from unauthenticated to
+    /// authenticated. Repeated successful auth commands return
+    /// [`AuthenticationTransition::AlreadyAuthenticated`] so callers can keep
+    /// connection-open side effects idempotent.
     ///
     /// # Examples
     ///
     /// ```
-    /// use nntp_proxy::session::AuthState;
+    /// use nntp_proxy::session::{AuthState, AuthenticationTransition};
     ///
     /// let auth_state = AuthState::new();
-    /// auth_state.mark_authenticated("bob");
+    /// assert_eq!(
+    ///     auth_state.mark_authenticated("bob"),
+    ///     AuthenticationTransition::NewlyAuthenticated
+    /// );
     ///
     /// assert!(auth_state.is_authenticated());
     /// assert_eq!(auth_state.username().unwrap(), "bob");
     /// ```
     #[inline]
-    pub fn mark_authenticated(&self, username: impl Into<Arc<str>>) {
+    pub fn mark_authenticated(&self, username: impl Into<Arc<str>>) -> AuthenticationTransition {
         let username_arc: Arc<str> = username.into();
         // Set username first (write-once, safe to call multiple times with same value)
         let _ = self.username.set(username_arc);
         // Then mark as authenticated (one-way transition)
-        self.authenticated.store(true, Ordering::Relaxed);
+        if self.authenticated.swap(true, Ordering::Relaxed) {
+            AuthenticationTransition::AlreadyAuthenticated
+        } else {
+            AuthenticationTransition::NewlyAuthenticated
+        }
     }
 
     /// Get the authenticated username if available
@@ -131,12 +163,15 @@ impl AuthState {
     /// # Examples
     ///
     /// ```
-    /// use nntp_proxy::session::AuthState;
+    /// use nntp_proxy::session::{AuthState, AuthenticationTransition};
     ///
     /// let auth_state = AuthState::new();
     /// assert!(auth_state.username().is_none());
     ///
-    /// auth_state.mark_authenticated("charlie");
+    /// assert_eq!(
+    ///     auth_state.mark_authenticated("charlie"),
+    ///     AuthenticationTransition::NewlyAuthenticated
+    /// );
     /// let username = auth_state.username().unwrap();
     /// assert_eq!(username, "charlie");
     ///
@@ -162,13 +197,16 @@ impl AuthState {
     /// # Examples
     ///
     /// ```
-    /// use nntp_proxy::session::AuthState;
+    /// use nntp_proxy::session::{AuthState, AuthenticationTransition};
     ///
     /// let auth_state = AuthState::new();
     /// assert!(!auth_state.is_authenticated_or_skipped(false));
     /// assert!(auth_state.is_authenticated_or_skipped(true)); // Skips check
     ///
-    /// auth_state.mark_authenticated("dave");
+    /// assert_eq!(
+    ///     auth_state.mark_authenticated("dave"),
+    ///     AuthenticationTransition::NewlyAuthenticated
+    /// );
     /// assert!(auth_state.is_authenticated_or_skipped(false));
     /// assert!(auth_state.is_authenticated_or_skipped(true));
     /// ```
@@ -200,7 +238,10 @@ mod tests {
     #[test]
     fn test_mark_authenticated() {
         let state = AuthState::new();
-        state.mark_authenticated("testuser");
+        assert_eq!(
+            state.mark_authenticated("testuser"),
+            AuthenticationTransition::NewlyAuthenticated
+        );
 
         assert!(state.is_authenticated());
         assert_eq!(state.username().unwrap(), "testuser");
@@ -210,7 +251,10 @@ mod tests {
     fn test_mark_authenticated_with_arc() {
         let state = AuthState::new();
         let username: Arc<str> = Arc::from("arcuser");
-        state.mark_authenticated(username);
+        assert_eq!(
+            state.mark_authenticated(username),
+            AuthenticationTransition::NewlyAuthenticated
+        );
 
         assert!(state.is_authenticated());
         assert_eq!(state.username().unwrap(), "arcuser");
@@ -226,7 +270,10 @@ mod tests {
         // Not authenticated, skip=true
         assert!(state.is_authenticated_or_skipped(true));
 
-        state.mark_authenticated("skiptest");
+        assert_eq!(
+            state.mark_authenticated("skiptest"),
+            AuthenticationTransition::NewlyAuthenticated
+        );
 
         // Authenticated, skip=false
         assert!(state.is_authenticated_or_skipped(false));
@@ -245,10 +292,32 @@ mod tests {
     #[test]
     fn test_multiple_mark_same_username() {
         let state = AuthState::new();
-        state.mark_authenticated("same");
-        state.mark_authenticated("same"); // Should not panic
+        assert_eq!(
+            state.mark_authenticated("same"),
+            AuthenticationTransition::NewlyAuthenticated
+        );
+        assert_eq!(
+            state.mark_authenticated("same"),
+            AuthenticationTransition::AlreadyAuthenticated
+        );
 
         assert!(state.is_authenticated());
         assert_eq!(state.username().unwrap(), "same");
+    }
+
+    #[test]
+    fn test_multiple_mark_keeps_original_username() {
+        let state = AuthState::new();
+        assert_eq!(
+            state.mark_authenticated("first"),
+            AuthenticationTransition::NewlyAuthenticated
+        );
+        assert_eq!(
+            state.mark_authenticated("second"),
+            AuthenticationTransition::AlreadyAuthenticated
+        );
+
+        assert!(state.is_authenticated());
+        assert_eq!(state.username().unwrap(), "first");
     }
 }

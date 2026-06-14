@@ -3,7 +3,7 @@
 //! This module provides the core data structure for representing an active NNTP client session,
 //! along with a builder pattern for flexible session construction.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crate::auth::AuthHandler;
 use crate::config::RoutingMode;
@@ -30,6 +30,12 @@ pub struct ClientSession {
     pub(super) auth_state: AuthState,
     /// Metrics collector for session statistics (always enabled)
     pub(super) metrics: crate::metrics::MetricsCollector,
+
+    /// Current owner of this session's live user-connection gauge.
+    ///
+    /// `None` means the session is visible as the anonymous/unauthenticated
+    /// user until authentication moves it to a concrete username.
+    user_connection_username: Mutex<Option<String>>,
 
     /// Connection statistics aggregator for logging connection creation
     pub(super) connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
@@ -185,6 +191,8 @@ impl ClientSessionBuilder {
             }
         };
 
+        let metrics = self.metrics;
+        metrics.user_connection_opened(None);
         ClientSession {
             client_addr: self.client_addr,
             buffer_pool: self.buffer_pool,
@@ -193,7 +201,8 @@ impl ClientSessionBuilder {
             mode_state: ModeState::new(mode, routing_mode),
             auth_handler: self.auth_handler,
             auth_state: AuthState::new(),
-            metrics: self.metrics,
+            user_connection_username: Mutex::new(None),
+            metrics,
             connection_stats: self.connection_stats,
             cache: self.cache.into_cache(),
             cache_articles: self.cache_articles,
@@ -218,6 +227,7 @@ impl ClientSession {
         auth_handler: Arc<AuthHandler>,
         metrics: MetricsCollector,
     ) -> Self {
+        metrics.user_connection_opened(None);
         Self {
             client_addr,
             buffer_pool,
@@ -226,6 +236,7 @@ impl ClientSession {
             mode_state: ModeState::new(SessionMode::Stateful, RoutingMode::Stateful),
             auth_handler,
             auth_state: AuthState::new(),
+            user_connection_username: Mutex::new(None),
             metrics,
             connection_stats: None,
             cache: Self::default_cache(),
@@ -247,6 +258,7 @@ impl ClientSession {
         auth_handler: Arc<AuthHandler>,
         metrics: MetricsCollector,
     ) -> Self {
+        metrics.user_connection_opened(None);
         Self {
             client_addr,
             buffer_pool,
@@ -255,6 +267,7 @@ impl ClientSession {
             mode_state: ModeState::new(SessionMode::PerCommand, routing_mode),
             auth_handler,
             auth_state: AuthState::new(),
+            user_connection_username: Mutex::new(None),
             metrics,
             connection_stats: None,
             cache: Self::default_cache(),
@@ -346,10 +359,19 @@ impl ClientSession {
     ///
     /// This marks the session as authenticated and stores the username.
     /// Called after successful authentication with the backend.
-    pub(crate) fn set_username(&self, username: Option<String>) {
-        if let Some(name) = username {
-            self.auth_state.mark_authenticated(name);
+    ///
+    /// Returns whether this was the first successful authentication transition
+    /// in this session.
+    pub(crate) fn set_username(&self, name: String) -> crate::session::AuthenticationTransition {
+        let transition = self.auth_state.mark_authenticated(name.clone());
+        if transition.is_new() {
+            self.metrics.user_connection_closed(None);
+            self.metrics.user_connection_opened(Some(&name));
+            if let Ok(mut current) = self.user_connection_username.lock() {
+                *current = Some(name);
+            }
         }
+        transition
     }
 
     /// Get the connection stats aggregator (if enabled)
@@ -371,6 +393,14 @@ impl ClientSession {
     #[inline]
     pub(crate) fn is_authenticated_cached(&self, skip_auth_check: bool) -> bool {
         self.auth_state.is_authenticated_or_skipped(skip_auth_check)
+    }
+}
+
+impl Drop for ClientSession {
+    fn drop(&mut self) {
+        if let Ok(current) = self.user_connection_username.lock() {
+            self.metrics.user_connection_closed(current.as_deref());
+        }
     }
 }
 
@@ -979,6 +1009,38 @@ mod tests {
     }
 
     #[test]
+    fn test_session_counts_as_anonymous_until_drop() {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
+        let metrics = MetricsCollector::new(1);
+
+        let session = ClientSession::new(
+            addr.into(),
+            buffer_pool,
+            test_auth_handler(),
+            metrics.clone(),
+        );
+
+        let snapshot = metrics.snapshot(None);
+        let anonymous = snapshot
+            .user_stats
+            .iter()
+            .find(|stats| stats.username == crate::constants::user::ANONYMOUS)
+            .expect("new session should be visible as anonymous");
+        assert_eq!(anonymous.active_connections.get(), 1);
+
+        drop(session);
+
+        let snapshot = metrics.snapshot(None);
+        let anonymous = snapshot
+            .user_stats
+            .iter()
+            .find(|stats| stats.username == crate::constants::user::ANONYMOUS)
+            .expect("anonymous user stats should remain for lifetime totals");
+        assert_eq!(anonymous.active_connections.get(), 0);
+    }
+
+    #[test]
     fn test_set_username_and_get() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
         let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
@@ -989,7 +1051,10 @@ mod tests {
             test_metrics(),
         );
 
-        session.set_username(Some("testuser".to_string()));
+        assert_eq!(
+            session.set_username("testuser".to_string()),
+            crate::session::AuthenticationTransition::NewlyAuthenticated
+        );
 
         let username = session.username();
         assert!(username.is_some());
@@ -997,19 +1062,51 @@ mod tests {
     }
 
     #[test]
-    fn test_set_username_none() {
+    fn test_set_username_moves_live_connection_from_anonymous_to_user_once() {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8080);
         let buffer_pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 4);
+        let metrics = MetricsCollector::new(1);
         let session = ClientSession::new(
             addr.into(),
             buffer_pool,
             test_auth_handler(),
-            test_metrics(),
+            metrics.clone(),
         );
 
-        session.set_username(None);
+        assert_eq!(
+            session.set_username("testuser".to_string()),
+            crate::session::AuthenticationTransition::NewlyAuthenticated
+        );
+        assert_eq!(
+            session.set_username("testuser".to_string()),
+            crate::session::AuthenticationTransition::AlreadyAuthenticated
+        );
 
-        assert!(session.username().is_none());
+        let snapshot = metrics.snapshot(None);
+        let anonymous = snapshot
+            .user_stats
+            .iter()
+            .find(|stats| stats.username == crate::constants::user::ANONYMOUS)
+            .expect("anonymous bucket should exist");
+        let user = snapshot
+            .user_stats
+            .iter()
+            .find(|stats| stats.username == "testuser")
+            .expect("authenticated user bucket should exist");
+        assert_eq!(anonymous.active_connections.get(), 0);
+        assert_eq!(user.active_connections.get(), 1);
+        assert_eq!(user.total_connections.get(), 1);
+
+        drop(session);
+
+        let snapshot = metrics.snapshot(None);
+        let user = snapshot
+            .user_stats
+            .iter()
+            .find(|stats| stats.username == "testuser")
+            .expect("authenticated user bucket should remain");
+        assert_eq!(user.active_connections.get(), 0);
+        assert_eq!(user.total_connections.get(), 1);
     }
 
     #[test]
@@ -1023,7 +1120,10 @@ mod tests {
             test_metrics(),
         );
 
-        session.set_username(Some("testuser".to_string()));
+        assert_eq!(
+            session.set_username("testuser".to_string()),
+            crate::session::AuthenticationTransition::NewlyAuthenticated
+        );
 
         let username1 = session.username();
         let username2 = session.username();
@@ -1111,7 +1211,10 @@ mod tests {
         )
         .build();
 
-        session.set_username(Some("testuser".to_string()));
+        assert_eq!(
+            session.set_username("testuser".to_string()),
+            crate::session::AuthenticationTransition::NewlyAuthenticated
+        );
 
         // Call metrics directly - should record
         session.metrics.record_command(BackendId::from_index(0));
@@ -1169,7 +1272,10 @@ mod tests {
         )
         .build();
 
-        session.set_username(Some("testuser".to_string()));
+        assert_eq!(
+            session.set_username("testuser".to_string()),
+            crate::session::AuthenticationTransition::NewlyAuthenticated
+        );
         session.metrics.user_bytes_sent(session.username(), 1024);
         session
             .metrics
@@ -1206,11 +1312,17 @@ mod tests {
         session.metrics.stateful_session_started();
 
         let snapshot = metrics.snapshot(None);
-        assert_eq!(snapshot.stateful_sessions, 1);
+        assert_eq!(
+            snapshot.stateful_sessions,
+            crate::metrics::StatefulSessions::new(1)
+        );
 
         session.metrics.stateful_session_ended();
 
         let snapshot = metrics.snapshot(None);
-        assert_eq!(snapshot.stateful_sessions, 0);
+        assert_eq!(
+            snapshot.stateful_sessions,
+            crate::metrics::StatefulSessions::ZERO
+        );
     }
 }

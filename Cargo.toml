@@ -74,6 +74,7 @@ chrono = { version = "0.4", features = ["serde", "clock"], default-features = fa
 serde_json = "1.0"  # JSON serialization for stats persistence
 postcard = { version = "1.1", features = ["use-std"], default-features = false }  # Compact binary codec for attached TUI dashboard snapshots
 tokio-tungstenite = "0.29"  # WebSocket transport for remote TUI attachment
+unicode-width = "0.2.2"  # Display-width measurement for allocation-free log wrapping
 
 # Derive helpers to reduce newtype boilerplate
 nutype = { version = "0.7", features = ["serde"] }  # Validated newtypes with automatic derives
