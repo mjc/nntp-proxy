@@ -4,7 +4,7 @@ use crate::metrics::{
     ActiveConnections, BackendHealthStatus, BackendStats, CacheEntries, CommandCount,
     DiskCacheStats, ErrorCount, MetricsSnapshot, PendingRequests, PipelineBatches,
     PipelineCommands, PipelineRequestsCompleted, PipelineRequestsQueued, StatefulSessions,
-    UserStats,
+    UserActiveConnections, UserStats,
 };
 use crate::tui::app::{ThroughputPoint, ViewMode};
 use crate::tui::system_stats::SystemStats;
@@ -106,7 +106,7 @@ impl RemoteBackendView {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DashboardUserStats {
     pub username: String,
-    pub active_connections: ActiveConnections,
+    pub active_connections: UserActiveConnections,
     pub total_connections: TotalConnections,
     pub bytes_sent: BytesSent,
     pub bytes_received: BytesReceived,
@@ -134,7 +134,7 @@ impl From<&UserStats> for DashboardUserStats {
     fn from(user: &UserStats) -> Self {
         Self {
             username: user.username.clone(),
-            active_connections: ActiveConnections::new(user.active_connections.get()),
+            active_connections: user.active_connections,
             total_connections: user.total_connections,
             bytes_sent: user.bytes_sent,
             bytes_received: user.bytes_received,

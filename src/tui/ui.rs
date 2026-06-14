@@ -18,6 +18,7 @@ use crate::tui::helpers::{
     health_indicator, socket_addr_text,
 };
 use crate::types::MaxConnections;
+use crate::types::TotalConnections;
 use arrayvec::ArrayString;
 use ratatui::{
     Frame,
@@ -91,7 +92,9 @@ ui_count_type!(
     PipelineRequestsQueued,
     StatefulSessions,
     TotalBuffers,
+    TotalConnections,
     UserActiveConnections,
+    MaxConnections,
 );
 
 // ============================================================================
@@ -722,9 +725,9 @@ fn render_target_part(
     );
 }
 
-fn connections_text(count: impl std::fmt::Display) -> ArrayString<32> {
+fn connections_text(count: impl UiCount) -> ArrayString<32> {
     let mut value = ArrayString::<32>::new();
-    let _ = write!(&mut value, "{count} connections");
+    let _ = write!(&mut value, "{} connections", count.as_count());
     value
 }
 
@@ -1817,9 +1820,11 @@ fn count_text(count: impl UiCount) -> ArrayString<32> {
     text
 }
 
-fn connections_used_max_text(used: ActiveConnections, max: MaxConnections) -> ArrayString<32> {
+fn connections_used_max_text(used: impl UiCount, max: impl UiCount) -> ArrayString<32> {
+    let used = used.as_count();
+    let max = max.as_count();
     let mut text = ArrayString::<32>::new();
-    let _ = write!(&mut text, "{used}/{}", max.get());
+    let _ = write!(&mut text, "{used}/{max}");
     text
 }
 
@@ -2431,7 +2436,7 @@ mod tests {
     fn user_stats(name: &str, total_bytes: u64) -> DashboardUserStats {
         DashboardUserStats {
             username: name.to_string(),
-            active_connections: crate::metrics::ActiveConnections::new(0),
+            active_connections: crate::metrics::UserActiveConnections::new(0),
             total_connections: crate::types::TotalConnections::new(0),
             bytes_sent: crate::types::BytesSent::new(total_bytes),
             bytes_received: crate::types::BytesReceived::ZERO,
@@ -2818,7 +2823,7 @@ mod tests {
     fn user_stats_line_uses_live_active_connections_column() {
         let user = DashboardUserStats {
             username: "alice".to_string(),
-            active_connections: crate::metrics::ActiveConnections::new(7),
+            active_connections: crate::metrics::UserActiveConnections::new(7),
             total_connections: crate::types::TotalConnections::new(99),
             bytes_sent: crate::types::BytesSent::ZERO,
             bytes_received: crate::types::BytesReceived::ZERO,

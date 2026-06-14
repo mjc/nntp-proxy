@@ -864,7 +864,7 @@ mod tests {
             top_users: (0..10)
                 .map(|idx| crate::tui::dashboard::DashboardUserStats {
                     username: format!("user-{idx}"),
-                    active_connections: crate::metrics::ActiveConnections::new(0),
+                    active_connections: crate::metrics::UserActiveConnections::new(0),
                     total_connections: crate::types::TotalConnections::new(0),
                     bytes_sent: crate::types::BytesSent::ZERO,
                     bytes_received: crate::types::BytesReceived::ZERO,
