@@ -115,15 +115,15 @@ pub type PointVec = SmallVec<[ChartPoint; 64]>;
 
 /// Stack-allocated chart data for typical backend counts.
 /// Most deployments have 1-4 backends, so this avoids heap allocation
-pub type ChartDataVec = SmallVec<[BackendChartData; 8]>;
+pub type ChartDataVec<'a> = SmallVec<[BackendChartData<'a>; 8]>;
 
 /// Chart data for a single backend server
 ///
 /// Pre-computed data points to avoid nested iterations during rendering
 #[derive(Debug, Clone)]
-pub struct BackendChartData {
+pub struct BackendChartData<'a> {
     /// Server name for legend
-    pub name: String,
+    pub name: &'a str,
     /// Color for this backend's lines
     pub color: Color,
     /// Pre-computed tuples for ratatui (cached to avoid allocation on render)
@@ -132,11 +132,11 @@ pub struct BackendChartData {
     recv_tuples: SmallVec<[(f64, f64); 64]>,
 }
 
-impl BackendChartData {
+impl<'a> BackendChartData<'a> {
     /// Create new chart data with pre-computed tuples
     #[must_use]
     pub fn new(
-        name: String,
+        name: &'a str,
         color: Color,
         sent_points: &[ChartPoint],
         recv_points: &[ChartPoint],

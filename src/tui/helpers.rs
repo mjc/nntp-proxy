@@ -76,7 +76,7 @@ pub fn create_sparkline_text(value: u64, max_value: u64) -> ArrayString<64> {
 /// 3. Accumulates results with global max tracking
 ///
 /// Returns (`chart_data`, `global_max_throughput`)
-pub fn build_chart_data(backend_views: &[BackendView]) -> (ChartDataVec, f64) {
+pub fn build_chart_data<'a>(backend_views: &'a [BackendView]) -> (ChartDataVec<'a>, f64) {
     /// Extract data from a single throughput point
     #[inline]
     fn extract_point_data(idx: usize, point: &ThroughputPoint) -> (ChartPoint, ChartPoint, ChartY) {
@@ -118,7 +118,7 @@ pub fn build_chart_data(backend_views: &[BackendView]) -> (ChartDataVec, f64) {
 
             (
                 BackendChartData::new(
-                    backend.server.name.as_str().to_string(),
+                    backend.server.name.as_str(),
                     backend_color(index),
                     &sent_points,
                     &recv_points,
@@ -393,11 +393,12 @@ mod tests {
     fn test_chart_data_vec_type() {
         // Verify ChartDataVec can hold typical backend count on stack
         let mut chart_data = ChartDataVec::new();
+        let names: Vec<String> = (0..8).map(|i| format!("Server {i}")).collect();
 
         // Add 8 backends (at SmallVec capacity)
-        for i in 0..8 {
+        for (i, name) in names.iter().enumerate() {
             chart_data.push(BackendChartData::new(
-                format!("Server {i}"),
+                name.as_str(),
                 backend_color(i),
                 &PointVec::new(),
                 &PointVec::new(),
@@ -412,7 +413,7 @@ mod tests {
     #[test]
     fn test_backend_chart_data_structure() {
         let data = BackendChartData::new(
-            "Test Server".to_string(),
+            "Test Server",
             backend_color(0),
             &PointVec::new(),
             &PointVec::new(),

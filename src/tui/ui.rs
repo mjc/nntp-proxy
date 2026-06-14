@@ -2015,7 +2015,7 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
         if !sent_points.is_empty() {
             datasets.push(
                 Dataset::default()
-                    .name(dataset_name(&data.name, text::ARROW_UP))
+                    .name(dataset_name(data.name, text::ARROW_UP))
                     .marker(symbols::Marker::Braille)
                     .graph_type(GraphType::Line)
                     .style(Style::default().fg(data.color))
@@ -2027,7 +2027,7 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
         if !recv_points.is_empty() {
             datasets.push(
                 Dataset::default()
-                    .name(dataset_name(&data.name, text::ARROW_DOWN))
+                    .name(dataset_name(data.name, text::ARROW_DOWN))
                     .marker(symbols::Marker::Braille)
                     .graph_type(GraphType::Line)
                     .style(Style::default().fg(data.color).add_modifier(Modifier::BOLD))
