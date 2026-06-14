@@ -127,9 +127,9 @@ pub struct BackendChartData {
     /// Color for this backend's lines
     pub color: Color,
     /// Pre-computed tuples for ratatui (cached to avoid allocation on render)
-    sent_tuples: Vec<(f64, f64)>,
+    sent_tuples: SmallVec<[(f64, f64); 64]>,
     /// Pre-computed tuples for ratatui (cached to avoid allocation on render)
-    recv_tuples: Vec<(f64, f64)>,
+    recv_tuples: SmallVec<[(f64, f64); 64]>,
 }
 
 impl BackendChartData {
@@ -141,8 +141,10 @@ impl BackendChartData {
         sent_points: &[ChartPoint],
         recv_points: &[ChartPoint],
     ) -> Self {
-        let sent_tuples = sent_points.iter().map(ChartPoint::as_tuple).collect();
-        let recv_tuples = recv_points.iter().map(ChartPoint::as_tuple).collect();
+        let sent_tuples: SmallVec<[(f64, f64); 64]> =
+            sent_points.iter().map(ChartPoint::as_tuple).collect();
+        let recv_tuples: SmallVec<[(f64, f64); 64]> =
+            recv_points.iter().map(ChartPoint::as_tuple).collect();
         Self {
             name,
             color,

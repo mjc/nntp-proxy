@@ -12,7 +12,9 @@ use crate::types::{
     BackendToClientBytes, BytesPerSecondRate, BytesReceived, BytesSent, ClientToBackendBytes,
     HostName, MaxConnections, Port, ServerName, TotalConnections,
 };
+use arrayvec::ArrayString;
 use std::fmt;
+use std::fmt::Write as _;
 use std::time::Duration;
 
 macro_rules! buffer_count_type {
@@ -172,19 +174,22 @@ impl DashboardMetrics {
     }
 
     #[must_use]
-    pub fn format_uptime(&self) -> String {
+    pub fn format_uptime(&self) -> ArrayString<24> {
         let secs = self.uptime.as_secs();
         let hours = secs / 3600;
         let minutes = (secs % 3600) / 60;
         let seconds = secs % 60;
 
+        let mut text = ArrayString::<24>::new();
         if hours > 0 {
-            format!("{hours}h {minutes}m {seconds}s")
+            let _ = write!(&mut text, "{hours}h {minutes}m {seconds}s");
         } else if minutes > 0 {
-            format!("{minutes}m {seconds}s")
+            let _ = write!(&mut text, "{minutes}m {seconds}s");
         } else {
-            format!("{seconds}s")
+            let _ = write!(&mut text, "{seconds}s");
         }
+
+        text
     }
 
     #[must_use]

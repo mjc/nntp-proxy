@@ -127,10 +127,10 @@ mod tests {
         let max_throughput = 10_485_760.0; // 10 MiB/s
         let label = format_throughput_label(max_throughput);
 
-        assert_eq!(label, "10 MiB/s");
+        assert_eq!(label.as_str(), "10 MiB/s");
 
         let half_label = format_throughput_label(max_throughput / 2.0);
-        assert_eq!(half_label, "5 MiB/s");
+        assert_eq!(half_label.as_str(), "5 MiB/s");
     }
 
     #[test]

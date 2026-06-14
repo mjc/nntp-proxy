@@ -15,7 +15,7 @@ use crate::tui::dashboard::{
 use crate::tui::helpers::{
     build_chart_data, calculate_chart_bounds, connection_failure_color, create_sparkline_text,
     error_count_color, error_rate_color, format_summary_throughput, format_throughput_label,
-    health_indicator,
+    health_indicator, socket_addr_text,
 };
 use crate::types::MaxConnections;
 use arrayvec::ArrayString;
@@ -30,6 +30,7 @@ use ratatui::{
 };
 use std::collections::VecDeque;
 use std::fmt::Write as _;
+use std::sync::LazyLock;
 
 #[cfg(test)]
 use crate::formatting::format_bytes;
@@ -710,8 +711,7 @@ fn render_target_part(
         "  |  Target: ",
         Style::default().fg(styles::LABEL),
     );
-    let mut target_buf = ArrayString::<64>::new();
-    let _ = write!(&mut target_buf, "{target}");
+    let target_buf = socket_addr_text(*target);
     write_part(
         buffer,
         x,
@@ -732,6 +732,10 @@ fn build_title_lines(
     metrics: &DashboardMetrics,
     remote_status: Option<&RemoteDashboardStatus>,
 ) -> Vec<Line<'static>> {
+    let uptime = metrics.format_uptime().to_string();
+    let active = connections_text(metrics.active_connections).to_string();
+    let total = connections_text(metrics.total_connections).to_string();
+
     let title_suffix = remote_status.map_or_else(
         || Span::from("- Real-Time Metrics Dashboard").fg(Color::White),
         |status| match status {
@@ -751,11 +755,11 @@ fn build_title_lines(
         || {
             Line::from(vec![
                 "Uptime: ".fg(styles::LABEL),
-                metrics.format_uptime().fg(styles::VALUE_PRIMARY).bold(),
+                uptime.fg(styles::VALUE_PRIMARY).bold(),
                 "  |  Active: ".fg(styles::LABEL),
-                format!("{} connections", metrics.active_connections).fg(styles::VALUE_SECONDARY),
+                active.fg(styles::VALUE_SECONDARY),
                 "  |  Total: ".fg(styles::LABEL),
-                format!("{} connections", metrics.total_connections).fg(styles::VALUE_NEUTRAL),
+                total.fg(styles::VALUE_NEUTRAL),
             ])
         },
         build_remote_title_status_line,
@@ -885,7 +889,7 @@ fn render_app_summary_panel(
         &mut row,
         right,
         "Uptime: ",
-        &uptime,
+        uptime.as_str(),
         Style::default().fg(styles::VALUE_PRIMARY),
     );
 
@@ -1170,7 +1174,7 @@ fn render_transfer_summary_panel(f: &mut Frame, area: Rect, state: &DashboardSta
         &mut row,
         right,
         "Client → Backend: ",
-        &client_to_backend,
+        client_to_backend.as_str(),
         Style::default().fg(styles::VALUE_SECONDARY),
     );
     render_label_value_row(
@@ -1179,7 +1183,7 @@ fn render_transfer_summary_panel(f: &mut Frame, area: Rect, state: &DashboardSta
         &mut row,
         right,
         "Backend → Client: ",
-        &backend_to_client,
+        backend_to_client.as_str(),
         Style::default()
             .fg(styles::VALUE_PRIMARY)
             .add_modifier(Modifier::BOLD),
@@ -1326,7 +1330,10 @@ fn build_app_summary_lines(
     let mut lines = vec![
         Line::from(vec![
             "Uptime: ".fg(styles::LABEL),
-            metrics.format_uptime().fg(styles::VALUE_PRIMARY),
+            metrics
+                .format_uptime()
+                .to_string()
+                .fg(styles::VALUE_PRIMARY),
         ]),
         Line::from(vec![
             "Stateful Sessions: ".fg(styles::LABEL),
@@ -1991,6 +1998,7 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
     // Calculate chart bounds (extracted for testing)
     let max_throughput_rounded = calculate_chart_bounds(max_throughput);
     let max_label = format_throughput_label(max_throughput_rounded);
+    let half_label = format_throughput_label(max_throughput_rounded / 2.0);
 
     fn dataset_name<'a>(backend_name: &'a str, direction: &'static str) -> Line<'a> {
         Line::from(vec![
@@ -2001,38 +2009,32 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
     }
 
     // Build datasets directly from pre-computed chart data
-    let datasets: Vec<Dataset> = chart_data
-        .iter()
-        .flat_map(|data| {
-            let mut ds = Vec::with_capacity(2);
+    let mut datasets = Vec::with_capacity(chart_data.len() * 2);
+    for data in &chart_data {
+        let sent_points = data.sent_points_as_tuples();
+        if !sent_points.is_empty() {
+            datasets.push(
+                Dataset::default()
+                    .name(dataset_name(&data.name, text::ARROW_UP))
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(data.color))
+                    .data(sent_points),
+            );
+        }
 
-            // Sent data (upload to backend)
-            if !data.sent_points_as_tuples().is_empty() {
-                ds.push(
-                    Dataset::default()
-                        .name(dataset_name(&data.name, text::ARROW_UP))
-                        .marker(symbols::Marker::Braille)
-                        .graph_type(GraphType::Line)
-                        .style(Style::default().fg(data.color))
-                        .data(data.sent_points_as_tuples()),
-                );
-            }
-
-            // Received data (download from backend)
-            if !data.recv_points_as_tuples().is_empty() {
-                ds.push(
-                    Dataset::default()
-                        .name(dataset_name(&data.name, text::ARROW_DOWN))
-                        .marker(symbols::Marker::Braille)
-                        .graph_type(GraphType::Line)
-                        .style(Style::default().fg(data.color).add_modifier(Modifier::BOLD))
-                        .data(data.recv_points_as_tuples()),
-                );
-            }
-
-            ds
-        })
-        .collect();
+        let recv_points = data.recv_points_as_tuples();
+        if !recv_points.is_empty() {
+            datasets.push(
+                Dataset::default()
+                    .name(dataset_name(&data.name, text::ARROW_DOWN))
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(data.color).add_modifier(Modifier::BOLD))
+                    .data(recv_points),
+            );
+        }
+    }
 
     // Build and render chart
     let chart = Chart::new(datasets)
@@ -2042,7 +2044,7 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
                 .title("")
                 .style(Style::default().fg(styles::LABEL))
                 .bounds([0.0, chart::HISTORY_POINTS])
-                .labels(vec![
+                .labels([
                     Line::from(chart::X_LABEL_15S),
                     Line::from(chart::X_LABEL_10S),
                     Line::from(chart::X_LABEL_5S),
@@ -2054,10 +2056,10 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
                 .title("Throughput")
                 .style(Style::default().fg(styles::LABEL))
                 .bounds([0.0, max_throughput_rounded])
-                .labels(vec![
+                .labels([
                     Line::from(chart::Y_LABEL_ZERO),
-                    Line::from(format_throughput_label(max_throughput_rounded / 2.0)),
-                    Line::from(max_label),
+                    Line::from(half_label.as_str()),
+                    Line::from(max_label.as_str()),
                 ]),
         );
 
@@ -2066,17 +2068,20 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
 
 /// Render footer with help text
 fn render_footer(f: &mut Frame, area: Rect) {
-    let footer = footer_help_line();
     render_block_lines(
         f,
         area,
         untitled_bordered_block(styles::LABEL),
-        std::slice::from_ref(&footer),
+        std::slice::from_ref(footer_help_line()),
         Alignment::Center,
     );
 }
 
-fn footer_help_line() -> Line<'static> {
+fn footer_help_line() -> &'static Line<'static> {
+    &FOOTER_HELP_LINE
+}
+
+static FOOTER_HELP_LINE: LazyLock<Line<'static>> = LazyLock::new(|| {
     Line::from(vec![
         "Press ".fg(styles::LABEL),
         "q".fg(styles::VALUE_INFO).bold(),
@@ -2090,7 +2095,7 @@ fn footer_help_line() -> Line<'static> {
         "Ctrl+C".fg(styles::VALUE_INFO).bold(),
         " to shutdown".fg(styles::LABEL),
     ])
-}
+});
 
 /// Render recent log messages
 fn render_logs(f: &mut Frame, area: Rect, log_source: LogSource<'_>, show_details: bool) {

@@ -2,6 +2,8 @@
 
 use arrayvec::ArrayString;
 use ratatui::style::Color;
+use std::fmt::Write as _;
+use std::net::SocketAddr;
 
 use super::constants::{BACKEND_COLORS, throughput};
 use super::dashboard::BackendView;
@@ -173,14 +175,16 @@ pub fn round_up_throughput(value: f64) -> f64 {
 ///
 /// Returns human-readable string like "10 MiB/s", "500 KiB/s", "100 B/s"
 #[must_use]
-pub fn format_throughput_label(value: f64) -> String {
+pub fn format_throughput_label(value: f64) -> ArrayString<24> {
+    let mut text = ArrayString::<24>::new();
     if value >= throughput::ONE_MIB {
-        format!("{:.0} MiB/s", value / throughput::ONE_MIB)
+        let _ = write!(&mut text, "{:.0} MiB/s", value / throughput::ONE_MIB);
     } else if value >= throughput::ONE_KIB {
-        format!("{:.0} KiB/s", value / throughput::ONE_KIB)
+        let _ = write!(&mut text, "{:.0} KiB/s", value / throughput::ONE_KIB);
     } else {
-        format!("{value:.0} B/s")
+        let _ = write!(&mut text, "{value:.0} B/s");
     }
+    text
 }
 
 // ============================================================================
@@ -189,23 +193,45 @@ pub fn format_throughput_label(value: f64) -> String {
 
 /// Format throughput strings for summary display
 #[must_use]
-pub fn format_summary_throughput(latest_throughput: Option<&ThroughputPoint>) -> (String, String) {
+pub fn format_summary_throughput(
+    latest_throughput: Option<&ThroughputPoint>,
+) -> (ArrayString<24>, ArrayString<24>) {
     use super::constants::text;
 
     latest_throughput.map_or_else(
         || {
-            (
-                format!("{}{}", text::ARROW_UP, text::DEFAULT_THROUGHPUT),
-                format!("{}{}", text::ARROW_DOWN, text::DEFAULT_THROUGHPUT),
-            )
+            let mut up = ArrayString::<24>::new();
+            let mut down = ArrayString::<24>::new();
+            let _ = write!(&mut up, "{}{}", text::ARROW_UP, text::DEFAULT_THROUGHPUT);
+            let _ = write!(
+                &mut down,
+                "{}{}",
+                text::ARROW_DOWN,
+                text::DEFAULT_THROUGHPUT
+            );
+            (up, down)
         },
         |point| {
-            (
-                format!("{}{}", text::ARROW_UP, point.sent_per_sec()),
-                format!("{}{}", text::ARROW_DOWN, point.received_per_sec()),
-            )
+            let mut up = ArrayString::<24>::new();
+            let mut down = ArrayString::<24>::new();
+            let _ = write!(&mut up, "{}{}", text::ARROW_UP, point.sent_per_sec());
+            let _ = write!(
+                &mut down,
+                "{}{}",
+                text::ARROW_DOWN,
+                point.received_per_sec()
+            );
+            (up, down)
         },
     )
+}
+
+/// Format a socket address for display without heap allocation.
+#[must_use]
+pub fn socket_addr_text(addr: SocketAddr) -> ArrayString<64> {
+    let mut text = ArrayString::<64>::new();
+    let _ = write!(&mut text, "{addr}");
+    text
 }
 
 // ============================================================================
@@ -330,17 +356,17 @@ mod tests {
 
     #[test]
     fn test_format_throughput_label() {
-        assert_eq!(format_throughput_label(10_485_760.0), "10 MiB/s");
-        assert_eq!(format_throughput_label(500_000.0), "488 KiB/s");
-        assert_eq!(format_throughput_label(100.0), "100 B/s");
+        assert_eq!(format_throughput_label(10_485_760.0).as_str(), "10 MiB/s");
+        assert_eq!(format_throughput_label(500_000.0).as_str(), "488 KiB/s");
+        assert_eq!(format_throughput_label(100.0).as_str(), "100 B/s");
     }
 
     #[test]
     fn test_format_throughput_label_boundaries() {
         // Test boundary values
-        assert_eq!(format_throughput_label(1_048_576.0), "1 MiB/s");
-        assert_eq!(format_throughput_label(1_024.0), "1 KiB/s");
-        assert_eq!(format_throughput_label(0.0), "0 B/s");
+        assert_eq!(format_throughput_label(1_048_576.0).as_str(), "1 MiB/s");
+        assert_eq!(format_throughput_label(1_024.0).as_str(), "1 KiB/s");
+        assert_eq!(format_throughput_label(0.0).as_str(), "0 B/s");
     }
 
     #[test]
