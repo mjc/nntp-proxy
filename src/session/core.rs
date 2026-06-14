@@ -1312,11 +1312,17 @@ mod tests {
         session.metrics.stateful_session_started();
 
         let snapshot = metrics.snapshot(None);
-        assert_eq!(snapshot.stateful_sessions, 1);
+        assert_eq!(
+            snapshot.stateful_sessions,
+            crate::metrics::StatefulSessions::new(1)
+        );
 
         session.metrics.stateful_session_ended();
 
         let snapshot = metrics.snapshot(None);
-        assert_eq!(snapshot.stateful_sessions, 0);
+        assert_eq!(
+            snapshot.stateful_sessions,
+            crate::metrics::StatefulSessions::ZERO
+        );
     }
 }

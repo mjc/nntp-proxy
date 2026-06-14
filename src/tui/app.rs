@@ -2,10 +2,12 @@
 
 use crate::config::Server;
 use crate::metrics::{MetricsCollector, MetricsSnapshot};
+use crate::metrics::{PendingRequests, StatefulSessions};
 use crate::router::BackendSelector;
 use crate::tui::dashboard::{
-    BackendDisplay, BackendView, BufferPoolStats, DashboardMetrics, DashboardState,
-    DashboardUserStats, RemoteBackendView, RemoteDashboardState,
+    AvailableBuffers, BackendDisplay, BackendView, BufferPoolStats, DashboardMetrics,
+    DashboardState, DashboardUserStats, InUseBuffers, RemoteBackendView, RemoteDashboardState,
+    TotalBuffers,
 };
 use crate::tui::log_capture::LogBuffer;
 use crate::tui::rate_estimator::{CumulativeCount, RateEstimate, RateEstimator, RatePerSecond};
@@ -633,11 +635,13 @@ impl TuiApp {
 
     /// Get pending command count for a backend
     #[must_use]
-    pub fn backend_pending_count(&self, backend_idx: usize) -> usize {
+    pub fn backend_pending_count(&self, backend_idx: usize) -> PendingRequests {
         use crate::types::BackendId;
         self.router
             .backend_load(BackendId::from_index(backend_idx))
-            .map_or(0, |pending| pending.get())
+            .map_or(PendingRequests::ZERO, |pending| {
+                PendingRequests::new(pending.get())
+            })
     }
 
     /// Get load ratio for a backend (pending / `max_connections`)
@@ -651,11 +655,13 @@ impl TuiApp {
 
     /// Get stateful connection count for a backend
     #[must_use]
-    pub fn backend_stateful_count(&self, backend_idx: usize) -> usize {
+    pub fn backend_stateful_count(&self, backend_idx: usize) -> StatefulSessions {
         use crate::types::BackendId;
         self.router
             .stateful_count(BackendId::from_index(backend_idx))
-            .map_or(0, |count| count.get())
+            .map_or(StatefulSessions::ZERO, |count| {
+                StatefulSessions::new(count.get())
+            })
     }
 
     /// Get traffic share percentage for a backend
@@ -894,20 +900,21 @@ impl TuiApp {
     fn snapshot_buffer_pool(pool: &crate::pool::BufferPool) -> BufferPoolStats {
         let (available, in_use, total) = pool.stats();
         BufferPoolStats {
-            available,
-            in_use,
-            total,
+            available: AvailableBuffers::new(available),
+            in_use: InUseBuffers::new(in_use),
+            total: TotalBuffers::new(total),
         }
     }
 
     fn snapshot_metrics(&self) -> DashboardMetrics {
         let mut metrics = DashboardMetrics::from(self.snapshot.as_ref());
-        metrics.in_flight_requests = self
-            .servers
-            .iter()
-            .enumerate()
-            .map(|(idx, _)| self.backend_pending_count(idx))
-            .sum();
+        metrics.in_flight_requests = PendingRequests::new(
+            self.servers
+                .iter()
+                .enumerate()
+                .map(|(idx, _)| self.backend_pending_count(idx).get())
+                .sum(),
+        );
         metrics
     }
 
@@ -1452,7 +1459,7 @@ mod tests {
         );
         assert_eq!(
             snapshot.buffer_pool.as_ref().map(|pool| pool.total),
-            Some(4)
+            Some(crate::tui::dashboard::TotalBuffers::new(4))
         );
     }
 
@@ -1468,7 +1475,7 @@ mod tests {
         app.snapshot = Arc::new(MetricsSnapshot {
             total_connections: crate::types::TotalConnections::new(42),
             active_connections: crate::metrics::ActiveConnections::new(3),
-            stateful_sessions: 2,
+            stateful_sessions: crate::metrics::StatefulSessions::new(2),
             client_to_backend_bytes: crate::types::ClientToBackendBytes::new(100),
             backend_to_client_bytes: crate::types::BackendToClientBytes::new(250),
             uptime: Duration::from_secs(61),
@@ -1483,22 +1490,22 @@ mod tests {
                 total_commands: CommandCount::new(17),
                 errors: ErrorCount::new(1),
             }],
-            cache_entries: 7,
+            cache_entries: crate::metrics::CacheEntries::new(7),
             cache_size_bytes: 8192,
             cache_hit_rate: 12.5,
             disk_cache: Some(DiskCacheStats {
-                disk_hits: 3,
+                disk_hits: crate::metrics::DiskHits::new(3),
                 disk_hit_rate: 50.0,
                 disk_capacity: 1024,
                 bytes_written: 2048,
                 bytes_read: 1024,
-                write_ios: 4,
-                read_ios: 5,
+                write_ios: crate::metrics::DiskWriteIos::new(4),
+                read_ios: crate::metrics::DiskReadIos::new(5),
             }),
-            pipeline_batches: 6,
-            pipeline_commands: 12,
-            pipeline_requests_queued: 8,
-            pipeline_requests_completed: 7,
+            pipeline_batches: crate::metrics::PipelineBatches::new(6),
+            pipeline_commands: crate::metrics::PipelineCommands::new(12),
+            pipeline_requests_queued: crate::metrics::PipelineRequestsQueued::new(8),
+            pipeline_requests_completed: crate::metrics::PipelineRequestsCompleted::new(7),
             ..MetricsSnapshot::default()
         });
 
@@ -1512,12 +1519,24 @@ mod tests {
             crate::types::TotalConnections::new(42)
         );
         assert_eq!(decoded.metrics.active_connections.get(), 3);
-        assert_eq!(decoded.metrics.stateful_sessions, 2);
-        assert_eq!(decoded.metrics.cache_entries, 7);
+        assert_eq!(
+            decoded.metrics.stateful_sessions,
+            crate::metrics::StatefulSessions::new(2)
+        );
+        assert_eq!(
+            decoded.metrics.cache_entries,
+            crate::metrics::CacheEntries::new(7)
+        );
         assert_eq!(decoded.metrics.cache_size_bytes, 8192);
         assert_eq!(decoded.metrics.cache_hit_rate, 12.5);
-        assert_eq!(decoded.metrics.pipeline_batches, 6);
-        assert_eq!(decoded.metrics.pipeline_commands, 12);
+        assert_eq!(
+            decoded.metrics.pipeline_batches,
+            crate::metrics::PipelineBatches::new(6)
+        );
+        assert_eq!(
+            decoded.metrics.pipeline_commands,
+            crate::metrics::PipelineCommands::new(12)
+        );
         assert_eq!(decoded.top_users.len(), 1);
         assert_eq!(decoded.top_users[0].username, "alice");
         assert_eq!(decoded.top_users[0].active_connections.get(), 2);
@@ -1560,8 +1579,14 @@ mod tests {
         let app = TuiApp::new(metrics, Arc::new(router), servers);
         let snapshot = app.snapshot_state();
 
-        assert_eq!(snapshot.backend_views[0].pending_count, 5);
-        assert_eq!(snapshot.metrics.in_flight_requests, 5);
+        assert_eq!(
+            snapshot.backend_views[0].pending_count,
+            crate::metrics::PendingRequests::new(5)
+        );
+        assert_eq!(
+            snapshot.metrics.in_flight_requests,
+            crate::metrics::PendingRequests::new(5)
+        );
     }
 
     #[test]

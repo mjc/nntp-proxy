@@ -4,7 +4,7 @@
 
 use nntp_proxy::cache::MAX_BACKENDS;
 use nntp_proxy::constants::user::ANONYMOUS;
-use nntp_proxy::metrics::{BackendHealthStatus, MetricsCollector};
+use nntp_proxy::metrics::{BackendHealthStatus, MetricsCollector, StatefulSessions};
 use nntp_proxy::types::{BackendId, MetricsBytes, Unrecorded};
 
 /// Test `MetricsCollector` creation
@@ -58,27 +58,27 @@ fn test_stateful_session_tracking() {
     let collector = MetricsCollector::new(1);
 
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.stateful_sessions, 0);
+    assert_eq!(snapshot.stateful_sessions, StatefulSessions::ZERO);
 
     // Start session
     collector.stateful_session_started();
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.stateful_sessions, 1);
+    assert_eq!(snapshot.stateful_sessions, StatefulSessions::new(1));
 
     // Start another
     collector.stateful_session_started();
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.stateful_sessions, 2);
+    assert_eq!(snapshot.stateful_sessions, StatefulSessions::new(2));
 
     // End one
     collector.stateful_session_ended();
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.stateful_sessions, 1);
+    assert_eq!(snapshot.stateful_sessions, StatefulSessions::new(1));
 
     // End another
     collector.stateful_session_ended();
     let snapshot = collector.snapshot(None);
-    assert_eq!(snapshot.stateful_sessions, 0);
+    assert_eq!(snapshot.stateful_sessions, StatefulSessions::ZERO);
 }
 
 /// Test command recording for backends

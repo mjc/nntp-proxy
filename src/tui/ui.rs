@@ -1,16 +1,23 @@
 //! TUI rendering and layout
 
 use crate::formatting::format_bytes_into;
+use crate::metrics::{
+    ActiveConnections, ArticleCount, CacheEntries, CommandCount, DiskHits, DiskReadIos,
+    DiskWriteIos, ErrorCount, FailureCount, PendingRequests, PipelineBatches, PipelineCommands,
+    PipelineRequestsCompleted, PipelineRequestsQueued, StatefulSessions, UserActiveConnections,
+};
 use crate::tui::RemoteDashboardStatus;
 use crate::tui::constants::{chart, layout, styles, text};
 use crate::tui::dashboard::{
-    BufferPoolStats, DashboardMetrics, DashboardState, DashboardUserStats,
+    AvailableBuffers, BufferPoolStats, DashboardMetrics, DashboardState, DashboardUserStats,
+    InUseBuffers, TotalBuffers,
 };
 use crate::tui::helpers::{
     build_chart_data, calculate_chart_bounds, connection_failure_color, create_sparkline_text,
     error_count_color, error_rate_color, format_summary_throughput, format_throughput_label,
     health_indicator,
 };
+use crate::types::MaxConnections;
 use arrayvec::ArrayString;
 use ratatui::{
     Frame,
@@ -30,17 +37,61 @@ use crate::formatting::format_bytes;
 use crate::tui::helpers::{create_sparkline, format_error_rate};
 
 #[allow(clippy::cast_precision_loss)] // Chart labels and percentages are presentation-only values.
-const fn counter_as_f64(value: u64) -> f64 {
+fn counter_as_f64(value: impl UiCount) -> f64 {
     // These chart labels and percentages are display-only aggregates; the
     // underlying pipeline counters remain exact integers in the snapshot.
-    value as f64
+    value.as_count() as f64
 }
 
 #[allow(clippy::cast_precision_loss)] // Pool utilization is displayed as a percentage in the UI.
-const fn size_as_f64(value: usize) -> f64 {
+fn size_as_f64(value: impl UiCount) -> f64 {
     // Pool utilization is presented as a percentage in the UI, not used for control flow.
-    value as f64
+    value.as_count() as f64
 }
+
+trait UiCount: Copy {
+    fn as_count(self) -> u64;
+
+    #[inline]
+    fn is_zero(self) -> bool {
+        self.as_count() == 0
+    }
+}
+
+macro_rules! ui_count_type {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl UiCount for $ty {
+                #[inline]
+                fn as_count(self) -> u64 {
+                    self.get() as u64
+                }
+            }
+        )+
+    };
+}
+
+ui_count_type!(
+    ActiveConnections,
+    ArticleCount,
+    AvailableBuffers,
+    CacheEntries,
+    CommandCount,
+    DiskHits,
+    DiskReadIos,
+    DiskWriteIos,
+    ErrorCount,
+    FailureCount,
+    InUseBuffers,
+    PendingRequests,
+    PipelineBatches,
+    PipelineCommands,
+    PipelineRequestsCompleted,
+    PipelineRequestsQueued,
+    StatefulSessions,
+    TotalBuffers,
+    UserActiveConnections,
+);
 
 // ============================================================================
 // Widget Creation Helpers (Pure Functions)
@@ -795,15 +846,17 @@ fn render_app_summary_panel(
         }
     }
 
-    fn session_color(count: usize) -> Color {
-        if count > 0 {
+    fn session_color(count: impl UiCount) -> Color {
+        if !count.is_zero() {
             styles::VALUE_PRIMARY
         } else {
             styles::VALUE_NEUTRAL
         }
     }
 
-    fn buffer_color(in_use: usize, total: usize) -> Color {
+    fn buffer_color(in_use: impl UiCount, total: impl UiCount) -> Color {
+        let in_use = in_use.as_count();
+        let total = total.as_count();
         let percent = (in_use * 100).checked_div(total).unwrap_or_default();
         if percent > 80 {
             Color::Red
@@ -836,7 +889,7 @@ fn render_app_summary_panel(
         Style::default().fg(styles::VALUE_PRIMARY),
     );
 
-    let stateful = count_usize_text(metrics.stateful_sessions);
+    let stateful = count_text(metrics.stateful_sessions);
     render_label_value_row(
         buffer,
         inner,
@@ -910,7 +963,7 @@ fn render_app_summary_panel(
         Style::default().fg(styles::VALUE_INFO),
     );
 
-    if metrics.pipeline_batches > 0 {
+    if !metrics.pipeline_batches.is_zero() {
         let avg_batch =
             counter_as_f64(metrics.pipeline_commands) / counter_as_f64(metrics.pipeline_batches);
         let mut text = ArrayString::<64>::new();
@@ -930,7 +983,7 @@ fn render_app_summary_panel(
         );
     }
 
-    if metrics.pipeline_requests_queued > 0 {
+    if !metrics.pipeline_requests_queued.is_zero() {
         let mut text = ArrayString::<64>::new();
         let _ = write!(
             &mut text,
@@ -949,8 +1002,8 @@ fn render_app_summary_panel(
     }
 
     if show_details && let Some(pool) = buffer_pool {
-        let usage_percent = if pool.total > 0 {
-            size_as_f64(pool.in_use * 100) / size_as_f64(pool.total)
+        let usage_percent = if !pool.total.is_zero() {
+            size_as_f64(pool.in_use) * 100.0 / size_as_f64(pool.total)
         } else {
             0.0
         };
@@ -973,8 +1026,8 @@ fn render_app_summary_panel(
 }
 
 fn render_cache_summary_panel(f: &mut Frame, area: Rect, metrics: &DashboardMetrics) {
-    const fn entries_color(count: u64) -> Color {
-        if count > 0 {
+    fn entries_color(count: impl UiCount) -> Color {
+        if !count.is_zero() {
             styles::VALUE_INFO
         } else {
             styles::VALUE_NEUTRAL
@@ -991,8 +1044,8 @@ fn render_cache_summary_panel(f: &mut Frame, area: Rect, metrics: &DashboardMetr
         }
     }
 
-    const fn non_zero_color(value: u64) -> Color {
-        if value > 0 {
+    fn non_zero_color(value: impl Into<u64>) -> Color {
+        if value.into() > 0 {
             styles::VALUE_INFO
         } else {
             styles::VALUE_NEUTRAL
@@ -1249,15 +1302,17 @@ fn build_app_summary_lines(
         }
     }
 
-    fn session_color(count: usize) -> Color {
-        if count > 0 {
+    fn session_color(count: impl UiCount) -> Color {
+        if !count.is_zero() {
             styles::VALUE_PRIMARY
         } else {
             styles::VALUE_NEUTRAL
         }
     }
 
-    fn buffer_color(in_use: usize, total: usize) -> Color {
+    fn buffer_color(in_use: impl UiCount, total: impl UiCount) -> Color {
+        let in_use = in_use.as_count();
+        let total = total.as_count();
         let percent = (in_use * 100).checked_div(total).unwrap_or_default();
         if percent > 80 {
             Color::Red
@@ -1312,7 +1367,7 @@ fn build_app_summary_lines(
         format!("{} requests", metrics.in_flight_requests).fg(styles::VALUE_INFO),
     ]));
 
-    if metrics.pipeline_batches > 0 {
+    if !metrics.pipeline_batches.is_zero() {
         let avg_batch =
             counter_as_f64(metrics.pipeline_commands) / counter_as_f64(metrics.pipeline_batches);
         lines.push(Line::from(vec![
@@ -1325,7 +1380,7 @@ fn build_app_summary_lines(
         ]));
     }
 
-    if metrics.pipeline_requests_queued > 0 {
+    if !metrics.pipeline_requests_queued.is_zero() {
         lines.push(Line::from(vec![
             "Mux Totals: ".fg(styles::LABEL),
             format!(
@@ -1337,8 +1392,8 @@ fn build_app_summary_lines(
     }
 
     if show_details && let Some(pool) = buffer_pool {
-        let usage_percent = if pool.total > 0 {
-            size_as_f64(pool.in_use * 100) / size_as_f64(pool.total)
+        let usage_percent = if !pool.total.is_zero() {
+            size_as_f64(pool.in_use) * 100.0 / size_as_f64(pool.total)
         } else {
             0.0
         };
@@ -1497,11 +1552,7 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
             &mut x,
             y,
             right,
-            connections_used_max_text(
-                backend.active_connections.get(),
-                server.max_connections.get(),
-            )
-            .as_str(),
+            connections_used_max_text(backend.active_connections, server.max_connections).as_str(),
             Style::default().fg(styles::VALUE_SECONDARY),
         );
         write_part(
@@ -1651,7 +1702,7 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
             &mut x,
             y,
             right,
-            count_text(backend_stats.article_count.get()).as_str(),
+            count_text(backend_stats.article_count).as_str(),
             Style::default().fg(styles::VALUE_NEUTRAL),
         );
         row = row.saturating_add(1);
@@ -1674,12 +1725,8 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
             &mut x,
             y,
             right,
-            error_counts_text(
-                backend_stats.errors_4xx.get(),
-                backend_stats.errors_5xx.get(),
-            )
-            .as_str(),
-            Style::default().fg(error_count_color(!backend_stats.errors.is_zero())),
+            error_counts_text(backend_stats.errors_4xx, backend_stats.errors_5xx).as_str(),
+            Style::default().fg(error_count_color(backend_stats.errors)),
         );
         write_part(
             buffer,
@@ -1694,10 +1741,8 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
             &mut x,
             y,
             right,
-            count_text(backend_stats.connection_failures.get()).as_str(),
-            Style::default().fg(connection_failure_color(
-                backend_stats.connection_failures.get(),
-            )),
+            count_text(backend_stats.connection_failures).as_str(),
+            Style::default().fg(connection_failure_color(backend_stats.connection_failures)),
         );
         row = row.saturating_add(1);
 
@@ -1759,25 +1804,19 @@ fn bytes_text(bytes: u64) -> ArrayString<32> {
     text
 }
 
-fn count_text(count: u64) -> ArrayString<32> {
+fn count_text(count: impl UiCount) -> ArrayString<32> {
     let mut text = ArrayString::<32>::new();
-    let _ = write!(&mut text, "{count}");
+    let _ = write!(&mut text, "{}", count.as_count());
     text
 }
 
-fn count_usize_text(count: usize) -> ArrayString<32> {
+fn connections_used_max_text(used: ActiveConnections, max: MaxConnections) -> ArrayString<32> {
     let mut text = ArrayString::<32>::new();
-    let _ = write!(&mut text, "{count}");
+    let _ = write!(&mut text, "{used}/{}", max.get());
     text
 }
 
-fn connections_used_max_text(used: usize, max: usize) -> ArrayString<32> {
-    let mut text = ArrayString::<32>::new();
-    let _ = write!(&mut text, "{used}/{max}");
-    text
-}
-
-fn error_counts_text(errors_4xx: u64, errors_5xx: u64) -> ArrayString<48> {
+fn error_counts_text(errors_4xx: ErrorCount, errors_5xx: ErrorCount) -> ArrayString<48> {
     let mut text = ArrayString::<48>::new();
     let _ = write!(&mut text, "4xx:{errors_4xx} 5xx:{errors_5xx}");
     text
@@ -1788,12 +1827,12 @@ fn write_backend_details(
     x: &mut u16,
     y: u16,
     right: u16,
-    pending: usize,
-    stateful: usize,
+    pending: PendingRequests,
+    stateful: StatefulSessions,
 ) {
     let style = Style::default().fg(styles::LABEL);
 
-    if stateful > 0 {
+    if !stateful.is_zero() {
         write_part(buffer, x, y, right, "  Stateful: ", style);
         write_fmt_part::<32>(buffer, x, y, right, format_args!("{stateful}"), style);
         write_part(buffer, x, y, right, " | ", style);
@@ -1823,9 +1862,9 @@ fn user_name_text(username: &str) -> ArrayString<64> {
     text
 }
 
-fn active_connections_text(count: usize) -> ArrayString<16> {
+fn active_connections_text(count: impl UiCount) -> ArrayString<16> {
     let mut text = ArrayString::<16>::new();
-    let _ = write!(&mut text, "{count:>5}");
+    let _ = write!(&mut text, "{:>5}", count.as_count());
     text
 }
 
@@ -1844,10 +1883,10 @@ fn rate_text(prefix: &str, bytes_per_sec: u64) -> ArrayString<40> {
 }
 
 #[cfg(test)]
-fn backend_details_text(pending: usize, stateful: usize) -> String {
+fn backend_details_text(pending: PendingRequests, stateful: StatefulSessions) -> String {
     let mut text = String::new();
 
-    if stateful > 0 {
+    if !stateful.is_zero() {
         text.push_str(&format!("  Stateful: {stateful} | "));
     }
 
@@ -1894,10 +1933,7 @@ fn backend_row_texts(state: &DashboardState, show_details: bool) -> Vec<String> 
         });
         rows.push(format!(
             "  Used/Max: {}/{} | Cmd/s: {} | TTFB: {}",
-            backend.active_connections,
-            server.max_connections.get(),
-            cmd_per_sec,
-            ttfb
+            backend.active_connections, server.max_connections, cmd_per_sec, ttfb
         ));
         rows.push(format!(
             "  {} {}  {} {}",
@@ -1909,13 +1945,12 @@ fn backend_row_texts(state: &DashboardState, show_details: bool) -> Vec<String> 
         rows.push(format!(
             "  Avg Article: {} | Articles: {}",
             avg_size,
-            backend_stats.article_count.get()
+            count_text(backend_stats.article_count).as_str()
         ));
         rows.push(format!(
-            "  Errors: 4xx:{} 5xx:{} | Conn Fails: {}",
-            backend_stats.errors_4xx.get(),
-            backend_stats.errors_5xx.get(),
-            backend_stats.connection_failures.get()
+            "  Errors: {} | Conn Fails: {}",
+            error_counts_text(backend_stats.errors_4xx, backend_stats.errors_5xx).as_str(),
+            count_text(backend_stats.connection_failures).as_str()
         ));
 
         if show_details {
@@ -2272,7 +2307,7 @@ fn render_user_stats(f: &mut Frame, area: Rect, top_users: &[DashboardUserStats]
             &mut x,
             y,
             right,
-            active_connections_text(user.active_connections.get()).as_str(),
+            active_connections_text(user.active_connections).as_str(),
             Style::default().fg(Color::Green),
         );
         row = row.saturating_add(1);
@@ -2419,9 +2454,9 @@ mod tests {
             show_details: false,
             log_lines: vec!["line".to_string()],
             buffer_pool: Some(BufferPoolStats {
-                available: 3,
-                in_use: 1,
-                total: 4,
+                available: crate::tui::dashboard::AvailableBuffers::new(3),
+                in_use: crate::tui::dashboard::InUseBuffers::new(1),
+                total: crate::tui::dashboard::TotalBuffers::new(4),
             }),
         };
 
@@ -2487,9 +2522,9 @@ mod tests {
         let metrics = DashboardMetrics::default();
         let system_stats = crate::tui::SystemStats::default();
         let buffer_pool = BufferPoolStats {
-            available: 3,
-            in_use: 2,
-            total: 5,
+            available: crate::tui::dashboard::AvailableBuffers::new(3),
+            in_use: crate::tui::dashboard::InUseBuffers::new(2),
+            total: crate::tui::dashboard::TotalBuffers::new(5),
         };
 
         let local_lines =
@@ -2626,7 +2661,7 @@ mod tests {
 
     #[test]
     fn backend_details_line_includes_pending_and_stateful_counts() {
-        let details = backend_details_text(4, 1);
+        let details = backend_details_text(PendingRequests::new(4), StatefulSessions::new(1));
 
         assert!(details.contains("Stateful: 1"));
         assert!(details.contains("Pending: 4"));
@@ -2639,17 +2674,36 @@ mod tests {
         assert_eq!(error_rate_text(1.2).as_str(), format_error_rate(1.2));
         assert_eq!(error_rate_text(7.8).as_str(), format_error_rate(7.8));
         assert_eq!(bytes_text(29_312_178).as_str(), format_bytes(29_312_178));
-        assert_eq!(count_text(42).as_str(), "42");
-        assert_eq!(count_usize_text(42).as_str(), "42");
-        assert_eq!(connections_used_max_text(3, 10).as_str(), "3/10");
-        assert_eq!(error_counts_text(4, 5).as_str(), "4xx:4 5xx:5");
+        assert_eq!(
+            count_text(crate::metrics::CommandCount::new(42)).as_str(),
+            "42"
+        );
+        assert_eq!(
+            connections_used_max_text(
+                crate::metrics::ActiveConnections::new(3),
+                crate::types::MaxConnections::try_new(10).unwrap(),
+            )
+            .as_str(),
+            "3/10"
+        );
+        assert_eq!(
+            error_counts_text(
+                crate::metrics::ErrorCount::new(4),
+                crate::metrics::ErrorCount::new(5),
+            )
+            .as_str(),
+            "4xx:4 5xx:5"
+        );
     }
 
     #[test]
     fn user_stats_stack_formatters_match_owned_display_text() {
         assert_eq!(user_name_text("alice").as_str(), format!("{:<12}", "alice"));
         assert_eq!(user_name_text("averylongusername").as_str(), "averylong...");
-        assert_eq!(active_connections_text(7).as_str(), format!("{:>5}", 7));
+        assert_eq!(
+            active_connections_text(crate::metrics::UserActiveConnections::new(7)).as_str(),
+            format!("{:>5}", 7)
+        );
         assert_eq!(
             padded_bytes_text(29_312_178).as_str(),
             format!("{:>8}", format_bytes(29_312_178))
@@ -2720,9 +2774,9 @@ mod tests {
             stats: BackendStats::default(),
             active_connections: crate::metrics::ActiveConnections::new(0),
             health_status: BackendHealthStatus::Healthy,
-            pending_count: 0,
+            pending_count: crate::metrics::PendingRequests::ZERO,
             load_ratio: None,
-            stateful_count: 0,
+            stateful_count: crate::metrics::StatefulSessions::ZERO,
             traffic_share: None,
             history: Vec::new(),
         }
@@ -2751,7 +2805,7 @@ mod tests {
                 " ".into(),
                 create_sparkline(user.total_bytes(), user.total_bytes()).fg(Color::Blue),
                 " ".into(),
-                format!("{:>5}", user.active_connections.get()).fg(Color::Green),
+                format!("{:>5}", user.active_connections.as_count()).fg(Color::Green),
             ]),
             Line::from(vec![
                 "  ↑".into(),

@@ -1,6 +1,10 @@
 //! Lock-free metrics collector
 
 use super::store::{BackendStore, MetricsStore, UserMetrics};
+use super::types::{
+    CacheEntries, DiskHits, DiskReadIos, DiskWriteIos, PipelineBatches, PipelineCommands,
+    PipelineRequestsCompleted, PipelineRequestsQueued, StatefulSessions,
+};
 use super::{BackendHealthStatus, BackendStats, MetricsSnapshot, UserStats};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use std::path::Path;
@@ -496,18 +500,23 @@ impl MetricsCollector {
             .sum();
 
         let (cache_entries, cache_size_bytes, cache_hit_rate, disk_cache) =
-            cache.map_or((0, 0, 0.0, None), |c| {
+            cache.map_or((CacheEntries::ZERO, 0, 0.0, None), |c| {
                 let stats = c.display_stats();
                 let disk = stats.disk.map(|d| super::snapshot::DiskCacheStats {
-                    disk_hits: d.disk_hits,
+                    disk_hits: DiskHits::new(d.disk_hits),
                     disk_hit_rate: d.disk_hit_rate,
                     disk_capacity: d.capacity,
                     bytes_written: d.bytes_written,
                     bytes_read: d.bytes_read,
-                    write_ios: d.write_ios,
-                    read_ios: d.read_ios,
+                    write_ios: DiskWriteIos::new(d.write_ios),
+                    read_ios: DiskReadIos::new(d.read_ios),
                 });
-                (stats.entry_count, stats.size_bytes, stats.hit_rate, disk)
+                (
+                    CacheEntries::new(stats.entry_count),
+                    stats.size_bytes,
+                    stats.hit_rate,
+                    disk,
+                )
             });
 
         MetricsSnapshot {
@@ -517,7 +526,9 @@ impl MetricsCollector {
             active_connections: super::types::ActiveConnections::new(
                 self.inner.active_connections.load(Ordering::Relaxed),
             ),
-            stateful_sessions: self.inner.stateful_sessions.load(Ordering::Relaxed),
+            stateful_sessions: StatefulSessions::new(
+                self.inner.stateful_sessions.load(Ordering::Relaxed),
+            ),
             client_to_backend_bytes: ClientToBackendBytes::new(total_sent),
             backend_to_client_bytes: BackendToClientBytes::new(total_received),
             uptime: self.inner.start_time.elapsed(),
@@ -527,18 +538,24 @@ impl MetricsCollector {
             cache_size_bytes,
             cache_hit_rate,
             disk_cache,
-            pipeline_batches: self.inner.store.pipeline_batches.load(Ordering::Relaxed),
-            pipeline_commands: self.inner.store.pipeline_commands.load(Ordering::Relaxed),
-            pipeline_requests_queued: self
-                .inner
-                .store
-                .pipeline_requests_queued
-                .load(Ordering::Relaxed),
-            pipeline_requests_completed: self
-                .inner
-                .store
-                .pipeline_requests_completed
-                .load(Ordering::Relaxed),
+            pipeline_batches: PipelineBatches::new(
+                self.inner.store.pipeline_batches.load(Ordering::Relaxed),
+            ),
+            pipeline_commands: PipelineCommands::new(
+                self.inner.store.pipeline_commands.load(Ordering::Relaxed),
+            ),
+            pipeline_requests_queued: PipelineRequestsQueued::new(
+                self.inner
+                    .store
+                    .pipeline_requests_queued
+                    .load(Ordering::Relaxed),
+            ),
+            pipeline_requests_completed: PipelineRequestsCompleted::new(
+                self.inner
+                    .store
+                    .pipeline_requests_completed
+                    .load(Ordering::Relaxed),
+            ),
         }
     }
 
@@ -682,13 +699,22 @@ mod tests {
         let collector = MetricsCollector::new(1);
 
         collector.stateful_session_started();
-        assert_eq!(collector.snapshot(None).stateful_sessions, 1);
+        assert_eq!(
+            collector.snapshot(None).stateful_sessions,
+            StatefulSessions::new(1)
+        );
 
         collector.stateful_session_started();
-        assert_eq!(collector.snapshot(None).stateful_sessions, 2);
+        assert_eq!(
+            collector.snapshot(None).stateful_sessions,
+            StatefulSessions::new(2)
+        );
 
         collector.stateful_session_ended();
-        assert_eq!(collector.snapshot(None).stateful_sessions, 1);
+        assert_eq!(
+            collector.snapshot(None).stateful_sessions,
+            StatefulSessions::new(1)
+        );
     }
 
     #[test]

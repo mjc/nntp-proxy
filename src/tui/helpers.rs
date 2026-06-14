@@ -6,6 +6,7 @@ use ratatui::style::Color;
 use super::constants::{BACKEND_COLORS, throughput};
 use super::dashboard::BackendView;
 use super::types::{BackendChartData, ChartDataVec, ChartPoint, ChartX, ChartY, PointVec};
+use crate::metrics::{ErrorCount, FailureCount};
 use crate::tui::app::ThroughputPoint;
 
 // ============================================================================
@@ -247,9 +248,9 @@ pub const fn error_rate_color(rate: f64) -> Color {
 
 /// Color for error count
 #[must_use]
-pub const fn error_count_color(has_errors: bool) -> Color {
+pub const fn error_count_color(errors: ErrorCount) -> Color {
     use super::constants::styles;
-    if has_errors {
+    if !errors.is_zero() {
         Color::Yellow
     } else {
         styles::VALUE_NEUTRAL
@@ -258,9 +259,9 @@ pub const fn error_count_color(has_errors: bool) -> Color {
 
 /// Color for connection failures
 #[must_use]
-pub const fn connection_failure_color(failures: u64) -> Color {
+pub fn connection_failure_color(failures: FailureCount) -> Color {
     use super::constants::styles;
-    if failures > 0 {
+    if !failures.is_zero() {
         Color::Red
     } else {
         styles::VALUE_NEUTRAL

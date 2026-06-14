@@ -8,7 +8,11 @@
 // Snapshot rates are presentation/monitoring values, and the tests exercise
 // exact deterministic fixtures rather than fuzzy comparisons.
 
-use super::types::{ActiveConnections, BackendHealthStatus, ErrorRatePercent};
+use super::types::{
+    ActiveConnections, BackendHealthCounts, BackendHealthStatus, CacheEntries, DiskHits,
+    DiskReadIos, DiskWriteIos, ErrorRatePercent, PipelineBatches, PipelineCommands,
+    PipelineRequestsCompleted, PipelineRequestsQueued, StatefulSessions,
+};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes, TotalConnections};
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,7 +39,7 @@ pub struct MetricsSnapshot {
     #[serde(skip, default)]
     pub active_connections: ActiveConnections,
     #[serde(skip, default)]
-    pub stateful_sessions: usize,
+    pub stateful_sessions: StatefulSessions,
     pub client_to_backend_bytes: ClientToBackendBytes,
     pub backend_to_client_bytes: BackendToClientBytes,
     #[serde(skip, default)]
@@ -43,7 +47,7 @@ pub struct MetricsSnapshot {
     pub backend_stats: Arc<[BackendStats]>,
     pub user_stats: Vec<UserStats>,
     #[serde(skip, default)]
-    pub cache_entries: u64,
+    pub cache_entries: CacheEntries,
     #[serde(skip, default)]
     pub cache_size_bytes: u64,
     #[serde(skip, default)]
@@ -52,20 +56,20 @@ pub struct MetricsSnapshot {
     #[serde(skip, default)]
     pub disk_cache: Option<DiskCacheStats>,
     /// Number of pipelined batches (batches with >1 command)
-    pub pipeline_batches: u64,
+    pub pipeline_batches: PipelineBatches,
     /// Total commands processed in pipelined batches
-    pub pipeline_commands: u64,
+    pub pipeline_commands: PipelineCommands,
     /// Total requests enqueued to backend pipeline queues
-    pub pipeline_requests_queued: u64,
+    pub pipeline_requests_queued: PipelineRequestsQueued,
     /// Total requests completed via backend pipeline
-    pub pipeline_requests_completed: u64,
+    pub pipeline_requests_completed: PipelineRequestsCompleted,
 }
 
 /// Disk cache statistics for hybrid cache mode
 #[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
 pub struct DiskCacheStats {
     /// Number of cache hits from disk tier
-    pub disk_hits: u64,
+    pub disk_hits: DiskHits,
     /// Disk hit rate (percentage of hits served from disk vs total hits)
     pub disk_hit_rate: f64,
     /// Configured disk cache capacity in bytes
@@ -75,9 +79,9 @@ pub struct DiskCacheStats {
     /// Bytes read from disk (from foyer statistics)
     pub bytes_read: u64,
     /// Number of write I/O operations
-    pub write_ios: u64,
+    pub write_ios: DiskWriteIos,
     /// Number of read I/O operations
-    pub read_ios: u64,
+    pub read_ios: DiskReadIos,
 }
 
 impl MetricsSnapshot {
@@ -216,17 +220,21 @@ impl MetricsSnapshot {
 
     /// Count backends by health status
     ///
-    /// Returns (healthy, degraded, down) counts.
+    /// Returns typed counts for healthy, degraded, and down backends.
     /// This is a pure calculation using iterator composition.
     #[must_use]
-    pub fn backend_health_counts(&self) -> (usize, usize, usize) {
-        self.backend_stats
-            .iter()
-            .fold((0, 0, 0), |(h, d, dn), stats| match stats.health_status {
-                BackendHealthStatus::Healthy => (h + 1, d, dn),
-                BackendHealthStatus::Degraded => (h, d + 1, dn),
-                BackendHealthStatus::Down => (h, d, dn + 1),
-            })
+    pub fn backend_health_counts(&self) -> BackendHealthCounts {
+        let mut counts = BackendHealthCounts::default();
+
+        for stats in self.backend_stats.iter() {
+            match stats.health_status {
+                BackendHealthStatus::Healthy => counts.healthy.increment(),
+                BackendHealthStatus::Degraded => counts.degraded.increment(),
+                BackendHealthStatus::Down => counts.down.increment(),
+            }
+        }
+
+        counts
     }
 }
 
@@ -234,7 +242,8 @@ impl MetricsSnapshot {
 mod tests {
     use super::*;
     use crate::metrics::{
-        ArticleCount, CommandCount, ErrorCount, FailureCount, RecvMicros, SendMicros, TtfbMicros,
+        ArticleCount, BackendHealthCount, CommandCount, ErrorCount, FailureCount, RecvMicros,
+        SendMicros, TtfbMicros,
     };
     use crate::types::BackendId;
 
@@ -282,20 +291,20 @@ mod tests {
         MetricsSnapshot {
             total_connections: TotalConnections::new(5),
             active_connections: ActiveConnections::new(5),
-            stateful_sessions: 2,
+            stateful_sessions: StatefulSessions::new(2),
             client_to_backend_bytes: ClientToBackendBytes::new(1500),
             backend_to_client_bytes: BackendToClientBytes::new(3500),
             uptime: Duration::from_secs(60 * 60),
             backend_stats: vec![backend1, backend2].into(),
             user_stats: vec![],
-            cache_entries: 0,
+            cache_entries: CacheEntries::ZERO,
             cache_size_bytes: 0,
             cache_hit_rate: 0.0,
             disk_cache: None,
-            pipeline_batches: 0,
-            pipeline_commands: 0,
-            pipeline_requests_queued: 0,
-            pipeline_requests_completed: 0,
+            pipeline_batches: PipelineBatches::ZERO,
+            pipeline_commands: PipelineCommands::ZERO,
+            pipeline_requests_queued: PipelineRequestsQueued::ZERO,
+            pipeline_requests_completed: PipelineRequestsCompleted::ZERO,
         }
     }
 
@@ -466,10 +475,10 @@ mod tests {
     #[test]
     fn test_backend_health_counts() {
         let snapshot = create_test_snapshot();
-        let (healthy, degraded, down) = snapshot.backend_health_counts();
-        assert_eq!(healthy, 1);
-        assert_eq!(degraded, 1);
-        assert_eq!(down, 0);
+        let counts = snapshot.backend_health_counts();
+        assert_eq!(counts.healthy, BackendHealthCount::new(1));
+        assert_eq!(counts.degraded, BackendHealthCount::new(1));
+        assert_eq!(counts.down, BackendHealthCount::ZERO);
     }
 
     #[test]
@@ -497,19 +506,19 @@ mod tests {
             ..Default::default()
         };
 
-        let (healthy, degraded, down) = snapshot.backend_health_counts();
-        assert_eq!(healthy, 2);
-        assert_eq!(degraded, 0);
-        assert_eq!(down, 1);
+        let counts = snapshot.backend_health_counts();
+        assert_eq!(counts.healthy, BackendHealthCount::new(2));
+        assert_eq!(counts.degraded, BackendHealthCount::ZERO);
+        assert_eq!(counts.down, BackendHealthCount::new(1));
     }
 
     #[test]
     fn test_backend_health_counts_empty() {
         let snapshot = MetricsSnapshot::default();
-        let (healthy, degraded, down) = snapshot.backend_health_counts();
-        assert_eq!(healthy, 0);
-        assert_eq!(degraded, 0);
-        assert_eq!(down, 0);
+        let counts = snapshot.backend_health_counts();
+        assert_eq!(counts.healthy, BackendHealthCount::ZERO);
+        assert_eq!(counts.degraded, BackendHealthCount::ZERO);
+        assert_eq!(counts.down, BackendHealthCount::ZERO);
     }
 
     #[test]
@@ -549,7 +558,7 @@ mod tests {
         let snapshot = MetricsSnapshot::default();
         assert_eq!(snapshot.total_connections, TotalConnections::ZERO);
         assert_eq!(snapshot.active_connections, ActiveConnections::ZERO);
-        assert_eq!(snapshot.stateful_sessions, 0);
+        assert_eq!(snapshot.stateful_sessions, StatefulSessions::ZERO);
         assert_eq!(snapshot.total_bytes(), 0);
         assert_eq!(snapshot.uptime, Duration::from_secs(0));
         assert_eq!(snapshot.backend_stats.len(), 0);
