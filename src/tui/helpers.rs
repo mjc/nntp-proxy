@@ -392,8 +392,8 @@ mod tests {
     #[test]
     fn test_chart_data_vec_type() {
         // Verify ChartDataVec can hold typical backend count on stack
-        let mut chart_data = ChartDataVec::new();
         let names: Vec<String> = (0..8).map(|i| format!("Server {i}")).collect();
+        let mut chart_data = ChartDataVec::new();
 
         // Add 8 backends (at SmallVec capacity)
         for (i, name) in names.iter().enumerate() {

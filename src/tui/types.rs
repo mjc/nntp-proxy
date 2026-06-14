@@ -236,12 +236,7 @@ mod tests {
         sent_points.push(ChartPoint::new(ChartX::new(0.0), ChartY::new(100.0)));
         sent_points.push(ChartPoint::new(ChartX::new(1.0), ChartY::new(200.0)));
 
-        let data = BackendChartData::new(
-            "Test".to_string(),
-            Color::Green,
-            &sent_points,
-            &PointVec::new(),
-        );
+        let data = BackendChartData::new("Test", Color::Green, &sent_points, &PointVec::new());
 
         let tuples = data.sent_points_as_tuples();
         assert_eq!(tuples.len(), 2);

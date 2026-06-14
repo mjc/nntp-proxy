@@ -26,11 +26,11 @@ use ratatui::{
     style::{Color, Modifier, Style, Stylize},
     symbols,
     text::{Line, Span},
-    widgets::{Axis, Block, Chart, Dataset, GraphType, Paragraph, Wrap},
+    widgets::{Axis, Block, Chart, Dataset, GraphType},
 };
-use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::LazyLock;
+use unicode_width::UnicodeWidthChar;
 
 #[cfg(test)]
 use crate::formatting::format_bytes;
@@ -2123,39 +2123,14 @@ fn render_snapshot_logs(
     fetch_count: usize,
     show_details: bool,
 ) {
-    if show_details {
-        let paragraph = Paragraph::new(recent_log_text_lines(log_lines, fetch_count))
-            .style(Style::default().fg(Color::Gray))
-            .block(bordered_block(" Recent Logs ", styles::BORDER_ACTIVE))
-            .wrap(Wrap { trim: false });
-        f.render_widget(paragraph, area);
-        return;
-    }
-
-    let block = bordered_block(" Recent Logs ", styles::BORDER_ACTIVE);
-    let inner = block.inner(area);
-    f.render_widget(block, area);
-
-    if inner.width == 0 || inner.height == 0 {
-        return;
-    }
-
-    for (row, line) in recent_log_lines(log_lines, fetch_count)
-        .iter()
-        .take(inner.height as usize)
-        .enumerate()
-    {
-        let rendered = Line::from(Span::styled(
-            line.as_str(),
-            Style::default().fg(Color::Gray),
-        ));
-        f.buffer_mut().set_line(
-            inner.left(),
-            inner.top().saturating_add(row as u16),
-            &rendered,
-            inner.width,
-        );
-    }
+    render_recent_log_lines(
+        f,
+        area,
+        recent_log_lines(log_lines, fetch_count)
+            .iter()
+            .map(String::as_str),
+        show_details,
+    );
 }
 
 fn render_buffer_logs(
@@ -2166,41 +2141,123 @@ fn render_buffer_logs(
     show_details: bool,
 ) {
     let _ = log_buffer.with_recent_lines(fetch_count, |lines, skip| {
-        if show_details {
-            let paragraph = Paragraph::new(recent_log_text_lines_from_deque(lines, skip))
-                .style(Style::default().fg(Color::Gray))
-                .block(bordered_block(" Recent Logs ", styles::BORDER_ACTIVE))
-                .wrap(Wrap { trim: false });
-            f.render_widget(paragraph, area);
-            return;
-        }
-
-        let block = bordered_block(" Recent Logs ", styles::BORDER_ACTIVE);
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-
-        if inner.width == 0 || inner.height == 0 {
-            return;
-        }
-
-        for (row, line) in lines
-            .iter()
-            .skip(skip)
-            .take(inner.height as usize)
-            .enumerate()
-        {
-            let rendered = Line::from(Span::styled(
-                line.as_str(),
-                Style::default().fg(Color::Gray),
-            ));
-            f.buffer_mut().set_line(
-                inner.left(),
-                inner.top().saturating_add(row as u16),
-                &rendered,
-                inner.width,
-            );
-        }
+        render_recent_log_lines(
+            f,
+            area,
+            lines.iter().skip(skip).map(String::as_str),
+            show_details,
+        );
     });
+}
+
+fn render_recent_log_lines<'a, I>(f: &mut Frame, area: Rect, lines: I, show_details: bool)
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let block = bordered_block(" Recent Logs ", styles::BORDER_ACTIVE);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let buffer = f.buffer_mut();
+    let style = Style::default().fg(Color::Gray);
+
+    if show_details {
+        render_wrapped_log_lines(buffer, inner, lines, style);
+    } else {
+        render_truncated_log_lines(buffer, inner, lines, style);
+    }
+}
+
+fn render_truncated_log_lines<'a, I>(buffer: &mut Buffer, area: Rect, lines: I, style: Style)
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let width = area.width as usize;
+    for (row, line) in lines.into_iter().take(area.height as usize).enumerate() {
+        buffer.set_stringn(
+            area.left(),
+            area.top().saturating_add(row as u16),
+            line,
+            width,
+            style,
+        );
+    }
+}
+
+fn render_wrapped_log_lines<'a, I>(buffer: &mut Buffer, area: Rect, lines: I, style: Style)
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    let width = area.width as usize;
+    let mut row = 0u16;
+
+    for line in lines {
+        if row >= area.height {
+            break;
+        }
+
+        let mut remaining = line;
+        loop {
+            if row >= area.height {
+                return;
+            }
+
+            let (chunk, rest) = split_display_width_prefix(remaining, width);
+            buffer.set_stringn(
+                area.left(),
+                area.top().saturating_add(row),
+                chunk,
+                width,
+                style,
+            );
+            row = row.saturating_add(1);
+
+            if rest.is_empty() {
+                break;
+            }
+
+            remaining = rest;
+        }
+    }
+}
+
+fn split_display_width_prefix(text: &str, max_width: usize) -> (&str, &str) {
+    if text.is_empty() {
+        return ("", "");
+    }
+
+    if max_width == 0 {
+        return ("", text);
+    }
+
+    let mut width = 0usize;
+    let mut end = 0usize;
+
+    for (idx, ch) in text.char_indices() {
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width + ch_width > max_width {
+            if end == 0 {
+                end = idx + ch.len_utf8();
+            }
+            break;
+        }
+
+        width += ch_width;
+        end = idx + ch.len_utf8();
+        if width == max_width {
+            break;
+        }
+    }
+
+    if end == 0 {
+        end = text.len();
+    }
+
+    (&text[..end], &text[end..])
 }
 
 fn render_block_lines(
@@ -2240,17 +2297,10 @@ fn recent_log_lines(lines: &[String], count: usize) -> &[String] {
     &lines[start..]
 }
 
+#[cfg(test)]
 fn recent_log_text_lines(lines: &[String], count: usize) -> Vec<Line<'_>> {
     recent_log_lines(lines, count)
         .iter()
-        .map(|line| Line::from(line.as_str()))
-        .collect()
-}
-
-fn recent_log_text_lines_from_deque(lines: &VecDeque<String>, skip: usize) -> Vec<Line<'_>> {
-    lines
-        .iter()
-        .skip(skip)
         .map(|line| Line::from(line.as_str()))
         .collect()
 }
@@ -2375,6 +2425,7 @@ mod tests {
     use crate::metrics::{CommandCount, ErrorCount};
     use crate::tui::app::ViewMode;
     use crate::tui::dashboard::{BufferPoolStats, DashboardMetrics};
+    use ratatui::buffer::Buffer;
     use ratatui::layout::Rect;
 
     fn user_stats(name: &str, total_bytes: u64) -> DashboardUserStats {
@@ -2433,6 +2484,50 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(rendered, vec!["two".to_string(), "three".to_string()]);
+    }
+
+    #[test]
+    fn split_display_width_prefix_keeps_progress_on_wide_characters() {
+        let (prefix, suffix) = split_display_width_prefix("你好世界", 2);
+
+        assert_eq!(prefix, "你");
+        assert_eq!(suffix, "好世界");
+    }
+
+    #[test]
+    fn render_truncated_log_lines_writes_rows_directly_to_buffer() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 2));
+        render_truncated_log_lines(
+            &mut buffer,
+            Rect::new(0, 0, 3, 2),
+            ["abc", "def"],
+            Style::default(),
+        );
+
+        assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "a");
+        assert_eq!(buffer.cell((1, 0)).unwrap().symbol(), "b");
+        assert_eq!(buffer.cell((2, 0)).unwrap().symbol(), "c");
+        assert_eq!(buffer.cell((0, 1)).unwrap().symbol(), "d");
+        assert_eq!(buffer.cell((1, 1)).unwrap().symbol(), "e");
+        assert_eq!(buffer.cell((2, 1)).unwrap().symbol(), "f");
+    }
+
+    #[test]
+    fn render_wrapped_log_lines_wraps_without_building_text() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 2));
+        render_wrapped_log_lines(
+            &mut buffer,
+            Rect::new(0, 0, 3, 2),
+            ["abcdef"],
+            Style::default(),
+        );
+
+        assert_eq!(buffer.cell((0, 0)).unwrap().symbol(), "a");
+        assert_eq!(buffer.cell((1, 0)).unwrap().symbol(), "b");
+        assert_eq!(buffer.cell((2, 0)).unwrap().symbol(), "c");
+        assert_eq!(buffer.cell((0, 1)).unwrap().symbol(), "d");
+        assert_eq!(buffer.cell((1, 1)).unwrap().symbol(), "e");
+        assert_eq!(buffer.cell((2, 1)).unwrap().symbol(), "f");
     }
 
     #[test]
