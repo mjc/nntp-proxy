@@ -75,6 +75,12 @@
           # Code quality & linting
           cargo-deny
           cargo-audit
+          cargo-hack
+          cargo-shear
+          cargo-semver-checks
+          cargo-vet
+          typos
+          zizmor
           shellcheck
           actionlint
 
@@ -82,6 +88,7 @@
           cargo-tarpaulin
           cargo-nextest
           cargo-mutants
+          cargo-careful
 
           # Build & dependencies
           cargo-outdated
@@ -183,6 +190,9 @@
           echo "   ./scripts/build-release.sh <version> - Build all release binaries"
           echo ""
           echo "🔍 Code quality:"
+          echo "   scripts/quality-fast.sh - Fast local/automation checks"
+          echo "   scripts/quality-pr.sh   - PR-equivalent checks"
+          echo "   scripts/quality-deep.sh <suite> - Deep automation checks"
           echo "   cargo deny check  - Check dependencies for security/licenses"
           echo "   cargo audit       - Check for security vulnerabilities"
           echo "   shellcheck scripts/*.sh - Lint shell scripts"

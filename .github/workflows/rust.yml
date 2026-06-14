@@ -5,26 +5,37 @@ on:
     branches:
       - main
     paths:
-      - '**.rs'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'flake.nix'
-      - 'Dockerfile'
-      - 'scripts/check-rust-version.sh'
-      - '.cargo/**'
-      - '.github/workflows/rust.yml'
+      - "**.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "flake.nix"
+      - "deny.toml"
+      - "audit.toml"
+      - "_typos.toml"
+      - ".config/nextest.toml"
+      - ".pre-commit-config.yaml"
+      - "Dockerfile"
+      - "scripts/**"
+      - ".cargo/**"
+      - ".github/workflows/**"
   pull_request:
     paths:
-      - '**.rs'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'flake.nix'
-      - 'Dockerfile'
-      - 'scripts/check-rust-version.sh'
-      - '.cargo/**'
-      - '.github/workflows/rust.yml'
+      - "**.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "flake.nix"
+      - "deny.toml"
+      - "audit.toml"
+      - "_typos.toml"
+      - ".config/nextest.toml"
+      - ".pre-commit-config.yaml"
+      - "Dockerfile"
+      - "scripts/**"
+      - ".cargo/**"
+      - ".github/workflows/**"
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -36,102 +47,196 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
   RUST_MIN_STACK: 8388608
 
+permissions:
+  contents: read
+
 jobs:
-  audit:
+  format:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Read Rust toolchain
+        id: rust-toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          if [ -z "$channel" ]; then
+            echo "Could not read channel from rust-toolchain.toml" >&2
+            exit 1
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --check
 
-    - name: Read Rust toolchain
-      id: rust-toolchain
-      run: |
-        channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
-        if [ -z "$channel" ]; then
-          echo "Could not read channel from rust-toolchain.toml" >&2
-          exit 1
-        fi
-        echo "channel=$channel" >> "$GITHUB_OUTPUT"
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Read Rust toolchain
+        id: rust-toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          if [ -z "$channel" ]; then
+            echo "Could not read channel from rust-toolchain.toml" >&2
+            exit 1
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+          components: clippy
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - name: Install mold
+        run: sudo apt-get update && sudo apt-get install -y mold
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: clippy
+          prefix-key: clippy-${{ runner.os }}-rust-${{ hashFiles('rust-toolchain.toml') }}-
+          cache-on-failure: true
+      - name: Run clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+  guardrails:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Run project guardrails
+        run: bash scripts/check-guardrails.sh
 
-    - name: Setup Rust cache
-      uses: Swatinem/rust-cache@v2
-      with:
-        shared-key: "audit"
-        cache-on-failure: true
+  shell-and-typos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Install shell tools
+        uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
+        with:
+          tool: shellcheck,typos
+      - name: Run shellcheck
+        run: shellcheck -S warning scripts/*.sh
+      - name: Run typos
+        run: typos
 
-    - name: Install cargo-audit
-      uses: taiki-e/install-action@v2
-      with:
-        tool: cargo-audit
+  workflow-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - uses: rhysd/actionlint@03d0035246f3e81f36aed592ffb4bebf33a03106 # v1.7.7
+      - name: Run actionlint
+        run: actionlint
+      - uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
+        with:
+          tool: zizmor
+      - name: Run zizmor
+        run: zizmor .github/workflows
 
-    - name: Audit dependencies
-      run: cargo audit
+  dependencies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Read Rust toolchain
+        id: rust-toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          if [ -z "$channel" ]; then
+            echo "Could not read channel from rust-toolchain.toml" >&2
+            exit 1
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: dependencies
+          prefix-key: dependencies-${{ runner.os }}-rust-${{ hashFiles('rust-toolchain.toml') }}-
+          cache-on-failure: true
+      - uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
+        with:
+          tool: cargo-deny,cargo-audit,cargo-shear
+      - name: Run dependency checks
+        run: cargo deny check && cargo audit && cargo shear
 
   test:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          persist-credentials: false
+      - name: Read Rust toolchain
+        id: rust-toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          if [ -z "$channel" ]; then
+            echo "Could not read channel from rust-toolchain.toml" >&2
+            exit 1
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+          components: llvm-tools-preview
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - name: Install mold
+        run: sudo apt-get update && sudo apt-get install -y mold
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: test-coverage
+          prefix-key: test-coverage-${{ runner.os }}-rust-${{ hashFiles('rust-toolchain.toml') }}-
+          cache-on-failure: true
+      - uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
+        with:
+          tool: cargo-llvm-cov,cargo-nextest
 
-    - name: Read Rust toolchain
-      id: rust-toolchain
-      run: |
-        channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
-        if [ -z "$channel" ]; then
-          echo "Could not read channel from rust-toolchain.toml" >&2
-          exit 1
-        fi
-        echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - name: Check Rust version pins
+        run: ./scripts/check-rust-version.sh
 
-    - name: Check Rust version pins
-      run: ./scripts/check-rust-version.sh
+      - name: Run tests with coverage
+        run: cargo llvm-cov nextest --workspace --profile ci --lcov --output-path lcov.info
 
-    - name: Install Rust
-      uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: ${{ steps.rust-toolchain.outputs.channel }}
-        components: llvm-tools-preview
+      - name: Upload coverage to Codecov
+        continue-on-error: true
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6
+        with:
+          files: lcov.info
+          flags: unittests
+          name: codecov-umbrella
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+          verbose: true
 
-    - name: Setup Rust cache
-      uses: Swatinem/rust-cache@v2
-      with:
-        shared-key: "test"
-        cache-on-failure: true
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6
+        with:
+          files: junit.xml
+          report_type: test_results
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
 
-    - name: Setup mold linker
-      uses: rui314/setup-mold@v1
-
-    - name: Install tools
-      uses: taiki-e/install-action@v2
-      with:
-        tool: cargo-nextest,cargo-llvm-cov
-
-    - name: Run tests with coverage
-      run: cargo llvm-cov nextest --workspace --lcov --output-path lcov.info
-
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v6
-      with:
-        files: lcov.info
-        flags: unittests
-        name: codecov-umbrella
-        token: ${{ secrets.CODECOV_TOKEN }}
-        fail_ci_if_error: false
-        verbose: true
-
-    - name: Upload test results to Codecov
-      if: ${{ !cancelled() }}
-      uses: codecov/codecov-action@v6
-      with:
-        report_type: test_results
-        token: ${{ secrets.CODECOV_TOKEN }}
-        fail_ci_if_error: false
-
-    - name: Archive coverage results
-      uses: actions/upload-artifact@v7
-      with:
-        name: coverage-report
-        path: lcov.info
+      - name: Archive coverage and test results
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: coverage-and-test-results
+          path: |
+            lcov.info
+            junit.xml
