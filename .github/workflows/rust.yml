@@ -67,7 +67,7 @@ jobs:
           fi
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ steps.rust-toolchain.outputs.channel }}
           components: rustfmt
@@ -90,7 +90,7 @@ jobs:
           fi
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ steps.rust-toolchain.outputs.channel }}
           components: clippy
@@ -121,7 +121,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install shell tools
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
         with:
           tool: shellcheck,typos
       - name: Run shellcheck
@@ -135,10 +135,10 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
-      - uses: rhysd/actionlint@v1.7.7
+      - uses: rhysd/actionlint@03d0035246f3e81f36aed592ffb4bebf33a03106 # v1.7.7
       - name: Run actionlint
         run: actionlint
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
         with:
           tool: zizmor
       - name: Run zizmor
@@ -160,7 +160,7 @@ jobs:
           fi
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ steps.rust-toolchain.outputs.channel }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
@@ -168,7 +168,7 @@ jobs:
           shared-key: dependencies
           prefix-key: dependencies-${{ runner.os }}-rust-${{ hashFiles('rust-toolchain.toml') }}-
           cache-on-failure: true
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
         with:
           tool: cargo-deny,cargo-audit,cargo-shear
       - name: Run dependency checks
@@ -190,7 +190,7 @@ jobs:
           fi
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ steps.rust-toolchain.outputs.channel }}
           components: llvm-tools-preview
@@ -202,7 +202,7 @@ jobs:
           shared-key: test-coverage
           prefix-key: test-coverage-${{ runner.os }}-rust-${{ hashFiles('rust-toolchain.toml') }}-
           cache-on-failure: true
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
         with:
           tool: cargo-llvm-cov,cargo-nextest
 
@@ -213,6 +213,7 @@ jobs:
         run: cargo llvm-cov nextest --workspace --profile ci --lcov --output-path lcov.info
 
       - name: Upload coverage to Codecov
+        continue-on-error: true
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6
         with:
           files: lcov.info
@@ -224,6 +225,7 @@ jobs:
 
       - name: Upload test results to Codecov
         if: ${{ !cancelled() }}
+        continue-on-error: true
         uses: codecov/codecov-action@fb8b3582c8e4def4969c97caa2f19720cb33a72f # v6
         with:
           files: junit.xml

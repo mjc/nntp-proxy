@@ -49,7 +49,7 @@ jobs:
           fi
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@master
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
           toolchain: ${{ steps.rust-toolchain.outputs.channel }}
       - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
@@ -60,10 +60,10 @@ jobs:
           shared-key: quality-dispatch-${{ inputs.suite || github.event.client_payload.suite || 'deps' }}
           prefix-key: quality-dispatch-${{ runner.os }}-rust-${{ hashFiles('rust-toolchain.toml') }}-
           cache-on-failure: true
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
         with:
           tool: cargo-hack,cargo-deny,cargo-audit,cargo-shear,shellcheck,typos,zizmor
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
         with:
           tool: cargo-mutants,cargo-careful
 
