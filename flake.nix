@@ -79,7 +79,6 @@
           cargo-shear
           cargo-semver-checks
           cargo-vet
-          actionlint
           typos
           zizmor
           shellcheck

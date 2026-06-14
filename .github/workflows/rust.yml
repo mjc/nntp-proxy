@@ -18,7 +18,7 @@ on:
       - "Dockerfile"
       - "scripts/**"
       - ".cargo/**"
-      - ".github/workflows/rust.yml"
+      - ".github/workflows/**"
   pull_request:
     paths:
       - "**.rs"
@@ -34,7 +34,7 @@ on:
       - "Dockerfile"
       - "scripts/**"
       - ".cargo/**"
-      - ".github/workflows/rust.yml"
+      - ".github/workflows/**"
   workflow_dispatch:
 
 concurrency:
