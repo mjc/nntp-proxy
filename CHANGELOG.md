@@ -7,15 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- Fixed TUI session and user connection counts so active sessions stay tied to the session-owned gauge instead of drifting or disappearing.
-- Reduced TUI render allocations by writing directly into the buffer, borrowing chart-label names, and using stack-backed formatting where possible.
-
-### Changed
-
-- Pushed the session-count model through typed metrics snapshots, dashboard conversions, and TUI rendering so count mixups become compile-time errors instead of runtime bugs.
-
 ## [0.5.2] - 2026-06-11
 
 ### Added
@@ -23,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added per-backend `stat_missing` retry probing, so backends that correctly answer `STAT` with `430` can help retry missing articles faster.
 - Added runtime CPU pinning support for multi-threaded workloads via a new `CpuPinning` runtime mode, using worker-thread startup hooks so pinned threads are the ones running proxy work.
 - Added [`rustix`](https://docs.rs/rustix)-based affinity handling for Linux CPU pinning so we can remove the direct `nix` pinning dependency path.
+- Added TUI session/user-count lifecycle fixes so active sessions stay tied to the session-owned gauge instead of drifting or disappearing.
 
 ### Changed
 
@@ -36,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replaced visibility and internal API cleanup work from the Rust 1.88/private-first pass, including module privacy tightening and simplification of small conditional branches.
 - Replaced `ResponseTransferError::into_anyhow` and `duration_polyfill` with idiomatic Rust 1.88-safe error and duration handling at call sites.
 - Adopted private-first encapsulation by tightening crate module visibility where public re-exports already provide the intended external surface.
+- Pushed the session-count model through typed metrics snapshots, dashboard conversions, and TUI rendering so count mixups become compile-time errors instead of runtime bugs.
 
 ### Fixed
 
@@ -44,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed a user-active connection-count regression that could diverge from true active-session totals; the dashboard now consistently reports active sessions from typed user-metric counters.
 - Migrated user/session metric collection to typed newtypes (including `ZERO` constructors) and arithmetic helpers so typed counters are incremented at source and cannot be accidentally mixed.
 - Fixed metric and stats storage consistency by updating update paths to use typed metrics throughout collection, reducing drift in user gauges and totals.
+- Reduced TUI render allocations by writing directly into the buffer, borrowing chart-label names, and using stack-backed formatting where possible.
 
 ### Docs
 
