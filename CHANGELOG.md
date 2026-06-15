@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed TUI session and user connection counts so active sessions stay tied to the session-owned gauge instead of drifting or disappearing.
+- Reduced TUI render allocations by writing directly into the buffer, borrowing chart-label names, and using stack-backed formatting where possible.
+
+### Changed
+
+- Pushed the session-count model through typed metrics snapshots, dashboard conversions, and TUI rendering so count mixups become compile-time errors instead of runtime bugs.
+
 ## [0.5.2] - 2026-06-11
 
 ### Added
