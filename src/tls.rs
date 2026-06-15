@@ -9,6 +9,7 @@
 
 use crate::connection_error::ConnectionError;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
     ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
@@ -369,7 +370,7 @@ impl TlsManager {
         let cert_data = std::fs::read(cert_path)
             .with_context(|| format!("Failed to read TLS certificate from {cert_path}"))?;
 
-        let certs = rustls_pemfile::certs(&mut cert_data.as_slice())
+        let certs = CertificateDer::pem_slice_iter(&cert_data)
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to parse TLS certificate")?;
 

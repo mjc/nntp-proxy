@@ -33,8 +33,7 @@ features() {
 }
 
 deps() {
-    run cargo deny check
-    run cargo audit
+    run scripts/audit-advisories
     run cargo shear
     if [ -d supply-chain ]; then
         run cargo vet
