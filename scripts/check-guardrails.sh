@@ -18,6 +18,9 @@ if [ -z "$base_ref" ]; then
         base_ref="origin/main"
     elif git rev-parse --verify main >/dev/null 2>&1; then
         base_ref="main"
+    elif [ -n "${GITHUB_ACTIONS:-}" ]; then
+        echo "error: could not resolve guardrail base ref in GitHub Actions" >&2
+        exit 2
     else
         base_ref=""
     fi
