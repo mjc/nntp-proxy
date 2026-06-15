@@ -184,7 +184,7 @@ mod session_error;
 pub(crate) mod shared_client_writer;
 mod state;
 
-pub use auth_state::AuthState;
+pub use auth_state::{AuthState, AuthenticationTransition};
 pub use backend::format_hex_preview;
 pub use core::{ClientSession, ClientSessionBuilder};
 pub use metrics_ext::MetricsRecorder;

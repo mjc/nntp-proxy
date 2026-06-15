@@ -2,10 +2,13 @@
 
 use arrayvec::ArrayString;
 use ratatui::style::Color;
+use std::fmt::Write as _;
+use std::net::SocketAddr;
 
 use super::constants::{BACKEND_COLORS, throughput};
 use super::dashboard::BackendView;
 use super::types::{BackendChartData, ChartDataVec, ChartPoint, ChartX, ChartY, PointVec};
+use crate::metrics::{ErrorCount, FailureCount};
 use crate::tui::app::ThroughputPoint;
 
 // ============================================================================
@@ -73,7 +76,7 @@ pub fn create_sparkline_text(value: u64, max_value: u64) -> ArrayString<64> {
 /// 3. Accumulates results with global max tracking
 ///
 /// Returns (`chart_data`, `global_max_throughput`)
-pub fn build_chart_data(backend_views: &[BackendView]) -> (ChartDataVec, f64) {
+pub fn build_chart_data<'a>(backend_views: &'a [BackendView]) -> (ChartDataVec<'a>, f64) {
     /// Extract data from a single throughput point
     #[inline]
     fn extract_point_data(idx: usize, point: &ThroughputPoint) -> (ChartPoint, ChartPoint, ChartY) {
@@ -115,7 +118,7 @@ pub fn build_chart_data(backend_views: &[BackendView]) -> (ChartDataVec, f64) {
 
             (
                 BackendChartData::new(
-                    backend.server.name.as_str().to_string(),
+                    backend.server.name.as_str(),
                     backend_color(index),
                     &sent_points,
                     &recv_points,
@@ -172,14 +175,16 @@ pub fn round_up_throughput(value: f64) -> f64 {
 ///
 /// Returns human-readable string like "10 MiB/s", "500 KiB/s", "100 B/s"
 #[must_use]
-pub fn format_throughput_label(value: f64) -> String {
+pub fn format_throughput_label(value: f64) -> ArrayString<24> {
+    let mut text = ArrayString::<24>::new();
     if value >= throughput::ONE_MIB {
-        format!("{:.0} MiB/s", value / throughput::ONE_MIB)
+        let _ = write!(&mut text, "{:.0} MiB/s", value / throughput::ONE_MIB);
     } else if value >= throughput::ONE_KIB {
-        format!("{:.0} KiB/s", value / throughput::ONE_KIB)
+        let _ = write!(&mut text, "{:.0} KiB/s", value / throughput::ONE_KIB);
     } else {
-        format!("{value:.0} B/s")
+        let _ = write!(&mut text, "{value:.0} B/s");
     }
+    text
 }
 
 // ============================================================================
@@ -188,23 +193,45 @@ pub fn format_throughput_label(value: f64) -> String {
 
 /// Format throughput strings for summary display
 #[must_use]
-pub fn format_summary_throughput(latest_throughput: Option<&ThroughputPoint>) -> (String, String) {
+pub fn format_summary_throughput(
+    latest_throughput: Option<&ThroughputPoint>,
+) -> (ArrayString<24>, ArrayString<24>) {
     use super::constants::text;
 
     latest_throughput.map_or_else(
         || {
-            (
-                format!("{}{}", text::ARROW_UP, text::DEFAULT_THROUGHPUT),
-                format!("{}{}", text::ARROW_DOWN, text::DEFAULT_THROUGHPUT),
-            )
+            let mut up = ArrayString::<24>::new();
+            let mut down = ArrayString::<24>::new();
+            let _ = write!(&mut up, "{}{}", text::ARROW_UP, text::DEFAULT_THROUGHPUT);
+            let _ = write!(
+                &mut down,
+                "{}{}",
+                text::ARROW_DOWN,
+                text::DEFAULT_THROUGHPUT
+            );
+            (up, down)
         },
         |point| {
-            (
-                format!("{}{}", text::ARROW_UP, point.sent_per_sec()),
-                format!("{}{}", text::ARROW_DOWN, point.received_per_sec()),
-            )
+            let mut up = ArrayString::<24>::new();
+            let mut down = ArrayString::<24>::new();
+            let _ = write!(&mut up, "{}{}", text::ARROW_UP, point.sent_per_sec());
+            let _ = write!(
+                &mut down,
+                "{}{}",
+                text::ARROW_DOWN,
+                point.received_per_sec()
+            );
+            (up, down)
         },
     )
+}
+
+/// Format a socket address for display without heap allocation.
+#[must_use]
+pub fn socket_addr_text(addr: SocketAddr) -> ArrayString<64> {
+    let mut text = ArrayString::<64>::new();
+    let _ = write!(&mut text, "{addr}");
+    text
 }
 
 // ============================================================================
@@ -247,9 +274,9 @@ pub const fn error_rate_color(rate: f64) -> Color {
 
 /// Color for error count
 #[must_use]
-pub const fn error_count_color(has_errors: bool) -> Color {
+pub const fn error_count_color(errors: ErrorCount) -> Color {
     use super::constants::styles;
-    if has_errors {
+    if !errors.is_zero() {
         Color::Yellow
     } else {
         styles::VALUE_NEUTRAL
@@ -258,9 +285,9 @@ pub const fn error_count_color(has_errors: bool) -> Color {
 
 /// Color for connection failures
 #[must_use]
-pub const fn connection_failure_color(failures: u64) -> Color {
+pub fn connection_failure_color(failures: FailureCount) -> Color {
     use super::constants::styles;
-    if failures > 0 {
+    if !failures.is_zero() {
         Color::Red
     } else {
         styles::VALUE_NEUTRAL
@@ -329,17 +356,17 @@ mod tests {
 
     #[test]
     fn test_format_throughput_label() {
-        assert_eq!(format_throughput_label(10_485_760.0), "10 MiB/s");
-        assert_eq!(format_throughput_label(500_000.0), "488 KiB/s");
-        assert_eq!(format_throughput_label(100.0), "100 B/s");
+        assert_eq!(format_throughput_label(10_485_760.0).as_str(), "10 MiB/s");
+        assert_eq!(format_throughput_label(500_000.0).as_str(), "488 KiB/s");
+        assert_eq!(format_throughput_label(100.0).as_str(), "100 B/s");
     }
 
     #[test]
     fn test_format_throughput_label_boundaries() {
         // Test boundary values
-        assert_eq!(format_throughput_label(1_048_576.0), "1 MiB/s");
-        assert_eq!(format_throughput_label(1_024.0), "1 KiB/s");
-        assert_eq!(format_throughput_label(0.0), "0 B/s");
+        assert_eq!(format_throughput_label(1_048_576.0).as_str(), "1 MiB/s");
+        assert_eq!(format_throughput_label(1_024.0).as_str(), "1 KiB/s");
+        assert_eq!(format_throughput_label(0.0).as_str(), "0 B/s");
     }
 
     #[test]
@@ -365,12 +392,13 @@ mod tests {
     #[test]
     fn test_chart_data_vec_type() {
         // Verify ChartDataVec can hold typical backend count on stack
+        let names: Vec<String> = (0..8).map(|i| format!("Server {i}")).collect();
         let mut chart_data = ChartDataVec::new();
 
         // Add 8 backends (at SmallVec capacity)
-        for i in 0..8 {
+        for (i, name) in names.iter().enumerate() {
             chart_data.push(BackendChartData::new(
-                format!("Server {i}"),
+                name.as_str(),
                 backend_color(i),
                 &PointVec::new(),
                 &PointVec::new(),
@@ -385,7 +413,7 @@ mod tests {
     #[test]
     fn test_backend_chart_data_structure() {
         let data = BackendChartData::new(
-            "Test Server".to_string(),
+            "Test Server",
             backend_color(0),
             &PointVec::new(),
             &PointVec::new(),

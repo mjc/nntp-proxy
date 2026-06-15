@@ -2210,6 +2210,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "twox-hash",
+ "unicode-width",
  "uuid",
  "webpki-roots",
  "yenc",

@@ -585,9 +585,9 @@ mod tests {
                 stats: crate::metrics::BackendStats::default(),
                 active_connections: crate::metrics::ActiveConnections::new(0),
                 health_status: crate::metrics::BackendHealthStatus::Healthy,
-                pending_count: 0,
+                pending_count: crate::metrics::PendingRequests::ZERO,
                 load_ratio: None,
-                stateful_count: 0,
+                stateful_count: crate::metrics::StatefulSessions::ZERO,
                 traffic_share: None,
                 history: vec![ThroughputPoint::new_backend(
                     Timestamp::now(),
@@ -864,7 +864,7 @@ mod tests {
             top_users: (0..10)
                 .map(|idx| crate::tui::dashboard::DashboardUserStats {
                     username: format!("user-{idx}"),
-                    active_connections: crate::metrics::ActiveConnections::new(0),
+                    active_connections: crate::metrics::UserActiveConnections::new(0),
                     total_connections: crate::types::TotalConnections::new(0),
                     bytes_sent: crate::types::BytesSent::ZERO,
                     bytes_received: crate::types::BytesReceived::ZERO,
@@ -1006,9 +1006,9 @@ mod tests {
             show_details: false,
             log_lines: vec!["first".to_string()],
             buffer_pool: Some(BufferPoolStats {
-                available: 1,
-                in_use: 0,
-                total: 1,
+                available: crate::tui::dashboard::AvailableBuffers::new(1),
+                in_use: crate::tui::dashboard::InUseBuffers::new(0),
+                total: crate::tui::dashboard::TotalBuffers::new(1),
             }),
         };
         let mut second = first.clone();
@@ -1176,9 +1176,9 @@ mod tests {
             show_details: true,
             log_lines: vec!["second".to_string()],
             buffer_pool: Some(BufferPoolStats {
-                available: 2,
-                in_use: 1,
-                total: 3,
+                available: crate::tui::dashboard::AvailableBuffers::new(2),
+                in_use: crate::tui::dashboard::InUseBuffers::new(1),
+                total: crate::tui::dashboard::TotalBuffers::new(3),
             }),
             ..empty_dashboard_state()
         };
@@ -1195,7 +1195,7 @@ mod tests {
         assert!(second_observed.show_details);
         assert_eq!(
             second_observed.buffer_pool.as_ref().map(|pool| pool.total),
-            Some(3)
+            Some(crate::tui::dashboard::TotalBuffers::new(3))
         );
         assert_eq!(
             state_rx.borrow().status,

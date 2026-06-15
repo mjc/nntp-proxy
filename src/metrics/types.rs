@@ -181,6 +181,40 @@ counter_type!(ActiveConnections, usize);
 // lifetime totals in place of live sessions.
 counter_type!(UserActiveConnections, usize);
 
+// Live dashboard/session counts.
+counter_type!(StatefulSessions, usize);
+counter_type!(PendingRequests, usize);
+counter_type!(BackendHealthCount, usize);
+
+/// Count of backends by health state.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct BackendHealthCounts {
+    pub healthy: BackendHealthCount,
+    pub degraded: BackendHealthCount,
+    pub down: BackendHealthCount,
+}
+
+impl BackendHealthCounts {
+    #[must_use]
+    pub const fn new(healthy: usize, degraded: usize, down: usize) -> Self {
+        Self {
+            healthy: BackendHealthCount::new(healthy),
+            degraded: BackendHealthCount::new(degraded),
+            down: BackendHealthCount::new(down),
+        }
+    }
+}
+
+// Snapshot/presentation counters.
+counter_type!(CacheEntries, u64);
+counter_type!(PipelineBatches, u64);
+counter_type!(PipelineCommands, u64);
+counter_type!(PipelineRequestsQueued, u64);
+counter_type!(PipelineRequestsCompleted, u64);
+counter_type!(DiskHits, u64);
+counter_type!(DiskWriteIos, u64);
+counter_type!(DiskReadIos, u64);
+
 // ============================================================================
 // Time measurements - Different units and types of timing
 // ============================================================================

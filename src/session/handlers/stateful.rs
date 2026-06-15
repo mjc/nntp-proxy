@@ -373,7 +373,6 @@ impl ClientSession {
                                         auth_handler: &self.auth_handler,
                                         auth_state: &self.auth_state,
                                         routing_mode: &crate::config::RoutingMode::Stateful,
-                                        metrics: &self.metrics,
                                         connection_stats: self.connection_stats(),
                                     },
                                     self.client_addr,
@@ -405,8 +404,6 @@ impl ClientSession {
 
         // Final metrics - report any remaining byte deltas
         state.flush_byte_deltas(&self.metrics, backend_id, self.username());
-
-        self.metrics.user_connection_closed(self.username());
 
         Ok(state.into_metrics())
     }

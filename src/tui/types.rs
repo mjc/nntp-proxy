@@ -115,34 +115,36 @@ pub type PointVec = SmallVec<[ChartPoint; 64]>;
 
 /// Stack-allocated chart data for typical backend counts.
 /// Most deployments have 1-4 backends, so this avoids heap allocation
-pub type ChartDataVec = SmallVec<[BackendChartData; 8]>;
+pub type ChartDataVec<'a> = SmallVec<[BackendChartData<'a>; 8]>;
 
 /// Chart data for a single backend server
 ///
 /// Pre-computed data points to avoid nested iterations during rendering
 #[derive(Debug, Clone)]
-pub struct BackendChartData {
+pub struct BackendChartData<'a> {
     /// Server name for legend
-    pub name: String,
+    pub name: &'a str,
     /// Color for this backend's lines
     pub color: Color,
     /// Pre-computed tuples for ratatui (cached to avoid allocation on render)
-    sent_tuples: Vec<(f64, f64)>,
+    sent_tuples: SmallVec<[(f64, f64); 64]>,
     /// Pre-computed tuples for ratatui (cached to avoid allocation on render)
-    recv_tuples: Vec<(f64, f64)>,
+    recv_tuples: SmallVec<[(f64, f64); 64]>,
 }
 
-impl BackendChartData {
+impl<'a> BackendChartData<'a> {
     /// Create new chart data with pre-computed tuples
     #[must_use]
     pub fn new(
-        name: String,
+        name: &'a str,
         color: Color,
         sent_points: &[ChartPoint],
         recv_points: &[ChartPoint],
     ) -> Self {
-        let sent_tuples = sent_points.iter().map(ChartPoint::as_tuple).collect();
-        let recv_tuples = recv_points.iter().map(ChartPoint::as_tuple).collect();
+        let sent_tuples: SmallVec<[(f64, f64); 64]> =
+            sent_points.iter().map(ChartPoint::as_tuple).collect();
+        let recv_tuples: SmallVec<[(f64, f64); 64]> =
+            recv_points.iter().map(ChartPoint::as_tuple).collect();
         Self {
             name,
             color,
@@ -234,12 +236,7 @@ mod tests {
         sent_points.push(ChartPoint::new(ChartX::new(0.0), ChartY::new(100.0)));
         sent_points.push(ChartPoint::new(ChartX::new(1.0), ChartY::new(200.0)));
 
-        let data = BackendChartData::new(
-            "Test".to_string(),
-            Color::Green,
-            &sent_points,
-            &PointVec::new(),
-        );
+        let data = BackendChartData::new("Test", Color::Green, &sent_points, &PointVec::new());
 
         let tuples = data.sent_points_as_tuples();
         assert_eq!(tuples.len(), 2);
