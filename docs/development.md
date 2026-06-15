@@ -18,6 +18,15 @@ cargo nextest run
 
 Use `cargo test` when you need doctests, exact filtering, or `-- --nocapture` debugging output.
 
+Dependency and advisory triage:
+
+```bash
+scripts/audit-advisories
+```
+
+See [security-advisories.md](security-advisories.md) for ignore policy and
+revisit expectations.
+
 ## Pre-commit hook
 
 The pre-commit hook runs `cargo fmt --check` and `cargo clippy --all-features -- -D warnings`. Install it with:

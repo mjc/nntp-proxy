@@ -11,14 +11,18 @@ all-features = true
 version = 2
 yanked = "deny"
 ignore = [
-  # Transitive through foyer/iai-callgrind; no safe upgrade is available yet.
+  # Runtime via foyer 0.22.3 and dev-only via iai-callgrind 0.16.1.
+  # Keep iai-callgrind for deterministic perf benches. Revisit by 2026-09-15
+  # or on foyer/iai-callgrind upgrade. Upstream: https://github.com/foyer-rs/foyer
+  # and https://github.com/iai-callgrind/iai-callgrind.
   "RUSTSEC-2025-0141",
-  # Transitive through foyer; no safe upgrade is available yet.
+  # Runtime via foyer 0.22.3. Revisit by 2026-09-15 or on foyer upgrade.
+  # Upstream: https://github.com/foyer-rs/foyer.
   "RUSTSEC-2024-0436",
-  # Transitive through iai-callgrind dev-dependency; no safe upgrade is available yet.
+  # Dev-only via iai-callgrind 0.16.1 macro support.
+  # Keep iai-callgrind for deterministic perf benches. Revisit by 2026-09-15
+  # or on iai-callgrind upgrade. Upstream: https://github.com/iai-callgrind/iai-callgrind.
   "RUSTSEC-2026-0173",
-  # Direct dependency retained until the PEM loading path migrates to rustls-pki-types::PemObject.
-  "RUSTSEC-2025-0134",
 ]
 
 [licenses]

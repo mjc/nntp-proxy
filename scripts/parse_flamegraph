@@ -8,6 +8,7 @@ SOURCE="$SCRIPT_DIR/parse_flamegraph.rs"
 # Rebuild if source is newer than binary or binary doesn't exist
 if [ ! -f "$BINARY" ] || [ "$SOURCE" -nt "$BINARY" ]; then
     echo "Compiling parse_flamegraph..." >&2
+    mkdir -p "$(dirname "$BINARY")"
     rustc -O -o "$BINARY" "$SOURCE"
 fi
 

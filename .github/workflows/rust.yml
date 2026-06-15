@@ -126,7 +126,9 @@ jobs:
         with:
           tool: shellcheck,typos
       - name: Run shellcheck
-        run: shellcheck -S warning scripts/*.sh
+        run: |
+          mapfile -t shell_scripts < <(find scripts -maxdepth 1 -type f \( -name '*.sh' -o -perm -111 \) | sort)
+          shellcheck -S warning "${shell_scripts[@]}"
       - name: Run typos
         run: typos
 

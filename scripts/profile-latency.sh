@@ -29,6 +29,17 @@ if [ $# -gt 0 ]; then
 fi
 
 EXTRA_ARGS=("$@")
+APP_PID=""
+
+cleanup_profile_app() {
+    if [ -n "${APP_PID:-}" ] && kill -0 "$APP_PID" 2>/dev/null; then
+        kill "$APP_PID" 2>/dev/null || true
+        wait "$APP_PID" 2>/dev/null || true
+    fi
+}
+
+trap cleanup_profile_app EXIT
+trap 'cleanup_profile_app; exit 130' INT TERM
 
 if [ "$MODE" = "-h" ] || [ "$MODE" = "--help" ]; then
     echo "Usage: $0 [MODE] [TARGET] [ARGS...]"
@@ -151,16 +162,18 @@ case "$MODE" in
         "$BINARY" "${EXTRA_ARGS[@]}" &
         APP_PID=$!
         sleep 0.5
-        perf sched record -p $APP_PID -o perf-offcpu.data
-        wait $APP_PID || true
+        perf sched record -p "$APP_PID" -o perf-offcpu.data
+        wait "$APP_PID" || true
+        APP_PID=""
         ;;
 
       perf-cpu)
         "$BINARY" "${EXTRA_ARGS[@]}" &
         APP_PID=$!
         sleep 0.5
-        perf record -p $APP_PID -e cpu-clock -g --call-graph fp -F 997 -o perf-offcpu.data
-        wait $APP_PID || true
+        perf record -p "$APP_PID" -e cpu-clock -g --call-graph fp -F 997 -o perf-offcpu.data
+        wait "$APP_PID" || true
+        APP_PID=""
         ;;
     esac
     set -e
