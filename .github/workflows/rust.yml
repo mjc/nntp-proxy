@@ -135,11 +135,10 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
         with:
           persist-credentials: false
+      - uses: rhysd/actionlint@03d0035246f3e81f36aed592ffb4bebf33a03106 # v1.7.7
       - uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
         with:
-          tool: actionlint,zizmor
-      - name: Run actionlint
-        run: actionlint
+          tool: zizmor
       - name: Run zizmor
         run: zizmor .github/workflows
 
