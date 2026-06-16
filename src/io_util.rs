@@ -1,6 +1,4 @@
 use anyhow::{Context, Result};
-#[cfg(unix)]
-use std::fs;
 use std::future::poll_fn;
 use std::io::{Error, ErrorKind, IoSlice};
 use std::path::Path;
@@ -26,19 +24,13 @@ where
     Ok(())
 }
 
-#[cfg(unix)]
 pub(crate) fn atomic_replace_file(tmp_path: &Path, path: &Path) -> Result<()> {
-    fs::rename(tmp_path, path).with_context(|| {
-        format!(
-            "Failed to atomically replace {} with {}",
-            path.display(),
-            tmp_path.display()
-        )
-    })
+    platform::atomic_replace_file(tmp_path, path)
 }
 
 #[cfg(windows)]
-pub(crate) fn atomic_replace_file(tmp_path: &Path, path: &Path) -> Result<()> {
+mod platform {
+    use super::*;
     use std::os::windows::ffi::OsStrExt;
 
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
@@ -53,28 +45,46 @@ pub(crate) fn atomic_replace_file(tmp_path: &Path, path: &Path) -> Result<()> {
         path.as_os_str().encode_wide().chain(Some(0)).collect()
     }
 
-    let tmp_wide = wide_path(tmp_path);
-    let path_wide = wide_path(path);
+    pub(super) fn atomic_replace_file(tmp_path: &Path, path: &Path) -> Result<()> {
+        let tmp_wide = wide_path(tmp_path);
+        let path_wide = wide_path(path);
 
-    // SAFETY: both buffers are valid, null-terminated UTF-16 strings and live
-    // for the duration of the call.
-    let ok = unsafe {
-        MoveFileExW(
-            tmp_wide.as_ptr(),
-            path_wide.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
+        // SAFETY: both buffers are valid, null-terminated UTF-16 strings and live
+        // for the duration of the call.
+        let ok = unsafe {
+            MoveFileExW(
+                tmp_wide.as_ptr(),
+                path_wide.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
 
-    if ok == 0 {
-        Err(std::io::Error::last_os_error()).with_context(|| {
+        if ok == 0 {
+            Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "Failed to atomically replace {} with {}",
+                    path.display(),
+                    tmp_path.display()
+                )
+            })
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[cfg(unix)]
+mod platform {
+    use super::*;
+    use std::fs;
+
+    pub(super) fn atomic_replace_file(tmp_path: &Path, path: &Path) -> Result<()> {
+        fs::rename(tmp_path, path).with_context(|| {
             format!(
                 "Failed to atomically replace {} with {}",
                 path.display(),
                 tmp_path.display()
             )
         })
-    } else {
-        Ok(())
     }
 }
