@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Backend DNS resolution now uses hickory’s TTL-aware caching behavior, with refreshed lookup handling that avoids unnecessary IPv4 cache clears on IPv6-unreachable failures.
+- Tightened `unsafe` boundaries in the pooled-buffer and Windows file-replacement paths, and moved the old `review_claims` coverage into the RFC4643 auth/bypass and buffer test modules.
 
 ## [0.5.1] - 2026-06-05
 

@@ -1345,6 +1345,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_read_from_exposes_only_initialized_bytes() {
+        let pool = BufferPool::for_tests();
+        let mut buffer = pool.acquire();
+        let data = b"Test data for AsyncRead";
+        let mut reader = std::io::Cursor::new(data);
+
+        let read = buffer.read_from(&mut reader).await.unwrap();
+        assert_eq!(read, data.len());
+        assert_eq!(buffer.initialized(), data.len());
+        assert_eq!(buffer.as_ref(), data);
+    }
+
+    #[tokio::test]
     async fn test_read_from_is_limited_to_fixed_writable_region() {
         let pool = BufferPool::new(BufferSize::try_new(8).unwrap(), 1);
         let mut buffer = pool.acquire();

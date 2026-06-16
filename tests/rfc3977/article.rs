@@ -242,15 +242,15 @@ fn test_very_long_header() {
 #[test]
 fn test_zero_copy_slices() {
     let article = article(VALID_ARTICLE_TEXT);
-    let headers_ptr = article.headers.unwrap().as_bytes().as_ptr();
-    let body_ptr = article.body.unwrap().as_ptr();
-    let original_ptr = VALID_ARTICLE_TEXT.as_ptr();
-    let original_end = unsafe { original_ptr.add(VALID_ARTICLE_TEXT.len()) };
+    let headers_addr = article.headers.unwrap().as_bytes().as_ptr().addr();
+    let body_addr = article.body.unwrap().as_ptr().addr();
+    let original_start = VALID_ARTICLE_TEXT.as_ptr().addr();
+    let original_end = original_start + VALID_ARTICLE_TEXT.len();
 
-    assert!(headers_ptr >= original_ptr);
-    assert!(headers_ptr < original_end);
-    assert!(body_ptr >= original_ptr);
-    assert!(body_ptr < original_end);
+    assert!(headers_addr >= original_start);
+    assert!(headers_addr < original_end);
+    assert!(body_addr >= original_start);
+    assert!(body_addr < original_end);
 }
 
 mod headers_tests {
