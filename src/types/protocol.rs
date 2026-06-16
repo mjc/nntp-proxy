@@ -36,16 +36,6 @@ impl<'a> MessageId<'a> {
         Ok(Self(Cow::Borrowed(s)))
     }
 
-    /// Create from pre-validated string (zero-copy, unchecked)
-    ///
-    /// # Safety
-    /// Caller must ensure: `s.len() >= 3`, `s.starts_with('<')`, `s.ends_with('>')`
-    #[inline]
-    #[must_use]
-    pub const unsafe fn from_str_unchecked(s: &'a str) -> Self {
-        Self(Cow::Borrowed(s))
-    }
-
     /// Create owned `MessageId`, auto-wrapping in angle brackets if needed
     ///
     /// # Errors
@@ -56,7 +46,7 @@ impl<'a> MessageId<'a> {
         if s.is_empty() {
             return Err(ValidationError::InvalidMessageId("empty".to_string()));
         }
-        let wrapped = if s.starts_with('<') && s.ends_with('>') {
+        let wrapped = if Self::has_angle_brackets(s) {
             s.to_string()
         } else {
             format!("<{s}>")
@@ -66,13 +56,20 @@ impl<'a> MessageId<'a> {
 
     #[inline]
     fn validate(s: &str) -> Result<(), ValidationError> {
-        if s.len() < 3 || !s.starts_with('<') || !s.ends_with('>') {
-            Err(ValidationError::InvalidMessageId(
-                "must be <...>".to_string(),
-            ))
-        } else {
-            Ok(())
-        }
+        Self::inner(s)
+            .map(|_| ())
+            .ok_or_else(|| ValidationError::InvalidMessageId("must be <...>".to_string()))
+    }
+
+    #[inline]
+    fn inner(s: &str) -> Option<&str> {
+        let inner = s.strip_prefix('<')?.strip_suffix('>')?;
+        (!inner.is_empty()).then_some(inner)
+    }
+
+    #[inline]
+    fn has_angle_brackets(s: &str) -> bool {
+        s.starts_with('<') && s.ends_with('>')
     }
 
     #[must_use]
@@ -84,7 +81,7 @@ impl<'a> MessageId<'a> {
     #[must_use]
     #[inline]
     pub fn without_brackets(&self) -> &str {
-        &self.0[1..self.0.len() - 1]
+        Self::inner(&self.0).expect("MessageId invariant requires angle brackets")
     }
 
     #[must_use]
@@ -198,6 +195,7 @@ mod tests {
         );
         // Empty string should error
         assert!(MessageId::from_str_or_wrap("").is_err());
+        assert!(MessageId::from_str_or_wrap("<>").is_err());
     }
 
     #[test]
