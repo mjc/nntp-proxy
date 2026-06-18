@@ -262,6 +262,8 @@ impl DashboardMetrics {
                 .get()
                 .min(pipeline_requests_queued.get()),
         );
+        let pipeline_batches =
+            PipelineBatches::new(pipeline_batches.get().min(pipeline_commands.get()));
 
         Self {
             total_connections,

@@ -1605,6 +1605,29 @@ mod tests {
     }
 
     #[test]
+    fn test_snapshot_state_does_not_publish_more_pipeline_batches_than_commands() {
+        let metrics = MetricsCollector::new(1);
+        let router = Arc::new(BackendSelector::new());
+        let servers = create_test_servers(1);
+        let mut app = TuiAppBuilder::new(metrics, router, servers).build();
+
+        app.snapshot = Arc::new(MetricsSnapshot {
+            pipeline_batches: crate::metrics::PipelineBatches::new(5),
+            pipeline_commands: crate::metrics::PipelineCommands::new(1),
+            ..MetricsSnapshot::default()
+        });
+
+        let snapshot = app.snapshot_state();
+
+        assert!(
+            snapshot.metrics.pipeline_batches.get() <= snapshot.metrics.pipeline_commands.get(),
+            "dashboard must not publish {} pipeline batches when only {} pipeline commands were processed",
+            snapshot.metrics.pipeline_batches.get(),
+            snapshot.metrics.pipeline_commands.get()
+        );
+    }
+
+    #[test]
     fn test_snapshot_state_does_not_publish_user_active_connections_above_global_active() {
         use crate::metrics::{CommandCount, ErrorCount};
 
