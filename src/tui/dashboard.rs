@@ -117,9 +117,57 @@ pub struct DashboardUserStats {
 }
 
 impl DashboardUserStats {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        username: String,
+        active_connections: UserActiveConnections,
+        total_connections: TotalConnections,
+        bytes_sent: BytesSent,
+        bytes_received: BytesReceived,
+        bytes_sent_per_sec: BytesPerSecondRate,
+        bytes_received_per_sec: BytesPerSecondRate,
+        total_commands: CommandCount,
+        errors: ErrorCount,
+    ) -> Self {
+        Self {
+            username,
+            active_connections: UserActiveConnections::new(
+                active_connections
+                    .get()
+                    .min(usize::try_from(total_connections.get()).unwrap_or(usize::MAX)),
+            ),
+            total_connections,
+            bytes_sent,
+            bytes_received,
+            bytes_sent_per_sec,
+            bytes_received_per_sec,
+            total_commands,
+            errors,
+        }
+    }
+
     #[must_use]
     pub fn from_user_stats(user: &UserStats) -> Self {
         Self::from(user)
+    }
+
+    #[must_use]
+    pub fn from_user_stats_with_active_connections(
+        user: &UserStats,
+        active_connections: UserActiveConnections,
+    ) -> Self {
+        Self::new(
+            user.username.clone(),
+            active_connections,
+            user.total_connections,
+            user.bytes_sent,
+            user.bytes_received,
+            user.bytes_sent_per_sec,
+            user.bytes_received_per_sec,
+            user.total_commands,
+            user.errors,
+        )
     }
 
     #[must_use]
@@ -132,17 +180,33 @@ impl DashboardUserStats {
 
 impl From<&UserStats> for DashboardUserStats {
     fn from(user: &UserStats) -> Self {
+        Self::from_user_stats_with_active_connections(user, user.active_connections)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActiveConnectionBudget {
+    remaining: usize,
+}
+
+impl ActiveConnectionBudget {
+    #[must_use]
+    const fn new(global_active: ActiveConnections) -> Self {
         Self {
-            username: user.username.clone(),
-            active_connections: user.active_connections,
-            total_connections: user.total_connections,
-            bytes_sent: user.bytes_sent,
-            bytes_received: user.bytes_received,
-            bytes_sent_per_sec: user.bytes_sent_per_sec,
-            bytes_received_per_sec: user.bytes_received_per_sec,
-            total_commands: user.total_commands,
-            errors: user.errors,
+            remaining: global_active.get(),
         }
+    }
+
+    fn take_user(&mut self, requested: UserActiveConnections) -> UserActiveConnections {
+        let granted = requested.get().min(self.remaining);
+        self.remaining -= granted;
+        UserActiveConnections::new(granted)
+    }
+
+    fn take_backend(&mut self, requested: ActiveConnections) -> ActiveConnections {
+        let granted = requested.get().min(self.remaining);
+        self.remaining -= granted;
+        ActiveConnections::new(granted)
     }
 }
 
@@ -168,6 +232,51 @@ pub struct DashboardMetrics {
 }
 
 impl DashboardMetrics {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        total_connections: TotalConnections,
+        active_connections: ActiveConnections,
+        stateful_sessions: StatefulSessions,
+        client_to_backend_bytes: ClientToBackendBytes,
+        backend_to_client_bytes: BackendToClientBytes,
+        uptime: Duration,
+        cache_entries: CacheEntries,
+        cache_size_bytes: u64,
+        cache_hit_rate: f64,
+        disk_cache: Option<DiskCacheStats>,
+        pipeline_batches: PipelineBatches,
+        pipeline_commands: PipelineCommands,
+        pipeline_requests_queued: PipelineRequestsQueued,
+        pipeline_requests_completed: PipelineRequestsCompleted,
+    ) -> Self {
+        let active_connections = ActiveConnections::new(
+            active_connections
+                .get()
+                .min(usize::try_from(total_connections.get()).unwrap_or(usize::MAX)),
+        );
+        let stateful_sessions =
+            StatefulSessions::new(stateful_sessions.get().min(active_connections.get()));
+
+        Self {
+            total_connections,
+            active_connections,
+            stateful_sessions,
+            client_to_backend_bytes,
+            backend_to_client_bytes,
+            uptime,
+            cache_entries,
+            cache_size_bytes,
+            cache_hit_rate,
+            disk_cache,
+            pipeline_batches,
+            pipeline_commands,
+            pipeline_requests_queued,
+            pipeline_requests_completed,
+            in_flight_requests: PendingRequests::ZERO,
+        }
+    }
+
     #[must_use]
     pub fn from_snapshot(snapshot: &MetricsSnapshot) -> Self {
         Self::from(snapshot)
@@ -200,23 +309,22 @@ impl DashboardMetrics {
 
 impl From<&MetricsSnapshot> for DashboardMetrics {
     fn from(snapshot: &MetricsSnapshot) -> Self {
-        Self {
-            total_connections: snapshot.total_connections,
-            active_connections: snapshot.active_connections,
-            stateful_sessions: snapshot.stateful_sessions,
-            client_to_backend_bytes: snapshot.client_to_backend_bytes,
-            backend_to_client_bytes: snapshot.backend_to_client_bytes,
-            uptime: snapshot.uptime,
-            cache_entries: snapshot.cache_entries,
-            cache_size_bytes: snapshot.cache_size_bytes,
-            cache_hit_rate: snapshot.cache_hit_rate,
-            disk_cache: snapshot.disk_cache,
-            pipeline_batches: snapshot.pipeline_batches,
-            pipeline_commands: snapshot.pipeline_commands,
-            pipeline_requests_queued: snapshot.pipeline_requests_queued,
-            pipeline_requests_completed: snapshot.pipeline_requests_completed,
-            in_flight_requests: PendingRequests::ZERO,
-        }
+        Self::new(
+            snapshot.total_connections,
+            snapshot.active_connections,
+            snapshot.stateful_sessions,
+            snapshot.client_to_backend_bytes,
+            snapshot.backend_to_client_bytes,
+            snapshot.uptime,
+            snapshot.cache_entries,
+            snapshot.cache_size_bytes,
+            snapshot.cache_hit_rate,
+            snapshot.disk_cache,
+            snapshot.pipeline_batches,
+            snapshot.pipeline_commands,
+            snapshot.pipeline_requests_queued,
+            snapshot.pipeline_requests_completed,
+        )
     }
 }
 
@@ -246,6 +354,35 @@ pub struct RemoteDashboardState {
 }
 
 impl DashboardState {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        metrics: DashboardMetrics,
+        mut backend_views: Vec<BackendView>,
+        mut top_users: Vec<DashboardUserStats>,
+        client_history: Vec<ThroughputPoint>,
+        system_stats: SystemStats,
+        view_mode: ViewMode,
+        show_details: bool,
+        log_lines: Vec<String>,
+        buffer_pool: Option<BufferPoolStats>,
+    ) -> Self {
+        normalize_backend_active_counts(&mut backend_views, metrics.active_connections);
+        normalize_user_active_counts(&mut top_users, metrics.active_connections);
+
+        Self {
+            metrics,
+            backend_views,
+            top_users,
+            client_history,
+            system_stats,
+            view_mode,
+            show_details,
+            log_lines,
+            buffer_pool,
+        }
+    }
+
     #[must_use]
     fn backend_view(&self, backend_idx: usize) -> Option<&BackendView> {
         self.backend_views.get(backend_idx)
@@ -299,6 +436,29 @@ impl DashboardState {
 }
 
 impl RemoteDashboardState {
+    #[allow(clippy::too_many_arguments)]
+    #[must_use]
+    pub fn new(
+        metrics: DashboardMetrics,
+        mut backend_views: Vec<RemoteBackendView>,
+        mut top_users: Vec<DashboardUserStats>,
+        latest_client_throughput: Option<ThroughputPoint>,
+        system_stats: SystemStats,
+        log_lines: Vec<String>,
+    ) -> Self {
+        normalize_remote_backend_active_counts(&mut backend_views, metrics.active_connections);
+        normalize_user_active_counts(&mut top_users, metrics.active_connections);
+
+        Self {
+            metrics,
+            backend_views,
+            top_users,
+            latest_client_throughput,
+            system_stats,
+            log_lines,
+        }
+    }
+
     #[must_use]
     fn backend_view(&self, backend_idx: usize) -> Option<&RemoteBackendView> {
         self.backend_views.get(backend_idx)
@@ -345,19 +505,46 @@ impl From<BackendView> for RemoteBackendView {
 
 impl From<DashboardState> for RemoteDashboardState {
     fn from(state: DashboardState) -> Self {
-        Self {
-            metrics: state.metrics,
-            backend_views: state
+        Self::new(
+            state.metrics,
+            state
                 .backend_views
                 .into_iter()
                 .map(RemoteBackendView::from)
                 .collect(),
-            top_users: state.top_users,
-            latest_client_throughput: state.client_history.last().cloned(),
-            system_stats: state.system_stats,
-            log_lines: state.log_lines,
-        }
+            state.top_users,
+            state.client_history.last().cloned(),
+            state.system_stats,
+            state.log_lines,
+        )
     }
+}
+
+fn normalize_user_active_counts(
+    users: &mut [DashboardUserStats],
+    global_active: ActiveConnections,
+) {
+    let mut budget = ActiveConnectionBudget::new(global_active);
+    users.iter_mut().for_each(|user| {
+        user.active_connections = budget.take_user(user.active_connections);
+    });
+}
+
+fn normalize_backend_active_counts(backends: &mut [BackendView], global_active: ActiveConnections) {
+    let mut budget = ActiveConnectionBudget::new(global_active);
+    backends.iter_mut().for_each(|backend| {
+        backend.active_connections = budget.take_backend(backend.active_connections);
+    });
+}
+
+fn normalize_remote_backend_active_counts(
+    backends: &mut [RemoteBackendView],
+    global_active: ActiveConnections,
+) {
+    let mut budget = ActiveConnectionBudget::new(global_active);
+    backends.iter_mut().for_each(|backend| {
+        backend.active_connections = budget.take_backend(backend.active_connections);
+    });
 }
 
 #[cfg(test)]
