@@ -1649,6 +1649,34 @@ mod tests {
     }
 
     #[test]
+    fn test_snapshot_state_does_not_publish_disk_hit_rate_above_one_hundred_percent() {
+        let metrics = MetricsCollector::new(1);
+        let router = Arc::new(BackendSelector::new());
+        let servers = create_test_servers(1);
+        let mut app = TuiAppBuilder::new(metrics, router, servers).build();
+
+        app.snapshot = Arc::new(MetricsSnapshot {
+            disk_cache: Some(crate::metrics::DiskCacheStats {
+                disk_hit_rate: 125.0,
+                ..crate::metrics::DiskCacheStats::default()
+            }),
+            ..MetricsSnapshot::default()
+        });
+
+        let snapshot = app.snapshot_state();
+        let disk = snapshot
+            .metrics
+            .disk_cache
+            .expect("disk cache stats should be published");
+
+        assert!(
+            disk.disk_hit_rate <= 100.0,
+            "dashboard must not publish a disk hit rate above 100%, got {:.1}%",
+            disk.disk_hit_rate
+        );
+    }
+
+    #[test]
     fn test_snapshot_state_does_not_publish_user_active_connections_above_global_active() {
         use crate::metrics::{CommandCount, ErrorCount};
 
