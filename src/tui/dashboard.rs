@@ -257,6 +257,11 @@ impl DashboardMetrics {
         );
         let stateful_sessions =
             StatefulSessions::new(stateful_sessions.get().min(active_connections.get()));
+        let pipeline_requests_completed = PipelineRequestsCompleted::new(
+            pipeline_requests_completed
+                .get()
+                .min(pipeline_requests_queued.get()),
+        );
 
         Self {
             total_connections,

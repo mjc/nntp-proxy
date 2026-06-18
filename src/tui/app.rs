@@ -1581,6 +1581,30 @@ mod tests {
     }
 
     #[test]
+    fn test_snapshot_state_does_not_publish_more_completed_pipeline_requests_than_queued() {
+        let metrics = MetricsCollector::new(1);
+        let router = Arc::new(BackendSelector::new());
+        let servers = create_test_servers(1);
+        let mut app = TuiAppBuilder::new(metrics, router, servers).build();
+
+        app.snapshot = Arc::new(MetricsSnapshot {
+            pipeline_requests_queued: crate::metrics::PipelineRequestsQueued::new(1),
+            pipeline_requests_completed: crate::metrics::PipelineRequestsCompleted::new(5),
+            ..MetricsSnapshot::default()
+        });
+
+        let snapshot = app.snapshot_state();
+
+        assert!(
+            snapshot.metrics.pipeline_requests_completed.get()
+                <= snapshot.metrics.pipeline_requests_queued.get(),
+            "dashboard must not publish {} completed pipeline requests when only {} were queued",
+            snapshot.metrics.pipeline_requests_completed.get(),
+            snapshot.metrics.pipeline_requests_queued.get()
+        );
+    }
+
+    #[test]
     fn test_snapshot_state_does_not_publish_user_active_connections_above_global_active() {
         use crate::metrics::{CommandCount, ErrorCount};
 
