@@ -31,18 +31,20 @@ pub(crate) fn should_sample_backend_timing() -> bool {
     BACKEND_TIMING_SAMPLE_COUNTER.fetch_add(1, Ordering::Relaxed) & BACKEND_TIMING_SAMPLE_MASK == 0
 }
 
-/// Result of attempting to execute a command on a backend
+/// Result of attempting to execute a routed lookup on one backend.
 pub(super) enum BackendAttemptResult {
-    /// Article found - response written successfully
+    /// Backend response was accepted and written successfully.
     Success,
-    /// Article not found (430) - try next backend
-    /// Note: The 430 response is read and drained, just not stored
+    /// Backend returned authoritative article-missing status (430).
+    ///
+    /// The response has been read and drained; retry may continue only within
+    /// tier and availability constraints.
     ArticleNotFound {
         missing: AuthoritativeArticleMissing,
     },
-    /// Backend unavailable or error - try next backend
+    /// Backend was unavailable or returned an error that allows another attempt.
     BackendUnavailable,
-    /// No backend is retryable without violating tier or availability rules
+    /// No backend is retryable without violating tier or availability rules.
     NoRetryableBackend,
 }
 

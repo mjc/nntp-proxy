@@ -637,7 +637,7 @@ impl TcpManager {
             if !crate::protocol::StatusCode::parse(response.as_bytes())
                 .is_some_and(|code| code.is_auth_accepted())
             {
-                // Check for 482 (connection limit exceeded) before generic auth failure
+                // Some backends use 482 for connection-limit style auth setup failures.
                 if crate::protocol::StatusCode::parse(response.as_bytes())
                     .is_some_and(|c| c.as_u16() == 482)
                 {

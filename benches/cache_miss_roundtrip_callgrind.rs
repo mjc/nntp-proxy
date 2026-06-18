@@ -1,8 +1,9 @@
 //! Callgrind benchmarks for the real cache-miss proxy roundtrip path.
 //!
 //! These benches drive a client socket through a live per-command proxy with
-//! metadata-only cache enabled or no configured cache, so each `ARTICLE` request still buffers
-//! through the backend while paying the request/cache/routing fixed costs of the miss path.
+//! metadata-only cache enabled or no configured cache. Each `ARTICLE` request
+//! traverses the backend transfer path while paying the request/cache/routing
+//! fixed costs of a miss without retaining the payload in cache.
 //!
 //! Run with: `cargo bench --bench cache_miss_roundtrip_callgrind`
 

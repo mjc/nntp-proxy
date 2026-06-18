@@ -338,17 +338,17 @@ pub struct Cache {
         alias = "ttl"
     )]
     pub article_cache_ttl_secs: Duration,
-    /// Whether to store full article bodies in the article cache (default: false)
+    /// Whether to retain ARTICLE/BODY payloads in the response cache (default: false)
     ///
     /// When false:
-    /// - Cache still tracks backend availability (smart routing, 430 retry)
-    /// - Article bodies are NOT stored (saves ~750KB per article)
+    /// - Cache still tracks backend availability for retry/routing
+    /// - ARTICLE/BODY payload bytes are NOT stored
     /// - Uses the dedicated availability-only index with bounded LRU eviction
     /// - Useful for availability-only mode with limited memory
     ///
     /// When true:
-    /// - Full caching mode (bodies + availability tracking)
-    /// - Can serve articles from cache without backend query
+    /// - Payload caching mode plus availability tracking
+    /// - Can serve cached ARTICLE/BODY responses without backend query
     #[serde(
         default = "super::defaults::cache_articles",
         rename = "store_article_bodies",

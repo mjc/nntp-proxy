@@ -1,7 +1,8 @@
-//! Article routing with availability-aware backend selection
+//! Availability-aware routing for article lookup commands.
 //!
-//! Handles routing article commands across backends, using `ArticleAvailability`
-//! to skip backends that have already returned 430 for a given article.
+//! ARTICLE, BODY, HEAD, and STAT requests with a message-id share the same
+//! negative availability facts: a backend that returned 430 for that article is
+//! skipped until the entry expires.
 
 use crate::cache::ArticleAvailability;
 use crate::router::{BackendSelector, SuppressedBackends};
@@ -42,7 +43,7 @@ pub(super) enum PreparedRequest {
 }
 
 impl ClientSession {
-    /// Route a single request to a backend and execute it
+    /// Route a single lookup request to a backend and execute it.
     ///
     /// This function is `pub(super)` to allow reuse of per-command routing logic by sibling handler modules
     /// (such as `hybrid.rs`) that also need to route commands.
