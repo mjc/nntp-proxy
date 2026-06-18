@@ -1706,6 +1706,39 @@ mod tests {
     }
 
     #[test]
+    fn test_snapshot_state_does_not_publish_backend_error_subcounts_above_total_errors() {
+        let metrics = MetricsCollector::new(1);
+        let router = Arc::new(BackendSelector::new());
+        let servers = create_test_servers(1);
+        let mut app = TuiAppBuilder::new(metrics, router, servers).build();
+
+        app.snapshot = Arc::new(MetricsSnapshot {
+            backend_stats: vec![crate::metrics::BackendStats {
+                backend_id: crate::types::BackendId::from_index(0),
+                errors: crate::metrics::ErrorCount::new(1),
+                errors_4xx: crate::metrics::ErrorCount::new(3),
+                errors_5xx: crate::metrics::ErrorCount::new(2),
+                ..crate::metrics::BackendStats::default()
+            }]
+            .into(),
+            ..MetricsSnapshot::default()
+        });
+
+        let snapshot = app.snapshot_state();
+        let backend = &snapshot.backend_views[0].stats;
+        let classified_errors = backend
+            .errors_4xx
+            .get()
+            .saturating_add(backend.errors_5xx.get());
+
+        assert!(
+            classified_errors <= backend.errors.get(),
+            "dashboard must not publish {classified_errors} classified backend errors when only {} total errors exist",
+            backend.errors.get()
+        );
+    }
+
+    #[test]
     fn test_snapshot_state_does_not_publish_user_active_connections_above_global_active() {
         use crate::metrics::{CommandCount, ErrorCount};
 

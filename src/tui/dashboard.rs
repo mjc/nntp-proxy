@@ -553,6 +553,15 @@ fn normalize_backend_active_counts(backends: &mut [BackendView], global_active: 
                 .get()
                 .min(backend.stats.total_commands.get()),
         );
+        let errors_4xx = backend
+            .stats
+            .errors_4xx
+            .get()
+            .min(backend.stats.errors.get());
+        let remaining_errors = backend.stats.errors.get().saturating_sub(errors_4xx);
+        backend.stats.errors_4xx = ErrorCount::new(errors_4xx);
+        backend.stats.errors_5xx =
+            ErrorCount::new(backend.stats.errors_5xx.get().min(remaining_errors));
     });
 }
 
@@ -570,6 +579,15 @@ fn normalize_remote_backend_active_counts(
                 .get()
                 .min(backend.stats.total_commands.get()),
         );
+        let errors_4xx = backend
+            .stats
+            .errors_4xx
+            .get()
+            .min(backend.stats.errors.get());
+        let remaining_errors = backend.stats.errors.get().saturating_sub(errors_4xx);
+        backend.stats.errors_4xx = ErrorCount::new(errors_4xx);
+        backend.stats.errors_5xx =
+            ErrorCount::new(backend.stats.errors_5xx.get().min(remaining_errors));
     });
 }
 
