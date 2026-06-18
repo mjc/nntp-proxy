@@ -244,17 +244,9 @@ impl ActiveConnectionBudget {
         self.remaining -= granted;
         UserActiveConnections::new(granted)
     }
-
-    fn take_backend(&mut self, requested: ActiveConnections) -> ActiveConnections {
-        let granted = requested.get().min(self.remaining);
-        self.remaining -= granted;
-        ActiveConnections::new(granted)
-    }
 }
 
 fn normalize_backend_stats(stats: &mut BackendStats) {
-    stats.errors = cap_error_count(stats.errors, stats.total_commands);
-
     cap_classified_errors_to_total_errors(stats);
 }
 
@@ -266,34 +258,16 @@ fn cap_classified_errors_to_total_errors(stats: &mut BackendStats) {
 }
 
 trait BackendSnapshotView {
-    fn active_connections(&self) -> ActiveConnections;
-    fn set_active_connections(&mut self, active_connections: ActiveConnections);
     fn stats_mut(&mut self) -> &mut BackendStats;
 }
 
 impl BackendSnapshotView for BackendView {
-    fn active_connections(&self) -> ActiveConnections {
-        self.active_connections
-    }
-
-    fn set_active_connections(&mut self, active_connections: ActiveConnections) {
-        self.active_connections = active_connections;
-    }
-
     fn stats_mut(&mut self) -> &mut BackendStats {
         &mut self.stats
     }
 }
 
 impl BackendSnapshotView for RemoteBackendView {
-    fn active_connections(&self) -> ActiveConnections {
-        self.active_connections
-    }
-
-    fn set_active_connections(&mut self, active_connections: ActiveConnections) {
-        self.active_connections = active_connections;
-    }
-
     fn stats_mut(&mut self) -> &mut BackendStats {
         &mut self.stats
     }
@@ -460,7 +434,7 @@ impl DashboardState {
         log_lines: Vec<String>,
         buffer_pool: Option<BufferPoolStats>,
     ) -> Self {
-        normalize_backend_views(&mut backend_views, metrics.active_connections);
+        normalize_backend_views(&mut backend_views);
         normalize_user_active_counts(&mut top_users, metrics.active_connections);
 
         Self {
@@ -539,7 +513,7 @@ impl RemoteDashboardState {
         system_stats: SystemStats,
         log_lines: Vec<String>,
     ) -> Self {
-        normalize_backend_views(&mut backend_views, metrics.active_connections);
+        normalize_backend_views(&mut backend_views);
         normalize_user_active_counts(&mut top_users, metrics.active_connections);
 
         Self {
@@ -624,13 +598,8 @@ fn normalize_user_active_counts(
     });
 }
 
-fn normalize_backend_views<T: BackendSnapshotView>(
-    backends: &mut [T],
-    global_active: ActiveConnections,
-) {
-    let mut budget = ActiveConnectionBudget::new(global_active);
+fn normalize_backend_views<T: BackendSnapshotView>(backends: &mut [T]) {
     backends.iter_mut().for_each(|backend| {
-        backend.set_active_connections(budget.take_backend(backend.active_connections()));
         normalize_backend_stats(backend.stats_mut());
     });
 }

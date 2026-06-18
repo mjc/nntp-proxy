@@ -1677,7 +1677,7 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_state_does_not_publish_backend_errors_above_total_commands() {
+    fn test_snapshot_state_preserves_backend_errors_not_tied_to_commands() {
         let metrics = MetricsCollector::new(1);
         let router = Arc::new(BackendSelector::new());
         let servers = create_test_servers(1);
@@ -1697,11 +1697,10 @@ mod tests {
         let snapshot = app.snapshot_state();
         let backend = &snapshot.backend_views[0].stats;
 
-        assert!(
-            backend.errors.get() <= backend.total_commands.get(),
-            "dashboard must not publish {} backend errors when only {} commands ran",
+        assert_eq!(
             backend.errors.get(),
-            backend.total_commands.get()
+            5,
+            "dashboard must preserve backend/session errors even when they happen before commands are recorded"
         );
     }
 
@@ -1926,7 +1925,7 @@ mod tests {
     }
 
     #[test]
-    fn test_snapshot_state_does_not_publish_backend_active_connections_above_global_active() {
+    fn test_snapshot_state_preserves_backend_active_connections_above_global_active() {
         let metrics = MetricsCollector::new(2);
         let router = Arc::new(BackendSelector::new());
         let servers = create_test_servers(2);
@@ -1957,10 +1956,9 @@ mod tests {
             .map(|backend| backend.active_connections.get())
             .sum::<usize>();
 
-        assert!(
-            displayed_backend_active <= snapshot.metrics.active_connections.get(),
-            "dashboard must not publish {displayed_backend_active} displayed backend-active connections when only {} global connections are active",
-            snapshot.metrics.active_connections.get()
+        assert_eq!(
+            displayed_backend_active, 5,
+            "dashboard must preserve backend pool activity because backend checkouts are not capped by client connections"
         );
     }
 
