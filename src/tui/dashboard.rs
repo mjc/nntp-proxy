@@ -194,6 +194,20 @@ fn cap_error_count(count: ErrorCount, limit: CommandCount) -> ErrorCount {
     ErrorCount::new(count.get().min(limit.get()))
 }
 
+fn cap_completed_requests_to_queued(
+    completed: PipelineRequestsCompleted,
+    queued: PipelineRequestsQueued,
+) -> PipelineRequestsCompleted {
+    PipelineRequestsCompleted::new(completed.get().min(queued.get()))
+}
+
+fn cap_pipeline_batches_to_commands(
+    batches: PipelineBatches,
+    commands: PipelineCommands,
+) -> PipelineBatches {
+    PipelineBatches::new(batches.get().min(commands.get()))
+}
+
 fn cap_user_active_connections(
     active: UserActiveConnections,
     total: TotalConnections,
@@ -241,10 +255,48 @@ impl ActiveConnectionBudget {
 fn normalize_backend_stats(stats: &mut BackendStats) {
     stats.errors = cap_error_count(stats.errors, stats.total_commands);
 
+    cap_classified_errors_to_total_errors(stats);
+}
+
+fn cap_classified_errors_to_total_errors(stats: &mut BackendStats) {
     let errors_4xx = stats.errors_4xx.get().min(stats.errors.get());
     let remaining_errors = stats.errors.get().saturating_sub(errors_4xx);
     stats.errors_4xx = ErrorCount::new(errors_4xx);
     stats.errors_5xx = ErrorCount::new(stats.errors_5xx.get().min(remaining_errors));
+}
+
+trait BackendSnapshotView {
+    fn active_connections(&self) -> ActiveConnections;
+    fn set_active_connections(&mut self, active_connections: ActiveConnections);
+    fn stats_mut(&mut self) -> &mut BackendStats;
+}
+
+impl BackendSnapshotView for BackendView {
+    fn active_connections(&self) -> ActiveConnections {
+        self.active_connections
+    }
+
+    fn set_active_connections(&mut self, active_connections: ActiveConnections) {
+        self.active_connections = active_connections;
+    }
+
+    fn stats_mut(&mut self) -> &mut BackendStats {
+        &mut self.stats
+    }
+}
+
+impl BackendSnapshotView for RemoteBackendView {
+    fn active_connections(&self) -> ActiveConnections {
+        self.active_connections
+    }
+
+    fn set_active_connections(&mut self, active_connections: ActiveConnections) {
+        self.active_connections = active_connections;
+    }
+
+    fn stats_mut(&mut self) -> &mut BackendStats {
+        &mut self.stats
+    }
 }
 
 /// Serialized metrics used by the dashboard payload.
@@ -289,13 +341,10 @@ impl DashboardMetrics {
     ) -> Self {
         let active_connections = cap_active_connections(active_connections, total_connections);
         let stateful_sessions = cap_stateful_sessions(stateful_sessions, active_connections);
-        let pipeline_requests_completed = PipelineRequestsCompleted::new(
-            pipeline_requests_completed
-                .get()
-                .min(pipeline_requests_queued.get()),
-        );
+        let pipeline_requests_completed =
+            cap_completed_requests_to_queued(pipeline_requests_completed, pipeline_requests_queued);
         let pipeline_batches =
-            PipelineBatches::new(pipeline_batches.get().min(pipeline_commands.get()));
+            cap_pipeline_batches_to_commands(pipeline_batches, pipeline_commands);
         let cache_hit_rate = clamp_percent(cache_hit_rate);
         let disk_cache = disk_cache.map(|mut stats| {
             stats.disk_hit_rate = clamp_percent(stats.disk_hit_rate);
@@ -411,7 +460,7 @@ impl DashboardState {
         log_lines: Vec<String>,
         buffer_pool: Option<BufferPoolStats>,
     ) -> Self {
-        normalize_backend_active_counts(&mut backend_views, metrics.active_connections);
+        normalize_backend_views(&mut backend_views, metrics.active_connections);
         normalize_user_active_counts(&mut top_users, metrics.active_connections);
 
         Self {
@@ -490,7 +539,7 @@ impl RemoteDashboardState {
         system_stats: SystemStats,
         log_lines: Vec<String>,
     ) -> Self {
-        normalize_remote_backend_active_counts(&mut backend_views, metrics.active_connections);
+        normalize_backend_views(&mut backend_views, metrics.active_connections);
         normalize_user_active_counts(&mut top_users, metrics.active_connections);
 
         Self {
@@ -575,22 +624,14 @@ fn normalize_user_active_counts(
     });
 }
 
-fn normalize_backend_active_counts(backends: &mut [BackendView], global_active: ActiveConnections) {
-    let mut budget = ActiveConnectionBudget::new(global_active);
-    backends.iter_mut().for_each(|backend| {
-        backend.active_connections = budget.take_backend(backend.active_connections);
-        normalize_backend_stats(&mut backend.stats);
-    });
-}
-
-fn normalize_remote_backend_active_counts(
-    backends: &mut [RemoteBackendView],
+fn normalize_backend_views<T: BackendSnapshotView>(
+    backends: &mut [T],
     global_active: ActiveConnections,
 ) {
     let mut budget = ActiveConnectionBudget::new(global_active);
     backends.iter_mut().for_each(|backend| {
-        backend.active_connections = budget.take_backend(backend.active_connections);
-        normalize_backend_stats(&mut backend.stats);
+        backend.set_active_connections(budget.take_backend(backend.active_connections()));
+        normalize_backend_stats(backend.stats_mut());
     });
 }
 
