@@ -264,6 +264,7 @@ impl DashboardMetrics {
         );
         let pipeline_batches =
             PipelineBatches::new(pipeline_batches.get().min(pipeline_commands.get()));
+        let cache_hit_rate = cache_hit_rate.clamp(0.0, 100.0);
 
         Self {
             total_connections,
