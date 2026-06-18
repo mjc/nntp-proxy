@@ -81,11 +81,8 @@ impl NntpProxy {
 
         let last_activity_nanos = self.last_activity_nanos.load(Ordering::Relaxed);
 
-        // If never been active, no need to clear
-        if last_activity_nanos == 0 {
-            return false;
-        }
-
+        // Before the first client connects, prewarmed backend pools still age
+        // from process start and must be eligible for idle cleanup.
         let last_activity = Duration::from_nanos(last_activity_nanos);
         let now = self.start_instant.elapsed();
         let idle_duration = now.saturating_sub(last_activity);
@@ -452,6 +449,49 @@ mod tests {
     use crate::config::RoutingMode;
     use crate::session::SessionMode;
     use std::sync::Arc;
+    use std::time::Duration;
+
+    async fn spawn_mock_backend() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    if stream
+                        .write_all(b"200 Mock Backend Ready\r\n")
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+
+                    let mut buffer = [0u8; 1024];
+                    loop {
+                        let n = match stream.read(&mut buffer).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+
+                        let cmd = String::from_utf8_lossy(&buffer[..n]).to_uppercase();
+                        if cmd.starts_with("DATE") {
+                            let _ = stream.write_all(b"111 20260101000000\r\n").await;
+                        } else if cmd.starts_with("QUIT") {
+                            let _ = stream.write_all(b"205 Goodbye\r\n").await;
+                            break;
+                        } else {
+                            let _ = stream.write_all(b"200 OK\r\n").await;
+                        }
+                    }
+                });
+            }
+        });
+
+        addr
+    }
 
     fn create_test_config() -> crate::config::Config {
         super::super::tests::create_test_config()
@@ -920,6 +960,34 @@ mod tests {
         // No prior activity (last_activity_nanos = 0)
         let cleared = proxy.check_and_clear_stale_pools();
         assert!(!cleared);
+    }
+
+    #[tokio::test]
+    async fn test_check_and_clear_clears_prewarmed_pools_without_client_activity() {
+        use crate::config::{Config, Server};
+        use crate::types::{MaxConnections, Port};
+
+        let backend_addr = spawn_mock_backend().await;
+        let config = Config {
+            servers: vec![
+                Server::builder("127.0.0.1", Port::try_new(backend_addr.port()).unwrap())
+                    .name("Prewarmed Backend")
+                    .max_connections(MaxConnections::try_new(1).unwrap())
+                    .backend_idle_timeout(Duration::from_nanos(1))
+                    .build()
+                    .unwrap(),
+            ],
+            ..Default::default()
+        };
+        let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
+
+        proxy.prewarm_connections().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        assert!(
+            proxy.check_and_clear_stale_pools(),
+            "prewarmed idle backend pools should clear even before any client ever connects"
+        );
     }
 
     #[test]
