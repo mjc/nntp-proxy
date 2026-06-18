@@ -130,13 +130,11 @@ impl DashboardUserStats {
         total_commands: CommandCount,
         errors: ErrorCount,
     ) -> Self {
+        let active_connections = cap_user_active_connections(active_connections, total_connections);
+
         Self {
             username,
-            active_connections: UserActiveConnections::new(
-                active_connections
-                    .get()
-                    .min(usize::try_from(total_connections.get()).unwrap_or(usize::MAX)),
-            ),
+            active_connections,
             total_connections,
             bytes_sent,
             bytes_received,
@@ -184,6 +182,36 @@ impl From<&UserStats> for DashboardUserStats {
     }
 }
 
+fn u64_to_usize_saturating(value: u64) -> usize {
+    usize::try_from(value).unwrap_or(usize::MAX)
+}
+
+fn clamp_percent(value: f64) -> f64 {
+    value.clamp(0.0, 100.0)
+}
+
+fn cap_error_count(count: ErrorCount, limit: CommandCount) -> ErrorCount {
+    ErrorCount::new(count.get().min(limit.get()))
+}
+
+fn cap_user_active_connections(
+    active: UserActiveConnections,
+    total: TotalConnections,
+) -> UserActiveConnections {
+    UserActiveConnections::new(active.get().min(u64_to_usize_saturating(total.get())))
+}
+
+fn cap_active_connections(active: ActiveConnections, total: TotalConnections) -> ActiveConnections {
+    ActiveConnections::new(active.get().min(u64_to_usize_saturating(total.get())))
+}
+
+fn cap_stateful_sessions(
+    stateful: StatefulSessions,
+    active: ActiveConnections,
+) -> StatefulSessions {
+    StatefulSessions::new(stateful.get().min(active.get()))
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ActiveConnectionBudget {
     remaining: usize,
@@ -208,6 +236,15 @@ impl ActiveConnectionBudget {
         self.remaining -= granted;
         ActiveConnections::new(granted)
     }
+}
+
+fn normalize_backend_stats(stats: &mut BackendStats) {
+    stats.errors = cap_error_count(stats.errors, stats.total_commands);
+
+    let errors_4xx = stats.errors_4xx.get().min(stats.errors.get());
+    let remaining_errors = stats.errors.get().saturating_sub(errors_4xx);
+    stats.errors_4xx = ErrorCount::new(errors_4xx);
+    stats.errors_5xx = ErrorCount::new(stats.errors_5xx.get().min(remaining_errors));
 }
 
 /// Serialized metrics used by the dashboard payload.
@@ -250,13 +287,8 @@ impl DashboardMetrics {
         pipeline_requests_queued: PipelineRequestsQueued,
         pipeline_requests_completed: PipelineRequestsCompleted,
     ) -> Self {
-        let active_connections = ActiveConnections::new(
-            active_connections
-                .get()
-                .min(usize::try_from(total_connections.get()).unwrap_or(usize::MAX)),
-        );
-        let stateful_sessions =
-            StatefulSessions::new(stateful_sessions.get().min(active_connections.get()));
+        let active_connections = cap_active_connections(active_connections, total_connections);
+        let stateful_sessions = cap_stateful_sessions(stateful_sessions, active_connections);
         let pipeline_requests_completed = PipelineRequestsCompleted::new(
             pipeline_requests_completed
                 .get()
@@ -264,9 +296,9 @@ impl DashboardMetrics {
         );
         let pipeline_batches =
             PipelineBatches::new(pipeline_batches.get().min(pipeline_commands.get()));
-        let cache_hit_rate = cache_hit_rate.clamp(0.0, 100.0);
+        let cache_hit_rate = clamp_percent(cache_hit_rate);
         let disk_cache = disk_cache.map(|mut stats| {
-            stats.disk_hit_rate = stats.disk_hit_rate.clamp(0.0, 100.0);
+            stats.disk_hit_rate = clamp_percent(stats.disk_hit_rate);
             stats
         });
 
@@ -539,7 +571,7 @@ fn normalize_user_active_counts(
     let mut budget = ActiveConnectionBudget::new(global_active);
     users.iter_mut().for_each(|user| {
         user.active_connections = budget.take_user(user.active_connections);
-        user.errors = ErrorCount::new(user.errors.get().min(user.total_commands.get()));
+        user.errors = cap_error_count(user.errors, user.total_commands);
     });
 }
 
@@ -547,22 +579,7 @@ fn normalize_backend_active_counts(backends: &mut [BackendView], global_active: 
     let mut budget = ActiveConnectionBudget::new(global_active);
     backends.iter_mut().for_each(|backend| {
         backend.active_connections = budget.take_backend(backend.active_connections);
-        backend.stats.errors = ErrorCount::new(
-            backend
-                .stats
-                .errors
-                .get()
-                .min(backend.stats.total_commands.get()),
-        );
-        let errors_4xx = backend
-            .stats
-            .errors_4xx
-            .get()
-            .min(backend.stats.errors.get());
-        let remaining_errors = backend.stats.errors.get().saturating_sub(errors_4xx);
-        backend.stats.errors_4xx = ErrorCount::new(errors_4xx);
-        backend.stats.errors_5xx =
-            ErrorCount::new(backend.stats.errors_5xx.get().min(remaining_errors));
+        normalize_backend_stats(&mut backend.stats);
     });
 }
 
@@ -573,22 +590,7 @@ fn normalize_remote_backend_active_counts(
     let mut budget = ActiveConnectionBudget::new(global_active);
     backends.iter_mut().for_each(|backend| {
         backend.active_connections = budget.take_backend(backend.active_connections);
-        backend.stats.errors = ErrorCount::new(
-            backend
-                .stats
-                .errors
-                .get()
-                .min(backend.stats.total_commands.get()),
-        );
-        let errors_4xx = backend
-            .stats
-            .errors_4xx
-            .get()
-            .min(backend.stats.errors.get());
-        let remaining_errors = backend.stats.errors.get().saturating_sub(errors_4xx);
-        backend.stats.errors_4xx = ErrorCount::new(errors_4xx);
-        backend.stats.errors_5xx =
-            ErrorCount::new(backend.stats.errors_5xx.get().min(remaining_errors));
+        normalize_backend_stats(&mut backend.stats);
     });
 }
 
