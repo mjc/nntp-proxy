@@ -5,15 +5,15 @@
 Build:
 
 ```bash
-cargo build
+nix develop -c cargo build
 ```
 
 Format, lint, and test:
 
 ```bash
-cargo fmt --check
-cargo clippy --all-features -- -D warnings
-cargo nextest run
+nix develop -c cargo fmt --check
+nix develop -c cargo clippy --all-features -- -D warnings
+nix develop -c cargo nextest run
 ```
 
 Use `cargo test` when you need doctests, exact filtering, or `-- --nocapture` debugging output.
@@ -21,7 +21,7 @@ Use `cargo test` when you need doctests, exact filtering, or `-- --nocapture` de
 Dependency and advisory triage:
 
 ```bash
-scripts/audit-advisories
+nix develop -c scripts/audit-advisories
 ```
 
 See [security-advisories.md](security-advisories.md) for ignore policy and
@@ -50,6 +50,36 @@ Build the packaged binary with Nix:
 ```bash
 nix build .#default
 ```
+
+## Response Handling Work
+
+Use RFC 3977 and RFC 4643 when protocol behavior is unclear. In this codebase,
+response shape is request-scoped: check `RequestContext::has_response_body()`
+instead of inferring multiline behavior from a status code alone.
+
+Keep multiline response boundary logic in `src/session/multiline_framing.rs`.
+Benchmarks and tests should import production framing and request-classification
+code instead of reimplementing terminator scanners or local command parsers.
+
+AI-facing repository rules are intentionally short. See [AGENTS.md](../AGENTS.md)
+and [.github/copilot-instructions.md](../.github/copilot-instructions.md).
+
+Current response responsibilities:
+
+- `src/protocol/request.rs` owns `RequestContext`, route classes, response-body
+  expectations, and request-scoped response/cache metadata.
+- `src/protocol/response.rs` owns three-digit status parsing.
+- `src/protocol/responses.rs` owns local single-line response constants and
+  small formatting helpers.
+- `src/session/multiline_framing.rs` owns all response-boundary detection,
+  packed-next-response preservation, ordered response emission, capture,
+  observe, and write operations.
+- `src/session/backend.rs` is the facade over backend execution and
+  framer-owned operations.
+- `src/session/response_transfer.rs` maps transfer outcomes to backend
+  connection reuse decisions.
+- `src/cache/article.rs` and `src/cache/hybrid_codec.rs` store semantic article
+  payload sections and render cache-hit responses back to NNTP wire bytes.
 
 ## Benchmarks
 

@@ -40,10 +40,10 @@ pub struct ClientSession {
     /// Connection statistics aggregator for logging connection creation
     pub(super) connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
 
-    /// Article cache (always present - fixed-size, memory-backed, hybrid, or disabled)
+    /// Response cache, always present for availability tracking.
     pub(super) cache: Arc<crate::cache::UnifiedCache>,
 
-    /// Whether to cache article bodies (config-driven)
+    /// Whether to retain ARTICLE/BODY payload bytes.
     pub(super) cache_articles: bool,
 
     /// Whether to use adaptive availability prechecking for STAT/HEAD
@@ -150,17 +150,17 @@ impl ClientSessionBuilder {
         self
     }
 
-    /// Add article cache to this session (always present for backend availability tracking)
+    /// Add the response cache used for payload retention and availability tracking.
     #[must_use]
     pub fn with_cache(mut self, cache: Arc<crate::cache::UnifiedCache>) -> Self {
         self.cache = BuilderCache::Shared(cache);
         self
     }
 
-    /// Set whether to cache article bodies.
+    /// Set whether to retain ARTICLE/BODY payload bytes.
     ///
-    /// When false, only backend availability is tracked (saves memory).
-    /// When true, full article bodies are cached.
+    /// When false, only backend availability is tracked.
+    /// When true, cacheable ARTICLE/BODY payloads may be served without a backend query.
     #[must_use]
     pub const fn with_cache_articles(mut self, cache: bool) -> Self {
         self.cache_articles = cache;
@@ -212,7 +212,7 @@ impl ClientSessionBuilder {
 }
 
 impl ClientSession {
-    /// Create default cache for availability tracking only (no content caching)
+    /// Create the default availability-only cache.
     fn default_cache() -> Arc<crate::cache::UnifiedCache> {
         Arc::new(crate::cache::UnifiedCache::availability(
             std::time::Duration::MAX,

@@ -1,8 +1,8 @@
-//! NNTP Response Parsing and Handling
+//! NNTP response status parsing.
 //!
-//! This module implements efficient parsing of NNTP server responses according to
-//! [RFC 3977](https://datatracker.ietf.org/doc/html/rfc3977) with optimizations
-//! for high-throughput proxy use.
+//! This module parses the three-digit status indicator from NNTP responses.
+//! Response shape is request-scoped and lives in `RequestContext`; multiline
+//! boundary handling lives in `src/session/multiline_framing.rs`.
 //!
 //! # NNTP Protocol References
 //!
@@ -18,18 +18,12 @@
 //!
 //! Per [RFC 3977 §3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2):
 //! ```text
-//! response     = status-line [CRLF multiline-data]
-//! status-line  = status-code SP status-text CRLF
-//! status-code  = 3DIGIT
+//! simple-response     = initial-response-line
+//! multi-line-response = initial-response-line multi-line-data-block
+//! initial-response-line = 3DIGIT *(SP response-argument) CRLF
 //! ```
 //!
-//! # Multiline Responses
-//!
-//! Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1):
-//! ```text
-//! Multiline responses end with a line containing a single period:
-//! CRLF "." CRLF
-//! ```
+//! See `docs/development.md` for the repository-level response handling split.
 
 use nutype::nutype;
 

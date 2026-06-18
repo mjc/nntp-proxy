@@ -15,23 +15,24 @@
 //!   <https://www.rfc-editor.org/rfc/rfc4643.html#section-2.4.1>
 //! - `503` Feature not supported\
 //!   <https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1>
-//!   Used when a feature (e.g. stateful commands in per-command mode) is not supported
+//!   Used when this proxy cannot provide a feature, such as reader state in
+//!   per-command routing or transit-only `IHAVE`.
 
 use crate::protocol::{
     RequestContext, RequestKind, RequestResponseMetadata, RequestRouteClass, StatusCode, codes,
 };
 
-/// Action to take in response to a command
+/// Action to take after interpreting a typed request.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum CommandAction<'a> {
-    /// Intercept and send authentication response to client
+    /// Intercept and send an authentication response to the client.
     InterceptAuth(AuthAction<'a>),
-    /// Reject the command with an error message (NNTP response format with CRLF)
+    /// Reject the request with an NNTP response.
     Reject(RejectResponse),
-    /// Forward the command to backend (stateless)
+    /// Forward the request without binding this client to one backend session.
     ForwardStateless,
-    /// Intercept CAPABILITIES and return a synthetic proxy-accurate capability list
+    /// Intercept CAPABILITIES and return a synthetic proxy-accurate capability list.
     InterceptCapabilities,
 }
 
@@ -550,7 +551,7 @@ mod tests {
             panic!("Expected Reject")
         };
 
-        // Stateful commands rejected with stateless-mode message
+        // Stateful commands rejected with per-command-mode message
         assert!(stateful_reject.contains("stateless"));
         // POST rejected with RFC 3977 §6.3.1 440 response
         assert!(post_reject.starts_with("440"));
@@ -640,13 +641,13 @@ mod tests {
         // Correct for commands the proxy structurally cannot support
         // (e.g. stateful GROUP in per-command mode, or transit-only IHAVE)
 
-        // Stateful commands in stateless mode use 503
+        // Commands that require state the per-command path does not hold use 503.
         let CommandAction::Reject(response) = classify("GROUP alt.test") else {
             panic!("Expected Reject");
         };
         assert!(
             response.starts_with("503 "),
-            "Stateful commands should return 503, got: {response}"
+            "Unsupported stateful commands should return 503, got: {response}"
         );
 
         // POST uses 440 per RFC 3977 §6.3.1 (posting not permitted)
@@ -690,7 +691,7 @@ mod tests {
         assert!(
             stateful.to_lowercase().contains("stateless")
                 || stateful.to_lowercase().contains("mode"),
-            "Should explain stateless mode restriction: {stateful}"
+            "Should explain per-command mode restriction: {stateful}"
         );
 
         let CommandAction::Reject(post) = classify("POST") else {

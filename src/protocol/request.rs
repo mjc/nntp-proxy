@@ -742,6 +742,11 @@ impl RequestContext {
         }
     }
 
+    /// Return whether this request/status pair carries a multiline response body.
+    ///
+    /// RFC 3977 defines multiline responses per command, not by status code
+    /// alone. For example, `211` is single-line for `GROUP` and multiline for
+    /// `LISTGROUP`.
     #[must_use]
     pub fn has_response_body(&self, status: StatusCode) -> bool {
         request_kind_has_response_body(self.kind, status)

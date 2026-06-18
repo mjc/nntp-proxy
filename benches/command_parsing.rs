@@ -1,6 +1,6 @@
-//! Benchmarks for NNTP command classification
+//! Benchmarks for typed NNTP request parsing and route classification.
 //!
-//! This benchmark suite measures command classification performance across:
+//! This benchmark suite measures `RequestContext::parse` performance across:
 //! - Different command types (ARTICLE, BODY, HEAD, STAT, etc.)
 //! - Message-ID vs numeric article specifications
 //! - Real-world command distribution (70% article retrieval, 10% GROUP, etc.)
@@ -16,8 +16,7 @@ fn main() {
     divan::main();
 }
 
-/// Macro to generate benchmark modules for command classification
-/// Uses 1000 samples × 100 iterations for stable results on noisy hardware
+/// Generate one parser benchmark for a single request line.
 macro_rules! bench_command {
     ($mod_name:ident, $command:expr) => {
         mod $mod_name {
@@ -27,7 +26,7 @@ macro_rules! bench_command {
             fn classifier(bencher: Bencher) {
                 bencher.bench(|| {
                     black_box(
-                        RequestContext::parse(black_box(b"IHAVE <unique@msgid.com>"))
+                        RequestContext::parse(black_box($command.as_bytes()))
                             .expect("valid request line"),
                     )
                 });
@@ -114,7 +113,7 @@ bench_command!(
 mod realistic_workload {
     use super::{Bencher, RequestContext, black_box};
 
-    /// Simulates a realistic distribution of NNTP commands:
+    /// Simulates a realistic distribution of typed NNTP request parsing:
     /// - 70% article retrieval (ARTICLE/BODY/HEAD/STAT)
     /// - 10% GROUP navigation
     /// - 10% header retrieval (OVER/XOVER)

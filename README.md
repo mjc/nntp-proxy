@@ -16,7 +16,9 @@ Client-facing connections are plain NNTP only. TLS support is for outbound backe
 
 ## Performance snapshot
 
-Historical published Ryzen 9 results saw the `1/1/1` shape (1 client, 1 proxy thread, 1 backend connection) reach **4797.65 MiB/s** in the 10GiB matrix, while separate 100GiB spot checks measured **4712.73 MiB/s mean** over 10 runs. See [CHANGELOG.md](CHANGELOG.md) for the recorded numbers and [docs/development.md](docs/development.md) for the current benchmark workflow.
+Historical benchmark notes are retained in [CHANGELOG.md](CHANGELOG.md) and the
+archive docs. Treat them as release evidence, not current guarantees. See
+[docs/development.md](docs/development.md) for the current benchmark workflow.
 
 ## Current status
 
@@ -25,7 +27,7 @@ Hybrid is the default routing mode. `per-command` and `stateful` remain availabl
 ## Quick start
 
 ```bash
-cargo build --release
+nix develop -c cargo build --release
 cp config.minimal.toml config.toml
 ./target/release/nntp-proxy --config config.toml
 ```

@@ -1,29 +1,29 @@
 //! Cache policy decisions
 //!
-//! Pure functions for determining caching behavior based on response codes
-//! and command types.
+//! Pure functions for mapping typed requests and response codes to cache actions.
 
 use crate::protocol::{RequestContext, RequestRouteClass, StatusCode};
 
-/// Determine what caching action to take for a response
+/// Cache-side outcome for a routed response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheAction {
-    /// Capture full article content and cache it
+    /// Capture cacheable article/body payload bytes and cache them.
     CaptureArticle,
-    /// Track availability only (for HEAD/BODY/STAT success)
+    /// Track availability only for successful article-like lookups.
     TrackAvailability,
-    /// Track STAT availability (223 response)
+    /// Track STAT availability (223 response).
     TrackStat,
-    /// No caching action needed
+    /// No cache or availability update is needed.
     None,
 }
 
-/// Check if a response should be captured for article caching
+/// Check if this response should be retained in the article/body cache.
 ///
-/// Cache full article responses (220) AND body responses (222).
+/// Cache full ARTICLE responses (220) and BODY responses (222). HEAD and STAT
+/// successes update availability only.
 /// Response codes:
 /// - 220 = ARTICLE (full article - headers + body)
-/// - 221 = HEAD (headers only - don't cache)
+/// - 221 = HEAD (headers only - track availability)
 /// - 222 = BODY (body only - cache this for yEnc content)
 /// - 223 = STAT (availability, no payload)
 #[inline]
@@ -39,13 +39,13 @@ fn should_capture_for_cache(
         && matches!(response_code.as_u16(), 220 | 222)
 }
 
-/// Check if a response should be tracked for availability (HEAD/BODY/ARTICLE/STAT success)
+/// Check if a successful ARTICLE/BODY/HEAD/STAT response proves availability.
 #[inline]
 pub fn should_track_availability(response_code: StatusCode, has_message_id: bool) -> bool {
     has_message_id && matches!(response_code.as_u16(), 220..=223)
 }
 
-/// Determine caching action for a response
+/// Determine cache and availability behavior for a routed response.
 ///
 /// The request context determines whether the status code carries a response
 /// body for this command:
@@ -237,7 +237,7 @@ mod tests {
             determine_cache_action("HEAD <test@example.com>", 221, true, true),
             CacheAction::TrackAvailability
         );
-        // BODY (222) now captures full article when cache_articles=true
+        // BODY (222) captures the body payload when cache_articles=true
         assert_eq!(
             determine_cache_action("BODY <test@example.com>", 222, true, true),
             CacheAction::CaptureArticle
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn test_determine_cache_action_cache_disabled() {
-        // When cache_articles is false, don't capture full article but still track availability
+        // When cache_articles is false, don't retain payload bytes but still track availability
         assert_eq!(
             determine_cache_action("ARTICLE <test@example.com>", 220, false, true),
             CacheAction::TrackAvailability

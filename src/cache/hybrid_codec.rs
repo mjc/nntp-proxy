@@ -1,7 +1,8 @@
-//! Disk cache entry type and foyer codec
+//! Disk cache entry type and foyer codec.
 //!
-//! Contains `DiskCachedArticle` and its manual `Code` implementation for
-//! efficient serialization to/from foyer's disk cache.
+//! `DiskCachedArticle` is the historical type name for the disk entry that
+//! stores typed ARTICLE/BODY/HEAD/STAT cache metadata, optional retained
+//! payload sections, and negative availability facts.
 //!
 //! # Wire Format
 //!
@@ -69,7 +70,7 @@ impl CachedSectionLen {
     }
 }
 
-/// Valid NNTP status codes for cached articles
+/// Valid NNTP status codes for cache entries.
 ///
 /// Using an enum instead of raw `u16` makes invalid states unrepresentable.
 /// The `repr(u16)` allows efficient serialization as a 2-byte wire format.
@@ -112,18 +113,18 @@ impl TryFrom<u16> for CacheableStatusCode {
     }
 }
 
-/// Typed article entry stored by the disk cache.
+/// Typed response/availability entry stored by the disk cache.
 ///
 /// INVARIANT: Every entry has a valid NNTP status code (220, 221, 222, 223, 430).
 /// This is enforced at construction - `new()` returns `Option<Self>`.
 ///
-/// Implements foyer's Code trait manually for efficient serialization:
+/// Implements foyer's `Code` trait manually for efficient serialization:
 /// - Pre-allocates buffer on decode (no vec resizing)
 /// - Simple binary format:
 ///   [magic:u32][status:u16][missing:u64][timestamp:u64][tier:u8][typed-payload]
 #[derive(Clone, Debug)]
 pub struct DiskCachedArticle {
-    /// Validated NNTP status code — only cacheable codes are representable
+    /// Validated NNTP status code; only cacheable outcomes are representable.
     status_code: CacheableStatusCode,
     /// Backend availability tracking (authoritative missing bitset)
     pub(super) availability: ArticleAvailability,
@@ -131,8 +132,7 @@ pub struct DiskCachedArticle {
     /// Used to expire stale availability-only entries (missing articles, STAT responses)
     /// and for tier-aware TTL calculation
     pub(super) timestamp: ttl::CacheTimestampMillis,
-    /// Server tier (lower = higher priority)
-    /// Used for tier-aware TTL: higher tier = longer TTL
+    /// Server tier used by tier-aware TTL calculation.
     tier: ttl::CacheTier,
     payload: CachedPayload,
 }

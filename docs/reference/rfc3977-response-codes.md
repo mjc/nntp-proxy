@@ -1,12 +1,17 @@
 # RFC 3977 NNTP Response Codes
 
-Curated operator-focused reference from [RFC 3977 §3.2.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2.1) and [RFC 4643 (Authentication)](https://datatracker.ietf.org/doc/html/rfc4643).
+Curated operator-focused reference from [RFC 3977 §3.2.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2.1), [RFC 3977 §3.1.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.1.1), and [RFC 4643](https://datatracker.ietf.org/doc/html/rfc4643).
 
-## 1xx - Informational (All Multiline)
+RFC 3977 defines some responses as multiline and all others as single-line.
+Multiline shape is sometimes command-specific, so the proxy uses
+`RequestContext::has_response_body(status)` rather than a status-code-only
+lookup.
 
-- **100** - Help text follows
-- **101** - Capabilities list follows
-- **111** - Date (DATE command response)
+## 1xx - Informational
+
+- **100** - Help text follows **[MULTILINE]**
+- **101** - Capabilities list follows **[MULTILINE]**
+- **111** - Date/time response for `DATE` **[SINGLE-LINE]**
 
 ## 2xx - Success (Selected Responses)
 
@@ -17,7 +22,7 @@ Curated operator-focused reference from [RFC 3977 §3.2.1](https://datatracker.i
 - **202** - Slave status noted (SLAVE)
 - **203** - Streaming permitted (MODE STREAM)
 - **205** - Connection closing (QUIT)
-- **211** - Group selected
+- **211** - Group selected for `GROUP` **[SINGLE-LINE]**; article numbers follow for `LISTGROUP` **[MULTILINE]**
 
 ### Article Operations
 
@@ -50,7 +55,7 @@ Curated operator-focused reference from [RFC 3977 §3.2.1](https://datatracker.i
 ### Authentication (RFC 4643)
 
 - **381** - Password required (AUTHINFO PASS)
-- **383** - Account/OTP required (not commonly implemented)
+- **383** - Continue with SASL exchange
 
 ## 4xx - Temporary Errors
 
@@ -83,7 +88,7 @@ Curated operator-focused reference from [RFC 3977 §3.2.1](https://datatracker.i
 
 - **480** - Authentication required for command
 - **481** - Authentication rejected (AUTHINFO USER)
-- **482** - Authentication rejected (AUTHINFO PASS)
+- **482** - Authentication commands issued out of sequence, or SASL protocol error
 - **483** - Encryption required (not commonly implemented)
 
 ## 5xx - Permanent Errors
@@ -92,16 +97,30 @@ Curated operator-focused reference from [RFC 3977 §3.2.1](https://datatracker.i
 
 - **500** - Unknown/unsupported command
 - **501** - Command syntax error
-- **502** - Service permanently unavailable
+- **502** - Permission denied / command unavailable
 - **503** - Feature not supported
 
 ## Response Code Categories
 
 ### Multiline Responses
 
-All responses that send multiline data (terminated by `.\r\n`):
-- All 1xx codes (100-199)
-- Selected 2xx codes: 215, 220, 221, 222, 224, 225, 230, 231
+The proxy treats these request/status combinations as multiline:
+
+- `HELP` with **100**
+- `CAPABILITIES` with **101**
+- `LISTGROUP` with **211**
+- `LIST` with **215**
+- `ARTICLE` with **220**
+- `HEAD` with **221**
+- `BODY` with **222**
+- `OVER`/`XOVER` with **224**
+- `HDR`/`XHDR` with **225**
+- `NEWNEWS` with **230**
+- `NEWGROUPS` with **231**
+
+Unknown extension commands fall back to generic status codes that imply a
+multiline body: **100**, **101**, **215**, **220**, **221**, **222**, **224**,
+**225**, **230**, **231**, **282**, and **288**.
 
 ### Success Codes (Non-Error)
 
@@ -126,8 +145,9 @@ All responses that send multiline data (terminated by `.\r\n`):
 
 ### Authentication Flow (RFC 4643)
 
-1. **480** → AUTHINFO USER → **381** → AUTHINFO PASS → **281** (success) or **482** (fail)
-2. **480** → AUTHINFO USER → **481** (reject username)
+1. **480** → AUTHINFO USER → **381** → AUTHINFO PASS → **281** (success) or **481** (failure)
+2. AUTHINFO PASS before AUTHINFO USER → **482** (out of sequence)
+3. AUTHINFO after successful authentication → **502** (command unavailable)
 
 ### Streaming (RFC 4644)
 
