@@ -546,6 +546,13 @@ fn normalize_backend_active_counts(backends: &mut [BackendView], global_active: 
     let mut budget = ActiveConnectionBudget::new(global_active);
     backends.iter_mut().for_each(|backend| {
         backend.active_connections = budget.take_backend(backend.active_connections);
+        backend.stats.errors = ErrorCount::new(
+            backend
+                .stats
+                .errors
+                .get()
+                .min(backend.stats.total_commands.get()),
+        );
     });
 }
 
@@ -556,6 +563,13 @@ fn normalize_remote_backend_active_counts(
     let mut budget = ActiveConnectionBudget::new(global_active);
     backends.iter_mut().for_each(|backend| {
         backend.active_connections = budget.take_backend(backend.active_connections);
+        backend.stats.errors = ErrorCount::new(
+            backend
+                .stats
+                .errors
+                .get()
+                .min(backend.stats.total_commands.get()),
+        );
     });
 }
 

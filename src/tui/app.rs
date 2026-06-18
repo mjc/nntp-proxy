@@ -1677,6 +1677,35 @@ mod tests {
     }
 
     #[test]
+    fn test_snapshot_state_does_not_publish_backend_errors_above_total_commands() {
+        let metrics = MetricsCollector::new(1);
+        let router = Arc::new(BackendSelector::new());
+        let servers = create_test_servers(1);
+        let mut app = TuiAppBuilder::new(metrics, router, servers).build();
+
+        app.snapshot = Arc::new(MetricsSnapshot {
+            backend_stats: vec![crate::metrics::BackendStats {
+                backend_id: crate::types::BackendId::from_index(0),
+                total_commands: crate::metrics::CommandCount::new(1),
+                errors: crate::metrics::ErrorCount::new(5),
+                ..crate::metrics::BackendStats::default()
+            }]
+            .into(),
+            ..MetricsSnapshot::default()
+        });
+
+        let snapshot = app.snapshot_state();
+        let backend = &snapshot.backend_views[0].stats;
+
+        assert!(
+            backend.errors.get() <= backend.total_commands.get(),
+            "dashboard must not publish {} backend errors when only {} commands ran",
+            backend.errors.get(),
+            backend.total_commands.get()
+        );
+    }
+
+    #[test]
     fn test_snapshot_state_does_not_publish_user_active_connections_above_global_active() {
         use crate::metrics::{CommandCount, ErrorCount};
 
