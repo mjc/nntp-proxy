@@ -759,20 +759,17 @@ impl TuiApp {
         history_limit: Option<usize>,
     ) -> DashboardState {
         let buffer_pool = self.buffer_pool.as_ref().map(Self::snapshot_buffer_pool);
-        DashboardState {
-            metrics: self.snapshot_metrics(),
-            backend_views: self.snapshot_backend_views(history_limit),
-            top_users: self.snapshot_top_users(),
-            client_history: Self::snapshot_history_points(
-                self.client_history.points(),
-                history_limit,
-            ),
-            system_stats: self.system_stats.clone(),
-            view_mode: self.view_mode,
-            show_details: self.show_details,
-            log_lines: self.snapshot_log_lines(log_limit),
+        DashboardState::new(
+            self.snapshot_metrics(),
+            self.snapshot_backend_views(history_limit),
+            self.snapshot_top_users(),
+            Self::snapshot_history_points(self.client_history.points(), history_limit),
+            self.system_stats.clone(),
+            self.view_mode,
+            self.show_details,
+            self.snapshot_log_lines(log_limit),
             buffer_pool,
-        }
+        )
     }
 
     /// Build a serializable attached-dashboard snapshot with only remote-render fields.
@@ -783,14 +780,14 @@ impl TuiApp {
         history_limit: Option<usize>,
         top_user_limit: Option<usize>,
     ) -> RemoteDashboardState {
-        RemoteDashboardState {
-            metrics: self.snapshot_metrics(),
-            backend_views: self.snapshot_remote_backend_views(history_limit),
-            top_users: self.snapshot_top_users_with_limit(top_user_limit),
-            latest_client_throughput: self.client_history.latest().cloned(),
-            system_stats: self.system_stats.clone(),
-            log_lines: self.snapshot_log_lines(log_limit),
-        }
+        RemoteDashboardState::new(
+            self.snapshot_metrics(),
+            self.snapshot_remote_backend_views(history_limit),
+            self.snapshot_top_users_with_limit(top_user_limit),
+            self.client_history.latest().cloned(),
+            self.system_stats.clone(),
+            self.snapshot_log_lines(log_limit),
+        )
     }
 
     fn snapshot_log_lines(&self, log_limit: Option<usize>) -> Vec<String> {
@@ -932,11 +929,6 @@ impl TuiApp {
             .iter()
             .map(DashboardUserStats::from)
             .collect::<Vec<_>>();
-        if self.snapshot.active_connections.is_zero() {
-            top_users.iter_mut().for_each(|user| {
-                user.active_connections = crate::metrics::UserActiveConnections::ZERO;
-            });
-        }
         top_users.sort_by_key(|user| std::cmp::Reverse(user.total_bytes()));
         if let Some(limit) = top_user_limit {
             top_users.truncate(limit);
@@ -1585,6 +1577,223 @@ mod tests {
             nzbget.active_connections,
             crate::metrics::UserActiveConnections::ZERO,
             "dashboard must not publish stale per-user active connections when global active connections is zero"
+        );
+    }
+
+    #[test]
+    fn test_snapshot_state_does_not_publish_user_active_connections_above_global_active() {
+        use crate::metrics::{CommandCount, ErrorCount};
+
+        let metrics = MetricsCollector::new(1);
+        let router = Arc::new(BackendSelector::new());
+        let servers = create_test_servers(1);
+        let mut app = TuiAppBuilder::new(metrics, router, servers).build();
+
+        app.snapshot = Arc::new(MetricsSnapshot {
+            active_connections: crate::metrics::ActiveConnections::new(2),
+            user_stats: vec![
+                crate::metrics::UserStats {
+                    username: "nzbget".to_string(),
+                    active_connections: crate::metrics::UserActiveConnections::new(5),
+                    total_connections: crate::types::TotalConnections::new(5),
+                    bytes_sent: crate::types::BytesSent::new(10_000),
+                    bytes_received: crate::types::BytesReceived::new(20_000),
+                    bytes_sent_per_sec: crate::types::BytesPerSecondRate::ZERO,
+                    bytes_received_per_sec: crate::types::BytesPerSecondRate::ZERO,
+                    total_commands: CommandCount::new(10),
+                    errors: ErrorCount::ZERO,
+                },
+                crate::metrics::UserStats {
+                    username: "sabnzbd".to_string(),
+                    active_connections: crate::metrics::UserActiveConnections::new(1),
+                    total_connections: crate::types::TotalConnections::new(1),
+                    bytes_sent: crate::types::BytesSent::new(2_000),
+                    bytes_received: crate::types::BytesReceived::new(4_000),
+                    bytes_sent_per_sec: crate::types::BytesPerSecondRate::ZERO,
+                    bytes_received_per_sec: crate::types::BytesPerSecondRate::ZERO,
+                    total_commands: CommandCount::new(2),
+                    errors: ErrorCount::ZERO,
+                },
+            ],
+            ..MetricsSnapshot::default()
+        });
+
+        let snapshot = app.snapshot_state();
+        let displayed_user_active = snapshot
+            .top_users
+            .iter()
+            .map(|user| user.active_connections.get())
+            .sum::<usize>();
+
+        assert!(
+            displayed_user_active <= snapshot.metrics.active_connections.get(),
+            "dashboard must not publish {displayed_user_active} displayed user-active connections when only {} global connections are active",
+            snapshot.metrics.active_connections.get()
+        );
+    }
+
+    #[test]
+    fn test_remote_snapshot_does_not_publish_user_active_connections_above_global_active() {
+        use crate::metrics::{CommandCount, ErrorCount};
+
+        let metrics = MetricsCollector::new(1);
+        let router = Arc::new(BackendSelector::new());
+        let servers = create_test_servers(1);
+        let mut app = TuiAppBuilder::new(metrics, router, servers).build();
+
+        app.snapshot = Arc::new(MetricsSnapshot {
+            active_connections: crate::metrics::ActiveConnections::new(1),
+            user_stats: vec![crate::metrics::UserStats {
+                username: "nzbget".to_string(),
+                active_connections: crate::metrics::UserActiveConnections::new(5),
+                total_connections: crate::types::TotalConnections::new(5),
+                bytes_sent: crate::types::BytesSent::new(10_000),
+                bytes_received: crate::types::BytesReceived::new(20_000),
+                bytes_sent_per_sec: crate::types::BytesPerSecondRate::ZERO,
+                bytes_received_per_sec: crate::types::BytesPerSecondRate::ZERO,
+                total_commands: CommandCount::new(10),
+                errors: ErrorCount::ZERO,
+            }],
+            ..MetricsSnapshot::default()
+        });
+
+        let snapshot = app.snapshot_remote_state_with_limits(None, None, Some(5));
+        let displayed_user_active = snapshot
+            .top_users
+            .iter()
+            .map(|user| user.active_connections.get())
+            .sum::<usize>();
+
+        assert!(
+            displayed_user_active <= snapshot.metrics.active_connections.get(),
+            "remote dashboard must not publish {displayed_user_active} displayed user-active connections when only {} global connections are active",
+            snapshot.metrics.active_connections.get()
+        );
+    }
+
+    #[test]
+    fn test_snapshot_state_does_not_publish_user_active_connections_above_user_total_connections() {
+        use crate::metrics::{CommandCount, ErrorCount};
+
+        let metrics = MetricsCollector::new(1);
+        let router = Arc::new(BackendSelector::new());
+        let servers = create_test_servers(1);
+        let mut app = TuiAppBuilder::new(metrics, router, servers).build();
+
+        app.snapshot = Arc::new(MetricsSnapshot {
+            active_connections: crate::metrics::ActiveConnections::new(5),
+            user_stats: vec![crate::metrics::UserStats {
+                username: "nzbget".to_string(),
+                active_connections: crate::metrics::UserActiveConnections::new(5),
+                total_connections: crate::types::TotalConnections::new(1),
+                bytes_sent: crate::types::BytesSent::new(10_000),
+                bytes_received: crate::types::BytesReceived::new(20_000),
+                bytes_sent_per_sec: crate::types::BytesPerSecondRate::ZERO,
+                bytes_received_per_sec: crate::types::BytesPerSecondRate::ZERO,
+                total_commands: CommandCount::new(10),
+                errors: ErrorCount::ZERO,
+            }],
+            ..MetricsSnapshot::default()
+        });
+
+        let snapshot = app.snapshot_state();
+        let nzbget = snapshot
+            .top_users
+            .iter()
+            .find(|user| user.username == "nzbget")
+            .expect("nzbget row should still be present for historical traffic");
+
+        assert!(
+            nzbget.active_connections.get() as u64 <= nzbget.total_connections.get(),
+            "dashboard must not publish {} active connections for a user with only {} total connections",
+            nzbget.active_connections.get(),
+            nzbget.total_connections.get()
+        );
+    }
+
+    #[test]
+    fn test_snapshot_state_does_not_publish_active_connections_above_total_connections() {
+        let metrics = MetricsCollector::new(1);
+        let router = Arc::new(BackendSelector::new());
+        let servers = create_test_servers(1);
+        let mut app = TuiAppBuilder::new(metrics, router, servers).build();
+
+        app.snapshot = Arc::new(MetricsSnapshot {
+            total_connections: crate::types::TotalConnections::new(1),
+            active_connections: crate::metrics::ActiveConnections::new(5),
+            ..MetricsSnapshot::default()
+        });
+
+        let snapshot = app.snapshot_state();
+        let active_connections = snapshot.metrics.active_connections.get() as u64;
+
+        assert!(
+            active_connections <= snapshot.metrics.total_connections.get(),
+            "dashboard must not publish {} active connections when only {} total connections have ever opened",
+            snapshot.metrics.active_connections.get(),
+            snapshot.metrics.total_connections.get()
+        );
+    }
+
+    #[test]
+    fn test_snapshot_state_does_not_publish_backend_active_connections_above_global_active() {
+        let metrics = MetricsCollector::new(2);
+        let router = Arc::new(BackendSelector::new());
+        let servers = create_test_servers(2);
+        let mut app = TuiAppBuilder::new(metrics, router, servers).build();
+
+        app.snapshot = Arc::new(MetricsSnapshot {
+            active_connections: crate::metrics::ActiveConnections::new(1),
+            backend_stats: vec![
+                crate::metrics::BackendStats {
+                    backend_id: crate::types::BackendId::from_index(0),
+                    active_connections: crate::metrics::ActiveConnections::new(3),
+                    ..crate::metrics::BackendStats::default()
+                },
+                crate::metrics::BackendStats {
+                    backend_id: crate::types::BackendId::from_index(1),
+                    active_connections: crate::metrics::ActiveConnections::new(2),
+                    ..crate::metrics::BackendStats::default()
+                },
+            ]
+            .into(),
+            ..MetricsSnapshot::default()
+        });
+
+        let snapshot = app.snapshot_state();
+        let displayed_backend_active = snapshot
+            .backend_views
+            .iter()
+            .map(|backend| backend.active_connections.get())
+            .sum::<usize>();
+
+        assert!(
+            displayed_backend_active <= snapshot.metrics.active_connections.get(),
+            "dashboard must not publish {displayed_backend_active} displayed backend-active connections when only {} global connections are active",
+            snapshot.metrics.active_connections.get()
+        );
+    }
+
+    #[test]
+    fn test_snapshot_state_does_not_publish_stateful_sessions_above_active_connections() {
+        let metrics = MetricsCollector::new(1);
+        let router = Arc::new(BackendSelector::new());
+        let servers = create_test_servers(1);
+        let mut app = TuiAppBuilder::new(metrics, router, servers).build();
+
+        app.snapshot = Arc::new(MetricsSnapshot {
+            active_connections: crate::metrics::ActiveConnections::new(1),
+            stateful_sessions: crate::metrics::StatefulSessions::new(3),
+            ..MetricsSnapshot::default()
+        });
+
+        let snapshot = app.snapshot_state();
+
+        assert!(
+            snapshot.metrics.stateful_sessions.get() <= snapshot.metrics.active_connections.get(),
+            "dashboard must not publish {} stateful sessions when only {} connections are active",
+            snapshot.metrics.stateful_sessions.get(),
+            snapshot.metrics.active_connections.get()
         );
     }
 
