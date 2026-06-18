@@ -1739,6 +1739,38 @@ mod tests {
     }
 
     #[test]
+    fn test_snapshot_state_does_not_publish_user_errors_above_total_commands() {
+        let metrics = MetricsCollector::new(1);
+        let router = Arc::new(BackendSelector::new());
+        let servers = create_test_servers(1);
+        let mut app = TuiAppBuilder::new(metrics, router, servers).build();
+
+        app.snapshot = Arc::new(MetricsSnapshot {
+            user_stats: vec![crate::metrics::UserStats {
+                username: "nzbget".to_string(),
+                total_commands: crate::metrics::CommandCount::new(1),
+                errors: crate::metrics::ErrorCount::new(5),
+                ..crate::metrics::UserStats::default()
+            }],
+            ..MetricsSnapshot::default()
+        });
+
+        let snapshot = app.snapshot_state();
+        let user = snapshot
+            .top_users
+            .iter()
+            .find(|user| user.username == "nzbget")
+            .expect("user row should be published");
+
+        assert!(
+            user.errors.get() <= user.total_commands.get(),
+            "dashboard must not publish {} user errors when only {} commands ran",
+            user.errors.get(),
+            user.total_commands.get()
+        );
+    }
+
+    #[test]
     fn test_snapshot_state_does_not_publish_user_active_connections_above_global_active() {
         use crate::metrics::{CommandCount, ErrorCount};
 

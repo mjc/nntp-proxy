@@ -539,6 +539,7 @@ fn normalize_user_active_counts(
     let mut budget = ActiveConnectionBudget::new(global_active);
     users.iter_mut().for_each(|user| {
         user.active_connections = budget.take_user(user.active_connections);
+        user.errors = ErrorCount::new(user.errors.get().min(user.total_commands.get()));
     });
 }
 
