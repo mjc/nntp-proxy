@@ -932,6 +932,11 @@ impl TuiApp {
             .iter()
             .map(DashboardUserStats::from)
             .collect::<Vec<_>>();
+        if self.snapshot.active_connections.is_zero() {
+            top_users.iter_mut().for_each(|user| {
+                user.active_connections = crate::metrics::UserActiveConnections::ZERO;
+            });
+        }
         top_users.sort_by_key(|user| std::cmp::Reverse(user.total_bytes()));
         if let Some(limit) = top_user_limit {
             top_users.truncate(limit);
@@ -1542,6 +1547,45 @@ mod tests {
         assert_eq!(decoded.top_users[0].active_connections.get(), 2);
         assert_eq!(decoded.top_users[0].bytes_sent_per_sec.get(), 11);
         assert_eq!(decoded.top_users[0].bytes_received_per_sec.get(), 13);
+    }
+
+    #[test]
+    fn test_snapshot_state_does_not_publish_stale_user_active_connections() {
+        use crate::metrics::{CommandCount, ErrorCount};
+
+        let metrics = MetricsCollector::new(1);
+        let router = Arc::new(BackendSelector::new());
+        let servers = create_test_servers(1);
+        let mut app = TuiAppBuilder::new(metrics, router, servers).build();
+
+        app.snapshot = Arc::new(MetricsSnapshot {
+            active_connections: crate::metrics::ActiveConnections::ZERO,
+            user_stats: vec![crate::metrics::UserStats {
+                username: "nzbget".to_string(),
+                active_connections: crate::metrics::UserActiveConnections::new(5),
+                total_connections: crate::types::TotalConnections::new(5),
+                bytes_sent: crate::types::BytesSent::new(10_000),
+                bytes_received: crate::types::BytesReceived::new(20_000),
+                bytes_sent_per_sec: crate::types::BytesPerSecondRate::ZERO,
+                bytes_received_per_sec: crate::types::BytesPerSecondRate::ZERO,
+                total_commands: CommandCount::new(10),
+                errors: ErrorCount::ZERO,
+            }],
+            ..MetricsSnapshot::default()
+        });
+
+        let snapshot = app.snapshot_state();
+        let nzbget = snapshot
+            .top_users
+            .iter()
+            .find(|user| user.username == "nzbget")
+            .expect("nzbget row should still be present for historical traffic");
+
+        assert_eq!(
+            nzbget.active_connections,
+            crate::metrics::UserActiveConnections::ZERO,
+            "dashboard must not publish stale per-user active connections when global active connections is zero"
+        );
     }
 
     #[test]
