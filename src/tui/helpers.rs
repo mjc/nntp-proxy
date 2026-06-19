@@ -76,7 +76,7 @@ pub fn create_sparkline_text(value: u64, max_value: u64) -> ArrayString<64> {
 /// 3. Accumulates results with global max tracking
 ///
 /// Returns (`chart_data`, `global_max_throughput`)
-pub fn build_chart_data<'a>(backend_views: &'a [BackendView]) -> (ChartDataVec<'a>, f64) {
+pub fn build_chart_data(backend_views: &[BackendView]) -> (ChartDataVec, f64) {
     /// Extract data from a single throughput point
     #[inline]
     fn extract_point_data(idx: usize, point: &ThroughputPoint) -> (ChartPoint, ChartPoint, ChartY) {
@@ -117,12 +117,7 @@ pub fn build_chart_data<'a>(backend_views: &'a [BackendView]) -> (ChartDataVec<'
                 );
 
             (
-                BackendChartData::new(
-                    backend.server.name.as_str(),
-                    backend_color(index),
-                    &sent_points,
-                    &recv_points,
-                ),
+                BackendChartData::new(backend_color(index), &sent_points, &recv_points),
                 backend_max.get(),
             )
         })
@@ -396,13 +391,11 @@ mod tests {
     #[test]
     fn test_chart_data_vec_type() {
         // Verify ChartDataVec can hold typical backend count on stack
-        let names: Vec<String> = (0..8).map(|i| format!("Server {i}")).collect();
         let mut chart_data = ChartDataVec::new();
 
         // Add 8 backends (at SmallVec capacity)
-        for (i, name) in names.iter().enumerate() {
+        for i in 0..8 {
             chart_data.push(BackendChartData::new(
-                name.as_str(),
                 backend_color(i),
                 &PointVec::new(),
                 &PointVec::new(),
@@ -410,20 +403,12 @@ mod tests {
         }
 
         assert_eq!(chart_data.len(), 8);
-        assert_eq!(chart_data[0].name, "Server 0");
-        assert_eq!(chart_data[7].name, "Server 7");
     }
 
     #[test]
     fn test_backend_chart_data_structure() {
-        let data = BackendChartData::new(
-            "Test Server",
-            backend_color(0),
-            &PointVec::new(),
-            &PointVec::new(),
-        );
+        let data = BackendChartData::new(backend_color(0), &PointVec::new(), &PointVec::new());
 
-        assert_eq!(data.name, "Test Server");
         // Verify pre-computed tuples are empty
         assert_eq!(data.sent_points_as_tuples().len(), 0);
         assert_eq!(data.recv_points_as_tuples().len(), 0);
@@ -464,7 +449,6 @@ mod tests {
         let (chart_data, max_throughput) = build_chart_data(&backend_views);
 
         assert_eq!(chart_data.len(), 1);
-        assert_eq!(chart_data[0].name, "Backend");
         assert_eq!(
             chart_data[0].sent_points_as_tuples(),
             &[(0.0, 100.0), (1.0, 150.0)]

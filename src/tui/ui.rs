@@ -2005,14 +2005,6 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
     let max_label = format_throughput_label(max_throughput_rounded);
     let half_label = format_throughput_label(max_throughput_rounded / 2.0);
 
-    fn dataset_name<'a>(backend_name: &'a str, direction: &'static str) -> Line<'a> {
-        Line::from(vec![
-            Span::raw(backend_name),
-            Span::raw(" "),
-            Span::raw(direction),
-        ])
-    }
-
     // Build datasets directly from pre-computed chart data.
     let mut datasets = Vec::with_capacity(chart_data.len() * 2);
     for data in &chart_data {
@@ -2020,7 +2012,6 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
         if !recv_points.is_empty() {
             datasets.push(
                 Dataset::default()
-                    .name(dataset_name(data.name, text::ARROW_DOWN))
                     .marker(symbols::Marker::Braille)
                     .graph_type(GraphType::Area)
                     .fill_to_y(0.0)
@@ -2033,7 +2024,6 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
         if !sent_points.is_empty() {
             datasets.push(
                 Dataset::default()
-                    .name(dataset_name(data.name, text::ARROW_UP))
                     .marker(symbols::Marker::Braille)
                     .graph_type(GraphType::Line)
                     .style(Style::default().fg(data.color))
@@ -2045,6 +2035,7 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
     // Build and render chart
     let chart = Chart::new(datasets)
         .block(bordered_block(chart::TITLE, styles::BORDER_NORMAL))
+        .legend_position(None)
         .x_axis(
             Axis::default()
                 .title("")
