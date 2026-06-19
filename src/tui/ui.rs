@@ -13,9 +13,9 @@ use crate::tui::dashboard::{
     InUseBuffers, TotalBuffers,
 };
 use crate::tui::helpers::{
-    build_chart_data, calculate_chart_bounds, connection_failure_color, create_sparkline_text,
-    error_count_color, error_rate_color, format_summary_throughput, format_throughput_label,
-    health_indicator, socket_addr_text,
+    backend_color, build_chart_data, calculate_chart_bounds, connection_failure_color,
+    create_sparkline_text, error_count_color, error_rate_color, format_summary_throughput,
+    format_throughput_label, health_indicator, socket_addr_text,
 };
 use crate::types::MaxConnections;
 use crate::types::TotalConnections;
@@ -1451,10 +1451,22 @@ fn render_backend_list(f: &mut Frame, area: Rect, state: &DashboardState, show_d
         let backend_stats = &backend.stats;
         let server = &backend.server;
         let y = inner.top().saturating_add(row);
+        let chart_color = backend_color(i);
         let (health_icon, health_color) = health_indicator(backend.health_status);
         let error_rate = backend_stats.error_rate_percent();
 
         let mut x = inner.left();
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            "■",
+            Style::default()
+                .fg(chart_color)
+                .add_modifier(Modifier::BOLD),
+        );
+        write_part(buffer, &mut x, y, right, " ", Style::default());
         write_part(
             buffer,
             &mut x,
@@ -2013,8 +2025,7 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
             datasets.push(
                 Dataset::default()
                     .marker(symbols::Marker::Braille)
-                    .graph_type(GraphType::Area)
-                    .fill_to_y(0.0)
+                    .graph_type(GraphType::Line)
                     .style(Style::default().fg(data.color).add_modifier(Modifier::BOLD))
                     .data(recv_points),
             );
@@ -2061,6 +2072,51 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
         );
 
     f.render_widget(chart, area);
+    render_data_flow_legend(f.buffer_mut(), area, &state.backend_views);
+}
+
+fn render_data_flow_legend(
+    buffer: &mut Buffer,
+    area: Rect,
+    backends: &[crate::tui::dashboard::BackendView],
+) {
+    if area.width <= 4 || area.height == 0 || backends.is_empty() {
+        return;
+    }
+
+    let title_offset = u16::try_from(chart::TITLE.len())
+        .unwrap_or(u16::MAX)
+        .saturating_add(5);
+    let mut x = area.x.saturating_add(title_offset);
+    let y = area.y;
+    let right = area.right().saturating_sub(1);
+
+    for (index, backend) in backends.iter().enumerate() {
+        if x >= right {
+            break;
+        }
+        if index > 0 {
+            write_part(buffer, &mut x, y, right, "  ", Style::default());
+        }
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            "■ ",
+            Style::default()
+                .fg(backend_color(index))
+                .add_modifier(Modifier::BOLD),
+        );
+        write_part(
+            buffer,
+            &mut x,
+            y,
+            right,
+            backend.server.name.as_str(),
+            Style::default().fg(styles::LABEL),
+        );
+    }
 }
 
 /// Render footer with help text
@@ -2854,6 +2910,24 @@ mod tests {
         assert!(lines.iter().any(|line| line.contains("one")));
         assert!(lines.iter().any(|line| line.contains("two")));
         assert!(lines.iter().any(String::is_empty));
+    }
+
+    #[test]
+    fn data_flow_legend_maps_backend_names_to_chart_colors() {
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 3));
+        let backends = vec![test_backend_view("one"), test_backend_view("two")];
+
+        render_data_flow_legend(&mut buffer, Rect::new(0, 0, 80, 3), &backends);
+
+        let row = (0..80)
+            .map(|x| buffer.cell((x, 0)).unwrap().symbol())
+            .collect::<String>();
+        let marker_x = u16::try_from(chart::TITLE.len()).unwrap() + 5;
+
+        assert!(row.contains("one"));
+        assert!(row.contains("two"));
+        assert_eq!(buffer.cell((marker_x, 0)).unwrap().symbol(), "■");
+        assert_eq!(buffer.cell((marker_x, 0)).unwrap().fg, backend_color(0));
     }
 
     fn test_backend_view(name: &str) -> crate::tui::dashboard::BackendView {
