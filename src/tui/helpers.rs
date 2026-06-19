@@ -311,6 +311,10 @@ pub fn calculate_chart_bounds(max_throughput: f64) -> f64 {
 #[allow(clippy::float_cmp)] // These helper tests use exact expected fixture values for chart math.
 mod tests {
     use super::*;
+    use crate::metrics::{BackendHealthStatus, BackendStats};
+    use crate::tui::dashboard::{BackendDisplay, BackendView};
+    use crate::types::tui::{CommandsPerSecond, Throughput, Timestamp};
+    use crate::types::{HostName, MaxConnections, Port, ServerName};
 
     #[test]
     fn test_backend_color_cycles() {
@@ -423,6 +427,53 @@ mod tests {
         // Verify pre-computed tuples are empty
         assert_eq!(data.sent_points_as_tuples().len(), 0);
         assert_eq!(data.recv_points_as_tuples().len(), 0);
+    }
+
+    #[test]
+    fn test_build_chart_data_preserves_sent_and_recv_series() {
+        let backend_views = vec![BackendView {
+            server: BackendDisplay {
+                host: HostName::try_new("backend.example.com".to_string()).unwrap(),
+                port: Port::try_new(119).unwrap(),
+                name: ServerName::try_new("Backend".to_string()).unwrap(),
+                max_connections: MaxConnections::try_new(10).unwrap(),
+            },
+            stats: BackendStats::default(),
+            active_connections: crate::metrics::ActiveConnections::new(1),
+            health_status: BackendHealthStatus::Healthy,
+            pending_count: crate::metrics::PendingRequests::new(0),
+            load_ratio: Some(0.5),
+            stateful_count: crate::metrics::StatefulSessions::new(0),
+            traffic_share: Some(42.0),
+            history: vec![
+                ThroughputPoint::new_backend(
+                    Timestamp::now(),
+                    Throughput::new(100.0),
+                    Throughput::new(200.0),
+                    CommandsPerSecond::new(10.0),
+                ),
+                ThroughputPoint::new_backend(
+                    Timestamp::now(),
+                    Throughput::new(150.0),
+                    Throughput::new(175.0),
+                    CommandsPerSecond::new(12.0),
+                ),
+            ],
+        }];
+
+        let (chart_data, max_throughput) = build_chart_data(&backend_views);
+
+        assert_eq!(chart_data.len(), 1);
+        assert_eq!(chart_data[0].name, "Backend");
+        assert_eq!(
+            chart_data[0].sent_points_as_tuples(),
+            &[(0.0, 100.0), (1.0, 150.0)]
+        );
+        assert_eq!(
+            chart_data[0].recv_points_as_tuples(),
+            &[(0.0, 200.0), (1.0, 175.0)]
+        );
+        assert_eq!(max_throughput, 200.0);
     }
 
     // ========================================================================

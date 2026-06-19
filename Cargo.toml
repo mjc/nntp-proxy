@@ -64,7 +64,7 @@ uuid = { version = "1.23", features = ["v4"] }  # Unique IDs for request trackin
 moka = { version = "0.12", features = ["future"], default-features = false }  # Async LRU cache, minimal features
 foyer = { version = "0.22", features = ["serde"] }  # Hybrid memory+disk cache for large article caching
 bytes = "1.11"  # Efficient byte buffer for zero-copy operations
-ratatui = "0.30"  # Terminal UI framework
+ratatui = "0.30.2"  # Terminal UI framework
 crossterm = "0.29"  # Cross-platform terminal manipulation
 smallvec = { version = "1.15", features = ["serde"] }  # Stack-allocated vectors for small collections
 arrayvec = "0.7"  # Stack-backed strings for small display formatting without heap allocation

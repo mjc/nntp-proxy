@@ -2013,9 +2013,22 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
         ])
     }
 
-    // Build datasets directly from pre-computed chart data
+    // Build datasets directly from pre-computed chart data.
     let mut datasets = Vec::with_capacity(chart_data.len() * 2);
     for data in &chart_data {
+        let recv_points = data.recv_points_as_tuples();
+        if !recv_points.is_empty() {
+            datasets.push(
+                Dataset::default()
+                    .name(dataset_name(data.name, text::ARROW_DOWN))
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(GraphType::Area)
+                    .fill_to_y(0.0)
+                    .style(Style::default().fg(data.color).add_modifier(Modifier::BOLD))
+                    .data(recv_points),
+            );
+        }
+
         let sent_points = data.sent_points_as_tuples();
         if !sent_points.is_empty() {
             datasets.push(
@@ -2025,18 +2038,6 @@ fn render_data_flow(f: &mut Frame, area: Rect, state: &DashboardState) {
                     .graph_type(GraphType::Line)
                     .style(Style::default().fg(data.color))
                     .data(sent_points),
-            );
-        }
-
-        let recv_points = data.recv_points_as_tuples();
-        if !recv_points.is_empty() {
-            datasets.push(
-                Dataset::default()
-                    .name(dataset_name(data.name, text::ARROW_DOWN))
-                    .marker(symbols::Marker::Braille)
-                    .graph_type(GraphType::Line)
-                    .style(Style::default().fg(data.color).add_modifier(Modifier::BOLD))
-                    .data(recv_points),
             );
         }
     }
