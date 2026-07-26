@@ -34,16 +34,6 @@
 
       craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-      # Nightly toolchain for tools that require it (cargo-udeps)
-      rustNightlyForUdeps = pkgs.rust-bin.nightly.latest.default;
-
-      # Wrapper for cargo-udeps that uses nightly
-      cargo-udeps-wrapped = pkgs.writeShellScriptBin "cargo-udeps" ''
-        export RUSTC="${rustNightlyForUdeps}/bin/rustc"
-        export CARGO="${rustNightlyForUdeps}/bin/cargo"
-        exec ${pkgs.cargo-udeps}/bin/cargo-udeps "$@"
-      '';
-
       # Stable toolchain with all cross-compilation targets for releases
       rustCrossToolchain = pkgs.rust-bin.stable.${rustVersion}.default.override {
         extensions = ["rust-src"];
@@ -93,7 +83,6 @@
           # Build & dependencies
           cargo-outdated
           cargo-bloat
-          cargo-udeps-wrapped
 
           # Utilities
           tokei
