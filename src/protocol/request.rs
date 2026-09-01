@@ -225,6 +225,43 @@ impl From<u64> for RequestCacheArticleNumber {
 }
 
 #[derive(Debug)]
+enum RequestCompletion {
+    Local {
+        response: RequestResponseMetadata,
+    },
+    Cache {
+        response: RequestResponseMetadata,
+    },
+    Backend {
+        backend_id: BackendId,
+        response: RequestResponseMetadata,
+        payload: Option<Box<crate::pool::ChunkedResponse>>,
+    },
+}
+
+impl RequestCompletion {
+    fn clone_without_payload(&self) -> Self {
+        match self {
+            Self::Local { response } => Self::Local {
+                response: *response,
+            },
+            Self::Cache { response } => Self::Cache {
+                response: *response,
+            },
+            Self::Backend {
+                backend_id,
+                response,
+                ..
+            } => Self::Backend {
+                backend_id: *backend_id,
+                response: *response,
+                payload: None,
+            },
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct RequestContext {
     kind: RequestKind,
     verb: SmallVec<[u8; 16]>,
@@ -232,9 +269,7 @@ pub struct RequestContext {
     message_id: Option<(usize, usize)>,
     cache_status: Option<RequestCacheStatus>,
     cache_entry: Option<RequestCacheEntryMetadata>,
-    backend_id: Option<BackendId>,
-    response: Option<RequestResponseMetadata>,
-    response_payload: Option<crate::pool::ChunkedResponse>,
+    completion: Option<RequestCompletion>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,7 +344,13 @@ impl<'a> RequestLine<'a> {
 impl Clone for RequestContext {
     fn clone(&self) -> Self {
         debug_assert!(
-            self.response_payload.is_none(),
+            !matches!(
+                self.completion,
+                Some(RequestCompletion::Backend {
+                    payload: Some(_),
+                    ..
+                })
+            ),
             "completed response payloads are not cloned"
         );
         Self {
@@ -319,9 +360,10 @@ impl Clone for RequestContext {
             message_id: self.message_id,
             cache_status: self.cache_status,
             cache_entry: self.cache_entry,
-            backend_id: self.backend_id,
-            response: self.response,
-            response_payload: None,
+            completion: self
+                .completion
+                .as_ref()
+                .map(RequestCompletion::clone_without_payload),
         }
     }
 }
@@ -449,9 +491,7 @@ impl RequestContext {
             message_id,
             cache_status: None,
             cache_entry: None,
-            backend_id: None,
-            response: None,
-            response_payload: None,
+            completion: None,
         }
     }
 
@@ -464,7 +504,10 @@ impl RequestContext {
     #[inline]
     #[must_use]
     pub const fn backend_id(&self) -> Option<BackendId> {
-        self.backend_id
+        match self.completion {
+            Some(RequestCompletion::Backend { backend_id, .. }) => Some(backend_id),
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -562,8 +605,10 @@ impl RequestContext {
     #[inline]
     #[must_use]
     pub const fn response_status(&self) -> Option<StatusCode> {
-        match self.response {
-            Some(response) => Some(response.status),
+        match self.completion {
+            Some(RequestCompletion::Local { response })
+            | Some(RequestCompletion::Cache { response })
+            | Some(RequestCompletion::Backend { response, .. }) => Some(response.status),
             None => None,
         }
     }
@@ -571,8 +616,10 @@ impl RequestContext {
     #[inline]
     #[must_use]
     pub const fn response_wire_len(&self) -> Option<ResponseWireLen> {
-        match self.response {
-            Some(response) => Some(response.wire_len),
+        match self.completion {
+            Some(RequestCompletion::Local { response })
+            | Some(RequestCompletion::Cache { response })
+            | Some(RequestCompletion::Backend { response, .. }) => Some(response.wire_len),
             None => None,
         }
     }
@@ -580,16 +627,24 @@ impl RequestContext {
     #[inline]
     #[must_use]
     pub(crate) const fn response_metadata(&self) -> Option<RequestResponseMetadata> {
-        self.response
+        match self.completion {
+            Some(RequestCompletion::Local { response })
+            | Some(RequestCompletion::Cache { response })
+            | Some(RequestCompletion::Backend { response, .. }) => Some(response),
+            None => None,
+        }
     }
 
     #[inline]
     #[must_use]
     #[cfg(test)]
     pub(crate) const fn response_payload_len(&self) -> Option<ResponsePayloadLen> {
-        match &self.response_payload {
-            Some(response) => Some(ResponsePayloadLen::new(response.len())),
-            None => None,
+        match &self.completion {
+            Some(RequestCompletion::Backend {
+                payload: Some(response),
+                ..
+            }) => Some(ResponsePayloadLen::new(response.len())),
+            _ => None,
         }
     }
 
@@ -601,16 +656,24 @@ impl RequestContext {
         status: StatusCode,
         response: crate::pool::ChunkedResponse,
     ) {
-        self.backend_id = Some(backend_id);
-        self.response = Some(RequestResponseMetadata::new(status, response.len().into()));
-        self.response_payload = Some(response);
+        self.completion = Some(RequestCompletion::Backend {
+            backend_id,
+            response: RequestResponseMetadata::new(status, response.len().into()),
+            payload: Some(Box::new(response)),
+        });
     }
 
     #[inline]
     #[cfg(test)]
     #[must_use]
     pub(crate) fn response_payload(&self) -> Option<&crate::pool::ChunkedResponse> {
-        self.response_payload.as_ref()
+        match &self.completion {
+            Some(RequestCompletion::Backend {
+                payload: Some(response),
+                ..
+            }) => Some(response.as_ref()),
+            _ => None,
+        }
     }
 
     #[inline]
@@ -634,24 +697,27 @@ impl RequestContext {
     }
 
     #[inline]
-    pub(crate) const fn record_backend_response(
+    pub(crate) fn record_backend_response(
         &mut self,
         backend_id: BackendId,
         response: RequestResponseMetadata,
     ) {
-        self.backend_id = Some(backend_id);
-        self.response = Some(response);
+        self.completion = Some(RequestCompletion::Backend {
+            backend_id,
+            response,
+            payload: None,
+        });
     }
 
     #[inline]
-    pub(crate) const fn record_cache_response(&mut self, response: RequestResponseMetadata) {
+    pub(crate) fn record_cache_response(&mut self, response: RequestResponseMetadata) {
         self.cache_status = Some(RequestCacheStatus::Hit);
-        self.response = Some(response);
+        self.completion = Some(RequestCompletion::Cache { response });
     }
 
     #[inline]
-    pub(crate) const fn record_local_response(&mut self, response: RequestResponseMetadata) {
-        self.response = Some(response);
+    pub(crate) fn record_local_response(&mut self, response: RequestResponseMetadata) {
+        self.completion = Some(RequestCompletion::Local { response });
     }
 
     #[inline]
@@ -1291,6 +1357,27 @@ mod tests {
         assert_eq!(ctx.response_status(), Some(status));
         assert_eq!(ctx.response_wire_len(), Some(ResponseWireLen::new(24)));
         assert_eq!(wire(&ctx), b"QUIT\r\n");
+    }
+
+    #[test]
+    fn request_context_completion_replaces_the_previous_source() {
+        let mut ctx = request_context(b"STAT <a@b>\r\n");
+        let backend_id = BackendId::from_index(2);
+        let backend_status = StatusCode::new(223);
+        let local_status = StatusCode::new(205);
+
+        ctx.record_backend_response(
+            backend_id,
+            RequestResponseMetadata::new(backend_status, ResponseWireLen::new(19)),
+        );
+        ctx.record_local_response(RequestResponseMetadata::new(
+            local_status,
+            ResponseWireLen::new(15),
+        ));
+
+        assert_eq!(ctx.backend_id(), None);
+        assert_eq!(ctx.response_status(), Some(local_status));
+        assert_eq!(ctx.response_wire_len(), Some(ResponseWireLen::new(15)));
     }
 
     #[test]

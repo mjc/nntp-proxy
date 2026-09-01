@@ -22,6 +22,27 @@ use tracing::{debug, warn};
 // Re-export TlsStream for use in other modules
 pub use tokio_rustls::client::TlsStream;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TlsVerification {
+    VerifyCertificate,
+    SkipCertificateVerification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TlsPolicy {
+    Plain,
+    Tls {
+        verification: TlsVerification,
+        cert_path: Option<String>,
+    },
+}
+
+impl TlsPolicy {
+    pub(crate) const fn is_enabled(&self) -> bool {
+        matches!(self, Self::Tls { .. })
+    }
+}
+
 /// Configuration for TLS connections
 #[derive(Debug, Clone)]
 pub struct TlsConfig {
@@ -58,6 +79,20 @@ impl TlsConfig {
     #[must_use]
     pub fn builder() -> TlsConfigBuilder {
         TlsConfigBuilder::default()
+    }
+    pub(crate) fn policy(&self) -> TlsPolicy {
+        if !self.use_tls {
+            return TlsPolicy::Plain;
+        }
+
+        TlsPolicy::Tls {
+            verification: if self.tls_verify_cert {
+                TlsVerification::VerifyCertificate
+            } else {
+                TlsVerification::SkipCertificateVerification
+            },
+            cert_path: self.tls_cert_path.clone(),
+        }
     }
 }
 

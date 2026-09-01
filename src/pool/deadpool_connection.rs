@@ -21,10 +21,69 @@ use tokio::sync::Notify;
 use crate::connection_error::ConnectionError;
 use crate::protocol::{RequestContext, authinfo_pass, authinfo_user};
 use crate::stream::ConnectionStream;
-use crate::tls::{TlsConfig, TlsManager};
+use crate::tls::{TlsConfig, TlsManager, TlsPolicy};
+
+/// A backend connection that has completed all setup negotiations.
+#[derive(Debug)]
+pub struct ReadyBackendConnection(ConnectionStream);
+
+impl ReadyBackendConnection {
+    fn new(stream: ConnectionStream) -> Self {
+        Self(stream)
+    }
+}
+
+impl std::ops::Deref for ReadyBackendConnection {
+    type Target = ConnectionStream;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ReadyBackendConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl tokio::io::AsyncRead for ReadyBackendConnection {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for ReadyBackendConnection {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().0).poll_shutdown(cx)
+    }
+}
 
 /// Type alias for the deadpool connection pool
 pub type Pool = managed::Pool<TcpManager>;
+pub(crate) type PooledConnection = managed::Object<TcpManager>;
 
 /// Shared DNS resolver instance for all managers.
 static DNS_RESOLVER: OnceLock<TokioResolver> = OnceLock::new();
@@ -60,6 +119,40 @@ enum CompressionSupportState {
     Probing(Arc<Notify>),
     Supported,
     Unsupported,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompressionMode {
+    Disabled,
+    Auto,
+    Required,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompressionPolicy {
+    mode: CompressionMode,
+    level: u32,
+}
+
+impl CompressionPolicy {
+    fn from_raw(mode: Option<bool>, level: Option<u32>) -> Result<Self, ConnectionError> {
+        let level = level.unwrap_or(1);
+        if level > 9 {
+            return Err(ConnectionError::IoError(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("compression level {level} is outside the supported 0-9 range"),
+            )));
+        }
+
+        Ok(Self {
+            mode: match mode {
+                Some(false) => CompressionMode::Disabled,
+                Some(true) => CompressionMode::Required,
+                None => CompressionMode::Auto,
+            },
+            level,
+        })
+    }
 }
 
 /// Optional settings for [`TcpManager`] construction
@@ -109,15 +202,12 @@ pub struct TcpManager {
     pub(crate) name: String,
     pub(crate) username: Option<String>,
     pub(crate) password: Option<String>,
-    pub(crate) tls_config: TlsConfig,
+    pub(crate) tls_policy: TlsPolicy,
     /// Cached TLS manager with pre-loaded certificates (avoids base64 decode overhead)
     pub(crate) tls_manager: Option<Arc<TlsManager>>,
     pub(crate) recv_buffer_size: usize,
     pub(crate) send_buffer_size: usize,
-    /// Wire compression mode: None = auto-detect, Some(true) = require, Some(false) = disable
-    pub(crate) compress: Option<bool>,
-    /// Compression level (0-9). None = fast (level 1).
-    pub(crate) compress_level: Option<u32>,
+    compression: CompressionPolicy,
     compression_support: Arc<Mutex<CompressionSupportState>>,
     /// Whether to send MODE READER after authentication (RFC 3977 §5.3)
     pub(crate) send_mode_reader: bool,
@@ -203,19 +293,24 @@ impl TcpManager {
         name: String,
         options: TcpManagerOptions,
     ) -> Result<Self, ConnectionError> {
-        let (tls_config, tls_manager) = match options.tls_config {
-            Some(cfg) if cfg.use_tls => {
+        let tls_policy = options
+            .tls_config
+            .as_ref()
+            .map(TlsConfig::policy)
+            .unwrap_or(TlsPolicy::Plain);
+        let tls_manager = match options.tls_config {
+            Some(cfg) if tls_policy.is_enabled() => {
                 let mgr = Arc::new(TlsManager::new(cfg.clone()).map_err(|e| {
                     ConnectionError::TlsHandshake {
                         backend: name.clone(),
                         source: e.into(),
                     }
                 })?);
-                (cfg, Some(mgr))
+                Some(mgr)
             }
-            Some(cfg) => (cfg, None),
-            None => (TlsConfig::default(), None),
+            Some(_) | None => None,
         };
+        let compression = CompressionPolicy::from_raw(options.compress, options.compress_level)?;
 
         Ok(Self {
             host,
@@ -223,12 +318,11 @@ impl TcpManager {
             name,
             username: options.username,
             password: options.password,
-            tls_config,
+            tls_policy,
             tls_manager,
             recv_buffer_size: options.recv_buffer_size,
             send_buffer_size: options.send_buffer_size,
-            compress: options.compress,
-            compress_level: options.compress_level,
+            compression,
             compression_support: Arc::new(Mutex::new(CompressionSupportState::Unknown)),
             send_mode_reader: options.send_mode_reader,
         })
@@ -350,7 +444,7 @@ impl TcpManager {
         let tcp_stream = self.create_connected_tcp_stream().await?;
 
         // Perform TLS handshake if enabled
-        if self.tls_config.use_tls {
+        if self.tls_policy.is_enabled() {
             // Use cached TLS manager to avoid re-parsing certificates
             let Some(tls_manager) = self.tls_manager.as_ref() else {
                 return Err(ConnectionError::TlsHandshake {
@@ -475,11 +569,11 @@ impl TcpManager {
         stream: &mut ConnectionStream,
         buffer: &mut [u8],
     ) -> Result<bool, ConnectionError> {
-        if self.compress == Some(false) {
+        if matches!(self.compression.mode, CompressionMode::Disabled) {
             return Ok(false);
         }
 
-        if self.compress == Some(true) {
+        if matches!(self.compression.mode, CompressionMode::Required) {
             return self
                 .probe_compression_with_timeout(stream, buffer)
                 .await
@@ -590,7 +684,7 @@ impl TcpManager {
             return Ok(CompressionSupport::Supported);
         }
 
-        if self.compress == Some(true) {
+        if matches!(self.compression.mode, CompressionMode::Required) {
             return Err(ConnectionError::CompressionRequired {
                 backend: self.name.clone(),
                 response: response.trim().to_string(),
@@ -692,10 +786,10 @@ impl TcpManager {
 // ============================================================================
 
 impl managed::Manager for TcpManager {
-    type Type = ConnectionStream;
+    type Type = ReadyBackendConnection;
     type Error = ConnectionError;
 
-    async fn create(&self) -> Result<ConnectionStream, ConnectionError> {
+    async fn create(&self) -> Result<ReadyBackendConnection, ConnectionError> {
         let mut stream = self.create_optimized_stream().await?;
         let mut buffer = [0u8; 4096];
 
@@ -707,20 +801,20 @@ impl managed::Manager for TcpManager {
         }
 
         if self.negotiate_compression(&mut stream, &mut buffer).await? {
-            let level = self.compress_level.unwrap_or(1);
+            let level = self.compression.level;
             stream = stream.into_compressed(level)?;
         }
 
-        Ok(stream)
+        Ok(ReadyBackendConnection::new(stream))
     }
 
     async fn recycle(
         &self,
-        conn: &mut ConnectionStream,
+        conn: &mut ReadyBackendConnection,
         _metrics: &managed::Metrics,
     ) -> managed::RecycleResult<ConnectionError> {
         use super::health_check::check_tcp_alive;
-        match check_tcp_alive(conn) {
+        match check_tcp_alive(&mut conn.0) {
             Ok(()) => Ok(()),
             Err(e) => {
                 // Shut down TCP immediately so backend releases the slot
@@ -732,7 +826,7 @@ impl managed::Manager for TcpManager {
         }
     }
 
-    fn detach(&self, _conn: &mut ConnectionStream) {}
+    fn detach(&self, _conn: &mut ReadyBackendConnection) {}
 }
 
 #[cfg(test)]
@@ -756,6 +850,26 @@ mod tests {
     }
 
     #[test]
+    fn test_tcp_manager_new_rejects_invalid_compression_level() {
+        let result = TcpManager::new(
+            "news.example.com".to_string(),
+            119,
+            "TestServer".to_string(),
+            TcpManagerOptions {
+                compress_level: Some(10),
+                ..TcpManagerOptions::default()
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(ConnectionError::IoError(ref error))
+                if error.kind() == io::ErrorKind::InvalidInput
+                    && error.to_string().contains("compression level")
+        ));
+    }
+
+    #[test]
     fn test_tcp_manager_new_plain() {
         let manager = TcpManager::new(
             "news.example.com".to_string(),
@@ -774,7 +888,7 @@ mod tests {
         assert_eq!(manager.name, "TestServer");
         assert_eq!(manager.username, Some("user".to_string()));
         assert_eq!(manager.password, Some("pass".to_string()));
-        assert!(!manager.tls_config.use_tls);
+        assert!(!manager.tls_policy.is_enabled());
         assert!(manager.tls_manager.is_none());
     }
 
@@ -866,7 +980,7 @@ mod tests {
 
         assert_eq!(manager.host, "news.example.com");
         assert_eq!(manager.port, 119);
-        assert!(!manager.tls_config.use_tls);
+        assert!(!manager.tls_policy.is_enabled());
         assert!(manager.tls_manager.is_none());
     }
 
@@ -892,7 +1006,7 @@ mod tests {
 
         assert_eq!(manager.host, "secure.example.com");
         assert_eq!(manager.port, 563);
-        assert!(manager.tls_config.use_tls);
+        assert!(manager.tls_policy.is_enabled());
         assert!(manager.tls_manager.is_some());
     }
 

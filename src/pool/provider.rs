@@ -8,7 +8,7 @@
 //! - Graceful shutdown with QUIT commands
 
 use super::connection_trait::ConnectionProvider;
-use super::deadpool_connection::{Pool, TcpManager, TcpManagerOptions};
+use super::deadpool_connection::{Pool, PooledConnection, TcpManager, TcpManagerOptions};
 use super::health_check::{HealthCheckMetrics, check_date_response};
 use crate::pool::PoolStatus;
 use crate::tls::TlsConfig;
@@ -497,7 +497,7 @@ impl DeadpoolConnectionProvider {
     /// provide a healthy backend connection.
     pub(in crate::pool) async fn get_pooled_connection(
         &self,
-    ) -> Result<managed::Object<TcpManager>, crate::connection_error::ConnectionError> {
+    ) -> Result<PooledConnection, crate::connection_error::ConnectionError> {
         use crate::connection_error::ConnectionError;
         self.pool.get().await.map_err(|e| {
             let status = self.pool.status();
@@ -575,7 +575,7 @@ impl DeadpoolConnectionProvider {
     /// the backend did not fail. For example, a client disconnect can leave
     /// unread backend response bytes in flight, making the socket dirty without
     /// implying that replacement connections should be throttled.
-    pub(super) fn remove_without_cooldown(&self, conn: managed::Object<TcpManager>) {
+    pub(super) fn remove_without_cooldown(&self, conn: PooledConnection) {
         shutdown_and_drop(conn);
     }
 
@@ -597,7 +597,7 @@ impl DeadpoolConnectionProvider {
     /// either [`shutdown_and_drop`] or [`resize_then_drop`], so the caller cannot
     /// accidentally `drop(conn)` before `pool.resize()`. Any attempt to reorder
     /// would be a use-after-move error.
-    pub(super) fn remove_with_cooldown(&self, conn: managed::Object<TcpManager>) {
+    pub(super) fn remove_with_cooldown(&self, conn: PooledConnection) {
         if self.is_shutting_down.load(Ordering::Acquire) {
             shutdown_and_drop(conn);
             return;
@@ -885,12 +885,12 @@ where
 /// The ordering matters: if we dropped first, waiters would see
 /// `pool.size < pool.max_size` and immediately create a replacement,
 /// defeating the cooldown.
-fn resize_then_drop(pool: &Pool, conn: managed::Object<TcpManager>, new_max: usize) {
+fn resize_then_drop(pool: &Pool, conn: PooledConnection, new_max: usize) {
     pool.resize(new_max);
     shutdown_and_drop(conn);
 }
 
-fn shutdown_and_drop(conn: managed::Object<TcpManager>) {
+fn shutdown_and_drop(conn: PooledConnection) {
     let _ = socket2::SockRef::from(conn.underlying_tcp_stream()).shutdown(std::net::Shutdown::Both);
     drop(conn);
 }
