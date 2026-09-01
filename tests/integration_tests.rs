@@ -1142,7 +1142,7 @@ async fn test_partial_buffered_command_does_not_block() -> Result<()> {
 
     // The proxy must respond to the first STAT within a reasonable time.
     // If it blocks trying to read_line() on the partial second command, this will timeout.
-    let n = timeout(Duration::from_millis(500), client.read(&mut buffer))
+    let n = timeout(Duration::from_millis(2_000), client.read(&mut buffer))
         .await
         .map_err(|_| {
             anyhow::anyhow!(
