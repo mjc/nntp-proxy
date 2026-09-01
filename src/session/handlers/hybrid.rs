@@ -59,9 +59,9 @@ impl Drop for StatefulSessionGuard<'_> {
 
 fn stateful_initial_client_bytes(
     carried_client_to_backend_bytes: u64,
-    initial_request: &crate::protocol::RequestContext,
+    initial_request: crate::command::StatefulRequest<'_>,
 ) -> u64 {
-    carried_client_to_backend_bytes + initial_request.request_wire_len().as_u64()
+    carried_client_to_backend_bytes + initial_request.request().request_wire_len().as_u64()
 }
 
 impl ClientSession {
@@ -85,7 +85,7 @@ impl ClientSession {
         &self,
         client_reader: BufReader<R>,
         client_write: W,
-        initial_request: &crate::protocol::RequestContext,
+        initial_request: crate::command::StatefulRequest<'_>,
         client_to_backend_bytes: u64,
         backend_to_client_bytes: u64,
     ) -> Result<TransferMetrics, crate::session::SessionError>
@@ -113,6 +113,7 @@ impl ClientSession {
 
         // Forward the triggering request (response handled by proxy loop)
         initial_request
+            .request()
             .write_wire_to(&mut **conn_guard)
             .await
             .context("Failed to send initial request to backend")?;
@@ -124,7 +125,7 @@ impl ClientSession {
             backend_to_client_bytes,
             self.auth_handler.is_enabled(),
         );
-        state.mark_backend_request_sent(initial_request.kind());
+        state.mark_backend_request_sent(initial_request.request().kind());
 
         // Split backend for bidirectional proxy
         let (backend_read, backend_write) = tokio::io::split(&mut **conn_guard);
@@ -205,7 +206,11 @@ mod tests {
         let request = RequestContext::parse(b"group alt.test\r\n").expect("valid request line");
 
         assert_eq!(
-            super::stateful_initial_client_bytes(10, &request),
+            super::stateful_initial_client_bytes(
+                10,
+                crate::command::CommandHandler::stateful_request(&request)
+                    .expect("GROUP must mint stateful capability")
+            ),
             10 + "group alt.test\r\n".len() as u64
         );
     }

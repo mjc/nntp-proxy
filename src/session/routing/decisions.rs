@@ -49,7 +49,7 @@ mod tests {
             CommandPlan::InterceptCapabilities => CommandRoutingDecision::InterceptCapabilities,
             CommandPlan::Forward => CommandRoutingDecision::Forward,
             CommandPlan::RequireAuth => CommandRoutingDecision::RequireAuth,
-            CommandPlan::SwitchToStateful => CommandRoutingDecision::SwitchToStateful,
+            CommandPlan::SwitchToStateful(_) => CommandRoutingDecision::SwitchToStateful,
             CommandPlan::Reject(_) => CommandRoutingDecision::Reject,
         }
     }
@@ -72,6 +72,25 @@ mod tests {
             ),
             CommandPlan::Reject(response) if response.status().as_u16() == 440
         ));
+    }
+
+    #[test]
+    fn canonical_plan_mints_typed_request_capabilities() {
+        let article_request = RequestContext::parse(b"ARTICLE <article@example.com>\r\n").unwrap();
+        let article = CommandHandler::article_lookup_request(&article_request)
+            .expect("message-id article must mint an article capability");
+        assert_eq!(article.message_id().as_str(), "<article@example.com>");
+
+        let stateful_request = RequestContext::parse(b"GROUP alt.test\r\n").unwrap();
+        let CommandPlan::SwitchToStateful(stateful) =
+            CommandHandler::classify_request(&stateful_request, true, true, RoutingMode::Hybrid)
+        else {
+            panic!("authenticated stateful hybrid request must switch");
+        };
+        assert_eq!(
+            stateful.request().kind(),
+            crate::protocol::RequestKind::Group
+        );
     }
 
     #[test]

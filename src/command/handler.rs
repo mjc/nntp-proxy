@@ -23,6 +23,79 @@ use crate::protocol::{
     RequestContext, RequestKind, RequestResponseMetadata, RequestRouteClass, StatusCode, codes,
 };
 
+/// Evidence-bearing request for article-cache policy.
+///
+/// The private constructor keeps capability minting inside the canonical
+/// command classifier.
+///
+/// Construction is intentionally restricted to the canonical classifier.
+///
+/// ```compile_fail
+/// use nntp_proxy::command::ArticleLookupRequest;
+/// use nntp_proxy::protocol::RequestContext;
+///
+/// let request = RequestContext::parse(b"ARTICLE <article@example.com>\\r\\n").unwrap();
+/// let _ = ArticleLookupRequest { request: &request };
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct ArticleLookupRequest<'a> {
+    request: &'a RequestContext,
+}
+
+impl<'a> ArticleLookupRequest<'a> {
+    fn new(request: &'a RequestContext) -> Option<Self> {
+        (request.route_class() == RequestRouteClass::ArticleByMessageId).then_some(Self { request })
+    }
+
+    #[must_use]
+    pub const fn request(&self) -> &'a RequestContext {
+        self.request
+    }
+
+    #[must_use]
+    pub fn message_id(&self) -> crate::types::MessageId<'a> {
+        self.request
+            .message_id_value()
+            .expect("article lookup capability always has a valid message id")
+    }
+}
+
+/// Evidence-bearing request for the stateful handoff.
+///
+/// The private constructor prevents callers from manufacturing a stateful
+/// handoff from an arbitrary request context.
+///
+/// Construction is intentionally restricted to the canonical classifier.
+///
+/// ```compile_fail
+/// use nntp_proxy::command::StatefulRequest;
+/// use nntp_proxy::protocol::RequestContext;
+///
+/// let request = RequestContext::parse(b"GROUP alt.test\\r\\n").unwrap();
+/// let _ = StatefulRequest { request: &request };
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct StatefulRequest<'a> {
+    request: &'a RequestContext,
+}
+
+impl<'a> StatefulRequest<'a> {
+    fn new(request: &'a RequestContext) -> Self {
+        Self { request }
+    }
+
+    #[must_use]
+    pub const fn request(&self) -> &'a RequestContext {
+        self.request
+    }
+}
+
+impl PartialEq for StatefulRequest<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.request, other.request)
+    }
+}
+
 /// Payload-bearing plan produced by the canonical command classifier.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
@@ -36,7 +109,7 @@ pub enum CommandPlan<'a> {
     /// Require authentication before handling the request.
     RequireAuth,
     /// Switch from hybrid per-command routing to stateful routing.
-    SwitchToStateful,
+    SwitchToStateful(StatefulRequest<'a>),
     /// Intercept CAPABILITIES and return a synthetic proxy-accurate capability list.
     InterceptCapabilities,
 }
@@ -128,6 +201,17 @@ pub enum AuthAction<'a> {
 pub struct CommandHandler;
 
 impl CommandHandler {
+    pub(crate) fn article_lookup_request<'a>(
+        request: &'a RequestContext,
+    ) -> Option<ArticleLookupRequest<'a>> {
+        ArticleLookupRequest::new(request)
+    }
+
+    pub(crate) fn stateful_request<'a>(request: &'a RequestContext) -> Option<StatefulRequest<'a>> {
+        matches!(request.route_class(), RequestRouteClass::Stateful)
+            .then_some(StatefulRequest::new(request))
+    }
+
     /// Classify an already parsed request context into an execution plan.
     #[must_use]
     pub fn classify_request(
@@ -150,7 +234,7 @@ impl CommandHandler {
                 }
                 RequestRouteClass::Stateful if routing_mode == RoutingMode::Hybrid => {
                     if is_authenticated || !auth_enabled {
-                        CommandPlan::SwitchToStateful
+                        CommandPlan::SwitchToStateful(StatefulRequest::new(request))
                     } else {
                         CommandPlan::RequireAuth
                     }

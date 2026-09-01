@@ -203,7 +203,9 @@ impl ClientSession {
                 self.handle_require_auth(request, client_writer, backend_to_client_bytes)
                     .await
             }
-            CommandPlan::SwitchToStateful => Ok(self.handle_stateful_switch_decision(request)),
+            CommandPlan::SwitchToStateful(stateful_request) => {
+                Ok(self.handle_stateful_switch_decision(stateful_request))
+            }
             CommandPlan::Reject(response) => {
                 self.handle_rejected_request(
                     request,
@@ -289,7 +291,11 @@ impl ClientSession {
         })
     }
 
-    fn handle_stateful_switch_decision(&self, request: &RequestContext) -> CommandResult {
+    fn handle_stateful_switch_decision(
+        &self,
+        stateful_request: crate::command::StatefulRequest<'_>,
+    ) -> CommandResult {
+        let request = stateful_request.request();
         debug!(
             "Client {} decision: SwitchToStateful kind={:?}, verb={:?}",
             self.client_addr,
@@ -753,7 +759,8 @@ impl ClientSession {
         self.switch_to_stateful_mode(
             client_reader,
             client_write,
-            request,
+            crate::command::CommandHandler::stateful_request(request)
+                .expect("stateful switch target must be stateful"),
             state.client_to_backend_bytes.into(),
             state.backend_to_client_bytes.into(),
         )

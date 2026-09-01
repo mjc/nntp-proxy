@@ -101,7 +101,7 @@ type BackendTimings = (u64, u64, u64);
 #[derive(Clone, Copy)]
 pub(super) struct ResponseWriteParams<'a> {
     pub(super) request: &'a RequestContext,
-    pub(super) msg_id: Option<&'a crate::types::MessageId<'a>>,
+    pub(super) article_request: Option<crate::command::ArticleLookupRequest<'a>>,
     pub(super) status_code: StatusCode,
 }
 
@@ -294,8 +294,12 @@ impl ClientSession {
                     "Direct backend attempt returned 430 before writing response"
                 );
                 self.record_authoritative_article_missing(&missing, state.availability);
-                if let Some(msg_id) = request.message_id_value() {
-                    self.cache.record_backend_missing(msg_id, backend_id).await;
+                if let Some(article_request) =
+                    crate::command::CommandHandler::article_lookup_request(request)
+                {
+                    self.cache
+                        .record_backend_missing(article_request.message_id(), backend_id)
+                        .await;
                 }
                 crate::session::backend::observe_response(
                     request,
@@ -317,7 +321,6 @@ impl ClientSession {
             Err(backend) => backend,
         };
 
-        let msg_id = request.message_id_value();
         let response = match self
             .write_successful_retry_response(
                 conn,
@@ -326,7 +329,9 @@ impl ClientSession {
                 buffer,
                 ResponseWriteParams {
                     request,
-                    msg_id: msg_id.as_ref(),
+                    article_request: crate::command::CommandHandler::article_lookup_request(
+                        request,
+                    ),
                     status_code,
                 },
                 state.backend_connection,
@@ -438,8 +443,12 @@ impl ClientSession {
                 RetryStatProbeOutcome::Missing(backend_id) => {
                     let missing = AuthoritativeArticleMissing { backend_id };
                     self.record_authoritative_article_missing(&missing, state.availability);
-                    if let Some(msg_id) = request.message_id_value() {
-                        self.cache.record_backend_missing(msg_id, backend_id).await;
+                    if let Some(article_request) =
+                        crate::command::CommandHandler::article_lookup_request(request)
+                    {
+                        self.cache
+                            .record_backend_missing(article_request.message_id(), backend_id)
+                            .await;
                     }
                 }
                 RetryStatProbeOutcome::Present => {}
@@ -744,7 +753,7 @@ impl ClientSession {
         debug!(
             client = %self.client_addr,
             backend = backend_id.as_index(),
-            msg_id = ?params.msg_id,
+            msg_id = ?params.article_request,
             bytes_written,
             "Backend response write complete"
         );
@@ -1215,17 +1224,16 @@ impl ClientSession {
     {
         let backend_id = backend.backend_id();
         let cache_action = determine_cache_action_for_request(
-            params.request,
+            params.article_request,
             params.status_code,
             self.cache_articles,
-            params.msg_id.is_some(),
         );
 
         debug!(
             "write_response_to_client: code={}, cache_articles={}, has_msg_id={}, action={:?}",
             params.status_code.as_u16(),
             self.cache_articles,
-            params.msg_id.is_some(),
+            params.article_request.is_some(),
             cache_action
         );
 
@@ -1278,7 +1286,10 @@ impl ClientSession {
         captured: Option<crate::pool::ChunkedResponse>,
     ) {
         let backend_id = backend;
-        match (cache_action, params.msg_id, captured) {
+        let msg_id = params
+            .article_request
+            .map(|article_request| article_request.message_id());
+        match (cache_action, msg_id.as_ref(), captured) {
             (CacheAction::CaptureArticle, msg_id, Some(response)) => {
                 self.maybe_cache_upsert_buffer(msg_id, response.into(), backend);
             }
@@ -1371,11 +1382,11 @@ impl ClientSession {
             .await?;
         drop(backend_bytes);
         self.log_body_response_written(backend_id, params, bytes_written as usize);
-        if retained && let Some(msg_id_ref) = params.msg_id {
+        if retained && let Some(article_request) = params.article_request {
             debug!(
                 "Client {} caching full article for {} ({} bytes captured)",
                 self.client_addr,
-                msg_id_ref,
+                article_request.message_id(),
                 captured.len()
             );
         }
@@ -2441,7 +2452,7 @@ mod tests {
             CacheAction::TrackStat,
             ResponseWriteParams {
                 request: &request,
-                msg_id: Some(&msg_id),
+                article_request: crate::command::CommandHandler::article_lookup_request(&request),
                 status_code: StatusCode::new(223),
             },
             BackendId::from_index(0),
@@ -2704,7 +2715,7 @@ mod tests {
             crate::session::routing::CacheAction::CaptureArticle,
             ResponseWriteParams {
                 request: &request,
-                msg_id: Some(&msg_id),
+                article_request: crate::command::CommandHandler::article_lookup_request(&request),
                 status_code: StatusCode::new(220),
             },
             backend_id,
@@ -2902,7 +2913,7 @@ mod tests {
                 backend_bytes,
                 ResponseWriteParams {
                     request: &request,
-                    msg_id: None,
+                    article_request: None,
                     status_code: StatusCode::new(223),
                 },
                 None,
@@ -2950,7 +2961,7 @@ mod tests {
                 backend_bytes,
                 ResponseWriteParams {
                     request: &request,
-                    msg_id: None,
+                    article_request: None,
                     status_code: StatusCode::new(220),
                 },
                 None,
@@ -2999,7 +3010,7 @@ mod tests {
                 backend_bytes,
                 ResponseWriteParams {
                     request: &request,
-                    msg_id: None,
+                    article_request: None,
                     status_code: StatusCode::new(220),
                 },
                 None,

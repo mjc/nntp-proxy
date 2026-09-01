@@ -386,7 +386,7 @@ where
     match plan {
         CommandPlan::Forward
         | CommandPlan::RequireAuth
-        | CommandPlan::SwitchToStateful
+        | CommandPlan::SwitchToStateful(_)
         | CommandPlan::Reject(_) => {
             // Reject all non-auth commands before authentication
             use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
