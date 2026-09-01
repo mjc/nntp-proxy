@@ -13,7 +13,7 @@ use crate::protocol::{
     codes,
 };
 use crate::session::common;
-use crate::session::{ClientSession, connection};
+use crate::session::{ClientAuthState, ClientSession, connection};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -66,7 +66,7 @@ struct CommandExecutionParams<'a> {
     router: &'a Arc<BackendSelector>,
     client_writer: &'a crate::session::SharedClientWriter,
     backend_connection: &'a mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
-    auth_username: &'a mut Option<String>,
+    auth_username: &'a mut ClientAuthState,
     client_to_backend_bytes: ClientToBackendBytes,
     backend_to_client_bytes: &'a mut BackendToClientBytes,
 }
@@ -78,7 +78,7 @@ struct ProcessCommandParams<'a> {
     router: &'a Arc<BackendSelector>,
     client_writer: &'a crate::session::SharedClientWriter,
     backend_connection: &'a mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
-    auth_username: &'a mut Option<String>,
+    auth_username: &'a mut ClientAuthState,
     client_to_backend_bytes: ClientToBackendBytes,
     backend_to_client_bytes: &'a mut BackendToClientBytes,
 }
@@ -111,7 +111,7 @@ impl Drop for BatchBackendConnection {
 struct PerCommandLoopState {
     client_to_backend_bytes: ClientToBackendBytes,
     backend_to_client_bytes: BackendToClientBytes,
-    auth_username: Option<String>,
+    auth_username: ClientAuthState,
     skip_auth_check: bool,
 }
 
@@ -120,7 +120,7 @@ impl PerCommandLoopState {
         Self {
             client_to_backend_bytes: ClientToBackendBytes::zero(),
             backend_to_client_bytes: BackendToClientBytes::zero(),
-            auth_username: None,
+            auth_username: ClientAuthState::anonymous(),
             skip_auth_check,
         }
     }
@@ -177,7 +177,7 @@ impl ClientSession {
                     common::on_authentication_success(
                         self.client_id(),
                         self.client_addr,
-                        auth_username.clone(),
+                        auth_username.username().map(str::to_owned),
                         self.mode_state.routing_mode(),
                         self.connection_stats(),
                         |username| self.set_username(username),
@@ -231,7 +231,7 @@ impl ClientSession {
         &self,
         auth_action: AuthAction<'_>,
         client_writer: &crate::session::SharedClientWriter,
-        auth_username: &mut Option<String>,
+        auth_username: &mut ClientAuthState,
     ) -> Result<common::AuthResult> {
         debug!("Client {} decision: InterceptAuth", self.client_addr);
         let mut client_write = client_writer.lock().await;
@@ -411,10 +411,10 @@ impl ClientSession {
     /// Returns an error if the router is unavailable, a client write fails, or
     /// switching into stateful mode fails.
     pub async fn handle_per_command_routing(
-        &self,
+        &mut self,
         client_stream: TcpStream,
     ) -> Result<TransferMetrics, SessionError> {
-        let Some(router) = self.router.as_ref() else {
+        let Some(router) = self.router.clone() else {
             return Err(SessionError::Backend(anyhow::anyhow!(
                 "Per-command routing mode requires a router"
             )));
@@ -422,7 +422,7 @@ impl ClientSession {
 
         let (client_read, client_write) = client_stream.into_split();
         self.run_per_command_loop(
-            router,
+            &router,
             BufReader::with_capacity(READER_CAPACITY, client_read),
             crate::session::SharedClientWriter::new(client_write),
         )
@@ -430,7 +430,7 @@ impl ClientSession {
     }
 
     async fn run_per_command_loop(
-        &self,
+        &mut self,
         router: &Arc<BackendSelector>,
         mut client_reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
         client_writer: crate::session::SharedClientWriter,
@@ -734,7 +734,7 @@ impl ClientSession {
     }
 
     async fn switch_batch_to_stateful(
-        &self,
+        &mut self,
         client_reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
         client_writer: crate::session::SharedClientWriter,
         batch: &mut crate::session::handlers::pipeline::RequestBatch,

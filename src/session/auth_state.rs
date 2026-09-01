@@ -3,8 +3,22 @@
 //! This module provides a type-safe wrapper around authentication state,
 //! ensuring proper initialization and access patterns.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use crate::types::Username;
 use std::sync::{Arc, OnceLock};
+/// Final authenticated identity, published exactly once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedUser(Arc<str>);
+
+impl AuthenticatedUser {
+    fn new(username: impl Into<Arc<str>>) -> Self {
+        Self(username.into())
+    }
+
+    #[must_use]
+    pub fn username(&self) -> &str {
+        &self.0
+    }
+}
 
 /// Result of attempting to authenticate a session.
 #[must_use = "authentication transitions drive user connection gauge updates"]
@@ -23,16 +37,94 @@ impl AuthenticationTransition {
     }
 }
 
+/// Runtime authentication state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientAuthState {
+    /// No username has been supplied yet.
+    Anonymous,
+    /// A username is waiting for its password.
+    AwaitingPassword(Username),
+    /// The client has successfully authenticated.
+    Authenticated(Username),
+}
+
+impl ClientAuthState {
+    #[must_use]
+    pub const fn anonymous() -> Self {
+        Self::Anonymous
+    }
+
+    #[must_use]
+    pub fn username(&self) -> Option<&str> {
+        match self {
+            Self::Anonymous => None,
+            Self::AwaitingPassword(username) | Self::Authenticated(username) => {
+                Some(username.as_str())
+            }
+        }
+    }
+    #[must_use]
+    pub const fn is_none(&self) -> bool {
+        matches!(self, Self::Anonymous)
+    }
+
+    /// Reduce one parsed authentication event without performing I/O.
+    #[must_use]
+    pub fn reduce(
+        self,
+        event: ClientAuthEvent,
+        credentials_valid: bool,
+    ) -> (Self, AuthReducerResult) {
+        match (self, event) {
+            (Self::Authenticated(username), _) => (
+                Self::Authenticated(username),
+                AuthReducerResult::AlreadyAuthenticated,
+            ),
+            (Self::Anonymous, ClientAuthEvent::User(username))
+            | (Self::AwaitingPassword(_), ClientAuthEvent::User(username)) => (
+                Self::AwaitingPassword(username),
+                AuthReducerResult::PasswordRequired,
+            ),
+            (Self::Anonymous, ClientAuthEvent::Password { .. }) => {
+                (Self::Anonymous, AuthReducerResult::OutOfSequence)
+            }
+            (Self::AwaitingPassword(username), ClientAuthEvent::Password { .. })
+                if credentials_valid =>
+            {
+                (Self::Authenticated(username), AuthReducerResult::Accepted)
+            }
+            (Self::AwaitingPassword(username), ClientAuthEvent::Password { .. }) => (
+                Self::AwaitingPassword(username),
+                AuthReducerResult::Rejected,
+            ),
+            (state, ClientAuthEvent::Unknown) => (state, AuthReducerResult::Unknown),
+        }
+    }
+}
+
+/// Parsed authentication input for ClientAuthState::reduce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientAuthEvent {
+    User(Username),
+    Password { bytes: Vec<u8> },
+    Unknown,
+}
+
+/// Result of reducing one authentication input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthReducerResult {
+    PasswordRequired,
+    Accepted,
+    Rejected,
+    OutOfSequence,
+    AlreadyAuthenticated,
+    Unknown,
+}
+
 /// Represents the authentication state of a client session
 ///
-/// This type encapsulates the authentication status and username in a
-/// thread-safe manner using atomic operations and write-once semantics.
-///
-/// # Design
-///
-/// - **Status**: `AtomicBool` for lock-free concurrent access
-/// - **Username**: `OnceLock<Arc<str>>` for write-once, cheap-clone reads
-/// - Both fields are private and accessed through controlled methods
+/// This type owns the final authenticated identity and publishes it once.
+/// Reads observe the published identity through `OnceLock`.
 ///
 /// # Examples
 ///
@@ -52,18 +144,8 @@ impl AuthenticationTransition {
 /// ```
 #[derive(Debug)]
 pub struct AuthState {
-    /// Whether the client has successfully authenticated
-    ///
-    /// Starts as `false` and is set to `true` after successful authentication.
-    /// Uses `Relaxed` ordering since authentication is a one-way transition
-    /// and doesn't require synchronization with other memory operations.
-    authenticated: AtomicBool,
-
-    /// The authenticated username (if any)
-    ///
-    /// Write-once field that stores the username after successful authentication.
-    /// Uses `Arc<str>` for cheap clones when reading the username.
-    username: OnceLock<Arc<str>>,
+    /// The final authenticated identity, published at most once.
+    identity: OnceLock<AuthenticatedUser>,
 }
 
 impl AuthState {
@@ -82,14 +164,13 @@ impl AuthState {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            authenticated: AtomicBool::new(false),
-            username: OnceLock::new(),
+            identity: OnceLock::new(),
         }
     }
 
     /// Check if the client has authenticated
     ///
-    /// This is a cheap operation (single atomic load) that can be called
+    /// This is a cheap identity check that can be called
     /// frequently without performance concerns.
     ///
     /// # Examples
@@ -109,7 +190,7 @@ impl AuthState {
     #[inline]
     #[must_use]
     pub fn is_authenticated(&self) -> bool {
-        self.authenticated.load(Ordering::Relaxed)
+        self.identity.get().is_some()
     }
 
     /// Mark the client as authenticated with the given username
@@ -144,14 +225,10 @@ impl AuthState {
     /// ```
     #[inline]
     pub fn mark_authenticated(&self, username: impl Into<Arc<str>>) -> AuthenticationTransition {
-        let username_arc: Arc<str> = username.into();
-        // Set username first (write-once, safe to call multiple times with same value)
-        let _ = self.username.set(username_arc);
-        // Then mark as authenticated (one-way transition)
-        if self.authenticated.swap(true, Ordering::Relaxed) {
-            AuthenticationTransition::AlreadyAuthenticated
-        } else {
+        if self.identity.set(AuthenticatedUser::new(username)).is_ok() {
             AuthenticationTransition::NewlyAuthenticated
+        } else {
+            AuthenticationTransition::AlreadyAuthenticated
         }
     }
 
@@ -182,7 +259,7 @@ impl AuthState {
     #[inline]
     #[must_use]
     pub fn username(&self) -> Option<&str> {
-        self.username.get().map(|arc| &**arc)
+        self.identity.get().map(AuthenticatedUser::username)
     }
 
     /// Check if authenticated, optionally bypassing the check
@@ -319,5 +396,54 @@ mod tests {
 
         assert!(state.is_authenticated());
         assert_eq!(state.username().unwrap(), "first");
+    }
+    #[test]
+    fn reducer_covers_authentication_ordering() {
+        let alice = Username::try_new("alice".to_owned()).unwrap();
+        let (state, result) =
+            ClientAuthState::anonymous().reduce(ClientAuthEvent::User(alice.clone()), false);
+        assert_eq!(state, ClientAuthState::AwaitingPassword(alice.clone()));
+        assert_eq!(result, AuthReducerResult::PasswordRequired);
+
+        let (state, result) = ClientAuthState::anonymous().reduce(
+            ClientAuthEvent::Password {
+                bytes: b"secret".to_vec(),
+            },
+            true,
+        );
+        assert_eq!(state, ClientAuthState::Anonymous);
+        assert_eq!(result, AuthReducerResult::OutOfSequence);
+
+        let (state, result) = ClientAuthState::AwaitingPassword(alice.clone()).reduce(
+            ClientAuthEvent::Password {
+                bytes: b"wrong".to_vec(),
+            },
+            false,
+        );
+        assert_eq!(state, ClientAuthState::AwaitingPassword(alice.clone()));
+        assert_eq!(result, AuthReducerResult::Rejected);
+
+        let (state, result) = ClientAuthState::AwaitingPassword(alice.clone()).reduce(
+            ClientAuthEvent::Password {
+                bytes: b"secret".to_vec(),
+            },
+            true,
+        );
+        assert_eq!(state, ClientAuthState::Authenticated(alice.clone()));
+        assert_eq!(result, AuthReducerResult::Accepted);
+
+        let (state, result) = ClientAuthState::Authenticated(alice.clone()).reduce(
+            ClientAuthEvent::User(Username::try_new("bob".to_owned()).unwrap()),
+            false,
+        );
+        assert_eq!(state, ClientAuthState::Authenticated(alice));
+        assert_eq!(result, AuthReducerResult::AlreadyAuthenticated);
+    }
+
+    #[test]
+    fn reducer_preserves_unknown_events() {
+        let (state, result) = ClientAuthState::anonymous().reduce(ClientAuthEvent::Unknown, false);
+        assert_eq!(state, ClientAuthState::Anonymous);
+        assert_eq!(result, AuthReducerResult::Unknown);
     }
 }

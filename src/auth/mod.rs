@@ -4,4 +4,4 @@
 
 mod handler;
 
-pub use handler::AuthHandler;
+pub use handler::{AuthHandler, Credentials, SecretPassword};

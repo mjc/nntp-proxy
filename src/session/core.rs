@@ -180,15 +180,11 @@ impl ClientSessionBuilder {
     /// routing mode.
     #[must_use]
     pub fn build(self) -> ClientSession {
-        let (mode, routing_mode) = match (&self.router, self.routing_mode) {
-            // Per-command or Hybrid: start in per-command mode (stateless)
-            (Some(_), RoutingMode::PerCommand | RoutingMode::Hybrid) => {
-                (SessionMode::PerCommand, self.routing_mode)
-            }
-            // Stateful mode with router, or no router: always Stateful
-            (Some(_), RoutingMode::Stateful) | (None, _) => {
-                (SessionMode::Stateful, RoutingMode::Stateful)
-            }
+        let routing_mode = match (&self.router, self.routing_mode) {
+            // Per-command or Hybrid: preserve the configured runtime routing mode.
+            (Some(_), RoutingMode::PerCommand | RoutingMode::Hybrid) => self.routing_mode,
+            // Stateful mode with a router, or no router: always Stateful.
+            (Some(_), RoutingMode::Stateful) | (None, _) => RoutingMode::Stateful,
         };
 
         let metrics = self.metrics;
@@ -198,7 +194,7 @@ impl ClientSessionBuilder {
             buffer_pool: self.buffer_pool,
             client_id: ClientId::new(),
             router: self.router,
-            mode_state: ModeState::new(mode, routing_mode),
+            mode_state: ModeState::new(routing_mode),
             auth_handler: self.auth_handler,
             auth_state: AuthState::new(),
             user_connection_username: Mutex::new(None),
@@ -233,7 +229,7 @@ impl ClientSession {
             buffer_pool,
             client_id: ClientId::new(),
             router: None,
-            mode_state: ModeState::new(SessionMode::Stateful, RoutingMode::Stateful),
+            mode_state: ModeState::new(RoutingMode::Stateful),
             auth_handler,
             auth_state: AuthState::new(),
             user_connection_username: Mutex::new(None),
@@ -264,7 +260,7 @@ impl ClientSession {
             buffer_pool,
             client_id: ClientId::new(),
             router: Some(router),
-            mode_state: ModeState::new(SessionMode::PerCommand, routing_mode),
+            mode_state: ModeState::new(routing_mode),
             auth_handler,
             auth_state: AuthState::new(),
             user_connection_username: Mutex::new(None),

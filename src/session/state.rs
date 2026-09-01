@@ -4,6 +4,7 @@
 //! all mutable state needed during a session command loop.
 
 use crate::protocol::RequestKind;
+use crate::session::ClientAuthState;
 use crate::session::backend::BackendResponseOrder;
 use crate::session::multiline_framing::{OrderedClientWrites, ReadyDeferredReplies};
 use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
@@ -35,8 +36,8 @@ pub struct SessionLoopState {
     pub last_reported_b2c: BackendToClientBytes,
     /// Iteration counter for metrics flush timing
     iteration_count: u32,
-    /// Username from AUTHINFO USER command (if any)
-    pub auth_username: Option<String>,
+    /// Runtime authentication state for this session loop.
+    pub auth_username: ClientAuthState,
     /// Whether to skip auth checking (optimization after first auth)
     pub skip_auth_check: bool,
     /// Forwarded backend replies and deferred local replies in client-visible order.
@@ -62,7 +63,7 @@ impl SessionLoopState {
             last_reported_c2b: ClientToBackendBytes::zero(),
             last_reported_b2c: BackendToClientBytes::zero(),
             iteration_count: 0,
-            auth_username: None,
+            auth_username: ClientAuthState::anonymous(),
             skip_auth_check: !auth_enabled,
             backend_replies: BackendResponseOrder::default(),
         }

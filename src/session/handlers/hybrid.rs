@@ -82,7 +82,7 @@ impl ClientSession {
     /// # Errors
     /// Returns error if router unavailable, backend unreachable, or connection fails
     pub(super) async fn switch_to_stateful_mode<R, W>(
-        &self,
+        &mut self,
         client_reader: BufReader<R>,
         client_write: W,
         initial_request: crate::command::StatefulRequest<'_>,
@@ -94,7 +94,7 @@ impl ClientSession {
         W: tokio::io::AsyncWrite + Unpin,
     {
         // One-way transition: PerCommand → Stateful
-        self.mode_state.switch_to_stateful();
+        let _ = self.mode_state.switch_to_stateful();
 
         // Acquire backend connection (returns CommandGuard to track pending_count)
         let (mut conn_guard, backend_id, _pending_guard) = self

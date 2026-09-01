@@ -3,6 +3,7 @@
 use crate::auth::AuthHandler;
 use crate::command::{AuthAction, CommandHandler, CommandPlan};
 use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata, StatusCode, codes};
+use crate::session::{AuthReducerResult, ClientAuthEvent, ClientAuthState};
 use crate::types::BackendToClientBytes;
 
 use anyhow::Result;
@@ -56,7 +57,7 @@ pub async fn handle_auth_command<W>(
     auth_handler: &Arc<AuthHandler>,
     auth_action: AuthAction<'_>,
     client_write: &mut W,
-    auth_username: &mut Option<String>,
+    auth_username: &mut ClientAuthState,
     auth_state: &crate::session::AuthState,
 ) -> Result<AuthResult>
 where
@@ -74,14 +75,31 @@ where
         });
     }
 
-    let had_username = auth_username.is_some();
+    let had_username = auth_username.username().is_some();
     if let AuthAction::RequestPassword(username) = auth_action {
-        *auth_username = Some(username.to_string());
+        let username = crate::types::Username::try_new(username.to_owned())?;
+        let (next_state, _) = auth_username
+            .clone()
+            .reduce(ClientAuthEvent::User(username), false);
+        *auth_username = next_state;
     }
 
     let (bytes, auth_success) = auth_handler
-        .handle_auth_command(auth_action, client_write, auth_username.as_deref())
+        .handle_auth_command(auth_action, client_write, auth_username.username())
         .await?;
+
+    let reducer_event = match auth_action {
+        AuthAction::RequestPassword(username) => {
+            ClientAuthEvent::User(crate::types::Username::try_new(username.to_owned())?)
+        }
+        AuthAction::ValidateAndRespond { password } => ClientAuthEvent::Password {
+            bytes: password.as_bytes().to_vec(),
+        },
+        AuthAction::UnknownSubcommand => ClientAuthEvent::Unknown,
+    };
+    let (next_state, reducer_result) = auth_username.clone().reduce(reducer_event, auth_success);
+    *auth_username = next_state;
+    let auth_success = matches!(reducer_result, AuthReducerResult::Accepted);
 
     let bytes_written = BackendToClientBytes::new(bytes as u64);
     let response = auth_response_metadata(auth_action, had_username, auth_success);
@@ -374,7 +392,7 @@ pub struct AuthCheckContext<'a> {
 pub async fn handle_stateful_auth_check<W>(
     request: &crate::protocol::RequestContext,
     client_write: &mut W,
-    auth_username: &mut Option<String>,
+    auth_username: &mut ClientAuthState,
     ctx: &AuthCheckContext<'_>,
     client_addr: impl std::fmt::Display + Clone,
     set_username_fn: impl FnOnce(String) -> crate::session::AuthenticationTransition,
@@ -419,7 +437,7 @@ where
                     on_authentication_success(
                         ctx.client_id,
                         client_addr,
-                        auth_username.clone(),
+                        auth_username.username().map(str::to_owned),
                         *ctx.routing_mode,
                         ctx.connection_stats,
                         set_username_fn,

@@ -1,293 +1,133 @@
-//! Session mode state management
-//!
-//! This module provides a type-safe wrapper for session mode and routing mode,
-//! ensuring valid state transitions and clear mode switching logic.
+//! Session mode state management.
 
 use crate::config::RoutingMode;
-use std::sync::atomic::{AtomicU8, Ordering};
 
-/// Session mode - determines how commands are routed
-///
-/// This is separate from `RoutingMode` (configuration) - it represents the
-/// *current* runtime state of the session, which can change (e.g., hybrid mode).
+/// Session mode derived from the runtime routing state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum SessionMode {
-    /// Per-command routing - each command may go to different backend
-    PerCommand = 0,
-
-    /// Stateful mode - using a dedicated backend connection
-    Stateful = 1,
+    /// Per-command routing.
+    PerCommand,
+    /// Stateful routing.
+    Stateful,
 }
 
-impl SessionMode {
-    /// Check if this mode is per-command routing
-    #[inline]
-    #[must_use]
-    pub const fn is_per_command(self) -> bool {
-        matches!(self, Self::PerCommand)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum RuntimeRoutingState {
+    Stateful = 0,
+    PerCommand = 1,
+    HybridPerCommand = 2,
+    HybridStateful = 3,
+}
+
+impl RuntimeRoutingState {
+    const fn from_routing_mode(mode: RoutingMode) -> Self {
+        match mode {
+            RoutingMode::Stateful => Self::Stateful,
+            RoutingMode::PerCommand => Self::PerCommand,
+            RoutingMode::Hybrid => Self::HybridPerCommand,
+        }
     }
 
-    /// Check if this mode is stateful
-    #[inline]
-    #[must_use]
-    pub const fn is_stateful(self) -> bool {
-        matches!(self, Self::Stateful)
+    const fn mode(self) -> SessionMode {
+        match self {
+            Self::Stateful | Self::HybridStateful => SessionMode::Stateful,
+            Self::PerCommand | Self::HybridPerCommand => SessionMode::PerCommand,
+        }
     }
 
-    /// Convert to u8 for atomic storage
-    #[inline]
-    const fn to_u8(self) -> u8 {
-        self as u8
-    }
-
-    /// Convert from u8 from atomic storage
-    #[inline]
-    const fn from_u8(value: u8) -> Self {
-        match value {
-            1 => Self::Stateful,
-            _ => Self::PerCommand, // 0 or any unknown value
+    const fn routing_mode(self) -> RoutingMode {
+        match self {
+            Self::Stateful => RoutingMode::Stateful,
+            Self::PerCommand => RoutingMode::PerCommand,
+            Self::HybridPerCommand | Self::HybridStateful => RoutingMode::Hybrid,
         }
     }
 }
 
-/// Manages session mode state with support for runtime transitions
+/// Result of attempting the one-way hybrid transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeTransition {
+    /// The session changed from hybrid per-command to hybrid stateful.
+    Switched,
+    /// The session was already stateful.
+    AlreadyStateful,
+    /// The session was not in a hybrid per-command state.
+    NotHybrid,
+}
+
+/// Manages the valid runtime routing state of a session.
 ///
-/// This type encapsulates the current session mode and routing mode configuration,
-/// providing thread-safe mode transitions for hybrid routing.
-///
-/// # Design
-///
-/// - **Current Mode**: `AtomicU8` for lock-free concurrent reads/writes
-/// - **Routing Mode**: Immutable configuration (Stateful, `PerCommand`, or Hybrid)
-/// - Mode transitions are only allowed in Hybrid mode
-///
-/// # One-Way Transition Invariant
-///
-/// **CRITICAL**: In Hybrid mode, the transition from `PerCommand` → Stateful is
-/// **permanent and irreversible** for the lifetime of the connection:
-///
-/// ```text
-/// PerCommand ──stateful command──> Stateful
-///     ↑                               │
-///     └───────── NO WAY BACK ─────────┘
-/// ```
-///
-/// Once `switch_to_stateful()` is called:
-/// - Connection acquires a dedicated backend
-/// - All subsequent commands use that backend
-/// - Connection stays stateful until client disconnects
-/// - New client connection starts fresh in `PerCommand` mode (if Hybrid)
-///
-/// # Examples
-///
-/// ```
-/// use nntp_proxy::session::{ModeState, SessionMode};
-/// use nntp_proxy::config::RoutingMode;
-///
-/// // Stateful mode (no transitions allowed)
-/// let state = ModeState::new(SessionMode::Stateful, RoutingMode::Stateful);
-/// assert!(state.is_stateful());
-/// assert!(!state.can_switch_mode());
-///
-/// // Hybrid mode (starts per-command, can switch)
-/// let state = ModeState::new(SessionMode::PerCommand, RoutingMode::Hybrid);
-/// assert!(state.is_per_command());
-/// assert!(state.can_switch_mode());
-///
-/// state.switch_to_stateful();
-/// assert!(state.is_stateful());
-/// // Now permanently stateful for this connection
-/// ```
+/// A single runtime discriminant owns both configured routing and current mode,
+/// so invalid combinations cannot be constructed.
 #[derive(Debug)]
 pub struct ModeState {
-    /// Current session mode (can change at runtime in Hybrid mode)
-    mode: AtomicU8,
-
-    /// Routing mode configuration (immutable)
-    routing_mode: RoutingMode,
+    state: RuntimeRoutingState,
 }
 
 impl ModeState {
-    /// Create a new mode state
-    ///
-    /// # Arguments
-    ///
-    /// * `initial_mode` - Initial session mode
-    /// * `routing_mode` - Routing mode configuration
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use nntp_proxy::session::{ModeState, SessionMode};
-    /// use nntp_proxy::config::RoutingMode;
-    ///
-    /// let state = ModeState::new(SessionMode::Stateful, RoutingMode::Stateful);
-    /// assert!(state.is_stateful());
-    /// ```
-    #[inline]
+    /// Create a session in the initial state implied by its routing configuration.
     #[must_use]
-    pub const fn new(initial_mode: SessionMode, routing_mode: RoutingMode) -> Self {
+    pub const fn new(routing_mode: RoutingMode) -> Self {
         Self {
-            mode: AtomicU8::new(initial_mode.to_u8()),
-            routing_mode,
+            state: RuntimeRoutingState::from_routing_mode(routing_mode),
         }
     }
 
-    /// Get the current session mode
-    ///
-    /// This is a cheap atomic load operation.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use nntp_proxy::session::{ModeState, SessionMode};
-    /// use nntp_proxy::config::RoutingMode;
-    ///
-    /// let state = ModeState::new(SessionMode::PerCommand, RoutingMode::PerCommand);
-    /// assert_eq!(state.mode(), SessionMode::PerCommand);
-    /// ```
-    #[inline]
+    fn runtime_state(&self) -> RuntimeRoutingState {
+        self.state
+    }
+
+    /// Get the current session mode.
     #[must_use]
     pub fn mode(&self) -> SessionMode {
-        SessionMode::from_u8(self.mode.load(Ordering::Relaxed))
+        self.runtime_state().mode()
     }
 
-    /// Get the routing mode configuration
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use nntp_proxy::session::{ModeState, SessionMode};
-    /// use nntp_proxy::config::RoutingMode;
-    ///
-    /// let state = ModeState::new(SessionMode::Stateful, RoutingMode::Stateful);
-    /// assert_eq!(state.routing_mode(), RoutingMode::Stateful);
-    /// ```
-    #[inline]
+    /// Get the configured routing mode.
     #[must_use]
-    pub const fn routing_mode(&self) -> RoutingMode {
-        self.routing_mode
+    pub fn routing_mode(&self) -> RoutingMode {
+        self.runtime_state().routing_mode()
     }
 
-    /// Check if currently in per-command mode
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use nntp_proxy::session::{ModeState, SessionMode};
-    /// use nntp_proxy::config::RoutingMode;
-    ///
-    /// let state = ModeState::new(SessionMode::PerCommand, RoutingMode::PerCommand);
-    /// assert!(state.is_per_command());
-    /// ```
-    #[inline]
+    /// Check if the current mode is per-command.
     #[must_use]
     pub fn is_per_command(&self) -> bool {
-        self.mode().is_per_command()
+        matches!(self.mode(), SessionMode::PerCommand)
     }
 
-    /// Check if currently in stateful mode
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use nntp_proxy::session::{ModeState, SessionMode};
-    /// use nntp_proxy::config::RoutingMode;
-    ///
-    /// let state = ModeState::new(SessionMode::Stateful, RoutingMode::Stateful);
-    /// assert!(state.is_stateful());
-    /// ```
-    #[inline]
+    /// Check if the current mode is stateful.
     #[must_use]
     pub fn is_stateful(&self) -> bool {
-        self.mode().is_stateful()
+        matches!(self.mode(), SessionMode::Stateful)
     }
 
-    /// Check if mode switching is allowed
-    ///
-    /// Mode switching is only allowed in Hybrid routing mode.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use nntp_proxy::session::{ModeState, SessionMode};
-    /// use nntp_proxy::config::RoutingMode;
-    ///
-    /// let hybrid = ModeState::new(SessionMode::PerCommand, RoutingMode::Hybrid);
-    /// assert!(hybrid.can_switch_mode());
-    ///
-    /// let stateful = ModeState::new(SessionMode::Stateful, RoutingMode::Stateful);
-    /// assert!(!stateful.can_switch_mode());
-    /// ```
-    #[inline]
+    /// Check if the one-way hybrid transition is available.
     #[must_use]
-    pub const fn can_switch_mode(&self) -> bool {
-        matches!(self.routing_mode, RoutingMode::Hybrid)
+    pub fn can_switch_mode(&self) -> bool {
+        matches!(self.runtime_state(), RuntimeRoutingState::HybridPerCommand)
     }
 
-    /// Switch to stateful mode (one-way transition)
-    ///
-    /// **IMPORTANT**: This is a **permanent, one-way transition** for this connection.
-    /// Once switched from per-command to stateful mode, the connection remains
-    /// stateful for its entire lifetime and **never switches back**.
-    ///
-    /// This transition happens in Hybrid mode when:
-    /// - Client issues a stateful command (GROUP, NEXT, LAST, XOVER, etc.)
-    /// - Client needs server-side state maintained across commands
-    /// - Connection acquires a dedicated backend and keeps it until disconnect
-    ///
-    /// Only allowed in Hybrid routing mode. No-op if already stateful or
-    /// if routing mode doesn't allow switching.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use nntp_proxy::session::{ModeState, SessionMode};
-    /// use nntp_proxy::config::RoutingMode;
-    ///
-    /// let state = ModeState::new(SessionMode::PerCommand, RoutingMode::Hybrid);
-    /// assert!(state.is_per_command());
-    ///
-    /// // Client sends "GROUP alt.binaries.test"
-    /// state.switch_to_stateful();
-    /// assert!(state.is_stateful());
-    ///
-    /// // Connection stays stateful until client disconnects
-    /// // (no way to switch back to per-command)
-    /// ```
-    #[inline]
-    pub fn switch_to_stateful(&self) {
-        if self.can_switch_mode() {
-            self.mode
-                .store(SessionMode::Stateful.to_u8(), Ordering::Relaxed);
+    /// Switch a hybrid session to stateful mode.
+    #[must_use]
+    pub fn switch_to_stateful(&mut self) -> ModeTransition {
+        match self.state {
+            RuntimeRoutingState::HybridPerCommand => {
+                self.state = RuntimeRoutingState::HybridStateful;
+                ModeTransition::Switched
+            }
+            RuntimeRoutingState::HybridStateful | RuntimeRoutingState::Stateful => {
+                ModeTransition::AlreadyStateful
+            }
+            RuntimeRoutingState::PerCommand => ModeTransition::NotHybrid,
         }
     }
 
-    /// Check if this session is using per-command routing
-    ///
-    /// Returns true if `routing_mode` is `PerCommand` or Hybrid.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use nntp_proxy::session::{ModeState, SessionMode};
-    /// use nntp_proxy::config::RoutingMode;
-    ///
-    /// let per_cmd = ModeState::new(SessionMode::PerCommand, RoutingMode::PerCommand);
-    /// assert!(per_cmd.is_per_command_routing());
-    ///
-    /// let hybrid = ModeState::new(SessionMode::PerCommand, RoutingMode::Hybrid);
-    /// assert!(hybrid.is_per_command_routing());
-    ///
-    /// let stateful = ModeState::new(SessionMode::Stateful, RoutingMode::Stateful);
-    /// assert!(!stateful.is_per_command_routing());
-    /// ```
-    #[inline]
+    /// Check if the configured routing uses per-command execution.
     #[must_use]
-    pub const fn is_per_command_routing(&self) -> bool {
+    pub fn is_per_command_routing(&self) -> bool {
         matches!(
-            self.routing_mode,
+            self.routing_mode(),
             RoutingMode::PerCommand | RoutingMode::Hybrid
         )
     }
@@ -298,127 +138,80 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_session_mode_is_per_command() {
-        assert!(SessionMode::PerCommand.is_per_command());
-        assert!(!SessionMode::Stateful.is_per_command());
+    fn stateful_constructor_starts_stateful() {
+        let state = ModeState::new(RoutingMode::Stateful);
+        assert_eq!(state.mode(), SessionMode::Stateful);
+        assert_eq!(state.routing_mode(), RoutingMode::Stateful);
     }
 
     #[test]
-    fn test_session_mode_is_stateful() {
-        assert!(SessionMode::Stateful.is_stateful());
-        assert!(!SessionMode::PerCommand.is_stateful());
+    fn constructors_derive_valid_runtime_states() {
+        let cases = [
+            (RoutingMode::Stateful, SessionMode::Stateful),
+            (RoutingMode::PerCommand, SessionMode::PerCommand),
+            (RoutingMode::Hybrid, SessionMode::PerCommand),
+        ];
+
+        for (routing_mode, expected_mode) in cases {
+            let state = ModeState::new(routing_mode);
+            assert_eq!(state.mode(), expected_mode);
+            assert_eq!(state.routing_mode(), routing_mode);
+        }
     }
 
     #[test]
-    fn test_session_mode_roundtrip() {
-        assert_eq!(
-            SessionMode::from_u8(SessionMode::PerCommand.to_u8()),
-            SessionMode::PerCommand
-        );
-        assert_eq!(
-            SessionMode::from_u8(SessionMode::Stateful.to_u8()),
-            SessionMode::Stateful
-        );
+    fn hybrid_transition_table_is_exhaustive() {
+        let cases = [
+            (
+                RoutingMode::Stateful,
+                ModeTransition::AlreadyStateful,
+                SessionMode::Stateful,
+            ),
+            (
+                RoutingMode::PerCommand,
+                ModeTransition::NotHybrid,
+                SessionMode::PerCommand,
+            ),
+            (
+                RoutingMode::Hybrid,
+                ModeTransition::Switched,
+                SessionMode::Stateful,
+            ),
+        ];
+
+        for (routing_mode, expected_transition, expected_mode) in cases {
+            let mut state = ModeState::new(routing_mode);
+            assert_eq!(state.switch_to_stateful(), expected_transition);
+            assert_eq!(state.mode(), expected_mode);
+            assert_eq!(
+                state.switch_to_stateful(),
+                match routing_mode {
+                    RoutingMode::PerCommand => ModeTransition::NotHybrid,
+                    RoutingMode::Stateful | RoutingMode::Hybrid => ModeTransition::AlreadyStateful,
+                }
+            );
+        }
     }
 
     #[test]
-    fn test_mode_state_new() {
-        let state = ModeState::new(SessionMode::PerCommand, RoutingMode::PerCommand);
-        assert_eq!(state.mode(), SessionMode::PerCommand);
-        assert_eq!(state.routing_mode(), RoutingMode::PerCommand);
-    }
-
-    #[test]
-    fn test_mode_state_is_per_command() {
-        let state = ModeState::new(SessionMode::PerCommand, RoutingMode::PerCommand);
+    fn hybrid_transition_is_one_way() {
+        let mut state = ModeState::new(RoutingMode::Hybrid);
         assert!(state.is_per_command());
-        assert!(!state.is_stateful());
-    }
-
-    #[test]
-    fn test_mode_state_is_stateful() {
-        let state = ModeState::new(SessionMode::Stateful, RoutingMode::Stateful);
-        assert!(state.is_stateful());
-        assert!(!state.is_per_command());
-    }
-
-    #[test]
-    fn test_can_switch_mode_hybrid() {
-        let state = ModeState::new(SessionMode::PerCommand, RoutingMode::Hybrid);
         assert!(state.can_switch_mode());
-    }
 
-    #[test]
-    fn test_cannot_switch_mode_stateful() {
-        let state = ModeState::new(SessionMode::Stateful, RoutingMode::Stateful);
+        assert_eq!(state.switch_to_stateful(), ModeTransition::Switched);
+        assert!(state.is_stateful());
         assert!(!state.can_switch_mode());
+        assert_eq!(state.switch_to_stateful(), ModeTransition::AlreadyStateful);
+        assert_eq!(state.routing_mode(), RoutingMode::Hybrid);
     }
 
     #[test]
-    fn test_cannot_switch_mode_per_command() {
-        let state = ModeState::new(SessionMode::PerCommand, RoutingMode::PerCommand);
-        assert!(!state.can_switch_mode());
-    }
+    fn per_command_routing_reflects_configuration_after_hybrid_transition() {
+        let mut state = ModeState::new(RoutingMode::Hybrid);
+        assert!(state.is_per_command_routing());
 
-    #[test]
-    fn test_switch_to_stateful_in_hybrid() {
-        let state = ModeState::new(SessionMode::PerCommand, RoutingMode::Hybrid);
-        assert!(state.is_per_command());
-
-        state.switch_to_stateful();
-        assert!(state.is_stateful());
-    }
-
-    #[test]
-    fn test_switch_to_stateful_noop_in_stateful_mode() {
-        let state = ModeState::new(SessionMode::Stateful, RoutingMode::Stateful);
-        assert!(state.is_stateful());
-
-        state.switch_to_stateful();
-        assert!(state.is_stateful());
-    }
-
-    #[test]
-    fn test_switch_to_stateful_noop_in_per_command_mode() {
-        let state = ModeState::new(SessionMode::PerCommand, RoutingMode::PerCommand);
-        assert!(state.is_per_command());
-
-        state.switch_to_stateful();
-        // Should remain in per-command mode
-        assert!(state.is_per_command());
-    }
-
-    #[test]
-    fn test_is_per_command_routing() {
-        let per_cmd = ModeState::new(SessionMode::PerCommand, RoutingMode::PerCommand);
-        assert!(per_cmd.is_per_command_routing());
-
-        let hybrid = ModeState::new(SessionMode::PerCommand, RoutingMode::Hybrid);
-        assert!(hybrid.is_per_command_routing());
-
-        let stateful = ModeState::new(SessionMode::Stateful, RoutingMode::Stateful);
-        assert!(!stateful.is_per_command_routing());
-    }
-
-    #[test]
-    fn test_one_way_transition_invariant() {
-        // Once switched to stateful in hybrid mode, stays stateful forever
-        let state = ModeState::new(SessionMode::PerCommand, RoutingMode::Hybrid);
-        assert!(state.is_per_command());
-
-        // Simulate client sending "GROUP alt.test"
-        state.switch_to_stateful();
-        assert!(state.is_stateful());
-
-        // No way to switch back - would need new connection
-        // (No switch_to_per_command() method exists)
-
-        // Verify it stays stateful
-        assert!(state.is_stateful());
-        assert!(!state.is_per_command());
-
-        // Can call switch_to_stateful again (no-op)
-        state.switch_to_stateful();
-        assert!(state.is_stateful());
+        let _ = state.switch_to_stateful();
+        assert!(state.is_per_command_routing());
     }
 }

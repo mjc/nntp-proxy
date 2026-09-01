@@ -6,13 +6,56 @@ use crate::types::{Password, Username, ValidationError};
 use std::collections::HashMap;
 use tokio::io::AsyncWriteExt;
 
-/// Handles client-facing authentication interception
-#[derive(Default)]
-pub struct AuthHandler {
-    /// Map of username -> password for O(1) lookups
-    users: HashMap<String, String>,
+/// A password held as bytes with redacted formatting.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretPassword(Vec<u8>);
+
+impl SecretPassword {
+    fn new(password: Password) -> Self {
+        Self(password.as_str().as_bytes().to_vec())
+    }
+
+    fn matches(&self, candidate: &[u8]) -> bool {
+        self.0 == candidate
+    }
 }
 
+impl std::fmt::Debug for SecretPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
+
+/// A validated username and its secret password.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Credentials {
+    username: Username,
+    password: SecretPassword,
+}
+
+impl Credentials {
+    fn new(username: Username, password: Password) -> Self {
+        Self {
+            username,
+            password: SecretPassword::new(password),
+        }
+    }
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("username", &self.username)
+            .field("password", &self.password)
+            .finish()
+    }
+}
+
+/// Handles client-facing authentication interception.
+#[derive(Default)]
+pub struct AuthHandler {
+    users: HashMap<Username, Credentials>,
+}
 impl std::fmt::Debug for AuthHandler {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthHandler")
@@ -48,7 +91,7 @@ impl AuthHandler {
             // Both provided - validate they're non-empty
             let username = Username::try_new(u)?; // Returns Err if empty
             let password = Password::try_new(p)?; // Returns Err if empty
-            users.insert(username.as_str().to_string(), password.as_str().to_string());
+            users.insert(username.clone(), Credentials::new(username, password));
         }
 
         Ok(Self { users })
@@ -65,7 +108,7 @@ impl AuthHandler {
             // Validate each credential pair
             let username = Username::try_new(u.clone())?;
             let password = Password::try_new(p.clone())?;
-            users.insert(username.as_str().to_string(), password.as_str().to_string());
+            users.insert(username.clone(), Credentials::new(username, password));
         }
 
         Ok(Self { users })
@@ -83,14 +126,19 @@ impl AuthHandler {
     /// If auth is disabled (no users configured), returns true for all credentials
     #[must_use]
     pub fn validate_credentials(&self, username: &str, password: &str) -> bool {
+        self.validate_credentials_bytes(username, password.as_bytes())
+    }
+
+    fn validate_credentials_bytes(&self, username: &str, password: &[u8]) -> bool {
         if self.users.is_empty() {
-            // Auth disabled - allow all
             true
         } else {
-            // Auth enabled - validate credentials
+            let Ok(username) = Username::try_new(username.to_owned()) else {
+                return false;
+            };
             self.users
-                .get(username)
-                .is_some_and(|stored_pass| stored_pass == password)
+                .get(&username)
+                .is_some_and(|credentials| credentials.password.matches(password))
         }
     }
 
@@ -123,8 +171,9 @@ impl AuthHandler {
                 }
 
                 // Validate credentials
-                let auth_success = stored_username
-                    .is_some_and(|username| self.validate_credentials(username, password));
+                let auth_success = stored_username.is_some_and(|username| {
+                    self.validate_credentials_bytes(username, password.as_bytes())
+                });
 
                 let response = if auth_success {
                     AUTH_ACCEPTED
@@ -448,5 +497,15 @@ mod tests {
             "Proxy must refuse to start with empty credentials from config. \
              Silently disabling auth would be a critical security vulnerability!"
         );
+    }
+    #[test]
+    fn secret_password_debug_is_redacted_and_bytes_are_exact() {
+        let password = Password::try_new("secret".to_owned()).unwrap();
+        let debug = format!("{:?}", SecretPassword::new(password));
+        assert!(!debug.contains("secret"));
+
+        let handler = AuthHandler::new(Some("user".to_owned()), Some("secret".to_owned())).unwrap();
+        assert!(handler.validate_credentials_bytes("user", b"secret"));
+        assert!(!handler.validate_credentials_bytes("user", b"secret\0"));
     }
 }

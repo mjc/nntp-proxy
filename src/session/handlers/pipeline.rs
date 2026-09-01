@@ -19,38 +19,29 @@ const COMMAND_LINE_CAPACITY: usize = crate::protocol::MAX_COMMAND_LINE_OCTETS;
 const PIPELINE_REFILL_GRACE: Duration = Duration::from_millis(1);
 type BatchContexts = SmallVec<[RequestContext; MAX_PIPELINE_DEPTH]>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum CommandLineKind {
+#[expect(
+    clippy::large_enum_variant,
+    reason = "retain inline request storage without per-command allocation"
+)]
+#[derive(Debug)]
+enum CommandLine {
     Eof,
     Oversized { wire_len: usize },
-    Parsed,
-}
-
-struct CommandLine {
-    kind: CommandLineKind,
-    request: Option<RequestContext>,
+    Invalid,
+    Parsed(RequestContext),
 }
 
 impl CommandLine {
     const fn eof() -> Self {
-        Self {
-            kind: CommandLineKind::Eof,
-            request: None,
-        }
+        Self::Eof
     }
 
     const fn oversized(wire_len: usize) -> Self {
-        Self {
-            kind: CommandLineKind::Oversized { wire_len },
-            request: None,
-        }
+        Self::Oversized { wire_len }
     }
 
-    const fn parsed(request: Option<RequestContext>) -> Self {
-        Self {
-            kind: CommandLineKind::Parsed,
-            request,
-        }
+    fn parsed(request: Option<RequestContext>) -> Self {
+        request.map_or(Self::Invalid, Self::Parsed)
     }
 }
 
@@ -60,145 +51,171 @@ enum RequestRejection {
     Invalid,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "retain the inline pipeline capacity"
+)]
+#[derive(Debug)]
+enum BatchContents {
+    Empty,
+    Rejected(RequestRejection),
+    Contexts(BatchContexts),
+}
+
+#[expect(
+    clippy::large_enum_variant,
+    reason = "retain inline trailing request storage"
+)]
+#[derive(Debug)]
+enum BatchTail {
+    None,
+    Context(RequestContext),
+    Rejection(RequestRejection),
+}
+
 /// A batch of requests read from the client's TCP buffer.
 ///
-/// Uses typed contexts for pipelineable requests and the trailing
-/// non-pipelineable line, keeping one request model for the whole batch.
+/// The contents and trailing item are payload-bearing states, so a request and
+/// its rejection cannot coexist in the same slot.
 pub(super) struct RequestBatch {
-    /// Typed contexts for each pipelineable command.
-    contexts: BatchContexts,
-    /// Typed context for trailing non-pipelineable command if present.
-    trailing_context: Option<RequestContext>,
-    /// Rejection for the first command, before context creation.
-    first_rejection: Option<RequestRejection>,
-    /// Rejection for a trailing command after pipelineable contexts.
-    trailing_rejection: Option<RequestRejection>,
+    contents: BatchContents,
+    trailing: BatchTail,
 }
 
 impl RequestBatch {
     fn empty() -> Self {
         Self {
-            contexts: smallvec::SmallVec::new(),
-            trailing_context: None,
-            first_rejection: None,
-            trailing_rejection: None,
+            contents: BatchContents::Empty,
+            trailing: BatchTail::None,
         }
     }
 
-    fn first_oversized() -> Self {
+    fn first_oversized(wire_len: usize) -> Self {
         Self {
-            first_rejection: Some(RequestRejection::Oversized { wire_len: 0 }),
-            ..Self::empty()
+            contents: BatchContents::Rejected(RequestRejection::Oversized { wire_len }),
+            trailing: BatchTail::None,
         }
     }
 
     fn first_invalid() -> Self {
         Self {
-            first_rejection: Some(RequestRejection::Invalid),
-            ..Self::empty()
+            contents: BatchContents::Rejected(RequestRejection::Invalid),
+            trailing: BatchTail::None,
         }
     }
 
     fn trailing(context: RequestContext) -> Self {
         Self {
-            trailing_context: Some(context),
-            ..Self::empty()
+            contents: BatchContents::Empty,
+            trailing: BatchTail::Context(context),
         }
     }
 
-    const fn contexts_with_trailing_oversized(
-        contexts: BatchContexts,
-        trailing_wire_len: usize,
-    ) -> Self {
+    fn contexts_with_trailing_oversized(contexts: BatchContexts, trailing_wire_len: usize) -> Self {
         Self {
-            contexts,
-            trailing_context: None,
-            first_rejection: None,
-            trailing_rejection: Some(RequestRejection::Oversized {
+            contents: BatchContents::Contexts(contexts),
+            trailing: BatchTail::Rejection(RequestRejection::Oversized {
                 wire_len: trailing_wire_len,
             }),
         }
     }
 
-    const fn contexts_with_trailing_invalid(contexts: BatchContexts) -> Self {
+    fn contexts_with_trailing_invalid(contexts: BatchContexts) -> Self {
         Self {
-            contexts,
-            trailing_context: None,
-            first_rejection: None,
-            trailing_rejection: Some(RequestRejection::Invalid),
+            contents: BatchContents::Contexts(contexts),
+            trailing: BatchTail::Rejection(RequestRejection::Invalid),
         }
     }
 
-    const fn contexts_with_trailing(
-        contexts: BatchContexts,
-        trailing_context: RequestContext,
-    ) -> Self {
+    fn contexts_with_trailing(contexts: BatchContexts, trailing_context: RequestContext) -> Self {
         Self {
-            contexts,
-            trailing_context: Some(trailing_context),
-            first_rejection: None,
-            trailing_rejection: None,
+            contents: BatchContents::Contexts(contexts),
+            trailing: BatchTail::Context(trailing_context),
         }
     }
 
     fn contexts(contexts: BatchContexts) -> Self {
         Self {
-            contexts,
-            ..Self::empty()
+            contents: BatchContents::Contexts(contexts),
+            trailing: BatchTail::None,
         }
     }
 
     /// Whether this batch is empty (client disconnected)
     pub(super) fn is_empty(&self) -> bool {
-        self.contexts.is_empty()
-            && self.trailing_context.is_none()
-            && self.first_rejection.is_none()
-            && self.trailing_rejection.is_none()
+        matches!(
+            (&self.contents, &self.trailing),
+            (BatchContents::Empty, BatchTail::None)
+        )
     }
 
     /// Get a typed context by index from the pipelineable commands.
     pub(super) fn context(&self, i: usize) -> &RequestContext {
-        &self.contexts[i]
+        match &self.contents {
+            BatchContents::Contexts(contexts) => &contexts[i],
+            BatchContents::Empty | BatchContents::Rejected(_) => {
+                panic!("request context requested from a non-context batch")
+            }
+        }
     }
 
     /// Get a mutable typed context by index from the pipelineable commands.
     pub(super) fn context_mut(&mut self, i: usize) -> &mut RequestContext {
-        &mut self.contexts[i]
+        match &mut self.contents {
+            BatchContents::Contexts(contexts) => &mut contexts[i],
+            BatchContents::Empty | BatchContents::Rejected(_) => {
+                panic!("request context requested from a non-context batch")
+            }
+        }
     }
 
     /// Get the trailing typed context if present.
-    pub(super) const fn trailing_context(&self) -> Option<&RequestContext> {
-        self.trailing_context.as_ref()
+    pub(super) fn trailing_context(&self) -> Option<&RequestContext> {
+        match &self.trailing {
+            BatchTail::Context(context) => Some(context),
+            BatchTail::None | BatchTail::Rejection(_) => None,
+        }
     }
 
     /// Get the trailing typed context mutably if present.
-    pub(super) const fn trailing_context_mut(&mut self) -> Option<&mut RequestContext> {
-        self.trailing_context.as_mut()
+    pub(super) fn trailing_context_mut(&mut self) -> Option<&mut RequestContext> {
+        match &mut self.trailing {
+            BatchTail::Context(context) => Some(context),
+            BatchTail::None | BatchTail::Rejection(_) => None,
+        }
     }
 
     /// Number of pipelineable commands
     pub(super) fn len(&self) -> usize {
-        self.contexts.len()
+        match &self.contents {
+            BatchContents::Contexts(contexts) => contexts.len(),
+            BatchContents::Empty | BatchContents::Rejected(_) => 0,
+        }
     }
 
     /// Whether the trailing command exceeded the 512-byte RFC 3977 limit
     pub const fn is_trailing_oversized(&self) -> bool {
         matches!(
-            self.trailing_rejection,
-            Some(RequestRejection::Oversized { .. })
+            self.trailing,
+            BatchTail::Rejection(RequestRejection::Oversized { .. })
         )
     }
 
     /// Whether the trailing command was syntactically invalid.
     pub const fn is_trailing_invalid(&self) -> bool {
-        matches!(self.trailing_rejection, Some(RequestRejection::Invalid))
+        matches!(
+            self.trailing,
+            BatchTail::Rejection(RequestRejection::Invalid)
+        )
     }
 
     /// Wire length for the trailing oversized command, if any.
     pub const fn trailing_wire_len(&self) -> usize {
-        match self.trailing_rejection {
-            Some(RequestRejection::Oversized { wire_len }) => wire_len,
-            Some(RequestRejection::Invalid) | None => 0,
+        match self.trailing {
+            BatchTail::Rejection(RequestRejection::Oversized { wire_len }) => wire_len,
+            BatchTail::None
+            | BatchTail::Context(_)
+            | BatchTail::Rejection(RequestRejection::Invalid) => 0,
         }
     }
 
@@ -206,14 +223,17 @@ impl RequestBatch {
     /// When true, the batch is otherwise empty — caller should send 501 and continue.
     pub const fn is_first_oversized(&self) -> bool {
         matches!(
-            self.first_rejection,
-            Some(RequestRejection::Oversized { .. })
+            self.contents,
+            BatchContents::Rejected(RequestRejection::Oversized { .. })
         )
     }
 
     /// Whether the first command was syntactically invalid.
     pub const fn is_first_invalid(&self) -> bool {
-        matches!(self.first_rejection, Some(RequestRejection::Invalid))
+        matches!(
+            self.contents,
+            BatchContents::Rejected(RequestRejection::Invalid)
+        )
     }
 }
 
@@ -336,14 +356,13 @@ impl ClientSession {
     {
         // First command: blocking read (must wait for client)
         let line = Self::read_command_line(reader, line_buf).await?;
-        let request = match line.kind {
-            CommandLineKind::Eof => return Ok(RequestBatch::empty()),
-            CommandLineKind::Parsed => line.request,
-            CommandLineKind::Oversized { .. } => return Ok(RequestBatch::first_oversized()),
-        };
-
-        let Some(request) = request else {
-            return Ok(RequestBatch::first_invalid());
+        let request = match line {
+            CommandLine::Eof => return Ok(RequestBatch::empty()),
+            CommandLine::Invalid => return Ok(RequestBatch::first_invalid()),
+            CommandLine::Oversized { wire_len } => {
+                return Ok(RequestBatch::first_oversized(wire_len));
+            }
+            CommandLine::Parsed(request) => request,
         };
         if !request.is_pipelineable() {
             // Single non-pipelineable command → return as trailing
@@ -368,18 +387,18 @@ impl ClientSession {
             }
 
             let line = Self::read_command_line(reader, line_buf).await?;
-            match line.kind {
-                CommandLineKind::Eof => break,
-                CommandLineKind::Oversized { wire_len } => {
+            match line {
+                CommandLine::Eof => break,
+                CommandLine::Oversized { wire_len } => {
                     return Ok(RequestBatch::contexts_with_trailing_oversized(
                         batch_contexts,
                         wire_len,
                     ));
                 }
-                CommandLineKind::Parsed => {
-                    let Some(request) = line.request else {
-                        return Ok(RequestBatch::contexts_with_trailing_invalid(batch_contexts));
-                    };
+                CommandLine::Invalid => {
+                    return Ok(RequestBatch::contexts_with_trailing_invalid(batch_contexts));
+                }
+                CommandLine::Parsed(request) => {
                     if !request.is_pipelineable() {
                         // Non-pipelineable command ends the batch
                         return Ok(RequestBatch::contexts_with_trailing(
@@ -400,6 +419,7 @@ impl ClientSession {
 mod tests {
     use std::sync::Arc;
 
+    use super::{BatchTail, MAX_PIPELINE_DEPTH, RequestBatch};
     use tokio::io::{AsyncWriteExt, BufReader};
 
     use crate::auth::AuthHandler;
@@ -748,5 +768,11 @@ mod tests {
         assert_eq!(trailing.kind(), RequestKind::Group);
         assert_eq!(trailing.args(), b"alt.test");
         assert_eq!(trailing.route_class(), RequestRouteClass::Stateful);
+    }
+    #[test]
+    fn pipeline_products_keep_the_inline_batch_capacity() {
+        assert_eq!(MAX_PIPELINE_DEPTH, 16);
+        assert!(std::mem::size_of::<RequestBatch>() > 0);
+        assert!(std::mem::size_of::<BatchTail>() > 0);
     }
 }

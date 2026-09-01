@@ -434,7 +434,7 @@ impl NntpProxy {
             .await
             .map_err(SessionError::from)?;
 
-        let session = self.create_session(client_addr, Some(self.router.clone()));
+        let mut session = self.create_session(client_addr, Some(self.router.clone()));
         let session_id = Self::generate_session_id(&session);
 
         let metrics = session.handle_per_command_routing(client_stream).await;
