@@ -26,7 +26,14 @@ fn classify(command: &str) -> CommandAction<'static> {
                 "501 Syntax error in command\r\n",
             ))
         },
-        |request| CommandHandler::classify_request(Box::leak(Box::new(request))),
+        |request| {
+            CommandHandler::classify_request(
+                Box::leak(Box::new(request)),
+                true,
+                true,
+                RoutingMode::PerCommand,
+            )
+        },
     )
 }
 
@@ -315,7 +322,7 @@ async fn test_reject_response_formatting() {
 #[test]
 fn test_command_classification_for_stateless() {
     for command in ["ARTICLE <msgid@example.com>\r\n", "LIST\r\n"] {
-        assert_eq!(classify(command), CommandAction::ForwardStateless);
+        assert_eq!(classify(command), CommandAction::Forward);
     }
 }
 

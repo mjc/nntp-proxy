@@ -2,7 +2,7 @@
 //!
 //! Bidirectional proxy: each client gets a dedicated backend connection.
 
-use crate::command::{CommandAction, CommandHandler, RejectResponse};
+use crate::command::{CommandHandler, CommandPlan, RejectResponse};
 use crate::protocol::{RequestContext, RequestKind, RequestRouteClass};
 use crate::session::state::StatefulReadMode;
 use crate::session::{ClientSession, common};
@@ -120,12 +120,17 @@ fn classify_authenticated_stateful_action(
     request: &RequestContext,
     auth_enabled: bool,
 ) -> AuthenticatedStatefulAction {
-    match CommandHandler::classify_request(request) {
-        CommandAction::InterceptAuth(_) if auth_enabled => {
+    match CommandHandler::classify_request(
+        request,
+        true,
+        auth_enabled,
+        crate::config::RoutingMode::Stateful,
+    ) {
+        CommandPlan::InterceptAuth(_) if auth_enabled => {
             AuthenticatedStatefulAction::RejectAuthAlreadyAuthenticated
         }
-        CommandAction::InterceptCapabilities => AuthenticatedStatefulAction::InterceptCapabilities,
-        CommandAction::Reject(response)
+        CommandPlan::InterceptCapabilities => AuthenticatedStatefulAction::InterceptCapabilities,
+        CommandPlan::Reject(response)
             if matches!(request.kind(), RequestKind::Post | RequestKind::Ihave)
                 || request.route_class() == RequestRouteClass::Reject =>
         {

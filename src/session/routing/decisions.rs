@@ -3,29 +3,22 @@
 //! Pure functions for determining how to route NNTP commands based on
 //! authentication state and routing mode.
 
+use crate::command::{CommandHandler, CommandPlan};
 use crate::config::RoutingMode;
-use crate::protocol::{RequestContext, RequestKind, RequestRouteClass};
+use crate::protocol::RequestContext;
 
-/// Decision for how to handle a command in per-command routing mode
+/// Legacy tag-only projection of a canonical [`CommandPlan`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandRoutingDecision {
-    /// Intercept and handle authentication locally
     InterceptAuth,
-    /// Return a synthetic proxy-accurate CAPABILITIES list
     InterceptCapabilities,
-    /// Forward command to backend (authenticated or auth disabled)
     Forward,
-    /// Require authentication first
     RequireAuth,
-    /// Switch to stateful mode (hybrid mode only)
     SwitchToStateful,
-    /// Reject the command
     Reject,
 }
 
-/// Determine how to handle a request based on auth state and routing mode
-///
-/// This is a pure function that can be easily tested without I/O dependencies.
+/// Project the canonical plan into the legacy routing tag used by older callers.
 #[must_use]
 pub fn decide_request_routing(
     request: &RequestContext,
@@ -33,40 +26,20 @@ pub fn decide_request_routing(
     auth_enabled: bool,
     routing_mode: RoutingMode,
 ) -> CommandRoutingDecision {
-    match request.kind() {
-        RequestKind::AuthInfo => CommandRoutingDecision::InterceptAuth,
-        RequestKind::Capabilities => CommandRoutingDecision::InterceptCapabilities,
-        RequestKind::Quit => CommandRoutingDecision::Forward,
-        _ => match request.route_class() {
-            RequestRouteClass::ArticleByMessageId | RequestRouteClass::Stateless => {
-                if is_authenticated || !auth_enabled {
-                    CommandRoutingDecision::Forward
-                } else {
-                    CommandRoutingDecision::RequireAuth
-                }
-            }
-            RequestRouteClass::Stateful if routing_mode == RoutingMode::Hybrid => {
-                if is_authenticated || !auth_enabled {
-                    CommandRoutingDecision::SwitchToStateful
-                } else {
-                    CommandRoutingDecision::RequireAuth
-                }
-            }
-            RequestRouteClass::Stateful | RequestRouteClass::Reject => {
-                if auth_enabled && !is_authenticated {
-                    CommandRoutingDecision::RequireAuth
-                } else {
-                    CommandRoutingDecision::Reject
-                }
-            }
-            RequestRouteClass::Local => CommandRoutingDecision::Reject,
-        },
+    match CommandHandler::classify_request(request, is_authenticated, auth_enabled, routing_mode) {
+        CommandPlan::InterceptAuth(_) => CommandRoutingDecision::InterceptAuth,
+        CommandPlan::InterceptCapabilities => CommandRoutingDecision::InterceptCapabilities,
+        CommandPlan::Forward => CommandRoutingDecision::Forward,
+        CommandPlan::RequireAuth => CommandRoutingDecision::RequireAuth,
+        CommandPlan::SwitchToStateful => CommandRoutingDecision::SwitchToStateful,
+        CommandPlan::Reject(_) => CommandRoutingDecision::Reject,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::command::{AuthAction, CommandHandler, CommandPlan};
 
     fn decide_command_routing(
         command: &str,
@@ -76,6 +49,26 @@ mod tests {
     ) -> CommandRoutingDecision {
         let request = RequestContext::parse(command.as_bytes()).expect("valid request line");
         decide_request_routing(&request, is_authenticated, auth_enabled, routing_mode)
+    }
+
+    #[test]
+    fn canonical_plan_carries_auth_and_rejection_payloads() {
+        let auth_request = RequestContext::parse(b"AUTHINFO USER alice\r\n").unwrap();
+        assert!(matches!(
+            CommandHandler::classify_request(&auth_request, false, true, RoutingMode::PerCommand,),
+            CommandPlan::InterceptAuth(AuthAction::RequestPassword("alice"))
+        ));
+
+        let post_request = RequestContext::parse(b"POST\r\n").unwrap();
+        assert!(matches!(
+            CommandHandler::classify_request(
+                &post_request,
+                true,
+                true,
+                RoutingMode::PerCommand,
+            ),
+            CommandPlan::Reject(response) if response.status().as_u16() == 440
+        ));
     }
 
     #[test]

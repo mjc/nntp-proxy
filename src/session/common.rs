@@ -1,7 +1,7 @@
 //! Common utilities shared across handler modules
 
 use crate::auth::AuthHandler;
-use crate::command::AuthAction;
+use crate::command::{AuthAction, CommandHandler, CommandPlan};
 use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata, StatusCode, codes};
 use crate::types::BackendToClientBytes;
 
@@ -382,11 +382,12 @@ pub async fn handle_stateful_auth_check<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    use crate::command::{CommandAction, CommandHandler};
-
-    let action = CommandHandler::classify_request(request);
-    match action {
-        CommandAction::ForwardStateless | CommandAction::Reject(_) => {
+    let plan = CommandHandler::classify_request(request, false, true, *ctx.routing_mode);
+    match plan {
+        CommandPlan::Forward
+        | CommandPlan::RequireAuth
+        | CommandPlan::SwitchToStateful
+        | CommandPlan::Reject(_) => {
             // Reject all non-auth commands before authentication
             use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
             client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
@@ -394,7 +395,7 @@ where
                 bytes_written: AUTH_REQUIRED_FOR_COMMAND.len() as u64,
             })
         }
-        CommandAction::InterceptCapabilities => {
+        CommandPlan::InterceptCapabilities => {
             // RFC 4643 §3.1: CAPABILITIES must be accessible before authentication.
             // Auth is enabled and client is not yet authenticated → include AUTHINFO.
             let capabilities = crate::session::backend::capabilities_response(true);
@@ -403,7 +404,7 @@ where
                 bytes_written: capabilities.len() as u64,
             })
         }
-        CommandAction::InterceptAuth(auth_action) => {
+        CommandPlan::InterceptAuth(auth_action) => {
             let result = handle_auth_command(
                 ctx.auth_handler,
                 auth_action,

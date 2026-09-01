@@ -22,7 +22,12 @@ fn classify(command: &str) -> CommandAction<'static> {
     let request = Box::leak(Box::new(
         RequestContext::parse(command.as_bytes()).expect("valid request line"),
     ));
-    CommandHandler::classify_request(request)
+    CommandHandler::classify_request(
+        request,
+        true,
+        true,
+        nntp_proxy::config::RoutingMode::PerCommand,
+    )
 }
 
 #[tokio::test]
@@ -155,7 +160,7 @@ async fn test_auth_handler_integration() {
 
     // Test command classification
     let action = classify("LIST\r\n");
-    assert_eq!(action, CommandAction::ForwardStateless);
+    assert_eq!(action, CommandAction::Forward);
 
     let action = classify("AUTHINFO USER alice\r\n");
     assert!(matches!(

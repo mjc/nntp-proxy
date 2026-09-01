@@ -18,23 +18,31 @@
 //!   Used when this proxy cannot provide a feature, such as reader state in
 //!   per-command routing or transit-only `IHAVE`.
 
+use crate::config::RoutingMode;
 use crate::protocol::{
     RequestContext, RequestKind, RequestResponseMetadata, RequestRouteClass, StatusCode, codes,
 };
 
-/// Action to take after interpreting a typed request.
+/// Payload-bearing plan produced by the canonical command classifier.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
-pub enum CommandAction<'a> {
+pub enum CommandPlan<'a> {
     /// Intercept and send an authentication response to the client.
     InterceptAuth(AuthAction<'a>),
     /// Reject the request with an NNTP response.
     Reject(RejectResponse),
-    /// Forward the request without binding this client to one backend session.
-    ForwardStateless,
+    /// Forward the request to the backend selected by the current session mode.
+    Forward,
+    /// Require authentication before handling the request.
+    RequireAuth,
+    /// Switch from hybrid per-command routing to stateful routing.
+    SwitchToStateful,
     /// Intercept CAPABILITIES and return a synthetic proxy-accurate capability list.
     InterceptCapabilities,
 }
+
+/// Compatibility name for callers that only need the plan action type.
+pub type CommandAction<'a> = CommandPlan<'a>;
 
 /// Static local reject response with typed status metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,35 +128,78 @@ pub enum AuthAction<'a> {
 pub struct CommandHandler;
 
 impl CommandHandler {
-    /// Classify an already parsed request context and return the action to take.
+    /// Classify an already parsed request context into an execution plan.
     #[must_use]
-    pub fn classify_request(request: &RequestContext) -> CommandAction<'_> {
+    pub fn classify_request(
+        request: &RequestContext,
+        is_authenticated: bool,
+        auth_enabled: bool,
+        routing_mode: RoutingMode,
+    ) -> CommandPlan<'_> {
         match request.kind() {
-            RequestKind::AuthInfo => strip_authinfo_arg(request.args(), b"USER").map_or_else(
-                || {
-                    strip_authinfo_arg(request.args(), b"PASS").map_or(
-                        CommandAction::InterceptAuth(AuthAction::UnknownSubcommand),
-                        |password| {
-                            CommandAction::InterceptAuth(AuthAction::ValidateAndRespond {
-                                password,
-                            })
-                        },
-                    )
-                },
-                |username| CommandAction::InterceptAuth(AuthAction::RequestPassword(username)),
-            ),
-            RequestKind::Capabilities => CommandAction::InterceptCapabilities,
-            RequestKind::Post => CommandAction::Reject(POST_REJECT),
-            RequestKind::Ihave => CommandAction::Reject(TRANSIT_REJECT),
+            RequestKind::AuthInfo => CommandPlan::InterceptAuth(classify_auth(request.args())),
+            RequestKind::Capabilities => CommandPlan::InterceptCapabilities,
+            RequestKind::Quit => CommandPlan::Forward,
             _ => match request.route_class() {
                 RequestRouteClass::ArticleByMessageId | RequestRouteClass::Stateless => {
-                    CommandAction::ForwardStateless
+                    if is_authenticated || !auth_enabled {
+                        CommandPlan::Forward
+                    } else {
+                        CommandPlan::RequireAuth
+                    }
                 }
-                RequestRouteClass::Stateful => CommandAction::Reject(STATEFUL_REJECT),
-                RequestRouteClass::Reject => CommandAction::Reject(TRANSIT_REJECT),
-                RequestRouteClass::Local => CommandAction::ForwardStateless,
+                RequestRouteClass::Stateful if routing_mode == RoutingMode::Hybrid => {
+                    if is_authenticated || !auth_enabled {
+                        CommandPlan::SwitchToStateful
+                    } else {
+                        CommandPlan::RequireAuth
+                    }
+                }
+                RequestRouteClass::Stateful if routing_mode == RoutingMode::Stateful => {
+                    if auth_enabled && !is_authenticated {
+                        CommandPlan::RequireAuth
+                    } else {
+                        CommandPlan::Forward
+                    }
+                }
+                RequestRouteClass::Stateful | RequestRouteClass::Reject => {
+                    if auth_enabled && !is_authenticated {
+                        CommandPlan::RequireAuth
+                    } else {
+                        CommandPlan::Reject(rejection_for(request))
+                    }
+                }
+                RequestRouteClass::Local => {
+                    if routing_mode == RoutingMode::Stateful {
+                        CommandPlan::Forward
+                    } else {
+                        CommandPlan::Reject(TRANSIT_REJECT)
+                    }
+                }
             },
         }
+    }
+}
+
+fn classify_auth(args: &[u8]) -> AuthAction<'_> {
+    strip_authinfo_arg(args, b"USER").map_or_else(
+        || {
+            strip_authinfo_arg(args, b"PASS").map_or(AuthAction::UnknownSubcommand, |password| {
+                AuthAction::ValidateAndRespond { password }
+            })
+        },
+        AuthAction::RequestPassword,
+    )
+}
+
+fn rejection_for(request: &RequestContext) -> RejectResponse {
+    match request.kind() {
+        RequestKind::Post => POST_REJECT,
+        RequestKind::Ihave => TRANSIT_REJECT,
+        _ => match request.route_class() {
+            RequestRouteClass::Stateful => STATEFUL_REJECT,
+            _ => TRANSIT_REJECT,
+        },
     }
 }
 
@@ -183,10 +234,17 @@ mod tests {
     use super::*;
 
     fn classify(command: &str) -> CommandAction<'static> {
-        RequestContext::parse(command.as_bytes())
-            .map_or(CommandAction::Reject(STATEFUL_REJECT), |request| {
-                CommandHandler::classify_request(Box::leak(Box::new(request)))
-            })
+        RequestContext::parse(command.as_bytes()).map_or(
+            CommandAction::Reject(STATEFUL_REJECT),
+            |request| {
+                CommandHandler::classify_request(
+                    Box::leak(Box::new(request)),
+                    true,
+                    true,
+                    crate::config::RoutingMode::PerCommand,
+                )
+            },
+        )
     }
 
     #[test]
@@ -219,16 +277,16 @@ mod tests {
     #[test]
     fn test_article_by_message_id() {
         let action = classify("ARTICLE <test@example.com>");
-        assert_eq!(action, CommandAction::ForwardStateless);
+        assert_eq!(action, CommandAction::Forward);
     }
 
     #[test]
     fn test_stateless_command() {
         let action = classify("LIST");
-        assert_eq!(action, CommandAction::ForwardStateless);
+        assert_eq!(action, CommandAction::Forward);
 
         let action = classify("HELP");
-        assert_eq!(action, CommandAction::ForwardStateless);
+        assert_eq!(action, CommandAction::Forward);
     }
 
     #[test]
@@ -269,7 +327,7 @@ mod tests {
         for cmd in msgid_commands {
             assert_eq!(
                 classify(cmd),
-                CommandAction::ForwardStateless,
+                CommandAction::Forward,
                 "Command '{cmd}' should be forwarded as stateless"
             );
         }
@@ -289,7 +347,7 @@ mod tests {
         for cmd in stateless_commands {
             assert_eq!(
                 classify(cmd),
-                CommandAction::ForwardStateless,
+                CommandAction::Forward,
                 "Command '{cmd}' should be stateless"
             );
         }
@@ -364,10 +422,10 @@ mod tests {
     #[test]
     fn test_case_insensitive_handling() {
         // Test that command handling is case-insensitive
-        assert_eq!(classify("list"), CommandAction::ForwardStateless);
-        assert_eq!(classify("LiSt"), CommandAction::ForwardStateless);
-        assert_eq!(classify("QUIT"), CommandAction::ForwardStateless);
-        assert_eq!(classify("quit"), CommandAction::ForwardStateless);
+        assert_eq!(classify("list"), CommandAction::Forward);
+        assert_eq!(classify("LiSt"), CommandAction::Forward);
+        assert_eq!(classify("QUIT"), CommandAction::Forward);
+        assert_eq!(classify("quit"), CommandAction::Forward);
     }
 
     #[test]
@@ -385,7 +443,7 @@ mod tests {
 
         // Command with trailing whitespace
         let action = classify("LIST  ");
-        assert_eq!(action, CommandAction::ForwardStateless);
+        assert_eq!(action, CommandAction::Forward);
 
         // Auth command with trailing whitespace
         let action = classify("AUTHINFO USER test  ");
@@ -437,11 +495,11 @@ mod tests {
     fn test_article_commands_with_newlines() {
         // Command with CRLF
         let action = classify("ARTICLE <msg@test.com>\r\n");
-        assert_eq!(action, CommandAction::ForwardStateless);
+        assert_eq!(action, CommandAction::Forward);
 
         // Command with just LF
         let action = classify("LIST\n");
-        assert_eq!(action, CommandAction::ForwardStateless);
+        assert_eq!(action, CommandAction::Forward);
     }
 
     #[test]
@@ -461,10 +519,7 @@ mod tests {
     #[test]
     fn test_command_action_equality() {
         // Test that CommandAction implements PartialEq correctly
-        assert_eq!(
-            CommandAction::ForwardStateless,
-            CommandAction::ForwardStateless
-        );
+        assert_eq!(CommandAction::Forward, CommandAction::Forward);
         assert_eq!(
             CommandAction::InterceptAuth(AuthAction::RequestPassword("test")),
             CommandAction::InterceptAuth(AuthAction::RequestPassword("test"))
@@ -526,12 +581,12 @@ mod tests {
         // NEWGROUPS/NEWNEWS are stateless (RFC 3977 §7.3-7.4) — forwarded, not rejected
         assert_eq!(
             classify("NEWGROUPS 20240101 000000 GMT"),
-            CommandAction::ForwardStateless,
+            CommandAction::Forward,
             "NEWGROUPS should be forwarded as stateless"
         );
         assert_eq!(
             classify("NEWNEWS * 20240101 000000 GMT"),
-            CommandAction::ForwardStateless,
+            CommandAction::Forward,
             "NEWNEWS should be forwarded as stateless"
         );
     }

@@ -12,7 +12,12 @@ fn classify(command: &str) -> CommandAction<'static> {
     let request = Box::leak(Box::new(
         RequestContext::parse(command.as_bytes()).expect("valid request line"),
     ));
-    CommandHandler::classify_request(request)
+    CommandHandler::classify_request(
+        request,
+        true,
+        true,
+        nntp_proxy::config::RoutingMode::PerCommand,
+    )
 }
 
 /// Test that `StandardHandler` requires valid credentials
@@ -139,7 +144,7 @@ async fn test_rejected_stateful_command_does_not_unlock_stateless_commands() {
     );
 
     let action = classify("LIST\r\n");
-    assert_eq!(action, CommandAction::ForwardStateless);
+    assert_eq!(action, CommandAction::Forward);
     assert!(auth_handler.is_enabled());
     assert!(
         !authenticated.load(Ordering::Acquire),

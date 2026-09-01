@@ -13,7 +13,6 @@ use crate::protocol::{
     codes,
 };
 use crate::session::common;
-use crate::session::routing::{CommandRoutingDecision, decide_request_routing};
 use crate::session::{ClientSession, connection};
 use anyhow::Result;
 use std::sync::Arc;
@@ -21,7 +20,7 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
-use crate::command::{CommandAction, CommandHandler};
+use crate::command::{AuthAction, CommandHandler, CommandPlan};
 use crate::constants::buffer::READER_CAPACITY;
 use crate::router::BackendSelector;
 use crate::session::SessionError;
@@ -161,24 +160,35 @@ impl ClientSession {
             ..
         } = params;
 
-        let decision = decide_request_routing(
+        let plan = CommandHandler::classify_request(
             request,
             skip_auth_check,
             self.auth_handler.is_enabled(),
             self.mode_state.routing_mode(),
         );
 
-        match decision {
-            CommandRoutingDecision::InterceptAuth => {
-                self.handle_intercept_auth(
-                    request,
-                    client_writer,
-                    auth_username,
-                    backend_to_client_bytes,
-                )
-                .await
+        match plan {
+            CommandPlan::InterceptAuth(auth_action) => {
+                let result = self
+                    .handle_intercept_auth(auth_action, client_writer, auth_username)
+                    .await?;
+                let auth_succeeded = matches!(result, common::AuthResult::Authenticated { .. });
+                if auth_succeeded {
+                    common::on_authentication_success(
+                        self.client_id(),
+                        self.client_addr,
+                        auth_username.clone(),
+                        self.mode_state.routing_mode(),
+                        self.connection_stats(),
+                        |username| self.set_username(username),
+                    );
+                }
+                request.record_local_response(result.response_metadata());
+                *backend_to_client_bytes =
+                    backend_to_client_bytes.add_u64(result.bytes_written().as_u64());
+                Ok(CommandResult::Continue { auth_succeeded })
             }
-            CommandRoutingDecision::Forward => {
+            CommandPlan::Forward => {
                 self.handle_forward_decision(
                     request,
                     router,
@@ -189,18 +199,21 @@ impl ClientSession {
                 )
                 .await
             }
-            CommandRoutingDecision::RequireAuth => {
+            CommandPlan::RequireAuth => {
                 self.handle_require_auth(request, client_writer, backend_to_client_bytes)
                     .await
             }
-            CommandRoutingDecision::SwitchToStateful => {
-                Ok(self.handle_stateful_switch_decision(request))
+            CommandPlan::SwitchToStateful => Ok(self.handle_stateful_switch_decision(request)),
+            CommandPlan::Reject(response) => {
+                self.handle_rejected_request(
+                    request,
+                    response,
+                    client_writer,
+                    backend_to_client_bytes,
+                )
+                .await
             }
-            CommandRoutingDecision::Reject => {
-                self.handle_rejected_request(request, client_writer, backend_to_client_bytes)
-                    .await
-            }
-            CommandRoutingDecision::InterceptCapabilities => {
+            CommandPlan::InterceptCapabilities => {
                 self.handle_capabilities_request(
                     request,
                     skip_auth_check,
@@ -214,40 +227,20 @@ impl ClientSession {
 
     async fn handle_intercept_auth(
         &self,
-        request: &mut RequestContext,
+        auth_action: AuthAction<'_>,
         client_writer: &crate::session::SharedClientWriter,
         auth_username: &mut Option<String>,
-        backend_to_client_bytes: &mut BackendToClientBytes,
-    ) -> Result<CommandResult> {
+    ) -> Result<common::AuthResult> {
         debug!("Client {} decision: InterceptAuth", self.client_addr);
-        let action = CommandHandler::classify_request(request);
-        let CommandAction::InterceptAuth(auth_action) = action else {
-            unreachable!("InterceptAuth decision must come from InterceptAuth action")
-        };
-
         let mut client_write = client_writer.lock().await;
-        let result = common::handle_auth_command(
+        common::handle_auth_command(
             &self.auth_handler,
             auth_action,
             &mut *client_write,
             auth_username,
             &self.auth_state,
         )
-        .await?;
-        let auth_succeeded = matches!(result, common::AuthResult::Authenticated { .. });
-        if auth_succeeded {
-            common::on_authentication_success(
-                self.client_id(),
-                self.client_addr,
-                auth_username.clone(),
-                self.mode_state.routing_mode(),
-                self.connection_stats(),
-                |username| self.set_username(username),
-            );
-        }
-        request.record_local_response(result.response_metadata());
-        *backend_to_client_bytes = backend_to_client_bytes.add_u64(result.bytes_written().as_u64());
-        Ok(CommandResult::Continue { auth_succeeded })
+        .await
     }
 
     async fn handle_forward_decision(
@@ -315,14 +308,11 @@ impl ClientSession {
     async fn handle_rejected_request(
         &self,
         request: &mut RequestContext,
+        response: crate::command::RejectResponse,
         client_writer: &crate::session::SharedClientWriter,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<CommandResult> {
         debug!("Client {} decision: Reject", self.client_addr);
-        let action = CommandHandler::classify_request(request);
-        let CommandAction::Reject(response) = action else {
-            unreachable!("Reject decision must come from Reject action")
-        };
         let mut client_write = client_writer.lock().await;
         client_write.write_all(response.as_bytes()).await?;
         request.record_local_response(response.metadata());
