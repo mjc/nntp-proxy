@@ -2139,7 +2139,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    const EXHAUSTIVE_BYTES: [u8; 4] = [b'\r', b'\n', b'.', b'x'];
+    const EXHAUSTIVE_BYTES: [u8; 4] = *b"\r\n.x";
 
     struct FailingWriter;
 
