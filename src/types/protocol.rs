@@ -6,6 +6,8 @@ use std::fmt;
 use std::str::FromStr;
 
 use super::ValidationError;
+const MIN_MESSAGE_ID_OCTETS: usize = 3;
+const MAX_MESSAGE_ID_OCTETS: usize = 250;
 
 /// A validated NNTP message ID (RFC 3977 §3.6)
 ///
@@ -56,15 +58,34 @@ impl<'a> MessageId<'a> {
 
     #[inline]
     fn validate(s: &str) -> Result<(), ValidationError> {
-        Self::inner(s)
-            .map(|_| ())
-            .ok_or_else(|| ValidationError::InvalidMessageId("must be <...>".to_string()))
+        let bytes = s.as_bytes();
+        if !(MIN_MESSAGE_ID_OCTETS..=MAX_MESSAGE_ID_OCTETS).contains(&bytes.len())
+            || bytes.first() != Some(&b'<')
+            || bytes.last() != Some(&b'>')
+        {
+            return Err(ValidationError::InvalidMessageId(
+                "must be 3..=250 printable US-ASCII octets enclosed in <...>".to_string(),
+            ));
+        }
+
+        let inner = &bytes[1..bytes.len() - 1];
+        if inner
+            .iter()
+            .any(|&byte| !(0x21..=0x7e).contains(&byte) || byte == b'>')
+        {
+            return Err(ValidationError::InvalidMessageId(
+                "must contain only printable US-ASCII except >".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     #[inline]
     fn inner(s: &str) -> Option<&str> {
-        let inner = s.strip_prefix('<')?.strip_suffix('>')?;
-        (!inner.is_empty()).then_some(inner)
+        s.strip_prefix('<')?
+            .strip_suffix('>')
+            .filter(|inner| !inner.is_empty())
     }
 
     #[inline]
@@ -269,5 +290,21 @@ mod tests {
 
         // Valid minimal
         assert!(MessageId::new("<a>".to_string()).is_ok());
+    }
+
+    #[test]
+    fn test_message_id_enforces_rfc3977_wire_invariant() {
+        for message_id in ["<a>b>", "<a b>", "<a\tb>", "<a\nb>", "<é>"] {
+            assert!(
+                MessageId::new(message_id.to_string()).is_err(),
+                "accepted invalid message ID {message_id:?}"
+            );
+        }
+
+        let max_length = format!("<{}>", "a".repeat(248));
+        assert!(MessageId::new(max_length).is_ok());
+
+        let too_long = format!("<{}>", "a".repeat(249));
+        assert!(MessageId::new(too_long).is_err());
     }
 }
