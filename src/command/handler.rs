@@ -159,7 +159,7 @@ impl CommandHandler {
                     if auth_enabled && !is_authenticated {
                         CommandPlan::RequireAuth
                     } else {
-                        CommandPlan::Forward
+                        CommandPlan::Reject(rejection_for(request))
                     }
                 }
                 RequestRouteClass::Stateful | RequestRouteClass::Reject => {

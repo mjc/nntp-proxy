@@ -3,43 +3,21 @@
 //! Pure functions for determining how to route NNTP commands based on
 //! authentication state and routing mode.
 
-use crate::command::{CommandHandler, CommandPlan};
-use crate::config::RoutingMode;
-use crate::protocol::RequestContext;
-
-/// Legacy tag-only projection of a canonical [`CommandPlan`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandRoutingDecision {
-    InterceptAuth,
-    InterceptCapabilities,
-    Forward,
-    RequireAuth,
-    SwitchToStateful,
-    Reject,
-}
-
-/// Project the canonical plan into the legacy routing tag used by older callers.
-#[must_use]
-pub fn decide_request_routing(
-    request: &RequestContext,
-    is_authenticated: bool,
-    auth_enabled: bool,
-    routing_mode: RoutingMode,
-) -> CommandRoutingDecision {
-    match CommandHandler::classify_request(request, is_authenticated, auth_enabled, routing_mode) {
-        CommandPlan::InterceptAuth(_) => CommandRoutingDecision::InterceptAuth,
-        CommandPlan::InterceptCapabilities => CommandRoutingDecision::InterceptCapabilities,
-        CommandPlan::Forward => CommandRoutingDecision::Forward,
-        CommandPlan::RequireAuth => CommandRoutingDecision::RequireAuth,
-        CommandPlan::SwitchToStateful => CommandRoutingDecision::SwitchToStateful,
-        CommandPlan::Reject(_) => CommandRoutingDecision::Reject,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::command::{AuthAction, CommandHandler, CommandPlan};
+    use crate::config::RoutingMode;
+    use crate::protocol::RequestContext;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum CommandRoutingDecision {
+        InterceptAuth,
+        InterceptCapabilities,
+        Forward,
+        RequireAuth,
+        SwitchToStateful,
+        Reject,
+    }
 
     fn decide_command_routing(
         command: &str,
@@ -48,7 +26,32 @@ mod tests {
         routing_mode: RoutingMode,
     ) -> CommandRoutingDecision {
         let request = RequestContext::parse(command.as_bytes()).expect("valid request line");
-        decide_request_routing(&request, is_authenticated, auth_enabled, routing_mode)
+        classify_request_kind(&request, is_authenticated, auth_enabled, routing_mode)
+    }
+
+    fn classify_request_kind(
+        request: &RequestContext,
+        is_authenticated: bool,
+        auth_enabled: bool,
+        routing_mode: RoutingMode,
+    ) -> CommandRoutingDecision {
+        plan_kind(CommandHandler::classify_request(
+            request,
+            is_authenticated,
+            auth_enabled,
+            routing_mode,
+        ))
+    }
+
+    fn plan_kind(plan: CommandPlan<'_>) -> CommandRoutingDecision {
+        match plan {
+            CommandPlan::InterceptAuth(_) => CommandRoutingDecision::InterceptAuth,
+            CommandPlan::InterceptCapabilities => CommandRoutingDecision::InterceptCapabilities,
+            CommandPlan::Forward => CommandRoutingDecision::Forward,
+            CommandPlan::RequireAuth => CommandRoutingDecision::RequireAuth,
+            CommandPlan::SwitchToStateful => CommandRoutingDecision::SwitchToStateful,
+            CommandPlan::Reject(_) => CommandRoutingDecision::Reject,
+        }
     }
 
     #[test]
@@ -154,11 +157,11 @@ mod tests {
     fn test_decide_routing_hybrid_unknown_extensions_require_auth_when_enabled() {
         let request = RequestContext::parse(b"XFOO arg\r\n").expect("valid request line");
         assert_eq!(
-            decide_request_routing(&request, false, true, RoutingMode::Hybrid),
+            classify_request_kind(&request, false, true, RoutingMode::Hybrid),
             CommandRoutingDecision::RequireAuth
         );
         assert_eq!(
-            decide_request_routing(&request, true, true, RoutingMode::Hybrid),
+            classify_request_kind(&request, true, true, RoutingMode::Hybrid),
             CommandRoutingDecision::SwitchToStateful
         );
     }
@@ -301,15 +304,15 @@ mod tests {
     fn test_decide_request_routing_unknown_extensions_are_stateful() {
         let request = RequestContext::parse(b"XFOO arg\r\n").expect("valid request line");
         assert_eq!(
-            decide_request_routing(&request, true, false, RoutingMode::Hybrid),
+            classify_request_kind(&request, true, false, RoutingMode::Hybrid),
             CommandRoutingDecision::SwitchToStateful
         );
         assert_eq!(
-            decide_request_routing(&request, false, true, RoutingMode::Hybrid),
+            classify_request_kind(&request, false, true, RoutingMode::Hybrid),
             CommandRoutingDecision::RequireAuth
         );
         assert_eq!(
-            decide_request_routing(&request, true, false, RoutingMode::PerCommand),
+            classify_request_kind(&request, true, false, RoutingMode::PerCommand),
             CommandRoutingDecision::Reject
         );
     }

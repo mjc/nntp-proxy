@@ -10,6 +10,8 @@
 //! Run with: cargo bench --bench `command_parsing`
 
 use divan::{Bencher, black_box};
+use nntp_proxy::command::CommandHandler;
+use nntp_proxy::config::RoutingMode;
 use nntp_proxy::protocol::RequestContext;
 
 fn main() {
@@ -29,6 +31,19 @@ macro_rules! bench_command {
                         RequestContext::parse(black_box($command.as_bytes()))
                             .expect("valid request line"),
                     )
+                });
+            }
+            #[divan::bench(name = "plan", sample_count = 1000, sample_size = 100)]
+            fn plan(bencher: Bencher) {
+                bencher.bench(|| {
+                    let request = RequestContext::parse(black_box($command.as_bytes()))
+                        .expect("valid request line");
+                    black_box(CommandHandler::classify_request(
+                        &request,
+                        true,
+                        true,
+                        RoutingMode::PerCommand,
+                    ));
                 });
             }
         }
@@ -111,7 +126,7 @@ bench_command!(
 // =============================================================================
 
 mod realistic_workload {
-    use super::{Bencher, RequestContext, black_box};
+    use super::{Bencher, CommandHandler, RequestContext, RoutingMode, black_box};
 
     /// Simulates a realistic distribution of typed NNTP request parsing:
     /// - 70% article retrieval (ARTICLE/BODY/HEAD/STAT)
@@ -152,5 +167,22 @@ mod realistic_workload {
                     );
                 }
             });
+        #[divan::bench(name = "plan", sample_count = 1000, sample_size = 100)]
+        fn plan(bencher: Bencher) {
+            bencher
+                .counter(divan::counter::ItemsCount::new(COMMANDS.len()))
+                .bench(|| {
+                    for cmd in COMMANDS {
+                        let request = RequestContext::parse(black_box(cmd.as_bytes()))
+                            .expect("valid request line");
+                        black_box(CommandHandler::classify_request(
+                            &request,
+                            true,
+                            true,
+                            RoutingMode::PerCommand,
+                        ));
+                    }
+                });
+        }
     }
 }

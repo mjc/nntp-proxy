@@ -8,5 +8,4 @@ mod decisions;
 mod metrics_policy;
 
 pub use cache_policy::{CacheAction, determine_cache_action_for_request};
-pub use decisions::{CommandRoutingDecision, decide_request_routing};
 pub use metrics_policy::{MetricsAction, determine_metrics_action_for_request};
