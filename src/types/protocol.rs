@@ -9,51 +9,18 @@ use super::ValidationError;
 const MIN_MESSAGE_ID_OCTETS: usize = 3;
 const MAX_MESSAGE_ID_OCTETS: usize = 250;
 
-/// A validated NNTP message ID (RFC 3977 §3.6)
-///
-/// Message IDs must be enclosed in angle brackets.
-/// Uses `Cow<'a, str>` for zero-copy parsing (borrowed) and owned storage.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MessageId<'a>(Cow<'a, str>);
+struct ValidatedMessageId<'a>(Cow<'a, str>);
 
-impl<'a> MessageId<'a> {
-    /// Create owned `MessageId` from String with validation
-    ///
-    /// # Errors
-    /// Returns `ValidationError::InvalidMessageId` when the string is not a
-    /// valid RFC-style NNTP message ID.
-    pub fn new(s: String) -> Result<Self, ValidationError> {
+impl<'a> ValidatedMessageId<'a> {
+    fn owned(s: String) -> Result<Self, ValidationError> {
         Self::validate(&s)?;
         Ok(Self(Cow::Owned(s)))
     }
 
-    /// Create borrowed `MessageId` from &str (zero-copy)
-    #[inline]
-    ///
-    /// # Errors
-    /// Returns `ValidationError::InvalidMessageId` when the string is not a
-    /// valid RFC-style NNTP message ID.
-    pub fn from_borrowed(s: &'a str) -> Result<Self, ValidationError> {
+    fn borrowed(s: &'a str) -> Result<Self, ValidationError> {
         Self::validate(s)?;
         Ok(Self(Cow::Borrowed(s)))
-    }
-
-    /// Create owned `MessageId`, auto-wrapping in angle brackets if needed
-    ///
-    /// # Errors
-    /// Returns `ValidationError::InvalidMessageId` if the resulting wrapped
-    /// value is still not a valid message ID.
-    pub fn from_str_or_wrap(s: impl AsRef<str>) -> Result<MessageId<'static>, ValidationError> {
-        let s = s.as_ref();
-        if s.is_empty() {
-            return Err(ValidationError::InvalidMessageId("empty".to_string()));
-        }
-        let wrapped = if Self::has_angle_brackets(s) {
-            s.to_string()
-        } else {
-            format!("<{s}>")
-        };
-        MessageId::new(wrapped)
     }
 
     #[inline]
@@ -82,10 +49,70 @@ impl<'a> MessageId<'a> {
     }
 
     #[inline]
-    fn inner(s: &str) -> Option<&str> {
-        s.strip_prefix('<')?
-            .strip_suffix('>')
-            .filter(|inner| !inner.is_empty())
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[inline]
+    fn without_brackets(&self) -> &str {
+        self.0
+            .strip_prefix('<')
+            .and_then(|value| value.strip_suffix('>'))
+            .expect("ValidatedMessageId invariant requires angle brackets")
+    }
+
+    fn into_owned(self) -> ValidatedMessageId<'static> {
+        ValidatedMessageId(Cow::Owned(self.0.into_owned()))
+    }
+
+    fn to_owned(&self) -> ValidatedMessageId<'static> {
+        ValidatedMessageId(Cow::Owned(self.0.clone().into_owned()))
+    }
+}
+
+/// A validated NNTP message ID (RFC 3977 §3.6)
+///
+/// Message IDs must be enclosed in angle brackets.
+/// Uses `Cow<'a, str>` for zero-copy parsing (borrowed) and owned storage.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct MessageId<'a>(ValidatedMessageId<'a>);
+
+impl<'a> MessageId<'a> {
+    /// Create owned `MessageId` from String with validation
+    ///
+    /// # Errors
+    /// Returns `ValidationError::InvalidMessageId` when the string is not a
+    /// valid RFC-style NNTP message ID.
+    pub fn new(s: String) -> Result<Self, ValidationError> {
+        Ok(Self(ValidatedMessageId::owned(s)?))
+    }
+
+    /// Create borrowed `MessageId` from &str (zero-copy)
+    #[inline]
+    ///
+    /// # Errors
+    /// Returns `ValidationError::InvalidMessageId` when the string is not a
+    /// valid RFC-style NNTP message ID.
+    pub fn from_borrowed(s: &'a str) -> Result<Self, ValidationError> {
+        Ok(Self(ValidatedMessageId::borrowed(s)?))
+    }
+
+    /// Create owned `MessageId`, auto-wrapping in angle brackets if needed
+    ///
+    /// # Errors
+    /// Returns `ValidationError::InvalidMessageId` if the resulting wrapped
+    /// value is still not a valid message ID.
+    pub fn from_str_or_wrap(s: impl AsRef<str>) -> Result<MessageId<'static>, ValidationError> {
+        let s = s.as_ref();
+        if s.is_empty() {
+            return Err(ValidationError::InvalidMessageId("empty".to_string()));
+        }
+        let wrapped = if Self::has_angle_brackets(s) {
+            s.to_string()
+        } else {
+            format!("<{s}>")
+        };
+        MessageId::new(wrapped)
     }
 
     #[inline]
@@ -96,23 +123,23 @@ impl<'a> MessageId<'a> {
     #[must_use]
     #[inline]
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 
     #[must_use]
     #[inline]
     pub fn without_brackets(&self) -> &str {
-        Self::inner(&self.0).expect("MessageId invariant requires angle brackets")
+        self.0.without_brackets()
     }
 
     #[must_use]
     pub fn into_owned(self) -> MessageId<'static> {
-        MessageId(Cow::Owned(self.0.into_owned()))
+        MessageId(self.0.into_owned())
     }
 
     #[must_use]
     pub fn to_owned(&self) -> MessageId<'static> {
-        MessageId(Cow::Owned(self.0.clone().into_owned()))
+        MessageId(self.0.to_owned())
     }
 }
 
@@ -126,7 +153,7 @@ impl FromStr for MessageId<'static> {
 impl AsRef<str> for MessageId<'_> {
     #[inline]
     fn as_ref(&self) -> &str {
-        &self.0
+        self.as_str()
     }
 }
 
@@ -134,19 +161,19 @@ impl std::ops::Deref for MessageId<'_> {
     type Target = str;
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.0
+        self.as_str()
     }
 }
 
 impl Borrow<str> for MessageId<'_> {
     fn borrow(&self) -> &str {
-        &self.0
+        self.as_str()
     }
 }
 
 impl fmt::Display for MessageId<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.as_str())
     }
 }
 
@@ -159,7 +186,7 @@ impl TryFrom<String> for MessageId<'static> {
 
 impl<'a> From<MessageId<'a>> for String {
     fn from(msgid: MessageId<'a>) -> Self {
-        msgid.0.into_owned()
+        msgid.0.into_owned().0.into_owned()
     }
 }
 
@@ -168,7 +195,7 @@ impl Serialize for MessageId<'_> {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&self.0)
+        serializer.serialize_str(self.as_str())
     }
 }
 

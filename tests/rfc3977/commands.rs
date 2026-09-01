@@ -305,15 +305,11 @@ fn test_standard_commands_under_512_octets() {
 }
 
 #[test]
-fn test_long_message_id_command_length() {
+fn test_long_message_id_is_rejected_before_command_building() {
     let long_id = format!("<{}@example.com>", "x".repeat(500));
-    let cmd = protocol::article_request(&msgid(&long_id));
-    let wire = wire(&cmd);
 
-    assert!(wire.len() > 512);
-    assert!(RequestContext::parse(&wire).is_none());
+    assert!(MessageId::from_borrowed(&long_id).is_err());
 }
-
 // === Request Classification ===
 
 #[test]
