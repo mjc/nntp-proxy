@@ -59,7 +59,7 @@ impl Drop for StatefulSessionGuard<'_> {
 
 fn stateful_initial_client_bytes(
     carried_client_to_backend_bytes: u64,
-    initial_request: crate::command::StatefulRequest<'_>,
+    initial_request: &crate::command::StatefulHandoff,
 ) -> u64 {
     carried_client_to_backend_bytes + initial_request.request().request_wire_len().as_u64()
 }
@@ -85,7 +85,7 @@ impl ClientSession {
         &mut self,
         client_reader: BufReader<R>,
         client_write: W,
-        initial_request: crate::command::StatefulRequest<'_>,
+        initial_request: crate::command::StatefulHandoff,
         client_to_backend_bytes: u64,
         backend_to_client_bytes: u64,
     ) -> Result<TransferMetrics, crate::session::SessionError>
@@ -116,7 +116,8 @@ impl ClientSession {
             .context("Failed to send initial request to backend")?;
 
         // Build initial state with carried-over byte counts
-        let initial_bytes = stateful_initial_client_bytes(client_to_backend_bytes, initial_request);
+        let initial_bytes =
+            stateful_initial_client_bytes(client_to_backend_bytes, &initial_request);
         let mut state = crate::session::state::SessionLoopState::from_initial_bytes(
             initial_bytes,
             backend_to_client_bytes,
@@ -220,13 +221,15 @@ mod tests {
     #[test]
     fn stateful_initial_client_bytes_uses_typed_wire_len() {
         let request = RequestContext::parse(b"group alt.test\r\n").expect("valid request line");
+        let handoff = CommandHandler::prepare_stateful_handoff(
+            request,
+            crate::command::AuthenticationAccess::Unrestricted,
+            RoutingMode::Hybrid,
+        )
+        .expect("GROUP must prepare a stateful handoff");
 
         assert_eq!(
-            super::stateful_initial_client_bytes(
-                10,
-                crate::command::CommandHandler::stateful_request(&request)
-                    .expect("GROUP must mint stateful capability")
-            ),
+            super::stateful_initial_client_bytes(10, &handoff),
             10 + "group alt.test\r\n".len() as u64
         );
     }
@@ -243,8 +246,12 @@ mod tests {
             MetricsCollector::new(1),
         );
         let request = RequestContext::parse(b"GROUP alt.test\r\n").expect("valid request");
-        let stateful_request =
-            CommandHandler::stateful_request(&request).expect("GROUP is stateful");
+        let stateful_request = CommandHandler::prepare_stateful_handoff(
+            request,
+            crate::command::AuthenticationAccess::Unrestricted,
+            RoutingMode::Hybrid,
+        )
+        .expect("GROUP starts a hybrid stateful handoff");
         let (client_write, client_read) = tokio::io::duplex(64);
 
         let result = session

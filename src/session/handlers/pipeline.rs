@@ -17,7 +17,36 @@ use tokio::time::Duration;
 const MAX_PIPELINE_DEPTH: usize = 16;
 const COMMAND_LINE_CAPACITY: usize = crate::protocol::MAX_COMMAND_LINE_OCTETS;
 const PIPELINE_REFILL_GRACE: Duration = Duration::from_millis(1);
-type BatchContexts = SmallVec<[RequestContext; MAX_PIPELINE_DEPTH]>;
+type BatchContexts = SmallVec<[PipelineableRequest; MAX_PIPELINE_DEPTH]>;
+
+/// A request admitted to a pipelined batch.
+///
+/// Construction stays with the batch reader so stateful commands cannot enter
+/// the concurrent batch executor.
+#[derive(Debug)]
+pub(super) struct PipelineableRequest(RequestContext);
+
+impl PipelineableRequest {
+    #[expect(
+        clippy::result_large_err,
+        reason = "the trailing path retains the parsed request without allocating"
+    )]
+    fn partition(request: RequestContext) -> Result<Self, RequestContext> {
+        if request.is_pipelineable() {
+            Ok(Self(request))
+        } else {
+            Err(request)
+        }
+    }
+
+    pub(super) fn request(&self) -> &RequestContext {
+        &self.0
+    }
+
+    pub(super) fn request_mut(&mut self) -> &mut RequestContext {
+        &mut self.0
+    }
+}
 
 #[expect(
     clippy::large_enum_variant,
@@ -149,8 +178,8 @@ impl RequestBatch {
         )
     }
 
-    /// Get a typed context by index from the pipelineable commands.
-    pub(super) fn context(&self, i: usize) -> &RequestContext {
+    /// Get a pipelineable request by index.
+    pub(super) fn context(&self, i: usize) -> &PipelineableRequest {
         match &self.contents {
             BatchContents::Contexts(contexts) => &contexts[i],
             BatchContents::Empty | BatchContents::Rejected(_) => {
@@ -159,8 +188,8 @@ impl RequestBatch {
         }
     }
 
-    /// Get a mutable typed context by index from the pipelineable commands.
-    pub(super) fn context_mut(&mut self, i: usize) -> &mut RequestContext {
+    /// Get a mutable pipelineable request by index.
+    pub(super) fn context_mut(&mut self, i: usize) -> &mut PipelineableRequest {
         match &mut self.contents {
             BatchContents::Contexts(contexts) => &mut contexts[i],
             BatchContents::Empty | BatchContents::Rejected(_) => {
@@ -170,6 +199,7 @@ impl RequestBatch {
     }
 
     /// Get the trailing typed context if present.
+    #[cfg(test)]
     pub(super) fn trailing_context(&self) -> Option<&RequestContext> {
         match &self.trailing {
             BatchTail::Context(context) => Some(context),
@@ -177,9 +207,10 @@ impl RequestBatch {
         }
     }
 
-    /// Get the trailing typed context mutably if present.
-    pub(super) fn trailing_context_mut(&mut self) -> Option<&mut RequestContext> {
-        match &mut self.trailing {
+    /// Take the trailing non-pipelineable request for single-command handling.
+    pub(super) fn take_trailing_context(&mut self) -> Option<RequestContext> {
+        let trailing = std::mem::replace(&mut self.trailing, BatchTail::None);
+        match trailing {
             BatchTail::Context(context) => Some(context),
             BatchTail::None | BatchTail::Rejection(_) => None,
         }
@@ -364,13 +395,11 @@ impl ClientSession {
             }
             CommandLine::Parsed(request) => request,
         };
-        if !request.is_pipelineable() {
-            // Single non-pipelineable command → return as trailing
-            return Ok(RequestBatch::trailing(request));
-        }
-
         let mut batch_contexts = BatchContexts::new();
-        batch_contexts.push(request);
+        match PipelineableRequest::partition(request) {
+            Ok(request) => batch_contexts.push(request),
+            Err(request) => return Ok(RequestBatch::trailing(request)),
+        }
 
         // Read more commands from the buffer (non-blocking)
         while batch_contexts.len() < MAX_PIPELINE_DEPTH {
@@ -398,16 +427,15 @@ impl ClientSession {
                 CommandLine::Invalid => {
                     return Ok(RequestBatch::contexts_with_trailing_invalid(batch_contexts));
                 }
-                CommandLine::Parsed(request) => {
-                    if !request.is_pipelineable() {
-                        // Non-pipelineable command ends the batch
+                CommandLine::Parsed(request) => match PipelineableRequest::partition(request) {
+                    Ok(request) => batch_contexts.push(request),
+                    Err(request) => {
                         return Ok(RequestBatch::contexts_with_trailing(
                             batch_contexts,
                             request,
                         ));
                     }
-                    batch_contexts.push(request);
-                }
+                },
             }
         }
 
@@ -466,7 +494,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(batch.len(), 1);
-        assert_eq!(batch.context(0).kind(), RequestKind::Article);
+        assert_eq!(batch.context(0).request().kind(), RequestKind::Article);
         let trailing = batch
             .trailing_context()
             .expect("non-pipelineable command trails the ARTICLE batch");
@@ -495,7 +523,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(batch.len(), 1);
-        assert_eq!(batch.context(0).kind(), RequestKind::Stat);
+        assert_eq!(batch.context(0).request().kind(), RequestKind::Stat);
         assert!(batch.is_trailing_oversized());
         assert!(batch.trailing_context().is_none());
         assert!(batch.trailing_wire_len() > 512);
@@ -537,7 +565,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(batch.len(), 1);
-        assert_eq!(batch.context(0).kind(), RequestKind::Stat);
+        assert_eq!(batch.context(0).request().kind(), RequestKind::Stat);
         assert!(batch.is_trailing_invalid());
         assert!(batch.trailing_context().is_none());
     }
@@ -571,7 +599,7 @@ mod tests {
 
         assert_eq!(batch.len(), 4);
         for idx in 0..4 {
-            assert_eq!(batch.context(idx).kind(), RequestKind::Body);
+            assert_eq!(batch.context(idx).request().kind(), RequestKind::Body);
         }
         let trailing = batch
             .trailing_context()
@@ -607,9 +635,9 @@ mod tests {
             .unwrap();
         assert_eq!(first_batch.len(), 4);
         for idx in 0..4 {
-            assert_eq!(first_batch.context(idx).kind(), RequestKind::Body);
+            assert_eq!(first_batch.context(idx).request().kind(), RequestKind::Body);
             assert_eq!(
-                first_batch.context(idx).args(),
+                first_batch.context(idx).request().args(),
                 format!("<body-{}@example>", idx + 1).as_bytes()
             );
         }
@@ -635,9 +663,12 @@ mod tests {
             .unwrap();
         assert_eq!(second_batch.len(), 4);
         for idx in 0..4 {
-            assert_eq!(second_batch.context(idx).kind(), RequestKind::Body);
             assert_eq!(
-                second_batch.context(idx).args(),
+                second_batch.context(idx).request().kind(),
+                RequestKind::Body
+            );
+            assert_eq!(
+                second_batch.context(idx).request().args(),
                 format!("<body-{}@example>", idx + 5).as_bytes()
             );
         }
@@ -671,9 +702,9 @@ mod tests {
             .unwrap();
         assert_eq!(first_batch.len(), 4);
         for idx in 0..4 {
-            assert_eq!(first_batch.context(idx).kind(), RequestKind::Body);
+            assert_eq!(first_batch.context(idx).request().kind(), RequestKind::Body);
             assert_eq!(
-                first_batch.context(idx).args(),
+                first_batch.context(idx).request().args(),
                 format!("<body-{}@example>", idx + 1).as_bytes()
             );
         }
@@ -690,8 +721,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second_batch.len(), 1);
-        assert_eq!(second_batch.context(0).kind(), RequestKind::Body);
-        assert_eq!(second_batch.context(0).args(), b"<body-5@example>");
+        assert_eq!(second_batch.context(0).request().kind(), RequestKind::Body);
+        assert_eq!(
+            second_batch.context(0).request().args(),
+            b"<body-5@example>"
+        );
 
         let trailing = second_batch
             .trailing_context()
@@ -727,9 +761,12 @@ mod tests {
             .unwrap();
         assert_eq!(first_batch.len(), 4);
         for idx in 0..4 {
-            assert_eq!(first_batch.context(idx).kind(), RequestKind::Article);
             assert_eq!(
-                first_batch.context(idx).args(),
+                first_batch.context(idx).request().kind(),
+                RequestKind::Article
+            );
+            assert_eq!(
+                first_batch.context(idx).request().args(),
                 format!("<article-{}@example>", idx + 1).as_bytes()
             );
         }
@@ -756,9 +793,12 @@ mod tests {
             .unwrap();
         assert_eq!(second_batch.len(), 4);
         for idx in 0..4 {
-            assert_eq!(second_batch.context(idx).kind(), RequestKind::Article);
             assert_eq!(
-                second_batch.context(idx).args(),
+                second_batch.context(idx).request().kind(),
+                RequestKind::Article
+            );
+            assert_eq!(
+                second_batch.context(idx).request().args(),
                 format!("<article-{}@example>", idx + 5).as_bytes()
             );
         }

@@ -96,6 +96,26 @@ impl PartialEq for StatefulRequest<'_> {
     }
 }
 
+/// A classifier-approved request that owns the bytes needed for a stateful handoff.
+///
+/// The command classifier is the only constructor, so an arbitrary parsed request
+/// cannot enter the stateful loop through this type.
+#[derive(Debug)]
+pub(crate) struct StatefulHandoff {
+    request: RequestContext,
+}
+
+impl StatefulHandoff {
+    fn new(request: RequestContext) -> Self {
+        Self { request }
+    }
+
+    #[must_use]
+    pub(crate) const fn request(&self) -> &RequestContext {
+        &self.request
+    }
+}
+
 /// Authentication access available to the current client session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthenticationAccess {
@@ -265,9 +285,19 @@ impl CommandHandler {
         ArticleLookupRequest::new(request)
     }
 
-    pub(crate) fn stateful_request<'a>(request: &'a RequestContext) -> Option<StatefulRequest<'a>> {
-        matches!(request.route_class(), RequestRouteClass::Stateful)
-            .then_some(StatefulRequest::new(request))
+    #[expect(
+        clippy::result_large_err,
+        reason = "the non-handoff path retains the parsed request without allocating"
+    )]
+    pub(crate) fn prepare_stateful_handoff(
+        request: RequestContext,
+        auth_access: AuthenticationAccess,
+        routing_mode: RoutingMode,
+    ) -> Result<StatefulHandoff, RequestContext> {
+        match Self::classify_request(&request, auth_access, routing_mode) {
+            CommandPlan::SwitchToStateful(_) => Ok(StatefulHandoff::new(request)),
+            _ => Err(request),
+        }
     }
 
     /// Classify an already parsed request context into an execution plan.
@@ -411,6 +441,28 @@ mod tests {
         assert!(
             matches!(action, CommandAction::Reject(msg) if msg.contains("stateless")),
             "Expected Reject with 'stateless' in message"
+        );
+    }
+
+    #[test]
+    fn stateful_handoff_keeps_the_classified_request_and_requires_auth() {
+        let handoff = CommandHandler::prepare_stateful_handoff(
+            RequestContext::parse(b"GROUP alt.test\r\n").expect("valid request"),
+            AuthenticationAccess::Unrestricted,
+            crate::config::RoutingMode::Hybrid,
+        )
+        .expect("unrestricted GROUP starts a hybrid handoff");
+        assert_eq!(handoff.request().kind(), RequestKind::Group);
+        assert_eq!(handoff.request().args(), b"alt.test");
+
+        let blocked = CommandHandler::prepare_stateful_handoff(
+            RequestContext::parse(b"GROUP alt.test\r\n").expect("valid request"),
+            AuthenticationAccess::Required,
+            crate::config::RoutingMode::Hybrid,
+        );
+        assert!(
+            blocked.is_err(),
+            "GROUP must not hand off before authentication"
         );
     }
 

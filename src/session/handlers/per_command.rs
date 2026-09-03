@@ -20,7 +20,7 @@ use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::command::{AuthAction, AuthenticationAccess, CommandHandler, CommandPlan};
 use crate::constants::buffer::READER_CAPACITY;
@@ -36,8 +36,6 @@ fn safe_command_log_label(request: &RequestContext) -> &str {
 enum CommandResult {
     /// Continue processing commands
     Continue,
-    /// Switch to stateful mode (early return from loop)
-    SwitchToStateful,
 }
 
 /// Result of processing a single command
@@ -46,19 +44,16 @@ enum SingleCommandResult {
     Continue,
     /// Client sent QUIT command (bytes already added to `backend_to_client_bytes`)
     Quit,
-    /// Switch to stateful mode (early return from loop)
-    SwitchToStateful,
 }
 
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the owned stateful handoff avoids a heap allocation on this rare transition"
+)]
 enum BatchLoopAction {
     Continue,
     Break,
-    SwitchToStateful(BatchSwitchTarget),
-}
-
-enum BatchSwitchTarget {
-    Context(usize),
-    Trailing,
+    SwitchToStateful(crate::command::StatefulHandoff),
 }
 
 /// Shared parameters for command execution and single-command processing
@@ -188,8 +183,8 @@ impl ClientSession {
                 self.handle_require_auth(request, client_writer, backend_to_client_bytes)
                     .await
             }
-            CommandPlan::SwitchToStateful(stateful_request) => {
-                Ok(self.handle_stateful_switch_decision(stateful_request))
+            CommandPlan::SwitchToStateful(_) => {
+                anyhow::bail!("stateful command reached per-command execution after classification")
             }
             CommandPlan::Reject(response) => {
                 self.handle_rejected_request(
@@ -272,26 +267,6 @@ impl ClientSession {
         Ok(CommandResult::Continue)
     }
 
-    fn handle_stateful_switch_decision(
-        &self,
-        stateful_request: crate::command::StatefulRequest<'_>,
-    ) -> CommandResult {
-        let request = stateful_request.request();
-        debug!(
-            "Client {} decision: SwitchToStateful kind={:?}, verb={:?}",
-            self.client_addr,
-            request.kind(),
-            request.verb()
-        );
-        info!(
-            "Client {} switching to stateful mode (kind={:?}, verb={:?})",
-            self.client_addr,
-            request.kind(),
-            request.verb()
-        );
-        CommandResult::SwitchToStateful
-    }
-
     async fn handle_rejected_request(
         &self,
         request: &mut RequestContext,
@@ -360,7 +335,7 @@ impl ClientSession {
             return Ok(SingleCommandResult::Quit);
         }
 
-        // Execute command decision
+        // Execute command decision.
         match self
             .execute_command_decision(CommandExecutionParams {
                 request,
@@ -375,7 +350,6 @@ impl ClientSession {
             .await?
         {
             CommandResult::Continue => Ok(SingleCommandResult::Continue),
-            CommandResult::SwitchToStateful => Ok(SingleCommandResult::SwitchToStateful),
         }
     }
 
@@ -435,14 +409,19 @@ impl ClientSession {
             {
                 BatchLoopAction::Continue => {}
                 BatchLoopAction::Break => break,
-                BatchLoopAction::SwitchToStateful(target) => {
+                BatchLoopAction::SwitchToStateful(initial_request) => {
+                    let client_write = client_writer.try_into_inner().map_err(|_| {
+                        SessionError::Backend(anyhow::anyhow!(
+                            "client writer still shared while switching to stateful mode"
+                        ))
+                    })?;
                     return self
-                        .switch_batch_to_stateful(
+                        .switch_to_stateful_mode(
                             client_reader,
-                            client_writer,
-                            &mut batch,
-                            target,
-                            &state,
+                            client_write,
+                            initial_request,
+                            state.client_to_backend_bytes.into(),
+                            state.backend_to_client_bytes.into(),
                         )
                         .await;
                 }
@@ -488,28 +467,17 @@ impl ClientSession {
             return Ok(action);
         }
 
-        let action = match self
-            .process_pipelineable_batch(
-                router,
-                client_writer,
-                state,
-                batch,
-                &mut backend_connection,
-            )
-            .await?
-        {
-            BatchLoopAction::Continue => {
-                self.handle_trailing_command(
-                    router,
-                    client_writer,
-                    state,
-                    batch,
-                    &mut backend_connection,
-                )
-                .await?
-            }
-            action => action,
-        };
+        self.process_pipelineable_batch(
+            router,
+            client_writer,
+            state,
+            batch,
+            &mut backend_connection,
+        )
+        .await?;
+        let action = self
+            .handle_trailing_command(router, client_writer, state, batch, &mut backend_connection)
+            .await?;
         backend_connection.complete_success();
         Ok(action)
     }
@@ -558,10 +526,10 @@ impl ClientSession {
         _state: &mut PerCommandLoopState,
         batch: &mut crate::session::handlers::pipeline::RequestBatch,
         backend_connection: &mut BatchBackendConnection,
-    ) -> Result<BatchLoopAction, SessionError> {
+    ) -> Result<(), SessionError> {
         let batch_size = batch.len();
         if batch_size == 0 {
-            return Ok(BatchLoopAction::Continue);
+            return Ok(());
         }
         if batch_size > 1 {
             debug!(
@@ -570,16 +538,18 @@ impl ClientSession {
             );
         }
 
-        let action = self
-            .process_pipelineable_commands(router, client_writer, _state, batch, backend_connection)
-            .await?;
-        if !matches!(action, BatchLoopAction::Continue) {
-            return Ok(action);
-        }
+        self.process_pipelineable_commands(
+            router,
+            client_writer,
+            _state,
+            batch,
+            backend_connection,
+        )
+        .await?;
         if batch_size > 1 {
             self.metrics.record_pipeline_batch(batch_size as u64);
         }
-        Ok(BatchLoopAction::Continue)
+        Ok(())
     }
 
     async fn process_pipelineable_commands(
@@ -589,10 +559,10 @@ impl ClientSession {
         state: &mut PerCommandLoopState,
         batch: &mut crate::session::handlers::pipeline::RequestBatch,
         backend_connection: &mut BatchBackendConnection,
-    ) -> Result<BatchLoopAction, SessionError> {
+    ) -> Result<(), SessionError> {
         let batch_size = batch.len();
         for i in 0..batch_size {
-            let request = batch.context(i);
+            let request = batch.context(i).request();
             debug!(
                 "Client {} received {} request bytes: kind={:?}, verb={:?}",
                 self.client_addr,
@@ -606,7 +576,7 @@ impl ClientSession {
                 .add(request.request_wire_len().get());
             state.auth_access = self.authentication_access(state.auth_access);
 
-            let request = batch.context_mut(i);
+            let request = batch.context_mut(i).request_mut();
             match self
                 .process_single_command(CommandExecutionParams {
                     request,
@@ -621,16 +591,15 @@ impl ClientSession {
                 .await?
             {
                 SingleCommandResult::Continue => {}
-                SingleCommandResult::Quit => return Ok(BatchLoopAction::Break),
-                SingleCommandResult::SwitchToStateful => {
-                    return Ok(BatchLoopAction::SwitchToStateful(
-                        BatchSwitchTarget::Context(i),
-                    ));
+                SingleCommandResult::Quit => {
+                    return Err(SessionError::Backend(anyhow::anyhow!(
+                        "pipelineable request unexpectedly terminated the session"
+                    )));
                 }
             }
         }
 
-        Ok(BatchLoopAction::Continue)
+        Ok(())
     }
 
     async fn handle_trailing_command(
@@ -667,14 +636,14 @@ impl ClientSession {
             return Ok(BatchLoopAction::Continue);
         }
 
-        let Some(trailing_context) = batch.trailing_context() else {
+        let Some(trailing_context) = batch.take_trailing_context() else {
             return Ok(BatchLoopAction::Continue);
         };
         if !matches!(trailing_context.kind(), RequestKind::AuthInfo) {
             debug!(
                 "Client {} trailing non-pipelineable {}",
                 self.client_addr,
-                safe_command_log_label(trailing_context)
+                safe_command_log_label(&trailing_context)
             );
         }
         state.client_to_backend_bytes = state
@@ -682,12 +651,18 @@ impl ClientSession {
             .add(trailing_context.request_wire_len().get());
         state.auth_access = self.authentication_access(state.auth_access);
 
-        let Some(trailing_context) = batch.trailing_context_mut() else {
-            return Ok(BatchLoopAction::Continue);
+        let trailing_context = match CommandHandler::prepare_stateful_handoff(
+            trailing_context,
+            state.auth_access,
+            self.mode_state.routing_mode(),
+        ) {
+            Ok(handoff) => return Ok(BatchLoopAction::SwitchToStateful(handoff)),
+            Err(context) => context,
         };
+        let mut trailing_context = trailing_context;
         match self
             .process_single_command(CommandExecutionParams {
-                request: trailing_context,
+                request: &mut trailing_context,
                 auth_access: state.auth_access,
                 router,
                 client_writer,
@@ -700,44 +675,7 @@ impl ClientSession {
         {
             SingleCommandResult::Continue => Ok(BatchLoopAction::Continue),
             SingleCommandResult::Quit => Ok(BatchLoopAction::Break),
-            SingleCommandResult::SwitchToStateful => Ok(BatchLoopAction::SwitchToStateful(
-                BatchSwitchTarget::Trailing,
-            )),
         }
-    }
-
-    async fn switch_batch_to_stateful(
-        &mut self,
-        client_reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
-        client_writer: crate::session::SharedClientWriter,
-        batch: &mut crate::session::handlers::pipeline::RequestBatch,
-        target: BatchSwitchTarget,
-        state: &PerCommandLoopState,
-    ) -> Result<TransferMetrics, SessionError> {
-        let request = match target {
-            BatchSwitchTarget::Context(i) if i < batch.len() => batch.context_mut(i),
-            BatchSwitchTarget::Trailing => match batch.trailing_context_mut() {
-                Some(request) => request,
-                None => return Ok(state.transfer_metrics()),
-            },
-            BatchSwitchTarget::Context(_) => return Ok(state.transfer_metrics()),
-        };
-
-        let client_write = client_writer.try_into_inner().map_err(|_| {
-            SessionError::Backend(anyhow::anyhow!(
-                "client writer still shared while switching to stateful mode"
-            ))
-        })?;
-
-        self.switch_to_stateful_mode(
-            client_reader,
-            client_write,
-            crate::command::CommandHandler::stateful_request(request)
-                .expect("stateful switch target must be stateful"),
-            state.client_to_backend_bytes.into(),
-            state.backend_to_client_bytes.into(),
-        )
-        .await
     }
 }
 

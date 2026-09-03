@@ -6,6 +6,7 @@
 
 mod handler;
 
+pub(crate) use handler::StatefulHandoff;
 pub use handler::{
     ArticleLookupRequest, AuthAction, AuthenticationAccess, CommandAction, CommandHandler,
     CommandPlan, RejectResponse, StatefulRequest,
