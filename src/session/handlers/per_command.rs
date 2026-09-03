@@ -59,20 +59,8 @@ enum BatchSwitchTarget {
     Trailing,
 }
 
-/// Parameters for executing a command decision
+/// Shared parameters for command execution and single-command processing
 struct CommandExecutionParams<'a> {
-    request: &'a mut RequestContext,
-    skip_auth_check: bool,
-    router: &'a Arc<BackendSelector>,
-    client_writer: &'a crate::session::SharedClientWriter,
-    backend_connection: &'a mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
-    auth_username: &'a mut ClientAuthState,
-    client_to_backend_bytes: ClientToBackendBytes,
-    backend_to_client_bytes: &'a mut BackendToClientBytes,
-}
-
-/// Parameters for processing a single command (full flow including QUIT handling)
-struct ProcessCommandParams<'a> {
     request: &'a mut RequestContext,
     skip_auth_check: bool,
     router: &'a Arc<BackendSelector>,
@@ -354,9 +342,9 @@ impl ClientSession {
     /// Returns `SingleCommandResult` indicating whether to continue, quit, or switch to stateful mode.
     async fn process_single_command(
         &self,
-        params: ProcessCommandParams<'_>,
+        params: CommandExecutionParams<'_>,
     ) -> Result<SingleCommandResult> {
-        let ProcessCommandParams {
+        let CommandExecutionParams {
             request,
             skip_auth_check,
             router,
@@ -630,7 +618,7 @@ impl ClientSession {
 
             let request = batch.context_mut(i);
             match self
-                .process_single_command(ProcessCommandParams {
+                .process_single_command(CommandExecutionParams {
                     request,
                     skip_auth_check: state.skip_auth_check,
                     router,
@@ -710,7 +698,7 @@ impl ClientSession {
             return Ok(BatchLoopAction::Continue);
         };
         match self
-            .process_single_command(ProcessCommandParams {
+            .process_single_command(CommandExecutionParams {
                 request: trailing_context,
                 skip_auth_check: state.skip_auth_check,
                 router,
