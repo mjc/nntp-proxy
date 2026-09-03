@@ -7,6 +7,6 @@
 mod handler;
 
 pub use handler::{
-    ArticleLookupRequest, AuthAction, CommandAction, CommandHandler, CommandPlan, RejectResponse,
-    StatefulRequest,
+    ArticleLookupRequest, AuthAction, AuthenticationAccess, CommandAction, CommandHandler,
+    CommandPlan, RejectResponse, StatefulRequest,
 };

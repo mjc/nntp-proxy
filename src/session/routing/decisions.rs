@@ -5,7 +5,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::command::{AuthAction, CommandHandler, CommandPlan};
+    use crate::command::{AuthAction, AuthenticationAccess, CommandHandler, CommandPlan};
     use crate::config::RoutingMode;
     use crate::protocol::RequestContext;
 
@@ -26,19 +26,24 @@ mod tests {
         routing_mode: RoutingMode,
     ) -> CommandRoutingDecision {
         let request = RequestContext::parse(command.as_bytes()).expect("valid request line");
-        classify_request_kind(&request, is_authenticated, auth_enabled, routing_mode)
+        let auth_access = if !auth_enabled {
+            AuthenticationAccess::Unrestricted
+        } else if is_authenticated {
+            AuthenticationAccess::Authenticated
+        } else {
+            AuthenticationAccess::Required
+        };
+        classify_request_kind(&request, auth_access, routing_mode)
     }
 
     fn classify_request_kind(
         request: &RequestContext,
-        is_authenticated: bool,
-        auth_enabled: bool,
+        auth_access: AuthenticationAccess,
         routing_mode: RoutingMode,
     ) -> CommandRoutingDecision {
         plan_kind(CommandHandler::classify_request(
             request,
-            is_authenticated,
-            auth_enabled,
+            auth_access,
             routing_mode,
         ))
     }
@@ -58,7 +63,11 @@ mod tests {
     fn canonical_plan_carries_auth_and_rejection_payloads() {
         let auth_request = RequestContext::parse(b"AUTHINFO USER alice\r\n").unwrap();
         assert!(matches!(
-            CommandHandler::classify_request(&auth_request, false, true, RoutingMode::PerCommand,),
+            CommandHandler::classify_request(
+                &auth_request,
+                AuthenticationAccess::Required,
+                RoutingMode::PerCommand,
+            ),
             CommandPlan::InterceptAuth(AuthAction::RequestPassword("alice"))
         ));
 
@@ -66,8 +75,7 @@ mod tests {
         assert!(matches!(
             CommandHandler::classify_request(
                 &post_request,
-                true,
-                true,
+                AuthenticationAccess::Authenticated,
                 RoutingMode::PerCommand,
             ),
             CommandPlan::Reject(response) if response.status().as_u16() == 440
@@ -82,9 +90,11 @@ mod tests {
         assert_eq!(article.message_id().as_str(), "<article@example.com>");
 
         let stateful_request = RequestContext::parse(b"GROUP alt.test\r\n").unwrap();
-        let CommandPlan::SwitchToStateful(stateful) =
-            CommandHandler::classify_request(&stateful_request, true, true, RoutingMode::Hybrid)
-        else {
+        let CommandPlan::SwitchToStateful(stateful) = CommandHandler::classify_request(
+            &stateful_request,
+            AuthenticationAccess::Authenticated,
+            RoutingMode::Hybrid,
+        ) else {
             panic!("authenticated stateful hybrid request must switch");
         };
         assert_eq!(
@@ -176,11 +186,19 @@ mod tests {
     fn test_decide_routing_hybrid_unknown_extensions_require_auth_when_enabled() {
         let request = RequestContext::parse(b"XFOO arg\r\n").expect("valid request line");
         assert_eq!(
-            classify_request_kind(&request, false, true, RoutingMode::Hybrid),
+            classify_request_kind(
+                &request,
+                AuthenticationAccess::Required,
+                RoutingMode::Hybrid,
+            ),
             CommandRoutingDecision::RequireAuth
         );
         assert_eq!(
-            classify_request_kind(&request, true, true, RoutingMode::Hybrid),
+            classify_request_kind(
+                &request,
+                AuthenticationAccess::Authenticated,
+                RoutingMode::Hybrid,
+            ),
             CommandRoutingDecision::SwitchToStateful
         );
     }
@@ -323,15 +341,27 @@ mod tests {
     fn test_decide_request_routing_unknown_extensions_are_stateful() {
         let request = RequestContext::parse(b"XFOO arg\r\n").expect("valid request line");
         assert_eq!(
-            classify_request_kind(&request, true, false, RoutingMode::Hybrid),
+            classify_request_kind(
+                &request,
+                AuthenticationAccess::Unrestricted,
+                RoutingMode::Hybrid,
+            ),
             CommandRoutingDecision::SwitchToStateful
         );
         assert_eq!(
-            classify_request_kind(&request, false, true, RoutingMode::Hybrid),
+            classify_request_kind(
+                &request,
+                AuthenticationAccess::Required,
+                RoutingMode::Hybrid,
+            ),
             CommandRoutingDecision::RequireAuth
         );
         assert_eq!(
-            classify_request_kind(&request, true, false, RoutingMode::PerCommand),
+            classify_request_kind(
+                &request,
+                AuthenticationAccess::Unrestricted,
+                RoutingMode::PerCommand,
+            ),
             CommandRoutingDecision::Reject
         );
     }

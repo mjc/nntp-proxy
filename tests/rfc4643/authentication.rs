@@ -30,8 +30,7 @@ fn classify(command: &str) -> CommandAction<'static> {
         |request| {
             CommandHandler::classify_request(
                 Box::leak(Box::new(request)),
-                true,
-                true,
+                nntp_proxy::command::AuthenticationAccess::Authenticated,
                 RoutingMode::PerCommand,
             )
         },

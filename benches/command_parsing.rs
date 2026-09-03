@@ -40,8 +40,7 @@ macro_rules! bench_command {
                         .expect("valid request line");
                     black_box(CommandHandler::classify_request(
                         &request,
-                        true,
-                        true,
+                        nntp_proxy::command::AuthenticationAccess::Authenticated,
                         RoutingMode::PerCommand,
                     ));
                 });
@@ -177,8 +176,7 @@ mod realistic_workload {
                             .expect("valid request line");
                         black_box(CommandHandler::classify_request(
                             &request,
-                            true,
-                            true,
+                            nntp_proxy::command::AuthenticationAccess::Authenticated,
                             RoutingMode::PerCommand,
                         ));
                     }

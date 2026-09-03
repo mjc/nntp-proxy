@@ -1,7 +1,7 @@
 //! Common utilities shared across handler modules
 
 use crate::auth::AuthHandler;
-use crate::command::{AuthAction, CommandHandler, CommandPlan};
+use crate::command::{AuthAction, AuthenticationAccess, CommandHandler, CommandPlan};
 use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata, StatusCode, codes};
 use crate::session::{AuthReducerResult, ClientAuthEvent, ClientAuthState};
 use crate::types::BackendToClientBytes;
@@ -294,10 +294,7 @@ mod tests {
 
     #[test]
     fn test_auth_handler_result_bytes_written() {
-        let auth = AuthHandlerResult::Authenticated {
-            bytes_written: 100,
-            skip_further_checks: true,
-        };
+        let auth = AuthHandlerResult::Authenticated { bytes_written: 100 };
         assert_eq!(auth.bytes_written(), 100);
 
         let not_auth = AuthHandlerResult::NotAuthenticated { bytes_written: 50 };
@@ -309,17 +306,8 @@ mod tests {
 
     #[test]
     fn test_auth_handler_result_should_skip_further_checks() {
-        let skip = AuthHandlerResult::Authenticated {
-            bytes_written: 100,
-            skip_further_checks: true,
-        };
+        let skip = AuthHandlerResult::Authenticated { bytes_written: 100 };
         assert!(skip.should_skip_further_checks());
-
-        let no_skip = AuthHandlerResult::Authenticated {
-            bytes_written: 100,
-            skip_further_checks: false,
-        };
-        assert!(!no_skip.should_skip_further_checks());
 
         let not_auth = AuthHandlerResult::NotAuthenticated { bytes_written: 50 };
         assert!(!not_auth.should_skip_further_checks());
@@ -337,10 +325,7 @@ mod tests {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthHandlerResult {
     /// Authentication succeeded, session can continue
-    Authenticated {
-        bytes_written: u64,
-        skip_further_checks: bool,
-    },
+    Authenticated { bytes_written: u64 },
     /// Authentication required but not yet complete
     NotAuthenticated { bytes_written: u64 },
     /// Command rejected
@@ -361,13 +346,7 @@ impl AuthHandlerResult {
     /// Check if should skip further auth checks
     #[inline]
     pub const fn should_skip_further_checks(&self) -> bool {
-        matches!(
-            self,
-            Self::Authenticated {
-                skip_further_checks: true,
-                ..
-            }
-        )
+        matches!(self, Self::Authenticated { .. })
     }
 }
 
@@ -400,7 +379,11 @@ pub async fn handle_stateful_auth_check<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    let plan = CommandHandler::classify_request(request, false, true, *ctx.routing_mode);
+    let plan = CommandHandler::classify_request(
+        request,
+        AuthenticationAccess::Required,
+        *ctx.routing_mode,
+    );
     match plan {
         CommandPlan::Forward
         | CommandPlan::RequireAuth
@@ -445,7 +428,6 @@ where
 
                     Ok(AuthHandlerResult::Authenticated {
                         bytes_written: bytes.as_u64(),
-                        skip_further_checks: true,
                     })
                 }
                 AuthResult::NotAuthenticated { bytes, .. } => {

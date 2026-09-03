@@ -3,6 +3,7 @@
 //! This module provides the `SessionLoopState` struct which encapsulates
 //! all mutable state needed during a session command loop.
 
+use crate::command::AuthenticationAccess;
 use crate::protocol::RequestKind;
 use crate::session::ClientAuthState;
 use crate::session::backend::BackendResponseOrder;
@@ -38,8 +39,8 @@ pub struct SessionLoopState {
     iteration_count: u32,
     /// Runtime authentication state for this session loop.
     pub auth_username: ClientAuthState,
-    /// Whether to skip auth checking (optimization after first auth)
-    pub skip_auth_check: bool,
+    /// Effective access for this session loop.
+    pub auth_access: AuthenticationAccess,
     /// Forwarded backend replies and deferred local replies in client-visible order.
     backend_replies: BackendResponseOrder,
 }
@@ -64,7 +65,7 @@ impl SessionLoopState {
             last_reported_b2c: BackendToClientBytes::zero(),
             iteration_count: 0,
             auth_username: ClientAuthState::anonymous(),
-            skip_auth_check: !auth_enabled,
+            auth_access: AuthenticationAccess::from_auth_enabled(auth_enabled),
             backend_replies: BackendResponseOrder::default(),
         }
     }
@@ -162,7 +163,7 @@ impl SessionLoopState {
     /// Mark authentication as complete (skip future checks)
     #[inline]
     pub fn mark_authenticated(&mut self) {
-        self.skip_auth_check = true;
+        self.auth_access = self.auth_access.after_success();
     }
 
     /// Update state based on auth handler result
@@ -251,18 +252,18 @@ mod tests {
         let state = SessionLoopState::new(true);
         assert_eq!(state.client_to_backend.as_u64(), 0);
         assert_eq!(state.backend_to_client.as_u64(), 0);
-        assert!(!state.skip_auth_check); // Auth enabled = don't skip
+        assert_eq!(state.auth_access, AuthenticationAccess::Required);
         assert!(state.auth_username.is_none());
 
         let state2 = SessionLoopState::new(false);
-        assert!(state2.skip_auth_check); // Auth disabled = skip
+        assert_eq!(state2.auth_access, AuthenticationAccess::Unrestricted);
     }
 
     #[test]
     fn test_session_loop_state_default() {
         let state = SessionLoopState::default();
         assert_eq!(state.client_to_backend.as_u64(), 0);
-        assert!(state.skip_auth_check); // Default = auth disabled
+        assert_eq!(state.auth_access, AuthenticationAccess::Unrestricted);
         assert!(!state.has_pending_backend_replies());
     }
 
@@ -281,7 +282,7 @@ mod tests {
         assert_eq!(state.backend_to_client.as_u64(), 200);
         assert_eq!(state.last_reported_c2b.as_u64(), 100);
         assert_eq!(state.last_reported_b2c.as_u64(), 200);
-        assert!(!state.skip_auth_check);
+        assert_eq!(state.auth_access, AuthenticationAccess::Required);
     }
 
     #[test]
@@ -304,10 +305,10 @@ mod tests {
     #[test]
     fn test_session_loop_state_mark_authenticated() {
         let mut state = SessionLoopState::new(true);
-        assert!(!state.skip_auth_check);
+        assert_eq!(state.auth_access, AuthenticationAccess::Required);
 
         state.mark_authenticated();
-        assert!(state.skip_auth_check);
+        assert_eq!(state.auth_access, AuthenticationAccess::Authenticated);
     }
 
     #[test]
@@ -464,19 +465,16 @@ mod tests {
     #[test]
     fn test_session_loop_state_apply_auth_result() {
         let mut state = SessionLoopState::new(true);
-        assert!(!state.skip_auth_check);
+        assert_eq!(state.auth_access, AuthenticationAccess::Required);
         assert_eq!(state.backend_to_client.as_u64(), 0);
 
-        // Authenticated result should update bytes and skip flag
-        let result = AuthHandlerResult::Authenticated {
-            bytes_written: 100,
-            skip_further_checks: true,
-        };
+        // Authenticated result should update bytes and grant access.
+        let result = AuthHandlerResult::Authenticated { bytes_written: 100 };
         let bytes = state.apply_auth_result(&result);
 
         assert_eq!(bytes, 100);
         assert_eq!(state.backend_to_client.as_u64(), 100);
-        assert!(state.skip_auth_check);
+        assert_eq!(state.auth_access, AuthenticationAccess::Authenticated);
     }
 
     #[test]
@@ -487,7 +485,7 @@ mod tests {
         state.apply_auth_result(&result);
 
         assert_eq!(state.backend_to_client.as_u64(), 50);
-        assert!(!state.skip_auth_check); // Still need to check
+        assert_eq!(state.auth_access, AuthenticationAccess::Required);
     }
 
     #[test]

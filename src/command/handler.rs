@@ -96,6 +96,46 @@ impl PartialEq for StatefulRequest<'_> {
     }
 }
 
+/// Authentication access available to the current client session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticationAccess {
+    /// The backend requires a successful client authentication.
+    Required,
+    /// The client has successfully authenticated.
+    Authenticated,
+    /// The backend does not require client authentication.
+    Unrestricted,
+}
+
+impl AuthenticationAccess {
+    #[must_use]
+    pub const fn from_auth_enabled(auth_enabled: bool) -> Self {
+        if auth_enabled {
+            Self::Required
+        } else {
+            Self::Unrestricted
+        }
+    }
+
+    #[must_use]
+    pub const fn can_access_backend(self) -> bool {
+        !matches!(self, Self::Required)
+    }
+
+    #[must_use]
+    pub const fn auth_enabled(self) -> bool {
+        !matches!(self, Self::Unrestricted)
+    }
+
+    #[must_use]
+    pub const fn after_success(self) -> Self {
+        match self {
+            Self::Required => Self::Authenticated,
+            Self::Authenticated | Self::Unrestricted => self,
+        }
+    }
+}
+
 /// Payload-bearing plan produced by the canonical command classifier.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
@@ -234,8 +274,7 @@ impl CommandHandler {
     #[must_use]
     pub fn classify_request(
         request: &RequestContext,
-        is_authenticated: bool,
-        auth_enabled: bool,
+        auth_access: AuthenticationAccess,
         routing_mode: RoutingMode,
     ) -> CommandPlan<'_> {
         match request.kind() {
@@ -244,28 +283,28 @@ impl CommandHandler {
             RequestKind::Quit => CommandPlan::Forward,
             _ => match request.route_class() {
                 RequestRouteClass::ArticleByMessageId | RequestRouteClass::Stateless => {
-                    if is_authenticated || !auth_enabled {
+                    if auth_access.can_access_backend() {
                         CommandPlan::Forward
                     } else {
                         CommandPlan::RequireAuth
                     }
                 }
                 RequestRouteClass::Stateful if routing_mode == RoutingMode::Hybrid => {
-                    if is_authenticated || !auth_enabled {
+                    if auth_access.can_access_backend() {
                         CommandPlan::SwitchToStateful(StatefulRequest::new(request))
                     } else {
                         CommandPlan::RequireAuth
                     }
                 }
                 RequestRouteClass::Stateful if routing_mode == RoutingMode::Stateful => {
-                    if auth_enabled && !is_authenticated {
+                    if !auth_access.can_access_backend() {
                         CommandPlan::RequireAuth
                     } else {
                         CommandPlan::Reject(rejection_for(request))
                     }
                 }
                 RequestRouteClass::Stateful | RequestRouteClass::Reject => {
-                    if auth_enabled && !is_authenticated {
+                    if !auth_access.can_access_backend() {
                         CommandPlan::RequireAuth
                     } else {
                         CommandPlan::Reject(rejection_for(request))
@@ -341,8 +380,7 @@ mod tests {
             |request| {
                 CommandHandler::classify_request(
                     Box::leak(Box::new(request)),
-                    true,
-                    true,
+                    AuthenticationAccess::Authenticated,
                     crate::config::RoutingMode::PerCommand,
                 )
             },

@@ -3,7 +3,7 @@
 //! These tests verify that session handlers properly validate credentials
 //! before marking a session as authenticated.
 
-use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
+use nntp_proxy::command::{AuthAction, AuthenticationAccess, CommandAction, CommandHandler};
 use nntp_proxy::protocol::RequestContext;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,8 +14,7 @@ fn classify(command: &str) -> CommandAction<'static> {
     ));
     CommandHandler::classify_request(
         request,
-        true,
-        true,
+        AuthenticationAccess::Authenticated,
         nntp_proxy::config::RoutingMode::PerCommand,
     )
 }

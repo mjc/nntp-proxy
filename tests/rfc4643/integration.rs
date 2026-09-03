@@ -14,7 +14,7 @@ use crate::test_helpers::{
     send_command_read_line, spawn_single_backend_proxy, spawn_single_backend_proxy_with_auth,
 };
 
-use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
+use nntp_proxy::command::{AuthAction, AuthenticationAccess, CommandAction, CommandHandler};
 use nntp_proxy::config::{ClientAuth, Config, HealthCheck, Proxy, UserCredentials};
 use nntp_proxy::protocol::RequestContext;
 
@@ -24,8 +24,7 @@ fn classify(command: &str) -> CommandAction<'static> {
     ));
     CommandHandler::classify_request(
         request,
-        true,
-        true,
+        AuthenticationAccess::Authenticated,
         nntp_proxy::config::RoutingMode::PerCommand,
     )
 }

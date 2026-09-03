@@ -2,7 +2,7 @@
 //!
 //! Bidirectional proxy: each client gets a dedicated backend connection.
 
-use crate::command::{CommandHandler, CommandPlan, RejectResponse};
+use crate::command::{AuthenticationAccess, CommandHandler, CommandPlan, RejectResponse};
 use crate::protocol::{RequestContext, RequestKind, RequestRouteClass};
 use crate::session::state::StatefulReadMode;
 use crate::session::{ClientSession, common};
@@ -118,15 +118,14 @@ enum AuthenticatedStatefulAction {
 
 fn classify_authenticated_stateful_action(
     request: &RequestContext,
-    auth_enabled: bool,
+    auth_access: AuthenticationAccess,
 ) -> AuthenticatedStatefulAction {
     match CommandHandler::classify_request(
         request,
-        true,
-        auth_enabled,
+        auth_access,
         crate::config::RoutingMode::Stateful,
     ) {
-        CommandPlan::InterceptAuth(_) if auth_enabled => {
+        CommandPlan::InterceptAuth(_) if auth_access.auth_enabled() => {
             AuthenticatedStatefulAction::RejectAuthAlreadyAuthenticated
         }
         CommandPlan::InterceptCapabilities => AuthenticatedStatefulAction::InterceptCapabilities,
@@ -152,7 +151,7 @@ impl ClientSession {
         W: tokio::io::AsyncWrite + Unpin,
         BW: tokio::io::AsyncWrite + Unpin,
     {
-        match classify_authenticated_stateful_action(request, self.auth_handler.is_enabled()) {
+        match classify_authenticated_stateful_action(request, state.auth_access) {
             AuthenticatedStatefulAction::Forward => {
                 request.write_wire_to(backend_write).await?;
                 backend_write.flush().await?;
@@ -357,9 +356,9 @@ impl ClientSession {
                             let request = command_reader
                                 .take_request()
                                 .expect("ready command should have parsed request");
-                            state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
+                            state.auth_access = self.authentication_access(state.auth_access);
 
-                            if state.skip_auth_check {
+                            if state.auth_access.can_access_backend() {
                                 self.handle_authenticated_stateful_request(
                                     &request,
                                     &mut client_write,
@@ -444,7 +443,7 @@ mod tests {
     async fn test_client_disconnect_returns_metrics() {
         let session = test_session();
         let backend_id = BackendId::from_index(0);
-        let state = SessionLoopState::new(false); // auth disabled → skip_auth_check = true
+        let state = SessionLoopState::new(false); // auth disabled → unrestricted access
 
         let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
         let (backend_end, proxy_backend_end) = tokio::io::duplex(4096);

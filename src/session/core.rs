@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::auth::AuthHandler;
+use crate::command::AuthenticationAccess;
 use crate::config::RoutingMode;
 use crate::metrics::MetricsCollector;
 use crate::pool::BufferPool;
@@ -362,16 +363,17 @@ impl ClientSession {
         self.connection_stats.as_ref()
     }
 
-    /// Check if already authenticated (cached for performance)
-    ///
-    /// # Arguments
-    /// * `skip_auth_check` - If true, bypasses the authentication check
-    ///
-    /// # Returns
-    /// Returns true if authenticated or if `skip_auth_check` is true
+    /// Refresh loop access from the session's published authenticated identity.
     #[inline]
-    pub(crate) fn is_authenticated_cached(&self, skip_auth_check: bool) -> bool {
-        self.auth_state.is_authenticated_or_skipped(skip_auth_check)
+    pub(crate) fn authentication_access(
+        &self,
+        auth_access: AuthenticationAccess,
+    ) -> AuthenticationAccess {
+        if self.auth_state.is_authenticated() {
+            auth_access.after_success()
+        } else {
+            auth_access
+        }
     }
 }
 
