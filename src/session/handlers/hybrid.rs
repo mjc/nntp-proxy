@@ -29,6 +29,43 @@ mod error {
     pub const BACKEND_NOT_FOUND: &str = "Backend not found";
 }
 
+/// The dedicated backend resources held from hybrid handoff through loop exit.
+///
+/// Keeping the connection, selected backend, and pending-command accounting
+/// together prevents a partial handoff from accidentally returning only part
+/// of its resources to the pool.
+struct StatefulBackendLease {
+    connection: crate::pool::ConnectionGuard,
+    backend_id: crate::types::BackendId,
+    _pending_command: crate::router::CommandGuard,
+}
+
+impl StatefulBackendLease {
+    const fn new(
+        connection: crate::pool::ConnectionGuard,
+        backend_id: crate::types::BackendId,
+        pending_command: crate::router::CommandGuard,
+    ) -> Self {
+        Self {
+            connection,
+            backend_id,
+            _pending_command: pending_command,
+        }
+    }
+
+    fn connection_mut(&mut self) -> &mut crate::pool::ConnectionGuard {
+        &mut self.connection
+    }
+
+    const fn backend_id(&self) -> crate::types::BackendId {
+        self.backend_id
+    }
+
+    fn complete_success(self) {
+        let _ = self.connection.complete_success();
+    }
+}
+
 /// RAII guard for stateful session metrics
 ///
 /// Automatically calls `stateful_session_ended()` on drop.
@@ -93,8 +130,7 @@ impl ClientSession {
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
     {
-        // Acquire backend connection (returns CommandGuard to track pending_count)
-        let (mut conn_guard, backend_id, _pending_guard) = self
+        let mut backend = self
             .acquire_stateful_backend()
             .await
             .context("Failed to acquire backend for stateful mode")?;
@@ -104,14 +140,14 @@ impl ClientSession {
 
         info!(
             client = %self.client_addr,
-            backend = ?backend_id,
+            backend = ?backend.backend_id(),
             "Switched to stateful mode"
         );
 
         // Forward the triggering request (response handled by proxy loop)
         initial_request
             .request()
-            .write_wire_to(&mut **conn_guard)
+            .write_wire_to(&mut ***backend.connection_mut())
             .await
             .context("Failed to send initial request to backend")?;
 
@@ -126,7 +162,8 @@ impl ClientSession {
         state.mark_backend_request_sent(initial_request.request().kind());
 
         // Split backend for bidirectional proxy
-        let (backend_read, backend_write) = tokio::io::split(&mut **conn_guard);
+        let backend_id = backend.backend_id();
+        let (backend_read, backend_write) = tokio::io::split(&mut ***backend.connection_mut());
 
         match self.mode_state.switch_to_stateful() {
             crate::session::ModeTransition::Switched => {}
@@ -153,8 +190,8 @@ impl ClientSession {
 
         // H1: Only return connection to pool on success
         if result.is_ok() {
-            let _conn = conn_guard.complete_success();
-        } // else: guard drops -> removes connection with replacement cooldown
+            backend.complete_success();
+        } // else: lease drop removes the connection with replacement cooldown
 
         // Metrics guard automatically ends session via Drop
         result.map_err(crate::session::SessionError::from)
@@ -163,17 +200,11 @@ impl ClientSession {
     /// Acquire a dedicated backend connection for stateful mode
     ///
     /// Routes the client to a backend, then gets a pooled connection.
-    /// Returns the connection, backend ID, and a `CommandGuard` that decrements
-    /// `pending_count` on drop. Creating the guard here immediately after
+    /// Returns a lease owning the connection, backend ID, and `CommandGuard`
+    /// that decrements `pending_count` on drop. Creating the guard immediately after
     /// routing ensures the count is decremented even if `get_pooled_connection`
     /// fails.
-    async fn acquire_stateful_backend(
-        &self,
-    ) -> Result<(
-        crate::pool::ConnectionGuard,
-        crate::types::BackendId,
-        crate::router::CommandGuard,
-    )> {
+    async fn acquire_stateful_backend(&self) -> Result<StatefulBackendLease> {
         let router = self
             .router
             .as_ref()
@@ -193,7 +224,11 @@ impl ClientSession {
         let provider = provider.clone();
         let conn_guard = provider.checkout_connection_guard().await?;
 
-        Ok((conn_guard, backend_id, pending_guard))
+        Ok(StatefulBackendLease::new(
+            conn_guard,
+            backend_id,
+            pending_guard,
+        ))
     }
 }
 
