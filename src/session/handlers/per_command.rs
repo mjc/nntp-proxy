@@ -8,6 +8,8 @@
 //! - [`command_execution`]: Single-backend command execution and response writing
 //! - [`cache_operations`]: Cache lookups, upserts, and tier helpers
 
+use super::BackendLease;
+
 use crate::protocol::{
     AUTH_REQUIRED_FOR_COMMAND, RequestContext, RequestKind, RequestResponseMetadata, StatusCode,
     codes,
@@ -24,7 +26,7 @@ use crate::command::{AuthAction, CommandHandler, CommandPlan};
 use crate::constants::buffer::READER_CAPACITY;
 use crate::router::BackendSelector;
 use crate::session::SessionError;
-use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
+use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
 fn safe_command_log_label(request: &RequestContext) -> &str {
     std::str::from_utf8(request.verb()).unwrap_or("<non-utf8-command>")
@@ -65,7 +67,7 @@ struct CommandExecutionParams<'a> {
     skip_auth_check: bool,
     router: &'a Arc<BackendSelector>,
     client_writer: &'a crate::session::SharedClientWriter,
-    backend_connection: &'a mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
+    backend_connection: &'a mut Option<BackendLease>,
     auth_username: &'a mut ClientAuthState,
     client_to_backend_bytes: ClientToBackendBytes,
     backend_to_client_bytes: &'a mut BackendToClientBytes,
@@ -73,25 +75,25 @@ struct CommandExecutionParams<'a> {
 
 #[derive(Default)]
 struct BatchBackendConnection {
-    conn: Option<(BackendId, crate::pool::ConnectionGuard)>,
+    conn: Option<BackendLease>,
 }
 
 impl BatchBackendConnection {
-    fn slot(&mut self) -> &mut Option<(BackendId, crate::pool::ConnectionGuard)> {
+    fn slot(&mut self) -> &mut Option<BackendLease> {
         &mut self.conn
     }
 
     fn complete_success(&mut self) {
-        if let Some((_backend_id, conn)) = self.conn.take() {
-            let _ = conn.complete_success();
+        if let Some(lease) = self.conn.take() {
+            lease.complete_success();
         }
     }
 }
 
 impl Drop for BatchBackendConnection {
     fn drop(&mut self) {
-        if let Some((_backend_id, conn)) = self.conn.take() {
-            conn.fail_backend();
+        if let Some(lease) = self.conn.take() {
+            lease.fail_backend();
         }
     }
 }
@@ -238,7 +240,7 @@ impl ClientSession {
         request: &mut RequestContext,
         router: &Arc<BackendSelector>,
         client_writer: &crate::session::SharedClientWriter,
-        backend_connection: &mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
+        backend_connection: &mut Option<BackendLease>,
         client_to_backend_bytes: ClientToBackendBytes,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<CommandResult> {
@@ -856,7 +858,7 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             let _batch = super::BatchBackendConnection {
-                conn: Some((BackendId::from_index(0), conn)),
+                conn: Some(super::BackendLease::new(BackendId::from_index(0), conn)),
             };
             tokio::time::sleep(Duration::from_secs(1)).await;
             drop(_batch);

@@ -3,6 +3,8 @@
 //! Handles executing commands on individual backends, including connection retry,
 //! response validation, and writing backend responses to clients.
 
+use super::BackendLease;
+
 use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata, StatusCode};
 use crate::router::{ArticleBackend, BackendSelector, SuppressedBackends};
 use crate::session::SessionError;
@@ -55,7 +57,7 @@ pub(super) enum BackendAttemptResult {
 pub(super) struct ArticleAttemptState<'a> {
     pub availability: &'a mut crate::cache::ArticleAvailability,
     pub client_to_backend_bytes: &'a mut ClientToBackendBytes,
-    pub backend_connection: &'a mut Option<(BackendId, crate::pool::ConnectionGuard)>,
+    pub backend_connection: &'a mut Option<BackendLease>,
     pub unavailable_backends: &'a mut SuppressedBackends,
 }
 
@@ -565,7 +567,7 @@ impl ClientSession {
         backend: &ArticleBackend,
         buffer: crate::pool::PooledBuffer,
         params: ResponseWriteParams<'_>,
-        backend_connection: &mut Option<(BackendId, crate::pool::ConnectionGuard)>,
+        backend_connection: &mut Option<BackendLease>,
     ) -> Result<RequestResponseMetadata, SessionError> {
         let mut client_write = client_writer.lock().await;
         self.write_successful_backend_response(
@@ -711,7 +713,7 @@ impl ClientSession {
         backend: &ArticleBackend,
         backend_bytes: crate::pool::PooledBuffer,
         params: ResponseWriteParams<'_>,
-        backend_connection: Option<&mut Option<(BackendId, crate::pool::ConnectionGuard)>>,
+        backend_connection: Option<&mut Option<BackendLease>>,
     ) -> Result<RequestResponseMetadata, SessionError>
     where
         W: AsyncWrite + Unpin,
@@ -825,7 +827,7 @@ impl ClientSession {
         conn: crate::pool::ConnectionGuard,
         backend_id: BackendId,
         request: &RequestContext,
-        backend_connection: Option<&mut Option<(BackendId, crate::pool::ConnectionGuard)>>,
+        backend_connection: Option<&mut Option<BackendLease>>,
     ) {
         match crate::session::response_transfer::connection_reuse_after_response(&conn).pool_fate()
         {
@@ -866,7 +868,7 @@ impl ClientSession {
                         pool_waiting = status.waiting,
                         "Direct per-command response finished cleanly; keeping backend connection for this client batch"
                     );
-                    *slot = Some((backend_id, conn));
+                    *slot = Some(BackendLease::new(backend_id, conn));
                 } else {
                     debug!(
                         client = %self.client_addr,
@@ -891,7 +893,7 @@ impl ClientSession {
         provider: &crate::pool::DeadpoolConnectionProvider,
         backend_id: crate::types::BackendId,
         request: &RequestContext,
-        backend_connection: &mut Option<(BackendId, crate::pool::ConnectionGuard)>,
+        backend_connection: &mut Option<BackendLease>,
     ) -> Result<crate::pool::ConnectionGuard> {
         let checkout_status = provider.status_counts();
         let can_expand_or_use_idle =
@@ -909,7 +911,10 @@ impl ClientSession {
             "Starting pool checkout for direct backend attempt"
         );
         let guard = match backend_connection.take() {
-            Some((cached_backend_id, mut guard)) if cached_backend_id == backend_id => {
+            Some(BackendLease {
+                backend_id: cached_backend_id,
+                connection: mut guard,
+            }) if cached_backend_id == backend_id => {
                 if !self.cached_batch_connection_is_healthy(&mut guard, backend_id, request) {
                     guard.fail_backend();
                     let checkout_status = provider.status_counts();
@@ -941,7 +946,7 @@ impl ClientSession {
                         pending_bytes = guard.pending_bytes_len(),
                         "Using idle pool capacity before reusing cached batch connection"
                     );
-                    *backend_connection = Some((cached_backend_id, guard));
+                    *backend_connection = Some(BackendLease::new(cached_backend_id, guard));
                     match provider.checkout_connection_guard().await {
                         Ok(conn) => conn,
                         Err(err) => {
@@ -953,10 +958,10 @@ impl ClientSession {
                                 error = %err,
                                 "Idle pool checkout failed; falling back to cached batch connection"
                             );
-                            let (_, cached_guard) = backend_connection.take().expect(
-                                "cached backend connection should be present for fallback reuse",
-                            );
-                            cached_guard
+                            backend_connection
+                                .take()
+                                .expect("cached backend connection should be present for fallback reuse")
+                                .connection
                         }
                     }
                 } else {
@@ -979,7 +984,10 @@ impl ClientSession {
                 }
             }
             Some(cached) => {
-                let (cached_backend_id, cached_conn) = cached;
+                let BackendLease {
+                    backend_id: cached_backend_id,
+                    connection: cached_conn,
+                } = cached;
                 trace!(
                     client = %self.client_addr,
                     cached_backend = cached_backend_id.as_index(),
@@ -1067,7 +1075,7 @@ impl ClientSession {
         provider: &crate::pool::DeadpoolConnectionProvider,
         backend: &ArticleBackend,
         request: &RequestContext,
-        backend_connection: &mut Option<(BackendId, crate::pool::ConnectionGuard)>,
+        backend_connection: &mut Option<BackendLease>,
         stat_probe_retry_only: bool,
     ) -> Result<ExecutedBackendAttempt> {
         let backend_id = backend.backend_id();
@@ -1501,6 +1509,7 @@ mod tests {
     use super::ArticleAttemptState;
     use super::AuthoritativeArticleMissing;
     use super::BackendAttemptResult;
+    use super::BackendLease;
     use super::ResponseWriteParams;
     use super::classify_response_write_err;
     use crate::auth::AuthHandler;
@@ -1533,11 +1542,9 @@ mod tests {
         RequestContext::parse(line).expect("valid request line")
     }
 
-    fn finalize_backend_connection(
-        backend_connection: &mut Option<(BackendId, crate::pool::ConnectionGuard)>,
-    ) {
-        if let Some((_backend_id, conn)) = backend_connection.take() {
-            let _ = conn.complete_success();
+    fn finalize_backend_connection(backend_connection: &mut Option<BackendLease>) {
+        if let Some(lease) = backend_connection.take() {
+            lease.complete_success();
         }
     }
 
@@ -2374,9 +2381,10 @@ mod tests {
             .checkout_connection_guard()
             .await
             .expect("initial pooled connection should be created");
-        let mut backend_connection = Some((backend_id, conn));
-        if let Some((_, cached_guard)) = backend_connection.as_mut() {
-            cached_guard
+        let mut backend_connection = Some(BackendLease::new(backend_id, conn));
+        if let Some(lease) = backend_connection.as_mut() {
+            lease
+                .connection
                 .get_mut()
                 .queue_pending_bytes(b"stale")
                 .expect("test should be able to inject queued bytes");

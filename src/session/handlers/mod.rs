@@ -9,6 +9,30 @@
 //!
 //! All handler functions are implemented as methods on `ClientSession` in their
 //! respective modules. No need to re-export since they're all impl blocks.
+use crate::pool::ConnectionGuard;
+use crate::types::BackendId;
+
+pub(super) struct BackendLease {
+    pub(super) backend_id: BackendId,
+    pub(super) connection: ConnectionGuard,
+}
+
+impl BackendLease {
+    pub(super) const fn new(backend_id: BackendId, connection: ConnectionGuard) -> Self {
+        Self {
+            backend_id,
+            connection,
+        }
+    }
+
+    pub(super) fn complete_success(self) {
+        let _ = self.connection.complete_success();
+    }
+
+    pub(super) fn fail_backend(self) {
+        self.connection.fail_backend();
+    }
+}
 
 mod article_retry;
 mod cache_operations;

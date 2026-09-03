@@ -4,6 +4,8 @@
 //! negative availability facts: a backend that returned 430 for that article is
 //! skipped until the entry expires.
 
+use super::BackendLease;
+
 use crate::cache::ArticleAvailability;
 use crate::router::{BackendSelector, SuppressedBackends};
 use crate::session::ClientSession;
@@ -26,8 +28,7 @@ use crate::session::precheck;
 /// Client-side write state shared across cache, precheck, and direct routing paths.
 pub(super) struct RequestExecutionIo<'a> {
     pub(super) client_writer: &'a crate::session::SharedClientWriter,
-    pub(super) backend_connection:
-        &'a mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
+    pub(super) backend_connection: &'a mut Option<BackendLease>,
     pub(super) client_to_backend_bytes: &'a mut ClientToBackendBytes,
     pub(super) backend_to_client_bytes: &'a mut BackendToClientBytes,
 }
@@ -52,7 +53,7 @@ impl ClientSession {
         router: Arc<BackendSelector>,
         request: &mut RequestContext,
         client_writer: &crate::session::SharedClientWriter,
-        backend_connection: &mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
+        backend_connection: &mut Option<BackendLease>,
         client_to_backend_bytes: &mut ClientToBackendBytes,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<(), SessionError> {
