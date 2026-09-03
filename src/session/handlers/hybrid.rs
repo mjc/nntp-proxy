@@ -93,9 +93,6 @@ impl ClientSession {
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
     {
-        // One-way transition: PerCommand → Stateful
-        let _ = self.mode_state.switch_to_stateful();
-
         // Acquire backend connection (returns CommandGuard to track pending_count)
         let (mut conn_guard, backend_id, _pending_guard) = self
             .acquire_stateful_backend()
@@ -129,6 +126,15 @@ impl ClientSession {
 
         // Split backend for bidirectional proxy
         let (backend_read, backend_write) = tokio::io::split(&mut **conn_guard);
+
+        match self.mode_state.switch_to_stateful() {
+            crate::session::ModeTransition::Switched => {}
+            transition => {
+                return Err(crate::session::SessionError::Backend(anyhow::anyhow!(
+                    "stateful handoff entered from invalid mode: {transition:?}"
+                )));
+            }
+        }
 
         // Delegate to stateful loop (handles all remaining commands + responses)
         let result = self
@@ -192,7 +198,17 @@ impl ClientSession {
 
 #[cfg(test)]
 mod tests {
+    use crate::auth::AuthHandler;
+    use crate::command::CommandHandler;
+    use crate::config::RoutingMode;
+    use crate::metrics::MetricsCollector;
+    use crate::pool::BufferPool;
     use crate::protocol::RequestContext;
+    use crate::router::BackendSelector;
+    use crate::session::{ClientSession, SessionMode};
+    use crate::types::{BufferSize, ClientAddress};
+    use std::sync::Arc;
+    use tokio::io::BufReader;
 
     #[test]
     fn test_error_messages_are_descriptive() {
@@ -213,5 +229,35 @@ mod tests {
             ),
             10 + "group alt.test\r\n".len() as u64
         );
+    }
+
+    #[tokio::test]
+    async fn failed_hybrid_handoff_does_not_commit_stateful_mode() {
+        let addr: std::net::SocketAddr = "127.0.0.1:119".parse().expect("valid client address");
+        let mut session = ClientSession::new_with_router(
+            ClientAddress::from(addr),
+            BufferPool::new(BufferSize::try_new(1024).expect("valid buffer size"), 1),
+            Arc::new(BackendSelector::new()),
+            RoutingMode::Hybrid,
+            Arc::new(AuthHandler::new(None, None).expect("valid auth handler")),
+            MetricsCollector::new(1),
+        );
+        let request = RequestContext::parse(b"GROUP alt.test\r\n").expect("valid request");
+        let stateful_request =
+            CommandHandler::stateful_request(&request).expect("GROUP is stateful");
+        let (client_write, client_read) = tokio::io::duplex(64);
+
+        let result = session
+            .switch_to_stateful_mode(
+                BufReader::new(client_read),
+                client_write,
+                stateful_request,
+                0,
+                0,
+            )
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(session.mode(), SessionMode::PerCommand);
     }
 }
