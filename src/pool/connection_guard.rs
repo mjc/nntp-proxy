@@ -77,7 +77,6 @@ const _SALVAGE_NO_LOOP: () = {
 pub struct ConnectionGuard {
     conn: Option<PooledConnection>,
     provider: DeadpoolConnectionProvider,
-    released: bool,
 }
 
 impl ConnectionGuard {
@@ -86,7 +85,6 @@ impl ConnectionGuard {
         Self {
             conn: Some(conn),
             provider,
-            released: false,
         }
     }
 
@@ -99,7 +97,6 @@ impl ConnectionGuard {
     ///
     /// Panics if the guard has already been consumed (double-release).
     pub fn complete_success(mut self) -> PooledConnection {
-        self.released = true;
         self.conn
             .take()
             .expect("ConnectionGuard::complete_success() called on consumed guard")
@@ -114,7 +111,6 @@ impl ConnectionGuard {
     ///
     /// Panics if the guard has already been consumed.
     pub(crate) fn fail_client(mut self) {
-        self.released = true;
         let conn = self
             .conn
             .take()
@@ -132,7 +128,6 @@ impl ConnectionGuard {
     ///
     /// Panics if the guard has already been consumed.
     pub(crate) fn fail_backend(mut self) {
-        self.released = true;
         let conn = self
             .conn
             .take()
@@ -186,12 +181,10 @@ impl ConnectionGuard {
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         debug_assert!(
-            self.released,
+            self.conn.is_none(),
             "ConnectionGuard dropped without explicit finalize"
         );
-        if !self.released
-            && let Some(conn) = self.conn.take()
-        {
+        if let Some(conn) = self.conn.take() {
             tracing::debug!(
                 connection_type = conn.connection_type(),
                 pending_bytes = conn.pending_bytes_len(),
