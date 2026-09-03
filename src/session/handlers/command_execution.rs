@@ -1234,13 +1234,13 @@ impl ClientSession {
         let cache_action = determine_cache_action_for_request(
             params.article_request,
             params.status_code,
-            self.cache_articles,
+            self.cache.payload_policy(),
         );
 
         debug!(
-            "write_response_to_client: code={}, cache_articles={}, has_msg_id={}, action={:?}",
+            "write_response_to_client: code={}, payload_policy={:?}, has_msg_id={}, action={:?}",
             params.status_code.as_u16(),
-            self.cache_articles,
+            self.cache.payload_policy(),
             params.article_request.is_some(),
             cache_action
         );
@@ -1312,9 +1312,7 @@ impl ClientSession {
                     self.tier_for_backend(backend_id),
                 );
             }
-            (CacheAction::TrackStat, msg_id, _)
-                if self.cache_articles && self.cache.stores_payload_responses() =>
-            {
+            (CacheAction::TrackStat, msg_id, _) if self.cache.stores_payload_responses() => {
                 self.maybe_cache_upsert_buffer(
                     msg_id,
                     crate::cache::CacheIngestResponse::from(b"223\r\n".as_slice()),
@@ -1562,10 +1560,7 @@ mod tests {
         .build()
     }
 
-    fn test_session_with_cache(
-        cache: Arc<UnifiedCache>,
-        cache_articles: bool,
-    ) -> crate::session::ClientSession {
+    fn test_session_with_cache(cache: Arc<UnifiedCache>) -> crate::session::ClientSession {
         let addr: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
         let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 4);
         let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
@@ -1577,7 +1572,6 @@ mod tests {
             metrics,
         )
         .with_cache(cache)
-        .with_cache_articles(cache_articles)
         .build()
     }
 
@@ -2449,9 +2443,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn track_stat_records_availability_when_article_cache_disabled() {
+    async fn track_stat_stores_synthetic_response_in_payload_cache() {
         let cache = Arc::new(UnifiedCache::memory(1024, Duration::from_secs(60)));
-        let session = test_session_with_cache(cache.clone(), false);
+        let session = test_session_with_cache(cache.clone());
         let request = request_context(b"STAT <stat-disabled@example.com>\r\n");
         let msg_id =
             MessageId::new("<stat-disabled@example.com>".to_string()).expect("valid message id");
@@ -2713,7 +2707,6 @@ mod tests {
             metrics,
         )
         .with_cache(cache)
-        .with_cache_articles(true)
         .build();
         let backend_id = BackendId::from_index(0);
         let request = request_context(b"ARTICLE <large@example.com>\r\n");

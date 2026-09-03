@@ -104,10 +104,10 @@ impl ClientSession {
             request.verb()
         );
         debug!(
-            "Client {} msg_id={:?}, cache_articles={}",
+            "Client {} msg_id={:?}, payload_policy={:?}",
             self.client_addr,
             request.message_id(),
-            self.cache_articles
+            self.cache.payload_policy()
         );
     }
 
@@ -177,7 +177,7 @@ impl ClientSession {
         if !self.adaptive_precheck || !(request.is_stat() || request.is_head()) {
             return Ok(false);
         }
-        if request.is_head() && !self.cache_articles {
+        if request.is_head() && !self.cache.stores_payload_responses() {
             return Ok(false);
         }
         let Some(msg_id) = request.message_id_value() else {

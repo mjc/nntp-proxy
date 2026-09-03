@@ -43,9 +43,6 @@ pub struct ClientSession {
     /// Response cache, always present for availability tracking.
     pub(super) cache: Arc<crate::cache::UnifiedCache>,
 
-    /// Whether to retain ARTICLE/BODY payload bytes.
-    pub(super) cache_articles: bool,
-
     /// Whether to use adaptive availability prechecking for STAT/HEAD
     pub(super) adaptive_precheck: bool,
 }
@@ -92,7 +89,6 @@ pub struct ClientSessionBuilder {
     metrics: MetricsCollector,
     connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
     cache: BuilderCache,
-    cache_articles: bool,
     adaptive_precheck: bool,
 }
 
@@ -157,16 +153,6 @@ impl ClientSessionBuilder {
         self
     }
 
-    /// Set whether to retain ARTICLE/BODY payload bytes.
-    ///
-    /// When false, only backend availability is tracked.
-    /// When true, cacheable ARTICLE/BODY payloads may be served without a backend query.
-    #[must_use]
-    pub const fn with_cache_articles(mut self, cache: bool) -> Self {
-        self.cache_articles = cache;
-        self
-    }
-
     /// Configure adaptive availability prechecking
     #[must_use]
     pub const fn with_adaptive_precheck(mut self, enable: bool) -> Self {
@@ -189,6 +175,7 @@ impl ClientSessionBuilder {
 
         let metrics = self.metrics;
         metrics.user_connection_opened(None);
+        let cache = self.cache.into_cache();
         ClientSession {
             client_addr: self.client_addr,
             buffer_pool: self.buffer_pool,
@@ -200,8 +187,7 @@ impl ClientSessionBuilder {
             user_connection_username: Mutex::new(None),
             metrics,
             connection_stats: self.connection_stats,
-            cache: self.cache.into_cache(),
-            cache_articles: self.cache_articles,
+            cache,
             adaptive_precheck: self.adaptive_precheck,
         }
     }
@@ -236,7 +222,6 @@ impl ClientSession {
             metrics,
             connection_stats: None,
             cache: Self::default_cache(),
-            cache_articles: false,
             adaptive_precheck: false,
         }
     }
@@ -267,7 +252,6 @@ impl ClientSession {
             metrics,
             connection_stats: None,
             cache: Self::default_cache(),
-            cache_articles: false,
             adaptive_precheck: false,
         }
     }
@@ -309,7 +293,6 @@ impl ClientSession {
             metrics,
             connection_stats: None,
             cache: BuilderCache::DefaultAvailability,
-            cache_articles: false,
             adaptive_precheck: false,
         }
     }

@@ -34,6 +34,22 @@ use crate::protocol::StatusCode;
 use crate::types::{BackendId, MessageId};
 use smallvec::SmallVec;
 
+/// Retention policy represented by a unified cache implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePayloadPolicy {
+    /// Keep availability metadata but discard response payloads.
+    AvailabilityOnly,
+    /// Retain cacheable response payloads as well as availability metadata.
+    StoreBodies,
+}
+
+impl CachePayloadPolicy {
+    #[must_use]
+    pub const fn stores_payloads(self) -> bool {
+        matches!(self, Self::StoreBodies)
+    }
+}
+
 /// Owned response storage passed across the async cache ingest boundary.
 ///
 /// Hot-path code should hand off one of these owned forms directly instead of
@@ -255,6 +271,18 @@ mod tests {
         assert_eq!(entry.availability().missing_bits(), 0);
         assert!(entry.should_try_backend(backend_id));
     }
+
+    #[test]
+    fn unified_cache_payload_policy_matches_storage_kind() {
+        assert_eq!(
+            UnifiedCache::availability(std::time::Duration::from_secs(60)).payload_policy(),
+            CachePayloadPolicy::AvailabilityOnly
+        );
+        assert_eq!(
+            UnifiedCache::memory(1000, std::time::Duration::from_secs(60)).payload_policy(),
+            CachePayloadPolicy::StoreBodies
+        );
+    }
 }
 
 /// Statistics for cache display in TUI
@@ -380,7 +408,16 @@ impl UnifiedCache {
     /// Returns true when this cache stores response payloads.
     #[must_use]
     pub const fn stores_payload_responses(&self) -> bool {
-        !matches!(self, Self::Availability(_))
+        self.payload_policy().stores_payloads()
+    }
+
+    /// Return the retention policy encoded by this cache implementation.
+    #[must_use]
+    pub const fn payload_policy(&self) -> CachePayloadPolicy {
+        match self {
+            Self::Availability(_) => CachePayloadPolicy::AvailabilityOnly,
+            Self::Memory(_) | Self::Hybrid(_) => CachePayloadPolicy::StoreBodies,
+        }
     }
 
     /// Get an article from the cache

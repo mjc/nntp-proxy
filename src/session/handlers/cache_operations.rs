@@ -69,14 +69,14 @@ impl ClientSession {
         request.record_cache_entry_metadata(cache_entry_metadata(&cached, &availability));
 
         debug!(
-            "Client {} cache HIT for {} (cache_articles={})",
+            "Client {} cache HIT for {} (payload_policy={:?})",
             self.client_addr,
             request.message_id().unwrap_or("<invalid>"),
-            self.cache_articles
+            self.cache.payload_policy()
         );
 
         // If full article caching enabled, try to serve from cache
-        if !self.cache_articles {
+        if !self.cache.stores_payload_responses() {
             // Availability-only mode - spawn background precheck to update availability
             // then fall through to use availability info for routing
             if self.adaptive_precheck && request.is_stat() {
@@ -195,7 +195,6 @@ impl ClientSession {
             cache: &self.cache,
             buffer_pool: &self.buffer_pool,
             metrics: &self.metrics,
-            cache_articles: self.cache_articles,
         }
     }
 }
@@ -269,7 +268,6 @@ mod tests {
             1024,
             Duration::from_secs(60),
         )))
-        .with_cache_articles(true)
         .build()
     }
 

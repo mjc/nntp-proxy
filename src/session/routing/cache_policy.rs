@@ -2,6 +2,7 @@
 //!
 //! Pure functions for mapping typed requests and response codes to cache actions.
 
+use crate::cache::CachePayloadPolicy;
 use crate::command::ArticleLookupRequest;
 #[cfg(test)]
 use crate::protocol::RequestContext;
@@ -33,9 +34,9 @@ pub enum CacheAction {
 fn should_capture_article_response(
     request: &ArticleLookupRequest<'_>,
     response_code: StatusCode,
-    cache_articles: bool,
+    payload_policy: CachePayloadPolicy,
 ) -> bool {
-    cache_articles
+    payload_policy.stores_payloads()
         && request.request().has_response_body(response_code)
         && matches!(response_code.as_u16(), 220 | 222)
 }
@@ -56,20 +57,20 @@ pub fn should_track_availability(response_code: StatusCode) -> bool {
 fn determine_cache_action(
     command: &str,
     response_code: u16,
-    cache_articles: bool,
+    payload_policy: CachePayloadPolicy,
     has_message_id: bool,
 ) -> CacheAction {
     let request = RequestContext::parse(command.as_bytes()).expect("valid request line");
     let response_code = StatusCode::new(response_code);
     let article_request = crate::command::CommandHandler::article_lookup_request(&request);
     let article_request = article_request.filter(|_| has_message_id);
-    determine_cache_action_for_request(article_request, response_code, cache_articles)
+    determine_cache_action_for_request(article_request, response_code, payload_policy)
 }
 
 pub fn determine_cache_action_for_request(
     article_request: Option<ArticleLookupRequest<'_>>,
     response_code: StatusCode,
-    cache_articles: bool,
+    payload_policy: CachePayloadPolicy,
 ) -> CacheAction {
     let Some(article_request) = article_request else {
         return CacheAction::None;
@@ -77,7 +78,7 @@ pub fn determine_cache_action_for_request(
 
     let has_response_body = article_request.request().has_response_body(response_code);
 
-    if should_capture_article_response(&article_request, response_code, cache_articles) {
+    if should_capture_article_response(&article_request, response_code, payload_policy) {
         CacheAction::CaptureArticle
     } else if has_response_body && should_track_availability(response_code) {
         CacheAction::TrackAvailability
@@ -98,7 +99,7 @@ mod tests {
     fn should_capture_for_test(
         request: &RequestContext,
         response_code: StatusCode,
-        cache_articles: bool,
+        store_bodies: bool,
         has_message_id: bool,
     ) -> bool {
         if !has_message_id {
@@ -107,7 +108,15 @@ mod tests {
 
         let article_request = crate::command::CommandHandler::article_lookup_request(request);
         article_request.as_ref().is_some_and(|request| {
-            should_capture_article_response(request, response_code, cache_articles)
+            should_capture_article_response(
+                request,
+                response_code,
+                if store_bodies {
+                    CachePayloadPolicy::StoreBodies
+                } else {
+                    CachePayloadPolicy::AvailabilityOnly
+                },
+            )
         })
     }
     fn should_track_availability_for_test(response_code: StatusCode, has_message_id: bool) -> bool {
@@ -261,7 +270,12 @@ mod tests {
     fn test_determine_cache_action_capture_article() {
         // Full article capture for 220 response when cache enabled
         assert_eq!(
-            determine_cache_action("ARTICLE <test@example.com>", 220, true, true),
+            determine_cache_action(
+                "ARTICLE <test@example.com>",
+                220,
+                CachePayloadPolicy::StoreBodies,
+                true,
+            ),
             CacheAction::CaptureArticle
         );
     }
@@ -270,17 +284,32 @@ mod tests {
     fn test_determine_cache_action_track_availability() {
         // HEAD (221) only tracks availability (headers only)
         assert_eq!(
-            determine_cache_action("HEAD <test@example.com>", 221, true, true),
+            determine_cache_action(
+                "HEAD <test@example.com>",
+                221,
+                CachePayloadPolicy::StoreBodies,
+                true,
+            ),
             CacheAction::TrackAvailability
         );
-        // BODY (222) captures the body payload when cache_articles=true
+        // BODY (222) captures the body payload when the policy stores bodies.
         assert_eq!(
-            determine_cache_action("BODY <test@example.com>", 222, true, true),
+            determine_cache_action(
+                "BODY <test@example.com>",
+                222,
+                CachePayloadPolicy::StoreBodies,
+                true,
+            ),
             CacheAction::CaptureArticle
         );
-        // BODY (222) with cache_articles=false only tracks availability
+        // BODY (222) with availability-only policy only tracks availability.
         assert_eq!(
-            determine_cache_action("BODY <test@example.com>", 222, false, true),
+            determine_cache_action(
+                "BODY <test@example.com>",
+                222,
+                CachePayloadPolicy::AvailabilityOnly,
+                true,
+            ),
             CacheAction::TrackAvailability
         );
     }
@@ -290,11 +319,21 @@ mod tests {
         // STAT (223) can retain a synthetic payload in article-cache mode, or
         // record positive availability in availability-only mode.
         assert_eq!(
-            determine_cache_action("STAT <test@example.com>", 223, true, true),
+            determine_cache_action(
+                "STAT <test@example.com>",
+                223,
+                CachePayloadPolicy::StoreBodies,
+                true,
+            ),
             CacheAction::TrackStat
         );
         assert_eq!(
-            determine_cache_action("STAT <test@example.com>", 223, false, true),
+            determine_cache_action(
+                "STAT <test@example.com>",
+                223,
+                CachePayloadPolicy::AvailabilityOnly,
+                true,
+            ),
             CacheAction::TrackStat
         );
     }
@@ -303,20 +342,35 @@ mod tests {
     fn test_determine_cache_action_error_responses() {
         // No caching for error responses
         assert_eq!(
-            determine_cache_action("ARTICLE <test@example.com>", 430, true, true),
+            determine_cache_action(
+                "ARTICLE <test@example.com>",
+                430,
+                CachePayloadPolicy::StoreBodies,
+                true,
+            ),
             CacheAction::None
         );
         assert_eq!(
-            determine_cache_action("ARTICLE <test@example.com>", 500, true, true),
+            determine_cache_action(
+                "ARTICLE <test@example.com>",
+                500,
+                CachePayloadPolicy::StoreBodies,
+                true,
+            ),
             CacheAction::None
         );
     }
 
     #[test]
     fn test_determine_cache_action_cache_disabled() {
-        // When cache_articles is false, don't retain payload bytes but still track availability
+        // Availability-only policy does not retain payload bytes but still tracks availability.
         assert_eq!(
-            determine_cache_action("ARTICLE <test@example.com>", 220, false, true),
+            determine_cache_action(
+                "ARTICLE <test@example.com>",
+                220,
+                CachePayloadPolicy::AvailabilityOnly,
+                true,
+            ),
             CacheAction::TrackAvailability
         );
     }

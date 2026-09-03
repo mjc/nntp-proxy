@@ -130,7 +130,6 @@ impl NntpProxy {
         .with_routing_mode(routing_mode)
         .with_connection_stats(self.connection_stats.clone())
         .with_cache(cache)
-        .with_cache_articles(self.store_article_bodies)
         .with_adaptive_precheck(self.adaptive_precheck);
 
         // Apply optional router

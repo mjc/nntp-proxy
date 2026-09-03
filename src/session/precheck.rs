@@ -111,7 +111,6 @@ pub struct PrecheckDeps<'a> {
     pub cache: &'a Arc<UnifiedCache>,
     pub buffer_pool: &'a BufferPool,
     pub metrics: &'a MetricsCollector,
-    pub cache_articles: bool,
 }
 
 #[derive(Clone)]
@@ -120,7 +119,6 @@ struct OwnedDeps {
     cache: Arc<UnifiedCache>,
     buffer_pool: BufferPool,
     metrics: MetricsCollector,
-    cache_articles: bool,
 }
 
 impl PrecheckDeps<'_> {
@@ -130,7 +128,6 @@ impl PrecheckDeps<'_> {
             cache: Arc::clone(self.cache),
             buffer_pool: self.buffer_pool.clone(),
             metrics: self.metrics.clone(),
-            cache_articles: self.cache_articles,
         }
     }
 }
@@ -290,7 +287,8 @@ async fn read_complete_precheck_hit(
     buffer: &mut crate::pool::PooledBuffer,
 ) -> Result<PrecheckHit, ()> {
     let mut response = deps
-        .cache_articles
+        .cache
+        .stores_payload_responses()
         .then(crate::pool::ChunkedResponse::default);
 
     if let Some(response) = &mut response {
@@ -656,7 +654,6 @@ mod tests {
             cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
             buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 1),
             metrics: MetricsCollector::new(num_backends),
-            cache_articles: true,
         }
     }
 
@@ -953,7 +950,6 @@ mod tests {
             cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
             buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 2),
             metrics: MetricsCollector::new(1),
-            cache_articles: true,
         };
 
         let request =
@@ -973,7 +969,6 @@ mod tests {
             cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
             buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 2),
             metrics: MetricsCollector::new(1),
-            cache_articles: true,
         };
 
         let request =
@@ -992,7 +987,6 @@ mod tests {
             cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
             buffer_pool: BufferPool::new(BufferSize::try_new(65536).unwrap(), 2),
             metrics: MetricsCollector::new(1),
-            cache_articles: true,
         };
 
         let request =
