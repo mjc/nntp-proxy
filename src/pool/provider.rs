@@ -21,12 +21,34 @@ use std::sync::atomic::Ordering;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatMissingPolicy {
+    Disabled,
+    Probe,
+}
+
+impl StatMissingPolicy {
+    const fn from_enabled(enabled: bool) -> Self {
+        if enabled { Self::Probe } else { Self::Disabled }
+    }
+
+    const fn is_enabled(self) -> bool {
+        matches!(self, Self::Probe)
+    }
+}
+
+impl From<bool> for StatMissingPolicy {
+    fn from(enabled: bool) -> Self {
+        Self::from_enabled(enabled)
+    }
+}
+
 /// Connection provider using deadpool for connection pooling
 #[derive(Debug, Clone)]
 pub struct DeadpoolConnectionProvider {
     pool: Pool,
     name: Arc<str>,
-    stat_missing: bool,
+    stat_missing: StatMissingPolicy,
     /// Shutdown signal sender for background health check task.
     /// Stored to keep the channel alive - when dropped, the background task will terminate.
     /// Used by `shutdown()` method to gracefully stop health checks.
@@ -88,7 +110,7 @@ pub struct Builder {
     port: u16,
     name: Option<String>,
     max_size: usize,
-    stat_missing: bool,
+    stat_missing: StatMissingPolicy,
     username: Option<String>,
     password: Option<String>,
     tls_config: Option<TlsConfig>,
@@ -107,7 +129,7 @@ impl Builder {
             port,
             name: None,
             max_size: 10, // Default max connections
-            stat_missing: false,
+            stat_missing: StatMissingPolicy::Disabled,
             username: None,
             password: None,
             tls_config: None,
@@ -131,7 +153,7 @@ impl Builder {
     /// Enable/disable `STAT` pre-probing on article-missing retries.
     #[must_use]
     pub const fn stat_missing(mut self, stat_missing: bool) -> Self {
-        self.stat_missing = stat_missing;
+        self.stat_missing = StatMissingPolicy::from_enabled(stat_missing);
         self
     }
 
@@ -344,7 +366,7 @@ impl DeadpoolConnectionProvider {
             .expect("Plain TCP TcpManager creation cannot fail"),
             name,
             max_size,
-            false,
+            StatMissingPolicy::Disabled,
         )
     }
 
@@ -372,7 +394,12 @@ impl DeadpoolConnectionProvider {
                 ..TcpManagerOptions::default()
             },
         )?;
-        Ok(Self::from_manager(manager, name, max_size, false))
+        Ok(Self::from_manager(
+            manager,
+            name,
+            max_size,
+            StatMissingPolicy::Disabled,
+        ))
     }
 
     /// Construct a provider from a pre-built `TcpManager`
@@ -380,7 +407,7 @@ impl DeadpoolConnectionProvider {
         manager: TcpManager,
         name: String,
         max_size: usize,
-        stat_missing: bool,
+        stat_missing: StatMissingPolicy,
     ) -> Self {
         let pool = Pool::builder(manager)
             .max_size(max_size)
@@ -480,7 +507,7 @@ impl DeadpoolConnectionProvider {
         Ok(Self {
             pool,
             name: Arc::from(server.name.to_string()),
-            stat_missing: server.stat_missing_enabled(),
+            stat_missing: server.stat_missing_enabled().into(),
             shutdown_tx,
             health_check_metrics: metrics,
             original_max_size: max_size,
@@ -538,7 +565,7 @@ impl DeadpoolConnectionProvider {
 
     #[must_use]
     pub const fn stat_missing_enabled(&self) -> bool {
-        self.stat_missing
+        self.stat_missing.is_enabled()
     }
 
     /// Clear all idle connections from the pool
@@ -918,7 +945,7 @@ mod tests {
         assert_eq!(builder.host, "news.example.com");
         assert_eq!(builder.port, 119);
         assert_eq!(builder.max_size, 10); // Default
-        assert!(!builder.stat_missing);
+        assert_eq!(builder.stat_missing, StatMissingPolicy::Disabled);
         assert!(builder.name.is_none());
         assert!(builder.username.is_none());
         assert!(builder.password.is_none());
@@ -940,7 +967,7 @@ mod tests {
     #[test]
     fn test_builder_with_stat_missing() {
         let builder = Builder::new("example.com", 119).stat_missing(true);
-        assert!(builder.stat_missing);
+        assert_eq!(builder.stat_missing, StatMissingPolicy::Probe);
     }
 
     #[test]
@@ -1209,7 +1236,7 @@ mod tests {
         DeadpoolConnectionProvider {
             pool,
             name: Arc::from(format!("test-{}", addr.port())),
-            stat_missing: false,
+            stat_missing: StatMissingPolicy::Disabled,
             shutdown_tx: None,
             health_check_metrics: Arc::new(crate::pool::health_check::HealthCheckMetrics::new()),
             original_max_size: max_size,

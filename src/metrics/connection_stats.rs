@@ -17,6 +17,12 @@ const AGGREGATION_WINDOW: Duration = Duration::from_secs(30);
 use crate::constants::user::ANONYMOUS;
 use crate::types::ClientId;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionEvent {
+    Connected,
+    Disconnected,
+}
+
 /// Statistics for a single user's connections
 #[derive(Debug)]
 struct UserConnectionStats {
@@ -155,7 +161,7 @@ impl ConnectionStatsAggregator {
         &self,
         username: Option<&str>,
         routing_mode: &'static str,
-        is_connection: bool,
+        event: ConnectionEvent,
     ) {
         // Fast path: only flush if actually needed (check lock-free first)
         let now = Instant::now();
@@ -165,10 +171,9 @@ impl ConnectionStatsAggregator {
             self.maybe_flush(now, false);
         }
 
-        let stats = if is_connection {
-            &self.connection_stats
-        } else {
-            &self.disconnection_stats
+        let stats = match event {
+            ConnectionEvent::Connected => &self.connection_stats,
+            ConnectionEvent::Disconnected => &self.disconnection_stats,
         };
         let username = username.unwrap_or(ANONYMOUS).to_string();
 
@@ -180,7 +185,7 @@ impl ConnectionStatsAggregator {
 
     /// Record a new connection
     pub fn record_connection(&self, username: Option<&str>, routing_mode: &'static str) {
-        self.record_event(username, routing_mode, true);
+        self.record_event(username, routing_mode, ConnectionEvent::Connected);
     }
 
     /// Record a new client session connection once per `ClientId`.
@@ -193,12 +198,12 @@ impl ConnectionStatsAggregator {
         if !self.seen_connections.insert(client_id) {
             return;
         }
-        self.record_event(username, routing_mode, true);
+        self.record_event(username, routing_mode, ConnectionEvent::Connected);
     }
 
     /// Record a disconnection
     pub fn record_disconnection(&self, username: Option<&str>, routing_mode: &'static str) {
-        self.record_event(username, routing_mode, false);
+        self.record_event(username, routing_mode, ConnectionEvent::Disconnected);
     }
 
     /// Record a client session disconnection once per `ClientId`.
@@ -212,7 +217,7 @@ impl ConnectionStatsAggregator {
             return;
         }
         self.seen_connections.remove(&client_id);
-        self.record_event(username, routing_mode, false);
+        self.record_event(username, routing_mode, ConnectionEvent::Disconnected);
     }
 
     /// Force flush all pending stats (for graceful shutdown)
