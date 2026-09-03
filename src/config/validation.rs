@@ -46,17 +46,7 @@ impl Config {
             "memory.socket_send_buffer_size",
             self.memory.socket_send_buffer_size,
         )?;
-        if self
-            .routing
-            .queue
-            .backpressure
-            .hard_waiters_per_connection_percent
-            < self
-                .routing
-                .queue
-                .backpressure
-                .soft_waiters_per_connection_percent
-        {
+        if self.routing.queue.backpressure.limits().is_none() {
             return Err(anyhow::anyhow!(
                 "routing.queue.backpressure.hard_waiters_per_connection_percent must be >= soft_waiters_per_connection_percent"
             ));
@@ -245,12 +235,14 @@ mod tests {
             .routing
             .queue
             .backpressure
-            .soft_waiters_per_connection_percent = 60;
+            .soft_waiters_per_connection_percent =
+            crate::types::QueuePressurePercent::try_new(60).unwrap();
         config
             .routing
             .queue
             .backpressure
-            .hard_waiters_per_connection_percent = 50;
+            .hard_waiters_per_connection_percent =
+            crate::types::QueuePressurePercent::try_new(50).unwrap();
 
         let result = config.validate();
         assert!(result.is_err());

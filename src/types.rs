@@ -13,8 +13,8 @@ pub mod validated;
 
 pub use config::{
     BackendReadTimeout, BufferSize, CacheCapacity, CommandExecutionTimeout, ConnectionTimeout,
-    HealthCheckTimeout, MaxConnections, MaxErrors, Port, ThreadCount, WindowSize, duration_serde,
-    option_duration_serde,
+    HealthCheckTimeout, MaxConnections, MaxErrors, Port, QueuePressurePercent, ThreadCount,
+    WindowSize, duration_serde, option_duration_serde,
 };
 pub use metrics::{
     ArticleBytesTotal, BackendToClientBytes, BytesPerSecondRate, BytesReceived, BytesSent,

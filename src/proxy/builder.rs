@@ -194,8 +194,9 @@ impl NntpProxyBuilder {
             let mut r = router::BackendSelector::with_strategy(backend_strategy)
                 .with_queue_backpressure(
                     queue_backpressure.enabled,
-                    queue_backpressure.soft_waiters_per_connection_percent,
-                    queue_backpressure.hard_waiters_per_connection_percent,
+                    queue_backpressure
+                        .limits()
+                        .expect("config validation establishes queue-pressure limits"),
                     queue_backpressure.all_busy_sleep_ms,
                 );
             for (idx, provider) in connection_providers.iter().enumerate() {

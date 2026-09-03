@@ -47,7 +47,7 @@ use std::time::Duration;
 use tracing::{debug, info};
 
 use crate::cache::ArticleAvailability;
-use crate::config::BackendSelectionStrategy;
+use crate::config::{BackendSelectionStrategy, QueuePressureLimits};
 use crate::pool::DeadpoolConnectionProvider;
 use crate::types::{BackendId, ClientId, ServerName};
 use strategies::{LeastLoaded, WeightedRoundRobin};
@@ -455,10 +455,8 @@ pub struct BackendSelector {
     initial_article_probe_counter: AtomicUsize,
     /// Enable/disable per-connection queue-pressure filtering.
     queue_backpressure_enabled: bool,
-    /// Soft threshold for queued requests per connection (percentage).
-    queue_backpressure_soft_waiters_per_connection_percent: u16,
-    /// Hard threshold for queued requests per connection (percentage).
-    queue_backpressure_hard_waiters_per_connection_percent: u16,
+    /// Validated soft and hard thresholds for queued requests per connection.
+    queue_backpressure_limits: QueuePressureLimits,
     /// Delay to apply when all eligible backends in a tier are hard-saturated.
     queue_backpressure_all_busy_sleep_ms: u64,
 }
@@ -471,8 +469,6 @@ impl Default for BackendSelector {
 
 impl BackendSelector {
     const DEFAULT_QUEUE_BACKPRESSURE_ENABLED: bool = true;
-    const DEFAULT_QUEUE_BACKPRESSURE_SOFT_WAITERS_PER_CONNECTION_PERCENT: u16 = 25;
-    const DEFAULT_QUEUE_BACKPRESSURE_HARD_WAITERS_PER_CONNECTION_PERCENT: u16 = 50;
     const DEFAULT_QUEUE_BACKPRESSURE_ALL_BUSY_SLEEP_MS: u64 = 1;
 
     /// Find backend by ID
@@ -549,10 +545,7 @@ impl BackendSelector {
             sorted_tiers: smallvec::SmallVec::new(),
             initial_article_probe_counter: AtomicUsize::new(0),
             queue_backpressure_enabled: Self::DEFAULT_QUEUE_BACKPRESSURE_ENABLED,
-            queue_backpressure_soft_waiters_per_connection_percent:
-                Self::DEFAULT_QUEUE_BACKPRESSURE_SOFT_WAITERS_PER_CONNECTION_PERCENT,
-            queue_backpressure_hard_waiters_per_connection_percent:
-                Self::DEFAULT_QUEUE_BACKPRESSURE_HARD_WAITERS_PER_CONNECTION_PERCENT,
+            queue_backpressure_limits: QueuePressureLimits::default(),
             queue_backpressure_all_busy_sleep_ms:
                 Self::DEFAULT_QUEUE_BACKPRESSURE_ALL_BUSY_SLEEP_MS,
         }
@@ -563,19 +556,11 @@ impl BackendSelector {
     pub fn with_queue_backpressure(
         mut self,
         enabled: bool,
-        soft_waiters_per_connection_percent: u16,
-        hard_waiters_per_connection_percent: u16,
+        limits: QueuePressureLimits,
         all_busy_sleep_ms: u64,
     ) -> Self {
         self.queue_backpressure_enabled = enabled;
-        self.queue_backpressure_soft_waiters_per_connection_percent =
-            soft_waiters_per_connection_percent;
-        self.queue_backpressure_hard_waiters_per_connection_percent =
-            if hard_waiters_per_connection_percent < soft_waiters_per_connection_percent {
-                soft_waiters_per_connection_percent
-            } else {
-                hard_waiters_per_connection_percent
-            };
+        self.queue_backpressure_limits = limits;
         self.queue_backpressure_all_busy_sleep_ms = all_busy_sleep_ms;
         self
     }
@@ -926,10 +911,8 @@ impl BackendSelector {
             return 0;
         }
         let queue_depth = Self::queue_depth_for_score(pending, checked_out, waiting);
-        let soft_limit = Self::queue_depth_limit(
-            max_connections,
-            self.queue_backpressure_soft_waiters_per_connection_percent,
-        );
+        let soft_limit =
+            Self::queue_depth_limit(max_connections, self.queue_backpressure_limits.soft());
         queue_depth.saturating_sub(soft_limit)
     }
 
@@ -945,16 +928,17 @@ impl BackendSelector {
             return false;
         }
         let queue_depth = Self::queue_depth_for_score(pending, checked_out, waiting);
-        let hard_limit = Self::queue_depth_limit(
-            max_connections,
-            self.queue_backpressure_hard_waiters_per_connection_percent,
-        );
+        let hard_limit =
+            Self::queue_depth_limit(max_connections, self.queue_backpressure_limits.hard());
         queue_depth > hard_limit
     }
 
     #[inline]
-    fn queue_depth_limit(max_connections: usize, per_connection_percent: u16) -> usize {
-        let product = max_connections.saturating_mul(usize::from(per_connection_percent));
+    fn queue_depth_limit(
+        max_connections: usize,
+        per_connection_percent: crate::types::QueuePressurePercent,
+    ) -> usize {
+        let product = max_connections.saturating_mul(usize::from(per_connection_percent.get()));
         product.div_ceil(100)
     }
 
@@ -1445,10 +1429,34 @@ mod tests {
 
     #[test]
     fn queue_depth_limit_scales_with_connection_count() {
-        assert_eq!(BackendSelector::queue_depth_limit(40, 25), 10);
-        assert_eq!(BackendSelector::queue_depth_limit(50, 25), 13);
-        assert_eq!(BackendSelector::queue_depth_limit(40, 50), 20);
-        assert_eq!(BackendSelector::queue_depth_limit(50, 50), 25);
+        assert_eq!(
+            BackendSelector::queue_depth_limit(
+                40,
+                crate::types::QueuePressurePercent::try_new(25).unwrap(),
+            ),
+            10
+        );
+        assert_eq!(
+            BackendSelector::queue_depth_limit(
+                50,
+                crate::types::QueuePressurePercent::try_new(25).unwrap(),
+            ),
+            13
+        );
+        assert_eq!(
+            BackendSelector::queue_depth_limit(
+                40,
+                crate::types::QueuePressurePercent::try_new(50).unwrap(),
+            ),
+            20
+        );
+        assert_eq!(
+            BackendSelector::queue_depth_limit(
+                50,
+                crate::types::QueuePressurePercent::try_new(50).unwrap(),
+            ),
+            25
+        );
     }
 
     #[test]

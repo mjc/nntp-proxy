@@ -73,6 +73,35 @@ impl MaxErrors {
     }
 }
 
+/// A queue-pressure percentage in the inclusive range 0..=100.
+#[nutype(
+    validate(less_or_equal = 100),
+    derive(
+        Debug,
+        Clone,
+        Copy,
+        PartialEq,
+        Eq,
+        Hash,
+        Display,
+        TryFrom,
+        AsRef,
+        Deref,
+        Serialize,
+        Deserialize
+    )
+)]
+pub struct QueuePressurePercent(u16);
+
+impl QueuePressurePercent {
+    /// Return the percentage as a primitive for arithmetic at the routing boundary.
+    #[inline]
+    #[must_use]
+    pub fn get(&self) -> u16 {
+        self.into_inner()
+    }
+}
+
 /// A non-zero thread count
 ///
 /// Ensures thread pools always have at least 1 thread.
@@ -292,6 +321,14 @@ mod tests {
     #[test]
     fn test_max_errors_serde_json_zero_rejected() {
         assert!(serde_json::from_str::<MaxErrors>("0").is_err());
+    }
+
+    #[test]
+    fn test_queue_pressure_percent_bounds_and_serde() {
+        assert_eq!(QueuePressurePercent::try_new(0).unwrap().get(), 0);
+        assert_eq!(QueuePressurePercent::try_new(100).unwrap().get(), 100);
+        assert!(QueuePressurePercent::try_new(101).is_err());
+        assert!(serde_json::from_str::<QueuePressurePercent>("101").is_err());
     }
 
     // ============================================================================

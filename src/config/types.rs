@@ -4,8 +4,8 @@
 
 use super::defaults;
 use crate::types::{
-    CacheCapacity, HostName, MaxConnections, MaxErrors, Port, ServerName, ThreadCount,
-    duration_serde, option_duration_serde,
+    CacheCapacity, HostName, MaxConnections, MaxErrors, Port, QueuePressurePercent, ServerName,
+    ThreadCount, duration_serde, option_duration_serde,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -251,13 +251,59 @@ pub struct QueueBackpressure {
     pub enabled: bool,
     /// Soft queue-pressure threshold (queued requests per connection, percent).
     #[serde(default = "super::defaults::queue_backpressure_soft_waiters_per_connection_percent")]
-    pub soft_waiters_per_connection_percent: u16,
+    pub soft_waiters_per_connection_percent: QueuePressurePercent,
     /// Hard queue-pressure threshold (queued requests per connection, percent).
     #[serde(default = "super::defaults::queue_backpressure_hard_waiters_per_connection_percent")]
-    pub hard_waiters_per_connection_percent: u16,
+    pub hard_waiters_per_connection_percent: QueuePressurePercent,
     /// Sleep duration in milliseconds when all eligible backends in a tier are hard-saturated.
     #[serde(default = "super::defaults::queue_backpressure_all_busy_sleep_ms")]
     pub all_busy_sleep_ms: u64,
+}
+
+/// Validated soft and hard queue-pressure thresholds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueuePressureLimits {
+    soft: QueuePressurePercent,
+    hard: QueuePressurePercent,
+}
+
+impl QueuePressureLimits {
+    /// Construct limits when both percentages are bounded and hard is not below soft.
+    #[must_use]
+    pub fn try_new(soft: u16, hard: u16) -> Option<Self> {
+        let soft = QueuePressurePercent::try_new(soft).ok()?;
+        let hard = QueuePressurePercent::try_new(hard).ok()?;
+        (hard.get() >= soft.get()).then_some(Self { soft, hard })
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn soft(self) -> QueuePressurePercent {
+        self.soft
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn hard(self) -> QueuePressurePercent {
+        self.hard
+    }
+}
+
+impl Default for QueuePressureLimits {
+    fn default() -> Self {
+        Self::try_new(25, 50).expect("default queue-pressure limits are valid")
+    }
+}
+
+impl QueueBackpressure {
+    /// Return thresholds that are safe to pass to router construction.
+    #[must_use]
+    pub fn limits(&self) -> Option<QueuePressureLimits> {
+        QueuePressureLimits::try_new(
+            self.soft_waiters_per_connection_percent.get(),
+            self.hard_waiters_per_connection_percent.get(),
+        )
+    }
 }
 
 impl Default for QueueBackpressure {
@@ -1001,16 +1047,23 @@ mod tests {
                 .queue
                 .backpressure
                 .soft_waiters_per_connection_percent,
-            25
+            QueuePressurePercent::try_new(25).unwrap()
         );
         assert_eq!(
             routing
                 .queue
                 .backpressure
                 .hard_waiters_per_connection_percent,
-            50
+            QueuePressurePercent::try_new(50).unwrap()
         );
         assert_eq!(routing.queue.backpressure.all_busy_sleep_ms, 1);
+    }
+
+    #[test]
+    fn test_queue_pressure_limits_reject_invalid_order() {
+        assert!(QueuePressureLimits::try_new(60, 50).is_none());
+        assert!(QueuePressureLimits::try_new(0, 101).is_none());
+        assert!(QueuePressureLimits::try_new(0, 100).is_some());
     }
 
     // HealthCheck tests
