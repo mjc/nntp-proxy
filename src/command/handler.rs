@@ -120,19 +120,20 @@ pub type CommandAction<'a> = CommandPlan<'a>;
 /// Static local reject response with typed status metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RejectResponse {
-    status: u16,
+    status: StatusCode,
     wire: &'static str,
 }
 
 impl RejectResponse {
     #[must_use]
-    pub const fn new(status: u16, wire: &'static str) -> Self {
+    pub const fn new(status: StatusCode, wire: &'static str) -> Self {
+        assert!(wire_status(wire) == status.as_u16());
         Self { status, wire }
     }
 
     #[must_use]
     pub fn status(self) -> StatusCode {
-        StatusCode::new(self.status)
+        self.status
     }
 
     #[must_use]
@@ -175,15 +176,32 @@ impl std::fmt::Display for RejectResponse {
     }
 }
 
-const POST_REJECT: RejectResponse = RejectResponse::new(440, "440 Posting not permitted\r\n");
+const POST_REJECT: RejectResponse =
+    RejectResponse::new(StatusCode::new(440), "440 Posting not permitted\r\n");
 const TRANSIT_REJECT: RejectResponse = RejectResponse::new(
-    codes::FEATURE_NOT_SUPPORTED,
+    StatusCode::new(codes::FEATURE_NOT_SUPPORTED),
     "503 Feature not supported in per-command routing mode\r\n",
 );
 const STATEFUL_REJECT: RejectResponse = RejectResponse::new(
-    codes::FEATURE_NOT_SUPPORTED,
+    StatusCode::new(codes::FEATURE_NOT_SUPPORTED),
     "503 Feature not supported in stateless proxy mode\r\n",
 );
+
+const fn wire_status(wire: &str) -> u16 {
+    let bytes = wire.as_bytes();
+    if bytes.len() < 3 {
+        return 0;
+    }
+
+    let d0 = bytes[0].wrapping_sub(b'0');
+    let d1 = bytes[1].wrapping_sub(b'0');
+    let d2 = bytes[2].wrapping_sub(b'0');
+    if d0 > 9 || d1 > 9 || d2 > 9 {
+        return 0;
+    }
+
+    (d0 as u16) * 100 + (d1 as u16) * 10 + (d2 as u16)
+}
 
 /// Specific authentication action
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -819,6 +837,12 @@ mod tests {
             panic!("Expected Reject");
         };
         assert_eq!(response.status().as_u16(), 440);
+    }
+
+    #[test]
+    #[should_panic]
+    fn reject_response_rejects_mismatched_wire_status() {
+        let _ = RejectResponse::new(StatusCode::new(501), "502 Wrong status\r\n");
     }
 
     #[test]

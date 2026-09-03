@@ -16,13 +16,14 @@ use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
 use nntp_proxy::config::RoutingMode;
 use nntp_proxy::protocol::RequestContext;
+use nntp_proxy::protocol::StatusCode;
 use nntp_proxy::session::ClientSession;
 
 fn classify(command: &str) -> CommandAction<'static> {
     RequestContext::parse(command.as_bytes()).map_or_else(
         || {
             CommandAction::Reject(nntp_proxy::command::RejectResponse::new(
-                nntp_proxy::protocol::codes::COMMAND_SYNTAX_ERROR,
+                StatusCode::new(nntp_proxy::protocol::codes::COMMAND_SYNTAX_ERROR),
                 "501 Syntax error in command\r\n",
             ))
         },
