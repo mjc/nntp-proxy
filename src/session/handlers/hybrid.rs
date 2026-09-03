@@ -66,6 +66,34 @@ impl StatefulBackendLease {
     }
 }
 
+/// Backend resources and loop state after the triggering request is registered.
+///
+/// This bundle is the boundary between handoff setup and bidirectional proxying:
+/// its existence means the dedicated connection has accepted the request and
+/// the response ordering state already expects its reply.
+struct PreparedStatefulLoop {
+    backend: StatefulBackendLease,
+    state: crate::session::state::SessionLoopState,
+}
+
+impl PreparedStatefulLoop {
+    const fn new(
+        backend: StatefulBackendLease,
+        state: crate::session::state::SessionLoopState,
+    ) -> Self {
+        Self { backend, state }
+    }
+
+    fn into_parts(
+        self,
+    ) -> (
+        StatefulBackendLease,
+        crate::session::state::SessionLoopState,
+    ) {
+        (self.backend, self.state)
+    }
+}
+
 /// RAII guard for stateful session metrics
 ///
 /// Automatically calls `stateful_session_ended()` on drop.
@@ -161,9 +189,7 @@ impl ClientSession {
         );
         state.mark_backend_request_sent(initial_request.request().kind());
 
-        // Split backend for bidirectional proxy
-        let backend_id = backend.backend_id();
-        let (backend_read, backend_write) = tokio::io::split(&mut ***backend.connection_mut());
+        let prepared = PreparedStatefulLoop::new(backend, state);
 
         match self.mode_state.switch_to_stateful() {
             crate::session::ModeTransition::Switched => {}
@@ -173,6 +199,10 @@ impl ClientSession {
                 )));
             }
         }
+
+        let (mut backend, state) = prepared.into_parts();
+        let backend_id = backend.backend_id();
+        let (backend_read, backend_write) = tokio::io::split(&mut ***backend.connection_mut());
 
         // Delegate to stateful loop (handles all remaining commands + responses)
         let result = self
