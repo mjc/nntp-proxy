@@ -26,6 +26,8 @@ pub enum ValidationError {
     EmptyUsername,
     #[error("password cannot be empty or whitespace")]
     EmptyPassword,
+    #[error("availability namespace cannot be empty or whitespace")]
+    EmptyAvailabilityNamespace,
 }
 
 /// Validated hostname (non-empty, non-whitespace)
@@ -106,6 +108,28 @@ impl fmt::Debug for Password {
     }
 }
 
+/// Explicit namespace for sharing authoritative article-availability facts.
+///
+/// The value is trimmed like the other validated configuration strings. An
+/// omitted server namespace falls back to that server's exact host string.
+#[nutype(
+    sanitize(trim),
+    validate(not_empty),
+    derive(
+        Debug,
+        Clone,
+        PartialEq,
+        Eq,
+        Hash,
+        Display,
+        AsRef,
+        TryFrom,
+        Serialize,
+        Deserialize
+    )
+)]
+pub struct AvailabilityNamespace(String);
+
 // Convert nutype errors to our ValidationError
 impl From<HostNameError> for ValidationError {
     fn from(_: HostNameError) -> Self {
@@ -128,6 +152,12 @@ impl From<UsernameError> for ValidationError {
 impl From<PasswordError> for ValidationError {
     fn from(_: PasswordError) -> Self {
         Self::EmptyPassword
+    }
+}
+
+impl From<AvailabilityNamespaceError> for ValidationError {
+    fn from(_: AvailabilityNamespaceError) -> Self {
+        Self::EmptyAvailabilityNamespace
     }
 }
 

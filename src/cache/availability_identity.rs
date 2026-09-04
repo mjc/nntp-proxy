@@ -22,7 +22,7 @@ pub(crate) enum AccountIdentity {
 /// A backend namespace whose authoritative article facts may be shared.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct AvailabilityIdentity {
-    pub(crate) host: String,
+    pub(crate) namespace: String,
     pub(crate) account: AccountIdentity,
 }
 
@@ -30,7 +30,11 @@ impl AvailabilityIdentity {
     #[must_use]
     pub(crate) fn from_server(server: &Server) -> Self {
         Self {
-            host: server.host.to_string(),
+            namespace: server
+                .availability_namespace
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| server.host.to_string()),
             account: server
                 .username
                 .clone()
@@ -99,7 +103,7 @@ impl AvailabilityLayout {
     pub(crate) fn synthetic(count: usize) -> Self {
         let identities = (0..count)
             .map(|index| AvailabilityIdentity {
-                host: format!("backend-{index}"),
+                namespace: format!("backend-{index}"),
                 account: AccountIdentity::Anonymous,
             })
             .collect::<Vec<_>>();
@@ -239,7 +243,7 @@ impl AvailabilityLayout {
         let mut identities = self.identities.to_vec();
         identities.sort_unstable();
         for identity in &identities {
-            hasher.write(identity.host.as_bytes());
+            hasher.write(identity.namespace.as_bytes());
             hasher.write_u8(0);
             match &identity.account {
                 AccountIdentity::Anonymous => hasher.write_u8(0),
@@ -280,8 +284,8 @@ impl std::error::Error for AvailabilityLayoutError {}
 
 impl Ord for AvailabilityIdentity {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.host
-            .cmp(&other.host)
+        self.namespace
+            .cmp(&other.namespace)
             .then_with(|| self.account.cmp(&other.account))
     }
 }
@@ -309,7 +313,7 @@ fn parse_registry(data: &[u8]) -> Result<(Vec<AvailabilityIdentity>, u64)> {
     }
     let mut identities = Vec::with_capacity(count);
     for _ in 0..count {
-        let host = read_string(data, &mut cursor, "hostname")?;
+        let namespace = read_string(data, &mut cursor, "namespace")?;
         let marker = *data
             .get(cursor)
             .ok_or_else(|| anyhow::anyhow!("truncated hybrid account marker"))?;
@@ -320,7 +324,7 @@ fn parse_registry(data: &[u8]) -> Result<(Vec<AvailabilityIdentity>, u64)> {
             _ => anyhow::bail!("invalid hybrid account marker"),
         };
         let account = account.map_or(AccountIdentity::Anonymous, AccountIdentity::Username);
-        let identity = AvailabilityIdentity { host, account };
+        let identity = AvailabilityIdentity { namespace, account };
         if identities.contains(&identity) {
             anyhow::bail!("duplicate hybrid availability identity");
         }
@@ -338,7 +342,7 @@ fn publish_registry(path: &Path, epoch: u64, identities: &[AvailabilityIdentity]
     data.extend_from_slice(&epoch.to_le_bytes());
     data.extend_from_slice(&(identities.len() as u64).to_le_bytes());
     for identity in identities {
-        write_string(&mut data, &identity.host)?;
+        write_string(&mut data, &identity.namespace)?;
         match &identity.account {
             AccountIdentity::Username(username) => {
                 data.push(1);

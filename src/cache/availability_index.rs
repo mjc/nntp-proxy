@@ -886,10 +886,11 @@ fn remap_missing_bits(
 }
 
 fn write_identity(bytes: &mut Vec<u8>, identity: &AvailabilityIdentity) -> Result<()> {
-    let host = identity.host.as_bytes();
-    let host_len = u32::try_from(host.len()).context("availability hostname too long")?;
-    bytes.extend_from_slice(&host_len.to_le_bytes());
-    bytes.extend_from_slice(host);
+    let namespace = identity.namespace.as_bytes();
+    let namespace_len =
+        u32::try_from(namespace.len()).context("availability namespace too long")?;
+    bytes.extend_from_slice(&namespace_len.to_le_bytes());
+    bytes.extend_from_slice(namespace);
     match &identity.account {
         AccountIdentity::Username(username) => {
             bytes.push(1);
@@ -905,7 +906,7 @@ fn write_identity(bytes: &mut Vec<u8>, identity: &AvailabilityIdentity) -> Resul
 }
 
 fn read_identity(data: &[u8], cursor: &mut usize) -> Result<AvailabilityIdentity> {
-    let host = read_string(data, cursor, "hostname")?;
+    let namespace = read_string(data, cursor, "namespace")?;
     let has_username = *data
         .get(*cursor)
         .ok_or_else(|| anyhow::anyhow!("truncated availability account marker"))?;
@@ -916,7 +917,7 @@ fn read_identity(data: &[u8], cursor: &mut usize) -> Result<AvailabilityIdentity
         _ => anyhow::bail!("invalid availability account marker"),
     };
     Ok(AvailabilityIdentity {
-        host,
+        namespace,
         account: account.map_or(AccountIdentity::Anonymous, AccountIdentity::Username),
     })
 }

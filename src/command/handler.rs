@@ -289,10 +289,7 @@ impl CommandHandler {
         clippy::result_large_err,
         reason = "the non-handoff path retains the parsed request without allocating"
     )]
-    #[expect(
-        dead_code,
-        reason = "the consuming handoff helper is retained for focused hybrid tests"
-    )]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn prepare_stateful_handoff(
         request: RequestContext,
         auth_access: AuthenticationAccess,

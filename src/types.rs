@@ -28,7 +28,9 @@ pub use pool::{
     AvailableConnections, CreatedConnections, InUseConnections, MaxPoolSize, PoolUtilization,
 };
 pub use protocol::MessageId;
-pub use validated::{ConfigPath, HostName, Password, ServerName, Username, ValidationError};
+pub use validated::{
+    AvailabilityNamespace, ConfigPath, HostName, Password, ServerName, Username, ValidationError,
+};
 
 use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;

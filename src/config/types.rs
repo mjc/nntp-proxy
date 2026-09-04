@@ -4,8 +4,8 @@
 
 use super::defaults;
 use crate::types::{
-    CacheCapacity, HostName, MaxConnections, MaxErrors, Port, QueuePressurePercent, ServerName,
-    ThreadCount, duration_serde, option_duration_serde,
+    AvailabilityNamespace, CacheCapacity, HostName, MaxConnections, MaxErrors, Port,
+    QueuePressurePercent, ServerName, ThreadCount, duration_serde, option_duration_serde,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -601,6 +601,10 @@ pub struct Server {
     pub username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// Explicit identity namespace for sharing authoritative article availability.
+    /// When omitted, the exact backend host and username define the namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability_namespace: Option<AvailabilityNamespace>,
     /// Maximum number of concurrent connections to this server
     #[serde(default = "super::defaults::max_connections")]
     pub max_connections: MaxConnections,
@@ -702,6 +706,7 @@ pub struct ServerBuilder {
     name: Option<String>,
     username: Option<String>,
     password: Option<String>,
+    availability_namespace: Option<AvailabilityNamespace>,
     max_connections: Option<MaxConnections>,
     stat_missing: u8,
     use_tls: bool,
@@ -731,6 +736,7 @@ impl ServerBuilder {
             name: None,
             username: None,
             password: None,
+            availability_namespace: None,
             max_connections: None,
             stat_missing: super::defaults::stat_missing(),
             use_tls: false,
@@ -765,6 +771,16 @@ impl ServerBuilder {
     #[must_use]
     pub fn password(mut self, password: impl Into<String>) -> Self {
         self.password = Some(password.into());
+        self
+    }
+
+    /// Set the explicit namespace used for article-availability sharing.
+    #[must_use]
+    pub fn availability_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.availability_namespace = Some(
+            AvailabilityNamespace::try_new(namespace.into())
+                .expect("availability namespace must not be empty"),
+        );
         self
     }
 
@@ -911,6 +927,7 @@ impl ServerBuilder {
             name,
             username: self.username,
             password: self.password,
+            availability_namespace: self.availability_namespace,
             max_connections,
             stat_missing: self.stat_missing,
             use_tls: self.use_tls,

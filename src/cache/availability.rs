@@ -327,6 +327,41 @@ mod tests {
     }
 
     #[test]
+    fn explicit_namespace_controls_cross_host_sharing() {
+        let servers = [
+            Server::builder("news-a.example", Port::try_new(119).unwrap())
+                .availability_namespace("shared-feed")
+                .username("reader")
+                .password("first-secret")
+                .build()
+                .unwrap(),
+            Server::builder("news-b.example", Port::try_new(563).unwrap())
+                .availability_namespace("shared-feed")
+                .username("reader")
+                .password("second-secret")
+                .build()
+                .unwrap(),
+            Server::builder("news-b.example", Port::try_new(119).unwrap())
+                .availability_namespace("different-feed")
+                .username("reader")
+                .password("second-secret")
+                .build()
+                .unwrap(),
+        ];
+        let layout = AvailabilityLayout::from_servers(&servers).unwrap();
+
+        assert_eq!(
+            layout.slot_for_backend(BackendId::from_index(0)),
+            layout.slot_for_backend(BackendId::from_index(1))
+        );
+        assert_ne!(
+            layout.slot_for_backend(BackendId::from_index(1)),
+            layout.slot_for_backend(BackendId::from_index(2))
+        );
+        assert_eq!(layout.identity_count(), 2);
+    }
+
+    #[test]
     fn hybrid_registry_appends_without_reusing_slots() {
         let directory = tempfile::tempdir().unwrap();
         let first = [Server::builder("news.example", Port::try_new(119).unwrap())
@@ -375,6 +410,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let servers = [Server::builder("news.example", Port::try_new(119).unwrap())
             .username("reader")
+            .password("secret")
             .build()
             .unwrap()];
         let initial = AvailabilityLayout::from_hybrid_registry(&servers, directory.path()).unwrap();
