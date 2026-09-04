@@ -106,7 +106,7 @@ pub(crate) struct StatefulHandoff {
 }
 
 impl StatefulHandoff {
-    fn new(request: RequestContext) -> Self {
+    pub(crate) fn new(request: RequestContext) -> Self {
         Self { request }
     }
 
@@ -288,6 +288,10 @@ impl CommandHandler {
     #[expect(
         clippy::result_large_err,
         reason = "the non-handoff path retains the parsed request without allocating"
+    )]
+    #[expect(
+        dead_code,
+        reason = "the consuming handoff helper is retained for focused hybrid tests"
     )]
     pub(crate) fn prepare_stateful_handoff(
         request: RequestContext,

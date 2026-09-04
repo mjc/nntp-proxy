@@ -46,6 +46,59 @@ enum SingleCommandResult {
     Quit,
 }
 
+/// A classified command plan whose request-borrowing evidence has been reduced
+/// to the execution data needed after the request is mutably borrowed.
+///
+/// Authentication arguments are copied because `CommandPlan` borrows them from
+/// the request. The classification itself still happens exactly once.
+enum ExecutableCommandPlan {
+    InterceptAuth(OwnedAuthAction),
+    Reject(crate::command::RejectResponse),
+    Forward,
+    RequireAuth,
+    SwitchToStateful,
+    InterceptCapabilities,
+}
+
+enum OwnedAuthAction {
+    RequestPassword(String),
+    ValidateAndRespond { password: String },
+    UnknownSubcommand,
+}
+
+impl From<CommandPlan<'_>> for ExecutableCommandPlan {
+    fn from(plan: CommandPlan<'_>) -> Self {
+        match plan {
+            CommandPlan::InterceptAuth(AuthAction::RequestPassword(username)) => {
+                Self::InterceptAuth(OwnedAuthAction::RequestPassword(username.to_owned()))
+            }
+            CommandPlan::InterceptAuth(AuthAction::ValidateAndRespond { password }) => {
+                Self::InterceptAuth(OwnedAuthAction::ValidateAndRespond {
+                    password: password.to_owned(),
+                })
+            }
+            CommandPlan::InterceptAuth(AuthAction::UnknownSubcommand) => {
+                Self::InterceptAuth(OwnedAuthAction::UnknownSubcommand)
+            }
+            CommandPlan::Reject(response) => Self::Reject(response),
+            CommandPlan::Forward => Self::Forward,
+            CommandPlan::RequireAuth => Self::RequireAuth,
+            CommandPlan::SwitchToStateful(_) => Self::SwitchToStateful,
+            CommandPlan::InterceptCapabilities => Self::InterceptCapabilities,
+        }
+    }
+}
+
+impl OwnedAuthAction {
+    fn as_borrowed(&self) -> AuthAction<'_> {
+        match self {
+            Self::RequestPassword(username) => AuthAction::RequestPassword(username),
+            Self::ValidateAndRespond { password } => AuthAction::ValidateAndRespond { password },
+            Self::UnknownSubcommand => AuthAction::UnknownSubcommand,
+        }
+    }
+}
+
 #[expect(
     clippy::large_enum_variant,
     reason = "the owned stateful handoff avoids a heap allocation on this rare transition"
@@ -126,87 +179,6 @@ fn record_local_response(request: &mut RequestContext, status: u16, response: &[
 }
 
 impl ClientSession {
-    /// Execute a command routing decision
-    ///
-    /// Handles all routing decision types: auth, forwarding, rejection, etc.
-    async fn execute_command_decision(
-        &self,
-        params: CommandExecutionParams<'_>,
-    ) -> Result<CommandResult> {
-        let request = params.request;
-        let auth_access = params.auth_access;
-        let CommandExecutionParams {
-            router,
-            client_writer,
-            backend_connection,
-            auth_username,
-            client_to_backend_bytes,
-            backend_to_client_bytes,
-            ..
-        } = params;
-
-        let plan =
-            CommandHandler::classify_request(request, auth_access, self.mode_state.routing_mode());
-
-        match plan {
-            CommandPlan::InterceptAuth(auth_action) => {
-                let result = self
-                    .handle_intercept_auth(auth_action, client_writer, auth_username)
-                    .await?;
-                if matches!(result, common::AuthResult::Authenticated { .. }) {
-                    common::on_authentication_success(
-                        self.client_id(),
-                        self.client_addr,
-                        auth_username.username().map(str::to_owned),
-                        self.mode_state.routing_mode(),
-                        self.connection_stats(),
-                        |username| self.set_username(username),
-                    );
-                }
-                request.record_local_response(result.response_metadata());
-                *backend_to_client_bytes =
-                    backend_to_client_bytes.add_u64(result.bytes_written().as_u64());
-                Ok(CommandResult::Continue)
-            }
-            CommandPlan::Forward => {
-                self.handle_forward_decision(
-                    request,
-                    router,
-                    client_writer,
-                    backend_connection,
-                    client_to_backend_bytes,
-                    backend_to_client_bytes,
-                )
-                .await
-            }
-            CommandPlan::RequireAuth => {
-                self.handle_require_auth(request, client_writer, backend_to_client_bytes)
-                    .await
-            }
-            CommandPlan::SwitchToStateful(_) => {
-                anyhow::bail!("stateful command reached per-command execution after classification")
-            }
-            CommandPlan::Reject(response) => {
-                self.handle_rejected_request(
-                    request,
-                    response,
-                    client_writer,
-                    backend_to_client_bytes,
-                )
-                .await
-            }
-            CommandPlan::InterceptCapabilities => {
-                self.handle_capabilities_request(
-                    request,
-                    auth_access,
-                    client_writer,
-                    backend_to_client_bytes,
-                )
-                .await
-            }
-        }
-    }
-
     async fn handle_intercept_auth(
         &self,
         auth_action: AuthAction<'_>,
@@ -319,6 +291,42 @@ impl ClientSession {
             client_to_backend_bytes,
             backend_to_client_bytes,
         } = params;
+        let plan = ExecutableCommandPlan::from(CommandHandler::classify_request(
+            request,
+            auth_access,
+            self.mode_state.routing_mode(),
+        ));
+        self.process_single_command_with_plan(
+            CommandExecutionParams {
+                request,
+                auth_access,
+                router,
+                client_writer,
+                backend_connection,
+                auth_username,
+                client_to_backend_bytes,
+                backend_to_client_bytes,
+            },
+            plan,
+        )
+        .await
+    }
+
+    async fn process_single_command_with_plan(
+        &self,
+        params: CommandExecutionParams<'_>,
+        plan: ExecutableCommandPlan,
+    ) -> Result<SingleCommandResult> {
+        let CommandExecutionParams {
+            request,
+            auth_access,
+            router,
+            client_writer,
+            backend_connection,
+            auth_username,
+            client_to_backend_bytes,
+            backend_to_client_bytes,
+        } = params;
 
         // Handle QUIT locally
         let quit_status = {
@@ -335,21 +343,57 @@ impl ClientSession {
             return Ok(SingleCommandResult::Quit);
         }
 
-        // Execute command decision.
-        match self
-            .execute_command_decision(CommandExecutionParams {
-                request,
-                auth_access,
-                router,
-                client_writer,
-                backend_connection,
-                auth_username,
-                client_to_backend_bytes,
-                backend_to_client_bytes,
-            })
-            .await?
-        {
-            CommandResult::Continue => Ok(SingleCommandResult::Continue),
+        match plan {
+            ExecutableCommandPlan::InterceptAuth(auth_action) => {
+                let result = self
+                    .handle_intercept_auth(auth_action.as_borrowed(), client_writer, auth_username)
+                    .await?;
+                if matches!(result, common::AuthResult::Authenticated { .. }) {
+                    common::on_authentication_success(
+                        self.client_id(),
+                        self.client_addr,
+                        auth_username.username().map(str::to_owned),
+                        self.mode_state.routing_mode(),
+                        self.connection_stats(),
+                        |username| self.set_username(username),
+                    );
+                }
+                request.record_local_response(result.response_metadata());
+                *backend_to_client_bytes =
+                    backend_to_client_bytes.add_u64(result.bytes_written().as_u64());
+                Ok(SingleCommandResult::Continue)
+            }
+            ExecutableCommandPlan::Forward => self
+                .handle_forward_decision(
+                    request,
+                    router,
+                    client_writer,
+                    backend_connection,
+                    client_to_backend_bytes,
+                    backend_to_client_bytes,
+                )
+                .await
+                .map(|CommandResult::Continue| SingleCommandResult::Continue),
+            ExecutableCommandPlan::RequireAuth => self
+                .handle_require_auth(request, client_writer, backend_to_client_bytes)
+                .await
+                .map(|CommandResult::Continue| SingleCommandResult::Continue),
+            ExecutableCommandPlan::SwitchToStateful => {
+                anyhow::bail!("stateful command reached per-command execution after classification")
+            }
+            ExecutableCommandPlan::Reject(response) => self
+                .handle_rejected_request(request, response, client_writer, backend_to_client_bytes)
+                .await
+                .map(|CommandResult::Continue| SingleCommandResult::Continue),
+            ExecutableCommandPlan::InterceptCapabilities => self
+                .handle_capabilities_request(
+                    request,
+                    auth_access,
+                    client_writer,
+                    backend_to_client_bytes,
+                )
+                .await
+                .map(|CommandResult::Continue| SingleCommandResult::Continue),
         }
     }
 
@@ -651,26 +695,31 @@ impl ClientSession {
             .add(trailing_context.request_wire_len().get());
         state.auth_access = self.authentication_access(state.auth_access);
 
-        let trailing_context = match CommandHandler::prepare_stateful_handoff(
-            trailing_context,
+        let trailing_plan = ExecutableCommandPlan::from(CommandHandler::classify_request(
+            &trailing_context,
             state.auth_access,
             self.mode_state.routing_mode(),
-        ) {
-            Ok(handoff) => return Ok(BatchLoopAction::SwitchToStateful(handoff)),
-            Err(context) => context,
-        };
+        ));
+        if matches!(trailing_plan, ExecutableCommandPlan::SwitchToStateful) {
+            return Ok(BatchLoopAction::SwitchToStateful(
+                crate::command::StatefulHandoff::new(trailing_context),
+            ));
+        }
         let mut trailing_context = trailing_context;
         match self
-            .process_single_command(CommandExecutionParams {
-                request: &mut trailing_context,
-                auth_access: state.auth_access,
-                router,
-                client_writer,
-                backend_connection: backend_connection.slot(),
-                auth_username: &mut state.auth_username,
-                client_to_backend_bytes: state.client_to_backend_bytes,
-                backend_to_client_bytes: &mut state.backend_to_client_bytes,
-            })
+            .process_single_command_with_plan(
+                CommandExecutionParams {
+                    request: &mut trailing_context,
+                    auth_access: state.auth_access,
+                    router,
+                    client_writer,
+                    backend_connection: backend_connection.slot(),
+                    auth_username: &mut state.auth_username,
+                    client_to_backend_bytes: state.client_to_backend_bytes,
+                    backend_to_client_bytes: &mut state.backend_to_client_bytes,
+                },
+                trailing_plan,
+            )
             .await?
         {
             SingleCommandResult::Continue => Ok(BatchLoopAction::Continue),
