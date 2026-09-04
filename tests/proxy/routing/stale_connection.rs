@@ -8,7 +8,8 @@
 //! This prevents the "overnight 430" bug where all articles fail after idle periods.
 
 use crate::test_helpers::{
-    create_test_server_config, spawn_test_proxy_on_random_port, wait_for_server,
+    create_test_server_config, create_test_server_config_with_availability_namespace,
+    spawn_test_proxy_on_random_port, wait_for_server,
 };
 use anyhow::Result;
 use nntp_proxy::config::BackendSelectionStrategy;
@@ -536,8 +537,18 @@ async fn test_availability_survives_pool_clearing() -> Result<()> {
     // Create proxy with both backends - MUST enable cache for availability tracking!
     let config = Config {
         servers: vec![
-            create_test_server_config("127.0.0.1", port0, "Backend0-430"),
-            create_test_server_config("127.0.0.1", port1, "Backend1-Has"),
+            create_test_server_config_with_availability_namespace(
+                "127.0.0.1",
+                port0,
+                "Backend0-430",
+                "pool-clear-backend-0",
+            ),
+            create_test_server_config_with_availability_namespace(
+                "127.0.0.1",
+                port1,
+                "Backend1-Has",
+                "pool-clear-backend-1",
+            ),
         ],
         cache: Some(Cache {
             adaptive_precheck: false, // Don't precheck, let the request go through normally

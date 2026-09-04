@@ -912,6 +912,25 @@ pub fn create_test_server_config(host: &str, port: u16, name: &str) -> Server {
         .expect("Valid server config")
 }
 
+/// Create a basic server configuration with an explicit availability namespace.
+///
+/// Test backends that share a loopback address but represent different feeds
+/// must not share authoritative article-availability facts.
+#[must_use]
+pub fn create_test_server_config_with_availability_namespace(
+    host: &str,
+    port: u16,
+    name: &str,
+    availability_namespace: &str,
+) -> Server {
+    Server::builder(host, Port::try_new(port).unwrap())
+        .name(name)
+        .availability_namespace(availability_namespace)
+        .max_connections(MaxConnections::try_new(5).unwrap())
+        .build()
+        .expect("Valid server config")
+}
+
 /// Create a server configuration with authentication.
 ///
 /// # Panics
