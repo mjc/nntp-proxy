@@ -12,7 +12,8 @@ pub struct SecretPassword(Vec<u8>);
 
 impl SecretPassword {
     fn new(password: Password) -> Self {
-        Self(password.as_str().as_bytes().to_vec())
+        let password: &str = password.as_ref();
+        Self(password.as_bytes().to_vec())
     }
 
     fn matches(&self, candidate: &[u8]) -> bool {

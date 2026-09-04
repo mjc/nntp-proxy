@@ -88,25 +88,23 @@ pub struct ServerName(String);
 )]
 pub struct Username(String);
 
-/// Validated password (non-empty, non-whitespace)
+/// Validated password (non-empty, non-whitespace).
+///
+/// Leading and trailing whitespace is trimmed to preserve the existing config
+/// and authentication behavior. Debug output is redacted; callers must use
+/// `as_str()` when the cleartext value is intentionally required.
 #[nutype(
     sanitize(trim),
     validate(not_empty),
-    derive(
-        Debug,
-        Clone,
-        PartialEq,
-        Eq,
-        Hash,
-        Display,
-        AsRef,
-        Deref,
-        TryFrom,
-        Serialize,
-        Deserialize
-    )
+    derive(Clone, PartialEq, Eq, Hash, AsRef, TryFrom, Serialize, Deserialize)
 )]
 pub struct Password(String);
+
+impl fmt::Debug for Password {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("[redacted]")
+    }
+}
 
 // Convert nutype errors to our ValidationError
 impl From<HostNameError> for ValidationError {
@@ -313,6 +311,16 @@ mod tests {
         assert!(Password::try_new("   pass   ".to_string()).is_ok());
         assert!(Password::try_new("P@ssw0rd!".to_string()).is_ok());
         assert!(Password::try_new("密码123".to_string()).is_ok());
+    }
+
+    #[test]
+    fn password_debug_output_is_redacted() {
+        let password = Password::try_new("secret".to_owned()).unwrap();
+        let debug = format!("{password:?}");
+
+        assert_eq!(debug, "[redacted]");
+        let cleartext: &str = password.as_ref();
+        assert_eq!(cleartext, "secret");
     }
 
     #[test]
