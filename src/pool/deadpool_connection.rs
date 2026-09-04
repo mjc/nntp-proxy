@@ -8,7 +8,7 @@ use hickory_resolver::TokioResolver;
 use hickory_resolver::proto::rr::RecordType;
 use smallvec::SmallVec;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -224,6 +224,11 @@ impl TcpManager {
     }
 
     async fn lookup_socket_addrs(&self) -> Result<SmallVec<[SocketAddr; 4]>, ConnectionError> {
+        if let Ok(ip_addr) = self.host.parse::<IpAddr>() {
+            let mut addrs = SmallVec::new();
+            addrs.push(SocketAddr::new(ip_addr, self.port));
+            return Ok(addrs);
+        }
         let resolver = dns_resolver()?;
         let lookup = resolver
             .lookup_ip(self.host.as_str())

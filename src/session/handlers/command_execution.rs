@@ -1870,9 +1870,15 @@ mod tests {
         )
     }
 
-    async fn unused_local_port() -> u16 {
+    async fn spawn_connection_failure_server() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        listener.local_addr().unwrap().port()
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        port
     }
 
     fn router_with_backend(provider: DeadpoolConnectionProvider) -> Arc<BackendSelector> {
@@ -2553,7 +2559,7 @@ mod tests {
     #[tokio::test]
     async fn connection_failure_suppresses_backend_for_current_request() {
         let session = test_session();
-        let port = unused_local_port().await;
+        let port = spawn_connection_failure_server().await;
         let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
             .max_connections(1)
             .build()
