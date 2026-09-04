@@ -391,7 +391,7 @@ async fn test_retry_on_immediate_connection_failure() -> Result<()> {
 /// The cache correctly maintains 430 state until TTL expiry.
 #[tokio::test]
 async fn test_430_cache_is_authoritative() -> Result<()> {
-    use nntp_proxy::cache::{UnifiedCache, ttl};
+    use nntp_proxy::cache::{AvailabilitySlot, UnifiedCache, ttl};
     use nntp_proxy::protocol::StatusCode;
     use nntp_proxy::router::BackendCount;
     use nntp_proxy::types::{BackendId, MessageId};
@@ -401,10 +401,10 @@ async fn test_430_cache_is_authoritative() -> Result<()> {
 
     // Record backends as 430 using the public API
     cache
-        .record_backend_missing(msg_id.clone(), BackendId::from_index(0))
+        .record_availability_missing(msg_id.clone(), AvailabilitySlot::new(0).unwrap())
         .await;
     cache
-        .record_backend_missing(msg_id.clone(), BackendId::from_index(1))
+        .record_availability_missing(msg_id.clone(), AvailabilitySlot::new(1).unwrap())
         .await;
 
     // Verify all exhausted

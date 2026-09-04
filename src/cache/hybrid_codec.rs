@@ -544,7 +544,9 @@ impl DiskCachedArticle {
 
     #[cfg(test)]
     pub(crate) fn record_backend_missing(&mut self, backend_id: BackendId) {
-        self.availability.record_missing(backend_id);
+        self.availability.record_missing_slot(
+            AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
+        );
     }
 
     #[must_use]

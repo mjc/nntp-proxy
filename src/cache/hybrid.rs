@@ -150,6 +150,15 @@ impl std::fmt::Debug for HybridArticleCache {
 }
 
 impl HybridArticleCache {
+    #[cfg(test)]
+    pub async fn record_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
+        self.record_availability_missing(
+            message_id,
+            AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
+        )
+        .await;
+    }
+
     pub(crate) fn availability_slot(&self, backend: BackendId) -> AvailabilitySlot {
         self.layout.slot_for_backend(backend)
     }
@@ -473,15 +482,7 @@ impl HybridArticleCache {
         debug!(msg_id = %key, stored_bytes = entry_len.get(), tier = tier.get(), "Hybrid cache upsert");
     }
 
-    /// Record that a backend doesn't have an article (430 response)
-    pub async fn record_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
-        self.record_availability_missing(
-            message_id,
-            AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
-        )
-        .await;
-    }
-
+    /// Record that an article namespace returned an authoritative 430.
     pub(crate) async fn record_availability_missing(
         &self,
         message_id: MessageId<'_>,

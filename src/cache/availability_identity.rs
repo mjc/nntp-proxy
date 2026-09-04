@@ -12,11 +12,18 @@ use twox_hash::XxHash64;
 const REGISTRY_MAGIC: &[u8; 8] = b"ANEGREG1";
 const MAX_REGISTRY_FIELD_BYTES: usize = 1024 * 1024;
 
+/// Account scope used when sharing authoritative article facts.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
+pub(crate) enum AccountIdentity {
+    Anonymous,
+    Username(String),
+}
+
 /// A backend namespace whose authoritative article facts may be shared.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct AvailabilityIdentity {
     pub(crate) host: String,
-    pub(crate) username: Option<String>,
+    pub(crate) account: AccountIdentity,
 }
 
 impl AvailabilityIdentity {
@@ -24,18 +31,21 @@ impl AvailabilityIdentity {
     pub(crate) fn from_server(server: &Server) -> Self {
         Self {
             host: server.host.to_string(),
-            username: server.username.clone(),
+            account: server
+                .username
+                .clone()
+                .map_or(AccountIdentity::Anonymous, AccountIdentity::Username),
         }
     }
 }
 
 /// Bit position used by article availability state.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct AvailabilitySlot(usize);
+pub struct AvailabilitySlot(usize);
 
 impl AvailabilitySlot {
     #[must_use]
-    pub(crate) const fn new(index: usize) -> Option<Self> {
+    pub const fn new(index: usize) -> Option<Self> {
         if index < usize::BITS as usize {
             Some(Self(index))
         } else {
@@ -46,6 +56,26 @@ impl AvailabilitySlot {
     #[must_use]
     pub(crate) const fn bit(self) -> usize {
         1usize << self.0
+    }
+}
+
+/// Set of configured availability slots used for exhaustion decisions.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub(crate) struct AvailabilityMask(usize);
+
+impl AvailabilityMask {
+    #[must_use]
+    pub(crate) const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub(crate) fn insert(&mut self, slot: AvailabilitySlot) {
+        self.0 |= slot.bit();
+    }
+
+    #[must_use]
+    pub(crate) const fn bits(self) -> usize {
+        self.0
     }
 }
 
@@ -60,7 +90,7 @@ impl fmt::Display for AvailabilitySlot {
 pub(crate) struct AvailabilityLayout {
     backend_slots: Box<[AvailabilitySlot]>,
     identities: Box<[AvailabilityIdentity]>,
-    mask: usize,
+    mask: AvailabilityMask,
     epoch: u64,
 }
 
@@ -70,16 +100,16 @@ impl AvailabilityLayout {
         let identities = (0..count)
             .map(|index| AvailabilityIdentity {
                 host: format!("backend-{index}"),
-                username: None,
+                account: AccountIdentity::Anonymous,
             })
             .collect::<Vec<_>>();
         let backend_slots = (0..count)
             .map(|index| AvailabilitySlot::new(index).expect("synthetic count fits bitmap"))
             .collect::<Vec<_>>();
-        let mask = backend_slots
-            .iter()
-            .map(|slot| slot.bit())
-            .fold(0, |mask, bit| mask | bit);
+        let mut mask = AvailabilityMask::empty();
+        for slot in &backend_slots {
+            mask.insert(*slot);
+        }
         Self {
             backend_slots: backend_slots.into_boxed_slice(),
             identities: identities.into_boxed_slice(),
@@ -110,11 +140,10 @@ impl AvailabilityLayout {
             );
         }
 
-        let mask = identities
-            .iter()
-            .enumerate()
-            .map(|(index, _)| AvailabilitySlot::new(index).expect("validated slot").bit())
-            .fold(0, |mask, bit| mask | bit);
+        let mut mask = AvailabilityMask::empty();
+        for index in 0..identities.len() {
+            mask.insert(AvailabilitySlot::new(index).expect("validated slot"));
+        }
 
         Ok(Self {
             backend_slots: backend_slots.into_boxed_slice(),
@@ -158,7 +187,7 @@ impl AvailabilityLayout {
         }
 
         let mut backend_slots = Vec::with_capacity(servers.len());
-        let mut configured_mask = 0;
+        let mut configured_mask = AvailabilityMask::empty();
         for server in servers {
             let identity = AvailabilityIdentity::from_server(server);
             let index = identities
@@ -167,7 +196,7 @@ impl AvailabilityLayout {
                 .expect("configured identity is in registry");
             let slot =
                 AvailabilitySlot::new(index).ok_or(AvailabilityLayoutError::TooManyIdentities)?;
-            configured_mask |= slot.bit();
+            configured_mask.insert(slot);
             backend_slots.push(slot);
         }
         Ok(Self {
@@ -212,11 +241,12 @@ impl AvailabilityLayout {
         for identity in &identities {
             hasher.write(identity.host.as_bytes());
             hasher.write_u8(0);
-            if let Some(username) = &identity.username {
-                hasher.write_u8(1);
-                hasher.write(username.as_bytes());
-            } else {
-                hasher.write_u8(0);
+            match &identity.account {
+                AccountIdentity::Anonymous => hasher.write_u8(0),
+                AccountIdentity::Username(username) => {
+                    hasher.write_u8(1);
+                    hasher.write(username.as_bytes());
+                }
             }
             hasher.write_u8(0xff);
         }
@@ -252,7 +282,7 @@ impl Ord for AvailabilityIdentity {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.host
             .cmp(&other.host)
-            .then_with(|| self.username.cmp(&other.username))
+            .then_with(|| self.account.cmp(&other.account))
     }
 }
 
@@ -284,12 +314,13 @@ fn parse_registry(data: &[u8]) -> Result<(Vec<AvailabilityIdentity>, u64)> {
             .get(cursor)
             .ok_or_else(|| anyhow::anyhow!("truncated hybrid account marker"))?;
         cursor += 1;
-        let username = match marker {
+        let account = match marker {
             0 => None,
             1 => Some(read_string(data, &mut cursor, "username")?),
             _ => anyhow::bail!("invalid hybrid account marker"),
         };
-        let identity = AvailabilityIdentity { host, username };
+        let account = account.map_or(AccountIdentity::Anonymous, AccountIdentity::Username);
+        let identity = AvailabilityIdentity { host, account };
         if identities.contains(&identity) {
             anyhow::bail!("duplicate hybrid availability identity");
         }
@@ -308,12 +339,12 @@ fn publish_registry(path: &Path, epoch: u64, identities: &[AvailabilityIdentity]
     data.extend_from_slice(&(identities.len() as u64).to_le_bytes());
     for identity in identities {
         write_string(&mut data, &identity.host)?;
-        match &identity.username {
-            Some(username) => {
+        match &identity.account {
+            AccountIdentity::Username(username) => {
                 data.push(1);
                 write_string(&mut data, username)?;
             }
-            None => data.push(0),
+            AccountIdentity::Anonymous => data.push(0),
         }
     }
     let temporary = path.with_extension("registry.tmp");

@@ -28,8 +28,9 @@ mod mock_hybrid;
 
 pub use article::{ArticleCache, CachedArticle};
 pub use availability::{ArticleAvailability, BackendStatus, MAX_BACKENDS};
+pub use availability_identity::AvailabilitySlot;
 pub(crate) use availability_identity::{
-    AvailabilityIdentity, AvailabilityLayout, AvailabilitySlot,
+    AccountIdentity, AvailabilityIdentity, AvailabilityLayout, AvailabilityMask,
 };
 pub use availability_index::AvailabilityIndex;
 pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
@@ -385,6 +386,12 @@ pub enum UnifiedCache {
 }
 
 impl UnifiedCache {
+    #[cfg(test)]
+    pub async fn record_backend_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
+        let slot = AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap");
+        self.record_availability_missing(message_id, slot).await;
+    }
+
     /// Create an availability-only negative index.
     #[must_use]
     pub fn availability(ttl: std::time::Duration) -> Self {
@@ -515,17 +522,8 @@ impl UnifiedCache {
         }
     }
 
-    /// Record that a backend returned 430 for this article
-    pub async fn record_backend_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
-        let slot = match self {
-            Self::Availability(index) => index.availability_slot(backend_id),
-            Self::Memory(cache) => cache.availability_slot(backend_id),
-            Self::Hybrid(cache) => cache.availability_slot(backend_id),
-        };
-        self.record_availability_missing(message_id, slot).await;
-    }
-
-    pub(crate) async fn record_availability_missing(
+    /// Record that an article namespace returned an authoritative 430.
+    pub async fn record_availability_missing(
         &self,
         message_id: MessageId<'_>,
         slot: AvailabilitySlot,

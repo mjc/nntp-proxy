@@ -8,7 +8,7 @@
 //! Run with: cargo bench --bench `cache_lookup`
 
 use divan::{Bencher, black_box};
-use nntp_proxy::cache::{ArticleAvailability, UnifiedCache};
+use nntp_proxy::cache::{ArticleAvailability, AvailabilitySlot, UnifiedCache};
 use nntp_proxy::router::BackendCount;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::sync::Arc;
@@ -23,14 +23,16 @@ fn main() {
 // =============================================================================
 
 mod availability {
-    use super::{ArticleAvailability, BackendCount, BackendId, Bencher, black_box};
+    use super::{
+        ArticleAvailability, AvailabilitySlot, BackendCount, BackendId, Bencher, black_box,
+    };
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
     fn record_missing(bencher: Bencher) {
         bencher.bench(|| {
             let mut avail = ArticleAvailability::new();
             for i in 0..8u8 {
-                avail.record_missing(BackendId::from_index(i as usize));
+                avail.record_missing_slot(AvailabilitySlot::new(i as usize).unwrap());
             }
             black_box(avail)
         });
@@ -42,7 +44,8 @@ mod availability {
         bencher.bench(|| {
             let mut result = true;
             for i in 0..8u8 {
-                result &= !black_box(&avail).is_missing(BackendId::from_index(i as usize));
+                result &=
+                    !black_box(&avail).is_missing_slot(AvailabilitySlot::new(i as usize).unwrap());
             }
             black_box(result)
         });
@@ -53,12 +56,13 @@ mod availability {
         let mut avail = ArticleAvailability::new();
         // Mark backends 0-3 as missing (half exhausted)
         for i in 0..4u8 {
-            avail.record_missing(BackendId::from_index(i as usize));
+            avail.record_missing_slot(AvailabilitySlot::new(i as usize).unwrap());
         }
         bencher.bench(|| {
             let mut result = true;
             for i in 0..8u8 {
-                result &= !black_box(&avail).is_missing(BackendId::from_index(i as usize));
+                result &=
+                    !black_box(&avail).is_missing_slot(AvailabilitySlot::new(i as usize).unwrap());
             }
             black_box(result)
         });
@@ -91,7 +95,9 @@ mod availability {
 // =============================================================================
 
 mod unified_cache {
-    use super::{Arc, BackendId, Bencher, Duration, MessageId, UnifiedCache, black_box};
+    use super::{
+        Arc, AvailabilitySlot, BackendId, Bencher, Duration, MessageId, UnifiedCache, black_box,
+    };
 
     fn make_cache() -> Arc<UnifiedCache> {
         Arc::new(UnifiedCache::memory(
@@ -168,7 +174,10 @@ mod unified_cache {
             rt.block_on(async {
                 let msg_id = MessageId::from_borrowed("<missing@test.com>").unwrap();
                 cache
-                    .record_backend_missing(msg_id.to_owned(), BackendId::from_index(0))
+                    .record_availability_missing(
+                        msg_id.to_owned(),
+                        AvailabilitySlot::new(0).unwrap(),
+                    )
                     .await;
             });
         });
@@ -176,7 +185,7 @@ mod unified_cache {
 }
 
 mod availability_cache {
-    use super::{Arc, BackendId, Bencher, MessageId, UnifiedCache, black_box};
+    use super::{Arc, AvailabilitySlot, Bencher, MessageId, UnifiedCache, black_box};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     fn make_cache() -> Arc<UnifiedCache> {
@@ -202,7 +211,7 @@ mod availability_cache {
         let msg_id = MessageId::from_borrowed("<hit@example.com>").unwrap();
         rt.block_on(async {
             cache
-                .record_backend_missing(msg_id.clone(), BackendId::from_index(0))
+                .record_availability_missing(msg_id.clone(), AvailabilitySlot::new(0).unwrap())
                 .await;
         });
 
@@ -220,7 +229,7 @@ mod availability_cache {
             let msg_id = MessageId::new(format!("<bench-{id}@example.com>")).unwrap();
             rt.block_on(async {
                 cache
-                    .record_backend_missing(msg_id, BackendId::from_index(0))
+                    .record_availability_missing(msg_id, AvailabilitySlot::new(0).unwrap())
                     .await;
                 black_box(());
             });

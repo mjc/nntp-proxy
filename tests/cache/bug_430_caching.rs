@@ -10,7 +10,7 @@
 //! FIX: `record_backend_missing` now creates cache entries for 430 responses,
 //! preventing repeated queries to backends that don't have the article.
 
-use nntp_proxy::cache::ArticleCache;
+use nntp_proxy::cache::{ArticleCache, AvailabilitySlot};
 use nntp_proxy::metrics::MetricsCollector;
 use nntp_proxy::router::BackendCount;
 use nntp_proxy::types::{BackendId, MessageId};
@@ -28,7 +28,7 @@ async fn test_430_response_creates_cache_entry() {
 
     // Backend 0 returns 430
     cache
-        .record_backend_missing(msgid.clone(), BackendId::from_index(0))
+        .record_availability_missing(msgid.clone(), AvailabilitySlot::new(0).unwrap())
         .await;
 
     // MUST create cache entry
@@ -53,12 +53,12 @@ async fn test_multiple_430s_update_same_entry() {
 
     // Backend 0 returns 430
     cache
-        .record_backend_missing(msgid.clone(), BackendId::from_index(0))
+        .record_availability_missing(msgid.clone(), AvailabilitySlot::new(0).unwrap())
         .await;
 
     // Backend 1 returns 430
     cache
-        .record_backend_missing(msgid.clone(), BackendId::from_index(1))
+        .record_availability_missing(msgid.clone(), AvailabilitySlot::new(1).unwrap())
         .await;
 
     let entry = cache.get(&msgid).await.unwrap();
@@ -126,7 +126,7 @@ async fn test_cache_grows_with_430_responses() {
         let msgid = MessageId::from_borrowed(&msg_id_str).unwrap();
 
         cache
-            .record_backend_missing(msgid, BackendId::from_index(0))
+            .record_availability_missing(msgid, AvailabilitySlot::new(0).unwrap())
             .await;
         msg_ids.push(msg_id_str);
     }
@@ -164,7 +164,10 @@ async fn test_regression_bug_symptoms_fixed() {
         for backend_idx in 0..2 {
             let backend_id = BackendId::from_index(backend_idx);
             cache
-                .record_backend_missing(msgid.clone(), backend_id)
+                .record_availability_missing(
+                    msgid.clone(),
+                    AvailabilitySlot::new(backend_id.as_index()).unwrap(),
+                )
                 .await;
             metrics.record_error_4xx(backend_id);
         }

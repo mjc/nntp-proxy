@@ -354,6 +354,13 @@ pub struct CachedArticle {
 }
 
 impl CachedArticle {
+    #[cfg(test)]
+    pub fn record_backend_missing(&mut self, backend_id: BackendId) {
+        self.record_availability_missing(
+            AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
+        );
+    }
+
     /// Create an availability-only cache entry without payload bytes.
     #[must_use]
     pub(crate) fn availability_only(status_code: StatusCode, tier: ttl::CacheTier) -> Self {
@@ -505,12 +512,13 @@ impl CachedArticle {
         self.backend_availability.should_try(backend_id)
     }
 
-    /// Record that a backend returned 430 (doesn't have this article)
-    pub fn record_backend_missing(&mut self, backend_id: BackendId) {
-        self.backend_availability.record_missing(backend_id);
+    #[cfg(test)]
+    pub fn should_try_slot(&self, slot: AvailabilitySlot) -> bool {
+        self.backend_availability.should_try_slot(slot)
     }
 
-    pub(crate) fn record_availability_missing(&mut self, slot: AvailabilitySlot) {
+    /// Record that a backend returned 430 (doesn't have this article)
+    pub fn record_availability_missing(&mut self, slot: AvailabilitySlot) {
         self.backend_availability.record_missing_slot(slot);
     }
 
@@ -728,6 +736,12 @@ pub struct ArticleCache {
 }
 
 impl ArticleCache {
+    #[cfg(test)]
+    pub async fn record_backend_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
+        let slot = AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap");
+        self.record_availability_missing(message_id, slot).await;
+    }
+
     /// Create a new article cache
     ///
     /// # Arguments
@@ -1053,15 +1067,7 @@ impl ArticleCache {
     /// Note: We don't store the actual backend 430 response because:
     /// 1. We always send a standardized 430 to clients, never the backend's response
     /// 2. The only info we need is the availability bitset (which backends returned 430)
-    pub async fn record_backend_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
-        self.record_availability_missing(
-            message_id,
-            AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
-        )
-        .await;
-    }
-
-    pub(crate) async fn record_availability_missing(
+    pub async fn record_availability_missing(
         &self,
         message_id: MessageId<'_>,
         slot: AvailabilitySlot,

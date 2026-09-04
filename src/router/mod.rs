@@ -46,7 +46,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tracing::{debug, info};
 
-use crate::cache::{ArticleAvailability, AvailabilitySlot};
+use crate::cache::{ArticleAvailability, AvailabilityMask, AvailabilitySlot};
 use crate::config::{BackendSelectionStrategy, QueuePressureLimits};
 use crate::pool::DeadpoolConnectionProvider;
 use crate::types::{BackendId, ClientId, ServerName};
@@ -481,7 +481,7 @@ pub struct BackendSelector {
     /// Capacity-fair probe counter for the first availability-aware article attempt.
     initial_article_probe_counter: AtomicUsize,
     /// Bitmap of distinct configured article-availability identities.
-    availability_mask: usize,
+    availability_mask: AvailabilityMask,
     /// Enable/disable per-connection queue-pressure filtering.
     queue_backpressure_enabled: bool,
     /// Validated soft and hard thresholds for queued requests per connection.
@@ -579,7 +579,7 @@ impl BackendSelector {
             strategy: selection_strategy,
             sorted_tiers: smallvec::SmallVec::new(),
             initial_article_probe_counter: AtomicUsize::new(0),
-            availability_mask: 0,
+            availability_mask: AvailabilityMask::empty(),
             queue_backpressure_enabled: Self::DEFAULT_QUEUE_BACKPRESSURE_ENABLED,
             queue_backpressure_limits: QueuePressureLimits::default(),
             queue_backpressure_all_busy_sleep_ms:
@@ -668,7 +668,7 @@ impl BackendSelector {
             stateful_count: StatefulCount::new(),
             tier,
         });
-        self.availability_mask |= availability_slot.bit();
+        self.availability_mask.insert(availability_slot);
 
         // H4: Maintain sorted unique tiers (avoids Vec allocation in select_backend hot path)
         if !self.sorted_tiers.contains(&tier) {
@@ -820,7 +820,7 @@ impl BackendSelector {
     }
 
     #[inline]
-    pub(crate) const fn availability_mask(&self) -> usize {
+    pub(crate) const fn availability_mask(&self) -> AvailabilityMask {
         self.availability_mask
     }
 

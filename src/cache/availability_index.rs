@@ -6,10 +6,14 @@
 //! are pushed down by storing a keyed 64-bit fingerprint plus a keyed 16-bit
 //! confirmation tag per slot.
 
-use super::{AvailabilityIdentity, AvailabilityLayout, AvailabilitySlot, MAX_BACKENDS};
+use super::{
+    AccountIdentity, AvailabilityIdentity, AvailabilityLayout, AvailabilitySlot, MAX_BACKENDS,
+};
 use super::{CachedArticle, ttl};
 use crate::io_util::atomic_replace_file;
-use crate::types::{BackendId, MessageId};
+#[cfg(test)]
+use crate::types::BackendId;
+use crate::types::MessageId;
 use anyhow::{Context, Result};
 use std::fs;
 use std::hash::Hasher;
@@ -467,9 +471,12 @@ impl Default for AvailabilityIndex {
 }
 
 impl AvailabilityIndex {
-    pub(crate) fn availability_slot(&self, backend: BackendId) -> AvailabilitySlot {
-        self.layout.slot_for_backend(backend)
+    #[cfg(test)]
+    pub fn record_backend_missing(&self, message_id: &MessageId<'_>, backend_id: BackendId) {
+        let slot = AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap");
+        self.record_availability_missing(message_id, slot);
     }
+
     #[must_use]
     pub const fn fixed_capacity_bytes() -> u64 {
         FIXED_CAPACITY_BYTES
@@ -551,10 +558,6 @@ impl AvailabilityIndex {
     pub fn get_request_message_id(&self, message_id: &str) -> Option<CachedArticle> {
         let key = message_id.strip_prefix('<')?.strip_suffix('>')?;
         self.lookup_by_key(key)
-    }
-
-    pub fn record_backend_missing(&self, message_id: &MessageId<'_>, backend_id: BackendId) {
-        self.insert_missing_bits(message_id.without_brackets(), backend_id.availability_bit());
     }
 
     pub(crate) fn record_availability_missing(
@@ -887,8 +890,8 @@ fn write_identity(bytes: &mut Vec<u8>, identity: &AvailabilityIdentity) -> Resul
     let host_len = u32::try_from(host.len()).context("availability hostname too long")?;
     bytes.extend_from_slice(&host_len.to_le_bytes());
     bytes.extend_from_slice(host);
-    match &identity.username {
-        Some(username) => {
+    match &identity.account {
+        AccountIdentity::Username(username) => {
             bytes.push(1);
             let username = username.as_bytes();
             let username_len =
@@ -896,7 +899,7 @@ fn write_identity(bytes: &mut Vec<u8>, identity: &AvailabilityIdentity) -> Resul
             bytes.extend_from_slice(&username_len.to_le_bytes());
             bytes.extend_from_slice(username);
         }
-        None => bytes.push(0),
+        AccountIdentity::Anonymous => bytes.push(0),
     }
     Ok(())
 }
@@ -907,12 +910,15 @@ fn read_identity(data: &[u8], cursor: &mut usize) -> Result<AvailabilityIdentity
         .get(*cursor)
         .ok_or_else(|| anyhow::anyhow!("truncated availability account marker"))?;
     *cursor += 1;
-    let username = match has_username {
+    let account = match has_username {
         0 => None,
         1 => Some(read_string(data, cursor, "username")?),
         _ => anyhow::bail!("invalid availability account marker"),
     };
-    Ok(AvailabilityIdentity { host, username })
+    Ok(AvailabilityIdentity {
+        host,
+        account: account.map_or(AccountIdentity::Anonymous, AccountIdentity::Username),
+    })
 }
 
 fn read_string(data: &[u8], cursor: &mut usize, field: &str) -> Result<String> {

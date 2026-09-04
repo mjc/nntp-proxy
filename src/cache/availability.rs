@@ -15,7 +15,7 @@
 //! Availability uses `usize` bitmaps, so local retry checks remain compact while
 //! allowing the backend count to grow with the target word size.
 
-use super::AvailabilitySlot;
+use super::{AvailabilityMask, AvailabilitySlot};
 use crate::router::BackendCount;
 use crate::types::BackendId;
 
@@ -81,14 +81,7 @@ impl ArticleAvailability {
     /// Later positive observations do not clear the missing bit.
     ///
     #[inline]
-    pub fn record_missing(&mut self, backend_id: BackendId) -> &mut Self {
-        let mask = backend_id.availability_bit();
-        self.missing |= mask; // Mark as missing
-        self
-    }
-
-    #[inline]
-    pub(crate) fn record_missing_slot(&mut self, slot: AvailabilitySlot) -> &mut Self {
+    pub fn record_missing_slot(&mut self, slot: AvailabilitySlot) -> &mut Self {
         self.missing |= slot.bit();
         self
     }
@@ -97,13 +90,7 @@ impl ArticleAvailability {
     ///
     #[inline]
     #[must_use]
-    pub fn is_missing(&self, backend_id: BackendId) -> bool {
-        self.missing & backend_id.availability_bit() != 0
-    }
-
-    #[inline]
-    #[must_use]
-    pub(crate) fn is_missing_slot(&self, slot: AvailabilitySlot) -> bool {
+    pub fn is_missing_slot(&self, slot: AvailabilitySlot) -> bool {
         self.missing & slot.bit() != 0
     }
 
@@ -114,7 +101,9 @@ impl ArticleAvailability {
     #[inline]
     #[must_use]
     pub(crate) fn should_try(&self, backend_id: BackendId) -> bool {
-        !self.is_missing(backend_id)
+        !self.is_missing_slot(
+            AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
+        )
     }
 
     #[inline]
@@ -147,8 +136,8 @@ impl ArticleAvailability {
 
     #[inline]
     #[must_use]
-    pub(crate) fn all_exhausted_slots(&self, configured: usize) -> bool {
-        self.missing & configured == configured
+    pub(crate) fn all_exhausted_slots(&self, configured: AvailabilityMask) -> bool {
+        self.missing & configured.bits() == configured.bits()
     }
 
     /// Reconstruct from stored negative bits.
@@ -171,13 +160,28 @@ impl ArticleAvailability {
     ///
     #[inline]
     #[must_use]
-    pub fn status(&self, backend_id: BackendId) -> BackendStatus {
-        let mask = backend_id.availability_bit();
+    pub fn status(&self, slot: AvailabilitySlot) -> BackendStatus {
+        let mask = slot.bit();
         if self.missing & mask != 0 {
             BackendStatus::Missing
         } else {
             BackendStatus::Unknown
         }
+    }
+}
+
+impl ArticleAvailability {
+    pub fn record_missing(&mut self, backend_id: BackendId) -> &mut Self {
+        self.record_missing_slot(
+            AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
+        )
+    }
+
+    #[must_use]
+    pub fn is_missing(&self, backend_id: BackendId) -> bool {
+        self.is_missing_slot(
+            AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
+        )
     }
 }
 
