@@ -794,8 +794,8 @@ async fn test_backend_223_response_for_message_id() -> Result<()> {
 /// This test verifies the critical tier-based routing behavior:
 /// When backend 0 (tier 0) returns 430, the proxy MUST try backend 1 (tier 0)
 /// before escalating to tier 1. This ensures all tier 0 backends are exhausted.
-fn build_tiered_server(port: u16, name: &str, tier: u8) -> Result<Server> {
-    Server::builder("127.0.0.1", nntp_proxy::types::Port::try_new(port)?)
+fn build_tiered_server(host: &str, port: u16, name: &str, tier: u8) -> Result<Server> {
+    Server::builder(host, nntp_proxy::types::Port::try_new(port)?)
         .name(name)
         .tier(tier)
         .max_connections(nntp_proxy::types::MaxConnections::try_new(5)?)
@@ -886,9 +886,9 @@ async fn test_tier_0_exhaustion_before_escalation() -> Result<()> {
         .await?;
 
     let proxy_port = start_tiered_proxy(vec![
-        build_tiered_server(backend_0_port, "Backend-0-Tier-0", 0)?,
-        build_tiered_server(backend_1_port, "Backend-1-Tier-0", 0)?,
-        build_tiered_server(backend_2_port, "Backend-2-Tier-1", 1)?,
+        build_tiered_server("127.0.0.1", backend_0_port, "Backend-0-Tier-0", 0)?,
+        build_tiered_server("localhost", backend_1_port, "Backend-1-Tier-0", 0)?,
+        build_tiered_server("LOCALHOST", backend_2_port, "Backend-2-Tier-1", 1)?,
     ])
     .await?;
     let mut client = connect_tiered_client(proxy_port).await?;
@@ -955,9 +955,9 @@ async fn test_tier_exhaustion_multi_tier() -> Result<()> {
         .await?;
 
     let proxy_port = start_tiered_proxy(vec![
-        build_tiered_server(backend_0_port, "Backend-0-Tier-0", 0)?,
-        build_tiered_server(backend_1_port, "Backend-1-Tier-0", 0)?,
-        build_tiered_server(backend_2_port, "Backend-2-Tier-1", 1)?,
+        build_tiered_server("127.0.0.1", backend_0_port, "Backend-0-Tier-0", 0)?,
+        build_tiered_server("localhost", backend_1_port, "Backend-1-Tier-0", 0)?,
+        build_tiered_server("LOCALHOST", backend_2_port, "Backend-2-Tier-1", 1)?,
     ])
     .await?;
     let mut client = connect_tiered_client(proxy_port).await?;
