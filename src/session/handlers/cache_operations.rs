@@ -82,7 +82,7 @@ impl ClientSession {
             if self.adaptive_precheck && request.is_stat() {
                 precheck::spawn_background_precheck(
                     self.precheck_deps(router),
-                    request.clone(),
+                    request.clone_for_background_probe(),
                     MessageId::from_borrowed(
                         request
                             .message_id()

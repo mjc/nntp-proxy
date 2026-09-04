@@ -481,7 +481,7 @@ fn spawn_backend_queries_for_tier(
         })
         .map(|backend| {
             let deps = deps.clone();
-            let request = request.clone();
+            let request = request.clone_for_background_probe();
             tokio::spawn(async move { query_backend(&deps, backend, &request).await })
         })
         .collect()

@@ -235,30 +235,9 @@ enum RequestCompletion {
     Backend {
         backend_id: BackendId,
         response: RequestResponseMetadata,
+        #[cfg_attr(not(test), allow(dead_code))]
         payload: Option<Box<crate::pool::ChunkedResponse>>,
     },
-}
-
-impl RequestCompletion {
-    fn clone_without_payload(&self) -> Self {
-        match self {
-            Self::Local { response } => Self::Local {
-                response: *response,
-            },
-            Self::Cache { response } => Self::Cache {
-                response: *response,
-            },
-            Self::Backend {
-                backend_id,
-                response,
-                ..
-            } => Self::Backend {
-                backend_id: *backend_id,
-                response: *response,
-                payload: None,
-            },
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -341,17 +320,16 @@ impl<'a> RequestLine<'a> {
     }
 }
 
-impl Clone for RequestContext {
-    fn clone(&self) -> Self {
+impl RequestContext {
+    /// Copy a request before response completion for an independent background probe.
+    ///
+    /// Request contexts intentionally do not implement `Clone`: cloning a
+    /// completed backend response used to silently discard its payload. The
+    /// narrow operation below makes its pre-completion-only contract explicit.
+    pub(crate) fn clone_for_background_probe(&self) -> Self {
         debug_assert!(
-            !matches!(
-                self.completion,
-                Some(RequestCompletion::Backend {
-                    payload: Some(_),
-                    ..
-                })
-            ),
-            "completed response payloads are not cloned"
+            self.completion.is_none(),
+            "background probes must copy requests before response completion"
         );
         Self {
             kind: self.kind,
@@ -360,10 +338,7 @@ impl Clone for RequestContext {
             message_id: self.message_id,
             cache_status: self.cache_status,
             cache_entry: self.cache_entry,
-            completion: self
-                .completion
-                .as_ref()
-                .map(RequestCompletion::clone_without_payload),
+            completion: None,
         }
     }
 }
@@ -1106,6 +1081,16 @@ mod tests {
         assert_eq!(out.bytes, b"ARTICLE <a@b>\r\n");
         assert_eq!(out.writes, 0);
         assert_eq!(out.vectored_writes, 1);
+    }
+
+    #[test]
+    fn background_probe_copy_is_explicitly_pre_completion_only() {
+        let ctx = request_context(b"STAT <a@b>\r\n");
+        let probe = ctx.clone_for_background_probe();
+
+        assert_eq!(probe.kind(), ctx.kind());
+        assert_eq!(wire(&probe), wire(&ctx));
+        assert_eq!(probe.response_status(), None);
     }
 
     #[test]

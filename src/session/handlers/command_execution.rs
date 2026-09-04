@@ -409,7 +409,7 @@ impl ClientSession {
         let mut probes = FuturesUnordered::new();
         for (backend_id, provider) in candidates {
             let router = Arc::clone(router);
-            let stat_request = stat_request.clone();
+            let stat_request = stat_request.clone_for_background_probe();
             probes.push(async move {
                 let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
                 let mut conn = match provider.checkout_connection_guard().await {
@@ -533,7 +533,7 @@ impl ClientSession {
             for (backend_id, provider) in candidates {
                 let router = Arc::clone(&router);
                 let cache = Arc::clone(&cache);
-                let stat_request = stat_request.clone();
+                let stat_request = stat_request.clone_for_background_probe();
                 let msg_id_text = msg_id_text.clone();
                 let buffer_pool = buffer_pool.clone();
                 probes.push(async move {
