@@ -129,7 +129,7 @@ impl AuthHandler {
         self.validate_credentials_bytes(username, password.as_bytes())
     }
 
-    fn validate_credentials_bytes(&self, username: &str, password: &[u8]) -> bool {
+    pub(crate) fn validate_credentials_bytes(&self, username: &str, password: &[u8]) -> bool {
         if self.users.is_empty() {
             true
         } else {

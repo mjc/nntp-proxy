@@ -185,8 +185,8 @@ pub(crate) mod shared_client_writer;
 mod state;
 
 pub use auth_state::{
-    AuthReducerResult, AuthState, AuthenticatedUser, AuthenticationTransition, ClientAuthEvent,
-    ClientAuthState,
+    AuthDecision, AuthReducerResult, AuthState, AuthenticatedUser, AuthenticationTransition,
+    ClientAuthEvent, ClientAuthState,
 };
 pub use backend::format_hex_preview;
 pub use core::{ClientSession, ClientSessionBuilder};

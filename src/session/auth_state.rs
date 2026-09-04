@@ -48,6 +48,27 @@ pub enum ClientAuthState {
     Authenticated(Username),
 }
 
+/// Pure authentication decision produced before any client I/O occurs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthDecision {
+    next_state: ClientAuthState,
+    result: AuthReducerResult,
+}
+
+impl AuthDecision {
+    /// Return the state that may be committed after the response is written.
+    #[must_use]
+    pub fn into_parts(self) -> (ClientAuthState, AuthReducerResult) {
+        (self.next_state, self.result)
+    }
+
+    /// Return the reducer result without consuming the decision.
+    #[must_use]
+    pub const fn result(&self) -> AuthReducerResult {
+        self.result
+    }
+}
+
 impl ClientAuthState {
     #[must_use]
     pub const fn anonymous() -> Self {
@@ -75,7 +96,13 @@ impl ClientAuthState {
         event: ClientAuthEvent,
         credentials_valid: bool,
     ) -> (Self, AuthReducerResult) {
-        match (self, event) {
+        self.decide(event, credentials_valid).into_parts()
+    }
+
+    /// Decide an authentication transition without mutating the live state.
+    #[must_use]
+    pub fn decide(self, event: ClientAuthEvent, credentials_valid: bool) -> AuthDecision {
+        let (next_state, result) = match (self, event) {
             (Self::Authenticated(username), _) => (
                 Self::Authenticated(username),
                 AuthReducerResult::AlreadyAuthenticated,
@@ -98,7 +125,8 @@ impl ClientAuthState {
                 AuthReducerResult::Rejected,
             ),
             (state, ClientAuthEvent::Unknown) => (state, AuthReducerResult::Unknown),
-        }
+        };
+        AuthDecision { next_state, result }
     }
 }
 

@@ -75,19 +75,6 @@ where
         });
     }
 
-    let had_username = auth_username.username().is_some();
-    if let AuthAction::RequestPassword(username) = auth_action {
-        let username = crate::types::Username::try_new(username.to_owned())?;
-        let (next_state, _) = auth_username
-            .clone()
-            .reduce(ClientAuthEvent::User(username), false);
-        *auth_username = next_state;
-    }
-
-    let (bytes, auth_success) = auth_handler
-        .handle_auth_command(auth_action, client_write, auth_username.username())
-        .await?;
-
     let reducer_event = match auth_action {
         AuthAction::RequestPassword(username) => {
             ClientAuthEvent::User(crate::types::Username::try_new(username.to_owned())?)
@@ -97,22 +84,36 @@ where
         },
         AuthAction::UnknownSubcommand => ClientAuthEvent::Unknown,
     };
-    let (next_state, reducer_result) = auth_username.clone().reduce(reducer_event, auth_success);
+
+    let credentials_valid = match &reducer_event {
+        ClientAuthEvent::Password { bytes } => auth_username
+            .username()
+            .is_some_and(|username| auth_handler.validate_credentials_bytes(username, bytes)),
+        ClientAuthEvent::User(_) | ClientAuthEvent::Unknown => false,
+    };
+    let decision = auth_username
+        .clone()
+        .decide(reducer_event, credentials_valid);
+    let reducer_result = decision.result();
+    let (response, response_metadata) = auth_response(reducer_result);
+
+    // Commit the reducer state only after the wire response is accepted by the
+    // client writer, so a failed write cannot publish an auth transition.
+    client_write.write_all(response).await?;
+    let (next_state, _) = decision.into_parts();
     *auth_username = next_state;
-    let auth_success = matches!(reducer_result, AuthReducerResult::Accepted);
 
-    let bytes_written = BackendToClientBytes::new(bytes as u64);
-    let response = auth_response_metadata(auth_action, had_username, auth_success);
+    let bytes_written = BackendToClientBytes::new(response.len() as u64);
 
-    Ok(if auth_success {
+    Ok(if matches!(reducer_result, AuthReducerResult::Accepted) {
         AuthResult::Authenticated {
             bytes: bytes_written,
-            response,
+            response: response_metadata,
         }
     } else {
         AuthResult::NotAuthenticated {
             bytes: bytes_written,
-            response,
+            response: response_metadata,
         }
     })
 }
@@ -121,30 +122,27 @@ fn local_response_metadata(status: u16, response: &[u8]) -> RequestResponseMetad
     RequestResponseMetadata::new(StatusCode::new(status), response.len().into())
 }
 
-fn auth_response_metadata(
-    auth_action: AuthAction<'_>,
-    had_username: bool,
-    auth_success: bool,
-) -> RequestResponseMetadata {
-    match auth_action {
-        AuthAction::RequestPassword(_) => {
-            local_response_metadata(codes::PASSWORD_REQUIRED, crate::protocol::AUTH_REQUIRED)
+fn auth_response(result: AuthReducerResult) -> (&'static [u8], RequestResponseMetadata) {
+    let (status, response) = match result {
+        AuthReducerResult::PasswordRequired => {
+            (codes::PASSWORD_REQUIRED, crate::protocol::AUTH_REQUIRED)
         }
-        AuthAction::ValidateAndRespond { .. } if !had_username => local_response_metadata(
+        AuthReducerResult::Accepted => (codes::AUTH_ACCEPTED, crate::protocol::AUTH_ACCEPTED),
+        AuthReducerResult::Rejected => (codes::AUTH_REJECTED, crate::protocol::AUTH_FAILED),
+        AuthReducerResult::OutOfSequence => (
             codes::AUTH_OUT_OF_SEQUENCE,
             crate::protocol::AUTH_OUT_OF_SEQUENCE,
         ),
-        AuthAction::ValidateAndRespond { .. } if auth_success => {
-            local_response_metadata(codes::AUTH_ACCEPTED, crate::protocol::AUTH_ACCEPTED)
-        }
-        AuthAction::ValidateAndRespond { .. } => {
-            local_response_metadata(codes::AUTH_REJECTED, crate::protocol::AUTH_FAILED)
-        }
-        AuthAction::UnknownSubcommand => local_response_metadata(
+        AuthReducerResult::AlreadyAuthenticated => (
+            codes::ACCESS_DENIED,
+            crate::protocol::AUTH_ALREADY_AUTHENTICATED,
+        ),
+        AuthReducerResult::Unknown => (
             codes::COMMAND_SYNTAX_ERROR,
             crate::protocol::AUTH_UNKNOWN_SUBCOMMAND,
         ),
-    }
+    };
+    (response, local_response_metadata(status, response))
 }
 
 /// Check if command is QUIT and send closing response
