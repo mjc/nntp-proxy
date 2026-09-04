@@ -53,7 +53,7 @@ impl Config {
         }
 
         for server in &self.servers {
-            validate_server(server);
+            validate_server(server)?;
         }
 
         Ok(())
@@ -71,7 +71,14 @@ fn validate_socket_buffer_size(field: &str, size: usize) -> Result<()> {
 }
 
 /// Validate a single server configuration
-fn validate_server(server: &Server) {
+fn validate_server(server: &Server) -> Result<()> {
+    if server.username.is_some() != server.password.is_some() {
+        return Err(anyhow::anyhow!(
+            "backend '{}' username and password must be configured together",
+            server.name.as_str()
+        ));
+    }
+
     // Name, host, port, max_connections validations now enforced by types:
     // - HostName/ServerName cannot be empty (validated at construction)
     // - Port cannot be 0 (NonZeroU16)
@@ -101,6 +108,8 @@ fn validate_server(server: &Server) {
             MAX_RECOMMENDED_KEEPALIVE
         );
     }
+
+    Ok(())
 }
 
 #[cfg(test)]
@@ -134,6 +143,21 @@ mod tests {
             ..Default::default()
         };
         assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_rejects_incomplete_backend_credentials() {
+        let mut server = create_test_server("test", None);
+        server.username = Some("user".to_owned());
+        let config = Config {
+            servers: vec![server],
+            ..Default::default()
+        };
+
+        let error = config
+            .validate()
+            .expect_err("incomplete credentials must fail");
+        assert!(error.to_string().contains("configured together"));
     }
 
     #[test]
@@ -257,38 +281,38 @@ mod tests {
     #[test]
     fn test_validate_server_with_recommended_keepalive() {
         let server = create_test_server("test", Some(Duration::from_secs(60)));
-        validate_server(&server);
+        assert!(validate_server(&server).is_ok());
     }
 
     #[test]
     fn test_validate_server_with_low_keepalive_warns() {
         // This should warn but not fail
         let server = create_test_server("test", Some(Duration::from_secs(5)));
-        validate_server(&server);
+        assert!(validate_server(&server).is_ok());
     }
 
     #[test]
     fn test_validate_server_with_high_keepalive_warns() {
         // This should warn but not fail
         let server = create_test_server("test", Some(Duration::from_secs(600)));
-        validate_server(&server);
+        assert!(validate_server(&server).is_ok());
     }
 
     #[test]
     fn test_validate_server_with_no_keepalive() {
         let server = create_test_server("test", None);
-        validate_server(&server);
+        assert!(validate_server(&server).is_ok());
     }
 
     #[test]
     fn test_validate_server_at_min_boundary() {
         let server = create_test_server("test", Some(MIN_RECOMMENDED_KEEPALIVE));
-        validate_server(&server);
+        assert!(validate_server(&server).is_ok());
     }
 
     #[test]
     fn test_validate_server_at_max_boundary() {
         let server = create_test_server("test", Some(MAX_RECOMMENDED_KEEPALIVE));
-        validate_server(&server);
+        assert!(validate_server(&server).is_ok());
     }
 }

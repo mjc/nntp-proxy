@@ -878,8 +878,13 @@ impl ServerBuilder {
     /// - Port is 0
     /// - Name is empty (when explicitly set)
     /// - Max connections is 0 (when explicitly set)
+    /// - Exactly one of username/password is set
     pub fn build(self) -> Result<Server, anyhow::Error> {
         use crate::types::{HostName, ServerName};
+
+        if self.username.is_some() != self.password.is_some() {
+            anyhow::bail!("backend username and password must be configured together");
+        }
 
         let host = HostName::try_new(self.host.clone())?;
         let port = self.port; // Already a Port type
@@ -999,6 +1004,16 @@ mod tests {
         let proxy = Proxy::default();
         assert_eq!(proxy.host, "0.0.0.0");
         assert_eq!(proxy.port.get(), 8119);
+    }
+
+    #[test]
+    fn test_server_builder_rejects_incomplete_backend_credentials() {
+        let result = Server::builder("news.example.com", Port::try_new(119).unwrap())
+            .username("user")
+            .build();
+
+        let error = result.expect_err("incomplete credentials must fail");
+        assert!(error.to_string().contains("configured together"));
     }
 
     #[test]
