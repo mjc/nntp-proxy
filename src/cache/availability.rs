@@ -15,6 +15,7 @@
 //! Availability uses `usize` bitmaps, so local retry checks remain compact while
 //! allowing the backend count to grow with the target word size.
 
+use super::AvailabilitySlot;
 use crate::router::BackendCount;
 use crate::types::BackendId;
 
@@ -86,12 +87,24 @@ impl ArticleAvailability {
         self
     }
 
+    #[inline]
+    pub(crate) fn record_missing_slot(&mut self, slot: AvailabilitySlot) -> &mut Self {
+        self.missing |= slot.bit();
+        self
+    }
+
     /// Check if a backend is known to be missing (returned 430)
     ///
     #[inline]
     #[must_use]
     pub fn is_missing(&self, backend_id: BackendId) -> bool {
         self.missing & backend_id.availability_bit() != 0
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn is_missing_slot(&self, slot: AvailabilitySlot) -> bool {
+        self.missing & slot.bit() != 0
     }
 
     /// Check if we should attempt to fetch from this backend
@@ -102,6 +115,12 @@ impl ArticleAvailability {
     #[must_use]
     pub(crate) fn should_try(&self, backend_id: BackendId) -> bool {
         !self.is_missing(backend_id)
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn should_try_slot(&self, slot: AvailabilitySlot) -> bool {
+        !self.is_missing_slot(slot)
     }
 
     /// Get the raw missing bitset for debugging
@@ -124,6 +143,12 @@ impl ArticleAvailability {
             n => (1usize << n) - 1,
         };
         self.missing & expected_missing == expected_missing
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn all_exhausted_slots(&self, configured: usize) -> bool {
+        self.missing & configured == configured
     }
 
     /// Reconstruct from stored negative bits.
@@ -164,8 +189,12 @@ impl Default for ArticleAvailability {
 
 #[cfg(test)]
 mod tests {
+    use super::super::availability_identity::AvailabilityIdentity;
     use super::*;
+    use crate::cache::AvailabilityLayout;
+    use crate::config::Server;
     use crate::router::BackendCount;
+    use crate::types::Port;
 
     fn backend_count(count: usize) -> BackendCount {
         BackendCount::try_new(count).expect("test backend count fits availability bitmap")
@@ -238,5 +267,122 @@ mod tests {
 
         // But not all 3 backends (backend 2 still untried)
         assert!(!avail.all_exhausted(backend_count(3)));
+    }
+
+    #[test]
+    fn same_host_and_account_share_an_availability_slot_across_ports() {
+        let servers = [
+            Server::builder("news.example", Port::try_new(119).unwrap())
+                .username("reader")
+                .password("one")
+                .build()
+                .unwrap(),
+            Server::builder("news.example", Port::try_new(563).unwrap())
+                .username("reader")
+                .password("two")
+                .build()
+                .unwrap(),
+        ];
+        let layout = AvailabilityLayout::from_servers(&servers).unwrap();
+
+        assert_eq!(
+            layout.slot_for_backend(BackendId::from_index(0)),
+            layout.slot_for_backend(BackendId::from_index(1))
+        );
+        assert_eq!(layout.identity_count(), 1);
+    }
+
+    #[test]
+    fn availability_identity_includes_account_but_not_password() {
+        let servers = [
+            Server::builder("news.example", Port::try_new(119).unwrap())
+                .username("reader")
+                .password("first-secret")
+                .build()
+                .unwrap(),
+            Server::builder("news.example", Port::try_new(563).unwrap())
+                .username("writer")
+                .password("second-secret")
+                .build()
+                .unwrap(),
+            Server::builder("news.example", Port::try_new(119).unwrap())
+                .build()
+                .unwrap(),
+        ];
+        let layout = AvailabilityLayout::from_servers(&servers).unwrap();
+
+        assert_ne!(
+            layout.slot_for_backend(BackendId::from_index(0)),
+            layout.slot_for_backend(BackendId::from_index(1))
+        );
+        assert_ne!(
+            layout.slot_for_backend(BackendId::from_index(0)),
+            layout.slot_for_backend(BackendId::from_index(2))
+        );
+        assert_eq!(layout.identity_count(), 3);
+    }
+
+    #[test]
+    fn hybrid_registry_appends_without_reusing_slots() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = [Server::builder("news.example", Port::try_new(119).unwrap())
+            .username("reader")
+            .password("secret")
+            .build()
+            .unwrap()];
+        let first_layout =
+            AvailabilityLayout::from_hybrid_registry(&first, directory.path()).unwrap();
+        let first_slot = first_layout.slot_for_backend(BackendId::from_index(0));
+
+        let expanded = [
+            first[0].clone(),
+            Server::builder("other.example", Port::try_new(119).unwrap())
+                .build()
+                .unwrap(),
+        ];
+        let expanded_layout =
+            AvailabilityLayout::from_hybrid_registry(&expanded, directory.path()).unwrap();
+        assert_eq!(
+            first_slot,
+            expanded_layout
+                .slot_for_identity(&AvailabilityIdentity::from_server(&first[0]))
+                .unwrap()
+        );
+
+        let reordered = [expanded[1].clone(), expanded[0].clone()];
+        let reordered_layout =
+            AvailabilityLayout::from_hybrid_registry(&reordered, directory.path()).unwrap();
+        assert_eq!(
+            first_slot,
+            reordered_layout
+                .slot_for_identity(&AvailabilityIdentity::from_server(&first[0]))
+                .unwrap()
+        );
+        let registry = std::fs::read(directory.path().join("availability.registry")).unwrap();
+        assert!(
+            !registry
+                .windows(b"secret".len())
+                .any(|window| window == b"secret")
+        );
+    }
+
+    #[test]
+    fn corrupt_hybrid_registry_starts_new_epoch_without_reusing_current_slots() {
+        let directory = tempfile::tempdir().unwrap();
+        let servers = [Server::builder("news.example", Port::try_new(119).unwrap())
+            .username("reader")
+            .build()
+            .unwrap()];
+        let initial = AvailabilityLayout::from_hybrid_registry(&servers, directory.path()).unwrap();
+        let old_epoch = initial.availability_epoch();
+        std::fs::write(directory.path().join("availability.registry"), b"corrupt").unwrap();
+
+        let recovered =
+            AvailabilityLayout::from_hybrid_registry(&servers, directory.path()).unwrap();
+        assert_ne!(recovered.availability_epoch(), old_epoch);
+        assert_eq!(
+            recovered.slot_for_backend(BackendId::from_index(0)),
+            AvailabilitySlot::new(0).unwrap()
+        );
     }
 }

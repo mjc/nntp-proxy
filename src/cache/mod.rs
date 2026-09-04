@@ -17,6 +17,7 @@
 
 mod article;
 mod availability;
+mod availability_identity;
 mod availability_index;
 mod hybrid;
 mod hybrid_codec;
@@ -27,6 +28,9 @@ mod mock_hybrid;
 
 pub use article::{ArticleCache, CachedArticle};
 pub use availability::{ArticleAvailability, BackendStatus, MAX_BACKENDS};
+pub(crate) use availability_identity::{
+    AvailabilityIdentity, AvailabilityLayout, AvailabilitySlot,
+};
 pub use availability_index::AvailabilityIndex;
 pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
 
@@ -387,15 +391,39 @@ impl UnifiedCache {
         Self::Availability(AvailabilityIndex::with_ttl(ttl))
     }
 
+    pub(crate) fn availability_with_layout(
+        ttl: std::time::Duration,
+        layout: AvailabilityLayout,
+    ) -> Self {
+        Self::Availability(AvailabilityIndex::with_layout(ttl, layout))
+    }
+
     /// Create a memory-only cache
     #[must_use]
     pub fn memory(capacity: u64, ttl: std::time::Duration) -> Self {
         Self::Memory(ArticleCache::new(capacity, ttl))
     }
 
+    pub(crate) fn memory_with_layout(
+        capacity: u64,
+        ttl: std::time::Duration,
+        layout: AvailabilityLayout,
+    ) -> Self {
+        Self::Memory(ArticleCache::new(capacity, ttl).with_layout(layout))
+    }
+
     /// Create a hybrid cache (async because foyer needs async initialization)
     pub async fn hybrid(config: HybridCacheConfig) -> anyhow::Result<Self> {
         Ok(Self::Hybrid(HybridArticleCache::new(config).await?))
+    }
+
+    pub(crate) async fn hybrid_with_layout(
+        config: HybridCacheConfig,
+        layout: AvailabilityLayout,
+    ) -> anyhow::Result<Self> {
+        Ok(Self::Hybrid(
+            HybridArticleCache::new_with_layout(config, layout).await?,
+        ))
     }
 
     /// Returns true when successful backend responses update positive
@@ -465,20 +493,47 @@ impl UnifiedCache {
         match self {
             Self::Availability(_) => {}
             Self::Memory(cache) => {
-                cache.upsert_ingest(message_id, buffer, backend, tier).await;
+                cache
+                    .upsert_ingest_for_slot(
+                        message_id,
+                        buffer,
+                        cache.availability_slot(backend),
+                        tier,
+                    )
+                    .await;
             }
             Self::Hybrid(cache) => {
-                cache.upsert_ingest(message_id, buffer, backend, tier).await;
+                cache
+                    .upsert_ingest_for_slot(
+                        message_id,
+                        buffer,
+                        cache.availability_slot(backend),
+                        tier,
+                    )
+                    .await;
             }
         }
     }
 
     /// Record that a backend returned 430 for this article
     pub async fn record_backend_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
+        let slot = match self {
+            Self::Availability(index) => index.availability_slot(backend_id),
+            Self::Memory(cache) => cache.availability_slot(backend_id),
+            Self::Hybrid(cache) => cache.availability_slot(backend_id),
+        };
+        self.record_availability_missing(message_id, slot).await;
+    }
+
+    pub(crate) async fn record_availability_missing(
+        &self,
+        message_id: MessageId<'_>,
+        slot: AvailabilitySlot,
+    ) {
         match self {
-            Self::Availability(index) => index.record_backend_missing(&message_id, backend_id),
-            Self::Memory(cache) => cache.record_backend_missing(message_id, backend_id).await,
-            Self::Hybrid(cache) => cache.record_missing(message_id, backend_id).await,
+            Self::Availability(index) => index.record_availability_missing(&message_id, slot),
+            Self::Memory(cache) => cache.record_availability_missing(message_id, slot).await,
+            Self::Hybrid(cache) => cache.record_availability_missing(message_id, slot).await,
         }
     }
 
@@ -494,12 +549,22 @@ impl UnifiedCache {
             Self::Availability(_) => {}
             Self::Memory(cache) => {
                 cache
-                    .record_backend_has_status(message_id, status_code, backend, tier)
+                    .record_has_status_for_slot(
+                        message_id,
+                        status_code,
+                        cache.availability_slot(backend),
+                        tier,
+                    )
                     .await;
             }
             Self::Hybrid(cache) => {
                 cache
-                    .record_has_status(message_id, status_code, backend, tier)
+                    .record_has_status_for_slot(
+                        message_id,
+                        status_code,
+                        cache.availability_slot(backend),
+                        tier,
+                    )
                     .await;
             }
         }

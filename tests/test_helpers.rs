@@ -450,7 +450,7 @@ pub async fn setup_proxy_with_backends(
     let mut backend_listeners = Vec::new();
     let mut backend_ports = Vec::new();
     for _ in 0..backend_configs.len() {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listener = TcpListener::bind("0.0.0.0:0").await?;
         backend_ports.push(listener.local_addr()?.port());
         backend_listeners.push(listener);
     }
@@ -469,6 +469,7 @@ pub async fn setup_proxy_with_backends(
 
         let handle = MockNntpServer::new()
             .with_name(*name)
+            .with_auth(*name, *name)
             .on_command("DATE", "111 20251203120000\r\n")
             .on_command("QUIT", "205 Goodbye\r\n")
             .on_command("ARTICLE", response)
@@ -477,13 +478,16 @@ pub async fn setup_proxy_with_backends(
     }
 
     // Create proxy config
-    let config = create_test_config(
-        backend_ports
+    let config = Config {
+        servers: backend_ports
             .iter()
             .zip(backend_configs.iter())
-            .map(|(port, (name, _))| (*port, *name))
+            .map(|(port, (name, _))| {
+                create_test_server_config_with_auth("127.0.0.1", *port, name, name, name)
+            })
             .collect(),
-    );
+        ..Default::default()
+    };
 
     let proxy = NntpProxy::new(config, routing_mode).await?;
 

@@ -76,6 +76,7 @@ impl RetryAttemptKind {
 
 pub(super) struct AuthoritativeArticleMissing {
     backend_id: BackendId,
+    availability_slot: crate::cache::AvailabilitySlot,
 }
 
 impl AuthoritativeArticleMissing {
@@ -86,6 +87,7 @@ impl AuthoritativeArticleMissing {
         if status_code.as_u16() == 430 {
             Ok(Self {
                 backend_id: backend.backend_id(),
+                availability_slot: backend.availability_slot(),
             })
         } else {
             Err(backend)
@@ -94,6 +96,10 @@ impl AuthoritativeArticleMissing {
 
     pub(super) const fn backend_id(&self) -> BackendId {
         self.backend_id
+    }
+
+    pub(super) const fn availability_slot(&self) -> crate::cache::AvailabilitySlot {
+        self.availability_slot
     }
 }
 
@@ -300,7 +306,10 @@ impl ClientSession {
                     crate::command::CommandHandler::article_lookup_request(request)
                 {
                     self.cache
-                        .record_backend_missing(article_request.message_id(), backend_id)
+                        .record_availability_missing(
+                            article_request.message_id(),
+                            missing.availability_slot(),
+                        )
                         .await;
                 }
                 crate::session::backend::observe_response(
@@ -378,7 +387,9 @@ impl ClientSession {
         for tier in router.tiers() {
             for backend_id in router.backend_ids_in_tier(tier) {
                 if state.unavailable_backends.contains(backend_id)
-                    || !state.availability.should_try(backend_id)
+                    || !router
+                        .availability_slot(backend_id)
+                        .is_some_and(|slot| state.availability.should_try_slot(slot))
                 {
                     continue;
                 }
@@ -443,13 +454,21 @@ impl ClientSession {
         while let Some(outcome) = probes.next().await {
             match outcome {
                 RetryStatProbeOutcome::Missing(backend_id) => {
-                    let missing = AuthoritativeArticleMissing { backend_id };
+                    let missing = AuthoritativeArticleMissing {
+                        backend_id,
+                        availability_slot: router
+                            .availability_slot(backend_id)
+                            .expect("probe backend is registered"),
+                    };
                     self.record_authoritative_article_missing(&missing, state.availability);
                     if let Some(article_request) =
                         crate::command::CommandHandler::article_lookup_request(request)
                     {
                         self.cache
-                            .record_backend_missing(article_request.message_id(), backend_id)
+                            .record_availability_missing(
+                                article_request.message_id(),
+                                missing.availability_slot(),
+                            )
                             .await;
                     }
                 }
@@ -487,7 +506,10 @@ impl ClientSession {
         let mut candidates = Vec::new();
         for tier in router.tiers().filter(|tier| *tier > 0) {
             for backend_id in router.backend_ids_in_tier(tier) {
-                if unavailable_backends.contains(backend_id) || !availability.should_try(backend_id)
+                if unavailable_backends.contains(backend_id)
+                    || !router
+                        .availability_slot(backend_id)
+                        .is_some_and(|slot| availability.should_try_slot(slot))
                 {
                     continue;
                 }
@@ -515,6 +537,9 @@ impl ClientSession {
                 let msg_id_text = msg_id_text.clone();
                 let buffer_pool = buffer_pool.clone();
                 probes.push(async move {
+                    let availability_slot = router
+                        .availability_slot(backend_id)
+                        .expect("probe backend is registered");
                     let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
                     let mut conn = match provider.checkout_connection_guard().await {
                         Ok(conn) => conn,
@@ -552,7 +577,9 @@ impl ClientSession {
                     if status_code.is_some_and(|status| status.as_u16() == 430)
                         && let Ok(msg_id) = crate::types::MessageId::new(msg_id_text)
                     {
-                        cache.record_backend_missing(msg_id, backend_id).await;
+                        cache
+                            .record_availability_missing(msg_id, availability_slot)
+                            .await;
                     }
                 });
             }

@@ -7,20 +7,23 @@
 //! # Wire Format
 //!
 //! ```text
-//! [magic:u32][status:u16][missing:u64][timestamp:u64][tier:u8][payload-kind:u8]...
+//! [magic:u32][status:u16][availability-epoch:u64][missing:u64][timestamp:u64][tier:u8][payload-kind:u8]...
 //! ```
 
 use crate::protocol::StatusCode;
+#[cfg(test)]
 use crate::types::BackendId;
 use foyer::Code;
 use std::io::{Read, Write};
 use std::mem::size_of;
 
+use super::AvailabilitySlot;
 use super::article::{CachedArticleNumber, CachedPayload, parse_payload};
 use super::availability::ArticleAvailability;
 use super::ttl;
 
 const DISK_ENTRY_MAGIC_V6: u32 = 0x4e50_4336; // "NPC6"
+const DISK_ENTRY_MAGIC_V7: u32 = 0x4e50_4337; // "NPC7"
 const PAYLOAD_MISSING: u8 = 0;
 const PAYLOAD_AVAILABILITY_ONLY: u8 = 1;
 const PAYLOAD_ARTICLE: u8 = 2;
@@ -126,6 +129,8 @@ impl TryFrom<u16> for CacheableStatusCode {
 pub struct DiskCachedArticle {
     /// Validated NNTP status code; only cacheable outcomes are representable.
     status_code: CacheableStatusCode,
+    /// Layout fingerprint that scopes persisted negative availability bits.
+    availability_epoch: u64,
     /// Backend availability tracking (authoritative missing bitset)
     pub(super) availability: ArticleAvailability,
     /// Unix timestamp when availability info was last updated (milliseconds since epoch)
@@ -141,10 +146,13 @@ pub struct DiskCachedArticle {
 impl Code for DiskCachedArticle {
     fn encode(&self, writer: &mut impl Write) -> foyer::Result<()> {
         writer
-            .write_all(&DISK_ENTRY_MAGIC_V6.to_le_bytes())
+            .write_all(&DISK_ENTRY_MAGIC_V7.to_le_bytes())
             .map_err(foyer::Error::io_error)?;
         writer
             .write_all(&self.status_code.as_u16().to_le_bytes())
+            .map_err(foyer::Error::io_error)?;
+        writer
+            .write_all(&self.availability_epoch.to_le_bytes())
             .map_err(foyer::Error::io_error)?;
         writer
             .write_all(&availability_bits_to_wire(self.availability.missing_bits())?.to_le_bytes())
@@ -165,7 +173,7 @@ impl Code for DiskCachedArticle {
             .read_exact(&mut magic)
             .map_err(foyer::Error::io_error)?;
         let magic = u32::from_le_bytes(magic);
-        if magic != DISK_ENTRY_MAGIC_V6 {
+        if magic != DISK_ENTRY_MAGIC_V6 && magic != DISK_ENTRY_MAGIC_V7 {
             return Err(foyer::Error::io_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "old hybrid cache entry format",
@@ -186,6 +194,16 @@ impl Code for DiskCachedArticle {
                 format!("Invalid cached status code: {code}"),
             ))
         })?;
+
+        let availability_epoch = if magic == DISK_ENTRY_MAGIC_V7 {
+            let mut epoch_bytes = [0u8; 8];
+            reader
+                .read_exact(&mut epoch_bytes)
+                .map_err(foyer::Error::io_error)?;
+            u64::from_le_bytes(epoch_bytes)
+        } else {
+            0
+        };
 
         // ArticleAvailability is negative-only: 430 facts are authoritative,
         // positive observations remain request-cache metadata.
@@ -212,6 +230,7 @@ impl Code for DiskCachedArticle {
 
         Ok(Self {
             status_code,
+            availability_epoch,
             availability: ArticleAvailability::from_missing_bits(availability_bits_from_wire(
                 u64::from_le_bytes(missing_bytes),
             )?),
@@ -222,7 +241,7 @@ impl Code for DiskCachedArticle {
     }
 
     fn estimated_size(&self) -> usize {
-        4 + 2 + size_of::<u64>() + 8 + 1 + encoded_payload_size(&self.payload)
+        4 + 2 + size_of::<u64>() + size_of::<u64>() + 8 + 1 + encoded_payload_size(&self.payload)
     }
 }
 
@@ -414,6 +433,7 @@ impl DiskCachedArticle {
 
         Some(Self {
             status_code,
+            availability_epoch: 0,
             availability: ArticleAvailability::new(),
             timestamp: ttl::CacheTimestampMillis::now(),
             tier,
@@ -449,6 +469,7 @@ impl DiskCachedArticle {
     ) -> Self {
         Self {
             status_code,
+            availability_epoch: 0,
             availability: ArticleAvailability::new(),
             timestamp: ttl::CacheTimestampMillis::now(),
             tier,
@@ -460,6 +481,7 @@ impl DiskCachedArticle {
     pub(crate) fn missing(tier: ttl::CacheTier) -> Self {
         Self {
             status_code: CacheableStatusCode::Missing,
+            availability_epoch: 0,
             availability: ArticleAvailability::new(),
             timestamp: ttl::CacheTimestampMillis::now(),
             tier,
@@ -508,9 +530,26 @@ impl DiskCachedArticle {
         self.availability.should_try(backend_id)
     }
 
-    /// Record that a backend returned 430 (doesn't have this article)
+    pub(crate) fn record_availability_missing(&mut self, slot: AvailabilitySlot) {
+        self.availability.record_missing_slot(slot);
+    }
+
+    pub(crate) fn set_availability_epoch(&mut self, epoch: u64) {
+        self.availability_epoch = epoch;
+    }
+
+    pub(crate) fn clear_availability(&mut self) {
+        self.availability = ArticleAvailability::new();
+    }
+
+    #[cfg(test)]
     pub(crate) fn record_backend_missing(&mut self, backend_id: BackendId) {
         self.availability.record_missing(backend_id);
+    }
+
+    #[must_use]
+    pub(crate) const fn availability_epoch(&self) -> u64 {
+        self.availability_epoch
     }
 
     /// Record successful backend availability without storing response payload bytes.
@@ -1043,7 +1082,7 @@ mod tests {
     #[test]
     fn test_code_estimated_size() {
         let entry = disk_cached_article_from_ingest_bytes(b"220 article\r\n").unwrap();
-        let expected = 4 + 2 + size_of::<u64>() + 8 + 1 + 1;
+        let expected = 4 + 2 + size_of::<u64>() + size_of::<u64>() + 8 + 1 + 1;
         assert_eq!(entry.estimated_size(), expected);
     }
 

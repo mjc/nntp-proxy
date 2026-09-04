@@ -60,6 +60,7 @@ use tracing::{debug, info, warn};
 
 use super::hybrid_codec::{CacheableStatusCode, DiskCachedArticle};
 use super::ttl;
+use super::{AvailabilityLayout, AvailabilitySlot};
 
 const HYBRID_CACHE_NAME: &str = "nntp-article-cache-v4";
 
@@ -132,6 +133,8 @@ pub struct HybridArticleCache {
     config: HybridCacheConfig,
     /// Base TTL in milliseconds (used for tier-aware expiration via `effective_ttl`)
     ttl_millis: ttl::CacheTtlMillis,
+    availability_epoch: u64,
+    layout: AvailabilityLayout,
     mutation_locks: Vec<Mutex<()>>,
 }
 
@@ -147,10 +150,24 @@ impl std::fmt::Debug for HybridArticleCache {
 }
 
 impl HybridArticleCache {
+    pub(crate) fn availability_slot(&self, backend: BackendId) -> AvailabilitySlot {
+        self.layout.slot_for_backend(backend)
+    }
     /// Create a new hybrid cache with the given configuration
     ///
     /// This will create the disk cache directory if it doesn't exist.
     pub async fn new(config: HybridCacheConfig) -> anyhow::Result<Self> {
+        Self::new_with_layout(
+            config,
+            AvailabilityLayout::synthetic(crate::cache::MAX_BACKENDS),
+        )
+        .await
+    }
+
+    pub(crate) async fn new_with_layout(
+        config: HybridCacheConfig,
+        availability_layout: AvailabilityLayout,
+    ) -> anyhow::Result<Self> {
         // Ensure disk cache directory exists
         std::fs::create_dir_all(&config.disk_path).map_err(|e| {
             if e.kind() == std::io::ErrorKind::Other && e.to_string().contains("No space left") {
@@ -300,6 +317,8 @@ impl HybridArticleCache {
             disk_hits: AtomicU64::new(0),
             config,
             ttl_millis,
+            availability_epoch: availability_layout.availability_epoch(),
+            layout: availability_layout,
             mutation_locks: (0..16).map(|_| Mutex::new(())).collect(),
         })
     }
@@ -312,7 +331,10 @@ impl HybridArticleCache {
 
     async fn get_fresh_entry_for_mutation(&self, key: &str) -> Option<DiskCachedArticle> {
         let existing = self.cache.get(key).await.ok()??;
-        let entry = existing.value().clone();
+        let mut entry = existing.value().clone();
+        if entry.availability_epoch() != self.availability_epoch {
+            entry.clear_availability();
+        }
         (!entry.is_expired(self.ttl_millis)).then_some(entry)
     }
 
@@ -332,7 +354,10 @@ impl HybridArticleCache {
         let result = self.cache.get(key).await;
         match result {
             Ok(Some(entry)) => {
-                let cloned = entry.value().clone();
+                let mut cloned = entry.value().clone();
+                if cloned.availability_epoch() != self.availability_epoch {
+                    cloned.clear_availability();
+                }
 
                 // Check tier-aware TTL expiration
                 if cloned.is_expired(self.ttl_millis) {
@@ -380,6 +405,22 @@ impl HybridArticleCache {
         backend: super::BackendId,
         tier: super::ttl::CacheTier,
     ) {
+        self.upsert_ingest_for_slot(
+            message_id,
+            buffer,
+            AvailabilitySlot::new(backend.as_index()).expect("backend count fits bitmap"),
+            tier,
+        )
+        .await;
+    }
+
+    pub(crate) async fn upsert_ingest_for_slot(
+        &self,
+        message_id: MessageId<'_>,
+        buffer: impl Into<super::CacheIngestResponse>,
+        slot: AvailabilitySlot,
+        tier: super::ttl::CacheTier,
+    ) {
         let buffer = buffer.into();
         let key = message_id.without_brackets().to_string();
         let _mutation_guard = self.mutation_lock(&key).lock().await;
@@ -389,6 +430,7 @@ impl HybridArticleCache {
             warn!(msg_id = %key, buffer_len, "Cannot cache: invalid status code");
             return;
         };
+        entry.set_availability_epoch(self.availability_epoch);
         let entry_len = entry.payload_len();
 
         let mut existing_availability = None;
@@ -396,7 +438,7 @@ impl HybridArticleCache {
         // Check for existing entry - don't overwrite larger semantic payloads with smaller ones.
         if let Some(existing) = self.get_fresh_entry_for_mutation(&key).await {
             existing_availability = Some(existing.availability());
-            if existing.availability().is_missing(backend) {
+            if existing.availability().is_missing_slot(slot) {
                 return;
             }
             let existing_len = existing.payload_len();
@@ -411,6 +453,7 @@ impl HybridArticleCache {
                 // Existing entry is larger - refresh TTL without changing negative availability.
                 let mut updated = existing;
                 updated.timestamp = ttl::CacheTimestampMillis::now();
+                updated.set_availability_epoch(self.availability_epoch);
                 self.cache.insert(key.clone(), updated);
                 debug!(
                     msg_id = %key,
@@ -425,25 +468,39 @@ impl HybridArticleCache {
         if let Some(availability) = existing_availability {
             entry.availability = availability;
         }
+        entry.set_availability_epoch(self.availability_epoch);
         self.cache.insert(key.clone(), entry);
         debug!(msg_id = %key, stored_bytes = entry_len.get(), tier = tier.get(), "Hybrid cache upsert");
     }
 
     /// Record that a backend doesn't have an article (430 response)
     pub async fn record_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
+        self.record_availability_missing(
+            message_id,
+            AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
+        )
+        .await;
+    }
+
+    pub(crate) async fn record_availability_missing(
+        &self,
+        message_id: MessageId<'_>,
+        slot: AvailabilitySlot,
+    ) {
         let key = message_id.without_brackets().to_string();
         let _mutation_guard = self.mutation_lock(&key).lock().await;
 
         // Get existing entry or create a typed missing entry.
-        let entry = if let Some(existing) = self.get_fresh_entry_for_mutation(&key).await {
+        let mut entry = if let Some(existing) = self.get_fresh_entry_for_mutation(&key).await {
             let mut updated = existing;
-            updated.record_backend_missing(backend_id);
+            updated.record_availability_missing(slot);
             updated
         } else {
             let mut entry = DiskCachedArticle::missing(super::ttl::CacheTier::new(0));
-            entry.record_backend_missing(backend_id);
+            entry.record_availability_missing(slot);
             entry
         };
+        entry.set_availability_epoch(self.availability_epoch);
 
         self.cache.insert(key, entry);
     }
@@ -454,6 +511,22 @@ impl HybridArticleCache {
         message_id: MessageId<'_>,
         status_code: StatusCode,
         backend: super::BackendId,
+        tier: super::ttl::CacheTier,
+    ) {
+        self.record_has_status_for_slot(
+            message_id,
+            status_code,
+            AvailabilitySlot::new(backend.as_index()).expect("backend count fits bitmap"),
+            tier,
+        )
+        .await;
+    }
+
+    pub(crate) async fn record_has_status_for_slot(
+        &self,
+        message_id: MessageId<'_>,
+        status_code: StatusCode,
+        slot: AvailabilitySlot,
         tier: super::ttl::CacheTier,
     ) {
         let Ok(cacheable_status) = CacheableStatusCode::try_from(status_code.as_u16()) else {
@@ -467,8 +540,8 @@ impl HybridArticleCache {
 
         let key = message_id.without_brackets().to_string();
         let _mutation_guard = self.mutation_lock(&key).lock().await;
-        let entry = if let Some(existing) = self.get_fresh_entry_for_mutation(&key).await {
-            if existing.availability().is_missing(backend) {
+        let mut entry = if let Some(existing) = self.get_fresh_entry_for_mutation(&key).await {
+            if existing.availability().is_missing_slot(slot) {
                 return;
             }
             let mut updated = existing;
@@ -477,6 +550,7 @@ impl HybridArticleCache {
         } else {
             DiskCachedArticle::availability_only(cacheable_status, tier)
         };
+        entry.set_availability_epoch(self.availability_epoch);
 
         self.cache.insert(key, entry);
     }
@@ -600,6 +674,9 @@ impl HybridArticleCache {
             disk_hits: AtomicU64::new(0),
             config,
             ttl_millis: ttl::CacheTtlMillis::new(3600 * 1000), // 1 hour in milliseconds
+            availability_epoch: AvailabilityLayout::synthetic(crate::cache::MAX_BACKENDS)
+                .availability_epoch(),
+            layout: AvailabilityLayout::synthetic(crate::cache::MAX_BACKENDS),
             mutation_locks: (0..16).map(|_| Mutex::new(())).collect(),
         })
     }

@@ -67,11 +67,8 @@ impl ClientSession {
         };
         let preloaded_availability = if request.message_id_value().is_some() {
             Some(
-                self.load_article_availability(
-                    request.message_id_value().as_ref(),
-                    router.backend_count(),
-                )
-                .await,
+                self.load_article_availability(request.message_id_value().as_ref())
+                    .await,
             )
         } else {
             None
@@ -142,11 +139,8 @@ impl ClientSession {
             Some(availability)
         } else if request.message_id_value().is_some() {
             Some(
-                self.load_article_availability(
-                    request.message_id_value().as_ref(),
-                    router.backend_count(),
-                )
-                .await,
+                self.load_article_availability(request.message_id_value().as_ref())
+                    .await,
             )
         } else {
             None
@@ -293,7 +287,7 @@ impl ClientSession {
             router.backend_count().get()
         );
 
-        while !availability.all_exhausted(router.backend_count()) {
+        while !availability.all_exhausted_slots(router.availability_mask()) {
             if !is_retry_attempt && !non_primary_tier_prefetch_started {
                 self.spawn_non_primary_tier_stat_prefetch(
                     router,
@@ -397,7 +391,6 @@ impl ClientSession {
     pub(super) async fn load_article_availability(
         &self,
         msg_id: Option<&crate::types::MessageId<'_>>,
-        backend_count: crate::router::BackendCount,
     ) -> crate::cache::ArticleAvailability {
         match msg_id {
             Some(msg_id_ref) => self
@@ -405,7 +398,7 @@ impl ClientSession {
                 .get(msg_id_ref)
                 .await
                 .map(|entry| {
-                    let avail = entry.to_availability(backend_count);
+                    let avail = entry.to_availability();
                     debug!(
                         "Client {} loaded availability for {}: missing_bits={:08b}",
                         self.client_addr,
@@ -428,7 +421,7 @@ impl ClientSession {
         availability: &mut crate::cache::ArticleAvailability,
     ) {
         let backend_id = missing.backend_id();
-        availability.record_missing(backend_id);
+        availability.record_missing_slot(missing.availability_slot());
 
         // Track 430 responses in 4xx metrics for visibility in TUI
         // While 430 is normal retry behavior (not a failure), users want to see

@@ -47,7 +47,7 @@ pub(crate) enum PrecheckResponse {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum QueryResult {
     Found(BackendId, PrecheckHit),
-    Missing(BackendId),
+    Missing(ArticleBackend),
     Error,
 }
 
@@ -76,8 +76,8 @@ fn summarize_tier_results(results: &[QueryResult]) -> TierQuerySummary {
 
     for result in results {
         match result {
-            QueryResult::Missing(id) => {
-                availability.record_missing(*id);
+            QueryResult::Missing(backend) => {
+                availability.record_missing_slot(backend.availability_slot());
             }
             QueryResult::Found(_, _) => {
                 exhausted = false;
@@ -162,8 +162,10 @@ async fn record_precheck_result(
 ) -> Option<(BackendId, PrecheckHit)> {
     match result {
         QueryResult::Found(backend, hit) => Some((backend, hit)),
-        QueryResult::Missing(backend_id) => {
-            cache.record_backend_missing(msg_id, backend_id).await;
+        QueryResult::Missing(backend) => {
+            cache
+                .record_availability_missing(msg_id, backend.availability_slot())
+                .await;
             None
         }
         QueryResult::Error => None,
@@ -195,7 +197,7 @@ async fn query_backend(
 
     match query_result {
         QueryAttemptResult::Found(hit) => QueryResult::Found(backend_id, *hit),
-        QueryAttemptResult::Missing => QueryResult::Missing(backend_id),
+        QueryAttemptResult::Missing => QueryResult::Missing(backend),
         QueryAttemptResult::Error => QueryResult::Error,
     }
 }
@@ -424,11 +426,11 @@ async fn query_all_backends_racing(
                     });
                     return RacingQueryOutcome::Hit(id, response);
                 }
-                QueryResult::Missing(backend_id) => {
+                QueryResult::Missing(backend) => {
                     deps.cache
-                        .record_backend_missing(msg_id.to_owned(), backend_id)
+                        .record_availability_missing(msg_id.to_owned(), backend.availability_slot())
                         .await;
-                    results.push(QueryResult::Missing(backend_id));
+                    results.push(QueryResult::Missing(backend));
                 }
                 QueryResult::Error => {
                     results.push(QueryResult::Error);
@@ -472,7 +474,11 @@ fn spawn_backend_queries_for_tier(
 ) -> FuturesUnordered<tokio::task::JoinHandle<QueryResult>> {
     deps.router
         .backend_ids_in_tier(tier)
-        .filter_map(|id| ArticleBackend::from_availability(id, availability))
+        .filter_map(|id| {
+            deps.router
+                .availability_slot(id)
+                .and_then(|slot| ArticleBackend::from_availability_slot(id, slot, availability))
+        })
         .map(|backend| {
             let deps = deps.clone();
             let request = request.clone();
@@ -498,8 +504,8 @@ fn summarize(results: Vec<QueryResult>) -> (Option<(BackendId, PrecheckHit)>, Ar
                     found = Some((id, response));
                 }
             }
-            QueryResult::Missing(id) => {
-                availability.record_missing(id);
+            QueryResult::Missing(backend) => {
+                availability.record_missing_slot(backend.availability_slot());
             }
             QueryResult::Error => {}
         }
@@ -599,7 +605,7 @@ pub fn spawn_background_precheck(
         }
 
         let availability = cached
-            .map(|entry| entry.to_availability(owned.router.backend_count()))
+            .map(|entry| entry.to_availability())
             .unwrap_or_default();
         let results = query_all_backends(&owned, &request, &availability).await;
         let mut found = None;
@@ -660,7 +666,7 @@ mod tests {
     #[test]
     fn summarize_finds_first() {
         let results = vec![
-            QueryResult::Missing(BackendId::from_index(0)),
+            QueryResult::Missing(eligible(BackendId::from_index(0))),
             QueryResult::Found(
                 BackendId::from_index(1),
                 PrecheckHit::Payload(b"first".to_vec().into()),
@@ -686,8 +692,8 @@ mod tests {
     #[test]
     fn summarize_all_missing() {
         let results = vec![
-            QueryResult::Missing(BackendId::from_index(0)),
-            QueryResult::Missing(BackendId::from_index(1)),
+            QueryResult::Missing(eligible(BackendId::from_index(0))),
+            QueryResult::Missing(eligible(BackendId::from_index(1))),
         ];
         let (found, avail) = summarize(results);
         assert!(found.is_none());
@@ -710,7 +716,7 @@ mod tests {
         let found = record_precheck_result(
             &cache,
             msg_id.to_owned(),
-            QueryResult::Missing(BackendId::from_index(0)),
+            QueryResult::Missing(eligible(BackendId::from_index(0))),
         )
         .await;
 
@@ -746,8 +752,8 @@ mod tests {
     #[test]
     fn summarize_tier_results_requires_every_backend_to_miss() {
         let summary = summarize_tier_results(&[
-            QueryResult::Missing(BackendId::from_index(0)),
-            QueryResult::Missing(BackendId::from_index(1)),
+            QueryResult::Missing(eligible(BackendId::from_index(0))),
+            QueryResult::Missing(eligible(BackendId::from_index(1))),
         ]);
 
         let TierQuerySummary::Exhausted(availability) = summary else {
@@ -760,7 +766,7 @@ mod tests {
     #[test]
     fn summarize_tier_results_treats_partial_missing_with_error_as_inconclusive() {
         let summary = summarize_tier_results(&[
-            QueryResult::Missing(BackendId::from_index(0)),
+            QueryResult::Missing(eligible(BackendId::from_index(0))),
             QueryResult::Error,
         ]);
 

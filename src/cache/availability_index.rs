@@ -6,6 +6,7 @@
 //! are pushed down by storing a keyed 64-bit fingerprint plus a keyed 16-bit
 //! confirmation tag per slot.
 
+use super::{AvailabilityIdentity, AvailabilityLayout, AvailabilitySlot, MAX_BACKENDS};
 use super::{CachedArticle, ttl};
 use crate::io_util::atomic_replace_file;
 use crate::types::{BackendId, MessageId};
@@ -24,12 +25,14 @@ const DEFAULT_GENERATIONS: usize = 2;
 const BLOCK_SLOTS: usize = 2;
 const FIXED_ARTICLE_CAPACITY: usize = 256 * 1024;
 const ALL_BACKEND_BITS: usize = usize::MAX;
-const PERSISTENCE_MAGIC: &[u8; 8] = b"ANEGSIM4";
+const PERSISTENCE_MAGIC: &[u8; 8] = b"ANEGSIM5";
 const LEGACY_PERSISTENCE_MAGIC_V1: &[u8; 8] = b"ANEGIDX1";
 const LEGACY_PERSISTENCE_MAGIC_V2: &[u8; 8] = b"ANEGIDX2";
 const LEGACY_PERSISTENCE_MAGIC_V3: &[u8; 8] = b"ANEGSIM1";
 const LEGACY_PERSISTENCE_MAGIC_V4: &[u8; 8] = b"ANEGSIM2";
 const LEGACY_PERSISTENCE_MAGIC_V5: &[u8; 8] = b"ANEGSIM3";
+const LEGACY_PERSISTENCE_MAGIC_V6: &[u8; 8] = b"ANEGSIM4";
+const MAX_IDENTITY_FIELD_BYTES: usize = 1024 * 1024;
 
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -446,6 +449,7 @@ struct SnapshotResult {
 #[derive(Debug)]
 pub struct AvailabilityIndex {
     state: Mutex<FilterState>,
+    layout: AvailabilityLayout,
     capacity_bytes: u64,
     has_entries: AtomicBool,
     hits: AtomicU64,
@@ -463,6 +467,9 @@ impl Default for AvailabilityIndex {
 }
 
 impl AvailabilityIndex {
+    pub(crate) fn availability_slot(&self, backend: BackendId) -> AvailabilitySlot {
+        self.layout.slot_for_backend(backend)
+    }
     #[must_use]
     pub const fn fixed_capacity_bytes() -> u64 {
         FIXED_CAPACITY_BYTES
@@ -476,6 +483,13 @@ impl AvailabilityIndex {
     #[must_use]
     pub fn with_ttl(ttl: Duration) -> Self {
         Self::with_capacity_and_generation_count(FIXED_CAPACITY_BYTES, ttl, DEFAULT_GENERATIONS)
+    }
+
+    #[must_use]
+    pub(crate) fn with_layout(ttl: Duration, layout: AvailabilityLayout) -> Self {
+        let mut index = Self::with_ttl(ttl);
+        index.layout = layout;
+        index
     }
 
     #[must_use]
@@ -516,6 +530,7 @@ impl AvailabilityIndex {
                 generation_count,
                 rotation_interval_millis,
             )),
+            layout: AvailabilityLayout::synthetic(MAX_BACKENDS),
             capacity_bytes,
             has_entries: AtomicBool::new(false),
             hits: AtomicU64::new(0),
@@ -542,6 +557,14 @@ impl AvailabilityIndex {
         self.insert_missing_bits(message_id.without_brackets(), backend_id.availability_bit());
     }
 
+    pub(crate) fn record_availability_missing(
+        &self,
+        message_id: &MessageId<'_>,
+        slot: AvailabilitySlot,
+    ) {
+        self.insert_missing_bits(message_id.without_brackets(), slot.bit());
+    }
+
     pub fn load_from_path(&self, path: &Path) -> Result<bool> {
         if !path.exists() {
             return Ok(false);
@@ -550,7 +573,11 @@ impl AvailabilityIndex {
         let data = fs::read(path).with_context(|| {
             format!("Failed to read availability index from {}", path.display())
         })?;
-        let mut entries = parse_entries(&data)?;
+        let parsed = parse_snapshot(&data)?;
+        let (identities, mut entries) = parsed.unwrap_or_default();
+        for entry in &mut entries {
+            entry.missing = remap_missing_bits(entry.missing, &identities, &self.layout);
+        }
         entries.sort_by_key(|entry| entry.inserted_at);
 
         let now = ttl::now_millis();
@@ -612,6 +639,10 @@ impl AvailabilityIndex {
                 * (size_of::<u64>() + size_of::<u16>() + size_of::<u64>() + size_of::<u64>()),
         );
         bytes.extend_from_slice(PERSISTENCE_MAGIC);
+        bytes.extend_from_slice(&(self.layout.identity_count() as u64).to_le_bytes());
+        for identity in self.layout.identities() {
+            write_identity(&mut bytes, identity)?;
+        }
         bytes.extend_from_slice(&(snapshot.entries.len() as u64).to_le_bytes());
         for entry in snapshot.entries {
             bytes.extend_from_slice(&entry.hash.to_le_bytes());
@@ -766,7 +797,7 @@ impl AvailabilityIndex {
     }
 }
 
-fn parse_entries(data: &[u8]) -> Result<Vec<PersistedEntry>> {
+fn parse_snapshot(data: &[u8]) -> Result<Option<(Vec<AvailabilityIdentity>, Vec<PersistedEntry>)>> {
     if data.len() < PERSISTENCE_MAGIC.len() + size_of::<u64>() {
         anyhow::bail!("availability index file too short");
     }
@@ -777,21 +808,51 @@ fn parse_entries(data: &[u8]) -> Result<Vec<PersistedEntry>> {
         || magic == LEGACY_PERSISTENCE_MAGIC_V3
         || magic == LEGACY_PERSISTENCE_MAGIC_V4
         || magic == LEGACY_PERSISTENCE_MAGIC_V5
+        || magic == LEGACY_PERSISTENCE_MAGIC_V6
     {
-        return Ok(Vec::new());
+        return Ok(None);
     }
     if magic != PERSISTENCE_MAGIC {
         anyhow::bail!("unknown availability index format");
     }
 
     let mut cursor = PERSISTENCE_MAGIC.len();
-    let entry_count = read_u64(data, &mut cursor)? as usize;
+    let identity_count = read_u64(data, &mut cursor)?;
+    let identity_count = usize::try_from(identity_count)
+        .ok()
+        .filter(|count| *count <= MAX_BACKENDS)
+        .ok_or_else(|| anyhow::anyhow!("invalid availability identity count"))?;
+    let mut identities = Vec::with_capacity(identity_count);
+    for _ in 0..identity_count {
+        identities.push(read_identity(data, &mut cursor)?);
+    }
+    if identities
+        .iter()
+        .enumerate()
+        .any(|(index, identity)| identities[..index].contains(identity))
+    {
+        anyhow::bail!("duplicate availability identity");
+    }
+    let entry_count = usize::try_from(read_u64(data, &mut cursor)?)?;
+    let entry_width = size_of::<u64>() + size_of::<u16>() + size_of::<u64>() + size_of::<u64>();
+    if entry_count > data.len().saturating_sub(cursor) / entry_width {
+        anyhow::bail!("invalid availability entry count");
+    }
     let mut entries = Vec::with_capacity(entry_count);
 
     for _ in 0..entry_count {
         let hash = read_u64(data, &mut cursor)?;
         let tag = read_u16(data, &mut cursor)?;
-        let missing = availability_bits_from_wire(read_u64(data, &mut cursor)?)?;
+        let missing_wire = read_u64(data, &mut cursor)?;
+        let identity_mask = if identity_count == usize::BITS as usize {
+            usize::MAX
+        } else {
+            (1usize << identity_count).wrapping_sub(1)
+        };
+        if missing_wire & !(identity_mask as u64) != 0 {
+            anyhow::bail!("availability bits exceed declared identity table");
+        }
+        let missing = availability_bits_from_wire(missing_wire)?;
         let inserted_at = read_u64(data, &mut cursor)?;
         entries.push(PersistedEntry {
             hash,
@@ -801,7 +862,85 @@ fn parse_entries(data: &[u8]) -> Result<Vec<PersistedEntry>> {
         });
     }
 
-    Ok(entries)
+    if cursor != data.len() {
+        anyhow::bail!("trailing bytes in availability index");
+    }
+
+    Ok(Some((identities, entries)))
+}
+
+fn remap_missing_bits(
+    missing: usize,
+    old_identities: &[AvailabilityIdentity],
+    current: &AvailabilityLayout,
+) -> usize {
+    old_identities
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| missing & (1usize << index) != 0)
+        .filter_map(|(_, identity)| current.slot_for_identity(identity))
+        .fold(0, |bits, slot| bits | slot.bit())
+}
+
+fn write_identity(bytes: &mut Vec<u8>, identity: &AvailabilityIdentity) -> Result<()> {
+    let host = identity.host.as_bytes();
+    let host_len = u32::try_from(host.len()).context("availability hostname too long")?;
+    bytes.extend_from_slice(&host_len.to_le_bytes());
+    bytes.extend_from_slice(host);
+    match &identity.username {
+        Some(username) => {
+            bytes.push(1);
+            let username = username.as_bytes();
+            let username_len =
+                u32::try_from(username.len()).context("availability username too long")?;
+            bytes.extend_from_slice(&username_len.to_le_bytes());
+            bytes.extend_from_slice(username);
+        }
+        None => bytes.push(0),
+    }
+    Ok(())
+}
+
+fn read_identity(data: &[u8], cursor: &mut usize) -> Result<AvailabilityIdentity> {
+    let host = read_string(data, cursor, "hostname")?;
+    let has_username = *data
+        .get(*cursor)
+        .ok_or_else(|| anyhow::anyhow!("truncated availability account marker"))?;
+    *cursor += 1;
+    let username = match has_username {
+        0 => None,
+        1 => Some(read_string(data, cursor, "username")?),
+        _ => anyhow::bail!("invalid availability account marker"),
+    };
+    Ok(AvailabilityIdentity { host, username })
+}
+
+fn read_string(data: &[u8], cursor: &mut usize, field: &str) -> Result<String> {
+    let length = usize::try_from(read_u32(data, cursor)?)?;
+    if length > MAX_IDENTITY_FIELD_BYTES {
+        anyhow::bail!("availability {field} is too long");
+    }
+    let end = cursor
+        .checked_add(length)
+        .ok_or_else(|| anyhow::anyhow!("availability {field} length overflow"))?;
+    let bytes = data
+        .get(*cursor..end)
+        .ok_or_else(|| anyhow::anyhow!("truncated availability {field}"))?;
+    *cursor = end;
+    let value = String::from_utf8(bytes.to_vec())
+        .with_context(|| format!("invalid availability {field}"))?;
+    if value.is_empty() {
+        anyhow::bail!("empty availability {field}");
+    }
+    Ok(value)
+}
+
+fn read_u32(data: &[u8], cursor: &mut usize) -> Result<u32> {
+    let bytes = data
+        .get(*cursor..*cursor + size_of::<u32>())
+        .ok_or_else(|| anyhow::anyhow!("truncated u32 field"))?;
+    *cursor += size_of::<u32>();
+    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
 }
 
 fn read_u64(data: &[u8], cursor: &mut usize) -> Result<u64> {
@@ -881,7 +1020,7 @@ mod tests {
 
     fn rewrite_persisted_inserted_at(path: &std::path::Path, inserted_at: u64) {
         let data = std::fs::read(path).unwrap();
-        let mut entries = parse_entries(&data).unwrap();
+        let (identities, mut entries) = parse_snapshot(&data).unwrap().unwrap();
         assert_eq!(
             entries.len(),
             1,
@@ -891,6 +1030,10 @@ mod tests {
 
         let mut bytes = Vec::with_capacity(data.len());
         bytes.extend_from_slice(PERSISTENCE_MAGIC);
+        bytes.extend_from_slice(&(identities.len() as u64).to_le_bytes());
+        for identity in &identities {
+            write_identity(&mut bytes, identity).unwrap();
+        }
         bytes.extend_from_slice(&(entries.len() as u64).to_le_bytes());
         for entry in entries {
             bytes.extend_from_slice(&entry.hash.to_le_bytes());
@@ -939,6 +1082,54 @@ mod tests {
             cached.availability().missing_bits(),
             backend_id.availability_bit()
         );
+    }
+
+    #[test]
+    fn persisted_missing_bits_follow_identity_when_servers_reorder() {
+        let first = [
+            crate::config::Server::builder(
+                "news-a.example",
+                crate::types::Port::try_new(119).unwrap(),
+            )
+            .build()
+            .unwrap(),
+            crate::config::Server::builder(
+                "news-b.example",
+                crate::types::Port::try_new(119).unwrap(),
+            )
+            .build()
+            .unwrap(),
+        ];
+        let reordered = [first[1].clone(), first[0].clone()];
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("availability.idx");
+        let original = AvailabilityIndex::with_layout(
+            Duration::MAX,
+            AvailabilityLayout::from_servers(&first).unwrap(),
+        );
+        let b = BackendId::from_index(1);
+        let msg_id = MessageId::from_borrowed("<reorder@example.com>").unwrap();
+        original.record_availability_missing(
+            &msg_id,
+            AvailabilityLayout::from_servers(&first)
+                .unwrap()
+                .slot_for_backend(b),
+        );
+        original.save_to_path(&path).unwrap();
+        let persisted = std::fs::read(&path).unwrap();
+        assert!(
+            !persisted
+                .windows(b"first-secret".len())
+                .any(|window| window == b"first-secret")
+        );
+
+        let restored = AvailabilityIndex::with_layout(
+            Duration::MAX,
+            AvailabilityLayout::from_servers(&reordered).unwrap(),
+        );
+        restored.load_from_path(&path).unwrap();
+        let cached = restored.get(&msg_id).unwrap();
+        assert_eq!(cached.availability().missing_bits(), 0b01);
     }
 
     #[test]
