@@ -132,15 +132,16 @@ impl MockNntpServer {
                             }
                         }
 
-                        let mut handled = false;
-                        if let Some((_, response)) = handlers
+                        let handled = if let Some((_, response)) = handlers
                             .iter()
                             .filter(|(prefix, _)| cmd_upper.starts_with(prefix.as_str()))
                             .max_by_key(|(prefix, _)| prefix.len())
                         {
                             let _ = stream.write_all(response.as_bytes()).await;
-                            handled = true;
-                        }
+                            true
+                        } else {
+                            false
+                        };
 
                         if !handled {
                             let _ = stream.write_all(b"200 OK\r\n").await;
@@ -492,7 +493,7 @@ pub async fn setup_proxy_with_backends(
     let proxy = NntpProxy::new(config, routing_mode).await?;
 
     // Start proxy accept loop
-    let proxy_for_spawn = proxy.clone();
+    let proxy_for_spawn = proxy;
     tokio::spawn(async move {
         loop {
             if let Ok((stream, addr)) = proxy_listener.accept().await {
