@@ -177,6 +177,10 @@ name = "cache_ingest"
 harness = false
 
 [[bench]]
+name = "cache_metadata_payload"
+harness = false
+
+[[bench]]
 name = "end_to_end_proxy"
 harness = false
 
