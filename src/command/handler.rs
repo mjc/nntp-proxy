@@ -246,6 +246,10 @@ const STATEFUL_REJECT: RejectResponse = RejectResponse::new(
     StatusCode::new(codes::FEATURE_NOT_SUPPORTED),
     "503 Feature not supported in stateless proxy mode\r\n",
 );
+const TRANSPORT_REJECT: RejectResponse = RejectResponse::new(
+    StatusCode::new(codes::FEATURE_NOT_SUPPORTED),
+    "503 Transport-changing command not supported\r\n",
+);
 
 const fn wire_status(wire: &str) -> u16 {
     let bytes = wire.as_bytes();
@@ -368,6 +372,7 @@ fn rejection_for(request: &RequestContext) -> RejectResponse {
     match request.kind() {
         RequestKind::Post => POST_REJECT,
         RequestKind::Ihave => TRANSIT_REJECT,
+        RequestKind::Compress => TRANSPORT_REJECT,
         _ => match request.route_class() {
             RequestRouteClass::Stateful => STATEFUL_REJECT,
             _ => TRANSIT_REJECT,
@@ -562,6 +567,29 @@ mod tests {
             classify("Capabilities"),
             CommandAction::InterceptCapabilities,
         );
+    }
+
+    #[test]
+    fn compress_is_rejected_without_forwarding_in_any_routing_mode() {
+        let request = RequestContext::parse(b"COMPRESS DEFLATE\r\n").expect("valid command");
+        assert_eq!(request.kind(), RequestKind::Compress);
+        assert_eq!(request.route_class(), RequestRouteClass::Reject);
+
+        for routing_mode in [
+            crate::config::RoutingMode::PerCommand,
+            crate::config::RoutingMode::Hybrid,
+            crate::config::RoutingMode::Stateful,
+        ] {
+            let plan = CommandHandler::classify_request(
+                &request,
+                AuthenticationAccess::Authenticated,
+                routing_mode,
+            );
+            assert!(
+                matches!(plan, CommandPlan::Reject(response) if response.status().as_u16() == 503),
+                "COMPRESS must be rejected in {routing_mode:?}: {plan:?}"
+            );
+        }
     }
 
     /// Bug 2 regression test: RFC 4643 §2.3.1 — AUTHINFO is case-insensitive.
