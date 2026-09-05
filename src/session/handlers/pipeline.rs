@@ -10,6 +10,7 @@ use crate::protocol::RequestContext;
 use crate::session::ClientSession;
 use anyhow::Result;
 use smallvec::SmallVec;
+use std::future::Future;
 use tokio::io::AsyncBufReadExt;
 use tokio::time::Duration;
 
@@ -24,7 +25,7 @@ type BatchContexts = SmallVec<[PipelineableRequest; MAX_PIPELINE_DEPTH]>;
 /// Construction stays with the batch reader so stateful commands cannot enter
 /// the concurrent batch executor.
 #[derive(Debug)]
-pub(super) struct PipelineableRequest(RequestContext);
+pub(super) struct PipelineableRequest(Option<RequestContext>);
 
 impl PipelineableRequest {
     #[expect(
@@ -33,20 +34,41 @@ impl PipelineableRequest {
     )]
     fn partition(request: RequestContext) -> Result<Self, RequestContext> {
         if request.is_pipelineable() {
-            Ok(Self(request))
+            Ok(Self(Some(request)))
         } else {
             Err(request)
         }
     }
 
     pub(super) fn request(&self) -> &RequestContext {
-        &self.0
+        self.0.as_ref().expect("pipelineable request was consumed")
     }
 
-    pub(super) fn request_mut(&mut self) -> &mut RequestContext {
-        &mut self.0
+    pub(super) async fn with_request_mut<F, Fut, T>(
+        &mut self,
+        f: F,
+    ) -> Result<T, PipelineInvariantError>
+    where
+        F: FnOnce(RequestContext) -> Fut,
+        Fut: Future<Output = (RequestContext, T)>,
+    {
+        let request = self
+            .0
+            .take()
+            .expect("pipelineable request was already consumed");
+        let (request, result) = f(request).await;
+        let pipelineable = request.is_pipelineable();
+        self.0 = Some(request);
+        if pipelineable {
+            Ok(result)
+        } else {
+            Err(PipelineInvariantError)
+        }
     }
 }
+
+#[derive(Debug)]
+pub(super) struct PipelineInvariantError;
 
 #[expect(
     clippy::large_enum_variant,
@@ -187,17 +209,23 @@ impl RequestBatch {
             }
         }
     }
-
-    /// Get a mutable pipelineable request by index.
-    pub(super) fn context_mut(&mut self, i: usize) -> &mut PipelineableRequest {
+    /// Mutably access a pipelineable request while preserving its admission invariant.
+    pub(super) async fn with_context_mut<F, Fut, T>(
+        &mut self,
+        i: usize,
+        f: F,
+    ) -> Result<T, PipelineInvariantError>
+    where
+        F: FnOnce(RequestContext) -> Fut,
+        Fut: Future<Output = (RequestContext, T)>,
+    {
         match &mut self.contents {
-            BatchContents::Contexts(contexts) => &mut contexts[i],
+            BatchContents::Contexts(contexts) => contexts[i].with_request_mut(f).await,
             BatchContents::Empty | BatchContents::Rejected(_) => {
                 panic!("request context requested from a non-context batch")
             }
         }
     }
-
     /// Get the trailing typed context if present.
     #[cfg(test)]
     pub(super) fn trailing_context(&self) -> Option<&RequestContext> {

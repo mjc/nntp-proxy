@@ -620,20 +620,29 @@ impl ClientSession {
                 .add(request.request_wire_len().get());
             state.auth_access = self.authentication_access(state.auth_access);
 
-            let request = batch.context_mut(i).request_mut();
-            match self
-                .process_single_command(CommandExecutionParams {
-                    request,
-                    auth_access: state.auth_access,
-                    router,
-                    client_writer,
-                    backend_connection: backend_connection.slot(),
-                    auth_username: &mut state.auth_username,
-                    client_to_backend_bytes: state.client_to_backend_bytes,
-                    backend_to_client_bytes: &mut state.backend_to_client_bytes,
+            let command_result = batch
+                .with_context_mut(i, |mut request| async {
+                    let result = self
+                        .process_single_command(CommandExecutionParams {
+                            request: &mut request,
+                            auth_access: state.auth_access,
+                            router,
+                            client_writer,
+                            backend_connection: backend_connection.slot(),
+                            auth_username: &mut state.auth_username,
+                            client_to_backend_bytes: state.client_to_backend_bytes,
+                            backend_to_client_bytes: &mut state.backend_to_client_bytes,
+                        })
+                        .await;
+                    (request, result)
                 })
-                .await?
-            {
+                .await
+                .map_err(|_| {
+                    SessionError::Backend(anyhow::anyhow!(
+                        "pipelineable request lost its pipelineability during execution"
+                    ))
+                })?;
+            match command_result? {
                 SingleCommandResult::Continue => {}
                 SingleCommandResult::Quit => {
                     return Err(SessionError::Backend(anyhow::anyhow!(
@@ -828,7 +837,11 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             let _batch = super::BatchBackendConnection {
-                conn: Some(super::BackendLease::new(BackendId::from_index(0), conn)),
+                conn: Some(super::BackendLease::new(
+                    BackendId::from_index(0),
+                    conn,
+                    crate::session::backend::BackendResponseComplete::for_test(),
+                )),
             };
             tokio::time::sleep(Duration::from_secs(1)).await;
             drop(_batch);
@@ -840,7 +853,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let next = provider.checkout_connection_guard().await.unwrap();
-        drop(next.complete_success());
+        drop(next.complete_success(crate::session::backend::BackendResponseComplete::for_test()));
         assert_eq!(
             accept_count.load(Ordering::SeqCst),
             2,
