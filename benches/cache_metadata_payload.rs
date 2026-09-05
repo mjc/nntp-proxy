@@ -2,7 +2,7 @@
 //!
 //! Run with: `cargo bench --bench cache_metadata_payload`
 
-use divan::{Bencher, black_box};
+use divan::Bencher;
 use nntp_proxy::cache::{HybridCacheConfig, UnifiedCache};
 use nntp_proxy::protocol::StatusCode;
 use nntp_proxy::types::{BackendId, MessageId};
@@ -49,15 +49,16 @@ fn metadata_only_updates(bencher: Bencher) {
     let (runtime, _directory, cache) = benchmark_cache();
     let sequence = AtomicU64::new(0);
 
-    bencher.bench(|| {
-        let id = message_id(sequence.fetch_add(1, Ordering::Relaxed));
-        runtime.block_on(cache.record_backend_has_status(
-            id,
-            StatusCode::new(223),
-            BackendId::from_index(0),
-            0.into(),
-        ));
-    });
+    bencher
+        .with_inputs(|| message_id(sequence.fetch_add(1, Ordering::Relaxed)))
+        .bench_values(|id| {
+            runtime.block_on(cache.record_backend_has_status(
+                id,
+                StatusCode::new(223),
+                BackendId::from_index(0),
+                0.into(),
+            ));
+        });
 
     runtime
         .block_on(cache.close())
@@ -69,15 +70,14 @@ fn retained_payload_updates(bencher: Bencher) {
     let (runtime, _directory, cache) = benchmark_cache();
     let sequence = AtomicU64::new(0);
 
-    bencher.bench(|| {
-        let sequence = sequence.fetch_add(1, Ordering::Relaxed);
-        runtime.block_on(cache.upsert_ingest(
-            message_id(sequence),
-            black_box(article_response(sequence)),
-            BackendId::from_index(0),
-            0.into(),
-        ));
-    });
+    bencher
+        .with_inputs(|| {
+            let sequence = sequence.fetch_add(1, Ordering::Relaxed);
+            (message_id(sequence), article_response(sequence))
+        })
+        .bench_values(|(id, response)| {
+            runtime.block_on(cache.upsert_ingest(id, response, BackendId::from_index(0), 0.into()));
+        });
 
     runtime
         .block_on(cache.close())
@@ -89,27 +89,30 @@ fn mixed_metadata_and_payload_updates(bencher: Bencher) {
     let (runtime, _directory, cache) = benchmark_cache();
     let sequence = AtomicU64::new(0);
 
-    bencher.bench(|| {
-        let sequence = sequence.fetch_add(2, Ordering::Relaxed);
-        runtime.block_on(async {
-            cache
-                .record_backend_has_status(
-                    message_id(sequence),
-                    StatusCode::new(223),
-                    BackendId::from_index(0),
-                    0.into(),
-                )
-                .await;
-            cache
-                .upsert_ingest(
-                    message_id(sequence + 1),
-                    black_box(article_response(sequence + 1)),
-                    BackendId::from_index(0),
-                    0.into(),
-                )
-                .await;
+    bencher
+        .with_inputs(|| {
+            let sequence = sequence.fetch_add(2, Ordering::Relaxed);
+            (
+                message_id(sequence),
+                message_id(sequence + 1),
+                article_response(sequence + 1),
+            )
+        })
+        .bench_values(|(metadata_id, payload_id, response)| {
+            runtime.block_on(async {
+                cache
+                    .record_backend_has_status(
+                        metadata_id,
+                        StatusCode::new(223),
+                        BackendId::from_index(0),
+                        0.into(),
+                    )
+                    .await;
+                cache
+                    .upsert_ingest(payload_id, response, BackendId::from_index(0), 0.into())
+                    .await;
+            });
         });
-    });
 
     runtime
         .block_on(cache.close())
