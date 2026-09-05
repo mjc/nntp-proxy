@@ -193,30 +193,37 @@ impl ClientSession {
         Ok(())
     }
 
-    async fn forward_stateful_backend_bytes<W, BR>(
+    async fn read_stateful_backend_bytes<BR>(
         &self,
-        client_write: &mut W,
         backend_read: &mut BR,
-        state: &mut crate::session::state::SessionLoopState,
-    ) -> Result<bool>
+    ) -> Result<Option<(crate::pool::PooledBuffer, usize)>>
     where
-        W: tokio::io::AsyncWrite + Unpin,
         BR: tokio::io::AsyncRead + Unpin,
     {
         let mut buffer = self.buffer_pool.acquire();
         match buffer.read_from(backend_read).await {
-            Ok(0) => Ok(false),
-            Ok(n) => {
-                for write in state.client_writes_for_backend_read(&buffer[..n]) {
-                    client_write.write_all(write.as_ref()).await?;
-                    state.add_backend_to_client(write.len() as u64);
-                }
-                client_write.flush().await?;
-
-                Ok(true)
-            }
+            Ok(0) => Ok(None),
+            Ok(n) => Ok(Some((buffer, n))),
             Err(e) => Err(e.into()),
         }
+    }
+
+    async fn write_stateful_backend_bytes<W>(
+        &self,
+        client_write: &mut W,
+        buffer: &crate::pool::PooledBuffer,
+        len: usize,
+        state: &mut crate::session::state::SessionLoopState,
+    ) -> Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        for write in state.client_writes_for_backend_read(&buffer[..len]) {
+            client_write.write_all(write.as_ref()).await?;
+            state.add_backend_to_client(write.len() as u64);
+        }
+        client_write.flush().await?;
+        Ok(())
     }
 
     /// Handle stateful session - acquire backend and proxy bidirectionally
@@ -315,16 +322,18 @@ impl ClientSession {
             }
 
             if matches!(state.read_mode(), StatefulReadMode::DrainBackendReplies) {
-                match self
-                    .forward_stateful_backend_bytes(
-                        &mut client_write,
-                        &mut backend_read,
-                        &mut state,
-                    )
-                    .await
-                {
-                    Ok(true) => continue,
-                    Ok(false) => break,
+                match self.read_stateful_backend_bytes(&mut backend_read).await {
+                    Ok(Some((buffer, len))) => {
+                        self.write_stateful_backend_bytes(
+                            &mut client_write,
+                            &buffer,
+                            len,
+                            &mut state,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Ok(None) => break,
                     Err(e) => {
                         warn!(client = %self.client_addr, error = %e, "Backend read error");
                         break;
@@ -395,10 +404,20 @@ impl ClientSession {
                 }
 
                 // Backend → Client
-                result = self.forward_stateful_backend_bytes(&mut client_write, &mut backend_read, &mut state) => {
+                result = self.read_stateful_backend_bytes(&mut backend_read) => {
                     match result {
-                        Ok(true) => {}
-                        Ok(false) => break, // Backend disconnected
+                        Ok(Some((buffer, len))) => {
+                            // Complete output after select! returns so client readiness cannot
+                            // cancel a partially completed write.
+                            self.write_stateful_backend_bytes(
+                                &mut client_write,
+                                &buffer,
+                                len,
+                                &mut state,
+                            )
+                            .await?;
+                        }
+                        Ok(None) => break, // Backend disconnected
                         Err(e) => {
                             warn!(client = %self.client_addr, error = %e, "Backend read error");
                             break;
@@ -417,8 +436,13 @@ impl ClientSession {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
     use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll, Waker};
+    use tokio::io::AsyncWrite;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::sync::Notify;
 
     use crate::auth::AuthHandler;
     use crate::metrics::MetricsCollector;
@@ -439,6 +463,167 @@ mod tests {
             metrics,
         )
         .build()
+    }
+
+    struct GateWriterState {
+        bytes: Vec<u8>,
+        blocked: bool,
+        first_write: bool,
+        waker: Option<Waker>,
+    }
+
+    struct GateWriter {
+        state: Arc<Mutex<GateWriterState>>,
+        partial: Arc<Notify>,
+        complete: Arc<Notify>,
+        expected_len: usize,
+    }
+
+    impl GateWriter {
+        fn new(expected_len: usize, partial: Arc<Notify>, complete: Arc<Notify>) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(GateWriterState {
+                    bytes: Vec::new(),
+                    blocked: false,
+                    first_write: true,
+                    waker: None,
+                })),
+                partial,
+                complete,
+                expected_len,
+            }
+        }
+
+        fn release(&self) {
+            let waker = {
+                let mut state = self.state.lock().expect("writer mutex poisoned");
+                state.blocked = false;
+                state.waker.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.state
+                .lock()
+                .expect("writer mutex poisoned")
+                .bytes
+                .clone()
+        }
+    }
+
+    impl AsyncWrite for GateWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            let mut state = this.state.lock().expect("writer mutex poisoned");
+            if state.blocked {
+                state.waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+
+            if state.first_write && bytes.len() > 1 {
+                let accepted = (bytes.len() / 2).max(1).min(bytes.len() - 1);
+                state.bytes.extend_from_slice(&bytes[..accepted]);
+                state.first_write = false;
+                state.blocked = true;
+                drop(state);
+                this.partial.notify_one();
+                return Poll::Ready(Ok(accepted));
+            }
+
+            state.bytes.extend_from_slice(bytes);
+            let complete = state.bytes.len() >= this.expected_len;
+            drop(state);
+            if complete {
+                this.complete.notify_one();
+            }
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_output_is_not_cancelled_by_ready_client_input() {
+        let session = test_session();
+        let backend_id = BackendId::from_index(0);
+        let state = SessionLoopState::new(false);
+        let first_response = b"111 first\r\n";
+        let second_response = b"111 second\r\n";
+        let expected = [first_response.as_slice(), second_response.as_slice()].concat();
+
+        let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
+        let (backend_end, proxy_backend_end) = tokio::io::duplex(4096);
+        client_end.write_all(b"DATE\r\n").await.unwrap();
+
+        let backend = tokio::spawn(async move {
+            let (backend_read, mut backend_write) = tokio::io::split(backend_end);
+            let mut reader = BufReader::new(backend_read);
+            let mut line = String::new();
+            for response in [first_response.as_slice(), second_response.as_slice()] {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                backend_write.write_all(response).await.unwrap();
+            }
+        });
+
+        let partial = Arc::new(Notify::new());
+        let complete = Arc::new(Notify::new());
+        let writer = GateWriter::new(expected.len(), Arc::clone(&partial), Arc::clone(&complete));
+        let writer_control = GateWriter {
+            state: Arc::clone(&writer.state),
+            partial,
+            complete,
+            expected_len: writer.expected_len,
+        };
+        let (proxy_client_read, _) = tokio::io::split(proxy_client_end);
+        let client_reader = BufReader::new(proxy_client_read);
+        let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
+
+        let proxy = tokio::spawn(async move {
+            session
+                .run_stateful_proxy_loop(
+                    client_reader,
+                    writer,
+                    backend_read,
+                    backend_write,
+                    state,
+                    backend_id,
+                )
+                .await
+        });
+
+        writer_control.partial.notified().await;
+        client_end.write_all(b"DATE\r\n").await.unwrap();
+        writer_control.release();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            writer_control.complete.notified(),
+        )
+        .await
+        .expect("backend output did not complete");
+        assert_eq!(writer_control.bytes(), expected);
+
+        drop(client_end);
+        tokio::time::timeout(std::time::Duration::from_secs(1), proxy)
+            .await
+            .expect("stateful proxy did not stop")
+            .expect("stateful proxy task panicked")
+            .expect("stateful proxy failed");
+        backend.await.unwrap();
     }
 
     #[tokio::test]
