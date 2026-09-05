@@ -52,6 +52,7 @@ use foyer::{
     HybridCachePolicy, LruConfig, PsyncIoEngineConfig, RecoverMode, Source, Spawner,
 };
 use std::hash::{Hash, Hasher};
+use std::mem::size_of;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -63,6 +64,13 @@ use super::ttl;
 use super::{AvailabilityLayout, AvailabilitySlot};
 
 const HYBRID_CACHE_NAME: &str = "nntp-article-cache-v4";
+
+fn hybrid_entry_weight(key: &str, value: &DiskCachedArticle) -> usize {
+    size_of::<String>()
+        .saturating_add(key.len())
+        .saturating_add(size_of::<DiskCachedArticle>())
+        .saturating_add(value.encoded_len())
+}
 
 /// Check available disk space at the given path using df command
 fn check_available_space(_path: &Path) -> Option<u64> {
@@ -268,7 +276,7 @@ impl HybridArticleCache {
             .with_eviction_config(LruConfig {
                 high_priority_pool_ratio: 0.1,
             })
-            .with_weighter(|_key: &String, value: &DiskCachedArticle| value.payload_len().get())
+            .with_weighter(|key: &String, value| hybrid_entry_weight(key, value))
             .storage()
             .with_io_engine_config(PsyncIoEngineConfig::new())
             .with_engine_config(
@@ -653,7 +661,7 @@ impl HybridArticleCache {
             .with_eviction_config(LruConfig {
                 high_priority_pool_ratio: 0.1,
             })
-            .with_weighter(|_key: &String, value: &DiskCachedArticle| value.payload_len().get())
+            .with_weighter(|key: &String, value| hybrid_entry_weight(key, value))
             .storage()
             .with_io_engine_config(Box::new(NoopIoEngineConfig) as Box<dyn foyer::IoEngineConfig>);
 
@@ -688,6 +696,32 @@ mod tests {
     //! Cache-level integration tests for `HybridArticleCache`
     //!
     use super::*;
+
+    #[test]
+    fn hybrid_weight_includes_key_metadata_and_payload_framing() {
+        let missing = DiskCachedArticle::missing(super::ttl::CacheTier::new(0));
+        let article = DiskCachedArticle::from_ingest_response_with_tier(
+            b"220 1 <weight@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n"
+                .as_slice()
+                .into(),
+            super::ttl::CacheTier::new(0),
+        )
+        .expect("valid cache entry");
+
+        let short_key = String::from("a");
+        let long_key = String::from("a-long-message-id");
+        let missing_weight = hybrid_entry_weight(&short_key, &missing);
+
+        assert_eq!(
+            missing_weight,
+            size_of::<String>()
+                + short_key.len()
+                + size_of::<DiskCachedArticle>()
+                + missing.encoded_len()
+        );
+        assert!(hybrid_entry_weight(&long_key, &missing) > missing_weight);
+        assert!(hybrid_entry_weight(&short_key, &article) > missing_weight);
+    }
 
     #[test]
     fn hybrid_cache_name_cold_invalidates_old_disk_formats() {
