@@ -7,7 +7,10 @@
 //! # Wire Format
 //!
 //! ```text
-//! [magic:u32][status:u16][availability-epoch:u64][missing:u64][timestamp:u64][tier:u8][payload-kind:u8]...
+//! V8: [magic:u32][status:u16][availability-epoch:u64][missing:u64]
+//!     [negative-timestamps:u64 * MAX_BACKENDS][timestamp:u64][tier:u8][payload-kind:u8]...
+//! V6/V7 omit the per-backend timestamp array and use the entry timestamp for
+//! negative-availability expiration.
 //! ```
 
 use crate::protocol::StatusCode;
@@ -24,6 +27,7 @@ use super::ttl;
 
 const DISK_ENTRY_MAGIC_V6: u32 = 0x4e50_4336; // "NPC6"
 const DISK_ENTRY_MAGIC_V7: u32 = 0x4e50_4337; // "NPC7"
+const DISK_ENTRY_MAGIC_V8: u32 = 0x4e50_4338; // "NPC8"
 const PAYLOAD_MISSING: u8 = 0;
 const PAYLOAD_AVAILABILITY_ONLY: u8 = 1;
 const PAYLOAD_ARTICLE: u8 = 2;
@@ -34,6 +38,7 @@ const NO_ARTICLE_NUMBER: u64 = u64::MAX;
 const DISK_ENTRY_FIXED_SIZE: usize = size_of::<u32>()
     + size_of::<u16>()
     + size_of::<u64>()
+    + size_of::<u64>() * super::MAX_BACKENDS
     + size_of::<u64>()
     + size_of::<u64>()
     + size_of::<u8>();
@@ -130,7 +135,10 @@ impl TryFrom<u16> for CacheableStatusCode {
 /// Implements foyer's `Code` trait manually for efficient serialization:
 /// - Pre-allocates buffer on decode (no vec resizing)
 /// - Simple binary format:
-///   [magic:u32][status:u16][missing:u64][timestamp:u64][tier:u8][typed-payload]
+///   V8 stores one negative-availability timestamp per backend immediately
+///   after the missing-bitset, before the entry timestamp and tier. Older V6/V7
+///   entries omit that array and are decoded with their entry timestamp copied
+///   into every slot.
 #[derive(Clone, Debug)]
 pub struct DiskCachedArticle {
     /// Validated NNTP status code; only cacheable outcomes are representable.
@@ -139,6 +147,9 @@ pub struct DiskCachedArticle {
     availability_epoch: u64,
     /// Backend availability tracking (authoritative missing bitset)
     pub(super) availability: ArticleAvailability,
+    /// Per-slot timestamps keep one backend's negative fact from being renewed by another.
+    /// In V8 these are persisted in backend-slot order after `availability`.
+    negative_timestamps: [ttl::CacheTimestampMillis; super::MAX_BACKENDS],
     /// Unix timestamp when availability info was last updated (milliseconds since epoch)
     /// Used to expire stale availability-only entries (missing articles, STAT responses)
     /// and for tier-aware TTL calculation
@@ -152,7 +163,7 @@ pub struct DiskCachedArticle {
 impl Code for DiskCachedArticle {
     fn encode(&self, writer: &mut impl Write) -> foyer::Result<()> {
         writer
-            .write_all(&DISK_ENTRY_MAGIC_V7.to_le_bytes())
+            .write_all(&DISK_ENTRY_MAGIC_V8.to_le_bytes())
             .map_err(foyer::Error::io_error)?;
         writer
             .write_all(&self.status_code.as_u16().to_le_bytes())
@@ -163,6 +174,11 @@ impl Code for DiskCachedArticle {
         writer
             .write_all(&availability_bits_to_wire(self.availability.missing_bits())?.to_le_bytes())
             .map_err(foyer::Error::io_error)?;
+        for timestamp in &self.negative_timestamps {
+            writer
+                .write_all(&timestamp.get().to_le_bytes())
+                .map_err(foyer::Error::io_error)?;
+        }
         writer
             .write_all(&self.timestamp.get().to_le_bytes())
             .map_err(foyer::Error::io_error)?;
@@ -179,7 +195,10 @@ impl Code for DiskCachedArticle {
             .read_exact(&mut magic)
             .map_err(foyer::Error::io_error)?;
         let magic = u32::from_le_bytes(magic);
-        if magic != DISK_ENTRY_MAGIC_V6 && magic != DISK_ENTRY_MAGIC_V7 {
+        if magic != DISK_ENTRY_MAGIC_V6
+            && magic != DISK_ENTRY_MAGIC_V7
+            && magic != DISK_ENTRY_MAGIC_V8
+        {
             return Err(foyer::Error::io_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "old hybrid cache entry format",
@@ -201,7 +220,7 @@ impl Code for DiskCachedArticle {
             ))
         })?;
 
-        let availability_epoch = if magic == DISK_ENTRY_MAGIC_V7 {
+        let availability_epoch = if magic == DISK_ENTRY_MAGIC_V7 || magic == DISK_ENTRY_MAGIC_V8 {
             let mut epoch_bytes = [0u8; 8];
             reader
                 .read_exact(&mut epoch_bytes)
@@ -218,12 +237,30 @@ impl Code for DiskCachedArticle {
             .read_exact(&mut missing_bytes)
             .map_err(foyer::Error::io_error)?;
 
+        let missing_bits = availability_bits_from_wire(u64::from_le_bytes(missing_bytes))?;
+        let mut negative_timestamps = if magic == DISK_ENTRY_MAGIC_V8 {
+            let mut timestamps = [ttl::CacheTimestampMillis::new(0); super::MAX_BACKENDS];
+            for timestamp in &mut timestamps {
+                let mut bytes = [0u8; 8];
+                reader
+                    .read_exact(&mut bytes)
+                    .map_err(foyer::Error::io_error)?;
+                *timestamp = ttl::CacheTimestampMillis::new(u64::from_le_bytes(bytes));
+            }
+            timestamps
+        } else {
+            [ttl::CacheTimestampMillis::new(0); super::MAX_BACKENDS]
+        };
+
         // Read timestamp
         let mut timestamp_bytes = [0u8; 8];
         reader
             .read_exact(&mut timestamp_bytes)
             .map_err(foyer::Error::io_error)?;
         let timestamp = ttl::CacheTimestampMillis::new(u64::from_le_bytes(timestamp_bytes));
+        if magic != DISK_ENTRY_MAGIC_V8 {
+            negative_timestamps = [timestamp; super::MAX_BACKENDS];
+        }
 
         // Read tier
         let mut tier_byte = [0u8; 1];
@@ -237,9 +274,8 @@ impl Code for DiskCachedArticle {
         Ok(Self {
             status_code,
             availability_epoch,
-            availability: ArticleAvailability::from_missing_bits(availability_bits_from_wire(
-                u64::from_le_bytes(missing_bytes),
-            )?),
+            availability: ArticleAvailability::from_missing_bits(missing_bits),
+            negative_timestamps,
             timestamp,
             tier,
             payload,
@@ -247,7 +283,7 @@ impl Code for DiskCachedArticle {
     }
 
     fn estimated_size(&self) -> usize {
-        4 + 2 + size_of::<u64>() + size_of::<u64>() + 8 + 1 + encoded_payload_size(&self.payload)
+        self.encoded_len()
     }
 }
 
@@ -441,6 +477,7 @@ impl DiskCachedArticle {
             status_code,
             availability_epoch: 0,
             availability: ArticleAvailability::new(),
+            negative_timestamps: [ttl::CacheTimestampMillis::new(0); super::MAX_BACKENDS],
             timestamp: ttl::CacheTimestampMillis::now(),
             tier,
             payload,
@@ -477,6 +514,7 @@ impl DiskCachedArticle {
             status_code,
             availability_epoch: 0,
             availability: ArticleAvailability::new(),
+            negative_timestamps: [ttl::CacheTimestampMillis::new(0); super::MAX_BACKENDS],
             timestamp: ttl::CacheTimestampMillis::now(),
             tier,
             payload: CachedPayload::AvailabilityOnly,
@@ -489,6 +527,7 @@ impl DiskCachedArticle {
             status_code: CacheableStatusCode::Missing,
             availability_epoch: 0,
             availability: ArticleAvailability::new(),
+            negative_timestamps: [ttl::CacheTimestampMillis::new(0); super::MAX_BACKENDS],
             timestamp: ttl::CacheTimestampMillis::now(),
             tier,
             payload: CachedPayload::Missing,
@@ -544,6 +583,7 @@ impl DiskCachedArticle {
 
     pub(crate) fn record_availability_missing(&mut self, slot: AvailabilitySlot) {
         self.availability.record_missing_slot(slot);
+        self.negative_timestamps[slot.index()] = ttl::CacheTimestampMillis::now();
     }
 
     pub(crate) fn set_availability_epoch(&mut self, epoch: u64) {
@@ -552,13 +592,44 @@ impl DiskCachedArticle {
 
     pub(crate) fn clear_availability(&mut self) {
         self.availability = ArticleAvailability::new();
+        self.negative_timestamps = [ttl::CacheTimestampMillis::new(0); super::MAX_BACKENDS];
+    }
+
+    pub(crate) fn set_negative_timestamps(
+        &mut self,
+        timestamps: [ttl::CacheTimestampMillis; super::MAX_BACKENDS],
+    ) {
+        self.negative_timestamps = timestamps;
+    }
+
+    #[must_use]
+    pub(crate) const fn negative_timestamps(
+        &self,
+    ) -> [ttl::CacheTimestampMillis; super::MAX_BACKENDS] {
+        self.negative_timestamps
     }
 
     #[cfg(test)]
     pub(crate) fn record_backend_missing(&mut self, backend_id: BackendId) {
-        self.availability.record_missing_slot(
+        self.record_availability_missing(
             AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
         );
+    }
+
+    pub(crate) fn expire_stale_availability(&mut self, base_ttl: ttl::CacheTtlMillis) {
+        let mut missing_bits = self.availability.missing_bits();
+        for index in 0..super::MAX_BACKENDS {
+            let Some(slot) = AvailabilitySlot::new(index) else {
+                continue;
+            };
+            if self.availability.is_missing_slot(slot)
+                && ttl::is_expired(self.negative_timestamps[index], base_ttl, self.tier)
+            {
+                missing_bits &= !slot.bit();
+                self.negative_timestamps[index] = ttl::CacheTimestampMillis::new(0);
+            }
+        }
+        self.availability = ArticleAvailability::from_missing_bits(missing_bits);
     }
 
     #[must_use]
@@ -629,6 +700,7 @@ mod tests {
     fn assert_entry_eq(original: &DiskCachedArticle, decoded: &DiskCachedArticle) {
         assert_eq!(original.status_code, decoded.status_code);
         assert_eq!(original.availability, decoded.availability);
+        assert_eq!(original.negative_timestamps, decoded.negative_timestamps);
         assert_eq!(original.timestamp, decoded.timestamp);
         assert_eq!(original.tier, decoded.tier);
         assert_eq!(original.payload, decoded.payload);
@@ -1094,9 +1166,41 @@ mod tests {
     }
 
     #[test]
+    fn test_code_encode_decode_preserves_negative_timestamps() {
+        let mut entry = disk_cached_article_from_ingest_bytes(b"220 ok\r\n").unwrap();
+        entry.record_backend_missing(BackendId::from_index(1));
+        let mut timestamps = [ttl::CacheTimestampMillis::new(0); crate::cache::MAX_BACKENDS];
+        timestamps[1] = ttl::CacheTimestampMillis::new(123_456);
+        entry.set_negative_timestamps(timestamps);
+
+        let mut encoded = Vec::new();
+        entry.encode(&mut encoded).unwrap();
+        let decoded = DiskCachedArticle::decode(&mut encoded.as_slice()).unwrap();
+
+        assert_eq!(decoded.negative_timestamps(), timestamps);
+        assert!(!decoded.should_try_backend(BackendId::from_index(1)));
+    }
+
+    #[test]
+    fn negative_availability_expires_per_backend_after_positive_update() {
+        let mut entry = disk_cached_article_from_ingest_bytes(b"220 ok\r\n").unwrap();
+        entry.record_backend_missing(BackendId::from_index(0));
+        entry.record_backend_missing(BackendId::from_index(1));
+        entry.negative_timestamps[0] = ttl::CacheTimestampMillis::new(0);
+        entry.negative_timestamps[1] =
+            ttl::CacheTimestampMillis::new(ttl::now_millis().saturating_add(60_000));
+
+        entry.record_backend_has_status(CacheableStatusCode::Stat, ttl::CacheTier::new(0));
+        entry.expire_stale_availability(ttl::CacheTtlMillis::new(1));
+
+        assert!(entry.should_try_backend(BackendId::from_index(0)));
+        assert!(!entry.should_try_backend(BackendId::from_index(1)));
+    }
+
+    #[test]
     fn test_code_estimated_size() {
         let entry = disk_cached_article_from_ingest_bytes(b"220 article\r\n").unwrap();
-        let expected = 4 + 2 + size_of::<u64>() + size_of::<u64>() + 8 + 1 + 1;
+        let expected = entry.encoded_len();
         assert_eq!(entry.estimated_size(), expected);
     }
 

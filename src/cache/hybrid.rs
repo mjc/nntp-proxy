@@ -352,6 +352,7 @@ impl HybridArticleCache {
         if entry.availability_epoch() != self.availability_epoch {
             entry.clear_availability();
         }
+        entry.expire_stale_availability(self.ttl_millis);
         (!entry.is_expired(self.ttl_millis)).then_some(entry)
     }
 
@@ -375,6 +376,7 @@ impl HybridArticleCache {
                 if cloned.availability_epoch() != self.availability_epoch {
                     cloned.clear_availability();
                 }
+                cloned.expire_stale_availability(self.ttl_millis);
 
                 // Check tier-aware TTL expiration
                 if cloned.is_expired(self.ttl_millis) {
@@ -451,10 +453,12 @@ impl HybridArticleCache {
         let entry_len = entry.payload_len();
 
         let mut existing_availability = None;
+        let mut existing_negative_timestamps = None;
 
         // Check for existing entry - don't overwrite larger semantic payloads with smaller ones.
         if let Some(existing) = self.get_fresh_entry_for_mutation(&key).await {
             existing_availability = Some(existing.availability());
+            existing_negative_timestamps = Some(existing.negative_timestamps());
             if existing.availability().is_missing_slot(slot) {
                 return;
             }
@@ -484,6 +488,9 @@ impl HybridArticleCache {
 
         if let Some(availability) = existing_availability {
             entry.availability = availability;
+        }
+        if let Some(timestamps) = existing_negative_timestamps {
+            entry.set_negative_timestamps(timestamps);
         }
         entry.set_availability_epoch(self.availability_epoch);
         self.cache.insert(key.clone(), entry);
