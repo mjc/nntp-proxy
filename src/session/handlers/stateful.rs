@@ -14,6 +14,73 @@ use tracing::{debug, error, warn};
 
 use crate::constants::buffer::READER_CAPACITY;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::session) enum StatefulConnectionDisposition {
+    Reusable,
+    RetireClient,
+    RetireBackend,
+}
+
+#[must_use]
+pub(in crate::session) struct StatefulLoopResult {
+    metrics: TransferMetrics,
+    disposition: StatefulConnectionDisposition,
+}
+
+impl StatefulLoopResult {
+    fn new(metrics: TransferMetrics, disposition: StatefulConnectionDisposition) -> Self {
+        Self {
+            metrics,
+            disposition,
+        }
+    }
+
+    pub(in crate::session) const fn disposition(&self) -> StatefulConnectionDisposition {
+        self.disposition
+    }
+
+    pub(in crate::session) const fn into_metrics(self) -> TransferMetrics {
+        self.metrics
+    }
+}
+
+impl std::ops::Deref for StatefulLoopResult {
+    type Target = TransferMetrics;
+
+    fn deref(&self) -> &Self::Target {
+        &self.metrics
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatefulSessionExit {
+    ClientDisconnected,
+    ClientReadError,
+    BackendDisconnected,
+    BackendReadError,
+}
+
+impl StatefulSessionExit {
+    fn disposition(
+        self,
+        state: &crate::session::state::SessionLoopState,
+    ) -> StatefulConnectionDisposition {
+        match self {
+            Self::ClientDisconnected
+                if !state.has_pending_backend_replies() && !state.has_deferred_replies() =>
+            {
+                StatefulConnectionDisposition::Reusable
+            }
+            Self::ClientDisconnected | Self::ClientReadError => {
+                StatefulConnectionDisposition::RetireClient
+            }
+            Self::BackendDisconnected | Self::BackendReadError => {
+                StatefulConnectionDisposition::RetireBackend
+            }
+        }
+    }
+}
+
 enum StatefulClientLine {
     Eof,
     Oversized,
@@ -275,14 +342,23 @@ impl ClientSession {
             )
             .await;
 
-        // H2: Only return connection to pool on success
-        if result.is_ok() {
-            let _conn = conn_guard.complete_success(
-                crate::session::backend::BackendResponseComplete::stateful_session(),
-            );
-        } // else: guard drops -> removes connection with replacement cooldown
-
-        result.map_err(crate::session::SessionError::from)
+        match result {
+            Ok(outcome) => {
+                let disposition = outcome.disposition();
+                let metrics = outcome.into_metrics();
+                match disposition {
+                    StatefulConnectionDisposition::Reusable => {
+                        let _conn = conn_guard.complete_success(
+                            crate::session::backend::BackendResponseComplete::stateful_session(),
+                        );
+                    }
+                    StatefulConnectionDisposition::RetireClient => conn_guard.fail_client(),
+                    StatefulConnectionDisposition::RetireBackend => conn_guard.fail_backend(),
+                }
+                Ok(metrics)
+            }
+            Err(error) => Err(crate::session::SessionError::from(error)),
+        }
     }
 
     /// Core bidirectional proxy loop
@@ -296,7 +372,7 @@ impl ClientSession {
         mut backend_write: BW,
         mut state: crate::session::state::SessionLoopState,
         backend_id: crate::types::BackendId,
-    ) -> Result<TransferMetrics>
+    ) -> Result<StatefulLoopResult>
     where
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
@@ -305,7 +381,7 @@ impl ClientSession {
     {
         let mut command_reader = StatefulCommandReader::new();
 
-        loop {
+        let exit = loop {
             // Periodic metrics flush
             if state.check_and_maybe_flush_metrics() {
                 state.flush_byte_deltas(&self.metrics, backend_id, self.username());
@@ -333,10 +409,10 @@ impl ClientSession {
                         .await?;
                         continue;
                     }
-                    Ok(None) => break,
+                    Ok(None) => break StatefulSessionExit::BackendDisconnected,
                     Err(e) => {
                         warn!(client = %self.client_addr, error = %e, "Backend read error");
-                        break;
+                        break StatefulSessionExit::BackendReadError;
                     }
                 }
             }
@@ -345,7 +421,9 @@ impl ClientSession {
                 // Client → Backend
                 result = command_reader.read_next(&mut client_reader) => {
                     match result {
-                        Ok(StatefulClientLine::Eof) => break, // Client disconnected
+                        Ok(StatefulClientLine::Eof) => {
+                            break StatefulSessionExit::ClientDisconnected;
+                        }
                         Ok(StatefulClientLine::Oversized) => {
                             use crate::protocol::COMMAND_TOO_LONG;
                             client_write.write_all(COMMAND_TOO_LONG).await?;
@@ -398,7 +476,7 @@ impl ClientSession {
                         }
                         Err(e) => {
                             warn!(client = %self.client_addr, error = %e, "Client read error");
-                            break;
+                            break StatefulSessionExit::ClientReadError;
                         }
                     }
                 }
@@ -417,20 +495,21 @@ impl ClientSession {
                             )
                             .await?;
                         }
-                        Ok(None) => break, // Backend disconnected
+                        Ok(None) => break StatefulSessionExit::BackendDisconnected,
                         Err(e) => {
                             warn!(client = %self.client_addr, error = %e, "Backend read error");
-                            break;
+                            break StatefulSessionExit::BackendReadError;
                         }
                     }
                 }
             }
-        }
+        };
 
         // Final metrics - report any remaining byte deltas
         state.flush_byte_deltas(&self.metrics, backend_id, self.username());
 
-        Ok(state.into_metrics())
+        let disposition = exit.disposition(&state);
+        Ok(StatefulLoopResult::new(state.into_metrics(), disposition))
     }
 }
 
@@ -447,6 +526,7 @@ mod tests {
     use crate::auth::AuthHandler;
     use crate::metrics::MetricsCollector;
     use crate::pool::BufferPool;
+    use crate::protocol::RequestKind;
     use crate::session::ClientSession;
     use crate::session::state::SessionLoopState;
     use crate::types::{BackendId, BufferSize, ClientAddress};
@@ -463,6 +543,27 @@ mod tests {
             metrics,
         )
         .build()
+    }
+
+    #[test]
+    fn stateful_connection_reuse_requires_a_drained_exchange() {
+        let clean = SessionLoopState::new(false);
+        assert_eq!(
+            super::StatefulSessionExit::ClientDisconnected.disposition(&clean),
+            super::StatefulConnectionDisposition::Reusable
+        );
+
+        let mut pending = SessionLoopState::new(false);
+        pending.mark_backend_request_sent(RequestKind::Date);
+        assert_eq!(
+            super::StatefulSessionExit::ClientDisconnected.disposition(&pending),
+            super::StatefulConnectionDisposition::RetireClient
+        );
+
+        assert_eq!(
+            super::StatefulSessionExit::BackendDisconnected.disposition(&clean),
+            super::StatefulConnectionDisposition::RetireBackend
+        );
     }
 
     struct GateWriterState {
@@ -622,7 +723,7 @@ mod tests {
         assert_eq!(writer_control.bytes(), expected);
 
         drop(client_end);
-        tokio::time::timeout(std::time::Duration::from_secs(1), proxy)
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), proxy)
             .await
             .expect("stateful proxy did not stop")
             .expect("stateful proxy task panicked")
