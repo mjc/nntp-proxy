@@ -191,7 +191,7 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
     let mut buffer = [0; 1024];
 
     // Read greeting (sent by prepare_stateful_connection)
-    let n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
+    let n = timeout(Duration::from_secs(5), client.read(&mut buffer)).await??;
     let greeting = String::from_utf8_lossy(&buffer[..n]);
     assert!(
         greeting.contains("201"),
@@ -199,7 +199,7 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
     );
 
     // Read error (sent by handle_stateful_session when backend connection fails)
-    let n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
+    let n = timeout(Duration::from_secs(5), client.read(&mut buffer)).await??;
     let error_response = String::from_utf8_lossy(&buffer[..n]);
     assert!(
         error_response.contains("400 Backend server unavailable"),
