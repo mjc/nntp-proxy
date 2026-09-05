@@ -31,6 +31,12 @@ const PAYLOAD_HEAD: u8 = 3;
 const PAYLOAD_BODY: u8 = 4;
 const PAYLOAD_STAT: u8 = 5;
 const NO_ARTICLE_NUMBER: u64 = u64::MAX;
+const DISK_ENTRY_FIXED_SIZE: usize = size_of::<u32>()
+    + size_of::<u16>()
+    + size_of::<u64>()
+    + size_of::<u64>()
+    + size_of::<u64>()
+    + size_of::<u8>();
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct CachedSectionLen(u32);
@@ -502,6 +508,12 @@ impl DiskCachedArticle {
     #[must_use]
     pub(crate) fn payload_len(&self) -> super::article::CachedPayloadLen {
         self.payload.len()
+    }
+
+    /// Size of the serialized value, including metadata and payload framing.
+    #[must_use]
+    pub(crate) fn encoded_len(&self) -> usize {
+        DISK_ENTRY_FIXED_SIZE + encoded_payload_size(&self.payload)
     }
 
     #[must_use]
