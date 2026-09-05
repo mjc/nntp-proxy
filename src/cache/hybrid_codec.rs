@@ -595,6 +595,53 @@ impl DiskCachedArticle {
         self.negative_timestamps = [ttl::CacheTimestampMillis::new(0); super::MAX_BACKENDS];
     }
 
+    pub(crate) fn merge_compatible_sections(&mut self, other: &Self) -> bool {
+        let merged = match (&self.payload, &other.payload) {
+            (
+                CachedPayload::Head {
+                    article_number: left_number,
+                    headers,
+                },
+                CachedPayload::Body {
+                    article_number: right_number,
+                    body,
+                },
+            ) if compatible_article_numbers(*left_number, *right_number) => {
+                Some(CachedPayload::Article {
+                    article_number: (*left_number).or(*right_number),
+                    headers: headers.clone(),
+                    body: body.clone(),
+                })
+            }
+            (
+                CachedPayload::Body {
+                    article_number: left_number,
+                    body,
+                },
+                CachedPayload::Head {
+                    article_number: right_number,
+                    headers,
+                },
+            ) if compatible_article_numbers(*left_number, *right_number) => {
+                Some(CachedPayload::Article {
+                    article_number: (*left_number).or(*right_number),
+                    headers: headers.clone(),
+                    body: body.clone(),
+                })
+            }
+            _ => None,
+        };
+
+        let Some(payload) = merged else {
+            return false;
+        };
+        self.status_code = CacheableStatusCode::Article;
+        self.tier = self.tier.max(other.tier);
+        self.payload = payload;
+        self.timestamp = ttl::CacheTimestampMillis::now();
+        true
+    }
+
     pub(crate) fn set_negative_timestamps(
         &mut self,
         timestamps: [ttl::CacheTimestampMillis; super::MAX_BACKENDS],
@@ -643,7 +690,10 @@ impl DiskCachedArticle {
         status_code: CacheableStatusCode,
         tier: ttl::CacheTier,
     ) {
-        if !self.is_complete_article() {
+        if matches!(
+            self.payload,
+            CachedPayload::Missing | CachedPayload::AvailabilityOnly
+        ) {
             self.status_code = status_code;
             self.payload = CachedPayload::AvailabilityOnly;
             self.tier = tier;
@@ -688,6 +738,13 @@ impl DiskCachedArticle {
     pub(crate) const fn tier(&self) -> ttl::CacheTier {
         self.tier
     }
+}
+
+fn compatible_article_numbers(
+    left: Option<CachedArticleNumber>,
+    right: Option<CachedArticleNumber>,
+) -> bool {
+    left.is_none() || right.is_none() || left == right
 }
 
 #[cfg(test)]
@@ -1230,6 +1287,78 @@ mod tests {
         let entry =
             disk_cached_article_from_ingest_bytes(b"221 0 <t@x>\r\nSubject: T\r\n.\r\n").unwrap();
         assert!(!entry.is_complete_article());
+    }
+
+    #[test]
+    fn successful_status_update_preserves_cached_head() {
+        let mut entry =
+            disk_cached_article_from_ingest_bytes(b"221 0 <id>\r\nH: V\r\n.\r\n").unwrap();
+
+        entry.record_backend_has_status(CacheableStatusCode::Stat, ttl::CacheTier::new(0));
+
+        assert!(
+            entry
+                .cached_response_for(RequestKind::Head, "<id>")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn compatible_head_and_body_sections_merge() {
+        let mut head =
+            disk_cached_article_from_ingest_bytes(b"221 0 <id>\r\nH: V\r\n.\r\n").unwrap();
+        let body = disk_cached_article_from_ingest_bytes(b"222 0 <id>\r\nB\r\n.\r\n").unwrap();
+
+        assert!(head.merge_compatible_sections(&body));
+        assert!(
+            head.cached_response_for(RequestKind::Head, "<id>")
+                .is_some()
+        );
+        assert!(
+            head.cached_response_for(RequestKind::Body, "<id>")
+                .is_some()
+        );
+        assert!(
+            head.cached_response_for(RequestKind::Article, "<id>")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn merging_sections_keeps_the_longer_tier_ttl() {
+        let mut head = DiskCachedArticle::from_contiguous_ingest_with_tier(
+            b"221 0 <id>\r\nH: V\r\n.\r\n",
+            ttl::CacheTier::new(1),
+        )
+        .unwrap();
+        let body = DiskCachedArticle::from_contiguous_ingest_with_tier(
+            b"222 0 <id>\r\nB\r\n.\r\n",
+            ttl::CacheTier::new(3),
+        )
+        .unwrap();
+
+        assert!(head.merge_compatible_sections(&body));
+        assert_eq!(head.tier(), ttl::CacheTier::new(3));
+    }
+
+    #[test]
+    fn incompatible_article_numbers_do_not_merge_sections() {
+        let mut head = DiskCachedArticle::from_contiguous_ingest_with_tier(
+            b"221 10 <id>\r\nH: V\r\n.\r\n",
+            ttl::CacheTier::new(0),
+        )
+        .unwrap();
+        let body = DiskCachedArticle::from_contiguous_ingest_with_tier(
+            b"222 11 <id>\r\nB\r\n.\r\n",
+            ttl::CacheTier::new(0),
+        )
+        .unwrap();
+
+        assert!(!head.merge_compatible_sections(&body));
+        assert!(
+            head.cached_response_for(RequestKind::Article, "<id>")
+                .is_none()
+        );
     }
 
     #[test]
