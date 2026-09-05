@@ -16,7 +16,6 @@ use crate::constants::buffer::READER_CAPACITY;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::session) enum StatefulConnectionDisposition {
-    Reusable,
     RetireClient,
     RetireBackend,
 }
@@ -99,16 +98,8 @@ enum StatefulSessionExit {
 }
 
 impl StatefulSessionExit {
-    fn disposition(
-        self,
-        state: &crate::session::state::SessionLoopState,
-    ) -> StatefulConnectionDisposition {
+    fn disposition(self) -> StatefulConnectionDisposition {
         match self {
-            Self::ClientDisconnected
-                if !state.has_pending_backend_replies() && !state.has_deferred_replies() =>
-            {
-                StatefulConnectionDisposition::Reusable
-            }
             Self::ClientDisconnected | Self::ClientReadError => {
                 StatefulConnectionDisposition::RetireClient
             }
@@ -415,11 +406,6 @@ impl ClientSession {
                 let disposition = outcome.disposition();
                 let metrics = outcome.into_metrics();
                 match disposition {
-                    StatefulConnectionDisposition::Reusable => {
-                        let _conn = conn_guard.complete_success(
-                            crate::session::backend::BackendResponseComplete::stateful_session(),
-                        );
-                    }
                     StatefulConnectionDisposition::RetireClient => conn_guard.fail_client(),
                     StatefulConnectionDisposition::RetireBackend => conn_guard.fail_backend(),
                 }
@@ -603,7 +589,7 @@ impl ClientSession {
         // Final metrics - report any remaining byte deltas
         state.flush_byte_deltas(&self.metrics, backend_id, self.username());
 
-        let disposition = exit.disposition(&state);
+        let disposition = exit.disposition();
         Ok(StatefulLoopResult::new(state.into_metrics(), disposition))
     }
 }
@@ -621,7 +607,6 @@ mod tests {
     use crate::auth::AuthHandler;
     use crate::metrics::MetricsCollector;
     use crate::pool::BufferPool;
-    use crate::protocol::RequestKind;
     use crate::session::ClientSession;
     use crate::session::state::SessionLoopState;
     use crate::types::{BackendId, BufferSize, ClientAddress};
@@ -641,22 +626,18 @@ mod tests {
     }
 
     #[test]
-    fn stateful_connection_reuse_requires_a_drained_exchange() {
-        let clean = SessionLoopState::new(false);
+    fn stateful_session_exit_never_assumes_reader_state_is_reset() {
         assert_eq!(
-            super::StatefulSessionExit::ClientDisconnected.disposition(&clean),
-            super::StatefulConnectionDisposition::Reusable
-        );
-
-        let mut pending = SessionLoopState::new(false);
-        pending.mark_backend_request_sent(RequestKind::Date);
-        assert_eq!(
-            super::StatefulSessionExit::ClientDisconnected.disposition(&pending),
+            super::StatefulSessionExit::ClientDisconnected.disposition(),
             super::StatefulConnectionDisposition::RetireClient
         );
 
         assert_eq!(
-            super::StatefulSessionExit::BackendDisconnected.disposition(&clean),
+            super::StatefulSessionExit::ClientReadError.disposition(),
+            super::StatefulConnectionDisposition::RetireClient
+        );
+        assert_eq!(
+            super::StatefulSessionExit::BackendDisconnected.disposition(),
             super::StatefulConnectionDisposition::RetireBackend
         );
     }
