@@ -512,6 +512,15 @@ mod tests {
                 .bytes
                 .clone()
         }
+
+        fn control(&self) -> Self {
+            Self {
+                state: Arc::clone(&self.state),
+                partial: Arc::clone(&self.partial),
+                complete: Arc::clone(&self.complete),
+                expected_len: self.expected_len,
+            }
+        }
     }
 
     impl AsyncWrite for GateWriter {
@@ -582,12 +591,7 @@ mod tests {
         let partial = Arc::new(Notify::new());
         let complete = Arc::new(Notify::new());
         let writer = GateWriter::new(expected.len(), Arc::clone(&partial), Arc::clone(&complete));
-        let writer_control = GateWriter {
-            state: Arc::clone(&writer.state),
-            partial,
-            complete,
-            expected_len: writer.expected_len,
-        };
+        let writer_control = writer.control();
         let (proxy_client_read, _) = tokio::io::split(proxy_client_end);
         let client_reader = BufReader::new(proxy_client_read);
         let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
