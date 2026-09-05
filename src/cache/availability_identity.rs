@@ -61,6 +61,11 @@ impl AvailabilitySlot {
     pub(crate) const fn bit(self) -> usize {
         1usize << self.0
     }
+
+    #[must_use]
+    pub(crate) const fn index(self) -> usize {
+        self.0
+    }
 }
 
 /// Set of configured availability slots used for exhaustion decisions.
