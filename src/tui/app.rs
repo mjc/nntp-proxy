@@ -2087,9 +2087,8 @@ mod tests {
             .iter()
             .find(|user| user.username == "alice")
             .expect("alice stats should exist");
-        let raw_received = backend.raw_received_per_sec().get() as u64;
         assert!(
-            user.bytes_received_per_sec.get() < raw_received,
+            (user.bytes_received_per_sec.get() as f64) < backend.raw_received_per_sec().get(),
             "user display rate should use smoothed value"
         );
     }

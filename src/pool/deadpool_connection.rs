@@ -301,16 +301,16 @@ impl TcpManager {
         let tls_policy = options
             .tls_config
             .as_ref()
-            .map(TlsConfig::policy)
-            .unwrap_or(TlsPolicy::Plain);
+            .map_or(TlsPolicy::Plain, TlsConfig::policy);
         let tls_manager = match options.tls_config {
             Some(cfg) if tls_policy.is_enabled() => {
-                let mgr = Arc::new(TlsManager::new(cfg.clone()).map_err(|e| {
-                    ConnectionError::TlsHandshake {
-                        backend: name.clone(),
-                        source: e.into(),
-                    }
-                })?);
+                let mgr =
+                    Arc::new(
+                        TlsManager::new(cfg).map_err(|e| ConnectionError::TlsHandshake {
+                            backend: name.clone(),
+                            source: e.into(),
+                        })?,
+                    );
                 Some(mgr)
             }
             Some(_) | None => None,

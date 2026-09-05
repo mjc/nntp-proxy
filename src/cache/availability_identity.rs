@@ -33,8 +33,7 @@ impl AvailabilityIdentity {
             namespace: server
                 .availability_namespace
                 .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| server.host.to_string()),
+                .map_or_else(|| server.host.to_string(), ToString::to_string),
             account: server
                 .username
                 .clone()

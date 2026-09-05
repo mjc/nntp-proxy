@@ -381,12 +381,12 @@ impl NntpProxyBuilder {
                 Arc::new(UnifiedCache::memory_with_layout(
                     capacity,
                     cache_config.article_cache_ttl_secs,
-                    availability_layout.clone(),
+                    availability_layout,
                 ))
             } else {
                 Arc::new(UnifiedCache::availability_with_layout(
                     cache_config.article_cache_ttl_secs,
-                    availability_layout.clone(),
+                    availability_layout,
                 ))
             };
 

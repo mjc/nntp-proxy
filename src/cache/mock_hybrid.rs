@@ -118,7 +118,6 @@ impl MockHybridCache {
 mod tests {
     use super::*;
     use crate::protocol::RequestKind;
-    use anyhow::Result;
     use futures::executor::block_on;
 
     fn msg_id() -> MessageId<'static> {
@@ -183,7 +182,7 @@ mod tests {
     }
 
     #[test]
-    fn basic_ops() -> Result<()> {
+    fn basic_ops() {
         let cache = MockHybridCache::new(1024 * 1024);
 
         let message_id = msgid("<test@example.com>");
@@ -200,12 +199,10 @@ mod tests {
         let stats = cache.stats();
         assert_eq!(stats.hits, 1);
         assert_eq!(stats.misses, 0);
-
-        Ok(())
     }
 
     #[test]
-    fn upsert_accepts_borrowed_backend_bytes() -> Result<()> {
+    fn upsert_accepts_borrowed_backend_bytes() {
         let cache = MockHybridCache::new(1024 * 1024);
         let message_id = msgid("<borrowed@example.com>");
         let buffer = b"220 0 <borrowed@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n";
@@ -217,12 +214,10 @@ mod tests {
             &message_id,
             buffer,
         );
-
-        Ok(())
     }
 
     #[test]
-    fn cache_miss_updates_stats() -> Result<()> {
+    fn cache_miss_updates_stats() {
         let cache = MockHybridCache::new(1024 * 1024);
 
         let message_id = msgid("<nonexistent@example.com>");
@@ -233,12 +228,10 @@ mod tests {
         let stats = cache.stats();
         assert_eq!(stats.hits, 0);
         assert_eq!(stats.misses, 1);
-
-        Ok(())
     }
 
     #[test]
-    fn upsert_preserves_larger_buffer() -> Result<()> {
+    fn upsert_preserves_larger_buffer() {
         let cache = MockHybridCache::new(1024 * 1024);
 
         let message_id = msgid("<test@example.com>");
@@ -260,12 +253,10 @@ mod tests {
         let entry = cache.get(&message_id).unwrap();
         assert_article(&entry, &message_id, large_buffer);
         assert_availability(&entry, &[(0, true), (1, true)]);
-
-        Ok(())
     }
 
     #[test]
-    fn record_missing_creates_availability_entry() -> Result<()> {
+    fn record_missing_creates_availability_entry() {
         let cache = MockHybridCache::new(1024 * 1024);
 
         let message_id = msgid("<missing@example.com>");
@@ -277,12 +268,10 @@ mod tests {
 
         let entry = entry.unwrap();
         assert_availability(&entry, &[(0, false), (1, true)]);
-
-        Ok(())
     }
 
     #[test]
-    fn tracks_availability() -> Result<()> {
+    fn tracks_availability() {
         let cache = MockHybridCache::new(1024 * 1024);
 
         let message_id = msgid("<avail@example.com>");
@@ -298,12 +287,10 @@ mod tests {
 
         let entry = cache.get(&message_id).unwrap();
         assert_availability(&entry, &[(0, true), (1, false), (2, false), (3, true)]);
-
-        Ok(())
     }
 
     #[test]
-    fn close_succeeds() -> Result<()> {
+    fn close_succeeds() {
         let cache = MockHybridCache::new(1024 * 1024);
 
         let message_id = msgid("<test@example.com>");
@@ -314,7 +301,5 @@ mod tests {
         );
 
         MockHybridCache::close();
-
-        Ok(())
     }
 }
