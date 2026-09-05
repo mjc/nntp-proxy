@@ -812,7 +812,7 @@ pub(crate) fn request_kind_has_response_body(kind: RequestKind, status: StatusCo
             | (RequestKind::List, 215)
             | (RequestKind::Over | RequestKind::Xover, 224)
             | (RequestKind::Hdr, 225)
-            | (RequestKind::Xhdr, 221)
+            | (RequestKind::Xhdr, 221 | 225)
             | (RequestKind::NewNews, 230)
             | (RequestKind::NewGroups, 231)
     ) || matches!(kind, RequestKind::Unknown) && status_implies_response_body(code)
@@ -1461,5 +1461,8 @@ mod tests {
         assert!(unknown.has_response_body(StatusCode::new(282)));
         assert!(unknown.has_response_body(StatusCode::new(288)));
         assert!(!unknown.has_response_body(StatusCode::new(281)));
+        let xhdr = request_context(b"XHDR Subject 1-10\r\n");
+        assert!(xhdr.has_response_body(StatusCode::new(221)));
+        assert!(xhdr.has_response_body(StatusCode::new(225)));
     }
 }

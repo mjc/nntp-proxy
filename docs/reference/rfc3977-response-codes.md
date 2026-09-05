@@ -114,7 +114,8 @@ The proxy treats these request/status combinations as multiline:
 - `HEAD` with **221**
 - `BODY` with **222**
 - `OVER`/`XOVER` with **224**
-- `HDR`/`XHDR` with **225**
+- `HDR` with **225**
+- `XHDR` with **221** or **225**
 - `NEWNEWS` with **230**
 - `NEWGROUPS` with **231**
 
