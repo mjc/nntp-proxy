@@ -419,7 +419,6 @@ impl ClientSession {
                 let disposition = error.disposition();
                 let source = error.into_source();
                 match disposition {
-                    StatefulConnectionDisposition::Reusable => conn_guard.fail_backend(),
                     StatefulConnectionDisposition::RetireClient => conn_guard.fail_client(),
                     StatefulConnectionDisposition::RetireBackend => conn_guard.fail_backend(),
                 }

@@ -7,7 +7,10 @@
 //! # Wire Format
 //!
 //! ```text
-//! [magic:u32][status:u16][availability-epoch:u64][missing:u64][timestamp:u64][tier:u8][payload-kind:u8]...
+//! V8: [magic:u32][status:u16][availability-epoch:u64][missing:u64]
+//!     [negative-timestamps:u64 * MAX_BACKENDS][timestamp:u64][tier:u8][payload-kind:u8]...
+//! V6/V7 omit the per-backend timestamp array and use the entry timestamp for
+//! negative-availability expiration.
 //! ```
 
 use crate::protocol::StatusCode;
@@ -132,7 +135,10 @@ impl TryFrom<u16> for CacheableStatusCode {
 /// Implements foyer's `Code` trait manually for efficient serialization:
 /// - Pre-allocates buffer on decode (no vec resizing)
 /// - Simple binary format:
-///   [magic:u32][status:u16][missing:u64][timestamp:u64][tier:u8][typed-payload]
+///   V8 stores one negative-availability timestamp per backend immediately
+///   after the missing-bitset, before the entry timestamp and tier. Older V6/V7
+///   entries omit that array and are decoded with their entry timestamp copied
+///   into every slot.
 #[derive(Clone, Debug)]
 pub struct DiskCachedArticle {
     /// Validated NNTP status code; only cacheable outcomes are representable.
@@ -142,6 +148,7 @@ pub struct DiskCachedArticle {
     /// Backend availability tracking (authoritative missing bitset)
     pub(super) availability: ArticleAvailability,
     /// Per-slot timestamps keep one backend's negative fact from being renewed by another.
+    /// In V8 these are persisted in backend-slot order after `availability`.
     negative_timestamps: [ttl::CacheTimestampMillis; super::MAX_BACKENDS],
     /// Unix timestamp when availability info was last updated (milliseconds since epoch)
     /// Used to expire stale availability-only entries (missing articles, STAT responses)
@@ -693,6 +700,7 @@ mod tests {
     fn assert_entry_eq(original: &DiskCachedArticle, decoded: &DiskCachedArticle) {
         assert_eq!(original.status_code, decoded.status_code);
         assert_eq!(original.availability, decoded.availability);
+        assert_eq!(original.negative_timestamps, decoded.negative_timestamps);
         assert_eq!(original.timestamp, decoded.timestamp);
         assert_eq!(original.tier, decoded.tier);
         assert_eq!(original.payload, decoded.payload);
@@ -1155,6 +1163,22 @@ mod tests {
         assert!(decoded.should_try_backend(BackendId::from_index(0)));
         assert!(decoded.should_try_backend(BackendId::from_index(1)));
         assert!(!decoded.should_try_backend(BackendId::from_index(2)));
+    }
+
+    #[test]
+    fn test_code_encode_decode_preserves_negative_timestamps() {
+        let mut entry = disk_cached_article_from_ingest_bytes(b"220 ok\r\n").unwrap();
+        entry.record_backend_missing(BackendId::from_index(1));
+        let mut timestamps = [ttl::CacheTimestampMillis::new(0); crate::cache::MAX_BACKENDS];
+        timestamps[1] = ttl::CacheTimestampMillis::new(123_456);
+        entry.set_negative_timestamps(timestamps);
+
+        let mut encoded = Vec::new();
+        entry.encode(&mut encoded).unwrap();
+        let decoded = DiskCachedArticle::decode(&mut encoded.as_slice()).unwrap();
+
+        assert_eq!(decoded.negative_timestamps(), timestamps);
+        assert!(!decoded.should_try_backend(BackendId::from_index(1)));
     }
 
     #[test]
