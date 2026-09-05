@@ -65,9 +65,9 @@ use super::{AvailabilityLayout, AvailabilitySlot};
 
 const HYBRID_CACHE_NAME: &str = "nntp-article-cache-v4";
 
-fn hybrid_entry_weight(key: &str, value: &DiskCachedArticle) -> usize {
+fn hybrid_entry_weight(key: &String, value: &DiskCachedArticle) -> usize {
     size_of::<String>()
-        .saturating_add(key.len())
+        .saturating_add(key.capacity())
         .saturating_add(size_of::<DiskCachedArticle>())
         .saturating_add(value.encoded_len())
 }
@@ -715,12 +715,16 @@ mod tests {
         assert_eq!(
             missing_weight,
             size_of::<String>()
-                + short_key.len()
+                + short_key.capacity()
                 + size_of::<DiskCachedArticle>()
                 + missing.encoded_len()
         );
         assert!(hybrid_entry_weight(&long_key, &missing) > missing_weight);
         assert!(hybrid_entry_weight(&short_key, &article) > missing_weight);
+
+        let mut overallocated_key = String::from("a");
+        overallocated_key.reserve(128);
+        assert!(hybrid_entry_weight(&overallocated_key, &missing) > missing_weight);
     }
 
     #[test]
