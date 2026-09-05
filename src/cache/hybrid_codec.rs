@@ -636,6 +636,7 @@ impl DiskCachedArticle {
             return false;
         };
         self.status_code = CacheableStatusCode::Article;
+        self.tier = self.tier.max(other.tier);
         self.payload = payload;
         self.timestamp = ttl::CacheTimestampMillis::now();
         true
@@ -1320,6 +1321,43 @@ mod tests {
         assert!(
             head.cached_response_for(RequestKind::Article, "<id>")
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn merging_sections_keeps_the_longer_tier_ttl() {
+        let mut head = DiskCachedArticle::from_contiguous_ingest_with_tier(
+            b"221 0 <id>\r\nH: V\r\n.\r\n",
+            ttl::CacheTier::new(1),
+        )
+        .unwrap();
+        let body = DiskCachedArticle::from_contiguous_ingest_with_tier(
+            b"222 0 <id>\r\nB\r\n.\r\n",
+            ttl::CacheTier::new(3),
+        )
+        .unwrap();
+
+        assert!(head.merge_compatible_sections(&body));
+        assert_eq!(head.tier(), ttl::CacheTier::new(3));
+    }
+
+    #[test]
+    fn incompatible_article_numbers_do_not_merge_sections() {
+        let mut head = DiskCachedArticle::from_contiguous_ingest_with_tier(
+            b"221 10 <id>\r\nH: V\r\n.\r\n",
+            ttl::CacheTier::new(0),
+        )
+        .unwrap();
+        let body = DiskCachedArticle::from_contiguous_ingest_with_tier(
+            b"222 11 <id>\r\nB\r\n.\r\n",
+            ttl::CacheTier::new(0),
+        )
+        .unwrap();
+
+        assert!(!head.merge_compatible_sections(&body));
+        assert!(
+            head.cached_response_for(RequestKind::Article, "<id>")
+                .is_none()
         );
     }
 
