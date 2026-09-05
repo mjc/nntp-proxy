@@ -28,6 +28,37 @@ pub(crate) struct BackendReadResult {
     inner: BackendReadResultInner,
 }
 
+#[must_use]
+pub(crate) struct BackendResponseComplete(());
+
+impl BackendResponseComplete {
+    pub(super) fn from_reusable_response(
+        reuse: &crate::session::response_transfer::ResponseConnectionReuse,
+    ) -> Option<Self> {
+        if matches!(
+            reuse,
+            crate::session::response_transfer::ResponseConnectionReuse::Reusable
+        ) {
+            Some(Self(()))
+        } else {
+            None
+        }
+    }
+
+    pub(crate) const fn response() -> Self {
+        Self(())
+    }
+
+    pub(crate) const fn stateful_session() -> Self {
+        Self(())
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn for_test() -> Self {
+        Self(())
+    }
+}
+
 /// Failure while reading a complete single-line backend reply into caller-owned
 /// scratch storage.
 #[derive(Debug)]
@@ -128,6 +159,19 @@ impl BackendReadResult {
             BackendReadResultInner::Response(response) => Some(response.status_code()),
             BackendReadResultInner::Invalid(_) => None,
         }
+    }
+
+    pub(crate) fn completion_proof(
+        &self,
+        request: &RequestContext,
+    ) -> Result<BackendResponseComplete> {
+        let Some(status_code) = self.status_code() else {
+            anyhow::bail!("cannot prove completion for an invalid backend response");
+        };
+        if request.has_response_body(status_code) {
+            anyhow::bail!("multiline response requires framer-owned completion");
+        }
+        Ok(BackendResponseComplete(()))
     }
 
     #[must_use]
@@ -299,9 +343,10 @@ pub(crate) async fn observe_response(
     conn: &mut crate::stream::ConnectionStream,
     pool: &crate::pool::BufferPool,
     backend_id: crate::types::BackendId,
-) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
+) -> Result<BackendResponseComplete, crate::session::response_transfer::ResponseTransferError> {
     crate::session::multiline_framing::observe_response(request, buffer, conn, pool, backend_id)
-        .await
+        .await?;
+    Ok(BackendResponseComplete(()))
 }
 
 /// Capture an isolated multiline response into a single pooled capture buffer.
@@ -312,9 +357,10 @@ pub(crate) async fn capture_complete_multiline_response(
     conn: &mut crate::stream::ConnectionStream,
     buffer: &mut PooledBuffer,
     capture: &mut PooledBuffer,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<BackendResponseComplete> {
     crate::session::multiline_framing::capture_isolated_multiline_response(conn, buffer, capture)
-        .await
+        .await?;
+    Ok(BackendResponseComplete(()))
 }
 
 /// Capture an isolated multiline response into chunked pooled storage while it
@@ -324,22 +370,25 @@ pub(crate) async fn capture_complete_multiline_response_chunked_optional(
     buffer: &mut PooledBuffer,
     pool: &crate::pool::BufferPool,
     response: &mut crate::pool::ChunkedResponse,
-) -> anyhow::Result<bool> {
-    crate::session::multiline_framing::capture_isolated_multiline_response_chunked_optional(
-        conn, buffer, pool, response,
-    )
-    .await
-    .map_err(|err| anyhow::anyhow!("backend multiline response capture failed: {err:?}"))
+) -> anyhow::Result<(bool, BackendResponseComplete)> {
+    let retained =
+        crate::session::multiline_framing::capture_isolated_multiline_response_chunked_optional(
+            conn, buffer, pool, response,
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("backend multiline response capture failed: {err:?}"))?;
+    Ok((retained, BackendResponseComplete(())))
 }
 
 /// Drain an isolated multiline response without retaining the bytes.
 pub(crate) async fn observe_complete_multiline_response(
     conn: &mut crate::stream::ConnectionStream,
     buffer: &mut PooledBuffer,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<BackendResponseComplete> {
     crate::session::multiline_framing::observe_isolated_multiline_response(conn, buffer)
         .await
-        .map_err(|err| anyhow::anyhow!("backend multiline response drain failed: {err:?}"))
+        .map_err(|err| anyhow::anyhow!("backend multiline response drain failed: {err:?}"))?;
+    Ok(BackendResponseComplete(()))
 }
 
 #[cfg(test)]

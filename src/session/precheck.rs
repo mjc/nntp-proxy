@@ -220,11 +220,11 @@ async fn execute_backend_query(
     let mut buffer = deps.buffer_pool.acquire();
 
     let response = if should_sample_backend_timing() {
-        backend::execute_request_classified_timed(&mut **conn, request, &mut buffer)
+        backend::execute_request_classified_timed(conn.stream_mut(), request, &mut buffer)
             .await
             .map(|(response, ttfb, send, recv)| (response, Some((ttfb, send, recv))))
     } else {
-        backend::execute_request_classified(&mut **conn, request, &mut buffer)
+        backend::execute_request_classified(conn.stream_mut(), request, &mut buffer)
             .await
             .map(|response| (response, None))
     };
@@ -241,9 +241,10 @@ async fn execute_backend_query(
                 .single_line_bytes(&buffer)
                 .map(crate::cache::CacheIngestResponse::from);
 
-            let response = build_precheck_hit(
+            let (response, completion) = build_precheck_hit(
                 deps,
                 request,
+                &response,
                 status_code,
                 single_line_payload,
                 &mut conn,
@@ -253,7 +254,7 @@ async fn execute_backend_query(
 
             let result = classify_precheck_result(deps, backend, status_code, timings, response);
 
-            let _ = conn.complete_success(); // response received; connection healthy, return to pool
+            let _ = conn.complete_success(completion);
             Ok(result)
         }
         Err(_) => {
@@ -266,20 +267,29 @@ async fn execute_backend_query(
 async fn build_precheck_hit(
     deps: &OwnedDeps,
     request: &RequestContext,
+    response: &crate::session::backend::BackendReadResult,
     status_code: StatusCode,
     single_line_payload: Option<crate::cache::CacheIngestResponse>,
     conn: &mut crate::pool::ConnectionGuard,
     buffer: &mut crate::pool::PooledBuffer,
-) -> Result<PrecheckHit, ()> {
+) -> Result<
+    (
+        PrecheckHit,
+        crate::session::backend::BackendResponseComplete,
+    ),
+    (),
+> {
     if request.has_response_body(status_code) {
         return read_complete_precheck_hit(deps, status_code, conn, buffer).await;
     }
 
-    if let Some(payload) = single_line_payload {
-        Ok(PrecheckHit::Payload(payload))
+    let completion = response.completion_proof(request).map_err(|_| ())?;
+    let hit = if let Some(payload) = single_line_payload {
+        PrecheckHit::Payload(payload)
     } else {
-        Ok(PrecheckHit::Availability(status_code))
-    }
+        PrecheckHit::Availability(status_code)
+    };
+    Ok((hit, completion))
 }
 
 async fn read_complete_precheck_hit(
@@ -287,16 +297,22 @@ async fn read_complete_precheck_hit(
     status_code: StatusCode,
     conn: &mut crate::pool::ConnectionGuard,
     buffer: &mut crate::pool::PooledBuffer,
-) -> Result<PrecheckHit, ()> {
+) -> Result<
+    (
+        PrecheckHit,
+        crate::session::backend::BackendResponseComplete,
+    ),
+    (),
+> {
     let mut response = deps
         .cache
         .stores_payload_responses()
         .then(crate::pool::ChunkedResponse::default);
 
-    if let Some(response) = &mut response {
-        let retained =
+    let completion = if let Some(response) = &mut response {
+        let (retained, completion) =
             crate::session::backend::capture_complete_multiline_response_chunked_optional(
-                conn.as_mut(),
+                conn.stream_mut(),
                 buffer,
                 &deps.buffer_pool,
                 response,
@@ -305,21 +321,21 @@ async fn read_complete_precheck_hit(
             .map_err(|_| ())?;
         if !retained {
             response.clear();
-            return Ok(PrecheckHit::Availability(status_code));
+            return Ok((PrecheckHit::Availability(status_code), completion));
         }
+        completion
     } else {
-        crate::session::backend::observe_complete_multiline_response(conn.as_mut(), buffer)
+        crate::session::backend::observe_complete_multiline_response(conn.stream_mut(), buffer)
             .await
-            .map_err(|_| ())?;
-    }
+            .map_err(|_| ())?
+    };
 
-    if let Some(response) = response {
-        Ok(PrecheckHit::Payload(
-            crate::cache::CacheIngestResponse::Chunked(response),
-        ))
+    let hit = if let Some(response) = response {
+        PrecheckHit::Payload(crate::cache::CacheIngestResponse::Chunked(response))
     } else {
-        Ok(PrecheckHit::Availability(status_code))
-    }
+        PrecheckHit::Availability(status_code)
+    };
+    Ok((hit, completion))
 }
 
 fn classify_precheck_result(

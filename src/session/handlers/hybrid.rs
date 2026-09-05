@@ -61,8 +61,8 @@ impl StatefulBackendLease {
         self.backend_id
     }
 
-    fn complete_success(self) {
-        let _ = self.connection.complete_success();
+    fn complete_success(self, completion: crate::session::backend::BackendResponseComplete) {
+        let _ = self.connection.complete_success(completion);
     }
 }
 
@@ -175,7 +175,7 @@ impl ClientSession {
         // Forward the triggering request (response handled by proxy loop)
         initial_request
             .request()
-            .write_wire_to(&mut ***backend.connection_mut())
+            .write_wire_to(backend.connection_mut().stream_mut())
             .await
             .context("Failed to send initial request to backend")?;
 
@@ -202,7 +202,7 @@ impl ClientSession {
 
         let (mut backend, state) = prepared.into_parts();
         let backend_id = backend.backend_id();
-        let (backend_read, backend_write) = tokio::io::split(&mut ***backend.connection_mut());
+        let (backend_read, backend_write) = tokio::io::split(backend.connection_mut().stream_mut());
 
         // Delegate to stateful loop (handles all remaining commands + responses)
         let result = self
@@ -220,7 +220,9 @@ impl ClientSession {
 
         // H1: Only return connection to pool on success
         if result.is_ok() {
-            backend.complete_success();
+            backend.complete_success(
+                crate::session::backend::BackendResponseComplete::stateful_session(),
+            );
         } // else: lease drop removes the connection with replacement cooldown
 
         // Metrics guard automatically ends session via Drop

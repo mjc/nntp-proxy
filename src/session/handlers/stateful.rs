@@ -254,7 +254,7 @@ impl ClientSession {
         // Split streams
         let (client_read, client_write) = client_stream.split();
         let client_reader = BufReader::with_capacity(READER_CAPACITY, client_read);
-        let (backend_read, backend_write) = tokio::io::split(&mut **conn_guard);
+        let (backend_read, backend_write) = tokio::io::split(conn_guard.stream_mut());
         let state = crate::session::state::SessionLoopState::new(self.auth_handler.is_enabled());
 
         let result = self
@@ -270,7 +270,9 @@ impl ClientSession {
 
         // H2: Only return connection to pool on success
         if result.is_ok() {
-            let _conn = conn_guard.complete_success();
+            let _conn = conn_guard.complete_success(
+                crate::session::backend::BackendResponseComplete::stateful_session(),
+            );
         } // else: guard drops -> removes connection with replacement cooldown
 
         result.map_err(crate::session::SessionError::from)
