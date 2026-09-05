@@ -51,6 +51,10 @@ impl StatefulLoopError {
     pub(in crate::session) const fn disposition(&self) -> StatefulConnectionDisposition {
         self.disposition
     }
+
+    pub(in crate::session) fn into_source(self) -> anyhow::Error {
+        self.source
+    }
 }
 
 impl std::fmt::Display for StatefulLoopError {
@@ -427,13 +431,13 @@ impl ClientSession {
             }
             Err(error) => {
                 let disposition = error.disposition();
+                let source = error.into_source();
                 match disposition {
+                    StatefulConnectionDisposition::Reusable => conn_guard.fail_backend(),
                     StatefulConnectionDisposition::RetireClient => conn_guard.fail_client(),
                     StatefulConnectionDisposition::RetireBackend => conn_guard.fail_backend(),
                 }
-                Err(crate::session::SessionError::from(anyhow::Error::new(
-                    error,
-                )))
+                Err(crate::session::SessionError::from(source))
             }
         }
     }
