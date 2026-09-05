@@ -263,7 +263,7 @@ impl<'a> RequestLine<'a> {
     #[must_use]
     pub fn parse(line: &'a [u8]) -> Self {
         let bytes = trim_line_end(line);
-        let split = memchr::memchr(b' ', bytes).unwrap_or(bytes.len());
+        let split = memchr::memchr2(b' ', b'\t', bytes).unwrap_or(bytes.len());
         let verb = &bytes[..split];
         let args = if split < bytes.len() {
             &bytes[split + 1..]
@@ -1119,6 +1119,16 @@ mod tests {
 
         assert_eq!(spaced.message_id(), Some("<a@b>"));
         assert_eq!(spaced.route_class(), RequestRouteClass::ArticleByMessageId);
+    }
+
+    #[test]
+    fn borrowed_request_line_accepts_tab_command_separator() {
+        let parsed = RequestLine::parse(b"ARTICLE\t<a@b>\r\n");
+
+        assert_eq!(parsed.kind(), RequestKind::Article);
+        assert_eq!(parsed.args(), b"<a@b>");
+        assert_eq!(parsed.message_id(), Some("<a@b>"));
+        assert_eq!(parsed.route_class(), RequestRouteClass::ArticleByMessageId);
     }
 
     #[test]
