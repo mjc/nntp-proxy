@@ -40,10 +40,19 @@ impl RecordingState for Recorded {}
 /// let recorded = bytes.mark_recorded();
 /// // Can't record again - `bytes` has been moved!
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct MetricsBytes<State: RecordingState> {
     bytes: u64,
     _state: PhantomData<State>,
+}
+
+impl Clone for MetricsBytes<Recorded> {
+    fn clone(&self) -> Self {
+        Self {
+            bytes: self.bytes,
+            _state: PhantomData,
+        }
+    }
 }
 
 impl MetricsBytes<Unrecorded> {
@@ -110,10 +119,19 @@ pub enum TransferDirection {
 }
 
 /// Strongly-typed byte count with direction
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DirectionalBytes<State: RecordingState> {
     bytes: MetricsBytes<State>,
     direction: TransferDirection,
+}
+
+impl Clone for DirectionalBytes<Recorded> {
+    fn clone(&self) -> Self {
+        Self {
+            bytes: self.bytes.clone(),
+            direction: self.direction,
+        }
+    }
 }
 
 impl DirectionalBytes<Unrecorded> {
@@ -219,13 +237,6 @@ mod tests {
         assert_eq!(recorded.as_u64(), 1024);
     }
 
-    #[test]
-    fn test_unrecorded_clone() {
-        let bytes1 = MetricsBytes::<Unrecorded>::new(512);
-        let bytes2 = bytes1.clone();
-        assert_eq!(bytes1.peek(), bytes2.peek());
-    }
-
     // MetricsBytes<Recorded> tests
     #[test]
     fn test_recorded_as_u64() {
@@ -307,15 +318,6 @@ mod tests {
 
         assert_eq!(cmd.direction(), TransferDirection::ClientToBackend);
         assert_eq!(resp.direction(), TransferDirection::BackendToClient);
-    }
-
-    #[test]
-    fn test_directional_clone() {
-        let bytes1 = DirectionalBytes::client_to_backend(768);
-        let bytes2 = bytes1.clone();
-
-        assert_eq!(bytes1.direction(), bytes2.direction());
-        assert_eq!(bytes1.into_bytes().peek(), bytes2.into_bytes().peek());
     }
 
     #[test]
