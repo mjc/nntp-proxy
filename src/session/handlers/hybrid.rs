@@ -64,6 +64,25 @@ impl StatefulBackendLease {
     fn complete_success(self, completion: crate::session::backend::BackendResponseComplete) {
         let _ = self.connection.complete_success(completion);
     }
+
+    fn finalize(
+        self,
+        disposition: crate::session::handlers::stateful::StatefulConnectionDisposition,
+    ) {
+        match disposition {
+            crate::session::handlers::stateful::StatefulConnectionDisposition::Reusable => {
+                self.complete_success(
+                    crate::session::backend::BackendResponseComplete::stateful_session(),
+                );
+            }
+            crate::session::handlers::stateful::StatefulConnectionDisposition::RetireClient => {
+                self.connection.fail_client();
+            }
+            crate::session::handlers::stateful::StatefulConnectionDisposition::RetireBackend => {
+                self.connection.fail_backend();
+            }
+        }
+    }
 }
 
 /// Backend resources and loop state after the triggering request is registered.
@@ -173,11 +192,17 @@ impl ClientSession {
         );
 
         // Forward the triggering request (response handled by proxy loop)
-        initial_request
+        if let Err(error) = initial_request
             .request()
             .write_wire_to(backend.connection_mut().stream_mut())
             .await
-            .context("Failed to send initial request to backend")?;
+            .context("Failed to send initial request to backend")
+        {
+            backend.finalize(
+                crate::session::handlers::stateful::StatefulConnectionDisposition::RetireBackend,
+            );
+            return Err(crate::session::SessionError::from(error));
+        }
 
         // Build initial state with carried-over byte counts
         let initial_bytes =
@@ -189,16 +214,19 @@ impl ClientSession {
         );
         state.mark_backend_request_sent(initial_request.request().kind());
 
-        let prepared = PreparedStatefulLoop::new(backend, state);
-
         match self.mode_state.switch_to_stateful() {
             crate::session::ModeTransition::Switched => {}
             transition => {
+                backend.finalize(
+                    crate::session::handlers::stateful::StatefulConnectionDisposition::RetireBackend,
+                );
                 return Err(crate::session::SessionError::Backend(anyhow::anyhow!(
                     "stateful handoff entered from invalid mode: {transition:?}"
                 )));
             }
         }
+
+        let prepared = PreparedStatefulLoop::new(backend, state);
 
         let (mut backend, state) = prepared.into_parts();
         let backend_id = backend.backend_id();
@@ -218,15 +246,21 @@ impl ClientSession {
 
         // pending_guard automatically calls complete_command via Drop
 
-        // H1: Only return connection to pool on success
-        if result.is_ok() {
-            backend.complete_success(
-                crate::session::backend::BackendResponseComplete::stateful_session(),
-            );
-        } // else: lease drop removes the connection with replacement cooldown
-
         // Metrics guard automatically ends session via Drop
-        result.map_err(crate::session::SessionError::from)
+        match result {
+            Ok(outcome) => {
+                let disposition = outcome.disposition();
+                let metrics = outcome.into_metrics();
+                backend.finalize(disposition);
+                Ok(metrics)
+            }
+            Err(error) => {
+                let disposition = error.disposition();
+                let source = error.into_source();
+                backend.finalize(disposition);
+                Err(crate::session::SessionError::from(source))
+            }
+        }
     }
 
     /// Acquire a dedicated backend connection for stateful mode
