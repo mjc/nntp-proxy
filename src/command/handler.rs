@@ -372,7 +372,7 @@ fn rejection_for(request: &RequestContext) -> RejectResponse {
     match request.kind() {
         RequestKind::Post => POST_REJECT,
         RequestKind::Ihave => TRANSIT_REJECT,
-        RequestKind::Compress => TRANSPORT_REJECT,
+        RequestKind::Compress | RequestKind::StartTls => TRANSPORT_REJECT,
         _ => match request.route_class() {
             RequestRouteClass::Stateful => STATEFUL_REJECT,
             _ => TRANSIT_REJECT,
@@ -585,9 +585,13 @@ mod tests {
                 AuthenticationAccess::Authenticated,
                 routing_mode,
             );
-            assert!(
-                matches!(plan, CommandPlan::Reject(response) if response.status().as_u16() == 503),
-                "COMPRESS must be rejected in {routing_mode:?}: {plan:?}"
+            let CommandPlan::Reject(response) = plan else {
+                panic!("COMPRESS must be rejected in {routing_mode:?}: {plan:?}");
+            };
+            assert_eq!(response.status().as_u16(), 503);
+            assert_eq!(
+                response.to_string(),
+                "503 Transport-changing command not supported\r\n"
             );
         }
     }
