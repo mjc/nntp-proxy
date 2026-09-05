@@ -40,7 +40,7 @@ impl RecordingState for Recorded {}
 /// let recorded = bytes.mark_recorded();
 /// // Can't record again - `bytes` has been moved!
 /// ```
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct MetricsBytes<State: RecordingState> {
     bytes: u64,
     _state: PhantomData<State>,
@@ -110,7 +110,7 @@ pub enum TransferDirection {
 }
 
 /// Strongly-typed byte count with direction
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DirectionalBytes<State: RecordingState> {
     bytes: MetricsBytes<State>,
     direction: TransferDirection,
@@ -222,7 +222,7 @@ mod tests {
     #[test]
     fn test_unrecorded_clone() {
         let bytes1 = MetricsBytes::<Unrecorded>::new(512);
-        let bytes2 = bytes1;
+        let bytes2 = bytes1.clone();
         assert_eq!(bytes1.peek(), bytes2.peek());
     }
 
@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn test_recorded_clone() {
         let bytes1 = MetricsBytes::<Unrecorded>::new(256).mark_recorded();
-        let bytes2 = bytes1;
+        let bytes2 = bytes1.clone();
         assert_eq!(bytes1.as_u64(), bytes2.as_u64());
     }
 
@@ -312,7 +312,7 @@ mod tests {
     #[test]
     fn test_directional_clone() {
         let bytes1 = DirectionalBytes::client_to_backend(768);
-        let bytes2 = bytes1;
+        let bytes2 = bytes1.clone();
 
         assert_eq!(bytes1.direction(), bytes2.direction());
         assert_eq!(bytes1.into_bytes().peek(), bytes2.into_bytes().peek());
