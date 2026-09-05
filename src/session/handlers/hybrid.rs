@@ -64,6 +64,25 @@ impl StatefulBackendLease {
     fn complete_success(self, completion: crate::session::backend::BackendResponseComplete) {
         let _ = self.connection.complete_success(completion);
     }
+
+    fn finalize(
+        self,
+        disposition: crate::session::handlers::stateful::StatefulConnectionDisposition,
+    ) {
+        match disposition {
+            crate::session::handlers::stateful::StatefulConnectionDisposition::Reusable => {
+                self.complete_success(
+                    crate::session::backend::BackendResponseComplete::stateful_session(),
+                );
+            }
+            crate::session::handlers::stateful::StatefulConnectionDisposition::RetireClient => {
+                self.connection.fail_client();
+            }
+            crate::session::handlers::stateful::StatefulConnectionDisposition::RetireBackend => {
+                self.connection.fail_backend();
+            }
+        }
+    }
 }
 
 /// Backend resources and loop state after the triggering request is registered.
@@ -218,15 +237,16 @@ impl ClientSession {
 
         // pending_guard automatically calls complete_command via Drop
 
-        // H1: Only return connection to pool on success
-        if result.is_ok() {
-            backend.complete_success(
-                crate::session::backend::BackendResponseComplete::stateful_session(),
-            );
-        } // else: lease drop removes the connection with replacement cooldown
-
         // Metrics guard automatically ends session via Drop
-        result.map_err(crate::session::SessionError::from)
+        match result {
+            Ok(outcome) => {
+                let disposition = outcome.disposition();
+                let metrics = outcome.into_metrics();
+                backend.finalize(disposition);
+                Ok(metrics)
+            }
+            Err(error) => Err(crate::session::SessionError::from(error)),
+        }
     }
 
     /// Acquire a dedicated backend connection for stateful mode
