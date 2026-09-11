@@ -19,6 +19,10 @@ validate_yenc = true
 # Minimum log level for debug.log file (default: "warn")
 # Options: "error", "warn", "info", "debug", "trace"
 log_file_level = "warn"
+# Optional interval in seconds for response write metrics logging (default: disabled)
+# response_write_metrics_secs = 10
+# Optional interval in seconds for client writer lock contention metrics (default: disabled)
+# client_writer_lock_metrics_secs = 10
 # Optional stats persistence path used by the TUI dashboard
 # stats_file = "/var/lib/nntp-proxy/stats.json"
 
@@ -30,6 +34,20 @@ mode = "hybrid"
 backend_selection = "least-loaded"
 # Enable adaptive availability prechecking for STAT/HEAD commands
 adaptive_precheck = false
+
+# Queue backpressure keeps article routing from piling more work onto
+# already-saturated backend connection pools.
+[routing.queue.backpressure]
+enabled = true
+# Soft threshold for queued requests per backend connection, as a percentage.
+# Above this, routing penalizes the backend but may still select it.
+soft_waiters_per_connection_percent = 25
+# Hard threshold for queued requests per backend connection, as a percentage.
+# Above this, routing filters the backend while alternatives exist in the tier.
+hard_waiters_per_connection_percent = 50
+# Sleep duration in milliseconds before retrying when every eligible backend
+# in the preferred tier is above the hard threshold.
+all_busy_sleep_ms = 1
 
 # Memory Configuration
 # These settings affect transport buffers and buffer pools, not article storage.
