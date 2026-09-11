@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use super::availability::ArticleAvailability;
 use super::ttl;
+use super::{AvailabilityLayout, AvailabilitySlot};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct CachedArticleNumber(u64);
@@ -353,6 +354,13 @@ pub struct CachedArticle {
 }
 
 impl CachedArticle {
+    #[cfg(test)]
+    pub fn record_backend_missing(&mut self, backend_id: BackendId) {
+        self.record_availability_missing(
+            AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
+        );
+    }
+
     /// Create an availability-only cache entry without payload bytes.
     #[must_use]
     pub(crate) fn availability_only(status_code: StatusCode, tier: ttl::CacheTier) -> Self {
@@ -504,9 +512,14 @@ impl CachedArticle {
         self.backend_availability.should_try(backend_id)
     }
 
+    #[cfg(test)]
+    pub fn should_try_slot(&self, slot: AvailabilitySlot) -> bool {
+        self.backend_availability.should_try_slot(slot)
+    }
+
     /// Record that a backend returned 430 (doesn't have this article)
-    pub fn record_backend_missing(&mut self, backend_id: BackendId) {
-        self.backend_availability.record_missing(backend_id);
+    pub fn record_availability_missing(&mut self, slot: AvailabilitySlot) {
+        self.backend_availability.record_missing_slot(slot);
     }
 
     /// Check if all backends have been tried and none have the article
@@ -557,17 +570,8 @@ impl CachedArticle {
     ///
     /// Creates a fresh `ArticleAvailability` with backends marked missing based on
     /// cached knowledge (backends that previously returned 430).
-    pub(crate) fn to_availability(&self, total_backends: BackendCount) -> ArticleAvailability {
-        let mut availability = ArticleAvailability::new();
-
-        // Mark backends we know don't have this article
-        for backend_id in total_backends.backend_ids() {
-            if !self.should_try_backend(backend_id) {
-                availability.record_missing(backend_id);
-            }
-        }
-
-        availability
+    pub(crate) const fn to_availability(&self) -> ArticleAvailability {
+        ArticleAvailability::from_missing_bits(self.backend_availability.missing_bits())
     }
 
     #[must_use]
@@ -728,9 +732,16 @@ pub struct ArticleCache {
     capacity: u64,
     /// Base TTL in milliseconds (used for tier-aware expiration via `effective_ttl`)
     ttl_millis: ttl::CacheTtlMillis,
+    layout: AvailabilityLayout,
 }
 
 impl ArticleCache {
+    #[cfg(test)]
+    pub async fn record_backend_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
+        let slot = AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap");
+        self.record_availability_missing(message_id, slot).await;
+    }
+
     /// Create a new article cache
     ///
     /// # Arguments
@@ -810,7 +821,17 @@ impl ArticleCache {
             misses: Arc::new(AtomicU64::new(0)),
             capacity: max_capacity,
             ttl_millis: ttl::CacheTtlMillis::from_duration(ttl),
+            layout: AvailabilityLayout::synthetic(super::MAX_BACKENDS),
         }
+    }
+
+    pub(crate) fn with_layout(mut self, layout: AvailabilityLayout) -> Self {
+        self.layout = layout;
+        self
+    }
+
+    pub(crate) fn availability_slot(&self, backend: BackendId) -> AvailabilitySlot {
+        self.layout.slot_for_backend(backend)
     }
 
     /// Get an article from the cache
@@ -859,11 +880,11 @@ impl ArticleCache {
     fn merge_ingest_entry(
         maybe_entry: Option<Entry<Arc<str>, CachedArticle>>,
         new_entry_template: &CachedArticle,
-        backend: BackendId,
+        slot: AvailabilitySlot,
         ttl_millis: ttl::CacheTtlMillis,
     ) -> CachedArticle {
         if let Some(mut entry) = Self::fresh_entry_for_mutation(maybe_entry, ttl_millis) {
-            if entry.backend_availability.is_missing(backend) {
+            if entry.backend_availability.is_missing_slot(slot) {
                 return entry;
             }
 
@@ -894,13 +915,13 @@ impl ArticleCache {
         maybe_entry: Option<Entry<Arc<str>, CachedArticle>>,
         new_entry_template: &CachedArticle,
         status_code: StatusCode,
-        backend: BackendId,
+        slot: AvailabilitySlot,
         tier: ttl::CacheTier,
         ttl_millis: ttl::CacheTtlMillis,
     ) -> CachedArticle {
         let mut entry = Self::fresh_entry_for_mutation(maybe_entry, ttl_millis)
             .unwrap_or_else(|| new_entry_template.clone());
-        if entry.backend_availability.is_missing(backend) {
+        if entry.backend_availability.is_missing_slot(slot) {
             return entry;
         }
         if !entry.is_complete_article() {
@@ -912,17 +933,17 @@ impl ArticleCache {
         entry
     }
 
-    fn merge_backend_missing_entry(
+    fn merge_availability_missing_entry(
         maybe_entry: Option<Entry<Arc<str>, CachedArticle>>,
-        backend_id: BackendId,
+        slot: AvailabilitySlot,
         ttl_millis: ttl::CacheTtlMillis,
     ) -> CachedArticle {
         if let Some(mut entry) = Self::fresh_entry_for_mutation(maybe_entry, ttl_millis) {
-            entry.record_backend_missing(backend_id);
+            entry.record_availability_missing(slot);
             entry
         } else {
             let mut entry = CachedArticle::missing(ttl::CacheTier::new(0));
-            entry.record_backend_missing(backend_id);
+            entry.record_availability_missing(slot);
             entry
         }
     }
@@ -954,6 +975,22 @@ impl ArticleCache {
         backend: BackendId,
         tier: ttl::CacheTier,
     ) {
+        self.upsert_ingest_for_slot(
+            message_id,
+            buffer,
+            AvailabilitySlot::new(backend.as_index()).expect("backend count fits bitmap"),
+            tier,
+        )
+        .await;
+    }
+
+    pub(crate) async fn upsert_ingest_for_slot(
+        &self,
+        message_id: MessageId<'_>,
+        buffer: impl Into<super::CacheIngestResponse>,
+        slot: AvailabilitySlot,
+        tier: ttl::CacheTier,
+    ) {
         let buffer = buffer.into();
         let key: Arc<str> = message_id.without_brackets().into();
         let new_entry_template = CachedArticle::from_ingest_response_with_tier(buffer, tier);
@@ -967,7 +1004,7 @@ impl ArticleCache {
                 std::future::ready(Self::merge_ingest_entry(
                     maybe_entry,
                     &new_entry_template,
-                    backend,
+                    slot,
                     ttl_millis,
                 ))
             })
@@ -982,6 +1019,22 @@ impl ArticleCache {
         backend: BackendId,
         tier: ttl::CacheTier,
     ) {
+        self.record_has_status_for_slot(
+            message_id,
+            status_code,
+            AvailabilitySlot::new(backend.as_index()).expect("backend count fits bitmap"),
+            tier,
+        )
+        .await;
+    }
+
+    pub(crate) async fn record_has_status_for_slot(
+        &self,
+        message_id: MessageId<'_>,
+        status_code: StatusCode,
+        slot: AvailabilitySlot,
+        tier: ttl::CacheTier,
+    ) {
         let key: Arc<str> = message_id.without_brackets().into();
         let new_entry_template = CachedArticle::availability_only(status_code, tier);
         let ttl_millis = self.ttl_millis;
@@ -993,7 +1046,7 @@ impl ArticleCache {
                     maybe_entry,
                     &new_entry_template,
                     status_code,
-                    backend,
+                    slot,
                     tier,
                     ttl_millis,
                 ))
@@ -1014,7 +1067,11 @@ impl ArticleCache {
     /// Note: We don't store the actual backend 430 response because:
     /// 1. We always send a standardized 430 to clients, never the backend's response
     /// 2. The only info we need is the availability bitset (which backends returned 430)
-    pub async fn record_backend_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
+    pub async fn record_availability_missing(
+        &self,
+        message_id: MessageId<'_>,
+        slot: AvailabilitySlot,
+    ) {
         let key: Arc<str> = message_id.without_brackets().into();
         let misses = &self.misses;
         let ttl_millis = self.ttl_millis;
@@ -1024,9 +1081,9 @@ impl ArticleCache {
             .cache
             .entry(key)
             .and_upsert_with(move |maybe_entry| {
-                std::future::ready(Self::merge_backend_missing_entry(
+                std::future::ready(Self::merge_availability_missing_entry(
                     maybe_entry,
-                    backend_id,
+                    slot,
                     ttl_millis,
                 ))
             })

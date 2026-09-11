@@ -1,7 +1,10 @@
-//! Article routing with availability-aware backend selection
+//! Availability-aware routing for article lookup commands.
 //!
-//! Handles routing article commands across backends, using `ArticleAvailability`
-//! to skip backends that have already returned 430 for a given article.
+//! ARTICLE, BODY, HEAD, and STAT requests with a message-id share the same
+//! negative availability facts: a backend that returned 430 for that article is
+//! skipped until the entry expires.
+
+use super::BackendLease;
 
 use crate::cache::ArticleAvailability;
 use crate::router::{BackendSelector, SuppressedBackends};
@@ -25,8 +28,7 @@ use crate::session::precheck;
 /// Client-side write state shared across cache, precheck, and direct routing paths.
 pub(super) struct RequestExecutionIo<'a> {
     pub(super) client_writer: &'a crate::session::SharedClientWriter,
-    pub(super) backend_connection:
-        &'a mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
+    pub(super) backend_connection: &'a mut Option<BackendLease>,
     pub(super) client_to_backend_bytes: &'a mut ClientToBackendBytes,
     pub(super) backend_to_client_bytes: &'a mut BackendToClientBytes,
 }
@@ -42,7 +44,7 @@ pub(super) enum PreparedRequest {
 }
 
 impl ClientSession {
-    /// Route a single request to a backend and execute it
+    /// Route a single lookup request to a backend and execute it.
     ///
     /// This function is `pub(super)` to allow reuse of per-command routing logic by sibling handler modules
     /// (such as `hybrid.rs`) that also need to route commands.
@@ -51,7 +53,7 @@ impl ClientSession {
         router: Arc<BackendSelector>,
         request: &mut RequestContext,
         client_writer: &crate::session::SharedClientWriter,
-        backend_connection: &mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
+        backend_connection: &mut Option<BackendLease>,
         client_to_backend_bytes: &mut ClientToBackendBytes,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<(), SessionError> {
@@ -65,11 +67,8 @@ impl ClientSession {
         };
         let preloaded_availability = if request.message_id_value().is_some() {
             Some(
-                self.load_article_availability(
-                    request.message_id_value().as_ref(),
-                    router.backend_count(),
-                )
-                .await,
+                self.load_article_availability(request.message_id_value().as_ref())
+                    .await,
             )
         } else {
             None
@@ -102,10 +101,10 @@ impl ClientSession {
             request.verb()
         );
         debug!(
-            "Client {} msg_id={:?}, cache_articles={}",
+            "Client {} msg_id={:?}, payload_policy={:?}",
             self.client_addr,
             request.message_id(),
-            self.cache_articles
+            self.cache.payload_policy()
         );
     }
 
@@ -140,11 +139,8 @@ impl ClientSession {
             Some(availability)
         } else if request.message_id_value().is_some() {
             Some(
-                self.load_article_availability(
-                    request.message_id_value().as_ref(),
-                    router.backend_count(),
-                )
-                .await,
+                self.load_article_availability(request.message_id_value().as_ref())
+                    .await,
             )
         } else {
             None
@@ -175,7 +171,7 @@ impl ClientSession {
         if !self.adaptive_precheck || !(request.is_stat() || request.is_head()) {
             return Ok(false);
         }
-        if request.is_head() && !self.cache_articles {
+        if request.is_head() && !self.cache.stores_payload_responses() {
             return Ok(false);
         }
         let Some(msg_id) = request.message_id_value() else {
@@ -291,7 +287,7 @@ impl ClientSession {
             router.backend_count().get()
         );
 
-        while !availability.all_exhausted(router.backend_count()) {
+        while !availability.all_exhausted_slots(router.availability_mask()) {
             if !is_retry_attempt && !non_primary_tier_prefetch_started {
                 self.spawn_non_primary_tier_stat_prefetch(
                     router,
@@ -395,7 +391,6 @@ impl ClientSession {
     pub(super) async fn load_article_availability(
         &self,
         msg_id: Option<&crate::types::MessageId<'_>>,
-        backend_count: crate::router::BackendCount,
     ) -> crate::cache::ArticleAvailability {
         match msg_id {
             Some(msg_id_ref) => self
@@ -403,7 +398,7 @@ impl ClientSession {
                 .get(msg_id_ref)
                 .await
                 .map(|entry| {
-                    let avail = entry.to_availability(backend_count);
+                    let avail = entry.to_availability();
                     debug!(
                         "Client {} loaded availability for {}: missing_bits={:08b}",
                         self.client_addr,
@@ -426,7 +421,7 @@ impl ClientSession {
         availability: &mut crate::cache::ArticleAvailability,
     ) {
         let backend_id = missing.backend_id();
-        availability.record_missing(backend_id);
+        availability.record_missing_slot(missing.availability_slot());
 
         // Track 430 responses in 4xx metrics for visibility in TUI
         // While 430 is normal retry behavior (not a failure), users want to see

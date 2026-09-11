@@ -4,8 +4,8 @@
 
 use super::defaults;
 use crate::types::{
-    CacheCapacity, HostName, MaxConnections, MaxErrors, Port, ServerName, ThreadCount,
-    duration_serde, option_duration_serde,
+    AvailabilityNamespace, CacheCapacity, HostName, MaxConnections, MaxErrors, Port,
+    QueuePressurePercent, ServerName, ThreadCount, duration_serde, option_duration_serde,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -251,13 +251,59 @@ pub struct QueueBackpressure {
     pub enabled: bool,
     /// Soft queue-pressure threshold (queued requests per connection, percent).
     #[serde(default = "super::defaults::queue_backpressure_soft_waiters_per_connection_percent")]
-    pub soft_waiters_per_connection_percent: u16,
+    pub soft_waiters_per_connection_percent: QueuePressurePercent,
     /// Hard queue-pressure threshold (queued requests per connection, percent).
     #[serde(default = "super::defaults::queue_backpressure_hard_waiters_per_connection_percent")]
-    pub hard_waiters_per_connection_percent: u16,
+    pub hard_waiters_per_connection_percent: QueuePressurePercent,
     /// Sleep duration in milliseconds when all eligible backends in a tier are hard-saturated.
     #[serde(default = "super::defaults::queue_backpressure_all_busy_sleep_ms")]
     pub all_busy_sleep_ms: u64,
+}
+
+/// Validated soft and hard queue-pressure thresholds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueuePressureLimits {
+    soft: QueuePressurePercent,
+    hard: QueuePressurePercent,
+}
+
+impl QueuePressureLimits {
+    /// Construct limits when both percentages are bounded and hard is not below soft.
+    #[must_use]
+    pub fn try_new(soft: u16, hard: u16) -> Option<Self> {
+        let soft = QueuePressurePercent::try_new(soft).ok()?;
+        let hard = QueuePressurePercent::try_new(hard).ok()?;
+        (hard.get() >= soft.get()).then_some(Self { soft, hard })
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn soft(self) -> QueuePressurePercent {
+        self.soft
+    }
+
+    #[inline]
+    #[must_use]
+    pub const fn hard(self) -> QueuePressurePercent {
+        self.hard
+    }
+}
+
+impl Default for QueuePressureLimits {
+    fn default() -> Self {
+        Self::try_new(25, 50).expect("default queue-pressure limits are valid")
+    }
+}
+
+impl QueueBackpressure {
+    /// Return thresholds that are safe to pass to router construction.
+    #[must_use]
+    pub fn limits(&self) -> Option<QueuePressureLimits> {
+        QueuePressureLimits::try_new(
+            self.soft_waiters_per_connection_percent.get(),
+            self.hard_waiters_per_connection_percent.get(),
+        )
+    }
 }
 
 impl Default for QueueBackpressure {
@@ -338,17 +384,17 @@ pub struct Cache {
         alias = "ttl"
     )]
     pub article_cache_ttl_secs: Duration,
-    /// Whether to store full article bodies in the article cache (default: false)
+    /// Whether to retain ARTICLE/BODY payloads in the response cache (default: false)
     ///
     /// When false:
-    /// - Cache still tracks backend availability (smart routing, 430 retry)
-    /// - Article bodies are NOT stored (saves ~750KB per article)
+    /// - Cache still tracks backend availability for retry/routing
+    /// - ARTICLE/BODY payload bytes are NOT stored
     /// - Uses the dedicated availability-only index with bounded LRU eviction
     /// - Useful for availability-only mode with limited memory
     ///
     /// When true:
-    /// - Full caching mode (bodies + availability tracking)
-    /// - Can serve articles from cache without backend query
+    /// - Payload caching mode plus availability tracking
+    /// - Can serve cached ARTICLE/BODY responses without backend query
     #[serde(
         default = "super::defaults::cache_articles",
         rename = "store_article_bodies",
@@ -555,6 +601,10 @@ pub struct Server {
     pub username: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
+    /// Explicit identity namespace for sharing authoritative article availability.
+    /// When omitted, the exact backend host and username define the namespace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub availability_namespace: Option<AvailabilityNamespace>,
     /// Maximum number of concurrent connections to this server
     #[serde(default = "super::defaults::max_connections")]
     pub max_connections: MaxConnections,
@@ -656,6 +706,7 @@ pub struct ServerBuilder {
     name: Option<String>,
     username: Option<String>,
     password: Option<String>,
+    availability_namespace: Option<AvailabilityNamespace>,
     max_connections: Option<MaxConnections>,
     stat_missing: u8,
     use_tls: bool,
@@ -685,6 +736,7 @@ impl ServerBuilder {
             name: None,
             username: None,
             password: None,
+            availability_namespace: None,
             max_connections: None,
             stat_missing: super::defaults::stat_missing(),
             use_tls: false,
@@ -719,6 +771,16 @@ impl ServerBuilder {
     #[must_use]
     pub fn password(mut self, password: impl Into<String>) -> Self {
         self.password = Some(password.into());
+        self
+    }
+
+    /// Set the explicit namespace used for article-availability sharing.
+    #[must_use]
+    pub fn availability_namespace(mut self, namespace: impl Into<String>) -> Self {
+        self.availability_namespace = Some(
+            AvailabilityNamespace::try_new(namespace.into())
+                .expect("availability namespace must not be empty"),
+        );
         self
     }
 
@@ -832,8 +894,13 @@ impl ServerBuilder {
     /// - Port is 0
     /// - Name is empty (when explicitly set)
     /// - Max connections is 0 (when explicitly set)
+    /// - Exactly one of username/password is set
     pub fn build(self) -> Result<Server, anyhow::Error> {
         use crate::types::{HostName, ServerName};
+
+        if self.username.is_some() != self.password.is_some() {
+            anyhow::bail!("backend username and password must be configured together");
+        }
 
         let host = HostName::try_new(self.host.clone())?;
         let port = self.port; // Already a Port type
@@ -860,6 +927,7 @@ impl ServerBuilder {
             name,
             username: self.username,
             password: self.password,
+            availability_namespace: self.availability_namespace,
             max_connections,
             stat_missing: self.stat_missing,
             use_tls: self.use_tls,
@@ -956,6 +1024,16 @@ mod tests {
     }
 
     #[test]
+    fn test_server_builder_rejects_incomplete_backend_credentials() {
+        let result = Server::builder("news.example.com", Port::try_new(119).unwrap())
+            .username("user")
+            .build();
+
+        let error = result.expect_err("incomplete credentials must fail");
+        assert!(error.to_string().contains("configured together"));
+    }
+
+    #[test]
     fn test_proxy_default_host_constant() {
         assert_eq!(Proxy::DEFAULT_HOST, "0.0.0.0");
     }
@@ -1001,16 +1079,23 @@ mod tests {
                 .queue
                 .backpressure
                 .soft_waiters_per_connection_percent,
-            25
+            QueuePressurePercent::try_new(25).unwrap()
         );
         assert_eq!(
             routing
                 .queue
                 .backpressure
                 .hard_waiters_per_connection_percent,
-            50
+            QueuePressurePercent::try_new(50).unwrap()
         );
         assert_eq!(routing.queue.backpressure.all_busy_sleep_ms, 1);
+    }
+
+    #[test]
+    fn test_queue_pressure_limits_reject_invalid_order() {
+        assert!(QueuePressureLimits::try_new(60, 50).is_none());
+        assert!(QueuePressureLimits::try_new(0, 101).is_none());
+        assert!(QueuePressureLimits::try_new(0, 100).is_some());
     }
 
     // HealthCheck tests

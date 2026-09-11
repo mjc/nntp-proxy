@@ -115,15 +115,13 @@ pub type PointVec = SmallVec<[ChartPoint; 64]>;
 
 /// Stack-allocated chart data for typical backend counts.
 /// Most deployments have 1-4 backends, so this avoids heap allocation
-pub type ChartDataVec<'a> = SmallVec<[BackendChartData<'a>; 8]>;
+pub type ChartDataVec = SmallVec<[BackendChartData; 8]>;
 
 /// Chart data for a single backend server
 ///
 /// Pre-computed data points to avoid nested iterations during rendering
 #[derive(Debug, Clone)]
-pub struct BackendChartData<'a> {
-    /// Server name for legend
-    pub name: &'a str,
+pub struct BackendChartData {
     /// Color for this backend's lines
     pub color: Color,
     /// Pre-computed tuples for ratatui (cached to avoid allocation on render)
@@ -132,21 +130,15 @@ pub struct BackendChartData<'a> {
     recv_tuples: SmallVec<[(f64, f64); 64]>,
 }
 
-impl<'a> BackendChartData<'a> {
+impl BackendChartData {
     /// Create new chart data with pre-computed tuples
     #[must_use]
-    pub fn new(
-        name: &'a str,
-        color: Color,
-        sent_points: &[ChartPoint],
-        recv_points: &[ChartPoint],
-    ) -> Self {
+    pub fn new(color: Color, sent_points: &[ChartPoint], recv_points: &[ChartPoint]) -> Self {
         let sent_tuples: SmallVec<[(f64, f64); 64]> =
             sent_points.iter().map(ChartPoint::as_tuple).collect();
         let recv_tuples: SmallVec<[(f64, f64); 64]> =
             recv_points.iter().map(ChartPoint::as_tuple).collect();
         Self {
-            name,
             color,
             sent_tuples,
             recv_tuples,
@@ -236,7 +228,7 @@ mod tests {
         sent_points.push(ChartPoint::new(ChartX::new(0.0), ChartY::new(100.0)));
         sent_points.push(ChartPoint::new(ChartX::new(1.0), ChartY::new(200.0)));
 
-        let data = BackendChartData::new("Test", Color::Green, &sent_points, &PointVec::new());
+        let data = BackendChartData::new(Color::Green, &sent_points, &PointVec::new());
 
         let tuples = data.sent_points_as_tuples();
         assert_eq!(tuples.len(), 2);

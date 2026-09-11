@@ -34,16 +34,6 @@
 
       craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-      # Nightly toolchain for tools that require it (cargo-udeps)
-      rustNightlyForUdeps = pkgs.rust-bin.nightly.latest.default;
-
-      # Wrapper for cargo-udeps that uses nightly
-      cargo-udeps-wrapped = pkgs.writeShellScriptBin "cargo-udeps" ''
-        export RUSTC="${rustNightlyForUdeps}/bin/rustc"
-        export CARGO="${rustNightlyForUdeps}/bin/cargo"
-        exec ${pkgs.cargo-udeps}/bin/cargo-udeps "$@"
-      '';
-
       # Stable toolchain with all cross-compilation targets for releases
       rustCrossToolchain = pkgs.rust-bin.stable.${rustVersion}.default.override {
         extensions = ["rust-src"];
@@ -75,6 +65,12 @@
           # Code quality & linting
           cargo-deny
           cargo-audit
+          cargo-hack
+          cargo-shear
+          cargo-semver-checks
+          cargo-vet
+          typos
+          zizmor
           shellcheck
           actionlint
 
@@ -82,11 +78,11 @@
           cargo-tarpaulin
           cargo-nextest
           cargo-mutants
+          cargo-careful
 
           # Build & dependencies
           cargo-outdated
           cargo-bloat
-          cargo-udeps-wrapped
 
           # Utilities
           tokei
@@ -183,6 +179,9 @@
           echo "   ./scripts/build-release.sh <version> - Build all release binaries"
           echo ""
           echo "🔍 Code quality:"
+          echo "   scripts/quality-fast.sh - Fast local/automation checks"
+          echo "   scripts/quality-pr.sh   - PR-equivalent checks"
+          echo "   scripts/quality-deep.sh <suite> - Deep automation checks"
           echo "   cargo deny check  - Check dependencies for security/licenses"
           echo "   cargo audit       - Check for security vulnerabilities"
           echo "   shellcheck scripts/*.sh - Lint shell scripts"

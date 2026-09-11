@@ -32,7 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Backend DNS lookups now respect TTL.
+- Backend DNS resolution now uses hickory’s TTL-aware caching behavior, with refreshed lookup handling that avoids unnecessary IPv4 cache clears on IPv6-unreachable failures.
+- Tightened `unsafe` boundaries in the pooled-buffer and Windows file-replacement paths, and moved the old `review_claims` coverage into the RFC4643 auth/bypass and buffer test modules.
 - Hardened retry-path routing and guard handling around pending counts, capacity-weighted initial article probing, and idle-pool preference.
 - Fixed a user-active connection-count regression that could diverge from true active-session totals; the dashboard now consistently reports active sessions from typed user-metric counters.
 - Migrated user/session metric collection to typed newtypes (including `ZERO` constructors) and arithmetic helpers so typed counters are incremented at source and cannot be accidentally mixed.

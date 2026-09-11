@@ -1,0 +1,102 @@
+name: Quality Dispatch
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: Deep quality suite to run
+        required: true
+        default: deps
+        type: choice
+        options:
+          - features
+          - deps
+          - mutants
+          - benches
+          - ub
+          - all
+  repository_dispatch:
+    types:
+      - quality-deep
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.suite || github.event.client_payload.suite || 'deps' }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  RUST_MIN_STACK: 8388608
+
+permissions:
+  contents: read
+
+jobs:
+  quality-dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.event.client_payload.ref || github.ref }}
+          persist-credentials: false
+      - name: Read Rust toolchain
+        id: rust-toolchain
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          if [ -z "$channel" ]; then
+            echo "Could not read channel from rust-toolchain.toml" >&2
+            exit 1
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ steps.rust-toolchain.outputs.channel }}
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+      - name: Install mold
+        run: sudo apt-get update && sudo apt-get install -y mold
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          shared-key: quality-dispatch-${{ inputs.suite || github.event.client_payload.suite || 'deps' }}
+          prefix-key: quality-dispatch-${{ runner.os }}-rust-${{ hashFiles('rust-toolchain.toml') }}-
+          cache-on-failure: true
+      - uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
+        with:
+          tool: cargo-hack,cargo-deny,cargo-audit,cargo-shear,shellcheck,typos,zizmor
+      - uses: taiki-e/install-action@7a79fe8c3a13344501c80d99cae481c1c9085912 # v2
+        with:
+          tool: cargo-mutants,cargo-careful
+
+      - name: Resolve suite
+        id: suite
+        env:
+          INPUT_SUITE: ${{ inputs.suite }}
+          PAYLOAD_SUITE: ${{ github.event.client_payload.suite }}
+        run: |
+          suite="${INPUT_SUITE:-${PAYLOAD_SUITE:-deps}}"
+          case "$suite" in
+            features|deps|mutants|benches|ub|all) ;;
+            *)
+              echo "Unsupported suite: $suite" >&2
+              exit 2
+              ;;
+          esac
+          echo "suite=$suite" >> "$GITHUB_OUTPUT"
+
+      - name: Run deep quality suite
+        env:
+          QUALITY_SUITE: ${{ steps.suite.outputs.suite }}
+        run: bash scripts/quality-deep.sh "$QUALITY_SUITE" 2>&1 | tee "quality-$QUALITY_SUITE.log"
+
+      - name: Upload quality results
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: quality-${{ steps.suite.outputs.suite }}
+          path: |
+            quality-${{ steps.suite.outputs.suite }}.log
+            mutants.out/**
+            target/criterion/**
+          retention-days: 7
+          if-no-files-found: ignore

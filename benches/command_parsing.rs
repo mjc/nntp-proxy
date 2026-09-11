@@ -1,6 +1,6 @@
-//! Benchmarks for NNTP command classification
+//! Benchmarks for typed NNTP request parsing and route classification.
 //!
-//! This benchmark suite measures command classification performance across:
+//! This benchmark suite measures `RequestContext::parse` performance across:
 //! - Different command types (ARTICLE, BODY, HEAD, STAT, etc.)
 //! - Message-ID vs numeric article specifications
 //! - Real-world command distribution (70% article retrieval, 10% GROUP, etc.)
@@ -10,14 +10,15 @@
 //! Run with: cargo bench --bench `command_parsing`
 
 use divan::{Bencher, black_box};
+use nntp_proxy::command::CommandHandler;
+use nntp_proxy::config::RoutingMode;
 use nntp_proxy::protocol::RequestContext;
 
 fn main() {
     divan::main();
 }
 
-/// Macro to generate benchmark modules for command classification
-/// Uses 1000 samples × 100 iterations for stable results on noisy hardware
+/// Generate one parser benchmark for a single request line.
 macro_rules! bench_command {
     ($mod_name:ident, $command:expr) => {
         mod $mod_name {
@@ -27,9 +28,21 @@ macro_rules! bench_command {
             fn classifier(bencher: Bencher) {
                 bencher.bench(|| {
                     black_box(
-                        RequestContext::parse(black_box(b"IHAVE <unique@msgid.com>"))
+                        RequestContext::parse(black_box($command.as_bytes()))
                             .expect("valid request line"),
                     )
+                });
+            }
+            #[divan::bench(name = "plan", sample_count = 1000, sample_size = 100)]
+            fn plan(bencher: Bencher) {
+                bencher.bench(|| {
+                    let request = RequestContext::parse(black_box($command.as_bytes()))
+                        .expect("valid request line");
+                    black_box(CommandHandler::classify_request(
+                        &request,
+                        nntp_proxy::command::AuthenticationAccess::Authenticated,
+                        RoutingMode::PerCommand,
+                    ));
                 });
             }
         }
@@ -112,9 +125,9 @@ bench_command!(
 // =============================================================================
 
 mod realistic_workload {
-    use super::{Bencher, RequestContext, black_box};
+    use super::{Bencher, CommandHandler, RequestContext, RoutingMode, black_box};
 
-    /// Simulates a realistic distribution of NNTP commands:
+    /// Simulates a realistic distribution of typed NNTP request parsing:
     /// - 70% article retrieval (ARTICLE/BODY/HEAD/STAT)
     /// - 10% GROUP navigation
     /// - 10% header retrieval (OVER/XOVER)
@@ -153,5 +166,21 @@ mod realistic_workload {
                     );
                 }
             });
+        #[divan::bench(name = "plan", sample_count = 1000, sample_size = 100)]
+        fn plan(bencher: Bencher) {
+            bencher
+                .counter(divan::counter::ItemsCount::new(COMMANDS.len()))
+                .bench(|| {
+                    for cmd in COMMANDS {
+                        let request = RequestContext::parse(black_box(cmd.as_bytes()))
+                            .expect("valid request line");
+                        black_box(CommandHandler::classify_request(
+                            &request,
+                            nntp_proxy::command::AuthenticationAccess::Authenticated,
+                            RoutingMode::PerCommand,
+                        ));
+                    }
+                });
+        }
     }
 }

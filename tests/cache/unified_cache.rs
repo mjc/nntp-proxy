@@ -6,7 +6,7 @@
 //! - `CachedArticle::cached_response_for()` including STAT synthesis
 //! - `DiskCache` configuration defaults and validation
 
-use nntp_proxy::cache::{ArticleCache, AvailabilityIndex, UnifiedCache};
+use nntp_proxy::cache::{ArticleCache, AvailabilityIndex, AvailabilitySlot, UnifiedCache};
 use nntp_proxy::protocol::RequestKind;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
@@ -76,7 +76,10 @@ async fn test_unified_cache_memory_record_missing() {
     let backend_id = BackendId::from_index(0);
 
     cache
-        .record_backend_missing(msg_id.clone(), backend_id)
+        .record_availability_missing(
+            msg_id.clone(),
+            AvailabilitySlot::new(backend_id.as_index()).unwrap(),
+        )
         .await;
 
     let result = cache.get(&msg_id).await;
@@ -92,7 +95,10 @@ async fn test_unified_cache_availability_record_missing() {
     let backend_id = BackendId::from_index(0);
 
     cache
-        .record_backend_missing(msg_id.clone(), backend_id)
+        .record_availability_missing(
+            msg_id.clone(),
+            AvailabilitySlot::new(backend_id.as_index()).unwrap(),
+        )
         .await;
 
     let entry = cache.get(&msg_id).await.expect("availability entry");
@@ -113,7 +119,7 @@ async fn test_unified_cache_record_missing_preserves_existing_article() {
         .await;
 
     cache
-        .record_backend_missing(msg_id.clone(), BackendId::from_index(1))
+        .record_availability_missing(msg_id.clone(), AvailabilitySlot::new(1).unwrap())
         .await;
 
     // Verify backend 1 is now marked as missing
@@ -128,7 +134,7 @@ async fn test_unified_cache_availability_records_only_missing_facts() {
     let cache = UnifiedCache::availability(std::time::Duration::MAX);
     let msg_id = MessageId::from_str_or_wrap("test@example.com").unwrap();
     cache
-        .record_backend_missing(msg_id.clone(), BackendId::from_index(1))
+        .record_availability_missing(msg_id.clone(), AvailabilitySlot::new(1).unwrap())
         .await;
 
     let result = cache.get(&msg_id).await.expect("availability entry");

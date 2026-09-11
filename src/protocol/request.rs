@@ -39,6 +39,7 @@ pub enum RequestKind {
     TakeThis,
     AuthInfo,
     StartTls,
+    Compress,
     Unknown,
 }
 
@@ -225,6 +226,22 @@ impl From<u64> for RequestCacheArticleNumber {
 }
 
 #[derive(Debug)]
+enum RequestCompletion {
+    Local {
+        response: RequestResponseMetadata,
+    },
+    Cache {
+        response: RequestResponseMetadata,
+    },
+    Backend {
+        backend_id: BackendId,
+        response: RequestResponseMetadata,
+        #[cfg_attr(not(test), allow(dead_code))]
+        payload: Option<Box<crate::pool::ChunkedResponse>>,
+    },
+}
+
+#[derive(Debug)]
 pub struct RequestContext {
     kind: RequestKind,
     verb: SmallVec<[u8; 16]>,
@@ -232,9 +249,7 @@ pub struct RequestContext {
     message_id: Option<(usize, usize)>,
     cache_status: Option<RequestCacheStatus>,
     cache_entry: Option<RequestCacheEntryMetadata>,
-    backend_id: Option<BackendId>,
-    response: Option<RequestResponseMetadata>,
-    response_payload: Option<crate::pool::ChunkedResponse>,
+    completion: Option<RequestCompletion>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -249,7 +264,7 @@ impl<'a> RequestLine<'a> {
     #[must_use]
     pub fn parse(line: &'a [u8]) -> Self {
         let bytes = trim_line_end(line);
-        let split = memchr::memchr(b' ', bytes).unwrap_or(bytes.len());
+        let split = memchr::memchr2(b' ', b'\t', bytes).unwrap_or(bytes.len());
         let verb = &bytes[..split];
         let args = if split < bytes.len() {
             &bytes[split + 1..]
@@ -306,11 +321,16 @@ impl<'a> RequestLine<'a> {
     }
 }
 
-impl Clone for RequestContext {
-    fn clone(&self) -> Self {
+impl RequestContext {
+    /// Copy a request before response completion for an independent background probe.
+    ///
+    /// Request contexts intentionally do not implement `Clone`: cloning a
+    /// completed backend response used to silently discard its payload. The
+    /// narrow operation below makes its pre-completion-only contract explicit.
+    pub(crate) fn clone_for_background_probe(&self) -> Self {
         debug_assert!(
-            self.response_payload.is_none(),
-            "completed response payloads are not cloned"
+            self.completion.is_none(),
+            "background probes must copy requests before response completion"
         );
         Self {
             kind: self.kind,
@@ -319,9 +339,7 @@ impl Clone for RequestContext {
             message_id: self.message_id,
             cache_status: self.cache_status,
             cache_entry: self.cache_entry,
-            backend_id: self.backend_id,
-            response: self.response,
-            response_payload: None,
+            completion: None,
         }
     }
 }
@@ -449,9 +467,7 @@ impl RequestContext {
             message_id,
             cache_status: None,
             cache_entry: None,
-            backend_id: None,
-            response: None,
-            response_payload: None,
+            completion: None,
         }
     }
 
@@ -464,7 +480,10 @@ impl RequestContext {
     #[inline]
     #[must_use]
     pub const fn backend_id(&self) -> Option<BackendId> {
-        self.backend_id
+        match self.completion {
+            Some(RequestCompletion::Backend { backend_id, .. }) => Some(backend_id),
+            _ => None,
+        }
     }
 
     #[cfg(test)]
@@ -562,8 +581,10 @@ impl RequestContext {
     #[inline]
     #[must_use]
     pub const fn response_status(&self) -> Option<StatusCode> {
-        match self.response {
-            Some(response) => Some(response.status),
+        match self.completion {
+            Some(RequestCompletion::Local { response })
+            | Some(RequestCompletion::Cache { response })
+            | Some(RequestCompletion::Backend { response, .. }) => Some(response.status),
             None => None,
         }
     }
@@ -571,8 +592,10 @@ impl RequestContext {
     #[inline]
     #[must_use]
     pub const fn response_wire_len(&self) -> Option<ResponseWireLen> {
-        match self.response {
-            Some(response) => Some(response.wire_len),
+        match self.completion {
+            Some(RequestCompletion::Local { response })
+            | Some(RequestCompletion::Cache { response })
+            | Some(RequestCompletion::Backend { response, .. }) => Some(response.wire_len),
             None => None,
         }
     }
@@ -580,16 +603,24 @@ impl RequestContext {
     #[inline]
     #[must_use]
     pub(crate) const fn response_metadata(&self) -> Option<RequestResponseMetadata> {
-        self.response
+        match self.completion {
+            Some(RequestCompletion::Local { response })
+            | Some(RequestCompletion::Cache { response })
+            | Some(RequestCompletion::Backend { response, .. }) => Some(response),
+            None => None,
+        }
     }
 
     #[inline]
     #[must_use]
     #[cfg(test)]
     pub(crate) const fn response_payload_len(&self) -> Option<ResponsePayloadLen> {
-        match &self.response_payload {
-            Some(response) => Some(ResponsePayloadLen::new(response.len())),
-            None => None,
+        match &self.completion {
+            Some(RequestCompletion::Backend {
+                payload: Some(response),
+                ..
+            }) => Some(ResponsePayloadLen::new(response.len())),
+            _ => None,
         }
     }
 
@@ -601,16 +632,24 @@ impl RequestContext {
         status: StatusCode,
         response: crate::pool::ChunkedResponse,
     ) {
-        self.backend_id = Some(backend_id);
-        self.response = Some(RequestResponseMetadata::new(status, response.len().into()));
-        self.response_payload = Some(response);
+        self.completion = Some(RequestCompletion::Backend {
+            backend_id,
+            response: RequestResponseMetadata::new(status, response.len().into()),
+            payload: Some(Box::new(response)),
+        });
     }
 
     #[inline]
     #[cfg(test)]
     #[must_use]
     pub(crate) fn response_payload(&self) -> Option<&crate::pool::ChunkedResponse> {
-        self.response_payload.as_ref()
+        match &self.completion {
+            Some(RequestCompletion::Backend {
+                payload: Some(response),
+                ..
+            }) => Some(response.as_ref()),
+            _ => None,
+        }
     }
 
     #[inline]
@@ -634,24 +673,27 @@ impl RequestContext {
     }
 
     #[inline]
-    pub(crate) const fn record_backend_response(
+    pub(crate) fn record_backend_response(
         &mut self,
         backend_id: BackendId,
         response: RequestResponseMetadata,
     ) {
-        self.backend_id = Some(backend_id);
-        self.response = Some(response);
+        self.completion = Some(RequestCompletion::Backend {
+            backend_id,
+            response,
+            payload: None,
+        });
     }
 
     #[inline]
-    pub(crate) const fn record_cache_response(&mut self, response: RequestResponseMetadata) {
+    pub(crate) fn record_cache_response(&mut self, response: RequestResponseMetadata) {
         self.cache_status = Some(RequestCacheStatus::Hit);
-        self.response = Some(response);
+        self.completion = Some(RequestCompletion::Cache { response });
     }
 
     #[inline]
-    pub(crate) const fn record_local_response(&mut self, response: RequestResponseMetadata) {
-        self.response = Some(response);
+    pub(crate) fn record_local_response(&mut self, response: RequestResponseMetadata) {
+        self.completion = Some(RequestCompletion::Local { response });
     }
 
     #[inline]
@@ -742,6 +784,11 @@ impl RequestContext {
         }
     }
 
+    /// Return whether this request/status pair carries a multiline response body.
+    ///
+    /// RFC 3977 defines multiline responses per command, not by status code
+    /// alone. For example, `211` is single-line for `GROUP` and multiline for
+    /// `LISTGROUP`.
     #[must_use]
     pub fn has_response_body(&self, status: StatusCode) -> bool {
         request_kind_has_response_body(self.kind, status)
@@ -765,7 +812,8 @@ pub(crate) fn request_kind_has_response_body(kind: RequestKind, status: StatusCo
             | (RequestKind::Capabilities, 101)
             | (RequestKind::List, 215)
             | (RequestKind::Over | RequestKind::Xover, 224)
-            | (RequestKind::Hdr | RequestKind::Xhdr, 225)
+            | (RequestKind::Hdr, 225)
+            | (RequestKind::Xhdr, 221 | 225)
             | (RequestKind::NewNews, 230)
             | (RequestKind::NewGroups, 231)
     ) || matches!(kind, RequestKind::Unknown) && status_implies_response_body(code)
@@ -787,7 +835,8 @@ const fn route_class(kind: RequestKind, has_message_id: bool) -> RequestRouteCla
         | RequestKind::Ihave
         | RequestKind::Check
         | RequestKind::TakeThis
-        | RequestKind::StartTls => RequestRouteClass::Reject,
+        | RequestKind::StartTls
+        | RequestKind::Compress => RequestRouteClass::Reject,
         RequestKind::Article | RequestKind::Body | RequestKind::Head | RequestKind::Stat
             if has_message_id =>
         {
@@ -870,6 +919,7 @@ const fn classify_verb(verb: &[u8]) -> RequestKind {
         },
         8 => {
             b"AUTHINFO" => RequestKind::AuthInfo,
+            b"COMPRESS" => RequestKind::Compress,
             b"STARTTLS" => RequestKind::StartTls,
             b"TAKETHIS" => RequestKind::TakeThis,
         },
@@ -1038,6 +1088,16 @@ mod tests {
     }
 
     #[test]
+    fn background_probe_copy_is_explicitly_pre_completion_only() {
+        let ctx = request_context(b"STAT <a@b>\r\n");
+        let probe = ctx.clone_for_background_probe();
+
+        assert_eq!(probe.kind(), ctx.kind());
+        assert_eq!(wire(&probe), wire(&ctx));
+        assert_eq!(probe.response_status(), None);
+    }
+
+    #[test]
     fn borrowed_request_line_parses_without_owning_bytes() {
         let bytes = b"ARTICLE <a@b>\r\n";
         let parsed = RequestLine::parse(bytes);
@@ -1063,6 +1123,16 @@ mod tests {
 
         assert_eq!(spaced.message_id(), Some("<a@b>"));
         assert_eq!(spaced.route_class(), RequestRouteClass::ArticleByMessageId);
+    }
+
+    #[test]
+    fn borrowed_request_line_accepts_tab_command_separator() {
+        let parsed = RequestLine::parse(b"ARTICLE\t<a@b>\r\n");
+
+        assert_eq!(parsed.kind(), RequestKind::Article);
+        assert_eq!(parsed.args(), b"<a@b>");
+        assert_eq!(parsed.message_id(), Some("<a@b>"));
+        assert_eq!(parsed.route_class(), RequestRouteClass::ArticleByMessageId);
     }
 
     #[test]
@@ -1289,6 +1359,27 @@ mod tests {
     }
 
     #[test]
+    fn request_context_completion_replaces_the_previous_source() {
+        let mut ctx = request_context(b"STAT <a@b>\r\n");
+        let backend_id = BackendId::from_index(2);
+        let backend_status = StatusCode::new(223);
+        let local_status = StatusCode::new(205);
+
+        ctx.record_backend_response(
+            backend_id,
+            RequestResponseMetadata::new(backend_status, ResponseWireLen::new(19)),
+        );
+        ctx.record_local_response(RequestResponseMetadata::new(
+            local_status,
+            ResponseWireLen::new(15),
+        ));
+
+        assert_eq!(ctx.backend_id(), None);
+        assert_eq!(ctx.response_status(), Some(local_status));
+        assert_eq!(ctx.response_wire_len(), Some(ResponseWireLen::new(15)));
+    }
+
+    #[test]
     fn unknown_extensions_are_stateful() {
         let ctx = request_context(b"XFOO arg\r\n");
         assert_eq!(ctx.kind(), RequestKind::Unknown);
@@ -1324,6 +1415,7 @@ mod tests {
             ("TAKETHIS <a@b>\r\n", RequestKind::TakeThis),
             ("AUTHINFO USER test\r\n", RequestKind::AuthInfo),
             ("STARTTLS\r\n", RequestKind::StartTls),
+            ("COMPRESS DEFLATE\r\n", RequestKind::Compress),
         ];
 
         for (line, expected) in cases {
@@ -1350,6 +1442,7 @@ mod tests {
             ("CHECK <a@b>\r\n", RequestRouteClass::Reject),
             ("TAKETHIS <a@b>\r\n", RequestRouteClass::Reject),
             ("STARTTLS\r\n", RequestRouteClass::Reject),
+            ("COMPRESS DEFLATE\r\n", RequestRouteClass::Reject),
             ("XFOO arg\r\n", RequestRouteClass::Stateful),
         ];
 
@@ -1373,5 +1466,8 @@ mod tests {
         assert!(unknown.has_response_body(StatusCode::new(282)));
         assert!(unknown.has_response_body(StatusCode::new(288)));
         assert!(!unknown.has_response_body(StatusCode::new(281)));
+        let xhdr = request_context(b"XHDR Subject 1-10\r\n");
+        assert!(xhdr.has_response_body(StatusCode::new(221)));
+        assert!(xhdr.has_response_body(StatusCode::new(225)));
     }
 }

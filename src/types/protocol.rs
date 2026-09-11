@@ -6,13 +6,76 @@ use std::fmt;
 use std::str::FromStr;
 
 use super::ValidationError;
+const MIN_MESSAGE_ID_OCTETS: usize = 3;
+const MAX_MESSAGE_ID_OCTETS: usize = 250;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ValidatedMessageId<'a>(Cow<'a, str>);
+
+impl<'a> ValidatedMessageId<'a> {
+    fn owned(s: String) -> Result<Self, ValidationError> {
+        Self::validate(&s)?;
+        Ok(Self(Cow::Owned(s)))
+    }
+
+    fn borrowed(s: &'a str) -> Result<Self, ValidationError> {
+        Self::validate(s)?;
+        Ok(Self(Cow::Borrowed(s)))
+    }
+
+    #[inline]
+    fn validate(s: &str) -> Result<(), ValidationError> {
+        let bytes = s.as_bytes();
+        if !(MIN_MESSAGE_ID_OCTETS..=MAX_MESSAGE_ID_OCTETS).contains(&bytes.len())
+            || bytes.first() != Some(&b'<')
+            || bytes.last() != Some(&b'>')
+        {
+            return Err(ValidationError::InvalidMessageId(
+                "must be 3..=250 printable US-ASCII octets enclosed in <...>".to_string(),
+            ));
+        }
+
+        let inner = &bytes[1..bytes.len() - 1];
+        if inner
+            .iter()
+            .any(|&byte| !(0x21..=0x7e).contains(&byte) || byte == b'>')
+        {
+            return Err(ValidationError::InvalidMessageId(
+                "must contain only printable US-ASCII except >".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
+    #[inline]
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[inline]
+    fn without_brackets(&self) -> &str {
+        self.0
+            .strip_prefix('<')
+            .and_then(|value| value.strip_suffix('>'))
+            .expect("ValidatedMessageId invariant requires angle brackets")
+    }
+
+    fn into_owned(self) -> ValidatedMessageId<'static> {
+        ValidatedMessageId(Cow::Owned(self.0.into_owned()))
+    }
+
+    fn to_owned(&self) -> ValidatedMessageId<'static> {
+        ValidatedMessageId(Cow::Owned(self.0.clone().into_owned()))
+    }
+}
 
 /// A validated NNTP message ID (RFC 3977 §3.6)
 ///
 /// Message IDs must be enclosed in angle brackets.
 /// Uses `Cow<'a, str>` for zero-copy parsing (borrowed) and owned storage.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct MessageId<'a>(Cow<'a, str>);
+pub struct MessageId<'a>(ValidatedMessageId<'a>);
 
 impl<'a> MessageId<'a> {
     /// Create owned `MessageId` from String with validation
@@ -21,8 +84,7 @@ impl<'a> MessageId<'a> {
     /// Returns `ValidationError::InvalidMessageId` when the string is not a
     /// valid RFC-style NNTP message ID.
     pub fn new(s: String) -> Result<Self, ValidationError> {
-        Self::validate(&s)?;
-        Ok(Self(Cow::Owned(s)))
+        Ok(Self(ValidatedMessageId::owned(s)?))
     }
 
     /// Create borrowed `MessageId` from &str (zero-copy)
@@ -32,18 +94,7 @@ impl<'a> MessageId<'a> {
     /// Returns `ValidationError::InvalidMessageId` when the string is not a
     /// valid RFC-style NNTP message ID.
     pub fn from_borrowed(s: &'a str) -> Result<Self, ValidationError> {
-        Self::validate(s)?;
-        Ok(Self(Cow::Borrowed(s)))
-    }
-
-    /// Create from pre-validated string (zero-copy, unchecked)
-    ///
-    /// # Safety
-    /// Caller must ensure: `s.len() >= 3`, `s.starts_with('<')`, `s.ends_with('>')`
-    #[inline]
-    #[must_use]
-    pub const unsafe fn from_str_unchecked(s: &'a str) -> Self {
-        Self(Cow::Borrowed(s))
+        Ok(Self(ValidatedMessageId::borrowed(s)?))
     }
 
     /// Create owned `MessageId`, auto-wrapping in angle brackets if needed
@@ -56,7 +107,7 @@ impl<'a> MessageId<'a> {
         if s.is_empty() {
             return Err(ValidationError::InvalidMessageId("empty".to_string()));
         }
-        let wrapped = if s.starts_with('<') && s.ends_with('>') {
+        let wrapped = if Self::has_angle_brackets(s) {
             s.to_string()
         } else {
             format!("<{s}>")
@@ -65,36 +116,30 @@ impl<'a> MessageId<'a> {
     }
 
     #[inline]
-    fn validate(s: &str) -> Result<(), ValidationError> {
-        if s.len() < 3 || !s.starts_with('<') || !s.ends_with('>') {
-            Err(ValidationError::InvalidMessageId(
-                "must be <...>".to_string(),
-            ))
-        } else {
-            Ok(())
-        }
+    fn has_angle_brackets(s: &str) -> bool {
+        s.starts_with('<') && s.ends_with('>')
     }
 
     #[must_use]
     #[inline]
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 
     #[must_use]
     #[inline]
     pub fn without_brackets(&self) -> &str {
-        &self.0[1..self.0.len() - 1]
+        self.0.without_brackets()
     }
 
     #[must_use]
     pub fn into_owned(self) -> MessageId<'static> {
-        MessageId(Cow::Owned(self.0.into_owned()))
+        MessageId(self.0.into_owned())
     }
 
     #[must_use]
     pub fn to_owned(&self) -> MessageId<'static> {
-        MessageId(Cow::Owned(self.0.clone().into_owned()))
+        MessageId(self.0.to_owned())
     }
 }
 
@@ -108,7 +153,7 @@ impl FromStr for MessageId<'static> {
 impl AsRef<str> for MessageId<'_> {
     #[inline]
     fn as_ref(&self) -> &str {
-        &self.0
+        self.as_str()
     }
 }
 
@@ -116,19 +161,19 @@ impl std::ops::Deref for MessageId<'_> {
     type Target = str;
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.0
+        self.as_str()
     }
 }
 
 impl Borrow<str> for MessageId<'_> {
     fn borrow(&self) -> &str {
-        &self.0
+        self.as_str()
     }
 }
 
 impl fmt::Display for MessageId<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(self.as_str())
     }
 }
 
@@ -141,7 +186,7 @@ impl TryFrom<String> for MessageId<'static> {
 
 impl<'a> From<MessageId<'a>> for String {
     fn from(msgid: MessageId<'a>) -> Self {
-        msgid.0.into_owned()
+        msgid.0.into_owned().0.into_owned()
     }
 }
 
@@ -150,7 +195,7 @@ impl Serialize for MessageId<'_> {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&self.0)
+        serializer.serialize_str(self.as_str())
     }
 }
 
@@ -198,6 +243,7 @@ mod tests {
         );
         // Empty string should error
         assert!(MessageId::from_str_or_wrap("").is_err());
+        assert!(MessageId::from_str_or_wrap("<>").is_err());
     }
 
     #[test]
@@ -271,5 +317,21 @@ mod tests {
 
         // Valid minimal
         assert!(MessageId::new("<a>".to_string()).is_ok());
+    }
+
+    #[test]
+    fn test_message_id_enforces_rfc3977_wire_invariant() {
+        for message_id in ["<a>b>", "<a b>", "<a\tb>", "<a\nb>", "<é>"] {
+            assert!(
+                MessageId::new(message_id.to_string()).is_err(),
+                "accepted invalid message ID {message_id:?}"
+            );
+        }
+
+        let max_length = format!("<{}>", "a".repeat(248));
+        assert!(MessageId::new(max_length).is_ok());
+
+        let too_long = format!("<{}>", "a".repeat(249));
+        assert!(MessageId::new(too_long).is_err());
     }
 }

@@ -46,8 +46,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tracing::{debug, info};
 
-use crate::cache::ArticleAvailability;
-use crate::config::BackendSelectionStrategy;
+use crate::cache::{ArticleAvailability, AvailabilityMask, AvailabilitySlot};
+use crate::config::{BackendSelectionStrategy, QueuePressureLimits};
 use crate::pool::DeadpoolConnectionProvider;
 use crate::types::{BackendId, ClientId, ServerName};
 use strategies::{LeastLoaded, WeightedRoundRobin};
@@ -126,24 +126,46 @@ pub struct ArticleRoute<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArticleBackend {
     backend_id: BackendId,
+    availability_slot: AvailabilitySlot,
 }
 
 impl ArticleBackend {
     #[inline]
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn from_availability(
         backend_id: BackendId,
         availability: &ArticleAvailability,
     ) -> Option<Self> {
+        let availability_slot = AvailabilitySlot::new(backend_id.as_index())?;
+        Self::from_availability_slot(backend_id, availability_slot, availability)
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) fn from_availability_slot(
+        backend_id: BackendId,
+        availability_slot: AvailabilitySlot,
+        availability: &ArticleAvailability,
+    ) -> Option<Self> {
         availability
-            .should_try(backend_id)
-            .then_some(Self { backend_id })
+            .should_try_slot(availability_slot)
+            .then_some(Self {
+                backend_id,
+                availability_slot,
+            })
     }
 
     #[inline]
     #[must_use]
     pub const fn backend_id(self) -> BackendId {
         self.backend_id
+    }
+
+    #[inline]
+    #[must_use]
+    pub(crate) const fn availability_slot(self) -> AvailabilitySlot {
+        self.availability_slot
     }
 
     #[inline]
@@ -200,7 +222,7 @@ pub trait RouteMode: route_mode::Sealed {
     where
         Self: Sized;
 
-    fn output(request: &RouteRequest<'_, Self>, backend_id: BackendId) -> Result<Self::Output>
+    fn output(request: &RouteRequest<'_, Self>, backend: &BackendInfo) -> Result<Self::Output>
     where
         Self: Sized;
 }
@@ -212,8 +234,8 @@ impl RouteMode for RawRoute {
         None
     }
 
-    fn output(_request: &RouteRequest<'_, Self>, backend_id: BackendId) -> Result<Self::Output> {
-        Ok(backend_id)
+    fn output(_request: &RouteRequest<'_, Self>, backend: &BackendInfo) -> Result<Self::Output> {
+        Ok(backend.id)
     }
 }
 
@@ -226,11 +248,16 @@ impl RouteMode for ArticleRoute<'_> {
         Some(request.mode.availability)
     }
 
-    fn output(request: &RouteRequest<'_, Self>, backend_id: BackendId) -> Result<Self::Output> {
-        ArticleBackend::from_availability(backend_id, request.mode.availability).ok_or_else(|| {
+    fn output(request: &RouteRequest<'_, Self>, backend: &BackendInfo) -> Result<Self::Output> {
+        ArticleBackend::from_availability_slot(
+            backend.id,
+            backend.availability_slot,
+            request.mode.availability,
+        )
+        .ok_or_else(|| {
             anyhow::anyhow!(
                 "selected backend {} is no longer eligible for article routing",
-                backend_id.as_index()
+                backend.id.as_index()
             )
         })
     }
@@ -453,12 +480,12 @@ pub struct BackendSelector {
     sorted_tiers: smallvec::SmallVec<[u8; 4]>,
     /// Capacity-fair probe counter for the first availability-aware article attempt.
     initial_article_probe_counter: AtomicUsize,
+    /// Bitmap of distinct configured article-availability identities.
+    availability_mask: AvailabilityMask,
     /// Enable/disable per-connection queue-pressure filtering.
     queue_backpressure_enabled: bool,
-    /// Soft threshold for queued requests per connection (percentage).
-    queue_backpressure_soft_waiters_per_connection_percent: u16,
-    /// Hard threshold for queued requests per connection (percentage).
-    queue_backpressure_hard_waiters_per_connection_percent: u16,
+    /// Validated soft and hard thresholds for queued requests per connection.
+    queue_backpressure_limits: QueuePressureLimits,
     /// Delay to apply when all eligible backends in a tier are hard-saturated.
     queue_backpressure_all_busy_sleep_ms: u64,
 }
@@ -471,8 +498,6 @@ impl Default for BackendSelector {
 
 impl BackendSelector {
     const DEFAULT_QUEUE_BACKPRESSURE_ENABLED: bool = true;
-    const DEFAULT_QUEUE_BACKPRESSURE_SOFT_WAITERS_PER_CONNECTION_PERCENT: u16 = 25;
-    const DEFAULT_QUEUE_BACKPRESSURE_HARD_WAITERS_PER_CONNECTION_PERCENT: u16 = 50;
     const DEFAULT_QUEUE_BACKPRESSURE_ALL_BUSY_SLEEP_MS: u64 = 1;
 
     /// Find backend by ID
@@ -481,6 +506,12 @@ impl BackendSelector {
     #[inline]
     fn find_backend(&self, backend_id: BackendId) -> Option<&BackendInfo> {
         self.backends.iter().find(|b| b.id == backend_id)
+    }
+
+    #[inline]
+    pub(crate) fn availability_slot(&self, backend_id: BackendId) -> Option<AvailabilitySlot> {
+        self.find_backend(backend_id)
+            .map(|backend| backend.availability_slot)
     }
 
     /// Create a guard for a backend already reserved by `route()`.
@@ -548,11 +579,9 @@ impl BackendSelector {
             strategy: selection_strategy,
             sorted_tiers: smallvec::SmallVec::new(),
             initial_article_probe_counter: AtomicUsize::new(0),
+            availability_mask: AvailabilityMask::empty(),
             queue_backpressure_enabled: Self::DEFAULT_QUEUE_BACKPRESSURE_ENABLED,
-            queue_backpressure_soft_waiters_per_connection_percent:
-                Self::DEFAULT_QUEUE_BACKPRESSURE_SOFT_WAITERS_PER_CONNECTION_PERCENT,
-            queue_backpressure_hard_waiters_per_connection_percent:
-                Self::DEFAULT_QUEUE_BACKPRESSURE_HARD_WAITERS_PER_CONNECTION_PERCENT,
+            queue_backpressure_limits: QueuePressureLimits::default(),
             queue_backpressure_all_busy_sleep_ms:
                 Self::DEFAULT_QUEUE_BACKPRESSURE_ALL_BUSY_SLEEP_MS,
         }
@@ -563,19 +592,11 @@ impl BackendSelector {
     pub fn with_queue_backpressure(
         mut self,
         enabled: bool,
-        soft_waiters_per_connection_percent: u16,
-        hard_waiters_per_connection_percent: u16,
+        limits: QueuePressureLimits,
         all_busy_sleep_ms: u64,
     ) -> Self {
         self.queue_backpressure_enabled = enabled;
-        self.queue_backpressure_soft_waiters_per_connection_percent =
-            soft_waiters_per_connection_percent;
-        self.queue_backpressure_hard_waiters_per_connection_percent =
-            if hard_waiters_per_connection_percent < soft_waiters_per_connection_percent {
-                soft_waiters_per_connection_percent
-            } else {
-                hard_waiters_per_connection_percent
-            };
+        self.queue_backpressure_limits = limits;
         self.queue_backpressure_all_busy_sleep_ms = all_busy_sleep_ms;
         self
     }
@@ -594,6 +615,17 @@ impl BackendSelector {
         name: ServerName,
         provider: DeadpoolConnectionProvider,
         tier: u8,
+    ) -> BackendId {
+        let slot = AvailabilitySlot::new(self.backends.len()).expect("backend count fits bitmap");
+        self.add_backend_with_slot(name, provider, tier, slot)
+    }
+
+    pub(crate) fn add_backend_with_slot(
+        &mut self,
+        name: ServerName,
+        provider: DeadpoolConnectionProvider,
+        tier: u8,
+        availability_slot: AvailabilitySlot,
     ) -> BackendId {
         let backend_id = BackendId::from_index(self.backends.len());
         let max_connections = provider.max_size();
@@ -629,12 +661,14 @@ impl BackendSelector {
 
         self.backends.push(BackendInfo {
             id: backend_id,
+            availability_slot,
             name,
             provider,
             pending_count: PendingCount::new(),
             stateful_count: StatefulCount::new(),
             tier,
         });
+        self.availability_mask.insert(availability_slot);
 
         // H4: Maintain sorted unique tiers (avoids Vec allocation in select_backend hot path)
         if !self.sorted_tiers.contains(&tier) {
@@ -666,7 +700,7 @@ impl BackendSelector {
         // Availability check closure
         let is_available = |backend: &&BackendInfo| {
             !suppressed_backends.contains(backend.id)
-                && availability.is_none_or(|avail| avail.should_try(backend.id))
+                && availability.is_none_or(|avail| avail.should_try_slot(backend.availability_slot))
         };
 
         // H4: Tier filtering enabled - try tiers in order 0, 1, 2, ...
@@ -759,7 +793,8 @@ impl BackendSelector {
             if availability.is_some()
                 && self.backends.iter().any(|backend| {
                     backend.tier == tier
-                        && availability.is_none_or(|avail| avail.should_try(backend.id))
+                        && availability
+                            .is_none_or(|avail| avail.should_try_slot(backend.availability_slot))
                 })
             {
                 tracing::debug!(
@@ -780,8 +815,13 @@ impl BackendSelector {
 
     fn availability_missing_in_tier(&self, availability: &ArticleAvailability, tier: u8) -> bool {
         self.backends.iter().any(|backend| {
-            backend.tier == tier && availability.missing_bits() & backend.id.availability_bit() != 0
+            backend.tier == tier && availability.is_missing_slot(backend.availability_slot)
         })
+    }
+
+    #[inline]
+    pub(crate) const fn availability_mask(&self) -> AvailabilityMask {
+        self.availability_mask
     }
 
     /// Select a backend by capacity weight, independent of current pending load.
@@ -844,7 +884,7 @@ impl BackendSelector {
                 pool = %backend.provider.name(),
                 tier,
                 selected = selected_backend == Some(backend.id),
-                should_try = availability.is_none_or(|avail| avail.should_try(backend.id)),
+                should_try = availability.is_none_or(|avail| avail.should_try_slot(backend.availability_slot)),
                 availability_missing_bits,
                 pending,
                 checked_out,
@@ -882,7 +922,8 @@ impl BackendSelector {
             let mut has_candidate = false;
             let mut has_non_over_hard = false;
             for backend in self.backends.iter().filter(|backend| backend.tier == tier) {
-                if suppressed_backends.contains(backend.id) || !availability.should_try(backend.id)
+                if suppressed_backends.contains(backend.id)
+                    || !availability.should_try_slot(backend.availability_slot)
                 {
                     continue;
                 }
@@ -926,10 +967,8 @@ impl BackendSelector {
             return 0;
         }
         let queue_depth = Self::queue_depth_for_score(pending, checked_out, waiting);
-        let soft_limit = Self::queue_depth_limit(
-            max_connections,
-            self.queue_backpressure_soft_waiters_per_connection_percent,
-        );
+        let soft_limit =
+            Self::queue_depth_limit(max_connections, self.queue_backpressure_limits.soft());
         queue_depth.saturating_sub(soft_limit)
     }
 
@@ -945,16 +984,17 @@ impl BackendSelector {
             return false;
         }
         let queue_depth = Self::queue_depth_for_score(pending, checked_out, waiting);
-        let hard_limit = Self::queue_depth_limit(
-            max_connections,
-            self.queue_backpressure_hard_waiters_per_connection_percent,
-        );
+        let hard_limit =
+            Self::queue_depth_limit(max_connections, self.queue_backpressure_limits.hard());
         queue_depth > hard_limit
     }
 
     #[inline]
-    fn queue_depth_limit(max_connections: usize, per_connection_percent: u16) -> usize {
-        let product = max_connections.saturating_mul(usize::from(per_connection_percent));
+    fn queue_depth_limit(
+        max_connections: usize,
+        per_connection_percent: crate::types::QueuePressurePercent,
+    ) -> usize {
+        let product = max_connections.saturating_mul(usize::from(per_connection_percent.get()));
         product.div_ceil(100)
     }
 
@@ -1095,7 +1135,7 @@ impl BackendSelector {
                     )
                 })?;
             let backend = selected.backend;
-            let output = Mode::output(request, backend.id)?;
+            let output = Mode::output(request, backend)?;
 
             let reserved = if let Some(observed) = selected.pending_snapshot {
                 backend.pending_count.try_increment_from(observed)
@@ -1434,6 +1474,34 @@ mod tests {
     }
 
     #[test]
+    fn article_routing_shares_negative_slot_between_transport_backends() {
+        let mut selector = BackendSelector::new();
+        for name in ["plain", "tls"] {
+            selector.add_backend_with_slot(
+                ServerName::try_new(name.to_string()).unwrap(),
+                crate::pool::DeadpoolConnectionProvider::new(
+                    "news.example".to_string(),
+                    119,
+                    name.to_string(),
+                    10,
+                    None,
+                    None,
+                ),
+                0,
+                AvailabilitySlot::new(0).unwrap(),
+            );
+        }
+
+        let mut availability = ArticleAvailability::new();
+        availability.record_missing_slot(AvailabilitySlot::new(0).unwrap());
+        assert!(
+            selector
+                .route(RouteRequest::new(ClientId::new()).with_availability(&availability))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn active_for_score_accounts_for_pool_waiters() {
         assert_eq!(BackendSelector::active_for_score(5, 40, 10), 50);
         assert_eq!(BackendSelector::active_for_score(80, 40, 10), 80);
@@ -1445,10 +1513,34 @@ mod tests {
 
     #[test]
     fn queue_depth_limit_scales_with_connection_count() {
-        assert_eq!(BackendSelector::queue_depth_limit(40, 25), 10);
-        assert_eq!(BackendSelector::queue_depth_limit(50, 25), 13);
-        assert_eq!(BackendSelector::queue_depth_limit(40, 50), 20);
-        assert_eq!(BackendSelector::queue_depth_limit(50, 50), 25);
+        assert_eq!(
+            BackendSelector::queue_depth_limit(
+                40,
+                crate::types::QueuePressurePercent::try_new(25).unwrap(),
+            ),
+            10
+        );
+        assert_eq!(
+            BackendSelector::queue_depth_limit(
+                50,
+                crate::types::QueuePressurePercent::try_new(25).unwrap(),
+            ),
+            13
+        );
+        assert_eq!(
+            BackendSelector::queue_depth_limit(
+                40,
+                crate::types::QueuePressurePercent::try_new(50).unwrap(),
+            ),
+            20
+        );
+        assert_eq!(
+            BackendSelector::queue_depth_limit(
+                50,
+                crate::types::QueuePressurePercent::try_new(50).unwrap(),
+            ),
+            25
+        );
     }
 
     #[test]

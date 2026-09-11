@@ -47,7 +47,7 @@ pub(crate) enum PrecheckResponse {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum QueryResult {
     Found(BackendId, PrecheckHit),
-    Missing(BackendId),
+    Missing(ArticleBackend),
     Error,
 }
 
@@ -76,8 +76,8 @@ fn summarize_tier_results(results: &[QueryResult]) -> TierQuerySummary {
 
     for result in results {
         match result {
-            QueryResult::Missing(id) => {
-                availability.record_missing(*id);
+            QueryResult::Missing(backend) => {
+                availability.record_missing_slot(backend.availability_slot());
             }
             QueryResult::Found(_, _) => {
                 exhausted = false;
@@ -111,7 +111,6 @@ pub struct PrecheckDeps<'a> {
     pub cache: &'a Arc<UnifiedCache>,
     pub buffer_pool: &'a BufferPool,
     pub metrics: &'a MetricsCollector,
-    pub cache_articles: bool,
 }
 
 #[derive(Clone)]
@@ -120,7 +119,6 @@ struct OwnedDeps {
     cache: Arc<UnifiedCache>,
     buffer_pool: BufferPool,
     metrics: MetricsCollector,
-    cache_articles: bool,
 }
 
 impl PrecheckDeps<'_> {
@@ -130,7 +128,6 @@ impl PrecheckDeps<'_> {
             cache: Arc::clone(self.cache),
             buffer_pool: self.buffer_pool.clone(),
             metrics: self.metrics.clone(),
-            cache_articles: self.cache_articles,
         }
     }
 }
@@ -165,8 +162,10 @@ async fn record_precheck_result(
 ) -> Option<(BackendId, PrecheckHit)> {
     match result {
         QueryResult::Found(backend, hit) => Some((backend, hit)),
-        QueryResult::Missing(backend_id) => {
-            cache.record_backend_missing(msg_id, backend_id).await;
+        QueryResult::Missing(backend) => {
+            cache
+                .record_availability_missing(msg_id, backend.availability_slot())
+                .await;
             None
         }
         QueryResult::Error => None,
@@ -198,7 +197,7 @@ async fn query_backend(
 
     match query_result {
         QueryAttemptResult::Found(hit) => QueryResult::Found(backend_id, *hit),
-        QueryAttemptResult::Missing => QueryResult::Missing(backend_id),
+        QueryAttemptResult::Missing => QueryResult::Missing(backend),
         QueryAttemptResult::Error => QueryResult::Error,
     }
 }
@@ -221,11 +220,11 @@ async fn execute_backend_query(
     let mut buffer = deps.buffer_pool.acquire();
 
     let response = if should_sample_backend_timing() {
-        backend::execute_request_classified_timed(&mut **conn, request, &mut buffer)
+        backend::execute_request_classified_timed(conn.stream_mut(), request, &mut buffer)
             .await
             .map(|(response, ttfb, send, recv)| (response, Some((ttfb, send, recv))))
     } else {
-        backend::execute_request_classified(&mut **conn, request, &mut buffer)
+        backend::execute_request_classified(conn.stream_mut(), request, &mut buffer)
             .await
             .map(|response| (response, None))
     };
@@ -242,9 +241,10 @@ async fn execute_backend_query(
                 .single_line_bytes(&buffer)
                 .map(crate::cache::CacheIngestResponse::from);
 
-            let response = build_precheck_hit(
+            let (response, completion) = build_precheck_hit(
                 deps,
                 request,
+                &response,
                 status_code,
                 single_line_payload,
                 &mut conn,
@@ -254,7 +254,7 @@ async fn execute_backend_query(
 
             let result = classify_precheck_result(deps, backend, status_code, timings, response);
 
-            let _ = conn.complete_success(); // response received; connection healthy, return to pool
+            let _ = conn.complete_success(completion);
             Ok(result)
         }
         Err(_) => {
@@ -267,20 +267,29 @@ async fn execute_backend_query(
 async fn build_precheck_hit(
     deps: &OwnedDeps,
     request: &RequestContext,
+    response: &crate::session::backend::BackendReadResult,
     status_code: StatusCode,
     single_line_payload: Option<crate::cache::CacheIngestResponse>,
     conn: &mut crate::pool::ConnectionGuard,
     buffer: &mut crate::pool::PooledBuffer,
-) -> Result<PrecheckHit, ()> {
+) -> Result<
+    (
+        PrecheckHit,
+        crate::session::backend::BackendResponseComplete,
+    ),
+    (),
+> {
     if request.has_response_body(status_code) {
         return read_complete_precheck_hit(deps, status_code, conn, buffer).await;
     }
 
-    if let Some(payload) = single_line_payload {
-        Ok(PrecheckHit::Payload(payload))
+    let completion = response.completion_proof(request).map_err(|_| ())?;
+    let hit = if let Some(payload) = single_line_payload {
+        PrecheckHit::Payload(payload)
     } else {
-        Ok(PrecheckHit::Availability(status_code))
-    }
+        PrecheckHit::Availability(status_code)
+    };
+    Ok((hit, completion))
 }
 
 async fn read_complete_precheck_hit(
@@ -288,15 +297,22 @@ async fn read_complete_precheck_hit(
     status_code: StatusCode,
     conn: &mut crate::pool::ConnectionGuard,
     buffer: &mut crate::pool::PooledBuffer,
-) -> Result<PrecheckHit, ()> {
+) -> Result<
+    (
+        PrecheckHit,
+        crate::session::backend::BackendResponseComplete,
+    ),
+    (),
+> {
     let mut response = deps
-        .cache_articles
+        .cache
+        .stores_payload_responses()
         .then(crate::pool::ChunkedResponse::default);
 
-    if let Some(response) = &mut response {
-        let retained =
+    let completion = if let Some(response) = &mut response {
+        let (retained, completion) =
             crate::session::backend::capture_complete_multiline_response_chunked_optional(
-                conn.as_mut(),
+                conn.stream_mut(),
                 buffer,
                 &deps.buffer_pool,
                 response,
@@ -305,21 +321,21 @@ async fn read_complete_precheck_hit(
             .map_err(|_| ())?;
         if !retained {
             response.clear();
-            return Ok(PrecheckHit::Availability(status_code));
+            return Ok((PrecheckHit::Availability(status_code), completion));
         }
+        completion
     } else {
-        crate::session::backend::observe_complete_multiline_response(conn.as_mut(), buffer)
+        crate::session::backend::observe_complete_multiline_response(conn.stream_mut(), buffer)
             .await
-            .map_err(|_| ())?;
-    }
+            .map_err(|_| ())?
+    };
 
-    if let Some(response) = response {
-        Ok(PrecheckHit::Payload(
-            crate::cache::CacheIngestResponse::Chunked(response),
-        ))
+    let hit = if let Some(response) = response {
+        PrecheckHit::Payload(crate::cache::CacheIngestResponse::Chunked(response))
     } else {
-        Ok(PrecheckHit::Availability(status_code))
-    }
+        PrecheckHit::Availability(status_code)
+    };
+    Ok((hit, completion))
 }
 
 fn classify_precheck_result(
@@ -426,11 +442,11 @@ async fn query_all_backends_racing(
                     });
                     return RacingQueryOutcome::Hit(id, response);
                 }
-                QueryResult::Missing(backend_id) => {
+                QueryResult::Missing(backend) => {
                     deps.cache
-                        .record_backend_missing(msg_id.to_owned(), backend_id)
+                        .record_availability_missing(msg_id.to_owned(), backend.availability_slot())
                         .await;
-                    results.push(QueryResult::Missing(backend_id));
+                    results.push(QueryResult::Missing(backend));
                 }
                 QueryResult::Error => {
                     results.push(QueryResult::Error);
@@ -474,10 +490,14 @@ fn spawn_backend_queries_for_tier(
 ) -> FuturesUnordered<tokio::task::JoinHandle<QueryResult>> {
     deps.router
         .backend_ids_in_tier(tier)
-        .filter_map(|id| ArticleBackend::from_availability(id, availability))
+        .filter_map(|id| {
+            deps.router
+                .availability_slot(id)
+                .and_then(|slot| ArticleBackend::from_availability_slot(id, slot, availability))
+        })
         .map(|backend| {
             let deps = deps.clone();
-            let request = request.clone();
+            let request = request.clone_for_background_probe();
             tokio::spawn(async move { query_backend(&deps, backend, &request).await })
         })
         .collect()
@@ -500,8 +520,8 @@ fn summarize(results: Vec<QueryResult>) -> (Option<(BackendId, PrecheckHit)>, Ar
                     found = Some((id, response));
                 }
             }
-            QueryResult::Missing(id) => {
-                availability.record_missing(id);
+            QueryResult::Missing(backend) => {
+                availability.record_missing_slot(backend.availability_slot());
             }
             QueryResult::Error => {}
         }
@@ -601,7 +621,7 @@ pub fn spawn_background_precheck(
         }
 
         let availability = cached
-            .map(|entry| entry.to_availability(owned.router.backend_count()))
+            .map(|entry| entry.to_availability())
             .unwrap_or_default();
         let results = query_all_backends(&owned, &request, &availability).await;
         let mut found = None;
@@ -656,14 +676,13 @@ mod tests {
             cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
             buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 1),
             metrics: MetricsCollector::new(num_backends),
-            cache_articles: true,
         }
     }
 
     #[test]
     fn summarize_finds_first() {
         let results = vec![
-            QueryResult::Missing(BackendId::from_index(0)),
+            QueryResult::Missing(eligible(BackendId::from_index(0))),
             QueryResult::Found(
                 BackendId::from_index(1),
                 PrecheckHit::Payload(b"first".to_vec().into()),
@@ -689,8 +708,8 @@ mod tests {
     #[test]
     fn summarize_all_missing() {
         let results = vec![
-            QueryResult::Missing(BackendId::from_index(0)),
-            QueryResult::Missing(BackendId::from_index(1)),
+            QueryResult::Missing(eligible(BackendId::from_index(0))),
+            QueryResult::Missing(eligible(BackendId::from_index(1))),
         ];
         let (found, avail) = summarize(results);
         assert!(found.is_none());
@@ -713,7 +732,7 @@ mod tests {
         let found = record_precheck_result(
             &cache,
             msg_id.to_owned(),
-            QueryResult::Missing(BackendId::from_index(0)),
+            QueryResult::Missing(eligible(BackendId::from_index(0))),
         )
         .await;
 
@@ -749,8 +768,8 @@ mod tests {
     #[test]
     fn summarize_tier_results_requires_every_backend_to_miss() {
         let summary = summarize_tier_results(&[
-            QueryResult::Missing(BackendId::from_index(0)),
-            QueryResult::Missing(BackendId::from_index(1)),
+            QueryResult::Missing(eligible(BackendId::from_index(0))),
+            QueryResult::Missing(eligible(BackendId::from_index(1))),
         ]);
 
         let TierQuerySummary::Exhausted(availability) = summary else {
@@ -763,7 +782,7 @@ mod tests {
     #[test]
     fn summarize_tier_results_treats_partial_missing_with_error_as_inconclusive() {
         let summary = summarize_tier_results(&[
-            QueryResult::Missing(BackendId::from_index(0)),
+            QueryResult::Missing(eligible(BackendId::from_index(0))),
             QueryResult::Error,
         ]);
 
@@ -953,7 +972,6 @@ mod tests {
             cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
             buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 2),
             metrics: MetricsCollector::new(1),
-            cache_articles: true,
         };
 
         let request =
@@ -973,7 +991,6 @@ mod tests {
             cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
             buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 2),
             metrics: MetricsCollector::new(1),
-            cache_articles: true,
         };
 
         let request =
@@ -992,7 +1009,6 @@ mod tests {
             cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
             buffer_pool: BufferPool::new(BufferSize::try_new(65536).unwrap(), 2),
             metrics: MetricsCollector::new(1),
-            cache_articles: true,
         };
 
         let request =

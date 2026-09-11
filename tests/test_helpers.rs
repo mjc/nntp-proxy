@@ -132,15 +132,16 @@ impl MockNntpServer {
                             }
                         }
 
-                        let mut handled = false;
-                        if let Some((_, response)) = handlers
+                        let handled = if let Some((_, response)) = handlers
                             .iter()
                             .filter(|(prefix, _)| cmd_upper.starts_with(prefix.as_str()))
                             .max_by_key(|(prefix, _)| prefix.len())
                         {
                             let _ = stream.write_all(response.as_bytes()).await;
-                            handled = true;
-                        }
+                            true
+                        } else {
+                            false
+                        };
 
                         if !handled {
                             let _ = stream.write_all(b"200 OK\r\n").await;
@@ -450,7 +451,7 @@ pub async fn setup_proxy_with_backends(
     let mut backend_listeners = Vec::new();
     let mut backend_ports = Vec::new();
     for _ in 0..backend_configs.len() {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listener = TcpListener::bind("0.0.0.0:0").await?;
         backend_ports.push(listener.local_addr()?.port());
         backend_listeners.push(listener);
     }
@@ -469,6 +470,7 @@ pub async fn setup_proxy_with_backends(
 
         let handle = MockNntpServer::new()
             .with_name(*name)
+            .with_auth(*name, *name)
             .on_command("DATE", "111 20251203120000\r\n")
             .on_command("QUIT", "205 Goodbye\r\n")
             .on_command("ARTICLE", response)
@@ -477,18 +479,21 @@ pub async fn setup_proxy_with_backends(
     }
 
     // Create proxy config
-    let config = create_test_config(
-        backend_ports
+    let config = Config {
+        servers: backend_ports
             .iter()
             .zip(backend_configs.iter())
-            .map(|(port, (name, _))| (*port, *name))
+            .map(|(port, (name, _))| {
+                create_test_server_config_with_auth("127.0.0.1", *port, name, name, name)
+            })
             .collect(),
-    );
+        ..Default::default()
+    };
 
     let proxy = NntpProxy::new(config, routing_mode).await?;
 
     // Start proxy accept loop
-    let proxy_for_spawn = proxy.clone();
+    let proxy_for_spawn = proxy;
     tokio::spawn(async move {
         loop {
             if let Ok((stream, addr)) = proxy_listener.accept().await {
@@ -903,6 +908,25 @@ pub async fn send_command_read_multiline_response(
 pub fn create_test_server_config(host: &str, port: u16, name: &str) -> Server {
     Server::builder(host, Port::try_new(port).unwrap())
         .name(name)
+        .max_connections(MaxConnections::try_new(5).unwrap())
+        .build()
+        .expect("Valid server config")
+}
+
+/// Create a basic server configuration with an explicit availability namespace.
+///
+/// Test backends that share a loopback address but represent different feeds
+/// must not share authoritative article-availability facts.
+#[must_use]
+pub fn create_test_server_config_with_availability_namespace(
+    host: &str,
+    port: u16,
+    name: &str,
+    availability_namespace: &str,
+) -> Server {
+    Server::builder(host, Port::try_new(port).unwrap())
+        .name(name)
+        .availability_namespace(availability_namespace)
         .max_connections(MaxConnections::try_new(5).unwrap())
         .build()
         .expect("Valid server config")

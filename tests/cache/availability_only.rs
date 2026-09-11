@@ -1,8 +1,7 @@
 //! Tests for availability-only mode (`cache_articles` = false)
 //!
-//! This test suite verifies that the cache works in availability-only mode,
-//! storing only backend availability bitsets without headers/body data.
-//! This mode should use minimal memory while still providing smart routing.
+//! This test suite verifies that the cache can store backend availability
+//! facts without retaining response payload bytes.
 
 use anyhow::Result;
 use nntp_proxy::RoutingMode;
@@ -13,8 +12,8 @@ use crate::test_helpers::{
 
 #[tokio::test]
 async fn test_availability_only_mode_tracks_backend_availability() -> Result<()> {
-    // In availability-only mode (cache_articles=false), the cache should still
-    // track which backends have which articles for smart routing
+    // Availability-only mode stores routing facts without retaining headers or
+    // body bytes.
     let (proxy_port, _backend_ports, _mock_handles) = setup_proxy_with_backends(
         vec![("Backend1", true), ("Backend2", false)],
         RoutingMode::PerCommand,
@@ -33,7 +32,7 @@ async fn test_availability_only_mode_tracks_backend_availability() -> Result<()>
     );
     assert!(!body1.is_empty());
 
-    // Second request - should use cached availability info to route to correct backend
+    // Second request should use cached availability info to avoid known misses.
     let (status2, body2) = send_article_read_multiline_response(&mut client, msgid).await?;
     assert!(
         status2.starts_with("220"),
@@ -46,7 +45,7 @@ async fn test_availability_only_mode_tracks_backend_availability() -> Result<()>
 
 #[tokio::test]
 async fn test_availability_only_mode_retries_430() -> Result<()> {
-    // Test that availability-only mode still does 430 retries
+    // Availability-only mode still records 430 facts and retries eligible backends.
     let (proxy_port, _backend_ports, _mock_handles) = setup_proxy_with_backends(
         vec![
             ("Backend1", false), // No article
@@ -72,7 +71,7 @@ async fn test_availability_only_mode_retries_430() -> Result<()> {
 
 #[tokio::test]
 async fn test_availability_only_mode_learns_from_requests() -> Result<()> {
-    // Test that availability tracking improves over multiple requests
+    // Availability tracking should improve backend choice over multiple requests.
     let (proxy_port, _backend_ports, _mock_handles) = setup_proxy_with_backends(
         vec![
             ("Backend1", false), // No articles
@@ -84,7 +83,7 @@ async fn test_availability_only_mode_learns_from_requests() -> Result<()> {
 
     let mut client = connect_and_read_greeting(proxy_port).await?;
 
-    // Request multiple articles - cache should learn Backend2 has them
+    // Request multiple articles so the cache can learn from successful routing.
     for i in 0..5 {
         let msgid = format!("<article-{i}@example.com>");
         let (status, body) = send_article_read_multiline_response(&mut client, &msgid).await?;
@@ -92,13 +91,13 @@ async fn test_availability_only_mode_learns_from_requests() -> Result<()> {
         assert!(!body.is_empty());
     }
 
-    // All requests should succeed, with cache learning backend availability
+    // All requests should succeed while availability state is updated.
     Ok(())
 }
 
 #[tokio::test]
 async fn test_availability_only_mode_mixed_availability() -> Result<()> {
-    // Test with articles split across backends
+    // Test with articles distributed across backends.
     let (proxy_port, _backend_ports, _mock_handles) = setup_proxy_with_backends(
         vec![
             ("Backend1", true), // Has some articles
@@ -110,11 +109,11 @@ async fn test_availability_only_mode_mixed_availability() -> Result<()> {
 
     let mut client = connect_and_read_greeting(proxy_port).await?;
 
-    // Request multiple articles - some on each backend
+    // Request multiple articles across the backend set.
     for i in 0..10 {
         let msgid = format!("<mixed-article-{i}@example.com>");
         let (status, _body) = send_article_read_multiline_response(&mut client, &msgid).await?;
-        // May get 220 or 430 depending on backend availability
+        // May get 220 or 430 depending on backend availability.
         assert!(
             status.starts_with("220") || status.starts_with("430"),
             "Valid response for article {i}"

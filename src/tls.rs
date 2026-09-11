@@ -9,6 +9,7 @@
 
 use crate::connection_error::ConnectionError;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
     ClientConfig, DigitallySignedStruct, Error as RustlsError, RootCertStore, SignatureScheme,
@@ -20,6 +21,27 @@ use tracing::{debug, warn};
 
 // Re-export TlsStream for use in other modules
 pub use tokio_rustls::client::TlsStream;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TlsVerification {
+    VerifyCertificate,
+    SkipCertificateVerification,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TlsPolicy {
+    Plain,
+    Tls {
+        verification: TlsVerification,
+        cert_path: Option<String>,
+    },
+}
+
+impl TlsPolicy {
+    pub(crate) const fn is_enabled(&self) -> bool {
+        matches!(self, Self::Tls { .. })
+    }
+}
 
 /// Configuration for TLS connections
 #[derive(Debug, Clone)]
@@ -57,6 +79,20 @@ impl TlsConfig {
     #[must_use]
     pub fn builder() -> TlsConfigBuilder {
         TlsConfigBuilder::default()
+    }
+    pub(crate) fn policy(&self) -> TlsPolicy {
+        if !self.use_tls {
+            return TlsPolicy::Plain;
+        }
+
+        TlsPolicy::Tls {
+            verification: if self.tls_verify_cert {
+                TlsVerification::VerifyCertificate
+            } else {
+                TlsVerification::SkipCertificateVerification
+            },
+            cert_path: self.tls_cert_path.clone(),
+        }
     }
 }
 
@@ -369,7 +405,7 @@ impl TlsManager {
         let cert_data = std::fs::read(cert_path)
             .with_context(|| format!("Failed to read TLS certificate from {cert_path}"))?;
 
-        let certs = rustls_pemfile::certs(&mut cert_data.as_slice())
+        let certs = CertificateDer::pem_slice_iter(&cert_data)
             .collect::<Result<Vec<_>, _>>()
             .context("Failed to parse TLS certificate")?;
 

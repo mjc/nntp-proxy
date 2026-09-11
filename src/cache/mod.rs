@@ -3,9 +3,11 @@
 //! This module provides caching functionality for NNTP articles,
 //! allowing the proxy to cache article content and reduce backend load.
 //!
-//! The `ArticleAvailability` type serves dual purposes:
-//! 1. Cache persistence - track which backends have which articles across requests
-//! 2. Retry tracking - track which backends tried during 430 retry loops (transient)
+//! The `ArticleAvailability` type is a negative bitset for authoritative `430`
+//! facts and serves dual purposes:
+//! 1. Cache persistence - track which backends are known missing across requests
+//! 2. Retry tracking - track which backends returned `430` during retry loops
+//!    (transient)
 //!
 //! ## Cache Implementations
 //!
@@ -15,6 +17,7 @@
 
 mod article;
 mod availability;
+mod availability_identity;
 mod availability_index;
 mod hybrid;
 mod hybrid_codec;
@@ -25,12 +28,32 @@ mod mock_hybrid;
 
 pub use article::{ArticleCache, CachedArticle};
 pub use availability::{ArticleAvailability, BackendStatus, MAX_BACKENDS};
+pub use availability_identity::AvailabilitySlot;
+pub(crate) use availability_identity::{
+    AccountIdentity, AvailabilityIdentity, AvailabilityLayout, AvailabilityMask,
+};
 pub use availability_index::AvailabilityIndex;
 pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
 
 use crate::protocol::StatusCode;
 use crate::types::{BackendId, MessageId};
 use smallvec::SmallVec;
+
+/// Retention policy represented by a unified cache implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CachePayloadPolicy {
+    /// Keep availability metadata but discard response payloads.
+    AvailabilityOnly,
+    /// Retain cacheable response payloads as well as availability metadata.
+    StoreBodies,
+}
+
+impl CachePayloadPolicy {
+    #[must_use]
+    pub const fn stores_payloads(self) -> bool {
+        matches!(self, Self::StoreBodies)
+    }
+}
 
 /// Owned response storage passed across the async cache ingest boundary.
 ///
@@ -253,6 +276,18 @@ mod tests {
         assert_eq!(entry.availability().missing_bits(), 0);
         assert!(entry.should_try_backend(backend_id));
     }
+
+    #[test]
+    fn unified_cache_payload_policy_matches_storage_kind() {
+        assert_eq!(
+            UnifiedCache::availability(std::time::Duration::from_secs(60)).payload_policy(),
+            CachePayloadPolicy::AvailabilityOnly
+        );
+        assert_eq!(
+            UnifiedCache::memory(1000, std::time::Duration::from_secs(60)).payload_policy(),
+            CachePayloadPolicy::StoreBodies
+        );
+    }
 }
 
 /// Statistics for cache display in TUI
@@ -351,10 +386,23 @@ pub enum UnifiedCache {
 }
 
 impl UnifiedCache {
+    #[cfg(test)]
+    pub async fn record_backend_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
+        let slot = AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap");
+        self.record_availability_missing(message_id, slot).await;
+    }
+
     /// Create an availability-only negative index.
     #[must_use]
     pub fn availability(ttl: std::time::Duration) -> Self {
         Self::Availability(AvailabilityIndex::with_ttl(ttl))
+    }
+
+    pub(crate) fn availability_with_layout(
+        ttl: std::time::Duration,
+        layout: AvailabilityLayout,
+    ) -> Self {
+        Self::Availability(AvailabilityIndex::with_layout(ttl, layout))
     }
 
     /// Create a memory-only cache
@@ -363,9 +411,26 @@ impl UnifiedCache {
         Self::Memory(ArticleCache::new(capacity, ttl))
     }
 
+    pub(crate) fn memory_with_layout(
+        capacity: u64,
+        ttl: std::time::Duration,
+        layout: AvailabilityLayout,
+    ) -> Self {
+        Self::Memory(ArticleCache::new(capacity, ttl).with_layout(layout))
+    }
+
     /// Create a hybrid cache (async because foyer needs async initialization)
     pub async fn hybrid(config: HybridCacheConfig) -> anyhow::Result<Self> {
         Ok(Self::Hybrid(HybridArticleCache::new(config).await?))
+    }
+
+    pub(crate) async fn hybrid_with_layout(
+        config: HybridCacheConfig,
+        layout: AvailabilityLayout,
+    ) -> anyhow::Result<Self> {
+        Ok(Self::Hybrid(
+            HybridArticleCache::new_with_layout(config, layout).await?,
+        ))
     }
 
     /// Returns true when successful backend responses update positive
@@ -378,7 +443,16 @@ impl UnifiedCache {
     /// Returns true when this cache stores response payloads.
     #[must_use]
     pub const fn stores_payload_responses(&self) -> bool {
-        !matches!(self, Self::Availability(_))
+        self.payload_policy().stores_payloads()
+    }
+
+    /// Return the retention policy encoded by this cache implementation.
+    #[must_use]
+    pub const fn payload_policy(&self) -> CachePayloadPolicy {
+        match self {
+            Self::Availability(_) => CachePayloadPolicy::AvailabilityOnly,
+            Self::Memory(_) | Self::Hybrid(_) => CachePayloadPolicy::StoreBodies,
+        }
     }
 
     /// Get an article from the cache
@@ -426,20 +500,38 @@ impl UnifiedCache {
         match self {
             Self::Availability(_) => {}
             Self::Memory(cache) => {
-                cache.upsert_ingest(message_id, buffer, backend, tier).await;
+                cache
+                    .upsert_ingest_for_slot(
+                        message_id,
+                        buffer,
+                        cache.availability_slot(backend),
+                        tier,
+                    )
+                    .await;
             }
             Self::Hybrid(cache) => {
-                cache.upsert_ingest(message_id, buffer, backend, tier).await;
+                cache
+                    .upsert_ingest_for_slot(
+                        message_id,
+                        buffer,
+                        cache.availability_slot(backend),
+                        tier,
+                    )
+                    .await;
             }
         }
     }
 
-    /// Record that a backend returned 430 for this article
-    pub async fn record_backend_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
+    /// Record that an article namespace returned an authoritative 430.
+    pub async fn record_availability_missing(
+        &self,
+        message_id: MessageId<'_>,
+        slot: AvailabilitySlot,
+    ) {
         match self {
-            Self::Availability(index) => index.record_backend_missing(&message_id, backend_id),
-            Self::Memory(cache) => cache.record_backend_missing(message_id, backend_id).await,
-            Self::Hybrid(cache) => cache.record_missing(message_id, backend_id).await,
+            Self::Availability(index) => index.record_availability_missing(&message_id, slot),
+            Self::Memory(cache) => cache.record_availability_missing(message_id, slot).await,
+            Self::Hybrid(cache) => cache.record_availability_missing(message_id, slot).await,
         }
     }
 
@@ -455,12 +547,22 @@ impl UnifiedCache {
             Self::Availability(_) => {}
             Self::Memory(cache) => {
                 cache
-                    .record_backend_has_status(message_id, status_code, backend, tier)
+                    .record_has_status_for_slot(
+                        message_id,
+                        status_code,
+                        cache.availability_slot(backend),
+                        tier,
+                    )
                     .await;
             }
             Self::Hybrid(cache) => {
                 cache
-                    .record_has_status(message_id, status_code, backend, tier)
+                    .record_has_status_for_slot(
+                        message_id,
+                        status_code,
+                        cache.availability_slot(backend),
+                        tier,
+                    )
                     .await;
             }
         }

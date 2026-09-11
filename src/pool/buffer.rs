@@ -27,7 +27,7 @@ use tracing::{debug, info, warn};
 /// process(&*buffer);  // Deref returns only &buffer[..n]
 /// ```
 pub struct PooledBuffer {
-    buffer: BytesMut,
+    buffer: BufferStorage,
     pool: Arc<ArrayQueue<BytesMut>>,
     pool_size: Arc<AtomicUsize>,
     allocated_count: Arc<AtomicUsize>,
@@ -51,6 +51,94 @@ struct PooledBufferSource {
     fallback: bool,
 }
 
+struct BufferAcquisition {
+    buffer: BytesMut,
+    fallback: bool,
+    counts_toward_pool: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadMode {
+    Reset,
+    Append,
+}
+
+#[derive(Default)]
+struct BufferStorage {
+    bytes: BytesMut,
+}
+
+impl BufferStorage {
+    fn new(bytes: BytesMut) -> Self {
+        Self { bytes }
+    }
+
+    #[inline]
+    fn capacity(&self) -> usize {
+        self.bytes.capacity()
+    }
+
+    #[inline]
+    fn initialized_len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    #[inline]
+    fn clear(&mut self) {
+        self.bytes.clear();
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    fn copy_from_slice(&mut self, data: &[u8]) {
+        self.bytes.clear();
+        self.bytes.extend_from_slice(data);
+    }
+
+    fn extend_from_slice(&mut self, data: &[u8]) {
+        self.bytes.extend_from_slice(data);
+    }
+
+    fn freeze(&mut self) -> Bytes {
+        self.take().freeze()
+    }
+
+    fn take(&mut self) -> BytesMut {
+        std::mem::take(&mut self.bytes)
+    }
+
+    fn restore(&mut self, bytes: BytesMut) {
+        self.bytes = bytes;
+    }
+
+    async fn read_from<R>(&mut self, reader: &mut R, read_len: usize) -> std::io::Result<usize>
+    where
+        R: AsyncRead + Unpin,
+    {
+        if read_len == 0 {
+            return Ok(0);
+        }
+
+        let spare = self.bytes.spare_capacity_mut();
+        let read_len = read_len.min(spare.len());
+        if read_len == 0 {
+            return Ok(0);
+        }
+
+        let mut read_buf = ReadBuf::uninit(&mut spare[..read_len]);
+        poll_fn(|cx| Pin::new(&mut *reader).poll_read(cx, &mut read_buf)).await?;
+        let read = read_buf.filled().len();
+        // SAFETY: `poll_read` initialized exactly `read` bytes in the spare slice.
+        unsafe {
+            self.bytes.advance_mut(read);
+        }
+        Ok(read)
+    }
+}
+
 impl PooledBufferSource {
     const fn regular(fallback: bool) -> Self {
         Self {
@@ -70,7 +158,7 @@ impl PooledBufferSource {
 impl std::fmt::Debug for PooledBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PooledBuffer")
-            .field("initialized", &self.buffer.len())
+            .field("initialized", &self.buffer.initialized_len())
             .field("capacity", &self.buffer.capacity())
             .finish_non_exhaustive()
     }
@@ -88,7 +176,7 @@ impl PooledBuffer {
     #[must_use]
     #[inline]
     pub fn initialized(&self) -> usize {
-        self.buffer.len()
+        self.buffer.initialized_len()
     }
 
     #[inline]
@@ -108,8 +196,7 @@ impl PooledBuffer {
     where
         R: AsyncRead + Unpin,
     {
-        self.buffer.clear();
-        self.read_into_spare(reader, self.read_limit()).await
+        self.read_into_spare(reader, ReadMode::Reset).await
     }
 
     /// Read more data at the current initialized offset, accumulating bytes.
@@ -125,28 +212,23 @@ impl PooledBuffer {
     where
         R: AsyncRead + Unpin,
     {
-        let limit = self.read_limit().saturating_sub(self.buffer.len());
-        self.read_into_spare(reader, limit).await
+        self.read_into_spare(reader, ReadMode::Append).await
     }
 
-    async fn read_into_spare<R>(&mut self, reader: &mut R, limit: usize) -> std::io::Result<usize>
+    async fn read_into_spare<R>(&mut self, reader: &mut R, mode: ReadMode) -> std::io::Result<usize>
     where
         R: AsyncRead + Unpin,
     {
-        let spare = self.buffer.spare_capacity_mut();
-        let read_len = limit.min(spare.len());
-        if read_len == 0 {
-            return Ok(0);
-        }
-
-        let mut read_buf = ReadBuf::uninit(&mut spare[..read_len]);
-        poll_fn(|cx| Pin::new(&mut *reader).poll_read(cx, &mut read_buf)).await?;
-        let read = read_buf.filled().len();
-        // SAFETY: `poll_read` initialized exactly `read` bytes in the spare slice.
-        unsafe {
-            self.buffer.advance_mut(read);
-        }
-        Ok(read)
+        let read_len = match mode {
+            ReadMode::Reset => {
+                self.buffer.clear();
+                self.read_limit()
+            }
+            ReadMode::Append => self
+                .read_limit()
+                .saturating_sub(self.buffer.initialized_len()),
+        };
+        self.buffer.read_from(reader, read_len).await
     }
 
     /// Copy data into buffer and mark as initialized
@@ -159,8 +241,7 @@ impl PooledBuffer {
             data.len() <= self.buffer.capacity(),
             "data exceeds buffer capacity"
         );
-        self.buffer.clear();
-        self.buffer.extend_from_slice(data);
+        self.buffer.copy_from_slice(data);
     }
 
     /// Reset the logical contents of the buffer without changing its backing allocation.
@@ -193,12 +274,12 @@ impl PooledBuffer {
     /// After calling this, `.len()` (via Deref) returns the total accumulated length.
     #[inline]
     pub fn extend_from_slice(&mut self, data: &[u8]) {
-        let needed = self.buffer.len() + data.len();
+        let needed = self.buffer.initialized_len() + data.len();
         // Accumulator/capture mode may grow; resized buffers are discarded on drop.
         if needed > self.buffer.capacity() {
             tracing::warn!(
                 "Capture buffer growing: {} + {} > {} capacity (will allocate)",
-                self.buffer.len(),
+                self.buffer.initialized_len(),
                 data.len(),
                 self.buffer.capacity()
             );
@@ -212,7 +293,7 @@ impl PooledBuffer {
     /// ownership escapes through `Bytes`.
     #[must_use]
     pub fn freeze(mut self) -> Bytes {
-        std::mem::take(&mut self.buffer).freeze()
+        self.buffer.freeze()
     }
 }
 
@@ -221,7 +302,7 @@ impl Deref for PooledBuffer {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.buffer
+        self.buffer.as_slice()
     }
 }
 
@@ -230,7 +311,7 @@ impl Deref for PooledBuffer {
 impl AsRef<[u8]> for PooledBuffer {
     #[inline]
     fn as_ref(&self) -> &[u8] {
-        &self.buffer
+        self.buffer.as_slice()
     }
 }
 
@@ -268,11 +349,11 @@ impl Drop for PooledBuffer {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    let buffer = std::mem::take(&mut self.buffer);
+                    let buffer = self.buffer.take();
                     match self.pool.push(buffer) {
                         Ok(()) => return,
                         Err(buffer) => {
-                            self.buffer = buffer;
+                            self.buffer.restore(buffer);
                             self.pool_size.fetch_sub(1, Ordering::Relaxed);
                             self.allocated_count.fetch_sub(1, Ordering::Relaxed);
                             return;
@@ -1026,9 +1107,10 @@ impl BufferPool {
         fallback: bool,
         counts_toward_pool: bool,
     ) -> PooledBuffer {
+        let expected_capacity = buffer.capacity();
         PooledBuffer {
-            expected_capacity: buffer.capacity(),
-            buffer,
+            expected_capacity,
+            buffer: BufferStorage::new(buffer),
             pool: Arc::clone(&self.pool),
             pool_size: Arc::clone(&self.pool_size),
             allocated_count: Arc::clone(&self.allocated_count),
@@ -1138,9 +1220,7 @@ impl BufferPool {
     /// Returns a `PooledBuffer` backed by a pooled capture buffer.
     /// Used for accumulating streaming data (e.g., caching articles).
     pub(crate) fn acquire_capture_now(&self) -> PooledBuffer {
-        let mut fallback = false;
-        let mut counts_toward_pool = true;
-        let buffer = self.capture_pool.pop().map_or_else(
+        let acquisition = self.capture_pool.pop().map_or_else(
             || {
                 let capacity = if self.capture_capacity > 0 {
                     self.capture_capacity
@@ -1149,11 +1229,13 @@ impl BufferPool {
                 };
 
                 if self.try_reserve_capture_slot() {
-                    return BytesMut::with_capacity(capacity);
+                    return BufferAcquisition {
+                        buffer: BytesMut::with_capacity(capacity),
+                        fallback: false,
+                        counts_toward_pool: true,
+                    };
                 }
 
-                fallback = true;
-                counts_toward_pool = false;
                 hot_path_allocation_metrics()
                     .capture_pool_fallback_allocations
                     .fetch_add(1, Ordering::Relaxed);
@@ -1162,27 +1244,36 @@ impl BufferPool {
                     capacity, "Capture buffer pool exhausted; allocating fallback buffer"
                 );
                 // Pool exhausted - allocate a visible fallback buffer.
-                BytesMut::with_capacity(capacity)
+                BufferAcquisition {
+                    buffer: BytesMut::with_capacity(capacity),
+                    fallback: true,
+                    counts_toward_pool: false,
+                }
             },
             |mut buffer| {
                 self.capture_pool_size.fetch_sub(1, Ordering::Relaxed);
                 // Clear but keep capacity for reuse.
                 buffer.clear();
-                buffer
+                BufferAcquisition {
+                    buffer,
+                    fallback: false,
+                    counts_toward_pool: true,
+                }
             },
         );
 
+        let expected_capacity = acquisition.buffer.capacity();
         PooledBuffer {
-            expected_capacity: buffer.capacity(),
-            buffer,
+            expected_capacity,
+            buffer: BufferStorage::new(acquisition.buffer),
             pool: Arc::clone(&self.capture_pool),
             pool_size: Arc::clone(&self.capture_pool_size),
             allocated_count: Arc::clone(&self.capture_allocated_count),
             max_pool_size: self.max_capture_pool_size,
             writable_len: 0,
             acquired_at: Instant::now(),
-            source: PooledBufferSource::capture(fallback),
-            counts_toward_pool,
+            source: PooledBufferSource::capture(acquisition.fallback),
+            counts_toward_pool: acquisition.counts_toward_pool,
         }
     }
 
@@ -1251,6 +1342,19 @@ mod tests {
         assert_eq!(buffer.initialized(), 11);
         assert_eq!(&*buffer, b"220 ready\r\n");
         assert_eq!(buffer.capacity(), capacity);
+    }
+
+    #[tokio::test]
+    async fn test_read_from_exposes_only_initialized_bytes() {
+        let pool = BufferPool::for_tests();
+        let mut buffer = pool.acquire();
+        let data = b"Test data for AsyncRead";
+        let mut reader = std::io::Cursor::new(data);
+
+        let read = buffer.read_from(&mut reader).await.unwrap();
+        assert_eq!(read, data.len());
+        assert_eq!(buffer.initialized(), data.len());
+        assert_eq!(buffer.as_ref(), data);
     }
 
     #[tokio::test]

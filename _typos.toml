@@ -1,0 +1,6 @@
+[files]
+extend-exclude = ["baseline-bench.txt"]
+
+[default.extend-words]
+flate = "flate"
+ratatui = "ratatui"

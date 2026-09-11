@@ -16,17 +16,24 @@ use nntp_proxy::auth::AuthHandler;
 use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
 use nntp_proxy::config::RoutingMode;
 use nntp_proxy::protocol::RequestContext;
+use nntp_proxy::protocol::StatusCode;
 use nntp_proxy::session::ClientSession;
 
 fn classify(command: &str) -> CommandAction<'static> {
     RequestContext::parse(command.as_bytes()).map_or_else(
         || {
             CommandAction::Reject(nntp_proxy::command::RejectResponse::new(
-                nntp_proxy::protocol::codes::COMMAND_SYNTAX_ERROR,
+                StatusCode::new(nntp_proxy::protocol::codes::COMMAND_SYNTAX_ERROR),
                 "501 Syntax error in command\r\n",
             ))
         },
-        |request| CommandHandler::classify_request(Box::leak(Box::new(request))),
+        |request| {
+            CommandHandler::classify_request(
+                Box::leak(Box::new(request)),
+                nntp_proxy::command::AuthenticationAccess::Authenticated,
+                RoutingMode::PerCommand,
+            )
+        },
     )
 }
 
@@ -208,6 +215,97 @@ async fn test_auth_handler_processes_auth_commands() {
 }
 
 #[tokio::test]
+async fn test_authentication_state_is_per_session() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct SessionAuth {
+        handler: Arc<AuthHandler>,
+        authenticated: AtomicBool,
+    }
+
+    impl SessionAuth {
+        fn new(handler: Arc<AuthHandler>) -> Self {
+            Self {
+                handler,
+                authenticated: AtomicBool::new(false),
+            }
+        }
+
+        async fn authenticate(&self, username: &str, password: &str) -> bool {
+            let mut output = Vec::new();
+            let (_, success) = self
+                .handler
+                .handle_auth_command(
+                    AuthAction::ValidateAndRespond { password },
+                    &mut output,
+                    Some(username),
+                )
+                .await
+                .unwrap();
+
+            if success {
+                self.authenticated.store(true, Ordering::Release);
+            }
+
+            success
+        }
+    }
+
+    let handler = auth_handler("alice", "secret");
+    let alice = SessionAuth::new(handler.clone());
+    let bob = SessionAuth::new(handler.clone());
+    let alice_again = SessionAuth::new(handler);
+
+    assert!(alice.authenticate("alice", "secret").await);
+    assert!(!bob.authenticate("bob", "wrong").await);
+    assert!(alice_again.authenticate("alice", "secret").await);
+
+    assert!(alice.authenticated.load(Ordering::Acquire));
+    assert!(!bob.authenticated.load(Ordering::Acquire));
+    assert!(alice_again.authenticated.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn test_sequential_auth_attempts_use_current_username() {
+    let handler = auth_handler("user", "pass");
+    let mut auth_username = Some("user".to_string());
+    let mut output = Vec::new();
+
+    let (_, success) = handler
+        .handle_auth_command(
+            AuthAction::ValidateAndRespond { password: "wrong" },
+            &mut output,
+            auth_username.as_deref(),
+        )
+        .await
+        .unwrap();
+    assert!(!success);
+
+    output.clear();
+    let (_, success) = handler
+        .handle_auth_command(
+            AuthAction::ValidateAndRespond { password: "pass" },
+            &mut output,
+            auth_username.as_deref(),
+        )
+        .await
+        .unwrap();
+    assert!(success);
+
+    auth_username = Some("otheruser".to_string());
+    output.clear();
+    let (_, success) = handler
+        .handle_auth_command(
+            AuthAction::ValidateAndRespond { password: "pass" },
+            &mut output,
+            auth_username.as_deref(),
+        )
+        .await
+        .unwrap();
+    assert!(!success);
+}
+
+#[tokio::test]
 async fn test_reject_response_formatting() {
     use tokio::io::AsyncWriteExt;
 
@@ -224,7 +322,7 @@ async fn test_reject_response_formatting() {
 #[test]
 fn test_command_classification_for_stateless() {
     for command in ["ARTICLE <msgid@example.com>\r\n", "LIST\r\n"] {
-        assert_eq!(classify(command), CommandAction::ForwardStateless);
+        assert_eq!(classify(command), CommandAction::Forward);
     }
 }
 

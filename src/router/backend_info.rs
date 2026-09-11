@@ -8,6 +8,7 @@ use std::cmp::Ordering as CmpOrdering;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::cache::AvailabilitySlot;
 use crate::pool::DeadpoolConnectionProvider;
 use crate::types::{BackendId, ServerName};
 
@@ -192,9 +193,11 @@ impl Default for StatefulCount {
 
 /// Backend connection information
 #[derive(Debug, Clone)]
-pub(super) struct BackendInfo {
+pub struct BackendInfo {
     /// Backend identifier
     pub(super) id: BackendId,
+    /// Article-availability identity slot, shared by equivalent transports.
+    pub(super) availability_slot: AvailabilitySlot,
     /// Server name for logging
     pub(super) name: ServerName,
     /// Connection provider for this backend

@@ -2139,7 +2139,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    const EXHAUSTIVE_BYTES: [u8; 4] = [b'\r', b'\n', b'.', b'x'];
+    const EXHAUSTIVE_BYTES: [u8; 4] = *b"\r\n.x";
 
     struct FailingWriter;
 
@@ -3050,6 +3050,26 @@ mod tests {
         assert_eq!(writes.len(), 2);
         assert_eq!(&writes[0][..], b"111 20260520120000\r\n");
         assert_eq!(&writes[1][..], b"205 Goodbye\r\n");
+        assert!(!order.has_pending_backend_replies());
+        assert!(!order.has_deferred_replies());
+    }
+
+    #[test]
+    fn xhdr_221_response_completes_when_fragmented_before_deferred_reply() {
+        let request = crate::protocol::RequestContext::parse(b"XHDR Subject 1-10\r\n")
+            .expect("valid request");
+        let mut order = BackendResponseOrder::default();
+        order.push_request(request.kind());
+        order.push_deferred_reply(b"205 Goodbye\r\n");
+
+        let first = order.client_writes_for_backend_read(b"221 1 Subject\r\nvalue\r\n");
+        assert_eq!(first.len(), 1);
+        assert_eq!(&first[0][..], b"221 1 Subject\r\nvalue\r\n");
+
+        let second = order.client_writes_for_backend_read(b".\r\n");
+        assert_eq!(second.len(), 2);
+        assert_eq!(&second[0][..], b".\r\n");
+        assert_eq!(&second[1][..], b"205 Goodbye\r\n");
         assert!(!order.has_pending_backend_replies());
         assert!(!order.has_deferred_replies());
     }

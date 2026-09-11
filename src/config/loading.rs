@@ -307,6 +307,13 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
     let password_key = format!("NNTP_SERVER_{index}_PASSWORD");
     let password = env.get(&password_key);
 
+    let availability_namespace_key = format!("NNTP_SERVER_{index}_AVAILABILITY_NAMESPACE");
+    let availability_namespace = env.get(&availability_namespace_key).map(|namespace| {
+        crate::types::AvailabilityNamespace::try_new(namespace.clone()).unwrap_or_else(|_| {
+            panic!("Invalid availability namespace in {availability_namespace_key}: '{namespace}'")
+        })
+    });
+
     let max_conn_key = format!("NNTP_SERVER_{index}_MAX_CONNECTIONS");
     let max_connections = env
         .get(&max_conn_key)
@@ -375,6 +382,7 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
             .unwrap_or_else(|_| panic!("Invalid server name in {name_key}: '{name}'")),
         username,
         password,
+        availability_namespace,
         max_connections,
         stat_missing,
         use_tls,
@@ -624,6 +632,7 @@ pub fn create_default_config() -> Config {
                 .expect("Valid server name"),
             username: None,
             password: None,
+            availability_namespace: None,
             max_connections: defaults::max_connections(),
             stat_missing: defaults::stat_missing(),
             use_tls: false,
@@ -698,6 +707,7 @@ mod tests {
             .set("NNTP_SERVER_0_NAME", "Secure News")
             .set("NNTP_SERVER_0_USERNAME", "testuser")
             .set("NNTP_SERVER_0_PASSWORD", "testpass")
+            .set("NNTP_SERVER_0_AVAILABILITY_NAMESPACE", "shared-feed")
             .set("NNTP_SERVER_0_MAX_CONNECTIONS", "20")
             .set("NNTP_SERVER_0_USE_TLS", "true")
             .set("NNTP_SERVER_0_TLS_VERIFY_CERT", "false");
@@ -708,6 +718,10 @@ mod tests {
         assert_eq!(server.name.as_str(), "Secure News");
         assert_eq!(server.username, Some("testuser".to_string()));
         assert_eq!(server.password, Some("testpass".to_string()));
+        assert_eq!(
+            server.availability_namespace.as_ref().map(AsRef::as_ref),
+            Some("shared-feed")
+        );
         assert_eq!(server.max_connections.get(), 20);
         assert!(server.use_tls);
         assert!(!server.tls_verify_cert);

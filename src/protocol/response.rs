@@ -1,8 +1,8 @@
-//! NNTP Response Parsing and Handling
+//! NNTP response status parsing.
 //!
-//! This module implements efficient parsing of NNTP server responses according to
-//! [RFC 3977](https://datatracker.ietf.org/doc/html/rfc3977) with optimizations
-//! for high-throughput proxy use.
+//! This module parses the three-digit status indicator from NNTP responses.
+//! Response shape is request-scoped and lives in `RequestContext`; multiline
+//! boundary handling lives in `src/session/multiline_framing.rs`.
 //!
 //! # NNTP Protocol References
 //!
@@ -18,35 +18,57 @@
 //!
 //! Per [RFC 3977 §3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2):
 //! ```text
-//! response     = status-line [CRLF multiline-data]
-//! status-line  = status-code SP status-text CRLF
-//! status-code  = 3DIGIT
+//! simple-response     = initial-response-line
+//! multi-line-response = initial-response-line multi-line-data-block
+//! initial-response-line = 3DIGIT *(SP response-argument) CRLF
 //! ```
 //!
-//! # Multiline Responses
-//!
-//! Per [RFC 3977 §3.4.1](https://datatracker.ietf.org/doc/html/rfc3977#section-3.4.1):
-//! ```text
-//! Multiline responses end with a line containing a single period:
-//! CRLF "." CRLF
-//! ```
-
-use nutype::nutype;
+//! See `docs/development.md` for the repository-level response handling split.
 
 /// Raw NNTP status code (3-digit number)
 ///
 /// Per [RFC 3977 §3.2](https://datatracker.ietf.org/doc/html/rfc3977#section-3.2),
 /// all NNTP responses start with a 3-digit status code (100-599).
-#[nutype(derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display, AsRef, Deref
-))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct StatusCode(u16);
 
 impl StatusCode {
+    /// Lowest status code permitted by the NNTP wire format.
+    pub const MIN: u16 = 100;
+
+    /// Highest status code permitted by the NNTP wire format.
+    pub const MAX: u16 = 599;
+
+    /// Construct a status code, panicking if it is outside the NNTP range.
+    #[must_use]
+    pub const fn new(value: u16) -> Self {
+        match Self::try_new(value) {
+            Some(status) => status,
+            None => panic!("NNTP status code must be in the range 100..=599"),
+        }
+    }
+
+    /// Construct a status code only when it is valid for NNTP.
+    #[must_use]
+    pub const fn try_new(value: u16) -> Option<Self> {
+        if value >= Self::MIN && value <= Self::MAX {
+            Some(Self(value))
+        } else {
+            None
+        }
+    }
+
+    /// Return the wrapped numeric status code.
+    #[inline]
+    #[must_use]
+    pub const fn into_inner(self) -> u16 {
+        self.0
+    }
+
     /// Get the raw numeric value
     #[inline]
     #[must_use]
-    pub fn as_u16(&self) -> u16 {
+    pub const fn as_u16(&self) -> u16 {
         self.into_inner()
     }
 
@@ -146,7 +168,27 @@ impl StatusCode {
 
         // Combine into u16: d0*100 + d1*10 + d2
         let code = u16::from(d0) * 100 + u16::from(d1) * 10 + u16::from(d2);
-        Some(Self::new(code))
+        Self::try_new(code)
+    }
+}
+
+impl AsRef<u16> for StatusCode {
+    fn as_ref(&self) -> &u16 {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for StatusCode {
+    type Target = u16;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for StatusCode {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
     }
 }
 
@@ -184,6 +226,16 @@ mod tests {
         assert_eq!(StatusCode::parse(b"ABC Invalid\r\n"), None);
         assert_eq!(StatusCode::parse(b"20"), None);
         assert_eq!(StatusCode::parse(b"2X0 Error\r\n"), None);
+        assert_eq!(StatusCode::parse(b"000 Invalid\r\n"), None);
+        assert_eq!(StatusCode::parse(b"999 Invalid\r\n"), None);
+    }
+
+    #[test]
+    fn test_status_code_validation() {
+        assert_eq!(StatusCode::try_new(99), None);
+        assert_eq!(StatusCode::try_new(100), Some(StatusCode::new(100)));
+        assert_eq!(StatusCode::try_new(599), Some(StatusCode::new(599)));
+        assert_eq!(StatusCode::try_new(600), None);
     }
 
     #[test]

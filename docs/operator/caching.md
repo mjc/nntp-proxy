@@ -43,6 +43,12 @@ This mode:
 
 `store_article_bodies` only controls whether payloads are retained. Availability tracking is still part of the cache behavior either way.
 
+Cached article entries store typed payload sections, not raw backend response
+bytes. Cache-hit responses are rendered back to NNTP wire format from the stored
+status, article number, message ID, headers, and body. Multiline cache-hit
+completion is shared with the session framer so cache code does not duplicate
+response-boundary logic.
+
 ## What gets retained or tracked
 
 Caching behavior is for message-ID based article retrievals:
@@ -55,6 +61,11 @@ Caching behavior is for message-ID based article retrievals:
 | `STAT <message-id>` | `223` | Track availability | Track availability / synthetic cache hit metadata |
 
 Group-context and article-number commands are not cacheable across backends in the same way.
+
+`430` responses are retained as authoritative negative availability for the
+backend that returned them. They do not contain a multiline body and are used to
+avoid retrying a backend already known not to have that message ID until the
+availability entry expires.
 
 ## Disk cache
 

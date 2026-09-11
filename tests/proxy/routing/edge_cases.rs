@@ -206,7 +206,11 @@ fn test_stateful_acquisition_with_max_connections_1() {
 fn test_concurrent_route_calls() {
     // Disable queue backpressure so routing remains deterministic for this test.
     // We only want to validate command distribution and avoid queue penalties.
-    let mut router = BackendSelector::new().with_queue_backpressure(false, 0, 0, 0);
+    let mut router = BackendSelector::new().with_queue_backpressure(
+        false,
+        nntp_proxy::config::QueuePressureLimits::try_new(0, 0).unwrap(),
+        0,
+    );
 
     // Add 3 backends
     for i in 0..3 {

@@ -98,8 +98,6 @@ fn test_status_code_parse_valid_inputs() {
         (b"200 Service ready\r\n".as_slice(), 200),
         (b"200".as_slice(), 200),
         (b"200 ".as_slice(), 200),
-        (b"000".as_slice(), 0),
-        (b"999".as_slice(), 999),
         (b"211 42 1 100 alt.test".as_slice(), 211),
         (b"200 Welcome! <server@example>\r\n".as_slice(), 200),
         (b"200  multiple  spaces  \r\n".as_slice(), 200),
@@ -121,6 +119,8 @@ fn test_status_code_parse_invalid_inputs() {
         b"2X0 Error\r\n".as_slice(),
         b"ABC Invalid\r\n".as_slice(),
         b" 200 Error\r\n".as_slice(),
+        b"000 Invalid\r\n".as_slice(),
+        b"999 Invalid\r\n".as_slice(),
     ] {
         assert_eq!(StatusCode::parse(input), None);
     }

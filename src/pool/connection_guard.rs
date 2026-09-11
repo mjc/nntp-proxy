@@ -10,11 +10,10 @@
 //! - Compile-time const assertions on timeout values
 //! - Type-level guarantees preventing timeout loops
 
-use deadpool::managed::Object;
-
 use crate::constants::pool::HEALTH_CHECK_TIMEOUT;
-use crate::pool::deadpool_connection::TcpManager;
+use crate::pool::deadpool_connection::PooledConnection;
 use crate::pool::provider::DeadpoolConnectionProvider;
+use crate::session::backend::BackendResponseComplete;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // COMPILE-TIME SAFEGUARDS: Connection Hold Time Limits
@@ -77,22 +76,30 @@ const _SALVAGE_NO_LOOP: () = {
 ///
 /// Follows the same pattern as `CommandGuard` from `src/router/mod.rs`.
 pub struct ConnectionGuard {
-    conn: Option<Object<TcpManager>>,
+    conn: Option<PooledConnection>,
     provider: DeadpoolConnectionProvider,
-    released: bool,
+}
+
+/// A connection whose last backend exchange was proven complete.
+#[must_use]
+pub(crate) struct ReusableConnection {
+    _connection: PooledConnection,
 }
 
 impl ConnectionGuard {
     /// Create a new guard (removes from pool on drop unless released).
-    pub(crate) const fn new(
-        conn: Object<TcpManager>,
-        provider: DeadpoolConnectionProvider,
-    ) -> Self {
+    pub(crate) const fn new(conn: PooledConnection, provider: DeadpoolConnectionProvider) -> Self {
         Self {
             conn: Some(conn),
             provider,
-            released: false,
         }
+    }
+    /// Return a checked-out connection that has not been used yet.
+    ///
+    /// This is the only successful release available without response-completion
+    /// evidence; callers cannot obtain protocol-stream access from this API.
+    pub fn release_idle(mut self) {
+        drop(self.conn.take().expect("ConnectionGuard already consumed"));
     }
 
     /// Return connection to pool after a successful exchange.
@@ -103,11 +110,16 @@ impl ConnectionGuard {
     /// # Panics
     ///
     /// Panics if the guard has already been consumed (double-release).
-    pub fn complete_success(mut self) -> Object<TcpManager> {
-        self.released = true;
-        self.conn
-            .take()
-            .expect("ConnectionGuard::complete_success() called on consumed guard")
+    pub(crate) fn complete_success(
+        mut self,
+        _completion: BackendResponseComplete,
+    ) -> ReusableConnection {
+        ReusableConnection {
+            _connection: self
+                .conn
+                .take()
+                .expect("ConnectionGuard::complete_success() called on consumed guard"),
+        }
     }
 
     /// Close and remove the connection without applying replacement cooldown.
@@ -119,7 +131,6 @@ impl ConnectionGuard {
     ///
     /// Panics if the guard has already been consumed.
     pub(crate) fn fail_client(mut self) {
-        self.released = true;
         let conn = self
             .conn
             .take()
@@ -137,7 +148,6 @@ impl ConnectionGuard {
     ///
     /// Panics if the guard has already been consumed.
     pub(crate) fn fail_backend(mut self) {
-        self.released = true;
         let conn = self
             .conn
             .take()
@@ -150,10 +160,21 @@ impl ConnectionGuard {
     /// # Panics
     ///
     /// Panics if the guard has already been consumed.
-    pub(crate) const fn get_mut(&mut self) -> &mut Object<TcpManager> {
+    pub(crate) const fn get_mut(&mut self) -> &mut PooledConnection {
         self.conn
             .as_mut()
             .expect("ConnectionGuard already consumed")
+    }
+    /// Get mutable access to the protocol stream without exposing the pool object.
+    pub(crate) fn stream_mut(&mut self) -> &mut crate::stream::ConnectionStream {
+        self.get_mut()
+    }
+
+    /// Transfer ownership to the bounded health-check path without claiming success.
+    pub(crate) fn into_connection_for_health_check(mut self) -> PooledConnection {
+        self.conn
+            .take()
+            .expect("ConnectionGuard::into_connection_for_health_check() called on consumed guard")
     }
 
     /// Get shared reference to the connection
@@ -161,7 +182,7 @@ impl ConnectionGuard {
     /// # Panics
     ///
     /// Panics if the guard has already been consumed.
-    pub(crate) const fn get(&self) -> &Object<TcpManager> {
+    pub(crate) const fn get(&self) -> &PooledConnection {
         self.conn
             .as_ref()
             .expect("ConnectionGuard already consumed")
@@ -191,12 +212,10 @@ impl ConnectionGuard {
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         debug_assert!(
-            self.released,
+            self.conn.is_none(),
             "ConnectionGuard dropped without explicit finalize"
         );
-        if !self.released
-            && let Some(conn) = self.conn.take()
-        {
+        if let Some(conn) = self.conn.take() {
             tracing::debug!(
                 connection_type = conn.connection_type(),
                 pending_bytes = conn.pending_bytes_len(),
@@ -208,15 +227,9 @@ impl Drop for ConnectionGuard {
 }
 
 impl std::ops::Deref for ConnectionGuard {
-    type Target = Object<TcpManager>;
+    type Target = PooledConnection;
     fn deref(&self) -> &Self::Target {
         self.get()
-    }
-}
-
-impl std::ops::DerefMut for ConnectionGuard {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.get_mut()
     }
 }
 
@@ -237,21 +250,22 @@ impl std::ops::DerefMut for ConnectionGuard {
 /// * `conn` - Pooled connection to verify
 /// * `provider` - Connection provider (used for `remove_with_cooldown` on failure)
 pub(crate) async fn salvage_with_health_check(
-    mut conn: Object<TcpManager>,
+    mut conn: PooledConnection,
     provider: DeadpoolConnectionProvider,
-) {
+) -> Option<ReusableConnection> {
     use tracing::{debug, warn};
 
     match crate::pool::health_check::check_date_response(&mut *conn).await {
         Ok(()) => {
             debug!("Connection salvaged after Invalid response - DATE check passed");
-            drop(conn); // returns to pool
+            Some(ReusableConnection { _connection: conn })
         }
         Err(e) => {
             warn!("DATE health check failed after Invalid response: {}", e);
             // Unconditional: this is a pool-level operation with no client involved.
             // DATE failure means the connection is in an unknown/dirty state.
             provider.remove_with_cooldown(conn);
+            None
         }
     }
 }
@@ -362,7 +376,7 @@ mod tests {
 
         // complete_success() returns conn to pool (no shutdown)
         let guard = ConnectionGuard::new(conn, provider.clone());
-        drop(guard.complete_success());
+        drop(guard.complete_success(crate::session::backend::BackendResponseComplete::for_test()));
 
         // Second get — pool recycles the existing connection (no new TCP handshake)
         let _conn2 = provider.get_pooled_connection().await.unwrap();

@@ -223,11 +223,6 @@ fn configure_worker_cpu_pinning(_builder: &mut tokio::runtime::Builder, _worker_
     tracing::info!("CPU pinning not available on this platform");
 }
 
-#[cfg(not(target_os = "linux"))]
-fn pin_current_thread_to_cpu(_core: usize) {
-    tracing::info!("CPU pinning not available on this platform");
-}
-
 /// Wait for shutdown signal (Ctrl+C or SIGTERM on Unix)
 ///
 /// This is a common utility for all binary targets. Handler installation

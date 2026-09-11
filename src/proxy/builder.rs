@@ -189,20 +189,32 @@ impl NntpProxyBuilder {
         let backend_count = router::BackendCount::try_new(self.config.servers.len())
             .expect("config validation bounds backend count");
         let servers: Arc<[Server]> = self.config.servers.into();
+        let availability_layout = if let Some(cache) = &cache_config
+            && cache.store_article_bodies
+            && let Some(disk) = &cache.disk
+        {
+            crate::cache::AvailabilityLayout::from_hybrid_registry(&servers, &disk.path)
+                .context("Failed to construct hybrid availability registry")?
+        } else {
+            crate::cache::AvailabilityLayout::from_servers(&servers)
+                .context("Failed to construct backend availability layout")?
+        };
 
         let router = Arc::new({
             let mut r = router::BackendSelector::with_strategy(backend_strategy)
                 .with_queue_backpressure(
                     queue_backpressure.enabled,
-                    queue_backpressure.soft_waiters_per_connection_percent,
-                    queue_backpressure.hard_waiters_per_connection_percent,
+                    queue_backpressure
+                        .limits()
+                        .expect("config validation establishes queue-pressure limits"),
                     queue_backpressure.all_busy_sleep_ms,
                 );
             for (idx, provider) in connection_providers.iter().enumerate() {
-                let backend_id = r.add_backend(
+                let backend_id = r.add_backend_with_slot(
                     servers[idx].name.clone(),
                     provider.clone(),
                     servers[idx].tier,
+                    availability_layout.slot_for_backend(crate::types::BackendId::from_index(idx)),
                 );
                 debug_assert_eq!(backend_id.as_index(), idx);
             }
@@ -240,14 +252,15 @@ impl NntpProxyBuilder {
             adaptive_precheck,
             routing_mode: self.routing_mode,
             memory,
+            availability_layout,
         };
 
         Ok((ctx, cache_config))
     }
 
     /// Log cache configuration details
-    fn log_cache_config(cache_config: &crate::config::Cache, store_article_bodies: bool) {
-        if store_article_bodies {
+    fn log_cache_config(cache_config: &crate::config::Cache, cache: &UnifiedCache) {
+        if cache.stores_payload_responses() {
             info!(
                 "Article cache enabled: max_capacity={}, ttl={}s (full caching)",
                 cache_config.article_cache_capacity,
@@ -262,11 +275,8 @@ impl NntpProxyBuilder {
         }
     }
 
-    fn warn_if_disk_cache_inactive(
-        cache_config: &crate::config::Cache,
-        store_article_bodies: bool,
-    ) {
-        if cache_config.disk.is_some() && !store_article_bodies {
+    fn warn_if_disk_cache_inactive(cache_config: &crate::config::Cache, cache: &UnifiedCache) {
+        if cache_config.disk.is_some() && !cache.stores_payload_responses() {
             warn!(
                 "Disk cache configured but store_article_bodies=false - disk cache is inactive in availability-only mode."
             );
@@ -284,17 +294,17 @@ impl NntpProxyBuilder {
     /// - Hybrid cache initialization fails (if disk cache configured)
     pub async fn build(self) -> Result<NntpProxy> {
         let (ctx, cache_config) = self.build_infrastructure()?;
+        let availability_layout = ctx.availability_layout.clone();
 
         // Create article cache (always enabled for availability tracking)
-        let (cache, store_article_bodies) = if let Some(cache_config) = &cache_config {
+        let cache = if let Some(cache_config) = &cache_config {
             let capacity = cache_config.article_cache_capacity.as_u64();
             let store_article_bodies = cache_config.store_article_bodies;
 
-            Self::warn_if_disk_cache_inactive(cache_config, store_article_bodies);
-
             let cache = if !store_article_bodies {
-                Arc::new(UnifiedCache::availability(
+                Arc::new(UnifiedCache::availability_with_layout(
                     cache_config.article_cache_ttl_secs,
+                    availability_layout.clone(),
                 ))
             } else if let Some(disk_config) = &cache_config.disk {
                 let hybrid_config = HybridCacheConfig {
@@ -314,25 +324,30 @@ impl NntpProxyBuilder {
                 );
 
                 Arc::new(
-                    UnifiedCache::hybrid(hybrid_config)
+                    UnifiedCache::hybrid_with_layout(hybrid_config, availability_layout.clone())
                         .await
                         .context("Failed to initialize hybrid disk cache")?,
                 )
             } else {
-                Arc::new(UnifiedCache::memory(
+                Arc::new(UnifiedCache::memory_with_layout(
                     capacity,
                     cache_config.article_cache_ttl_secs,
+                    availability_layout.clone(),
                 ))
             };
 
-            Self::log_cache_config(cache_config, store_article_bodies);
-            (cache, store_article_bodies)
+            Self::warn_if_disk_cache_inactive(cache_config, &cache);
+            Self::log_cache_config(cache_config, &cache);
+            cache
         } else {
             debug!("Cache not configured, using in-memory availability tracking only");
-            (Arc::new(UnifiedCache::availability(Duration::MAX)), false)
+            Arc::new(UnifiedCache::availability_with_layout(
+                Duration::MAX,
+                availability_layout.clone(),
+            ))
         };
 
-        Ok(ctx.into_proxy(cache, store_article_bodies))
+        Ok(ctx.into_proxy(cache))
     }
 
     /// Build the `NntpProxy` instance (synchronous version)
@@ -349,12 +364,11 @@ impl NntpProxyBuilder {
     /// - Buffer size is zero
     pub fn build_sync(self) -> Result<NntpProxy> {
         let (ctx, cache_config) = self.build_infrastructure()?;
+        let availability_layout = ctx.availability_layout.clone();
 
         // Create article cache (memory-only in sync version)
-        let (cache, store_article_bodies) = if let Some(cache_config) = &cache_config {
+        let cache = if let Some(cache_config) = &cache_config {
             let store_article_bodies = cache_config.store_article_bodies;
-
-            Self::warn_if_disk_cache_inactive(cache_config, store_article_bodies);
 
             if cache_config.disk.is_some() && store_article_bodies {
                 warn!(
@@ -364,24 +378,30 @@ impl NntpProxyBuilder {
 
             let cache = if store_article_bodies {
                 let capacity = cache_config.article_cache_capacity.as_u64();
-                Arc::new(UnifiedCache::memory(
+                Arc::new(UnifiedCache::memory_with_layout(
                     capacity,
                     cache_config.article_cache_ttl_secs,
+                    availability_layout,
                 ))
             } else {
-                Arc::new(UnifiedCache::availability(
+                Arc::new(UnifiedCache::availability_with_layout(
                     cache_config.article_cache_ttl_secs,
+                    availability_layout,
                 ))
             };
 
-            Self::log_cache_config(cache_config, store_article_bodies);
-            (cache, store_article_bodies)
+            Self::warn_if_disk_cache_inactive(cache_config, &cache);
+            Self::log_cache_config(cache_config, &cache);
+            cache
         } else {
             debug!("Cache not configured, using in-memory availability tracking only");
-            (Arc::new(UnifiedCache::availability(Duration::MAX)), false)
+            Arc::new(UnifiedCache::availability_with_layout(
+                Duration::MAX,
+                availability_layout,
+            ))
         };
 
-        Ok(ctx.into_proxy(cache, store_article_bodies))
+        Ok(ctx.into_proxy(cache))
     }
 }
 
@@ -399,15 +419,12 @@ pub(super) struct BuildContext {
     adaptive_precheck: bool,
     routing_mode: RoutingMode,
     memory: Memory,
+    availability_layout: crate::cache::AvailabilityLayout,
 }
 
 impl BuildContext {
     /// Construct the final `NntpProxy` from this context and a cache
-    pub(super) fn into_proxy(
-        self,
-        cache: Arc<UnifiedCache>,
-        store_article_bodies: bool,
-    ) -> NntpProxy {
+    pub(super) fn into_proxy(self, cache: Arc<UnifiedCache>) -> NntpProxy {
         NntpProxy {
             servers: self.servers,
             router: self.router,
@@ -419,7 +436,6 @@ impl BuildContext {
             connection_stats: ConnectionStatsAggregator::new(),
             cache,
             memory: self.memory,
-            store_article_bodies,
             adaptive_precheck: self.adaptive_precheck,
             last_activity_nanos: Arc::new(AtomicU64::new(0)),
             active_clients: Arc::new(AtomicUsize::new(0)),
@@ -522,7 +538,7 @@ mod tests {
             .build_sync()
             .expect("Failed to build proxy");
 
-        assert!(!proxy.store_article_bodies);
+        assert!(!proxy.cache.stores_payload_responses());
         assert_eq!(
             proxy.cache.capacity(),
             AvailabilityIndex::fixed_capacity_bytes()
@@ -540,7 +556,7 @@ mod tests {
             .await
             .expect("Failed to build proxy");
 
-        assert!(!proxy.store_article_bodies);
+        assert!(!proxy.cache.stores_payload_responses());
         assert_eq!(
             proxy.cache.capacity(),
             AvailabilityIndex::fixed_capacity_bytes()
@@ -560,7 +576,7 @@ mod tests {
         .await
         .expect("Failed to build proxy");
 
-        assert!(!proxy.store_article_bodies);
+        assert!(!proxy.cache.stores_payload_responses());
         assert_eq!(
             proxy.cache.capacity(),
             AvailabilityIndex::fixed_capacity_bytes()

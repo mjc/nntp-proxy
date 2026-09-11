@@ -48,9 +48,11 @@ The target invariant is:
     capture facade instead of caller-side boundary detection.
   - Retention paths can still move bytes into `ChunkedResponse` when ownership
     is required after the current write.
-  - A packed suffix after a terminator can still freeze the current buffer into
-    shared bytes and reacquire a pooled buffer. This is rare but still detaches
-    that allocation from the normal pool lifecycle.
+  - Packed bytes after a completed response are queued back onto
+    `ConnectionStream` as opaque pending input. When the pending input can keep a
+    pooled buffer segment, the original buffer stays pool-owned; small copied
+    pending segments and inline-segment overflow remain observable allocation
+    risks.
 
 - `src/pool/buffer.rs`
   - `ChunkedResponse` has 16 inline response chunks.
@@ -153,18 +155,17 @@ Plan:
 - consider an `ArrayVec` plus explicit large-response fallback if we want a hard
   no-heap boundary
 
-### 6. Handle Packed Suffixes Without Freezing Normal Read Buffers
-
-Packed suffixes currently freeze the backing buffer into shared bytes. This is
-correct, but it detaches the allocation from the regular pool.
+### 6. Keep Packed Pending Bytes Pool-Friendly
 
 Plan:
 
-- add a small per-connection leftover slab/ring for packed status/request-sized
-  suffixes
-- copy only the suffix into that preallocated storage
-- keep the main response buffer eligible to return to the regular pool
-- retain the current shared-bytes fallback for unusually large suffixes
+- keep using pooled pending-byte segments when a packed suffix comes from a
+  pooled backend read buffer
+- add counters/tests for copied pending bytes and inline pending-input overflow
+- consider a small per-connection leftover slab for status-sized suffixes that
+  cannot reuse a pooled buffer segment
+- keep hard capacity checks so a malformed backend cannot queue unbounded
+  pending response data
 
 ### 7. Gate Cache Update Allocations More Aggressively
 

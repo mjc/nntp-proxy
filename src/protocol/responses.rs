@@ -1,7 +1,8 @@
-//! NNTP response message constants and construction helpers
+//! Local NNTP response message constants and construction helpers.
 //!
-//! This module provides pre-defined NNTP response messages and helpers
-//! for constructing responses according to RFC 3977.
+//! This module provides static single-line responses and small formatting
+//! helpers. Locally generated multiline responses such as CAPABILITIES live with
+//! the session framer so terminator handling stays centralized.
 
 /// Line ending: "\r\n"
 pub const CRLF: &[u8] = b"\r\n";

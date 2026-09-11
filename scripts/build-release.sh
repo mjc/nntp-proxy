@@ -21,7 +21,7 @@ set -euo pipefail
 # ============================================================================
 
 # Check for jq if version argument is not provided
-if [ -z "$1" ]; then
+if [ -z "${1:-}" ]; then
     if ! command -v jq &> /dev/null; then
         echo "Error: jq is required but not installed. Please install jq to continue." >&2
         exit 1

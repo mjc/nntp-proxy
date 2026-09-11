@@ -1,0 +1,55 @@
+[graph]
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = [
+  # Runtime via foyer 0.22.3 and dev-only via iai-callgrind 0.16.1.
+  # Keep iai-callgrind for deterministic perf benches. Revisit by 2026-09-15
+  # or on foyer/iai-callgrind upgrade. Upstream: https://github.com/foyer-rs/foyer
+  # and https://github.com/iai-callgrind/iai-callgrind.
+  "RUSTSEC-2025-0141",
+  # Runtime via foyer 0.22.3. Revisit by 2026-09-15 or on foyer upgrade.
+  # Upstream: https://github.com/foyer-rs/foyer.
+  "RUSTSEC-2024-0436",
+  # Dev-only via iai-callgrind 0.16.1 macro support.
+  # Keep iai-callgrind for deterministic perf benches. Revisit by 2026-09-15
+  # or on iai-callgrind upgrade. Upstream: https://github.com/iai-callgrind/iai-callgrind.
+  "RUSTSEC-2026-0173",
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.8
+allow = [
+  "Apache-2.0",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CDLA-Permissive-2.0",
+  "ISC",
+  "MIT",
+  "Unicode-3.0",
+  "Zlib",
+]
+exceptions = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+highlight = "all"
+skip = []
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

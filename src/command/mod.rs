@@ -6,4 +6,8 @@
 
 mod handler;
 
-pub use handler::{AuthAction, CommandAction, CommandHandler, RejectResponse};
+pub(crate) use handler::StatefulHandoff;
+pub use handler::{
+    ArticleLookupRequest, AuthAction, AuthenticationAccess, CommandAction, CommandHandler,
+    CommandPlan, RejectResponse, StatefulRequest,
+};

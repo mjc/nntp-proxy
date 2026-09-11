@@ -14,7 +14,7 @@ use crate::test_helpers::{
     send_command_read_line, spawn_single_backend_proxy, spawn_single_backend_proxy_with_auth,
 };
 
-use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
+use nntp_proxy::command::{AuthAction, AuthenticationAccess, CommandAction, CommandHandler};
 use nntp_proxy::config::{ClientAuth, Config, HealthCheck, Proxy, UserCredentials};
 use nntp_proxy::protocol::RequestContext;
 
@@ -22,7 +22,11 @@ fn classify(command: &str) -> CommandAction<'static> {
     let request = Box::leak(Box::new(
         RequestContext::parse(command.as_bytes()).expect("valid request line"),
     ));
-    CommandHandler::classify_request(request)
+    CommandHandler::classify_request(
+        request,
+        AuthenticationAccess::Authenticated,
+        nntp_proxy::config::RoutingMode::PerCommand,
+    )
 }
 
 #[tokio::test]
@@ -155,7 +159,7 @@ async fn test_auth_handler_integration() {
 
     // Test command classification
     let action = classify("LIST\r\n");
-    assert_eq!(action, CommandAction::ForwardStateless);
+    assert_eq!(action, CommandAction::Forward);
 
     let action = classify("AUTHINFO USER alice\r\n");
     assert!(matches!(

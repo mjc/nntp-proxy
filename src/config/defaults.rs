@@ -3,7 +3,7 @@
 //! This module centralizes all default value functions used in serde deserialization.
 
 use super::types::CompressionCodec;
-use crate::types::{CacheCapacity, MaxConnections, MaxErrors};
+use crate::types::{CacheCapacity, MaxConnections, MaxErrors, QueuePressurePercent};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -91,15 +91,15 @@ pub const fn queue_backpressure_enabled() -> bool {
 /// Default soft queue-pressure limit per connection (percentage).
 #[inline]
 #[must_use]
-pub const fn queue_backpressure_soft_waiters_per_connection_percent() -> u16 {
-    25
+pub fn queue_backpressure_soft_waiters_per_connection_percent() -> QueuePressurePercent {
+    QueuePressurePercent::try_new(25).expect("25 is a valid percentage")
 }
 
 /// Default hard queue-pressure limit per connection (percentage).
 #[inline]
 #[must_use]
-pub const fn queue_backpressure_hard_waiters_per_connection_percent() -> u16 {
-    50
+pub fn queue_backpressure_hard_waiters_per_connection_percent() -> QueuePressurePercent {
+    QueuePressurePercent::try_new(50).expect("50 is a valid percentage")
 }
 
 /// Default delay (ms) before re-trying selection when all tier-local backends are overloaded.

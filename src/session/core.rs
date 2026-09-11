@@ -6,6 +6,7 @@
 use std::sync::{Arc, Mutex};
 
 use crate::auth::AuthHandler;
+use crate::command::AuthenticationAccess;
 use crate::config::RoutingMode;
 use crate::metrics::MetricsCollector;
 use crate::pool::BufferPool;
@@ -40,11 +41,8 @@ pub struct ClientSession {
     /// Connection statistics aggregator for logging connection creation
     pub(super) connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
 
-    /// Article cache (always present - fixed-size, memory-backed, hybrid, or disabled)
+    /// Response cache, always present for availability tracking.
     pub(super) cache: Arc<crate::cache::UnifiedCache>,
-
-    /// Whether to cache article bodies (config-driven)
-    pub(super) cache_articles: bool,
 
     /// Whether to use adaptive availability prechecking for STAT/HEAD
     pub(super) adaptive_precheck: bool,
@@ -92,7 +90,6 @@ pub struct ClientSessionBuilder {
     metrics: MetricsCollector,
     connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
     cache: BuilderCache,
-    cache_articles: bool,
     adaptive_precheck: bool,
 }
 
@@ -150,20 +147,10 @@ impl ClientSessionBuilder {
         self
     }
 
-    /// Add article cache to this session (always present for backend availability tracking)
+    /// Add the response cache used for payload retention and availability tracking.
     #[must_use]
     pub fn with_cache(mut self, cache: Arc<crate::cache::UnifiedCache>) -> Self {
         self.cache = BuilderCache::Shared(cache);
-        self
-    }
-
-    /// Set whether to cache article bodies.
-    ///
-    /// When false, only backend availability is tracked (saves memory).
-    /// When true, full article bodies are cached.
-    #[must_use]
-    pub const fn with_cache_articles(mut self, cache: bool) -> Self {
-        self.cache_articles = cache;
         self
     }
 
@@ -180,39 +167,35 @@ impl ClientSessionBuilder {
     /// routing mode.
     #[must_use]
     pub fn build(self) -> ClientSession {
-        let (mode, routing_mode) = match (&self.router, self.routing_mode) {
-            // Per-command or Hybrid: start in per-command mode (stateless)
-            (Some(_), RoutingMode::PerCommand | RoutingMode::Hybrid) => {
-                (SessionMode::PerCommand, self.routing_mode)
-            }
-            // Stateful mode with router, or no router: always Stateful
-            (Some(_), RoutingMode::Stateful) | (None, _) => {
-                (SessionMode::Stateful, RoutingMode::Stateful)
-            }
+        let routing_mode = match (&self.router, self.routing_mode) {
+            // Per-command or Hybrid: preserve the configured runtime routing mode.
+            (Some(_), RoutingMode::PerCommand | RoutingMode::Hybrid) => self.routing_mode,
+            // Stateful mode with a router, or no router: always Stateful.
+            (Some(_), RoutingMode::Stateful) | (None, _) => RoutingMode::Stateful,
         };
 
         let metrics = self.metrics;
         metrics.user_connection_opened(None);
+        let cache = self.cache.into_cache();
         ClientSession {
             client_addr: self.client_addr,
             buffer_pool: self.buffer_pool,
             client_id: ClientId::new(),
             router: self.router,
-            mode_state: ModeState::new(mode, routing_mode),
+            mode_state: ModeState::new(routing_mode),
             auth_handler: self.auth_handler,
             auth_state: AuthState::new(),
             user_connection_username: Mutex::new(None),
             metrics,
             connection_stats: self.connection_stats,
-            cache: self.cache.into_cache(),
-            cache_articles: self.cache_articles,
+            cache,
             adaptive_precheck: self.adaptive_precheck,
         }
     }
 }
 
 impl ClientSession {
-    /// Create default cache for availability tracking only (no content caching)
+    /// Create the default availability-only cache.
     fn default_cache() -> Arc<crate::cache::UnifiedCache> {
         Arc::new(crate::cache::UnifiedCache::availability(
             std::time::Duration::MAX,
@@ -233,14 +216,13 @@ impl ClientSession {
             buffer_pool,
             client_id: ClientId::new(),
             router: None,
-            mode_state: ModeState::new(SessionMode::Stateful, RoutingMode::Stateful),
+            mode_state: ModeState::new(RoutingMode::Stateful),
             auth_handler,
             auth_state: AuthState::new(),
             user_connection_username: Mutex::new(None),
             metrics,
             connection_stats: None,
             cache: Self::default_cache(),
-            cache_articles: false,
             adaptive_precheck: false,
         }
     }
@@ -264,14 +246,13 @@ impl ClientSession {
             buffer_pool,
             client_id: ClientId::new(),
             router: Some(router),
-            mode_state: ModeState::new(SessionMode::PerCommand, routing_mode),
+            mode_state: ModeState::new(routing_mode),
             auth_handler,
             auth_state: AuthState::new(),
             user_connection_username: Mutex::new(None),
             metrics,
             connection_stats: None,
             cache: Self::default_cache(),
-            cache_articles: false,
             adaptive_precheck: false,
         }
     }
@@ -313,7 +294,6 @@ impl ClientSession {
             metrics,
             connection_stats: None,
             cache: BuilderCache::DefaultAvailability,
-            cache_articles: false,
             adaptive_precheck: false,
         }
     }
@@ -383,16 +363,17 @@ impl ClientSession {
         self.connection_stats.as_ref()
     }
 
-    /// Check if already authenticated (cached for performance)
-    ///
-    /// # Arguments
-    /// * `skip_auth_check` - If true, bypasses the authentication check
-    ///
-    /// # Returns
-    /// Returns true if authenticated or if `skip_auth_check` is true
+    /// Refresh loop access from the session's published authenticated identity.
     #[inline]
-    pub(crate) fn is_authenticated_cached(&self, skip_auth_check: bool) -> bool {
-        self.auth_state.is_authenticated_or_skipped(skip_auth_check)
+    pub(crate) fn authentication_access(
+        &self,
+        auth_access: AuthenticationAccess,
+    ) -> AuthenticationAccess {
+        if self.auth_state.is_authenticated() {
+            auth_access.after_success()
+        } else {
+            auth_access
+        }
     }
 }
 

@@ -463,7 +463,7 @@ proptest! {
                     + u16::from(digits[1] - b'0') * 10
                     + u16::from(digits[2] - b'0')
             })
-        });
+        }).filter(|code| (100..=599).contains(code));
 
         prop_assert_eq!(status.map(|code| code.as_u16()), expected);
     }

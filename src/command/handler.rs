@@ -15,42 +15,185 @@
 //!   <https://www.rfc-editor.org/rfc/rfc4643.html#section-2.4.1>
 //! - `503` Feature not supported\
 //!   <https://www.rfc-editor.org/rfc/rfc3977.html#section-3.2.1>
-//!   Used when a feature (e.g. stateful commands in per-command mode) is not supported
+//!   Used when this proxy cannot provide a feature, such as reader state in
+//!   per-command routing or transit-only `IHAVE`.
 
+use crate::config::RoutingMode;
 use crate::protocol::{
     RequestContext, RequestKind, RequestResponseMetadata, RequestRouteClass, StatusCode, codes,
 };
 
-/// Action to take in response to a command
+/// Evidence-bearing request for article-cache policy.
+///
+/// The private constructor keeps capability minting inside the canonical
+/// command classifier.
+///
+/// Construction is intentionally restricted to the canonical classifier.
+///
+/// ```compile_fail
+/// use nntp_proxy::command::ArticleLookupRequest;
+/// use nntp_proxy::protocol::RequestContext;
+///
+/// let request = RequestContext::parse(b"ARTICLE <article@example.com>\\r\\n").unwrap();
+/// let _ = ArticleLookupRequest { request: &request };
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct ArticleLookupRequest<'a> {
+    request: &'a RequestContext,
+}
+
+impl<'a> ArticleLookupRequest<'a> {
+    fn new(request: &'a RequestContext) -> Option<Self> {
+        (request.route_class() == RequestRouteClass::ArticleByMessageId).then_some(Self { request })
+    }
+
+    #[must_use]
+    pub const fn request(&self) -> &'a RequestContext {
+        self.request
+    }
+
+    #[must_use]
+    pub fn message_id(&self) -> crate::types::MessageId<'a> {
+        self.request
+            .message_id_value()
+            .expect("article lookup capability always has a valid message id")
+    }
+}
+
+/// Evidence-bearing request for the stateful handoff.
+///
+/// The private constructor prevents callers from manufacturing a stateful
+/// handoff from an arbitrary request context.
+///
+/// Construction is intentionally restricted to the canonical classifier.
+///
+/// ```compile_fail
+/// use nntp_proxy::command::StatefulRequest;
+/// use nntp_proxy::protocol::RequestContext;
+///
+/// let request = RequestContext::parse(b"GROUP alt.test\\r\\n").unwrap();
+/// let _ = StatefulRequest { request: &request };
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct StatefulRequest<'a> {
+    request: &'a RequestContext,
+}
+
+impl<'a> StatefulRequest<'a> {
+    fn new(request: &'a RequestContext) -> Self {
+        Self { request }
+    }
+
+    #[must_use]
+    pub const fn request(&self) -> &'a RequestContext {
+        self.request
+    }
+}
+
+impl PartialEq for StatefulRequest<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.request, other.request)
+    }
+}
+
+/// A classifier-approved request that owns the bytes needed for a stateful handoff.
+///
+/// The command classifier is the only constructor, so an arbitrary parsed request
+/// cannot enter the stateful loop through this type.
+#[derive(Debug)]
+pub(crate) struct StatefulHandoff {
+    request: RequestContext,
+}
+
+impl StatefulHandoff {
+    pub(crate) fn new(request: RequestContext) -> Self {
+        Self { request }
+    }
+
+    #[must_use]
+    pub(crate) const fn request(&self) -> &RequestContext {
+        &self.request
+    }
+}
+
+/// Authentication access available to the current client session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthenticationAccess {
+    /// The backend requires a successful client authentication.
+    Required,
+    /// The client has successfully authenticated.
+    Authenticated,
+    /// The backend does not require client authentication.
+    Unrestricted,
+}
+
+impl AuthenticationAccess {
+    #[must_use]
+    pub const fn from_auth_enabled(auth_enabled: bool) -> Self {
+        if auth_enabled {
+            Self::Required
+        } else {
+            Self::Unrestricted
+        }
+    }
+
+    #[must_use]
+    pub const fn can_access_backend(self) -> bool {
+        !matches!(self, Self::Required)
+    }
+
+    #[must_use]
+    pub const fn auth_enabled(self) -> bool {
+        !matches!(self, Self::Unrestricted)
+    }
+
+    #[must_use]
+    pub const fn after_success(self) -> Self {
+        match self {
+            Self::Required => Self::Authenticated,
+            Self::Authenticated | Self::Unrestricted => self,
+        }
+    }
+}
+
+/// Payload-bearing plan produced by the canonical command classifier.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
-pub enum CommandAction<'a> {
-    /// Intercept and send authentication response to client
+pub enum CommandPlan<'a> {
+    /// Intercept and send an authentication response to the client.
     InterceptAuth(AuthAction<'a>),
-    /// Reject the command with an error message (NNTP response format with CRLF)
+    /// Reject the request with an NNTP response.
     Reject(RejectResponse),
-    /// Forward the command to backend (stateless)
-    ForwardStateless,
-    /// Intercept CAPABILITIES and return a synthetic proxy-accurate capability list
+    /// Forward the request to the backend selected by the current session mode.
+    Forward,
+    /// Require authentication before handling the request.
+    RequireAuth,
+    /// Switch from hybrid per-command routing to stateful routing.
+    SwitchToStateful(StatefulRequest<'a>),
+    /// Intercept CAPABILITIES and return a synthetic proxy-accurate capability list.
     InterceptCapabilities,
 }
+
+/// Compatibility name for callers that only need the plan action type.
+pub type CommandAction<'a> = CommandPlan<'a>;
 
 /// Static local reject response with typed status metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RejectResponse {
-    status: u16,
+    status: StatusCode,
     wire: &'static str,
 }
 
 impl RejectResponse {
     #[must_use]
-    pub const fn new(status: u16, wire: &'static str) -> Self {
+    pub const fn new(status: StatusCode, wire: &'static str) -> Self {
+        assert!(wire_status(wire) == status.as_u16());
         Self { status, wire }
     }
 
     #[must_use]
     pub fn status(self) -> StatusCode {
-        StatusCode::new(self.status)
+        self.status
     }
 
     #[must_use]
@@ -93,15 +236,36 @@ impl std::fmt::Display for RejectResponse {
     }
 }
 
-const POST_REJECT: RejectResponse = RejectResponse::new(440, "440 Posting not permitted\r\n");
+const POST_REJECT: RejectResponse =
+    RejectResponse::new(StatusCode::new(440), "440 Posting not permitted\r\n");
 const TRANSIT_REJECT: RejectResponse = RejectResponse::new(
-    codes::FEATURE_NOT_SUPPORTED,
+    StatusCode::new(codes::FEATURE_NOT_SUPPORTED),
     "503 Feature not supported in per-command routing mode\r\n",
 );
 const STATEFUL_REJECT: RejectResponse = RejectResponse::new(
-    codes::FEATURE_NOT_SUPPORTED,
+    StatusCode::new(codes::FEATURE_NOT_SUPPORTED),
     "503 Feature not supported in stateless proxy mode\r\n",
 );
+const TRANSPORT_REJECT: RejectResponse = RejectResponse::new(
+    StatusCode::new(codes::FEATURE_NOT_SUPPORTED),
+    "503 Transport-changing command not supported\r\n",
+);
+
+const fn wire_status(wire: &str) -> u16 {
+    let bytes = wire.as_bytes();
+    if bytes.len() < 3 {
+        return 0;
+    }
+
+    let d0 = bytes[0].wrapping_sub(b'0');
+    let d1 = bytes[1].wrapping_sub(b'0');
+    let d2 = bytes[2].wrapping_sub(b'0');
+    if d0 > 9 || d1 > 9 || d2 > 9 {
+        return 0;
+    }
+
+    (d0 as u16) * 100 + (d1 as u16) * 10 + (d2 as u16)
+}
 
 /// Specific authentication action
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -119,35 +283,100 @@ pub enum AuthAction<'a> {
 pub struct CommandHandler;
 
 impl CommandHandler {
-    /// Classify an already parsed request context and return the action to take.
+    pub(crate) fn article_lookup_request<'a>(
+        request: &'a RequestContext,
+    ) -> Option<ArticleLookupRequest<'a>> {
+        ArticleLookupRequest::new(request)
+    }
+
+    #[expect(
+        clippy::result_large_err,
+        reason = "the non-handoff path retains the parsed request without allocating"
+    )]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn prepare_stateful_handoff(
+        request: RequestContext,
+        auth_access: AuthenticationAccess,
+        routing_mode: RoutingMode,
+    ) -> Result<StatefulHandoff, RequestContext> {
+        match Self::classify_request(&request, auth_access, routing_mode) {
+            CommandPlan::SwitchToStateful(_) => Ok(StatefulHandoff::new(request)),
+            _ => Err(request),
+        }
+    }
+
+    /// Classify an already parsed request context into an execution plan.
     #[must_use]
-    pub fn classify_request(request: &RequestContext) -> CommandAction<'_> {
+    pub fn classify_request(
+        request: &RequestContext,
+        auth_access: AuthenticationAccess,
+        routing_mode: RoutingMode,
+    ) -> CommandPlan<'_> {
         match request.kind() {
-            RequestKind::AuthInfo => strip_authinfo_arg(request.args(), b"USER").map_or_else(
-                || {
-                    strip_authinfo_arg(request.args(), b"PASS").map_or(
-                        CommandAction::InterceptAuth(AuthAction::UnknownSubcommand),
-                        |password| {
-                            CommandAction::InterceptAuth(AuthAction::ValidateAndRespond {
-                                password,
-                            })
-                        },
-                    )
-                },
-                |username| CommandAction::InterceptAuth(AuthAction::RequestPassword(username)),
-            ),
-            RequestKind::Capabilities => CommandAction::InterceptCapabilities,
-            RequestKind::Post => CommandAction::Reject(POST_REJECT),
-            RequestKind::Ihave => CommandAction::Reject(TRANSIT_REJECT),
+            RequestKind::AuthInfo => CommandPlan::InterceptAuth(classify_auth(request.args())),
+            RequestKind::Capabilities => CommandPlan::InterceptCapabilities,
+            RequestKind::Quit => CommandPlan::Forward,
             _ => match request.route_class() {
                 RequestRouteClass::ArticleByMessageId | RequestRouteClass::Stateless => {
-                    CommandAction::ForwardStateless
+                    if auth_access.can_access_backend() {
+                        CommandPlan::Forward
+                    } else {
+                        CommandPlan::RequireAuth
+                    }
                 }
-                RequestRouteClass::Stateful => CommandAction::Reject(STATEFUL_REJECT),
-                RequestRouteClass::Reject => CommandAction::Reject(TRANSIT_REJECT),
-                RequestRouteClass::Local => CommandAction::ForwardStateless,
+                RequestRouteClass::Stateful if routing_mode == RoutingMode::Hybrid => {
+                    if auth_access.can_access_backend() {
+                        CommandPlan::SwitchToStateful(StatefulRequest::new(request))
+                    } else {
+                        CommandPlan::RequireAuth
+                    }
+                }
+                RequestRouteClass::Stateful if routing_mode == RoutingMode::Stateful => {
+                    if !auth_access.can_access_backend() {
+                        CommandPlan::RequireAuth
+                    } else {
+                        CommandPlan::Reject(rejection_for(request))
+                    }
+                }
+                RequestRouteClass::Stateful | RequestRouteClass::Reject => {
+                    if !auth_access.can_access_backend() {
+                        CommandPlan::RequireAuth
+                    } else {
+                        CommandPlan::Reject(rejection_for(request))
+                    }
+                }
+                RequestRouteClass::Local => {
+                    if routing_mode == RoutingMode::Stateful {
+                        CommandPlan::Forward
+                    } else {
+                        CommandPlan::Reject(TRANSIT_REJECT)
+                    }
+                }
             },
         }
+    }
+}
+
+fn classify_auth(args: &[u8]) -> AuthAction<'_> {
+    strip_authinfo_arg(args, b"USER").map_or_else(
+        || {
+            strip_authinfo_arg(args, b"PASS").map_or(AuthAction::UnknownSubcommand, |password| {
+                AuthAction::ValidateAndRespond { password }
+            })
+        },
+        AuthAction::RequestPassword,
+    )
+}
+
+fn rejection_for(request: &RequestContext) -> RejectResponse {
+    match request.kind() {
+        RequestKind::Post => POST_REJECT,
+        RequestKind::Ihave => TRANSIT_REJECT,
+        RequestKind::Compress | RequestKind::StartTls => TRANSPORT_REJECT,
+        _ => match request.route_class() {
+            RequestRouteClass::Stateful => STATEFUL_REJECT,
+            _ => TRANSIT_REJECT,
+        },
     }
 }
 
@@ -182,10 +411,16 @@ mod tests {
     use super::*;
 
     fn classify(command: &str) -> CommandAction<'static> {
-        RequestContext::parse(command.as_bytes())
-            .map_or(CommandAction::Reject(STATEFUL_REJECT), |request| {
-                CommandHandler::classify_request(Box::leak(Box::new(request)))
-            })
+        RequestContext::parse(command.as_bytes()).map_or(
+            CommandAction::Reject(STATEFUL_REJECT),
+            |request| {
+                CommandHandler::classify_request(
+                    Box::leak(Box::new(request)),
+                    AuthenticationAccess::Authenticated,
+                    crate::config::RoutingMode::PerCommand,
+                )
+            },
+        )
     }
 
     #[test]
@@ -216,18 +451,40 @@ mod tests {
     }
 
     #[test]
+    fn stateful_handoff_keeps_the_classified_request_and_requires_auth() {
+        let handoff = CommandHandler::prepare_stateful_handoff(
+            RequestContext::parse(b"GROUP alt.test\r\n").expect("valid request"),
+            AuthenticationAccess::Unrestricted,
+            crate::config::RoutingMode::Hybrid,
+        )
+        .expect("unrestricted GROUP starts a hybrid handoff");
+        assert_eq!(handoff.request().kind(), RequestKind::Group);
+        assert_eq!(handoff.request().args(), b"alt.test");
+
+        let blocked = CommandHandler::prepare_stateful_handoff(
+            RequestContext::parse(b"GROUP alt.test\r\n").expect("valid request"),
+            AuthenticationAccess::Required,
+            crate::config::RoutingMode::Hybrid,
+        );
+        assert!(
+            blocked.is_err(),
+            "GROUP must not hand off before authentication"
+        );
+    }
+
+    #[test]
     fn test_article_by_message_id() {
         let action = classify("ARTICLE <test@example.com>");
-        assert_eq!(action, CommandAction::ForwardStateless);
+        assert_eq!(action, CommandAction::Forward);
     }
 
     #[test]
     fn test_stateless_command() {
         let action = classify("LIST");
-        assert_eq!(action, CommandAction::ForwardStateless);
+        assert_eq!(action, CommandAction::Forward);
 
         let action = classify("HELP");
-        assert_eq!(action, CommandAction::ForwardStateless);
+        assert_eq!(action, CommandAction::Forward);
     }
 
     #[test]
@@ -268,7 +525,7 @@ mod tests {
         for cmd in msgid_commands {
             assert_eq!(
                 classify(cmd),
-                CommandAction::ForwardStateless,
+                CommandAction::Forward,
                 "Command '{cmd}' should be forwarded as stateless"
             );
         }
@@ -288,7 +545,7 @@ mod tests {
         for cmd in stateless_commands {
             assert_eq!(
                 classify(cmd),
-                CommandAction::ForwardStateless,
+                CommandAction::Forward,
                 "Command '{cmd}' should be stateless"
             );
         }
@@ -310,6 +567,33 @@ mod tests {
             classify("Capabilities"),
             CommandAction::InterceptCapabilities,
         );
+    }
+
+    #[test]
+    fn compress_is_rejected_without_forwarding_in_any_routing_mode() {
+        let request = RequestContext::parse(b"COMPRESS DEFLATE\r\n").expect("valid command");
+        assert_eq!(request.kind(), RequestKind::Compress);
+        assert_eq!(request.route_class(), RequestRouteClass::Reject);
+
+        for routing_mode in [
+            crate::config::RoutingMode::PerCommand,
+            crate::config::RoutingMode::Hybrid,
+            crate::config::RoutingMode::Stateful,
+        ] {
+            let plan = CommandHandler::classify_request(
+                &request,
+                AuthenticationAccess::Authenticated,
+                routing_mode,
+            );
+            let CommandPlan::Reject(response) = plan else {
+                panic!("COMPRESS must be rejected in {routing_mode:?}: {plan:?}");
+            };
+            assert_eq!(response.status().as_u16(), 503);
+            assert_eq!(
+                response.to_string(),
+                "503 Transport-changing command not supported\r\n"
+            );
+        }
     }
 
     /// Bug 2 regression test: RFC 4643 §2.3.1 — AUTHINFO is case-insensitive.
@@ -363,10 +647,10 @@ mod tests {
     #[test]
     fn test_case_insensitive_handling() {
         // Test that command handling is case-insensitive
-        assert_eq!(classify("list"), CommandAction::ForwardStateless);
-        assert_eq!(classify("LiSt"), CommandAction::ForwardStateless);
-        assert_eq!(classify("QUIT"), CommandAction::ForwardStateless);
-        assert_eq!(classify("quit"), CommandAction::ForwardStateless);
+        assert_eq!(classify("list"), CommandAction::Forward);
+        assert_eq!(classify("LiSt"), CommandAction::Forward);
+        assert_eq!(classify("QUIT"), CommandAction::Forward);
+        assert_eq!(classify("quit"), CommandAction::Forward);
     }
 
     #[test]
@@ -384,7 +668,7 @@ mod tests {
 
         // Command with trailing whitespace
         let action = classify("LIST  ");
-        assert_eq!(action, CommandAction::ForwardStateless);
+        assert_eq!(action, CommandAction::Forward);
 
         // Auth command with trailing whitespace
         let action = classify("AUTHINFO USER test  ");
@@ -436,11 +720,11 @@ mod tests {
     fn test_article_commands_with_newlines() {
         // Command with CRLF
         let action = classify("ARTICLE <msg@test.com>\r\n");
-        assert_eq!(action, CommandAction::ForwardStateless);
+        assert_eq!(action, CommandAction::Forward);
 
         // Command with just LF
         let action = classify("LIST\n");
-        assert_eq!(action, CommandAction::ForwardStateless);
+        assert_eq!(action, CommandAction::Forward);
     }
 
     #[test]
@@ -460,10 +744,7 @@ mod tests {
     #[test]
     fn test_command_action_equality() {
         // Test that CommandAction implements PartialEq correctly
-        assert_eq!(
-            CommandAction::ForwardStateless,
-            CommandAction::ForwardStateless
-        );
+        assert_eq!(CommandAction::Forward, CommandAction::Forward);
         assert_eq!(
             CommandAction::InterceptAuth(AuthAction::RequestPassword("test")),
             CommandAction::InterceptAuth(AuthAction::RequestPassword("test"))
@@ -525,12 +806,12 @@ mod tests {
         // NEWGROUPS/NEWNEWS are stateless (RFC 3977 §7.3-7.4) — forwarded, not rejected
         assert_eq!(
             classify("NEWGROUPS 20240101 000000 GMT"),
-            CommandAction::ForwardStateless,
+            CommandAction::Forward,
             "NEWGROUPS should be forwarded as stateless"
         );
         assert_eq!(
             classify("NEWNEWS * 20240101 000000 GMT"),
-            CommandAction::ForwardStateless,
+            CommandAction::Forward,
             "NEWNEWS should be forwarded as stateless"
         );
     }
@@ -550,7 +831,7 @@ mod tests {
             panic!("Expected Reject")
         };
 
-        // Stateful commands rejected with stateless-mode message
+        // Stateful commands rejected with per-command-mode message
         assert!(stateful_reject.contains("stateless"));
         // POST rejected with RFC 3977 §6.3.1 440 response
         assert!(post_reject.starts_with("440"));
@@ -640,13 +921,13 @@ mod tests {
         // Correct for commands the proxy structurally cannot support
         // (e.g. stateful GROUP in per-command mode, or transit-only IHAVE)
 
-        // Stateful commands in stateless mode use 503
+        // Commands that require state the per-command path does not hold use 503.
         let CommandAction::Reject(response) = classify("GROUP alt.test") else {
             panic!("Expected Reject");
         };
         assert!(
             response.starts_with("503 "),
-            "Stateful commands should return 503, got: {response}"
+            "Unsupported stateful commands should return 503, got: {response}"
         );
 
         // POST uses 440 per RFC 3977 §6.3.1 (posting not permitted)
@@ -682,6 +963,12 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
+    fn reject_response_rejects_mismatched_wire_status() {
+        let _ = RejectResponse::new(StatusCode::new(501), "502 Wrong status\r\n");
+    }
+
+    #[test]
     fn test_response_messages_are_descriptive() {
         // Responses should explain why the command is rejected
         let CommandAction::Reject(stateful) = classify("GROUP alt.test") else {
@@ -690,7 +977,7 @@ mod tests {
         assert!(
             stateful.to_lowercase().contains("stateless")
                 || stateful.to_lowercase().contains("mode"),
-            "Should explain stateless mode restriction: {stateful}"
+            "Should explain per-command mode restriction: {stateful}"
         );
 
         let CommandAction::Reject(post) = classify("POST") else {

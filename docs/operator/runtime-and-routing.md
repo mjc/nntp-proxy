@@ -49,7 +49,8 @@ Hybrid is the default routing mode. `per-command` and `stateful` remain availabl
 
 ## What per-command mode supports
 
-Per-command mode is meant for stateless operations, especially message-ID lookups such as:
+Per-command mode is meant for stateless operations, especially message-ID
+lookups such as:
 
 - `ARTICLE <message-id>`
 - `BODY <message-id>`
@@ -61,6 +62,23 @@ Per-command mode is meant for stateless operations, especially message-ID lookup
 - `CAPABILITIES`
 
 Commands that depend on selected group or current article state are not a good fit for `per-command` mode.
+
+## Response Handling
+
+Routing code works with typed request metadata, not raw command strings. The
+request kind decides whether a successful backend status has a response body:
+`211` is single-line for `GROUP` but multiline for `LISTGROUP`, while article
+payload commands use their own `220`/`221`/`222` body status codes.
+
+Backend response boundaries are owned by `src/session/multiline_framing.rs`.
+Normal ARTICLE/BODY/HEAD forwarding writes borrowed slices from pooled backend
+read buffers. The proxy only owns full response payloads for explicit retention
+paths such as article-body caching, cache-hit rendering, list-style responses
+that need ownership, tests/prechecks, and oversize or pool-exhaustion fallbacks.
+
+When a backend read includes bytes for the next response, those bytes are kept as
+opaque pending input on the backend connection. Connections with pending bytes
+are not returned to the general pool after a completed per-command response.
 
 ## CLI overrides
 

@@ -1,8 +1,9 @@
 //! Common utilities shared across handler modules
 
 use crate::auth::AuthHandler;
-use crate::command::AuthAction;
+use crate::command::{AuthAction, AuthenticationAccess, CommandHandler, CommandPlan};
 use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata, StatusCode, codes};
+use crate::session::{AuthReducerResult, ClientAuthEvent, ClientAuthState};
 use crate::types::BackendToClientBytes;
 
 use anyhow::Result;
@@ -56,7 +57,7 @@ pub async fn handle_auth_command<W>(
     auth_handler: &Arc<AuthHandler>,
     auth_action: AuthAction<'_>,
     client_write: &mut W,
-    auth_username: &mut Option<String>,
+    auth_username: &mut ClientAuthState,
     auth_state: &crate::session::AuthState,
 ) -> Result<AuthResult>
 where
@@ -74,27 +75,45 @@ where
         });
     }
 
-    let had_username = auth_username.is_some();
-    if let AuthAction::RequestPassword(username) = auth_action {
-        *auth_username = Some(username.to_string());
-    }
+    let reducer_event = match auth_action {
+        AuthAction::RequestPassword(username) => {
+            ClientAuthEvent::User(crate::types::Username::try_new(username.to_owned())?)
+        }
+        AuthAction::ValidateAndRespond { password } => ClientAuthEvent::Password {
+            bytes: password.as_bytes().to_vec(),
+        },
+        AuthAction::UnknownSubcommand => ClientAuthEvent::Unknown,
+    };
 
-    let (bytes, auth_success) = auth_handler
-        .handle_auth_command(auth_action, client_write, auth_username.as_deref())
-        .await?;
+    let credentials_valid = match &reducer_event {
+        ClientAuthEvent::Password { bytes } => auth_username
+            .username()
+            .is_some_and(|username| auth_handler.validate_credentials_bytes(username, bytes)),
+        ClientAuthEvent::User(_) | ClientAuthEvent::Unknown => false,
+    };
+    let decision = auth_username
+        .clone()
+        .decide(reducer_event, credentials_valid);
+    let reducer_result = decision.result();
+    let (response, response_metadata) = auth_response(reducer_result);
 
-    let bytes_written = BackendToClientBytes::new(bytes as u64);
-    let response = auth_response_metadata(auth_action, had_username, auth_success);
+    // Commit the reducer state only after the wire response is accepted by the
+    // client writer, so a failed write cannot publish an auth transition.
+    client_write.write_all(response).await?;
+    let (next_state, _) = decision.into_parts();
+    *auth_username = next_state;
 
-    Ok(if auth_success {
+    let bytes_written = BackendToClientBytes::new(response.len() as u64);
+
+    Ok(if matches!(reducer_result, AuthReducerResult::Accepted) {
         AuthResult::Authenticated {
             bytes: bytes_written,
-            response,
+            response: response_metadata,
         }
     } else {
         AuthResult::NotAuthenticated {
             bytes: bytes_written,
-            response,
+            response: response_metadata,
         }
     })
 }
@@ -103,30 +122,27 @@ fn local_response_metadata(status: u16, response: &[u8]) -> RequestResponseMetad
     RequestResponseMetadata::new(StatusCode::new(status), response.len().into())
 }
 
-fn auth_response_metadata(
-    auth_action: AuthAction<'_>,
-    had_username: bool,
-    auth_success: bool,
-) -> RequestResponseMetadata {
-    match auth_action {
-        AuthAction::RequestPassword(_) => {
-            local_response_metadata(codes::PASSWORD_REQUIRED, crate::protocol::AUTH_REQUIRED)
+fn auth_response(result: AuthReducerResult) -> (&'static [u8], RequestResponseMetadata) {
+    let (status, response) = match result {
+        AuthReducerResult::PasswordRequired => {
+            (codes::PASSWORD_REQUIRED, crate::protocol::AUTH_REQUIRED)
         }
-        AuthAction::ValidateAndRespond { .. } if !had_username => local_response_metadata(
+        AuthReducerResult::Accepted => (codes::AUTH_ACCEPTED, crate::protocol::AUTH_ACCEPTED),
+        AuthReducerResult::Rejected => (codes::AUTH_REJECTED, crate::protocol::AUTH_FAILED),
+        AuthReducerResult::OutOfSequence => (
             codes::AUTH_OUT_OF_SEQUENCE,
             crate::protocol::AUTH_OUT_OF_SEQUENCE,
         ),
-        AuthAction::ValidateAndRespond { .. } if auth_success => {
-            local_response_metadata(codes::AUTH_ACCEPTED, crate::protocol::AUTH_ACCEPTED)
-        }
-        AuthAction::ValidateAndRespond { .. } => {
-            local_response_metadata(codes::AUTH_REJECTED, crate::protocol::AUTH_FAILED)
-        }
-        AuthAction::UnknownSubcommand => local_response_metadata(
+        AuthReducerResult::AlreadyAuthenticated => (
+            codes::ACCESS_DENIED,
+            crate::protocol::AUTH_ALREADY_AUTHENTICATED,
+        ),
+        AuthReducerResult::Unknown => (
             codes::COMMAND_SYNTAX_ERROR,
             crate::protocol::AUTH_UNKNOWN_SUBCOMMAND,
         ),
-    }
+    };
+    (response, local_response_metadata(status, response))
 }
 
 /// Check if command is QUIT and send closing response
@@ -276,10 +292,7 @@ mod tests {
 
     #[test]
     fn test_auth_handler_result_bytes_written() {
-        let auth = AuthHandlerResult::Authenticated {
-            bytes_written: 100,
-            skip_further_checks: true,
-        };
+        let auth = AuthHandlerResult::Authenticated { bytes_written: 100 };
         assert_eq!(auth.bytes_written(), 100);
 
         let not_auth = AuthHandlerResult::NotAuthenticated { bytes_written: 50 };
@@ -291,17 +304,8 @@ mod tests {
 
     #[test]
     fn test_auth_handler_result_should_skip_further_checks() {
-        let skip = AuthHandlerResult::Authenticated {
-            bytes_written: 100,
-            skip_further_checks: true,
-        };
+        let skip = AuthHandlerResult::Authenticated { bytes_written: 100 };
         assert!(skip.should_skip_further_checks());
-
-        let no_skip = AuthHandlerResult::Authenticated {
-            bytes_written: 100,
-            skip_further_checks: false,
-        };
-        assert!(!no_skip.should_skip_further_checks());
 
         let not_auth = AuthHandlerResult::NotAuthenticated { bytes_written: 50 };
         assert!(!not_auth.should_skip_further_checks());
@@ -319,10 +323,7 @@ mod tests {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthHandlerResult {
     /// Authentication succeeded, session can continue
-    Authenticated {
-        bytes_written: u64,
-        skip_further_checks: bool,
-    },
+    Authenticated { bytes_written: u64 },
     /// Authentication required but not yet complete
     NotAuthenticated { bytes_written: u64 },
     /// Command rejected
@@ -343,13 +344,7 @@ impl AuthHandlerResult {
     /// Check if should skip further auth checks
     #[inline]
     pub const fn should_skip_further_checks(&self) -> bool {
-        matches!(
-            self,
-            Self::Authenticated {
-                skip_further_checks: true,
-                ..
-            }
-        )
+        matches!(self, Self::Authenticated { .. })
     }
 }
 
@@ -374,7 +369,7 @@ pub struct AuthCheckContext<'a> {
 pub async fn handle_stateful_auth_check<W>(
     request: &crate::protocol::RequestContext,
     client_write: &mut W,
-    auth_username: &mut Option<String>,
+    auth_username: &mut ClientAuthState,
     ctx: &AuthCheckContext<'_>,
     client_addr: impl std::fmt::Display + Clone,
     set_username_fn: impl FnOnce(String) -> crate::session::AuthenticationTransition,
@@ -382,11 +377,16 @@ pub async fn handle_stateful_auth_check<W>(
 where
     W: AsyncWriteExt + Unpin,
 {
-    use crate::command::{CommandAction, CommandHandler};
-
-    let action = CommandHandler::classify_request(request);
-    match action {
-        CommandAction::ForwardStateless | CommandAction::Reject(_) => {
+    let plan = CommandHandler::classify_request(
+        request,
+        AuthenticationAccess::Required,
+        *ctx.routing_mode,
+    );
+    match plan {
+        CommandPlan::Forward
+        | CommandPlan::RequireAuth
+        | CommandPlan::SwitchToStateful(_)
+        | CommandPlan::Reject(_) => {
             // Reject all non-auth commands before authentication
             use crate::protocol::AUTH_REQUIRED_FOR_COMMAND;
             client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
@@ -394,7 +394,7 @@ where
                 bytes_written: AUTH_REQUIRED_FOR_COMMAND.len() as u64,
             })
         }
-        CommandAction::InterceptCapabilities => {
+        CommandPlan::InterceptCapabilities => {
             // RFC 4643 §3.1: CAPABILITIES must be accessible before authentication.
             // Auth is enabled and client is not yet authenticated → include AUTHINFO.
             let capabilities = crate::session::backend::capabilities_response(true);
@@ -403,7 +403,7 @@ where
                 bytes_written: capabilities.len() as u64,
             })
         }
-        CommandAction::InterceptAuth(auth_action) => {
+        CommandPlan::InterceptAuth(auth_action) => {
             let result = handle_auth_command(
                 ctx.auth_handler,
                 auth_action,
@@ -418,7 +418,7 @@ where
                     on_authentication_success(
                         ctx.client_id,
                         client_addr,
-                        auth_username.clone(),
+                        auth_username.username().map(str::to_owned),
                         *ctx.routing_mode,
                         ctx.connection_stats,
                         set_username_fn,
@@ -426,7 +426,6 @@ where
 
                     Ok(AuthHandlerResult::Authenticated {
                         bytes_written: bytes.as_u64(),
-                        skip_further_checks: true,
                     })
                 }
                 AuthResult::NotAuthenticated { bytes, .. } => {

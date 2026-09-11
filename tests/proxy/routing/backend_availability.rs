@@ -17,8 +17,9 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::test_helpers::{
-    connect_and_read_greeting, create_test_server_config, send_article_read_multiline_response,
-    setup_proxy_with_backends, spawn_test_proxy_on_random_port, wait_for_server,
+    connect_and_read_greeting, create_test_server_config_with_availability_namespace,
+    send_article_read_multiline_response, setup_proxy_with_backends,
+    spawn_test_proxy_on_random_port, wait_for_server,
 };
 
 async fn read_line(stream: &mut tokio::net::TcpStream, context: &str) -> Result<String> {
@@ -227,9 +228,24 @@ async fn test_availability_learned_before_client_disconnect_is_persisted() -> Re
 
     let config = Config {
         servers: vec![
-            create_test_server_config("127.0.0.1", port0, "Backend0-430"),
-            create_test_server_config("127.0.0.1", port1, "Backend1-430"),
-            create_test_server_config("127.0.0.1", port2, "Backend2-Has"),
+            create_test_server_config_with_availability_namespace(
+                "127.0.0.1",
+                port0,
+                "Backend0-430",
+                "disconnect-sync-backend-0",
+            ),
+            create_test_server_config_with_availability_namespace(
+                "127.0.0.1",
+                port1,
+                "Backend1-430",
+                "disconnect-sync-backend-1",
+            ),
+            create_test_server_config_with_availability_namespace(
+                "127.0.0.1",
+                port2,
+                "Backend2-Has",
+                "disconnect-sync-backend-2",
+            ),
         ],
         cache: Some(Cache {
             adaptive_precheck: false,

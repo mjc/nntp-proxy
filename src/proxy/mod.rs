@@ -48,8 +48,6 @@ pub struct NntpProxy {
     pub(super) cache: Arc<UnifiedCache>,
     /// Memory configuration for transport and pooling
     pub(super) memory: Memory,
-    /// Whether to cache article bodies (config-driven)
-    pub(super) store_article_bodies: bool,
     /// Whether to use adaptive availability prechecking for STAT/HEAD
     pub(super) adaptive_precheck: bool,
     /// Timestamp (as epoch nanos) when last client disconnected (for idle detection)

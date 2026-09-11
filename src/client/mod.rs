@@ -142,12 +142,17 @@ impl NntpClient {
             .context("Failed to get connection from pool")?;
         let mut buffer = self.buffer_pool.acquire();
 
-        let response = execute_request_classified(&mut **conn, &request, &mut buffer).await?;
+        let response = execute_request_classified(conn.stream_mut(), &request, &mut buffer).await?;
         let Some(status_code) = response.status_code() else {
             anyhow::bail!("Invalid STAT response");
         };
 
-        Self::parse_stat_response(status_code)
+        let result = Self::parse_stat_response(status_code);
+        if result.is_ok() {
+            let completion = response.completion_proof(&request)?;
+            let _reusable = conn.complete_success(completion);
+        }
+        result
     }
 
     /// Parse STAT response code into existence check
@@ -173,7 +178,8 @@ impl NntpClient {
             .context("Failed to get connection from pool")?;
         let mut io_buffer = self.buffer_pool.acquire();
 
-        let response = execute_request_classified(&mut **conn, &request, &mut io_buffer).await?;
+        let response =
+            execute_request_classified(conn.stream_mut(), &request, &mut io_buffer).await?;
         let Some(status_code) = response.status_code() else {
             anyhow::bail!("Invalid response from server");
         };
@@ -186,6 +192,8 @@ impl NntpClient {
                 .await;
         }
 
+        let completion = response.completion_proof(&request)?;
+        let _reusable = conn.complete_success(completion);
         Ok(io_buffer)
     }
 
@@ -198,17 +206,20 @@ impl NntpClient {
         // capture buffer. It delegates all multiline response completion and
         // trailing-byte rejection to the backend/framer facade.
         let mut capture = self.buffer_pool.acquire_capture();
-        if let Err(err) = crate::session::backend::capture_complete_multiline_response(
-            &mut conn,
+        let completion = match crate::session::backend::capture_complete_multiline_response(
+            conn.stream_mut(),
             &mut io_buffer,
             &mut capture,
         )
         .await
         {
-            conn.fail_backend();
-            return Err(err);
-        }
-        let _ = conn.complete_success();
+            Ok(completion) => completion,
+            Err(err) => {
+                conn.fail_backend();
+                return Err(err);
+            }
+        };
+        let _reusable = conn.complete_success(completion);
         Ok(capture)
     }
 
@@ -418,7 +429,10 @@ mod tests {
         io_buffer: &mut PooledBuffer,
         capture: &mut PooledBuffer,
     ) -> Result<()> {
-        crate::session::backend::capture_complete_multiline_response(conn, io_buffer, capture).await
+        let _completion =
+            crate::session::backend::capture_complete_multiline_response(conn, io_buffer, capture)
+                .await?;
+        Ok(())
     }
 
     /// Verify the session response reader captures the complete response when it all

@@ -8,24 +8,25 @@
 //! - [`command_execution`]: Single-backend command execution and response writing
 //! - [`cache_operations`]: Cache lookups, upserts, and tier helpers
 
+use super::BackendLease;
+
 use crate::protocol::{
     AUTH_REQUIRED_FOR_COMMAND, RequestContext, RequestKind, RequestResponseMetadata, StatusCode,
     codes,
 };
 use crate::session::common;
-use crate::session::routing::{CommandRoutingDecision, decide_request_routing};
-use crate::session::{ClientSession, connection};
+use crate::session::{ClientAuthState, ClientSession, connection};
 use anyhow::Result;
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
-use crate::command::{CommandAction, CommandHandler};
+use crate::command::{AuthAction, AuthenticationAccess, CommandHandler, CommandPlan};
 use crate::constants::buffer::READER_CAPACITY;
 use crate::router::BackendSelector;
 use crate::session::SessionError;
-use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
+use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
 fn safe_command_log_label(request: &RequestContext) -> &str {
     std::str::from_utf8(request.verb()).unwrap_or("<non-utf8-command>")
@@ -34,77 +35,113 @@ fn safe_command_log_label(request: &RequestContext) -> &str {
 /// Result of executing a routing decision
 enum CommandResult {
     /// Continue processing commands
-    Continue { auth_succeeded: bool },
-    /// Switch to stateful mode (early return from loop)
-    SwitchToStateful,
+    Continue,
 }
 
 /// Result of processing a single command
 enum SingleCommandResult {
     /// Continue processing commands
-    Continue { auth_succeeded: bool },
+    Continue,
     /// Client sent QUIT command (bytes already added to `backend_to_client_bytes`)
     Quit,
-    /// Switch to stateful mode (early return from loop)
-    SwitchToStateful,
 }
 
+/// A classified command plan whose request-borrowing evidence has been reduced
+/// to the execution data needed after the request is mutably borrowed.
+///
+/// Authentication arguments are copied because `CommandPlan` borrows them from
+/// the request. The classification itself still happens exactly once.
+enum ExecutableCommandPlan {
+    InterceptAuth(OwnedAuthAction),
+    Reject(crate::command::RejectResponse),
+    Forward,
+    RequireAuth,
+    SwitchToStateful,
+    InterceptCapabilities,
+}
+
+enum OwnedAuthAction {
+    RequestPassword(String),
+    ValidateAndRespond { password: String },
+    UnknownSubcommand,
+}
+
+impl From<CommandPlan<'_>> for ExecutableCommandPlan {
+    fn from(plan: CommandPlan<'_>) -> Self {
+        match plan {
+            CommandPlan::InterceptAuth(AuthAction::RequestPassword(username)) => {
+                Self::InterceptAuth(OwnedAuthAction::RequestPassword(username.to_owned()))
+            }
+            CommandPlan::InterceptAuth(AuthAction::ValidateAndRespond { password }) => {
+                Self::InterceptAuth(OwnedAuthAction::ValidateAndRespond {
+                    password: password.to_owned(),
+                })
+            }
+            CommandPlan::InterceptAuth(AuthAction::UnknownSubcommand) => {
+                Self::InterceptAuth(OwnedAuthAction::UnknownSubcommand)
+            }
+            CommandPlan::Reject(response) => Self::Reject(response),
+            CommandPlan::Forward => Self::Forward,
+            CommandPlan::RequireAuth => Self::RequireAuth,
+            CommandPlan::SwitchToStateful(_) => Self::SwitchToStateful,
+            CommandPlan::InterceptCapabilities => Self::InterceptCapabilities,
+        }
+    }
+}
+
+impl OwnedAuthAction {
+    fn as_borrowed(&self) -> AuthAction<'_> {
+        match self {
+            Self::RequestPassword(username) => AuthAction::RequestPassword(username),
+            Self::ValidateAndRespond { password } => AuthAction::ValidateAndRespond { password },
+            Self::UnknownSubcommand => AuthAction::UnknownSubcommand,
+        }
+    }
+}
+
+#[expect(
+    clippy::large_enum_variant,
+    reason = "the owned stateful handoff avoids a heap allocation on this rare transition"
+)]
 enum BatchLoopAction {
     Continue,
     Break,
-    SwitchToStateful(BatchSwitchTarget),
+    SwitchToStateful(crate::command::StatefulHandoff),
 }
 
-enum BatchSwitchTarget {
-    Context(usize),
-    Trailing,
-}
-
-/// Parameters for executing a command decision
+/// Shared parameters for command execution and single-command processing
 struct CommandExecutionParams<'a> {
     request: &'a mut RequestContext,
-    skip_auth_check: bool,
+    auth_access: AuthenticationAccess,
     router: &'a Arc<BackendSelector>,
     client_writer: &'a crate::session::SharedClientWriter,
-    backend_connection: &'a mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
-    auth_username: &'a mut Option<String>,
-    client_to_backend_bytes: ClientToBackendBytes,
-    backend_to_client_bytes: &'a mut BackendToClientBytes,
-}
-
-/// Parameters for processing a single command (full flow including QUIT handling)
-struct ProcessCommandParams<'a> {
-    request: &'a mut RequestContext,
-    skip_auth_check: bool,
-    router: &'a Arc<BackendSelector>,
-    client_writer: &'a crate::session::SharedClientWriter,
-    backend_connection: &'a mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
-    auth_username: &'a mut Option<String>,
+    backend_connection: &'a mut Option<BackendLease>,
+    auth_username: &'a mut ClientAuthState,
     client_to_backend_bytes: ClientToBackendBytes,
     backend_to_client_bytes: &'a mut BackendToClientBytes,
 }
 
 #[derive(Default)]
 struct BatchBackendConnection {
-    conn: Option<(BackendId, crate::pool::ConnectionGuard)>,
+    conn: Option<BackendLease>,
 }
 
 impl BatchBackendConnection {
-    fn slot(&mut self) -> &mut Option<(BackendId, crate::pool::ConnectionGuard)> {
+    fn slot(&mut self) -> &mut Option<BackendLease> {
         &mut self.conn
     }
 
     fn complete_success(&mut self) {
-        if let Some((_backend_id, conn)) = self.conn.take() {
-            let _ = conn.complete_success();
+        if let Some(lease) = self.conn.take() {
+            lease.complete_success();
         }
     }
 }
 
 impl Drop for BatchBackendConnection {
     fn drop(&mut self) {
-        if let Some((_backend_id, conn)) = self.conn.take() {
-            conn.fail_backend();
+        if let Some(lease) = self.conn.take() {
+            lease.fail_backend();
         }
     }
 }
@@ -112,17 +149,17 @@ impl Drop for BatchBackendConnection {
 struct PerCommandLoopState {
     client_to_backend_bytes: ClientToBackendBytes,
     backend_to_client_bytes: BackendToClientBytes,
-    auth_username: Option<String>,
-    skip_auth_check: bool,
+    auth_username: ClientAuthState,
+    auth_access: AuthenticationAccess,
 }
 
 impl PerCommandLoopState {
-    const fn new(skip_auth_check: bool) -> Self {
+    const fn new(auth_access: AuthenticationAccess) -> Self {
         Self {
             client_to_backend_bytes: ClientToBackendBytes::zero(),
             backend_to_client_bytes: BackendToClientBytes::zero(),
-            auth_username: None,
-            skip_auth_check,
+            auth_username: ClientAuthState::anonymous(),
+            auth_access,
         }
     }
 
@@ -142,112 +179,22 @@ fn record_local_response(request: &mut RequestContext, status: u16, response: &[
 }
 
 impl ClientSession {
-    /// Execute a command routing decision
-    ///
-    /// Handles all routing decision types: auth, forwarding, rejection, etc.
-    async fn execute_command_decision(
-        &self,
-        params: CommandExecutionParams<'_>,
-    ) -> Result<CommandResult> {
-        let request = params.request;
-        let skip_auth_check = params.skip_auth_check;
-        let CommandExecutionParams {
-            router,
-            client_writer,
-            backend_connection,
-            auth_username,
-            client_to_backend_bytes,
-            backend_to_client_bytes,
-            ..
-        } = params;
-
-        let decision = decide_request_routing(
-            request,
-            skip_auth_check,
-            self.auth_handler.is_enabled(),
-            self.mode_state.routing_mode(),
-        );
-
-        match decision {
-            CommandRoutingDecision::InterceptAuth => {
-                self.handle_intercept_auth(
-                    request,
-                    client_writer,
-                    auth_username,
-                    backend_to_client_bytes,
-                )
-                .await
-            }
-            CommandRoutingDecision::Forward => {
-                self.handle_forward_decision(
-                    request,
-                    router,
-                    client_writer,
-                    backend_connection,
-                    client_to_backend_bytes,
-                    backend_to_client_bytes,
-                )
-                .await
-            }
-            CommandRoutingDecision::RequireAuth => {
-                self.handle_require_auth(request, client_writer, backend_to_client_bytes)
-                    .await
-            }
-            CommandRoutingDecision::SwitchToStateful => {
-                Ok(self.handle_stateful_switch_decision(request))
-            }
-            CommandRoutingDecision::Reject => {
-                self.handle_rejected_request(request, client_writer, backend_to_client_bytes)
-                    .await
-            }
-            CommandRoutingDecision::InterceptCapabilities => {
-                self.handle_capabilities_request(
-                    request,
-                    skip_auth_check,
-                    client_writer,
-                    backend_to_client_bytes,
-                )
-                .await
-            }
-        }
-    }
-
     async fn handle_intercept_auth(
         &self,
-        request: &mut RequestContext,
+        auth_action: AuthAction<'_>,
         client_writer: &crate::session::SharedClientWriter,
-        auth_username: &mut Option<String>,
-        backend_to_client_bytes: &mut BackendToClientBytes,
-    ) -> Result<CommandResult> {
+        auth_username: &mut ClientAuthState,
+    ) -> Result<common::AuthResult> {
         debug!("Client {} decision: InterceptAuth", self.client_addr);
-        let action = CommandHandler::classify_request(request);
-        let CommandAction::InterceptAuth(auth_action) = action else {
-            unreachable!("InterceptAuth decision must come from InterceptAuth action")
-        };
-
         let mut client_write = client_writer.lock().await;
-        let result = common::handle_auth_command(
+        common::handle_auth_command(
             &self.auth_handler,
             auth_action,
             &mut *client_write,
             auth_username,
             &self.auth_state,
         )
-        .await?;
-        let auth_succeeded = matches!(result, common::AuthResult::Authenticated { .. });
-        if auth_succeeded {
-            common::on_authentication_success(
-                self.client_id(),
-                self.client_addr,
-                auth_username.clone(),
-                self.mode_state.routing_mode(),
-                self.connection_stats(),
-                |username| self.set_username(username),
-            );
-        }
-        request.record_local_response(result.response_metadata());
-        *backend_to_client_bytes = backend_to_client_bytes.add_u64(result.bytes_written().as_u64());
-        Ok(CommandResult::Continue { auth_succeeded })
+        .await
     }
 
     async fn handle_forward_decision(
@@ -255,7 +202,7 @@ impl ClientSession {
         request: &mut RequestContext,
         router: &Arc<BackendSelector>,
         client_writer: &crate::session::SharedClientWriter,
-        backend_connection: &mut Option<(crate::types::BackendId, crate::pool::ConnectionGuard)>,
+        backend_connection: &mut Option<BackendLease>,
         client_to_backend_bytes: ClientToBackendBytes,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<CommandResult> {
@@ -275,9 +222,7 @@ impl ClientSession {
             backend_to_client_bytes,
         )
         .await?;
-        Ok(CommandResult::Continue {
-            auth_succeeded: false,
-        })
+        Ok(CommandResult::Continue)
     }
 
     async fn handle_require_auth(
@@ -291,51 +236,28 @@ impl ClientSession {
         client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
         record_local_response(request, codes::AUTH_REQUIRED, AUTH_REQUIRED_FOR_COMMAND);
         *backend_to_client_bytes = backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
-        Ok(CommandResult::Continue {
-            auth_succeeded: false,
-        })
-    }
-
-    fn handle_stateful_switch_decision(&self, request: &RequestContext) -> CommandResult {
-        debug!(
-            "Client {} decision: SwitchToStateful kind={:?}, verb={:?}",
-            self.client_addr,
-            request.kind(),
-            request.verb()
-        );
-        info!(
-            "Client {} switching to stateful mode (kind={:?}, verb={:?})",
-            self.client_addr,
-            request.kind(),
-            request.verb()
-        );
-        CommandResult::SwitchToStateful
+        Ok(CommandResult::Continue)
     }
 
     async fn handle_rejected_request(
         &self,
         request: &mut RequestContext,
+        response: crate::command::RejectResponse,
         client_writer: &crate::session::SharedClientWriter,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<CommandResult> {
         debug!("Client {} decision: Reject", self.client_addr);
-        let action = CommandHandler::classify_request(request);
-        let CommandAction::Reject(response) = action else {
-            unreachable!("Reject decision must come from Reject action")
-        };
         let mut client_write = client_writer.lock().await;
         client_write.write_all(response.as_bytes()).await?;
         request.record_local_response(response.metadata());
         *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
-        Ok(CommandResult::Continue {
-            auth_succeeded: false,
-        })
+        Ok(CommandResult::Continue)
     }
 
     async fn handle_capabilities_request(
         &self,
         request: &mut RequestContext,
-        skip_auth_check: bool,
+        auth_access: AuthenticationAccess,
         client_writer: &crate::session::SharedClientWriter,
         backend_to_client_bytes: &mut BackendToClientBytes,
     ) -> Result<CommandResult> {
@@ -343,14 +265,13 @@ impl ClientSession {
             "Client {} decision: InterceptCapabilities",
             self.client_addr
         );
-        let capabilities = crate::session::backend::capabilities_response(!skip_auth_check);
+        let capabilities =
+            crate::session::backend::capabilities_response(!auth_access.can_access_backend());
         let mut client_write = client_writer.lock().await;
         client_write.write_all(capabilities).await?;
         record_local_response(request, codes::CAPABILITY_LIST, capabilities);
         *backend_to_client_bytes = backend_to_client_bytes.add(capabilities.len());
-        Ok(CommandResult::Continue {
-            auth_succeeded: false,
-        })
+        Ok(CommandResult::Continue)
     }
 
     /// Process a single command (handles QUIT, auth, routing decision)
@@ -358,11 +279,47 @@ impl ClientSession {
     /// Returns `SingleCommandResult` indicating whether to continue, quit, or switch to stateful mode.
     async fn process_single_command(
         &self,
-        params: ProcessCommandParams<'_>,
+        params: CommandExecutionParams<'_>,
     ) -> Result<SingleCommandResult> {
-        let ProcessCommandParams {
+        let CommandExecutionParams {
             request,
-            skip_auth_check,
+            auth_access,
+            router,
+            client_writer,
+            backend_connection,
+            auth_username,
+            client_to_backend_bytes,
+            backend_to_client_bytes,
+        } = params;
+        let plan = ExecutableCommandPlan::from(CommandHandler::classify_request(
+            request,
+            auth_access,
+            self.mode_state.routing_mode(),
+        ));
+        self.process_single_command_with_plan(
+            CommandExecutionParams {
+                request,
+                auth_access,
+                router,
+                client_writer,
+                backend_connection,
+                auth_username,
+                client_to_backend_bytes,
+                backend_to_client_bytes,
+            },
+            plan,
+        )
+        .await
+    }
+
+    async fn process_single_command_with_plan(
+        &self,
+        params: CommandExecutionParams<'_>,
+        plan: ExecutableCommandPlan,
+    ) -> Result<SingleCommandResult> {
+        let CommandExecutionParams {
+            request,
+            auth_access,
             router,
             client_writer,
             backend_connection,
@@ -386,24 +343,57 @@ impl ClientSession {
             return Ok(SingleCommandResult::Quit);
         }
 
-        // Execute command decision
-        match self
-            .execute_command_decision(CommandExecutionParams {
-                request,
-                skip_auth_check,
-                router,
-                client_writer,
-                backend_connection,
-                auth_username,
-                client_to_backend_bytes,
-                backend_to_client_bytes,
-            })
-            .await?
-        {
-            CommandResult::Continue { auth_succeeded } => {
-                Ok(SingleCommandResult::Continue { auth_succeeded })
+        match plan {
+            ExecutableCommandPlan::InterceptAuth(auth_action) => {
+                let result = self
+                    .handle_intercept_auth(auth_action.as_borrowed(), client_writer, auth_username)
+                    .await?;
+                if matches!(result, common::AuthResult::Authenticated { .. }) {
+                    common::on_authentication_success(
+                        self.client_id(),
+                        self.client_addr,
+                        auth_username.username().map(str::to_owned),
+                        self.mode_state.routing_mode(),
+                        self.connection_stats(),
+                        |username| self.set_username(username),
+                    );
+                }
+                request.record_local_response(result.response_metadata());
+                *backend_to_client_bytes =
+                    backend_to_client_bytes.add_u64(result.bytes_written().as_u64());
+                Ok(SingleCommandResult::Continue)
             }
-            CommandResult::SwitchToStateful => Ok(SingleCommandResult::SwitchToStateful),
+            ExecutableCommandPlan::Forward => self
+                .handle_forward_decision(
+                    request,
+                    router,
+                    client_writer,
+                    backend_connection,
+                    client_to_backend_bytes,
+                    backend_to_client_bytes,
+                )
+                .await
+                .map(|CommandResult::Continue| SingleCommandResult::Continue),
+            ExecutableCommandPlan::RequireAuth => self
+                .handle_require_auth(request, client_writer, backend_to_client_bytes)
+                .await
+                .map(|CommandResult::Continue| SingleCommandResult::Continue),
+            ExecutableCommandPlan::SwitchToStateful => {
+                anyhow::bail!("stateful command reached per-command execution after classification")
+            }
+            ExecutableCommandPlan::Reject(response) => self
+                .handle_rejected_request(request, response, client_writer, backend_to_client_bytes)
+                .await
+                .map(|CommandResult::Continue| SingleCommandResult::Continue),
+            ExecutableCommandPlan::InterceptCapabilities => self
+                .handle_capabilities_request(
+                    request,
+                    auth_access,
+                    client_writer,
+                    backend_to_client_bytes,
+                )
+                .await
+                .map(|CommandResult::Continue| SingleCommandResult::Continue),
         }
     }
 
@@ -415,10 +405,10 @@ impl ClientSession {
     /// Returns an error if the router is unavailable, a client write fails, or
     /// switching into stateful mode fails.
     pub async fn handle_per_command_routing(
-        &self,
+        &mut self,
         client_stream: TcpStream,
     ) -> Result<TransferMetrics, SessionError> {
-        let Some(router) = self.router.as_ref() else {
+        let Some(router) = self.router.clone() else {
             return Err(SessionError::Backend(anyhow::anyhow!(
                 "Per-command routing mode requires a router"
             )));
@@ -426,7 +416,7 @@ impl ClientSession {
 
         let (client_read, client_write) = client_stream.into_split();
         self.run_per_command_loop(
-            router,
+            &router,
             BufReader::with_capacity(READER_CAPACITY, client_read),
             crate::session::SharedClientWriter::new(client_write),
         )
@@ -434,14 +424,16 @@ impl ClientSession {
     }
 
     async fn run_per_command_loop(
-        &self,
+        &mut self,
         router: &Arc<BackendSelector>,
         mut client_reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
         client_writer: crate::session::SharedClientWriter,
     ) -> Result<TransferMetrics, SessionError> {
         debug!("Client {} entering command loop", self.client_addr);
         let mut command_buf = [0u8; crate::protocol::MAX_COMMAND_LINE_OCTETS];
-        let mut state = PerCommandLoopState::new(!self.auth_handler.is_enabled());
+        let mut state = PerCommandLoopState::new(AuthenticationAccess::from_auth_enabled(
+            self.auth_handler.is_enabled(),
+        ));
 
         loop {
             let Some(mut batch) = self
@@ -461,14 +453,19 @@ impl ClientSession {
             {
                 BatchLoopAction::Continue => {}
                 BatchLoopAction::Break => break,
-                BatchLoopAction::SwitchToStateful(target) => {
+                BatchLoopAction::SwitchToStateful(initial_request) => {
+                    let client_write = client_writer.try_into_inner().map_err(|_| {
+                        SessionError::Backend(anyhow::anyhow!(
+                            "client writer still shared while switching to stateful mode"
+                        ))
+                    })?;
                     return self
-                        .switch_batch_to_stateful(
+                        .switch_to_stateful_mode(
                             client_reader,
-                            client_writer,
-                            &mut batch,
-                            target,
-                            &state,
+                            client_write,
+                            initial_request,
+                            state.client_to_backend_bytes.into(),
+                            state.backend_to_client_bytes.into(),
                         )
                         .await;
                 }
@@ -514,28 +511,17 @@ impl ClientSession {
             return Ok(action);
         }
 
-        let action = match self
-            .process_pipelineable_batch(
-                router,
-                client_writer,
-                state,
-                batch,
-                &mut backend_connection,
-            )
-            .await?
-        {
-            BatchLoopAction::Continue => {
-                self.handle_trailing_command(
-                    router,
-                    client_writer,
-                    state,
-                    batch,
-                    &mut backend_connection,
-                )
-                .await?
-            }
-            action => action,
-        };
+        self.process_pipelineable_batch(
+            router,
+            client_writer,
+            state,
+            batch,
+            &mut backend_connection,
+        )
+        .await?;
+        let action = self
+            .handle_trailing_command(router, client_writer, state, batch, &mut backend_connection)
+            .await?;
         backend_connection.complete_success();
         Ok(action)
     }
@@ -584,10 +570,10 @@ impl ClientSession {
         _state: &mut PerCommandLoopState,
         batch: &mut crate::session::handlers::pipeline::RequestBatch,
         backend_connection: &mut BatchBackendConnection,
-    ) -> Result<BatchLoopAction, SessionError> {
+    ) -> Result<(), SessionError> {
         let batch_size = batch.len();
         if batch_size == 0 {
-            return Ok(BatchLoopAction::Continue);
+            return Ok(());
         }
         if batch_size > 1 {
             debug!(
@@ -596,16 +582,18 @@ impl ClientSession {
             );
         }
 
-        let action = self
-            .process_pipelineable_commands(router, client_writer, _state, batch, backend_connection)
-            .await?;
-        if !matches!(action, BatchLoopAction::Continue) {
-            return Ok(action);
-        }
+        self.process_pipelineable_commands(
+            router,
+            client_writer,
+            _state,
+            batch,
+            backend_connection,
+        )
+        .await?;
         if batch_size > 1 {
             self.metrics.record_pipeline_batch(batch_size as u64);
         }
-        Ok(BatchLoopAction::Continue)
+        Ok(())
     }
 
     async fn process_pipelineable_commands(
@@ -615,10 +603,10 @@ impl ClientSession {
         state: &mut PerCommandLoopState,
         batch: &mut crate::session::handlers::pipeline::RequestBatch,
         backend_connection: &mut BatchBackendConnection,
-    ) -> Result<BatchLoopAction, SessionError> {
+    ) -> Result<(), SessionError> {
         let batch_size = batch.len();
         for i in 0..batch_size {
-            let request = batch.context(i);
+            let request = batch.context(i).request();
             debug!(
                 "Client {} received {} request bytes: kind={:?}, verb={:?}",
                 self.client_addr,
@@ -630,35 +618,41 @@ impl ClientSession {
             state.client_to_backend_bytes = state
                 .client_to_backend_bytes
                 .add(request.request_wire_len().get());
-            state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
+            state.auth_access = self.authentication_access(state.auth_access);
 
-            let request = batch.context_mut(i);
-            match self
-                .process_single_command(ProcessCommandParams {
-                    request,
-                    skip_auth_check: state.skip_auth_check,
-                    router,
-                    client_writer,
-                    backend_connection: backend_connection.slot(),
-                    auth_username: &mut state.auth_username,
-                    client_to_backend_bytes: state.client_to_backend_bytes,
-                    backend_to_client_bytes: &mut state.backend_to_client_bytes,
+            let command_result = batch
+                .with_context_mut(i, |mut request| async {
+                    let result = self
+                        .process_single_command(CommandExecutionParams {
+                            request: &mut request,
+                            auth_access: state.auth_access,
+                            router,
+                            client_writer,
+                            backend_connection: backend_connection.slot(),
+                            auth_username: &mut state.auth_username,
+                            client_to_backend_bytes: state.client_to_backend_bytes,
+                            backend_to_client_bytes: &mut state.backend_to_client_bytes,
+                        })
+                        .await;
+                    (request, result)
                 })
-                .await?
-            {
-                SingleCommandResult::Continue { auth_succeeded } => {
-                    state.skip_auth_check |= auth_succeeded;
-                }
-                SingleCommandResult::Quit => return Ok(BatchLoopAction::Break),
-                SingleCommandResult::SwitchToStateful => {
-                    return Ok(BatchLoopAction::SwitchToStateful(
-                        BatchSwitchTarget::Context(i),
-                    ));
+                .await
+                .map_err(|_| {
+                    SessionError::Backend(anyhow::anyhow!(
+                        "pipelineable request lost its pipelineability during execution"
+                    ))
+                })?;
+            match command_result? {
+                SingleCommandResult::Continue => {}
+                SingleCommandResult::Quit => {
+                    return Err(SessionError::Backend(anyhow::anyhow!(
+                        "pipelineable request unexpectedly terminated the session"
+                    )));
                 }
             }
         }
 
-        Ok(BatchLoopAction::Continue)
+        Ok(())
     }
 
     async fn handle_trailing_command(
@@ -695,79 +689,51 @@ impl ClientSession {
             return Ok(BatchLoopAction::Continue);
         }
 
-        let Some(trailing_context) = batch.trailing_context() else {
+        let Some(trailing_context) = batch.take_trailing_context() else {
             return Ok(BatchLoopAction::Continue);
         };
         if !matches!(trailing_context.kind(), RequestKind::AuthInfo) {
             debug!(
                 "Client {} trailing non-pipelineable {}",
                 self.client_addr,
-                safe_command_log_label(trailing_context)
+                safe_command_log_label(&trailing_context)
             );
         }
         state.client_to_backend_bytes = state
             .client_to_backend_bytes
             .add(trailing_context.request_wire_len().get());
-        state.skip_auth_check = self.is_authenticated_cached(state.skip_auth_check);
+        state.auth_access = self.authentication_access(state.auth_access);
 
-        let Some(trailing_context) = batch.trailing_context_mut() else {
-            return Ok(BatchLoopAction::Continue);
-        };
+        let trailing_plan = ExecutableCommandPlan::from(CommandHandler::classify_request(
+            &trailing_context,
+            state.auth_access,
+            self.mode_state.routing_mode(),
+        ));
+        if matches!(trailing_plan, ExecutableCommandPlan::SwitchToStateful) {
+            return Ok(BatchLoopAction::SwitchToStateful(
+                crate::command::StatefulHandoff::new(trailing_context),
+            ));
+        }
+        let mut trailing_context = trailing_context;
         match self
-            .process_single_command(ProcessCommandParams {
-                request: trailing_context,
-                skip_auth_check: state.skip_auth_check,
-                router,
-                client_writer,
-                backend_connection: backend_connection.slot(),
-                auth_username: &mut state.auth_username,
-                client_to_backend_bytes: state.client_to_backend_bytes,
-                backend_to_client_bytes: &mut state.backend_to_client_bytes,
-            })
+            .process_single_command_with_plan(
+                CommandExecutionParams {
+                    request: &mut trailing_context,
+                    auth_access: state.auth_access,
+                    router,
+                    client_writer,
+                    backend_connection: backend_connection.slot(),
+                    auth_username: &mut state.auth_username,
+                    client_to_backend_bytes: state.client_to_backend_bytes,
+                    backend_to_client_bytes: &mut state.backend_to_client_bytes,
+                },
+                trailing_plan,
+            )
             .await?
         {
-            SingleCommandResult::Continue { auth_succeeded } => {
-                state.skip_auth_check |= auth_succeeded;
-                Ok(BatchLoopAction::Continue)
-            }
+            SingleCommandResult::Continue => Ok(BatchLoopAction::Continue),
             SingleCommandResult::Quit => Ok(BatchLoopAction::Break),
-            SingleCommandResult::SwitchToStateful => Ok(BatchLoopAction::SwitchToStateful(
-                BatchSwitchTarget::Trailing,
-            )),
         }
-    }
-
-    async fn switch_batch_to_stateful(
-        &self,
-        client_reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
-        client_writer: crate::session::SharedClientWriter,
-        batch: &mut crate::session::handlers::pipeline::RequestBatch,
-        target: BatchSwitchTarget,
-        state: &PerCommandLoopState,
-    ) -> Result<TransferMetrics, SessionError> {
-        let request = match target {
-            BatchSwitchTarget::Context(i) if i < batch.len() => batch.context_mut(i),
-            BatchSwitchTarget::Trailing => match batch.trailing_context_mut() {
-                Some(request) => request,
-                None => return Ok(state.transfer_metrics()),
-            },
-            BatchSwitchTarget::Context(_) => return Ok(state.transfer_metrics()),
-        };
-
-        let client_write = client_writer.try_into_inner().map_err(|_| {
-            SessionError::Backend(anyhow::anyhow!(
-                "client writer still shared while switching to stateful mode"
-            ))
-        })?;
-
-        self.switch_to_stateful_mode(
-            client_reader,
-            client_write,
-            request,
-            state.client_to_backend_bytes.into(),
-            state.backend_to_client_bytes.into(),
-        )
-        .await
     }
 }
 
@@ -871,7 +837,11 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             let _batch = super::BatchBackendConnection {
-                conn: Some((BackendId::from_index(0), conn)),
+                conn: Some(super::BackendLease::new(
+                    BackendId::from_index(0),
+                    conn,
+                    crate::session::backend::BackendResponseComplete::for_test(),
+                )),
             };
             tokio::time::sleep(Duration::from_secs(1)).await;
             drop(_batch);
@@ -883,7 +853,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let next = provider.checkout_connection_guard().await.unwrap();
-        drop(next.complete_success());
+        drop(next.complete_success(crate::session::backend::BackendResponseComplete::for_test()));
         assert_eq!(
             accept_count.load(Ordering::SeqCst),
             2,

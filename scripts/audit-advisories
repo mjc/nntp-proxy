@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Summarize current RustSec advisory state and the dependency paths behind
+# intentionally ignored advisories.
+
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
+
+run() {
+    echo
+    echo "==> $*"
+    "$@"
+}
+
+require_cargo_subcommand() {
+    local subcommand="$1"
+    if ! cargo "$subcommand" --version >/dev/null 2>&1; then
+        echo "cargo-$subcommand is not available; run through nix develop." >&2
+        exit 127
+    fi
+}
+
+tree_for() {
+    local crate="$1"
+
+    echo
+    echo "==> full dependency paths for $crate"
+    cargo tree --target=all -i "$crate" || true
+
+    echo
+    echo "==> runtime/build dependency paths for $crate"
+    cargo tree --edges normal,build -i "$crate" || true
+}
+
+require_cargo_subcommand audit
+require_cargo_subcommand deny
+
+run cargo audit
+run cargo deny check advisories
+
+tree_for bincode
+tree_for paste
+tree_for proc-macro-error2
+
+echo
+echo "Upstream projects to watch:"
+echo "- foyer: https://github.com/foyer-rs/foyer"
+echo "- iai-callgrind: https://github.com/iai-callgrind/iai-callgrind"

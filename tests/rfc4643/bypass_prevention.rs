@@ -3,7 +3,7 @@
 //! These tests verify that session handlers properly validate credentials
 //! before marking a session as authenticated.
 
-use nntp_proxy::command::{AuthAction, CommandAction, CommandHandler};
+use nntp_proxy::command::{AuthAction, AuthenticationAccess, CommandAction, CommandHandler};
 use nntp_proxy::protocol::RequestContext;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -12,7 +12,11 @@ fn classify(command: &str) -> CommandAction<'static> {
     let request = Box::leak(Box::new(
         RequestContext::parse(command.as_bytes()).expect("valid request line"),
     ));
-    CommandHandler::classify_request(request)
+    CommandHandler::classify_request(
+        request,
+        AuthenticationAccess::Authenticated,
+        nntp_proxy::config::RoutingMode::PerCommand,
+    )
 }
 
 /// Test that `StandardHandler` requires valid credentials
@@ -116,6 +120,34 @@ async fn test_pass_before_user_rejected() {
     assert!(
         !auth_success,
         "AUTHINFO PASS without prior AUTHINFO USER should not authenticate"
+    );
+}
+
+/// Test that rejecting a stateful command does not change authentication state.
+#[tokio::test]
+async fn test_rejected_stateful_command_does_not_unlock_stateless_commands() {
+    use crate::test_helpers::create_test_auth_handler;
+
+    let auth_handler = create_test_auth_handler();
+    let authenticated = Arc::new(AtomicBool::new(false));
+
+    let action = classify("GROUP misc.test\r\n");
+    let CommandAction::Reject(response) = action else {
+        panic!("GROUP should be rejected in stateless mode")
+    };
+
+    assert!(response.contains("stateless"));
+    assert!(
+        !authenticated.load(Ordering::Acquire),
+        "Rejected stateful commands must not authenticate the session"
+    );
+
+    let action = classify("LIST\r\n");
+    assert_eq!(action, CommandAction::Forward);
+    assert!(auth_handler.is_enabled());
+    assert!(
+        !authenticated.load(Ordering::Acquire),
+        "Following stateless commands still require the normal auth gate"
     );
 }
 

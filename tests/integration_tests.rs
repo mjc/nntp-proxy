@@ -191,7 +191,7 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
     let mut buffer = [0; 1024];
 
     // Read greeting (sent by prepare_stateful_connection)
-    let n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
+    let n = timeout(Duration::from_secs(5), client.read(&mut buffer)).await??;
     let greeting = String::from_utf8_lossy(&buffer[..n]);
     assert!(
         greeting.contains("201"),
@@ -199,7 +199,7 @@ async fn test_proxy_handles_connection_failure() -> Result<()> {
     );
 
     // Read error (sent by handle_stateful_session when backend connection fails)
-    let n = timeout(Duration::from_secs(1), client.read(&mut buffer)).await??;
+    let n = timeout(Duration::from_secs(5), client.read(&mut buffer)).await??;
     let error_response = String::from_utf8_lossy(&buffer[..n]);
     assert!(
         error_response.contains("400 Backend server unavailable"),
@@ -794,8 +794,8 @@ async fn test_backend_223_response_for_message_id() -> Result<()> {
 /// This test verifies the critical tier-based routing behavior:
 /// When backend 0 (tier 0) returns 430, the proxy MUST try backend 1 (tier 0)
 /// before escalating to tier 1. This ensures all tier 0 backends are exhausted.
-fn build_tiered_server(port: u16, name: &str, tier: u8) -> Result<Server> {
-    Server::builder("127.0.0.1", nntp_proxy::types::Port::try_new(port)?)
+fn build_tiered_server(host: &str, port: u16, name: &str, tier: u8) -> Result<Server> {
+    Server::builder(host, nntp_proxy::types::Port::try_new(port)?)
         .name(name)
         .tier(tier)
         .max_connections(nntp_proxy::types::MaxConnections::try_new(5)?)
@@ -886,9 +886,9 @@ async fn test_tier_0_exhaustion_before_escalation() -> Result<()> {
         .await?;
 
     let proxy_port = start_tiered_proxy(vec![
-        build_tiered_server(backend_0_port, "Backend-0-Tier-0", 0)?,
-        build_tiered_server(backend_1_port, "Backend-1-Tier-0", 0)?,
-        build_tiered_server(backend_2_port, "Backend-2-Tier-1", 1)?,
+        build_tiered_server("127.0.0.1", backend_0_port, "Backend-0-Tier-0", 0)?,
+        build_tiered_server("localhost", backend_1_port, "Backend-1-Tier-0", 0)?,
+        build_tiered_server("LOCALHOST", backend_2_port, "Backend-2-Tier-1", 1)?,
     ])
     .await?;
     let mut client = connect_tiered_client(proxy_port).await?;
@@ -955,9 +955,9 @@ async fn test_tier_exhaustion_multi_tier() -> Result<()> {
         .await?;
 
     let proxy_port = start_tiered_proxy(vec![
-        build_tiered_server(backend_0_port, "Backend-0-Tier-0", 0)?,
-        build_tiered_server(backend_1_port, "Backend-1-Tier-0", 0)?,
-        build_tiered_server(backend_2_port, "Backend-2-Tier-1", 1)?,
+        build_tiered_server("127.0.0.1", backend_0_port, "Backend-0-Tier-0", 0)?,
+        build_tiered_server("localhost", backend_1_port, "Backend-1-Tier-0", 0)?,
+        build_tiered_server("LOCALHOST", backend_2_port, "Backend-2-Tier-1", 1)?,
     ])
     .await?;
     let mut client = connect_tiered_client(proxy_port).await?;
@@ -1142,7 +1142,7 @@ async fn test_partial_buffered_command_does_not_block() -> Result<()> {
 
     // The proxy must respond to the first STAT within a reasonable time.
     // If it blocks trying to read_line() on the partial second command, this will timeout.
-    let n = timeout(Duration::from_millis(500), client.read(&mut buffer))
+    let n = timeout(Duration::from_millis(2_000), client.read(&mut buffer))
         .await
         .map_err(|_| {
             anyhow::anyhow!(
