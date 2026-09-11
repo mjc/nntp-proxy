@@ -185,12 +185,15 @@ name = "end_to_end_proxy"
 harness = false
 
 [profile.dev]
+debug = 0             # Use the profiling/bench profiles when symbols are needed
+incremental = false   # Avoid retaining a second full set of object files
 split-debuginfo = "unpacked"  # Faster linking — don't bundle debuginfo into binary
 
 [profile.dev.package."*"]
 opt-level = 1  # Compile dependencies with optimizations in dev mode
                # Huge runtime speedup for rustls/ring/foyer/moka
                # Minimal compile-time cost (deps cached after first build)
+debug = 0      # Keep dependency artifacts compact in the dev profile
 
 [profile.release]
 debug = false          # No debug symbols for smaller binaries
