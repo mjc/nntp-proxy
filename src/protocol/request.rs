@@ -39,6 +39,7 @@ pub enum RequestKind {
     TakeThis,
     AuthInfo,
     StartTls,
+    Compress,
     Unknown,
 }
 
@@ -811,7 +812,8 @@ pub(crate) fn request_kind_has_response_body(kind: RequestKind, status: StatusCo
             | (RequestKind::Capabilities, 101)
             | (RequestKind::List, 215)
             | (RequestKind::Over | RequestKind::Xover, 224)
-            | (RequestKind::Hdr | RequestKind::Xhdr, 225)
+            | (RequestKind::Hdr, 225)
+            | (RequestKind::Xhdr, 221 | 225)
             | (RequestKind::NewNews, 230)
             | (RequestKind::NewGroups, 231)
     ) || matches!(kind, RequestKind::Unknown) && status_implies_response_body(code)
@@ -833,7 +835,8 @@ const fn route_class(kind: RequestKind, has_message_id: bool) -> RequestRouteCla
         | RequestKind::Ihave
         | RequestKind::Check
         | RequestKind::TakeThis
-        | RequestKind::StartTls => RequestRouteClass::Reject,
+        | RequestKind::StartTls
+        | RequestKind::Compress => RequestRouteClass::Reject,
         RequestKind::Article | RequestKind::Body | RequestKind::Head | RequestKind::Stat
             if has_message_id =>
         {
@@ -916,6 +919,7 @@ const fn classify_verb(verb: &[u8]) -> RequestKind {
         },
         8 => {
             b"AUTHINFO" => RequestKind::AuthInfo,
+            b"COMPRESS" => RequestKind::Compress,
             b"STARTTLS" => RequestKind::StartTls,
             b"TAKETHIS" => RequestKind::TakeThis,
         },
@@ -1411,6 +1415,7 @@ mod tests {
             ("TAKETHIS <a@b>\r\n", RequestKind::TakeThis),
             ("AUTHINFO USER test\r\n", RequestKind::AuthInfo),
             ("STARTTLS\r\n", RequestKind::StartTls),
+            ("COMPRESS DEFLATE\r\n", RequestKind::Compress),
         ];
 
         for (line, expected) in cases {
@@ -1437,6 +1442,7 @@ mod tests {
             ("CHECK <a@b>\r\n", RequestRouteClass::Reject),
             ("TAKETHIS <a@b>\r\n", RequestRouteClass::Reject),
             ("STARTTLS\r\n", RequestRouteClass::Reject),
+            ("COMPRESS DEFLATE\r\n", RequestRouteClass::Reject),
             ("XFOO arg\r\n", RequestRouteClass::Stateful),
         ];
 
@@ -1460,5 +1466,8 @@ mod tests {
         assert!(unknown.has_response_body(StatusCode::new(282)));
         assert!(unknown.has_response_body(StatusCode::new(288)));
         assert!(!unknown.has_response_body(StatusCode::new(281)));
+        let xhdr = request_context(b"XHDR Subject 1-10\r\n");
+        assert!(xhdr.has_response_body(StatusCode::new(221)));
+        assert!(xhdr.has_response_body(StatusCode::new(225)));
     }
 }
