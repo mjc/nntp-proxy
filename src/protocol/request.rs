@@ -39,6 +39,7 @@ pub enum RequestKind {
     TakeThis,
     AuthInfo,
     StartTls,
+    Compress,
     Unknown,
 }
 
@@ -834,7 +835,8 @@ const fn route_class(kind: RequestKind, has_message_id: bool) -> RequestRouteCla
         | RequestKind::Ihave
         | RequestKind::Check
         | RequestKind::TakeThis
-        | RequestKind::StartTls => RequestRouteClass::Reject,
+        | RequestKind::StartTls
+        | RequestKind::Compress => RequestRouteClass::Reject,
         RequestKind::Article | RequestKind::Body | RequestKind::Head | RequestKind::Stat
             if has_message_id =>
         {
@@ -917,6 +919,7 @@ const fn classify_verb(verb: &[u8]) -> RequestKind {
         },
         8 => {
             b"AUTHINFO" => RequestKind::AuthInfo,
+            b"COMPRESS" => RequestKind::Compress,
             b"STARTTLS" => RequestKind::StartTls,
             b"TAKETHIS" => RequestKind::TakeThis,
         },
@@ -1412,6 +1415,7 @@ mod tests {
             ("TAKETHIS <a@b>\r\n", RequestKind::TakeThis),
             ("AUTHINFO USER test\r\n", RequestKind::AuthInfo),
             ("STARTTLS\r\n", RequestKind::StartTls),
+            ("COMPRESS DEFLATE\r\n", RequestKind::Compress),
         ];
 
         for (line, expected) in cases {
@@ -1438,6 +1442,7 @@ mod tests {
             ("CHECK <a@b>\r\n", RequestRouteClass::Reject),
             ("TAKETHIS <a@b>\r\n", RequestRouteClass::Reject),
             ("STARTTLS\r\n", RequestRouteClass::Reject),
+            ("COMPRESS DEFLATE\r\n", RequestRouteClass::Reject),
             ("XFOO arg\r\n", RequestRouteClass::Stateful),
         ];
 
