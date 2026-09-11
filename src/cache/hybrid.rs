@@ -688,6 +688,7 @@ mod tests {
     //! Cache-level integration tests for `HybridArticleCache`
     //!
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn hybrid_cache_name_cold_invalidates_old_disk_formats() {
@@ -980,6 +981,85 @@ mod tests {
         assert!(entry.should_try_backend(BackendId::from_index(0)));
         assert!(entry.should_try_backend(BackendId::from_index(1)));
 
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn hybrid_disk_reinsertion_does_not_corrupt_lru() {
+        const KEYS: u64 = 64;
+        const WORKERS: u64 = 32;
+
+        let disk_dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            HybridArticleCache::new(HybridCacheConfig {
+                memory_capacity: 256 * 1024,
+                disk_capacity: 128 * 1024 * 1024,
+                disk_path: disk_dir.path().to_path_buf(),
+                ttl: Duration::from_secs(60 * 60),
+                compression: CompressionCodec::None,
+                shards: 1,
+            })
+            .await
+            .unwrap(),
+        );
+
+        for key in 0..KEYS * 2 {
+            let message_id = format!("<lru-reinsert-{key}@example.com>");
+            let response = format!(
+                "220 0 {message_id} article\r\n\r\n{}\r\n.\r\n",
+                "x".repeat(4096)
+            )
+            .into_bytes();
+            cache
+                .upsert_ingest(
+                    MessageId::from_borrowed(&message_id).unwrap(),
+                    response,
+                    BackendId::from_index(0),
+                    0.into(),
+                )
+                .await;
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut workers = Vec::new();
+
+        for worker in 0..WORKERS {
+            let cache = Arc::clone(&cache);
+            workers.push(tokio::spawn(async move {
+                let mut state = worker + 1;
+                while tokio::time::Instant::now() < deadline {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    let key = state % (KEYS * 2);
+                    let message_id = format!("<lru-reinsert-{key}@example.com>");
+                    let message_id_ref = MessageId::from_borrowed(&message_id).unwrap();
+
+                    if state % 10 < 7 {
+                        let _ = cache.get(&message_id_ref).await;
+                    } else {
+                        let response = format!(
+                            "220 0 {message_id} article\r\n\r\n{}\r\n.\r\n",
+                            "x".repeat(4096)
+                        )
+                        .into_bytes();
+                        cache
+                            .upsert_ingest(
+                                message_id_ref,
+                                response,
+                                BackendId::from_index(0),
+                                0.into(),
+                            )
+                            .await;
+                    }
+                }
+            }));
+        }
+
+        for worker in workers {
+            worker.await.unwrap();
+        }
         cache.close().await.unwrap();
     }
 }
