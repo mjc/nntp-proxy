@@ -12,8 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Added per-backend `stat_missing` retry probing, so backends that correctly answer `STAT` with `430` can help retry missing articles faster.
-- Added runtime CPU pinning support for multi-threaded workloads via a new `CpuPinning` runtime mode, using worker-thread startup hooks so pinned threads are the ones running proxy work.
-- Added [`rustix`](https://docs.rs/rustix)-based affinity handling for Linux CPU pinning so we can remove the direct `nix` pinning dependency path.
+- Runtime CPU pinning support is now available for multi-threaded workloads via a new `CpuPinning` runtime mode, using worker-thread startup hooks so pinned threads are the ones running proxy work.
+- Linux CPU pinning now uses [`rustix`](https://docs.rs/rustix)-based affinity handling, so we can remove the direct `nix` pinning dependency path.
 - Added TUI session/user-count lifecycle fixes so active sessions stay tied to the session-owned gauge instead of drifting or disappearing.
 
 ### Changed
