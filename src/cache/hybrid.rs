@@ -462,6 +462,13 @@ impl HybridArticleCache {
             if existing.availability().is_missing_slot(slot) {
                 return;
             }
+            let mut merged = existing;
+            if merged.merge_compatible_sections(&entry) {
+                merged.set_availability_epoch(self.availability_epoch);
+                self.cache.insert(key, merged);
+                return;
+            }
+            let existing = merged;
             let existing_len = existing.payload_len();
             let existing_complete = existing.is_complete_article();
             let new_complete = entry.is_complete_article();
