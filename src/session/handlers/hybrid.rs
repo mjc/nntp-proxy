@@ -61,20 +61,11 @@ impl StatefulBackendLease {
         self.backend_id
     }
 
-    fn complete_success(self, completion: crate::session::backend::BackendResponseComplete) {
-        let _ = self.connection.complete_success(completion);
-    }
-
     fn finalize(
         self,
         disposition: crate::session::handlers::stateful::StatefulConnectionDisposition,
     ) {
         match disposition {
-            crate::session::handlers::stateful::StatefulConnectionDisposition::Reusable => {
-                self.complete_success(
-                    crate::session::backend::BackendResponseComplete::stateful_session(),
-                );
-            }
             crate::session::handlers::stateful::StatefulConnectionDisposition::RetireClient => {
                 self.connection.fail_client();
             }
