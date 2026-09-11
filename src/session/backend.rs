@@ -49,10 +49,6 @@ impl BackendResponseComplete {
         Self(())
     }
 
-    pub(crate) const fn stateful_session() -> Self {
-        Self(())
-    }
-
     #[cfg(test)]
     pub(crate) const fn for_test() -> Self {
         Self(())

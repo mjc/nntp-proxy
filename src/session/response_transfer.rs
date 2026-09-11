@@ -14,9 +14,8 @@ pub(crate) enum ResponseTransferError {
 
     /// Client write failed after backend response ownership was already established.
     ///
-    /// This is treated as terminal for backend-connection reuse to prevent
-    /// protocol desync when a partially-written client response races with
-    /// subsequent backend reuse.
+    /// A complete response with no queued backend bytes leaves the backend
+    /// reusable even when the client disappears during the final write.
     ClientWrite(std::io::Error),
 
     /// Backend closed connection before sending a complete multiline response.
@@ -54,9 +53,8 @@ impl ResponseTransferError {
             ResponseConnectionReuse::QueuedBytes { .. } => BackendConnectionOutcome::BackendDirty,
             ResponseConnectionReuse::Reusable => match self {
                 Self::ClientDisconnect(_) => BackendConnectionOutcome::BackendHealthy,
-                Self::ClientWrite(_) | Self::BackendEof { .. } | Self::Io(_) => {
-                    BackendConnectionOutcome::BackendFailed
-                }
+                Self::ClientWrite(_) => BackendConnectionOutcome::BackendHealthy,
+                Self::BackendEof { .. } | Self::Io(_) => BackendConnectionOutcome::BackendFailed,
             },
         }
     }
@@ -155,7 +153,7 @@ mod tests {
         );
         assert_eq!(
             client_write.pool_fate(ResponseConnectionReuse::Reusable),
-            BackendConnectionOutcome::BackendFailed
+            BackendConnectionOutcome::BackendHealthy
         );
         assert_eq!(
             eof.pool_fate(ResponseConnectionReuse::Reusable),
