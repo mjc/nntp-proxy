@@ -919,7 +919,9 @@ fn resize_then_drop(pool: &Pool, conn: PooledConnection, new_max: usize) {
 
 fn shutdown_and_drop(conn: PooledConnection) {
     let _ = socket2::SockRef::from(conn.underlying_tcp_stream()).shutdown(std::net::Shutdown::Both);
-    drop(conn);
+    // `Object::drop` returns the object to deadpool. Take it first so a retired
+    // socket cannot re-enter the idle pool after its file descriptor is closed.
+    drop(deadpool::managed::Object::take(conn));
 }
 
 impl ConnectionProvider for DeadpoolConnectionProvider {
@@ -1330,6 +1332,7 @@ mod tests {
         provider.remove_without_cooldown(conn);
 
         assert_eq!(provider.pool.status().max_size, max_size);
+        assert_eq!(provider.pool.status().size, 0);
         assert_eq!(provider.active_cooldowns.load(Ordering::Acquire), 0);
     }
 

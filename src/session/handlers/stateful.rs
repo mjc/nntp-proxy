@@ -14,6 +14,106 @@ use tracing::{debug, error, warn};
 
 use crate::constants::buffer::READER_CAPACITY;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::session) enum StatefulConnectionDisposition {
+    RetireClient,
+    RetireBackend,
+}
+
+#[must_use]
+pub(in crate::session) struct StatefulLoopResult {
+    metrics: TransferMetrics,
+    disposition: StatefulConnectionDisposition,
+}
+
+#[derive(Debug)]
+pub(in crate::session) struct StatefulLoopError {
+    source: anyhow::Error,
+    disposition: StatefulConnectionDisposition,
+}
+
+impl StatefulLoopError {
+    fn client(source: anyhow::Error) -> Self {
+        Self {
+            source,
+            disposition: StatefulConnectionDisposition::RetireClient,
+        }
+    }
+
+    fn backend(source: anyhow::Error) -> Self {
+        Self {
+            source,
+            disposition: StatefulConnectionDisposition::RetireBackend,
+        }
+    }
+
+    pub(in crate::session) const fn disposition(&self) -> StatefulConnectionDisposition {
+        self.disposition
+    }
+
+    pub(in crate::session) fn into_source(self) -> anyhow::Error {
+        self.source
+    }
+}
+
+impl std::fmt::Display for StatefulLoopError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for StatefulLoopError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source.source()
+    }
+}
+
+impl StatefulLoopResult {
+    fn new(metrics: TransferMetrics, disposition: StatefulConnectionDisposition) -> Self {
+        Self {
+            metrics,
+            disposition,
+        }
+    }
+
+    pub(in crate::session) const fn disposition(&self) -> StatefulConnectionDisposition {
+        self.disposition
+    }
+
+    pub(in crate::session) const fn into_metrics(self) -> TransferMetrics {
+        self.metrics
+    }
+}
+
+impl std::ops::Deref for StatefulLoopResult {
+    type Target = TransferMetrics;
+
+    fn deref(&self) -> &Self::Target {
+        &self.metrics
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatefulSessionExit {
+    ClientDisconnected,
+    ClientReadError,
+    BackendDisconnected,
+    BackendReadError,
+}
+
+impl StatefulSessionExit {
+    fn disposition(self) -> StatefulConnectionDisposition {
+        match self {
+            Self::ClientDisconnected | Self::ClientReadError => {
+                StatefulConnectionDisposition::RetireClient
+            }
+            Self::BackendDisconnected | Self::BackendReadError => {
+                StatefulConnectionDisposition::RetireBackend
+            }
+        }
+    }
+}
+
 enum StatefulClientLine {
     Eof,
     Oversized,
@@ -146,15 +246,21 @@ impl ClientSession {
         client_write: &mut W,
         backend_write: &mut BW,
         state: &mut crate::session::state::SessionLoopState,
-    ) -> Result<()>
+    ) -> std::result::Result<(), StatefulLoopError>
     where
         W: tokio::io::AsyncWrite + Unpin,
         BW: tokio::io::AsyncWrite + Unpin,
     {
         match classify_authenticated_stateful_action(request, state.auth_access) {
             AuthenticatedStatefulAction::Forward => {
-                request.write_wire_to(backend_write).await?;
-                backend_write.flush().await?;
+                request
+                    .write_wire_to(backend_write)
+                    .await
+                    .map_err(|error| StatefulLoopError::backend(error.into()))?;
+                backend_write
+                    .flush()
+                    .await
+                    .map_err(|error| StatefulLoopError::backend(error.into()))?;
                 state.add_client_to_backend(request.request_wire_len().get());
                 state.mark_backend_request_sent(request.kind());
             }
@@ -163,8 +269,14 @@ impl ClientSession {
                 if state.has_pending_backend_replies() {
                     state.push_deferred_reply(AUTH_ALREADY_AUTHENTICATED);
                 } else {
-                    client_write.write_all(AUTH_ALREADY_AUTHENTICATED).await?;
-                    client_write.flush().await?;
+                    client_write
+                        .write_all(AUTH_ALREADY_AUTHENTICATED)
+                        .await
+                        .map_err(|error| StatefulLoopError::client(error.into()))?;
+                    client_write
+                        .flush()
+                        .await
+                        .map_err(|error| StatefulLoopError::client(error.into()))?;
                     state.add_backend_to_client(AUTH_ALREADY_AUTHENTICATED.len() as u64);
                 }
             }
@@ -174,8 +286,14 @@ impl ClientSession {
                 if state.has_pending_backend_replies() {
                     state.push_deferred_reply(capabilities);
                 } else {
-                    client_write.write_all(capabilities).await?;
-                    client_write.flush().await?;
+                    client_write
+                        .write_all(capabilities)
+                        .await
+                        .map_err(|error| StatefulLoopError::client(error.into()))?;
+                    client_write
+                        .flush()
+                        .await
+                        .map_err(|error| StatefulLoopError::client(error.into()))?;
                     state.add_backend_to_client(capabilities.len() as u64);
                 }
             }
@@ -183,8 +301,14 @@ impl ClientSession {
                 if state.has_pending_backend_replies() {
                     state.push_deferred_reply(response.as_bytes());
                 } else {
-                    client_write.write_all(response.as_bytes()).await?;
-                    client_write.flush().await?;
+                    client_write
+                        .write_all(response.as_bytes())
+                        .await
+                        .map_err(|error| StatefulLoopError::client(error.into()))?;
+                    client_write
+                        .flush()
+                        .await
+                        .map_err(|error| StatefulLoopError::client(error.into()))?;
                     state.add_backend_to_client(response.len() as u64);
                 }
             }
@@ -193,30 +317,43 @@ impl ClientSession {
         Ok(())
     }
 
-    async fn forward_stateful_backend_bytes<W, BR>(
+    async fn read_stateful_backend_bytes<BR>(
         &self,
-        client_write: &mut W,
         backend_read: &mut BR,
-        state: &mut crate::session::state::SessionLoopState,
-    ) -> Result<bool>
+    ) -> Result<Option<(crate::pool::PooledBuffer, usize)>>
     where
-        W: tokio::io::AsyncWrite + Unpin,
         BR: tokio::io::AsyncRead + Unpin,
     {
         let mut buffer = self.buffer_pool.acquire();
         match buffer.read_from(backend_read).await {
-            Ok(0) => Ok(false),
-            Ok(n) => {
-                for write in state.client_writes_for_backend_read(&buffer[..n]) {
-                    client_write.write_all(write.as_ref()).await?;
-                    state.add_backend_to_client(write.len() as u64);
-                }
-                client_write.flush().await?;
-
-                Ok(true)
-            }
+            Ok(0) => Ok(None),
+            Ok(n) => Ok(Some((buffer, n))),
             Err(e) => Err(e.into()),
         }
+    }
+
+    async fn write_stateful_backend_bytes<W>(
+        &self,
+        client_write: &mut W,
+        buffer: &crate::pool::PooledBuffer,
+        len: usize,
+        state: &mut crate::session::state::SessionLoopState,
+    ) -> std::result::Result<(), StatefulLoopError>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        for write in state.client_writes_for_backend_read(&buffer[..len]) {
+            client_write
+                .write_all(write.as_ref())
+                .await
+                .map_err(|error| StatefulLoopError::client(error.into()))?;
+            state.add_backend_to_client(write.len() as u64);
+        }
+        client_write
+            .flush()
+            .await
+            .map_err(|error| StatefulLoopError::client(error.into()))?;
+        Ok(())
     }
 
     /// Handle stateful session - acquire backend and proxy bidirectionally
@@ -268,14 +405,26 @@ impl ClientSession {
             )
             .await;
 
-        // H2: Only return connection to pool on success
-        if result.is_ok() {
-            let _conn = conn_guard.complete_success(
-                crate::session::backend::BackendResponseComplete::stateful_session(),
-            );
-        } // else: guard drops -> removes connection with replacement cooldown
-
-        result.map_err(crate::session::SessionError::from)
+        match result {
+            Ok(outcome) => {
+                let disposition = outcome.disposition();
+                let metrics = outcome.into_metrics();
+                match disposition {
+                    StatefulConnectionDisposition::RetireClient => conn_guard.fail_client(),
+                    StatefulConnectionDisposition::RetireBackend => conn_guard.fail_backend(),
+                }
+                Ok(metrics)
+            }
+            Err(error) => {
+                let disposition = error.disposition();
+                let source = error.into_source();
+                match disposition {
+                    StatefulConnectionDisposition::RetireClient => conn_guard.fail_client(),
+                    StatefulConnectionDisposition::RetireBackend => conn_guard.fail_backend(),
+                }
+                Err(crate::session::SessionError::from(source))
+            }
+        }
     }
 
     /// Core bidirectional proxy loop
@@ -289,7 +438,7 @@ impl ClientSession {
         mut backend_write: BW,
         mut state: crate::session::state::SessionLoopState,
         backend_id: crate::types::BackendId,
-    ) -> Result<TransferMetrics>
+    ) -> std::result::Result<StatefulLoopResult, StatefulLoopError>
     where
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
@@ -298,7 +447,7 @@ impl ClientSession {
     {
         let mut command_reader = StatefulCommandReader::new();
 
-        loop {
+        let exit = loop {
             // Periodic metrics flush
             if state.check_and_maybe_flush_metrics() {
                 state.flush_byte_deltas(&self.metrics, backend_id, self.username());
@@ -307,27 +456,35 @@ impl ClientSession {
             let replies = state.take_ready_deferred_replies();
             if !replies.is_empty() {
                 for reply in replies {
-                    client_write.write_all(reply).await?;
+                    client_write
+                        .write_all(reply)
+                        .await
+                        .map_err(|error| StatefulLoopError::client(error.into()))?;
                     state.add_backend_to_client(reply.len() as u64);
                 }
-                client_write.flush().await?;
+                client_write
+                    .flush()
+                    .await
+                    .map_err(|error| StatefulLoopError::client(error.into()))?;
                 continue;
             }
 
             if matches!(state.read_mode(), StatefulReadMode::DrainBackendReplies) {
-                match self
-                    .forward_stateful_backend_bytes(
-                        &mut client_write,
-                        &mut backend_read,
-                        &mut state,
-                    )
-                    .await
-                {
-                    Ok(true) => continue,
-                    Ok(false) => break,
+                match self.read_stateful_backend_bytes(&mut backend_read).await {
+                    Ok(Some((buffer, len))) => {
+                        self.write_stateful_backend_bytes(
+                            &mut client_write,
+                            &buffer,
+                            len,
+                            &mut state,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    Ok(None) => break StatefulSessionExit::BackendDisconnected,
                     Err(e) => {
                         warn!(client = %self.client_addr, error = %e, "Backend read error");
-                        break;
+                        break StatefulSessionExit::BackendReadError;
                     }
                 }
             }
@@ -336,19 +493,31 @@ impl ClientSession {
                 // Client → Backend
                 result = command_reader.read_next(&mut client_reader) => {
                     match result {
-                        Ok(StatefulClientLine::Eof) => break, // Client disconnected
+                        Ok(StatefulClientLine::Eof) => {
+                            break StatefulSessionExit::ClientDisconnected;
+                        }
                         Ok(StatefulClientLine::Oversized) => {
                             use crate::protocol::COMMAND_TOO_LONG;
-                            client_write.write_all(COMMAND_TOO_LONG).await?;
-                            client_write.flush().await?;
+                            client_write
+                                .write_all(COMMAND_TOO_LONG)
+                                .await
+                                .map_err(|error| StatefulLoopError::client(error.into()))?;
+                            client_write
+                                .flush()
+                                .await
+                                .map_err(|error| StatefulLoopError::client(error.into()))?;
                             state.add_backend_to_client(COMMAND_TOO_LONG.len() as u64);
                             continue;
                         }
                         Ok(StatefulClientLine::Invalid) => {
                             client_write
                                 .write_all(crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE)
-                                .await?;
-                            client_write.flush().await?;
+                                .await
+                                .map_err(|error| StatefulLoopError::client(error.into()))?;
+                            client_write
+                                .flush()
+                                .await
+                                .map_err(|error| StatefulLoopError::client(error.into()))?;
                             state.add_backend_to_client(
                                 crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE.len() as u64,
                             );
@@ -383,42 +552,60 @@ impl ClientSession {
                                     },
                                     self.client_addr,
                                     |username| self.set_username(username),
-                                ).await?;
+                                )
+                                .await
+                                .map_err(StatefulLoopError::client)?;
                                 state.apply_auth_result(&auth_result);
                             }
                         }
                         Err(e) => {
                             warn!(client = %self.client_addr, error = %e, "Client read error");
-                            break;
+                            break StatefulSessionExit::ClientReadError;
                         }
                     }
                 }
 
                 // Backend → Client
-                result = self.forward_stateful_backend_bytes(&mut client_write, &mut backend_read, &mut state) => {
+                result = self.read_stateful_backend_bytes(&mut backend_read) => {
                     match result {
-                        Ok(true) => {}
-                        Ok(false) => break, // Backend disconnected
+                        Ok(Some((buffer, len))) => {
+                            // Complete output after select! returns so client readiness cannot
+                            // cancel a partially completed write.
+                            self.write_stateful_backend_bytes(
+                                &mut client_write,
+                                &buffer,
+                                len,
+                                &mut state,
+                            )
+                            .await?;
+                        }
+                        Ok(None) => break StatefulSessionExit::BackendDisconnected,
                         Err(e) => {
                             warn!(client = %self.client_addr, error = %e, "Backend read error");
-                            break;
+                            break StatefulSessionExit::BackendReadError;
                         }
                     }
                 }
             }
-        }
+        };
 
         // Final metrics - report any remaining byte deltas
         state.flush_byte_deltas(&self.metrics, backend_id, self.username());
 
-        Ok(state.into_metrics())
+        let disposition = exit.disposition();
+        Ok(StatefulLoopResult::new(state.into_metrics(), disposition))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
     use std::sync::Arc;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll, Waker};
+    use tokio::io::AsyncWrite;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::sync::Notify;
 
     use crate::auth::AuthHandler;
     use crate::metrics::MetricsCollector;
@@ -439,6 +626,188 @@ mod tests {
             metrics,
         )
         .build()
+    }
+
+    #[test]
+    fn stateful_session_exit_never_assumes_reader_state_is_reset() {
+        assert_eq!(
+            super::StatefulSessionExit::ClientDisconnected.disposition(),
+            super::StatefulConnectionDisposition::RetireClient
+        );
+
+        assert_eq!(
+            super::StatefulSessionExit::ClientReadError.disposition(),
+            super::StatefulConnectionDisposition::RetireClient
+        );
+        assert_eq!(
+            super::StatefulSessionExit::BackendDisconnected.disposition(),
+            super::StatefulConnectionDisposition::RetireBackend
+        );
+    }
+
+    struct GateWriterState {
+        bytes: Vec<u8>,
+        blocked: bool,
+        first_write: bool,
+        waker: Option<Waker>,
+    }
+
+    struct GateWriter {
+        state: Arc<Mutex<GateWriterState>>,
+        partial: Arc<Notify>,
+        complete: Arc<Notify>,
+        expected_len: usize,
+    }
+
+    impl GateWriter {
+        fn new(expected_len: usize, partial: Arc<Notify>, complete: Arc<Notify>) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(GateWriterState {
+                    bytes: Vec::new(),
+                    blocked: false,
+                    first_write: true,
+                    waker: None,
+                })),
+                partial,
+                complete,
+                expected_len,
+            }
+        }
+
+        fn release(&self) {
+            let waker = {
+                let mut state = self.state.lock().expect("writer mutex poisoned");
+                state.blocked = false;
+                state.waker.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+
+        fn bytes(&self) -> Vec<u8> {
+            self.state
+                .lock()
+                .expect("writer mutex poisoned")
+                .bytes
+                .clone()
+        }
+
+        fn control(&self) -> Self {
+            Self {
+                state: Arc::clone(&self.state),
+                partial: Arc::clone(&self.partial),
+                complete: Arc::clone(&self.complete),
+                expected_len: self.expected_len,
+            }
+        }
+    }
+
+    impl AsyncWrite for GateWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let this = self.get_mut();
+            let mut state = this.state.lock().expect("writer mutex poisoned");
+            if state.blocked {
+                state.waker = Some(cx.waker().clone());
+                return Poll::Pending;
+            }
+
+            if state.first_write && bytes.len() > 1 {
+                let accepted = (bytes.len() / 2).max(1).min(bytes.len() - 1);
+                state.bytes.extend_from_slice(&bytes[..accepted]);
+                state.first_write = false;
+                state.blocked = true;
+                drop(state);
+                this.partial.notify_one();
+                return Poll::Ready(Ok(accepted));
+            }
+
+            state.bytes.extend_from_slice(bytes);
+            let complete = state.bytes.len() >= this.expected_len;
+            drop(state);
+            if complete {
+                this.complete.notify_one();
+            }
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_output_is_not_cancelled_by_ready_client_input() {
+        let session = test_session();
+        let backend_id = BackendId::from_index(0);
+        let state = SessionLoopState::new(false);
+        let first_response = b"111 first\r\n";
+        let second_response = b"111 second\r\n";
+        let expected = [first_response.as_slice(), second_response.as_slice()].concat();
+
+        let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
+        let (backend_end, proxy_backend_end) = tokio::io::duplex(4096);
+        client_end.write_all(b"DATE\r\n").await.unwrap();
+
+        let backend = tokio::spawn(async move {
+            let (backend_read, mut backend_write) = tokio::io::split(backend_end);
+            let mut reader = BufReader::new(backend_read);
+            let mut line = String::new();
+            for response in [first_response.as_slice(), second_response.as_slice()] {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                backend_write.write_all(response).await.unwrap();
+            }
+        });
+
+        let partial = Arc::new(Notify::new());
+        let complete = Arc::new(Notify::new());
+        let writer = GateWriter::new(expected.len(), Arc::clone(&partial), Arc::clone(&complete));
+        let writer_control = writer.control();
+        let (proxy_client_read, _) = tokio::io::split(proxy_client_end);
+        let client_reader = BufReader::new(proxy_client_read);
+        let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
+
+        let proxy = tokio::spawn(async move {
+            session
+                .run_stateful_proxy_loop(
+                    client_reader,
+                    writer,
+                    backend_read,
+                    backend_write,
+                    state,
+                    backend_id,
+                )
+                .await
+        });
+
+        writer_control.partial.notified().await;
+        client_end.write_all(b"DATE\r\n").await.unwrap();
+        writer_control.release();
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            writer_control.complete.notified(),
+        )
+        .await
+        .expect("backend output did not complete");
+        assert_eq!(writer_control.bytes(), expected);
+
+        drop(client_end);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), proxy)
+            .await
+            .expect("stateful proxy did not stop")
+            .expect("stateful proxy task panicked")
+            .expect("stateful proxy failed");
+        backend.await.unwrap();
     }
 
     #[tokio::test]

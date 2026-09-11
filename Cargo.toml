@@ -113,6 +113,25 @@ tokio-console = ["dep:console-subscriber", "tokio/tracing"]  # Runtime/task inst
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
+[lints.clippy]
+branches_sharing_code = "deny"
+cast_sign_loss = "deny"
+collection_is_never_read = "deny"
+derive_partial_eq_without_eq = "deny"
+format_collect = "deny"
+future_not_send = "deny"
+literal_string_with_formatting_args = "deny"
+map_unwrap_or = "deny"
+match_wildcard_for_single_variants = "deny"
+needless_collect = "deny"
+or_fun_call = "deny"
+redundant_clone = "deny"
+unchecked_time_subtraction = "deny"
+unnecessary_struct_initialization = "deny"
+unnecessary_wraps = "deny"
+useless_let_if_seq = "deny"
+unused_async = "deny"
+
 [[bench]]
 name = "command_parsing"
 harness = false
@@ -158,16 +177,23 @@ name = "cache_ingest"
 harness = false
 
 [[bench]]
+name = "cache_metadata_payload"
+harness = false
+
+[[bench]]
 name = "end_to_end_proxy"
 harness = false
 
 [profile.dev]
+debug = 0             # Use the profiling/bench profiles when symbols are needed
+incremental = false   # Avoid retaining a second full set of object files
 split-debuginfo = "unpacked"  # Faster linking — don't bundle debuginfo into binary
 
 [profile.dev.package."*"]
 opt-level = 1  # Compile dependencies with optimizations in dev mode
                # Huge runtime speedup for rustls/ring/foyer/moka
                # Minimal compile-time cost (deps cached after first build)
+debug = 0      # Keep dependency artifacts compact in the dev profile
 
 [profile.release]
 debug = false          # No debug symbols for smaller binaries

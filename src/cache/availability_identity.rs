@@ -33,8 +33,7 @@ impl AvailabilityIdentity {
             namespace: server
                 .availability_namespace
                 .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_else(|| server.host.to_string()),
+                .map_or_else(|| server.host.to_string(), ToString::to_string),
             account: server
                 .username
                 .clone()
@@ -60,6 +59,11 @@ impl AvailabilitySlot {
     #[must_use]
     pub(crate) const fn bit(self) -> usize {
         1usize << self.0
+    }
+
+    #[must_use]
+    pub(crate) const fn index(self) -> usize {
+        self.0
     }
 }
 

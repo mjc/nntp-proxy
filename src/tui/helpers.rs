@@ -45,9 +45,8 @@ pub fn create_sparkline(value: u64, max_value: u64) -> String {
 #[must_use]
 pub fn create_sparkline_text(value: u64, max_value: u64) -> ArrayString<64> {
     let filled = if max_value > 0 {
-        // Sparkline width is tiny and purely visual, so approximate float math is
-        // sufficient and keeping the cast local makes the display tradeoff explicit.
-        ((value as f64 / max_value as f64) * SPARKLINE_WIDTH as f64) as usize
+        let numerator = u128::from(value.min(max_value)) * SPARKLINE_WIDTH as u128;
+        usize::try_from(numerator / u128::from(max_value)).unwrap_or(SPARKLINE_WIDTH)
     } else {
         0
     };
