@@ -245,10 +245,3 @@ pub fn log_file_level() -> String {
 pub const fn response_write_metrics_secs() -> Option<u64> {
     None
 }
-
-/// Default disabled interval for client-writer lock metrics logger.
-#[inline]
-#[allow(clippy::unnecessary_wraps)] // Optional config field uses None as disabled default.
-pub const fn client_writer_lock_metrics_secs() -> Option<u64> {
-    None
-}

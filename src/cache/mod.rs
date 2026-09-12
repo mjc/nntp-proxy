@@ -38,6 +38,10 @@ pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
 use crate::protocol::StatusCode;
 use crate::types::{BackendId, MessageId};
 use smallvec::SmallVec;
+use std::sync::Arc;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+const CACHE_UPDATE_CONCURRENCY: usize = 64;
 
 /// Retention policy represented by a unified cache implementation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -288,6 +292,17 @@ mod tests {
             CachePayloadPolicy::StoreBodies
         );
     }
+
+    #[test]
+    fn cache_update_admission_is_bounded() {
+        let cache = UnifiedCache::memory(1000, std::time::Duration::from_secs(60));
+        let permits: Vec<_> = (0..CACHE_UPDATE_CONCURRENCY)
+            .map(|_| cache.try_acquire_update().expect("slot available"))
+            .collect();
+        assert!(cache.try_acquire_update().is_none());
+        drop(permits);
+        assert!(cache.try_acquire_update().is_some());
+    }
 }
 
 /// Statistics for cache display in TUI
@@ -376,13 +391,20 @@ impl CacheStatsProvider for HybridArticleCache {
 /// allowing the proxy to switch between availability-only, memory, and disk-backed
 /// caching based on configuration.
 #[derive(Debug)]
-pub enum UnifiedCache {
+enum UnifiedCacheKind {
     /// Availability-only negative index with exact key matches.
     Availability(AvailabilityIndex),
     /// Memory-only cache using moka
     Memory(ArticleCache),
     /// Hybrid memory+disk cache using foyer
     Hybrid(HybridArticleCache),
+}
+
+/// Unified cache facade for the configured cache implementation.
+#[derive(Debug)]
+pub struct UnifiedCache {
+    kind: UnifiedCacheKind,
+    update_slots: Arc<Semaphore>,
 }
 
 impl UnifiedCache {
@@ -395,20 +417,24 @@ impl UnifiedCache {
     /// Create an availability-only negative index.
     #[must_use]
     pub fn availability(ttl: std::time::Duration) -> Self {
-        Self::Availability(AvailabilityIndex::with_ttl(ttl))
+        Self::new(UnifiedCacheKind::Availability(AvailabilityIndex::with_ttl(
+            ttl,
+        )))
     }
 
     pub(crate) fn availability_with_layout(
         ttl: std::time::Duration,
         layout: AvailabilityLayout,
     ) -> Self {
-        Self::Availability(AvailabilityIndex::with_layout(ttl, layout))
+        Self::new(UnifiedCacheKind::Availability(
+            AvailabilityIndex::with_layout(ttl, layout),
+        ))
     }
 
     /// Create a memory-only cache
     #[must_use]
     pub fn memory(capacity: u64, ttl: std::time::Duration) -> Self {
-        Self::Memory(ArticleCache::new(capacity, ttl))
+        Self::new(UnifiedCacheKind::Memory(ArticleCache::new(capacity, ttl)))
     }
 
     pub(crate) fn memory_with_layout(
@@ -416,28 +442,54 @@ impl UnifiedCache {
         ttl: std::time::Duration,
         layout: AvailabilityLayout,
     ) -> Self {
-        Self::Memory(ArticleCache::new(capacity, ttl).with_layout(layout))
+        Self::new(UnifiedCacheKind::Memory(
+            ArticleCache::new(capacity, ttl).with_layout(layout),
+        ))
     }
 
     /// Create a hybrid cache (async because foyer needs async initialization)
     pub async fn hybrid(config: HybridCacheConfig) -> anyhow::Result<Self> {
-        Ok(Self::Hybrid(HybridArticleCache::new(config).await?))
+        Ok(Self::new(UnifiedCacheKind::Hybrid(
+            HybridArticleCache::new(config).await?,
+        )))
     }
 
     pub(crate) async fn hybrid_with_layout(
         config: HybridCacheConfig,
         layout: AvailabilityLayout,
     ) -> anyhow::Result<Self> {
-        Ok(Self::Hybrid(
+        Ok(Self::new(UnifiedCacheKind::Hybrid(
             HybridArticleCache::new_with_layout(config, layout).await?,
-        ))
+        )))
+    }
+
+    fn new(kind: UnifiedCacheKind) -> Self {
+        Self {
+            kind,
+            update_slots: Arc::new(Semaphore::new(CACHE_UPDATE_CONCURRENCY)),
+        }
+    }
+
+    /// Reserve bounded capacity before a detached cache update owns response data.
+    pub(crate) fn try_acquire_update(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.update_slots).try_acquire_owned().ok()
+    }
+
+    async fn wait_for_updates(&self) {
+        let permits = self
+            .update_slots
+            .clone()
+            .acquire_many_owned(CACHE_UPDATE_CONCURRENCY as u32)
+            .await
+            .expect("cache update semaphore cannot be closed");
+        drop(permits);
     }
 
     /// Returns true when successful backend responses update positive
     /// availability metadata.
     #[must_use]
     pub const fn records_backend_has_status(&self) -> bool {
-        !matches!(self, Self::Availability(_))
+        !matches!(&self.kind, UnifiedCacheKind::Availability(_))
     }
 
     /// Returns true when this cache stores response payloads.
@@ -449,18 +501,20 @@ impl UnifiedCache {
     /// Return the retention policy encoded by this cache implementation.
     #[must_use]
     pub const fn payload_policy(&self) -> CachePayloadPolicy {
-        match self {
-            Self::Availability(_) => CachePayloadPolicy::AvailabilityOnly,
-            Self::Memory(_) | Self::Hybrid(_) => CachePayloadPolicy::StoreBodies,
+        match &self.kind {
+            UnifiedCacheKind::Availability(_) => CachePayloadPolicy::AvailabilityOnly,
+            UnifiedCacheKind::Memory(_) | UnifiedCacheKind::Hybrid(_) => {
+                CachePayloadPolicy::StoreBodies
+            }
         }
     }
 
     /// Get an article from the cache
     pub async fn get(&self, message_id: &MessageId<'_>) -> Option<CachedArticle> {
-        match self {
-            Self::Availability(index) => index.get(message_id),
-            Self::Memory(cache) => cache.get(message_id).await,
-            Self::Hybrid(cache) => cache
+        match &self.kind {
+            UnifiedCacheKind::Availability(index) => index.get(message_id),
+            UnifiedCacheKind::Memory(cache) => cache.get(message_id).await,
+            UnifiedCacheKind::Hybrid(cache) => cache
                 .get(message_id)
                 .await
                 .map(hybrid_codec::DiskCachedArticle::into_cached_article),
@@ -472,13 +526,13 @@ impl UnifiedCache {
     /// Memory and hybrid cache hits avoid rebuilding a `MessageId` by looking up
     /// the stripped cache key directly.
     pub async fn get_request_message_id(&self, message_id: &str) -> Option<CachedArticle> {
-        match self {
-            Self::Availability(index) => index.get_request_message_id(message_id),
-            Self::Memory(cache) => {
+        match &self.kind {
+            UnifiedCacheKind::Availability(index) => index.get_request_message_id(message_id),
+            UnifiedCacheKind::Memory(cache) => {
                 let key = message_id.strip_prefix('<')?.strip_suffix('>')?;
                 cache.get_by_cache_key(key).await
             }
-            Self::Hybrid(cache) => {
+            UnifiedCacheKind::Hybrid(cache) => {
                 let key = message_id.strip_prefix('<')?.strip_suffix('>')?;
                 cache
                     .get_by_cache_key(key)
@@ -497,9 +551,9 @@ impl UnifiedCache {
         tier: ttl::CacheTier,
     ) {
         let buffer = buffer.into();
-        match self {
-            Self::Availability(_) => {}
-            Self::Memory(cache) => {
+        match &self.kind {
+            UnifiedCacheKind::Availability(_) => {}
+            UnifiedCacheKind::Memory(cache) => {
                 cache
                     .upsert_ingest_for_slot(
                         message_id,
@@ -509,7 +563,7 @@ impl UnifiedCache {
                     )
                     .await;
             }
-            Self::Hybrid(cache) => {
+            UnifiedCacheKind::Hybrid(cache) => {
                 cache
                     .upsert_ingest_for_slot(
                         message_id,
@@ -528,10 +582,16 @@ impl UnifiedCache {
         message_id: MessageId<'_>,
         slot: AvailabilitySlot,
     ) {
-        match self {
-            Self::Availability(index) => index.record_availability_missing(&message_id, slot),
-            Self::Memory(cache) => cache.record_availability_missing(message_id, slot).await,
-            Self::Hybrid(cache) => cache.record_availability_missing(message_id, slot).await,
+        match &self.kind {
+            UnifiedCacheKind::Availability(index) => {
+                index.record_availability_missing(&message_id, slot)
+            }
+            UnifiedCacheKind::Memory(cache) => {
+                cache.record_availability_missing(message_id, slot).await
+            }
+            UnifiedCacheKind::Hybrid(cache) => {
+                cache.record_availability_missing(message_id, slot).await
+            }
         }
     }
 
@@ -543,9 +603,9 @@ impl UnifiedCache {
         backend: BackendId,
         tier: ttl::CacheTier,
     ) {
-        match self {
-            Self::Availability(_) => {}
-            Self::Memory(cache) => {
+        match &self.kind {
+            UnifiedCacheKind::Availability(_) => {}
+            UnifiedCacheKind::Memory(cache) => {
                 cache
                     .record_has_status_for_slot(
                         message_id,
@@ -555,7 +615,7 @@ impl UnifiedCache {
                     )
                     .await;
             }
-            Self::Hybrid(cache) => {
+            UnifiedCacheKind::Hybrid(cache) => {
                 cache
                     .record_has_status_for_slot(
                         message_id,
@@ -570,82 +630,82 @@ impl UnifiedCache {
 
     /// Load persisted availability state if this is an availability-only cache.
     pub fn load_from_disk(&self, path: &std::path::Path) -> anyhow::Result<bool> {
-        match self {
-            Self::Availability(index) => index.load_from_path(path),
-            Self::Memory(_) | Self::Hybrid(_) => Ok(false),
+        match &self.kind {
+            UnifiedCacheKind::Availability(index) => index.load_from_path(path),
+            UnifiedCacheKind::Memory(_) | UnifiedCacheKind::Hybrid(_) => Ok(false),
         }
     }
 
     /// Save persisted availability state if this is an availability-only cache.
     pub fn save_to_disk(&self, path: &std::path::Path) -> anyhow::Result<bool> {
-        match self {
-            Self::Availability(index) => {
+        match &self.kind {
+            UnifiedCacheKind::Availability(index) => {
                 index.save_to_path(path)?;
                 Ok(true)
             }
-            Self::Memory(_) | Self::Hybrid(_) => Ok(false),
+            UnifiedCacheKind::Memory(_) | UnifiedCacheKind::Hybrid(_) => Ok(false),
         }
     }
 
     /// Get cache capacity
     #[must_use]
     pub fn capacity(&self) -> u64 {
-        match self {
-            Self::Availability(index) => index.capacity_bytes(),
-            Self::Memory(cache) => cache.capacity(),
-            Self::Hybrid(cache) => cache.stats().memory_capacity,
+        match &self.kind {
+            UnifiedCacheKind::Availability(index) => index.capacity_bytes(),
+            UnifiedCacheKind::Memory(cache) => cache.capacity(),
+            UnifiedCacheKind::Hybrid(cache) => cache.stats().memory_capacity,
         }
     }
 
     /// Get number of cached entries
     #[must_use]
     pub fn entry_count(&self) -> u64 {
-        match self {
-            Self::Availability(index) => index.entry_count(),
-            Self::Memory(cache) => cache.entry_count(),
-            Self::Hybrid(_cache) => 0, // foyer doesn't expose this easily
+        match &self.kind {
+            UnifiedCacheKind::Availability(index) => index.entry_count(),
+            UnifiedCacheKind::Memory(cache) => cache.entry_count(),
+            UnifiedCacheKind::Hybrid(_cache) => 0, // foyer doesn't expose this easily
         }
     }
 
     /// Get weighted size in bytes
     #[must_use]
     pub fn weighted_size(&self) -> u64 {
-        match self {
-            Self::Availability(index) => index.used_bytes(),
-            Self::Memory(cache) => cache.weighted_size(),
-            Self::Hybrid(cache) => cache.stats().memory_capacity,
+        match &self.kind {
+            UnifiedCacheKind::Availability(index) => index.used_bytes(),
+            UnifiedCacheKind::Memory(cache) => cache.weighted_size(),
+            UnifiedCacheKind::Hybrid(cache) => cache.stats().memory_capacity,
         }
     }
 
     /// Get cache hit rate
     #[must_use]
     pub fn hit_rate(&self) -> f64 {
-        match self {
-            Self::Availability(index) => index.hit_rate(),
-            Self::Memory(cache) => cache.hit_rate(),
-            Self::Hybrid(cache) => cache.stats().hit_rate(),
+        match &self.kind {
+            UnifiedCacheKind::Availability(index) => index.hit_rate(),
+            UnifiedCacheKind::Memory(cache) => cache.hit_rate(),
+            UnifiedCacheKind::Hybrid(cache) => cache.stats().hit_rate(),
         }
     }
 
     /// Check if this is a hybrid cache (has disk tier)
     #[must_use]
     pub const fn is_hybrid(&self) -> bool {
-        matches!(self, Self::Hybrid(_))
+        matches!(&self.kind, UnifiedCacheKind::Hybrid(_))
     }
 
     /// Check if this cache is the dedicated availability-only index.
     #[must_use]
     pub const fn is_availability_only(&self) -> bool {
-        matches!(self, Self::Availability(_))
+        matches!(&self.kind, UnifiedCacheKind::Availability(_))
     }
 
     /// Run pending background tasks (for testing)
     ///
     /// Ensures all async maintenance tasks complete for deterministic testing.
     pub async fn sync(&self) {
-        match self {
-            Self::Availability(_) | Self::Hybrid(_) => {}
-            Self::Memory(cache) => cache.sync().await,
+        match &self.kind {
+            UnifiedCacheKind::Availability(_) | UnifiedCacheKind::Hybrid(_) => {}
+            UnifiedCacheKind::Memory(cache) => cache.sync().await,
         }
     }
 
@@ -654,20 +714,21 @@ impl UnifiedCache {
     /// For hybrid cache, this ensures all enqueued disk writes complete before returning.
     /// For memory cache, this is a no-op (no persistent state).
     pub async fn close(&self) -> anyhow::Result<()> {
-        match self {
-            Self::Availability(_) => Ok(()),
-            Self::Memory(_) => Ok(()), // No persistent state
-            Self::Hybrid(cache) => cache.close().await,
+        self.wait_for_updates().await;
+        match &self.kind {
+            UnifiedCacheKind::Availability(_) => Ok(()),
+            UnifiedCacheKind::Memory(_) => Ok(()), // No persistent state
+            UnifiedCacheKind::Hybrid(cache) => cache.close().await,
         }
     }
 }
 
 impl CacheStatsProvider for UnifiedCache {
     fn display_stats(&self) -> CacheDisplayStats {
-        match self {
-            Self::Availability(index) => index.display_stats(),
-            Self::Memory(cache) => cache.display_stats(),
-            Self::Hybrid(cache) => cache.display_stats(),
+        match &self.kind {
+            UnifiedCacheKind::Availability(index) => index.display_stats(),
+            UnifiedCacheKind::Memory(cache) => cache.display_stats(),
+            UnifiedCacheKind::Hybrid(cache) => cache.display_stats(),
         }
     }
 }

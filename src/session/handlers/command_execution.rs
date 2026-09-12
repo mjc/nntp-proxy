@@ -246,7 +246,7 @@ impl ClientSession {
         &self,
         router: &Arc<BackendSelector>,
         request: &mut RequestContext,
-        client_writer: &crate::session::SharedClientWriter,
+        client_writer: &mut crate::session::ClientWriter,
         state: &mut ArticleAttemptState<'_>,
         is_retry_attempt: bool,
     ) -> Result<BackendAttemptResult, SessionError> {
@@ -598,16 +598,16 @@ impl ClientSession {
     async fn write_successful_retry_response(
         &self,
         conn: crate::pool::ConnectionGuard,
-        client_writer: &crate::session::SharedClientWriter,
+        client_writer: &mut crate::session::ClientWriter,
         backend: &ArticleBackend,
         buffer: crate::pool::PooledBuffer,
         params: ResponseWriteParams<'_>,
         backend_connection: &mut Option<BackendLease>,
     ) -> Result<RequestResponseMetadata, SessionError> {
-        let mut client_write = client_writer.lock().await;
+        let client_write = client_writer.get_mut();
         self.write_successful_backend_response(
             conn,
-            &mut *client_write,
+            client_write,
             backend,
             buffer,
             params,
@@ -1882,8 +1882,8 @@ mod tests {
         (port, article_commands)
     }
 
-    async fn shared_client_writer_pair() -> (
-        crate::session::SharedClientWriter,
+    async fn client_writer_pair() -> (
+        crate::session::ClientWriter,
         tokio::net::tcp::OwnedReadHalf,
         tokio::net::tcp::OwnedWriteHalf,
     ) {
@@ -1895,7 +1895,7 @@ mod tests {
         let (client_read, client_write) = client.into_split();
 
         (
-            crate::session::SharedClientWriter::new(proxy_write),
+            crate::session::ClientWriter::new(proxy_write),
             client_read,
             client_write,
         )
@@ -2073,8 +2073,7 @@ mod tests {
             .build()
             .unwrap();
         let router = router_with_backend(provider);
-        let (client_writer, _client_read, _client_write) = shared_client_writer_pair().await;
-        let held_writer = client_writer.lock().await;
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
 
         let mut request = request_context(b"BODY <missing@example.com>\r\n");
         let mut availability = ArticleAvailability::new();
@@ -2093,7 +2092,7 @@ mod tests {
             session.try_backend_for_article(
                 &router,
                 &mut request,
-                &client_writer,
+                &mut client_writer,
                 &mut state,
                 false,
             ),
@@ -2110,8 +2109,6 @@ mod tests {
         assert!(availability.is_missing(BackendId::from_index(0)));
         assert_eq!(article_commands.load(Ordering::SeqCst), 1);
         finalize_backend_connection(&mut backend_connection);
-
-        drop(held_writer);
     }
 
     #[tokio::test]
@@ -2124,7 +2121,7 @@ mod tests {
             .build()
             .unwrap();
         let router = router_with_backend(provider);
-        let (client_writer, _client_read, _client_write) = shared_client_writer_pair().await;
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
 
         let mut request = request_context(b"BODY <missing@example.com>\r\n");
         let mut availability = ArticleAvailability::new();
@@ -2139,7 +2136,7 @@ mod tests {
         };
 
         let result = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, false)
+            .try_backend_for_article(&router, &mut request, &mut client_writer, &mut state, false)
             .await
             .expect("first attempt should be handled without transport error");
 
@@ -2480,7 +2477,7 @@ mod tests {
             .build()
             .unwrap();
         let router = router_with_backend(provider);
-        let (client_writer, _client_read, _client_write) = shared_client_writer_pair().await;
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
 
         let mut request = request_context(b"BODY <missing@example.com>\r\n");
         let mut availability = ArticleAvailability::new();
@@ -2495,7 +2492,7 @@ mod tests {
         };
 
         let result = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, false)
+            .try_backend_for_article(&router, &mut request, &mut client_writer, &mut state, false)
             .await
             .expect("first BODY attempt should complete without transport error");
 
@@ -2556,7 +2553,7 @@ mod tests {
             .build()
             .unwrap();
         let router = router_with_backend(provider);
-        let (client_writer, _client_read, _client_write) = shared_client_writer_pair().await;
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
 
         let mut request = request_context(b"BODY <bad-response@example.com>\r\n");
         let mut availability = ArticleAvailability::new();
@@ -2575,7 +2572,7 @@ mod tests {
             session.try_backend_for_article(
                 &router,
                 &mut request,
-                &client_writer,
+                &mut client_writer,
                 &mut state,
                 false,
             ),
@@ -2600,7 +2597,7 @@ mod tests {
             .build()
             .unwrap();
         let router = router_with_backend(provider);
-        let (client_writer, _client_read, _client_write) = shared_client_writer_pair().await;
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
 
         let mut request = request_context(b"BODY <connection-failure@example.com>\r\n");
         let mut availability = ArticleAvailability::new();
@@ -2619,7 +2616,7 @@ mod tests {
             session.try_backend_for_article(
                 &router,
                 &mut request,
-                &client_writer,
+                &mut client_writer,
                 &mut state,
                 false,
             ),
@@ -2657,7 +2654,7 @@ mod tests {
                 0,
             ),
         ]);
-        let (client_writer, mut client_read, _client_write) = shared_client_writer_pair().await;
+        let (mut client_writer, mut client_read, _client_write) = client_writer_pair().await;
 
         let mut request = request_context(b"BODY <found@example.com>\r\n");
         let mut availability = ArticleAvailability::new();
@@ -2672,7 +2669,7 @@ mod tests {
         };
 
         let first = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, false)
+            .try_backend_for_article(&router, &mut request, &mut client_writer, &mut state, false)
             .await
             .expect("invalid response should be handled");
         assert!(matches!(first, BackendAttemptResult::BackendUnavailable));
@@ -2681,7 +2678,7 @@ mod tests {
         assert_eq!(state.unavailable_backends.bits(), 0b0000_0001);
 
         let second = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, true)
+            .try_backend_for_article(&router, &mut request, &mut client_writer, &mut state, true)
             .await
             .expect("same-tier retry should succeed");
         assert!(matches!(second, BackendAttemptResult::Success));
@@ -2725,7 +2722,7 @@ mod tests {
                 0,
             ),
         ]);
-        let (client_writer, _client_read, _client_write) = shared_client_writer_pair().await;
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
 
         let mut request = request_context(b"BODY <found@example.com>\r\n");
         let mut availability = ArticleAvailability::new();
@@ -2740,7 +2737,7 @@ mod tests {
         };
 
         let first = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, false)
+            .try_backend_for_article(&router, &mut request, &mut client_writer, &mut state, false)
             .await;
         assert!(matches!(first, Err(SessionError::Backend(_))));
         assert_eq!(state.availability.missing_bits(), 0);
@@ -2748,7 +2745,7 @@ mod tests {
         assert_eq!(state.unavailable_backends.bits(), 0b0000_0001);
 
         let second = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, true)
+            .try_backend_for_article(&router, &mut request, &mut client_writer, &mut state, true)
             .await
             .expect("same-tier retry should continue after backend EOF");
         assert!(matches!(second, BackendAttemptResult::Success));
@@ -2840,7 +2837,7 @@ mod tests {
                 1,
             ),
         ]);
-        let (client_writer, _client_read, _client_write) = shared_client_writer_pair().await;
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
 
         let mut request = request_context(b"BODY <bad-response@example.com>\r\n");
         let mut availability = ArticleAvailability::new();
@@ -2859,7 +2856,7 @@ mod tests {
                 .try_backend_for_article(
                     &router,
                     &mut request,
-                    &client_writer,
+                    &mut client_writer,
                     &mut state,
                     index > 0,
                 )
@@ -2870,7 +2867,7 @@ mod tests {
         }
 
         let exhausted = session
-            .try_backend_for_article(&router, &mut request, &client_writer, &mut state, true)
+            .try_backend_for_article(&router, &mut request, &mut client_writer, &mut state, true)
             .await
             .expect("tier exhaustion should be reported without transport failure");
         assert!(matches!(
@@ -2882,78 +2879,6 @@ mod tests {
         assert_eq!(backup_article_commands.load(Ordering::SeqCst), 0);
         assert_eq!(availability.missing_bits(), 0);
         assert_eq!(availability.missing_bits(), 0);
-        finalize_backend_connection(&mut backend_connection);
-    }
-
-    #[tokio::test]
-    async fn successful_retry_attempt_waits_for_client_writer_only_to_emit_response() {
-        let session = test_session();
-        let response = b"222 0 <found@example.com> body follows\r\npayload\r\n.\r\n";
-        let (port, article_commands) = spawn_article_response_server(response).await;
-        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
-            .max_connections(1)
-            .build()
-            .unwrap();
-        let router = router_with_backend(provider);
-        let (client_writer, mut client_read, _client_write) = shared_client_writer_pair().await;
-        let held_writer = client_writer.lock().await;
-
-        let mut request = request_context(b"BODY <found@example.com>\r\n");
-        let mut availability = ArticleAvailability::new();
-        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
-        let mut backend_connection = None;
-        let mut unavailable_backends = SuppressedBackends::empty();
-        let mut state = ArticleAttemptState {
-            availability: &mut availability,
-            client_to_backend_bytes: &mut client_to_backend_bytes,
-            backend_connection: &mut backend_connection,
-            unavailable_backends: &mut unavailable_backends,
-        };
-
-        let mut attempt = Box::pin(session.try_backend_for_article(
-            &router,
-            &mut request,
-            &client_writer,
-            &mut state,
-            false,
-        ));
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while article_commands.load(Ordering::SeqCst) == 0 {
-                tokio::select! {
-                    _ = &mut attempt => {
-                        panic!("successful attempt completed before client writer lock was released");
-                    }
-                    () = tokio::time::sleep(Duration::from_millis(5)) => {}
-                }
-            }
-        })
-        .await
-        .expect("backend should receive article command while client writer is locked");
-
-        assert!(
-            tokio::time::timeout(Duration::from_millis(50), &mut attempt)
-                .await
-                .is_err(),
-            "successful response should wait for the client writer lock before emitting"
-        );
-
-        drop(held_writer);
-        let result = tokio::time::timeout(Duration::from_secs(1), attempt)
-            .await
-            .expect("successful attempt should finish once the writer lock is released")
-            .expect("successful attempt should not fail");
-        assert!(matches!(result, BackendAttemptResult::Success));
-        assert_eq!(article_commands.load(Ordering::SeqCst), 1);
-        assert_eq!(availability.missing_bits(), 0);
-        assert_eq!(availability.missing_bits(), 0);
-        assert_eq!(request.backend_id(), Some(BackendId::from_index(0)));
-
-        let mut written = vec![0; response.len()];
-        tokio::time::timeout(Duration::from_secs(1), client_read.read_exact(&mut written))
-            .await
-            .expect("client response should be readable")
-            .expect("client read should succeed");
-        assert_eq!(written, response);
         finalize_backend_connection(&mut backend_connection);
     }
 

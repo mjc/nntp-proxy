@@ -36,6 +36,7 @@ impl ClientSession {
     ///
     /// Returns `CacheLookupResult::Hit` if served, `PartialHit` if entry existed but
     /// wasn't servable, or `Miss`.
+    #[cfg(test)]
     pub(super) async fn try_serve_from_cache<W>(
         &self,
         request: &mut RequestContext,
@@ -51,12 +52,39 @@ impl ClientSession {
             return Ok(CacheLookupResult::Miss);
         };
 
+        let cached = self.cache.get_request_message_id(msg_id_for_lookup).await;
+        self.try_serve_from_cached(
+            request,
+            router,
+            client_write,
+            backend_to_client_bytes,
+            cached,
+        )
+        .await
+    }
+
+    pub(super) async fn try_serve_from_cached<W>(
+        &self,
+        request: &mut RequestContext,
+        router: &Arc<BackendSelector>,
+        client_write: &mut W,
+        backend_to_client_bytes: &mut BackendToClientBytes,
+        cached: Option<crate::cache::CachedArticle>,
+    ) -> Result<CacheLookupResult>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let Some(msg_id_for_lookup) = request.message_id() else {
+            request.record_cache_status(RequestCacheStatus::Miss);
+            return Ok(CacheLookupResult::Miss);
+        };
+
         debug!(
             "Client {} checking cache for {}",
             self.client_addr, msg_id_for_lookup
         );
 
-        let Some(cached) = self.cache.get_request_message_id(msg_id_for_lookup).await else {
+        let Some(cached) = cached else {
             debug!("Cache MISS for message-ID: {}", msg_id_for_lookup);
             request.record_cache_status(RequestCacheStatus::Miss);
             return Ok(CacheLookupResult::Miss);
@@ -96,22 +124,9 @@ impl ClientSession {
             return Ok(CacheLookupResult::PartialHit);
         }
 
-        // Check if this is a complete article we can serve.
-        // Availability-only or missing entries should not be served as article payloads.
-        // Exception: STAT can be answered from any cache entry (we just need to know it exists)
-        if !request.is_stat() && !cached.is_complete_article() {
-            debug!(
-                "Client {} cache entry for {} has no complete payload (payload_len={}), fetching full article",
-                self.client_addr,
-                request.message_id().unwrap_or("<invalid>"),
-                cached.payload_len().get()
-            );
-            request.record_cache_status(RequestCacheStatus::PartialHit);
-            return Ok(CacheLookupResult::PartialHit);
-        }
-
-        // Serve from cache, avoiding buffer copies for the common path.
-        // STAT is synthesized (tiny response), everything else writes directly from typed payload sections.
+        // Serve from cache, avoiding buffer copies for the common path. The
+        // typed response view decides whether this entry satisfies the request;
+        // HEAD entries, for example, are valid HEAD hits without a full body.
         let request_kind = request.kind();
         let msg_id_for_write = request
             .message_id()
@@ -146,9 +161,14 @@ impl ClientSession {
             return;
         }
 
+        let Some(update_permit) = self.cache.try_acquire_update() else {
+            debug!("Skipping cache payload update because the update queue is full");
+            return;
+        };
         let cache_clone = self.cache.clone();
         let msg_id_owned = msg_id.to_owned();
         tokio::spawn(async move {
+            let _update_permit = update_permit;
             cache_clone
                 .upsert_ingest(msg_id_owned, buffer, backend, tier)
                 .await;
@@ -167,9 +187,14 @@ impl ClientSession {
             return;
         }
 
+        let Some(update_permit) = self.cache.try_acquire_update() else {
+            debug!("Skipping cache availability update because the update queue is full");
+            return;
+        };
         let cache_clone = self.cache.clone();
         let msg_id_owned = msg_id.to_owned();
         tokio::spawn(async move {
+            let _update_permit = update_permit;
             cache_clone
                 .record_backend_has_status(msg_id_owned, status_code, backend, tier)
                 .await;
@@ -382,6 +407,41 @@ mod tests {
             Some(ResponseWireLen::new(expected.len()))
         );
         assert_eq!(metrics, BackendToClientBytes::zero().add(expected.len()));
+    }
+
+    #[tokio::test]
+    async fn head_cache_entry_is_served_for_head_request() {
+        let session = test_session();
+        let msg_id = MessageId::new("<head-only@example>".to_string()).expect("valid message id");
+        let expected = b"221 0 <head-only@example>\r\nSubject: cached\r\n.\r\n";
+        session
+            .cache
+            .upsert_ingest(
+                msg_id,
+                expected.to_vec(),
+                BackendId::from_index(0),
+                0.into(),
+            )
+            .await;
+
+        let router = Arc::new(BackendSelector::new());
+        let mut metrics = BackendToClientBytes::zero();
+        let (mut client, mut server) = tcp_write_pair().await;
+        let (_read, mut write) = client.split();
+        let mut request = request_context(b"HEAD <head-only@example>\r\n");
+
+        let result = session
+            .try_serve_from_cache(&mut request, &router, &mut write, &mut metrics)
+            .await
+            .expect("lookup succeeds");
+
+        let mut written = vec![0; expected.len()];
+        server
+            .read_exact(&mut written)
+            .await
+            .expect("cached response written");
+        assert!(matches!(result, CacheLookupResult::Hit));
+        assert_eq!(written, expected);
     }
 
     #[tokio::test]

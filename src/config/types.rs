@@ -165,9 +165,6 @@ pub struct Proxy {
     /// Interval in seconds for response/hot-path metrics logging. `None` disables it.
     #[serde(default = "super::defaults::response_write_metrics_secs")]
     pub response_write_metrics_secs: Option<u64>,
-    /// Interval in seconds for client-writer lock contention logging. `None` disables it.
-    #[serde(default = "super::defaults::client_writer_lock_metrics_secs")]
-    pub client_writer_lock_metrics_secs: Option<u64>,
     /// Path to stats file for metric persistence (optional)
     /// When set, metrics are persisted to this file every 30 seconds and on shutdown
     /// Defaults to "stats.json" alongside the config file if not specified
@@ -195,7 +192,6 @@ impl Default for Proxy {
             validate_yenc: true,
             log_file_level: defaults::log_file_level(),
             response_write_metrics_secs: defaults::response_write_metrics_secs(),
-            client_writer_lock_metrics_secs: defaults::client_writer_lock_metrics_secs(),
             stats_file: None,
             routing_mode: RoutingMode::default(),
             backend_selection: BackendSelectionStrategy::default(),

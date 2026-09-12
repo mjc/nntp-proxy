@@ -40,7 +40,6 @@ See [../../config.full.toml](../../config.full.toml) for a complete example.
 | `validate_yenc` | `true` | Validate yEnc structure/checksums |
 | `log_file_level` | `"warn"` | Filter for the optional local `debug.log` appender |
 | `response_write_metrics_secs` | unset | Optional interval for response write metrics logging |
-| `client_writer_lock_metrics_secs` | unset | Optional interval for client-writer lock contention metrics logging |
 | `stats_file` | unset | If unset, metrics persistence defaults to `stats.json` next to the config file |
 
 ### `[routing]`
