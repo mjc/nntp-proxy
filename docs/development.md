@@ -83,7 +83,18 @@ Current response responsibilities:
 
 ## Benchmarks
 
-Published benchmark numbers were intentionally removed from the docs until they are rerun.
+The stock cache-miss E2E harness ran on an AMD Ryzen 9 5950X with 32 logical
+CPUs. `main` commit `145b36c6b86621dccfe965926b0ef501ffd33b06` and Finder
+candidate commit `e176fef31432ed36dc101471dfa1c94cc1650908` each completed
+the default 112-cell matrix twice for Finder (10 GiB per cell, 728,320-byte
+articles, article-only mix, pipeline depth 32). The fresh main control's
+equal-weight mean was 3,546.6 MiB/s; Finder repeats were 3,564.3 MiB/s
+(+0.5%) and 3,560.8 MiB/s (+0.4%). Their paired medians were -0.4% and
++0.4%, geometric means +0.6% and -0.5%, and win/loss counts 50/62 and 63/49.
+Measured proxy CPU changed -0.8% then +0.2%. The fresh main control was 0.8%
+above the older main baseline. The repeats have substantial per-cell spread,
+so they do not demonstrate a reliable end-to-end speedup. The fresh CSVs are
+retained locally and are not committed.
 
 When you want fresh numbers:
 
