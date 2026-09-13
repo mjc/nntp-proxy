@@ -303,6 +303,17 @@ mod tests {
         drop(permits);
         assert!(cache.try_acquire_update().is_some());
     }
+
+    #[tokio::test]
+    async fn cache_update_barrier_blocks_new_updates_while_held() {
+        let cache = UnifiedCache::memory(1000, std::time::Duration::from_secs(60));
+
+        let barrier = cache.wait_for_updates().await;
+        assert!(cache.try_acquire_update().is_none());
+
+        drop(barrier);
+        assert!(cache.try_acquire_update().is_some());
+    }
 }
 
 /// Statistics for cache display in TUI
@@ -475,14 +486,12 @@ impl UnifiedCache {
         Arc::clone(&self.update_slots).try_acquire_owned().ok()
     }
 
-    async fn wait_for_updates(&self) {
-        let permits = self
-            .update_slots
+    async fn wait_for_updates(&self) -> OwnedSemaphorePermit {
+        self.update_slots
             .clone()
             .acquire_many_owned(CACHE_UPDATE_CONCURRENCY as u32)
             .await
-            .expect("cache update semaphore cannot be closed");
-        drop(permits);
+            .expect("cache update semaphore cannot be closed")
     }
 
     /// Returns true when successful backend responses update positive
@@ -714,7 +723,7 @@ impl UnifiedCache {
     /// For hybrid cache, this ensures all enqueued disk writes complete before returning.
     /// For memory cache, this is a no-op (no persistent state).
     pub async fn close(&self) -> anyhow::Result<()> {
-        self.wait_for_updates().await;
+        let _update_barrier = self.wait_for_updates().await;
         match &self.kind {
             UnifiedCacheKind::Availability(_) => Ok(()),
             UnifiedCacheKind::Memory(_) => Ok(()), // No persistent state

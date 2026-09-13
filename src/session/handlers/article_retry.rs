@@ -132,7 +132,12 @@ impl ClientSession {
                 CacheLookupResult::Miss => None,
             }
         };
-        let availability = availability.or(preloaded_availability);
+        let availability = availability.or(preloaded_availability).or_else(|| {
+            request
+                .message_id_value()
+                .is_some()
+                .then(ArticleAvailability::new)
+        });
         if let Some(availability) = availability.as_ref() {
             self.spawn_non_primary_tier_stat_prefetch(
                 router,
