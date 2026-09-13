@@ -2059,6 +2059,199 @@ fn terminator_ends(data: &[u8]) -> impl Iterator<Item = usize> + '_ {
     memchr::memmem::find_iter(data, TERMINATOR).map(|found| found + TERMINATOR.len())
 }
 
+#[cfg(feature = "scanner-bench")]
+pub mod scanner_bench {
+    use super::TERMINATOR;
+    use memchr::memmem::Finder;
+    use rand::{RngExt, SeedableRng, rngs::StdRng};
+
+    pub const STREAM_BYTES: usize = 8 * 1024 * 1024;
+    pub const ARTICLE_BYTES: usize = 1024 * 1024;
+    pub const ARTICLE_COUNT: usize = 8;
+
+    /// Construct a reproducible wire fixture outside measurement.
+    ///
+    /// Printable, varied body bytes and dot-stuffed lines exercise false
+    /// candidates that the old repeated-x fixture almost never contained.
+    pub fn packed_stream() -> Vec<u8> {
+        let mut rng = StdRng::seed_from_u64(0x4e4e_5450);
+        let mut data = Vec::with_capacity(STREAM_BYTES);
+        for article in 0..ARTICLE_COUNT {
+            let end = (article + 1) * ARTICLE_BYTES;
+            data.extend_from_slice(
+                b"220 0 <benchmark@example> article follows\r\n\
+                  Message-ID: <benchmark@example>\r\n\
+                  From: benchmark@example\r\n\
+                  Subject: Scanner benchmark\r\n\r\n",
+            );
+            // These valid dot-stuffed lines are deliberately close to a terminator.
+            data.extend_from_slice(b"..\r\n...\r\n..not-a-terminator\r\n");
+            while end - data.len() > 136 {
+                let line_len = rng.random_range(32..=128);
+                let first = rng.random_range(b' '..=b'~');
+                if first == b'.' {
+                    data.push(b'.');
+                }
+                data.push(first);
+                for _ in 1..line_len {
+                    data.push(rng.random_range(b' '..=b'~'));
+                }
+                data.extend_from_slice(b"\r\n");
+            }
+            // Finish this response at exactly 1 MiB, including its wire terminator.
+            data.resize(end - TERMINATOR.len(), b'x');
+            data.extend_from_slice(TERMINATOR);
+        }
+        data
+    }
+
+    pub fn finder() -> Finder<'static> {
+        Finder::new(TERMINATOR)
+    }
+
+    /// One-shot memchr setup occurs once per response, as in the original API.
+    /// The returned count and checksum keep every discovered boundary observable
+    /// without allocation, per-byte bookkeeping, or an output array.
+    #[inline(never)]
+    pub fn scan_memchr(data: &[u8]) -> (usize, usize) {
+        let mut offset = 0;
+        let mut count = 0;
+        let mut checksum = 0;
+        while offset < data.len() {
+            let found = memchr::memmem::find_iter(&data[offset..], TERMINATOR)
+                .next()
+                .expect("complete benchmark response");
+            offset += found + TERMINATOR.len();
+            count += 1;
+            checksum += offset;
+        }
+        (count, checksum)
+    }
+
+    #[inline(never)]
+    pub fn scan_finder(data: &[u8], finder: &Finder<'_>) -> (usize, usize) {
+        let mut offset = 0;
+        let mut count = 0;
+        let mut checksum = 0;
+        while offset < data.len() {
+            let found = finder
+                .find(&data[offset..])
+                .expect("complete benchmark response");
+            offset += found + TERMINATOR.len();
+            count += 1;
+            checksum += offset;
+        }
+        (count, checksum)
+    }
+
+    #[inline(never)]
+    pub fn scan_ashwa(data: &[u8]) -> (usize, usize) {
+        let mut offset = 0;
+        let mut count = 0;
+        let mut checksum = 0;
+        while offset < data.len() {
+            let found =
+                ashwa::search_n(&data[offset..], TERMINATOR).expect("complete benchmark response");
+            offset += found + TERMINATOR.len();
+            count += 1;
+            checksum += offset;
+        }
+        (count, checksum)
+    }
+
+    /// Validate every boundary independently, then warm all search dispatch paths.
+    /// Call only during setup: this deliberately reads the entire fixture.
+    pub fn validate(data: &[u8], finder: &Finder<'_>) {
+        assert_eq!(data.len(), STREAM_BYTES);
+        let expected: Vec<_> = (1..=ARTICLE_COUNT).map(|n| n * ARTICLE_BYTES).collect();
+        let actual: Vec<_> = data
+            .windows(TERMINATOR.len())
+            .enumerate()
+            .filter_map(|(start, bytes)| (bytes == TERMINATOR).then_some(start + TERMINATOR.len()))
+            .collect();
+        assert_eq!(actual, expected);
+        let mut start = 0;
+        for &end in &expected {
+            let remaining = &data[start..];
+            assert_eq!(
+                memchr::memmem::find_iter(remaining, TERMINATOR).next(),
+                Some(end - start - TERMINATOR.len())
+            );
+            assert_eq!(finder.find(remaining), Some(end - start - TERMINATOR.len()));
+            assert_eq!(
+                ashwa::search_n(remaining, TERMINATOR),
+                Some(end - start - TERMINATOR.len())
+            );
+            start = end;
+        }
+        let result = (ARTICLE_COUNT, expected.iter().sum());
+        assert_eq!(scan_memchr(data), result);
+        assert_eq!(scan_finder(data, finder), result);
+        assert_eq!(scan_ashwa(data), result);
+    }
+
+    /// Evict the input from all CPU cache levels before a RAM timing sample.
+    /// CLFLUSH writes back dirty lines; MFENCE completes eviction before timing.
+    /// This must run outside measurement, once per scan (sample_size = 1).
+    #[cfg(target_arch = "x86_64")]
+    pub fn flush_input(data: &[u8]) {
+        use std::arch::x86_64::{__cpuid, _mm_clflush, _mm_mfence};
+        use std::sync::atomic::{Ordering, compiler_fence};
+
+        let cpu = __cpuid(1);
+        assert_ne!(cpu.edx & (1 << 19), 0, "RAM benchmark requires CLFLUSH");
+        let line_bytes = ((cpu.ebx >> 8) & 0xff) as usize * 8;
+        assert_ne!(line_bytes, 0);
+        compiler_fence(Ordering::SeqCst);
+        // SAFETY: Every pointer addresses a live, initialized byte of this shared
+        // slice. CLFLUSH permits unaligned addresses and does not change bytes or
+        // ownership. The final byte covers the last line of an unaligned slice.
+        unsafe {
+            for offset in (0..data.len()).step_by(line_bytes) {
+                _mm_clflush(data.as_ptr().add(offset));
+            }
+            if let Some(last) = data.last() {
+                _mm_clflush(last);
+            }
+            _mm_mfence();
+        }
+        compiler_fence(Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn packed_stream_has_exact_boundaries_for_all_scanners() {
+            let data = packed_stream();
+            let finder = finder();
+            validate(&data, &finder);
+            // The scanner must not depend on the allocation's alignment.
+            for padding in 1..=64 {
+                let mut shifted = vec![0; padding];
+                shifted.extend_from_slice(&data);
+                let remaining = &shifted[padding..];
+                let expected = (ARTICLE_COUNT, ARTICLE_BYTES * 36);
+                assert_eq!(scan_memchr(remaining), expected);
+                assert_eq!(scan_finder(remaining, &finder), expected);
+                assert_eq!(scan_ashwa(remaining), expected);
+            }
+        }
+
+        #[test]
+        #[cfg(target_arch = "x86_64")]
+        fn cache_flush_preserves_empty_and_unaligned_inputs() {
+            flush_input(&[]);
+            let bytes = [42; 193];
+            for end in 1..bytes.len() {
+                flush_input(&bytes[1..end]);
+            }
+            assert_eq!(bytes, [42; 193]);
+        }
+    }
+}
+
 #[inline]
 #[cfg(test)]
 fn find_terminator_end_from(data: &[u8], start: usize) -> Option<usize> {

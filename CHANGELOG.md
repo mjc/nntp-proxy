@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Docs
+
+- Added Tina E2E cache-miss records and an audited scanner benchmark: explicit
+  functions, verified packed responses, untimed cache eviction for RAM timing,
+  and separate Gungraun instruction counts. Withdrew the earlier scanner ranking.
+
 ## [0.5.2] - 2026-06-11
 
 ### Added
@@ -167,7 +173,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
-- Large cache-miss forwarding now reaches multi-GiB/s throughput while using much less transient memory than the old full-response buffering path. With one client connection, one proxy thread, and one backend connection, current release checks measured 4.60 GiB/s on the Ryzen 9 5950X system and 3.13 GiB/s on the Apple M1 system; see [release benchmarks](docs/archive/release-benchmarks.md) for the archived note and regeneration pointers.
+- Large cache-miss forwarding now reaches multi-GiB/s throughput while using much less transient memory than the old full-response buffering path. The 2026-09-13 stock 10 GiB `nntpbench` run on the Ryzen 9 5950X system measured 3,476.6 MiB/s (3.40 GiB/s) for the one-thread/one-backend/one-client shape; the complete 112-cell result and limits are recorded in [release benchmarks](docs/archive/release-benchmarks.md).
 - Per-command direct forwarding and cache-hit serving are now built around borrowed buffers and vectored writes, so the steady-state hot path is intended to be allocation-free after buffer-pool warmup when configured pools have capacity. Stateful mode, payload retention/cache ingest, connection setup, logging, metrics snapshots, pool exhaustion, and oversized-retention fallbacks can still allocate.
 - Sequential article fetches benefit from backend command pipelining, response batching, fewer request re-parses, and reduced connection churn.
 

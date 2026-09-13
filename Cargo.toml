@@ -94,6 +94,7 @@ rand = "0.10"  # Jittered backoff for stale-connection retries
 flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }  # RFC 8054 COMPRESS DEFLATE
 pin-project-lite = "0.2"  # Safe pin projection (already in dep tree via tokio)
 hickory-resolver = { version = "0.26", features = ["tokio", "system-config"] }  # DNS lookups with TTL-aware caching from system resolver config
+ashwa = { version = "1.0.1", optional = true }  # Benchmark-only SIMD substring comparator
 
 [dev-dependencies]
 tokio = { version = "1.52", features = ["test-util"] }  # Paused time for deterministic async tests
@@ -104,11 +105,13 @@ yenc = "0.2.2"  # For benchmark comparison only
 
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dev-dependencies]
 iai-callgrind = "0.16.1"  # Instruction-count benchmarking for hot path comparisons
+gungraun = "0.19.4"  # Callgrind benchmarking for scanner instruction comparisons
 
 [features]
 default = []
 zlib-ng = ["flate2/zlib-ng"]  # SIMD-optimized compression (requires cmake; ~2-3x faster)
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]  # Runtime/task instrumentation for tokio-console; build with RUSTFLAGS="--cfg tokio_unstable"
+scanner-bench = ["dep:ashwa"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
@@ -183,6 +186,16 @@ harness = false
 [[bench]]
 name = "end_to_end_proxy"
 harness = false
+
+[[bench]]
+name = "multiline_terminator_divan"
+harness = false
+required-features = ["scanner-bench"]
+
+[[bench]]
+name = "multiline_terminator_gungraun"
+harness = false
+required-features = ["scanner-bench"]
 
 [profile.dev]
 debug = 0             # Use the profiling/bench profiles when symbols are needed

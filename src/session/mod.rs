@@ -176,6 +176,9 @@ mod handlers;
 mod metrics_ext;
 mod mode_state;
 pub(crate) mod multiline_framing;
+
+#[cfg(feature = "scanner-bench")]
+pub use multiline_framing::scanner_bench as multiline_framing_bench;
 mod precheck;
 pub(crate) mod response_transfer;
 pub(crate) mod retry;
