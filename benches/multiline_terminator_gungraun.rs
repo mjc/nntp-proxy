@@ -39,10 +39,25 @@ const TERMINATOR: &[u8] = b"\r\n.\r\n";
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 static PAYLOAD: LazyLock<Box<[u8]>> = LazyLock::new(|| {
-    let mut stream = vec![b'x'; STREAM_BYTES];
-    for offset in (1024 * 1024 - TERMINATOR.len()..STREAM_BYTES).step_by(1024 * 1024) {
-        stream[offset..offset + TERMINATOR.len()].copy_from_slice(TERMINATOR);
+    let mut stream = Vec::with_capacity(STREAM_BYTES);
+    for article in 0..8 {
+        stream.extend_from_slice(
+            format!(
+                "220 {article} <bench-{article}@example>\r\nSubject: scanner benchmark {article}\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        let end = (article + 1) * (STREAM_BYTES / 8) - TERMINATOR.len();
+        while stream.len() < end {
+            stream.push(b'a' + ((stream.len() + article * 17) % 26) as u8);
+            if stream.len() % 79 == 0 {
+                stream.extend_from_slice(b"\r\n..dot-stuffed\r\n");
+            }
+        }
+        stream.truncate(end);
+        stream.extend_from_slice(TERMINATOR);
     }
+    assert_eq!(stream.len(), STREAM_BYTES);
     stream.into_boxed_slice()
 });
 
