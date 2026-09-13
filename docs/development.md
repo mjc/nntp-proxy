@@ -83,7 +83,7 @@ Current response responsibilities:
 
 ## Benchmarks
 
-The 2026-09-13 release-profile run on Tina (AMD Ryzen 9 5950X, 32 logical
+The 2026-09-13 main profiling-profile run on Tina (AMD Ryzen 9 5950X, 32 logical
 CPUs) completed the stock cache-miss E2E matrix. It used the pinned nntpbench
 revision from the harness, `RUSTFLAGS="-C target-cpu=native"`, a 10 GiB target
 per cell, and the default 4 x 7 x 4 thread/connection/client matrix. The run
@@ -93,6 +93,13 @@ completed all 112 cells; summary and interpretation are in
 The generated CSV remains on Tina at
 `target/bench-results/release-cache-miss-e2e-20260913T190920Z.csv`; it is an
 artifact of the run and is intentionally not committed.
+
+The reused-Finder candidate also completed the unchanged 112-cell script.
+Its equal-weight mean throughput was 3,715.7 versus main's 3,518.8 MiB/s
+(+5.6%), with total proxy CPU down 2.5%. The median paired gain was only
++0.6%, with substantial gains and regressions across cells; this single-pass
+comparison does not establish a reliable speedup. The archive records the
+full comparison, exact source, command, and retained candidate artifacts.
 
 The scanner benchmarks use an 8 MiB packed stream of eight 1 MiB multiline
 responses. The Divan functions are explicit in

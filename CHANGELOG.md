@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Reuse the multiline terminator Finder on the benchmark branch to measure
+  the production path with the stock E2E harness; preserve framing semantics.
+  Record the full main comparison, including mixed per-case results.
+
 ### Docs
 
 - Added Tina E2E cache-miss records and an audited scanner benchmark: explicit

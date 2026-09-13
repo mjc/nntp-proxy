@@ -1,8 +1,9 @@
 # Release Benchmarks
 
-## 2026-09-13 cache-miss E2E run
+## 2026-09-13 main cache-miss E2E baseline
 
-This run used the repository harness
+This is the existing `main` baseline at `145b36c6b86621dccfe965926b0ef501ffd33b06`,
+not a reused-Finder run. It used the repository harness
 `scripts/bench-release-cache-miss-e2e.sh` on Tina, an AMD Ryzen 9 5950X with
 32 logical CPUs. It was run in the existing `/home/mjc/projects/nntp-proxy`
 checkout after a clean profiling build, with
@@ -32,6 +33,60 @@ The complete CSV is retained on Tina at
 `target/bench-results/release-cache-miss-e2e-20260913T190920Z.csv`. It is not
 checked into the repository. These numbers are evidence for this host and
 configuration, not a cross-machine guarantee or a before/after claim.
+
+## 2026-09-13 reused-Finder E2E comparison
+
+The candidate reuses one lazily initialized `memchr::memmem::Finder` in the
+production framer. Candidate collection, suffix checks, split-read handling,
+and all caller behavior are unchanged. Measured source is benchmark commit
+`72ec27c3717ed463eb4c6f349c92754804123766` plus this scanner substitution;
+the measured `src/session/multiline_framing.rs` Git blob is
+`d6c57a5f1902daa0bc5f8f0404dc928a0751e508`.
+
+After a whole-target `cargo clean` (preserving existing results), the E2E
+script built the proxy and supplied nntpbench itself. It completed all 112
+default cells with the same native flags, profiling profile, 10 GiB target,
+article size, pipeline depth, and matrix as main. No affinity override or
+`SKIP_BUILDS` was used. The pinned nntpbench revision was
+`f4d0c98ca26ffb7bc75377e69a04ef73fd0891db`. Tina's existing background load
+was allowed; no separate build or benchmark ran during measurement.
+
+```bash
+RUSTFLAGS="-C target-cpu=native" \
+RESULT_FILE=target/bench-results/release-cache-miss-e2e-memchr-finder.csv \
+nix develop -c scripts/bench-release-cache-miss-e2e.sh
+```
+
+Rows were paired by threads, backend connections, clients, and repeat. Each
+CSV has 112 unique matching cells, each reaching at least 10 GiB. Request
+counts were 14,741–14,742; byte-target overshoot varies slightly, so throughput
+uses actual response bytes. Means below give each cell equal weight.
+
+| Proxy threads | Main mean MiB/s | Finder mean MiB/s | Change | Main proxy CPU s | Finder proxy CPU s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 3,186.4 | 3,236.0 | +1.6% | 57.34 | 56.85 |
+| 2 | 3,705.4 | 4,086.7 | +10.3% | 68.69 | 64.57 |
+| 4 | 3,562.8 | 3,918.5 | +10.0% | 74.40 | 71.43 |
+| 8 | 3,620.6 | 3,621.6 | +0.03% | 72.88 | 73.54 |
+| All 112 cells | 3,518.8 | 3,715.7 | +5.6% | 273.31 | 266.39 |
+
+Total measured proxy CPU fell 2.5%. The median paired throughput change was
+only +0.6%, and the geometric mean paired change was +3.2%. Finder won 65
+cells and lost 47; 40 improved by more than 5%, while 23 regressed by more
+than 5%. Individual changes ranged from -46.5% (`2/4/4`) to +67.1% (`2/16/8`).
+The `1/1/1` case rose from 3,476.6 to 3,772.1 MiB/s (+8.5%), with proxy CPU
+falling from 2.24 to 2.08 seconds. Total bytes divided by total measured
+elapsed time rose from 1,363.8 to 1,376.4 MiB/s (+0.9%); this is different
+from the equal-weight arithmetic mean of cell rates above.
+
+This is one full matrix per variant, not a repeated interleaved experiment.
+The overall direction is encouraging, but the spread and near-flat paired
+median do not establish a reliable speedup or a regression-free change.
+The Finder substitution remains an experiment on the benchmark branch.
+
+Candidate CSV and script log remain on Tina at
+`target/bench-results/release-cache-miss-e2e-memchr-finder.csv` and
+`target/bench-results/release-cache-miss-e2e-memchr-finder.log`.
 
 ## Scanner benchmark audit and RAM methodology
 
@@ -80,12 +135,11 @@ offsets and an independent scalar scan. It also checks the scanner loops
 with 64 shifted input alignments. A second check exercises empty and
 unaligned cache-flush inputs and verifies that flushing preserves bytes.
 
-The earlier branch also changed the production scanner to a global Finder.
-That change has been removed. Production still eagerly collects all candidate
-terminators in `MultilineFramer::split_chunk`; these three kernel measurements
-do not model that policy, suffix checks, or split reads. The recorded
-nntpbench E2E run above remains separate evidence and does not establish a
-before/after improvement for these scanner candidates.
+The global production Finder was removed during the scanner audit and then
+reintroduced for the E2E comparison above. Production still eagerly collects
+all candidate terminators in `MultilineFramer::split_chunk`; these three
+kernel measurements do not model that policy, suffix checks, or split reads.
+The stock nntpbench E2E comparison evaluates the actual production path.
 
 Finish builds before timing. Pin to one physical core, record its SMT sibling
 and system I/O activity, and repeat with candidate order reversed. Preserve

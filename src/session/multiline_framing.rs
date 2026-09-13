@@ -11,6 +11,7 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ops::Range;
+use std::sync::LazyLock;
 
 use anyhow::Context;
 use smallvec::SmallVec;
@@ -19,6 +20,9 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
 const TERMINATOR_TAIL_SIZE: usize = 4;
 const MAX_CAPTURED_MULTILINE_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+static TERMINATOR_FINDER: LazyLock<memchr::memmem::Finder<'static>> =
+    LazyLock::new(|| memchr::memmem::Finder::new(TERMINATOR));
 
 #[must_use]
 pub(crate) fn cached_response_completion() -> std::io::IoSlice<'static> {
@@ -2056,7 +2060,9 @@ fn find_terminator_end(data: &[u8]) -> Option<usize> {
 
 #[inline]
 fn terminator_ends(data: &[u8]) -> impl Iterator<Item = usize> + '_ {
-    memchr::memmem::find_iter(data, TERMINATOR).map(|found| found + TERMINATOR.len())
+    TERMINATOR_FINDER
+        .find_iter(data)
+        .map(|found| found + TERMINATOR.len())
 }
 
 #[cfg(feature = "scanner-bench")]
