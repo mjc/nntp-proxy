@@ -104,6 +104,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
+name = "ashwa"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4e41b456e1a0385f381d5e6821def8c9dc9b38e48e32eab4164729824d522a88"
+
+[[package]]
 name = "async-lock"
 version = "3.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -202,6 +208,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1f45e9417d87227c7a56d22e471c6206462cba514c7590c09aff4cf6d1ddcad"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "bincode-next"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbe9e7e6d14aeb39557f226bff158a30e367fac279d0e69b8b42fb41999f9a86"
+dependencies = [
+ "serde",
+ "unty-next",
 ]
 
 [[package]]
@@ -884,6 +900,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
 
 [[package]]
+name = "either-or-both"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6717164c227120ba9ddf3e2b32305fc0122741d3ee41a54968eae7573ee01933"
+dependencies = [
+ "indexmap",
+ "serde",
+]
+
+[[package]]
 name = "embedded-io"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1283,6 +1309,44 @@ dependencies = [
  "libc",
  "r-efi 6.0.0",
  "rand_core 0.10.1",
+]
+
+[[package]]
+name = "gungraun"
+version = "0.19.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9300d38d30facf6870c15bc9e243edcc47e5ddc270c9d2c1ae824a00b1faea79"
+dependencies = [
+ "bincode-next",
+ "derive_more",
+ "gungraun-macros",
+ "gungraun-runner",
+]
+
+[[package]]
+name = "gungraun-macros"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7f3214bae6cfd6739f4f29edb262bae439c6393a7b7b12c4eeb96417c2e50df"
+dependencies = [
+ "derive_more",
+ "proc-macro-error3",
+ "proc-macro2",
+ "quote",
+ "rustc_version",
+ "serde",
+ "serde_json",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "gungraun-runner"
+version = "0.19.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "47c68c92812da579a2510a2cc702d5aa3251992b9662d4a98502ca46e0cbe16e"
+dependencies = [
+ "either-or-both",
+ "serde",
 ]
 
 [[package]]
@@ -2164,6 +2228,7 @@ version = "0.5.2"
 dependencies = [
  "anyhow",
  "arrayvec",
+ "ashwa",
  "bytes",
  "bytesize",
  "chrono",
@@ -2179,6 +2244,7 @@ dependencies = [
  "flate2",
  "foyer",
  "futures",
+ "gungraun",
  "hickory-resolver",
  "iai-callgrind",
  "memchr",
@@ -2634,6 +2700,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "proc-macro-error-attr3"
+version = "3.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e564d14133360e1ae169ffde5da25881b5fa47261665b8e5713c212c27799da"
+dependencies = [
+ "proc-macro2",
+ "quote",
+]
+
+[[package]]
 name = "proc-macro-error2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2643,6 +2719,18 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "proc-macro-error3"
+version = "3.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8f0d4471b3436c22106b21913b1dda531558918ae9b7ec55d58aa84b43552233"
+dependencies = [
+ "proc-macro-error-attr3",
+ "proc-macro2",
+ "quote",
+ "syn 3.0.4",
 ]
 
 [[package]]
@@ -3973,6 +4061,12 @@ name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+
+[[package]]
+name = "unty-next"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16062d030850f35054e37746427b9febb74a2f24c9c6dd6fa2d0c13c5f53221e"
 
 [[package]]
 name = "url"

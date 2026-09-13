@@ -11,6 +11,8 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ops::Range;
+#[cfg(feature = "scanner-bench")]
+use std::sync::LazyLock;
 
 use anyhow::Context;
 use smallvec::SmallVec;
@@ -2057,6 +2059,37 @@ fn find_terminator_end(data: &[u8]) -> Option<usize> {
 #[inline]
 fn terminator_ends(data: &[u8]) -> impl Iterator<Item = usize> + '_ {
     memchr::memmem::find_iter(data, TERMINATOR).map(|found| found + TERMINATOR.len())
+}
+
+#[cfg(feature = "scanner-bench")]
+static BENCH_TERMINATOR_FINDER: LazyLock<memchr::memmem::Finder<'static>> =
+    LazyLock::new(|| memchr::memmem::Finder::new(TERMINATOR));
+
+#[cfg(feature = "scanner-bench")]
+#[must_use]
+pub fn benchmark_memchr_convenience(data: &[u8]) -> usize {
+    memchr::memmem::find_iter(data, TERMINATOR).count()
+}
+
+#[cfg(feature = "scanner-bench")]
+#[must_use]
+pub fn benchmark_memchr_finder(data: &[u8]) -> usize {
+    BENCH_TERMINATOR_FINDER.find_iter(data).count()
+}
+
+#[cfg(feature = "scanner-bench")]
+#[must_use]
+pub fn benchmark_ashwa(data: &[u8]) -> usize {
+    let mut count = 0;
+    let mut offset = 0;
+    while let Some(found) = ashwa::search_n(&data[offset..], TERMINATOR) {
+        count += 1;
+        offset += found + 1;
+        if offset >= data.len() {
+            break;
+        }
+    }
+    count
 }
 
 #[inline]
