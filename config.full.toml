@@ -21,8 +21,6 @@ validate_yenc = true
 log_file_level = "warn"
 # Optional interval in seconds for response write metrics logging (default: disabled)
 # response_write_metrics_secs = 10
-# Optional interval in seconds for client writer lock contention metrics (default: disabled)
-# client_writer_lock_metrics_secs = 10
 # Optional stats persistence path used by the TUI dashboard
 # stats_file = "/var/lib/nntp-proxy/stats.json"
 

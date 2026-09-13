@@ -114,7 +114,7 @@ struct CommandExecutionParams<'a> {
     request: &'a mut RequestContext,
     auth_access: AuthenticationAccess,
     router: &'a Arc<BackendSelector>,
-    client_writer: &'a crate::session::SharedClientWriter,
+    client_writer: &'a mut crate::session::ClientWriter,
     backend_connection: &'a mut Option<BackendLease>,
     auth_username: &'a mut ClientAuthState,
     client_to_backend_bytes: ClientToBackendBytes,
@@ -182,30 +182,31 @@ impl ClientSession {
     async fn handle_intercept_auth(
         &self,
         auth_action: AuthAction<'_>,
-        client_writer: &crate::session::SharedClientWriter,
+        client_writer: &mut crate::session::ClientWriter,
         auth_username: &mut ClientAuthState,
-    ) -> Result<common::AuthResult> {
+    ) -> std::result::Result<common::AuthResult, SessionError> {
         debug!("Client {} decision: InterceptAuth", self.client_addr);
-        let mut client_write = client_writer.lock().await;
+        let client_write = client_writer.get_mut();
         common::handle_auth_command(
             &self.auth_handler,
             auth_action,
-            &mut *client_write,
+            client_write,
             auth_username,
             &self.auth_state,
         )
         .await
+        .map_err(SessionError::from)
     }
 
     async fn handle_forward_decision(
         &self,
         request: &mut RequestContext,
         router: &Arc<BackendSelector>,
-        client_writer: &crate::session::SharedClientWriter,
+        client_writer: &mut crate::session::ClientWriter,
         backend_connection: &mut Option<BackendLease>,
         client_to_backend_bytes: ClientToBackendBytes,
         backend_to_client_bytes: &mut BackendToClientBytes,
-    ) -> Result<CommandResult> {
+    ) -> std::result::Result<CommandResult, SessionError> {
         debug!(
             "Client {} decision: Forward kind={:?}, verb={:?}",
             self.client_addr,
@@ -228,11 +229,11 @@ impl ClientSession {
     async fn handle_require_auth(
         &self,
         request: &mut RequestContext,
-        client_writer: &crate::session::SharedClientWriter,
+        client_writer: &mut crate::session::ClientWriter,
         backend_to_client_bytes: &mut BackendToClientBytes,
-    ) -> Result<CommandResult> {
+    ) -> std::result::Result<CommandResult, SessionError> {
         debug!("Client {} decision: RequireAuth", self.client_addr);
-        let mut client_write = client_writer.lock().await;
+        let client_write = client_writer.get_mut();
         client_write.write_all(AUTH_REQUIRED_FOR_COMMAND).await?;
         record_local_response(request, codes::AUTH_REQUIRED, AUTH_REQUIRED_FOR_COMMAND);
         *backend_to_client_bytes = backend_to_client_bytes.add(AUTH_REQUIRED_FOR_COMMAND.len());
@@ -243,11 +244,11 @@ impl ClientSession {
         &self,
         request: &mut RequestContext,
         response: crate::command::RejectResponse,
-        client_writer: &crate::session::SharedClientWriter,
+        client_writer: &mut crate::session::ClientWriter,
         backend_to_client_bytes: &mut BackendToClientBytes,
-    ) -> Result<CommandResult> {
+    ) -> std::result::Result<CommandResult, SessionError> {
         debug!("Client {} decision: Reject", self.client_addr);
-        let mut client_write = client_writer.lock().await;
+        let client_write = client_writer.get_mut();
         client_write.write_all(response.as_bytes()).await?;
         request.record_local_response(response.metadata());
         *backend_to_client_bytes = backend_to_client_bytes.add(response.len());
@@ -258,16 +259,16 @@ impl ClientSession {
         &self,
         request: &mut RequestContext,
         auth_access: AuthenticationAccess,
-        client_writer: &crate::session::SharedClientWriter,
+        client_writer: &mut crate::session::ClientWriter,
         backend_to_client_bytes: &mut BackendToClientBytes,
-    ) -> Result<CommandResult> {
+    ) -> std::result::Result<CommandResult, SessionError> {
         debug!(
             "Client {} decision: InterceptCapabilities",
             self.client_addr
         );
         let capabilities =
             crate::session::backend::capabilities_response(!auth_access.can_access_backend());
-        let mut client_write = client_writer.lock().await;
+        let client_write = client_writer.get_mut();
         client_write.write_all(capabilities).await?;
         record_local_response(request, codes::CAPABILITY_LIST, capabilities);
         *backend_to_client_bytes = backend_to_client_bytes.add(capabilities.len());
@@ -280,7 +281,7 @@ impl ClientSession {
     async fn process_single_command(
         &self,
         params: CommandExecutionParams<'_>,
-    ) -> Result<SingleCommandResult> {
+    ) -> std::result::Result<SingleCommandResult, SessionError> {
         let CommandExecutionParams {
             request,
             auth_access,
@@ -316,7 +317,7 @@ impl ClientSession {
         &self,
         params: CommandExecutionParams<'_>,
         plan: ExecutableCommandPlan,
-    ) -> Result<SingleCommandResult> {
+    ) -> std::result::Result<SingleCommandResult, SessionError> {
         let CommandExecutionParams {
             request,
             auth_access,
@@ -330,7 +331,7 @@ impl ClientSession {
 
         // Handle QUIT locally
         let quit_status = {
-            let mut client_write = client_writer.lock().await;
+            let client_write = client_writer.get_mut();
             common::handle_quit_command(request, &mut *client_write).await?
         };
         if let common::QuitStatus::Quit(bytes) = quit_status {
@@ -378,9 +379,9 @@ impl ClientSession {
                 .handle_require_auth(request, client_writer, backend_to_client_bytes)
                 .await
                 .map(|CommandResult::Continue| SingleCommandResult::Continue),
-            ExecutableCommandPlan::SwitchToStateful => {
-                anyhow::bail!("stateful command reached per-command execution after classification")
-            }
+            ExecutableCommandPlan::SwitchToStateful => Err(SessionError::Backend(anyhow::anyhow!(
+                "stateful command reached per-command execution after classification"
+            ))),
             ExecutableCommandPlan::Reject(response) => self
                 .handle_rejected_request(request, response, client_writer, backend_to_client_bytes)
                 .await
@@ -418,7 +419,7 @@ impl ClientSession {
         self.run_per_command_loop(
             &router,
             BufReader::with_capacity(READER_CAPACITY, client_read),
-            crate::session::SharedClientWriter::new(client_write),
+            crate::session::ClientWriter::new(client_write),
         )
         .await
     }
@@ -427,7 +428,7 @@ impl ClientSession {
         &mut self,
         router: &Arc<BackendSelector>,
         mut client_reader: BufReader<tokio::net::tcp::OwnedReadHalf>,
-        client_writer: crate::session::SharedClientWriter,
+        mut client_writer: crate::session::ClientWriter,
     ) -> Result<TransferMetrics, SessionError> {
         debug!("Client {} entering command loop", self.client_addr);
         let mut command_buf = [0u8; crate::protocol::MAX_COMMAND_LINE_OCTETS];
@@ -448,17 +449,13 @@ impl ClientSession {
             };
 
             match self
-                .handle_command_batch(router, &client_writer, &mut state, &mut batch)
+                .handle_command_batch(router, &mut client_writer, &mut state, &mut batch)
                 .await?
             {
                 BatchLoopAction::Continue => {}
                 BatchLoopAction::Break => break,
                 BatchLoopAction::SwitchToStateful(initial_request) => {
-                    let client_write = client_writer.try_into_inner().map_err(|_| {
-                        SessionError::Backend(anyhow::anyhow!(
-                            "client writer still shared while switching to stateful mode"
-                        ))
-                    })?;
+                    let client_write = client_writer.into_inner();
                     return self
                         .switch_to_stateful_mode(
                             client_reader,
@@ -502,7 +499,7 @@ impl ClientSession {
     async fn handle_command_batch(
         &self,
         router: &Arc<BackendSelector>,
-        client_writer: &crate::session::SharedClientWriter,
+        client_writer: &mut crate::session::ClientWriter,
         state: &mut PerCommandLoopState,
         batch: &mut crate::session::handlers::pipeline::RequestBatch,
     ) -> Result<BatchLoopAction, SessionError> {
@@ -529,14 +526,14 @@ impl ClientSession {
     async fn handle_batch_rejections(
         &self,
         batch: &crate::session::handlers::pipeline::RequestBatch,
-        client_writer: &crate::session::SharedClientWriter,
+        client_writer: &mut crate::session::ClientWriter,
     ) -> Result<Option<BatchLoopAction>, SessionError> {
         if batch.is_first_oversized() {
             warn!(
                 "Client {} sent oversized first command, rejecting with 501",
                 self.client_addr
             );
-            let mut client_write = client_writer.lock().await;
+            let client_write = client_writer.get_mut();
             client_write
                 .write_all(crate::protocol::COMMAND_TOO_LONG)
                 .await
@@ -548,7 +545,7 @@ impl ClientSession {
                 "Client {} sent invalid first command, rejecting with 501",
                 self.client_addr
             );
-            let mut client_write = client_writer.lock().await;
+            let client_write = client_writer.get_mut();
             client_write
                 .write_all(crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE)
                 .await
@@ -566,7 +563,7 @@ impl ClientSession {
     async fn process_pipelineable_batch(
         &self,
         router: &Arc<BackendSelector>,
-        client_writer: &crate::session::SharedClientWriter,
+        client_writer: &mut crate::session::ClientWriter,
         _state: &mut PerCommandLoopState,
         batch: &mut crate::session::handlers::pipeline::RequestBatch,
         backend_connection: &mut BatchBackendConnection,
@@ -599,7 +596,7 @@ impl ClientSession {
     async fn process_pipelineable_commands(
         &self,
         router: &Arc<BackendSelector>,
-        client_writer: &crate::session::SharedClientWriter,
+        client_writer: &mut crate::session::ClientWriter,
         state: &mut PerCommandLoopState,
         batch: &mut crate::session::handlers::pipeline::RequestBatch,
         backend_connection: &mut BatchBackendConnection,
@@ -658,7 +655,7 @@ impl ClientSession {
     async fn handle_trailing_command(
         &self,
         router: &Arc<BackendSelector>,
-        client_writer: &crate::session::SharedClientWriter,
+        client_writer: &mut crate::session::ClientWriter,
         state: &mut PerCommandLoopState,
         batch: &mut crate::session::handlers::pipeline::RequestBatch,
         backend_connection: &mut BatchBackendConnection,
@@ -669,7 +666,7 @@ impl ClientSession {
                 self.client_addr,
                 batch.trailing_wire_len()
             );
-            let mut client_write = client_writer.lock().await;
+            let client_write = client_writer.get_mut();
             client_write
                 .write_all(crate::protocol::COMMAND_TOO_LONG)
                 .await
@@ -681,7 +678,7 @@ impl ClientSession {
                 "Client {} sent invalid trailing command, rejecting",
                 self.client_addr
             );
-            let mut client_write = client_writer.lock().await;
+            let client_write = client_writer.get_mut();
             client_write
                 .write_all(crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE)
                 .await

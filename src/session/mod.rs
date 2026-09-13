@@ -193,5 +193,5 @@ pub use core::{ClientSession, ClientSessionBuilder};
 pub use metrics_ext::MetricsRecorder;
 pub use mode_state::{ModeState, ModeTransition, SessionMode};
 pub use session_error::SessionError;
-pub(crate) use shared_client_writer::SharedClientWriter;
+pub(crate) use shared_client_writer::ClientWriter;
 pub use state::SessionLoopState;

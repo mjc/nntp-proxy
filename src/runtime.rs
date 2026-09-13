@@ -484,62 +484,6 @@ pub fn spawn_response_write_metrics_logger(period: Option<std::time::Duration>) 
     });
 }
 
-/// Spawn background task to periodically log client-writer mutex contention.
-///
-/// Enable this via `proxy.client_writer_lock_metrics_secs` in config.
-pub fn spawn_client_writer_lock_metrics_logger(period: Option<std::time::Duration>) {
-    use tracing::debug;
-
-    let Some(period) = period else {
-        crate::session::shared_client_writer::set_client_writer_lock_metrics_enabled(false);
-        return;
-    };
-    crate::session::shared_client_writer::set_client_writer_lock_metrics_enabled(true);
-
-    let mut previous = crate::session::shared_client_writer::client_writer_lock_metrics_snapshot();
-
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(period);
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
-        loop {
-            interval.tick().await;
-            let current =
-                crate::session::shared_client_writer::client_writer_lock_metrics_snapshot();
-            let requests_delta = current.lock_requests.saturating_sub(previous.lock_requests);
-            let wait_nanos_delta = current.wait_nanos.saturating_sub(previous.wait_nanos);
-            let avg_wait_nanos = if current
-                .contended_locks
-                .saturating_sub(previous.contended_locks)
-                == 0
-            {
-                0
-            } else {
-                wait_nanos_delta
-                    / (current
-                        .contended_locks
-                        .saturating_sub(previous.contended_locks) as u64)
-            };
-
-            debug!(
-                requests_delta = requests_delta,
-                immediate_delta = current
-                    .immediate_locks
-                    .saturating_sub(previous.immediate_locks),
-                contended_delta = current
-                    .contended_locks
-                    .saturating_sub(previous.contended_locks),
-                wait_nanos_delta = wait_nanos_delta,
-                avg_wait_nanos = avg_wait_nanos,
-                max_wait_nanos_seen = current.max_wait_nanos,
-                "Client writer lock metrics"
-            );
-
-            previous = current;
-        }
-    });
-}
-
 #[cfg(tokio_unstable)]
 #[derive(Clone, Copy, Debug)]
 struct TokioRuntimeMetricsSnapshot {

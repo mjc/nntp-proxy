@@ -49,6 +49,11 @@ impl From<anyhow::Error> for SessionError {
     fn from(e: anyhow::Error) -> Self {
         use crate::connection_error::{ConnectionError, is_disconnect_kind};
 
+        let e = match e.downcast::<Self>() {
+            Ok(session_error) => return session_error,
+            Err(error) => error,
+        };
+
         // Fast path: bare io::Error (most common for client disconnects in stateful path)
         match e.downcast::<std::io::Error>() {
             Ok(io_err) if is_disconnect_kind(io_err.kind()) => Self::ClientDisconnect(io_err),
@@ -64,6 +69,12 @@ impl From<anyhow::Error> for SessionError {
                 }
             }
         }
+    }
+}
+
+impl From<std::io::Error> for SessionError {
+    fn from(error: std::io::Error) -> Self {
+        Self::from(anyhow::Error::from(error))
     }
 }
 
@@ -100,6 +111,13 @@ mod tests {
         let io_err = std::io::Error::from(ErrorKind::ConnectionReset);
         let e = SessionError::from(anyhow::Error::from(io_err));
         assert!(matches!(e, SessionError::ClientDisconnect(_)));
+    }
+
+    #[test]
+    fn client_disconnect_survives_anyhow_wrapping() {
+        let original = SessionError::ClientDisconnect(std::io::Error::from(ErrorKind::BrokenPipe));
+        let restored = SessionError::from(anyhow::Error::new(original));
+        assert!(matches!(restored, SessionError::ClientDisconnect(_)));
     }
 
     #[test]

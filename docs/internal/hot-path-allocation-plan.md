@@ -18,7 +18,7 @@ The target invariant is:
 
 - `src/session/handlers/per_command.rs`
   - `handle_per_command_routing` allocates per connection via `TcpStream::into_split`,
-    `Box::pin`, `BufReader::with_capacity`, and `SharedClientWriter::new`.
+    `Box::pin`, and `BufReader::with_capacity`.
   - These are per-connection costs, not per-article costs, but they are still
     known allocations at the start of the path.
 
@@ -112,19 +112,11 @@ Candidate approaches:
 
 This removes one per-connection allocation.
 
-### 3. Avoid `SharedClientWriter` For Sequential Per-Command Delivery
+### 3. Use Direct Mutable Ownership For Per-Command Delivery
 
-The normal per-command path writes responses sequentially. It should use a direct
-`&mut OwnedWriteHalf` where no backend worker needs shared writer ownership.
-
-Plan:
-
-- introduce a writer abstraction that can be either direct or shared
-- route the normal path through direct mutable writer access
-- keep `SharedClientWriter` only for code paths that genuinely need cross-task
-  writer sharing
-
-This removes an `Arc<Mutex<_>>` allocation and lock overhead from the common path.
+The normal per-command path writes responses sequentially through `ClientWriter`,
+which owns the `OwnedWriteHalf` and exposes it by mutable reference. This removes
+the `Arc<Mutex<_>>` allocation and lock overhead from the common path.
 
 ### 4. Stop Copying RFC-Sized Request Lines Into Owned Verb/Args
 

@@ -9,15 +9,14 @@
 use crate::protocol::RequestContext;
 use crate::session::ClientSession;
 use anyhow::Result;
+use futures::FutureExt;
 use smallvec::SmallVec;
 use std::future::Future;
-use tokio::io::AsyncBufReadExt;
-use tokio::time::Duration;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 /// Maximum pipeline depth (number of commands read from client buffer at once)
 const MAX_PIPELINE_DEPTH: usize = 16;
 const COMMAND_LINE_CAPACITY: usize = crate::protocol::MAX_COMMAND_LINE_OCTETS;
-const PIPELINE_REFILL_GRACE: Duration = Duration::from_millis(1);
 type BatchContexts = SmallVec<[PipelineableRequest; MAX_PIPELINE_DEPTH]>;
 
 /// A request admitted to a pipelined batch.
@@ -381,7 +380,7 @@ impl ClientSession {
         memchr::memchr(b'\n', reader.buffer()).is_some()
     }
 
-    async fn refill_available_client_bytes<R>(
+    fn refill_available_client_bytes<R>(
         reader: &mut tokio::io::BufReader<R>,
     ) -> std::io::Result<bool>
     where
@@ -391,10 +390,15 @@ impl ClientSession {
             return Ok(false);
         }
 
-        match tokio::time::timeout(PIPELINE_REFILL_GRACE, reader.fill_buf()).await {
-            Ok(result) => result.map(|buf| !buf.is_empty()),
-            Err(_) => Ok(false),
-        }
+        std::future::poll_fn(
+            |cx| match std::pin::Pin::new(&mut *reader).poll_fill_buf(cx) {
+                std::task::Poll::Ready(Ok(buf)) => std::task::Poll::Ready(Ok(!buf.is_empty())),
+                std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(error)),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            },
+        )
+        .now_or_never()
+        .unwrap_or(Ok(false))
     }
 
     /// Read a batch of commands from the client's buffered reader.
@@ -432,7 +436,7 @@ impl ClientSession {
         // Read more commands from the buffer (non-blocking)
         while batch_contexts.len() < MAX_PIPELINE_DEPTH {
             if !Self::queued_complete_command_line(reader)
-                && !Self::refill_available_client_bytes(reader).await?
+                && !Self::refill_available_client_bytes(reader)?
             {
                 break;
             }

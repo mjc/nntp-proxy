@@ -27,7 +27,7 @@ use crate::session::precheck;
 
 /// Client-side write state shared across cache, precheck, and direct routing paths.
 pub(super) struct RequestExecutionIo<'a> {
-    pub(super) client_writer: &'a crate::session::SharedClientWriter,
+    pub(super) client_writer: &'a mut crate::session::ClientWriter,
     pub(super) backend_connection: &'a mut Option<BackendLease>,
     pub(super) client_to_backend_bytes: &'a mut ClientToBackendBytes,
     pub(super) backend_to_client_bytes: &'a mut BackendToClientBytes,
@@ -52,7 +52,7 @@ impl ClientSession {
         &self,
         router: Arc<BackendSelector>,
         request: &mut RequestContext,
-        client_writer: &crate::session::SharedClientWriter,
+        client_writer: &mut crate::session::ClientWriter,
         backend_connection: &mut Option<BackendLease>,
         client_to_backend_bytes: &mut ClientToBackendBytes,
         backend_to_client_bytes: &mut BackendToClientBytes,
@@ -65,24 +65,21 @@ impl ClientSession {
             client_to_backend_bytes,
             backend_to_client_bytes,
         };
-        let preloaded_availability = if request.message_id_value().is_some() {
-            Some(
-                self.load_article_availability(request.message_id_value().as_ref())
-                    .await,
-            )
-        } else {
-            None
+        let preloaded_cache = match request.message_id() {
+            Some(message_id) => self.cache.get_request_message_id(message_id).await,
+            None => None,
         };
-        if let Some(availability) = preloaded_availability.as_ref() {
-            self.spawn_non_primary_tier_stat_prefetch(
+        let preloaded_availability = preloaded_cache
+            .as_ref()
+            .map(|cached| cached.to_availability());
+        let availability = match self
+            .prepare_request_execution(
                 &router,
                 request,
-                availability,
-                SuppressedBackends::empty(),
-            );
-        }
-        let availability = match self
-            .prepare_request_execution(&router, request, &mut io, preloaded_availability)
+                &mut io,
+                preloaded_cache,
+                preloaded_availability,
+            )
             .await?
         {
             PreparedRequest::Served => return Ok(()),
@@ -113,16 +110,18 @@ impl ClientSession {
         router: &Arc<BackendSelector>,
         request: &mut RequestContext,
         io: &mut RequestExecutionIo<'_>,
+        preloaded_cache: Option<crate::cache::CachedArticle>,
         preloaded_availability: Option<ArticleAvailability>,
     ) -> Result<PreparedRequest, SessionError> {
         let availability = {
-            let mut client_write = io.client_writer.lock().await;
+            let client_write = io.client_writer.get_mut();
             match self
-                .try_serve_from_cache(
+                .try_serve_from_cached(
                     request,
                     router,
-                    &mut *client_write,
+                    client_write,
                     io.backend_to_client_bytes,
+                    preloaded_cache,
                 )
                 .await?
             {
@@ -133,18 +132,20 @@ impl ClientSession {
                 CacheLookupResult::Miss => None,
             }
         };
-        let availability = if let Some(availability) = availability {
-            Some(availability)
-        } else if let Some(availability) = preloaded_availability {
-            Some(availability)
-        } else if request.message_id_value().is_some() {
-            Some(
-                self.load_article_availability(request.message_id_value().as_ref())
-                    .await,
-            )
-        } else {
-            None
-        };
+        let availability = availability.or(preloaded_availability).or_else(|| {
+            request
+                .message_id_value()
+                .is_some()
+                .then(ArticleAvailability::new)
+        });
+        if let Some(availability) = availability.as_ref() {
+            self.spawn_non_primary_tier_stat_prefetch(
+                router,
+                request,
+                availability,
+                SuppressedBackends::empty(),
+            );
+        }
         if self
             .try_adaptive_precheck(router, request, io, availability.as_ref())
             .await?
@@ -186,7 +187,7 @@ impl ClientSession {
             return Ok(false);
         };
 
-        let mut client_write = io.client_writer.lock().await;
+        let client_write = io.client_writer.get_mut();
         let bytes_written = match response {
             precheck::PrecheckResponse::Cached(entry) => {
                 if let Some(write) = write_cached_article_response(
@@ -349,8 +350,8 @@ impl ClientSession {
                 }
                 Ok(BackendAttemptResult::NoRetryableBackend) => {
                     let bytes_written = {
-                        let mut client_write = io.client_writer.lock().await;
-                        Self::write_backend_error_response(&mut *client_write).await?
+                        let client_write = io.client_writer.get_mut();
+                        Self::write_backend_error_response(client_write).await?
                     };
                     *io.backend_to_client_bytes = io.backend_to_client_bytes.add(bytes_written);
                     return Ok(());
@@ -379,37 +380,12 @@ impl ClientSession {
             request.message_id_value()
         );
         {
-            let mut client_write = io.client_writer.lock().await;
-            self.send_430_to_client(&mut *client_write, io.backend_to_client_bytes)
+            let client_write = io.client_writer.get_mut();
+            self.send_430_to_client(client_write, io.backend_to_client_bytes)
                 .await?;
         }
 
         Ok(())
-    }
-
-    /// Load article availability from cache or create fresh tracker
-    pub(super) async fn load_article_availability(
-        &self,
-        msg_id: Option<&crate::types::MessageId<'_>>,
-    ) -> crate::cache::ArticleAvailability {
-        match msg_id {
-            Some(msg_id_ref) => self
-                .cache
-                .get(msg_id_ref)
-                .await
-                .map(|entry| {
-                    let avail = entry.to_availability();
-                    debug!(
-                        "Client {} loaded availability for {}: missing_bits={:08b}",
-                        self.client_addr,
-                        msg_id_ref,
-                        avail.missing_bits()
-                    );
-                    avail
-                })
-                .unwrap_or_default(),
-            None => crate::cache::ArticleAvailability::new(),
-        }
     }
 
     /// Record 430 response in availability tracker.

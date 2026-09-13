@@ -24,9 +24,12 @@ fn create_config_with_precheck(backend_port: u16, adaptive_precheck: bool) -> Co
         )],
         cache: Some(Cache {
             store_article_bodies: false,
-            adaptive_precheck,
             ..Default::default()
         }),
+        routing: nntp_proxy::config::Routing {
+            adaptive_precheck,
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -48,6 +51,7 @@ async fn setup_proxy_with_config(config: Config, routing_mode: RoutingMode) -> R
     let proxy_port = proxy_listener.local_addr()?.port();
     let proxy_addr = format!("127.0.0.1:{proxy_port}");
 
+    let uses_per_command = routing_mode.supports_per_command_routing();
     let proxy = NntpProxy::new(config, routing_mode).await?;
 
     tokio::spawn(async move {
@@ -55,7 +59,13 @@ async fn setup_proxy_with_config(config: Config, routing_mode: RoutingMode) -> R
             if let Ok((stream, addr)) = proxy_listener.accept().await {
                 let proxy_clone = proxy.clone();
                 tokio::spawn(async move {
-                    let _ = proxy_clone.handle_client(stream, addr.into()).await;
+                    let _ = if uses_per_command {
+                        proxy_clone
+                            .handle_client_per_command_routing(stream, addr.into())
+                            .await
+                    } else {
+                        proxy_clone.handle_client(stream, addr.into()).await
+                    };
                 });
             }
         }
@@ -171,13 +181,16 @@ async fn test_head_precheck_first_response_wins() -> Result<()> {
         .with_name("fast-backend")
         .on_command(
             "HEAD",
-            "221 0 <test@example.com>\r\nSubject: Fast\r\n\r\n.\r\n",
+            "221 1 <test@example.com>\r\nSubject: Fast\r\n\r\n.\r\n",
         )
         .spawn_on_listener(backend1_listener);
 
     // Backend 2: Slow responder
+    let slow_head_seen = Arc::new(Notify::new());
+    let slow_head_seen_server = Arc::clone(&slow_head_seen);
     tokio::spawn(async move {
         while let Ok((stream, _)) = backend2_listener.accept().await {
+            let slow_head_seen = Arc::clone(&slow_head_seen_server);
             tokio::spawn(async move {
                 let mut reader = BufReader::new(stream);
                 reader
@@ -194,13 +207,14 @@ async fn test_head_precheck_first_response_wins() -> Result<()> {
                             let cmd = line.trim();
 
                             if cmd.starts_with("HEAD") {
+                                slow_head_seen.notify_one();
                                 for _ in 0..64 {
                                     tokio::task::yield_now().await;
                                 }
                                 reader
                                     .get_mut()
                                     .write_all(
-                                        b"221 0 <test@example.com>\r\nSubject: Slow\r\n\r\n.\r\n",
+                                        b"221 2 <test@example.com>\r\nSubject: Slow\r\n\r\n.\r\n",
                                     )
                                     .await
                                     .ok();
@@ -227,10 +241,13 @@ async fn test_head_precheck_first_response_wins() -> Result<()> {
             create_test_server_config("127.0.0.1", backend2_port, "slow-backend"),
         ],
         cache: Some(Cache {
-            store_article_bodies: false,
-            adaptive_precheck: true,
+            store_article_bodies: true,
             ..Default::default()
         }),
+        routing: nntp_proxy::config::Routing {
+            adaptive_precheck: true,
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -244,6 +261,7 @@ async fn test_head_precheck_first_response_wins() -> Result<()> {
     timeout(Duration::from_secs(1), client.read(&mut buf)).await??;
 
     let start = std::time::Instant::now();
+    let slow_head_seen = slow_head_seen.notified();
     client.write_all(b"HEAD <test@example.com>\r\n").await?;
     let n = timeout(Duration::from_secs(1), client.read(&mut buf)).await??;
     let response = String::from_utf8_lossy(&buf[..n]);
@@ -255,9 +273,10 @@ async fn test_head_precheck_first_response_wins() -> Result<()> {
         "Response took too long: {elapsed:?}"
     );
     assert!(
-        response.starts_with("221"),
-        "Expected 221 response, got: {response}"
+        response.starts_with("221 1"),
+        "Expected the fast backend response, got: {response}"
     );
+    timeout(Duration::from_secs(1), slow_head_seen).await?;
 
     Ok(())
 }
@@ -336,10 +355,13 @@ async fn test_precheck_stays_in_tier_zero_when_found() -> Result<()> {
             create_tiered_server_config(tier1_port, "tier1", 1),
         ],
         cache: Some(Cache {
-            store_article_bodies: false,
-            adaptive_precheck: true,
+            store_article_bodies: true,
             ..Default::default()
         }),
+        routing: nntp_proxy::config::Routing {
+            adaptive_precheck: true,
+            ..Default::default()
+        },
         ..Default::default()
     };
 
@@ -434,14 +456,13 @@ async fn test_precheck_requires_message_id() -> Result<()> {
     let n = timeout(Duration::from_secs(1), client.read(&mut buf)).await??;
     let response = String::from_utf8_lossy(&buf[..n]);
 
-    // Should get error from backend
+    // Stateless routing rejects the context-dependent form locally.
     assert!(
-        response.starts_with("412"),
-        "Expected error response, got: {response}"
+        response.starts_with("503"),
+        "Expected stateless-mode rejection, got: {response}"
     );
 
-    // Test passes if we get the 412 response and don't crash
-    // (No way to verify backend call count with current MockNntpServer API)
+    // A backend 412 here would mean the request incorrectly reached precheck or routing.
 
     Ok(())
 }

@@ -83,11 +83,6 @@ async fn run_proxy(
         .response_write_metrics_secs
         .filter(|secs| *secs > 0)
         .map(Duration::from_secs);
-    let client_writer_lock_metrics_period = config
-        .proxy
-        .client_writer_lock_metrics_secs
-        .filter(|secs| *secs > 0)
-        .map(Duration::from_secs);
     args.common
         .validate_dashboard_listen(&launch.host, launch.port)?;
 
@@ -111,7 +106,6 @@ async fn run_proxy(
     runtime::spawn_availability_saver(&proxy, launch.availability_path.clone());
     runtime::spawn_idle_connection_clearer(&proxy);
     runtime::spawn_response_write_metrics_logger(response_write_metrics_period);
-    runtime::spawn_client_writer_lock_metrics_logger(client_writer_lock_metrics_period);
     runtime::spawn_tokio_runtime_metrics_logger();
 
     let (dashboard_handle, dashboard_shutdown_tx) =

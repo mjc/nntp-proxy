@@ -579,6 +579,54 @@ impl CachedArticle {
         self.payload.len()
     }
 
+    /// Combine complementary HEAD and BODY responses into one article entry.
+    pub(crate) fn merge_compatible_sections(&mut self, other: &Self) -> bool {
+        let payload = match (&self.payload, &other.payload) {
+            (
+                CachedPayload::Head {
+                    article_number: left_number,
+                    headers,
+                },
+                CachedPayload::Body {
+                    article_number: right_number,
+                    body,
+                },
+            ) if compatible_article_numbers(*left_number, *right_number) => {
+                Some(CachedPayload::Article {
+                    article_number: (*left_number).or(*right_number),
+                    headers: headers.clone(),
+                    body: body.clone(),
+                })
+            }
+            (
+                CachedPayload::Body {
+                    article_number: left_number,
+                    body,
+                },
+                CachedPayload::Head {
+                    article_number: right_number,
+                    headers,
+                },
+            ) if compatible_article_numbers(*left_number, *right_number) => {
+                Some(CachedPayload::Article {
+                    article_number: (*left_number).or(*right_number),
+                    headers: headers.clone(),
+                    body: body.clone(),
+                })
+            }
+            _ => None,
+        };
+
+        let Some(payload) = payload else {
+            return false;
+        };
+        self.status_code = StatusCode::new(220);
+        self.tier = self.tier.max(other.tier);
+        self.payload = payload;
+        self.inserted_at = ttl::CacheTimestampMillis::now();
+        true
+    }
+
     #[must_use]
     pub fn cached_response_for(
         &self,
@@ -715,6 +763,13 @@ fn parse_article_number(status_line: &[u8]) -> Option<CachedArticleNumber> {
         .parse::<u64>()
         .ok()
         .map(CachedArticleNumber::new)
+}
+
+fn compatible_article_numbers(
+    left: Option<CachedArticleNumber>,
+    right: Option<CachedArticleNumber>,
+) -> bool {
+    left.is_none() || right.is_none() || left == right
 }
 
 /// Article cache using LRU eviction with TTL
@@ -888,6 +943,10 @@ impl ArticleCache {
                 return entry;
             }
 
+            if entry.merge_compatible_sections(new_entry_template) {
+                return entry;
+            }
+
             let existing_complete = entry.is_complete_article();
             let new_complete = new_entry_template.is_complete_article();
             let should_replace = match (existing_complete, new_complete) {
@@ -992,8 +1051,18 @@ impl ArticleCache {
         tier: ttl::CacheTier,
     ) {
         let buffer = buffer.into();
-        let key: Arc<str> = message_id.without_brackets().into();
         let new_entry_template = CachedArticle::from_ingest_response_with_tier(buffer, tier);
+        self.upsert_cached_entry_for_slot(message_id, new_entry_template, slot)
+            .await;
+    }
+
+    async fn upsert_cached_entry_for_slot(
+        &self,
+        message_id: MessageId<'_>,
+        new_entry_template: CachedArticle,
+        slot: AvailabilitySlot,
+    ) {
+        let key: Arc<str> = message_id.without_brackets().into();
         let ttl_millis = self.ttl_millis;
 
         // Use atomic upsert - this provides key-level locking and eliminates
@@ -1481,6 +1550,62 @@ mod tests {
         assert_eq!(
             rendered(&cached, RequestKind::Body, msg_id.as_str()),
             complete.as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn upsert_merges_head_and_body_sections() {
+        let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
+        let msg_id = MessageId::from_str_or_wrap("test@example.com").unwrap();
+        let backend = BackendId::from_index(0);
+        let availability = ArticleAvailability::new();
+        let tier = ttl::CacheTier::new(0);
+        let inserted_at = ttl::now_millis();
+        let head = CachedArticle::from_parts(
+            StatusCode::new(221),
+            CachedPayload::Head {
+                article_number: Some(CachedArticleNumber::new(7)),
+                headers: Arc::from(b"Subject: Test".as_slice()),
+            },
+            availability,
+            tier,
+            inserted_at,
+        );
+        let body = CachedArticle::from_parts(
+            StatusCode::new(222),
+            CachedPayload::Body {
+                article_number: Some(CachedArticleNumber::new(7)),
+                body: Arc::from(b"Body".as_slice()),
+            },
+            availability,
+            tier,
+            inserted_at,
+        );
+        let slot = cache.availability_slot(backend);
+
+        cache
+            .upsert_cached_entry_for_slot(msg_id.clone(), head, slot)
+            .await;
+        cache
+            .upsert_cached_entry_for_slot(msg_id.clone(), body, slot)
+            .await;
+
+        let cached = cache.get(&msg_id).await.expect("merged article");
+        assert_eq!(cached.status_code(), StatusCode::new(220));
+        assert!(
+            cached
+                .cached_response_for(RequestKind::Article, msg_id.as_str())
+                .is_some()
+        );
+        assert!(
+            cached
+                .cached_response_for(RequestKind::Head, msg_id.as_str())
+                .is_some()
+        );
+        assert!(
+            cached
+                .cached_response_for(RequestKind::Body, msg_id.as_str())
+                .is_some()
         );
     }
 
