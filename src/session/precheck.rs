@@ -414,7 +414,8 @@ async fn query_all_backends_racing(
     let mut results = Vec::with_capacity(deps.router.backend_count().get());
 
     for tier in deps.router.tiers() {
-        let mut pending = spawn_backend_queries_for_tier(deps, request, tier, initial_availability);
+        let mut pending =
+            spawn_racing_backend_queries_for_tier(deps, request, tier, initial_availability);
         let tier_results_start = results.len();
 
         while let Some(result) = pending.next().await {
@@ -470,31 +471,41 @@ async fn query_tier_backends(
     tier: u8,
     availability: &ArticleAvailability,
 ) -> Vec<QueryResult> {
-    let mut pending = spawn_backend_queries_for_tier(deps, request, tier, availability);
-    let mut results = Vec::new();
+    let mut pending = FuturesUnordered::new();
+    for backend in eligible_backends_in_tier(deps, tier, availability) {
+        let deps = deps.clone();
+        let request = request.clone_for_background_probe();
+        pending.push(async move { query_backend(&deps, backend, &request).await });
+    }
+
+    let mut results = Vec::with_capacity(deps.router.backend_count().get());
 
     while let Some(result) = pending.next().await {
-        if let Ok(result) = result {
-            results.push(result);
-        }
+        results.push(result);
     }
 
     results
 }
 
-fn spawn_backend_queries_for_tier(
+fn eligible_backends_in_tier<'a>(
+    deps: &'a OwnedDeps,
+    tier: u8,
+    availability: &'a ArticleAvailability,
+) -> impl Iterator<Item = ArticleBackend> + 'a {
+    deps.router.backend_ids_in_tier(tier).filter_map(move |id| {
+        deps.router
+            .availability_slot(id)
+            .and_then(|slot| ArticleBackend::from_availability_slot(id, slot, availability))
+    })
+}
+
+fn spawn_racing_backend_queries_for_tier(
     deps: &OwnedDeps,
     request: &RequestContext,
     tier: u8,
     availability: &ArticleAvailability,
 ) -> FuturesUnordered<tokio::task::JoinHandle<QueryResult>> {
-    deps.router
-        .backend_ids_in_tier(tier)
-        .filter_map(|id| {
-            deps.router
-                .availability_slot(id)
-                .and_then(|slot| ArticleBackend::from_availability_slot(id, slot, availability))
-        })
+    eligible_backends_in_tier(deps, tier, availability)
         .map(|backend| {
             let deps = deps.clone();
             let request = request.clone_for_background_probe();

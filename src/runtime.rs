@@ -1108,7 +1108,7 @@ pub fn spawn_availability_saver(
 
 /// Spawn background task that periodically checks for and clears idle backend connections.
 ///
-/// Runs every 60 seconds and delegates to [`NntpProxy::check_and_clear_stale_pools`],
+/// Runs every 60 seconds and delegates to [`crate::NntpProxy`] stale-pool cleanup,
 /// which checks each backend independently against its configured `backend_idle_timeout`.
 ///
 /// This prevents zombie connections from accumulating during extended idle periods,
