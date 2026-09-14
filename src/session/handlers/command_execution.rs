@@ -143,6 +143,11 @@ enum BackendReadAttemptError {
     Backend(anyhow::Error),
 }
 
+pub(super) enum PresendResponseError {
+    Read(anyhow::Error),
+    Transfer(ResponseTransferError),
+}
+
 impl From<SessionError> for BackendReadAttemptError {
     fn from(err: SessionError) -> Self {
         Self::Backend(anyhow::Error::new(err))
@@ -821,7 +826,7 @@ impl ClientSession {
         ))
     }
 
-    fn handle_response_transfer_error(
+    pub(super) fn handle_response_transfer_error(
         &self,
         conn: crate::pool::ConnectionGuard,
         backend_id: BackendId,
@@ -940,7 +945,7 @@ impl ClientSession {
         }
     }
 
-    async fn checkout_direct_backend_connection(
+    pub(super) async fn checkout_direct_backend_connection(
         &self,
         provider: &crate::pool::DeadpoolConnectionProvider,
         backend_id: crate::types::BackendId,
@@ -1247,6 +1252,92 @@ impl ClientSession {
         Ok((response, buffer, timings))
     }
 
+    pub(super) async fn read_and_write_presend_response<W>(
+        &self,
+        conn: &mut crate::pool::ConnectionGuard,
+        client_write: &mut W,
+        backend: &ArticleBackend,
+        request: &mut RequestContext,
+        availability: &mut crate::cache::ArticleAvailability,
+        backend_to_client_bytes: &mut BackendToClientBytes,
+    ) -> Result<crate::session::backend::BackendResponseComplete, PresendResponseError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let backend_id = backend.backend_id();
+        let mut buffer = self.buffer_pool.acquire();
+        let read =
+            backend::read_presend_request_classified(conn.stream_mut(), request, &mut buffer)
+                .await
+                .map_err(PresendResponseError::Read)?;
+        let Some(status_code) = read.status_code() else {
+            read.log_warnings(&buffer, self.client_addr, backend_id);
+            return Err(PresendResponseError::Read(anyhow::anyhow!(
+                "backend returned an invalid response to a presend request"
+            )));
+        };
+
+        if let Ok(missing) = AuthoritativeArticleMissing::from_status_code(*backend, status_code) {
+            self.record_authoritative_article_missing(&missing, availability);
+            if let Some(article_request) =
+                crate::command::CommandHandler::article_lookup_request(request)
+            {
+                self.cache
+                    .record_availability_missing(
+                        article_request.message_id(),
+                        missing.availability_slot(),
+                    )
+                    .await;
+            }
+            let completion = backend::observe_response(
+                request,
+                &mut buffer,
+                conn.stream_mut(),
+                &self.buffer_pool,
+                backend_id,
+            )
+            .await
+            .map_err(PresendResponseError::Transfer)?;
+            self.send_430_to_client(client_write, backend_to_client_bytes)
+                .await
+                .map_err(|error| {
+                    PresendResponseError::Transfer(classify_response_write_err(error))
+                })?;
+            client_write.flush().await.map_err(|error| {
+                PresendResponseError::Transfer(classify_response_write_err(error))
+            })?;
+            return Ok(completion);
+        }
+
+        let params = ResponseWriteParams {
+            request,
+            article_request: crate::command::CommandHandler::article_lookup_request(request),
+            status_code,
+        };
+        let (bytes_written, completion) = self
+            .write_response_to_client(conn.stream_mut(), client_write, backend, buffer, params)
+            .await
+            .map_err(PresendResponseError::Transfer)?;
+        client_write
+            .flush()
+            .await
+            .map_err(|error| PresendResponseError::Transfer(classify_response_write_err(error)))?;
+        self.record_response_metrics(
+            backend_id,
+            request,
+            status_code,
+            request.request_wire_len().as_u64(),
+            bytes_written,
+        );
+        let response = RequestResponseMetadata::new(
+            status_code,
+            usize::try_from(bytes_written).unwrap_or(usize::MAX).into(),
+        );
+        request.record_backend_response(backend_id, response);
+        *backend_to_client_bytes = backend_to_client_bytes.add(response.wire_len().get());
+        Ok(completion)
+    }
+
     #[inline]
     fn should_use_stat_missing_probe(
         provider: &crate::pool::DeadpoolConnectionProvider,
@@ -1493,7 +1584,7 @@ impl ClientSession {
         &self,
         client_write: &mut W,
         backend_to_client_bytes: &mut BackendToClientBytes,
-    ) -> Result<()>
+    ) -> std::io::Result<()>
     where
         W: AsyncWrite + Unpin,
     {

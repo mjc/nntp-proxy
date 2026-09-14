@@ -402,19 +402,23 @@ impl NntpProxy {
     ///
     /// This creates a session with the router, allowing commands from this client
     /// to be routed to different backends based on load balancing.
-    pub async fn handle_client_per_command_routing(
+    pub fn handle_client_per_command_routing(
         &self,
         client_stream: TcpStream,
         client_addr: ClientAddress,
-    ) -> Result<(), SessionError> {
-        // Check for stale pools before handling (lazy recreation after idle)
-        self.check_and_clear_stale_pools();
-        self.increment_active_clients();
+    ) -> futures::future::BoxFuture<'_, Result<(), SessionError>> {
+        Box::pin(async move {
+            // Check for stale pools before handling (lazy recreation after idle)
+            self.check_and_clear_stale_pools();
+            self.increment_active_clients();
 
-        let result = Box::pin(self.handle_per_command_client(client_stream, client_addr)).await;
+            let result = self
+                .handle_per_command_client(client_stream, client_addr)
+                .await;
 
-        self.decrement_active_clients();
-        result
+            self.decrement_active_clients();
+            result
+        })
     }
 
     /// Handle a per-command routing session

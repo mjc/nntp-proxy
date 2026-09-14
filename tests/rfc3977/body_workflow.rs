@@ -682,6 +682,186 @@ async fn expect_pass_through_borrows_initial_backend_bytes_with_auth(
 }
 
 #[tokio::test]
+async fn test_per_command_body_window_sends_two_requests_before_first_reply() -> Result<()> {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let (connection_count, seen_commands) = spawn_delayed_pipeline_backend(
+        backend_listener,
+        &[
+            (
+                "BODY <window-1@example>",
+                "222 1 <window-1@example>\r\nwindow-1-line\r\n.\r\n",
+            ),
+            (
+                "BODY <window-2@example>",
+                "222 2 <window-2@example>\r\nwindow-2-line\r\n.\r\n",
+            ),
+        ],
+        &[],
+    );
+
+    let proxy_port = spawn_proxy_with_config(
+        pipeline_backend_config(backend_port, "BodyUpstreamWindow"),
+        RoutingMode::PerCommand,
+    )
+    .await?;
+    let client = connect_and_read_greeting(proxy_port).await?;
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    write_commands(
+        &mut write_half,
+        &["BODY <window-1@example>\r\n", "BODY <window-2@example>\r\n"],
+    )
+    .await?;
+
+    let responses = read_multiline_responses(&mut reader, 2).await?;
+    assert_eq!(
+        responses,
+        vec![
+            (
+                "222 1 <window-1@example>\r\n".to_string(),
+                vec!["window-1-line\r\n".to_string()],
+            ),
+            (
+                "222 2 <window-2@example>\r\n".to_string(),
+                vec!["window-2-line\r\n".to_string()],
+            ),
+        ]
+    );
+    assert_eq!(connection_count.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        seen_commands
+            .lock()
+            .await
+            .iter()
+            .filter(|command| command.starts_with("BODY "))
+            .count(),
+        2,
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_per_command_body_window_keeps_430_before_following_success() -> Result<()> {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let (_connection_count, _seen_commands) = spawn_delayed_pipeline_backend(
+        backend_listener,
+        &[
+            ("BODY <window-missing@example>", "430 No such article\r\n"),
+            (
+                "BODY <window-present@example>",
+                "222 2 <window-present@example>\r\nwindow-present-line\r\n.\r\n",
+            ),
+        ],
+        &[],
+    );
+
+    let proxy_port = spawn_proxy_with_config(
+        pipeline_backend_config(backend_port, "BodyUpstreamWindow430"),
+        RoutingMode::PerCommand,
+    )
+    .await?;
+    let client = connect_and_read_greeting(proxy_port).await?;
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    write_commands(
+        &mut write_half,
+        &[
+            "BODY <window-missing@example>\r\n",
+            "BODY <window-present@example>\r\n",
+        ],
+    )
+    .await?;
+
+    assert_eq!(
+        read_line(&mut reader, "missing presend response").await?,
+        "430 No such article\r\n",
+    );
+    assert_eq!(
+        read_multiline_response(&mut reader).await?,
+        (
+            "222 2 <window-present@example>\r\n".to_string(),
+            vec!["window-present-line\r\n".to_string()],
+        ),
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_per_command_body_window_keeps_cached_430_after_earlier_success() -> Result<()> {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let (_connection_count, seen_commands) = spawn_delayed_pipeline_backend(
+        backend_listener,
+        &[(
+            "BODY <window-present-before-cached-missing@example>",
+            "222 2 <window-present-before-cached-missing@example>\r\nwindow-present-line\r\n.\r\n",
+        )],
+        &[(
+            "BODY <window-cached-missing@example>",
+            "430 No such article\r\n",
+        )],
+    );
+
+    let proxy_port = spawn_proxy_with_config(
+        pipeline_backend_config(backend_port, "BodyUpstreamWindowCached430"),
+        RoutingMode::PerCommand,
+    )
+    .await?;
+    let client = connect_and_read_greeting(proxy_port).await?;
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    write_commands(
+        &mut write_half,
+        &["BODY <window-cached-missing@example>\r\n"],
+    )
+    .await?;
+    assert_eq!(
+        read_line(&mut reader, "cache warmup 430").await?,
+        "430 No such article\r\n",
+    );
+
+    write_commands(
+        &mut write_half,
+        &[
+            "BODY <window-present-before-cached-missing@example>\r\n",
+            "BODY <window-cached-missing@example>\r\n",
+        ],
+    )
+    .await?;
+
+    assert_eq!(
+        read_multiline_response(&mut reader).await?,
+        (
+            "222 2 <window-present-before-cached-missing@example>\r\n".to_string(),
+            vec!["window-present-line\r\n".to_string()],
+        ),
+    );
+    assert_eq!(
+        read_line(&mut reader, "cached missing response").await?,
+        "430 No such article\r\n",
+    );
+
+    let seen_commands = seen_commands.lock().await;
+    assert_eq!(
+        seen_commands
+            .iter()
+            .filter(|command| command.as_str() == "BODY <window-cached-missing@example>")
+            .count(),
+        1,
+        "known-missing request must not be sent upstream again",
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_body_pipelining_pairs_four_responses_on_single_backend_connection() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();

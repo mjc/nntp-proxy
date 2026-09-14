@@ -11,12 +11,13 @@
 use super::BackendLease;
 
 use crate::protocol::{
-    AUTH_REQUIRED_FOR_COMMAND, RequestContext, RequestKind, RequestResponseMetadata, StatusCode,
-    codes,
+    AUTH_REQUIRED_FOR_COMMAND, RequestCacheStatus, RequestContext, RequestKind,
+    RequestResponseMetadata, StatusCode, codes,
 };
 use crate::session::common;
 use crate::session::{ClientAuthState, ClientSession, connection};
 use anyhow::Result;
+use smallvec::SmallVec;
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -151,6 +152,23 @@ struct PerCommandLoopState {
     backend_to_client_bytes: BackendToClientBytes,
     auth_username: ClientAuthState,
     auth_access: AuthenticationAccess,
+}
+
+enum PresendDecision {
+    Backend {
+        backend: crate::router::ArticleBackend,
+        availability: crate::cache::ArticleAvailability,
+        guard: Option<crate::router::CommandGuard>,
+    },
+    Missing,
+}
+
+struct PipelineCommandParams<'a> {
+    router: &'a Arc<BackendSelector>,
+    client_writer: &'a mut crate::session::ClientWriter,
+    state: &'a mut PerCommandLoopState,
+    batch: &'a mut crate::session::handlers::pipeline::RequestBatch,
+    backend_connection: &'a mut BatchBackendConnection,
 }
 
 impl PerCommandLoopState {
@@ -601,55 +619,339 @@ impl ClientSession {
         batch: &mut crate::session::handlers::pipeline::RequestBatch,
         backend_connection: &mut BatchBackendConnection,
     ) -> Result<(), SessionError> {
+        state.auth_access = self.authentication_access(state.auth_access);
+        if self
+            .try_process_presend_window(router, client_writer, state, batch, backend_connection)
+            .await?
+        {
+            return Ok(());
+        }
+
         let batch_size = batch.len();
         for i in 0..batch_size {
-            let request = batch.context(i).request();
-            debug!(
-                "Client {} received {} request bytes: kind={:?}, verb={:?}",
-                self.client_addr,
-                request.request_wire_len().get(),
-                request.kind(),
-                request.verb()
-            );
+            self.process_pipelineable_command(
+                i,
+                true,
+                PipelineCommandParams {
+                    router,
+                    client_writer,
+                    state,
+                    batch,
+                    backend_connection,
+                },
+            )
+            .await?;
+        }
 
+        Ok(())
+    }
+
+    async fn process_pipelineable_command(
+        &self,
+        i: usize,
+        account_request: bool,
+        params: PipelineCommandParams<'_>,
+    ) -> Result<(), SessionError> {
+        let PipelineCommandParams {
+            router,
+            client_writer,
+            state,
+            batch,
+            backend_connection,
+        } = params;
+        let request = batch.context(i).request();
+        debug!(
+            "Client {} received {} request bytes: kind={:?}, verb={:?}",
+            self.client_addr,
+            request.request_wire_len().get(),
+            request.kind(),
+            request.verb()
+        );
+
+        if account_request {
             state.client_to_backend_bytes = state
                 .client_to_backend_bytes
                 .add(request.request_wire_len().get());
-            state.auth_access = self.authentication_access(state.auth_access);
+        }
+        state.auth_access = self.authentication_access(state.auth_access);
 
-            let command_result = batch
-                .with_context_mut(i, |mut request| async {
-                    let result = self
-                        .process_single_command(CommandExecutionParams {
-                            request: &mut request,
-                            auth_access: state.auth_access,
-                            router,
-                            client_writer,
-                            backend_connection: backend_connection.slot(),
-                            auth_username: &mut state.auth_username,
-                            client_to_backend_bytes: state.client_to_backend_bytes,
-                            backend_to_client_bytes: &mut state.backend_to_client_bytes,
-                        })
-                        .await;
-                    (request, result)
-                })
-                .await
-                .map_err(|_| {
-                    SessionError::Backend(anyhow::anyhow!(
-                        "pipelineable request lost its pipelineability during execution"
-                    ))
-                })?;
-            match command_result? {
-                SingleCommandResult::Continue => {}
-                SingleCommandResult::Quit => {
-                    return Err(SessionError::Backend(anyhow::anyhow!(
-                        "pipelineable request unexpectedly terminated the session"
-                    )));
-                }
+        let command_result = batch
+            .with_context_mut(i, |mut request| async {
+                let result = self
+                    .process_single_command(CommandExecutionParams {
+                        request: &mut request,
+                        auth_access: state.auth_access,
+                        router,
+                        client_writer,
+                        backend_connection: backend_connection.slot(),
+                        auth_username: &mut state.auth_username,
+                        client_to_backend_bytes: state.client_to_backend_bytes,
+                        backend_to_client_bytes: &mut state.backend_to_client_bytes,
+                    })
+                    .await;
+                (request, result)
+            })
+            .await
+            .map_err(|_| {
+                SessionError::Backend(anyhow::anyhow!(
+                    "pipelineable request lost its pipelineability during execution"
+                ))
+            })?;
+        match command_result? {
+            SingleCommandResult::Continue => {}
+            SingleCommandResult::Quit => {
+                return Err(SessionError::Backend(anyhow::anyhow!(
+                    "pipelineable request unexpectedly terminated the session"
+                )));
             }
         }
 
         Ok(())
+    }
+
+    async fn try_process_presend_window(
+        &self,
+        router: &Arc<BackendSelector>,
+        client_writer: &mut crate::session::ClientWriter,
+        state: &mut PerCommandLoopState,
+        batch: &mut crate::session::handlers::pipeline::RequestBatch,
+        backend_connection: &mut BatchBackendConnection,
+    ) -> Result<bool, SessionError> {
+        if batch.len() < 2
+            || router.backend_count() != 1
+            || self.cache.stores_payload_responses()
+            || !state.auth_access.can_access_backend()
+            || (0..batch.len()).any(|i| {
+                let request = batch.context(i).request();
+                !matches!(
+                    request.kind(),
+                    RequestKind::Article | RequestKind::Body | RequestKind::Head
+                ) || !matches!(
+                    CommandHandler::classify_request(
+                        request,
+                        state.auth_access,
+                        self.mode_state.routing_mode(),
+                    ),
+                    CommandPlan::Forward
+                )
+            })
+        {
+            return Ok(false);
+        }
+
+        let Some(backend_id) = router
+            .tiers()
+            .flat_map(|tier| router.backend_ids_in_tier(tier))
+            .next()
+        else {
+            return Ok(false);
+        };
+        let Some(provider) = router.backend_provider(backend_id) else {
+            return Ok(false);
+        };
+        if provider.stat_missing_enabled() {
+            return Ok(false);
+        }
+
+        let mut decisions = SmallVec::<[PresendDecision; 16]>::new();
+        for i in 0..batch.len() {
+            let availability = batch
+                .with_context_mut(i, |mut request| async {
+                    let cached = match request.message_id() {
+                        Some(message_id) => self.cache.get_request_message_id(message_id).await,
+                        None => None,
+                    };
+                    let availability = if let Some(cached) = cached {
+                        let availability = cached.to_availability();
+                        request.record_cache_entry_metadata(
+                            cached.request_cache_metadata(&availability),
+                        );
+                        request.record_cache_status(RequestCacheStatus::PartialHit);
+                        availability
+                    } else {
+                        request.record_cache_status(RequestCacheStatus::Miss);
+                        crate::cache::ArticleAvailability::new()
+                    };
+                    (request, availability)
+                })
+                .await
+                .map_err(|_| {
+                    SessionError::Backend(anyhow::anyhow!(
+                        "presend request lost its pipelineability during preparation"
+                    ))
+                })?;
+            let Some(availability_slot) = router.availability_slot(backend_id) else {
+                return Ok(false);
+            };
+            let Some(backend) = crate::router::ArticleBackend::from_availability_slot(
+                backend_id,
+                availability_slot,
+                &availability,
+            ) else {
+                decisions.push(PresendDecision::Missing);
+                continue;
+            };
+            decisions.push(PresendDecision::Backend {
+                backend,
+                availability,
+                guard: Some(BackendSelector::guard_for_manual_backend(
+                    router.clone(),
+                    backend_id,
+                )),
+            });
+        }
+
+        let Some(first_backend_index) = decisions
+            .iter()
+            .position(|decision| matches!(decision, PresendDecision::Backend { .. }))
+        else {
+            for _ in 0..batch.len() {
+                self.send_430_to_client(
+                    client_writer.get_mut(),
+                    &mut state.backend_to_client_bytes,
+                )
+                .await?;
+            }
+            client_writer.get_mut().flush().await?;
+            return Ok(true);
+        };
+        let first_request = batch.context(first_backend_index).request();
+        let mut conn = match self
+            .checkout_direct_backend_connection(
+                provider,
+                backend_id,
+                first_request,
+                backend_connection.slot(),
+            )
+            .await
+        {
+            Ok(conn) => conn,
+            Err(_) => return Ok(false),
+        };
+
+        for (i, decision) in decisions.iter().enumerate() {
+            if matches!(decision, PresendDecision::Backend { .. }) {
+                let request = batch.context(i).request();
+                self.metrics.record_command(backend_id);
+                self.metrics.user_command(self.username());
+                if request.write_wire_to(conn.stream_mut()).await.is_err() {
+                    conn.fail_backend();
+                    return Ok(false);
+                }
+            }
+        }
+        if conn.stream_mut().flush().await.is_err() {
+            conn.fail_backend();
+            return Ok(false);
+        }
+        for i in 0..batch.len() {
+            state.client_to_backend_bytes = state
+                .client_to_backend_bytes
+                .add(batch.context(i).request().request_wire_len().get());
+        }
+
+        let mut last_completion = None;
+        for (i, decision) in decisions.iter_mut().enumerate() {
+            match decision {
+                PresendDecision::Missing => {
+                    self.send_430_to_client(
+                        client_writer.get_mut(),
+                        &mut state.backend_to_client_bytes,
+                    )
+                    .await?;
+                }
+                PresendDecision::Backend {
+                    backend,
+                    availability,
+                    guard,
+                } => {
+                    let result = batch
+                        .with_context_mut(i, |mut request| async {
+                            let result = self
+                                .read_and_write_presend_response(
+                                    &mut conn,
+                                    client_writer.get_mut(),
+                                    backend,
+                                    &mut request,
+                                    availability,
+                                    &mut state.backend_to_client_bytes,
+                                )
+                                .await;
+                            (request, result)
+                        })
+                        .await
+                        .map_err(|_| {
+                            SessionError::Backend(anyhow::anyhow!(
+                                "presend request lost its pipelineability while reading response"
+                            ))
+                        })?;
+                    match result {
+                        Ok(completion) => {
+                            last_completion = Some(completion);
+                            guard
+                                .take()
+                                .expect("presend backend decision must retain its command guard")
+                                .complete();
+                        }
+                        Err(
+                            crate::session::handlers::command_execution::PresendResponseError::Read(
+                                error,
+                            ),
+                        ) => {
+                            debug!(
+                                client = %self.client_addr,
+                                backend = backend_id.as_index(),
+                                error = %error,
+                                "Presend response read failed; retrying remaining requests sequentially"
+                            );
+                            conn.fail_backend();
+                            for decision in &mut decisions[i..] {
+                                if let PresendDecision::Backend { guard, .. } = decision {
+                                    drop(guard.take());
+                                }
+                            }
+                            for retry_index in i..batch.len() {
+                                self.process_pipelineable_command(
+                                    retry_index,
+                                    false,
+                                    PipelineCommandParams {
+                                        router,
+                                        client_writer,
+                                        state,
+                                        batch,
+                                        backend_connection,
+                                    },
+                                )
+                                .await?;
+                            }
+                            return Ok(true);
+                        }
+                        Err(
+                            crate::session::handlers::command_execution::PresendResponseError::Transfer(
+                                error,
+                            ),
+                        ) => {
+                            let request = batch.context(i).request();
+                            return Err(self.handle_response_transfer_error(
+                                conn,
+                                backend_id,
+                                request,
+                                error,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        client_writer.get_mut().flush().await?;
+
+        let completion = last_completion.expect("presend window issued at least one request");
+        if conn.has_pending_bytes() {
+            conn.fail_client();
+        } else {
+            *backend_connection.slot() = Some(BackendLease::new(backend_id, conn, completion));
+        }
+        Ok(true)
     }
 
     async fn handle_trailing_command(

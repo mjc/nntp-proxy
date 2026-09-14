@@ -7,16 +7,11 @@
 //!
 //! Run with: `cargo bench --bench cache_miss_roundtrip_callgrind`
 
-macro_rules! supported {
-    ($($item:item)*) => {
-        $(
-            #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))]
-            $item
-        )*
-    };
-}
-
-supported! {
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod benchmarks {
     use gungraun::{
         Callgrind, LibraryBenchmarkConfig, library_benchmark, library_benchmark_group, main,
     };
@@ -49,10 +44,10 @@ supported! {
         Config {
             servers: vec![
                 Server::builder("127.0.0.1", Port::try_new(backend_port).unwrap())
-                .name("bench-backend")
-                .max_connections(MaxConnections::try_new(4).unwrap())
-                .build()
-                .unwrap(),
+                    .name("bench-backend")
+                    .max_connections(MaxConnections::try_new(4).unwrap())
+                    .build()
+                    .unwrap(),
             ],
             cache,
             ..Default::default()
@@ -191,8 +186,36 @@ supported! {
         }
 
         async fn article_roundtrip(&mut self) -> usize {
-            self.stream.write_all(b"ARTICLE <bench@example.com>\r\n").await.unwrap();
-            read_exact_response_into(&mut self.stream, &mut self.response_buffer, self.response_len).await
+            self.stream
+                .write_all(b"ARTICLE <bench@example.com>\r\n")
+                .await
+                .unwrap();
+            read_exact_response_into(
+                &mut self.stream,
+                &mut self.response_buffer,
+                self.response_len,
+            )
+            .await
+        }
+
+        async fn article_pair_roundtrip(&mut self) -> usize {
+            self.stream
+                .write_all(b"ARTICLE <bench@example.com>\r\nARTICLE <bench@example.com>\r\n")
+                .await
+                .unwrap();
+            let first = read_exact_response_into(
+                &mut self.stream,
+                &mut self.response_buffer,
+                self.response_len,
+            )
+            .await;
+            let second = read_exact_response_into(
+                &mut self.stream,
+                &mut self.response_buffer,
+                self.response_len,
+            )
+            .await;
+            first + second
         }
     }
 
@@ -207,10 +230,14 @@ supported! {
         }
     }
 
-    async fn read_exact_response_into(stream: &mut TcpStream, buffer: &mut [u8], expected: usize) -> usize {
+    async fn read_exact_response_into(
+        stream: &mut TcpStream,
+        buffer: &mut [u8],
+        expected: usize,
+    ) -> usize {
         let mut total = 0usize;
         while total < expected {
-            let n = stream.read(&mut buffer[total..]).await.unwrap();
+            let n = stream.read(&mut buffer[total..expected]).await.unwrap();
             assert_ne!(n, 0, "proxy closed during benchmark response");
             total += n;
         }
@@ -250,6 +277,12 @@ supported! {
     }
 
     #[library_benchmark]
+    #[bench::article_64k(args = (ARTICLE_64K), setup = setup_no_configured_cache_roundtrip)]
+    fn run_no_configured_cache_pair_roundtrip(mut harness: BenchHarness) -> usize {
+        black_box(harness.rt.block_on(harness.client.article_pair_roundtrip()))
+    }
+
+    #[library_benchmark]
     #[bench::article_64k(args = (ARTICLE_64K), setup = setup_metadata_only_cache_roundtrip)]
     #[bench::article_768k(args = (ARTICLE_768K), setup = setup_metadata_only_cache_roundtrip)]
     fn run_metadata_only_cache_roundtrip(mut harness: BenchHarness) -> usize {
@@ -267,6 +300,7 @@ supported! {
         name = cache_miss_roundtrip;
         benchmarks =
             run_no_configured_cache_roundtrip,
+            run_no_configured_cache_pair_roundtrip,
             run_metadata_only_cache_roundtrip,
             run_direct_backend_roundtrip
     );
@@ -280,6 +314,18 @@ supported! {
         );
         library_benchmark_groups = cache_miss_roundtrip
     );
+
+    pub(super) fn run() {
+        main();
+    }
+}
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+fn main() {
+    benchmarks::run();
 }
 
 #[cfg(not(all(

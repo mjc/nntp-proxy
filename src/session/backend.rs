@@ -273,6 +273,24 @@ where
     read_until_backend_reply(conn, request, buffer).await
 }
 
+/// Read a response for a request that was already written as part of an
+/// upstream pipeline window.
+pub(crate) async fn read_presend_request_classified<C>(
+    conn: &mut C,
+    request: &RequestContext,
+    buffer: &mut PooledBuffer,
+) -> Result<BackendReadResult>
+where
+    C: AsyncReadExt + Unpin,
+{
+    let n = buffer.read_from(conn).await?;
+    if n == 0 {
+        anyhow::bail!("Backend connection closed unexpectedly");
+    }
+
+    read_until_backend_reply(conn, request, buffer).await
+}
+
 pub(crate) async fn execute_request_classified_timed<C>(
     conn: &mut C,
     request: &RequestContext,
