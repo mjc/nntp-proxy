@@ -337,7 +337,9 @@ impl ConnectionStream {
             range.end <= buffer.initialized(),
             "pending pooled range exceeds initialized buffer"
         );
-        ensure_pending_bytes_capacity(self.pending_bytes_len(), len)?;
+        // A pipelined read may contain an arbitrarily large prefix of the next
+        // response. Unlike copied pending bytes, this retains one already
+        // pool-bounded allocation and does not grow memory with the range size.
         if self.pending_input.spilled()
             || self.pending_input.len() >= PENDING_BACKEND_INLINE_SEGMENTS
         {
@@ -346,6 +348,24 @@ impl ConnectionStream {
         self.pending_input
             .insert(0, PendingBackendInput::pooled(buffer, range));
         Ok(())
+    }
+
+    /// Move the leading pooled pending segment out for framer-owned reuse.
+    pub(crate) fn take_leading_pooled_pending_input(
+        &mut self,
+    ) -> Option<(crate::pool::PooledBuffer, Range<usize>)> {
+        if !matches!(
+            self.pending_input.first(),
+            Some(PendingBackendInput::Pooled { .. })
+        ) {
+            return None;
+        }
+        let PendingBackendInput::Pooled { buffer, range, pos } = self.pending_input.remove(0)
+        else {
+            unreachable!("leading pending input was checked as pooled")
+        };
+        debug_assert!(pos <= range.len());
+        Some((buffer, range.start + pos..range.end))
     }
 
     #[must_use]
@@ -679,6 +699,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn taking_partly_consumed_pooled_input_returns_only_the_unread_range() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
+        let pool =
+            crate::pool::BufferPool::new(crate::types::BufferSize::try_new(1024).unwrap(), 1);
+        let mut pending = pool.acquire();
+        pending.copy_from_slice(b"xxpooledyy");
+        let mut conn = ConnectionStream::plain(server_stream);
+        conn.queue_pooled_pending_bytes_first(pending, 2..8)
+            .unwrap();
+        let mut consumed = [0; 2];
+        conn.read_exact(&mut consumed).await.unwrap();
+
+        let (pending, unread) = conn
+            .take_leading_pooled_pending_input()
+            .expect("partly consumed pooled input should remain queued");
+
+        assert_eq!(&consumed, b"po");
+        assert_eq!(&pending[unread], b"oled");
+        assert!(!conn.has_pending_bytes());
+    }
+
+    #[tokio::test]
     async fn test_queue_pending_bytes_rejects_oversized_buffers() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -695,6 +741,29 @@ mod tests {
                 .contains(&MAX_PENDING_BACKEND_BYTES.to_string())
         );
         assert_eq!(conn.pending_bytes_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn pooled_pending_input_may_retain_more_than_the_copied_byte_limit() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client_handle = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (server_stream, _) = listener.accept().await.unwrap();
+        let _client = client_handle.await.unwrap();
+
+        let retained_len = MAX_PENDING_BACKEND_BYTES + 1;
+        let pool = crate::pool::BufferPool::new(
+            crate::types::BufferSize::try_new(retained_len).unwrap(),
+            1,
+        );
+        let mut pending = pool.acquire();
+        pending.copy_from_slice(&vec![b'x'; retained_len]);
+        let mut conn = ConnectionStream::plain(server_stream);
+
+        conn.queue_pooled_pending_bytes_first(pending, 0..retained_len)
+            .unwrap();
+
+        assert_eq!(conn.pending_bytes_len(), retained_len);
     }
 
     #[allow(clippy::reversed_empty_ranges)]

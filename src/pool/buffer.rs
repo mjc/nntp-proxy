@@ -66,16 +66,23 @@ enum ReadMode {
 #[derive(Default)]
 struct BufferStorage {
     bytes: BytesMut,
+    hidden_prefix: Option<BytesMut>,
+    allocation_capacity: usize,
 }
 
 impl BufferStorage {
     fn new(bytes: BytesMut) -> Self {
-        Self { bytes }
+        let allocation_capacity = bytes.capacity();
+        Self {
+            bytes,
+            hidden_prefix: None,
+            allocation_capacity,
+        }
     }
 
     #[inline]
     fn capacity(&self) -> usize {
-        self.bytes.capacity()
+        self.allocation_capacity
     }
 
     #[inline]
@@ -85,6 +92,13 @@ impl BufferStorage {
 
     #[inline]
     fn clear(&mut self) {
+        self.restore_hidden_prefix();
+        self.bytes.clear();
+    }
+
+    #[inline]
+    fn clear_for_fresh_read(&mut self) {
+        self.restore_hidden_prefix();
         self.bytes.clear();
     }
 
@@ -94,12 +108,49 @@ impl BufferStorage {
     }
 
     fn copy_from_slice(&mut self, data: &[u8]) {
-        self.bytes.clear();
+        self.clear();
         self.bytes.extend_from_slice(data);
     }
 
     fn extend_from_slice(&mut self, data: &[u8]) {
+        self.compact_visible();
         self.bytes.extend_from_slice(data);
+        self.allocation_capacity = self.bytes.capacity();
+    }
+
+    fn retain_range(&mut self, range: Range<usize>) {
+        assert!(
+            range.start < range.end && range.end <= self.initialized_len(),
+            "exposed range must be non-empty and inside initialized bytes"
+        );
+        let mut visible = self.bytes.split_off(range.start);
+        visible.truncate(range.len());
+        let newly_hidden_prefix = std::mem::replace(&mut self.bytes, visible);
+        if let Some(prefix) = &mut self.hidden_prefix {
+            prefix.unsplit(newly_hidden_prefix);
+        } else {
+            self.hidden_prefix = Some(newly_hidden_prefix);
+        }
+    }
+
+    fn compact_visible(&mut self) {
+        let Some(mut prefix) = self.hidden_prefix.take() else {
+            return;
+        };
+        let prefix_len = prefix.len();
+        let visible_len = self.bytes.len();
+        prefix.unsplit(std::mem::take(&mut self.bytes));
+        prefix.copy_within(prefix_len..prefix_len + visible_len, 0);
+        prefix.truncate(visible_len);
+        self.bytes = prefix;
+    }
+
+    fn restore_hidden_prefix(&mut self) {
+        let Some(mut prefix) = self.hidden_prefix.take() else {
+            return;
+        };
+        prefix.unsplit(std::mem::take(&mut self.bytes));
+        self.bytes = prefix;
     }
 
     fn freeze(&mut self) -> Bytes {
@@ -107,17 +158,22 @@ impl BufferStorage {
     }
 
     fn take(&mut self) -> BytesMut {
+        drop(self.hidden_prefix.take());
+        self.allocation_capacity = 0;
         std::mem::take(&mut self.bytes)
     }
 
     fn restore(&mut self, bytes: BytesMut) {
+        self.allocation_capacity = bytes.capacity();
         self.bytes = bytes;
+        self.hidden_prefix = None;
     }
 
     async fn read_from<R>(&mut self, reader: &mut R, read_len: usize) -> std::io::Result<usize>
     where
         R: AsyncRead + Unpin,
     {
+        debug_assert!(self.hidden_prefix.is_none());
         if read_len == 0 {
             return Ok(0);
         }
@@ -221,14 +277,39 @@ impl PooledBuffer {
     {
         let read_len = match mode {
             ReadMode::Reset => {
-                self.buffer.clear();
+                self.buffer.clear_for_fresh_read();
                 self.read_limit()
             }
-            ReadMode::Append => self
-                .read_limit()
-                .saturating_sub(self.buffer.initialized_len()),
+            ReadMode::Append => {
+                self.buffer.compact_visible();
+                self.read_limit()
+                    .saturating_sub(self.buffer.initialized_len())
+            }
         };
         self.buffer.read_from(reader, read_len).await
+    }
+
+    /// Expose only `range` while retaining the backing allocation in place.
+    pub(crate) fn expose_initialized_range_without_copying(&mut self, range: Range<usize>) {
+        self.buffer.retain_range(range);
+    }
+
+    #[must_use]
+    pub(crate) fn is_exposed_range_view(&self) -> bool {
+        self.buffer.hidden_prefix.is_some()
+    }
+
+    #[must_use]
+    pub(crate) fn has_remaining_fixed_writable_region(&self) -> bool {
+        self.buffer.initialized_len() < self.read_limit()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn allocation_ptr(&self) -> *const u8 {
+        self.buffer
+            .hidden_prefix
+            .as_ref()
+            .map_or_else(|| self.buffer.bytes.as_ptr(), |prefix| prefix.as_ptr())
     }
 
     /// Copy data into buffer and mark as initialized
@@ -1390,6 +1471,81 @@ mod tests {
         assert_eq!(read, 9);
         assert_eq!(buffer.initialized(), 11);
         assert_eq!(&*buffer, b"220 ready\r\n");
+    }
+
+    #[test]
+    fn retained_range_exposes_the_same_backing_allocation_without_copying() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
+        let mut buffer = pool.acquire();
+        buffer.copy_from_slice(b"discardkeepdiscard");
+        let allocation = buffer.allocation_ptr();
+
+        buffer.expose_initialized_range_without_copying(7..11);
+
+        assert_eq!(buffer.as_ref(), b"keep");
+        assert_eq!(buffer.allocation_ptr(), allocation);
+    }
+
+    #[tokio::test]
+    async fn read_more_compacts_a_retained_prefix_before_appending() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
+        let mut buffer = pool.acquire();
+        buffer.copy_from_slice(b"discard22unused");
+        let allocation = buffer.allocation_ptr();
+        buffer.expose_initialized_range_without_copying(7..9);
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(b"0 ready\r\n").await.unwrap();
+        drop(writer);
+
+        let read = buffer.read_more(&mut reader).await.unwrap();
+
+        assert_eq!(read, 9);
+        assert_eq!(buffer.as_ref(), b"220 ready\r\n");
+        assert_eq!(buffer.allocation_ptr(), allocation);
+    }
+
+    #[tokio::test]
+    async fn fresh_read_after_a_range_view_restores_the_full_writable_region() {
+        let pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 1);
+        let mut buffer = pool.acquire();
+        buffer.copy_from_slice(&vec![b'x'; 4096]);
+        let allocation = buffer.allocation_ptr();
+        buffer.expose_initialized_range_without_copying(3072..4096);
+        let mut reader = std::io::Cursor::new(vec![b'y'; 4096]);
+
+        let read = buffer.read_from(&mut reader).await.unwrap();
+
+        assert_eq!(read, 4096);
+        assert_eq!(buffer.as_ref(), vec![b'y'; 4096]);
+        assert_eq!(buffer.allocation_ptr(), allocation);
+    }
+
+    #[test]
+    fn dropping_a_range_view_returns_the_complete_allocation_to_the_pool() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
+        let capacity = {
+            let mut buffer = pool.acquire();
+            buffer.copy_from_slice(b"discardkeep");
+            buffer.expose_initialized_range_without_copying(7..11);
+            assert_eq!(buffer.as_ref(), b"keep");
+            buffer.capacity()
+        };
+
+        let buffer = pool
+            .try_acquire()
+            .expect("range view should return its allocation to the pool");
+        assert_eq!(buffer.capacity(), capacity);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn freezing_a_range_view_exposes_only_the_selected_bytes() {
+        let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
+        let mut buffer = pool.acquire();
+        buffer.copy_from_slice(b"discardkeepdiscard");
+        buffer.expose_initialized_range_without_copying(7..11);
+
+        assert_eq!(buffer.freeze(), Bytes::from_static(b"keep"));
     }
 
     #[tokio::test]

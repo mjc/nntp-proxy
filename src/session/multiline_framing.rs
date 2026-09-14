@@ -225,6 +225,18 @@ fn queue_packed_next_response_input(
     Ok(())
 }
 
+/// Reuse the framer-owned packed suffix, or acquire an empty read buffer.
+pub(crate) fn take_packed_response_buffer_or_acquire_empty(
+    conn: &mut crate::stream::ConnectionStream,
+    pool: &crate::pool::BufferPool,
+) -> crate::pool::PooledBuffer {
+    let Some((mut buffer, range)) = conn.take_leading_pooled_pending_input() else {
+        return pool.acquire();
+    };
+    buffer.expose_initialized_range_without_copying(range);
+    buffer
+}
+
 async fn write_response_chunk_preserving_suffix_on_error<W>(
     writer: &mut W,
     io_buffer: &mut crate::pool::PooledBuffer,
@@ -256,6 +268,93 @@ struct IncompleteMultilineWireChunk {
 }
 
 impl IncompleteMultilineWireChunk {
+    #[allow(clippy::too_many_arguments)]
+    async fn compact_packed_prefix_and_write_with_next_backend_chunk<W>(
+        self,
+        writer: &mut W,
+        current_len: usize,
+        framer: &mut MultilineFramer,
+        io_buffer: &mut crate::pool::PooledBuffer,
+        conn: &mut crate::stream::ConnectionStream,
+        pool: &crate::pool::BufferPool,
+        backend_id: crate::types::BackendId,
+    ) -> Result<ResponseWriteStats, crate::session::response_transfer::ResponseTransferError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let initial_response_start = self.response.start;
+        let n = io_buffer.read_more(conn).await.map_err(|e| {
+            crate::session::response_transfer::ResponseTransferError::Io(
+                anyhow::Error::from(e).context("Failed to read remaining response body"),
+            )
+        })?;
+        if n == 0 {
+            return Err(
+                crate::session::response_transfer::ResponseTransferError::BackendEof {
+                    backend_id,
+                    bytes_received: self.response.len() as u64,
+                },
+            );
+        }
+        let total_len = current_len + n;
+
+        match framer.frame_next_multiline_chunk(self, &io_buffer[current_len..total_len]) {
+            FramedMultilineChunk::Complete(complete) => {
+                let combined_response = initial_response_start..current_len + complete.response.end;
+                let combined_next_response = current_len + complete.next_response_input.start
+                    ..current_len + complete.next_response_input.end;
+                write_response_chunk_preserving_suffix_on_error(
+                    writer,
+                    io_buffer,
+                    conn,
+                    pool,
+                    total_len,
+                    &combined_response,
+                    &combined_next_response,
+                )
+                .await
+            }
+            FramedMultilineChunk::Incomplete(incomplete) => {
+                let combined_response =
+                    initial_response_start..current_len + incomplete.response.end;
+                let bytes_received = combined_response.len() as u64;
+                if let Err(error) = writer
+                    .write_all(&io_buffer[combined_response.clone()])
+                    .await
+                {
+                    consume_remaining_multiline_response(
+                        framer,
+                        incomplete,
+                        io_buffer,
+                        conn,
+                        backend_id,
+                        bytes_received,
+                    )
+                    .await?;
+                    return Err(
+                        crate::session::response_transfer::ResponseTransferError::ClientDisconnect(
+                            error,
+                        ),
+                    );
+                }
+                let mut stats = ResponseWriteStats::default();
+                stats.add_chunk(combined_response.len());
+                incomplete
+                    .write_after_current_chunk(
+                        writer,
+                        framer,
+                        io_buffer,
+                        conn,
+                        pool,
+                        backend_id,
+                        stats,
+                        bytes_received,
+                    )
+                    .await
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn write_and_consume_response<W>(
         self,
@@ -1248,17 +1347,32 @@ where
                 .await?
         }
         FramedMultilineChunk::Incomplete(incomplete) => {
-            incomplete
-                .write_and_consume_response(
-                    writer,
-                    initial_len,
-                    &mut framer,
-                    io_buffer,
-                    conn,
-                    pool,
-                    backend_id,
-                )
-                .await?
+            if io_buffer.is_exposed_range_view() && io_buffer.has_remaining_fixed_writable_region()
+            {
+                incomplete
+                    .compact_packed_prefix_and_write_with_next_backend_chunk(
+                        writer,
+                        initial_len,
+                        &mut framer,
+                        io_buffer,
+                        conn,
+                        pool,
+                        backend_id,
+                    )
+                    .await?
+            } else {
+                incomplete
+                    .write_and_consume_response(
+                        writer,
+                        initial_len,
+                        &mut framer,
+                        io_buffer,
+                        conn,
+                        pool,
+                        backend_id,
+                    )
+                    .await?
+            }
         }
     };
     stats.record();
@@ -2146,6 +2260,8 @@ mod tests {
     #[derive(Default)]
     struct RecordingWriter {
         bytes: Vec<u8>,
+        scalar_writes: usize,
+        vectored_writes: usize,
     }
 
     #[test]
@@ -2187,8 +2303,26 @@ mod tests {
             _cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
+            self.scalar_writes += 1;
             self.bytes.extend_from_slice(buf);
             Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bufs: &[io::IoSlice<'_>],
+        ) -> Poll<io::Result<usize>> {
+            self.vectored_writes += 1;
+            let written = bufs.iter().map(|buf| buf.len()).sum();
+            for buf in bufs {
+                self.bytes.extend_from_slice(buf);
+            }
+            Poll::Ready(Ok(written))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
         }
 
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -2871,6 +3005,203 @@ mod tests {
             1,
             "draining pooled pending input should return the original buffer"
         );
+    }
+
+    #[tokio::test]
+    async fn ordered_response_reuses_packed_suffix_buffer_without_copying() {
+        let first_response = b"220 article\r\nbody\r\n.\r\n";
+        let next_response = b"223 0 <next>\r\n";
+        let mut chunk = Vec::from(first_response.as_slice());
+        chunk.extend_from_slice(next_response);
+
+        let pool = make_pool();
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(&chunk);
+        let packed_buffer_ptr = io_buffer.allocation_ptr();
+        let request = crate::protocol::RequestContext::parse(b"ARTICLE <test@example>\r\n")
+            .expect("valid request");
+        let mut conn = loopback_connection_stream().await;
+        let mut writer = Vec::new();
+
+        write_response(
+            &request,
+            &mut io_buffer,
+            &mut conn,
+            &mut writer,
+            &pool,
+            crate::types::BackendId::from_index(1),
+        )
+        .await
+        .expect("complete multiline response should write");
+        drop(io_buffer);
+
+        let next_buffer = take_packed_response_buffer_or_acquire_empty(&mut conn, &pool);
+
+        assert_eq!(next_buffer.allocation_ptr(), packed_buffer_ptr);
+        assert_eq!(next_buffer.as_ref(), next_response);
+        assert!(!conn.has_pending_bytes());
+    }
+
+    #[tokio::test]
+    async fn repeated_packed_responses_keep_reusing_the_original_buffer() {
+        let first_response = b"220 first\r\nfirst body\r\n.\r\n";
+        let second_response = b"220 second\r\nsecond body\r\n.\r\n";
+        let third_response = b"223 0 <third>\r\n";
+        let mut chunk = Vec::from(first_response.as_slice());
+        chunk.extend_from_slice(second_response);
+        chunk.extend_from_slice(third_response);
+
+        let pool = make_pool();
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(&chunk);
+        let original_allocation = io_buffer.allocation_ptr();
+        let request = crate::protocol::RequestContext::parse(b"ARTICLE <test@example>\r\n")
+            .expect("valid request");
+        let mut conn = loopback_connection_stream().await;
+        let mut writer = Vec::new();
+
+        write_response(
+            &request,
+            &mut io_buffer,
+            &mut conn,
+            &mut writer,
+            &pool,
+            crate::types::BackendId::from_index(1),
+        )
+        .await
+        .expect("first response should write");
+        drop(io_buffer);
+
+        let mut second_buffer = take_packed_response_buffer_or_acquire_empty(&mut conn, &pool);
+        assert_eq!(second_buffer.allocation_ptr(), original_allocation);
+        assert_eq!(second_buffer.as_ref(), &chunk[first_response.len()..]);
+        writer.clear();
+        write_response(
+            &request,
+            &mut second_buffer,
+            &mut conn,
+            &mut writer,
+            &pool,
+            crate::types::BackendId::from_index(1),
+        )
+        .await
+        .expect("second response should write");
+        assert_eq!(writer, second_response);
+        drop(second_buffer);
+
+        let third_buffer = take_packed_response_buffer_or_acquire_empty(&mut conn, &pool);
+        assert_eq!(third_buffer.allocation_ptr(), original_allocation);
+        assert_eq!(third_buffer.as_ref(), third_response);
+        assert!(!conn.has_pending_bytes());
+    }
+
+    #[tokio::test]
+    async fn packed_multiline_prefix_and_completion_use_one_contiguous_write_at_every_split() {
+        let response = b"220 article\r\nbody\r\n.\r\n";
+        let next_response = b"223 0 <next>\r\n";
+        let status_line_len = b"220 article\r\n".len();
+        let request = crate::protocol::RequestContext::parse(b"ARTICLE <test@example>\r\n")
+            .expect("valid request");
+
+        for split in status_line_len..response.len() {
+            let pool = make_pool();
+            let mut packed = b"discard".to_vec();
+            packed.extend_from_slice(&response[..split]);
+            let mut io_buffer = pool.acquire();
+            io_buffer.copy_from_slice(&packed);
+            io_buffer.expose_initialized_range_without_copying(7..packed.len());
+            let mut continuation = response[split..].to_vec();
+            continuation.extend_from_slice(next_response);
+            let mut conn = mock_backend_conn(vec![continuation]).await;
+            let mut writer = RecordingWriter::default();
+
+            let written = write_response(
+                &request,
+                &mut io_buffer,
+                &mut conn,
+                &mut writer,
+                &pool,
+                crate::types::BackendId::from_index(1),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("split={split}: {error}"));
+
+            assert_eq!(written, response.len() as u64, "split={split}");
+            assert_eq!(writer.bytes, response, "split={split}");
+            assert_eq!(writer.scalar_writes, 1, "split={split}");
+            assert_eq!(writer.vectored_writes, 0, "split={split}");
+            let mut pending = vec![0; next_response.len()];
+            conn.read_exact(&mut pending).await.unwrap();
+            assert_eq!(pending, next_response, "split={split}");
+        }
+    }
+
+    #[tokio::test]
+    async fn packed_contiguous_write_failure_preserves_the_next_response_at_every_split() {
+        let response = b"220 article\r\nbody\r\n.\r\n";
+        let next_response = b"223 0 <next>\r\n";
+        let status_line_len = b"220 article\r\n".len();
+        let request = crate::protocol::RequestContext::parse(b"ARTICLE <test@example>\r\n")
+            .expect("valid request");
+
+        for split in status_line_len..response.len() {
+            let pool = make_pool();
+            let mut packed = b"discard".to_vec();
+            packed.extend_from_slice(&response[..split]);
+            let mut io_buffer = pool.acquire();
+            io_buffer.copy_from_slice(&packed);
+            io_buffer.expose_initialized_range_without_copying(7..packed.len());
+            let mut continuation = response[split..].to_vec();
+            continuation.extend_from_slice(next_response);
+            let mut conn = mock_backend_conn(vec![continuation]).await;
+            let mut writer = FailingWriter;
+
+            let error = write_response(
+                &request,
+                &mut io_buffer,
+                &mut conn,
+                &mut writer,
+                &pool,
+                crate::types::BackendId::from_index(1),
+            )
+            .await;
+
+            assert!(
+                matches!(error, Err(ResponseTransferError::ClientDisconnect(_))),
+                "split={split}"
+            );
+            let mut pending = vec![0; next_response.len()];
+            conn.read_exact(&mut pending).await.unwrap();
+            assert_eq!(pending, next_response, "split={split}");
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_incomplete_multiline_response_keeps_streaming_scalar_writes() {
+        let first = b"220 article\r\nbody";
+        let rest = b"\r\n.\r\n";
+        let request = crate::protocol::RequestContext::parse(b"ARTICLE <test@example>\r\n")
+            .expect("valid request");
+        let pool = make_pool();
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(first);
+        let mut conn = mock_backend_conn(vec![rest.to_vec()]).await;
+        let mut writer = RecordingWriter::default();
+
+        write_response(
+            &request,
+            &mut io_buffer,
+            &mut conn,
+            &mut writer,
+            &pool,
+            crate::types::BackendId::from_index(1),
+        )
+        .await
+        .expect("ordinary streaming response should write");
+
+        assert_eq!(writer.bytes, [first.as_slice(), rest.as_slice()].concat());
+        assert_eq!(writer.scalar_writes, 2);
+        assert_eq!(writer.vectored_writes, 0);
     }
 
     #[tokio::test]
