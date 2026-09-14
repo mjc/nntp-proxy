@@ -66,8 +66,17 @@ enum ReadMode {
 #[derive(Default)]
 struct BufferStorage {
     bytes: BytesMut,
-    hidden_prefix: Option<BytesMut>,
+    state: BufferState,
     allocation_capacity: usize,
+}
+
+#[derive(Default)]
+enum BufferState {
+    #[default]
+    Contiguous,
+    Retained {
+        prefix: BytesMut,
+    },
 }
 
 impl BufferStorage {
@@ -75,7 +84,7 @@ impl BufferStorage {
         let allocation_capacity = bytes.capacity();
         Self {
             bytes,
-            hidden_prefix: None,
+            state: BufferState::Contiguous,
             allocation_capacity,
         }
     }
@@ -92,13 +101,13 @@ impl BufferStorage {
 
     #[inline]
     fn clear(&mut self) {
-        self.restore_hidden_prefix();
+        self.restore_contiguous();
         self.bytes.clear();
     }
 
     #[inline]
     fn clear_for_fresh_read(&mut self) {
-        self.restore_hidden_prefix();
+        self.restore_contiguous();
         self.bytes.clear();
     }
 
@@ -126,15 +135,20 @@ impl BufferStorage {
         let mut visible = self.bytes.split_off(range.start);
         visible.truncate(range.len());
         let newly_hidden_prefix = std::mem::replace(&mut self.bytes, visible);
-        if let Some(prefix) = &mut self.hidden_prefix {
-            prefix.unsplit(newly_hidden_prefix);
-        } else {
-            self.hidden_prefix = Some(newly_hidden_prefix);
+        match &mut self.state {
+            BufferState::Contiguous => {
+                self.state = BufferState::Retained {
+                    prefix: newly_hidden_prefix,
+                };
+            }
+            BufferState::Retained { prefix } => {
+                prefix.unsplit(newly_hidden_prefix);
+            }
         }
     }
 
     fn compact_visible(&mut self) {
-        let Some(mut prefix) = self.hidden_prefix.take() else {
+        let BufferState::Retained { mut prefix } = std::mem::take(&mut self.state) else {
             return;
         };
         let prefix_len = prefix.len();
@@ -146,13 +160,15 @@ impl BufferStorage {
     }
 
     fn compact_visible_if_full(&mut self) {
-        if self.hidden_prefix.is_some() && self.bytes.capacity() == self.bytes.len() {
+        if matches!(self.state, BufferState::Retained { .. })
+            && self.bytes.capacity() == self.bytes.len()
+        {
             self.compact_visible();
         }
     }
 
-    fn restore_hidden_prefix(&mut self) {
-        let Some(mut prefix) = self.hidden_prefix.take() else {
+    fn restore_contiguous(&mut self) {
+        let BufferState::Retained { mut prefix } = std::mem::take(&mut self.state) else {
             return;
         };
         prefix.unsplit(std::mem::take(&mut self.bytes));
@@ -164,7 +180,7 @@ impl BufferStorage {
     }
 
     fn take(&mut self) -> BytesMut {
-        drop(self.hidden_prefix.take());
+        self.state = BufferState::Contiguous;
         self.allocation_capacity = 0;
         std::mem::take(&mut self.bytes)
     }
@@ -172,7 +188,7 @@ impl BufferStorage {
     fn restore(&mut self, bytes: BytesMut) {
         self.allocation_capacity = bytes.capacity();
         self.bytes = bytes;
-        self.hidden_prefix = None;
+        self.state = BufferState::Contiguous;
     }
 
     async fn read_from<R>(&mut self, reader: &mut R, read_len: usize) -> std::io::Result<usize>
@@ -301,7 +317,7 @@ impl PooledBuffer {
 
     #[must_use]
     pub(crate) fn is_exposed_range_view(&self) -> bool {
-        self.buffer.hidden_prefix.is_some()
+        matches!(self.buffer.state, BufferState::Retained { .. })
     }
 
     #[must_use]
@@ -311,10 +327,10 @@ impl PooledBuffer {
 
     #[cfg(test)]
     pub(crate) fn allocation_ptr(&self) -> *const u8 {
-        self.buffer
-            .hidden_prefix
-            .as_ref()
-            .map_or_else(|| self.buffer.bytes.as_ptr(), |prefix| prefix.as_ptr())
+        match &self.buffer.state {
+            BufferState::Contiguous => self.buffer.bytes.as_ptr(),
+            BufferState::Retained { prefix } => prefix.as_ptr(),
+        }
     }
 
     /// Copy data into buffer and mark as initialized
