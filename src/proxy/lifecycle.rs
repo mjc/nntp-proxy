@@ -402,6 +402,8 @@ impl NntpProxy {
     ///
     /// This creates a session with the router, allowing commands from this client
     /// to be routed to different backends based on load balancing.
+    /// The boxed entry-point future keeps instrumentation wrappers from expanding
+    /// the complete session state machine into their own generated future types.
     pub fn handle_client_per_command_routing(
         &self,
         client_stream: TcpStream,
