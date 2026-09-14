@@ -42,6 +42,7 @@ CLIENT_PROCESSES=${CLIENT_PROCESSES:-1}
 CLIENT_THREADS=${CLIENT_THREADS:-4}
 CLIENT_PIPELINE_DEPTH=${CLIENT_PIPELINE_DEPTH:-32}
 CLIENT_COMMAND_MIX=${CLIENT_COMMAND_MIX:-article}
+NNTPBENCH_VERIFICATION_POLICY=${NNTPBENCH_VERIFICATION_POLICY:-full}
 case "$(uname -s)" in
     Darwin)
         DEFAULT_SOCKET_BUFFER_SIZE=0
@@ -569,6 +570,7 @@ run_client_load() {
             --threads "$CLIENT_THREADS"
             --pipeline-depth "$CLIENT_PIPELINE_DEPTH"
             --command-mix "$CLIENT_COMMAND_MIX"
+            --verification-policy "$NNTPBENCH_VERIFICATION_POLICY"
             --socket-recv-buffer "$CLIENT_SOCKET_RECV_BUFFER"
             --socket-send-buffer "$CLIENT_SOCKET_SEND_BUFFER"
             --stats-interval-secs 0
@@ -628,6 +630,7 @@ PY
             --client-offset "$offset"
             --total-clients "$clients"
             --command-mix "$CLIENT_COMMAND_MIX"
+            --verification-policy "$NNTPBENCH_VERIFICATION_POLICY"
             --socket-recv-buffer "$CLIENT_SOCKET_RECV_BUFFER"
             --socket-send-buffer "$CLIENT_SOCKET_SEND_BUFFER"
             --stats-interval-secs 0
@@ -794,6 +797,7 @@ MEASURED_PORT="$(reserve_port)"
 SCENARIO_TRANSFER_BYTES="$(resolve_transfer_bytes_per_scenario)"
 
 echo "Scenario target: requests=${REQUESTS_PER_SCENARIO:-0} transfer_bytes=$SCENARIO_TRANSFER_BYTES repeat_factor=$TRANSFER_REPEAT_FACTOR"
+echo "nntpbench_verification_policy=$NNTPBENCH_VERIFICATION_POLICY client_pipeline_depth=$CLIENT_PIPELINE_DEPTH"
 
 build_proxy_binary
 build_nntpbench_binary
