@@ -41,9 +41,10 @@ run cargo deny check advisories
 
 tree_for bincode
 tree_for paste
-tree_for proc-macro-error2
+tree_for proc-macro-error3
+tree_for gungraun
 
 echo
 echo "Upstream projects to watch:"
 echo "- foyer: https://github.com/foyer-rs/foyer"
-echo "- iai-callgrind: https://github.com/iai-callgrind/iai-callgrind"
+echo "- gungraun: https://github.com/gungraun/gungraun"

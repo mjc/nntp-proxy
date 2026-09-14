@@ -47,8 +47,7 @@ impl FixedSink {
 }
 
 #[inline]
-fn write_request_slices(sink: &mut FixedSink, request: &RequestContext) -> usize {
-    sink.clear();
+fn append_request_slices(sink: &mut FixedSink, request: &RequestContext) -> usize {
     sink.write(request.verb());
     if !request.args().is_empty() {
         sink.write(b" ");
@@ -56,6 +55,12 @@ fn write_request_slices(sink: &mut FixedSink, request: &RequestContext) -> usize
     }
     sink.write(b"\r\n");
     sink.len()
+}
+
+#[inline]
+fn write_request_slices(sink: &mut FixedSink, request: &RequestContext) -> usize {
+    sink.clear();
+    append_request_slices(sink, request)
 }
 
 fn request_context(line: &[u8]) -> RequestContext {
@@ -121,6 +126,48 @@ mod mixed_batch {
                 requests
                     .iter()
                     .map(|request| write_request_slices(black_box(&mut sink), black_box(request)))
+                    .sum::<usize>()
+            });
+    }
+}
+
+mod upstream_window {
+    use super::{Bencher, FixedSink, append_request_slices, black_box, request_context};
+
+    const WINDOW: &[&str] = &[
+        "ARTICLE <a00@example.com>\r\n",
+        "ARTICLE <a01@example.com>\r\n",
+        "ARTICLE <a02@example.com>\r\n",
+        "ARTICLE <a03@example.com>\r\n",
+        "ARTICLE <a04@example.com>\r\n",
+        "ARTICLE <a05@example.com>\r\n",
+        "ARTICLE <a06@example.com>\r\n",
+        "ARTICLE <a07@example.com>\r\n",
+        "ARTICLE <a08@example.com>\r\n",
+        "ARTICLE <a09@example.com>\r\n",
+        "ARTICLE <a10@example.com>\r\n",
+        "ARTICLE <a11@example.com>\r\n",
+        "ARTICLE <a12@example.com>\r\n",
+        "ARTICLE <a13@example.com>\r\n",
+        "ARTICLE <a14@example.com>\r\n",
+        "ARTICLE <a15@example.com>\r\n",
+    ];
+
+    #[divan::bench(sample_count = 1000, sample_size = 100)]
+    fn sixteen_article_window(bencher: Bencher) {
+        let requests = WINDOW
+            .iter()
+            .map(|line| request_context(line.as_bytes()))
+            .collect::<Vec<_>>();
+
+        bencher
+            .counter(divan::counter::ItemsCount::new(requests.len()))
+            .bench(|| {
+                let mut sink = FixedSink::default();
+                sink.clear();
+                requests
+                    .iter()
+                    .map(|request| append_request_slices(black_box(&mut sink), black_box(request)))
                     .sum::<usize>()
             });
     }

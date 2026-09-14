@@ -1,4 +1,4 @@
-//! Callgrind benchmarks for the real cache-miss proxy roundtrip path.
+//! Gungraun benchmarks for the real cache-miss proxy roundtrip path.
 //!
 //! These benches drive a client socket through a live per-command proxy with
 //! metadata-only cache enabled or no configured cache. Each `ARTICLE` request
@@ -17,7 +17,7 @@ macro_rules! supported {
 }
 
 supported! {
-    use iai_callgrind::{
+    use gungraun::{
         Callgrind, LibraryBenchmarkConfig, library_benchmark, library_benchmark_group, main,
     };
     use nntp_proxy::config::{Cache, Config, Server};
