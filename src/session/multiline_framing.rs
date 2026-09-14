@@ -2188,7 +2188,7 @@ pub fn benchmark_multiline_response(body_len: usize) -> Vec<u8> {
     response
 }
 
-/// Feed each read to the production framer, retaining only its rolling tail.
+/// Measure the production-path baseline while retaining only its rolling tail.
 #[cfg(feature = "framing-bench")]
 #[must_use]
 pub fn benchmark_incremental_multiline_frame(response: &[u8], chunk_size: usize) -> usize {
@@ -2206,7 +2206,7 @@ pub fn benchmark_incremental_multiline_frame(response: &[u8], chunk_size: usize)
     0
 }
 
-/// Control that rescans the entire accumulated response after every read.
+/// Measure the control path that repeats a full accumulated-response rescan.
 #[cfg(feature = "framing-bench")]
 #[must_use]
 pub fn benchmark_stateless_multiline_frame(response: &[u8], chunk_size: usize) -> usize {
