@@ -103,7 +103,7 @@ proptest = "1.11"  # Property-based testing for comprehensive coverage
 yenc = "0.2.2"  # For benchmark comparison only
 
 [target.'cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")))'.dev-dependencies]
-iai-callgrind = "0.16.1"  # Instruction-count benchmarking for hot path comparisons
+gungraun = "0.19.4"  # Callgrind instruction/branch/cache benchmarking
 
 [features]
 default = []

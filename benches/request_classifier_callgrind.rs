@@ -1,4 +1,4 @@
-//! Callgrind benchmarks for NNTP request verb classification.
+//! Gungraun benchmarks for NNTP request verb classification.
 //!
 //! The `request_line_*` benches exercise the current borrowed request-line parser.
 //!
@@ -14,7 +14,7 @@ macro_rules! supported {
 }
 
 supported! {
-    use iai_callgrind::{
+    use gungraun::{
         Callgrind, EntryPoint, LibraryBenchmarkConfig, library_benchmark, library_benchmark_group, main,
     };
     use nntp_proxy::protocol::{RequestContext, RequestKind};

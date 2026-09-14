@@ -132,6 +132,21 @@
       package = import ./nix/package.nix {
         inherit pkgs craneLib cargoToml;
       };
+
+      gungraunRunner = pkgs.rustPlatform.buildRustPackage rec {
+        pname = "gungraun-runner";
+        version = "0.19.4";
+        src = pkgs.fetchFromGitHub {
+          owner = "gungraun";
+          repo = "gungraun";
+          rev = "v${version}";
+          hash = "sha256-KWQ4wMNIdKY9FTmPd9ZdlSuCpQQBFhIKD2Ereo3JQaI=";
+        };
+        cargoHash = "sha256-+3toaUDLCmExC3EvNv1GEdUbHSBeShurp2Y+zvE/t0k=";
+        cargoBuildFlags = ["-p" pname];
+        cargoInstallFlags = ["-p" pname];
+        doCheck = false;
+      };
     in {
       apps.default =
         (flake-utils.lib.mkApp {
@@ -142,7 +157,7 @@
         };
 
       devShells.default = pkgs.mkShell {
-        nativeBuildInputs = basicNativeBuildInputs;
+        nativeBuildInputs = basicNativeBuildInputs ++ [gungraunRunner];
         buildInputs = devBuildInputs;
 
         shellHook = ''
