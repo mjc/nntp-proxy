@@ -778,7 +778,7 @@ async fn test_per_command_body_window_keeps_430_before_following_success() -> Re
     .await?;
 
     assert_eq!(
-        read_line(&mut reader, "missing presend response").await?,
+        read_line(&mut reader, "missing upstream-window response").await?,
         "430 No such article\r\n",
     );
     assert_eq!(

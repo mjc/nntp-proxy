@@ -275,20 +275,22 @@ where
 
 /// Read a response for a request that was already written as part of an
 /// upstream pipeline window.
-pub(crate) async fn read_presend_request_classified<C>(
-    conn: &mut C,
+pub(crate) async fn read_classified_response_for_already_sent_request(
+    conn: &mut crate::stream::ConnectionStream,
     request: &RequestContext,
-    buffer: &mut PooledBuffer,
-) -> Result<BackendReadResult>
-where
-    C: AsyncReadExt + Unpin,
-{
-    let n = buffer.read_from(conn).await?;
-    if n == 0 {
-        anyhow::bail!("Backend connection closed unexpectedly");
+    pool: &crate::pool::BufferPool,
+) -> Result<(BackendReadResult, PooledBuffer)> {
+    let mut buffer =
+        crate::session::multiline_framing::take_packed_response_buffer_or_acquire_empty(conn, pool);
+    if buffer.initialized() == 0 {
+        let n = buffer.read_from(conn).await?;
+        if n == 0 {
+            anyhow::bail!("Backend connection closed unexpectedly");
+        }
     }
 
-    read_until_backend_reply(conn, request, buffer).await
+    let read = read_until_backend_reply(conn, request, &mut buffer).await?;
+    Ok((read, buffer))
 }
 
 pub(crate) async fn execute_request_classified_timed<C>(

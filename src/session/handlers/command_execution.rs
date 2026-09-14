@@ -143,7 +143,7 @@ enum BackendReadAttemptError {
     Backend(anyhow::Error),
 }
 
-pub(super) enum PresendResponseError {
+pub(super) enum AlreadySentResponseError {
     Read(anyhow::Error),
     Transfer(ResponseTransferError),
 }
@@ -1252,7 +1252,7 @@ impl ClientSession {
         Ok((response, buffer, timings))
     }
 
-    pub(super) async fn read_and_write_presend_response<W>(
+    pub(super) async fn forward_response_for_already_sent_request<W>(
         &self,
         conn: &mut crate::pool::ConnectionGuard,
         client_write: &mut W,
@@ -1260,20 +1260,22 @@ impl ClientSession {
         request: &mut RequestContext,
         availability: &mut crate::cache::ArticleAvailability,
         backend_to_client_bytes: &mut BackendToClientBytes,
-    ) -> Result<crate::session::backend::BackendResponseComplete, PresendResponseError>
+    ) -> Result<crate::session::backend::BackendResponseComplete, AlreadySentResponseError>
     where
         W: AsyncWrite + Unpin,
     {
         let backend_id = backend.backend_id();
-        let mut buffer = self.buffer_pool.acquire();
-        let read =
-            backend::read_presend_request_classified(conn.stream_mut(), request, &mut buffer)
-                .await
-                .map_err(PresendResponseError::Read)?;
+        let (read, mut buffer) = backend::read_classified_response_for_already_sent_request(
+            conn.stream_mut(),
+            request,
+            &self.buffer_pool,
+        )
+        .await
+        .map_err(AlreadySentResponseError::Read)?;
         let Some(status_code) = read.status_code() else {
             read.log_warnings(&buffer, self.client_addr, backend_id);
-            return Err(PresendResponseError::Read(anyhow::anyhow!(
-                "backend returned an invalid response to a presend request"
+            return Err(AlreadySentResponseError::Read(anyhow::anyhow!(
+                "backend returned an invalid response to an already-sent request"
             )));
         };
 
@@ -1297,14 +1299,14 @@ impl ClientSession {
                 backend_id,
             )
             .await
-            .map_err(PresendResponseError::Transfer)?;
+            .map_err(AlreadySentResponseError::Transfer)?;
             self.send_430_to_client(client_write, backend_to_client_bytes)
                 .await
                 .map_err(|error| {
-                    PresendResponseError::Transfer(classify_response_write_err(error))
+                    AlreadySentResponseError::Transfer(classify_response_write_err(error))
                 })?;
             client_write.flush().await.map_err(|error| {
-                PresendResponseError::Transfer(classify_response_write_err(error))
+                AlreadySentResponseError::Transfer(classify_response_write_err(error))
             })?;
             return Ok(completion);
         }
@@ -1317,11 +1319,10 @@ impl ClientSession {
         let (bytes_written, completion) = self
             .write_response_to_client(conn.stream_mut(), client_write, backend, buffer, params)
             .await
-            .map_err(PresendResponseError::Transfer)?;
-        client_write
-            .flush()
-            .await
-            .map_err(|error| PresendResponseError::Transfer(classify_response_write_err(error)))?;
+            .map_err(AlreadySentResponseError::Transfer)?;
+        client_write.flush().await.map_err(|error| {
+            AlreadySentResponseError::Transfer(classify_response_write_err(error))
+        })?;
         self.record_response_metrics(
             backend_id,
             request,
