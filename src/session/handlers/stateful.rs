@@ -14,6 +14,8 @@ use tracing::{debug, error, warn};
 
 use crate::constants::buffer::READER_CAPACITY;
 
+const MAX_UPSTREAM_PIPELINE_DEPTH: usize = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::session) enum StatefulConnectionDisposition {
     RetireClient,
@@ -257,10 +259,6 @@ impl ClientSession {
                     .write_wire_to(backend_write)
                     .await
                     .map_err(|error| StatefulLoopError::backend(error.into()))?;
-                backend_write
-                    .flush()
-                    .await
-                    .map_err(|error| StatefulLoopError::backend(error.into()))?;
                 state.add_client_to_backend(request.request_wire_len().get());
                 state.mark_backend_request_sent(request.kind());
             }
@@ -446,6 +444,10 @@ impl ClientSession {
         BW: tokio::io::AsyncWrite + Unpin,
     {
         let mut command_reader = StatefulCommandReader::new();
+        // Keep a small upstream window open while the client is producing
+        // commands. Replies are still consumed and ordered by the framer below;
+        // this counter only controls when buffered request bytes are flushed.
+        let mut pending_backend_writes = 0usize;
 
         let exit = loop {
             // Periodic metrics flush
@@ -470,6 +472,13 @@ impl ClientSession {
             }
 
             if matches!(state.read_mode(), StatefulReadMode::DrainBackendReplies) {
+                if pending_backend_writes != 0 {
+                    backend_write
+                        .flush()
+                        .await
+                        .map_err(|error| StatefulLoopError::backend(error.into()))?;
+                    pending_backend_writes = 0;
+                }
                 match self.read_stateful_backend_bytes(&mut backend_read).await {
                     Ok(Some((buffer, len))) => {
                         self.write_stateful_backend_bytes(
@@ -537,6 +546,15 @@ impl ClientSession {
                                     &mut state,
                                 )
                                 .await?;
+                                pending_backend_writes =
+                                    pending_backend_writes.saturating_add(1);
+                                if pending_backend_writes >= MAX_UPSTREAM_PIPELINE_DEPTH {
+                                    backend_write
+                                        .flush()
+                                        .await
+                                        .map_err(|error| StatefulLoopError::backend(error.into()))?;
+                                    pending_backend_writes = 0;
+                                }
                             } else {
                                 // Auth path
                                 let auth_result = common::handle_stateful_auth_check(
@@ -567,6 +585,13 @@ impl ClientSession {
 
                 // Backend → Client
                 result = self.read_stateful_backend_bytes(&mut backend_read) => {
+                    if pending_backend_writes != 0 {
+                        backend_write
+                            .flush()
+                            .await
+                            .map_err(|error| StatefulLoopError::backend(error.into()))?;
+                        pending_backend_writes = 0;
+                    }
                     match result {
                         Ok(Some((buffer, len))) => {
                             // Complete output after select! returns so client readiness cannot
@@ -807,6 +832,63 @@ mod tests {
             .expect("stateful proxy did not stop")
             .expect("stateful proxy task panicked")
             .expect("stateful proxy failed");
+        backend.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn upstream_window_releases_two_commands_before_backend_replies() {
+        let session = test_session();
+        let state = SessionLoopState::new(false);
+        let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
+        let (backend_end, proxy_backend_end) = tokio::io::duplex(4096);
+
+        let backend = tokio::spawn(async move {
+            let (backend_read, mut backend_write) = tokio::io::split(backend_end);
+            let mut reader = BufReader::new(backend_read);
+            let mut first = String::new();
+            let mut second = String::new();
+            reader.read_line(&mut first).await.unwrap();
+            reader.read_line(&mut second).await.unwrap();
+            assert_eq!(first, "DATE\r\n");
+            assert_eq!(second, "DATE\r\n");
+            backend_write
+                .write_all(b"111 first\r\n111 second\r\n")
+                .await
+                .unwrap();
+        });
+
+        client_end.write_all(b"DATE\r\nDATE\r\n").await.unwrap();
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
+        let client_reader = BufReader::new(proxy_client_read);
+        let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
+        let proxy = tokio::spawn(async move {
+            session
+                .run_stateful_proxy_loop(
+                    client_reader,
+                    proxy_client_write,
+                    backend_read,
+                    backend_write,
+                    state,
+                    BackendId::from_index(0),
+                )
+                .await
+        });
+
+        let mut responses = [0u8; b"111 first\r\n111 second\r\n".len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            tokio::io::AsyncReadExt::read_exact(&mut client_end, &mut responses),
+        )
+        .await
+        .expect("client did not receive both ordered replies")
+        .unwrap();
+        assert_eq!(&responses, b"111 first\r\n111 second\r\n");
+
+        drop(client_end);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), proxy)
+            .await
+            .expect("stateful proxy did not stop")
+            .expect("stateful proxy task panicked");
         backend.await.unwrap();
     }
 
