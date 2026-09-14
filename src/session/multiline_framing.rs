@@ -226,7 +226,7 @@ fn queue_packed_next_response_input(
 }
 
 /// Reuse the framer-owned packed suffix, or acquire an empty read buffer.
-pub(crate) fn take_packed_response_buffer_or_acquire_empty(
+pub(crate) fn take_queued_input_or_acquire_empty(
     conn: &mut crate::stream::ConnectionStream,
     pool: &crate::pool::BufferPool,
 ) -> crate::pool::PooledBuffer {
@@ -3035,7 +3035,7 @@ mod tests {
         .expect("complete multiline response should write");
         drop(io_buffer);
 
-        let next_buffer = take_packed_response_buffer_or_acquire_empty(&mut conn, &pool);
+        let next_buffer = take_queued_input_or_acquire_empty(&mut conn, &pool);
 
         assert_eq!(next_buffer.allocation_ptr(), packed_buffer_ptr);
         assert_eq!(next_buffer.as_ref(), next_response);
@@ -3072,7 +3072,7 @@ mod tests {
         .expect("first response should write");
         drop(io_buffer);
 
-        let mut second_buffer = take_packed_response_buffer_or_acquire_empty(&mut conn, &pool);
+        let mut second_buffer = take_queued_input_or_acquire_empty(&mut conn, &pool);
         assert_eq!(second_buffer.allocation_ptr(), original_allocation);
         assert_eq!(second_buffer.as_ref(), &chunk[first_response.len()..]);
         writer.clear();
@@ -3089,7 +3089,7 @@ mod tests {
         assert_eq!(writer, second_response);
         drop(second_buffer);
 
-        let third_buffer = take_packed_response_buffer_or_acquire_empty(&mut conn, &pool);
+        let third_buffer = take_queued_input_or_acquire_empty(&mut conn, &pool);
         assert_eq!(third_buffer.allocation_ptr(), original_allocation);
         assert_eq!(third_buffer.as_ref(), third_response);
         assert!(!conn.has_pending_bytes());

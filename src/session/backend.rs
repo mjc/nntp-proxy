@@ -281,7 +281,7 @@ pub(crate) async fn read_classified_response_for_already_sent_request(
     pool: &crate::pool::BufferPool,
 ) -> Result<(BackendReadResult, PooledBuffer)> {
     let mut buffer =
-        crate::session::multiline_framing::take_packed_response_buffer_or_acquire_empty(conn, pool);
+        crate::session::multiline_framing::take_queued_input_or_acquire_empty(conn, pool);
     if buffer.initialized() == 0 {
         let n = buffer.read_from(conn).await?;
         if n == 0 {
