@@ -148,17 +148,17 @@ struct BenchProxy {
 }
 
 impl BenchProxy {
-    async fn start(body_len: usize, cache: Option<Cache>) -> Self {
+    async fn start(body_len: usize, cache: Option<Cache>, mode: RoutingMode) -> Self {
         let backend_listener = bind_localhost().await;
         let backend_port = backend_listener.local_addr().unwrap().port();
         spawn_backend(backend_listener, article_response(body_len).into());
 
         let proxy_listener = bind_localhost().await;
         let proxy_addr = proxy_listener.local_addr().unwrap();
-        let proxy = NntpProxy::new(bench_config(backend_port, cache), RoutingMode::PerCommand)
+        let proxy = NntpProxy::new(bench_config(backend_port, cache), mode)
             .await
             .unwrap();
-        spawn_proxy(proxy_listener, proxy, RoutingMode::PerCommand);
+        spawn_proxy(proxy_listener, proxy, mode);
 
         let mut stream = TcpStream::connect(proxy_addr).await.unwrap();
         stream.set_nodelay(true).unwrap();
@@ -172,7 +172,7 @@ impl BenchProxy {
 
         Self {
             stream,
-            response_buffer: vec![0; body_len + 512].into_boxed_slice(),
+            response_buffer: vec![0; body_len.saturating_mul(2) + 1024].into_boxed_slice(),
             response_len: article_response(body_len).len(),
         }
     }
@@ -186,6 +186,19 @@ impl BenchProxy {
             &mut self.stream,
             &mut self.response_buffer,
             self.response_len,
+        )
+        .await
+    }
+
+    async fn article_window_roundtrip(&mut self) -> usize {
+        self.stream
+            .write_all(b"ARTICLE <bench@example.com>\r\nARTICLE <bench@example.com>\r\n")
+            .await
+            .unwrap();
+        read_exact_response_into(
+            &mut self.stream,
+            &mut self.response_buffer,
+            self.response_len.saturating_mul(2),
         )
         .await
     }
@@ -219,7 +232,7 @@ async fn read_exact_response_into(
 
 fn bench_roundtrip(bencher: Bencher, body_len: usize, cache: Option<Cache>, warm_cache: bool) {
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
-    let mut proxy = rt.block_on(BenchProxy::start(body_len, cache));
+    let mut proxy = rt.block_on(BenchProxy::start(body_len, cache, RoutingMode::PerCommand));
     if warm_cache {
         let bytes = rt.block_on(proxy.article_roundtrip());
         assert!(bytes > body_len);
@@ -230,6 +243,25 @@ fn bench_roundtrip(bencher: Bencher, body_len: usize, cache: Option<Cache>, warm
             let bytes = rt.block_on(proxy.article_roundtrip());
             black_box(bytes)
         });
+}
+
+fn bench_window(bencher: Bencher, body_len: usize, mode: RoutingMode) {
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    let mut proxy = rt.block_on(BenchProxy::start(body_len, None, mode));
+    bencher
+        .counter(divan::counter::BytesCount::new(body_len.saturating_mul(2)))
+        .bench_local(|| {
+            let bytes = rt.block_on(proxy.article_window_roundtrip());
+            black_box(bytes)
+        });
+}
+
+fn bench_stateful_window(bencher: Bencher, body_len: usize) {
+    bench_window(bencher, body_len, RoutingMode::Stateful);
+}
+
+fn bench_per_command_pair(bencher: Bencher, body_len: usize) {
+    bench_window(bencher, body_len, RoutingMode::PerCommand);
 }
 
 mod backend_roundtrip {
@@ -314,5 +346,19 @@ mod cache_miss_roundtrip {
             Some(metadata_only_cache()),
             false,
         );
+    }
+}
+
+mod stateful_upstream_window {
+    use super::{ARTICLE_64K, Bencher, bench_per_command_pair, bench_stateful_window};
+
+    #[divan::bench(sample_count = 50, sample_size = 5)]
+    fn article_pair_64k(bencher: Bencher) {
+        bench_stateful_window(bencher, ARTICLE_64K);
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 5)]
+    fn per_command_pair_64k(bencher: Bencher) {
+        bench_per_command_pair(bencher, ARTICLE_64K);
     }
 }
