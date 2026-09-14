@@ -7,8 +7,6 @@
 //!
 //! Run with: `cargo bench --bench cache_miss_roundtrip_callgrind`
 
-#![recursion_limit = "256"]
-
 macro_rules! supported {
     ($($item:item)*) => {
         $(
