@@ -11,6 +11,7 @@
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ops::Range;
+use std::sync::LazyLock;
 
 use anyhow::Context;
 use smallvec::SmallVec;
@@ -19,6 +20,9 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
 const TERMINATOR_TAIL_SIZE: usize = 4;
 const MAX_CAPTURED_MULTILINE_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+static TERMINATOR_FINDER: LazyLock<memchr::memmem::Finder<'static>> =
+    LazyLock::new(|| memchr::memmem::Finder::new(TERMINATOR));
 
 #[must_use]
 pub(crate) fn cached_response_completion() -> std::io::IoSlice<'static> {
@@ -2170,7 +2174,57 @@ fn find_terminator_end(data: &[u8]) -> Option<usize> {
 
 #[inline]
 fn terminator_ends(data: &[u8]) -> impl Iterator<Item = usize> + '_ {
-    memchr::memmem::find_iter(data, TERMINATOR).map(|found| found + TERMINATOR.len())
+    TERMINATOR_FINDER
+        .find_iter(data)
+        .map(|found| found + TERMINATOR.len())
+}
+
+#[cfg(feature = "framing-bench")]
+#[must_use]
+pub fn benchmark_multiline_response(body_len: usize) -> Vec<u8> {
+    let mut response = b"220 42 <benchmark@example.com>\r\n".to_vec();
+    response.extend(std::iter::repeat_n(b'x', body_len));
+    response.extend_from_slice(TERMINATOR);
+    response
+}
+
+/// Feed each read to the production framer, retaining only its rolling tail.
+#[cfg(feature = "framing-bench")]
+#[must_use]
+pub fn benchmark_incremental_multiline_frame(response: &[u8], chunk_size: usize) -> usize {
+    let mut framer = MultilineFramer::default();
+    let chunk_size = chunk_size.max(1);
+
+    for chunk in response.chunks(chunk_size) {
+        if let Ok(FramedMultilineChunk::Complete(complete)) =
+            framer.split_chunk(chunk, PackedPendingBytesPolicy::AllowIfStatusPrefix)
+        {
+            return complete.response.end;
+        }
+    }
+
+    0
+}
+
+/// Control that rescans the entire accumulated response after every read.
+#[cfg(feature = "framing-bench")]
+#[must_use]
+pub fn benchmark_stateless_multiline_frame(response: &[u8], chunk_size: usize) -> usize {
+    let chunk_size = chunk_size.max(1);
+    let mut received = 0;
+
+    for chunk in response.chunks(chunk_size) {
+        received += chunk.len();
+        let mut framer = MultilineFramer::default();
+        if let Ok(FramedMultilineChunk::Complete(complete)) = framer.split_chunk(
+            &response[..received],
+            PackedPendingBytesPolicy::AllowIfStatusPrefix,
+        ) {
+            return complete.response.end;
+        }
+    }
+
+    0
 }
 
 #[inline]
@@ -3752,6 +3806,48 @@ mod tests {
                 next_response_input: b".\r\n".len()..b".\r\n".len(),
             }))
         );
+    }
+
+    #[test]
+    fn incremental_framer_matches_rescan_for_every_two_push_split() {
+        let response = b"220 article\r\nbody line\r\n.\r\n";
+        let expected = response.len();
+
+        for split in 0..=response.len() {
+            let mut framer = MultilineFramer::default();
+            let first = framer
+                .split_chunk(
+                    &response[..split],
+                    PackedPendingBytesPolicy::AllowIfStatusPrefix,
+                )
+                .expect("first push should not reject a valid response");
+            let actual = match first {
+                FramedMultilineChunk::Complete(complete) => Some(complete.response.end),
+                FramedMultilineChunk::Incomplete(_) => framer
+                    .split_chunk(
+                        &response[split..],
+                        PackedPendingBytesPolicy::AllowIfStatusPrefix,
+                    )
+                    .ok()
+                    .and_then(|result| match result {
+                        FramedMultilineChunk::Complete(complete) => {
+                            Some(split + complete.response.end)
+                        }
+                        FramedMultilineChunk::Incomplete(_) => None,
+                    }),
+            };
+
+            assert_eq!(actual, Some(expected), "split={split}");
+
+            let mut stateless = MultilineFramer::default();
+            let rescanned_end = stateless
+                .split_chunk(response, PackedPendingBytesPolicy::AllowIfStatusPrefix)
+                .expect("rescan should accept a valid response");
+            let FramedMultilineChunk::Complete(rescanned) = rescanned_end else {
+                panic!("rescan did not complete for split={split}");
+            };
+            assert_eq!(actual, Some(rescanned.response.end), "split={split}");
+        }
     }
 
     #[test]

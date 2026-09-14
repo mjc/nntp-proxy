@@ -107,6 +107,7 @@ gungraun = "0.19.4"  # Callgrind instruction/branch/cache benchmarking
 
 [features]
 default = []
+framing-bench = []
 zlib-ng = ["flate2/zlib-ng"]  # SIMD-optimized compression (requires cmake; ~2-3x faster)
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]  # Runtime/task instrumentation for tokio-console; build with RUSTFLAGS="--cfg tokio_unstable"
 
@@ -138,6 +139,10 @@ harness = false
 
 [[bench]]
 name = "response_parsing"
+harness = false
+
+[[bench]]
+name = "multiline_framing"
 harness = false
 
 [[bench]]
