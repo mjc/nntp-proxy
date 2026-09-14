@@ -145,6 +145,12 @@ impl BufferStorage {
         self.bytes = prefix;
     }
 
+    fn compact_visible_if_full(&mut self) {
+        if self.hidden_prefix.is_some() && self.bytes.capacity() == self.bytes.len() {
+            self.compact_visible();
+        }
+    }
+
     fn restore_hidden_prefix(&mut self) {
         let Some(mut prefix) = self.hidden_prefix.take() else {
             return;
@@ -173,7 +179,6 @@ impl BufferStorage {
     where
         R: AsyncRead + Unpin,
     {
-        debug_assert!(self.hidden_prefix.is_none());
         if read_len == 0 {
             return Ok(0);
         }
@@ -281,7 +286,7 @@ impl PooledBuffer {
                 self.read_limit()
             }
             ReadMode::Append => {
-                self.buffer.compact_visible();
+                self.buffer.compact_visible_if_full();
                 self.read_limit()
                     .saturating_sub(self.buffer.initialized_len())
             }
@@ -1487,7 +1492,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_more_compacts_a_retained_prefix_before_appending() {
+    async fn read_more_appends_after_a_retained_prefix_without_compacting() {
         let pool = BufferPool::new(BufferSize::try_new(1024).unwrap(), 1);
         let mut buffer = pool.acquire();
         buffer.copy_from_slice(b"discard22unused");
@@ -1501,6 +1506,24 @@ mod tests {
 
         assert_eq!(read, 9);
         assert_eq!(buffer.as_ref(), b"220 ready\r\n");
+        assert_eq!(buffer.allocation_ptr(), allocation);
+    }
+
+    #[tokio::test]
+    async fn read_more_compacts_a_retained_prefix_when_tail_is_full() {
+        let pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 1);
+        let mut buffer = pool.acquire();
+        buffer.copy_from_slice(&vec![b'x'; 4096]);
+        let allocation = buffer.allocation_ptr();
+        buffer.expose_initialized_range_without_copying(4094..4096);
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer.write_all(b"y").await.unwrap();
+        drop(writer);
+
+        let read = buffer.read_more(&mut reader).await.unwrap();
+
+        assert_eq!(read, 1);
+        assert_eq!(buffer.as_ref(), b"xxy");
         assert_eq!(buffer.allocation_ptr(), allocation);
     }
 
