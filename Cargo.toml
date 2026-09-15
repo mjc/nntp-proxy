@@ -144,10 +144,12 @@ harness = false
 [[bench]]
 name = "multiline_framing"
 harness = false
+required-features = ["framing-bench"]
 
 [[bench]]
 name = "retained_buffer"
 harness = false
+required-features = ["framing-bench"]
 
 [[bench]]
 name = "yenc_decoding"
