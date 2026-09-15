@@ -39,9 +39,19 @@ pub struct PooledBuffer {
     counts_toward_pool: bool,
 }
 
-/// Proof that a retained suffix has logical room for another backend read.
-pub(crate) struct AppendableRetainedBuffer<'a> {
+/// One permission to append a backend read to a retained buffer.
+pub(crate) struct RetainedAppendPermit<'a> {
     buffer: &'a mut PooledBuffer,
+}
+
+pub(crate) struct AppendedRead<'a> {
+    buffer: &'a mut PooledBuffer,
+    previous_len: usize,
+}
+
+pub(crate) enum AppendOutcome<'a> {
+    Data(AppendedRead<'a>),
+    Eof(&'a mut PooledBuffer),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -280,12 +290,12 @@ impl PooledBuffer {
         self.buffer.retain_range(range);
     }
 
-    pub(crate) fn appendable_retained(&mut self) -> Option<AppendableRetainedBuffer<'_>> {
+    pub(crate) fn retained_append_permit(&mut self) -> Option<RetainedAppendPermit<'_>> {
         if !self.buffer.has_retained_prefix() || self.buffer.initialized_len() >= self.read_limit()
         {
             return None;
         }
-        Some(AppendableRetainedBuffer { buffer: self })
+        Some(RetainedAppendPermit { buffer: self })
     }
 
     #[cfg(test)]
@@ -359,12 +369,38 @@ impl PooledBuffer {
     }
 }
 
-impl<'a> AppendableRetainedBuffer<'a> {
-    pub(crate) async fn read_more<R>(&mut self, reader: &mut R) -> std::io::Result<usize>
+impl<'a> RetainedAppendPermit<'a> {
+    pub(crate) async fn read<R>(self, reader: &mut R) -> std::io::Result<AppendOutcome<'a>>
     where
         R: AsyncRead + Unpin,
     {
-        self.buffer.read_more(reader).await
+        let Self { buffer } = self;
+        let previous_len = buffer.initialized();
+        let read = buffer.read_more(reader).await?;
+        Ok(match read {
+            0 => AppendOutcome::Eof(buffer),
+            _ => AppendOutcome::Data(AppendedRead {
+                buffer,
+                previous_len,
+            }),
+        })
+    }
+}
+
+impl<'a> AppendedRead<'a> {
+    #[must_use]
+    pub(crate) fn previous_len(&self) -> usize {
+        self.previous_len
+    }
+
+    #[must_use]
+    pub(crate) fn as_new_bytes(&self) -> &[u8] {
+        &self.buffer.as_ref()[self.previous_len..]
+    }
+
+    #[must_use]
+    pub(crate) fn total_len(&self) -> usize {
+        self.buffer.initialized()
     }
 
     pub(crate) fn into_inner(self) -> &'a mut PooledBuffer {
@@ -1493,15 +1529,59 @@ mod tests {
         writer.write_all(b"0 ready\r\n").await.unwrap();
         drop(writer);
 
-        let Some(mut appendable) = buffer.appendable_retained() else {
+        let Some(appendable) = buffer.retained_append_permit() else {
             panic!("retained prefix should have spare tail capacity");
         };
-        let read = appendable.read_more(&mut reader).await.unwrap();
+        let AppendOutcome::Data(appended) = appendable.read(&mut reader).await.unwrap() else {
+            panic!("the reader has data available");
+        };
+        let read = appended.as_new_bytes().len();
+        let buffer = appended.into_inner();
 
         assert_eq!(read, 9);
         assert_eq!(buffer.as_ref(), b"220 ready\r\n");
         assert_eq!(buffer.allocation_ptr(), allocation);
         assert!(buffer.buffer.has_retained_prefix());
+    }
+
+    #[tokio::test]
+    async fn retained_append_result_owns_the_new_logical_window() {
+        let pool = BufferPool::new(BufferSize::try_new(8).unwrap(), 1);
+        let mut buffer = pool.acquire();
+        buffer.copy_from_slice(b"discard22unused");
+        buffer.expose_initialized_range_without_copying(7..9);
+
+        let mut reader = std::io::Cursor::new(b"abcdefghi");
+        let Some(appendable) = buffer.retained_append_permit() else {
+            panic!("retained prefix should have logical room to append");
+        };
+        let AppendOutcome::Data(appended) = appendable.read(&mut reader).await.unwrap() else {
+            panic!("the reader has data available");
+        };
+
+        assert_eq!(appended.previous_len(), 2);
+        assert_eq!(appended.as_new_bytes(), b"abcdef");
+        let buffer = appended.into_inner();
+        assert_eq!(buffer.as_ref(), b"22abcdef");
+        assert!(buffer.retained_append_permit().is_none());
+    }
+
+    #[tokio::test]
+    async fn retained_append_result_distinguishes_eof_from_logical_exhaustion() {
+        let pool = BufferPool::new(BufferSize::try_new(8).unwrap(), 1);
+        let mut buffer = pool.acquire();
+        buffer.copy_from_slice(b"discard22unused");
+        buffer.expose_initialized_range_without_copying(7..9);
+
+        let mut reader = std::io::Cursor::new(Vec::<u8>::new());
+        let Some(appendable) = buffer.retained_append_permit() else {
+            panic!("retained prefix should have logical room to append");
+        };
+
+        let AppendOutcome::Eof(buffer) = appendable.read(&mut reader).await.unwrap() else {
+            panic!("an exhausted reader should produce the typed EOF outcome");
+        };
+        assert_eq!(buffer.initialized(), 2);
     }
 
     #[tokio::test]
@@ -1515,10 +1595,15 @@ mod tests {
         writer.write_all(b"y").await.unwrap();
         drop(writer);
 
-        let Some(mut appendable) = buffer.appendable_retained() else {
+        let Some(appendable) = buffer.retained_append_permit() else {
             panic!("retained prefix should have logical room to append");
         };
-        let read = appendable.read_more(&mut reader).await.unwrap();
+        let AppendOutcome::Data(appended) = appendable.read(&mut reader).await.unwrap() else {
+            panic!("the reader has data available");
+        };
+        let read = appended.as_new_bytes().len();
+        assert_eq!(appended.as_new_bytes(), b"y");
+        let buffer = appended.into_inner();
 
         assert_eq!(read, 1);
         assert_eq!(buffer.as_ref(), b"xxy");
