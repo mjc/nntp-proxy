@@ -14,7 +14,7 @@ Ignored advisories must document:
 - the next revisit trigger, such as an upstream release or review date
 - an upstream issue or repository link when one exists
 
-Use `scripts/audit-advisories` when triaging advisory changes. It runs the
+Use `devenv tasks run project:audit-advisories` when triaging advisory changes. It runs the
 standard advisory checks and prints dependency paths for the currently ignored
 crates, including runtime-only paths where Cargo can express them.
 
@@ -30,7 +30,7 @@ and periodically run:
 
 ```sh
 devenv shell cargo outdated
-devenv shell scripts/audit-advisories
+devenv tasks run project:audit-advisories
 ```
 
 When `foyer` or `iai-callgrind` publishes a new version, try the upgrade and
