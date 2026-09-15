@@ -30,12 +30,12 @@ revisit expectations.
 ## Quality checks
 
 Entering the devenv shell installs the managed pre-commit hook. The hook runs
-`devenv shell scripts/quality-fast.sh` only when creating a commit; shell
-activation itself does not run Clippy or any other checks. Run the quality gate
-explicitly when needed:
+the `project:quality-fast` devenv task only when creating a commit; shell activation
+itself does not run Clippy or any other checks. Run the quality gate explicitly
+when needed:
 
 ```bash
-devenv shell scripts/quality-fast.sh
+devenv tasks run project:quality-fast
 ```
 
 ## Nix
