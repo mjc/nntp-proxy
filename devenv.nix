@@ -44,6 +44,18 @@ in
     NIX_HARDENING_DISABLE = "fortify";
   };
 
+  # Install the hook when the shell activates; the hook itself runs only for
+  # commits, never as part of `direnv allow` or ordinary shell entry.
+  git-hooks.hooks."nntp-proxy-quality-fast" = {
+    enable = true;
+    name = "nntp-proxy quality-fast";
+    entry = "scripts/quality-fast.sh";
+    language = "system";
+    pass_filenames = false;
+    always_run = true;
+    stages = [ "commit" ];
+  };
+
   enterShell = ''
     # Do not inherit a host-wide CMake launcher: it can rewrite Clang's
     # target flags and break native build scripts such as zlib-ng.
