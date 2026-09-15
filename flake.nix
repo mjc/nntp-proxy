@@ -44,12 +44,12 @@
             "aarch64-unknown-linux-gnu"
             "x86_64-pc-windows-gnu"
           ]
-          ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
             # Only include Apple targets on macOS hosts where they can be built
             "x86_64-apple-darwin"
             "aarch64-apple-darwin"
           ]
-          ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [
+          ++ pkgs.lib.optionals (!pkgs.stdenv.hostPlatform.isDarwin) [
             # Add additional Windows target for Linux hosts
             "aarch64-pc-windows-msvc"
           ];
@@ -91,10 +91,8 @@
           # Performance profiling
           cargo-flamegraph
 
-          # Build acceleration
-          sccache # Build cache
         ]
-        ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+        ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
           perf
           heaptrack
           cargo-llvm-cov
@@ -164,16 +162,13 @@
           export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
           export PKG_CONFIG_PATH="${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig"
 
-          # Build acceleration
-          export RUSTC_WRAPPER="sccache"
-
-          ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+          ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
             # Linux: mold linker + native CPU optimizations
             export ${cargoTargetEnvPrefix}_LINKER="clang"
             export ${cargoTargetEnvPrefix}_RUSTFLAGS="-C link-arg=-fuse-ld=mold -C target-cpu=native"
           ''}
 
-          ${pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
+          ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
             # macOS: native CPU optimizations (no mold on macOS)
             export ${cargoTargetEnvPrefix}_RUSTFLAGS="-C target-cpu=native"
           ''}
@@ -211,7 +206,7 @@
           echo "⚡ Performance:"
           echo "   cargo flamegraph  - Generate performance flamegraph"
           echo "   cargo bench       - Run benchmarks"
-          ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+          ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
             echo "   perf              - Linux performance analysis tools"
             echo "   heaptrack         - Heap allocation profiler"
             echo "   heaptrack_print   - Analyze heaptrack captures"

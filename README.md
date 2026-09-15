@@ -27,10 +27,15 @@ Hybrid is the default routing mode. `per-command` and `stateful` remain availabl
 ## Quick start
 
 ```bash
-nix develop -c cargo build --release
+devenv shell -- cargo build --release
 cp config.minimal.toml config.toml
 ./target/release/nntp-proxy --config config.toml
 ```
+
+Install [devenv](https://devenv.sh/getting-started/) and run `direnv allow` in
+the repository root for automatic shell activation. Packaging and
+cross-platform release commands continue to use Nix; see
+[Development](docs/development.md).
 
 Then edit `config.toml` so `[[servers]]` points at a real backend and connect your NNTP client to `localhost:8119` unless you changed `[proxy].port`.
 

@@ -21,6 +21,7 @@ config.toml
 # Logs
 *.log
 .direnv
+.devenv/
 
 # Profiling artifacts
 flamegraph.svg

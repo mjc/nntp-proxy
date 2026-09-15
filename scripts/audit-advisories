@@ -16,7 +16,7 @@ run() {
 require_cargo_subcommand() {
     local subcommand="$1"
     if ! cargo "$subcommand" --version >/dev/null 2>&1; then
-        echo "cargo-$subcommand is not available; run through nix develop." >&2
+        echo "cargo-$subcommand is not available; run through devenv shell." >&2
         exit 127
     fi
 }
