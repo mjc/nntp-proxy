@@ -38,6 +38,8 @@ in
   };
 
   tasks."project:quality-fast".exec = "scripts/quality-fast.sh";
+  tasks."project:quality-pr".exec = "scripts/quality-pr.sh";
+  tasks."project:audit-advisories".exec = "scripts/audit-advisories";
 
   # Install the hook when the shell activates; the hook invokes the devenv
   # task only for commits, never during shell activation.

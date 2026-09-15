@@ -21,7 +21,7 @@ Use `cargo test` when you need doctests, exact filtering, or `-- --nocapture` de
 Dependency and advisory triage:
 
 ```bash
-devenv shell scripts/audit-advisories
+devenv tasks run project:audit-advisories
 ```
 
 See [security-advisories.md](security-advisories.md) for ignore policy and
@@ -36,6 +36,12 @@ when needed:
 
 ```bash
 devenv tasks run project:quality-fast
+```
+
+Run the full PR-equivalent quality gate with:
+
+```bash
+devenv tasks run project:quality-pr
 ```
 
 ## Nix
