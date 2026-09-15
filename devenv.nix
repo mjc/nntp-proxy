@@ -55,7 +55,7 @@ in
   git-hooks.hooks."nntp-proxy-quality-fast" = {
     enable = true;
     name = "nntp-proxy quality-fast";
-    entry = "scripts/quality-fast.sh";
+    entry = "devenv shell -- scripts/quality-fast.sh";
     language = "system";
     pass_filenames = false;
     always_run = true;
