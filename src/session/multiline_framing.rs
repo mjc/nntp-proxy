@@ -273,12 +273,12 @@ struct IncompleteMultilineWireChunk {
 
 impl IncompleteMultilineWireChunk {
     #[allow(clippy::too_many_arguments)]
-    async fn compact_packed_prefix_and_write_with_next_backend_chunk<W>(
+    async fn append_to_packed_prefix_and_write_with_next_backend_chunk<W>(
         self,
         writer: &mut W,
         current_len: usize,
         framer: &mut MultilineFramer,
-        io_buffer: &mut crate::pool::PooledBuffer,
+        mut io_buffer: crate::pool::AppendableRetainedBuffer<'_>,
         conn: &mut crate::stream::ConnectionStream,
         pool: &crate::pool::BufferPool,
         backend_id: crate::types::BackendId,
@@ -300,6 +300,7 @@ impl IncompleteMultilineWireChunk {
                 },
             );
         }
+        let io_buffer = io_buffer.into_inner();
         let total_len = current_len + n;
 
         match framer.frame_next_multiline_chunk(self, &io_buffer[current_len..total_len]) {
@@ -1351,9 +1352,9 @@ where
                 .await?
         }
         FramedMultilineChunk::Incomplete(incomplete) => {
-            if io_buffer.has_retained_prefix() && io_buffer.has_remaining_fixed_writable_region() {
+            if let Some(io_buffer) = io_buffer.appendable_retained() {
                 incomplete
-                    .compact_packed_prefix_and_write_with_next_backend_chunk(
+                    .append_to_packed_prefix_and_write_with_next_backend_chunk(
                         writer,
                         initial_len,
                         &mut framer,

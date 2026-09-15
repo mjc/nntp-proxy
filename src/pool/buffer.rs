@@ -39,6 +39,11 @@ pub struct PooledBuffer {
     counts_toward_pool: bool,
 }
 
+/// Proof that a retained suffix has logical room for another backend read.
+pub(crate) struct AppendableRetainedBuffer<'a> {
+    buffer: &'a mut PooledBuffer,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PooledBufferKind {
     Regular,
@@ -60,23 +65,14 @@ struct BufferAcquisition {
 #[derive(Default)]
 struct BufferStorage {
     bytes: BytesMut,
-    visible_start: VisibleStart,
-}
-
-#[derive(Clone, Copy, Default)]
-struct VisibleStart(usize);
-
-impl VisibleStart {
-    fn get(self) -> usize {
-        self.0
-    }
+    visible_from: usize,
 }
 
 impl BufferStorage {
     fn new(bytes: BytesMut) -> Self {
         Self {
             bytes,
-            visible_start: VisibleStart::default(),
+            visible_from: 0,
         }
     }
 
@@ -87,20 +83,18 @@ impl BufferStorage {
 
     #[inline]
     fn initialized_len(&self) -> usize {
-        self.as_slice().len()
+        self.bytes.len() - self.visible_from
     }
 
     #[inline]
     fn clear(&mut self) {
         self.bytes.clear();
-        self.visible_start = VisibleStart::default();
+        self.visible_from = 0;
     }
 
     #[inline]
     fn as_slice(&self) -> &[u8] {
-        self.bytes
-            .get(self.visible_start.get()..)
-            .expect("visible start must remain within initialized bytes")
+        &self.bytes[self.visible_from..]
     }
 
     fn copy_from_slice(&mut self, data: &[u8]) {
@@ -118,39 +112,31 @@ impl BufferStorage {
             range.start < range.end && range.end <= self.initialized_len(),
             "exposed range must be non-empty and inside initialized bytes"
         );
-        let start = self
-            .visible_start
-            .get()
-            .checked_add(range.start)
-            .expect("visible range start overflowed");
-        let end = self
-            .visible_start
-            .get()
-            .checked_add(range.end)
-            .expect("visible range end overflowed");
+        let start = self.visible_from + range.start;
+        let end = self.visible_from + range.end;
         self.bytes.truncate(end);
-        self.visible_start = VisibleStart(start);
+        self.visible_from = start;
     }
 
     fn compact_visible(&mut self) {
-        let visible_start = self.visible_start.get();
-        if visible_start == 0 {
+        if self.visible_from == 0 {
             return;
         }
 
-        self.bytes.copy_within(visible_start.., 0);
-        self.bytes.truncate(self.bytes.len() - visible_start);
-        self.visible_start = VisibleStart::default();
+        let len = self.initialized_len();
+        self.bytes.copy_within(self.visible_from.., 0);
+        self.bytes.truncate(len);
+        self.visible_from = 0;
     }
 
     fn compact_visible_if_tail_full(&mut self) {
-        if self.visible_start.get() != 0 && self.bytes.capacity() == self.bytes.len() {
+        if self.visible_from != 0 && self.bytes.capacity() == self.bytes.len() {
             self.compact_visible();
         }
     }
 
     fn has_retained_prefix(&self) -> bool {
-        self.visible_start.get() != 0
+        self.visible_from != 0
     }
 
     fn freeze(&mut self) -> Bytes {
@@ -158,19 +144,18 @@ impl BufferStorage {
     }
 
     fn take(&mut self) -> BytesMut {
-        let visible_start = self.visible_start.get();
-        self.visible_start = VisibleStart::default();
+        let visible_from = std::mem::take(&mut self.visible_from);
         let mut bytes = std::mem::take(&mut self.bytes);
-        if visible_start == 0 {
+        if visible_from == 0 {
             bytes
         } else {
-            bytes.split_off(visible_start)
+            bytes.split_off(visible_from)
         }
     }
 
     fn restore(&mut self, bytes: BytesMut) {
         self.bytes = bytes;
-        self.visible_start = VisibleStart::default();
+        self.visible_from = 0;
     }
 
     async fn read_from<R>(&mut self, reader: &mut R, read_len: usize) -> std::io::Result<usize>
@@ -295,14 +280,12 @@ impl PooledBuffer {
         self.buffer.retain_range(range);
     }
 
-    #[must_use]
-    pub(crate) fn has_retained_prefix(&self) -> bool {
-        self.buffer.has_retained_prefix()
-    }
-
-    #[must_use]
-    pub(crate) fn has_remaining_fixed_writable_region(&self) -> bool {
-        self.buffer.initialized_len() < self.read_limit()
+    pub(crate) fn appendable_retained(&mut self) -> Option<AppendableRetainedBuffer<'_>> {
+        if !self.buffer.has_retained_prefix() || self.buffer.initialized_len() >= self.read_limit()
+        {
+            return None;
+        }
+        Some(AppendableRetainedBuffer { buffer: self })
     }
 
     #[cfg(test)]
@@ -373,6 +356,19 @@ impl PooledBuffer {
     #[must_use]
     pub fn freeze(mut self) -> Bytes {
         self.buffer.freeze()
+    }
+}
+
+impl<'a> AppendableRetainedBuffer<'a> {
+    pub(crate) async fn read_more<R>(&mut self, reader: &mut R) -> std::io::Result<usize>
+    where
+        R: AsyncRead + Unpin,
+    {
+        self.buffer.read_more(reader).await
+    }
+
+    pub(crate) fn into_inner(self) -> &'a mut PooledBuffer {
+        self.buffer
     }
 }
 
@@ -1497,11 +1493,15 @@ mod tests {
         writer.write_all(b"0 ready\r\n").await.unwrap();
         drop(writer);
 
-        let read = buffer.read_more(&mut reader).await.unwrap();
+        let Some(mut appendable) = buffer.appendable_retained() else {
+            panic!("retained prefix should have spare tail capacity");
+        };
+        let read = appendable.read_more(&mut reader).await.unwrap();
 
         assert_eq!(read, 9);
         assert_eq!(buffer.as_ref(), b"220 ready\r\n");
         assert_eq!(buffer.allocation_ptr(), allocation);
+        assert!(buffer.buffer.has_retained_prefix());
     }
 
     #[tokio::test]
@@ -1515,7 +1515,10 @@ mod tests {
         writer.write_all(b"y").await.unwrap();
         drop(writer);
 
-        let read = buffer.read_more(&mut reader).await.unwrap();
+        let Some(mut appendable) = buffer.appendable_retained() else {
+            panic!("retained prefix should have logical room to append");
+        };
+        let read = appendable.read_more(&mut reader).await.unwrap();
 
         assert_eq!(read, 1);
         assert_eq!(buffer.as_ref(), b"xxy");
