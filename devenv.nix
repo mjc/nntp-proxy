@@ -37,8 +37,32 @@ in
     NIX_HARDENING_DISABLE = "fortify";
   };
 
-  tasks."project:quality-fast".exec = "scripts/quality-fast.sh";
-  tasks."project:quality-pr".exec = "scripts/quality-pr.sh";
+  tasks."project:quality-fast".exec = ''
+    mapfile -t shell_scripts < <(
+      find scripts -maxdepth 1 -type f \( -name '*.sh' -o -perm -111 \) | sort
+    )
+
+    cargo fmt --check
+    cargo clippy --all-targets --all-features -- -D warnings
+    shellcheck -S warning "''${shell_scripts[@]}"
+    scripts/check-guardrails.sh
+    actionlint
+    zizmor .github/workflows
+    typos
+  '';
+
+  tasks."project:quality-pr".exec = ''
+    devenv tasks run project:quality-fast
+    cargo llvm-cov nextest --workspace --profile ci --lcov --output-path lcov.info
+    cargo deny check
+    cargo audit
+    cargo shear
+
+    if [ -d supply-chain ]; then
+      cargo vet
+    fi
+  '';
+
   tasks."project:audit-advisories".exec = "scripts/audit-advisories";
 
   # Install the hook when the shell activates; the hook invokes the devenv
