@@ -145,6 +145,10 @@ name = "multiline_framing"
 harness = false
 
 [[bench]]
+name = "retained_buffer"
+harness = false
+
+[[bench]]
 name = "yenc_decoding"
 harness = false
 

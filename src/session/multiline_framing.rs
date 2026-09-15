@@ -273,12 +273,11 @@ struct IncompleteMultilineWireChunk {
 
 impl IncompleteMultilineWireChunk {
     #[allow(clippy::too_many_arguments)]
-    async fn compact_packed_prefix_and_write_with_next_backend_chunk<W>(
+    async fn append_to_packed_prefix_and_write_with_next_backend_chunk<W>(
         self,
         writer: &mut W,
-        current_len: usize,
         framer: &mut MultilineFramer,
-        io_buffer: &mut crate::pool::PooledBuffer,
+        io_buffer: crate::pool::RetainedAppendPermit<'_>,
         conn: &mut crate::stream::ConnectionStream,
         pool: &crate::pool::BufferPool,
         backend_id: crate::types::BackendId,
@@ -287,26 +286,34 @@ impl IncompleteMultilineWireChunk {
         W: AsyncWrite + Unpin,
     {
         let initial_response_start = self.response.start;
-        let n = io_buffer.read_more(conn).await.map_err(|e| {
+        let appended = io_buffer.read(conn).await.map_err(|e| {
             crate::session::response_transfer::ResponseTransferError::Io(
                 anyhow::Error::from(e).context("Failed to read remaining response body"),
             )
         })?;
-        if n == 0 {
-            return Err(
-                crate::session::response_transfer::ResponseTransferError::BackendEof {
-                    backend_id,
-                    bytes_received: self.response.len() as u64,
-                },
-            );
-        }
-        let total_len = current_len + n;
+        let appended = match appended {
+            crate::pool::AppendOutcome::Data(appended) => appended,
+            crate::pool::AppendOutcome::Eof(buffer) => {
+                let _ = buffer;
+                return Err(
+                    crate::session::response_transfer::ResponseTransferError::BackendEof {
+                        backend_id,
+                        bytes_received: self.response.len() as u64,
+                    },
+                );
+            }
+        };
+        let previous_len = appended.previous_len();
+        let total_len = appended.total_len();
+        let frame = framer.frame_next_multiline_chunk(self, appended.as_new_bytes());
+        let io_buffer = appended.into_inner();
 
-        match framer.frame_next_multiline_chunk(self, &io_buffer[current_len..total_len]) {
+        match frame {
             FramedMultilineChunk::Complete(complete) => {
-                let combined_response = initial_response_start..current_len + complete.response.end;
-                let combined_next_response = current_len + complete.next_response_input.start
-                    ..current_len + complete.next_response_input.end;
+                let combined_response =
+                    initial_response_start..previous_len + complete.response.end;
+                let combined_next_response = previous_len + complete.next_response_input.start
+                    ..previous_len + complete.next_response_input.end;
                 write_response_chunk_preserving_suffix_on_error(
                     writer,
                     io_buffer,
@@ -320,7 +327,7 @@ impl IncompleteMultilineWireChunk {
             }
             FramedMultilineChunk::Incomplete(incomplete) => {
                 let combined_response =
-                    initial_response_start..current_len + incomplete.response.end;
+                    initial_response_start..previous_len + incomplete.response.end;
                 let bytes_received = combined_response.len() as u64;
                 if let Err(error) = writer
                     .write_all(&io_buffer[combined_response.clone()])
@@ -1351,12 +1358,10 @@ where
                 .await?
         }
         FramedMultilineChunk::Incomplete(incomplete) => {
-            if io_buffer.is_exposed_range_view() && io_buffer.has_remaining_fixed_writable_region()
-            {
+            if let Some(io_buffer) = io_buffer.retained_append_permit() {
                 incomplete
-                    .compact_packed_prefix_and_write_with_next_backend_chunk(
+                    .append_to_packed_prefix_and_write_with_next_backend_chunk(
                         writer,
-                        initial_len,
                         &mut framer,
                         io_buffer,
                         conn,
