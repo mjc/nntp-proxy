@@ -45,10 +45,13 @@ scripts/
 .vscode/
 .vs/
 
-# NixOS/direnv
+# Nix development files
 .envrc
 flake.nix
 flake.lock
+devenv.nix
+devenv.yaml
+devenv.lock
 .direnv/
 
 # Workspace files

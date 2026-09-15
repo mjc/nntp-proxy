@@ -44,12 +44,12 @@
             "aarch64-unknown-linux-gnu"
             "x86_64-pc-windows-gnu"
           ]
-          ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
+          ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin [
             # Only include Apple targets on macOS hosts where they can be built
             "x86_64-apple-darwin"
             "aarch64-apple-darwin"
           ]
-          ++ pkgs.lib.optionals (!pkgs.stdenv.isDarwin) [
+          ++ pkgs.lib.optionals (!pkgs.stdenv.hostPlatform.isDarwin) [
             # Add additional Windows target for Linux hosts
             "aarch64-pc-windows-msvc"
           ];
@@ -59,8 +59,6 @@
       basicNativeBuildInputs = with pkgs;
         [
           rustToolchain
-          pkg-config
-          cmake # Required for zlib-ng feature in flate2
 
           # Code quality & linting
           cargo-deny
@@ -91,10 +89,8 @@
           # Performance profiling
           cargo-flamegraph
 
-          # Build acceleration
-          sccache # Build cache
         ]
-        ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+        ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
           perf
           heaptrack
           cargo-llvm-cov
@@ -117,8 +113,6 @@
       ];
 
       devBuildInputs = with pkgs; [
-        openssl
-        zlib
         bashInteractive
       ];
 
@@ -162,74 +156,19 @@
 
         shellHook = ''
           export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
-          export PKG_CONFIG_PATH="${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig"
-
-          # Build acceleration
-          export RUSTC_WRAPPER="sccache"
-
-          ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
+          ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
             # Linux: mold linker + native CPU optimizations
             export ${cargoTargetEnvPrefix}_LINKER="clang"
             export ${cargoTargetEnvPrefix}_RUSTFLAGS="-C link-arg=-fuse-ld=mold -C target-cpu=native"
           ''}
 
-          ${pkgs.lib.optionalString pkgs.stdenv.isDarwin ''
+          ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
             # macOS: native CPU optimizations (no mold on macOS)
             export ${cargoTargetEnvPrefix}_RUSTFLAGS="-C target-cpu=native"
           ''}
-
-          echo "🦀 Rust development environment loaded!"
-          echo "   Rust version: $(rustc --version)"
-          echo "   Cargo version: $(cargo --version)"
-          echo "   OpenSSL version: ${pkgs.openssl.version}"
-          echo ""
-          echo "🔧 Cross-compilation: Use './scripts/build-release.sh <version>' with the pinned stable toolchain"
-          echo ""
-          echo "📦 Available commands:"
-          echo "   cargo build       - Build the project"
-          echo "   cargo run         - Run the NNTP proxy"
-          echo "   cargo test        - Run tests"
-          echo "   cargo clippy      - Run linter"
-          echo "   cargo fmt         - Format code"
-          echo "   ./scripts/build-release.sh <version> - Build all release binaries"
-          echo ""
-          echo "🔍 Code quality:"
-          echo "   scripts/quality-fast.sh - Fast local/automation checks"
-          echo "   scripts/quality-pr.sh   - PR-equivalent checks"
-          echo "   scripts/quality-deep.sh <suite> - Deep automation checks"
-          echo "   cargo deny check  - Check dependencies for security/licenses"
-          echo "   cargo audit       - Check for security vulnerabilities"
-          echo "   shellcheck scripts/*.sh - Lint shell scripts"
-          echo "   actionlint        - Lint GitHub Actions workflows"
-          echo ""
-          echo "🧪 Testing & coverage:"
-          echo "   cargo nextest run - Fast test runner"
-          echo "   cargo tarpaulin   - Code coverage analysis"
-          echo "   cargo mutants     - Mutation testing"
-          echo "   cargo llvm-cov    - LLVM-based code coverage"
-          echo ""
-          echo "⚡ Performance:"
-          echo "   cargo flamegraph  - Generate performance flamegraph"
-          echo "   cargo bench       - Run benchmarks"
-          ${pkgs.lib.optionalString pkgs.stdenv.isLinux ''
-            echo "   perf              - Linux performance analysis tools"
-            echo "   heaptrack         - Heap allocation profiler"
-            echo "   heaptrack_print   - Analyze heaptrack captures"
-          ''}
-          echo ""
-          echo "📊 Dependencies:"
-          echo "   cargo outdated    - Check for outdated dependencies"
-          echo "   cargo tree        - Visualize dependency tree"
-          echo "   cargo bloat       - Find what takes up space in binary"
-          echo ""
         '';
 
         GH_PAGER = "cat";
-
-        # Environment variables for building with OpenSSL
-        OPENSSL_DIR = "${pkgs.openssl.dev}";
-        OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
-        PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig";
 
         # tikv-jemalloc-sys builds jemalloc from source; its configure script
         # fails strerror_r detection when _FORTIFY_SOURCE is set at -O0 (NixOS default).
@@ -246,8 +185,6 @@
 
         shellHook = ''
           export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
-          export PKG_CONFIG_PATH="${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig"
-
           export PATH="${rustCrossToolchain}/bin:$PATH"
           export NNTP_PROXY_CROSS_SHELL=1
 
@@ -275,9 +212,6 @@
           echo ""
         '';
 
-        OPENSSL_DIR = "${pkgs.openssl.dev}";
-        OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
-        PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig";
       };
 
       packages.default = package;

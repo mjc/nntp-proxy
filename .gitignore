@@ -21,6 +21,8 @@ config.toml
 # Logs
 *.log
 .direnv
+.devenv/
+.pre-commit-config.yaml
 
 # Profiling artifacts
 flamegraph.svg

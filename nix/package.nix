@@ -26,27 +26,14 @@ let
       inherit src;
       strictDeps = true;
 
-      nativeBuildInputs = with pkgs; [
-        pkg-config
-        cmake
-      ]
-      ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
-        clang
-        mold
-      ];
-
-      buildInputs = with pkgs; [
-        openssl
-        zlib
+      nativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [
+        pkgs.clang
+        pkgs.mold
       ];
 
       cargoBuildFlags = ["--bin" "nntp-proxy"];
-
-      OPENSSL_DIR = "${pkgs.openssl.dev}";
-      OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
-      PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig";
     }
-    // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux {
+    // pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
       # Match the dev-shell linker setup for packaged builds without forcing
       # non-portable CPU tuning into release artifacts.
       "${cargoTargetEnvPrefix}_LINKER" = "clang";

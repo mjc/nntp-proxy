@@ -5,15 +5,15 @@
 Build:
 
 ```bash
-nix develop -c cargo build
+devenv shell cargo build
 ```
 
 Format, lint, and test:
 
 ```bash
-nix develop -c cargo fmt --check
-nix develop -c cargo clippy --all-features -- -D warnings
-nix develop -c cargo nextest run
+devenv shell cargo fmt --check
+devenv shell cargo clippy --all-features -- -D warnings
+devenv shell cargo nextest run
 ```
 
 Use `cargo test` when you need doctests, exact filtering, or `-- --nocapture` debugging output.
@@ -21,35 +21,48 @@ Use `cargo test` when you need doctests, exact filtering, or `-- --nocapture` de
 Dependency and advisory triage:
 
 ```bash
-nix develop -c scripts/audit-advisories
+devenv shell scripts/audit-advisories
 ```
 
 See [security-advisories.md](security-advisories.md) for ignore policy and
 revisit expectations.
 
-## Pre-commit hook
+## Quality checks
 
-The pre-commit hook runs `cargo fmt --check` and `cargo clippy --all-features -- -D warnings`. Install it with:
+Entering the devenv shell installs the managed pre-commit hook. The hook runs
+`devenv shell scripts/quality-fast.sh` only when creating a commit; shell
+activation itself does not run Clippy or any other checks. Run the quality gate
+explicitly when needed:
 
 ```bash
-./scripts/install-git-hooks.sh
+devenv shell scripts/quality-fast.sh
 ```
-
-If Nix is available, the hook re-enters the dev shell automatically for consistent tooling.
 
 ## Nix
 
-If you use the flake/dev shell:
+The local development environment is managed by devenv:
 
 ```bash
-nix develop
+devenv shell
 ```
+
+The existing Nix flake remains the packaging and cross-compilation interface.
 
 Build the packaged binary with Nix:
 
 ```bash
 nix build .#default
 ```
+
+Build cross-platform release artifacts with the pinned cross-compilation shell:
+
+```bash
+./scripts/build-release.sh <version>
+```
+
+The release script enters the flake's `cross` shell automatically. Use devenv
+for local builds and quality checks; use the flake only for packaging and
+cross-compilation.
 
 ## Response Handling Work
 
@@ -61,8 +74,7 @@ Keep multiline response boundary logic in `src/session/multiline_framing.rs`.
 Benchmarks and tests should import production framing and request-classification
 code instead of reimplementing terminator scanners or local command parsers.
 
-AI-facing repository rules are intentionally short. See [AGENTS.md](../AGENTS.md)
-and [.github/copilot-instructions.md](../.github/copilot-instructions.md).
+See [AGENTS.md](../AGENTS.md) for the canonical repository rules.
 
 Current response responsibilities:
 
