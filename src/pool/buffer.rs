@@ -54,6 +54,64 @@ pub(crate) enum AppendOutcome<'a> {
     Eof(&'a mut PooledBuffer),
 }
 
+#[cfg(feature = "framing-bench")]
+#[doc(hidden)]
+pub struct RetainedAppendBenchmark {
+    buffer: PooledBuffer,
+    reader: std::io::Cursor<Vec<u8>>,
+}
+
+#[cfg(feature = "framing-bench")]
+#[doc(hidden)]
+#[must_use]
+pub fn retained_append_benchmark(physical_tail: usize) -> RetainedAppendBenchmark {
+    const CAPACITY: usize = 64 * 1024;
+    const RETAINED: usize = 32;
+
+    assert!(physical_tail <= CAPACITY - RETAINED);
+    let initialized = CAPACITY - physical_tail;
+    let pool = BufferPool::new(
+        BufferSize::try_new(CAPACITY).expect("valid benchmark size"),
+        1,
+    );
+    let mut buffer = pool.acquire();
+    buffer.copy_from_slice(&vec![b'x'; initialized]);
+    buffer.expose_initialized_range_without_copying(initialized - RETAINED..initialized);
+
+    RetainedAppendBenchmark {
+        buffer,
+        reader: std::io::Cursor::new(vec![b'y'; CAPACITY - RETAINED]),
+    }
+}
+
+#[cfg(feature = "framing-bench")]
+impl RetainedAppendBenchmark {
+    pub async fn drain(mut self) -> (usize, usize) {
+        let Some(permit) = self.buffer.retained_append_permit() else {
+            panic!("benchmark buffer should have logical room to append");
+        };
+        let AppendOutcome::Data(appended) = permit
+            .read(&mut self.reader)
+            .await
+            .expect("benchmark cursor read should succeed")
+        else {
+            panic!("benchmark cursor should contain data");
+        };
+        let first_read = appended.as_new_bytes().len();
+        let buffer = appended.into_inner();
+        let second_read = if self.reader.position() < self.reader.get_ref().len() as u64 {
+            buffer
+                .read_from(&mut self.reader)
+                .await
+                .expect("benchmark cursor read should succeed")
+        } else {
+            0
+        };
+        assert_eq!(first_read + second_read, 64 * 1024 - 32);
+        (first_read, second_read)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PooledBufferKind {
     Regular,
@@ -1608,6 +1666,89 @@ mod tests {
         assert_eq!(read, 1);
         assert_eq!(buffer.as_ref(), b"xxy");
         assert_eq!(buffer.allocation_ptr(), allocation);
+    }
+
+    #[tokio::test]
+    async fn retained_append_uses_a_tiny_physical_tail_without_compacting() {
+        let pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 1);
+        let mut buffer = pool.acquire();
+        buffer.copy_from_slice(&vec![b'x'; 4095]);
+        let allocation = buffer.allocation_ptr();
+        buffer.expose_initialized_range_without_copying(4063..4095);
+        let mut reader = std::io::Cursor::new(vec![b'y'; 4096]);
+
+        let Some(permit) = buffer.retained_append_permit() else {
+            panic!("retained prefix should have logical room to append");
+        };
+        let AppendOutcome::Data(appended) = permit.read(&mut reader).await.unwrap() else {
+            panic!("the reader has data available");
+        };
+
+        assert_eq!(appended.as_new_bytes(), b"y");
+        let buffer = appended.into_inner();
+        assert_eq!(buffer.initialized(), 33);
+        assert_eq!(buffer.allocation_ptr(), allocation);
+        assert_eq!(buffer.buffer.visible_from, 4063);
+    }
+
+    #[tokio::test]
+    async fn cancelling_retained_append_after_compaction_preserves_visible_bytes() {
+        let pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 1);
+        let mut buffer = pool.acquire();
+        buffer.copy_from_slice(&vec![b'x'; 4096]);
+        let allocation = buffer.allocation_ptr();
+        buffer.expose_initialized_range_without_copying(4094..4096);
+        let (_writer, mut reader) = tokio::io::duplex(64);
+
+        let Some(permit) = buffer.retained_append_permit() else {
+            panic!("retained prefix should have logical room to append");
+        };
+        let mut read = Box::pin(permit.read(&mut reader));
+        match futures::poll!(read.as_mut()) {
+            std::task::Poll::Pending => {}
+            std::task::Poll::Ready(_) => panic!("empty open reader should remain pending"),
+        }
+        drop(read);
+
+        assert_eq!(buffer.as_ref(), b"xx");
+        assert_eq!(buffer.allocation_ptr(), allocation);
+        assert_eq!(buffer.buffer.visible_from, 0);
+    }
+
+    #[tokio::test]
+    async fn retained_append_error_after_compaction_preserves_visible_bytes() {
+        struct ErrorReader;
+
+        impl AsyncRead for ErrorReader {
+            fn poll_read(
+                self: Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(std::io::Error::from(
+                    std::io::ErrorKind::ConnectionReset,
+                )))
+            }
+        }
+
+        let pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 1);
+        let mut buffer = pool.acquire();
+        buffer.copy_from_slice(&vec![b'x'; 4096]);
+        let allocation = buffer.allocation_ptr();
+        buffer.expose_initialized_range_without_copying(4094..4096);
+
+        let Some(permit) = buffer.retained_append_permit() else {
+            panic!("retained prefix should have logical room to append");
+        };
+        let error = match permit.read(&mut ErrorReader).await {
+            Err(error) => error,
+            Ok(_) => panic!("error reader should fail the append"),
+        };
+
+        assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+        assert_eq!(buffer.as_ref(), b"xx");
+        assert_eq!(buffer.allocation_ptr(), allocation);
+        assert_eq!(buffer.buffer.visible_from, 0);
     }
 
     #[tokio::test]
