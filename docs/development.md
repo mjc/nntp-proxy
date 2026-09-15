@@ -27,10 +27,14 @@ devenv shell -- scripts/audit-advisories
 See [security-advisories.md](security-advisories.md) for ignore policy and
 revisit expectations.
 
-## Pre-commit hook
+## Quality checks
 
-Entering the devenv shell installs the managed pre-commit hook. It runs
-`scripts/quality-fast.sh` inside the same environment as local development.
+The devenv shell does not install or run Git hooks during activation. Run the
+quality gate explicitly when needed:
+
+```bash
+devenv shell -- scripts/quality-fast.sh
+```
 
 ## Nix
 
