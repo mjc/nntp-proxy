@@ -1351,8 +1351,7 @@ where
                 .await?
         }
         FramedMultilineChunk::Incomplete(incomplete) => {
-            if io_buffer.is_exposed_range_view() && io_buffer.has_remaining_fixed_writable_region()
-            {
+            if io_buffer.has_retained_prefix() && io_buffer.has_remaining_fixed_writable_region() {
                 incomplete
                     .compact_packed_prefix_and_write_with_next_backend_chunk(
                         writer,

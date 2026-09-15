@@ -57,63 +57,50 @@ struct BufferAcquisition {
     counts_toward_pool: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReadMode {
-    Reset,
-    Append,
-}
-
 #[derive(Default)]
 struct BufferStorage {
     bytes: BytesMut,
-    state: BufferState,
-    allocation_capacity: usize,
+    visible_start: VisibleStart,
 }
 
-#[derive(Default)]
-enum BufferState {
-    #[default]
-    Contiguous,
-    Retained {
-        prefix: BytesMut,
-    },
+#[derive(Clone, Copy, Default)]
+struct VisibleStart(usize);
+
+impl VisibleStart {
+    fn get(self) -> usize {
+        self.0
+    }
 }
 
 impl BufferStorage {
     fn new(bytes: BytesMut) -> Self {
-        let allocation_capacity = bytes.capacity();
         Self {
             bytes,
-            state: BufferState::Contiguous,
-            allocation_capacity,
+            visible_start: VisibleStart::default(),
         }
     }
 
     #[inline]
     fn capacity(&self) -> usize {
-        self.allocation_capacity
+        self.bytes.capacity()
     }
 
     #[inline]
     fn initialized_len(&self) -> usize {
-        self.bytes.len()
+        self.as_slice().len()
     }
 
     #[inline]
     fn clear(&mut self) {
-        self.restore_contiguous();
         self.bytes.clear();
-    }
-
-    #[inline]
-    fn clear_for_fresh_read(&mut self) {
-        self.restore_contiguous();
-        self.bytes.clear();
+        self.visible_start = VisibleStart::default();
     }
 
     #[inline]
     fn as_slice(&self) -> &[u8] {
-        &self.bytes
+        self.bytes
+            .get(self.visible_start.get()..)
+            .expect("visible start must remain within initialized bytes")
     }
 
     fn copy_from_slice(&mut self, data: &[u8]) {
@@ -124,7 +111,6 @@ impl BufferStorage {
     fn extend_from_slice(&mut self, data: &[u8]) {
         self.compact_visible();
         self.bytes.extend_from_slice(data);
-        self.allocation_capacity = self.bytes.capacity();
     }
 
     fn retain_range(&mut self, range: Range<usize>) {
@@ -132,47 +118,39 @@ impl BufferStorage {
             range.start < range.end && range.end <= self.initialized_len(),
             "exposed range must be non-empty and inside initialized bytes"
         );
-        let mut visible = self.bytes.split_off(range.start);
-        visible.truncate(range.len());
-        let newly_hidden_prefix = std::mem::replace(&mut self.bytes, visible);
-        match &mut self.state {
-            BufferState::Contiguous => {
-                self.state = BufferState::Retained {
-                    prefix: newly_hidden_prefix,
-                };
-            }
-            BufferState::Retained { prefix } => {
-                prefix.unsplit(newly_hidden_prefix);
-            }
-        }
+        let start = self
+            .visible_start
+            .get()
+            .checked_add(range.start)
+            .expect("visible range start overflowed");
+        let end = self
+            .visible_start
+            .get()
+            .checked_add(range.end)
+            .expect("visible range end overflowed");
+        self.bytes.truncate(end);
+        self.visible_start = VisibleStart(start);
     }
 
     fn compact_visible(&mut self) {
-        let BufferState::Retained { mut prefix } = std::mem::take(&mut self.state) else {
+        let visible_start = self.visible_start.get();
+        if visible_start == 0 {
             return;
-        };
-        let prefix_len = prefix.len();
-        let visible_len = self.bytes.len();
-        prefix.unsplit(std::mem::take(&mut self.bytes));
-        prefix.copy_within(prefix_len..prefix_len + visible_len, 0);
-        prefix.truncate(visible_len);
-        self.bytes = prefix;
+        }
+
+        self.bytes.copy_within(visible_start.., 0);
+        self.bytes.truncate(self.bytes.len() - visible_start);
+        self.visible_start = VisibleStart::default();
     }
 
-    fn compact_visible_if_full(&mut self) {
-        if matches!(self.state, BufferState::Retained { .. })
-            && self.bytes.capacity() == self.bytes.len()
-        {
+    fn compact_visible_if_tail_full(&mut self) {
+        if self.visible_start.get() != 0 && self.bytes.capacity() == self.bytes.len() {
             self.compact_visible();
         }
     }
 
-    fn restore_contiguous(&mut self) {
-        let BufferState::Retained { mut prefix } = std::mem::take(&mut self.state) else {
-            return;
-        };
-        prefix.unsplit(std::mem::take(&mut self.bytes));
-        self.bytes = prefix;
+    fn has_retained_prefix(&self) -> bool {
+        self.visible_start.get() != 0
     }
 
     fn freeze(&mut self) -> Bytes {
@@ -180,15 +158,19 @@ impl BufferStorage {
     }
 
     fn take(&mut self) -> BytesMut {
-        self.state = BufferState::Contiguous;
-        self.allocation_capacity = 0;
-        std::mem::take(&mut self.bytes)
+        let visible_start = self.visible_start.get();
+        self.visible_start = VisibleStart::default();
+        let mut bytes = std::mem::take(&mut self.bytes);
+        if visible_start == 0 {
+            bytes
+        } else {
+            bytes.split_off(visible_start)
+        }
     }
 
     fn restore(&mut self, bytes: BytesMut) {
-        self.allocation_capacity = bytes.capacity();
         self.bytes = bytes;
-        self.state = BufferState::Contiguous;
+        self.visible_start = VisibleStart::default();
     }
 
     async fn read_from<R>(&mut self, reader: &mut R, read_len: usize) -> std::io::Result<usize>
@@ -273,7 +255,8 @@ impl PooledBuffer {
     where
         R: AsyncRead + Unpin,
     {
-        self.read_into_spare(reader, ReadMode::Reset).await
+        self.buffer.clear();
+        self.read_into_spare(reader, self.read_limit()).await
     }
 
     /// Read more data at the current initialized offset, accumulating bytes.
@@ -289,24 +272,21 @@ impl PooledBuffer {
     where
         R: AsyncRead + Unpin,
     {
-        self.read_into_spare(reader, ReadMode::Append).await
+        self.buffer.compact_visible_if_tail_full();
+        let read_len = self
+            .read_limit()
+            .saturating_sub(self.buffer.initialized_len());
+        self.read_into_spare(reader, read_len).await
     }
 
-    async fn read_into_spare<R>(&mut self, reader: &mut R, mode: ReadMode) -> std::io::Result<usize>
+    async fn read_into_spare<R>(
+        &mut self,
+        reader: &mut R,
+        read_len: usize,
+    ) -> std::io::Result<usize>
     where
         R: AsyncRead + Unpin,
     {
-        let read_len = match mode {
-            ReadMode::Reset => {
-                self.buffer.clear_for_fresh_read();
-                self.read_limit()
-            }
-            ReadMode::Append => {
-                self.buffer.compact_visible_if_full();
-                self.read_limit()
-                    .saturating_sub(self.buffer.initialized_len())
-            }
-        };
         self.buffer.read_from(reader, read_len).await
     }
 
@@ -316,8 +296,8 @@ impl PooledBuffer {
     }
 
     #[must_use]
-    pub(crate) fn is_exposed_range_view(&self) -> bool {
-        matches!(self.buffer.state, BufferState::Retained { .. })
+    pub(crate) fn has_retained_prefix(&self) -> bool {
+        self.buffer.has_retained_prefix()
     }
 
     #[must_use]
@@ -327,10 +307,7 @@ impl PooledBuffer {
 
     #[cfg(test)]
     pub(crate) fn allocation_ptr(&self) -> *const u8 {
-        match &self.buffer.state {
-            BufferState::Contiguous => self.buffer.bytes.as_ptr(),
-            BufferState::Retained { prefix } => prefix.as_ptr(),
-        }
+        self.buffer.bytes.as_ptr()
     }
 
     /// Copy data into buffer and mark as initialized
@@ -1500,11 +1477,13 @@ mod tests {
         let mut buffer = pool.acquire();
         buffer.copy_from_slice(b"discardkeepdiscard");
         let allocation = buffer.allocation_ptr();
+        let capacity = buffer.capacity();
 
         buffer.expose_initialized_range_without_copying(7..11);
 
         assert_eq!(buffer.as_ref(), b"keep");
         assert_eq!(buffer.allocation_ptr(), allocation);
+        assert_eq!(buffer.capacity(), capacity);
     }
 
     #[tokio::test]
