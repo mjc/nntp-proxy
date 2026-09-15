@@ -21,12 +21,18 @@ in
       cargo-audit
       cargo-hack
       cargo-shear
+      cargo-semver-checks
       cargo-vet
       cargo-nextest
       cargo-mutants
       cargo-careful
       cargo-outdated
+      cargo-tarpaulin
+      cargo-bloat
       cargo-llvm-cov
+      cargo-flamegraph
+      tokei
+      gh
       shellcheck
       actionlint
       zizmor

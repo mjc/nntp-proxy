@@ -54,6 +54,16 @@ Build the packaged binary with Nix:
 nix build .#default
 ```
 
+Build cross-platform release artifacts with the pinned cross-compilation shell:
+
+```bash
+./scripts/build-release.sh <version>
+```
+
+The release script enters the flake's `cross` shell automatically. Use devenv
+for local builds and quality checks; use the flake only for packaging and
+cross-compilation.
+
 ## Response Handling Work
 
 Use RFC 3977 and RFC 4643 when protocol behavior is unclear. In this codebase,
@@ -92,6 +102,10 @@ When you want fresh numbers:
 - microbenchmarks live under `benches/`
 - end-to-end cache-miss benchmarking uses `scripts/bench-release-cache-miss-e2e.sh`
 - profiling helpers include `scripts/parse_perfdata` and `scripts/parse_flamegraph`
+
+For the complete local toolset, run `devenv shell --` before invoking tools such
+as `cargo-semver-checks`, `cargo-tarpaulin`, `cargo-bloat`, `cargo-flamegraph`,
+`tokei`, or `gh`.
 
 Do not treat old README benchmark values as current project guarantees.
 
