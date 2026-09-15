@@ -5,15 +5,15 @@
 Build:
 
 ```bash
-devenv shell -- cargo build
+devenv shell cargo build
 ```
 
 Format, lint, and test:
 
 ```bash
-devenv shell -- cargo fmt --check
-devenv shell -- cargo clippy --all-features -- -D warnings
-devenv shell -- cargo nextest run
+devenv shell cargo fmt --check
+devenv shell cargo clippy --all-features -- -D warnings
+devenv shell cargo nextest run
 ```
 
 Use `cargo test` when you need doctests, exact filtering, or `-- --nocapture` debugging output.
@@ -21,7 +21,7 @@ Use `cargo test` when you need doctests, exact filtering, or `-- --nocapture` de
 Dependency and advisory triage:
 
 ```bash
-devenv shell -- scripts/audit-advisories
+devenv shell scripts/audit-advisories
 ```
 
 See [security-advisories.md](security-advisories.md) for ignore policy and
@@ -30,12 +30,12 @@ revisit expectations.
 ## Quality checks
 
 Entering the devenv shell installs the managed pre-commit hook. The hook runs
-`devenv shell -- scripts/quality-fast.sh` only when creating a commit; shell
+`devenv shell scripts/quality-fast.sh` only when creating a commit; shell
 activation itself does not run Clippy or any other checks. Run the quality gate
 explicitly when needed:
 
 ```bash
-devenv shell -- scripts/quality-fast.sh
+devenv shell scripts/quality-fast.sh
 ```
 
 ## Nix
@@ -102,10 +102,6 @@ When you want fresh numbers:
 - microbenchmarks live under `benches/`
 - end-to-end cache-miss benchmarking uses `scripts/bench-release-cache-miss-e2e.sh`
 - profiling helpers include `scripts/parse_perfdata` and `scripts/parse_flamegraph`
-
-For the complete local toolset, run `devenv shell --` before invoking tools such
-as `cargo-semver-checks`, `cargo-tarpaulin`, `cargo-bloat`, `cargo-flamegraph`,
-`tokei`, or `gh`.
 
 Do not treat old README benchmark values as current project guarantees.
 

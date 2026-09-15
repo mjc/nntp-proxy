@@ -45,7 +45,7 @@ scripts/
 .vscode/
 .vs/
 
-# NixOS/direnv
+# Nix development files
 .envrc
 flake.nix
 flake.lock

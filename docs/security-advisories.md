@@ -3,8 +3,8 @@
 This project treats both advisory tools as authoritative:
 
 ```sh
-devenv shell -- cargo audit
-devenv shell -- cargo deny check advisories
+devenv shell cargo audit
+devenv shell cargo deny check advisories
 ```
 
 Ignored advisories must document:
@@ -29,8 +29,8 @@ For dependency maintenance, run the advisory checks during normal PR validation
 and periodically run:
 
 ```sh
-devenv shell -- cargo outdated
-devenv shell -- scripts/audit-advisories
+devenv shell cargo outdated
+devenv shell scripts/audit-advisories
 ```
 
 When `foyer` or `iai-callgrind` publishes a new version, try the upgrade and

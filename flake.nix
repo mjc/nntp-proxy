@@ -59,8 +59,6 @@
       basicNativeBuildInputs = with pkgs;
         [
           rustToolchain
-          pkg-config
-          cmake # Required for zlib-ng feature in flate2
 
           # Code quality & linting
           cargo-deny
@@ -115,8 +113,6 @@
       ];
 
       devBuildInputs = with pkgs; [
-        openssl
-        zlib
         bashInteractive
       ];
 
@@ -160,8 +156,6 @@
 
         shellHook = ''
           export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
-          export PKG_CONFIG_PATH="${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig"
-
           ${pkgs.lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
             # Linux: mold linker + native CPU optimizations
             export ${cargoTargetEnvPrefix}_LINKER="clang"
@@ -175,11 +169,6 @@
         '';
 
         GH_PAGER = "cat";
-
-        # Environment variables for building with OpenSSL
-        OPENSSL_DIR = "${pkgs.openssl.dev}";
-        OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
-        PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig";
 
         # tikv-jemalloc-sys builds jemalloc from source; its configure script
         # fails strerror_r detection when _FORTIFY_SOURCE is set at -O0 (NixOS default).
@@ -196,8 +185,6 @@
 
         shellHook = ''
           export RUST_SRC_PATH="${rustToolchain}/lib/rustlib/src/rust/library"
-          export PKG_CONFIG_PATH="${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig"
-
           export PATH="${rustCrossToolchain}/bin:$PATH"
           export NNTP_PROXY_CROSS_SHELL=1
 
@@ -225,9 +212,6 @@
           echo ""
         '';
 
-        OPENSSL_DIR = "${pkgs.openssl.dev}";
-        OPENSSL_LIB_DIR = "${pkgs.openssl.out}/lib";
-        PKG_CONFIG_PATH = "${pkgs.openssl.dev}/lib/pkgconfig:${pkgs.zlib.dev}/lib/pkgconfig";
       };
 
       packages.default = package;

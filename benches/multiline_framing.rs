@@ -1,7 +1,7 @@
 //! Compare the proxy's incremental multiline framing with a stateless control.
 //!
 //! Run with:
-//! `devenv shell -- cargo bench --features framing-bench --bench multiline_framing`
+//! `devenv shell cargo bench --features framing-bench --bench multiline_framing`
 
 use divan::{Bencher, black_box, counter::BytesCount};
 use nntp_proxy::session::{

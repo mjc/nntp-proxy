@@ -4,14 +4,14 @@ This file is mandatory guidance for AI agents working in this repository.
 
 ## Workflow
 
-- Run project commands through devenv: `devenv shell -- <command>`.
+- Run project commands through devenv: `devenv shell <command>`.
 - Entering devenv installs the managed commit hook; it does not run checks until
   a commit is created.
 - Use `rg`/`rg --files` for search.
 - For normal code changes, run:
-  - `devenv shell -- cargo fmt --check`
-  - `devenv shell -- cargo clippy --all-features -- -D warnings`
-  - `devenv shell -- cargo nextest run`
+  - `devenv shell cargo fmt --check`
+  - `devenv shell cargo clippy --all-features -- -D warnings`
+  - `devenv shell cargo nextest run`
 - For performance-sensitive changes, benchmark before and after and accept no
   regressions.
 
