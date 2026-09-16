@@ -12,48 +12,14 @@
 //! should not rebuild command strings after request validation.
 
 use anyhow::Result;
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::pool::PooledBuffer;
 use crate::protocol::RequestContext;
 
 pub(crate) use crate::session::multiline_framing::BackendResponseOrder;
 
-/// Opaque result of reading enough backend bytes to classify one response.
-///
-/// Callers can inspect status and single-line bytes through methods, but they do
-/// not receive framing internals or boundary offsets. Any caller that needs to
-/// transfer or capture a body must pass the same buffer back through this module.
-pub(crate) struct BackendReadResult {
-    inner: BackendReadResultInner,
-}
-
-#[must_use]
-pub(crate) struct BackendResponseComplete(());
-
-impl BackendResponseComplete {
-    pub(super) fn from_reusable_response(
-        reuse: &crate::session::response_transfer::ResponseConnectionReuse,
-    ) -> Option<Self> {
-        if matches!(
-            reuse,
-            crate::session::response_transfer::ResponseConnectionReuse::Reusable
-        ) {
-            Some(Self(()))
-        } else {
-            None
-        }
-    }
-
-    pub(crate) const fn response() -> Self {
-        Self(())
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn for_test() -> Self {
-        Self(())
-    }
-}
+pub(crate) use crate::session::multiline_framing::ClassifiedResponse;
 
 /// Failure while reading a complete single-line backend reply into caller-owned
 /// scratch storage.
@@ -67,11 +33,6 @@ pub(crate) enum SingleLineReplyReadError {
     Closed,
     /// The bytes read so far cannot be a valid reply for the request.
     Invalid { bytes_read: usize },
-}
-
-enum BackendReadResultInner {
-    Response(crate::session::multiline_framing::BackendResponseRead),
-    Invalid(crate::session::multiline_framing::ResponseReadError),
 }
 
 pub(crate) async fn read_single_line_reply<C>(
@@ -148,83 +109,8 @@ pub(crate) const fn capabilities_without_authinfo_response() -> &'static [u8] {
     crate::session::multiline_framing::CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE
 }
 
-impl BackendReadResult {
-    #[must_use]
-    pub(crate) fn status_code(&self) -> Option<crate::protocol::StatusCode> {
-        match &self.inner {
-            BackendReadResultInner::Response(response) => Some(response.status_code()),
-            BackendReadResultInner::Invalid(_) => None,
-        }
-    }
-
-    pub(crate) fn completion_proof(
-        &self,
-        request: &RequestContext,
-    ) -> Result<BackendResponseComplete> {
-        let Some(status_code) = self.status_code() else {
-            anyhow::bail!("cannot prove completion for an invalid backend response");
-        };
-        if request.has_response_body(status_code) {
-            anyhow::bail!("multiline response requires framer-owned completion");
-        }
-        Ok(BackendResponseComplete(()))
-    }
-
-    #[must_use]
-    pub(crate) fn single_line_bytes<'a>(&self, buffer: &'a PooledBuffer) -> Option<&'a [u8]> {
-        match &self.inner {
-            BackendReadResultInner::Response(response) => response.single_line_bytes(buffer),
-            BackendReadResultInner::Invalid(_) => None,
-        }
-    }
-
-    pub(crate) fn log_warnings(
-        &self,
-        buffer: &[u8],
-        client_addr: impl std::fmt::Display,
-        backend_id: crate::types::BackendId,
-    ) {
-        if let BackendReadResultInner::Invalid(err) = &self.inner {
-            err.log_warnings(buffer, client_addr, backend_id);
-        }
-    }
-}
-
 fn duration_micros_u64(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
-}
-
-async fn read_until_backend_reply<C>(
-    conn: &mut C,
-    request: &RequestContext,
-    buffer: &mut PooledBuffer,
-) -> Result<BackendReadResult>
-where
-    C: AsyncReadExt + Unpin,
-{
-    loop {
-        match crate::session::multiline_framing::backend_response_read(request, buffer) {
-            Ok(response) => {
-                return Ok(BackendReadResult {
-                    inner: BackendReadResultInner::Response(response),
-                });
-            }
-            Err(err @ crate::session::multiline_framing::ResponseReadError::Invalid(_)) => {
-                return Ok(BackendReadResult {
-                    inner: BackendReadResultInner::Invalid(err),
-                });
-            }
-            Err(crate::session::multiline_framing::ResponseReadError::Incomplete) => {
-                let more = buffer.read_more(conn).await?;
-                if more == 0 {
-                    anyhow::bail!(
-                        "Backend EOF before complete backend response ({} bytes)",
-                        buffer.initialized()
-                    );
-                }
-            }
-        }
-    }
 }
 
 /// Format a hex preview of response bytes for debugging Invalid responses
@@ -258,8 +144,8 @@ pub fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
 pub(crate) async fn execute_request_classified<C>(
     conn: &mut C,
     request: &RequestContext,
-    buffer: &mut PooledBuffer,
-) -> Result<BackendReadResult>
+    mut buffer: PooledBuffer,
+) -> Result<ClassifiedResponse>
 where
     C: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -270,7 +156,7 @@ where
         anyhow::bail!("Backend connection closed unexpectedly");
     }
 
-    read_until_backend_reply(conn, request, buffer).await
+    ClassifiedResponse::read(conn, request, buffer).await
 }
 
 /// Read a response for a request that was already written as part of an
@@ -279,7 +165,7 @@ pub(crate) async fn read_classified_response_for_already_sent_request(
     conn: &mut crate::stream::ConnectionStream,
     request: &RequestContext,
     pool: &crate::pool::BufferPool,
-) -> Result<(BackendReadResult, PooledBuffer)> {
+) -> Result<ClassifiedResponse> {
     let mut buffer =
         crate::session::multiline_framing::take_queued_input_or_acquire_empty(conn, pool);
     if buffer.initialized() == 0 {
@@ -289,15 +175,14 @@ pub(crate) async fn read_classified_response_for_already_sent_request(
         }
     }
 
-    let read = read_until_backend_reply(conn, request, &mut buffer).await?;
-    Ok((read, buffer))
+    ClassifiedResponse::read(conn, request, buffer).await
 }
 
 pub(crate) async fn execute_request_classified_timed<C>(
     conn: &mut C,
     request: &RequestContext,
-    buffer: &mut PooledBuffer,
-) -> Result<(BackendReadResult, u64, u64, u64)>
+    mut buffer: PooledBuffer,
+) -> Result<(ClassifiedResponse, u64, u64, u64)>
 where
     C: AsyncReadExt + AsyncWriteExt + Unpin,
 {
@@ -312,7 +197,7 @@ where
         anyhow::bail!("Backend connection closed unexpectedly");
     }
 
-    let response = read_until_backend_reply(conn, request, buffer).await?;
+    let response = ClassifiedResponse::read(conn, request, buffer).await?;
     let after_recv = Instant::now();
     let send_elapsed = after_send.duration_since(start);
     let recv_elapsed = after_recv.duration_since(after_send);
@@ -324,87 +209,6 @@ where
         duration_micros_u64(send_elapsed),
         duration_micros_u64(recv_elapsed),
     ))
-}
-
-/// Capture one backend response into owned pooled chunks.
-///
-/// This is used for payload cache ingestion and other paths that explicitly need
-/// ownership of the complete response. It still delegates all response boundary
-/// detection to the framer.
-pub(crate) async fn write_response_with_optional_capture<W>(
-    request: &RequestContext,
-    buffer: &mut PooledBuffer,
-    conn: &mut crate::stream::ConnectionStream,
-    writer: &mut W,
-    captured: &mut crate::pool::ChunkedResponse,
-    pool: &crate::pool::BufferPool,
-    backend_id: crate::types::BackendId,
-) -> Result<(u64, bool), crate::session::response_transfer::ResponseTransferError>
-where
-    W: AsyncWrite + Unpin,
-{
-    crate::session::multiline_framing::write_response_with_optional_capture(
-        request, buffer, conn, writer, captured, pool, backend_id,
-    )
-    .await
-}
-
-/// Observe and drain one backend response without retaining its bytes.
-///
-/// This is for retry/control paths that must consume the backend response to
-/// keep the connection reusable but do not need ownership of the response body.
-pub(crate) async fn observe_response(
-    request: &RequestContext,
-    buffer: &mut PooledBuffer,
-    conn: &mut crate::stream::ConnectionStream,
-    pool: &crate::pool::BufferPool,
-    backend_id: crate::types::BackendId,
-) -> Result<BackendResponseComplete, crate::session::response_transfer::ResponseTransferError> {
-    crate::session::multiline_framing::observe_response(request, buffer, conn, pool, backend_id)
-        .await?;
-    Ok(BackendResponseComplete(()))
-}
-
-/// Capture an isolated multiline response into a single pooled capture buffer.
-///
-/// Used by client and precheck paths that issue commands outside the normal
-/// per-command transfer loop.
-pub(crate) async fn capture_complete_multiline_response(
-    conn: &mut crate::stream::ConnectionStream,
-    buffer: &mut PooledBuffer,
-    capture: &mut PooledBuffer,
-) -> anyhow::Result<BackendResponseComplete> {
-    crate::session::multiline_framing::capture_isolated_multiline_response(conn, buffer, capture)
-        .await?;
-    Ok(BackendResponseComplete(()))
-}
-
-/// Capture an isolated multiline response into chunked pooled storage while it
-/// remains within the framer-owned retention limit.
-pub(crate) async fn capture_complete_multiline_response_chunked_optional(
-    conn: &mut crate::stream::ConnectionStream,
-    buffer: &mut PooledBuffer,
-    pool: &crate::pool::BufferPool,
-    response: &mut crate::pool::ChunkedResponse,
-) -> anyhow::Result<(bool, BackendResponseComplete)> {
-    let retained =
-        crate::session::multiline_framing::capture_isolated_multiline_response_chunked_optional(
-            conn, buffer, pool, response,
-        )
-        .await
-        .map_err(|err| anyhow::anyhow!("backend multiline response capture failed: {err:?}"))?;
-    Ok((retained, BackendResponseComplete(())))
-}
-
-/// Drain an isolated multiline response without retaining the bytes.
-pub(crate) async fn observe_complete_multiline_response(
-    conn: &mut crate::stream::ConnectionStream,
-    buffer: &mut PooledBuffer,
-) -> anyhow::Result<BackendResponseComplete> {
-    crate::session::multiline_framing::observe_isolated_multiline_response(conn, buffer)
-        .await
-        .map_err(|err| anyhow::anyhow!("backend multiline response drain failed: {err:?}"))?;
-    Ok(BackendResponseComplete(()))
 }
 
 #[cfg(test)]
@@ -474,10 +278,10 @@ mod tests {
         let mut stream = ChunkedStream::new(vec![b"20".to_vec(), b"0 OK\r\n".to_vec()]);
 
         let pool = crate::pool::BufferPool::for_tests();
-        let mut buffer = pool.acquire();
+        let buffer = pool.acquire();
 
         let request = RequestContext::from_verb_args(b"DATE", b"");
-        let response = execute_request_classified(&mut stream, &request, &mut buffer)
+        let response = execute_request_classified(&mut stream, &request, buffer)
             .await
             .expect("send_request should handle partial reads");
         let status_code = response
@@ -495,10 +299,10 @@ mod tests {
         let mut stream = ChunkedStream::new(vec![b"111".to_vec(), b" 20260501173336\r\n".to_vec()]);
 
         let pool = crate::pool::BufferPool::for_tests();
-        let mut buffer = pool.acquire();
+        let buffer = pool.acquire();
 
         let request = RequestContext::from_verb_args(b"DATE", b"");
-        let response = execute_request_classified(&mut stream, &request, &mut buffer)
+        let response = execute_request_classified(&mut stream, &request, buffer)
             .await
             .expect("send_request should read through complete backend response");
         let status_code = response
@@ -506,7 +310,7 @@ mod tests {
             .expect("DATE response should be valid");
         assert_eq!(status_code, StatusCode::new(111));
         assert!(!request.has_response_body(status_code));
-        assert_eq!(&buffer[..buffer.initialized()], b"111 20260501173336\r\n");
+        assert_eq!(response.received_bytes(), b"111 20260501173336\r\n");
     }
 
     #[tokio::test]
@@ -517,10 +321,10 @@ mod tests {
         let mut stream = ChunkedStream::new(chunks);
 
         let pool = crate::pool::BufferPool::for_tests();
-        let mut buffer = pool.acquire();
+        let buffer = pool.acquire();
 
         let request = RequestContext::from_verb_args(b"GROUP", b"alt.test");
-        let response = execute_request_classified(&mut stream, &request, &mut buffer)
+        let response = execute_request_classified(&mut stream, &request, buffer)
             .await
             .expect("send_request should handle single-byte reads");
         let status_code = response

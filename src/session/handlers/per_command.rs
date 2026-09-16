@@ -1074,7 +1074,6 @@ impl ClientSession {
             batch,
             backend_connection,
         } = params;
-        let mut last_completion = None;
         let mut unread_requests = requests.into_iter().enumerate();
         while let Some((i, request_route)) = unread_requests.next() {
             match request_route {
@@ -1111,8 +1110,7 @@ impl ClientSession {
                             ))
                         })?;
                     match result {
-                        Ok(completion) => {
-                            last_completion = Some(completion);
+                        Ok(()) => {
                             guard.complete();
                         }
                         Err(
@@ -1161,12 +1159,10 @@ impl ClientSession {
         }
         client_writer.get_mut().flush().await?;
 
-        let completion =
-            last_completion.expect("sent article window contained an upstream request");
         if conn.has_pending_bytes() {
             conn.fail_client();
         } else {
-            *backend_connection.slot() = Some(BackendLease::new(backend_id, conn, completion));
+            *backend_connection.slot() = Some(BackendLease::new(backend_id, conn));
         }
         Ok(())
     }
@@ -1353,11 +1349,7 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             let _batch = super::BatchBackendConnection {
-                conn: Some(super::BackendLease::new(
-                    BackendId::from_index(0),
-                    conn,
-                    crate::session::backend::BackendResponseComplete::for_test(),
-                )),
+                conn: Some(super::BackendLease::new(BackendId::from_index(0), conn)),
             };
             tokio::time::sleep(Duration::from_secs(1)).await;
             drop(_batch);
@@ -1369,7 +1361,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let next = provider.checkout_connection_guard().await.unwrap();
-        drop(next.complete_success(crate::session::backend::BackendResponseComplete::for_test()));
+        next.release_idle();
         assert_eq!(
             accept_count.load(Ordering::SeqCst),
             2,

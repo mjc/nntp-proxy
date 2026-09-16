@@ -28,6 +28,9 @@ pub struct Article<'a> {
     pub body: Option<&'a [u8]>,
 }
 
+/// Consumer-facing view of an article whose framing has already been handled.
+pub type ArticleView<'a> = Article<'a>;
+
 impl<'a> TryFrom<&'a [u8]> for Article<'a> {
     type Error = ParseError;
 
@@ -359,5 +362,85 @@ mod tests {
         let decoded = article.decode();
 
         assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn compatibility_fixture_matrix_records_proxy_wire_contract() {
+        let fixtures = [
+            (
+                b"220 0 <article@example.com>\r\nSubject: fixture\r\n\r\nbody\r\n".as_slice(),
+                Some(0),
+                true,
+                true,
+            ),
+            (
+                b"221 0 <head@example.com>\r\nSubject: fixture\r\nFrom: test@example.com\r\n"
+                    .as_slice(),
+                Some(0),
+                true,
+                false,
+            ),
+            (
+                b"222 0 <body@example.com>\r\nbody\r\n".as_slice(),
+                Some(0),
+                false,
+                true,
+            ),
+            (
+                b"223 0 <stat@example.com>\r\n".as_slice(),
+                Some(0),
+                false,
+                false,
+            ),
+            (
+                b"222 0 <empty@example.com>\r\n".as_slice(),
+                Some(0),
+                false,
+                true,
+            ),
+        ];
+
+        for (wire, article_number, has_headers, has_body) in fixtures {
+            let article = Article::parse(wire, false).expect("proxy fixture remains accepted");
+            assert_eq!(article.article_number, article_number);
+            assert_eq!(article.headers.is_some(), has_headers);
+            assert_eq!(article.body.is_some(), has_body);
+        }
+    }
+
+    #[test]
+    fn compatibility_fixture_matrix_keeps_lenient_article_number_behavior() {
+        for number in [b"not-a-number".as_slice(), b"18446744073709551616"] {
+            let wire = [
+                b"220 ".as_slice(),
+                number,
+                b" <fixture@example.com>\r\nSubject: fixture\r\n\r\nbody\r\n",
+            ]
+            .concat();
+
+            let article = Article::parse(&wire, false).expect("proxy parser is permissive here");
+            assert_eq!(article.article_number, None);
+            assert_eq!(article.message_id.as_str(), "<fixture@example.com>");
+        }
+    }
+
+    #[test]
+    fn compatibility_fixture_matrix_preserves_proxy_wire_sections() {
+        let folded = b"220 0 <folded@example.com>\r\nSubject: first\r\n second\r\n\r\nbody\r\n";
+        let folded_article = Article::parse(folded, false).unwrap();
+        assert_eq!(
+            folded_article.headers.unwrap().get("Subject"),
+            Some(&b"first"[..])
+        );
+
+        let stuffed = b"222 0 <stuffed@example.com>\r\n..wire-dot\r\n";
+        let stuffed_article = Article::parse(stuffed, false).unwrap();
+        assert_eq!(stuffed_article.body, Some(&b"..wire-dot\r\n"[..]));
+
+        let binary = b"222 0 <binary@example.com>\r\nbinary\0body\r\n";
+        assert!(Article::parse(binary, false).is_ok());
+
+        let bare_lf = b"222 0 <bare@example.com>\r\nbody\nnext\r\n";
+        assert!(Article::parse(bare_lf, false).is_ok());
     }
 }

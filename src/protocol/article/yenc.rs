@@ -18,6 +18,14 @@ use std::io::{BufRead, BufReader};
 #[inline]
 #[must_use]
 pub fn decode_yenc_line(input: &[u8]) -> Vec<u8> {
+    // NNTP dot-stuffs a data line that begins with a dot. Remove only the
+    // protocol-added dot; a second leading dot is part of the yEnc payload.
+    let input = if input.starts_with(b"..") {
+        &input[1..]
+    } else {
+        input
+    };
+
     // yenc crate returns Result but decoding never actually fails
     // (it just returns empty/partial on malformed input)
     yenc::decode_buffer(input).unwrap_or_default()
@@ -254,6 +262,31 @@ mod tests {
 
         let result = validate_yenc_structure(data);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn decode_yenc_line_removes_one_wire_stuffed_leading_dot() {
+        let once_stuffed = decode_yenc_line(b"..encoded");
+        let twice_stuffed = decode_yenc_line(b"...encoded");
+
+        assert_eq!(once_stuffed, yenc::decode_buffer(b".encoded").unwrap());
+        assert_eq!(twice_stuffed, yenc::decode_buffer(b"..encoded").unwrap());
+    }
+
+    #[test]
+    fn stuffed_leading_dots_contribute_to_the_yenc_checksum_once() {
+        let mut actual = crc32fast::Hasher::new();
+        decode_and_checksum(b"..\r\n", &mut actual);
+
+        let mut expected = crc32fast::Hasher::new();
+        expected.update(&decode_yenc_line(b".."));
+        assert_eq!(actual.finalize(), expected.finalize());
+
+        let mut two_bytes = crc32fast::Hasher::new();
+        decode_and_checksum(b"...\r\n", &mut two_bytes);
+        let mut expected_two_bytes = crc32fast::Hasher::new();
+        expected_two_bytes.update(&decode_yenc_line(b"..."));
+        assert_eq!(two_bytes.finalize(), expected_two_bytes.finalize());
     }
 
     #[test]

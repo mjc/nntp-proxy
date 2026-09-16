@@ -111,7 +111,7 @@ framing-bench = []
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]  # Runtime/task instrumentation for tokio-console; build with RUSTFLAGS="--cfg tokio_unstable"
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)', 'cfg(response_contract, values(none(), "append_twice", "append_alias", "response_twice", "classified_buffer_reuse", "chunk_coordinate"))'] }
 
 [lints.clippy]
 branches_sharing_code = "deny"
@@ -143,10 +143,12 @@ harness = false
 [[bench]]
 name = "multiline_framing"
 harness = false
+required-features = ["framing-bench"]
 
 [[bench]]
 name = "retained_buffer"
 harness = false
+required-features = ["framing-bench"]
 
 [[bench]]
 name = "yenc_decoding"

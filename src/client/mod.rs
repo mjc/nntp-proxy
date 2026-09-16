@@ -37,7 +37,7 @@
 //! # fn process(_: &[u8]) {}
 //! ```
 
-use crate::pool::{BufferPool, ConnectionGuard, DeadpoolConnectionProvider, PooledBuffer};
+use crate::pool::{BufferPool, DeadpoolConnectionProvider, PooledBuffer};
 use crate::protocol::{RequestContext, article_request, body_request, head_request, stat_request};
 use crate::session::backend::execute_request_classified;
 use anyhow::{Context, Result};
@@ -46,7 +46,8 @@ use anyhow::{Context, Result};
 ///
 /// Zero-allocation design using caller-provided buffer pool.
 /// Share one pool across multiple clients for minimal allocations.
-/// Returns `PooledBuffer` - caller parses with `Article::parse()`.
+/// Returns a framer-owned, terminator-stripped `PooledBuffer` - caller parses
+/// with `Article::parse()`.
 #[derive(Clone)]
 pub struct NntpClient {
     conn_pool: DeadpoolConnectionProvider,
@@ -67,7 +68,8 @@ impl NntpClient {
 
     /// Fetch article body (BODY command)
     ///
-    /// Returns `PooledBuffer` with the backend response bytes.
+    /// Returns `PooledBuffer` with the status line and payload bytes. The
+    /// multiline terminator has already been consumed by the framer.
     /// Parse with `Article::parse(&buffer, validate_yenc)`.
     ///
     /// # Arguments
@@ -86,7 +88,8 @@ impl NntpClient {
 
     /// Fetch article headers (HEAD command)
     ///
-    /// Returns `PooledBuffer` with the backend response bytes.
+    /// Returns `PooledBuffer` with the status line and payload bytes. The
+    /// multiline terminator has already been consumed by the framer.
     /// Parse with `Article::parse(&buffer, false)`.
     ///
     /// # Arguments
@@ -105,7 +108,8 @@ impl NntpClient {
 
     /// Fetch full article (ARTICLE command)
     ///
-    /// Returns `PooledBuffer` with the backend response bytes.
+    /// Returns `PooledBuffer` with the status line and payload bytes. The
+    /// multiline terminator has already been consumed by the framer.
     /// Parse with `Article::parse(&buffer, validate_yenc)`.
     ///
     /// # Arguments
@@ -140,17 +144,17 @@ impl NntpClient {
             .checkout_connection_guard()
             .await
             .context("Failed to get connection from pool")?;
-        let mut buffer = self.buffer_pool.acquire();
+        let buffer = self.buffer_pool.acquire();
 
-        let response = execute_request_classified(conn.stream_mut(), &request, &mut buffer).await?;
+        let response = execute_request_classified(conn.stream_mut(), &request, buffer).await?;
         let Some(status_code) = response.status_code() else {
             anyhow::bail!("Invalid STAT response");
         };
 
         let result = Self::parse_stat_response(status_code);
         if result.is_ok() {
-            let completion = response.completion_proof(&request)?;
-            let _reusable = conn.complete_success(completion);
+            response.complete_single_line(&mut conn)?;
+            let _reusable = conn.complete_success();
         }
         result
     }
@@ -176,51 +180,27 @@ impl NntpClient {
             .checkout_connection_guard()
             .await
             .context("Failed to get connection from pool")?;
-        let mut io_buffer = self.buffer_pool.acquire();
+        let io_buffer = self.buffer_pool.acquire();
 
-        let response =
-            execute_request_classified(conn.stream_mut(), &request, &mut io_buffer).await?;
+        let response = execute_request_classified(conn.stream_mut(), &request, io_buffer).await?;
         let Some(status_code) = response.status_code() else {
             anyhow::bail!("Invalid response from server");
         };
 
         Self::validate_response(status_code)?;
 
-        if request.has_response_body(status_code) {
-            return self
-                .fetch_captured_multiline_response(conn, io_buffer)
-                .await;
-        }
-
-        let completion = response.completion_proof(&request)?;
-        let _reusable = conn.complete_success(completion);
-        Ok(io_buffer)
-    }
-
-    async fn fetch_captured_multiline_response(
-        &self,
-        mut conn: ConnectionGuard,
-        mut io_buffer: PooledBuffer,
-    ) -> Result<PooledBuffer> {
-        // This client helper is intentionally only an owner of the destination
-        // capture buffer. It delegates all multiline response completion and
-        // trailing-byte rejection to the backend/framer facade.
-        let mut capture = self.buffer_pool.acquire_capture();
-        let completion = match crate::session::backend::capture_complete_multiline_response(
-            conn.stream_mut(),
-            &mut io_buffer,
-            &mut capture,
-        )
-        .await
+        let captured = match response
+            .capture_isolated(&mut conn, &self.buffer_pool)
+            .await
         {
-            Ok(completion) => completion,
-            Err(err) => {
+            Ok(result) => result,
+            Err(error) => {
                 conn.fail_backend();
-                return Err(err);
+                return Err(error);
             }
         };
-        let _reusable = conn.complete_success(completion);
-        Ok(capture)
+        let _reusable = conn.complete_success();
+        Ok(captured)
     }
 
     /// Validate NNTP response status code
@@ -429,10 +409,10 @@ mod tests {
         io_buffer: &mut PooledBuffer,
         capture: &mut PooledBuffer,
     ) -> Result<()> {
-        let _completion =
-            crate::session::backend::capture_complete_multiline_response(conn, io_buffer, capture)
-                .await?;
-        Ok(())
+        crate::session::multiline_framing::capture_isolated_multiline_response(
+            conn, io_buffer, capture,
+        )
+        .await
     }
 
     /// Verify the session response reader captures the complete response when it all
@@ -559,7 +539,7 @@ mod tests {
 
         let buffer = client.fetch_head(&msg_id).await.unwrap();
 
-        assert_eq!(&buffer[..], response);
+        assert_eq!(&buffer[..], &response[..response.len() - 5]);
     }
 
     #[tokio::test]
@@ -571,7 +551,35 @@ mod tests {
 
         let buffer = client.fetch_body(&msg_id).await.unwrap();
 
-        assert_eq!(&buffer[..], response);
+        assert_eq!(&buffer[..], &response[..response.len() - 5]);
+        let article = crate::protocol::Article::parse(&buffer, false).unwrap();
+        assert_eq!(article.body, Some(&b"hello world"[..]));
+    }
+
+    #[tokio::test]
+    async fn fetch_head_can_be_parsed_by_the_documented_article_api() {
+        let response = b"221 0 <test@example.com>\r\nSubject: test\r\nFrom: tester\r\n.\r\n";
+        let addr = spawn_fetch_test_server("HEAD <test@example.com>", response).await;
+        let client = make_test_client(addr);
+        let msg_id = crate::types::MessageId::new("<test@example.com>".to_string()).unwrap();
+
+        let buffer = client.fetch_head(&msg_id).await.unwrap();
+        let article = crate::protocol::Article::parse(&buffer, false).unwrap();
+        assert_eq!(article.body, None);
+        assert_eq!(article.headers.unwrap().get("Subject"), Some(&b"test"[..]));
+    }
+
+    #[tokio::test]
+    async fn fetch_body_preserves_wire_dot_stuffing_for_the_article_decoder() {
+        let response = b"222 0 <dotted@example.com>\r\n..wire-dot\r\n.\r\n";
+        let addr = spawn_fetch_test_server("BODY <dotted@example.com>", response).await;
+        let client = make_test_client(addr);
+        let msg_id = crate::types::MessageId::new("<dotted@example.com>".to_string()).unwrap();
+
+        let buffer = client.fetch_body(&msg_id).await.unwrap();
+        assert_eq!(&buffer[..], &response[..response.len() - 5]);
+        let article = crate::protocol::Article::parse(&buffer, false).unwrap();
+        assert_eq!(article.body, Some(&b"..wire-dot"[..]));
     }
 
     #[tokio::test]
@@ -587,6 +595,6 @@ mod tests {
 
         let buffer = client.fetch_body(&msg_id).await.unwrap();
 
-        assert_eq!(&buffer[..], response);
+        assert_eq!(&buffer[..], &response[..response.len() - 5]);
     }
 }

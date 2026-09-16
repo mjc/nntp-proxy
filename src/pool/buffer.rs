@@ -7,7 +7,9 @@ use std::ops::{Deref, Range};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+#[cfg(not(test))]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
 use tracing::{debug, info, warn};
@@ -291,6 +293,10 @@ impl PooledBuffer {
         self.buffer.initialized_len()
     }
 
+    pub(crate) fn available_read_capacity(&self) -> usize {
+        self.read_limit().saturating_sub(self.initialized())
+    }
+
     #[inline]
     fn read_limit(&self) -> usize {
         if self.writable_len == 0 {
@@ -456,11 +462,7 @@ impl<'a> AppendedRead<'a> {
         &self.buffer.as_ref()[self.previous_len..]
     }
 
-    #[must_use]
-    pub(crate) fn total_len(&self) -> usize {
-        self.buffer.initialized()
-    }
-
+    #[cfg(any(test, feature = "framing-bench"))]
     pub(crate) fn into_inner(self) -> &'a mut PooledBuffer {
         self.buffer
     }
@@ -615,14 +617,26 @@ pub struct HotPathAllocationMetricsSnapshot {
 }
 
 fn response_write_metrics_enabled() -> bool {
+    #[cfg(test)]
+    {
+        TEST_RESPONSE_WRITE_METRICS_ENABLED.with(std::cell::Cell::get)
+    }
+
+    #[cfg(not(test))]
     response_write_metrics_enabled_flag().load(Ordering::Relaxed)
 }
 
 #[cfg(test)]
 pub(crate) fn set_response_write_metrics_enabled(enabled: bool) {
-    response_write_metrics_enabled_flag().store(enabled, Ordering::Relaxed);
+    TEST_RESPONSE_WRITE_METRICS_ENABLED.with(|value| value.set(enabled));
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_RESPONSE_WRITE_METRICS_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(not(test))]
 fn response_write_metrics_enabled_flag() -> &'static AtomicBool {
     static ENABLED: OnceLock<AtomicBool> = OnceLock::new();
     ENABLED.get_or_init(|| {
@@ -1800,6 +1814,7 @@ mod tests {
         let pool = BufferPool::new(BufferSize::try_new(8).unwrap(), 1);
         let mut buffer = pool.acquire();
         buffer.copy_from_slice(b"22");
+        assert_eq!(buffer.available_read_capacity(), 6);
 
         let (mut writer, mut reader) = tokio::io::duplex(64);
         writer.write_all(b"0 long response\r\n").await.unwrap();
@@ -1808,6 +1823,7 @@ mod tests {
         let read = buffer.read_more(&mut reader).await.unwrap();
         assert_eq!(read, 6);
         assert_eq!(buffer.initialized(), 8);
+        assert_eq!(buffer.available_read_capacity(), 0);
         assert_eq!(&*buffer, b"220 long");
     }
 
@@ -2377,5 +2393,27 @@ mod tests {
         let buffer2 = BufferPool::create_aligned_buffer(8192);
         assert_eq!(buffer2.len(), 0);
         assert_eq!(buffer2.capacity() % 4096, 0);
+    }
+}
+
+// These snippets compile against the actual private capabilities, not public
+// stand-ins. The script checks a successful control and precise error codes.
+#[cfg(response_contract)]
+#[allow(dead_code)]
+mod contracts {
+    use super::*;
+
+    async fn append_permission(buffer: &mut PooledBuffer, reader: &mut (impl AsyncRead + Unpin)) {
+        let permit = buffer
+            .retained_append_permit()
+            .expect("retained writable input");
+        let outcome = permit.read(reader).await.expect("read");
+        #[cfg(response_contract = "append_twice")]
+        let _ = permit.read(reader).await;
+        if let AppendOutcome::Data(appended) = outcome {
+            #[cfg(response_contract = "append_alias")]
+            buffer.copy_from_slice(b"changed");
+            std::hint::black_box(appended.as_new_bytes());
+        }
     }
 }

@@ -15,7 +15,7 @@ mod response;
 mod responses;
 
 // Re-export article parsing types
-pub use article::{Article, HeaderIter, Headers, ParseError, yenc};
+pub use article::{Article, ArticleView, HeaderIter, Headers, ParseError, yenc};
 
 // Re-export response types and utilities
 pub(crate) use request::{
