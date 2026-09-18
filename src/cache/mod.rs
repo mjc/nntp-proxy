@@ -69,7 +69,51 @@ pub enum CacheIngestResponse {
     Owned(Box<[u8]>),
     Pooled(crate::pool::PooledBuffer),
     Chunked(crate::pool::ChunkedResponse),
+    /// A framer-owned capture with an established cache payload boundary.
+    FramedChunked(FramedChunkedResponse),
     Inline(SmallVec<[u8; 128]>),
+}
+
+/// Retained cache input whose response boundary was established before it
+/// crossed the asynchronous cache-ingest boundary.
+#[derive(Debug)]
+pub struct FramedChunkedResponse {
+    response: crate::pool::ChunkedResponse,
+    status: StatusCode,
+    payload_end: CachePayloadEnd,
+}
+
+/// Exclusive end of the cache payload within its captured response.
+///
+/// This is a cache-codec coordinate, not a generic response content end: for
+/// multiline captures it excludes the wire terminator while preserving the
+/// payload's final CRLF. The framer establishes it before handing the capture
+/// across the cache boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CachePayloadEnd(usize);
+
+impl CachePayloadEnd {
+    pub(crate) fn new(end: usize, response_len: usize) -> Option<Self> {
+        (end <= response_len).then_some(Self(end))
+    }
+
+    pub(crate) const fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+impl FramedChunkedResponse {
+    pub(crate) async fn write_to<W>(&self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::AsyncWriteExt;
+
+        for chunk in self.response.iter_chunks() {
+            writer.write_all(chunk).await?;
+        }
+        Ok(())
+    }
 }
 
 impl CacheIngestResponse {
@@ -79,8 +123,22 @@ impl CacheIngestResponse {
             Self::Owned(buf) => buf.len(),
             Self::Pooled(buf) => buf.len(),
             Self::Chunked(buf) => buf.len(),
+            Self::FramedChunked(buf) => buf.response.len(),
             Self::Inline(buf) => buf.len(),
         }
+    }
+
+    pub(crate) fn from_framed_chunked(
+        response: crate::pool::ChunkedResponse,
+        status: StatusCode,
+        payload_end: CachePayloadEnd,
+    ) -> Self {
+        debug_assert!(payload_end.as_usize() <= response.len());
+        Self::FramedChunked(FramedChunkedResponse {
+            response,
+            status,
+            payload_end,
+        })
     }
 
     #[cfg(test)]
@@ -94,6 +152,7 @@ impl CacheIngestResponse {
                 buf.copy_prefix_into(3, &mut prefix);
                 StatusCode::parse(&prefix)
             }
+            Self::FramedChunked(buf) => Some(buf.status),
             Self::Inline(buf) => StatusCode::parse(buf),
         }
     }
@@ -107,6 +166,7 @@ impl PartialEq for CacheIngestResponse {
                 CacheIngestResponse::Owned(v) => Box::new(std::iter::once(v.as_ref())),
                 CacheIngestResponse::Pooled(v) => Box::new(std::iter::once(v.as_ref())),
                 CacheIngestResponse::Chunked(v) => Box::new(v.iter_chunks()),
+                CacheIngestResponse::FramedChunked(v) => Box::new(v.response.iter_chunks()),
                 CacheIngestResponse::Inline(v) => Box::new(std::iter::once(v.as_slice())),
             }
         }

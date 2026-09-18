@@ -290,6 +290,25 @@ mod tests {
     }
 
     #[test]
+    fn validate_yenc_preserves_two_and_three_wire_leading_dots() {
+        for wire_line in [b"..".as_slice(), b"...".as_slice()] {
+            let decoded = decode_yenc_line(wire_line);
+            let mut checksum = crc32fast::Hasher::new();
+            checksum.update(&decoded);
+            let crc = checksum.finalize();
+            let body = format!(
+                "=ybegin line=128 size={} name=dots.bin\r\n{}\r\n=yend size={} crc32={crc:08x}\r\n",
+                decoded.len(),
+                String::from_utf8_lossy(wire_line),
+                decoded.len(),
+            );
+
+            validate_yenc_structure(body.as_bytes())
+                .expect("wire dot stuffing must be removed exactly once");
+        }
+    }
+
+    #[test]
     fn test_missing_yend() {
         let data = b"=ybegin part=1 size=1000 name=test.bin\r\n\
                      <data>\r\n";

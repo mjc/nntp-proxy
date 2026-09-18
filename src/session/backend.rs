@@ -20,6 +20,7 @@ use crate::protocol::RequestContext;
 pub(crate) use crate::session::multiline_framing::BackendResponseOrder;
 
 pub(crate) use crate::session::multiline_framing::ClassifiedResponse;
+pub(crate) use crate::session::multiline_framing::ReceivingResponse;
 
 /// Failure while reading a complete single-line backend reply into caller-owned
 /// scratch storage.
@@ -159,23 +160,47 @@ where
     ClassifiedResponse::read(conn, request, buffer).await
 }
 
+/// Execute a request and retain the response together with the backend guard
+/// that owns its continuation and pooled input window.
+pub(crate) async fn execute_request_receiving<'a>(
+    conn: &'a mut crate::pool::ConnectionGuard,
+    request: &RequestContext,
+    mut buffer: PooledBuffer,
+    pool: &'a crate::pool::BufferPool,
+    backend_id: crate::types::BackendId,
+) -> Result<ReceivingResponse<'a>> {
+    request.write_wire_to(conn.stream_mut()).await?;
+
+    let n = buffer.read_from(conn.stream_mut()).await?;
+    if n == 0 {
+        anyhow::bail!("Backend connection closed unexpectedly");
+    }
+
+    let response = ClassifiedResponse::read(conn.stream_mut(), request, buffer).await?;
+    Ok(response.receiving(conn, pool, backend_id))
+}
+
 /// Read a response for a request that was already written as part of an
 /// upstream pipeline window.
-pub(crate) async fn read_classified_response_for_already_sent_request(
-    conn: &mut crate::stream::ConnectionStream,
+pub(crate) async fn read_receiving_response_for_already_sent_request<'a>(
+    conn: &'a mut crate::pool::ConnectionGuard,
     request: &RequestContext,
-    pool: &crate::pool::BufferPool,
-) -> Result<ClassifiedResponse> {
-    let mut buffer =
-        crate::session::multiline_framing::take_queued_input_or_acquire_empty(conn, pool);
+    pool: &'a crate::pool::BufferPool,
+    backend_id: crate::types::BackendId,
+) -> Result<ReceivingResponse<'a>> {
+    let mut buffer = crate::session::multiline_framing::take_queued_input_or_acquire_empty(
+        conn.stream_mut(),
+        pool,
+    );
     if buffer.initialized() == 0 {
-        let n = buffer.read_from(conn).await?;
+        let n = buffer.read_from(conn.stream_mut()).await?;
         if n == 0 {
             anyhow::bail!("Backend connection closed unexpectedly");
         }
     }
 
-    ClassifiedResponse::read(conn, request, buffer).await
+    let response = ClassifiedResponse::read(conn.stream_mut(), request, buffer).await?;
+    Ok(response.receiving(conn, pool, backend_id))
 }
 
 pub(crate) async fn execute_request_classified_timed<C>(

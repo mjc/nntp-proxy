@@ -316,7 +316,8 @@ impl ClientSession {
                         .await;
                 }
                 buffer
-                    .observe(&mut conn, &self.buffer_pool, backend_id)
+                    .receiving(&mut conn, &self.buffer_pool, backend_id)
+                    .observe()
                     .await
                     .map_err(SessionError::from)?;
                 self.release_or_reuse_connection(
@@ -411,7 +412,7 @@ impl ClientSession {
             probes.push(async move {
                 let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
                 let mut conn = match provider.checkout_connection_guard().await {
-                    Ok(conn) => conn,
+                    Ok(conn) => conn.activate(),
                     Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
                 };
                 let buffer = self.buffer_pool.acquire();
@@ -428,7 +429,8 @@ impl ClientSession {
 
                 let status_code = response.status_code();
                 match response
-                    .observe(&mut conn, &self.buffer_pool, backend_id)
+                    .receiving(&mut conn, &self.buffer_pool, backend_id)
+                    .observe()
                     .await
                 {
                     Ok(()) => {}
@@ -538,7 +540,7 @@ impl ClientSession {
                         .expect("probe backend is registered");
                     let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
                     let mut conn = match provider.checkout_connection_guard().await {
-                        Ok(conn) => conn,
+                        Ok(conn) => conn.activate(),
                         Err(_) => return,
                     };
                     let buffer = buffer_pool.acquire();
@@ -556,7 +558,11 @@ impl ClientSession {
                         }
                     };
                     let status_code = response.status_code();
-                    match response.observe(&mut conn, &buffer_pool, backend_id).await {
+                    match response
+                        .receiving(&mut conn, &buffer_pool, backend_id)
+                        .observe()
+                        .await
+                    {
                         Ok(()) => {}
                         Err(_) => {
                             conn.fail_backend();
@@ -747,8 +753,9 @@ impl ClientSession {
             has_response_body,
             "Writing backend response to client"
         );
+        let backend_bytes = backend_bytes.receiving(&mut conn, &self.buffer_pool, backend_id);
         let bytes_written = match self
-            .write_response_to_client(&mut conn, client_write, backend, backend_bytes, params)
+            .write_response_to_client(client_write, backend, backend_bytes, params)
             .await
         {
             Ok(result) => result,
@@ -949,7 +956,7 @@ impl ClientSession {
                         pool_waiting = checkout_status.waiting,
                         "Requesting pooled connection after retiring unhealthy cached batch connection"
                     );
-                    provider.checkout_connection_guard().await?
+                    provider.checkout_connection_guard().await?.activate()
                 } else if can_expand_or_use_idle {
                     debug!(
                         client = %self.client_addr,
@@ -967,7 +974,7 @@ impl ClientSession {
                     );
                     *backend_connection = Some(BackendLease::new(cached_backend_id, guard));
                     match provider.checkout_connection_guard().await {
-                        Ok(conn) => conn,
+                        Ok(conn) => conn.activate(),
                         Err(err) => {
                             debug!(
                                 client = %self.client_addr,
@@ -1031,7 +1038,7 @@ impl ClientSession {
                     pool_waiting = checkout_status.waiting,
                     "Requesting pooled connection after backend switch"
                 );
-                let conn = provider.checkout_connection_guard().await?;
+                let conn = provider.checkout_connection_guard().await?.activate();
                 let checkout_status = provider.status_counts();
                 trace!(
                     client = %self.client_addr,
@@ -1063,7 +1070,7 @@ impl ClientSession {
                     pool_waiting = checkout_status.waiting,
                     "Requesting pooled connection"
                 );
-                let conn = provider.checkout_connection_guard().await?;
+                let conn = provider.checkout_connection_guard().await?.activate();
                 let checkout_status = provider.status_counts();
                 trace!(
                     client = %self.client_addr,
@@ -1140,7 +1147,8 @@ impl ClientSession {
                     Ok((probe_response, probe_timings))
                 } else {
                     probe_response
-                        .observe(&mut guard, &self.buffer_pool, backend.backend_id())
+                        .receiving(&mut guard, &self.buffer_pool, backend.backend_id())
+                        .observe()
                         .await
                         .map_err(SessionError::from)?;
                     let _ = probe_timings;
@@ -1219,10 +1227,11 @@ impl ClientSession {
         W: AsyncWrite + Unpin,
     {
         let backend_id = backend.backend_id();
-        let buffer = backend::read_classified_response_for_already_sent_request(
-            conn.stream_mut(),
+        let buffer = backend::read_receiving_response_for_already_sent_request(
+            conn,
             request,
             &self.buffer_pool,
+            backend_id,
         )
         .await
         .map_err(AlreadySentResponseError::Read)?;
@@ -1246,7 +1255,7 @@ impl ClientSession {
                     .await;
             }
             buffer
-                .observe(conn, &self.buffer_pool, backend_id)
+                .observe()
                 .await
                 .map_err(AlreadySentResponseError::Transfer)?;
             self.send_430_to_client(client_write, backend_to_client_bytes)
@@ -1266,7 +1275,7 @@ impl ClientSession {
             status_code,
         };
         let bytes_written = self
-            .write_response_to_client(&mut *conn, client_write, backend, buffer, params)
+            .write_response_to_client(client_write, backend, buffer, params)
             .await
             .map_err(AlreadySentResponseError::Transfer)?;
         client_write.flush().await.map_err(|error| {
@@ -1317,10 +1326,9 @@ impl ClientSession {
     /// without string/downcast inspection.
     async fn write_response_to_client<W>(
         &self,
-        pooled_conn: &mut crate::pool::ConnectionGuard,
         client_write: &mut W,
         backend: &ArticleBackend,
-        backend_bytes: crate::session::backend::ClassifiedResponse,
+        backend_bytes: crate::session::backend::ReceivingResponse<'_>,
         params: ResponseWriteParams<'_>,
     ) -> Result<u64, ResponseTransferError>
     where
@@ -1352,23 +1360,17 @@ impl ClientSession {
             match ResponseRetention::for_request(params.request, cache_action) {
                 ResponseRetention::DiscardAfterWrite => {
                     let bytes = self
-                        .write_response_without_retention(
-                            pooled_conn,
-                            client_write,
-                            backend_id,
-                            backend_bytes,
-                        )
+                        .write_response_without_retention(client_write, backend_bytes)
                         .await?;
                     (bytes, None)
                 }
                 ResponseRetention::RetainAfterWrite => {
                     let (bytes, response) = self
                         .write_response_with_retention(
-                            pooled_conn,
                             client_write,
-                            backend_id,
                             backend_bytes,
                             params,
+                            backend_id,
                         )
                         .await?;
                     (bytes, response)
@@ -1386,7 +1388,7 @@ impl ClientSession {
         cache_action: CacheAction,
         params: ResponseWriteParams<'_>,
         backend: BackendId,
-        captured: Option<crate::pool::ChunkedResponse>,
+        captured: Option<crate::session::multiline_framing::CapturedChunkedResponse>,
     ) {
         let backend_id = backend;
         let msg_id = params
@@ -1394,7 +1396,7 @@ impl ClientSession {
             .map(|article_request| article_request.message_id());
         match (cache_action, msg_id.as_ref(), captured) {
             (CacheAction::CaptureArticle, msg_id, Some(response)) => {
-                self.maybe_cache_upsert_buffer(msg_id, response.into(), backend);
+                self.maybe_cache_upsert_buffer(msg_id, response.into_cache_ingest(), backend);
             }
             (CacheAction::TrackAvailability, Some(msg_id), _)
             | (CacheAction::CaptureArticle, Some(msg_id), None)
@@ -1433,28 +1435,28 @@ impl ClientSession {
 
     async fn write_response_without_retention<W>(
         &self,
-        pooled_conn: &mut crate::pool::ConnectionGuard,
         client_write: &mut W,
-        backend_id: BackendId,
-        backend_bytes: crate::session::backend::ClassifiedResponse,
+        backend_bytes: crate::session::backend::ReceivingResponse<'_>,
     ) -> Result<u64, ResponseTransferError>
     where
         W: AsyncWrite + Unpin,
     {
-        backend_bytes
-            .write(pooled_conn, client_write, &self.buffer_pool, backend_id)
-            .await
+        backend_bytes.write(client_write).await
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn write_response_with_retention<W>(
         &self,
-        pooled_conn: &mut crate::pool::ConnectionGuard,
         client_write: &mut W,
-        backend_id: BackendId,
-        backend_bytes: crate::session::backend::ClassifiedResponse,
+        backend_bytes: crate::session::backend::ReceivingResponse<'_>,
         params: ResponseWriteParams<'_>,
-    ) -> Result<(u64, Option<crate::pool::ChunkedResponse>), ResponseTransferError>
+        backend_id: BackendId,
+    ) -> Result<
+        (
+            u64,
+            Option<crate::session::multiline_framing::CapturedChunkedResponse>,
+        ),
+        ResponseTransferError,
+    >
     where
         W: AsyncWrite + Unpin,
     {
@@ -1463,26 +1465,22 @@ impl ClientSession {
         // framer-owned retention limit. Larger responses are streamed through
         // without cache insertion so normal delivery and backend reuse can
         // continue.
-        let (bytes_written, retained) = backend_bytes
-            .capture_and_write(
-                pooled_conn,
-                client_write,
-                &mut captured,
-                &self.buffer_pool,
-                backend_id,
-            )
+        let (bytes_written, captured) = backend_bytes
+            .capture_and_write(client_write, &mut captured)
             .await?;
         self.log_body_response_written(backend_id, params, bytes_written as usize);
-        if retained && let Some(article_request) = params.article_request {
+        if captured.is_some()
+            && let Some(article_request) = params.article_request
+        {
             debug!(
                 "Client {} caching full article for {} ({} bytes captured)",
                 self.client_addr,
                 article_request.message_id(),
-                captured.len()
+                captured.as_ref().map_or(0, |response| response.len())
             );
         }
-        if retained {
-            Ok((bytes_written, Some(captured)))
+        if captured.is_some() {
+            Ok((bytes_written, captured))
         } else {
             debug!(
                 client = %self.client_addr,
@@ -2462,7 +2460,8 @@ mod tests {
         let conn = provider
             .checkout_connection_guard()
             .await
-            .expect("initial pooled connection should be created");
+            .expect("initial pooled connection should be created")
+            .activate();
         let mut backend_connection = Some(BackendLease::new(backend_id, conn));
         if let Some(lease) = backend_connection.as_mut() {
             lease
@@ -2481,7 +2480,7 @@ mod tests {
             )
             .await
             .expect("checkout should recover with a fresh pooled connection");
-        guard.release_idle();
+        drop(guard);
 
         assert_eq!(
             accept_count.load(Ordering::SeqCst),
@@ -2913,7 +2912,11 @@ mod tests {
             .max_connections(5)
             .build()
             .unwrap();
-        let conn = provider.checkout_connection_guard().await.unwrap();
+        let conn = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
         assert_eq!(accept_count.load(Ordering::SeqCst), 1);
 
         let guard = conn;
@@ -2952,7 +2955,7 @@ mod tests {
         assert_eq!(client_write.writes, b"223 0 <test@example.com> status\r\n");
 
         let reused = provider.checkout_connection_guard().await.unwrap();
-        reused.release_idle();
+        reused.release();
         assert_eq!(
             accept_count.load(Ordering::SeqCst),
             1,
@@ -2968,7 +2971,11 @@ mod tests {
             .max_connections(5)
             .build()
             .unwrap();
-        let conn = provider.checkout_connection_guard().await.unwrap();
+        let conn = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
         assert_eq!(accept_count.load(Ordering::SeqCst), 1);
 
         let guard = conn;
@@ -3006,7 +3013,7 @@ mod tests {
         ));
 
         let reused = provider.checkout_connection_guard().await.unwrap();
-        reused.release_idle();
+        reused.release();
         assert_eq!(
             accept_count.load(Ordering::SeqCst),
             1,
@@ -3022,7 +3029,11 @@ mod tests {
             .max_connections(5)
             .build()
             .unwrap();
-        let conn = provider.checkout_connection_guard().await.unwrap();
+        let conn = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
         assert_eq!(accept_count.load(Ordering::SeqCst), 1);
 
         let guard = conn;
@@ -3062,7 +3073,7 @@ mod tests {
         ));
 
         let replacement = provider.checkout_connection_guard().await.unwrap();
-        replacement.release_idle();
+        replacement.release();
         assert_eq!(
             accept_count.load(Ordering::SeqCst),
             2,

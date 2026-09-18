@@ -1344,7 +1344,11 @@ mod tests {
     async fn batch_connection_cancel_retirees_connection_on_drop() {
         let (port, accept_count) = spawn_greeting_server().await;
         let provider = make_provider(port);
-        let conn = provider.checkout_connection_guard().await.unwrap();
+        let conn = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
         assert_eq!(accept_count.load(Ordering::SeqCst), 1);
 
         let handle = tokio::spawn(async move {
@@ -1361,7 +1365,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let next = provider.checkout_connection_guard().await.unwrap();
-        next.release_idle();
+        next.release();
         assert_eq!(
             accept_count.load(Ordering::SeqCst),
             2,

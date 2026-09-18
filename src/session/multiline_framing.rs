@@ -18,6 +18,7 @@ use smallvec::SmallVec;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
+const DOT_TERMINATOR: &[u8; 3] = b".\r\n";
 const TERMINATOR_TAIL_SIZE: usize = 4;
 const MAX_CAPTURED_MULTILINE_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -26,7 +27,7 @@ static TERMINATOR_FINDER: LazyLock<memchr::memmem::Finder<'static>> =
 
 #[must_use]
 pub(crate) fn cached_response_completion() -> std::io::IoSlice<'static> {
-    std::io::IoSlice::new(TERMINATOR)
+    std::io::IoSlice::new(DOT_TERMINATOR)
 }
 
 pub(crate) const CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE: &[u8] =
@@ -613,6 +614,7 @@ impl ResponseFrame {
 pub(crate) struct ClassifiedResponse {
     buffer: crate::pool::PooledBuffer,
     frame: Result<ResponseFrame, ResponseReadError>,
+    kind: crate::protocol::RequestKind,
 }
 
 impl ClassifiedResponse {
@@ -639,9 +641,32 @@ impl ClassifiedResponse {
                         );
                     }
                 }
-                frame => return Ok(Self { buffer, frame }),
+                frame => {
+                    return Ok(Self {
+                        buffer,
+                        frame,
+                        kind: request.kind(),
+                    });
+                }
             }
         }
+    }
+
+    /// Bind the classified response to the same backend exchange that supplied
+    /// its bytes. The resulting operation owns the only public path to
+    /// forwarding, observation, or intentional capture.
+    pub(crate) fn receiving<'a>(
+        self,
+        conn: &'a mut crate::pool::ConnectionGuard,
+        pool: &'a crate::pool::BufferPool,
+        backend_id: crate::types::BackendId,
+    ) -> ReceivingResponse<'a> {
+        crate::protocol::ArticleState(ReceivingOperation {
+            response: self,
+            conn,
+            pool,
+            backend_id,
+        })
     }
 
     pub(crate) fn status_code(&self) -> Option<crate::protocol::StatusCode> {
@@ -666,7 +691,7 @@ impl ClassifiedResponse {
         &self.buffer
     }
 
-    pub(crate) async fn capture_isolated(
+    async fn capture_isolated(
         mut self,
         conn: &mut crate::pool::ConnectionGuard,
         pool: &crate::pool::BufferPool,
@@ -690,7 +715,7 @@ impl ClassifiedResponse {
         }
     }
 
-    pub(crate) async fn capture_isolated_chunked_optional(
+    async fn capture_isolated_chunked_optional(
         mut self,
         conn: &mut crate::pool::ConnectionGuard,
         pool: &crate::pool::BufferPool,
@@ -712,7 +737,7 @@ impl ClassifiedResponse {
         Ok(retained)
     }
 
-    pub(crate) async fn observe_isolated(
+    async fn observe_isolated(
         mut self,
         conn: &mut crate::pool::ConnectionGuard,
     ) -> anyhow::Result<()> {
@@ -757,10 +782,7 @@ impl ClassifiedResponse {
     /// Complete a successfully isolated single-line response on its owning
     /// connection. Keeping the isolation check and guard transition together
     /// prevents callers from pairing an independent proof with a connection.
-    pub(crate) fn complete_single_line(
-        self,
-        conn: &mut crate::pool::ConnectionGuard,
-    ) -> anyhow::Result<()> {
+    fn complete_single_line(self, conn: &mut crate::pool::ConnectionGuard) -> anyhow::Result<()> {
         self.require_isolated_single_line()?;
         conn.mark_response_complete();
         Ok(())
@@ -776,15 +798,162 @@ impl ClassifiedResponse {
         let frame = std::mem::replace(&mut self.frame, Err(ResponseReadError::Incomplete));
         StreamingResponse::from_classification(frame, &mut self.buffer, conn, pool, backend_id)
     }
+}
+
+/// A classified response and its owning backend exchange.
+///
+/// The borrow ties the response's continuation, pooled bytes, and connection
+/// together until one consuming operation completes or retires the exchange.
+pub(crate) struct ReceivingOperation<'a> {
+    response: ClassifiedResponse,
+    conn: &'a mut crate::pool::ConnectionGuard,
+    pool: &'a crate::pool::BufferPool,
+    backend_id: crate::types::BackendId,
+}
+
+/// An active response operation bound to the connection that supplied it.
+pub(crate) type ReceivingResponse<'a> = crate::protocol::ArticleState<ReceivingOperation<'a>>;
+
+/// An intentionally captured response that retains the bytes produced by the
+/// framer. The status, request shape, and owner travel together.
+pub(crate) struct CapturedResponse {
+    state: crate::protocol::ArticleState<
+        crate::protocol::FramedArticleState<crate::pool::PooledBuffer>,
+    >,
+}
+
+/// A retained response whose cache payload boundary was established by the
+/// framer. The cache adapter receives this state instead of re-scanning the
+/// captured bytes for the multiline terminator.
+pub(crate) struct CapturedChunkedResponse {
+    state: crate::protocol::ArticleState<
+        crate::protocol::FramedArticleState<crate::pool::ChunkedResponse>,
+    >,
+    payload_end: crate::cache::CachePayloadEnd,
+}
+
+impl CapturedChunkedResponse {
+    fn new(
+        kind: crate::protocol::RequestKind,
+        status: crate::protocol::StatusCode,
+        bytes: crate::pool::ChunkedResponse,
+        payload_end: crate::cache::CachePayloadEnd,
+    ) -> Self {
+        debug_assert!(payload_end.as_usize() <= bytes.len());
+        Self {
+            state: crate::protocol::ArticleState(crate::protocol::FramedArticleState {
+                bytes,
+                kind,
+                status,
+            }),
+            payload_end,
+        }
+    }
+
+    pub(crate) fn into_cache_ingest(self) -> crate::cache::CacheIngestResponse {
+        let Self { state, payload_end } = self;
+        let crate::protocol::ArticleState(crate::protocol::FramedArticleState {
+            bytes,
+            status,
+            ..
+        }) = state;
+        crate::cache::CacheIngestResponse::from_framed_chunked(bytes, status, payload_end)
+    }
+
+    #[must_use]
+    pub(crate) fn len(&self) -> usize {
+        self.state.0.bytes.len()
+    }
+}
+
+impl CapturedResponse {
+    #[must_use]
+    pub(crate) const fn kind(&self) -> crate::protocol::RequestKind {
+        self.state.0.kind
+    }
+
+    #[must_use]
+    pub(crate) const fn status(&self) -> crate::protocol::StatusCode {
+        self.state.0.status
+    }
+
+    #[must_use]
+    pub(crate) fn into_bytes(self) -> crate::pool::PooledBuffer {
+        self.state.0.bytes
+    }
+}
+
+impl ReceivingOperation<'_> {
+    #[must_use]
+    pub(crate) fn status_code(&self) -> Option<crate::protocol::StatusCode> {
+        self.response.status_code()
+    }
+
+    pub(crate) fn log_warnings(
+        &self,
+        client_addr: impl std::fmt::Display,
+        backend_id: crate::types::BackendId,
+    ) {
+        self.response.log_warnings(client_addr, backend_id);
+    }
+
+    pub(crate) async fn capture_isolated(self) -> anyhow::Result<CapturedResponse> {
+        let Self {
+            response,
+            conn,
+            pool,
+            ..
+        } = self;
+        let kind = response.kind;
+        let status = response
+            .status_code()
+            .ok_or_else(|| anyhow::anyhow!("cannot capture invalid backend response"))?;
+        let bytes = response.capture_isolated(conn, pool).await?;
+        Ok(CapturedResponse {
+            state: crate::protocol::ArticleState(crate::protocol::FramedArticleState {
+                bytes,
+                kind,
+                status,
+            }),
+        })
+    }
+
+    pub(crate) async fn capture_isolated_chunked_optional(
+        self,
+        captured: &mut crate::pool::ChunkedResponse,
+    ) -> anyhow::Result<bool> {
+        let Self {
+            response,
+            conn,
+            pool,
+            ..
+        } = self;
+        response
+            .capture_isolated_chunked_optional(conn, pool, captured)
+            .await
+    }
+
+    pub(crate) async fn observe_isolated(self) -> anyhow::Result<()> {
+        let Self { response, conn, .. } = self;
+        response.observe_isolated(conn).await
+    }
+
+    pub(crate) fn complete_single_line(self) -> anyhow::Result<()> {
+        let Self { response, conn, .. } = self;
+        response.complete_single_line(conn)
+    }
 
     pub(crate) async fn write<W: AsyncWrite + Unpin>(
-        mut self,
-        conn: &mut crate::pool::ConnectionGuard,
+        self,
         writer: &mut W,
-        pool: &crate::pool::BufferPool,
-        backend_id: crate::types::BackendId,
     ) -> Result<u64, crate::session::response_transfer::ResponseTransferError> {
-        let stats = self
+        let Self {
+            mut response,
+            conn,
+            pool,
+            backend_id,
+        } = self;
+        let stats = response
             .stream(conn.stream_mut(), pool, backend_id)?
             .write(writer)
             .await?;
@@ -794,12 +963,16 @@ impl ClassifiedResponse {
     }
 
     pub(crate) async fn observe(
-        mut self,
-        conn: &mut crate::pool::ConnectionGuard,
-        pool: &crate::pool::BufferPool,
-        backend_id: crate::types::BackendId,
+        self,
     ) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
-        self.stream(conn.stream_mut(), pool, backend_id)?
+        let Self {
+            mut response,
+            conn,
+            pool,
+            backend_id,
+        } = self;
+        response
+            .stream(conn.stream_mut(), pool, backend_id)?
             .observe()
             .await?;
         conn.mark_response_complete();
@@ -807,19 +980,95 @@ impl ClassifiedResponse {
     }
 
     pub(crate) async fn capture_and_write<W: AsyncWrite + Unpin>(
-        mut self,
-        conn: &mut crate::pool::ConnectionGuard,
+        self,
         writer: &mut W,
         captured: &mut crate::pool::ChunkedResponse,
-        pool: &crate::pool::BufferPool,
-        backend_id: crate::types::BackendId,
-    ) -> Result<(u64, bool), crate::session::response_transfer::ResponseTransferError> {
-        let result = self
+    ) -> Result<
+        (u64, Option<CapturedChunkedResponse>),
+        crate::session::response_transfer::ResponseTransferError,
+    > {
+        let Self {
+            mut response,
+            conn,
+            pool,
+            backend_id,
+        } = self;
+        let kind = response.kind;
+        let status = response.status_code().ok_or_else(|| {
+            crate::session::response_transfer::ResponseTransferError::Io(anyhow::anyhow!(
+                "cannot retain an invalid backend response"
+            ))
+        })?;
+        let result = response
             .stream(conn.stream_mut(), pool, backend_id)?
             .capture_and_write(writer, captured, MAX_CAPTURED_MULTILINE_RESPONSE_BYTES)
             .await?;
         conn.mark_response_complete();
-        Ok(result)
+        let (bytes_written, payload_end) = result;
+        Ok((
+            bytes_written,
+            payload_end.map(|payload_end| {
+                CapturedChunkedResponse::new(kind, status, std::mem::take(captured), payload_end)
+            }),
+        ))
+    }
+}
+
+impl crate::protocol::ArticleState<ReceivingOperation<'_>> {
+    #[must_use]
+    pub(crate) fn status_code(&self) -> Option<crate::protocol::StatusCode> {
+        self.0.status_code()
+    }
+
+    pub(crate) fn log_warnings(
+        &self,
+        client_addr: impl std::fmt::Display,
+        backend_id: crate::types::BackendId,
+    ) {
+        self.0.log_warnings(client_addr, backend_id);
+    }
+
+    pub(crate) async fn capture_isolated(self) -> anyhow::Result<CapturedResponse> {
+        self.0.capture_isolated().await
+    }
+
+    pub(crate) async fn capture_isolated_chunked_optional(
+        self,
+        captured: &mut crate::pool::ChunkedResponse,
+    ) -> anyhow::Result<bool> {
+        self.0.capture_isolated_chunked_optional(captured).await
+    }
+
+    pub(crate) async fn observe_isolated(self) -> anyhow::Result<()> {
+        self.0.observe_isolated().await
+    }
+
+    pub(crate) fn complete_single_line(self) -> anyhow::Result<()> {
+        self.0.complete_single_line()
+    }
+
+    pub(crate) async fn write<W: AsyncWrite + Unpin>(
+        self,
+        writer: &mut W,
+    ) -> Result<u64, crate::session::response_transfer::ResponseTransferError> {
+        self.0.write(writer).await
+    }
+
+    pub(crate) async fn observe(
+        self,
+    ) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
+        self.0.observe().await
+    }
+
+    pub(crate) async fn capture_and_write<W: AsyncWrite + Unpin>(
+        self,
+        writer: &mut W,
+        captured: &mut crate::pool::ChunkedResponse,
+    ) -> Result<
+        (u64, Option<CapturedChunkedResponse>),
+        crate::session::response_transfer::ResponseTransferError,
+    > {
+        self.0.capture_and_write(writer, captured).await
     }
 }
 
@@ -1256,7 +1505,10 @@ impl<'a> StreamingResponse<'a> {
         writer: &mut W,
         response: &mut crate::pool::ChunkedResponse,
         retention_limit: usize,
-    ) -> Result<(u64, bool), crate::session::response_transfer::ResponseTransferError> {
+    ) -> Result<
+        (u64, Option<crate::cache::CachePayloadEnd>),
+        crate::session::response_transfer::ResponseTransferError,
+    > {
         response.clear();
         loop {
             let chunk_len = match &self.frame {
@@ -1283,7 +1535,7 @@ impl<'a> StreamingResponse<'a> {
                 response.clear();
                 stats += self.write_current_and_remaining_chunks(writer).await?;
                 stats.record();
-                return Ok((stats.bytes_written_u64(), false));
+                return Ok((stats.bytes_written_u64(), None));
             }
 
             match &self.frame {
@@ -1302,7 +1554,17 @@ impl<'a> StreamingResponse<'a> {
                         crate::session::response_transfer::ResponseTransferError::ClientDisconnect,
                     )?;
                     stats.record();
-                    return Ok((stats.bytes_written_u64(), true));
+                    let payload_end = match self.shape {
+                        ResponseShape::SingleLine => response.len(),
+                        ResponseShape::Multiline => response
+                            .len()
+                            .checked_sub(DOT_TERMINATOR.len())
+                            .expect("a complete multiline capture includes its terminator"),
+                    };
+                    let payload_end =
+                        crate::cache::CachePayloadEnd::new(payload_end, response.len())
+                            .expect("framer established a cache payload within the capture");
+                    return Ok((stats.bytes_written_u64(), Some(payload_end)));
                 }
                 ResponseWindow::Incomplete(chunk) => {
                     chunk.push_buffer_to(response, self.pool, self.io_buffer);
@@ -1683,8 +1945,8 @@ fn complete_multiline_payload_split(payload: &[u8]) -> Option<CompleteMultilineP
     match framer.split_chunk(payload, PackedPendingBytesPolicy::Reject) {
         Ok(ChunkProgress::Complete(complete)) => {
             let response_end = complete.consumed.0;
-            let body_end = response_end.checked_sub(TERMINATOR.len())?;
-            let terminator_start = response_end.checked_sub(3)?;
+            let body_end = response_end.checked_sub(DOT_TERMINATOR.len())?;
+            let terminator_start = response_end.checked_sub(DOT_TERMINATOR.len())?;
             Some(CompleteMultilinePayloadSplit::new(
                 0..body_end,
                 terminator_start..response_end,
@@ -1699,6 +1961,8 @@ fn complete_multiline_payload_body(payload: &[u8]) -> Option<&[u8]> {
     complete_multiline_payload_split(payload).map(|split| &payload[split.body()])
 }
 
+/// Returns the captured semantic payload, retaining its final content CRLF and
+/// excluding only the dot terminator.
 #[must_use]
 pub(crate) fn captured_multiline_payload_body(payload: &[u8]) -> Option<&[u8]> {
     complete_multiline_payload_body(payload)
@@ -2080,7 +2344,7 @@ mod tests {
             .expect("oversized retained response should stream through");
 
         assert_eq!(bytes_written as usize, expected.len());
-        assert!(!retained);
+        assert!(retained.is_none());
         assert!(captured.is_empty());
         assert_eq!(writer.bytes, expected);
     }
@@ -2108,9 +2372,53 @@ mod tests {
             .expect("complete oversized retained response should still write");
 
         assert_eq!(bytes_written as usize, response.len());
-        assert!(!retained);
+        assert!(retained.is_none());
         assert!(captured.is_empty());
         assert_eq!(writer.bytes, response);
+    }
+
+    #[tokio::test]
+    async fn capture_and_write_returns_framer_bound_cache_payload_end() {
+        let response = b"222 0 <test@example.com>\r\nBody\r\n.\r\n";
+        let pool = make_pool();
+        let mut conn = mock_backend_conn(vec![]).await;
+        let request = crate::protocol::RequestContext::parse(b"BODY <test@example.com>\r\n")
+            .expect("valid request");
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(response);
+        let mut captured = crate::pool::ChunkedResponse::default();
+        let mut writer = RecordingWriter::default();
+
+        let mut classified = ClassifiedResponse::read(&mut conn, &request, io_buffer)
+            .await
+            .unwrap();
+        let (bytes_written, payload_end) = classified
+            .stream(&mut conn, &pool, crate::types::BackendId::from_index(0))
+            .unwrap()
+            .capture_and_write(&mut writer, &mut captured, response.len())
+            .await
+            .expect("response should be retained");
+
+        assert_eq!(bytes_written as usize, response.len());
+        let payload_end = payload_end.expect("retained response");
+        let captured = CapturedChunkedResponse::new(
+            crate::protocol::RequestKind::Body,
+            crate::protocol::StatusCode::new(222),
+            captured,
+            payload_end,
+        );
+        let cache_input = captured.into_cache_ingest();
+        let entry = crate::cache::CachedArticle::from_ingest_response_with_tier(
+            cache_input,
+            crate::cache::ttl::CacheTier::new(0),
+        );
+        assert_eq!(entry.status_code(), crate::protocol::StatusCode::new(222));
+        let rendered = entry
+            .cached_response_for(crate::protocol::RequestKind::Body, "<test@example.com>")
+            .expect("cached body");
+        let mut output = Vec::new();
+        rendered.write_to(&mut output).await.unwrap();
+        assert_eq!(output, response);
     }
 
     #[tokio::test]
@@ -3465,11 +3773,11 @@ mod tests {
     }
 
     #[test]
-    fn complete_multiline_payload_body_returns_body_without_terminator() {
+    fn complete_multiline_payload_body_returns_content_without_dot_terminator() {
         assert_eq!(complete_multiline_payload_body(b".\r\n"), Some(&b""[..]));
         assert_eq!(
             complete_multiline_payload_body(b"body\r\n.\r\n"),
-            Some(&b"body"[..])
+            Some(&b"body\r\n"[..])
         );
         assert_eq!(complete_multiline_payload_body(b"body\r\n.\r\nextra"), None);
     }
@@ -3480,7 +3788,7 @@ mod tests {
 
         let split = complete_multiline_payload_split(payload).expect("complete payload");
 
-        assert_eq!(&payload[split.body()], b"body");
+        assert_eq!(&payload[split.body()], b"body\r\n");
         assert_eq!(&payload[split.terminator()], b".\r\n");
     }
 

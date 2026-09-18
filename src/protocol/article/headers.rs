@@ -15,6 +15,10 @@ pub struct Headers<'a> {
 }
 
 impl<'a> Headers<'a> {
+    pub(crate) const fn from_validated(data: &'a [u8]) -> Self {
+        Self { data }
+    }
+
     /// Parse and validate header block
     ///
     /// # Arguments

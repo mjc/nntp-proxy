@@ -213,9 +213,10 @@ async fn execute_backend_query(
     request: &RequestContext,
 ) -> Result<QueryAttemptResult, ()> {
     let backend_id = backend.backend_id();
-    let Ok(mut conn) = provider.checkout_connection_guard().await else {
+    let Ok(conn) = provider.checkout_connection_guard().await else {
         return Ok(QueryAttemptResult::Error);
     };
+    let mut conn = conn.activate();
 
     let buffer = deps.buffer_pool.acquire();
 
@@ -247,6 +248,7 @@ async fn execute_backend_query(
                 response,
                 status_code,
                 single_line_payload,
+                backend_id,
                 &mut conn,
             )
             .await?;
@@ -269,13 +271,17 @@ async fn build_precheck_hit(
     response: crate::session::backend::ClassifiedResponse,
     status_code: StatusCode,
     single_line_payload: Option<crate::cache::CacheIngestResponse>,
+    backend_id: crate::types::BackendId,
     conn: &mut crate::pool::ConnectionGuard,
 ) -> Result<PrecheckHit, ()> {
     if request.has_response_body(status_code) {
-        return read_complete_precheck_hit(deps, status_code, conn, response).await;
+        return read_complete_precheck_hit(deps, status_code, backend_id, conn, response).await;
     }
 
-    response.complete_single_line(conn).map_err(|_| ())?;
+    response
+        .receiving(conn, &deps.buffer_pool, backend_id)
+        .complete_single_line()
+        .map_err(|_| ())?;
     let hit = if let Some(payload) = single_line_payload {
         PrecheckHit::Payload(payload)
     } else {
@@ -287,6 +293,7 @@ async fn build_precheck_hit(
 async fn read_complete_precheck_hit(
     deps: &OwnedDeps,
     status_code: StatusCode,
+    backend_id: crate::types::BackendId,
     conn: &mut crate::pool::ConnectionGuard,
     classified: crate::session::backend::ClassifiedResponse,
 ) -> Result<PrecheckHit, ()> {
@@ -297,7 +304,8 @@ async fn read_complete_precheck_hit(
 
     if let Some(response) = &mut response {
         let retained = classified
-            .capture_isolated_chunked_optional(conn, &deps.buffer_pool, response)
+            .receiving(conn, &deps.buffer_pool, backend_id)
+            .capture_isolated_chunked_optional(response)
             .await
             .map_err(|_| ())?;
         if !retained {
@@ -305,7 +313,11 @@ async fn read_complete_precheck_hit(
             return Ok(PrecheckHit::Availability(status_code));
         }
     } else {
-        classified.observe_isolated(conn).await.map_err(|_| ())?;
+        classified
+            .receiving(conn, &deps.buffer_pool, backend_id)
+            .observe_isolated()
+            .await
+            .map_err(|_| ())?;
     };
 
     let hit = if let Some(response) = response {

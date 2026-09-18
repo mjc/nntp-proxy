@@ -80,6 +80,8 @@ impl PartialOrd<usize> for CachedPayloadLen {
     }
 }
 
+/// Semantic multiline sections retain their final content CRLF. The dot
+/// terminator is emitted separately when a cached response is rendered.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum CachedPayload {
     Missing,
@@ -192,7 +194,7 @@ impl CachedResponseWire<'_> {
                 let mut slices = [
                     IoSlice::new(self.status_line()),
                     IoSlice::new(headers),
-                    IoSlice::new(b"\r\n\r\n"),
+                    IoSlice::new(b"\r\n"),
                     IoSlice::new(body),
                     Self::response_completion(),
                 ];
@@ -222,7 +224,7 @@ impl CachedResponseWire<'_> {
         match self.payload {
             CachedResponseWirePayload::None => 0,
             CachedResponseWirePayload::Article { headers, body } => {
-                headers.len() + 4 + body.len() + Self::response_completion_len()
+                headers.len() + 2 + body.len() + Self::response_completion_len()
             }
             CachedResponseWirePayload::Head { headers } => {
                 headers.len() + Self::response_completion_len()
@@ -427,6 +429,26 @@ impl CachedArticle {
         }
     }
 
+    fn from_framed_chunked_with_tier(
+        response: super::FramedChunkedResponse,
+        tier: ttl::CacheTier,
+    ) -> Self {
+        let super::FramedChunkedResponse {
+            response,
+            status,
+            payload_end,
+        } = response;
+        let bytes = response.to_vec();
+        let payload = parse_framed_payload(status, &bytes[..payload_end.as_usize()]);
+        Self {
+            backend_availability: ArticleAvailability::new(),
+            status_code: status,
+            payload,
+            tier,
+            inserted_at: ttl::CacheTimestampMillis::now(),
+        }
+    }
+
     #[must_use]
     pub(crate) fn from_ingest_response_with_tier(
         buffer: impl Into<super::CacheIngestResponse>,
@@ -442,6 +464,9 @@ impl CachedArticle {
             }
             super::CacheIngestResponse::Chunked(buffer) => {
                 Self::from_contiguous_ingest_with_tier(buffer.to_vec(), tier)
+            }
+            super::CacheIngestResponse::FramedChunked(buffer) => {
+                Self::from_framed_chunked_with_tier(buffer, tier)
             }
             super::CacheIngestResponse::Inline(buffer) => {
                 Self::from_contiguous_ingest_with_tier(buffer, tier)
@@ -708,6 +733,26 @@ pub(crate) fn parse_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPay
     payload_for_status(code, article_number, payload)
 }
 
+/// Parse a response whose complete boundary was established by the session
+/// framer. Unlike [`parse_payload`], this must not search for a terminator a
+/// second time; `buffer` ends at the framer-provided cache payload boundary.
+pub(crate) fn parse_framed_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPayload {
+    let code = status_code.as_u16();
+    if code == 430 {
+        return CachedPayload::Missing;
+    }
+    let Some(status_end) = memchr::memmem::find(buffer, b"\r\n").map(|pos| pos + 2) else {
+        return CachedPayload::AvailabilityOnly;
+    };
+    let article_number = parse_article_number(&buffer[..status_end]);
+    let payload = &buffer[status_end..];
+    match code {
+        220..=222 => payload_for_status(code, article_number, payload),
+        223 => CachedPayload::Stat { article_number },
+        _ => CachedPayload::AvailabilityOnly,
+    }
+}
+
 /// Return semantic payload bytes for an already captured cache-ingest response.
 ///
 /// ARTICLE/HEAD/BODY payloads arrive here only after the session framer has
@@ -731,7 +776,7 @@ fn payload_for_status(
             if let Some(split) = memchr::memmem::find(payload, b"\r\n\r\n") {
                 CachedPayload::Article {
                     article_number,
-                    headers: payload[..split].into(),
+                    headers: payload[..split + 2].into(),
                     body: payload[split + 4..].into(),
                 }
             } else {
@@ -1338,6 +1383,7 @@ mod tests {
             out,
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n"
         );
+        assert_eq!(response.wire_len().get(), out.len());
     }
 
     #[tokio::test]
@@ -1408,6 +1454,16 @@ mod tests {
         response.write_to(&mut out).await.unwrap();
 
         assert_eq!(out, b"222 0 <test@example.com>\r\nBody\r\n.\r\n");
+    }
+
+    #[tokio::test]
+    async fn cached_empty_multiline_payload_preserves_wire_boundary() {
+        let entry = cached_article_from_ingest_bytes(b"222 0 <test@example.com>\r\n.\r\n");
+
+        assert_eq!(
+            rendered(&entry, RequestKind::Body, "<test@example.com>"),
+            b"222 0 <test@example.com>\r\n.\r\n"
+        );
     }
 
     #[test]
@@ -1565,7 +1621,7 @@ mod tests {
             StatusCode::new(221),
             CachedPayload::Head {
                 article_number: Some(CachedArticleNumber::new(7)),
-                headers: Arc::from(b"Subject: Test".as_slice()),
+                headers: Arc::from(b"Subject: Test\r\n".as_slice()),
             },
             availability,
             tier,
@@ -1575,7 +1631,7 @@ mod tests {
             StatusCode::new(222),
             CachedPayload::Body {
                 article_number: Some(CachedArticleNumber::new(7)),
-                body: Arc::from(b"Body".as_slice()),
+                body: Arc::from(b"Body\r\n".as_slice()),
             },
             availability,
             tier,
@@ -1739,8 +1795,8 @@ mod tests {
         assert_eq!(entry.status_code(), StatusCode::new(220));
         match entry.payload {
             CachedPayload::Article { headers, body, .. } => {
-                assert_eq!(headers.as_ref(), b"Subject: Test");
-                assert_eq!(body.as_ref(), b"Body");
+                assert_eq!(headers.as_ref(), b"Subject: Test\r\n");
+                assert_eq!(body.as_ref(), b"Body\r\n");
             }
             other => panic!("expected article payload, got {other:?}"),
         }
@@ -2191,7 +2247,7 @@ mod tests {
 
         let msgid = MessageId::from_borrowed("<test2@example.com>").unwrap();
         let buffer = b"220 0 <test2@example.com>\r\nSubject: Test2\r\n\r\nBody2\r\n.\r\n".to_vec();
-        let original_payload_size = b"Subject: Test2".len() + b"Body2".len();
+        let original_payload_size = b"Subject: Test2\r\n".len() + b"Body2\r\n".len();
 
         cache
             .upsert_ingest(msgid.clone(), buffer, BackendId::from_index(0), 0.into())

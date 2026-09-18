@@ -372,7 +372,7 @@ impl ClientSession {
         let mut conn_guard = match provider.checkout_connection_guard().await {
             Ok(conn_guard) => {
                 debug!(server = server_name, "Got pooled connection");
-                conn_guard
+                conn_guard.activate()
             }
             Err(e) => {
                 error!(server = server_name, client = %self.client_addr, error = %e, "Failed to get pooled connection");

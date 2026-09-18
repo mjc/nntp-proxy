@@ -235,6 +235,9 @@ impl ClientSession {
                 }
                 Ok(())
             }
+            crate::cache::CacheIngestResponse::FramedChunked(response) => {
+                response.write_to(client_write).await
+            }
             crate::cache::CacheIngestResponse::Inline(buffer) => {
                 client_write.write_all(buffer.as_slice()).await
             }

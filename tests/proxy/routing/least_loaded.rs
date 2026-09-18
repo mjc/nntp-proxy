@@ -318,7 +318,7 @@ async fn test_least_loaded_counts_checked_out_pool_connections() {
         "least-loaded must count checked-out pool connections, not only router pending counts"
     );
 
-    held_backend1.release_idle();
+    held_backend1.release();
 }
 
 #[test]

@@ -11,7 +11,7 @@
 //! ```no_run
 //! use nntp_proxy::client::NntpClient;
 //! use nntp_proxy::pool::{BufferPool, DeadpoolConnectionProvider};
-//! use nntp_proxy::protocol::Article;
+//! use nntp_proxy::protocol::{Article, YencValidation};
 //! use nntp_proxy::types::{BufferSize, MessageId};
 //!
 //! # async fn example() -> anyhow::Result<()> {
@@ -25,8 +25,9 @@
 //!
 //! # let message_ids: Vec<MessageId<'static>> = vec![];
 //! for msg_id in message_ids {
-//!     let buffer = client.fetch_body(&msg_id).await?;
-//!     let article = Article::parse(&buffer, true)?;
+//!     let framed = client.fetch_body(&msg_id).await?;
+//!     let validated = framed.validate_with_yenc(YencValidation::Enabled)?;
+//!     let article = validated.article();
 //!     if let Some(decoded) = article.decode() {
 //!         process(&decoded);
 //!     }
@@ -38,16 +39,20 @@
 //! ```
 
 use crate::pool::{BufferPool, DeadpoolConnectionProvider, PooledBuffer};
-use crate::protocol::{RequestContext, article_request, body_request, head_request, stat_request};
-use crate::session::backend::execute_request_classified;
+use crate::protocol::{
+    ArticleView, RequestContext, StatusCode, YencValidation, article_request, body_request,
+    head_request, stat_request,
+};
+use crate::session::backend::execute_request_receiving;
 use anyhow::{Context, Result};
 
 /// Standalone NNTP client for fetching articles
 ///
 /// Zero-allocation design using caller-provided buffer pool.
 /// Share one pool across multiple clients for minimal allocations.
-/// Returns a framer-owned, terminator-stripped `PooledBuffer` - caller parses
-/// with `Article::parse()`.
+/// Returns a framer-owned [`FramedArticle`]. Its bytes remain associated with
+/// the boundary established by the response framer; callers obtain a reusable
+/// [`ArticleView`] through the consuming [`FramedArticle::validate`] transition.
 #[derive(Clone)]
 pub struct NntpClient {
     conn_pool: DeadpoolConnectionProvider,
@@ -68,9 +73,8 @@ impl NntpClient {
 
     /// Fetch article body (BODY command)
     ///
-    /// Returns `PooledBuffer` with the status line and payload bytes. The
+    /// Returns a framed owner with the status line and payload bytes. The
     /// multiline terminator has already been consumed by the framer.
-    /// Parse with `Article::parse(&buffer, validate_yenc)`.
     ///
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets, e.g. `<abc@example.com>`
@@ -82,15 +86,14 @@ impl NntpClient {
     pub fn fetch_body(
         &self,
         message_id: &crate::types::MessageId<'_>,
-    ) -> impl std::future::Future<Output = Result<PooledBuffer>> + '_ {
+    ) -> impl std::future::Future<Output = Result<FramedArticle>> + '_ {
         self.fetch_response(body_request(message_id))
     }
 
     /// Fetch article headers (HEAD command)
     ///
-    /// Returns `PooledBuffer` with the status line and payload bytes. The
+    /// Returns a framed owner with the status line and payload bytes. The
     /// multiline terminator has already been consumed by the framer.
-    /// Parse with `Article::parse(&buffer, false)`.
     ///
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets
@@ -102,15 +105,14 @@ impl NntpClient {
     pub fn fetch_head(
         &self,
         message_id: &crate::types::MessageId<'_>,
-    ) -> impl std::future::Future<Output = Result<PooledBuffer>> + '_ {
+    ) -> impl std::future::Future<Output = Result<FramedArticle>> + '_ {
         self.fetch_response(head_request(message_id))
     }
 
     /// Fetch full article (ARTICLE command)
     ///
-    /// Returns `PooledBuffer` with the status line and payload bytes. The
+    /// Returns a framed owner with the status line and payload bytes. The
     /// multiline terminator has already been consumed by the framer.
-    /// Parse with `Article::parse(&buffer, validate_yenc)`.
     ///
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets
@@ -122,7 +124,7 @@ impl NntpClient {
     pub fn fetch_article(
         &self,
         message_id: &crate::types::MessageId<'_>,
-    ) -> impl std::future::Future<Output = Result<PooledBuffer>> + '_ {
+    ) -> impl std::future::Future<Output = Result<FramedArticle>> + '_ {
         self.fetch_response(article_request(message_id))
     }
 
@@ -143,17 +145,25 @@ impl NntpClient {
             .conn_pool
             .checkout_connection_guard()
             .await
-            .context("Failed to get connection from pool")?;
+            .context("Failed to get connection from pool")?
+            .activate();
         let buffer = self.buffer_pool.acquire();
 
-        let response = execute_request_classified(conn.stream_mut(), &request, buffer).await?;
+        let response = execute_request_receiving(
+            &mut conn,
+            &request,
+            buffer,
+            &self.buffer_pool,
+            crate::types::BackendId::from_index(0),
+        )
+        .await?;
         let Some(status_code) = response.status_code() else {
             anyhow::bail!("Invalid STAT response");
         };
 
         let result = Self::parse_stat_response(status_code);
         if result.is_ok() {
-            response.complete_single_line(&mut conn)?;
+            let _captured = response.capture_isolated().await?;
             let _reusable = conn.complete_success();
         }
         result
@@ -174,25 +184,30 @@ impl NntpClient {
     /// # Errors
     /// Returns any connection, write, read, or backend-status validation error
     /// encountered while fetching the NNTP response.
-    async fn fetch_response(&self, request: RequestContext) -> Result<PooledBuffer> {
+    async fn fetch_response(&self, request: RequestContext) -> Result<FramedArticle> {
         let mut conn = self
             .conn_pool
             .checkout_connection_guard()
             .await
-            .context("Failed to get connection from pool")?;
+            .context("Failed to get connection from pool")?
+            .activate();
         let io_buffer = self.buffer_pool.acquire();
 
-        let response = execute_request_classified(conn.stream_mut(), &request, io_buffer).await?;
+        let response = execute_request_receiving(
+            &mut conn,
+            &request,
+            io_buffer,
+            &self.buffer_pool,
+            crate::types::BackendId::from_index(0),
+        )
+        .await?;
         let Some(status_code) = response.status_code() else {
             anyhow::bail!("Invalid response from server");
         };
 
         Self::validate_response(status_code)?;
 
-        let captured = match response
-            .capture_isolated(&mut conn, &self.buffer_pool)
-            .await
-        {
+        let captured = match response.capture_isolated().await {
             Ok(result) => result,
             Err(error) => {
                 conn.fail_backend();
@@ -200,7 +215,11 @@ impl NntpClient {
             }
         };
         let _reusable = conn.complete_success();
-        Ok(captured)
+        Ok(FramedArticle::new(
+            captured.kind(),
+            captured.status(),
+            captured.into_bytes(),
+        ))
     }
 
     /// Validate NNTP response status code
@@ -211,6 +230,105 @@ impl NntpClient {
             code if code >= 400 => anyhow::bail!("Server error: {code}"),
             _ => Ok(()),
         }
+    }
+}
+
+/// An article-family response whose wire boundary has already been established.
+///
+/// The owner is the pooled allocation returned by the framing operation. The
+/// multiline terminator is not part of the stored bytes, while the status line
+/// and payload bytes are retained exactly as received. Framing and semantic
+/// article validity are separate guarantees.
+#[derive(Debug)]
+pub struct FramedArticle {
+    state: crate::protocol::ArticleState<crate::protocol::FramedArticleState<PooledBuffer>>,
+}
+
+impl FramedArticle {
+    fn new(kind: crate::protocol::RequestKind, status: StatusCode, bytes: PooledBuffer) -> Self {
+        Self {
+            state: crate::protocol::ArticleState(crate::protocol::FramedArticleState {
+                bytes,
+                kind,
+                status,
+            }),
+        }
+    }
+
+    /// Request kind that produced this response.
+    #[must_use]
+    pub const fn kind(&self) -> crate::protocol::RequestKind {
+        self.state.0.kind
+    }
+
+    /// Parsed status code established by the response framer.
+    #[must_use]
+    pub const fn status(&self) -> StatusCode {
+        self.state.0.status
+    }
+
+    /// Exact framed bytes, including the status line and excluding the
+    /// multiline terminator.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.state.0.bytes
+    }
+
+    /// Validate NNTP article semantics and transition to reusable typed access.
+    /// yEnc validation is explicit policy, not part of NNTP framing.
+    pub fn validate(self, validate_yenc: bool) -> Result<ValidatedArticle> {
+        let policy = match validate_yenc {
+            true => YencValidation::Enabled,
+            false => YencValidation::Disabled,
+        };
+        self.validate_with_yenc(policy)
+    }
+
+    /// Validate NNTP semantics and apply the selected optional yEnc policy.
+    pub fn validate_with_yenc(self, policy: YencValidation) -> Result<ValidatedArticle> {
+        let layout = crate::protocol::ArticleLayout::parse(self.as_bytes())?;
+        match policy {
+            YencValidation::Disabled => {}
+            YencValidation::Enabled => layout.validate_yenc(self.as_bytes())?,
+        }
+        Ok(ValidatedArticle {
+            state: crate::protocol::ArticleState(crate::protocol::ValidatedArticleState::new(
+                self.state.0.bytes,
+                layout,
+            )),
+        })
+    }
+
+    /// Consume the framed owner and return its pooled storage.
+    #[must_use]
+    pub fn into_bytes(self) -> PooledBuffer {
+        self.state.0.bytes
+    }
+}
+
+/// A semantically validated article whose layout remains bound to its bytes.
+#[derive(Debug)]
+pub struct ValidatedArticle {
+    state: crate::protocol::ArticleState<crate::protocol::ValidatedArticleState<PooledBuffer>>,
+}
+
+impl ValidatedArticle {
+    /// Return a reusable zero-copy article view without repeating validation.
+    #[must_use]
+    pub fn article(&self) -> ArticleView<'_> {
+        self.state.0.layout().view(self.state.0.bytes())
+    }
+
+    /// Return the validated wire bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.state.0.bytes()
+    }
+
+    /// Consume the validated state and return its pooled storage.
+    #[must_use]
+    pub fn into_bytes(self) -> PooledBuffer {
+        self.state.0.into_bytes()
     }
 }
 
@@ -537,9 +655,9 @@ mod tests {
         let client = make_test_client(addr);
         let msg_id = crate::types::MessageId::new("<test@example.com>".to_string()).unwrap();
 
-        let buffer = client.fetch_head(&msg_id).await.unwrap();
+        let framed = client.fetch_head(&msg_id).await.unwrap();
 
-        assert_eq!(&buffer[..], &response[..response.len() - 5]);
+        assert_eq!(framed.as_bytes(), &response[..response.len() - 5]);
     }
 
     #[tokio::test]
@@ -549,10 +667,11 @@ mod tests {
         let client = make_test_client(addr);
         let msg_id = crate::types::MessageId::new("<test@example.com>".to_string()).unwrap();
 
-        let buffer = client.fetch_body(&msg_id).await.unwrap();
+        let framed = client.fetch_body(&msg_id).await.unwrap();
 
-        assert_eq!(&buffer[..], &response[..response.len() - 5]);
-        let article = crate::protocol::Article::parse(&buffer, false).unwrap();
+        assert_eq!(framed.as_bytes(), &response[..response.len() - 5]);
+        let validated = framed.validate_with_yenc(YencValidation::Disabled).unwrap();
+        let article = validated.article();
         assert_eq!(article.body, Some(&b"hello world"[..]));
     }
 
@@ -563,8 +682,9 @@ mod tests {
         let client = make_test_client(addr);
         let msg_id = crate::types::MessageId::new("<test@example.com>".to_string()).unwrap();
 
-        let buffer = client.fetch_head(&msg_id).await.unwrap();
-        let article = crate::protocol::Article::parse(&buffer, false).unwrap();
+        let framed = client.fetch_head(&msg_id).await.unwrap();
+        let validated = framed.validate_with_yenc(YencValidation::Disabled).unwrap();
+        let article = validated.article();
         assert_eq!(article.body, None);
         assert_eq!(article.headers.unwrap().get("Subject"), Some(&b"test"[..]));
     }
@@ -576,10 +696,31 @@ mod tests {
         let client = make_test_client(addr);
         let msg_id = crate::types::MessageId::new("<dotted@example.com>".to_string()).unwrap();
 
-        let buffer = client.fetch_body(&msg_id).await.unwrap();
-        assert_eq!(&buffer[..], &response[..response.len() - 5]);
-        let article = crate::protocol::Article::parse(&buffer, false).unwrap();
+        let framed = client.fetch_body(&msg_id).await.unwrap();
+        assert_eq!(framed.as_bytes(), &response[..response.len() - 5]);
+        let validated = framed.validate_with_yenc(YencValidation::Disabled).unwrap();
+        let article = validated.article();
         assert_eq!(article.body, Some(&b"..wire-dot"[..]));
+    }
+
+    #[tokio::test]
+    async fn validated_article_view_is_reusable_without_revalidation() {
+        let response = b"222 0 <repeat@example.com>\r\nhello world\r\n.\r\n";
+        let addr = spawn_fetch_test_server("BODY <repeat@example.com>", response).await;
+        let client = make_test_client(addr);
+        let msg_id = crate::types::MessageId::new("<repeat@example.com>".to_string()).unwrap();
+
+        let validated = client
+            .fetch_body(&msg_id)
+            .await
+            .unwrap()
+            .validate_with_yenc(YencValidation::Disabled)
+            .unwrap();
+        let first = validated.article();
+        let second = validated.article();
+
+        assert_eq!(first, second);
+        assert_eq!(first.body, Some(&b"hello world"[..]));
     }
 
     #[tokio::test]
@@ -593,8 +734,8 @@ mod tests {
         let client = make_test_client(addr);
         let msg_id = crate::types::MessageId::new("<large@example.com>".to_string()).unwrap();
 
-        let buffer = client.fetch_body(&msg_id).await.unwrap();
+        let framed = client.fetch_body(&msg_id).await.unwrap();
 
-        assert_eq!(&buffer[..], &response[..response.len() - 5]);
+        assert_eq!(framed.as_bytes(), &response[..response.len() - 5]);
     }
 }

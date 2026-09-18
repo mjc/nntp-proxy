@@ -279,7 +279,7 @@ impl ClientSession {
             .ok_or_else(|| anyhow::anyhow!("{}: {:?}", error::BACKEND_NOT_FOUND, backend_id))?;
 
         let provider = provider.clone();
-        let conn_guard = provider.checkout_connection_guard().await?;
+        let conn_guard = provider.checkout_connection_guard().await?.activate();
 
         Ok(StatefulBackendLease::new(
             conn_guard,

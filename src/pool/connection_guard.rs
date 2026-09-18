@@ -80,6 +80,16 @@ pub struct ConnectionGuard {
     phase: ConnectionPhase,
 }
 
+/// A checked-out connection that has not started protocol I/O.
+///
+/// The checkout boundary is intentionally typestated: an idle connection can
+/// either be returned immediately or activated for an exchange.  Once it is
+/// activated, the idle-only release operation is no longer available.
+#[must_use]
+pub struct IdleConnection {
+    guard: ConnectionGuard,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConnectionPhase {
     Idle,
@@ -94,19 +104,8 @@ pub(crate) struct ReusableConnection {
 }
 
 impl ConnectionGuard {
-    /// Create a new guard (removes from pool on drop unless released).
-    pub(crate) const fn new(conn: PooledConnection, provider: DeadpoolConnectionProvider) -> Self {
-        Self {
-            conn: Some(conn),
-            provider,
-            phase: ConnectionPhase::Idle,
-        }
-    }
-    /// Return a checked-out connection that has not been used yet.
-    ///
-    /// This is the only successful release available without response-completion
-    /// evidence; callers cannot obtain protocol-stream access from this API.
-    pub fn release_idle(mut self) {
+    /// Release an idle checkout without starting an exchange.
+    fn release_idle(mut self) {
         assert_eq!(
             self.phase,
             ConnectionPhase::Idle,
@@ -240,6 +239,29 @@ impl ConnectionGuard {
     }
 }
 
+impl IdleConnection {
+    /// Create a new idle checkout (removes it from the pool on drop unless released).
+    pub(crate) const fn new(conn: PooledConnection, provider: DeadpoolConnectionProvider) -> Self {
+        Self {
+            guard: ConnectionGuard {
+                conn: Some(conn),
+                provider,
+                phase: ConnectionPhase::Idle,
+            },
+        }
+    }
+
+    /// Begin a protocol exchange, consuming the idle-only capability.
+    pub fn activate(self) -> ConnectionGuard {
+        self.guard
+    }
+
+    /// Return the connection without starting protocol I/O.
+    pub fn release(self) {
+        self.guard.release_idle();
+    }
+}
+
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
         // Cancellation can drop an exchange between reads. Cleanup must run
@@ -321,7 +343,7 @@ mod tests {
     // `complete_success()` would cause release_reuses_pool_connection to fail — the pool
     // would create a new TCP connection instead of reusing the existing one.
 
-    use super::ConnectionGuard;
+    use super::IdleConnection;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -405,8 +427,8 @@ mod tests {
         assert_eq!(accept_count.load(Ordering::SeqCst), 1);
 
         // An untouched checkout can be returned as idle.
-        let guard = ConnectionGuard::new(conn, provider.clone());
-        guard.release_idle();
+        let guard = IdleConnection::new(conn, provider.clone());
+        guard.release();
 
         // Second get — pool recycles the existing connection (no new TCP handshake)
         let _conn2 = provider.get_pooled_connection().await.unwrap();
@@ -426,7 +448,8 @@ mod tests {
         let (port, _accept_count) = spawn_greeting_server().await;
         let provider = make_provider(port);
         let mut guard =
-            ConnectionGuard::new(provider.get_pooled_connection().await.unwrap(), provider);
+            IdleConnection::new(provider.get_pooled_connection().await.unwrap(), provider)
+                .activate();
         let _ = guard.stream_mut();
         let _ = guard.complete_success();
     }
@@ -446,7 +469,7 @@ mod tests {
         assert_eq!(accept_count.load(Ordering::SeqCst), 1);
 
         // Drop without release → socket shut down
-        let guard = ConnectionGuard::new(conn, provider.clone());
+        let guard = IdleConnection::new(conn, provider.clone()).activate();
         drop(guard);
 
         // remove_with_cooldown calls socket2::shutdown(Both) synchronously, so the OS
@@ -477,7 +500,7 @@ mod tests {
         let (port, accept_count) = spawn_greeting_server().await;
         let provider = make_provider(port);
         let conn = provider.get_pooled_connection().await.unwrap();
-        let mut guard = ConnectionGuard::new(conn, provider.clone());
+        let mut guard = IdleConnection::new(conn, provider.clone()).activate();
         guard.stream_mut().write_all(b"DATE\r\n").await.unwrap();
 
         // The future owns a used connection whose reply has not been consumed.

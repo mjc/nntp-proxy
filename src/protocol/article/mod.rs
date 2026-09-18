@@ -5,12 +5,14 @@
 
 mod error;
 mod headers;
+pub(crate) mod state;
 pub mod yenc;
 
 pub use error::ParseError;
 pub use headers::{HeaderIter, Headers};
 
 use crate::types::protocol::MessageId;
+use std::ops::Range;
 use yenc::validate_yenc_structure;
 
 /// Parsed NNTP article response (zero-copy)
@@ -30,6 +32,98 @@ pub struct Article<'a> {
 
 /// Consumer-facing view of an article whose framing has already been handled.
 pub type ArticleView<'a> = Article<'a>;
+
+/// Optional yEnc policy applied after NNTP article structure is validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YencValidation {
+    Disabled,
+    Enabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArticleLayout {
+    message_id: Range<usize>,
+    article_number: Option<u64>,
+    headers: Option<Range<usize>>,
+    body: Option<Range<usize>>,
+}
+
+impl ArticleLayout {
+    pub(crate) fn parse(buf: &[u8]) -> Result<Self, ParseError> {
+        let status_code = parse_status_code(buf)?;
+        if !matches!(status_code, 220..=223) {
+            return Err(ParseError::InvalidStatusCode(status_code));
+        }
+        let first_line_end = find_line_end(buf, 0)?;
+        let (message_id, article_number) = parse_first_line_layout(&buf[..first_line_end])?;
+        let content_start = first_line_end + 2;
+
+        let (headers, body) = match status_code {
+            220 => {
+                let separator_pos = find_blank_line(buf, content_start)?;
+                let headers_range = content_start..separator_pos;
+                Headers::parse(&buf[headers_range.clone()])?;
+                let body_range = separator_pos + 4..buf.len();
+                (Some(headers_range), Some(body_range))
+            }
+            221 => {
+                if find_blank_line(buf, content_start).is_ok() {
+                    return Err(ParseError::UnexpectedBody);
+                }
+                let headers_range = content_start..buf.len();
+                Headers::parse(&buf[headers_range.clone()])?;
+                (Some(headers_range), None)
+            }
+            222 => {
+                let body_range = content_start..buf.len();
+                (None, Some(body_range))
+            }
+            223 => {
+                if content_start < buf.len() {
+                    return Err(ParseError::UnexpectedBody);
+                }
+                (None, None)
+            }
+            _ => unreachable!("article status was checked above"),
+        };
+
+        Ok(Self {
+            message_id,
+            article_number,
+            headers,
+            body,
+        })
+    }
+
+    /// Apply the optional encoding policy after NNTP structure is validated.
+    ///
+    /// The validated article state therefore proves protocol semantics only;
+    /// callers choose whether yEnc is relevant to their operation.
+    pub(crate) fn validate_yenc(&self, buf: &[u8]) -> Result<(), ParseError> {
+        let Some(body) = &self.body else {
+            return Ok(());
+        };
+        let body = &buf[body.clone()];
+        if body.starts_with(b"=ybegin") {
+            validate_yenc_structure(body)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn view<'a>(&self, buf: &'a [u8]) -> Article<'a> {
+        let message_id = std::str::from_utf8(&buf[self.message_id.clone()])
+            .expect("validated message ID remains UTF-8");
+        Article {
+            message_id: MessageId::from_validated(message_id),
+            article_number: self.article_number,
+            headers: self
+                .headers
+                .clone()
+                .map(|range| Headers::from_validated(&buf[range])),
+            body: self.body.clone().map(|range| &buf[range]),
+        }
+    }
+}
 
 impl<'a> TryFrom<&'a [u8]> for Article<'a> {
     type Error = ParseError;
@@ -52,124 +146,21 @@ impl<'a> Article<'a> {
     /// Returns `ParseError` when the NNTP response status line, message metadata,
     /// headers, body structure, or optional yEnc validation fails.
     pub fn parse(buf: &'a [u8], validate_yenc: bool) -> Result<Self, ParseError> {
-        // Parse status code from first line
-        let status_code = parse_status_code(buf)?;
-
-        // Dispatch to appropriate parser
-        match status_code {
-            220 => Self::parse_article(buf, validate_yenc),
-            221 => Self::parse_head(buf),
-            222 => Self::parse_body(buf, validate_yenc),
-            223 => Self::parse_stat(buf),
-            _ => Err(ParseError::InvalidStatusCode(status_code)),
-        }
+        let policy = match validate_yenc {
+            true => YencValidation::Enabled,
+            false => YencValidation::Disabled,
+        };
+        Self::parse_with_yenc(buf, policy)
     }
 
-    /// Parse 220 ARTICLE response (headers + body)
-    fn parse_article(buf: &'a [u8], validate_yenc: bool) -> Result<Self, ParseError> {
-        // 220 <article-number> <message-id> ...
-        let first_line_end = find_line_end(buf, 0)?;
-        let first_line = &buf[..first_line_end];
-
-        let (message_id, article_number) = parse_first_line(first_line)?;
-
-        // Find blank line separator
-        let content_start = first_line_end + 2;
-        let separator_pos = find_blank_line(buf, content_start)?;
-
-        // Headers are between content_start and separator
-        let headers_data = &buf[content_start..separator_pos];
-        let headers = Some(Headers::parse(headers_data)?);
-
-        // Body starts after blank line (\r\n\r\n is 4 bytes)
-        let body_start = separator_pos + 4;
-
-        let body_data = &buf[body_start..];
-
-        // Validate yenc if enabled and present
-        if validate_yenc && body_data.starts_with(b"=ybegin") {
-            validate_yenc_structure(body_data)?;
+    /// Parse NNTP structure and apply the selected optional yEnc policy.
+    pub fn parse_with_yenc(buf: &'a [u8], policy: YencValidation) -> Result<Self, ParseError> {
+        let layout = ArticleLayout::parse(buf)?;
+        match policy {
+            YencValidation::Disabled => {}
+            YencValidation::Enabled => layout.validate_yenc(buf)?,
         }
-
-        let body = Some(body_data);
-
-        Ok(Article {
-            message_id,
-            article_number,
-            headers,
-            body,
-        })
-    }
-
-    /// Parse 221 HEAD response (headers only)
-    fn parse_head(buf: &'a [u8]) -> Result<Self, ParseError> {
-        // 221 <article-number> <message-id> ...
-        let first_line_end = find_line_end(buf, 0)?;
-        let first_line = &buf[..first_line_end];
-
-        let (message_id, article_number) = parse_first_line(first_line)?;
-
-        let content_start = first_line_end + 2;
-        if find_blank_line(buf, content_start).is_ok() {
-            return Err(ParseError::UnexpectedBody);
-        }
-
-        let headers_data = &buf[content_start..];
-        let headers = Some(Headers::parse(headers_data)?);
-
-        Ok(Article {
-            message_id,
-            article_number,
-            headers,
-            body: None,
-        })
-    }
-
-    /// Parse 222 BODY response (body only)
-    fn parse_body(buf: &'a [u8], validate_yenc: bool) -> Result<Self, ParseError> {
-        // 222 <article-number> <message-id> ...
-        let first_line_end = find_line_end(buf, 0)?;
-        let first_line = &buf[..first_line_end];
-
-        let (message_id, article_number) = parse_first_line(first_line)?;
-
-        let body_start = first_line_end + 2;
-        let body_data = &buf[body_start..];
-
-        // Validate yenc if enabled and present
-        if validate_yenc && body_data.starts_with(b"=ybegin") {
-            validate_yenc_structure(body_data)?;
-        }
-
-        let body = Some(body_data);
-
-        Ok(Article {
-            message_id,
-            article_number,
-            headers: None,
-            body,
-        })
-    }
-
-    /// Parse 223 STAT response (metadata only)
-    fn parse_stat(buf: &'a [u8]) -> Result<Self, ParseError> {
-        // 223 <article-number> <message-id> ...
-        let first_line_end = find_line_end(buf, 0)?;
-        let first_line = &buf[..first_line_end];
-
-        let (message_id, article_number) = parse_first_line(first_line)?;
-
-        let content_start = first_line_end + 2;
-        if content_start < buf.len() {
-            return Err(ParseError::UnexpectedBody);
-        }
-
-        Ok(Article {
-            message_id,
-            article_number,
-            headers: None,
-            body: None,
-        })
+        Ok(layout.view(buf))
     }
 
     /// Decode yEnc-encoded body to raw bytes
@@ -235,8 +226,8 @@ fn parse_status_code(buf: &[u8]) -> Result<u16, ParseError> {
         .ok_or(ParseError::InvalidStatusCode(0))
 }
 
-/// Parse first line to extract message-id and optional article number
-fn parse_first_line(line: &[u8]) -> Result<(MessageId<'_>, Option<u64>), ParseError> {
+/// Parse first line to extract the message-ID range and optional article number.
+fn parse_first_line_layout(line: &[u8]) -> Result<(Range<usize>, Option<u64>), ParseError> {
     // Format: "220 <number> <message-id> ..." or "220 0 <message-id> ..."
 
     // Find first space (after status code)
@@ -268,9 +259,9 @@ fn parse_first_line(line: &[u8]) -> Result<(MessageId<'_>, Option<u64>), ParseEr
     let msg_id_bytes = &line[msg_id_start..msg_id_end];
     let msg_id_str = std::str::from_utf8(msg_id_bytes)
         .map_err(|_| ParseError::InvalidMessageId("Invalid UTF-8 in message-id".to_string()))?;
-    let message_id = MessageId::from_borrowed(msg_id_str)?;
+    MessageId::from_borrowed(msg_id_str)?;
 
-    Ok((message_id, article_number))
+    Ok((msg_id_start..msg_id_end, article_number))
 }
 
 /// Find end of line (\r in \r\n)
@@ -352,6 +343,19 @@ mod tests {
         let decoded = article.decode();
 
         assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn yenc_policy_is_separate_from_article_validation() {
+        let buf = b"222 100 <test@example.com> body\r\n\
+=ybegin line=128 size=1 name=test.bin\r\n\
+not-a-complete-yenc-body\r\n";
+
+        assert!(Article::parse_with_yenc(buf, YencValidation::Disabled).is_ok());
+        assert!(matches!(
+            Article::parse_with_yenc(buf, YencValidation::Enabled),
+            Err(ParseError::InvalidYenc(_))
+        ));
     }
 
     #[test]
