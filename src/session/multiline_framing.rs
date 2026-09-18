@@ -889,6 +889,10 @@ impl ReceivingOperation<'_> {
         self.response.status_code()
     }
 
+    pub(crate) fn single_line_bytes(&self) -> Option<&[u8]> {
+        self.response.single_line_bytes()
+    }
+
     pub(crate) fn log_warnings(
         &self,
         client_addr: impl std::fmt::Display,
@@ -1018,6 +1022,10 @@ impl crate::protocol::ArticleState<ReceivingOperation<'_>> {
     #[must_use]
     pub(crate) fn status_code(&self) -> Option<crate::protocol::StatusCode> {
         self.0.status_code()
+    }
+
+    pub(crate) fn single_line_bytes(&self) -> Option<&[u8]> {
+        self.0.single_line_bytes()
     }
 
     pub(crate) fn log_warnings(

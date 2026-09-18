@@ -180,6 +180,42 @@ pub(crate) async fn execute_request_receiving<'a>(
     Ok(response.receiving(conn, pool, backend_id))
 }
 
+/// Execute a request and retain the response together with the backend guard,
+/// recording the same timing points as the classified helper.  The returned
+/// response borrows the guard, so callers cannot inspect or retire the
+/// connection independently of the framed response operation.
+pub(crate) async fn execute_request_receiving_timed<'a>(
+    conn: &'a mut crate::pool::ConnectionGuard,
+    request: &RequestContext,
+    mut buffer: PooledBuffer,
+    pool: &'a crate::pool::BufferPool,
+    backend_id: crate::types::BackendId,
+) -> Result<(ReceivingResponse<'a>, u64, u64, u64)> {
+    use std::time::Instant;
+
+    let start = Instant::now();
+    request.write_wire_to(conn.stream_mut()).await?;
+    let after_send = Instant::now();
+
+    let n = buffer.read_from(conn.stream_mut()).await?;
+    if n == 0 {
+        anyhow::bail!("Backend connection closed unexpectedly");
+    }
+
+    let response = ClassifiedResponse::read(conn.stream_mut(), request, buffer).await?;
+    let after_recv = Instant::now();
+    let send_elapsed = after_send.duration_since(start);
+    let recv_elapsed = after_recv.duration_since(after_send);
+    let elapsed = after_recv.duration_since(start);
+
+    Ok((
+        response.receiving(conn, pool, backend_id),
+        duration_micros_u64(elapsed),
+        duration_micros_u64(send_elapsed),
+        duration_micros_u64(recv_elapsed),
+    ))
+}
+
 /// Read a response for a request that was already written as part of an
 /// upstream pipeline window.
 pub(crate) async fn read_receiving_response_for_already_sent_request<'a>(

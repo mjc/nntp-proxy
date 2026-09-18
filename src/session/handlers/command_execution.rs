@@ -120,22 +120,59 @@ struct InvalidBackendResponseContext<'a> {
     conn: crate::pool::ConnectionGuard,
 }
 
-pub(super) type PreparedBackendAttempt = Option<(
-    crate::pool::ConnectionGuard,
-    StatusCode,
-    crate::session::backend::ClassifiedResponse,
-)>;
+/// A successfully classified response together with the guard that owns its
+/// backend exchange. Keeping these fields in one state object prevents status,
+/// bytes, and connection ownership from being accidentally mixed at a call
+/// site.
+pub(super) struct PreparedBackendAttempt {
+    conn: crate::pool::ConnectionGuard,
+    status_code: StatusCode,
+    response: crate::session::backend::ClassifiedResponse,
+}
 
-type ExecutedBackendAttempt = (
-    crate::pool::ConnectionGuard,
-    crate::session::backend::ClassifiedResponse,
-    Option<BackendTimings>,
-);
+impl PreparedBackendAttempt {
+    async fn observe(
+        self,
+        pool: &crate::pool::BufferPool,
+        backend_id: BackendId,
+    ) -> Result<crate::pool::ConnectionGuard, SessionError> {
+        let Self {
+            mut conn, response, ..
+        } = self;
+        match response
+            .receiving(&mut conn, pool, backend_id)
+            .observe()
+            .await
+        {
+            Ok(()) => Ok(conn),
+            Err(error) => {
+                conn.fail_backend();
+                Err(SessionError::from(error))
+            }
+        }
+    }
 
-type BackendReadAttempt = (
-    crate::session::backend::ClassifiedResponse,
-    Option<BackendTimings>,
-);
+    fn into_parts(
+        self,
+    ) -> (
+        crate::pool::ConnectionGuard,
+        StatusCode,
+        crate::session::backend::ClassifiedResponse,
+    ) {
+        (self.conn, self.status_code, self.response)
+    }
+}
+
+struct ExecutedBackendAttempt {
+    conn: crate::pool::ConnectionGuard,
+    response: crate::session::backend::ClassifiedResponse,
+    timings: Option<BackendTimings>,
+}
+
+struct BackendReadAttempt {
+    response: crate::session::backend::ClassifiedResponse,
+    timings: Option<BackendTimings>,
+}
 
 enum BackendReadAttemptError {
     Backend(anyhow::Error),
@@ -288,12 +325,14 @@ impl ClientSession {
             return Ok(BackendAttemptResult::BackendUnavailable);
         };
 
-        let Some((mut conn, status_code, buffer)) = self
+        let Some(attempt) = self
             .prepare_backend_attempt(provider, &backend, request, state, is_retry_attempt)
             .await?
         else {
             return Ok(BackendAttemptResult::BackendUnavailable);
         };
+
+        let status_code = attempt.status_code;
 
         let backend = match AuthoritativeArticleMissing::from_status_code(backend, status_code) {
             Ok(missing) => {
@@ -315,11 +354,7 @@ impl ClientSession {
                         )
                         .await;
                 }
-                buffer
-                    .receiving(&mut conn, &self.buffer_pool, backend_id)
-                    .observe()
-                    .await
-                    .map_err(SessionError::from)?;
+                let conn = attempt.observe(&self.buffer_pool, backend_id).await?;
                 self.release_or_reuse_connection(
                     conn,
                     backend_id,
@@ -330,6 +365,8 @@ impl ClientSession {
             }
             Err(backend) => backend,
         };
+
+        let (conn, status_code, buffer) = attempt.into_parts();
 
         let response = match self
             .write_successful_retry_response(
@@ -416,9 +453,14 @@ impl ClientSession {
                     Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
                 };
                 let buffer = self.buffer_pool.acquire();
-                let read =
-                    backend::execute_request_classified(conn.stream_mut(), &stat_request, buffer)
-                        .await;
+                let read = backend::execute_request_receiving(
+                    &mut conn,
+                    &stat_request,
+                    buffer,
+                    &self.buffer_pool,
+                    backend_id,
+                )
+                .await;
                 let response = match read {
                     Ok(read) => read,
                     Err(_) => {
@@ -428,11 +470,7 @@ impl ClientSession {
                 };
 
                 let status_code = response.status_code();
-                match response
-                    .receiving(&mut conn, &self.buffer_pool, backend_id)
-                    .observe()
-                    .await
-                {
+                match response.observe().await {
                     Ok(()) => {}
                     Err(_) => {
                         conn.fail_backend();
@@ -544,10 +582,12 @@ impl ClientSession {
                         Err(_) => return,
                     };
                     let buffer = buffer_pool.acquire();
-                    let read = backend::execute_request_classified(
-                        conn.stream_mut(),
+                    let read = backend::execute_request_receiving(
+                        &mut conn,
                         &stat_request,
                         buffer,
+                        &buffer_pool,
+                        backend_id,
                     )
                     .await;
                     let response = match read {
@@ -558,11 +598,7 @@ impl ClientSession {
                         }
                     };
                     let status_code = response.status_code();
-                    match response
-                        .receiving(&mut conn, &buffer_pool, backend_id)
-                        .observe()
-                        .await
-                    {
+                    match response.observe().await {
                         Ok(()) => {}
                         Err(_) => {
                             conn.fail_backend();
@@ -612,7 +648,7 @@ impl ClientSession {
         request: &RequestContext,
         state: &mut ArticleAttemptState<'_>,
         is_retry_attempt: bool,
-    ) -> Result<PreparedBackendAttempt, SessionError> {
+    ) -> Result<Option<PreparedBackendAttempt>, SessionError> {
         let backend_id = backend.backend_id();
         let request_wire_len = request.request_wire_len().get();
         trace!(
@@ -623,7 +659,11 @@ impl ClientSession {
             request_wire_len,
             "Preparing direct backend attempt"
         );
-        let (conn, buffer, timings) = match retry_once!(
+        let ExecutedBackendAttempt {
+            conn,
+            response: buffer,
+            timings,
+        } = match retry_once!(
             self.execute_backend_attempt(
                 provider,
                 backend,
@@ -692,7 +732,11 @@ impl ClientSession {
             "Backend attempt received classifiable response bytes"
         );
 
-        Ok(Some((conn, status_code, buffer)))
+        Ok(Some(PreparedBackendAttempt {
+            conn,
+            status_code,
+            response: buffer,
+        }))
     }
 
     fn handle_invalid_backend_response(
@@ -1129,7 +1173,10 @@ impl ClientSession {
                     "Running STAT miss probe before backend article fetch"
                 );
 
-                let (probe_response, probe_timings) = self
+                let BackendReadAttempt {
+                    response: probe_response,
+                    timings: probe_timings,
+                } = self
                     .execute_and_read_response(guard.stream_mut(), backend, &stat_request)
                     .await
                     .map_err(|BackendReadAttemptError::Backend(e)| e)?;
@@ -1144,7 +1191,10 @@ impl ClientSession {
                         msg_id = ?request.message_id_value(),
                         "STAT miss probe returned 430; skipping backend article fetch"
                     );
-                    Ok((probe_response, probe_timings))
+                    Ok(BackendReadAttempt {
+                        response: probe_response,
+                        timings: probe_timings,
+                    })
                 } else {
                     probe_response
                         .receiving(&mut guard, &self.buffer_pool, backend.backend_id())
@@ -1161,7 +1211,11 @@ impl ClientSession {
             };
 
         match result {
-            Ok((response, timings)) => Ok((guard, response, timings)),
+            Ok(BackendReadAttempt { response, timings }) => Ok(ExecutedBackendAttempt {
+                conn: guard,
+                response,
+                timings,
+            }),
             Err(BackendReadAttemptError::Backend(e)) => {
                 debug!(
                     client = %self.client_addr,
@@ -1191,17 +1245,23 @@ impl ClientSession {
         self.metrics.user_command(self.username());
 
         let buffer = self.buffer_pool.acquire();
-        let (response, timings) = if should_sample_backend_timing() {
+        let result = if should_sample_backend_timing() {
             let (response, ttfb, send, recv) =
                 backend::execute_request_classified_timed(conn, request, buffer)
                     .await
                     .map_err(BackendReadAttemptError::Backend)?;
-            (response, Some((ttfb, send, recv)))
+            BackendReadAttempt {
+                response,
+                timings: Some((ttfb, send, recv)),
+            }
         } else {
             let response = backend::execute_request_classified(conn, request, buffer)
                 .await
                 .map_err(BackendReadAttemptError::Backend)?;
-            (response, None)
+            BackendReadAttempt {
+                response,
+                timings: None,
+            }
         };
         debug!(
             client = %self.client_addr,
@@ -1211,7 +1271,7 @@ impl ClientSession {
             "Backend response classification completed for direct attempt"
         );
 
-        Ok((response, timings))
+        Ok(result)
     }
 
     pub(super) async fn forward_response_for_already_sent_request<W>(
