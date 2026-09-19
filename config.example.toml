@@ -33,6 +33,9 @@ port = 119
 name = "Primary"
 username = "your_username"
 password = "your_password"
+# Optional stable identity for sharing 430 availability facts with equivalent
+# endpoints. The username remains part of the identity.
+# availability_namespace = "provider-feed"
 max_connections = 20
 tier = 0
 # Probe misses with STAT before ARTICLE/BODY/HEAD on this backend (0=off, non-zero=on)

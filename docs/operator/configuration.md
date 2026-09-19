@@ -123,6 +123,7 @@ password = "reader-password"
 | `port` | required | `119` for plain NNTP, `563` for NNTPS |
 | `name` | required | Friendly name used in logs and the TUI |
 | `username` / `password` | unset | Backend auth |
+| `availability_namespace` | backend host | Explicit identity namespace for sharing availability facts across transport endpoints; the configured username remains part of the identity |
 | `max_connections` | `10` | Per-backend pool size |
 | `stat_missing` | `0` | Probe missing articles with `STAT` before `ARTICLE`/`BODY`/`HEAD` on this backend. Enable it on backends that correctly return `430` to speed up retrying missing articles. |
 | `tier` | `0` | Lower tiers are preferred first |
@@ -148,6 +149,7 @@ Currently supported backend environment fields:
 - `NAME`
 - `USERNAME`
 - `PASSWORD`
+- `AVAILABILITY_NAMESPACE`
 - `MAX_CONNECTIONS`
 - `STAT_MISSING`
 - `USE_TLS`

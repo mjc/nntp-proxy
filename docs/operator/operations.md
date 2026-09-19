@@ -33,6 +33,9 @@ Common persisted files:
 
 - `stats.json` for metrics persistence when `[proxy].stats_file` is not set
 - `availability.idx` for availability-only cache persistence when `[cache]` is configured, `store_article_bodies = false`, and `[cache].availability_index_path` is not set
+- `availability.registry` beside a hybrid cache's payload directory, when a
+  disk-backed cache is configured; it preserves the namespace/account slot
+  mapping used for availability facts
 
 If you want explicit paths, configure them directly in `config.toml`.
 

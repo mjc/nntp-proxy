@@ -1,6 +1,14 @@
-//! Connection pooling and buffer pooling modules
+//! Connection and byte-buffer pooling.
 //!
-//! This module provides connection management and buffer pooling for the NNTP proxy.
+//! [`BufferPool`] owns reusable transport allocations and returns them through
+//! [`PooledBuffer`]. Normal article forwarding borrows slices from the current
+//! pooled read buffer. Full-response capture is an explicit operation for the
+//! standalone client, cache ingestion, and other consumers that need ownership;
+//! it is not part of the ordinary pass-through path.
+//!
+//! [`DeadpoolConnectionProvider`] exposes ready backend connections. A
+//! connection is reusable only after its response exchange has completed and
+//! all pending bytes have been consumed.
 
 pub mod buffer;
 pub mod connection_guard;

@@ -4,10 +4,17 @@
 
 The repository ships a single runtime binary, `nntp-proxy`. The same binary can run headless, with the built-in terminal dashboard, or as an attached read-only TUI client.
 
+The local NNTP listener is plain TCP. TLS is used for outbound backend
+connections; configure it per backend with `use_tls = true` rather than
+expecting the local listener to terminate TLS.
+
+Building the crate directly requires Rust 1.91 or newer. Repository builds and
+quality checks should use the pinned `devenv` environment.
+
 ## Build
 
 ```bash
-cargo build --release
+devenv shell cargo build --release
 ```
 
 The release binary will be at `./target/release/nntp-proxy`.
@@ -72,8 +79,13 @@ Keep the dashboard address on loopback and use a different port from the main NN
 3. Set `use_tls = true` and `port = 563` for NNTPS backends.
 4. Leave `tls_verify_cert = true` unless you are debugging a private CA setup.
 
-## Current routing note
+## Routing note
 
 Hybrid is the default routing mode. `stateful` and `per-command` remain available as explicit modes when you need them.
+
+The default cache configuration tracks authoritative article-missing (`430`)
+responses for routing and retry decisions without retaining article bodies. Set
+`[cache].store_article_bodies = true` only when the proxy should retain payloads;
+add `[cache.disk]` for a memory-to-disk payload tier.
 
 See [runtime-and-routing.md](runtime-and-routing.md) for details.

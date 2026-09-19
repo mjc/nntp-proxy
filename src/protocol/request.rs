@@ -9,70 +9,114 @@ use smallvec::SmallVec;
 use super::{StatusCode, codes};
 use crate::types::{BackendId, MessageId};
 
+/// Maximum accepted length of an NNTP command line, including its terminator.
 pub const MAX_COMMAND_LINE_OCTETS: usize = 512;
 
+/// Classified NNTP command verbs understood by the proxy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestKind {
+    /// Fetch a complete article.
     Article,
+    /// Fetch an article body.
     Body,
+    /// Fetch article headers.
     Head,
+    /// Check whether an article exists.
     Stat,
+    /// Select a newsgroup and establish group context.
     Group,
+    /// List article numbers in a group, optionally with a range.
     ListGroup,
+    /// Select the previous article in the current group.
     Last,
+    /// Select the next article in the current group.
     Next,
+    /// List groups or active group information.
     List,
+    /// Return the server date and time.
     Date,
+    /// Request server help text.
     Help,
+    /// Request server capability information.
     Capabilities,
+    /// Change NNTP session mode.
     Mode,
+    /// Close the NNTP session.
     Quit,
+    /// Request overview data.
     Over,
+    /// Request overview data using the XOVER extension.
     Xover,
+    /// Request header data.
     Hdr,
+    /// Request header data using the XHDR extension.
     Xhdr,
+    /// Request groups created after a date.
     NewGroups,
+    /// Request articles posted after a date.
     NewNews,
+    /// Begin posting an article.
     Post,
+    /// Begin an IHAVE transfer.
     Ihave,
+    /// Begin a CHECK transfer.
     Check,
+    /// Begin a TAKETHIS transfer.
     TakeThis,
+    /// Authenticate with the server.
     AuthInfo,
+    /// Begin a TLS upgrade.
     StartTls,
+    /// Negotiate wire compression.
     Compress,
+    /// An extension command not classified by the built-in parser.
     Unknown,
 }
 
+/// High-level routing category selected for a parsed request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestRouteClass {
+    /// An article-family request addressed by message ID.
     ArticleByMessageId,
+    /// A command that can be sent to any suitable backend independently.
     Stateless,
+    /// A command that requires session state on one backend connection.
     Stateful,
+    /// A command answered locally by the proxy.
     Local,
+    /// A command rejected by the proxy.
     Reject,
 }
 
+/// Cache lookup result recorded for a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RequestCacheStatus {
+    /// The complete requested response came from cache.
     Hit,
+    /// Some requested metadata came from cache, but a backend operation remains.
     PartialHit,
+    /// No usable cache entry was found.
     Miss,
 }
 
+/// Number of bytes in a serialized NNTP request, including `CRLF`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct RequestWireLen(usize);
 
 impl RequestWireLen {
+    /// Construct a request wire length from a byte count.
     #[must_use]
     pub const fn new(value: usize) -> Self {
         Self(value)
     }
 
+    /// Return the byte count as a `usize`.
     #[must_use]
     pub const fn get(self) -> usize {
         self.0
     }
 
+    /// Return the byte count as a `u64` for metrics APIs.
     #[must_use]
     pub const fn as_u64(self) -> u64 {
         self.0 as u64
@@ -85,15 +129,18 @@ impl From<usize> for RequestWireLen {
     }
 }
 
+/// Number of bytes in a complete serialized NNTP response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct ResponseWireLen(usize);
 
 impl ResponseWireLen {
+    /// Construct a response wire length from a byte count.
     #[must_use]
     pub const fn new(value: usize) -> Self {
         Self(value)
     }
 
+    /// Return the byte count as a `usize`.
     #[must_use]
     pub const fn get(self) -> usize {
         self.0
@@ -125,6 +172,7 @@ impl From<usize> for ResponsePayloadLen {
     }
 }
 
+/// Status and wire-size metadata recorded when a request completes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct RequestResponseMetadata {
     status: StatusCode,
@@ -143,6 +191,7 @@ impl RequestResponseMetadata {
     }
 }
 
+/// Backend availability facts considered while routing one request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct RequestCacheAvailability {
     checked: usize,
@@ -167,6 +216,7 @@ impl RequestCacheAvailability {
     }
 }
 
+/// Cache priority tier selected for a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct RequestCacheTier(u8);
 
@@ -183,6 +233,7 @@ impl From<u8> for RequestCacheTier {
     }
 }
 
+/// Cache timestamp represented as milliseconds since the Unix epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct RequestCacheTimestampMillis(u64);
 
@@ -199,16 +250,24 @@ impl From<u64> for RequestCacheTimestampMillis {
     }
 }
 
+/// Kind of cache entry associated with a request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RequestCachePayloadKind {
+    /// A known-missing article with no payload.
     Missing,
+    /// Availability metadata without article bytes.
     AvailabilityOnly,
+    /// A complete ARTICLE response payload.
     Article,
+    /// A HEAD response payload.
     Head,
+    /// A BODY response payload.
     Body,
+    /// A STAT response with article metadata only.
     Stat,
 }
 
+/// Article number recorded in cache metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct RequestCacheArticleNumber(u64);
 
@@ -241,6 +300,11 @@ enum RequestCompletion {
     },
 }
 
+/// Owned, validated metadata for one client request and its response.
+///
+/// The context owns the parsed verb and arguments, so it can cross backend
+/// worker boundaries without borrowing the client's input buffer. Response
+/// status and wire length become available after the request is completed.
 #[derive(Debug)]
 pub struct RequestContext {
     kind: RequestKind,
@@ -410,6 +474,12 @@ impl RequestCacheEntryMetadata {
 }
 
 impl RequestContext {
+    /// Parse one complete client command line.
+    ///
+    /// Returns `None` for an empty line or a line longer than
+    /// the command-line limit enforced by the parser. The command verb is classified
+    /// case-insensitively; unknown extension verbs are retained as
+    /// [`RequestKind::Unknown`].
     #[must_use]
     pub fn parse(line: &[u8]) -> Option<Self> {
         if line.len() > MAX_COMMAND_LINE_OCTETS {
@@ -471,12 +541,14 @@ impl RequestContext {
         }
     }
 
+    /// Return the classified command kind.
     #[inline]
     #[must_use]
     pub const fn kind(&self) -> RequestKind {
         self.kind
     }
 
+    /// Return the backend that completed this request, if any.
     #[inline]
     #[must_use]
     pub const fn backend_id(&self) -> Option<BackendId> {
@@ -509,6 +581,7 @@ impl RequestContext {
             .is_some_and(|availability| availability.backend_has_article(backend_id))
     }
 
+    /// Return the cached response status, if cache metadata was recorded.
     #[inline]
     #[must_use]
     pub const fn cache_entry_status(&self) -> Option<StatusCode> {
@@ -578,6 +651,7 @@ impl RequestContext {
         self.cache_entry = Some(metadata);
     }
 
+    /// Return the response status recorded at completion, if any.
     #[inline]
     #[must_use]
     pub const fn response_status(&self) -> Option<StatusCode> {
@@ -589,6 +663,7 @@ impl RequestContext {
         }
     }
 
+    /// Return the complete response length recorded at completion, if any.
     #[inline]
     #[must_use]
     pub const fn response_wire_len(&self) -> Option<ResponseWireLen> {
@@ -696,65 +771,77 @@ impl RequestContext {
         self.completion = Some(RequestCompletion::Local { response });
     }
 
+    /// Return the command verb as stored on the NNTP wire, without `CRLF`.
     #[inline]
     #[must_use]
     pub fn verb(&self) -> &[u8] {
         &self.verb
     }
 
+    /// Return the command arguments as stored on the NNTP wire.
     #[inline]
     #[must_use]
     pub fn args(&self) -> &[u8] {
         &self.args
     }
 
+    /// Return the message ID argument when this request has one.
     #[must_use]
     pub fn message_id(&self) -> Option<&str> {
         let (start, end) = self.message_id?;
         std::str::from_utf8(&self.args[start..end]).ok()
     }
 
+    /// Return the validated message ID argument when this request has one.
     #[must_use]
     pub fn message_id_value(&self) -> Option<MessageId<'_>> {
         let (start, end) = self.message_id?;
         MessageId::from_borrowed(std::str::from_utf8(&self.args[start..end]).ok()?).ok()
     }
 
+    /// Return whether this request contains a syntactically valid message ID.
     #[must_use]
     pub const fn has_message_id(&self) -> bool {
         self.message_id.is_some()
     }
 
+    /// Return whether this is a `STAT` request.
     #[must_use]
     pub const fn is_stat(&self) -> bool {
         matches!(self.kind, RequestKind::Stat)
     }
 
+    /// Return whether this is a `HEAD` request.
     #[must_use]
     pub const fn is_head(&self) -> bool {
         matches!(self.kind, RequestKind::Head)
     }
 
+    /// Return whether this is an unknown extension command.
     #[must_use]
     pub const fn is_unknown_extension(&self) -> bool {
         matches!(self.kind, RequestKind::Unknown)
     }
 
+    /// Return the route category selected for this request.
     #[must_use]
     pub const fn route_class(&self) -> RequestRouteClass {
         route_class(self.kind, self.message_id.is_some())
     }
 
+    /// Return whether the request can use the article pipeline fast path.
     #[must_use]
     pub const fn is_pipelineable(&self) -> bool {
         matches!(self.route_class(), RequestRouteClass::ArticleByMessageId)
     }
 
+    /// Return whether the request may transfer a large article payload.
     #[must_use]
     pub const fn is_large_transfer(&self) -> bool {
         matches!(self.kind, RequestKind::Article | RequestKind::Body) && self.message_id.is_some()
     }
 
+    /// Return the request's serialized wire length, including `CRLF`.
     #[must_use]
     pub fn request_wire_len(&self) -> RequestWireLen {
         (self.verb.len() + usize::from(!self.args.is_empty()) + self.args.len() + 2).into()
