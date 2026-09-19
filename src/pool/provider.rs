@@ -548,7 +548,7 @@ impl DeadpoolConnectionProvider {
         })
     }
 
-    /// Checkout a pooled connection wrapped in a `ConnectionGuard`.
+    /// Checkout a pooled connection in the idle state.
     ///
     /// Callers outside `crate::pool` should use this entrypoint instead of accessing
     /// raw pooled objects directly.
@@ -558,9 +558,15 @@ impl DeadpoolConnectionProvider {
     /// connection can be acquired.
     pub async fn checkout_connection_guard(
         &self,
-    ) -> Result<crate::pool::ConnectionGuard, crate::connection_error::ConnectionError> {
+    ) -> Result<
+        crate::pool::connection_guard::IdleConnection,
+        crate::connection_error::ConnectionError,
+    > {
         let conn = self.get_pooled_connection().await?;
-        Ok(crate::pool::ConnectionGuard::new(conn, self.clone()))
+        Ok(crate::pool::connection_guard::IdleConnection::new(
+            conn,
+            self.clone(),
+        ))
     }
 
     #[must_use]

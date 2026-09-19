@@ -98,6 +98,8 @@ mod unified_cache {
     use super::{
         Arc, AvailabilitySlot, BackendId, Bencher, Duration, MessageId, UnifiedCache, black_box,
     };
+    use nntp_proxy::protocol::RequestKind;
+    use nntp_proxy::session::benchmark_framed_cache_response;
 
     fn make_cache() -> Arc<UnifiedCache> {
         Arc::new(UnifiedCache::memory(
@@ -125,10 +127,11 @@ mod unified_cache {
         // Pre-populate
         rt.block_on(async {
             let msg_id = MessageId::from_borrowed("<hit@example.com>").unwrap();
+            let response = b"220 0 <hit@example.com>\r\nSubject: test\r\n\r\nbody\r\n.\r\n";
             cache
-                .upsert_ingest(
+                .upsert_framed_ingest(
                     msg_id.to_owned(),
-                    b"220 0 <hit@example.com>\r\nSubject: test\r\n\r\nbody\r\n.\r\n".to_vec(),
+                    benchmark_framed_cache_response(response, RequestKind::Article, 4096),
                     BackendId::from_index(0),
                     0.into(),
                 )
@@ -150,13 +153,20 @@ mod unified_cache {
             b"220 0 <bench@test.com>\r\nSubject: bench\r\n\r\nbenchmark body\r\n.\r\n".to_vec();
         bencher
             .counter(divan::counter::BytesCount::new(data.len()))
-            .bench(|| {
+            .with_inputs(|| {
+                (
+                    MessageId::from_borrowed("<bench@test.com>")
+                        .unwrap()
+                        .to_owned(),
+                    benchmark_framed_cache_response(&data, RequestKind::Article, 4096),
+                )
+            })
+            .bench_values(|(msg_id, framed)| {
                 rt.block_on(async {
-                    let msg_id = MessageId::from_borrowed("<bench@test.com>").unwrap();
                     cache
-                        .upsert_ingest(
-                            msg_id.to_owned(),
-                            data.clone(),
+                        .upsert_framed_ingest(
+                            msg_id,
+                            black_box(framed),
                             BackendId::from_index(0),
                             0.into(),
                         )

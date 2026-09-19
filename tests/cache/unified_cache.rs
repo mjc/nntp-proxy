@@ -57,7 +57,7 @@ async fn test_unified_cache_memory_upsert_and_get() {
     let backend_id = BackendId::from_index(0);
 
     cache
-        .upsert_ingest(msg_id.clone(), buffer.clone(), backend_id, 0.into())
+        .upsert_test_response(msg_id.clone(), buffer.clone(), backend_id, 0.into())
         .await;
 
     let result = cache.get(&msg_id).await;
@@ -115,7 +115,7 @@ async fn test_unified_cache_record_missing_preserves_existing_article() {
 
     // First insert an article
     cache
-        .upsert_ingest(msg_id.clone(), buffer.clone(), backend_id, 0.into())
+        .upsert_test_response(msg_id.clone(), buffer.clone(), backend_id, 0.into())
         .await;
 
     cache
@@ -165,7 +165,7 @@ async fn test_unified_cache_weighted_size() {
     let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
 
     cache
-        .upsert_ingest(
+        .upsert_test_response(
             msg_id.clone(),
             buffer,
             nntp_proxy::types::BackendId::from_index(0),

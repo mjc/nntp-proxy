@@ -10,6 +10,7 @@ pub mod health_check;
 pub mod prewarming;
 pub mod provider;
 
+pub(crate) use buffer::AppendOutcome;
 pub use buffer::{
     BufferPool, ChunkedResponse, HotPathAllocationMetricsSnapshot, PooledBuffer,
     hot_path_allocation_metrics_snapshot, reset_hot_path_allocation_metrics,

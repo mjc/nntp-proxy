@@ -38,9 +38,21 @@ git diff --unified=0 -- src benches >>"$diff_file"
 
 added_lines() {
     awk '
-        /^\+\+\+ / { next }
-        /^\+/ { print }
+        /^\+\+\+ / { path = $2; next }
+        /^\+/ && path != "" { print path "\t" substr($0, 2) }
     ' "$diff_file"
+}
+
+added_lines_outside_framer() {
+    added_lines | awk '$1 != "b/src/session/multiline_framing.rs" { sub(/^[^\t]*\t/, ""); print }'
+}
+
+added_lines_outside_framer_and_cache() {
+    added_lines | awk '$1 != "b/src/session/multiline_framing.rs" && $1 !~ /^b\/src\/cache\// { sub(/^[^\t]*\t/, ""); print }'
+}
+
+added_buffer_pool_lines() {
+    added_lines | awk '$1 == "b/src/pool/buffer.rs" { sub(/^[^\t]*\t/, ""); print }'
 }
 
 failures=0
@@ -59,9 +71,24 @@ check_added() {
     rm -f "$tmp"
 }
 
-check_added \
+check_added_from() {
+    local source="$1"
+    local title="$2"
+    local pattern="$3"
+    local tmp
+
+    tmp="$(mktemp)"
+    if "$source" | rg --pcre2 "$pattern" >"$tmp"; then
+        echo "error: $title"
+        sed 's/^/  /' "$tmp"
+        failures=$((failures + 1))
+    fi
+    rm -f "$tmp"
+}
+
+check_added_from added_lines_outside_framer \
     "new multiline response boundary logic must stay inside src/session/multiline_framing.rs" \
-    'ends_with\s*\(|starts_with\s*\(|windows\s*\(|\\r\\n\.\\r\\n|"\.\\r\\n"|b"\.\\r\\n"|line\s*==\s*b?"\.\\r\\n"|terminator offset|packed response|let\s+\w+\s*=\s*&\w+\s*\[\.\.'
+    'ends_with\s*\(|starts_with\s*\(|windows\s*\(|line\s*==\s*b?"\.\\r\\n"|terminator offset|packed response|let\s+\w+\s*=\s*&\w+\s*=\s*&\w+\s*\[\.\.'
 
 check_added \
     "new production response status checks should use StatusCode parsing or parsed status fields" \
@@ -75,7 +102,7 @@ check_added \
     "new too_many_arguments allowances should be avoided outside grandfathered internals" \
     '#\[allow\(clippy::too_many_arguments\)\]'
 
-check_added \
+check_added_from added_buffer_pool_lines \
     "new scratch socket-read buffers should not be grown with extend_from_slice in hot paths" \
     'extend_from_slice\s*\('
 

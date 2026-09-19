@@ -7,7 +7,7 @@
 //! # Wire Format
 //!
 //! ```text
-//! V8: [magic:u32][status:u16][availability-epoch:u64][missing:u64]
+//! V9: [magic:u32][status:u16][availability-epoch:u64][missing:u64]
 //!     [negative-timestamps:u64 * MAX_BACKENDS][timestamp:u64][tier:u8][payload-kind:u8]...
 //! V6/V7 omit the per-backend timestamp array and use the entry timestamp for
 //! negative-availability expiration.
@@ -21,13 +21,15 @@ use std::io::{Read, Write};
 use std::mem::size_of;
 
 use super::AvailabilitySlot;
-use super::article::{CachedArticleNumber, CachedPayload, parse_payload};
+use super::article::parse_payload;
+use super::article::{CachedArticleNumber, CachedPayload, parse_framed_chunked_payload};
 use super::availability::ArticleAvailability;
 use super::ttl;
 
 const DISK_ENTRY_MAGIC_V6: u32 = 0x4e50_4336; // "NPC6"
 const DISK_ENTRY_MAGIC_V7: u32 = 0x4e50_4337; // "NPC7"
 const DISK_ENTRY_MAGIC_V8: u32 = 0x4e50_4338; // "NPC8"
+const DISK_ENTRY_MAGIC_V9: u32 = 0x4e50_4339; // "NPC9"
 const PAYLOAD_MISSING: u8 = 0;
 const PAYLOAD_AVAILABILITY_ONLY: u8 = 1;
 const PAYLOAD_ARTICLE: u8 = 2;
@@ -135,7 +137,7 @@ impl TryFrom<u16> for CacheableStatusCode {
 /// Implements foyer's `Code` trait manually for efficient serialization:
 /// - Pre-allocates buffer on decode (no vec resizing)
 /// - Simple binary format:
-///   V8 stores one negative-availability timestamp per backend immediately
+///   V8/V9 store one negative-availability timestamp per backend immediately
 ///   after the missing-bitset, before the entry timestamp and tier. Older V6/V7
 ///   entries omit that array and are decoded with their entry timestamp copied
 ///   into every slot.
@@ -148,7 +150,7 @@ pub struct DiskCachedArticle {
     /// Backend availability tracking (authoritative missing bitset)
     pub(super) availability: ArticleAvailability,
     /// Per-slot timestamps keep one backend's negative fact from being renewed by another.
-    /// In V8 these are persisted in backend-slot order after `availability`.
+    /// In V8/V9 these are persisted in backend-slot order after `availability`.
     negative_timestamps: [ttl::CacheTimestampMillis; super::MAX_BACKENDS],
     /// Unix timestamp when availability info was last updated (milliseconds since epoch)
     /// Used to expire stale availability-only entries (missing articles, STAT responses)
@@ -163,7 +165,7 @@ pub struct DiskCachedArticle {
 impl Code for DiskCachedArticle {
     fn encode(&self, writer: &mut impl Write) -> foyer::Result<()> {
         writer
-            .write_all(&DISK_ENTRY_MAGIC_V8.to_le_bytes())
+            .write_all(&DISK_ENTRY_MAGIC_V9.to_le_bytes())
             .map_err(foyer::Error::io_error)?;
         writer
             .write_all(&self.status_code.as_u16().to_le_bytes())
@@ -198,6 +200,7 @@ impl Code for DiskCachedArticle {
         if magic != DISK_ENTRY_MAGIC_V6
             && magic != DISK_ENTRY_MAGIC_V7
             && magic != DISK_ENTRY_MAGIC_V8
+            && magic != DISK_ENTRY_MAGIC_V9
         {
             return Err(foyer::Error::io_error(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -220,7 +223,10 @@ impl Code for DiskCachedArticle {
             ))
         })?;
 
-        let availability_epoch = if magic == DISK_ENTRY_MAGIC_V7 || magic == DISK_ENTRY_MAGIC_V8 {
+        let availability_epoch = if magic == DISK_ENTRY_MAGIC_V7
+            || magic == DISK_ENTRY_MAGIC_V8
+            || magic == DISK_ENTRY_MAGIC_V9
+        {
             let mut epoch_bytes = [0u8; 8];
             reader
                 .read_exact(&mut epoch_bytes)
@@ -238,19 +244,20 @@ impl Code for DiskCachedArticle {
             .map_err(foyer::Error::io_error)?;
 
         let missing_bits = availability_bits_from_wire(u64::from_le_bytes(missing_bytes))?;
-        let mut negative_timestamps = if magic == DISK_ENTRY_MAGIC_V8 {
-            let mut timestamps = [ttl::CacheTimestampMillis::new(0); super::MAX_BACKENDS];
-            for timestamp in &mut timestamps {
-                let mut bytes = [0u8; 8];
-                reader
-                    .read_exact(&mut bytes)
-                    .map_err(foyer::Error::io_error)?;
-                *timestamp = ttl::CacheTimestampMillis::new(u64::from_le_bytes(bytes));
-            }
-            timestamps
-        } else {
-            [ttl::CacheTimestampMillis::new(0); super::MAX_BACKENDS]
-        };
+        let mut negative_timestamps =
+            if magic == DISK_ENTRY_MAGIC_V8 || magic == DISK_ENTRY_MAGIC_V9 {
+                let mut timestamps = [ttl::CacheTimestampMillis::new(0); super::MAX_BACKENDS];
+                for timestamp in &mut timestamps {
+                    let mut bytes = [0u8; 8];
+                    reader
+                        .read_exact(&mut bytes)
+                        .map_err(foyer::Error::io_error)?;
+                    *timestamp = ttl::CacheTimestampMillis::new(u64::from_le_bytes(bytes));
+                }
+                timestamps
+            } else {
+                [ttl::CacheTimestampMillis::new(0); super::MAX_BACKENDS]
+            };
 
         // Read timestamp
         let mut timestamp_bytes = [0u8; 8];
@@ -258,7 +265,7 @@ impl Code for DiskCachedArticle {
             .read_exact(&mut timestamp_bytes)
             .map_err(foyer::Error::io_error)?;
         let timestamp = ttl::CacheTimestampMillis::new(u64::from_le_bytes(timestamp_bytes));
-        if magic != DISK_ENTRY_MAGIC_V8 {
+        if magic != DISK_ENTRY_MAGIC_V8 && magic != DISK_ENTRY_MAGIC_V9 {
             negative_timestamps = [timestamp; super::MAX_BACKENDS];
         }
 
@@ -269,7 +276,7 @@ impl Code for DiskCachedArticle {
             .map_err(foyer::Error::io_error)?;
         let tier = ttl::CacheTier::new(tier_byte[0]);
 
-        let payload = decode_payload(reader)?;
+        let payload = decode_payload(reader, magic != DISK_ENTRY_MAGIC_V9)?;
 
         Ok(Self {
             status_code,
@@ -354,7 +361,10 @@ fn encode_payload(writer: &mut impl Write, payload: &CachedPayload) -> foyer::Re
     }
 }
 
-fn decode_payload(reader: &mut impl Read) -> foyer::Result<CachedPayload> {
+fn decode_payload(
+    reader: &mut impl Read,
+    normalize_legacy_sections: bool,
+) -> foyer::Result<CachedPayload> {
     let mut kind = [0u8; 1];
     reader
         .read_exact(&mut kind)
@@ -367,8 +377,8 @@ fn decode_payload(reader: &mut impl Read) -> foyer::Result<CachedPayload> {
         }),
         PAYLOAD_ARTICLE => {
             let article_number = read_article_number(reader)?;
-            let headers = read_section(reader)?;
-            let body = read_section(reader)?;
+            let headers = normalize_section(read_section(reader)?, normalize_legacy_sections);
+            let body = normalize_section(read_section(reader)?, normalize_legacy_sections);
             Ok(CachedPayload::Article {
                 article_number,
                 headers,
@@ -377,7 +387,7 @@ fn decode_payload(reader: &mut impl Read) -> foyer::Result<CachedPayload> {
         }
         PAYLOAD_HEAD => {
             let article_number = read_article_number(reader)?;
-            let headers = read_section(reader)?;
+            let headers = normalize_section(read_section(reader)?, normalize_legacy_sections);
             Ok(CachedPayload::Head {
                 article_number,
                 headers,
@@ -385,7 +395,7 @@ fn decode_payload(reader: &mut impl Read) -> foyer::Result<CachedPayload> {
         }
         PAYLOAD_BODY => {
             let article_number = read_article_number(reader)?;
-            let body = read_section(reader)?;
+            let body = normalize_section(read_section(reader)?, normalize_legacy_sections);
             Ok(CachedPayload::Body {
                 article_number,
                 body,
@@ -396,6 +406,13 @@ fn decode_payload(reader: &mut impl Read) -> foyer::Result<CachedPayload> {
             format!("Invalid cached payload kind: {other}"),
         ))),
     }
+}
+
+fn normalize_section(mut data: Vec<u8>, legacy: bool) -> std::sync::Arc<[u8]> {
+    if legacy && !data.is_empty() {
+        data.extend(crate::protocol::CRLF.iter().copied());
+    }
+    std::sync::Arc::from(data.into_boxed_slice())
 }
 
 fn write_article_number(
@@ -428,7 +445,7 @@ fn write_section(writer: &mut impl Write, data: &[u8]) -> foyer::Result<()> {
     writer.write_all(data).map_err(foyer::Error::io_error)
 }
 
-fn read_section(reader: &mut impl Read) -> foyer::Result<std::sync::Arc<[u8]>> {
+fn read_section(reader: &mut impl Read) -> foyer::Result<Vec<u8>> {
     let mut len_bytes = [0u8; 4];
     reader
         .read_exact(&mut len_bytes)
@@ -445,7 +462,7 @@ fn read_section(reader: &mut impl Read) -> foyer::Result<std::sync::Arc<[u8]>> {
             format!("Expected {} bytes, got {}", len, data.len()),
         )));
     }
-    Ok(std::sync::Arc::from(data.into_boxed_slice()))
+    Ok(data)
 }
 
 fn encoded_payload_size(payload: &CachedPayload) -> usize {
@@ -484,8 +501,31 @@ impl DiskCachedArticle {
         })
     }
 
+    pub(super) fn from_framed_chunked_with_tier(
+        response: super::FramedChunkedResponse,
+        tier: ttl::CacheTier,
+    ) -> Option<Self> {
+        let super::FramedChunkedResponse { state, payload_end } = response;
+        let framed = state.into_inner();
+        let status = framed.status();
+        let status_line_end = framed.status_line_end();
+        let response = framed.into_bytes();
+        let status_code = CacheableStatusCode::try_from(status.as_u16()).ok()?;
+        let payload = parse_framed_chunked_payload(status, status_line_end, &response, payload_end);
+
+        Some(Self {
+            status_code,
+            availability_epoch: 0,
+            availability: ArticleAvailability::new(),
+            negative_timestamps: [ttl::CacheTimestampMillis::new(0); super::MAX_BACKENDS],
+            timestamp: ttl::CacheTimestampMillis::now(),
+            tier,
+            payload,
+        })
+    }
+
     #[must_use]
-    pub(crate) fn from_ingest_response_with_tier(
+    pub(crate) fn from_unframed_ingest_for_test(
         buffer: super::CacheIngestResponse,
         tier: ttl::CacheTier,
     ) -> Option<Self> {
@@ -498,6 +538,9 @@ impl DiskCachedArticle {
             }
             super::CacheIngestResponse::Chunked(buffer) => {
                 Self::from_contiguous_ingest_with_tier(buffer.to_vec(), tier)
+            }
+            super::CacheIngestResponse::FramedChunked(buffer) => {
+                Self::from_framed_chunked_with_tier(buffer, tier)
             }
             super::CacheIngestResponse::Inline(buffer) => {
                 Self::from_contiguous_ingest_with_tier(buffer, tier)
@@ -518,6 +561,21 @@ impl DiskCachedArticle {
             timestamp: ttl::CacheTimestampMillis::now(),
             tier,
             payload: CachedPayload::AvailabilityOnly,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn stat(tier: ttl::CacheTier) -> Self {
+        Self {
+            status_code: CacheableStatusCode::Stat,
+            availability_epoch: 0,
+            availability: ArticleAvailability::new(),
+            negative_timestamps: [ttl::CacheTimestampMillis::new(0); super::MAX_BACKENDS],
+            timestamp: ttl::CacheTimestampMillis::now(),
+            tier,
+            payload: CachedPayload::Stat {
+                article_number: None,
+            },
         }
     }
 
@@ -696,6 +754,20 @@ impl DiskCachedArticle {
         ) {
             self.status_code = status_code;
             self.payload = CachedPayload::AvailabilityOnly;
+            self.tier = tier;
+        }
+        self.timestamp = ttl::CacheTimestampMillis::now();
+    }
+
+    pub(super) fn record_backend_stat(&mut self, tier: ttl::CacheTier) {
+        if matches!(
+            self.payload,
+            CachedPayload::Missing | CachedPayload::AvailabilityOnly
+        ) {
+            self.status_code = CacheableStatusCode::Stat;
+            self.payload = CachedPayload::Stat {
+                article_number: None,
+            };
             self.tier = tier;
         }
         self.timestamp = ttl::CacheTimestampMillis::now();
@@ -936,11 +1008,10 @@ mod tests {
 
     #[test]
     fn disk_cached_article_ingests_cache_ingest_response_without_required_vec() {
-        let entry = DiskCachedArticle::from_ingest_response_with_tier(
-            smallvec::SmallVec::<[u8; 128]>::from_slice(
+        let entry = DiskCachedArticle::from_unframed_ingest_for_test(
+            crate::cache::CacheIngestResponse::Inline(smallvec::SmallVec::<[u8; 128]>::from_slice(
                 b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
-            )
-            .into(),
+            )),
             ttl::CacheTier::new(0),
         )
         .expect("valid status code");
@@ -966,8 +1037,8 @@ mod tests {
             "test response must span chunks"
         );
 
-        let entry = DiskCachedArticle::from_ingest_response_with_tier(
-            response.into(),
+        let entry = DiskCachedArticle::from_unframed_ingest_for_test(
+            crate::cache::CacheIngestResponse::Chunked(response),
             ttl::CacheTier::new(0),
         )
         .expect("valid status code");
@@ -975,10 +1046,69 @@ mod tests {
         assert_eq!(entry.status_code().as_u16(), 220);
         match entry.payload {
             CachedPayload::Article { headers, body, .. } => {
-                assert_eq!(headers.as_ref(), b"Subject: Test");
-                assert_eq!(body.as_ref(), b"Body");
+                assert_eq!(headers.as_ref(), b"Subject: Test\r\n");
+                assert_eq!(body.as_ref(), b"Body\r\n");
             }
             other => panic!("expected article payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn decodes_legacy_sections_with_the_new_content_boundary() {
+        let mut entry = disk_cached_article_from_ingest_bytes(
+            b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
+        )
+        .expect("valid status code");
+        if let CachedPayload::Article {
+            article_number,
+            headers,
+            body,
+        } = &mut entry.payload
+        {
+            *headers = std::sync::Arc::from(b"Subject: Test".as_slice());
+            *body = std::sync::Arc::from(b"Body".as_slice());
+            assert_eq!(*article_number, Some(CachedArticleNumber::new(0)));
+        } else {
+            panic!("expected article payload");
+        }
+
+        let mut encoded = Vec::new();
+        entry.encode(&mut encoded).unwrap();
+        encoded[..4].copy_from_slice(&DISK_ENTRY_MAGIC_V8.to_le_bytes());
+
+        let decoded = DiskCachedArticle::decode(&mut encoded.as_slice()).unwrap();
+        match decoded.payload {
+            CachedPayload::Article { headers, body, .. } => {
+                assert_eq!(headers.as_ref(), b"Subject: Test\r\n");
+                assert_eq!(body.as_ref(), b"Body\r\n");
+            }
+            other => panic!("expected article payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_empty_sections_preserve_their_wire_boundary() {
+        let cases = [
+            (RequestKind::Article, 220),
+            (RequestKind::Head, 221),
+            (RequestKind::Body, 222),
+        ];
+
+        for (request_kind, status) in cases {
+            let expected =
+                crate::session::multiline_framing::empty_multiline_response_fixture(status);
+            let entry = disk_cached_article_from_ingest_bytes(&expected)
+                .expect("valid empty multiline response");
+            let mut encoded = Vec::new();
+            entry.encode(&mut encoded).unwrap();
+            encoded[..4].copy_from_slice(&DISK_ENTRY_MAGIC_V8.to_le_bytes());
+
+            let decoded = DiskCachedArticle::decode(&mut encoded.as_slice()).unwrap();
+            assert_eq!(
+                render_response(&decoded, request_kind, "<test@example.com>").unwrap(),
+                expected,
+                "{request_kind:?}"
+            );
         }
     }
 

@@ -10,6 +10,7 @@ use divan::{Bencher, black_box};
 use futures::executor::block_on;
 use nntp_proxy::cache::{ArticleCache, CachedArticle};
 use nntp_proxy::protocol::RequestKind;
+use nntp_proxy::session::benchmark_framed_cache_response;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
 
@@ -27,6 +28,8 @@ This is the benchmark body.\r\n\
 It has multiple lines.\r\n\
 .\r\n";
 
+const HEAD_RESPONSE: &[u8] = b"221 42 <bench@example.com>\r\nSubject: Benchmark\r\n.\r\n";
+
 fn cached_article() -> CachedArticle {
     cache_entry_from_bytes(ARTICLE_RESPONSE)
 }
@@ -37,9 +40,9 @@ fn cache_entry_from_bytes(response: impl AsRef<[u8]>) -> CachedArticle {
 
     block_on(async {
         cache
-            .upsert_ingest(
+            .upsert_framed_ingest(
                 msg_id.clone(),
-                response.as_ref(),
+                benchmark_framed_cache_response(response.as_ref(), RequestKind::Article, 4096),
                 BackendId::from_index(0),
                 0.into(),
             )
@@ -85,7 +88,10 @@ mod article_derived_hits {
 }
 
 mod no_payload_entries {
-    use super::{Bencher, RequestKind, black_box, cache_entry_from_bytes, write_cached_response};
+    use super::{
+        Bencher, HEAD_RESPONSE, RequestKind, black_box, cache_entry_from_bytes,
+        write_cached_response,
+    };
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
     fn missing_entry_returns_none(bencher: Bencher) {
@@ -101,7 +107,7 @@ mod no_payload_entries {
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
     fn availability_only_returns_none(bencher: Bencher) {
-        let entry = cache_entry_from_bytes(b"220 42 <bench@example.com>\r\n");
+        let entry = cache_entry_from_bytes(HEAD_RESPONSE);
 
         bencher.bench(|| {
             black_box(write_cached_response(

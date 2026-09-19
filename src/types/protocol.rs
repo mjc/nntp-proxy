@@ -78,6 +78,10 @@ impl<'a> ValidatedMessageId<'a> {
 pub struct MessageId<'a>(ValidatedMessageId<'a>);
 
 impl<'a> MessageId<'a> {
+    pub(crate) fn from_validated(s: &'a str) -> Self {
+        Self(ValidatedMessageId(Cow::Borrowed(s)))
+    }
+
     /// Create owned `MessageId` from String with validation
     ///
     /// # Errors

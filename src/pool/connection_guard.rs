@@ -13,7 +13,6 @@
 use crate::constants::pool::HEALTH_CHECK_TIMEOUT;
 use crate::pool::deadpool_connection::PooledConnection;
 use crate::pool::provider::DeadpoolConnectionProvider;
-use crate::session::backend::BackendResponseComplete;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // COMPILE-TIME SAFEGUARDS: Connection Hold Time Limits
@@ -78,6 +77,24 @@ const _SALVAGE_NO_LOOP: () = {
 pub struct ConnectionGuard {
     conn: Option<PooledConnection>,
     provider: DeadpoolConnectionProvider,
+    phase: ConnectionPhase,
+}
+
+/// A checked-out connection that has not started protocol I/O.
+///
+/// The checkout boundary is intentionally typestated: an idle connection can
+/// either be returned immediately or activated for an exchange.  Once it is
+/// activated, the idle-only release operation is no longer available.
+#[must_use]
+pub struct IdleConnection {
+    guard: ConnectionGuard,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectionPhase {
+    Idle,
+    InFlight,
+    Complete,
 }
 
 /// A connection whose last backend exchange was proven complete.
@@ -87,18 +104,13 @@ pub(crate) struct ReusableConnection {
 }
 
 impl ConnectionGuard {
-    /// Create a new guard (removes from pool on drop unless released).
-    pub(crate) const fn new(conn: PooledConnection, provider: DeadpoolConnectionProvider) -> Self {
-        Self {
-            conn: Some(conn),
-            provider,
-        }
-    }
-    /// Return a checked-out connection that has not been used yet.
-    ///
-    /// This is the only successful release available without response-completion
-    /// evidence; callers cannot obtain protocol-stream access from this API.
-    pub fn release_idle(mut self) {
+    /// Release an idle checkout without starting an exchange.
+    fn release_idle(mut self) {
+        assert_eq!(
+            self.phase,
+            ConnectionPhase::Idle,
+            "cannot release a connection after I/O began"
+        );
         drop(self.conn.take().expect("ConnectionGuard already consumed"));
     }
 
@@ -110,10 +122,17 @@ impl ConnectionGuard {
     /// # Panics
     ///
     /// Panics if the guard has already been consumed (double-release).
-    pub(crate) fn complete_success(
-        mut self,
-        _completion: BackendResponseComplete,
-    ) -> ReusableConnection {
+    pub(crate) fn complete_success(mut self) -> ReusableConnection {
+        assert_eq!(
+            self.phase,
+            ConnectionPhase::Complete,
+            "complete_success() requires a fully consumed response"
+        );
+        assert_eq!(
+            self.pending_bytes_len(),
+            0,
+            "complete_success() requires no queued backend response bytes"
+        );
         ReusableConnection {
             _connection: self
                 .conn
@@ -160,7 +179,8 @@ impl ConnectionGuard {
     /// # Panics
     ///
     /// Panics if the guard has already been consumed.
-    pub(crate) const fn get_mut(&mut self) -> &mut PooledConnection {
+    pub(crate) fn get_mut(&mut self) -> &mut PooledConnection {
+        self.phase = ConnectionPhase::InFlight;
         self.conn
             .as_mut()
             .expect("ConnectionGuard already consumed")
@@ -168,6 +188,42 @@ impl ConnectionGuard {
     /// Get mutable access to the protocol stream without exposing the pool object.
     pub(crate) fn stream_mut(&mut self) -> &mut crate::stream::ConnectionStream {
         self.get_mut()
+    }
+
+    /// Borrow the stream for a non-consuming health check.
+    ///
+    /// Health checks only inspect socket liveness and must not make an idle
+    /// cached connection look like an in-flight protocol exchange. Protocol
+    /// reads and writes continue to use [`Self::stream_mut`], which records
+    /// that the guard has entered an exchange.
+    pub(crate) fn health_check_stream_mut(&mut self) -> &mut crate::stream::ConnectionStream {
+        self.conn
+            .as_mut()
+            .expect("ConnectionGuard already consumed")
+    }
+
+    /// Record that the framer consumed the complete response for this guard.
+    ///
+    /// The phase is kept on the guard that owns the socket. This removes the
+    /// old detached zero-sized completion token, which could be paired with a
+    /// different connection by a caller.
+    pub(crate) fn mark_response_complete(&mut self) {
+        match self.phase {
+            ConnectionPhase::InFlight => self.phase = ConnectionPhase::Complete,
+            ConnectionPhase::Complete => {}
+            ConnectionPhase::Idle => {
+                panic!("response completion requires an active connection")
+            }
+        }
+    }
+
+    /// Whether the active response operation has proven that its backend
+    /// response was fully consumed. This is intentionally narrower than
+    /// checking for an empty pending-byte queue: an unfinished read can have
+    /// no locally queued bytes and still leave the protocol exchange dirty.
+    #[must_use]
+    pub(crate) const fn response_is_complete(&self) -> bool {
+        matches!(self.phase, ConnectionPhase::Complete)
     }
 
     /// Transfer ownership to the bounded health-check path without claiming success.
@@ -209,12 +265,34 @@ impl ConnectionGuard {
     }
 }
 
+impl IdleConnection {
+    /// Create a new idle checkout (removes it from the pool on drop unless released).
+    pub(crate) const fn new(conn: PooledConnection, provider: DeadpoolConnectionProvider) -> Self {
+        Self {
+            guard: ConnectionGuard {
+                conn: Some(conn),
+                provider,
+                phase: ConnectionPhase::Idle,
+            },
+        }
+    }
+
+    /// Begin a protocol exchange, consuming the idle-only capability.
+    pub fn activate(self) -> ConnectionGuard {
+        self.guard
+    }
+
+    /// Return the connection without starting protocol I/O.
+    pub fn release(self) {
+        self.guard.release_idle();
+    }
+}
+
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        debug_assert!(
-            self.conn.is_none(),
-            "ConnectionGuard dropped without explicit finalize"
-        );
+        // Cancellation can drop an exchange between reads. Cleanup must run
+        // in debug builds too; panicking here would drop the pool object
+        // normally and return an unfinished connection to the pool.
         if let Some(conn) = self.conn.take() {
             tracing::debug!(
                 connection_type = conn.connection_type(),
@@ -291,7 +369,7 @@ mod tests {
     // `complete_success()` would cause release_reuses_pool_connection to fail — the pool
     // would create a new TCP connection instead of reusing the existing one.
 
-    use super::ConnectionGuard;
+    use super::IdleConnection;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -374,9 +452,9 @@ mod tests {
         let conn = provider.get_pooled_connection().await.unwrap();
         assert_eq!(accept_count.load(Ordering::SeqCst), 1);
 
-        // complete_success() returns conn to pool (no shutdown)
-        let guard = ConnectionGuard::new(conn, provider.clone());
-        drop(guard.complete_success(crate::session::backend::BackendResponseComplete::for_test()));
+        // An untouched checkout can be returned as idle.
+        let guard = IdleConnection::new(conn, provider.clone());
+        guard.release();
 
         // Second get — pool recycles the existing connection (no new TCP handshake)
         let _conn2 = provider.get_pooled_connection().await.unwrap();
@@ -388,12 +466,66 @@ mod tests {
         );
     }
 
+    /// An active guard cannot be returned as reusable before the framer records
+    /// a complete response.
+    #[tokio::test]
+    #[should_panic(expected = "complete_success() requires a fully consumed response")]
+    async fn complete_success_rejects_incomplete_response() {
+        let (port, _accept_count) = spawn_greeting_server().await;
+        let provider = make_provider(port);
+        let mut guard =
+            IdleConnection::new(provider.get_pooled_connection().await.unwrap(), provider)
+                .activate();
+        let _ = guard.stream_mut();
+        let _ = guard.complete_success();
+    }
+
+    /// A complete current frame does not make a connection reusable when the
+    /// framer retained bytes belonging to the next backend response.
+    #[tokio::test]
+    #[should_panic(expected = "complete_success() requires no queued backend response bytes")]
+    async fn complete_success_rejects_queued_following_response() {
+        let (port, _accept_count) = spawn_greeting_server().await;
+        let provider = make_provider(port);
+        let mut guard =
+            IdleConnection::new(provider.get_pooled_connection().await.unwrap(), provider)
+                .activate();
+        guard
+            .stream_mut()
+            .queue_pending_bytes(b"223 next\r\n")
+            .unwrap();
+        guard.mark_response_complete();
+        let _ = guard.complete_success();
+    }
+
+    /// A completed response does not make a pipelined exchange reusable when
+    /// another command has already been written, even if its delayed reply has
+    /// not produced locally queued bytes yet.
+    #[tokio::test]
+    #[should_panic(expected = "complete_success() requires a fully consumed response")]
+    async fn complete_success_rejects_new_outstanding_request_without_pending_bytes() {
+        let (port, _accept_count) = spawn_greeting_server().await;
+        let provider = make_provider(port);
+        let mut guard =
+            IdleConnection::new(provider.get_pooled_connection().await.unwrap(), provider)
+                .activate();
+
+        guard.stream_mut().write_all(b"DATE\r\n").await.unwrap();
+        guard.mark_response_complete();
+
+        // Starting the next request moves the owning guard back to InFlight.
+        // The backend may reply later, but an empty local queue is not evidence
+        // that this outstanding exchange is clean.
+        guard.stream_mut().write_all(b"DATE\r\n").await.unwrap();
+        assert_eq!(guard.pending_bytes_len(), 0);
+        let _ = guard.complete_success();
+    }
+
     /// Invariant: drop without `complete_success()` removes the connection from the pool.
     ///
     /// The guard shuts down the socket; pool recycle detects EOF
     /// and discards it; next `get()` creates a fresh TCP connection.
     /// Unknown/backend-error drop paths apply replacement cooldown.
-    #[cfg(not(debug_assertions))]
     #[tokio::test]
     async fn drop_without_release_forces_new_connection() {
         let (port, accept_count) = spawn_greeting_server().await;
@@ -404,7 +536,7 @@ mod tests {
         assert_eq!(accept_count.load(Ordering::SeqCst), 1);
 
         // Drop without release → socket shut down
-        let guard = ConnectionGuard::new(conn, provider.clone());
+        let guard = IdleConnection::new(conn, provider.clone()).activate();
         drop(guard);
 
         // remove_with_cooldown calls socket2::shutdown(Both) synchronously, so the OS
@@ -427,14 +559,68 @@ mod tests {
         );
     }
 
-    #[cfg(debug_assertions)]
     #[tokio::test]
-    #[should_panic(expected = "ConnectionGuard dropped without explicit finalize")]
-    async fn drop_without_complete_success_panics_in_debug() {
-        let (port, _accept_count) = spawn_greeting_server().await;
+    async fn cancelling_an_unfinished_exchange_retires_its_connection() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let (port, accept_count) = spawn_greeting_server().await;
         let provider = make_provider(port);
         let conn = provider.get_pooled_connection().await.unwrap();
-        let _guard = ConnectionGuard::new(conn, provider.clone());
+        let mut guard = IdleConnection::new(conn, provider.clone()).activate();
+        guard.stream_mut().write_all(b"DATE\r\n").await.unwrap();
+
+        // The future owns a used connection whose reply has not been consumed.
+        // Cancellation must retire it even if no input is locally queued.
+        let mut exchange = Box::pin(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(exchange.as_mut().poll(&mut context), Poll::Pending);
+        drop(exchange);
+
+        let _replacement = provider.get_pooled_connection().await.unwrap();
+        assert_eq!(accept_count.load(Ordering::SeqCst), 2);
+    }
+
+    /// Cancellation must retire an unfinished exchange even when the framer
+    /// already retained bytes belonging to that exchange.  The retained bytes
+    /// are owned by the connection, so dropping the guard must remove that
+    /// connection rather than returning its buffered state to the pool.
+    #[tokio::test]
+    async fn cancelling_unfinished_exchange_with_buffered_bytes_retires_connection() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let (port, accept_count) = spawn_greeting_server().await;
+        let provider = make_provider(port);
+        let conn = provider.get_pooled_connection().await.unwrap();
+        let mut guard = IdleConnection::new(conn, provider.clone()).activate();
+        guard.stream_mut().write_all(b"DATE\r\n").await.unwrap();
+        guard
+            .stream_mut()
+            .queue_pending_bytes(b"223 queued-for-abandoned-exchange\r\n")
+            .unwrap();
+        assert!(guard.pending_bytes_len() > 0);
+
+        let mut exchange = Box::pin(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(exchange.as_mut().poll(&mut context), Poll::Pending);
+        drop(exchange);
+
+        // Allow the pool's closed-socket observation to complete before the
+        // replacement checkout asks the provider to recycle an idle object.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let _replacement = provider.get_pooled_connection().await.unwrap();
+        assert_eq!(
+            accept_count.load(Ordering::SeqCst),
+            2,
+            "an abandoned exchange with buffered bytes must not return its socket to the pool"
+        );
     }
 
     // ─── salvage_with_health_check notes ────────────────────────────────────

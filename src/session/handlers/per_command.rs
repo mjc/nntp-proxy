@@ -1074,7 +1074,6 @@ impl ClientSession {
             batch,
             backend_connection,
         } = params;
-        let mut last_completion = None;
         let mut unread_requests = requests.into_iter().enumerate();
         while let Some((i, request_route)) = unread_requests.next() {
             match request_route {
@@ -1094,7 +1093,7 @@ impl ClientSession {
                         .with_context_mut(i, |mut request| async {
                             let result = self
                                 .forward_response_for_already_sent_request(
-                                    &mut conn,
+                                    conn,
                                     client_writer.get_mut(),
                                     &backend,
                                     &mut request,
@@ -1111,8 +1110,8 @@ impl ClientSession {
                             ))
                         })?;
                     match result {
-                        Ok(completion) => {
-                            last_completion = Some(completion);
+                        Ok(next_conn) => {
+                            conn = next_conn;
                             guard.complete();
                         }
                         Err(
@@ -1126,7 +1125,6 @@ impl ClientSession {
                                 error = %error,
                                 "Upstream window response read failed; retrying unread requests sequentially"
                             );
-                            conn.fail_backend();
                             drop(guard);
                             drop(unread_requests);
                             self.execute_pipelineable_commands_with_recorded_request_bytes_from(
@@ -1147,13 +1145,7 @@ impl ClientSession {
                                 error,
                             ),
                         ) => {
-                            let request = batch.context(i).request();
-                            return Err(self.handle_response_transfer_error(
-                                conn,
-                                backend_id,
-                                request,
-                                error,
-                            ));
+                            return Err(error);
                         }
                     }
                 }
@@ -1161,12 +1153,10 @@ impl ClientSession {
         }
         client_writer.get_mut().flush().await?;
 
-        let completion =
-            last_completion.expect("sent article window contained an upstream request");
         if conn.has_pending_bytes() {
             conn.fail_client();
         } else {
-            *backend_connection.slot() = Some(BackendLease::new(backend_id, conn, completion));
+            *backend_connection.slot() = Some(BackendLease::new(backend_id, conn));
         }
         Ok(())
     }
@@ -1348,16 +1338,16 @@ mod tests {
     async fn batch_connection_cancel_retirees_connection_on_drop() {
         let (port, accept_count) = spawn_greeting_server().await;
         let provider = make_provider(port);
-        let conn = provider.checkout_connection_guard().await.unwrap();
+        let conn = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
         assert_eq!(accept_count.load(Ordering::SeqCst), 1);
 
         let handle = tokio::spawn(async move {
             let _batch = super::BatchBackendConnection {
-                conn: Some(super::BackendLease::new(
-                    BackendId::from_index(0),
-                    conn,
-                    crate::session::backend::BackendResponseComplete::for_test(),
-                )),
+                conn: Some(super::BackendLease::new(BackendId::from_index(0), conn)),
             };
             tokio::time::sleep(Duration::from_secs(1)).await;
             drop(_batch);
@@ -1369,7 +1359,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let next = provider.checkout_connection_guard().await.unwrap();
-        drop(next.complete_success(crate::session::backend::BackendResponseComplete::for_test()));
+        next.release();
         assert_eq!(
             accept_count.load(Ordering::SeqCst),
             2,
