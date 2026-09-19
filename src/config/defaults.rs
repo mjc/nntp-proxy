@@ -178,7 +178,7 @@ pub const fn health_check_pool_timeout() -> Duration {
     Duration::from_millis(HEALTH_CHECK_POOL_TIMEOUT_MS)
 }
 
-// Disk cache defaults (for hybrid-cache feature)
+// Defaults for the optional memory-to-disk article cache tier.
 
 /// Default disk cache path
 #[inline]

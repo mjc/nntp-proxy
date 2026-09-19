@@ -1,10 +1,15 @@
-//! Standalone NNTP client for fetching articles
+//! Standalone NNTP client for fetching and validating article responses.
 //!
-//! This module provides a zero-allocation API for fetching articles from NNTP servers,
-//! independent of the proxy functionality. Useful for building downloaders,
-//! indexers, or testing tools.
+//! Fetch articles from NNTP servers using shared connection and buffer pools.
+//! This API can be used independently of the proxy in applications, indexers,
+//! and testing tools.
 //!
-//! # Zero-Allocation Design
+//! A fetch returns a [`FramedArticle`] with known response boundaries. Consume
+//! it with [`FramedArticle::validate`] or [`FramedArticle::validate_with_yenc`]
+//! to check article structure and obtain a [`ValidatedArticle`]. Its borrowed
+//! [`ArticleView`] can be requested repeatedly without reparsing the response.
+//!
+//! # Shared pools
 //!
 //! The caller provides a shared buffer pool. One pool can serve multiple clients:
 //!
@@ -46,14 +51,12 @@ use crate::protocol::{
 use crate::session::backend::execute_request_exchange;
 use anyhow::{Context, Result};
 
-/// Standalone NNTP client for fetching articles
+/// Standalone NNTP client for fetching articles.
 ///
-/// Zero-allocation design using caller-provided buffer pool.
-/// Share one pool across multiple clients for minimal allocations.
-/// Returns a framer-produced [`FramedArticle`] backed by the captured pooled
-/// allocation. Its bytes remain associated with the boundary established by
-/// the response framer; callers obtain a reusable [`ArticleView`] through the
-/// consuming [`FramedArticle::validate`] transition.
+/// Multiple clients can share a caller-provided buffer pool. Each fetch returns
+/// a [`FramedArticle`] that owns its pooled allocation and retains the boundaries
+/// established by the framer. Consume it with [`FramedArticle::validate`] to
+/// check article structure and obtain reusable [`ArticleView`] values.
 #[derive(Clone)]
 pub struct NntpClient {
     conn_pool: DeadpoolConnectionProvider,
@@ -61,7 +64,7 @@ pub struct NntpClient {
 }
 
 impl NntpClient {
-    /// Create a new client with connection pool and buffer pool
+    /// Create a new client with connection and buffer pools.
     ///
     /// The buffer pool can be shared across multiple clients via `Clone`.
     #[must_use]
@@ -72,10 +75,11 @@ impl NntpClient {
         }
     }
 
-    /// Fetch article body (BODY command)
+    /// Fetch an article body (`BODY` command).
     ///
-    /// Returns a framed owner with the status line and payload bytes. The
-    /// multiline terminator has already been consumed by the framer.
+    /// The returned [`FramedArticle`] contains the status line and body bytes.
+    /// The framer consumes the multiline terminator. Validate the body and
+    /// decode yEnc separately if needed.
     ///
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets, e.g. `<abc@example.com>`
@@ -91,10 +95,11 @@ impl NntpClient {
         self.fetch_response(body_request(message_id))
     }
 
-    /// Fetch article headers (HEAD command)
+    /// Fetch article headers (`HEAD` command).
     ///
-    /// Returns a framed owner with the status line and payload bytes. The
-    /// multiline terminator has already been consumed by the framer.
+    /// The returned [`FramedArticle`] contains the status line and header bytes.
+    /// The framer consumes the multiline terminator. Validate the headers
+    /// separately if needed.
     ///
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets
@@ -110,10 +115,11 @@ impl NntpClient {
         self.fetch_response(head_request(message_id))
     }
 
-    /// Fetch full article (ARTICLE command)
+    /// Fetch a complete article (`ARTICLE` command).
     ///
-    /// Returns a framed owner with the status line and payload bytes. The
-    /// multiline terminator has already been consumed by the framer.
+    /// The returned [`FramedArticle`] contains the status line, headers, and body.
+    /// The framer consumes the multiline terminator. Validate the article and
+    /// decode yEnc separately if needed.
     ///
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets
@@ -129,13 +135,14 @@ impl NntpClient {
         self.fetch_response(article_request(message_id))
     }
 
-    /// Check if article exists (STAT command)
+    /// Check whether an article exists using `STAT`.
     ///
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets
     ///
     /// # Returns
-    /// `true` if article exists, `false` if 430 (not found)
+    /// Returns `true` for a `223` response and `false` for `430`.
+    /// Other status codes are returned as errors.
     ///
     /// # Errors
     /// Returns any connection or protocol error while issuing `STAT`, including
@@ -287,8 +294,16 @@ impl FramedArticle {
         self.state.as_bytes()
     }
 
-    /// Validate NNTP article semantics and transition to reusable typed access.
-    /// yEnc validation is explicit policy, not part of NNTP framing.
+    /// Validate article structure and return a [`ValidatedArticle`].
+    ///
+    /// The boolean is retained for source compatibility. Prefer
+    /// [`Self::validate_with_yenc`] to select yEnc validation with an enum.
+    /// yEnc validation runs separately from NNTP framing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an article parse error if the response does not match the
+    /// request's article shape or fails the selected yEnc validation.
     pub fn validate(self, validate_yenc: bool) -> Result<ValidatedArticle> {
         let policy = match validate_yenc {
             true => YencValidation::Enabled,
@@ -297,7 +312,12 @@ impl FramedArticle {
         self.validate_with_yenc(policy)
     }
 
-    /// Validate NNTP semantics and apply the selected optional yEnc policy.
+    /// Validate article structure, with optional yEnc validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an article parse error if the response does not match the
+    /// request's article shape or fails the selected yEnc validation.
     pub fn validate_with_yenc(self, policy: YencValidation) -> Result<ValidatedArticle> {
         let state = self.state.validate(policy)?;
         Ok(ValidatedArticle { state })
@@ -310,7 +330,12 @@ impl FramedArticle {
     }
 }
 
-/// A semantically validated article whose layout remains bound to its bytes.
+/// An article with validated structure and a layout tied to its pooled bytes.
+///
+/// Calling [`Self::article`] repeatedly returns borrowed views without reparsing
+/// the status line, headers, or body.
+/// The view borrows this value, so the pooled bytes cannot be returned or
+/// mutated while the view is alive.
 #[derive(Debug)]
 pub struct ValidatedArticle {
     state: crate::protocol::ArticleState<crate::protocol::ValidatedArticleState<PooledBuffer>>,
