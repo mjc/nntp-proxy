@@ -277,7 +277,7 @@ impl FramedArticle {
     /// multiline terminator.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        self.state.as_inner().bytes().as_ref()
+        self.state.as_bytes()
     }
 
     /// Validate NNTP article semantics and transition to reusable typed access.
@@ -292,13 +292,9 @@ impl FramedArticle {
 
     /// Validate NNTP semantics and apply the selected optional yEnc policy.
     pub fn validate_with_yenc(self, policy: YencValidation) -> Result<ValidatedArticle> {
-        let kind = self.kind();
-        let status = self.status();
         let state = self.state.into_inner().validate(policy)?;
         Ok(ValidatedArticle {
             state: crate::protocol::ArticleState::new(state),
-            kind,
-            status,
         })
     }
 
@@ -313,42 +309,37 @@ impl FramedArticle {
 #[derive(Debug)]
 pub struct ValidatedArticle {
     state: crate::protocol::ArticleState<crate::protocol::ValidatedArticleState<PooledBuffer>>,
-    kind: crate::protocol::RequestKind,
-    status: StatusCode,
 }
 
 impl ValidatedArticle {
     /// Request kind that established this validated article state.
     #[must_use]
     pub const fn kind(&self) -> crate::protocol::RequestKind {
-        self.kind
+        self.state.kind()
     }
 
     /// Status code that established this validated article state.
     #[must_use]
     pub const fn status(&self) -> StatusCode {
-        self.status
+        self.state.status()
     }
 
     /// Return a reusable zero-copy article view without repeating validation.
     #[must_use]
     pub fn article(&self) -> ArticleView<'_> {
-        self.state
-            .as_inner()
-            .layout()
-            .view(self.state.as_inner().as_bytes())
+        self.state.article()
     }
 
     /// Return the validated wire bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        self.state.as_inner().bytes()
+        self.state.as_bytes()
     }
 
     /// Consume the validated state and return its pooled storage.
     #[must_use]
     pub fn into_bytes(self) -> PooledBuffer {
-        self.state.into_inner().into_bytes()
+        self.state.into_bytes()
     }
 }
 
@@ -379,6 +370,14 @@ mod tests {
         expected_command: &'static str,
         response: &'static [u8],
     ) -> std::net::SocketAddr {
+        spawn_fetch_test_server_with_chunk_size(expected_command, response, response.len()).await
+    }
+
+    async fn spawn_fetch_test_server_with_chunk_size(
+        expected_command: &'static str,
+        response: &'static [u8],
+        chunk_size: usize,
+    ) -> std::net::SocketAddr {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -401,7 +400,10 @@ mod tests {
 
                             let command = std::str::from_utf8(&cmd_buf[..n]).unwrap();
                             if command.starts_with(expected_command) {
-                                let _ = stream.write_all(response).await;
+                                for chunk in response.chunks(chunk_size.max(1)) {
+                                    let _ = stream.write_all(chunk).await;
+                                    tokio::task::yield_now().await;
+                                }
                                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                                 return;
                             }
@@ -529,7 +531,10 @@ mod tests {
             .unwrap()
     }
 
-    fn make_test_client(addr: std::net::SocketAddr) -> NntpClient {
+    fn make_test_client_with_buffer_size(
+        addr: std::net::SocketAddr,
+        buffer_size: usize,
+    ) -> NntpClient {
         use crate::pool::BufferPool;
         use crate::types::BufferSize;
 
@@ -538,8 +543,12 @@ mod tests {
             .max_connections(2)
             .build()
             .unwrap();
-        let buffer_pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 2);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(buffer_size).unwrap(), 2);
         NntpClient::new(provider, buffer_pool)
+    }
+
+    fn make_test_client(addr: std::net::SocketAddr) -> NntpClient {
+        make_test_client_with_buffer_size(addr, 4096)
     }
 
     async fn capture_multiline_response_for_test(
@@ -695,6 +704,25 @@ mod tests {
         assert_eq!(validated.status(), StatusCode::new(222));
         let article = validated.article();
         assert_eq!(article.body, Some(&b"hello world"[..]));
+    }
+
+    #[tokio::test]
+    async fn fetch_body_validates_after_fragmented_production_capture() {
+        let response = b"222 0 <fragmented@example.com>\r\nfragmented body\r\n.\r\n";
+        let addr =
+            spawn_fetch_test_server_with_chunk_size("BODY <fragmented@example.com>", response, 1)
+                .await;
+        let client = make_test_client_with_buffer_size(addr, 4096);
+        let msg_id = crate::types::MessageId::new("<fragmented@example.com>".to_string()).unwrap();
+
+        let validated = client
+            .fetch_body(&msg_id)
+            .await
+            .unwrap()
+            .validate_with_yenc(YencValidation::Disabled)
+            .unwrap();
+
+        assert_eq!(validated.article().body, Some(&b"fragmented body"[..]));
     }
 
     #[tokio::test]

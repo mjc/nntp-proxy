@@ -81,7 +81,6 @@ pub struct FramedChunkedResponse {
     state: crate::protocol::ArticleState<
         crate::protocol::FramedArticleState<crate::pool::ChunkedResponse>,
     >,
-    payload_end: CachePayloadEnd,
 }
 
 /// Exclusive end of the cache payload within its captured response.
@@ -133,10 +132,9 @@ impl CacheIngestResponse {
         state: crate::protocol::ArticleState<
             crate::protocol::FramedArticleState<crate::pool::ChunkedResponse>,
         >,
-        payload_end: CachePayloadEnd,
     ) -> Self {
-        debug_assert!(payload_end.as_usize() <= state.as_inner().bytes().len());
-        Self::FramedChunked(FramedChunkedResponse { state, payload_end })
+        debug_assert!(state.as_inner().content_end().get() <= state.as_inner().bytes().len());
+        Self::FramedChunked(FramedChunkedResponse { state })
     }
 
     /// Construct a representative framer-bounded article capture for the
@@ -165,16 +163,15 @@ impl CacheIngestResponse {
             bytes.len(),
         )
         .expect("payload fits benchmark response");
-        Self::from_framed_article(
-            crate::protocol::ArticleState::new(crate::protocol::FramedArticleState::new(
+        Self::from_framed_article(crate::protocol::ArticleState::new(
+            crate::protocol::FramedArticleState::new(
                 response,
                 crate::protocol::RequestKind::Article,
                 StatusCode::new(220),
                 status_line_end,
                 crate::protocol::ContentEnd::new(payload_end.as_usize()),
-            )),
-            payload_end,
-        )
+            ),
+        ))
     }
 
     #[cfg(test)]

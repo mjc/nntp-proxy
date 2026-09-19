@@ -435,10 +435,13 @@ impl CachedArticle {
         response: super::FramedChunkedResponse,
         tier: ttl::CacheTier,
     ) -> Self {
-        let super::FramedChunkedResponse { state, payload_end } = response;
+        let super::FramedChunkedResponse { state } = response;
         let framed = state.into_inner();
         let status = framed.status();
         let status_line_end = framed.status_line_end();
+        let payload_end =
+            super::CachePayloadEnd::new(framed.content_end().get(), framed.bytes().len())
+                .expect("framer established an in-bounds cache payload boundary");
         let response = framed.into_bytes();
         let payload = parse_framed_chunked_payload(status, status_line_end, &response, payload_end);
         Self {
@@ -1889,8 +1892,6 @@ mod tests {
         response.push_buffer_range(buffer, 0..wire.len());
         let status_line_end =
             crate::protocol::StatusLineEnd::new(b"220 7 <test@example.com>\r\n".len());
-        let payload_end = crate::cache::CachePayloadEnd::new(wire.len(), wire.len())
-            .expect("payload is within captured response");
         let input = crate::cache::CacheIngestResponse::from_framed_article(
             crate::protocol::ArticleState::new(crate::protocol::FramedArticleState::new(
                 response,
@@ -1899,7 +1900,6 @@ mod tests {
                 status_line_end,
                 crate::protocol::ContentEnd::new(wire.len()),
             )),
-            payload_end,
         );
 
         let entry = CachedArticle::from_ingest_response_with_tier(input, ttl::CacheTier::new(0));

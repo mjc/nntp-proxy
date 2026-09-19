@@ -890,18 +890,6 @@ impl ClassifiedResponse {
         }
     }
 
-    fn status_line_end(&self) -> Option<crate::protocol::StatusLineEnd> {
-        match &self.frame {
-            Ok(ResponseFrame::SingleLine {
-                status_line_end, ..
-            })
-            | Ok(ResponseFrame::Multiline {
-                status_line_end, ..
-            }) => Some(*status_line_end),
-            Err(_) => None,
-        }
-    }
-
     pub(crate) fn single_line_bytes(&self) -> Option<&[u8]> {
         match &self.frame {
             Ok(ResponseFrame::SingleLine { framed, .. }) => {
@@ -916,24 +904,55 @@ impl ClassifiedResponse {
     }
 
     async fn capture_isolated(
-        mut self,
+        self,
         conn: &mut crate::pool::ConnectionGuard,
         pool: &crate::pool::BufferPool,
-    ) -> anyhow::Result<crate::pool::PooledBuffer> {
-        match self.frame {
-            Ok(ResponseFrame::SingleLine { framed, .. }) => {
+    ) -> anyhow::Result<CapturedResponse> {
+        let ClassifiedResponse {
+            buffer,
+            frame,
+            kind,
+        } = self;
+        match frame {
+            Ok(ResponseFrame::SingleLine {
+                status,
+                status_line_end,
+                framed,
+            }) => {
                 framed.require_isolated()?;
                 conn.mark_response_complete();
-                Ok(self.buffer)
+                let content_end = crate::protocol::ContentEnd::new(framed.response.end);
+                Ok(crate::protocol::ArticleState::new(
+                    crate::protocol::FramedArticleState::new(
+                        buffer,
+                        kind,
+                        status,
+                        status_line_end,
+                        content_end,
+                    ),
+                ))
             }
-            Ok(ResponseFrame::Multiline { .. }) => {
+            Ok(ResponseFrame::Multiline {
+                status,
+                status_line_end,
+            }) => {
+                let mut buffer = buffer;
                 let mut capture = pool.acquire_capture();
-                IsolatedMultilineResponse::begin(conn.stream_mut(), &mut self.buffer)
+                IsolatedMultilineResponse::begin(conn.stream_mut(), &mut buffer)
                     .map_err(isolated_multiline_error)?
                     .capture_payload_into(&mut capture)
                     .await?;
                 conn.mark_response_complete();
-                Ok(capture)
+                let content_end = crate::protocol::ContentEnd::new(capture.initialized());
+                Ok(crate::protocol::ArticleState::new(
+                    crate::protocol::FramedArticleState::new(
+                        capture,
+                        kind,
+                        status,
+                        status_line_end,
+                        content_end,
+                    ),
+                ))
             }
             Err(error) => anyhow::bail!("cannot capture invalid backend response: {error:?}"),
         }
@@ -1032,7 +1051,14 @@ impl ClassifiedResponse {
     ) -> Result<StreamingResponse<'a>, crate::session::response_transfer::ResponseTransferError>
     {
         let frame = std::mem::replace(&mut self.frame, Err(ResponseReadError::Incomplete));
-        StreamingResponse::from_classification(frame, &mut self.buffer, conn, pool, backend_id)
+        StreamingResponse::from_classification(
+            self.kind,
+            frame,
+            &mut self.buffer,
+            conn,
+            pool,
+            backend_id,
+        )
     }
 }
 
@@ -1062,7 +1088,6 @@ pub(crate) struct CapturedChunkedResponse {
     state: crate::protocol::ArticleState<
         crate::protocol::FramedArticleState<crate::pool::ChunkedResponse>,
     >,
-    payload_end: crate::cache::CachePayloadEnd,
 }
 
 impl CapturedChunkedResponse {
@@ -1083,12 +1108,11 @@ impl CapturedChunkedResponse {
             content_end,
         ));
         debug_assert_eq!(state.as_inner().content_end().get(), payload_end.as_usize());
-        Self { state, payload_end }
+        Self { state }
     }
 
     pub(crate) fn into_cache_ingest(self) -> crate::cache::CacheIngestResponse {
-        let Self { state, payload_end } = self;
-        crate::cache::CacheIngestResponse::from_framed_article(state, payload_end)
+        crate::cache::CacheIngestResponse::from_framed_article(self.state)
     }
 
     #[must_use]
@@ -1110,6 +1134,7 @@ impl Receiving<'_> {
         } = self;
         let frame = std::mem::replace(&mut response.frame, Err(ResponseReadError::Incomplete));
         StreamingResponse::from_classification(
+            response.kind,
             frame,
             &mut response.buffer,
             conn.stream_mut(),
@@ -1130,24 +1155,7 @@ impl Receiving<'_> {
             pool,
             ..
         } = self;
-        let kind = response.kind;
-        let status = response
-            .status_code()
-            .ok_or_else(|| anyhow::anyhow!("cannot capture invalid backend response"))?;
-        let status_line_end = response
-            .status_line_end()
-            .ok_or_else(|| anyhow::anyhow!("cannot capture invalid backend response"))?;
-        let bytes = response.capture_isolated(conn, pool).await?;
-        let content_end = crate::protocol::ContentEnd::new(bytes.initialized());
-        Ok(crate::protocol::ArticleState::new(
-            crate::protocol::FramedArticleState::new(
-                bytes,
-                kind,
-                status,
-                status_line_end,
-                content_end,
-            ),
-        ))
+        response.capture_isolated(conn, pool).await
     }
 
     pub(crate) async fn capture_isolated_chunked_optional(
@@ -1212,17 +1220,6 @@ impl Receiving<'_> {
         crate::session::response_transfer::ResponseTransferError,
     > {
         let mut receiving = self;
-        let kind = receiving.response.kind;
-        let status = receiving.response.status_code().ok_or_else(|| {
-            crate::session::response_transfer::ResponseTransferError::Io(anyhow::anyhow!(
-                "cannot retain an invalid backend response"
-            ))
-        })?;
-        let status_line_end = receiving.response.status_line_end().ok_or_else(|| {
-            crate::session::response_transfer::ResponseTransferError::Io(anyhow::anyhow!(
-                "cannot retain an invalid backend response"
-            ))
-        })?;
         let (result, completed) = {
             let mut streaming = receiving.stream()?;
             let result = streaming
@@ -1235,19 +1232,7 @@ impl Receiving<'_> {
             receiving.conn.mark_response_complete();
         }
         let result = result?;
-        let (bytes_written, payload_end) = result;
-        Ok((
-            bytes_written,
-            payload_end.map(|payload_end| {
-                CapturedChunkedResponse::new(
-                    kind,
-                    status,
-                    status_line_end,
-                    std::mem::take(captured),
-                    payload_end,
-                )
-            }),
-        ))
+        Ok(result)
     }
 }
 
@@ -1548,8 +1533,16 @@ struct StreamingResponse<'a> {
     cursor: ResponseCursor<'a>,
     pool: &'a crate::pool::BufferPool,
     backend_id: crate::types::BackendId,
+    metadata: ResponseMetadata,
     shape: ResponseShape,
     bytes_received: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ResponseMetadata {
+    kind: crate::protocol::RequestKind,
+    status: crate::protocol::StatusCode,
+    status_line_end: crate::protocol::StatusLineEnd,
 }
 
 enum ResponseShape {
@@ -1571,23 +1564,33 @@ impl<'a> StreamingResponse<'a> {
         backend_id: crate::types::BackendId,
     ) -> Result<Self, crate::session::response_transfer::ResponseTransferError> {
         let frame = ResponseFrame::parse(request, io_buffer);
-        Self::from_classification(frame, io_buffer, conn, pool, backend_id)
+        Self::from_classification(request.kind(), frame, io_buffer, conn, pool, backend_id)
     }
 
     fn from_classification(
+        kind: crate::protocol::RequestKind,
         classification: Result<ResponseFrame, ResponseReadError>,
         io_buffer: &'a mut crate::pool::PooledBuffer,
         conn: &'a mut crate::stream::ConnectionStream,
         pool: &'a crate::pool::BufferPool,
         backend_id: crate::types::BackendId,
     ) -> Result<Self, crate::session::response_transfer::ResponseTransferError> {
-        let (shape, cursor) = match classification.map_err(|err| {
+        let (shape, metadata, cursor) = match classification.map_err(|err| {
             crate::session::response_transfer::ResponseTransferError::Io(anyhow::anyhow!(
                 "Failed to frame response: {err:?}"
             ))
         })? {
-            ResponseFrame::SingleLine { framed, .. } => (
+            ResponseFrame::SingleLine {
+                status,
+                status_line_end,
+                framed,
+            } => (
                 ResponseShape::SingleLine,
+                ResponseMetadata {
+                    kind,
+                    status,
+                    status_line_end,
+                },
                 ResponseCursor {
                     conn,
                     io_buffer,
@@ -1600,8 +1603,16 @@ impl<'a> StreamingResponse<'a> {
                     packed_policy: PackedPendingBytesPolicy::AllowIfStatusPrefix,
                 },
             ),
-            ResponseFrame::Multiline { .. } => (
+            ResponseFrame::Multiline {
+                status,
+                status_line_end,
+            } => (
                 ResponseShape::Multiline,
+                ResponseMetadata {
+                    kind,
+                    status,
+                    status_line_end,
+                },
                 ResponseCursor::begin(
                     conn,
                     io_buffer,
@@ -1619,6 +1630,7 @@ impl<'a> StreamingResponse<'a> {
             cursor,
             pool,
             backend_id,
+            metadata,
             shape,
             bytes_received,
         })
@@ -1756,7 +1768,7 @@ impl<'a> StreamingResponse<'a> {
         response: &mut crate::pool::ChunkedResponse,
         retention_limit: usize,
     ) -> Result<
-        (u64, Option<crate::cache::CachePayloadEnd>),
+        (u64, Option<CapturedChunkedResponse>),
         crate::session::response_transfer::ResponseTransferError,
     > {
         response.clear();
@@ -1812,7 +1824,14 @@ impl<'a> StreamingResponse<'a> {
                     let payload_end =
                         crate::cache::CachePayloadEnd::new(payload_end, response.len())
                             .expect("framer established a cache payload within the capture");
-                    return Ok((stats.bytes_written_u64(), Some(payload_end)));
+                    let captured = CapturedChunkedResponse::new(
+                        self.metadata.kind,
+                        self.metadata.status,
+                        self.metadata.status_line_end,
+                        std::mem::take(response),
+                        payload_end,
+                    );
+                    return Ok((stats.bytes_written_u64(), Some(captured)));
                 }
                 ResponseWindow::Incomplete(chunk) => {
                     chunk.push_buffer_to(response, self.pool, self.cursor.io_buffer);
@@ -2657,7 +2676,7 @@ mod tests {
         let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, io_buffer)
             .await
             .unwrap();
-        let (bytes_written, payload_end) = classified
+        let (bytes_written, captured_response) = classified
             .stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0))
             .unwrap()
             .capture_and_write(&mut writer, &mut captured, response.len())
@@ -2665,15 +2684,9 @@ mod tests {
             .expect("response should be retained");
 
         assert_eq!(bytes_written as usize, response.len());
-        let payload_end = payload_end.expect("retained response");
-        let captured = CapturedChunkedResponse::new(
-            crate::protocol::RequestKind::Body,
-            crate::protocol::StatusCode::new(222),
-            crate::protocol::StatusLineEnd::new(status_line_len(response).unwrap()),
-            captured,
-            payload_end,
-        );
-        let cache_input = captured.into_cache_ingest();
+        let cache_input = captured_response
+            .expect("retained response")
+            .into_cache_ingest();
         let entry = crate::cache::CachedArticle::from_ingest_response_with_tier(
             cache_input,
             crate::cache::ttl::CacheTier::new(0),

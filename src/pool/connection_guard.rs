@@ -128,6 +128,11 @@ impl ConnectionGuard {
             ConnectionPhase::Complete,
             "complete_success() requires a fully consumed response"
         );
+        assert_eq!(
+            self.pending_bytes_len(),
+            0,
+            "complete_success() requires no queued backend response bytes"
+        );
         ReusableConnection {
             _connection: self
                 .conn
@@ -460,6 +465,24 @@ mod tests {
             IdleConnection::new(provider.get_pooled_connection().await.unwrap(), provider)
                 .activate();
         let _ = guard.stream_mut();
+        let _ = guard.complete_success();
+    }
+
+    /// A complete current frame does not make a connection reusable when the
+    /// framer retained bytes belonging to the next backend response.
+    #[tokio::test]
+    #[should_panic(expected = "complete_success() requires no queued backend response bytes")]
+    async fn complete_success_rejects_queued_following_response() {
+        let (port, _accept_count) = spawn_greeting_server().await;
+        let provider = make_provider(port);
+        let mut guard =
+            IdleConnection::new(provider.get_pooled_connection().await.unwrap(), provider)
+                .activate();
+        guard
+            .stream_mut()
+            .queue_pending_bytes(b"223 next\r\n")
+            .unwrap();
+        guard.mark_response_complete();
         let _ = guard.complete_success();
     }
 

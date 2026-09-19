@@ -93,6 +93,13 @@ impl<B> Article<Framed<B>> {
         self.0.content_end()
     }
 
+    pub(crate) fn as_bytes(&self) -> &[u8]
+    where
+        B: StableBytes,
+    {
+        self.0.bytes().as_slice()
+    }
+
     pub(crate) fn into_bytes(self) -> B {
         self.0.into_bytes()
     }
@@ -158,17 +165,20 @@ impl<B: StableBytes> Framed<B> {
     /// one state value, so callers cannot validate one allocation and later
     /// bind the result to another.
     pub(crate) fn validate(self, policy: YencValidation) -> Result<Validated<B>, ParseError> {
-        let layout = ArticleLayout::parse_framed(
-            self.bytes.as_slice(),
-            self.status,
-            self.status_line_end,
-            self.content_end,
-        )?;
+        let Self {
+            bytes,
+            kind,
+            status,
+            status_line_end,
+            content_end,
+        } = self;
+        let layout =
+            ArticleLayout::parse_framed(bytes.as_slice(), status, status_line_end, content_end)?;
         match policy {
             YencValidation::Disabled => {}
-            YencValidation::Enabled => layout.validate_yenc(self.bytes.as_slice())?,
+            YencValidation::Enabled => layout.validate_yenc(bytes.as_slice())?,
         }
-        Ok(Validated::new(self.bytes, layout))
+        Ok(Validated::new(bytes, kind, status, layout))
     }
 }
 
@@ -176,16 +186,32 @@ impl<B: StableBytes> Framed<B> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Validated<B> {
     bytes: B,
+    kind: RequestKind,
+    status: StatusCode,
     layout: ArticleLayout,
 }
 
 impl<B> Validated<B> {
-    pub(crate) const fn new(bytes: B, layout: ArticleLayout) -> Self {
-        Self { bytes, layout }
+    pub(crate) const fn new(
+        bytes: B,
+        kind: RequestKind,
+        status: StatusCode,
+        layout: ArticleLayout,
+    ) -> Self {
+        Self {
+            bytes,
+            kind,
+            status,
+            layout,
+        }
     }
 
-    pub(crate) fn bytes(&self) -> &B {
-        &self.bytes
+    pub(crate) const fn kind(&self) -> RequestKind {
+        self.kind
+    }
+
+    pub(crate) const fn status(&self) -> StatusCode {
+        self.status
     }
 
     pub(crate) fn layout(&self) -> &ArticleLayout {
@@ -200,5 +226,27 @@ impl<B> Validated<B> {
 impl<B: StableBytes> Validated<B> {
     pub(crate) fn as_bytes(&self) -> &[u8] {
         self.bytes.as_slice()
+    }
+}
+
+impl<B: StableBytes> Article<Validated<B>> {
+    pub(crate) const fn kind(&self) -> RequestKind {
+        self.0.kind()
+    }
+
+    pub(crate) const fn status(&self) -> StatusCode {
+        self.0.status()
+    }
+
+    pub(crate) fn article(&self) -> super::Article<'_> {
+        self.0.layout().view(self.0.as_bytes())
+    }
+
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        self.0.as_bytes()
+    }
+
+    pub(crate) fn into_bytes(self) -> B {
+        self.0.into_bytes()
     }
 }

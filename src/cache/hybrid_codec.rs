@@ -510,10 +510,12 @@ impl DiskCachedArticle {
         response: super::FramedChunkedResponse,
         tier: ttl::CacheTier,
     ) -> Option<Self> {
-        let super::FramedChunkedResponse { state, payload_end } = response;
+        let super::FramedChunkedResponse { state } = response;
         let framed = state.into_inner();
         let status = framed.status();
         let status_line_end = framed.status_line_end();
+        let payload_end =
+            super::CachePayloadEnd::new(framed.content_end().get(), framed.bytes().len())?;
         let response = framed.into_bytes();
         let status_code = CacheableStatusCode::try_from(status.as_u16()).ok()?;
         let payload = parse_framed_chunked_payload(status, status_line_end, &response, payload_end);
