@@ -150,10 +150,10 @@ impl ClientSession {
     }
 
     /// Spawn async cache upsert task with owned hot-path storage.
-    pub(super) fn spawn_cache_upsert_buffer(
+    pub(super) fn spawn_cache_upsert_framed(
         &self,
         msg_id: &crate::types::MessageId<'_>,
-        buffer: crate::cache::CacheIngestResponse,
+        buffer: crate::cache::FramedChunkedResponse,
         backend: BackendId,
         tier: CacheTier,
     ) {
@@ -170,7 +170,7 @@ impl ClientSession {
         tokio::spawn(async move {
             let _update_permit = update_permit;
             cache_clone
-                .upsert_ingest(msg_id_owned, buffer, backend, tier)
+                .upsert_framed_ingest(msg_id_owned, buffer, backend, tier)
                 .await;
         });
     }
@@ -197,6 +197,32 @@ impl ClientSession {
             let _update_permit = update_permit;
             cache_clone
                 .record_backend_has_status(msg_id_owned, status_code, backend, tier)
+                .await;
+        });
+    }
+
+    /// Spawn a typed STAT cache update without manufacturing an unframed
+    /// response buffer.
+    pub(super) fn spawn_cache_record_stat(
+        &self,
+        msg_id: &crate::types::MessageId<'_>,
+        backend: BackendId,
+        tier: CacheTier,
+    ) {
+        if !self.cache.stores_payload_responses() {
+            return;
+        }
+
+        let Some(update_permit) = self.cache.try_acquire_update() else {
+            debug!("Skipping cache STAT update because the update queue is full");
+            return;
+        };
+        let cache_clone = self.cache.clone();
+        let msg_id_owned = msg_id.to_owned();
+        tokio::spawn(async move {
+            let _update_permit = update_permit;
+            cache_clone
+                .record_backend_stat(msg_id_owned, backend, tier)
                 .await;
         });
     }
@@ -359,7 +385,7 @@ mod tests {
         let expected = b"220 0 <hit@example>\r\nHeader: v\r\n\r\nBody\r\n.\r\n";
         session
             .cache
-            .upsert_ingest(
+            .upsert_unframed_ingest(
                 msg_id.clone(),
                 expected.to_vec(),
                 BackendId::from_index(0),
@@ -416,7 +442,7 @@ mod tests {
         let expected = b"221 0 <head-only@example>\r\nSubject: cached\r\n.\r\n";
         session
             .cache
-            .upsert_ingest(
+            .upsert_unframed_ingest(
                 msg_id,
                 expected.to_vec(),
                 BackendId::from_index(0),

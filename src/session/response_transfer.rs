@@ -50,6 +50,7 @@ impl ResponseTransferError {
         reuse: ResponseConnectionReuse,
     ) -> BackendConnectionOutcome {
         match reuse {
+            ResponseConnectionReuse::Incomplete => BackendConnectionOutcome::BackendFailed,
             ResponseConnectionReuse::QueuedBytes { .. } => BackendConnectionOutcome::BackendDirty,
             ResponseConnectionReuse::Reusable => match self {
                 Self::ClientDisconnect(_) => BackendConnectionOutcome::BackendHealthy,
@@ -92,6 +93,9 @@ impl std::error::Error for ResponseTransferError {
 /// Reuse decision after a response transfer completed successfully.
 #[derive(Debug, Clone, Copy)]
 pub(super) enum ResponseConnectionReuse {
+    /// The active response operation has not proven a complete backend frame.
+    /// An empty local buffer is not evidence that the protocol exchange is clean.
+    Incomplete,
     /// No queued bytes remain on the connection.
     Reusable,
     /// Bytes are queued for the next response and the connection must stay on
@@ -103,6 +107,7 @@ impl ResponseConnectionReuse {
     /// Derive the backend connection fate from a successful transfer.
     pub(super) const fn pool_fate(self) -> BackendConnectionOutcome {
         match self {
+            Self::Incomplete => BackendConnectionOutcome::BackendFailed,
             Self::Reusable => BackendConnectionOutcome::BackendHealthy,
             Self::QueuedBytes { .. } => BackendConnectionOutcome::BackendDirty,
         }
@@ -115,7 +120,9 @@ impl ResponseConnectionReuse {
 pub(super) fn connection_reuse_after_response(
     conn: &crate::pool::ConnectionGuard,
 ) -> ResponseConnectionReuse {
-    if conn.has_pending_bytes() {
+    if !conn.response_is_complete() {
+        ResponseConnectionReuse::Incomplete
+    } else if conn.has_pending_bytes() {
         ResponseConnectionReuse::QueuedBytes {
             len: conn.pending_bytes_len(),
         }
@@ -148,6 +155,10 @@ mod tests {
             BackendConnectionOutcome::BackendHealthy
         );
         assert_eq!(
+            disconnect.pool_fate(ResponseConnectionReuse::Incomplete),
+            BackendConnectionOutcome::BackendFailed
+        );
+        assert_eq!(
             disconnect.pool_fate(ResponseConnectionReuse::QueuedBytes { len: 1 }),
             BackendConnectionOutcome::BackendDirty
         );
@@ -166,6 +177,10 @@ mod tests {
         assert_eq!(
             ResponseConnectionReuse::Reusable.pool_fate(),
             BackendConnectionOutcome::BackendHealthy
+        );
+        assert_eq!(
+            ResponseConnectionReuse::Incomplete.pool_fate(),
+            BackendConnectionOutcome::BackendFailed
         );
         assert_eq!(
             ResponseConnectionReuse::QueuedBytes { len: 12 }.pool_fate(),

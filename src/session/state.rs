@@ -439,6 +439,35 @@ mod tests {
     }
 
     #[test]
+    fn test_client_writes_for_backend_read_orders_multiline_before_deferred_reply() {
+        let mut state = SessionLoopState::new(false);
+        let deferred = b"101 Capability list:\r\n.\r\n";
+
+        state.mark_backend_request_sent(RequestKind::Help);
+        state.push_deferred_reply(deferred);
+        state.mark_backend_request_sent(RequestKind::Date);
+
+        let rendered: Vec<Vec<u8>> = state
+            .client_writes_for_backend_read(
+                b"100 Help follows\r\nbody\r\n.\r\n111 20260505120000\r\n",
+            )
+            .into_iter()
+            .map(Cow::into_owned)
+            .collect();
+
+        assert_eq!(
+            rendered,
+            vec![
+                b"100 Help follows\r\nbody\r\n.\r\n".to_vec(),
+                deferred.to_vec(),
+                b"111 20260505120000\r\n".to_vec(),
+            ]
+        );
+        assert!(!state.has_pending_backend_replies());
+        assert!(!state.has_deferred_replies());
+    }
+
+    #[test]
     fn test_client_writes_for_backend_read_orders_pipelined_body_replies() {
         let mut state = SessionLoopState::new(false);
         state.mark_backend_request_sent(RequestKind::Help);

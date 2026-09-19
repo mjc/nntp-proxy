@@ -15,7 +15,11 @@ mod response;
 mod responses;
 
 // Re-export article parsing types
-pub use article::{Article, HeaderIter, Headers, ParseError, yenc};
+pub(crate) use article::state::{
+    Article as ArticleState, ContentEnd, Framed as FramedArticleState, StatusLineEnd,
+    Validated as ValidatedArticleState,
+};
+pub use article::{Article, ArticleView, HeaderIter, Headers, ParseError, YencValidation, yenc};
 
 // Re-export response types and utilities
 pub(crate) use request::{
@@ -27,6 +31,23 @@ pub use request::{
     RequestContext, RequestKind, RequestRouteClass, RequestWireLen, ResponseWireLen,
 };
 pub use response::StatusCode;
+
+// This sibling module deliberately sits outside `article` so the negative
+// contract proves that layout fields cannot be constructed or rebound by a
+// caller that can name the crate-private state type but not its representation.
+#[cfg(response_contract)]
+#[allow(dead_code)]
+mod response_contracts {
+    #[cfg(response_contract = "article_layout_rebind")]
+    fn article_layout_rebind() {
+        let layout = crate::protocol::article::ArticleLayout {
+            message_id: 0..1,
+            article_number: None,
+            content: panic!("layout construction must stay private"),
+        };
+        std::hint::black_box(layout);
+    }
+}
 
 // Re-export command construction helpers
 pub use commands::{

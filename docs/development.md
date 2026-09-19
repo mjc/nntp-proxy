@@ -101,6 +101,44 @@ Current response responsibilities:
 
 ## Benchmarks
 
+### Response ownership contracts
+
+`StreamingResponse` keeps the request's response shape, scanner, current window,
+backend and pool together inside `multiline_framing.rs`. Write, observe and
+capture consume this operation. `IsolatedMultilineResponse` owns the same
+continuation relationship but rejects packed suffixes. Neither operation lends
+an independently usable continuation to a handler.
+
+The scanner returns `ChunkConsumed`, a count relative to the latest push.
+`FrameEnd` is an exclusive position in the current logical response window,
+not its physical allocation. Translation occurs inside the framer, including
+after compaction. Coordinates do not establish buffer identity: the
+operation's exclusive borrow and the storage-owned `AppendedRead` establish
+that association.
+
+Storage does not classify responses. `RetainedAppendPermit::read` consumes one
+permission and returns either EOF or an append result bound to the same buffer.
+Logical exhaustion cannot create a permit; it is not EOF. Compaction policy and
+pooled allocation reuse are unchanged. Ordinary forwarding borrows current
+pooled bytes; only intentional capture/cache paths retain entire responses.
+
+nntpbench uses the same framing-versus-validation distinction and consuming
+mutable operations, but freezes completed prefixes into immutable owners.
+Its typed article accessor reuses validated layout and transformation metadata;
+proxy pass-through does not manufacture that semantic guarantee.
+
+Cancellation may preserve bytes but does not prove a completed exchange. An
+unreleased `ConnectionGuard` retires its connection on drop in every build mode.
+
+Explicit compiler-contract checks exercise real private types, with successful
+controls and checked diagnostic codes:
+
+```bash
+nix develop -c bash scripts/check-response-contracts.sh
+```
+
+### Measurement
+
 Published benchmark numbers were intentionally removed from the docs until they are rerun.
 
 When you want fresh numbers:

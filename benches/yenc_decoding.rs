@@ -4,6 +4,7 @@
 //! we're getting expected performance from it.
 
 use divan::{Bencher, black_box};
+use nntp_proxy::protocol::yenc::decode_yenc_line;
 
 fn main() {
     divan::main();
@@ -39,7 +40,9 @@ fn generate_yenc_with_escapes(length: usize, escape_freq: usize) -> Vec<u8> {
 }
 
 mod yenc_crate_benches {
-    use super::{Bencher, black_box, generate_yenc_data, generate_yenc_with_escapes};
+    use super::{
+        Bencher, black_box, decode_yenc_line, generate_yenc_data, generate_yenc_with_escapes,
+    };
 
     #[divan::bench(sample_count = 1000)]
     fn yenc_decode_128_bytes(bencher: Bencher) {
@@ -149,5 +152,17 @@ mod yenc_crate_benches {
         // Real yenc-encoded "Hello, yEnc!" with CRLF
         let data = b"r\x8f\x96\x96\x99VJ\xa3o\x98\x8dK\r\n";
         bencher.bench(|| black_box(yenc::decode_buffer(black_box(data)).unwrap()));
+    }
+
+    #[divan::bench(sample_count = 1000)]
+    fn yenc_decode_wire_stuffed_line(bencher: Bencher) {
+        let data = b"..r\x8f\x96\x96\x99VJ\xa3o\x98\x8dK\r\n";
+        bencher.bench(|| black_box(decode_yenc_line(black_box(data))));
+    }
+
+    #[divan::bench(sample_count = 1000)]
+    fn yenc_decode_unstuffed_line(bencher: Bencher) {
+        let data = b"r\x8f\x96\x96\x99VJ\xa3o\x98\x8dK\r\n";
+        bencher.bench(|| black_box(decode_yenc_line(black_box(data))));
     }
 }

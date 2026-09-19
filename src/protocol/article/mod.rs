@@ -5,12 +5,14 @@
 
 mod error;
 mod headers;
+pub(crate) mod state;
 pub mod yenc;
 
 pub use error::ParseError;
 pub use headers::{HeaderIter, Headers};
 
 use crate::types::protocol::MessageId;
+use std::ops::Range;
 use yenc::validate_yenc_structure;
 
 /// Parsed NNTP article response (zero-copy)
@@ -28,6 +30,190 @@ pub struct Article<'a> {
     pub body: Option<&'a [u8]>,
 }
 
+/// Consumer-facing view of an article whose framing has already been handled.
+pub type ArticleView<'a> = Article<'a>;
+
+/// Optional yEnc policy applied after NNTP article structure is validated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum YencValidation {
+    Disabled,
+    Enabled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArticleLayout {
+    message_id: Range<usize>,
+    article_number: Option<u64>,
+    content: ArticleContent,
+}
+
+/// Article-family response shape. Keeping the alternatives explicit prevents
+/// impossible header/body combinations while preserving the proxy's raw-wire
+/// representation and lenient article-number policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArticleContent {
+    Article {
+        headers: Range<usize>,
+        body: Range<usize>,
+    },
+    Head {
+        headers: Range<usize>,
+    },
+    Body {
+        body: Range<usize>,
+    },
+    Stat,
+}
+
+impl ArticleLayout {
+    pub(crate) fn parse(buf: &[u8]) -> Result<Self, ParseError> {
+        let status =
+            crate::protocol::StatusCode::parse(buf).ok_or(ParseError::InvalidStatusCode(0))?;
+        let status_code = status.as_u16();
+        if !matches!(status_code, 220..=223) {
+            return Err(ParseError::InvalidStatusCode(status_code));
+        }
+        let first_line_end = find_line_end(buf, 0)?;
+        let (message_id, article_number) = parse_first_line_layout(&buf[..first_line_end])?;
+        Self::from_first_line(
+            buf,
+            status,
+            first_line_end,
+            message_id,
+            article_number,
+            buf.len(),
+        )
+    }
+
+    /// Parse article semantics using the status-line boundary already proven
+    /// by the response framer. The boundary and bytes remain in one framed
+    /// state, so this transition does not rediscover the first CRLF.
+    pub(crate) fn parse_framed(
+        buf: &[u8],
+        status: crate::protocol::StatusCode,
+        status_line_end: state::StatusLineEnd,
+        content_end: state::ContentEnd,
+    ) -> Result<Self, ParseError> {
+        let status_code = status.as_u16();
+        if !matches!(status_code, 220..=223) {
+            return Err(ParseError::InvalidStatusCode(status_code));
+        }
+        let line_end = status_line_end.get();
+        let content_end = content_end.get();
+        let first_line_end = line_end
+            .checked_sub(crate::protocol::CRLF.len())
+            .ok_or(ParseError::BufferTooShort)?;
+        if line_end > content_end
+            || content_end > buf.len()
+            || buf.get(first_line_end..line_end) != Some(crate::protocol::CRLF)
+        {
+            return Err(ParseError::BufferTooShort);
+        }
+        let (message_id, article_number) = parse_first_line_layout(&buf[..first_line_end])?;
+        Self::from_first_line(
+            buf,
+            status,
+            first_line_end,
+            message_id,
+            article_number,
+            content_end,
+        )
+    }
+
+    fn from_first_line(
+        buf: &[u8],
+        status: crate::protocol::StatusCode,
+        first_line_end: usize,
+        message_id: Range<usize>,
+        article_number: Option<u64>,
+        content_end: usize,
+    ) -> Result<Self, ParseError> {
+        let framed = buf.get(..content_end).ok_or(ParseError::BufferTooShort)?;
+        let content_start = first_line_end
+            .checked_add(crate::protocol::CRLF.len())
+            .ok_or(ParseError::BufferTooShort)?;
+
+        let content = match status.as_u16() {
+            220 => {
+                let separator_pos = find_blank_line(framed, content_start)?;
+                let headers_range = content_start..separator_pos;
+                Headers::parse(&framed[headers_range.clone()])?;
+                let body_range = separator_pos + 4..content_end;
+                ArticleContent::Article {
+                    headers: headers_range,
+                    body: body_range,
+                }
+            }
+            221 => {
+                if find_blank_line(framed, content_start).is_ok() {
+                    return Err(ParseError::UnexpectedBody);
+                }
+                let headers_range = content_start..content_end;
+                Headers::parse(&framed[headers_range.clone()])?;
+                ArticleContent::Head {
+                    headers: headers_range,
+                }
+            }
+            222 => {
+                let body_range = content_start..content_end;
+                ArticleContent::Body { body: body_range }
+            }
+            223 => {
+                if content_start < content_end {
+                    return Err(ParseError::UnexpectedBody);
+                }
+                ArticleContent::Stat
+            }
+            _ => unreachable!("article status was checked above"),
+        };
+
+        Ok(Self {
+            message_id,
+            article_number,
+            content,
+        })
+    }
+
+    /// Apply the optional encoding policy after NNTP structure is validated.
+    ///
+    /// The validated article state therefore proves protocol semantics only;
+    /// callers choose whether yEnc is relevant to their operation.
+    pub(crate) fn validate_yenc(&self, buf: &[u8]) -> Result<(), ParseError> {
+        let body = match &self.content {
+            ArticleContent::Article { body, .. } | ArticleContent::Body { body } => {
+                &buf[body.clone()]
+            }
+            ArticleContent::Head { .. } | ArticleContent::Stat => return Ok(()),
+        };
+        if body.get(..b"=ybegin".len()) == Some(b"=ybegin") {
+            validate_yenc_structure(body)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn view<'a>(&self, buf: &'a [u8]) -> Article<'a> {
+        let message_id = std::str::from_utf8(&buf[self.message_id.clone()])
+            .expect("validated message ID remains UTF-8");
+        let (headers, body) = match &self.content {
+            ArticleContent::Article { headers, body } => (
+                Some(Headers::from_validated(&buf[headers.clone()])),
+                Some(&buf[body.clone()]),
+            ),
+            ArticleContent::Head { headers } => {
+                (Some(Headers::from_validated(&buf[headers.clone()])), None)
+            }
+            ArticleContent::Body { body } => (None, Some(&buf[body.clone()])),
+            ArticleContent::Stat => (None, None),
+        };
+        Article {
+            message_id: MessageId::from_validated(message_id),
+            article_number: self.article_number,
+            headers,
+            body,
+        }
+    }
+}
+
 impl<'a> TryFrom<&'a [u8]> for Article<'a> {
     type Error = ParseError;
 
@@ -42,131 +228,29 @@ impl<'a> Article<'a> {
     /// Parse NNTP article response with optional yEnc validation
     ///
     /// # Arguments
-    /// * `buf` - Complete response bytes from the session response reader.
+    /// * `buf` - Complete framed response bytes from the session response
+    ///   reader. The framer has already consumed the multiline terminator.
     /// * `validate_yenc` - Whether to validate yEnc structure/checksums
     ///
     /// # Errors
     /// Returns `ParseError` when the NNTP response status line, message metadata,
     /// headers, body structure, or optional yEnc validation fails.
     pub fn parse(buf: &'a [u8], validate_yenc: bool) -> Result<Self, ParseError> {
-        // Parse status code from first line
-        let status_code = parse_status_code(buf)?;
-
-        // Dispatch to appropriate parser
-        match status_code {
-            220 => Self::parse_article(buf, validate_yenc),
-            221 => Self::parse_head(buf),
-            222 => Self::parse_body(buf, validate_yenc),
-            223 => Self::parse_stat(buf),
-            _ => Err(ParseError::InvalidStatusCode(status_code)),
-        }
+        let policy = match validate_yenc {
+            true => YencValidation::Enabled,
+            false => YencValidation::Disabled,
+        };
+        Self::parse_with_yenc(buf, policy)
     }
 
-    /// Parse 220 ARTICLE response (headers + body)
-    fn parse_article(buf: &'a [u8], validate_yenc: bool) -> Result<Self, ParseError> {
-        // 220 <article-number> <message-id> ...
-        let first_line_end = find_line_end(buf, 0)?;
-        let first_line = &buf[..first_line_end];
-
-        let (message_id, article_number) = parse_first_line(first_line)?;
-
-        // Find blank line separator
-        let content_start = first_line_end + 2;
-        let separator_pos = find_blank_line(buf, content_start)?;
-
-        // Headers are between content_start and separator
-        let headers_data = &buf[content_start..separator_pos];
-        let headers = Some(Headers::parse(headers_data)?);
-
-        // Body starts after blank line (\r\n\r\n is 4 bytes)
-        let body_start = separator_pos + 4;
-
-        let body_data = &buf[body_start..];
-
-        // Validate yenc if enabled and present
-        if validate_yenc && body_data.starts_with(b"=ybegin") {
-            validate_yenc_structure(body_data)?;
+    /// Parse NNTP structure and apply the selected optional yEnc policy.
+    pub fn parse_with_yenc(buf: &'a [u8], policy: YencValidation) -> Result<Self, ParseError> {
+        let layout = ArticleLayout::parse(buf)?;
+        match policy {
+            YencValidation::Disabled => {}
+            YencValidation::Enabled => layout.validate_yenc(buf)?,
         }
-
-        let body = Some(body_data);
-
-        Ok(Article {
-            message_id,
-            article_number,
-            headers,
-            body,
-        })
-    }
-
-    /// Parse 221 HEAD response (headers only)
-    fn parse_head(buf: &'a [u8]) -> Result<Self, ParseError> {
-        // 221 <article-number> <message-id> ...
-        let first_line_end = find_line_end(buf, 0)?;
-        let first_line = &buf[..first_line_end];
-
-        let (message_id, article_number) = parse_first_line(first_line)?;
-
-        let content_start = first_line_end + 2;
-        if find_blank_line(buf, content_start).is_ok() {
-            return Err(ParseError::UnexpectedBody);
-        }
-
-        let headers_data = &buf[content_start..];
-        let headers = Some(Headers::parse(headers_data)?);
-
-        Ok(Article {
-            message_id,
-            article_number,
-            headers,
-            body: None,
-        })
-    }
-
-    /// Parse 222 BODY response (body only)
-    fn parse_body(buf: &'a [u8], validate_yenc: bool) -> Result<Self, ParseError> {
-        // 222 <article-number> <message-id> ...
-        let first_line_end = find_line_end(buf, 0)?;
-        let first_line = &buf[..first_line_end];
-
-        let (message_id, article_number) = parse_first_line(first_line)?;
-
-        let body_start = first_line_end + 2;
-        let body_data = &buf[body_start..];
-
-        // Validate yenc if enabled and present
-        if validate_yenc && body_data.starts_with(b"=ybegin") {
-            validate_yenc_structure(body_data)?;
-        }
-
-        let body = Some(body_data);
-
-        Ok(Article {
-            message_id,
-            article_number,
-            headers: None,
-            body,
-        })
-    }
-
-    /// Parse 223 STAT response (metadata only)
-    fn parse_stat(buf: &'a [u8]) -> Result<Self, ParseError> {
-        // 223 <article-number> <message-id> ...
-        let first_line_end = find_line_end(buf, 0)?;
-        let first_line = &buf[..first_line_end];
-
-        let (message_id, article_number) = parse_first_line(first_line)?;
-
-        let content_start = first_line_end + 2;
-        if content_start < buf.len() {
-            return Err(ParseError::UnexpectedBody);
-        }
-
-        Ok(Article {
-            message_id,
-            article_number,
-            headers: None,
-            body: None,
-        })
+        Ok(layout.view(buf))
     }
 
     /// Decode yEnc-encoded body to raw bytes
@@ -226,14 +310,15 @@ impl<'a> Article<'a> {
 }
 
 /// Parse status code from buffer
+#[cfg(test)]
 fn parse_status_code(buf: &[u8]) -> Result<u16, ParseError> {
     crate::protocol::StatusCode::parse(buf)
         .map(|sc| sc.as_u16())
         .ok_or(ParseError::InvalidStatusCode(0))
 }
 
-/// Parse first line to extract message-id and optional article number
-fn parse_first_line(line: &[u8]) -> Result<(MessageId<'_>, Option<u64>), ParseError> {
+/// Parse first line to extract the message-ID range and optional article number.
+fn parse_first_line_layout(line: &[u8]) -> Result<(Range<usize>, Option<u64>), ParseError> {
     // Format: "220 <number> <message-id> ..." or "220 0 <message-id> ..."
 
     // Find first space (after status code)
@@ -265,9 +350,9 @@ fn parse_first_line(line: &[u8]) -> Result<(MessageId<'_>, Option<u64>), ParseEr
     let msg_id_bytes = &line[msg_id_start..msg_id_end];
     let msg_id_str = std::str::from_utf8(msg_id_bytes)
         .map_err(|_| ParseError::InvalidMessageId("Invalid UTF-8 in message-id".to_string()))?;
-    let message_id = MessageId::from_borrowed(msg_id_str)?;
+    MessageId::from_borrowed(msg_id_str)?;
 
-    Ok((message_id, article_number))
+    Ok((msg_id_start..msg_id_end, article_number))
 }
 
 /// Find end of line (\r in \r\n)
@@ -324,6 +409,63 @@ mod tests {
     }
 
     #[test]
+    fn framed_layout_reuses_the_proven_status_line_end() {
+        let buf = b"222 100 <test@example.com> body\r\nBody content\r\n";
+        let status_line_end = b"222 100 <test@example.com> body\r\n".len();
+        let parsed = ArticleLayout::parse(buf).unwrap();
+        let framed = ArticleLayout::parse_framed(
+            buf,
+            crate::protocol::StatusCode::new(222),
+            state::StatusLineEnd::new(status_line_end),
+            state::ContentEnd::new(buf.len()),
+        )
+        .unwrap();
+
+        assert_eq!(framed, parsed);
+        assert!(
+            ArticleLayout::parse_framed(
+                buf,
+                crate::protocol::StatusCode::new(222),
+                state::StatusLineEnd::new(status_line_end - 1),
+                state::ContentEnd::new(buf.len()),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            ArticleLayout::parse_framed(
+                buf,
+                crate::protocol::StatusCode::new(430),
+                state::StatusLineEnd::new(status_line_end),
+                state::ContentEnd::new(buf.len()),
+            ),
+            Err(ParseError::InvalidStatusCode(430))
+        );
+    }
+
+    #[test]
+    fn framed_layout_excludes_packed_response_suffix() {
+        let frame = b"222 100 <test@example.com> body\r\nBody content\r\n";
+        let suffix = b"223 1 <next@example.com>\r\n";
+        let packed = [frame.as_slice(), suffix.as_slice()].concat();
+        let status_line_end = b"222 100 <test@example.com> body\r\n".len();
+
+        let layout = ArticleLayout::parse_framed(
+            &packed,
+            crate::protocol::StatusCode::new(222),
+            state::StatusLineEnd::new(status_line_end),
+            state::ContentEnd::new(frame.len()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            layout.content,
+            ArticleContent::Body {
+                body: status_line_end..frame.len(),
+            }
+        );
+    }
+
+    #[test]
     fn test_decode_yenc_body() {
         // Valid yenc example from the validation tests
         let buf = b"222 100 <test@example.com> body\r\n\
@@ -352,6 +494,19 @@ mod tests {
     }
 
     #[test]
+    fn yenc_policy_is_separate_from_article_validation() {
+        let buf = b"222 100 <test@example.com> body\r\n\
+=ybegin line=128 size=1 name=test.bin\r\n\
+not-a-complete-yenc-body\r\n";
+
+        assert!(Article::parse_with_yenc(buf, YencValidation::Disabled).is_ok());
+        assert!(matches!(
+            Article::parse_with_yenc(buf, YencValidation::Enabled),
+            Err(ParseError::InvalidYenc(_))
+        ));
+    }
+
+    #[test]
     fn test_decode_no_body_returns_none() {
         let buf = b"223 100 <test@example.com>\r\n";
 
@@ -359,5 +514,85 @@ mod tests {
         let decoded = article.decode();
 
         assert!(decoded.is_none());
+    }
+
+    #[test]
+    fn compatibility_fixture_matrix_records_proxy_wire_contract() {
+        let fixtures = [
+            (
+                b"220 0 <article@example.com>\r\nSubject: fixture\r\n\r\nbody\r\n".as_slice(),
+                Some(0),
+                true,
+                true,
+            ),
+            (
+                b"221 0 <head@example.com>\r\nSubject: fixture\r\nFrom: test@example.com\r\n"
+                    .as_slice(),
+                Some(0),
+                true,
+                false,
+            ),
+            (
+                b"222 0 <body@example.com>\r\nbody\r\n".as_slice(),
+                Some(0),
+                false,
+                true,
+            ),
+            (
+                b"223 0 <stat@example.com>\r\n".as_slice(),
+                Some(0),
+                false,
+                false,
+            ),
+            (
+                b"222 0 <empty@example.com>\r\n".as_slice(),
+                Some(0),
+                false,
+                true,
+            ),
+        ];
+
+        for (wire, article_number, has_headers, has_body) in fixtures {
+            let article = Article::parse(wire, false).expect("proxy fixture remains accepted");
+            assert_eq!(article.article_number, article_number);
+            assert_eq!(article.headers.is_some(), has_headers);
+            assert_eq!(article.body.is_some(), has_body);
+        }
+    }
+
+    #[test]
+    fn compatibility_fixture_matrix_keeps_lenient_article_number_behavior() {
+        for number in [b"not-a-number".as_slice(), b"18446744073709551616"] {
+            let wire = [
+                b"220 ".as_slice(),
+                number,
+                b" <fixture@example.com>\r\nSubject: fixture\r\n\r\nbody\r\n",
+            ]
+            .concat();
+
+            let article = Article::parse(&wire, false).expect("proxy parser is permissive here");
+            assert_eq!(article.article_number, None);
+            assert_eq!(article.message_id.as_str(), "<fixture@example.com>");
+        }
+    }
+
+    #[test]
+    fn compatibility_fixture_matrix_preserves_proxy_wire_sections() {
+        let folded = b"220 0 <folded@example.com>\r\nSubject: first\r\n second\r\n\r\nbody\r\n";
+        let folded_article = Article::parse(folded, false).unwrap();
+        assert_eq!(
+            folded_article.headers.unwrap().get("Subject"),
+            Some(&b"first"[..])
+        );
+
+        let stuffed = b"222 0 <stuffed@example.com>\r\n..wire-dot\r\n";
+        let stuffed_article = Article::parse(stuffed, false).unwrap();
+        assert_eq!(stuffed_article.body, Some(&b"..wire-dot\r\n"[..]));
+
+        let binary = b"222 0 <binary@example.com>\r\nbinary\0body\r\n";
+        assert!(Article::parse(binary, false).is_ok());
+
+        let bare_lf = b"222 0 <bare@example.com>\r\nbody\nnext\r\n";
+        assert!(Article::parse(bare_lf, false).is_ok());
     }
 }

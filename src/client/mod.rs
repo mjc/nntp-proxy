@@ -11,7 +11,7 @@
 //! ```no_run
 //! use nntp_proxy::client::NntpClient;
 //! use nntp_proxy::pool::{BufferPool, DeadpoolConnectionProvider};
-//! use nntp_proxy::protocol::Article;
+//! use nntp_proxy::protocol::{Article, YencValidation};
 //! use nntp_proxy::types::{BufferSize, MessageId};
 //!
 //! # async fn example() -> anyhow::Result<()> {
@@ -25,8 +25,9 @@
 //!
 //! # let message_ids: Vec<MessageId<'static>> = vec![];
 //! for msg_id in message_ids {
-//!     let buffer = client.fetch_body(&msg_id).await?;
-//!     let article = Article::parse(&buffer, true)?;
+//!     let framed = client.fetch_body(&msg_id).await?;
+//!     let validated = framed.validate_with_yenc(YencValidation::Enabled)?;
+//!     let article = validated.article();
 //!     if let Some(decoded) = article.decode() {
 //!         process(&decoded);
 //!     }
@@ -37,16 +38,22 @@
 //! # fn process(_: &[u8]) {}
 //! ```
 
-use crate::pool::{BufferPool, ConnectionGuard, DeadpoolConnectionProvider, PooledBuffer};
-use crate::protocol::{RequestContext, article_request, body_request, head_request, stat_request};
-use crate::session::backend::execute_request_classified;
+use crate::pool::{BufferPool, DeadpoolConnectionProvider, PooledBuffer};
+use crate::protocol::{
+    ArticleView, RequestContext, StatusCode, YencValidation, article_request, body_request,
+    head_request, stat_request,
+};
+use crate::session::backend::execute_request_exchange;
 use anyhow::{Context, Result};
 
 /// Standalone NNTP client for fetching articles
 ///
 /// Zero-allocation design using caller-provided buffer pool.
 /// Share one pool across multiple clients for minimal allocations.
-/// Returns `PooledBuffer` - caller parses with `Article::parse()`.
+/// Returns a framer-produced [`FramedArticle`] backed by the captured pooled
+/// allocation. Its bytes remain associated with the boundary established by
+/// the response framer; callers obtain a reusable [`ArticleView`] through the
+/// consuming [`FramedArticle::validate`] transition.
 #[derive(Clone)]
 pub struct NntpClient {
     conn_pool: DeadpoolConnectionProvider,
@@ -67,8 +74,8 @@ impl NntpClient {
 
     /// Fetch article body (BODY command)
     ///
-    /// Returns `PooledBuffer` with the backend response bytes.
-    /// Parse with `Article::parse(&buffer, validate_yenc)`.
+    /// Returns a framed owner with the status line and payload bytes. The
+    /// multiline terminator has already been consumed by the framer.
     ///
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets, e.g. `<abc@example.com>`
@@ -80,14 +87,14 @@ impl NntpClient {
     pub fn fetch_body(
         &self,
         message_id: &crate::types::MessageId<'_>,
-    ) -> impl std::future::Future<Output = Result<PooledBuffer>> + '_ {
+    ) -> impl std::future::Future<Output = Result<FramedArticle>> + '_ {
         self.fetch_response(body_request(message_id))
     }
 
     /// Fetch article headers (HEAD command)
     ///
-    /// Returns `PooledBuffer` with the backend response bytes.
-    /// Parse with `Article::parse(&buffer, false)`.
+    /// Returns a framed owner with the status line and payload bytes. The
+    /// multiline terminator has already been consumed by the framer.
     ///
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets
@@ -99,14 +106,14 @@ impl NntpClient {
     pub fn fetch_head(
         &self,
         message_id: &crate::types::MessageId<'_>,
-    ) -> impl std::future::Future<Output = Result<PooledBuffer>> + '_ {
+    ) -> impl std::future::Future<Output = Result<FramedArticle>> + '_ {
         self.fetch_response(head_request(message_id))
     }
 
     /// Fetch full article (ARTICLE command)
     ///
-    /// Returns `PooledBuffer` with the backend response bytes.
-    /// Parse with `Article::parse(&buffer, validate_yenc)`.
+    /// Returns a framed owner with the status line and payload bytes. The
+    /// multiline terminator has already been consumed by the framer.
     ///
     /// # Arguments
     /// * `message_id` - Message-ID including angle brackets
@@ -118,7 +125,7 @@ impl NntpClient {
     pub fn fetch_article(
         &self,
         message_id: &crate::types::MessageId<'_>,
-    ) -> impl std::future::Future<Output = Result<PooledBuffer>> + '_ {
+    ) -> impl std::future::Future<Output = Result<FramedArticle>> + '_ {
         self.fetch_response(article_request(message_id))
     }
 
@@ -135,22 +142,32 @@ impl NntpClient {
     /// malformed or unexpected backend status codes.
     pub async fn stat(&self, message_id: &crate::types::MessageId<'_>) -> Result<bool> {
         let request = stat_request(message_id);
-        let mut conn = self
+        let conn = self
             .conn_pool
             .checkout_connection_guard()
             .await
-            .context("Failed to get connection from pool")?;
-        let mut buffer = self.buffer_pool.acquire();
+            .context("Failed to get connection from pool")?
+            .activate();
+        let buffer = self.buffer_pool.acquire();
 
-        let response = execute_request_classified(conn.stream_mut(), &request, &mut buffer).await?;
-        let Some(status_code) = response.status_code() else {
+        let exchange = execute_request_exchange(
+            conn,
+            &request,
+            buffer,
+            &self.buffer_pool,
+            crate::types::BackendId::from_index(0),
+        )
+        .await?;
+        let Some(status_code) = exchange.status_code() else {
+            exchange.fail_backend();
             anyhow::bail!("Invalid STAT response");
         };
 
         let result = Self::parse_stat_response(status_code);
         if result.is_ok() {
-            let completion = response.completion_proof(&request)?;
-            let _reusable = conn.complete_success(completion);
+            exchange.capture_isolated_and_reuse().await?;
+        } else {
+            exchange.fail_backend();
         }
         result
     }
@@ -170,57 +187,33 @@ impl NntpClient {
     /// # Errors
     /// Returns any connection, write, read, or backend-status validation error
     /// encountered while fetching the NNTP response.
-    async fn fetch_response(&self, request: RequestContext) -> Result<PooledBuffer> {
-        let mut conn = self
+    async fn fetch_response(&self, request: RequestContext) -> Result<FramedArticle> {
+        let conn = self
             .conn_pool
             .checkout_connection_guard()
             .await
-            .context("Failed to get connection from pool")?;
-        let mut io_buffer = self.buffer_pool.acquire();
+            .context("Failed to get connection from pool")?
+            .activate();
+        let io_buffer = self.buffer_pool.acquire();
 
-        let response =
-            execute_request_classified(conn.stream_mut(), &request, &mut io_buffer).await?;
-        let Some(status_code) = response.status_code() else {
+        let exchange = execute_request_exchange(
+            conn,
+            &request,
+            io_buffer,
+            &self.buffer_pool,
+            crate::types::BackendId::from_index(0),
+        )
+        .await?;
+        let Some(status_code) = exchange.status_code() else {
+            exchange.fail_backend();
             anyhow::bail!("Invalid response from server");
         };
 
         Self::validate_response(status_code)?;
+        Self::validate_article_response_shape(request.kind(), status_code)?;
 
-        if request.has_response_body(status_code) {
-            return self
-                .fetch_captured_multiline_response(conn, io_buffer)
-                .await;
-        }
-
-        let completion = response.completion_proof(&request)?;
-        let _reusable = conn.complete_success(completion);
-        Ok(io_buffer)
-    }
-
-    async fn fetch_captured_multiline_response(
-        &self,
-        mut conn: ConnectionGuard,
-        mut io_buffer: PooledBuffer,
-    ) -> Result<PooledBuffer> {
-        // This client helper is intentionally only an owner of the destination
-        // capture buffer. It delegates all multiline response completion and
-        // trailing-byte rejection to the backend/framer facade.
-        let mut capture = self.buffer_pool.acquire_capture();
-        let completion = match crate::session::backend::capture_complete_multiline_response(
-            conn.stream_mut(),
-            &mut io_buffer,
-            &mut capture,
-        )
-        .await
-        {
-            Ok(completion) => completion,
-            Err(err) => {
-                conn.fail_backend();
-                return Err(err);
-            }
-        };
-        let _reusable = conn.complete_success(completion);
-        Ok(capture)
+        let captured = exchange.capture_isolated_and_reuse().await?;
+        Ok(FramedArticle::from_framed(captured))
     }
 
     /// Validate NNTP response status code
@@ -231,6 +224,127 @@ impl NntpClient {
             code if code >= 400 => anyhow::bail!("Server error: {code}"),
             _ => Ok(()),
         }
+    }
+
+    /// Article-family commands have request-scoped successful status codes.
+    /// Keep this check at the fetch boundary so a valid ARTICLE frame cannot
+    /// be silently accepted as the result of a BODY or HEAD request.
+    #[inline]
+    fn validate_article_response_shape(
+        kind: crate::protocol::RequestKind,
+        status_code: crate::protocol::StatusCode,
+    ) -> Result<()> {
+        let expected = match kind {
+            crate::protocol::RequestKind::Article => 220,
+            crate::protocol::RequestKind::Head => 221,
+            crate::protocol::RequestKind::Body => 222,
+            _ => return Ok(()),
+        };
+        if status_code.as_u16() != expected {
+            anyhow::bail!(
+                "Unexpected {kind:?} response status: expected {expected}, got {}",
+                status_code.as_u16()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// An article-family response whose wire boundary has already been established.
+///
+/// The owner is the pooled allocation returned by the framing operation. The
+/// multiline terminator is not part of the stored bytes, while the status line
+/// and payload bytes are retained exactly as received. Framing and semantic
+/// article validity are separate guarantees.
+#[derive(Debug)]
+pub struct FramedArticle {
+    state: crate::protocol::ArticleState<crate::protocol::FramedArticleState<PooledBuffer>>,
+}
+
+impl FramedArticle {
+    fn from_framed(
+        state: crate::protocol::ArticleState<crate::protocol::FramedArticleState<PooledBuffer>>,
+    ) -> Self {
+        Self { state }
+    }
+
+    /// Request kind that produced this response.
+    #[must_use]
+    pub const fn kind(&self) -> crate::protocol::RequestKind {
+        self.state.as_inner().kind()
+    }
+
+    /// Parsed status code established by the response framer.
+    #[must_use]
+    pub const fn status(&self) -> StatusCode {
+        self.state.as_inner().status()
+    }
+
+    /// Exact framed bytes, including the status line and excluding the
+    /// multiline terminator.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.state.as_bytes()
+    }
+
+    /// Validate NNTP article semantics and transition to reusable typed access.
+    /// yEnc validation is explicit policy, not part of NNTP framing.
+    pub fn validate(self, validate_yenc: bool) -> Result<ValidatedArticle> {
+        let policy = match validate_yenc {
+            true => YencValidation::Enabled,
+            false => YencValidation::Disabled,
+        };
+        self.validate_with_yenc(policy)
+    }
+
+    /// Validate NNTP semantics and apply the selected optional yEnc policy.
+    pub fn validate_with_yenc(self, policy: YencValidation) -> Result<ValidatedArticle> {
+        let state = self.state.validate(policy)?;
+        Ok(ValidatedArticle { state })
+    }
+
+    /// Consume the framed owner and return its pooled storage.
+    #[must_use]
+    pub fn into_bytes(self) -> PooledBuffer {
+        self.state.into_inner().into_bytes()
+    }
+}
+
+/// A semantically validated article whose layout remains bound to its bytes.
+#[derive(Debug)]
+pub struct ValidatedArticle {
+    state: crate::protocol::ArticleState<crate::protocol::ValidatedArticleState<PooledBuffer>>,
+}
+
+impl ValidatedArticle {
+    /// Request kind that established this validated article state.
+    #[must_use]
+    pub const fn kind(&self) -> crate::protocol::RequestKind {
+        self.state.kind()
+    }
+
+    /// Status code that established this validated article state.
+    #[must_use]
+    pub const fn status(&self) -> StatusCode {
+        self.state.status()
+    }
+
+    /// Return a reusable zero-copy article view without repeating validation.
+    #[must_use]
+    pub fn article(&self) -> ArticleView<'_> {
+        self.state.article()
+    }
+
+    /// Return the validated wire bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        self.state.as_bytes()
+    }
+
+    /// Consume the validated state and return its pooled storage.
+    #[must_use]
+    pub fn into_bytes(self) -> PooledBuffer {
+        self.state.into_bytes()
     }
 }
 
@@ -261,6 +375,14 @@ mod tests {
         expected_command: &'static str,
         response: &'static [u8],
     ) -> std::net::SocketAddr {
+        spawn_fetch_test_server_with_chunk_size(expected_command, response, response.len()).await
+    }
+
+    async fn spawn_fetch_test_server_with_chunk_size(
+        expected_command: &'static str,
+        response: &'static [u8],
+        chunk_size: usize,
+    ) -> std::net::SocketAddr {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -283,7 +405,10 @@ mod tests {
 
                             let command = std::str::from_utf8(&cmd_buf[..n]).unwrap();
                             if command.starts_with(expected_command) {
-                                let _ = stream.write_all(response).await;
+                                for chunk in response.chunks(chunk_size.max(1)) {
+                                    let _ = stream.write_all(chunk).await;
+                                    tokio::task::yield_now().await;
+                                }
                                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                                 return;
                             }
@@ -411,7 +536,10 @@ mod tests {
             .unwrap()
     }
 
-    fn make_test_client(addr: std::net::SocketAddr) -> NntpClient {
+    fn make_test_client_with_buffer_size(
+        addr: std::net::SocketAddr,
+        buffer_size: usize,
+    ) -> NntpClient {
         use crate::pool::BufferPool;
         use crate::types::BufferSize;
 
@@ -420,8 +548,12 @@ mod tests {
             .max_connections(2)
             .build()
             .unwrap();
-        let buffer_pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 2);
+        let buffer_pool = BufferPool::new(BufferSize::try_new(buffer_size).unwrap(), 2);
         NntpClient::new(provider, buffer_pool)
+    }
+
+    fn make_test_client(addr: std::net::SocketAddr) -> NntpClient {
+        make_test_client_with_buffer_size(addr, 4096)
     }
 
     async fn capture_multiline_response_for_test(
@@ -429,10 +561,10 @@ mod tests {
         io_buffer: &mut PooledBuffer,
         capture: &mut PooledBuffer,
     ) -> Result<()> {
-        let _completion =
-            crate::session::backend::capture_complete_multiline_response(conn, io_buffer, capture)
-                .await?;
-        Ok(())
+        crate::session::multiline_framing::capture_isolated_multiline_response(
+            conn, io_buffer, capture,
+        )
+        .await
     }
 
     /// Verify the session response reader captures the complete response when it all
@@ -557,9 +689,12 @@ mod tests {
         let client = make_test_client(addr);
         let msg_id = crate::types::MessageId::new("<test@example.com>".to_string()).unwrap();
 
-        let buffer = client.fetch_head(&msg_id).await.unwrap();
+        let framed = client.fetch_head(&msg_id).await.unwrap();
 
-        assert_eq!(&buffer[..], response);
+        assert_eq!(
+            framed.as_bytes(),
+            b"221 0 <test@example.com>\r\nSubject: test\r\nFrom: tester\r\n"
+        );
     }
 
     #[tokio::test]
@@ -569,24 +704,254 @@ mod tests {
         let client = make_test_client(addr);
         let msg_id = crate::types::MessageId::new("<test@example.com>".to_string()).unwrap();
 
-        let buffer = client.fetch_body(&msg_id).await.unwrap();
+        let framed = client.fetch_body(&msg_id).await.unwrap();
 
-        assert_eq!(&buffer[..], response);
+        assert_eq!(
+            framed.as_bytes(),
+            b"222 0 <test@example.com>\r\nhello world"
+        );
+        let validated = framed.validate_with_yenc(YencValidation::Disabled).unwrap();
+        assert_eq!(validated.kind(), crate::protocol::RequestKind::Body);
+        assert_eq!(validated.status(), StatusCode::new(222));
+        let article = validated.article();
+        assert_eq!(article.body, Some(&b"hello world"[..]));
+    }
+
+    #[tokio::test]
+    async fn fetch_body_rejects_article_success_status_for_body_request() {
+        let response = b"220 0 <wrong-shape@example.com> article follows\r\nbody\r\n.\r\n";
+        let addr = spawn_fetch_test_server("BODY <wrong-shape@example.com>", response).await;
+        let client = make_test_client(addr);
+        let msg_id = crate::types::MessageId::new("<wrong-shape@example.com>".to_string()).unwrap();
+
+        let error = client.fetch_body(&msg_id).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Unexpected Body response status")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_body_validates_after_fragmented_production_capture() {
+        let response = b"222 0 <fragmented@example.com>\r\nfragmented body\r\n.\r\n";
+        let addr =
+            spawn_fetch_test_server_with_chunk_size("BODY <fragmented@example.com>", response, 1)
+                .await;
+        let client = make_test_client_with_buffer_size(addr, 4096);
+        let msg_id = crate::types::MessageId::new("<fragmented@example.com>".to_string()).unwrap();
+
+        let validated = client
+            .fetch_body(&msg_id)
+            .await
+            .unwrap()
+            .validate_with_yenc(YencValidation::Disabled)
+            .unwrap();
+
+        assert_eq!(validated.article().body, Some(&b"fragmented body"[..]));
+    }
+
+    #[tokio::test]
+    async fn fetch_article_validates_after_fragmented_production_capture() {
+        let response = b"220 7 <fragmented-article@example.com> article follows\r\n\
+            Subject: fragmented\r\n\
+            \r\n\
+            article body\r\n\
+            .\r\n";
+        let addr = spawn_fetch_test_server_with_chunk_size(
+            "ARTICLE <fragmented-article@example.com>",
+            response,
+            1,
+        )
+        .await;
+        let client = make_test_client_with_buffer_size(addr, 4096);
+        let msg_id =
+            crate::types::MessageId::new("<fragmented-article@example.com>".to_string()).unwrap();
+
+        let validated = client
+            .fetch_article(&msg_id)
+            .await
+            .unwrap()
+            .validate_with_yenc(YencValidation::Disabled)
+            .unwrap();
+
+        let article = validated.article();
+        assert_eq!(article.article_number, Some(7));
+        assert_eq!(article.body, Some(&b"article body"[..]));
+        assert_eq!(
+            article.headers.unwrap().get("Subject"),
+            Some(&b"fragmented"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_head_validates_after_fragmented_production_capture() {
+        let response = b"221 8 <fragmented-head@example.com>\r\n\
+            Subject: fragmented\r\n\
+            From: tester\r\n\
+            .\r\n";
+        let addr = spawn_fetch_test_server_with_chunk_size(
+            "HEAD <fragmented-head@example.com>",
+            response,
+            1,
+        )
+        .await;
+        let client = make_test_client_with_buffer_size(addr, 4096);
+        let msg_id =
+            crate::types::MessageId::new("<fragmented-head@example.com>".to_string()).unwrap();
+
+        let validated = client
+            .fetch_head(&msg_id)
+            .await
+            .unwrap()
+            .validate_with_yenc(YencValidation::Disabled)
+            .unwrap();
+
+        let article = validated.article();
+        assert_eq!(article.article_number, Some(8));
+        assert_eq!(article.body, None);
+        assert_eq!(
+            article.headers.unwrap().get("Subject"),
+            Some(&b"fragmented"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_article_returns_a_validated_article_view() {
+        let response = b"220 42 <article@example.com> article follows\r\n\
+            Subject: test\r\n\
+            From: tester\r\n\
+            \r\n\
+            article body\r\n\
+            .\r\n";
+        let addr = spawn_fetch_test_server("ARTICLE <article@example.com>", response).await;
+        let client = make_test_client(addr);
+        let msg_id = crate::types::MessageId::new("<article@example.com>".to_string()).unwrap();
+
+        let validated = client
+            .fetch_article(&msg_id)
+            .await
+            .unwrap()
+            .validate_with_yenc(YencValidation::Disabled)
+            .unwrap();
+        assert_eq!(validated.kind(), crate::protocol::RequestKind::Article);
+        assert_eq!(validated.status(), StatusCode::new(220));
+        let article = validated.article();
+
+        assert_eq!(article.article_number, Some(42));
+        assert_eq!(article.message_id.as_str(), "<article@example.com>");
+        assert_eq!(article.headers.unwrap().get("Subject"), Some(&b"test"[..]));
+        assert_eq!(article.body, Some(&b"article body"[..]));
+    }
+
+    #[tokio::test]
+    async fn stat_consumes_a_complete_single_line_response() {
+        let response = b"223 42 <stat@example.com> article exists\r\n";
+        let addr = spawn_fetch_test_server("STAT <stat@example.com>", response).await;
+        let client = make_test_client(addr);
+        let msg_id = crate::types::MessageId::new("<stat@example.com>".to_string()).unwrap();
+
+        assert!(client.stat(&msg_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn stat_consumes_a_fragmented_single_line_response() {
+        let response = b"223 42 <fragmented-stat@example.com> article exists\r\n";
+        let addr = spawn_fetch_test_server_with_chunk_size(
+            "STAT <fragmented-stat@example.com>",
+            response,
+            1,
+        )
+        .await;
+        let client = make_test_client(addr);
+        let msg_id =
+            crate::types::MessageId::new("<fragmented-stat@example.com>".to_string()).unwrap();
+
+        assert!(client.stat(&msg_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn stat_capture_failure_retires_packed_response_without_panicking() {
+        let response = b"223 42 <packed-stat@example.com> article exists\r\n\
+            223 43 <next-stat@example.com> article exists\r\n";
+        let addr = spawn_fetch_test_server("STAT <packed-stat@example.com>", response).await;
+        let client = make_test_client(addr);
+        let msg_id = crate::types::MessageId::new("<packed-stat@example.com>".to_string()).unwrap();
+
+        let error = client.stat(&msg_id).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unexpected bytes after isolated single-line response")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_head_uses_the_canonical_validated_article_view() {
+        let response = b"221 0 <test@example.com>\r\nSubject: test\r\nFrom: tester\r\n.\r\n";
+        let addr = spawn_fetch_test_server("HEAD <test@example.com>", response).await;
+        let client = make_test_client(addr);
+        let msg_id = crate::types::MessageId::new("<test@example.com>".to_string()).unwrap();
+
+        let framed = client.fetch_head(&msg_id).await.unwrap();
+        let validated = framed.validate_with_yenc(YencValidation::Disabled).unwrap();
+        let article = validated.article();
+        assert_eq!(article.body, None);
+        assert_eq!(article.headers.unwrap().get("Subject"), Some(&b"test"[..]));
+    }
+
+    #[tokio::test]
+    async fn fetch_body_preserves_wire_dot_stuffing_for_the_article_decoder() {
+        let response = b"222 0 <dotted@example.com>\r\n..wire-dot\r\n.\r\n";
+        let addr = spawn_fetch_test_server("BODY <dotted@example.com>", response).await;
+        let client = make_test_client(addr);
+        let msg_id = crate::types::MessageId::new("<dotted@example.com>".to_string()).unwrap();
+
+        let framed = client.fetch_body(&msg_id).await.unwrap();
+        assert_eq!(
+            framed.as_bytes(),
+            b"222 0 <dotted@example.com>\r\n..wire-dot"
+        );
+        let validated = framed.validate_with_yenc(YencValidation::Disabled).unwrap();
+        let article = validated.article();
+        assert_eq!(article.body, Some(&b"..wire-dot"[..]));
+    }
+
+    #[tokio::test]
+    async fn validated_article_view_is_reusable_without_revalidation() {
+        let response = b"222 0 <repeat@example.com>\r\nhello world\r\n.\r\n";
+        let addr = spawn_fetch_test_server("BODY <repeat@example.com>", response).await;
+        let client = make_test_client(addr);
+        let msg_id = crate::types::MessageId::new("<repeat@example.com>".to_string()).unwrap();
+
+        let validated = client
+            .fetch_body(&msg_id)
+            .await
+            .unwrap()
+            .validate_with_yenc(YencValidation::Disabled)
+            .unwrap();
+        let first = validated.article();
+        let second = validated.article();
+
+        assert_eq!(first, second);
+        assert_eq!(first.body, Some(&b"hello world"[..]));
     }
 
     #[tokio::test]
     async fn fetch_body_reads_multiline_response_above_retention_limit() {
-        let mut response = Vec::with_capacity((4 * 1024 * 1024) + 64);
-        response.extend_from_slice(b"222 0 <large@example.com>\r\n");
-        response.extend(std::iter::repeat_n(b'x', 4 * 1024 * 1024));
+        let mut expected = Vec::with_capacity((4 * 1024 * 1024) + 64);
+        expected.extend_from_slice(b"222 0 <large@example.com>\r\n");
+        expected.extend(std::iter::repeat_n(b'x', 4 * 1024 * 1024));
+        let mut response = expected.clone();
         response.extend_from_slice(b"\r\n.\r\n");
         let response: &'static [u8] = Box::leak(response.into_boxed_slice());
         let addr = spawn_fetch_test_server("BODY <large@example.com>", response).await;
         let client = make_test_client(addr);
         let msg_id = crate::types::MessageId::new("<large@example.com>".to_string()).unwrap();
 
-        let buffer = client.fetch_body(&msg_id).await.unwrap();
+        let framed = client.fetch_body(&msg_id).await.unwrap();
 
-        assert_eq!(&buffer[..], response);
+        assert_eq!(framed.as_bytes(), expected.as_slice());
     }
 }

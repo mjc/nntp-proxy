@@ -17,10 +17,12 @@ use crate::types::{BackendId, MessageId};
 use futures::{StreamExt, stream::FuturesUnordered};
 
 #[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum PrecheckHit {
-    Payload(crate::cache::CacheIngestResponse),
+    Payload(crate::cache::FramedChunkedResponse),
+    /// A complete single-line response retained only for direct forwarding.
+    /// Cache storage uses the typed STAT operation instead of ingesting these bytes.
+    SingleLine(Box<[u8]>),
     Availability(StatusCode),
 }
 
@@ -28,7 +30,7 @@ impl PrecheckHit {
     #[must_use]
     const fn will_update_cache(&self, cache: &UnifiedCache) -> bool {
         match self {
-            Self::Payload(_) => cache.stores_payload_responses(),
+            Self::Payload(_) | Self::SingleLine(_) => cache.stores_payload_responses(),
             Self::Availability(_) => cache.records_backend_has_status(),
         }
     }
@@ -38,12 +40,17 @@ impl PrecheckHit {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum PrecheckResponse {
     Cached(CachedArticle),
-    Direct(crate::cache::CacheIngestResponse),
+    Direct(DirectResponse),
+}
+
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum DirectResponse {
+    Framed(crate::cache::FramedChunkedResponse),
+    SingleLine(Box<[u8]>),
 }
 
 /// Result of querying a backend for an article.
 #[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum QueryResult {
     Found(BackendId, PrecheckHit),
@@ -96,7 +103,6 @@ fn summarize_tier_results(results: &[QueryResult]) -> TierQuerySummary {
 }
 
 #[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
 #[allow(clippy::large_enum_variant)]
 enum RacingQueryOutcome {
     Hit(BackendId, PrecheckHit),
@@ -145,7 +151,12 @@ async fn cache_precheck_hit(
 
     match hit {
         PrecheckHit::Payload(data) => {
-            cache.upsert_ingest(msg_id, data, backend, tier).await;
+            cache
+                .upsert_framed_ingest(msg_id, data, backend, tier)
+                .await;
+        }
+        PrecheckHit::SingleLine(_) => {
+            cache.record_backend_stat(msg_id, backend, tier).await;
         }
         PrecheckHit::Availability(status_code) => {
             cache
@@ -213,129 +224,112 @@ async fn execute_backend_query(
     request: &RequestContext,
 ) -> Result<QueryAttemptResult, ()> {
     let backend_id = backend.backend_id();
-    let Ok(mut conn) = provider.checkout_connection_guard().await else {
+    let Ok(conn) = provider.checkout_connection_guard().await else {
         return Ok(QueryAttemptResult::Error);
     };
+    let conn = conn.activate();
 
-    let mut buffer = deps.buffer_pool.acquire();
+    let buffer = deps.buffer_pool.acquire();
 
     let response = if should_sample_backend_timing() {
-        backend::execute_request_classified_timed(conn.stream_mut(), request, &mut buffer)
-            .await
-            .map(|(response, ttfb, send, recv)| (response, Some((ttfb, send, recv))))
+        backend::execute_request_exchange_timed(
+            conn,
+            request,
+            buffer,
+            &deps.buffer_pool,
+            backend_id,
+        )
+        .await
+        .map(|(response, ttfb, send, recv)| (response, Some((ttfb, send, recv))))
     } else {
-        backend::execute_request_classified(conn.stream_mut(), request, &mut buffer)
+        backend::execute_request_exchange(conn, request, buffer, &deps.buffer_pool, backend_id)
             .await
             .map(|response| (response, None))
     };
 
     // Use shared backend request execution with sampled timing
     match response {
-        Ok((response, timings)) => {
-            let Some(status_code) = response.status_code() else {
-                response.log_warnings(&buffer, "adaptive-precheck", backend_id);
-                conn.fail_backend();
+        Ok((mut exchange, timings)) => {
+            let Some(status_code) = exchange.status_code() else {
+                exchange.log_warnings("adaptive-precheck");
+                exchange.fail_backend();
                 return Err(());
             };
-            let single_line_payload = response
-                .single_line_bytes(&buffer)
-                .map(crate::cache::CacheIngestResponse::from);
+            let single_line_payload = exchange
+                .single_line_bytes()
+                .map(|bytes| bytes.to_vec().into_boxed_slice());
 
-            let (response, completion) = build_precheck_hit(
-                deps,
-                request,
-                &response,
-                status_code,
-                single_line_payload,
-                &mut conn,
-                &mut buffer,
-            )
-            .await?;
+            let response = match exchange.receiving() {
+                Ok(response) => {
+                    build_precheck_hit(deps, request, status_code, single_line_payload, response)
+                        .await
+                }
+                Err(_) => {
+                    exchange.fail_backend();
+                    return Err(());
+                }
+            };
+            let response = match response {
+                Ok(response) => response,
+                Err(()) => {
+                    exchange.into_connection_after_failure().fail_backend();
+                    return Err(());
+                }
+            };
 
             let result = classify_precheck_result(deps, backend, status_code, timings, response);
 
-            let _ = conn.complete_success(completion);
+            let _ = exchange.into_connection().complete_success();
             Ok(result)
         }
-        Err(_) => {
-            conn.fail_backend();
-            Err(())
-        }
+        Err(_) => Err(()),
     }
 }
 
 async fn build_precheck_hit(
     deps: &OwnedDeps,
     request: &RequestContext,
-    response: &crate::session::backend::BackendReadResult,
     status_code: StatusCode,
-    single_line_payload: Option<crate::cache::CacheIngestResponse>,
-    conn: &mut crate::pool::ConnectionGuard,
-    buffer: &mut crate::pool::PooledBuffer,
-) -> Result<
-    (
-        PrecheckHit,
-        crate::session::backend::BackendResponseComplete,
-    ),
-    (),
-> {
+    single_line_payload: Option<Box<[u8]>>,
+    response: crate::session::backend::ReceivingResponse<'_>,
+) -> Result<PrecheckHit, ()> {
     if request.has_response_body(status_code) {
-        return read_complete_precheck_hit(deps, status_code, conn, buffer).await;
+        return read_complete_precheck_hit(deps, status_code, response).await;
     }
 
-    let completion = response.completion_proof(request).map_err(|_| ())?;
+    response.complete_single_line().map_err(|_| ())?;
     let hit = if let Some(payload) = single_line_payload {
-        PrecheckHit::Payload(payload)
+        PrecheckHit::SingleLine(payload)
     } else {
         PrecheckHit::Availability(status_code)
     };
-    Ok((hit, completion))
+    Ok(hit)
 }
 
 async fn read_complete_precheck_hit(
     deps: &OwnedDeps,
     status_code: StatusCode,
-    conn: &mut crate::pool::ConnectionGuard,
-    buffer: &mut crate::pool::PooledBuffer,
-) -> Result<
-    (
-        PrecheckHit,
-        crate::session::backend::BackendResponseComplete,
-    ),
-    (),
-> {
-    let mut response = deps
+    response: crate::session::backend::ReceivingResponse<'_>,
+) -> Result<PrecheckHit, ()> {
+    let mut captured = deps
         .cache
         .stores_payload_responses()
         .then(crate::pool::ChunkedResponse::default);
 
-    let completion = if let Some(response) = &mut response {
-        let (retained, completion) =
-            crate::session::backend::capture_complete_multiline_response_chunked_optional(
-                conn.stream_mut(),
-                buffer,
-                &deps.buffer_pool,
-                response,
-            )
+    if let Some(captured) = &mut captured {
+        let captured = response
+            .capture_isolated_chunked_optional(captured)
             .await
             .map_err(|_| ())?;
-        if !retained {
-            response.clear();
-            return Ok((PrecheckHit::Availability(status_code), completion));
-        }
-        completion
+        let Some(captured) = captured else {
+            return Ok(PrecheckHit::Availability(status_code));
+        };
+        return Ok(PrecheckHit::Payload(captured.into_cache_ingest()));
     } else {
-        crate::session::backend::observe_complete_multiline_response(conn.stream_mut(), buffer)
-            .await
-            .map_err(|_| ())?
+        response.observe_isolated().await.map_err(|_| ())?;
     };
 
-    let hit = if let Some(response) = response {
-        PrecheckHit::Payload(crate::cache::CacheIngestResponse::Chunked(response))
-    } else {
-        PrecheckHit::Availability(status_code)
-    };
-    Ok((hit, completion))
+    Ok(PrecheckHit::Availability(status_code))
 }
 
 fn classify_precheck_result(
@@ -590,7 +584,25 @@ pub(crate) async fn precheck(
                         .await;
                         owned.cache.get(msg_id).await.map(PrecheckResponse::Cached)
                     } else {
-                        Some(PrecheckResponse::Direct(response))
+                        Some(PrecheckResponse::Direct(DirectResponse::Framed(response)))
+                    }
+                }
+                PrecheckHit::SingleLine(response) => {
+                    if owned.cache.stores_payload_responses() {
+                        let tier = crate::cache::ttl::CacheTier::new(0);
+                        cache_precheck_hit(
+                            &owned.cache,
+                            msg_id.to_owned(),
+                            backend,
+                            PrecheckHit::SingleLine(response),
+                            tier,
+                        )
+                        .await;
+                        owned.cache.get(msg_id).await.map(PrecheckResponse::Cached)
+                    } else {
+                        Some(PrecheckResponse::Direct(DirectResponse::SingleLine(
+                            response,
+                        )))
                     }
                 }
                 PrecheckHit::Availability(status_code) => {
@@ -696,21 +708,21 @@ mod tests {
             QueryResult::Missing(eligible(BackendId::from_index(0))),
             QueryResult::Found(
                 BackendId::from_index(1),
-                PrecheckHit::Payload(b"first".to_vec().into()),
+                PrecheckHit::SingleLine(b"223 1 <first@test> exists\r\n".to_vec().into()),
             ),
             QueryResult::Found(
                 BackendId::from_index(2),
-                PrecheckHit::Payload(b"second".to_vec().into()),
+                PrecheckHit::SingleLine(b"223 1 <second@test> exists\r\n".to_vec().into()),
             ),
         ];
         let (found, avail) = summarize(results);
-        assert_eq!(
+        assert!(matches!(
             found,
             Some((
-                BackendId::from_index(1),
-                PrecheckHit::Payload(crate::cache::CacheIngestResponse::from(b"first".to_vec()))
-            ))
-        );
+                id,
+                PrecheckHit::SingleLine(bytes)
+            )) if id == BackendId::from_index(1) && bytes.as_ref() == b"223 1 <first@test> exists\r\n"
+        ));
         assert!(avail.is_missing(BackendId::from_index(0)));
         assert!(!avail.is_missing(BackendId::from_index(1)));
         assert!(!avail.is_missing(BackendId::from_index(2)));
@@ -903,6 +915,44 @@ mod tests {
         addr
     }
 
+    async fn spawn_retained_article_precheck_server() -> std::net::SocketAddr {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            if let Ok((stream, _)) = listener.accept().await {
+                let mut reader = BufReader::new(stream);
+                let _ = reader.get_mut().write_all(b"200 mock\r\n").await;
+                let mut command = Vec::new();
+                loop {
+                    command.clear();
+                    if reader.read_until(b'\n', &mut command).await.is_err() {
+                        break;
+                    }
+                    let response = match crate::protocol::RequestContext::parse(&command)
+                        .map(|request| request.kind())
+                    {
+                        Some(crate::protocol::RequestKind::Article) => {
+                            b"220 0 <test@example.com>\r\nbody\r\n.\r\n".as_slice()
+                        }
+                        Some(crate::protocol::RequestKind::Date) => {
+                            b"111 20260526120000\r\n".as_slice()
+                        }
+                        _ => b"200 mock setup complete\r\n".as_slice(),
+                    };
+                    if reader.get_mut().write_all(response).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        });
+
+        addr
+    }
+
     async fn spawn_large_article_precheck_server() -> std::net::SocketAddr {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
@@ -922,13 +972,20 @@ mod tests {
                             if reader.read_until(b'\n', &mut command).await.is_err() {
                                 return;
                             }
-                            if command.starts_with(b"ARTICLE ") {
+                            if matches!(
+                                crate::protocol::RequestContext::parse(&command)
+                                    .map(|request| request.kind()),
+                                Some(crate::protocol::RequestKind::Article)
+                            ) {
                                 break;
                             }
-                            let response = if command.starts_with(b"DATE") {
-                                b"111 20260526120000\r\n".as_slice()
-                            } else {
-                                b"200 mock setup complete\r\n".as_slice()
+                            let response = match crate::protocol::RequestContext::parse(&command)
+                                .map(|request| request.kind())
+                            {
+                                Some(crate::protocol::RequestKind::Date) => {
+                                    b"111 20260526120000\r\n".as_slice()
+                                }
+                                _ => b"200 mock setup complete\r\n".as_slice(),
                             };
                             if reader.get_mut().write_all(response).await.is_err() {
                                 return;
@@ -988,7 +1045,7 @@ mod tests {
         let request =
             RequestContext::parse(b"ARTICLE <test@example.com>\r\n").expect("valid request line");
         let result = query_backend(&deps, eligible(backend_id), &request).await;
-        assert_eq!(result, QueryResult::Error);
+        assert!(matches!(result, QueryResult::Error));
     }
 
     #[tokio::test]
@@ -1007,7 +1064,7 @@ mod tests {
         let request =
             RequestContext::parse(b"ARTICLE <test@example.com>\r\n").expect("valid request line");
         let result = query_backend(&deps, eligible(backend_id), &request).await;
-        assert_eq!(result, QueryResult::Error);
+        assert!(matches!(result, QueryResult::Error));
     }
 
     #[tokio::test]
@@ -1026,9 +1083,38 @@ mod tests {
             RequestContext::parse(b"ARTICLE <test@example.com>\r\n").expect("valid request line");
         let result = query_backend(&deps, eligible(backend_id), &request).await;
 
-        assert_eq!(
+        assert!(matches!(
             result,
-            QueryResult::Found(backend_id, PrecheckHit::Availability(StatusCode::new(220)))
+            QueryResult::Found(backend, PrecheckHit::Availability(status))
+                if backend == backend_id && status == StatusCode::new(220)
+        ));
+    }
+
+    #[tokio::test]
+    async fn query_backend_retains_framer_bound_cache_capture() {
+        let addr = spawn_retained_article_precheck_server().await;
+        let (selector, backend_id) = selector_with_backend(addr, 1);
+
+        let deps = OwnedDeps {
+            router: Arc::new(selector),
+            cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
+            buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 1),
+            metrics: MetricsCollector::new(1),
+        };
+        let request =
+            RequestContext::parse(b"ARTICLE <test@example.com>\r\n").expect("valid request line");
+
+        let result = query_backend(&deps, eligible(backend_id), &request).await;
+
+        assert!(
+            matches!(
+                &result,
+                QueryResult::Found(
+                    id,
+                    PrecheckHit::Payload(_)
+                ) if id == &backend_id
+            ),
+            "unexpected precheck result: {result:?}"
         );
     }
 
