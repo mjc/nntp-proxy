@@ -151,7 +151,7 @@ impl PreparedBackendAttempt<'_> {
         match receiving.observe().await {
             Ok(()) => Ok(exchange.into_connection()),
             Err(error) => {
-                let conn = exchange.into_connection();
+                let conn = exchange.into_connection_after_failure();
                 conn.fail_backend();
                 Err(SessionError::from(error))
             }
@@ -180,7 +180,7 @@ enum BackendReadAttemptError {
 
 pub(super) enum AlreadySentResponseError {
     Read(anyhow::Error),
-    Transfer(ResponseTransferError),
+    Transfer(SessionError),
 }
 
 impl From<SessionError> for BackendReadAttemptError {
@@ -440,36 +440,40 @@ impl ClientSession {
             let stat_request = stat_request.clone_for_background_probe();
             probes.push(async move {
                 let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
-                let mut conn = match provider.checkout_connection_guard().await {
+                let conn = match provider.checkout_connection_guard().await {
                     Ok(conn) => conn.activate(),
                     Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
                 };
                 let buffer = self.buffer_pool.acquire();
-                let read = backend::execute_request_receiving(
-                    &mut conn,
+                let mut exchange = match backend::execute_request_exchange(
+                    conn,
                     &stat_request,
                     buffer,
                     &self.buffer_pool,
                     backend_id,
                 )
-                .await;
-                let response = match read {
-                    Ok(read) => read,
+                .await
+                {
+                    Ok(exchange) => exchange,
+                    Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
+                };
+
+                let status_code = exchange.status_code();
+                let response = match exchange.receiving() {
+                    Ok(response) => response,
                     Err(_) => {
-                        conn.fail_backend();
+                        exchange.fail_backend();
                         return RetryStatProbeOutcome::Unavailable(backend_id);
                     }
                 };
-
-                let status_code = response.status_code();
                 match response.observe().await {
                     Ok(()) => {}
                     Err(_) => {
-                        conn.fail_backend();
+                        exchange.into_connection_after_failure().fail_backend();
                         return RetryStatProbeOutcome::Unavailable(backend_id);
                     }
                 }
-                let _ = conn.complete_success();
+                let _ = exchange.into_connection().complete_success();
 
                 if status_code.is_some_and(|status| status.as_u16() == 430) {
                     RetryStatProbeOutcome::Missing(backend_id)
@@ -569,35 +573,39 @@ impl ClientSession {
                         .availability_slot(backend_id)
                         .expect("probe backend is registered");
                     let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
-                    let mut conn = match provider.checkout_connection_guard().await {
+                    let conn = match provider.checkout_connection_guard().await {
                         Ok(conn) => conn.activate(),
                         Err(_) => return,
                     };
                     let buffer = buffer_pool.acquire();
-                    let read = backend::execute_request_receiving(
-                        &mut conn,
+                    let mut exchange = match backend::execute_request_exchange(
+                        conn,
                         &stat_request,
                         buffer,
                         &buffer_pool,
                         backend_id,
                     )
-                    .await;
-                    let response = match read {
-                        Ok(read) => read,
+                    .await
+                    {
+                        Ok(exchange) => exchange,
+                        Err(_) => return,
+                    };
+                    let status_code = exchange.status_code();
+                    let response = match exchange.receiving() {
+                        Ok(response) => response,
                         Err(_) => {
-                            conn.fail_backend();
+                            exchange.fail_backend();
                             return;
                         }
                     };
-                    let status_code = response.status_code();
                     match response.observe().await {
                         Ok(()) => {}
                         Err(_) => {
-                            conn.fail_backend();
+                            exchange.into_connection_after_failure().fail_backend();
                             return;
                         }
                     }
-                    let _ = conn.complete_success();
+                    let _ = exchange.into_connection().complete_success();
 
                     if status_code.is_some_and(|status| status.as_u16() == 430)
                         && let Ok(msg_id) = crate::types::MessageId::new(msg_id_text)
@@ -793,7 +801,7 @@ impl ClientSession {
             Ok(result) => result,
             Err(e) => {
                 return Err(self.handle_response_transfer_error(
-                    exchange.into_connection(),
+                    exchange.into_connection_after_failure(),
                     backend_id,
                     context.request,
                     e,
@@ -945,9 +953,16 @@ impl ClientSession {
                     let _ = conn.complete_success();
                 }
             }
-            BackendConnectionOutcome::BackendFailed => unreachable!(
-                "successful per-command response reuse cannot produce failed backend fate"
-            ),
+            BackendConnectionOutcome::BackendFailed => {
+                warn!(
+                    client = %self.client_addr,
+                    backend = backend_id.as_index(),
+                    command_verb = ?request.verb(),
+                    msg_id = ?request.message_id_value(),
+                    "Refusing to reuse an incomplete backend response"
+                );
+                conn.fail_backend();
+            }
         }
     }
 
@@ -1251,18 +1266,18 @@ impl ClientSession {
 
     pub(super) async fn forward_response_for_already_sent_request<W>(
         &self,
-        conn: &mut crate::pool::ConnectionGuard,
+        conn: crate::pool::ConnectionGuard,
         client_write: &mut W,
         backend: &ArticleBackend,
         request: &mut RequestContext,
         availability: &mut crate::cache::ArticleAvailability,
         backend_to_client_bytes: &mut BackendToClientBytes,
-    ) -> Result<(), AlreadySentResponseError>
+    ) -> Result<crate::pool::ConnectionGuard, AlreadySentResponseError>
     where
         W: AsyncWrite + Unpin,
     {
         let backend_id = backend.backend_id();
-        let buffer = backend::read_receiving_response_for_already_sent_request(
+        let mut exchange = backend::read_exchange_for_already_sent_request(
             conn,
             request,
             &self.buffer_pool,
@@ -1270,8 +1285,9 @@ impl ClientSession {
         )
         .await
         .map_err(AlreadySentResponseError::Read)?;
-        let Some(status_code) = buffer.status_code() else {
-            buffer.log_warnings(self.client_addr, backend_id);
+        let Some(status_code) = exchange.status_code() else {
+            exchange.log_warnings(self.client_addr);
+            exchange.fail_backend();
             return Err(AlreadySentResponseError::Read(anyhow::anyhow!(
                 "backend returned an invalid response to an already-sent request"
             )));
@@ -1289,32 +1305,72 @@ impl ClientSession {
                     )
                     .await;
             }
-            buffer
-                .observe()
+            let response = exchange
+                .receiving()
+                .map_err(AlreadySentResponseError::Read)?;
+            if let Err(error) = response.observe().await {
+                let conn = exchange.into_connection_after_failure();
+                return Err(AlreadySentResponseError::Transfer(
+                    self.handle_response_transfer_error(conn, backend_id, request, error),
+                ));
+            }
+            let conn = exchange.into_connection();
+            if let Err(error) = self
+                .send_430_to_client(client_write, backend_to_client_bytes)
                 .await
-                .map_err(AlreadySentResponseError::Transfer)?;
-            self.send_430_to_client(client_write, backend_to_client_bytes)
-                .await
-                .map_err(|error| {
-                    AlreadySentResponseError::Transfer(classify_response_write_err(error))
-                })?;
-            client_write.flush().await.map_err(|error| {
-                AlreadySentResponseError::Transfer(classify_response_write_err(error))
-            })?;
-            return Ok(());
+            {
+                return Err(AlreadySentResponseError::Transfer(
+                    self.handle_response_transfer_error(
+                        conn,
+                        backend_id,
+                        request,
+                        classify_response_write_err(error),
+                    ),
+                ));
+            }
+            if let Err(error) = client_write.flush().await {
+                return Err(AlreadySentResponseError::Transfer(
+                    self.handle_response_transfer_error(
+                        conn,
+                        backend_id,
+                        request,
+                        classify_response_write_err(error),
+                    ),
+                ));
+            }
+            return Ok(conn);
         }
 
         let context = ResponseWriteContext {
             request,
             article_request: crate::command::CommandHandler::article_lookup_request(request),
         };
-        let bytes_written = self
-            .write_response_to_client(client_write, backend_id, buffer, context)
+        let response = exchange
+            .receiving()
+            .map_err(AlreadySentResponseError::Read)?;
+        let bytes_written = match self
+            .write_response_to_client(client_write, backend_id, response, context)
             .await
-            .map_err(AlreadySentResponseError::Transfer)?;
-        client_write.flush().await.map_err(|error| {
-            AlreadySentResponseError::Transfer(classify_response_write_err(error))
-        })?;
+        {
+            Ok(bytes_written) => bytes_written,
+            Err(error) => {
+                let conn = exchange.into_connection_after_failure();
+                return Err(AlreadySentResponseError::Transfer(
+                    self.handle_response_transfer_error(conn, backend_id, request, error),
+                ));
+            }
+        };
+        let conn = exchange.into_connection();
+        if let Err(error) = client_write.flush().await {
+            return Err(AlreadySentResponseError::Transfer(
+                self.handle_response_transfer_error(
+                    conn,
+                    backend_id,
+                    request,
+                    classify_response_write_err(error),
+                ),
+            ));
+        }
         self.record_response_metrics(
             backend_id,
             request,
@@ -1328,7 +1384,7 @@ impl ClientSession {
         );
         request.record_backend_response(backend_id, response);
         *backend_to_client_bytes = backend_to_client_bytes.add(response.wire_len().get());
-        Ok(())
+        Ok(conn)
     }
 
     #[inline]
@@ -2968,7 +3024,7 @@ mod tests {
         let mut backend_bytes = BufferPool::new(BufferSize::try_new(8192).unwrap(), 1).acquire();
         backend_bytes.copy_from_slice(b"223 0 <test@example.com> status\r\n");
 
-        let backend_bytes = crate::session::backend::ClassifiedResponse::read(
+        let backend_bytes = crate::session::backend::ClassifiedResponse::read_for_test(
             &mut tokio::io::empty(),
             &request,
             backend_bytes,
@@ -3010,7 +3066,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_disconnect_after_complete_response_reuses_backend_connection() {
+    #[should_panic(expected = "cannot release a backend exchange before completing its response")]
+    async fn dropping_a_receiving_response_cannot_claim_successful_completion() {
+        let (port, _) = spawn_greeting_server().await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(5)
+            .build()
+            .unwrap();
+        let conn = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+        let request = request_context(b"STAT <test@example.com>\r\n");
+        let mut backend_bytes = BufferPool::new(BufferSize::try_new(8192).unwrap(), 1).acquire();
+        backend_bytes.copy_from_slice(b"223 0 <test@example.com> status\r\n");
+        let response = crate::session::backend::ClassifiedResponse::read_for_test(
+            &mut tokio::io::empty(),
+            &request,
+            backend_bytes,
+        )
+        .await
+        .unwrap();
+        let pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 1);
+        let mut exchange = crate::session::backend::BackendResponseExchange::new(
+            conn,
+            response,
+            &pool,
+            BackendId::from_index(0),
+        );
+
+        drop(exchange.receiving().unwrap());
+        let _ = exchange.into_connection();
+    }
+
+    #[tokio::test]
+    async fn write_disconnect_after_complete_retained_response_reuses_backend_connection() {
         let session = test_session();
         let (port, accept_count) = spawn_greeting_server().await;
         let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
@@ -3030,7 +3121,7 @@ mod tests {
         let mut backend_bytes = BufferPool::new(BufferSize::try_new(8192).unwrap(), 1).acquire();
         backend_bytes.copy_from_slice(b"220 Article follows\r\nbody\r\n.\r\n");
 
-        let backend_bytes = crate::session::backend::ClassifiedResponse::read(
+        let backend_bytes = crate::session::backend::ClassifiedResponse::read_for_test(
             &mut tokio::io::empty(),
             &request,
             backend_bytes,
@@ -3049,7 +3140,9 @@ mod tests {
                 &mut client_write,
                 ResponseWriteContext {
                     request: &request,
-                    article_request: None,
+                    article_request: crate::command::CommandHandler::article_lookup_request(
+                        &request,
+                    ),
                 },
                 None,
             )
@@ -3093,7 +3186,7 @@ mod tests {
             b"220 Article follows\r\nbody\r\n.\r\n223 0 <next@example.com> status\r\n",
         );
 
-        let backend_bytes = crate::session::backend::ClassifiedResponse::read(
+        let backend_bytes = crate::session::backend::ClassifiedResponse::read_for_test(
             &mut tokio::io::empty(),
             &request,
             backend_bytes,

@@ -200,6 +200,15 @@ impl ConnectionGuard {
         }
     }
 
+    /// Whether the active response operation has proven that its backend
+    /// response was fully consumed. This is intentionally narrower than
+    /// checking for an empty pending-byte queue: an unfinished read can have
+    /// no locally queued bytes and still leave the protocol exchange dirty.
+    #[must_use]
+    pub(crate) const fn response_is_complete(&self) -> bool {
+        matches!(self.phase, ConnectionPhase::Complete)
+    }
+
     /// Transfer ownership to the bounded health-check path without claiming success.
     pub(crate) fn into_connection_for_health_check(mut self) -> PooledConnection {
         self.conn

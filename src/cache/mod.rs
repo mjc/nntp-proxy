@@ -78,9 +78,9 @@ pub enum CacheIngestResponse {
 /// crossed the asynchronous cache-ingest boundary.
 #[derive(Debug)]
 pub struct FramedChunkedResponse {
-    response: crate::pool::ChunkedResponse,
-    status: StatusCode,
-    status_line_end: crate::protocol::StatusLineEnd,
+    state: crate::protocol::ArticleState<
+        crate::protocol::FramedArticleState<crate::pool::ChunkedResponse>,
+    >,
     payload_end: CachePayloadEnd,
 }
 
@@ -110,7 +110,7 @@ impl FramedChunkedResponse {
     {
         use tokio::io::AsyncWriteExt;
 
-        for chunk in self.response.iter_chunks() {
+        for chunk in self.state.as_inner().bytes().iter_chunks() {
             writer.write_all(chunk).await?;
         }
         Ok(())
@@ -124,24 +124,19 @@ impl CacheIngestResponse {
             Self::Owned(buf) => buf.len(),
             Self::Pooled(buf) => buf.len(),
             Self::Chunked(buf) => buf.len(),
-            Self::FramedChunked(buf) => buf.response.len(),
+            Self::FramedChunked(buf) => buf.state.as_inner().bytes().len(),
             Self::Inline(buf) => buf.len(),
         }
     }
 
-    pub(crate) fn from_framed_chunked(
-        response: crate::pool::ChunkedResponse,
-        status: StatusCode,
-        status_line_end: crate::protocol::StatusLineEnd,
+    pub(crate) fn from_framed_article(
+        state: crate::protocol::ArticleState<
+            crate::protocol::FramedArticleState<crate::pool::ChunkedResponse>,
+        >,
         payload_end: CachePayloadEnd,
     ) -> Self {
-        debug_assert!(payload_end.as_usize() <= response.len());
-        Self::FramedChunked(FramedChunkedResponse {
-            response,
-            status,
-            status_line_end,
-            payload_end,
-        })
+        debug_assert!(payload_end.as_usize() <= state.as_inner().bytes().len());
+        Self::FramedChunked(FramedChunkedResponse { state, payload_end })
     }
 
     /// Construct a representative framer-bounded article capture for the
@@ -170,7 +165,16 @@ impl CacheIngestResponse {
             bytes.len(),
         )
         .expect("payload fits benchmark response");
-        Self::from_framed_chunked(response, StatusCode::new(220), status_line_end, payload_end)
+        Self::from_framed_article(
+            crate::protocol::ArticleState::new(crate::protocol::FramedArticleState::new(
+                response,
+                crate::protocol::RequestKind::Article,
+                StatusCode::new(220),
+                status_line_end,
+                crate::protocol::ContentEnd::new(payload_end.as_usize()),
+            )),
+            payload_end,
+        )
     }
 
     #[cfg(test)]
@@ -184,7 +188,7 @@ impl CacheIngestResponse {
                 buf.copy_prefix_into(3, &mut prefix);
                 StatusCode::parse(&prefix)
             }
-            Self::FramedChunked(buf) => Some(buf.status),
+            Self::FramedChunked(buf) => Some(buf.state.as_inner().status()),
             Self::Inline(buf) => StatusCode::parse(buf),
         }
     }
@@ -198,7 +202,9 @@ impl PartialEq for CacheIngestResponse {
                 CacheIngestResponse::Owned(v) => Box::new(std::iter::once(v.as_ref())),
                 CacheIngestResponse::Pooled(v) => Box::new(std::iter::once(v.as_ref())),
                 CacheIngestResponse::Chunked(v) => Box::new(v.iter_chunks()),
-                CacheIngestResponse::FramedChunked(v) => Box::new(v.response.iter_chunks()),
+                CacheIngestResponse::FramedChunked(v) => {
+                    Box::new(v.state.as_inner().bytes().iter_chunks())
+                }
                 CacheIngestResponse::Inline(v) => Box::new(std::iter::once(v.as_slice())),
             }
         }

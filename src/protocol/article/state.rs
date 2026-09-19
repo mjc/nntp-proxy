@@ -38,6 +38,22 @@ impl StatusLineEnd {
     }
 }
 
+/// Exclusive end of the framed wire content, relative to the bytes carried
+/// by the same `Framed` state. This is distinct from the status-line end so a
+/// validator cannot accidentally inspect a packed-response suffix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContentEnd(usize);
+
+impl ContentEnd {
+    pub(crate) const fn new(value: usize) -> Self {
+        Self(value)
+    }
+
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+}
+
 /// An article operation in one of the protocol-owned states.
 #[derive(Debug)]
 pub(crate) struct Article<State>(State);
@@ -56,6 +72,10 @@ impl<State> Article<State> {
     }
 }
 
+// These projections are consumed by the public `client::FramedArticle` facade.
+// The generic state is crate-private, so dead-code analysis cannot see those
+// external callers.
+#[allow(dead_code)]
 impl<B> Article<Framed<B>> {
     pub(crate) const fn kind(&self) -> RequestKind {
         self.0.kind()
@@ -67,6 +87,10 @@ impl<B> Article<Framed<B>> {
 
     pub(crate) const fn status_line_end(&self) -> StatusLineEnd {
         self.0.status_line_end()
+    }
+
+    pub(crate) const fn content_end(&self) -> ContentEnd {
+        self.0.content_end()
     }
 
     pub(crate) fn into_bytes(self) -> B {
@@ -81,6 +105,7 @@ pub(crate) struct Framed<B> {
     kind: RequestKind,
     status: StatusCode,
     status_line_end: StatusLineEnd,
+    content_end: ContentEnd,
 }
 
 impl<B> Framed<B> {
@@ -89,12 +114,14 @@ impl<B> Framed<B> {
         kind: RequestKind,
         status: StatusCode,
         status_line_end: StatusLineEnd,
+        content_end: ContentEnd,
     ) -> Self {
         Self {
             bytes,
             kind,
             status,
             status_line_end,
+            content_end,
         }
     }
 
@@ -114,6 +141,10 @@ impl<B> Framed<B> {
         self.status_line_end
     }
 
+    pub(crate) const fn content_end(&self) -> ContentEnd {
+        self.content_end
+    }
+
     pub(crate) fn into_bytes(self) -> B {
         self.bytes
     }
@@ -127,8 +158,12 @@ impl<B: StableBytes> Framed<B> {
     /// one state value, so callers cannot validate one allocation and later
     /// bind the result to another.
     pub(crate) fn validate(self, policy: YencValidation) -> Result<Validated<B>, ParseError> {
-        let layout =
-            ArticleLayout::parse_framed(self.bytes.as_slice(), self.status, self.status_line_end)?;
+        let layout = ArticleLayout::parse_framed(
+            self.bytes.as_slice(),
+            self.status,
+            self.status_line_end,
+            self.content_end,
+        )?;
         match policy {
             YencValidation::Disabled => {}
             YencValidation::Enabled => layout.validate_yenc(self.bytes.as_slice())?,

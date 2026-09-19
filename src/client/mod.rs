@@ -223,18 +223,13 @@ impl NntpClient {
         let captured = match exchange.receiving()?.capture_isolated().await {
             Ok(result) => result,
             Err(error) => {
-                exchange.into_connection().fail_backend();
+                exchange.into_connection_after_failure().fail_backend();
                 return Err(error);
             }
         };
         let conn = exchange.into_connection();
         let _reusable = conn.complete_success();
-        Ok(FramedArticle::new(
-            captured.kind(),
-            captured.status(),
-            captured.status_line_end(),
-            captured.into_bytes(),
-        ))
+        Ok(FramedArticle::from_framed(captured))
     }
 
     /// Validate NNTP response status code
@@ -260,20 +255,10 @@ pub struct FramedArticle {
 }
 
 impl FramedArticle {
-    fn new(
-        kind: crate::protocol::RequestKind,
-        status: StatusCode,
-        status_line_end: crate::protocol::StatusLineEnd,
-        bytes: PooledBuffer,
+    fn from_framed(
+        state: crate::protocol::ArticleState<crate::protocol::FramedArticleState<PooledBuffer>>,
     ) -> Self {
-        Self {
-            state: crate::protocol::ArticleState::new(crate::protocol::FramedArticleState::new(
-                bytes,
-                kind,
-                status,
-                status_line_end,
-            )),
-        }
+        Self { state }
     }
 
     /// Request kind that produced this response.
@@ -307,9 +292,13 @@ impl FramedArticle {
 
     /// Validate NNTP semantics and apply the selected optional yEnc policy.
     pub fn validate_with_yenc(self, policy: YencValidation) -> Result<ValidatedArticle> {
+        let kind = self.kind();
+        let status = self.status();
         let state = self.state.into_inner().validate(policy)?;
         Ok(ValidatedArticle {
             state: crate::protocol::ArticleState::new(state),
+            kind,
+            status,
         })
     }
 
@@ -324,9 +313,23 @@ impl FramedArticle {
 #[derive(Debug)]
 pub struct ValidatedArticle {
     state: crate::protocol::ArticleState<crate::protocol::ValidatedArticleState<PooledBuffer>>,
+    kind: crate::protocol::RequestKind,
+    status: StatusCode,
 }
 
 impl ValidatedArticle {
+    /// Request kind that established this validated article state.
+    #[must_use]
+    pub const fn kind(&self) -> crate::protocol::RequestKind {
+        self.kind
+    }
+
+    /// Status code that established this validated article state.
+    #[must_use]
+    pub const fn status(&self) -> StatusCode {
+        self.status
+    }
+
     /// Return a reusable zero-copy article view without repeating validation.
     #[must_use]
     pub fn article(&self) -> ArticleView<'_> {
@@ -688,8 +691,48 @@ mod tests {
 
         assert_eq!(framed.as_bytes(), &response[..response.len() - 5]);
         let validated = framed.validate_with_yenc(YencValidation::Disabled).unwrap();
+        assert_eq!(validated.kind(), crate::protocol::RequestKind::Body);
+        assert_eq!(validated.status(), StatusCode::new(222));
         let article = validated.article();
         assert_eq!(article.body, Some(&b"hello world"[..]));
+    }
+
+    #[tokio::test]
+    async fn fetch_article_returns_a_validated_article_view() {
+        let response = b"220 42 <article@example.com> article follows\r\n\
+            Subject: test\r\n\
+            From: tester\r\n\
+            \r\n\
+            article body\r\n\
+            .\r\n";
+        let addr = spawn_fetch_test_server("ARTICLE <article@example.com>", response).await;
+        let client = make_test_client(addr);
+        let msg_id = crate::types::MessageId::new("<article@example.com>".to_string()).unwrap();
+
+        let validated = client
+            .fetch_article(&msg_id)
+            .await
+            .unwrap()
+            .validate_with_yenc(YencValidation::Disabled)
+            .unwrap();
+        assert_eq!(validated.kind(), crate::protocol::RequestKind::Article);
+        assert_eq!(validated.status(), StatusCode::new(220));
+        let article = validated.article();
+
+        assert_eq!(article.article_number, Some(42));
+        assert_eq!(article.message_id.as_str(), "<article@example.com>");
+        assert_eq!(article.headers.unwrap().get("Subject"), Some(&b"test"[..]));
+        assert_eq!(article.body, Some(&b"article body"[..]));
+    }
+
+    #[tokio::test]
+    async fn stat_consumes_a_complete_single_line_response() {
+        let response = b"223 42 <stat@example.com> article exists\r\n";
+        let addr = spawn_fetch_test_server("STAT <stat@example.com>", response).await;
+        let client = make_test_client(addr);
+        let msg_id = crate::types::MessageId::new("<stat@example.com>".to_string()).unwrap();
+
+        assert!(client.stat(&msg_id).await.unwrap());
     }
 
     #[tokio::test]

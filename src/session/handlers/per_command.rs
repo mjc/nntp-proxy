@@ -1093,7 +1093,7 @@ impl ClientSession {
                         .with_context_mut(i, |mut request| async {
                             let result = self
                                 .forward_response_for_already_sent_request(
-                                    &mut conn,
+                                    conn,
                                     client_writer.get_mut(),
                                     &backend,
                                     &mut request,
@@ -1110,7 +1110,8 @@ impl ClientSession {
                             ))
                         })?;
                     match result {
-                        Ok(()) => {
+                        Ok(next_conn) => {
+                            conn = next_conn;
                             guard.complete();
                         }
                         Err(
@@ -1124,7 +1125,6 @@ impl ClientSession {
                                 error = %error,
                                 "Upstream window response read failed; retrying unread requests sequentially"
                             );
-                            conn.fail_backend();
                             drop(guard);
                             drop(unread_requests);
                             self.execute_pipelineable_commands_with_recorded_request_bytes_from(
@@ -1145,13 +1145,7 @@ impl ClientSession {
                                 error,
                             ),
                         ) => {
-                            let request = batch.context(i).request();
-                            return Err(self.handle_response_transfer_error(
-                                conn,
-                                backend_id,
-                                request,
-                                error,
-                            ));
+                            return Err(error);
                         }
                     }
                 }

@@ -75,7 +75,14 @@ impl ArticleLayout {
         }
         let first_line_end = find_line_end(buf, 0)?;
         let (message_id, article_number) = parse_first_line_layout(&buf[..first_line_end])?;
-        Self::from_first_line(buf, status, first_line_end, message_id, article_number)
+        Self::from_first_line(
+            buf,
+            status,
+            first_line_end,
+            message_id,
+            article_number,
+            buf.len(),
+        )
     }
 
     /// Parse article semantics using the status-line boundary already proven
@@ -85,21 +92,32 @@ impl ArticleLayout {
         buf: &[u8],
         status: crate::protocol::StatusCode,
         status_line_end: state::StatusLineEnd,
+        content_end: state::ContentEnd,
     ) -> Result<Self, ParseError> {
         let status_code = status.as_u16();
         if !matches!(status_code, 220..=223) {
             return Err(ParseError::InvalidStatusCode(status_code));
         }
         let line_end = status_line_end.get();
+        let content_end = content_end.get();
         let first_line_end = line_end
             .checked_sub(crate::protocol::CRLF.len())
             .ok_or(ParseError::BufferTooShort)?;
-        if line_end > buf.len() || buf.get(first_line_end..line_end) != Some(crate::protocol::CRLF)
+        if line_end > content_end
+            || content_end > buf.len()
+            || buf.get(first_line_end..line_end) != Some(crate::protocol::CRLF)
         {
             return Err(ParseError::BufferTooShort);
         }
         let (message_id, article_number) = parse_first_line_layout(&buf[..first_line_end])?;
-        Self::from_first_line(buf, status, first_line_end, message_id, article_number)
+        Self::from_first_line(
+            buf,
+            status,
+            first_line_end,
+            message_id,
+            article_number,
+            content_end,
+        )
     }
 
     fn from_first_line(
@@ -108,38 +126,40 @@ impl ArticleLayout {
         first_line_end: usize,
         message_id: Range<usize>,
         article_number: Option<u64>,
+        content_end: usize,
     ) -> Result<Self, ParseError> {
+        let framed = buf.get(..content_end).ok_or(ParseError::BufferTooShort)?;
         let content_start = first_line_end
             .checked_add(crate::protocol::CRLF.len())
             .ok_or(ParseError::BufferTooShort)?;
 
         let content = match status.as_u16() {
             220 => {
-                let separator_pos = find_blank_line(buf, content_start)?;
+                let separator_pos = find_blank_line(framed, content_start)?;
                 let headers_range = content_start..separator_pos;
-                Headers::parse(&buf[headers_range.clone()])?;
-                let body_range = separator_pos + 4..buf.len();
+                Headers::parse(&framed[headers_range.clone()])?;
+                let body_range = separator_pos + 4..content_end;
                 ArticleContent::Article {
                     headers: headers_range,
                     body: body_range,
                 }
             }
             221 => {
-                if find_blank_line(buf, content_start).is_ok() {
+                if find_blank_line(framed, content_start).is_ok() {
                     return Err(ParseError::UnexpectedBody);
                 }
-                let headers_range = content_start..buf.len();
-                Headers::parse(&buf[headers_range.clone()])?;
+                let headers_range = content_start..content_end;
+                Headers::parse(&framed[headers_range.clone()])?;
                 ArticleContent::Head {
                     headers: headers_range,
                 }
             }
             222 => {
-                let body_range = content_start..buf.len();
+                let body_range = content_start..content_end;
                 ArticleContent::Body { body: body_range }
             }
             223 => {
-                if content_start < buf.len() {
+                if content_start < content_end {
                     return Err(ParseError::UnexpectedBody);
                 }
                 ArticleContent::Stat
@@ -396,6 +416,7 @@ mod tests {
             buf,
             crate::protocol::StatusCode::new(222),
             state::StatusLineEnd::new(status_line_end),
+            state::ContentEnd::new(buf.len()),
         )
         .unwrap();
 
@@ -405,6 +426,7 @@ mod tests {
                 buf,
                 crate::protocol::StatusCode::new(222),
                 state::StatusLineEnd::new(status_line_end - 1),
+                state::ContentEnd::new(buf.len()),
             )
             .is_err()
         );
@@ -413,8 +435,32 @@ mod tests {
                 buf,
                 crate::protocol::StatusCode::new(430),
                 state::StatusLineEnd::new(status_line_end),
+                state::ContentEnd::new(buf.len()),
             ),
             Err(ParseError::InvalidStatusCode(430))
+        );
+    }
+
+    #[test]
+    fn framed_layout_excludes_packed_response_suffix() {
+        let frame = b"222 100 <test@example.com> body\r\nBody content\r\n";
+        let suffix = b"223 1 <next@example.com>\r\n";
+        let packed = [frame.as_slice(), suffix.as_slice()].concat();
+        let status_line_end = b"222 100 <test@example.com> body\r\n".len();
+
+        let layout = ArticleLayout::parse_framed(
+            &packed,
+            crate::protocol::StatusCode::new(222),
+            state::StatusLineEnd::new(status_line_end),
+            state::ContentEnd::new(frame.len()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            layout.content,
+            ArticleContent::Body {
+                body: status_line_end..frame.len(),
+            }
         );
     }
 
