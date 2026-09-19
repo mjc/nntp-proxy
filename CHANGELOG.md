@@ -7,9 +7,82 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-10-21
+
+### Added
+
+- Added optional per-backend `stat_missing` probes for backends that return authoritative `430` responses. Probes can avoid retrying known misses and can prefill availability from fallback tiers while the primary request continues.
+- Added queue-pressure routing controls under `[routing.queue.backpressure]`.
+- Added provider slots for availability tracking, so entries configured with
+  the same canonical hostname share recorded article misses
+  regardless of transport details, accounts, or resolved addresses.
+- Added an availability index with fixed capacity and exact message-ID checks.
+  Fingerprint collisions cannot mark a different article as missing; rotation
+  and replacement can remove old misses, allowing them to be retried.
+- Added `FramedArticle`, `ValidatedArticle`, and `ArticleView` to separate response framing from article validation and allow repeated zero-copy access to validated articles.
+- Added Gungraun benchmarks and reproducible framing, cache, retained-buffer, and end-to-end benchmark fixtures.
+
 ### Changed
 
-- Added explicit RFC 5322 unfolded-header access through `Headers::unfolded_bytes()` while keeping `Headers::as_bytes()` tied to the original wire bytes.
+- Moved response continuation, packed-response suffixes, and completion into the multiline framer. Normal `ARTICLE`/`BODY`/`HEAD` forwarding borrows pooled bytes directly.
+- Backend connection guards now require proof that a response is fully consumed and no pending bytes remain before allowing reuse. Cancellation and incomplete exchanges retire the connection.
+- Restricted the backend pool to fully initialized connections that have completed greeting, authentication, `MODE READER`, and compression negotiation.
+- Retained-buffer reads now consume an append permission and return a result tied to the buffer, allowing storage reuse across compaction and subsequent reads with fewer copies.
+- Added article windows for requests to the same backend, reuse of pooled suffix bytes, and a bounded stateful upstream request window to reduce round trips and copying on eligible pipelines.
+- Cached response sections now retain their wire boundaries, including the final content CRLF and empty multiline sections.
+- Requests now carry response shape metadata so status codes such as `211` are interpreted according to the command that produced them.
+- Kept `Headers::as_bytes()` tied to the received wire bytes and added lazy RFC 5322 continuation unfolding through `Headers::unfolded_bytes()`.
+- Command classification now produces plans that retain their payloads through pipeline execution and hybrid handoff, avoiding reclassification of accepted commands.
+- A single reducer now updates client authentication state, and the authenticated identity can be set only once. Password diagnostics are redacted; password parsing and serialization are unchanged.
+- Response-write metrics are configurable through `[proxy].response_write_metrics_secs` (disabled by default). Session, dashboard, and routing counters now use typed metric values.
+- Migrated development and CI workflows to `devenv`, reduced crate visibility, and removed obsolete compatibility code and unused large-transfer paths.
+- Refreshed runtime and development dependencies, including `foyer` 0.22.6, `nutype` 0.8, Tokio 1.54.1, and Hickory 0.26.3.
+- Updated Gungraun and its Nix-packaged runner to 0.20 and removed the obsolete benchmark advisory exception.
+
+### Fixed
+
+- Updated `rustls` to 0.23.46, `rustls-webpki` to 0.103.16, and `webpki-roots` to 1.0.10 to address certificate-validation advisories and refresh the bundled CA roots.
+- Increased the hybrid-cache benchmark disk budget to support four active flushers and spare blocks, preventing the fixture from stalling.
+- Preserved backend bytes following a completed response for the next request, including packed single-line and multiline responses.
+- Made stateful forwarding cancellation-safe so a client becoming ready cannot cancel an already-started backend write or leave the connection falsely reusable.
+- Corrected explicit stateful sessions so they begin in stateful mode, and deferred hybrid-mode stateful handoff until the handoff succeeds.
+- Client `AUTHINFO` state now changes only after its protocol response is written successfully, so a failed client write leaves authentication state unchanged.
+- Preserved the classified plan for a trailing pipelined command through direct execution or stateful handoff.
+- Tightened backend cleanup around failed authentication, probes, response writes, and partially completed exchanges.
+- Made DNS lookups TTL-aware and corrected address-family cache refresh behavior after IPv6-unreachable failures.
+- Saved and restored availability facts using canonical hostnames, exact message
+  IDs, and provider-slot translation. Stale identity mappings cannot be applied
+  after the backend layout changes.
+- Fixed cache updates so availability metadata does not replace a larger payload and so cached responses retain exact section boundaries on re-emission.
+- Enforced RFC 3977 message-ID syntax and rejected incomplete backend username/password configuration.
+- Rejected NUL bytes in framed ARTICLE and HEAD headers, as required for NNTP multi-line article data, without changing standalone parser compatibility.
+- Fixed active-session and dashboard counters, reduced TUI render allocations, and cleared prewarmed idle backend pools after their configured timeout.
+- Fixed retry routing, queue-pressure validation, backend selection based on available capacity, and response completion checks.
+
+### Upgrade notes
+
+- Queue-pressure routing is enabled by default with soft and hard waiter thresholds of 25% and 50%, plus a 1 ms retry delay when every eligible backend in a tier is hard-saturated. These values are configurable under `[routing.queue.backpressure]`.
+- Availability facts are keyed by the configured hostname after ASCII
+  case-folding and removal of one trailing DNS dot. The same hostname shares a
+  provider slot across ports, addresses, accounts, TLS settings, compression,
+  tiers, and display names; DNS resolution and account names do not affect
+  provider identity.
+- Availability-index snapshots written before the format that records hostnames
+  and exact message IDs are ignored; the proxy rebuilds the index. Hybrid-cache
+  registries retain canonical-host slot assignments, while existing payload
+  entries remain readable and older payload-section boundaries are normalized
+  during decoding.
+- `NntpClient` article fetches now return `FramedArticle` instead of a raw `PooledBuffer`. Validate it to obtain typed article access. Article validation and optional yEnc validation are separate operations.
+- Other breaking Rust API changes: the low-level `compression` and `network` modules and `constants::duration_polyfill` are private or removed; `RequestContext` no longer implements `Clone`, which dropped payloads; `ModeState` construction and transition APIs changed; and connection checkout/finalization now uses idle, active, complete, and reusable states.
+- `Password` no longer implements `Display` or `Deref<str>`, and its `Debug` output is redacted. Explicit `AsRef<str>` access remains available where cleartext is required.
+- The `zlib-ng` Cargo feature was removed. RFC 8054 DEFLATE support now uses the `zlib-rs` backend.
+- The minimum supported Rust version is now 1.95 to cover the resolved dependencies. The pinned toolchain remains 1.98.1.
+
+### Testing and documentation
+
+- Added regression coverage for fragmented and packed responses, terminators split across reads, request-scoped response shapes, cancellation and connection reuse, cache boundary preservation, canonical-host availability identity, exact-key collision safety, provider-slot snapshot restoration, authentication transitions, typed counters, and retained-buffer ownership.
+- Added devenv quality tasks covering formatting, Clippy, shell and workflow linting, typo checks, coverage, dependency policy, advisories, unused dependencies, and response-contract checks.
+- Updated operator, development, configuration, and release-benchmark documentation for the new routing, cache, framing, and development workflows.
 
 ## [0.5.2] - 2026-06-11
 
@@ -23,10 +96,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Wired response write metrics to runtime config and reduced response-metrics logging noise.
-- Added queue backpressure routing configuration in `config.full.toml` and documented
-  `[routing.queue.backpressure]` in operator configuration docs.
-- Finalized v0.5.2 release metadata and config coverage, including response-write and
-  client-writer lock contention interval settings.
+- Added queue backpressure routing configuration in `config.full.toml` and documented `[routing.queue.backpressure]` in operator configuration docs.
+- Finalized v0.5.2 release metadata and config coverage, including response-write and client-writer lock contention interval settings.
 - Removed legacy CLI compatibility aliases and aliases that are now obsolete after the cleanup pass: `--no-tui`, `--backend-strategy`, `--cache-capacity`, `--cache-ttl`, `--ttl-secs`, `--cache-articles`, `--store-articles`, and legacy `NNTP_PROXY_CACHE_*` env fallbacks.
 - Removed the dead ordered large-transfer pipeline path and associated retry gate/feature code now that it is permanently disabled.
 - Replaced visibility and internal API cleanup work from the Rust 1.88/private-first pass, including module privacy tightening and simplification of small conditional branches.
@@ -47,12 +118,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Docs
 
 - Documented the `stat_missing` backend option and routing behavior in operator docs.
-- Updated `docker-compose.yml`/`Dockerfile` examples and Nix module documentation
-  to cover `stat_missing` deployment usage.
-- Added release metadata/docs updates for v0.5.2 configuration fields such as
-  response write and client-writer lock contention metric intervals.
-- Added documentation for cleanup and migration context from the maintenance PR stack
-  around private-first cleanup, deprecated options removal, and runtime pinning behavior.
+- Updated `docker-compose.yml`/`Dockerfile` examples and Nix module documentation to cover `stat_missing` deployment usage.
+- Added release metadata/docs updates for v0.5.2 configuration fields such as response write and client-writer lock contention metric intervals.
+- Added documentation for cleanup and migration context from the maintenance PR stack around private-first cleanup, deprecated options removal, and runtime pinning behavior.
 
 ## [0.5.1] - 2026-06-05
 
@@ -171,7 +239,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
-- Large cache-miss forwarding now reaches multi-GiB/s throughput while using much less transient memory than the old full-response buffering path. With one client connection, one proxy thread, and one backend connection, current release checks measured 4.60 GiB/s on the Ryzen 9 5950X system and 3.13 GiB/s on the Apple M1 system; see [release benchmarks](docs/archive/release-benchmarks.md) for the archived note and regeneration pointers.
+- Large cache-miss forwarding borrows pooled buffers to avoid retaining a full response during pass-through. See [release benchmarks](docs/archive/release-benchmarks.md) for the measurement workflow. Historical results may differ from current performance.
 - Per-command direct forwarding and cache-hit serving are now built around borrowed buffers and vectored writes, so the steady-state hot path is intended to be allocation-free after buffer-pool warmup when configured pools have capacity. Stateful mode, payload retention/cache ingest, connection setup, logging, metrics snapshots, pool exhaustion, and oversized-retention fallbacks can still allocate.
 - Sequential article fetches benefit from backend command pipelining, response batching, fewer request re-parses, and reduced connection churn.
 
@@ -602,6 +670,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Docker support
   - Development documentation
 
+[0.6.0]: https://github.com/mjc/nntp-proxy/compare/v0.5.2...v0.6.0
 [0.5.1]: https://github.com/mjc/nntp-proxy/compare/v0.5.0...v0.5.1
 [0.5.2]: https://github.com/mjc/nntp-proxy/compare/v0.5.1...v0.5.2
 [0.5.0]: https://github.com/mjc/nntp-proxy/compare/v0.4.0...v0.5.0
