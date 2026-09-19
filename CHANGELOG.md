@@ -7,48 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.5.2] - 2026-06-11
+## [0.6.0] - 2026-09-19
 
 ### Added
 
-- Added per-backend `stat_missing` retry probing, so backends that correctly answer `STAT` with `430` can help retry missing articles faster.
-- Runtime CPU pinning support is now available for multi-threaded workloads via a new `CpuPinning` runtime mode, using worker-thread startup hooks so pinned threads are the ones running proxy work.
-- Linux CPU pinning now uses [`rustix`](https://docs.rs/rustix)-based affinity handling, so we can remove the direct `nix` pinning dependency path.
-- Added TUI session/user-count lifecycle fixes so active sessions stay tied to the session-owned gauge instead of drifting or disappearing.
+- Added optional per-backend `stat_missing` probes for backends that return authoritative `430` responses. Probes can avoid retrying known misses and can prefill availability from fallback tiers while the primary request continues.
+- Added queue-pressure routing controls under `[routing.queue.backpressure]`.
+- Added explicit availability namespaces and account scoping so authoritative missing-article facts can be shared safely between equivalent backends.
+- Added `FramedArticle`, `ValidatedArticle`, and `ArticleView` for response framing, semantic article validation, and repeated zero-copy typed access.
+- Added Gungraun benchmarks and reproducible framing, cache, retained-buffer, and end-to-end benchmark fixtures.
+- Added worker-thread CPU pinning with `rustix` on Linux.
 
 ### Changed
 
-- Wired response write metrics to runtime config and reduced response-metrics logging noise.
-- Added queue backpressure routing configuration in `config.full.toml` and documented
-  `[routing.queue.backpressure]` in operator configuration docs.
-- Finalized v0.5.2 release metadata and config coverage, including response-write and
-  client-writer lock contention interval settings.
-- Removed legacy CLI compatibility aliases and aliases that are now obsolete after the cleanup pass: `--no-tui`, `--backend-strategy`, `--cache-capacity`, `--cache-ttl`, `--ttl-secs`, `--cache-articles`, `--store-articles`, and legacy `NNTP_PROXY_CACHE_*` env fallbacks.
-- Removed the dead ordered large-transfer pipeline path and associated retry gate/feature code now that it is permanently disabled.
-- Replaced visibility and internal API cleanup work from the Rust 1.88/private-first pass, including module privacy tightening and simplification of small conditional branches.
-- Replaced `ResponseTransferError::into_anyhow` and `duration_polyfill` with idiomatic Rust 1.88-safe error and duration handling at call sites.
-- Adopted private-first encapsulation by tightening crate module visibility where public re-exports already provide the intended external surface.
-- Pushed the session-count model through typed metrics snapshots, dashboard conversions, and TUI rendering so count mixups become compile-time errors instead of runtime bugs.
+- Centralized NNTP response-boundary ownership in the multiline framer. Framing state now owns continuation, packed-response suffixes, and completion, while normal `ARTICLE`/`BODY`/`HEAD` forwarding continues to borrow pooled bytes directly.
+- Added completion proofs to backend connection guards. A connection is reusable only after its response is fully consumed and no pending bytes remain; cancellation and incomplete exchanges retire the connection instead.
+- Restricted the backend pool to fully initialized connections that have completed greeting, authentication, `MODE READER`, and compression negotiation.
+- Added consuming retained-buffer append permissions and buffer-bound append results, preserving low-copy reuse across compaction and subsequent reads.
+- Added same-backend article windows, pooled suffix reuse, and a bounded stateful upstream request window to reduce round trips and transient copying on eligible pipelines.
+- Made cached response sections retain their established wire boundaries, including final content CRLF and empty multiline sections.
+- Added request-scoped response shape metadata so status codes such as `211` are interpreted according to the command that produced them.
+- Consolidated command classification into payload-bearing plans and carried those plans through pipeline and hybrid handoff, avoiding late reclassification of already accepted commands.
+- Reworked client authentication around one reducer-owned state transition and write-once authenticated identity; password diagnostics are redacted while existing password parsing and serialization behavior is preserved.
+- Made response-write metrics configurable through `[proxy].response_write_metrics_secs` (disabled by default) and moved session, dashboard, and routing counters onto typed metric values.
+- Migrated development and CI workflows to `devenv`, tightened crate visibility, and removed obsolete compatibility and dead large-transfer paths.
+- Refreshed runtime and development dependencies, including `foyer` 0.22.6 and `nutype` 0.8. The minimum supported Rust version is now 1.91, required by the updated foyer release.
 
 ### Fixed
 
-- Backend DNS resolution now uses hickory’s TTL-aware caching behavior, with refreshed lookup handling that avoids unnecessary IPv4 cache clears on IPv6-unreachable failures.
-- Tightened `unsafe` boundaries in the pooled-buffer and Windows file-replacement paths, and moved the old `review_claims` coverage into the RFC4643 auth/bypass and buffer test modules.
-- Hardened retry-path routing and guard handling around pending counts, capacity-weighted initial article probing, and idle-pool preference.
-- Fixed a user-active connection-count regression that could diverge from true active-session totals; the dashboard now consistently reports active sessions from typed user-metric counters.
-- Migrated user/session metric collection to typed newtypes (including `ZERO` constructors) and arithmetic helpers so typed counters are incremented at source and cannot be accidentally mixed.
-- Fixed metric and stats storage consistency by updating update paths to use typed metrics throughout collection, reducing drift in user gauges and totals.
-- Reduced TUI render allocations by writing directly into the buffer, borrowing chart-label names, and using stack-backed formatting where possible.
+- Preserved backend bytes following a completed response for the next request, including packed single-line and multiline responses.
+- Made stateful forwarding cancellation-safe so a client becoming ready cannot cancel an already-started backend write or leave the connection falsely reusable.
+- Corrected explicit stateful sessions so they begin in stateful mode, and deferred hybrid-mode stateful handoff until the handoff succeeds.
+- Committed client `AUTHINFO` state only after its protocol response is written successfully, preventing a failed client write from publishing an authentication transition.
+- Preserved the classified plan for a trailing pipelined command through direct execution or stateful handoff.
+- Tightened backend cleanup around failed authentication, probes, response writes, and partially completed exchanges.
+- Made DNS lookups TTL-aware and corrected address-family cache refresh behavior after IPv6-unreachable failures.
+- Persisted and restored availability facts by stable host/account identity, while preventing stale identity mappings from being applied to a changed backend layout.
+- Fixed cache updates so availability metadata does not replace a larger payload and so cached responses retain exact section boundaries on re-emission.
+- Enforced RFC 3977 message-ID syntax and rejected incomplete backend username/password configuration.
+- Fixed active-session and dashboard counters, reduced TUI render allocations, and cleared prewarmed idle backend pools after their configured timeout.
+- Hardened retry routing, queue-pressure validation, capacity-aware backend selection, and response completion checks.
 
-### Docs
+### Upgrade notes
 
-- Documented the `stat_missing` backend option and routing behavior in operator docs.
-- Updated `docker-compose.yml`/`Dockerfile` examples and Nix module documentation
-  to cover `stat_missing` deployment usage.
-- Added release metadata/docs updates for v0.5.2 configuration fields such as
-  response write and client-writer lock contention metric intervals.
-- Added documentation for cleanup and migration context from the maintenance PR stack
-  around private-first cleanup, deprecated options removal, and runtime pinning behavior.
+- Queue-pressure routing is enabled by default with soft and hard waiter thresholds of 25% and 50%, plus a 1 ms retry delay when every eligible backend in a tier is hard-saturated. These values are configurable under `[routing.queue.backpressure]`.
+- `availability_namespace` and `NNTP_SERVER_<N>_AVAILABILITY_NAMESPACE` can explicitly define which backends share authoritative missing-article facts. When unset, the configured host and username define the identity; port, TLS, compression, tier, and display name do not.
+- The obsolete CLI aliases `--no-tui`, `--backend-strategy`, `--cache-capacity`, `--cache-ttl`, `--ttl-secs`, `--cache-articles`, and `--store-articles` were removed. Use the canonical flags documented in `docs/operator/runtime-and-routing.md` and `docs/operator/configuration.md`.
+- The legacy `NNTP_PROXY_CACHE_*` environment names were removed in favor of the corresponding `NNTP_PROXY_ARTICLE_CACHE_*` and `NNTP_PROXY_STORE_ARTICLE_BODIES` names.
+- Availability-index files written before stable host/account identity metadata are ignored and rebuilt. Existing hybrid-cache payload entries remain readable, and older payload-section boundaries are normalized during decoding.
+- `NntpClient` article fetches now return `FramedArticle` instead of a raw `PooledBuffer`. Consumers obtain typed access through the framed-to-validated transition; semantic validation and optional yEnc validation are separate operations.
+- The Rust library surface has further breaking changes: the low-level `compression` and `network` modules and `constants::duration_polyfill` are private or removed, `RequestContext` no longer implements payload-dropping `Clone`, `ModeState` construction and transition APIs changed, and connection checkout/finalization now uses explicit idle, active, complete, and reusable states.
+- `Password` no longer implements `Display` or `Deref<str>`, and its `Debug` output is redacted. Explicit `AsRef<str>` access remains available where cleartext is required.
+- The `zlib-ng` Cargo feature was removed. RFC 8054 DEFLATE support now uses the `zlib-rs` backend.
+- The minimum supported Rust version is now 1.91.
+
+### Testing and documentation
+
+- Added regression coverage for fragmented and packed responses, terminators split across reads, request-scoped response shapes, cancellation and connection reuse, cache boundary preservation, availability identity migration, authentication transitions, typed counters, and retained-buffer ownership.
+- Added devenv quality tasks covering formatting, Clippy, shell and workflow linting, typo checks, coverage, dependency policy, advisories, unused dependencies, and response-contract checks.
+- Updated operator, development, configuration, and release-benchmark documentation for the new routing, cache, framing, and development workflows.
 
 ## [0.5.1] - 2026-06-05
 
@@ -167,7 +184,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Performance
 
-- Large cache-miss forwarding now reaches multi-GiB/s throughput while using much less transient memory than the old full-response buffering path. With one client connection, one proxy thread, and one backend connection, current release checks measured 4.60 GiB/s on the Ryzen 9 5950X system and 3.13 GiB/s on the Apple M1 system; see [release benchmarks](docs/archive/release-benchmarks.md) for the archived note and regeneration pointers.
+- Large cache-miss forwarding uses borrowed pooled buffers and avoids full-response transient ownership on pass-through paths. See [release benchmarks](docs/archive/release-benchmarks.md) for the reproducible workflow; this changelog does not treat historical measurements as current release guarantees.
 - Per-command direct forwarding and cache-hit serving are now built around borrowed buffers and vectored writes, so the steady-state hot path is intended to be allocation-free after buffer-pool warmup when configured pools have capacity. Stateful mode, payload retention/cache ingest, connection setup, logging, metrics snapshots, pool exhaustion, and oversized-retention fallbacks can still allocate.
 - Sequential article fetches benefit from backend command pipelining, response batching, fewer request re-parses, and reduced connection churn.
 
@@ -598,6 +615,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Docker support
   - Development documentation
 
+[0.6.0]: https://github.com/mjc/nntp-proxy/compare/v0.5.2...v0.6.0
 [0.5.1]: https://github.com/mjc/nntp-proxy/compare/v0.5.0...v0.5.1
 [0.5.2]: https://github.com/mjc/nntp-proxy/compare/v0.5.1...v0.5.2
 [0.5.0]: https://github.com/mjc/nntp-proxy/compare/v0.4.0...v0.5.0

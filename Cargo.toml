@@ -1,9 +1,9 @@
 [package]
 name = "nntp-proxy"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2024"
-rust-version = "1.88"
-description = "NNTP proxy server with per-command backend multiplexing, caching, metrics, and TUI dashboard"
+rust-version = "1.91"
+description = "High-throughput NNTP proxy and pooled client with hybrid, per-command, and stateful routing, article caching, metrics, and a TUI dashboard"
 license = "MIT"
 repository = "https://github.com/mjc/nntp-proxy"
 documentation = "https://docs.rs/nntp-proxy"
