@@ -44,27 +44,85 @@ pub enum YencValidation {
 pub(crate) struct ArticleLayout {
     message_id: Range<usize>,
     article_number: Option<u64>,
-    headers: Option<Range<usize>>,
-    body: Option<Range<usize>>,
+    content: ArticleContent,
+}
+
+/// Article-family response shape. Keeping the alternatives explicit prevents
+/// impossible header/body combinations while preserving the proxy's raw-wire
+/// representation and lenient article-number policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ArticleContent {
+    Article {
+        headers: Range<usize>,
+        body: Range<usize>,
+    },
+    Head {
+        headers: Range<usize>,
+    },
+    Body {
+        body: Range<usize>,
+    },
+    Stat,
 }
 
 impl ArticleLayout {
     pub(crate) fn parse(buf: &[u8]) -> Result<Self, ParseError> {
-        let status_code = parse_status_code(buf)?;
+        let status =
+            crate::protocol::StatusCode::parse(buf).ok_or(ParseError::InvalidStatusCode(0))?;
+        let status_code = status.as_u16();
         if !matches!(status_code, 220..=223) {
             return Err(ParseError::InvalidStatusCode(status_code));
         }
         let first_line_end = find_line_end(buf, 0)?;
         let (message_id, article_number) = parse_first_line_layout(&buf[..first_line_end])?;
-        let content_start = first_line_end + 2;
+        Self::from_first_line(buf, status, first_line_end, message_id, article_number)
+    }
 
-        let (headers, body) = match status_code {
+    /// Parse article semantics using the status-line boundary already proven
+    /// by the response framer. The boundary and bytes remain in one framed
+    /// state, so this transition does not rediscover the first CRLF.
+    pub(crate) fn parse_framed(
+        buf: &[u8],
+        status: crate::protocol::StatusCode,
+        status_line_end: state::StatusLineEnd,
+    ) -> Result<Self, ParseError> {
+        let status_code = status.as_u16();
+        if !matches!(status_code, 220..=223) {
+            return Err(ParseError::InvalidStatusCode(status_code));
+        }
+        let line_end = status_line_end.get();
+        let first_line_end = line_end
+            .checked_sub(crate::protocol::CRLF.len())
+            .ok_or(ParseError::BufferTooShort)?;
+        if line_end > buf.len() || buf.get(first_line_end..line_end) != Some(crate::protocol::CRLF)
+        {
+            return Err(ParseError::BufferTooShort);
+        }
+        let (message_id, article_number) = parse_first_line_layout(&buf[..first_line_end])?;
+        Self::from_first_line(buf, status, first_line_end, message_id, article_number)
+    }
+
+    fn from_first_line(
+        buf: &[u8],
+        status: crate::protocol::StatusCode,
+        first_line_end: usize,
+        message_id: Range<usize>,
+        article_number: Option<u64>,
+    ) -> Result<Self, ParseError> {
+        let content_start = first_line_end
+            .checked_add(crate::protocol::CRLF.len())
+            .ok_or(ParseError::BufferTooShort)?;
+
+        let content = match status.as_u16() {
             220 => {
                 let separator_pos = find_blank_line(buf, content_start)?;
                 let headers_range = content_start..separator_pos;
                 Headers::parse(&buf[headers_range.clone()])?;
                 let body_range = separator_pos + 4..buf.len();
-                (Some(headers_range), Some(body_range))
+                ArticleContent::Article {
+                    headers: headers_range,
+                    body: body_range,
+                }
             }
             221 => {
                 if find_blank_line(buf, content_start).is_ok() {
@@ -72,17 +130,19 @@ impl ArticleLayout {
                 }
                 let headers_range = content_start..buf.len();
                 Headers::parse(&buf[headers_range.clone()])?;
-                (Some(headers_range), None)
+                ArticleContent::Head {
+                    headers: headers_range,
+                }
             }
             222 => {
                 let body_range = content_start..buf.len();
-                (None, Some(body_range))
+                ArticleContent::Body { body: body_range }
             }
             223 => {
                 if content_start < buf.len() {
                     return Err(ParseError::UnexpectedBody);
                 }
-                (None, None)
+                ArticleContent::Stat
             }
             _ => unreachable!("article status was checked above"),
         };
@@ -90,8 +150,7 @@ impl ArticleLayout {
         Ok(Self {
             message_id,
             article_number,
-            headers,
-            body,
+            content,
         })
     }
 
@@ -100,11 +159,13 @@ impl ArticleLayout {
     /// The validated article state therefore proves protocol semantics only;
     /// callers choose whether yEnc is relevant to their operation.
     pub(crate) fn validate_yenc(&self, buf: &[u8]) -> Result<(), ParseError> {
-        let Some(body) = &self.body else {
-            return Ok(());
+        let body = match &self.content {
+            ArticleContent::Article { body, .. } | ArticleContent::Body { body } => {
+                &buf[body.clone()]
+            }
+            ArticleContent::Head { .. } | ArticleContent::Stat => return Ok(()),
         };
-        let body = &buf[body.clone()];
-        if body.starts_with(b"=ybegin") {
+        if body.get(..b"=ybegin".len()) == Some(b"=ybegin") {
             validate_yenc_structure(body)?;
         }
         Ok(())
@@ -113,14 +174,22 @@ impl ArticleLayout {
     pub(crate) fn view<'a>(&self, buf: &'a [u8]) -> Article<'a> {
         let message_id = std::str::from_utf8(&buf[self.message_id.clone()])
             .expect("validated message ID remains UTF-8");
+        let (headers, body) = match &self.content {
+            ArticleContent::Article { headers, body } => (
+                Some(Headers::from_validated(&buf[headers.clone()])),
+                Some(&buf[body.clone()]),
+            ),
+            ArticleContent::Head { headers } => {
+                (Some(Headers::from_validated(&buf[headers.clone()])), None)
+            }
+            ArticleContent::Body { body } => (None, Some(&buf[body.clone()])),
+            ArticleContent::Stat => (None, None),
+        };
         Article {
             message_id: MessageId::from_validated(message_id),
             article_number: self.article_number,
-            headers: self
-                .headers
-                .clone()
-                .map(|range| Headers::from_validated(&buf[range])),
-            body: self.body.clone().map(|range| &buf[range]),
+            headers,
+            body,
         }
     }
 }
@@ -220,6 +289,7 @@ impl<'a> Article<'a> {
 }
 
 /// Parse status code from buffer
+#[cfg(test)]
 fn parse_status_code(buf: &[u8]) -> Result<u16, ParseError> {
     crate::protocol::StatusCode::parse(buf)
         .map(|sc| sc.as_u16())
@@ -315,6 +385,37 @@ mod tests {
         assert_eq!(article.article_number, Some(100));
         assert!(article.headers.is_some());
         assert!(article.body.is_some());
+    }
+
+    #[test]
+    fn framed_layout_reuses_the_proven_status_line_end() {
+        let buf = b"222 100 <test@example.com> body\r\nBody content\r\n";
+        let status_line_end = b"222 100 <test@example.com> body\r\n".len();
+        let parsed = ArticleLayout::parse(buf).unwrap();
+        let framed = ArticleLayout::parse_framed(
+            buf,
+            crate::protocol::StatusCode::new(222),
+            state::StatusLineEnd::new(status_line_end),
+        )
+        .unwrap();
+
+        assert_eq!(framed, parsed);
+        assert!(
+            ArticleLayout::parse_framed(
+                buf,
+                crate::protocol::StatusCode::new(222),
+                state::StatusLineEnd::new(status_line_end - 1),
+            )
+            .is_err()
+        );
+        assert_eq!(
+            ArticleLayout::parse_framed(
+                buf,
+                crate::protocol::StatusCode::new(430),
+                state::StatusLineEnd::new(status_line_end),
+            ),
+            Err(ParseError::InvalidStatusCode(430))
+        );
     }
 
     #[test]

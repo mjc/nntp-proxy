@@ -43,7 +43,7 @@ use crate::protocol::{
     ArticleView, RequestContext, StatusCode, YencValidation, article_request, body_request,
     head_request, stat_request,
 };
-use crate::session::backend::execute_request_receiving;
+use crate::session::backend::execute_request_exchange;
 use anyhow::{Context, Result};
 
 /// Standalone NNTP client for fetching articles
@@ -141,7 +141,7 @@ impl NntpClient {
     /// malformed or unexpected backend status codes.
     pub async fn stat(&self, message_id: &crate::types::MessageId<'_>) -> Result<bool> {
         let request = stat_request(message_id);
-        let mut conn = self
+        let conn = self
             .conn_pool
             .checkout_connection_guard()
             .await
@@ -149,22 +149,34 @@ impl NntpClient {
             .activate();
         let buffer = self.buffer_pool.acquire();
 
-        let response = execute_request_receiving(
-            &mut conn,
+        let mut exchange = execute_request_exchange(
+            conn,
             &request,
             buffer,
             &self.buffer_pool,
             crate::types::BackendId::from_index(0),
         )
         .await?;
-        let Some(status_code) = response.status_code() else {
+        let Some(status_code) = exchange.status_code() else {
+            exchange.fail_backend();
             anyhow::bail!("Invalid STAT response");
         };
 
         let result = Self::parse_stat_response(status_code);
         if result.is_ok() {
-            let _captured = response.capture_isolated().await?;
-            let _reusable = conn.complete_success();
+            let captured = exchange.receiving()?.capture_isolated().await;
+            let conn = exchange.into_connection();
+            match captured {
+                Ok(_captured) => {
+                    let _reusable = conn.complete_success();
+                }
+                Err(error) => {
+                    conn.fail_backend();
+                    return Err(error);
+                }
+            }
+        } else {
+            exchange.fail_backend();
         }
         result
     }
@@ -185,7 +197,7 @@ impl NntpClient {
     /// Returns any connection, write, read, or backend-status validation error
     /// encountered while fetching the NNTP response.
     async fn fetch_response(&self, request: RequestContext) -> Result<FramedArticle> {
-        let mut conn = self
+        let conn = self
             .conn_pool
             .checkout_connection_guard()
             .await
@@ -193,31 +205,34 @@ impl NntpClient {
             .activate();
         let io_buffer = self.buffer_pool.acquire();
 
-        let response = execute_request_receiving(
-            &mut conn,
+        let mut exchange = execute_request_exchange(
+            conn,
             &request,
             io_buffer,
             &self.buffer_pool,
             crate::types::BackendId::from_index(0),
         )
         .await?;
-        let Some(status_code) = response.status_code() else {
+        let Some(status_code) = exchange.status_code() else {
+            exchange.fail_backend();
             anyhow::bail!("Invalid response from server");
         };
 
         Self::validate_response(status_code)?;
 
-        let captured = match response.capture_isolated().await {
+        let captured = match exchange.receiving()?.capture_isolated().await {
             Ok(result) => result,
             Err(error) => {
-                conn.fail_backend();
+                exchange.into_connection().fail_backend();
                 return Err(error);
             }
         };
+        let conn = exchange.into_connection();
         let _reusable = conn.complete_success();
         Ok(FramedArticle::new(
             captured.kind(),
             captured.status(),
+            captured.status_line_end(),
             captured.into_bytes(),
         ))
     }
@@ -245,33 +260,39 @@ pub struct FramedArticle {
 }
 
 impl FramedArticle {
-    fn new(kind: crate::protocol::RequestKind, status: StatusCode, bytes: PooledBuffer) -> Self {
+    fn new(
+        kind: crate::protocol::RequestKind,
+        status: StatusCode,
+        status_line_end: crate::protocol::StatusLineEnd,
+        bytes: PooledBuffer,
+    ) -> Self {
         Self {
-            state: crate::protocol::ArticleState(crate::protocol::FramedArticleState {
+            state: crate::protocol::ArticleState::new(crate::protocol::FramedArticleState::new(
                 bytes,
                 kind,
                 status,
-            }),
+                status_line_end,
+            )),
         }
     }
 
     /// Request kind that produced this response.
     #[must_use]
     pub const fn kind(&self) -> crate::protocol::RequestKind {
-        self.state.0.kind
+        self.state.as_inner().kind()
     }
 
     /// Parsed status code established by the response framer.
     #[must_use]
     pub const fn status(&self) -> StatusCode {
-        self.state.0.status
+        self.state.as_inner().status()
     }
 
     /// Exact framed bytes, including the status line and excluding the
     /// multiline terminator.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        &self.state.0.bytes
+        self.state.as_inner().bytes().as_ref()
     }
 
     /// Validate NNTP article semantics and transition to reusable typed access.
@@ -286,23 +307,16 @@ impl FramedArticle {
 
     /// Validate NNTP semantics and apply the selected optional yEnc policy.
     pub fn validate_with_yenc(self, policy: YencValidation) -> Result<ValidatedArticle> {
-        let layout = crate::protocol::ArticleLayout::parse(self.as_bytes())?;
-        match policy {
-            YencValidation::Disabled => {}
-            YencValidation::Enabled => layout.validate_yenc(self.as_bytes())?,
-        }
+        let state = self.state.into_inner().validate(policy)?;
         Ok(ValidatedArticle {
-            state: crate::protocol::ArticleState(crate::protocol::ValidatedArticleState::new(
-                self.state.0.bytes,
-                layout,
-            )),
+            state: crate::protocol::ArticleState::new(state),
         })
     }
 
     /// Consume the framed owner and return its pooled storage.
     #[must_use]
     pub fn into_bytes(self) -> PooledBuffer {
-        self.state.0.bytes
+        self.state.into_inner().into_bytes()
     }
 }
 
@@ -316,19 +330,22 @@ impl ValidatedArticle {
     /// Return a reusable zero-copy article view without repeating validation.
     #[must_use]
     pub fn article(&self) -> ArticleView<'_> {
-        self.state.0.layout().view(self.state.0.bytes())
+        self.state
+            .as_inner()
+            .layout()
+            .view(self.state.as_inner().as_bytes())
     }
 
     /// Return the validated wire bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {
-        self.state.0.bytes()
+        self.state.as_inner().bytes()
     }
 
     /// Consume the validated state and return its pooled storage.
     #[must_use]
     pub fn into_bytes(self) -> PooledBuffer {
-        self.state.0.into_bytes()
+        self.state.into_inner().into_bytes()
     }
 }
 

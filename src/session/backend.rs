@@ -12,13 +12,16 @@
 //! should not rebuild command strings after request validation.
 
 use anyhow::Result;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncReadExt;
+#[cfg(test)]
+use tokio::io::AsyncWriteExt;
 
 use crate::pool::PooledBuffer;
 use crate::protocol::RequestContext;
 
 pub(crate) use crate::session::multiline_framing::BackendResponseOrder;
 
+pub(crate) use crate::session::multiline_framing::BackendResponseExchange;
 pub(crate) use crate::session::multiline_framing::ClassifiedResponse;
 pub(crate) use crate::session::multiline_framing::ReceivingResponse;
 
@@ -77,23 +80,6 @@ where
     }
 }
 
-/// Return the cache-wire terminator used when rendering stored multiline
-/// payloads back to a client.
-#[must_use]
-pub(crate) fn cached_response_completion() -> std::io::IoSlice<'static> {
-    crate::session::multiline_framing::cached_response_completion()
-}
-
-/// Return the payload body from a response that was already captured as a
-/// complete multiline payload.
-///
-/// This is a facade over the framer-owned payload split logic; cache code should
-/// not inspect multiline terminators directly.
-#[must_use]
-pub(crate) fn captured_multiline_payload_body(payload: &[u8]) -> Option<&[u8]> {
-    crate::session::multiline_framing::captured_multiline_payload_body(payload)
-}
-
 /// Capabilities response for the local proxy capability command.
 #[must_use]
 pub(crate) const fn capabilities_response(auth_enabled: bool) -> &'static [u8] {
@@ -142,7 +128,8 @@ pub fn format_hex_preview(data: &[u8], max_bytes: usize) -> String {
 
 // ─── Command execution ──────────────────────────────────────────────────────
 
-pub(crate) async fn execute_request_classified<C>(
+#[cfg(test)]
+async fn execute_request_classified<C>(
     conn: &mut C,
     request: &RequestContext,
     mut buffer: PooledBuffer,
@@ -158,6 +145,59 @@ where
     }
 
     ClassifiedResponse::read(conn, request, buffer).await
+}
+
+/// Execute a direct request and return the response bound to the connection
+/// that supplied it.  The exchange owns both values until a consuming
+/// forwarding, capture, or observation operation is selected.
+pub(crate) async fn execute_request_exchange<'pool>(
+    mut conn: crate::pool::ConnectionGuard,
+    request: &RequestContext,
+    mut buffer: PooledBuffer,
+    pool: &'pool crate::pool::BufferPool,
+    backend_id: crate::types::BackendId,
+) -> Result<BackendResponseExchange<'pool>> {
+    request.write_wire_to(conn.stream_mut()).await?;
+
+    let n = buffer.read_from(conn.stream_mut()).await?;
+    if n == 0 {
+        anyhow::bail!("Backend connection closed unexpectedly");
+    }
+
+    let response = ClassifiedResponse::read(conn.stream_mut(), request, buffer).await?;
+    Ok(BackendResponseExchange::new(
+        conn, response, pool, backend_id,
+    ))
+}
+
+/// Timed variant of [`execute_request_exchange`] used by the direct backend
+/// attempt sampler.
+pub(crate) async fn execute_request_exchange_timed<'pool>(
+    mut conn: crate::pool::ConnectionGuard,
+    request: &RequestContext,
+    mut buffer: PooledBuffer,
+    pool: &'pool crate::pool::BufferPool,
+    backend_id: crate::types::BackendId,
+) -> Result<(BackendResponseExchange<'pool>, u64, u64, u64)> {
+    use std::time::Instant;
+
+    let start = Instant::now();
+    request.write_wire_to(conn.stream_mut()).await?;
+    let after_send = Instant::now();
+
+    let n = buffer.read_from(conn.stream_mut()).await?;
+    if n == 0 {
+        anyhow::bail!("Backend connection closed unexpectedly");
+    }
+
+    let response = ClassifiedResponse::read(conn.stream_mut(), request, buffer).await?;
+    let after_recv = Instant::now();
+    Ok((
+        BackendResponseExchange::new(conn, response, pool, backend_id),
+        duration_micros_u64(after_recv.duration_since(start)),
+        duration_micros_u64(after_send.duration_since(start)),
+        duration_micros_u64(after_recv.duration_since(after_send)),
+    ))
 }
 
 /// Execute a request and retain the response together with the backend guard
@@ -176,8 +216,7 @@ pub(crate) async fn execute_request_receiving<'a>(
         anyhow::bail!("Backend connection closed unexpectedly");
     }
 
-    let response = ClassifiedResponse::read(conn.stream_mut(), request, buffer).await?;
-    Ok(response.receiving(conn, pool, backend_id))
+    ClassifiedResponse::read_receiving(conn, request, buffer, pool, backend_id).await
 }
 
 /// Execute a request and retain the response together with the backend guard,
@@ -202,14 +241,15 @@ pub(crate) async fn execute_request_receiving_timed<'a>(
         anyhow::bail!("Backend connection closed unexpectedly");
     }
 
-    let response = ClassifiedResponse::read(conn.stream_mut(), request, buffer).await?;
+    let response =
+        ClassifiedResponse::read_receiving(conn, request, buffer, pool, backend_id).await?;
     let after_recv = Instant::now();
     let send_elapsed = after_send.duration_since(start);
     let recv_elapsed = after_recv.duration_since(after_send);
     let elapsed = after_recv.duration_since(start);
 
     Ok((
-        response.receiving(conn, pool, backend_id),
+        response,
         duration_micros_u64(elapsed),
         duration_micros_u64(send_elapsed),
         duration_micros_u64(recv_elapsed),
@@ -235,41 +275,7 @@ pub(crate) async fn read_receiving_response_for_already_sent_request<'a>(
         }
     }
 
-    let response = ClassifiedResponse::read(conn.stream_mut(), request, buffer).await?;
-    Ok(response.receiving(conn, pool, backend_id))
-}
-
-pub(crate) async fn execute_request_classified_timed<C>(
-    conn: &mut C,
-    request: &RequestContext,
-    mut buffer: PooledBuffer,
-) -> Result<(ClassifiedResponse, u64, u64, u64)>
-where
-    C: AsyncReadExt + AsyncWriteExt + Unpin,
-{
-    use std::time::Instant;
-
-    let start = Instant::now();
-    request.write_wire_to(conn).await?;
-    let after_send = Instant::now();
-
-    let n = buffer.read_from(conn).await?;
-    if n == 0 {
-        anyhow::bail!("Backend connection closed unexpectedly");
-    }
-
-    let response = ClassifiedResponse::read(conn, request, buffer).await?;
-    let after_recv = Instant::now();
-    let send_elapsed = after_send.duration_since(start);
-    let recv_elapsed = after_recv.duration_since(after_send);
-    let elapsed = after_recv.duration_since(start);
-
-    Ok((
-        response,
-        duration_micros_u64(elapsed),
-        duration_micros_u64(send_elapsed),
-        duration_micros_u64(recv_elapsed),
-    ))
+    ClassifiedResponse::read_receiving(conn, request, buffer, pool, backend_id).await
 }
 
 #[cfg(test)]

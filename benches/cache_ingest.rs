@@ -145,3 +145,42 @@ mod chunked_ingest {
     bench_chunked_ingest!(chunked_article_64k_body, article_response(64 * 1024), 200);
     bench_chunked_ingest!(chunked_article_1mb_body, article_response(1024 * 1024), 50);
 }
+
+#[cfg(feature = "framing-bench")]
+mod framed_chunked_ingest {
+    use super::{
+        ArticleCache, BackendId, Bencher, Duration, MessageId, article_response, black_box,
+    };
+    use nntp_proxy::cache::CacheIngestResponse as PublicCacheIngestResponse;
+
+    #[divan::bench(sample_count = 200, sample_size = 100)]
+    fn article_64k_body(bencher: Bencher) {
+        bench_framed_article(bencher, article_response(64 * 1024));
+    }
+
+    #[divan::bench(sample_count = 50, sample_size = 20)]
+    fn article_1mb_body(bencher: Bencher) {
+        bench_framed_article(bencher, article_response(1024 * 1024));
+    }
+
+    fn bench_framed_article(bencher: Bencher, bytes: Vec<u8>) {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let cache = ArticleCache::new(16 * 1024 * 1024, Duration::from_secs(300));
+        bencher
+            .counter(divan::counter::BytesCount::new(bytes.len()))
+            .with_inputs(|| PublicCacheIngestResponse::benchmark_framed_article(&bytes))
+            .bench_values(|response| {
+                rt.block_on(async {
+                    let msg_id = MessageId::from_borrowed("<bench@example.com>").unwrap();
+                    cache
+                        .upsert_ingest(
+                            msg_id,
+                            black_box(response),
+                            BackendId::from_index(0),
+                            0.into(),
+                        )
+                        .await;
+                });
+            });
+    }
+}

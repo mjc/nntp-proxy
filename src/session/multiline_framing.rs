@@ -296,6 +296,11 @@ impl IncompleteResponseWindow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChunkConsumed(usize);
 
+/// Exclusive payload end from one scanner push, excluding the wire
+/// terminator. It is distinct from the response end consumed by the framer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkPayloadEnd(usize);
+
 /// Exclusive position in the current visible buffer, independent of physical
 /// allocation placement. This coordinate alone does not identify a buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,12 +310,16 @@ impl WindowEnd {
     fn after_chunk(self, consumed: ChunkConsumed) -> Self {
         Self(self.0 + consumed.0)
     }
+
+    fn after_payload_chunk(self, payload_end: ChunkPayloadEnd) -> Self {
+        Self(self.0 + payload_end.0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CompleteChunk {
     consumed: ChunkConsumed,
-    payload_end: ChunkConsumed,
+    payload_end: ChunkPayloadEnd,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -328,7 +337,7 @@ impl ChunkProgress {
                 let end = origin.after_chunk(complete.consumed);
                 ResponseWindow::Complete(CompleteResponseWindow {
                     response: 0..end.0,
-                    capture: 0..origin.after_chunk(complete.payload_end).0,
+                    capture: 0..origin.after_payload_chunk(complete.payload_end).0,
                     next_response_input: end.0..window_len,
                 })
             }
@@ -569,10 +578,12 @@ fn parse_response_status(chunk: &[u8]) -> ResponseStatusParse {
 enum ResponseFrame {
     SingleLine {
         status: crate::protocol::StatusCode,
+        status_line_end: crate::protocol::StatusLineEnd,
         framed: FramedSingleLineChunk,
     },
     Multiline {
         status: crate::protocol::StatusCode,
+        status_line_end: crate::protocol::StatusLineEnd,
     },
 }
 
@@ -596,11 +607,15 @@ impl ResponseFrame {
             return Err(ResponseReadError::Invalid(parsed.warnings));
         };
         if request.has_response_body(status) {
-            return Ok(Self::Multiline { status });
+            return Ok(Self::Multiline {
+                status,
+                status_line_end: crate::protocol::StatusLineEnd::new(status_line_end),
+            });
         }
 
         Ok(Self::SingleLine {
             status,
+            status_line_end: crate::protocol::StatusLineEnd::new(status_line_end),
             framed: FramedSingleLineChunk {
                 response: 0..status_line_end,
                 next_response_input: status_line_end..chunk.len(),
@@ -615,6 +630,97 @@ pub(crate) struct ClassifiedResponse {
     buffer: crate::pool::PooledBuffer,
     frame: Result<ResponseFrame, ResponseReadError>,
     kind: crate::protocol::RequestKind,
+}
+
+/// Owns a classified response and the backend connection that supplied it.
+///
+/// The response buffer and connection are deliberately moved together.  A
+/// caller can inspect the classification, then consume the exchange through
+/// `receiving()`; it cannot pair the classified bytes with another connection
+/// or forget which pool/window owns the continuation.
+pub(crate) struct BackendResponseExchange<'pool> {
+    conn: crate::pool::ConnectionGuard,
+    response: Option<ClassifiedResponse>,
+    pool: &'pool crate::pool::BufferPool,
+    backend_id: crate::types::BackendId,
+}
+
+impl<'pool> BackendResponseExchange<'pool> {
+    pub(crate) fn new(
+        conn: crate::pool::ConnectionGuard,
+        response: ClassifiedResponse,
+        pool: &'pool crate::pool::BufferPool,
+        backend_id: crate::types::BackendId,
+    ) -> Self {
+        Self {
+            conn,
+            response: Some(response),
+            pool,
+            backend_id,
+        }
+    }
+
+    pub(crate) fn status_code(&self) -> Option<crate::protocol::StatusCode> {
+        self.response
+            .as_ref()
+            .and_then(ClassifiedResponse::status_code)
+    }
+
+    pub(crate) const fn backend_id(&self) -> crate::types::BackendId {
+        self.backend_id
+    }
+
+    pub(crate) fn received_bytes(&self) -> &[u8] {
+        self.response
+            .as_ref()
+            .map_or(&[], ClassifiedResponse::received_bytes)
+    }
+
+    pub(crate) fn log_warnings(&self, client_addr: impl std::fmt::Display) {
+        if let Some(response) = &self.response {
+            response.log_warnings(client_addr, self.backend_id);
+        }
+    }
+
+    /// Start the sole consuming operation for this exchange.
+    ///
+    /// Taking the response out makes the transition one-shot.  The returned
+    /// operation borrows this exchange's connection, so the connection cannot
+    /// be released or replaced while framing/forwarding is in progress.
+    pub(crate) fn receiving(&mut self) -> anyhow::Result<ReceivingResponse<'_>> {
+        let response = self
+            .response
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("backend response operation already consumed"))?;
+        Ok(response.receiving(&mut self.conn, self.pool, self.backend_id))
+    }
+
+    /// Move out the backend connection after the response operation was taken.
+    ///
+    /// A successful connection handoff without first consuming the classified
+    /// response would leave unread protocol bytes behind. Keep that invalid
+    /// transition explicit at this boundary instead of relying on every caller
+    /// to remember the ordering rule.
+    #[inline]
+    pub(crate) fn into_connection(self) -> crate::pool::ConnectionGuard {
+        debug_assert!(
+            self.response.is_none(),
+            "cannot release a backend exchange before consuming its response"
+        );
+        self.conn
+    }
+
+    /// Discard an invalid or intentionally abandoned response while retaining
+    /// the connection for the caller's failure policy. This is distinct from a
+    /// successful handoff because the response was not consumed by the framer.
+    pub(crate) fn discard_response(self) -> crate::pool::ConnectionGuard {
+        self.conn
+    }
+
+    /// Retire an exchange whose response was never consumed.
+    pub(crate) fn fail_backend(self) {
+        self.conn.fail_backend();
+    }
 }
 
 impl ClassifiedResponse {
@@ -652,6 +758,22 @@ impl ClassifiedResponse {
         }
     }
 
+    /// Read and bind a response to the backend exchange that supplied it.
+    ///
+    /// Keeping the read and receiving transition together prevents callers
+    /// from pairing classified bytes with an unrelated connection, pool, or
+    /// backend identity after the response has been read.
+    pub(crate) async fn read_receiving<'a>(
+        conn: &'a mut crate::pool::ConnectionGuard,
+        request: &crate::protocol::RequestContext,
+        buffer: crate::pool::PooledBuffer,
+        pool: &'a crate::pool::BufferPool,
+        backend_id: crate::types::BackendId,
+    ) -> anyhow::Result<ReceivingResponse<'a>> {
+        let response = Self::read(conn.stream_mut(), request, buffer).await?;
+        Ok(response.receiving(conn, pool, backend_id))
+    }
+
     /// Bind the classified response to the same backend exchange that supplied
     /// its bytes. The resulting operation owns the only public path to
     /// forwarding, observation, or intentional capture.
@@ -661,7 +783,7 @@ impl ClassifiedResponse {
         pool: &'a crate::pool::BufferPool,
         backend_id: crate::types::BackendId,
     ) -> ReceivingResponse<'a> {
-        crate::protocol::ArticleState(ReceivingOperation {
+        crate::protocol::ArticleState::new(Receiving {
             response: self,
             conn,
             pool,
@@ -671,9 +793,21 @@ impl ClassifiedResponse {
 
     pub(crate) fn status_code(&self) -> Option<crate::protocol::StatusCode> {
         match &self.frame {
-            Ok(ResponseFrame::SingleLine { status, .. } | ResponseFrame::Multiline { status }) => {
-                Some(*status)
-            }
+            Ok(
+                ResponseFrame::SingleLine { status, .. } | ResponseFrame::Multiline { status, .. },
+            ) => Some(*status),
+            Err(_) => None,
+        }
+    }
+
+    fn status_line_end(&self) -> Option<crate::protocol::StatusLineEnd> {
+        match &self.frame {
+            Ok(ResponseFrame::SingleLine {
+                status_line_end, ..
+            })
+            | Ok(ResponseFrame::Multiline {
+                status_line_end, ..
+            }) => Some(*status_line_end),
             Err(_) => None,
         }
     }
@@ -804,7 +938,7 @@ impl ClassifiedResponse {
 ///
 /// The borrow ties the response's continuation, pooled bytes, and connection
 /// together until one consuming operation completes or retires the exchange.
-pub(crate) struct ReceivingOperation<'a> {
+pub(crate) struct Receiving<'a> {
     response: ClassifiedResponse,
     conn: &'a mut crate::pool::ConnectionGuard,
     pool: &'a crate::pool::BufferPool,
@@ -812,15 +946,12 @@ pub(crate) struct ReceivingOperation<'a> {
 }
 
 /// An active response operation bound to the connection that supplied it.
-pub(crate) type ReceivingResponse<'a> = crate::protocol::ArticleState<ReceivingOperation<'a>>;
+pub(crate) type ReceivingResponse<'a> = crate::protocol::ArticleState<Receiving<'a>>;
 
 /// An intentionally captured response that retains the bytes produced by the
 /// framer. The status, request shape, and owner travel together.
-pub(crate) struct CapturedResponse {
-    state: crate::protocol::ArticleState<
-        crate::protocol::FramedArticleState<crate::pool::PooledBuffer>,
-    >,
-}
+type CapturedResponse =
+    crate::protocol::ArticleState<crate::protocol::FramedArticleState<crate::pool::PooledBuffer>>;
 
 /// A retained response whose cache payload boundary was established by the
 /// framer. The cache adapter receives this state instead of re-scanning the
@@ -836,54 +967,43 @@ impl CapturedChunkedResponse {
     fn new(
         kind: crate::protocol::RequestKind,
         status: crate::protocol::StatusCode,
+        status_line_end: crate::protocol::StatusLineEnd,
         bytes: crate::pool::ChunkedResponse,
         payload_end: crate::cache::CachePayloadEnd,
     ) -> Self {
         debug_assert!(payload_end.as_usize() <= bytes.len());
         Self {
-            state: crate::protocol::ArticleState(crate::protocol::FramedArticleState {
+            state: crate::protocol::ArticleState::new(crate::protocol::FramedArticleState::new(
                 bytes,
                 kind,
                 status,
-            }),
+                status_line_end,
+            )),
             payload_end,
         }
     }
 
     pub(crate) fn into_cache_ingest(self) -> crate::cache::CacheIngestResponse {
         let Self { state, payload_end } = self;
-        let crate::protocol::ArticleState(crate::protocol::FramedArticleState {
+        let framed = state.into_inner();
+        let status = framed.status();
+        let status_line_end = framed.status_line_end();
+        let bytes = framed.into_bytes();
+        crate::cache::CacheIngestResponse::from_framed_chunked(
             bytes,
             status,
-            ..
-        }) = state;
-        crate::cache::CacheIngestResponse::from_framed_chunked(bytes, status, payload_end)
+            status_line_end,
+            payload_end,
+        )
     }
 
     #[must_use]
     pub(crate) fn len(&self) -> usize {
-        self.state.0.bytes.len()
+        self.state.as_inner().bytes().len()
     }
 }
 
-impl CapturedResponse {
-    #[must_use]
-    pub(crate) const fn kind(&self) -> crate::protocol::RequestKind {
-        self.state.0.kind
-    }
-
-    #[must_use]
-    pub(crate) const fn status(&self) -> crate::protocol::StatusCode {
-        self.state.0.status
-    }
-
-    #[must_use]
-    pub(crate) fn into_bytes(self) -> crate::pool::PooledBuffer {
-        self.state.0.bytes
-    }
-}
-
-impl ReceivingOperation<'_> {
+impl Receiving<'_> {
     #[must_use]
     pub(crate) fn status_code(&self) -> Option<crate::protocol::StatusCode> {
         self.response.status_code()
@@ -912,14 +1032,13 @@ impl ReceivingOperation<'_> {
         let status = response
             .status_code()
             .ok_or_else(|| anyhow::anyhow!("cannot capture invalid backend response"))?;
+        let status_line_end = response
+            .status_line_end()
+            .ok_or_else(|| anyhow::anyhow!("cannot capture invalid backend response"))?;
         let bytes = response.capture_isolated(conn, pool).await?;
-        Ok(CapturedResponse {
-            state: crate::protocol::ArticleState(crate::protocol::FramedArticleState {
-                bytes,
-                kind,
-                status,
-            }),
-        })
+        Ok(crate::protocol::ArticleState::new(
+            crate::protocol::FramedArticleState::new(bytes, kind, status, status_line_end),
+        ))
     }
 
     pub(crate) async fn capture_isolated_chunked_optional(
@@ -1003,6 +1122,11 @@ impl ReceivingOperation<'_> {
                 "cannot retain an invalid backend response"
             ))
         })?;
+        let status_line_end = response.status_line_end().ok_or_else(|| {
+            crate::session::response_transfer::ResponseTransferError::Io(anyhow::anyhow!(
+                "cannot retain an invalid backend response"
+            ))
+        })?;
         let result = response
             .stream(conn.stream_mut(), pool, backend_id)?
             .capture_and_write(writer, captured, MAX_CAPTURED_MULTILINE_RESPONSE_BYTES)
@@ -1012,20 +1136,26 @@ impl ReceivingOperation<'_> {
         Ok((
             bytes_written,
             payload_end.map(|payload_end| {
-                CapturedChunkedResponse::new(kind, status, std::mem::take(captured), payload_end)
+                CapturedChunkedResponse::new(
+                    kind,
+                    status,
+                    status_line_end,
+                    std::mem::take(captured),
+                    payload_end,
+                )
             }),
         ))
     }
 }
 
-impl crate::protocol::ArticleState<ReceivingOperation<'_>> {
+impl crate::protocol::ArticleState<Receiving<'_>> {
     #[must_use]
     pub(crate) fn status_code(&self) -> Option<crate::protocol::StatusCode> {
-        self.0.status_code()
+        self.as_inner().status_code()
     }
 
     pub(crate) fn single_line_bytes(&self) -> Option<&[u8]> {
-        self.0.single_line_bytes()
+        self.as_inner().single_line_bytes()
     }
 
     pub(crate) fn log_warnings(
@@ -1033,39 +1163,41 @@ impl crate::protocol::ArticleState<ReceivingOperation<'_>> {
         client_addr: impl std::fmt::Display,
         backend_id: crate::types::BackendId,
     ) {
-        self.0.log_warnings(client_addr, backend_id);
+        self.as_inner().log_warnings(client_addr, backend_id);
     }
 
     pub(crate) async fn capture_isolated(self) -> anyhow::Result<CapturedResponse> {
-        self.0.capture_isolated().await
+        self.into_inner().capture_isolated().await
     }
 
     pub(crate) async fn capture_isolated_chunked_optional(
         self,
         captured: &mut crate::pool::ChunkedResponse,
     ) -> anyhow::Result<bool> {
-        self.0.capture_isolated_chunked_optional(captured).await
+        self.into_inner()
+            .capture_isolated_chunked_optional(captured)
+            .await
     }
 
     pub(crate) async fn observe_isolated(self) -> anyhow::Result<()> {
-        self.0.observe_isolated().await
+        self.into_inner().observe_isolated().await
     }
 
     pub(crate) fn complete_single_line(self) -> anyhow::Result<()> {
-        self.0.complete_single_line()
+        self.into_inner().complete_single_line()
     }
 
     pub(crate) async fn write<W: AsyncWrite + Unpin>(
         self,
         writer: &mut W,
     ) -> Result<u64, crate::session::response_transfer::ResponseTransferError> {
-        self.0.write(writer).await
+        self.into_inner().write(writer).await
     }
 
     pub(crate) async fn observe(
         self,
     ) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
-        self.0.observe().await
+        self.into_inner().observe().await
     }
 
     pub(crate) async fn capture_and_write<W: AsyncWrite + Unpin>(
@@ -1076,7 +1208,7 @@ impl crate::protocol::ArticleState<ReceivingOperation<'_>> {
         (u64, Option<CapturedChunkedResponse>),
         crate::session::response_transfer::ResponseTransferError,
     > {
-        self.0.capture_and_write(writer, captured).await
+        self.into_inner().capture_and_write(writer, captured).await
     }
 }
 
@@ -1418,14 +1550,12 @@ impl<'a> StreamingResponse<'a> {
                 );
             }
         };
-        let origin = WindowEnd(appended.previous_len());
-        let new_bytes = appended.as_new_bytes();
-        self.bytes_received += new_bytes.len() as u64;
+        let new_len = appended.as_new_bytes().len();
+        self.bytes_received += new_len as u64;
         self.frame = self
             .framer
-            .split_chunk(new_bytes, PackedPendingBytesPolicy::AllowIfStatusPrefix)
-            .expect("pending bytes policy cannot reject trailing bytes")
-            .in_window(origin, origin.0 + new_bytes.len());
+            .split_appended(appended, PackedPendingBytesPolicy::AllowIfStatusPrefix)
+            .expect("pending bytes policy cannot reject trailing bytes");
         Ok(())
     }
 
@@ -1661,6 +1791,24 @@ impl MultilineFramer {
             .map(|progress| progress.in_window(WindowEnd(0), chunk.len()))
     }
 
+    /// Frame bytes appended to a retained response window.
+    ///
+    /// The append result owns the same buffer that supplied the bytes and
+    /// records the logical end before the read. Consuming it prevents a
+    /// stale appended view from surviving the framing transition. Keeping
+    /// coordinate translation here also prevents a caller from pairing an
+    /// arbitrary origin with an unrelated appended slice.
+    fn split_appended(
+        &mut self,
+        appended: crate::pool::buffer::AppendedRead<'_>,
+        suffix_policy: PackedPendingBytesPolicy,
+    ) -> Result<ResponseWindow, FramingError> {
+        let origin = WindowEnd(appended.previous_len());
+        let new_bytes = appended.as_new_bytes();
+        self.split_chunk(new_bytes, suffix_policy)
+            .map(|progress| progress.in_window(origin, origin.0 + new_bytes.len()))
+    }
+
     /// Update tail with the last bytes from a chunk
     ///
     /// Maintains the last `TERMINATOR_TAIL_SIZE` bytes of the concatenation of
@@ -1702,7 +1850,7 @@ impl MultilineFramer {
             {
                 return Ok(ChunkProgress::Complete(CompleteChunk {
                     consumed: ChunkConsumed(end),
-                    payload_end: ChunkConsumed(0),
+                    payload_end: ChunkPayloadEnd(0),
                 }));
             }
             if matches!(suffix_policy, PackedPendingBytesPolicy::Reject) {
@@ -1713,7 +1861,7 @@ impl MultilineFramer {
             if end == chunk.len() {
                 return Ok(ChunkProgress::Complete(CompleteChunk {
                     consumed: ChunkConsumed(end),
-                    payload_end: ChunkConsumed(
+                    payload_end: ChunkPayloadEnd(
                         end.checked_sub(TERMINATOR.len())
                             .expect("complete multiline response includes its terminator"),
                     ),
@@ -1729,7 +1877,7 @@ impl MultilineFramer {
                 {
                     return Ok(ChunkProgress::Complete(CompleteChunk {
                         consumed: ChunkConsumed(end),
-                        payload_end: ChunkConsumed(
+                        payload_end: ChunkPayloadEnd(
                             end.checked_sub(TERMINATOR.len())
                                 .expect("complete multiline response includes its terminator"),
                         ),
@@ -2412,6 +2560,7 @@ mod tests {
         let captured = CapturedChunkedResponse::new(
             crate::protocol::RequestKind::Body,
             crate::protocol::StatusCode::new(222),
+            crate::protocol::StatusLineEnd::new(status_line_len(response).unwrap()),
             captured,
             payload_end,
         );
@@ -3661,7 +3810,7 @@ mod tests {
             split,
             Ok(ChunkProgress::Complete(CompleteChunk {
                 consumed: ChunkConsumed(b"220 article\r\nbody\r\n.\r\n".len()),
-                payload_end: ChunkConsumed(b"220 article\r\nbody".len()),
+                payload_end: ChunkPayloadEnd(b"220 article\r\nbody".len()),
             }))
         );
     }
@@ -3677,7 +3826,7 @@ mod tests {
             split,
             Ok(ChunkProgress::Complete(CompleteChunk {
                 consumed: ChunkConsumed(b"220 article\r\nbody\r\n.\r\n".len()),
-                payload_end: ChunkConsumed(b"220 article\r\nbody".len()),
+                payload_end: ChunkPayloadEnd(b"220 article\r\nbody".len()),
             }))
         );
     }
@@ -3703,7 +3852,7 @@ mod tests {
             split,
             Ok(ChunkProgress::Complete(CompleteChunk {
                 consumed: ChunkConsumed(chunk.len()),
-                payload_end: ChunkConsumed(chunk.len() - TERMINATOR.len()),
+                payload_end: ChunkPayloadEnd(chunk.len() - TERMINATOR.len()),
             }))
         );
     }
@@ -3719,7 +3868,7 @@ mod tests {
             split,
             Ok(ChunkProgress::Complete(CompleteChunk {
                 consumed: ChunkConsumed(b".\r\n".len()),
-                payload_end: ChunkConsumed(0),
+                payload_end: ChunkPayloadEnd(0),
             }))
         );
     }

@@ -80,6 +80,7 @@ pub enum CacheIngestResponse {
 pub struct FramedChunkedResponse {
     response: crate::pool::ChunkedResponse,
     status: StatusCode,
+    status_line_end: crate::protocol::StatusLineEnd,
     payload_end: CachePayloadEnd,
 }
 
@@ -131,14 +132,45 @@ impl CacheIngestResponse {
     pub(crate) fn from_framed_chunked(
         response: crate::pool::ChunkedResponse,
         status: StatusCode,
+        status_line_end: crate::protocol::StatusLineEnd,
         payload_end: CachePayloadEnd,
     ) -> Self {
         debug_assert!(payload_end.as_usize() <= response.len());
         Self::FramedChunked(FramedChunkedResponse {
             response,
             status,
+            status_line_end,
             payload_end,
         })
+    }
+
+    /// Construct a representative framer-bounded article capture for the
+    /// cache-ingest benchmark without exposing cache boundary coordinates.
+    #[cfg(feature = "framing-bench")]
+    #[doc(hidden)]
+    pub fn benchmark_framed_article(bytes: &[u8]) -> Self {
+        const BENCHMARK_CHUNK_BYTES: usize = 4096;
+        let buffer_size = crate::types::BufferSize::try_new(BENCHMARK_CHUNK_BYTES)
+            .expect("benchmark chunk size is valid");
+        let chunk_count = bytes.len().div_ceil(BENCHMARK_CHUNK_BYTES).max(1);
+        let pool = crate::pool::BufferPool::new(buffer_size, 1)
+            .with_capture_pool(BENCHMARK_CHUNK_BYTES, chunk_count);
+        let mut response = crate::pool::ChunkedResponse::default();
+        for chunk in bytes.chunks(BENCHMARK_CHUNK_BYTES) {
+            let mut buffer = pool.acquire_capture();
+            buffer.copy_from_slice(chunk);
+            let chunk_len = chunk.len();
+            response.push_buffer_range(buffer, 0..chunk_len);
+        }
+        let status_line_end = memchr::memmem::find(bytes, b"\r\n")
+            .map(|end| crate::protocol::StatusLineEnd::new(end + 2))
+            .expect("benchmark response has a status line");
+        let payload_end = CachePayloadEnd::new(
+            bytes.len().checked_sub(3).expect("multiline terminator"),
+            bytes.len(),
+        )
+        .expect("payload fits benchmark response");
+        Self::from_framed_chunked(response, StatusCode::new(220), status_line_end, payload_end)
     }
 
     #[cfg(test)]

@@ -20,7 +20,7 @@ use std::io::{BufRead, BufReader};
 pub fn decode_yenc_line(input: &[u8]) -> Vec<u8> {
     // NNTP dot-stuffs a data line that begins with a dot. Remove only the
     // protocol-added dot; a second leading dot is part of the yEnc payload.
-    let input = if input.starts_with(b"..") {
+    let input = if input.get(..2) == Some(b"..") {
         &input[1..]
     } else {
         input

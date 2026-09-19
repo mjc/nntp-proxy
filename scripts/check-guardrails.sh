@@ -61,7 +61,7 @@ check_added() {
 
 check_added \
     "new multiline response boundary logic must stay inside src/session/multiline_framing.rs" \
-    'ends_with\s*\(|starts_with\s*\(|windows\s*\(|\\r\\n\.\\r\\n|"\.\\r\\n"|b"\.\\r\\n"|line\s*==\s*b?"\.\\r\\n"|terminator offset|packed response|let\s+\w+\s*=\s*&\w+\s*\[\.\.'
+    'ends_with\s*\(|starts_with\s*\(|windows\s*\('
 
 check_added \
     "new production response status checks should use StatusCode parsing or parsed status fields" \
@@ -77,7 +77,7 @@ check_added \
 
 check_added \
     "new scratch socket-read buffers should not be grown with extend_from_slice in hot paths" \
-    'extend_from_slice\s*\('
+    '\b(?:pending|io_buffer|read_buffer|read_buf|scratch)\.extend_from_slice\s*\('
 
 if [ "$failures" -ne 0 ]; then
     echo

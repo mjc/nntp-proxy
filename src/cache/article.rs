@@ -12,6 +12,8 @@ use crate::router::BackendCount;
 use crate::types::{BackendId, MessageId};
 use moka::Entry;
 use moka::future::Cache;
+use smallvec::SmallVec;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -156,7 +158,7 @@ enum CachedResponseWirePayload<'a> {
 
 impl CachedResponseWire<'_> {
     fn response_completion() -> std::io::IoSlice<'static> {
-        crate::session::backend::cached_response_completion()
+        crate::session::multiline_framing::cached_response_completion()
     }
 
     fn response_completion_len() -> usize {
@@ -436,10 +438,10 @@ impl CachedArticle {
         let super::FramedChunkedResponse {
             response,
             status,
+            status_line_end,
             payload_end,
         } = response;
-        let bytes = response.to_vec();
-        let payload = parse_framed_payload(status, &bytes[..payload_end.as_usize()]);
+        let payload = parse_framed_chunked_payload(status, status_line_end, &response, payload_end);
         Self {
             backend_availability: ArticleAvailability::new(),
             status_code: status,
@@ -717,7 +719,7 @@ pub(crate) fn cached_response_for_payload<'a>(
 
 pub(crate) fn parse_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPayload {
     let code = status_code.as_u16();
-    if code == 430 {
+    if status_code == StatusCode::new(430) {
         return CachedPayload::Missing;
     }
     let Some(status_end) = memchr::memmem::find(buffer, b"\r\n").map(|pos| pos + 2) else {
@@ -733,22 +735,94 @@ pub(crate) fn parse_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPay
     payload_for_status(code, article_number, payload)
 }
 
-/// Parse a response whose complete boundary was established by the session
-/// framer. Unlike [`parse_payload`], this must not search for a terminator a
-/// second time; `buffer` ends at the framer-provided cache payload boundary.
-pub(crate) fn parse_framed_payload(status_code: StatusCode, buffer: &[u8]) -> CachedPayload {
+/// Parse a framer-bounded chunked capture without flattening the response.
+///
+/// The framer has already established `payload_end`; this adapter only copies
+/// the semantic cache sections into their final `Arc<[u8]>` owners.
+pub(crate) fn parse_framed_chunked_payload(
+    status_code: StatusCode,
+    status_line_end: crate::protocol::StatusLineEnd,
+    response: &crate::pool::ChunkedResponse,
+    payload_end: super::CachePayloadEnd,
+) -> CachedPayload {
     let code = status_code.as_u16();
-    if code == 430 {
+    if status_code == StatusCode::new(430) {
         return CachedPayload::Missing;
     }
-    let Some(status_end) = memchr::memmem::find(buffer, b"\r\n").map(|pos| pos + 2) else {
+
+    let status_end = status_line_end.get();
+    let mut status_line = SmallVec::<[u8; 128]>::new();
+    response.copy_prefix_into(status_end, &mut status_line);
+    if status_line.len() != status_end {
         return CachedPayload::AvailabilityOnly;
+    }
+    let article_number = parse_article_number(&status_line);
+    if code == 223 {
+        return CachedPayload::Stat { article_number };
+    }
+    if !matches!(code, 220..=222) {
+        return CachedPayload::AvailabilityOnly;
+    }
+
+    let payload = copy_payload_bytes(response, status_end..payload_end.as_usize());
+    payload_for_status_owned(code, article_number, payload)
+}
+
+fn copy_payload_bytes(response: &crate::pool::ChunkedResponse, range: Range<usize>) -> Vec<u8> {
+    let Some(length) = range.end.checked_sub(range.start) else {
+        return Vec::new();
     };
-    let article_number = parse_article_number(&buffer[..status_end]);
-    let payload = &buffer[status_end..];
+    let mut copied = Vec::with_capacity(length);
+    let mut chunk_start = 0;
+    for chunk in response.iter_chunks() {
+        let chunk_end = chunk_start + chunk.len();
+        if range.start < chunk_end && range.end > chunk_start {
+            let start = range.start.saturating_sub(chunk_start);
+            let end = (range.end - chunk_start).min(chunk.len());
+            let bytes = &chunk[start..end];
+            let copied_start = copied.len();
+            copied.resize(copied_start + bytes.len(), 0);
+            copied[copied_start..].copy_from_slice(bytes);
+        }
+        chunk_start = chunk_end;
+        if chunk_start >= range.end {
+            break;
+        }
+    }
+    copied
+}
+
+fn payload_for_status_owned(
+    code: u16,
+    article_number: Option<CachedArticleNumber>,
+    mut payload: Vec<u8>,
+) -> CachedPayload {
     match code {
-        220..=222 => payload_for_status(code, article_number, payload),
-        223 => CachedPayload::Stat { article_number },
+        220 => {
+            if let Some(split) = memchr::memmem::find(&payload, b"\r\n\r\n") {
+                let body = payload.split_off(split + 4);
+                payload.truncate(split + 2);
+                CachedPayload::Article {
+                    article_number,
+                    headers: Arc::from(payload.into_boxed_slice()),
+                    body: Arc::from(body.into_boxed_slice()),
+                }
+            } else {
+                CachedPayload::Article {
+                    article_number,
+                    headers: Arc::from([]),
+                    body: Arc::from(payload.into_boxed_slice()),
+                }
+            }
+        }
+        221 => CachedPayload::Head {
+            article_number,
+            headers: Arc::from(payload.into_boxed_slice()),
+        },
+        222 => CachedPayload::Body {
+            article_number,
+            body: Arc::from(payload.into_boxed_slice()),
+        },
         _ => CachedPayload::AvailabilityOnly,
     }
 }
@@ -757,13 +831,13 @@ pub(crate) fn parse_framed_payload(status_code: StatusCode, buffer: &[u8]) -> Ca
 ///
 /// ARTICLE/HEAD/BODY payloads arrive here only after the session framer has
 /// captured a complete response. Cache parsing delegates multiline payload body
-/// extraction back through the backend facade instead of performing response
-/// boundary checks locally.
+/// extraction back to the owning framer instead of performing response boundary
+/// checks locally.
 fn captured_payload_body_for_status(code: u16, payload: &[u8]) -> Option<&[u8]> {
     if !matches!(code, 220..=222) {
         return Some(payload);
     }
-    crate::session::backend::captured_multiline_payload_body(payload)
+    crate::session::multiline_framing::captured_multiline_payload_body(payload)
 }
 
 fn payload_for_status(
@@ -1793,6 +1867,41 @@ mod tests {
         let entry = CachedArticle::from_ingest_response_with_tier(response, ttl::CacheTier::new(0));
 
         assert_eq!(entry.status_code(), StatusCode::new(220));
+        match entry.payload {
+            CachedPayload::Article { headers, body, .. } => {
+                assert_eq!(headers.as_ref(), b"Subject: Test\r\n");
+                assert_eq!(body.as_ref(), b"Body\r\n");
+            }
+            other => panic!("expected article payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cached_article_ingests_framer_bounded_chunked_response() {
+        let wire = b"220 7 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n";
+        let pool = crate::pool::BufferPool::new(
+            crate::types::BufferSize::try_new(1024).expect("valid buffer size"),
+            1,
+        )
+        .with_capture_pool(wire.len(), 1);
+        let mut response = crate::pool::ChunkedResponse::default();
+        let mut buffer = pool.acquire_capture();
+        buffer.copy_from_slice(wire);
+        response.push_buffer_range(buffer, 0..wire.len());
+        let status_line_end =
+            crate::protocol::StatusLineEnd::new(b"220 7 <test@example.com>\r\n".len());
+        let payload_end = crate::cache::CachePayloadEnd::new(wire.len(), wire.len())
+            .expect("payload is within captured response");
+        let input = crate::cache::CacheIngestResponse::from_framed_chunked(
+            response,
+            StatusCode::new(220),
+            status_line_end,
+            payload_end,
+        );
+
+        let entry = CachedArticle::from_ingest_response_with_tier(input, ttl::CacheTier::new(0));
+
+        assert_eq!(entry.article_number(), Some(CachedArticleNumber::new(7)));
         match entry.payload {
             CachedPayload::Article { headers, body, .. } => {
                 assert_eq!(headers.as_ref(), b"Subject: Test\r\n");

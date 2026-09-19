@@ -21,7 +21,9 @@ use std::io::{Read, Write};
 use std::mem::size_of;
 
 use super::AvailabilitySlot;
-use super::article::{CachedArticleNumber, CachedPayload, parse_framed_payload, parse_payload};
+use super::article::{
+    CachedArticleNumber, CachedPayload, parse_framed_chunked_payload, parse_payload,
+};
 use super::availability::ArticleAvailability;
 use super::ttl;
 
@@ -511,11 +513,11 @@ impl DiskCachedArticle {
         let super::FramedChunkedResponse {
             response,
             status,
+            status_line_end,
             payload_end,
         } = response;
         let status_code = CacheableStatusCode::try_from(status.as_u16()).ok()?;
-        let bytes = response.to_vec();
-        let payload = parse_framed_payload(status, &bytes[..payload_end.as_usize()]);
+        let payload = parse_framed_chunked_payload(status, status_line_end, &response, payload_end);
 
         Some(Self {
             status_code,
