@@ -432,18 +432,66 @@ impl FramedSingleLineChunk {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FramedResponseForRequest {
-    response: Range<usize>,
+    response: BackendChunkRange,
 }
 
 impl FramedResponseForRequest {
     #[must_use]
     fn backend_bytes<'a>(&self, source: &'a [u8]) -> &'a [u8] {
-        &source[self.response.clone()]
+        self.response.slice(source)
     }
 
     #[must_use]
-    fn consumed(&self) -> usize {
-        self.response.end
+    fn end(&self) -> BackendChunkEnd {
+        self.response.end()
+    }
+}
+
+/// Exclusive end position within the backend read currently being tracked.
+///
+/// This coordinate is relative to one `accept_backend_bytes` input slice. It
+/// is not a response-window coordinate and cannot be passed to the multiline
+/// framer without an explicit conversion inside this module.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackendChunkEnd(usize);
+
+impl BackendChunkEnd {
+    #[must_use]
+    const fn new(value: usize) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    const fn get(self) -> usize {
+        self.0
+    }
+
+    #[must_use]
+    fn after(self, consumed: ChunkConsumed) -> Self {
+        Self(self.0 + consumed.0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BackendChunkRange {
+    start: BackendChunkEnd,
+    end: BackendChunkEnd,
+}
+
+impl BackendChunkRange {
+    #[must_use]
+    const fn new(start: BackendChunkEnd, end: BackendChunkEnd) -> Self {
+        Self { start, end }
+    }
+
+    #[must_use]
+    fn slice(self, source: &[u8]) -> &[u8] {
+        &source[self.start.get()..self.end.get()]
+    }
+
+    #[must_use]
+    const fn end(self) -> BackendChunkEnd {
+        self.end
     }
 }
 
@@ -2079,19 +2127,19 @@ impl BackendReplyTracker {
         chunk: &'a [u8],
     ) -> smallvec::SmallVec<[BackendReplyBytes<'a>; 4]> {
         let mut output = smallvec::SmallVec::new();
-        let mut offset = 0;
+        let mut offset = BackendChunkEnd::new(0);
 
-        while offset < chunk.len() {
+        while offset.get() < chunk.len() {
             let Some(front) = self.pending.front_mut() else {
-                output.push(BackendReplyBytes::ForwardUntracked(&chunk[offset..]));
+                output.push(BackendReplyBytes::ForwardUntracked(&chunk[offset.get()..]));
                 break;
             };
             let Some(framed) = front.consume(chunk, offset) else {
-                output.push(BackendReplyBytes::ForwardUntracked(&chunk[offset..]));
+                output.push(BackendReplyBytes::ForwardUntracked(&chunk[offset.get()..]));
                 break;
             };
 
-            offset = framed.consumed();
+            offset = framed.end();
             output.push(BackendReplyBytes::CompletedTrackedReply(
                 framed.backend_bytes(chunk),
             ));
@@ -2103,68 +2151,82 @@ impl BackendReplyTracker {
 }
 
 impl PendingRequestFrame {
-    fn consume(&mut self, chunk: &[u8], offset: usize) -> Option<FramedResponseForRequest> {
+    fn consume(
+        &mut self,
+        chunk: &[u8],
+        offset: BackendChunkEnd,
+    ) -> Option<FramedResponseForRequest> {
+        let offset_bytes = &chunk[offset.get()..];
         match &mut self.state {
             PendingRequestFrameState::AwaitingStatusLine => {
-                let Some(pos) = memchr::memchr(b'\n', &chunk[offset..]) else {
-                    if self.status_line.len() + chunk[offset..].len()
+                let Some(pos) = memchr::memchr(b'\n', offset_bytes) else {
+                    if self.status_line.len() + offset_bytes.len()
                         > crate::constants::buffer::COMMAND
                     {
                         return Some(FramedResponseForRequest {
-                            response: offset..chunk.len(),
+                            response: BackendChunkRange::new(
+                                offset,
+                                BackendChunkEnd::new(chunk.len()),
+                            ),
                         });
                     }
-                    self.status_line.extend_from_slice(&chunk[offset..]);
+                    self.status_line.extend_from_slice(offset_bytes);
                     return None;
                 };
-                let end = offset + pos + 1;
-                if self.status_line.len() + end - offset > crate::constants::buffer::COMMAND {
+                let end = offset.after(ChunkConsumed(pos + 1));
+                if self.status_line.len() + end.get() - offset.get()
+                    > crate::constants::buffer::COMMAND
+                {
                     return Some(FramedResponseForRequest {
-                        response: offset..end,
+                        response: BackendChunkRange::new(offset, end),
                     });
                 }
-                self.status_line.extend_from_slice(&chunk[offset..end]);
+                self.status_line
+                    .extend_from_slice(&chunk[offset.get()..end.get()]);
                 let Some(status) = crate::protocol::StatusCode::parse(self.status_line.as_slice())
                 else {
                     return Some(FramedResponseForRequest {
-                        response: offset..end,
+                        response: BackendChunkRange::new(offset, end),
                     });
                 };
                 if !crate::protocol::request_kind_has_response_body(self.kind, status) {
                     return Some(FramedResponseForRequest {
-                        response: offset..end,
+                        response: BackendChunkRange::new(offset, end),
                     });
                 }
 
                 let mut framer = MultilineFramer::default();
                 framer.update(self.status_line.as_slice());
                 self.status_line.clear();
-                match framer
-                    .split_chunk(&chunk[end..], PackedPendingBytesPolicy::AllowIfStatusPrefix)
-                {
+                match framer.split_chunk(
+                    &chunk[end.get()..],
+                    PackedPendingBytesPolicy::AllowIfStatusPrefix,
+                ) {
                     Ok(ChunkProgress::Complete(complete)) => Some(FramedResponseForRequest {
-                        response: offset..FrameEnd(end).after_chunk(complete.consumed).0,
+                        response: BackendChunkRange::new(
+                            offset,
+                            BackendChunkEnd::new(end.get()).after(complete.consumed),
+                        ),
                     }),
                     Ok(ChunkProgress::Incomplete) => {
                         self.state = PendingRequestFrameState::ReadingMultiline { framer };
                         None
                     }
                     Err(_) => Some(FramedResponseForRequest {
-                        response: offset..chunk.len(),
+                        response: BackendChunkRange::new(offset, BackendChunkEnd::new(chunk.len())),
                     }),
                 }
             }
             PendingRequestFrameState::ReadingMultiline { framer } => {
-                match framer.split_chunk(
-                    &chunk[offset..],
-                    PackedPendingBytesPolicy::AllowIfStatusPrefix,
-                ) {
+                match framer
+                    .split_chunk(offset_bytes, PackedPendingBytesPolicy::AllowIfStatusPrefix)
+                {
                     Ok(ChunkProgress::Complete(complete)) => Some(FramedResponseForRequest {
-                        response: offset..FrameEnd(offset).after_chunk(complete.consumed).0,
+                        response: BackendChunkRange::new(offset, offset.after(complete.consumed)),
                     }),
                     Ok(ChunkProgress::Incomplete) => None,
                     Err(_) => Some(FramedResponseForRequest {
-                        response: offset..chunk.len(),
+                        response: BackendChunkRange::new(offset, BackendChunkEnd::new(chunk.len())),
                     }),
                 }
             }

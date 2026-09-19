@@ -219,6 +219,7 @@ impl NntpClient {
         };
 
         Self::validate_response(status_code)?;
+        Self::validate_article_response_shape(request.kind(), status_code)?;
 
         let captured = match exchange.receiving()?.capture_isolated().await {
             Ok(result) => result,
@@ -240,6 +241,29 @@ impl NntpClient {
             code if code >= 400 => anyhow::bail!("Server error: {code}"),
             _ => Ok(()),
         }
+    }
+
+    /// Article-family commands have request-scoped successful status codes.
+    /// Keep this check at the fetch boundary so a valid ARTICLE frame cannot
+    /// be silently accepted as the result of a BODY or HEAD request.
+    #[inline]
+    fn validate_article_response_shape(
+        kind: crate::protocol::RequestKind,
+        status_code: crate::protocol::StatusCode,
+    ) -> Result<()> {
+        let expected = match kind {
+            crate::protocol::RequestKind::Article => 220,
+            crate::protocol::RequestKind::Head => 221,
+            crate::protocol::RequestKind::Body => 222,
+            _ => return Ok(()),
+        };
+        if status_code.as_u16() != expected {
+            anyhow::bail!(
+                "Unexpected {kind:?} response status: expected {expected}, got {}",
+                status_code.as_u16()
+            );
+        }
+        Ok(())
     }
 }
 
@@ -707,6 +731,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_body_rejects_article_success_status_for_body_request() {
+        let response = b"220 0 <wrong-shape@example.com> article follows\r\nbody\r\n.\r\n";
+        let addr = spawn_fetch_test_server("BODY <wrong-shape@example.com>", response).await;
+        let client = make_test_client(addr);
+        let msg_id = crate::types::MessageId::new("<wrong-shape@example.com>".to_string()).unwrap();
+
+        let error = client.fetch_body(&msg_id).await.unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("Unexpected Body response status")
+        );
+    }
+
+    #[tokio::test]
     async fn fetch_body_validates_after_fragmented_production_capture() {
         let response = b"222 0 <fragmented@example.com>\r\nfragmented body\r\n.\r\n";
         let addr =
@@ -723,6 +763,71 @@ mod tests {
             .unwrap();
 
         assert_eq!(validated.article().body, Some(&b"fragmented body"[..]));
+    }
+
+    #[tokio::test]
+    async fn fetch_article_validates_after_fragmented_production_capture() {
+        let response = b"220 7 <fragmented-article@example.com> article follows\r\n\
+            Subject: fragmented\r\n\
+            \r\n\
+            article body\r\n\
+            .\r\n";
+        let addr = spawn_fetch_test_server_with_chunk_size(
+            "ARTICLE <fragmented-article@example.com>",
+            response,
+            1,
+        )
+        .await;
+        let client = make_test_client_with_buffer_size(addr, 4096);
+        let msg_id =
+            crate::types::MessageId::new("<fragmented-article@example.com>".to_string()).unwrap();
+
+        let validated = client
+            .fetch_article(&msg_id)
+            .await
+            .unwrap()
+            .validate_with_yenc(YencValidation::Disabled)
+            .unwrap();
+
+        let article = validated.article();
+        assert_eq!(article.article_number, Some(7));
+        assert_eq!(article.body, Some(&b"article body"[..]));
+        assert_eq!(
+            article.headers.unwrap().get("Subject"),
+            Some(&b"fragmented"[..])
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_head_validates_after_fragmented_production_capture() {
+        let response = b"221 8 <fragmented-head@example.com>\r\n\
+            Subject: fragmented\r\n\
+            From: tester\r\n\
+            .\r\n";
+        let addr = spawn_fetch_test_server_with_chunk_size(
+            "HEAD <fragmented-head@example.com>",
+            response,
+            1,
+        )
+        .await;
+        let client = make_test_client_with_buffer_size(addr, 4096);
+        let msg_id =
+            crate::types::MessageId::new("<fragmented-head@example.com>".to_string()).unwrap();
+
+        let validated = client
+            .fetch_head(&msg_id)
+            .await
+            .unwrap()
+            .validate_with_yenc(YencValidation::Disabled)
+            .unwrap();
+
+        let article = validated.article();
+        assert_eq!(article.article_number, Some(8));
+        assert_eq!(article.body, None);
+        assert_eq!(
+            article.headers.unwrap().get("Subject"),
+            Some(&b"fragmented"[..])
+        );
     }
 
     #[tokio::test]
@@ -759,6 +864,22 @@ mod tests {
         let addr = spawn_fetch_test_server("STAT <stat@example.com>", response).await;
         let client = make_test_client(addr);
         let msg_id = crate::types::MessageId::new("<stat@example.com>".to_string()).unwrap();
+
+        assert!(client.stat(&msg_id).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn stat_consumes_a_fragmented_single_line_response() {
+        let response = b"223 42 <fragmented-stat@example.com> article exists\r\n";
+        let addr = spawn_fetch_test_server_with_chunk_size(
+            "STAT <fragmented-stat@example.com>",
+            response,
+            1,
+        )
+        .await;
+        let client = make_test_client(addr);
+        let msg_id =
+            crate::types::MessageId::new("<fragmented-stat@example.com>".to_string()).unwrap();
 
         assert!(client.stat(&msg_id).await.unwrap());
     }
