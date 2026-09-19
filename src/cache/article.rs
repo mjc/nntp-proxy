@@ -178,6 +178,14 @@ impl CachedResponseWire<'_> {
         self.status_line.as_slice()
     }
 
+    fn article_separator(headers: &[u8], body: &[u8]) -> &'static [u8] {
+        if headers.is_empty() && body.is_empty() {
+            &[]
+        } else {
+            crate::protocol::CRLF
+        }
+    }
+
     #[must_use]
     pub const fn status(&self) -> StatusCode {
         self.status
@@ -196,7 +204,7 @@ impl CachedResponseWire<'_> {
                 let mut slices = [
                     IoSlice::new(self.status_line()),
                     IoSlice::new(headers),
-                    IoSlice::new(b"\r\n"),
+                    IoSlice::new(Self::article_separator(headers, body)),
                     IoSlice::new(body),
                     Self::response_completion(),
                 ];
@@ -226,7 +234,10 @@ impl CachedResponseWire<'_> {
         match self.payload {
             CachedResponseWirePayload::None => 0,
             CachedResponseWirePayload::Article { headers, body } => {
-                headers.len() + 2 + body.len() + Self::response_completion_len()
+                headers.len()
+                    + Self::article_separator(headers, body).len()
+                    + body.len()
+                    + Self::response_completion_len()
             }
             CachedResponseWirePayload::Head { headers } => {
                 headers.len() + Self::response_completion_len()
@@ -377,6 +388,21 @@ impl CachedArticle {
         }
     }
 
+    /// Create a cache entry for a successful STAT response without retaining
+    /// the response's wire bytes.
+    #[must_use]
+    pub(crate) fn stat(tier: ttl::CacheTier) -> Self {
+        Self {
+            backend_availability: ArticleAvailability::new(),
+            status_code: StatusCode::new(223),
+            payload: CachedPayload::Stat {
+                article_number: None,
+            },
+            tier,
+            inserted_at: ttl::CacheTimestampMillis::now(),
+        }
+    }
+
     #[must_use]
     pub(crate) fn missing(tier: ttl::CacheTier) -> Self {
         Self {
@@ -431,17 +457,14 @@ impl CachedArticle {
         }
     }
 
-    fn from_framed_chunked_with_tier(
+    pub(crate) fn from_framed_chunked_with_tier(
         response: super::FramedChunkedResponse,
         tier: ttl::CacheTier,
     ) -> Self {
-        let super::FramedChunkedResponse { state } = response;
+        let super::FramedChunkedResponse { state, payload_end } = response;
         let framed = state.into_inner();
         let status = framed.status();
         let status_line_end = framed.status_line_end();
-        let payload_end =
-            super::CachePayloadEnd::new(framed.content_end().get(), framed.bytes().len())
-                .expect("framer established an in-bounds cache payload boundary");
         let response = framed.into_bytes();
         let payload = parse_framed_chunked_payload(status, status_line_end, &response, payload_end);
         Self {
@@ -454,7 +477,7 @@ impl CachedArticle {
     }
 
     #[must_use]
-    pub(crate) fn from_ingest_response_with_tier(
+    pub(crate) fn from_unframed_ingest_for_test(
         buffer: impl Into<super::CacheIngestResponse>,
         tier: ttl::CacheTier,
     ) -> Self {
@@ -1113,6 +1136,29 @@ impl ArticleCache {
         entry
     }
 
+    fn merge_backend_stat_entry(
+        maybe_entry: Option<Entry<Arc<str>, CachedArticle>>,
+        new_entry_template: &CachedArticle,
+        slot: AvailabilitySlot,
+        ttl_millis: ttl::CacheTtlMillis,
+    ) -> CachedArticle {
+        let mut entry = Self::fresh_entry_for_mutation(maybe_entry, ttl_millis)
+            .unwrap_or_else(|| new_entry_template.clone());
+        if entry.backend_availability.is_missing_slot(slot) {
+            return entry;
+        }
+        if matches!(
+            entry.payload,
+            CachedPayload::Missing | CachedPayload::AvailabilityOnly
+        ) {
+            entry.status_code = new_entry_template.status_code;
+            entry.payload = new_entry_template.payload.clone();
+            entry.tier = new_entry_template.tier;
+        }
+        entry.inserted_at = ttl::CacheTimestampMillis::now();
+        entry
+    }
+
     fn merge_availability_missing_entry(
         maybe_entry: Option<Entry<Arc<str>, CachedArticle>>,
         slot: AvailabilitySlot,
@@ -1148,14 +1194,14 @@ impl ArticleCache {
     /// The tier is stored with the entry for tier-aware TTL calculation.
     ///
     /// CRITICAL: Always re-insert to refresh TTL while preserving negative availability.
-    pub async fn upsert_ingest(
+    pub async fn upsert_framed_ingest(
         &self,
         message_id: MessageId<'_>,
-        buffer: impl Into<super::CacheIngestResponse>,
+        buffer: super::FramedChunkedResponse,
         backend: BackendId,
         tier: ttl::CacheTier,
     ) {
-        self.upsert_ingest_for_slot(
+        self.upsert_framed_ingest_for_slot(
             message_id,
             buffer,
             AvailabilitySlot::new(backend.as_index()).expect("backend count fits bitmap"),
@@ -1164,7 +1210,36 @@ impl ArticleCache {
         .await;
     }
 
-    pub(crate) async fn upsert_ingest_for_slot(
+    pub(crate) async fn upsert_framed_ingest_for_slot(
+        &self,
+        message_id: MessageId<'_>,
+        buffer: super::FramedChunkedResponse,
+        slot: AvailabilitySlot,
+        tier: ttl::CacheTier,
+    ) {
+        let new_entry_template = CachedArticle::from_framed_chunked_with_tier(buffer, tier);
+        self.upsert_cached_entry_for_slot(message_id, new_entry_template, slot)
+            .await;
+    }
+
+    /// Parse an unframed response for cache compatibility tests.
+    pub(crate) async fn upsert_unframed_ingest(
+        &self,
+        message_id: MessageId<'_>,
+        buffer: impl Into<super::CacheIngestResponse>,
+        backend: BackendId,
+        tier: ttl::CacheTier,
+    ) {
+        self.upsert_unframed_ingest_for_slot(
+            message_id,
+            buffer,
+            AvailabilitySlot::new(backend.as_index()).expect("backend count fits bitmap"),
+            tier,
+        )
+        .await;
+    }
+
+    pub(crate) async fn upsert_unframed_ingest_for_slot(
         &self,
         message_id: MessageId<'_>,
         buffer: impl Into<super::CacheIngestResponse>,
@@ -1172,9 +1247,28 @@ impl ArticleCache {
         tier: ttl::CacheTier,
     ) {
         let buffer = buffer.into();
-        let new_entry_template = CachedArticle::from_ingest_response_with_tier(buffer, tier);
+        let new_entry_template = CachedArticle::from_unframed_ingest_for_test(buffer, tier);
         self.upsert_cached_entry_for_slot(message_id, new_entry_template, slot)
             .await;
+    }
+
+    /// Insert raw bytes for compatibility tests that predate framer-bound
+    /// cache ingestion. Production callers must provide a framed response.
+    #[doc(hidden)]
+    pub async fn upsert_test_response(
+        &self,
+        message_id: MessageId<'_>,
+        response: impl Into<Box<[u8]>>,
+        backend: BackendId,
+        tier: ttl::CacheTier,
+    ) {
+        self.upsert_unframed_ingest(
+            message_id,
+            super::CacheIngestResponse::Owned(response.into()),
+            backend,
+            tier,
+        )
+        .await;
     }
 
     async fn upsert_cached_entry_for_slot(
@@ -1238,6 +1332,29 @@ impl ArticleCache {
                     status_code,
                     slot,
                     tier,
+                    ttl_millis,
+                ))
+            })
+            .await;
+    }
+
+    pub(crate) async fn record_stat_for_slot(
+        &self,
+        message_id: MessageId<'_>,
+        slot: AvailabilitySlot,
+        tier: ttl::CacheTier,
+    ) {
+        let key: Arc<str> = message_id.without_brackets().into();
+        let new_entry_template = CachedArticle::stat(tier);
+        let ttl_millis = self.ttl_millis;
+
+        self.cache
+            .entry(key)
+            .and_upsert_with(move |maybe_entry| {
+                std::future::ready(Self::merge_backend_stat_entry(
+                    maybe_entry,
+                    &new_entry_template,
+                    slot,
                     ttl_millis,
                 ))
             })
@@ -1534,12 +1651,22 @@ mod tests {
 
     #[tokio::test]
     async fn cached_empty_multiline_payload_preserves_wire_boundary() {
-        let entry = cached_article_from_ingest_bytes(b"222 0 <test@example.com>\r\n.\r\n");
+        let cases = [
+            (RequestKind::Article, 220),
+            (RequestKind::Head, 221),
+            (RequestKind::Body, 222),
+        ];
 
-        assert_eq!(
-            rendered(&entry, RequestKind::Body, "<test@example.com>"),
-            b"222 0 <test@example.com>\r\n.\r\n"
-        );
+        for (request_kind, status) in cases {
+            let expected =
+                crate::session::multiline_framing::empty_multiline_response_fixture(status);
+            let entry = cached_article_from_ingest_bytes(&expected);
+            assert_eq!(
+                rendered(&entry, request_kind, "<test@example.com>"),
+                expected,
+                "{request_kind:?}"
+            );
+        }
     }
 
     #[test]
@@ -1615,7 +1742,7 @@ mod tests {
         );
 
         cache
-            .upsert_ingest(
+            .upsert_unframed_ingest(
                 msg_id.clone(),
                 complete.as_bytes().to_vec(),
                 backend,
@@ -1624,7 +1751,7 @@ mod tests {
             .await;
         let backend = backend_id;
         cache
-            .upsert_ingest(
+            .upsert_unframed_ingest(
                 msg_id.clone(),
                 b"222 0 <test@example.com>\r\n".to_vec(),
                 backend,
@@ -1652,7 +1779,7 @@ mod tests {
         );
 
         cache
-            .upsert_ingest(
+            .upsert_unframed_ingest(
                 msg_id.clone(),
                 b"222 0 <test@example.com>\r\n".to_vec(),
                 backend,
@@ -1670,7 +1797,7 @@ mod tests {
 
         let backend = backend_id;
         cache
-            .upsert_ingest(
+            .upsert_unframed_ingest(
                 msg_id.clone(),
                 complete.as_bytes().to_vec(),
                 backend,
@@ -1838,7 +1965,7 @@ mod tests {
 
     #[test]
     fn cached_article_ingests_cache_ingest_response_without_required_vec() {
-        let entry = CachedArticle::from_ingest_response_with_tier(
+        let entry = CachedArticle::from_unframed_ingest_for_test(
             smallvec::SmallVec::<[u8; 128]>::from_slice(
                 b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
             ),
@@ -1866,7 +1993,7 @@ mod tests {
             "test response must span chunks"
         );
 
-        let entry = CachedArticle::from_ingest_response_with_tier(response, ttl::CacheTier::new(0));
+        let entry = CachedArticle::from_unframed_ingest_for_test(response, ttl::CacheTier::new(0));
 
         assert_eq!(entry.status_code(), StatusCode::new(220));
         match entry.payload {
@@ -1902,7 +2029,7 @@ mod tests {
             )),
         );
 
-        let entry = CachedArticle::from_ingest_response_with_tier(input, ttl::CacheTier::new(0));
+        let entry = CachedArticle::from_unframed_ingest_for_test(input, ttl::CacheTier::new(0));
 
         assert_eq!(entry.article_number(), Some(CachedArticleNumber::new(7)));
         match entry.payload {
@@ -1927,7 +2054,7 @@ mod tests {
             b"220 123456789 <very-long-message-id-that-spans-chunks@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n",
         );
 
-        let entry = CachedArticle::from_ingest_response_with_tier(response, ttl::CacheTier::new(0));
+        let entry = CachedArticle::from_unframed_ingest_for_test(response, ttl::CacheTier::new(0));
 
         assert_eq!(
             entry.article_number(),
@@ -2068,7 +2195,7 @@ mod tests {
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
 
         cache
-            .upsert_ingest(
+            .upsert_unframed_ingest(
                 msgid.clone(),
                 buffer.clone(),
                 BackendId::from_index(0),
@@ -2095,7 +2222,7 @@ mod tests {
 
         // Insert with backend 0
         cache
-            .upsert_ingest(
+            .upsert_unframed_ingest(
                 msgid.clone(),
                 buffer.clone(),
                 BackendId::from_index(0),
@@ -2105,7 +2232,7 @@ mod tests {
 
         // Update with backend 1 - does nothing (entry already exists)
         cache
-            .upsert_ingest(
+            .upsert_unframed_ingest(
                 msgid.clone(),
                 buffer.clone(),
                 BackendId::from_index(1),
@@ -2155,7 +2282,7 @@ mod tests {
         );
 
         cache
-            .upsert_ingest(msgid.clone(), buffer, backend, 0.into())
+            .upsert_unframed_ingest(msgid.clone(), buffer, backend, 0.into())
             .await;
 
         let retrieved = cache.get(&msgid).await.unwrap();
@@ -2182,7 +2309,7 @@ mod tests {
             b"220 0 <expired-missing-upsert@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n"
                 .to_vec();
         cache
-            .upsert_ingest(msgid.clone(), buffer.clone(), backend, 0.into())
+            .upsert_unframed_ingest(msgid.clone(), buffer.clone(), backend, 0.into())
             .await;
 
         let retrieved = cache
@@ -2362,7 +2489,7 @@ mod tests {
         let original_payload_size = b"Subject: Test2\r\n".len() + b"Body2\r\n".len();
 
         cache
-            .upsert_ingest(msgid.clone(), buffer, BackendId::from_index(0), 0.into())
+            .upsert_unframed_ingest(msgid.clone(), buffer, BackendId::from_index(0), 0.into())
             .await;
         cache.sync().await;
 

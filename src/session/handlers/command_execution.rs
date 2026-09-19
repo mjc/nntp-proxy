@@ -122,11 +122,19 @@ pub(super) struct ResponseWriteContext<'a> {
     article_request: Option<crate::command::ArticleLookupRequest<'a>>,
 }
 
+/// Result of consuming one backend response for the client.
+///
+/// Returning the status with the byte count keeps the response metadata tied
+/// to the same operation that consumed the framed response.
+struct ResponseWriteResult {
+    status_code: StatusCode,
+    bytes_written: u64,
+}
+
 struct InvalidBackendResponseContext<'a> {
     provider: &'a crate::pool::DeadpoolConnectionProvider,
     request: &'a RequestContext,
-    buffer: &'a [u8],
-    conn: crate::pool::ConnectionGuard,
+    response: crate::session::multiline_framing::InvalidBackendResponse,
 }
 
 /// A successfully classified response together with the guard that owns its
@@ -146,16 +154,11 @@ impl PreparedBackendAttempt<'_> {
     }
 
     async fn observe(self) -> Result<crate::pool::ConnectionGuard, SessionError> {
-        let Self { mut exchange, .. } = self;
-        let receiving = exchange.receiving().map_err(SessionError::from)?;
-        match receiving.observe().await {
-            Ok(()) => Ok(exchange.into_connection()),
-            Err(error) => {
-                let conn = exchange.into_connection_after_failure();
-                conn.fail_backend();
-                Err(SessionError::from(error))
-            }
-        }
+        let Self { exchange, .. } = self;
+        exchange
+            .observe_and_reuse()
+            .await
+            .map_err(SessionError::from)
     }
 
     #[cfg(test)]
@@ -166,7 +169,7 @@ impl PreparedBackendAttempt<'_> {
         backend_id: BackendId,
     ) -> PreparedBackendAttempt<'_> {
         PreparedBackendAttempt {
-            exchange: crate::session::backend::BackendResponseExchange::new(
+            exchange: crate::session::backend::BackendResponseExchange::new_for_test(
                 conn, response, pool, backend_id,
             ),
             timings: None,
@@ -238,7 +241,7 @@ impl ClientSession {
         backend_id: BackendId,
         request: &RequestContext,
     ) -> bool {
-        match crate::pool::health_check::check_tcp_alive(guard.stream_mut()) {
+        match crate::pool::health_check::check_tcp_alive(guard.health_check_stream_mut()) {
             Ok(()) => true,
             Err(err) => {
                 warn!(
@@ -445,7 +448,7 @@ impl ClientSession {
                     Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
                 };
                 let buffer = self.buffer_pool.acquire();
-                let mut exchange = match backend::execute_request_exchange(
+                let exchange = match backend::execute_request_exchange(
                     conn,
                     &stat_request,
                     buffer,
@@ -459,21 +462,9 @@ impl ClientSession {
                 };
 
                 let status_code = exchange.status_code();
-                let response = match exchange.receiving() {
-                    Ok(response) => response,
-                    Err(_) => {
-                        exchange.fail_backend();
-                        return RetryStatProbeOutcome::Unavailable(backend_id);
-                    }
-                };
-                match response.observe().await {
-                    Ok(()) => {}
-                    Err(_) => {
-                        exchange.into_connection_after_failure().fail_backend();
-                        return RetryStatProbeOutcome::Unavailable(backend_id);
-                    }
+                if exchange.observe_and_reuse().await.is_err() {
+                    return RetryStatProbeOutcome::Unavailable(backend_id);
                 }
-                let _ = exchange.into_connection().complete_success();
 
                 if status_code.is_some_and(|status| status.as_u16() == 430) {
                     RetryStatProbeOutcome::Missing(backend_id)
@@ -578,7 +569,7 @@ impl ClientSession {
                         Err(_) => return,
                     };
                     let buffer = buffer_pool.acquire();
-                    let mut exchange = match backend::execute_request_exchange(
+                    let exchange = match backend::execute_request_exchange(
                         conn,
                         &stat_request,
                         buffer,
@@ -591,21 +582,9 @@ impl ClientSession {
                         Err(_) => return,
                     };
                     let status_code = exchange.status_code();
-                    let response = match exchange.receiving() {
-                        Ok(response) => response,
-                        Err(_) => {
-                            exchange.fail_backend();
-                            return;
-                        }
-                    };
-                    match response.observe().await {
-                        Ok(()) => {}
-                        Err(_) => {
-                            exchange.into_connection_after_failure().fail_backend();
-                            return;
-                        }
+                    if exchange.observe_and_reuse().await.is_err() {
+                        return;
                     }
-                    let _ = exchange.into_connection().complete_success();
 
                     if status_code.is_some_and(|status| status.as_u16() == 430)
                         && let Ok(msg_id) = crate::types::MessageId::new(msg_id_text)
@@ -699,15 +678,13 @@ impl ClientSession {
                     msg_id = ?request.message_id_value(),
                     "Backend attempt read bytes but could not parse a status code"
                 );
-                let received_bytes = attempt.exchange.received_bytes().to_vec();
-                let conn = attempt.exchange.discard_response();
+                let response = attempt.exchange.into_invalid_response();
                 self.handle_invalid_backend_response(
                     backend_id,
                     InvalidBackendResponseContext {
                         provider,
                         request,
-                        buffer: &received_bytes,
-                        conn,
+                        response,
                     },
                 );
                 state.unavailable_backends.suppress(backend_id);
@@ -721,7 +698,7 @@ impl ClientSession {
             command_verb = ?request.verb(),
             msg_id = ?request.message_id_value(),
             status_code = status_code.as_u16(),
-            backend_read_bytes = attempt.exchange.received_bytes().len(),
+            backend_read_bytes = attempt.exchange.received_len(),
             availability_missing_bits = format_args!("{:08b}", state.availability.missing_bits()),
             "Backend attempt received classifiable response bytes"
         );
@@ -737,22 +714,21 @@ impl ClientSession {
         let InvalidBackendResponseContext {
             provider,
             request,
-            buffer,
-            conn,
+            response,
         } = ctx;
         tracing::warn!(
             client = %self.client_addr,
             backend = ?backend_id,
             command_verb = ?request.verb(),
             first_bytes_hex = %crate::session::backend::format_hex_preview(
-                buffer, 256
+                response.bytes(), 256
             ),
-            first_bytes_utf8 = %String::from_utf8_lossy(buffer),
+            first_bytes_utf8 = %String::from_utf8_lossy(response.bytes()),
             "Backend returned invalid/unparseable response, attempting to salvage connection"
         );
         let request_kind = request.kind();
         let provider_for_salvage = provider.clone();
-        let conn_for_salvage = conn.into_connection_for_health_check();
+        let conn_for_salvage = response.into_connection_for_health_check();
         tokio::spawn(async move {
             tracing::debug!(
                 backend = ?backend_id,
@@ -774,27 +750,14 @@ impl ClientSession {
         W: AsyncWrite + Unpin,
     {
         let PreparedBackendAttempt { mut exchange, .. } = attempt;
-        let classified_status = exchange
-            .status_code()
-            .expect("prepared backend attempts contain a classified response");
         let backend_id = exchange.backend_id();
-        let has_response_body = context.request.has_response_body(classified_status);
-        let status_code = classified_status;
-        debug!(
-            client = %self.client_addr,
-            backend = backend_id.as_index(),
-            command_verb = ?context.request.verb(),
-            status_code = status_code.as_u16(),
-            has_response_body,
-            "Writing backend response to client"
-        );
         let backend_bytes = match exchange.receiving() {
             Ok(receiving) => receiving,
             Err(error) => {
                 return Err(SessionError::from(error));
             }
         };
-        let bytes_written = match self
+        let write_result = match self
             .write_response_to_client(client_write, backend_id, backend_bytes, context)
             .await
         {
@@ -808,6 +771,18 @@ impl ClientSession {
                 ));
             }
         };
+        let ResponseWriteResult {
+            status_code,
+            bytes_written,
+        } = write_result;
+        debug!(
+            client = %self.client_addr,
+            backend = backend_id.as_index(),
+            command_verb = ?context.request.verb(),
+            status_code = status_code.as_u16(),
+            has_response_body = context.request.has_response_body(status_code),
+            "Writing backend response to client"
+        );
         if let Err(e) = client_write.flush().await {
             return Err(self.handle_response_transfer_error(
                 exchange.into_connection(),
@@ -1348,11 +1323,11 @@ impl ClientSession {
         let response = exchange
             .receiving()
             .map_err(AlreadySentResponseError::Read)?;
-        let bytes_written = match self
+        let write_result = match self
             .write_response_to_client(client_write, backend_id, response, context)
             .await
         {
-            Ok(bytes_written) => bytes_written,
+            Ok(result) => result,
             Err(error) => {
                 let conn = exchange.into_connection_after_failure();
                 return Err(AlreadySentResponseError::Transfer(
@@ -1360,6 +1335,10 @@ impl ClientSession {
                 ));
             }
         };
+        let ResponseWriteResult {
+            status_code: written_status_code,
+            bytes_written,
+        } = write_result;
         let conn = exchange.into_connection();
         if let Err(error) = client_write.flush().await {
             return Err(AlreadySentResponseError::Transfer(
@@ -1374,12 +1353,12 @@ impl ClientSession {
         self.record_response_metrics(
             backend_id,
             request,
-            status_code,
+            written_status_code,
             request.request_wire_len().as_u64(),
             bytes_written,
         );
         let response = RequestResponseMetadata::new(
-            status_code,
+            written_status_code,
             usize::try_from(bytes_written).unwrap_or(usize::MAX).into(),
         );
         request.record_backend_response(backend_id, response);
@@ -1420,7 +1399,7 @@ impl ClientSession {
         backend_id: BackendId,
         backend_bytes: crate::session::backend::ReceivingResponse<'_>,
         context: ResponseWriteContext<'_>,
-    ) -> Result<u64, ResponseTransferError>
+    ) -> Result<ResponseWriteResult, ResponseTransferError>
     where
         W: AsyncWrite + Unpin,
     {
@@ -1477,7 +1456,10 @@ impl ClientSession {
         if let Some(backend) = backend_after_write {
             self.apply_cache_action(cache_action, params, backend, captured);
         }
-        Ok(bytes_written)
+        Ok(ResponseWriteResult {
+            status_code: params.status_code,
+            bytes_written,
+        })
     }
 
     fn apply_cache_action(
@@ -1493,7 +1475,7 @@ impl ClientSession {
             .map(|article_request| article_request.message_id());
         match (cache_action, msg_id.as_ref(), captured) {
             (CacheAction::CaptureArticle, msg_id, Some(response)) => {
-                self.maybe_cache_upsert_buffer(msg_id, response.into_cache_ingest(), backend);
+                self.maybe_cache_upsert_framed(msg_id, response.into_cache_ingest(), backend);
             }
             (CacheAction::TrackAvailability, Some(msg_id), _)
             | (CacheAction::CaptureArticle, Some(msg_id), None)
@@ -1507,11 +1489,13 @@ impl ClientSession {
                 );
             }
             (CacheAction::TrackStat, msg_id, _) if self.cache.stores_payload_responses() => {
-                self.maybe_cache_upsert_buffer(
-                    msg_id,
-                    crate::cache::CacheIngestResponse::from(b"223\r\n".as_slice()),
-                    backend,
-                );
+                if let Some(msg_id_ref) = msg_id {
+                    self.spawn_cache_record_stat(
+                        msg_id_ref,
+                        backend,
+                        self.tier_for_backend(backend),
+                    );
+                }
             }
             (CacheAction::TrackStat, Some(msg_id), _)
                 if !params.request.cache_records_backend_has_article(backend_id) =>
@@ -1640,16 +1624,16 @@ impl ClientSession {
     }
 
     #[inline]
-    fn maybe_cache_upsert_buffer(
+    fn maybe_cache_upsert_framed(
         &self,
         msg_id: Option<&crate::types::MessageId<'_>>,
-        data: crate::cache::CacheIngestResponse,
+        data: crate::cache::FramedChunkedResponse,
         backend: BackendId,
     ) {
         if let Some(msg_id_ref) = msg_id {
             let backend_id = backend;
             let tier = self.tier_for_backend(backend_id);
-            self.spawn_cache_upsert_buffer(msg_id_ref, data, backend, tier);
+            self.spawn_cache_upsert_framed(msg_id_ref, data, backend, tier);
         }
     }
 
@@ -3089,7 +3073,7 @@ mod tests {
         .await
         .unwrap();
         let pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 1);
-        let mut exchange = crate::session::backend::BackendResponseExchange::new(
+        let mut exchange = crate::session::backend::BackendResponseExchange::new_for_test(
             conn,
             response,
             &pool,

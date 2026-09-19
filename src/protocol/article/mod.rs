@@ -228,7 +228,8 @@ impl<'a> Article<'a> {
     /// Parse NNTP article response with optional yEnc validation
     ///
     /// # Arguments
-    /// * `buf` - Complete response bytes from the session response reader.
+    /// * `buf` - Complete framed response bytes from the session response
+    ///   reader. The framer has already consumed the multiline terminator.
     /// * `validate_yenc` - Whether to validate yEnc structure/checksums
     ///
     /// # Errors

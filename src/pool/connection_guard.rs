@@ -190,6 +190,18 @@ impl ConnectionGuard {
         self.get_mut()
     }
 
+    /// Borrow the stream for a non-consuming health check.
+    ///
+    /// Health checks only inspect socket liveness and must not make an idle
+    /// cached connection look like an in-flight protocol exchange. Protocol
+    /// reads and writes continue to use [`Self::stream_mut`], which records
+    /// that the guard has entered an exchange.
+    pub(crate) fn health_check_stream_mut(&mut self) -> &mut crate::stream::ConnectionStream {
+        self.conn
+            .as_mut()
+            .expect("ConnectionGuard already consumed")
+    }
+
     /// Record that the framer consumed the complete response for this guard.
     ///
     /// The phase is kept on the guard that owns the socket. This removes the
@@ -486,6 +498,29 @@ mod tests {
         let _ = guard.complete_success();
     }
 
+    /// A completed response does not make a pipelined exchange reusable when
+    /// another command has already been written, even if its delayed reply has
+    /// not produced locally queued bytes yet.
+    #[tokio::test]
+    #[should_panic(expected = "complete_success() requires a fully consumed response")]
+    async fn complete_success_rejects_new_outstanding_request_without_pending_bytes() {
+        let (port, _accept_count) = spawn_greeting_server().await;
+        let provider = make_provider(port);
+        let mut guard =
+            IdleConnection::new(provider.get_pooled_connection().await.unwrap(), provider)
+                .activate();
+
+        guard.stream_mut().write_all(b"DATE\r\n").await.unwrap();
+        guard.mark_response_complete();
+
+        // Starting the next request moves the owning guard back to InFlight.
+        // The backend may reply later, but an empty local queue is not evidence
+        // that this outstanding exchange is clean.
+        guard.stream_mut().write_all(b"DATE\r\n").await.unwrap();
+        assert_eq!(guard.pending_bytes_len(), 0);
+        let _ = guard.complete_success();
+    }
+
     /// Invariant: drop without `complete_success()` removes the connection from the pool.
     ///
     /// The guard shuts down the socket; pool recycle detects EOF
@@ -547,6 +582,45 @@ mod tests {
 
         let _replacement = provider.get_pooled_connection().await.unwrap();
         assert_eq!(accept_count.load(Ordering::SeqCst), 2);
+    }
+
+    /// Cancellation must retire an unfinished exchange even when the framer
+    /// already retained bytes belonging to that exchange.  The retained bytes
+    /// are owned by the connection, so dropping the guard must remove that
+    /// connection rather than returning its buffered state to the pool.
+    #[tokio::test]
+    async fn cancelling_unfinished_exchange_with_buffered_bytes_retires_connection() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+
+        let (port, accept_count) = spawn_greeting_server().await;
+        let provider = make_provider(port);
+        let conn = provider.get_pooled_connection().await.unwrap();
+        let mut guard = IdleConnection::new(conn, provider.clone()).activate();
+        guard.stream_mut().write_all(b"DATE\r\n").await.unwrap();
+        guard
+            .stream_mut()
+            .queue_pending_bytes(b"223 queued-for-abandoned-exchange\r\n")
+            .unwrap();
+        assert!(guard.pending_bytes_len() > 0);
+
+        let mut exchange = Box::pin(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        let mut context = Context::from_waker(Waker::noop());
+        assert_eq!(exchange.as_mut().poll(&mut context), Poll::Pending);
+        drop(exchange);
+
+        // Allow the pool's closed-socket observation to complete before the
+        // replacement checkout asks the provider to recycle an idle object.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let _replacement = provider.get_pooled_connection().await.unwrap();
+        assert_eq!(
+            accept_count.load(Ordering::SeqCst),
+            2,
+            "an abandoned exchange with buffered bytes must not return its socket to the pool"
+        );
     }
 
     // ─── salvage_with_health_check notes ────────────────────────────────────

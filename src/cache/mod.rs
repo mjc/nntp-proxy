@@ -81,6 +81,7 @@ pub struct FramedChunkedResponse {
     state: crate::protocol::ArticleState<
         crate::protocol::FramedArticleState<crate::pool::ChunkedResponse>,
     >,
+    payload_end: CachePayloadEnd,
 }
 
 /// Exclusive end of the cache payload within its captured response.
@@ -103,6 +104,19 @@ impl CachePayloadEnd {
 }
 
 impl FramedChunkedResponse {
+    pub(crate) fn from_article_state(
+        state: crate::protocol::ArticleState<
+            crate::protocol::FramedArticleState<crate::pool::ChunkedResponse>,
+        >,
+    ) -> Self {
+        let payload_end = CachePayloadEnd::new(
+            state.as_inner().content_end().get(),
+            state.as_inner().bytes().len(),
+        )
+        .expect("framer established an in-bounds cache payload boundary");
+        Self { state, payload_end }
+    }
+
     pub(crate) async fn write_to<W>(&self, writer: &mut W) -> std::io::Result<()>
     where
         W: tokio::io::AsyncWrite + Unpin,
@@ -113,6 +127,10 @@ impl FramedChunkedResponse {
             writer.write_all(chunk).await?;
         }
         Ok(())
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.state.as_inner().bytes().len()
     }
 }
 
@@ -128,50 +146,13 @@ impl CacheIngestResponse {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn from_framed_article(
         state: crate::protocol::ArticleState<
             crate::protocol::FramedArticleState<crate::pool::ChunkedResponse>,
         >,
     ) -> Self {
-        debug_assert!(state.as_inner().content_end().get() <= state.as_inner().bytes().len());
-        Self::FramedChunked(FramedChunkedResponse { state })
-    }
-
-    /// Construct a representative framer-bounded article capture for the
-    /// cache-ingest benchmark without exposing cache boundary coordinates.
-    #[cfg(feature = "framing-bench")]
-    #[doc(hidden)]
-    pub fn benchmark_framed_article(bytes: &[u8]) -> Self {
-        const BENCHMARK_CHUNK_BYTES: usize = 4096;
-        let buffer_size = crate::types::BufferSize::try_new(BENCHMARK_CHUNK_BYTES)
-            .expect("benchmark chunk size is valid");
-        let chunk_count = bytes.len().div_ceil(BENCHMARK_CHUNK_BYTES).max(1);
-        let pool = crate::pool::BufferPool::new(buffer_size, 1)
-            .with_capture_pool(BENCHMARK_CHUNK_BYTES, chunk_count);
-        let mut response = crate::pool::ChunkedResponse::default();
-        for chunk in bytes.chunks(BENCHMARK_CHUNK_BYTES) {
-            let mut buffer = pool.acquire_capture();
-            buffer.copy_from_slice(chunk);
-            let chunk_len = chunk.len();
-            response.push_buffer_range(buffer, 0..chunk_len);
-        }
-        let status_line_end = memchr::memmem::find(bytes, b"\r\n")
-            .map(|end| crate::protocol::StatusLineEnd::new(end + 2))
-            .expect("benchmark response has a status line");
-        let payload_end = CachePayloadEnd::new(
-            bytes.len().checked_sub(3).expect("multiline terminator"),
-            bytes.len(),
-        )
-        .expect("payload fits benchmark response");
-        Self::from_framed_article(crate::protocol::ArticleState::new(
-            crate::protocol::FramedArticleState::new(
-                response,
-                crate::protocol::RequestKind::Article,
-                StatusCode::new(220),
-                status_line_end,
-                crate::protocol::ContentEnd::new(payload_end.as_usize()),
-            ),
-        ))
+        Self::FramedChunked(FramedChunkedResponse::from_article_state(state))
     }
 
     #[cfg(test)]
@@ -374,6 +355,31 @@ mod tests {
         assert!(!entry.has_availability_info());
         assert_eq!(entry.availability().missing_bits(), 0);
         assert!(entry.should_try_backend(backend_id));
+    }
+
+    #[tokio::test]
+    async fn unified_cache_records_typed_stat_payload_without_wire_buffer() {
+        let cache = UnifiedCache::memory(1000, std::time::Duration::from_secs(60));
+        let msg_id = MessageId::new("<typed-stat@example>".to_string()).unwrap();
+        let backend_id = BackendId::from_index(1);
+
+        cache
+            .record_backend_stat(msg_id.clone(), backend_id, ttl::CacheTier::new(2))
+            .await;
+
+        let entry = cache.get(&msg_id).await.expect("entry is recorded");
+        assert_eq!(entry.status_code(), StatusCode::new(223));
+        assert_eq!(
+            entry
+                .request_cache_metadata(&entry.availability())
+                .payload_kind(),
+            crate::protocol::RequestCachePayloadKind::Stat
+        );
+        assert!(
+            entry
+                .cached_response_for(crate::protocol::RequestKind::Stat, "<typed-stat@example>")
+                .is_some()
+        );
     }
 
     #[test]
@@ -646,8 +652,42 @@ impl UnifiedCache {
         }
     }
 
-    /// Store a successful article response for an eligible backend.
-    pub async fn upsert_ingest(
+    /// Store a framer-bounded article response for an eligible backend.
+    pub async fn upsert_framed_ingest(
+        &self,
+        message_id: MessageId<'_>,
+        buffer: FramedChunkedResponse,
+        backend: BackendId,
+        tier: ttl::CacheTier,
+    ) {
+        match &self.kind {
+            UnifiedCacheKind::Availability(_) => {}
+            UnifiedCacheKind::Memory(cache) => {
+                cache
+                    .upsert_framed_ingest_for_slot(
+                        message_id,
+                        buffer,
+                        cache.availability_slot(backend),
+                        tier,
+                    )
+                    .await;
+            }
+            UnifiedCacheKind::Hybrid(cache) => {
+                cache
+                    .upsert_framed_ingest_for_slot(
+                        message_id,
+                        buffer,
+                        cache.availability_slot(backend),
+                        tier,
+                    )
+                    .await;
+            }
+        }
+    }
+
+    /// Parse an unframed response for cache compatibility tests.
+    /// Production response paths must use [`Self::upsert_framed_ingest`].
+    pub(crate) async fn upsert_unframed_ingest(
         &self,
         message_id: MessageId<'_>,
         buffer: impl Into<CacheIngestResponse>,
@@ -659,7 +699,7 @@ impl UnifiedCache {
             UnifiedCacheKind::Availability(_) => {}
             UnifiedCacheKind::Memory(cache) => {
                 cache
-                    .upsert_ingest_for_slot(
+                    .upsert_unframed_ingest_for_slot(
                         message_id,
                         buffer,
                         cache.availability_slot(backend),
@@ -669,7 +709,7 @@ impl UnifiedCache {
             }
             UnifiedCacheKind::Hybrid(cache) => {
                 cache
-                    .upsert_ingest_for_slot(
+                    .upsert_unframed_ingest_for_slot(
                         message_id,
                         buffer,
                         cache.availability_slot(backend),
@@ -678,6 +718,25 @@ impl UnifiedCache {
                     .await;
             }
         }
+    }
+
+    /// Insert raw bytes for compatibility tests that predate framer-bound
+    /// cache ingestion. Production callers must provide a framed response.
+    #[doc(hidden)]
+    pub async fn upsert_test_response(
+        &self,
+        message_id: MessageId<'_>,
+        response: impl Into<Box<[u8]>>,
+        backend: BackendId,
+        tier: ttl::CacheTier,
+    ) {
+        self.upsert_unframed_ingest(
+            message_id,
+            CacheIngestResponse::Owned(response.into()),
+            backend,
+            tier,
+        )
+        .await;
     }
 
     /// Record that an article namespace returned an authoritative 430.
@@ -727,6 +786,31 @@ impl UnifiedCache {
                         cache.availability_slot(backend),
                         tier,
                     )
+                    .await;
+            }
+        }
+    }
+
+    /// Record a successful STAT response as a typed cache payload.
+    ///
+    /// STAT has no body to capture, so it must not be represented by an
+    /// unframed synthetic wire buffer at the cache-ingest boundary.
+    pub async fn record_backend_stat(
+        &self,
+        message_id: MessageId<'_>,
+        backend: BackendId,
+        tier: ttl::CacheTier,
+    ) {
+        match &self.kind {
+            UnifiedCacheKind::Availability(_) => {}
+            UnifiedCacheKind::Memory(cache) => {
+                cache
+                    .record_stat_for_slot(message_id, cache.availability_slot(backend), tier)
+                    .await;
+            }
+            UnifiedCacheKind::Hybrid(cache) => {
+                cache
+                    .record_stat_for_slot(message_id, cache.availability_slot(backend), tier)
                     .await;
             }
         }

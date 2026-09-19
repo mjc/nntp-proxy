@@ -47,7 +47,7 @@ impl MockHybridCache {
         )
     }
 
-    fn upsert_ingest(
+    fn upsert_test_response(
         &self,
         message_id: &MessageId<'_>,
         buffer: impl Into<CacheIngestResponse>,
@@ -57,10 +57,9 @@ impl MockHybridCache {
         let key = message_id.without_brackets().to_string();
         let mut storage = self.storage.lock().unwrap();
 
-        let Some(mut entry) = DiskCachedArticle::from_ingest_response_with_tier(
-            buffer,
-            super::ttl::CacheTier::new(0),
-        ) else {
+        let Some(mut entry) =
+            DiskCachedArticle::from_unframed_ingest_for_test(buffer, super::ttl::CacheTier::new(0))
+        else {
             return;
         };
         let entry_len = entry.payload_len();
@@ -159,13 +158,13 @@ mod tests {
     #[test]
     fn upsert_keeps_existing_semantic_payload_over_longer_metadata_only_response() {
         let cache = MockHybridCache::new(1024);
-        cache.upsert_ingest(
+        cache.upsert_test_response(
             &msg_id(),
             b"220 1 <mock-hybrid@example>\r\nH: V\r\n\r\nBody\r\n.\r\n".as_slice(),
             BackendId::from_index(0),
         );
 
-        cache.upsert_ingest(
+        cache.upsert_test_response(
             &msg_id(),
             b"220 1 <mock-hybrid@example> long status line without payload\r\n".as_slice(),
             BackendId::from_index(1),
@@ -188,7 +187,7 @@ mod tests {
         let message_id = msgid("<test@example.com>");
         let buffer = b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n";
 
-        cache.upsert_ingest(&message_id, buffer.as_slice(), BackendId::from_index(0));
+        cache.upsert_test_response(&message_id, buffer.as_slice(), BackendId::from_index(0));
 
         assert_article(
             &cache.get(&message_id).expect("Entry should exist"),
@@ -207,7 +206,7 @@ mod tests {
         let message_id = msgid("<borrowed@example.com>");
         let buffer = b"220 0 <borrowed@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n";
 
-        cache.upsert_ingest(&message_id, buffer.as_slice(), BackendId::from_index(0));
+        cache.upsert_test_response(&message_id, buffer.as_slice(), BackendId::from_index(0));
 
         assert_article(
             &cache.get(&message_id).expect("cached entry"),
@@ -238,13 +237,13 @@ mod tests {
 
         let large_buffer =
             b"220 0 <test@example.com>\r\nSubject: Test\r\n\r\nLarge body content here\r\n.\r\n";
-        cache.upsert_ingest(
+        cache.upsert_test_response(
             &message_id,
             large_buffer.as_slice(),
             BackendId::from_index(0),
         );
 
-        cache.upsert_ingest(
+        cache.upsert_test_response(
             &message_id,
             b"223 0 <test@example.com>\r\n".as_slice(),
             BackendId::from_index(1),
@@ -276,7 +275,7 @@ mod tests {
 
         let message_id = msgid("<avail@example.com>");
 
-        cache.upsert_ingest(
+        cache.upsert_test_response(
             &message_id,
             b"220 0 <avail@example.com>\r\nBody\r\n.\r\n".as_slice(),
             BackendId::from_index(0),
@@ -294,7 +293,7 @@ mod tests {
         let cache = MockHybridCache::new(1024 * 1024);
 
         let message_id = msgid("<test@example.com>");
-        cache.upsert_ingest(
+        cache.upsert_test_response(
             &message_id,
             b"220 0 <test@example.com>\r\n.\r\n".as_slice(),
             BackendId::from_index(0),

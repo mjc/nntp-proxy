@@ -30,6 +30,13 @@ pub(crate) fn cached_response_completion() -> std::io::IoSlice<'static> {
     std::io::IoSlice::new(DOT_TERMINATOR)
 }
 
+#[cfg(test)]
+pub(crate) fn empty_multiline_response_fixture(status: u16) -> Vec<u8> {
+    let mut response = format!("{status} 0 <test@example.com>\r\n").into_bytes();
+    response.extend(DOT_TERMINATOR.iter().copied());
+    response
+}
+
 pub(crate) const CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE: &[u8] =
     b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nOVER\r\nHDR\r\n.\r\n";
 
@@ -406,6 +413,36 @@ impl<'a> ResponseCursor<'a> {
         })
     }
 
+    /// Start a multiline cursor after the request-scoped status line has
+    /// already been classified.  The status-line bytes still seed the
+    /// rolling tail because an empty body forms `\r\n.\r\n` across that
+    /// boundary, but they do not need to be searched a second time.
+    fn begin_after_status_line(
+        conn: &'a mut crate::stream::ConnectionStream,
+        io_buffer: &'a mut crate::pool::PooledBuffer,
+        status_line_end: crate::protocol::StatusLineEnd,
+        packed_policy: PackedPendingBytesPolicy,
+    ) -> Result<Self, FramingError> {
+        let total_len = io_buffer.initialized();
+        let status_line_end = status_line_end.get();
+        if status_line_end > total_len {
+            return Err(FramingError::InvalidFrameMetadata);
+        }
+
+        let mut framer = MultilineFramer::default();
+        framer.update(&io_buffer[..status_line_end]);
+        let frame = framer
+            .split_chunk(&io_buffer[status_line_end..total_len], packed_policy)
+            .map(|progress| progress.in_window(FrameEnd(status_line_end), total_len))?;
+        Ok(Self {
+            conn,
+            io_buffer,
+            framer,
+            frame,
+            packed_policy,
+        })
+    }
+
     fn frame_next_chunk(&mut self) -> Result<(), FramingError> {
         self.frame = self
             .framer
@@ -637,6 +674,7 @@ struct MultilineFramer {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FramingError {
     UnexpectedTrailingResponseBytes,
+    InvalidFrameMetadata,
     BackendEof,
     Io,
     CapturedResponseTooLarge { bytes: usize, max: usize },
@@ -753,6 +791,28 @@ pub(crate) struct BackendResponseExchange<'pool> {
     backend_id: crate::types::BackendId,
 }
 
+/// An invalid response together with the backend connection that supplied it.
+///
+/// Invalid bytes are retained only for diagnostics and health-check salvage;
+/// callers cannot detach them from the connection and accidentally apply a
+/// failure policy to a different exchange.
+pub(crate) struct InvalidBackendResponse {
+    buffer: crate::pool::PooledBuffer,
+    conn: crate::pool::ConnectionGuard,
+}
+
+impl InvalidBackendResponse {
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.buffer
+    }
+
+    pub(crate) fn into_connection_for_health_check(
+        self,
+    ) -> crate::pool::deadpool_connection::PooledConnection {
+        self.conn.into_connection_for_health_check()
+    }
+}
+
 impl<'pool> BackendResponseExchange<'pool> {
     /// Read one response and bind it to the connection, pool, and backend
     /// identity that supplied its bytes.
@@ -767,7 +827,7 @@ impl<'pool> BackendResponseExchange<'pool> {
         Ok(Self::new(conn, response, pool, backend_id))
     }
 
-    pub(crate) fn new(
+    fn new(
         conn: crate::pool::ConnectionGuard,
         response: ClassifiedResponse,
         pool: &'pool crate::pool::BufferPool,
@@ -781,6 +841,19 @@ impl<'pool> BackendResponseExchange<'pool> {
         }
     }
 
+    /// Construct an exchange for tests that inject an already-read response.
+    /// Production callers must use `read` so the response and guard are bound
+    /// by the same read operation.
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        conn: crate::pool::ConnectionGuard,
+        response: ClassifiedResponse,
+        pool: &'pool crate::pool::BufferPool,
+        backend_id: crate::types::BackendId,
+    ) -> Self {
+        Self::new(conn, response, pool, backend_id)
+    }
+
     pub(crate) fn status_code(&self) -> Option<crate::protocol::StatusCode> {
         self.response
             .as_ref()
@@ -791,10 +864,10 @@ impl<'pool> BackendResponseExchange<'pool> {
         self.backend_id
     }
 
-    pub(crate) fn received_bytes(&self) -> &[u8] {
+    pub(crate) fn received_len(&self) -> usize {
         self.response
             .as_ref()
-            .map_or(&[], ClassifiedResponse::received_bytes)
+            .map_or(0, ClassifiedResponse::received_len)
     }
 
     /// Borrow a complete single-line payload before selecting its consuming
@@ -855,16 +928,46 @@ impl<'pool> BackendResponseExchange<'pool> {
         self.conn
     }
 
-    /// Discard an invalid or intentionally abandoned response while retaining
-    /// the connection for the caller's failure policy. This is distinct from a
-    /// successful handoff because the response was not consumed by the framer.
-    pub(crate) fn discard_response(self) -> crate::pool::ConnectionGuard {
-        self.conn
+    /// Move an invalid response and its connection together for diagnostics
+    /// and health-check salvage.
+    pub(crate) fn into_invalid_response(self) -> InvalidBackendResponse {
+        let response = self
+            .response
+            .expect("invalid response conversion requires an unconsumed response");
+        debug_assert!(response.frame.is_err());
+        InvalidBackendResponse {
+            buffer: response.buffer,
+            conn: self.conn,
+        }
     }
 
     /// Retire an exchange whose response was never consumed.
     pub(crate) fn fail_backend(self) {
         self.conn.fail_backend();
+    }
+
+    /// Capture the framed response and return its connection only after the
+    /// same exchange has proved that no response bytes remain queued.
+    ///
+    /// Consuming the exchange keeps response ownership, framing completion,
+    /// and connection reuse in one operation. Any capture or framing failure
+    /// drops the owning guard instead of allowing a caller to release an
+    /// unfinished connection.
+    pub(crate) async fn capture_isolated_and_reuse(mut self) -> anyhow::Result<CapturedResponse> {
+        let captured = self.receiving()?.capture_isolated().await?;
+        let connection = self.into_connection();
+        let _reusable = connection.complete_success();
+        Ok(captured)
+    }
+
+    /// Drain the framed response and return its completed connection to the
+    /// caller's routing policy. The exchange owns failure cleanup; only a
+    /// response proven complete can produce the returned guard.
+    pub(crate) async fn observe_and_reuse(
+        mut self,
+    ) -> anyhow::Result<crate::pool::ConnectionGuard> {
+        self.receiving()?.observe().await?;
+        Ok(self.into_connection())
     }
 }
 
@@ -947,8 +1050,8 @@ impl ClassifiedResponse {
         }
     }
 
-    pub(crate) fn received_bytes(&self) -> &[u8] {
-        &self.buffer
+    pub(crate) fn received_len(&self) -> usize {
+        self.buffer.len()
     }
 
     async fn capture_isolated(
@@ -1029,7 +1132,7 @@ impl ClassifiedResponse {
         .map_err(|error| anyhow::anyhow!("backend multiline response capture failed: {error:?}"))?;
         conn.mark_response_complete();
         Ok(retained.map(|payload_end| {
-            CapturedChunkedResponse::new(
+            CapturedChunkedResponse::from_capture(
                 kind,
                 status,
                 status_line_end,
@@ -1130,16 +1233,14 @@ type CapturedResponse =
     crate::protocol::ArticleState<crate::protocol::FramedArticleState<crate::pool::PooledBuffer>>;
 
 /// A retained response whose cache payload boundary was established by the
-/// framer. The cache adapter receives this state instead of re-scanning the
-/// captured bytes for the multiline terminator.
-pub(crate) struct CapturedChunkedResponse {
-    state: crate::protocol::ArticleState<
-        crate::protocol::FramedArticleState<crate::pool::ChunkedResponse>,
-    >,
-}
+/// framer. The cache adapter receives this resource-bound state instead of
+/// re-scanning the captured bytes for the multiline terminator.
+pub(crate) type CapturedChunkedResponse = crate::protocol::ArticleState<
+    crate::protocol::FramedArticleState<crate::pool::ChunkedResponse>,
+>;
 
 impl CapturedChunkedResponse {
-    fn new(
+    pub(crate) fn from_capture(
         kind: crate::protocol::RequestKind,
         status: crate::protocol::StatusCode,
         status_line_end: crate::protocol::StatusLineEnd,
@@ -1156,16 +1257,15 @@ impl CapturedChunkedResponse {
             content_end,
         ));
         debug_assert_eq!(state.as_inner().content_end().get(), payload_end.as_usize());
-        Self { state }
+        state
     }
 
-    pub(crate) fn into_cache_ingest(self) -> crate::cache::CacheIngestResponse {
-        crate::cache::CacheIngestResponse::from_framed_article(self.state)
+    pub(crate) fn into_cache_ingest(self) -> crate::cache::FramedChunkedResponse {
+        crate::cache::FramedChunkedResponse::from_article_state(self)
     }
 
-    #[must_use]
     pub(crate) fn len(&self) -> usize {
-        self.state.as_inner().bytes().len()
+        self.as_inner().bytes().len()
     }
 }
 
@@ -1564,13 +1664,16 @@ impl<'a> IsolatedMultilineResponse<'a> {
 #[cfg(test)]
 async fn capture_response(
     request: &crate::protocol::RequestContext,
-    io_buffer: &mut crate::pool::PooledBuffer,
+    io_buffer: crate::pool::PooledBuffer,
     conn: &mut crate::stream::ConnectionStream,
     response: &mut crate::pool::ChunkedResponse,
     pool: &crate::pool::BufferPool,
     backend_id: crate::types::BackendId,
 ) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
-    StreamingResponse::begin(request, io_buffer, conn, pool, backend_id)?
+    ClassifiedResponse::read_for_test(conn, request, io_buffer)
+        .await
+        .map_err(crate::session::response_transfer::ResponseTransferError::Io)?
+        .stream_for_test(conn, pool, backend_id)?
         .capture(response)
         .await
 }
@@ -1601,18 +1704,6 @@ enum ResponseShape {
 impl<'a> StreamingResponse<'a> {
     fn is_complete(&self) -> bool {
         matches!(self.cursor.frame, ResponseWindow::Complete(_))
-    }
-
-    #[cfg(test)]
-    fn begin(
-        request: &crate::protocol::RequestContext,
-        io_buffer: &'a mut crate::pool::PooledBuffer,
-        conn: &'a mut crate::stream::ConnectionStream,
-        pool: &'a crate::pool::BufferPool,
-        backend_id: crate::types::BackendId,
-    ) -> Result<Self, crate::session::response_transfer::ResponseTransferError> {
-        let frame = ResponseFrame::parse(request, io_buffer);
-        Self::from_classification(request.kind(), frame, io_buffer, conn, pool, backend_id)
     }
 
     fn from_classification(
@@ -1661,9 +1752,10 @@ impl<'a> StreamingResponse<'a> {
                     status,
                     status_line_end,
                 },
-                ResponseCursor::begin(
+                ResponseCursor::begin_after_status_line(
                     conn,
                     io_buffer,
+                    status_line_end,
                     PackedPendingBytesPolicy::AllowIfStatusPrefix,
                 )
                 .map_err(|error| {
@@ -1872,7 +1964,7 @@ impl<'a> StreamingResponse<'a> {
                     let payload_end =
                         crate::cache::CachePayloadEnd::new(payload_end, response.len())
                             .expect("framer established a cache payload within the capture");
-                    let captured = CapturedChunkedResponse::new(
+                    let captured = CapturedChunkedResponse::from_capture(
                         self.metadata.kind,
                         self.metadata.status,
                         self.metadata.status_line_end,
@@ -2256,6 +2348,9 @@ fn isolated_multiline_error(err: FramingError) -> anyhow::Error {
         FramingError::UnexpectedTrailingResponseBytes => {
             anyhow::anyhow!("Backend sent unexpected trailing bytes after multiline response")
         }
+        FramingError::InvalidFrameMetadata => {
+            anyhow::anyhow!("Framer received inconsistent response metadata")
+        }
         FramingError::BackendEof => {
             anyhow::anyhow!("Backend closed connection before complete multiline response")
         }
@@ -2388,6 +2483,83 @@ pub fn benchmark_stateless_multiline_frame(response: &[u8], chunk_size: usize) -
     }
 
     0
+}
+
+/// Build the same framer-bounded cache input that production capture hands to
+/// the cache adapter.
+///
+/// This benchmark-only adapter keeps status classification, chunk progression,
+/// terminator recognition, and payload-boundary derivation inside this module.
+/// The cache benchmark therefore measures the production framed-ingest API
+/// without fabricating a `FramedArticleState` from caller-supplied offsets.
+#[cfg(feature = "framing-bench")]
+#[must_use]
+pub fn benchmark_framed_cache_response(
+    response: &[u8],
+    kind: crate::protocol::RequestKind,
+    chunk_size: usize,
+) -> crate::cache::FramedChunkedResponse {
+    assert!(chunk_size > 0, "benchmark chunk size must be nonzero");
+    let status_line_end = status_line_len(response).expect("benchmark response status line");
+    let status = parse_response_status(response)
+        .status_code
+        .expect("benchmark response status code");
+    let multiline = crate::protocol::request_kind_has_response_body(kind, status);
+
+    let mut response_end = status_line_end;
+    if multiline {
+        let mut framer = MultilineFramer::default();
+        framer.update(&response[..status_line_end]);
+        let mut complete = false;
+        for chunk in response[status_line_end..].chunks(chunk_size) {
+            match framer
+                .split_chunk(chunk, PackedPendingBytesPolicy::AllowIfStatusPrefix)
+                .expect("benchmark response must satisfy packed-byte policy")
+            {
+                ChunkProgress::Incomplete => response_end += chunk.len(),
+                ChunkProgress::Complete(progress) => {
+                    response_end += progress.consumed.0;
+                    complete = true;
+                    break;
+                }
+            }
+        }
+        assert!(complete, "benchmark response is incomplete");
+        assert_eq!(
+            response_end,
+            response.len(),
+            "benchmark response has a suffix"
+        );
+    }
+
+    let pool = crate::pool::BufferPool::new(
+        crate::types::BufferSize::try_new(chunk_size).expect("benchmark chunk size is valid"),
+        1,
+    )
+    .with_capture_pool(chunk_size, response.len().div_ceil(chunk_size).max(1));
+    let mut captured = crate::pool::ChunkedResponse::default();
+    for chunk in response.chunks(chunk_size) {
+        let mut buffer = pool.acquire_capture();
+        buffer.copy_from_slice(chunk);
+        captured.push_buffer_range(buffer, 0..chunk.len());
+    }
+
+    let payload_end = if multiline {
+        response
+            .len()
+            .checked_sub(DOT_TERMINATOR.len())
+            .expect("multiline benchmark response terminator")
+    } else {
+        status_line_end
+    };
+    let state = crate::protocol::ArticleState::new(crate::protocol::FramedArticleState::new(
+        captured,
+        kind,
+        status,
+        crate::protocol::StatusLineEnd::new(status_line_end),
+        crate::protocol::ContentEnd::new(payload_end),
+    ));
+    crate::cache::FramedChunkedResponse::from_article_state(state)
 }
 
 #[inline]
@@ -2655,7 +2827,7 @@ mod tests {
         let mut captured = crate::pool::ChunkedResponse::default();
         capture_response(
             &request,
-            &mut io_buffer,
+            io_buffer,
             conn,
             &mut captured,
             pool,
@@ -2749,8 +2921,8 @@ mod tests {
         let cache_input = captured_response
             .expect("retained response")
             .into_cache_ingest();
-        let entry = crate::cache::CachedArticle::from_ingest_response_with_tier(
-            cache_input,
+        let entry = crate::cache::CachedArticle::from_unframed_ingest_for_test(
+            crate::cache::CacheIngestResponse::FramedChunked(cache_input),
             crate::cache::ttl::CacheTier::new(0),
         );
         assert_eq!(entry.status_code(), crate::protocol::StatusCode::new(222));
@@ -2963,7 +3135,7 @@ mod tests {
 
         capture_response(
             &request,
-            &mut io_buffer,
+            io_buffer,
             &mut conn,
             &mut captured,
             &pool,
@@ -4251,10 +4423,10 @@ mod contracts {
         let mut response = ClassifiedResponse::read_for_test(conn, request, buffer)
             .await
             .expect("classified response");
-        let transfer = response
+        let mut streaming = response
             .stream_for_test(conn, pool, crate::types::BackendId::from_index(0))
-            .expect("classified response should stream")
-            .write(writer);
+            .expect("classified response should stream");
+        let transfer = streaming.write(writer);
         #[cfg(response_contract = "response_twice")]
         let _conflicting = response.status_code();
         std::hint::black_box(transfer);

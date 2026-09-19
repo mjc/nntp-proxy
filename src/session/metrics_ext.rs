@@ -15,7 +15,7 @@ use crate::types::BackendId;
 /// # Examples
 ///
 /// ```
-/// use nntp_proxy::session::metrics_ext::MetricsRecorder;
+/// use nntp_proxy::session::MetricsRecorder;
 /// use nntp_proxy::metrics::MetricsCollector;
 /// use nntp_proxy::types::BackendId;
 ///

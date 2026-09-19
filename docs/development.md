@@ -110,10 +110,11 @@ continuation relationship but rejects packed suffixes. Neither operation lends
 an independently usable continuation to a handler.
 
 The scanner returns `ChunkConsumed`, a count relative to the latest push.
-`WindowEnd` is an exclusive position in the buffer's visible window, not its
-physical allocation. Translation occurs inside the framer, including after
-compaction. Coordinates do not establish buffer identity: the operation's
-exclusive borrow and the storage-owned `AppendedRead` establish that association.
+`FrameEnd` is an exclusive position in the current logical response window,
+not its physical allocation. Translation occurs inside the framer, including
+after compaction. Coordinates do not establish buffer identity: the
+operation's exclusive borrow and the storage-owned `AppendedRead` establish
+that association.
 
 Storage does not classify responses. `RetainedAppendPermit::read` consumes one
 permission and returns either EOF or an append result bound to the same buffer.

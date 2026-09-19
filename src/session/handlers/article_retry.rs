@@ -214,35 +214,29 @@ impl ClientSession {
 
     async fn write_precheck_direct_response<W>(
         client_write: &mut W,
-        response: crate::cache::CacheIngestResponse,
+        response: precheck::DirectResponse,
     ) -> Result<usize, SessionError>
     where
         W: AsyncWrite + Unpin,
     {
-        let len = response.len();
-        let write_result = match response {
-            crate::cache::CacheIngestResponse::Owned(buffer) => {
-                client_write.write_all(&buffer).await
+        let len = match response {
+            precheck::DirectResponse::Framed(response) => {
+                let len = response.len();
+                response
+                    .write_to(client_write)
+                    .await
+                    .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                len
             }
-            crate::cache::CacheIngestResponse::Pooled(buffer) => {
-                client_write.write_all(buffer.as_ref()).await
-            }
-            crate::cache::CacheIngestResponse::Chunked(response) => {
-                for chunk in response.iter_chunks() {
-                    if let Err(err) = client_write.write_all(chunk).await {
-                        return Err(SessionError::from(anyhow::Error::from(err)));
-                    }
-                }
-                Ok(())
-            }
-            crate::cache::CacheIngestResponse::FramedChunked(response) => {
-                response.write_to(client_write).await
-            }
-            crate::cache::CacheIngestResponse::Inline(buffer) => {
-                client_write.write_all(buffer.as_slice()).await
+            precheck::DirectResponse::SingleLine(response) => {
+                let len = response.len();
+                client_write
+                    .write_all(&response)
+                    .await
+                    .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+                len
             }
         };
-        write_result.map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
         client_write
             .flush()
             .await

@@ -417,14 +417,14 @@ impl HybridArticleCache {
     /// A cached full article (220/222 response) must not be replaced by STAT availability.
     ///
     /// The tier is stored with the entry for tier-aware TTL calculation.
-    pub async fn upsert_ingest(
+    pub async fn upsert_framed_ingest(
         &self,
         message_id: MessageId<'_>,
-        buffer: impl Into<super::CacheIngestResponse>,
+        buffer: super::FramedChunkedResponse,
         backend: super::BackendId,
         tier: super::ttl::CacheTier,
     ) {
-        self.upsert_ingest_for_slot(
+        self.upsert_framed_ingest_for_slot(
             message_id,
             buffer,
             AvailabilitySlot::new(backend.as_index()).expect("backend count fits bitmap"),
@@ -433,7 +433,42 @@ impl HybridArticleCache {
         .await;
     }
 
-    pub(crate) async fn upsert_ingest_for_slot(
+    pub(crate) async fn upsert_framed_ingest_for_slot(
+        &self,
+        message_id: MessageId<'_>,
+        buffer: super::FramedChunkedResponse,
+        slot: AvailabilitySlot,
+        tier: super::ttl::CacheTier,
+    ) {
+        let key = message_id.without_brackets().to_string();
+        let _mutation_guard = self.mutation_lock(&key).lock().await;
+        let buffer_len = buffer.len();
+        let Some(entry) = DiskCachedArticle::from_framed_chunked_with_tier(buffer, tier) else {
+            warn!(msg_id = %key, buffer_len, "Cannot cache: invalid framed status code");
+            return;
+        };
+        self.upsert_entry_for_slot(key, entry, slot, tier).await;
+    }
+
+    /// Parse an unframed response for cache compatibility tests.
+    #[cfg(test)]
+    pub(crate) async fn upsert_unframed_ingest(
+        &self,
+        message_id: MessageId<'_>,
+        buffer: impl Into<super::CacheIngestResponse>,
+        backend: super::BackendId,
+        tier: super::ttl::CacheTier,
+    ) {
+        self.upsert_unframed_ingest_for_slot(
+            message_id,
+            buffer,
+            AvailabilitySlot::new(backend.as_index()).expect("backend count fits bitmap"),
+            tier,
+        )
+        .await;
+    }
+
+    pub(crate) async fn upsert_unframed_ingest_for_slot(
         &self,
         message_id: MessageId<'_>,
         buffer: impl Into<super::CacheIngestResponse>,
@@ -444,11 +479,20 @@ impl HybridArticleCache {
         let key = message_id.without_brackets().to_string();
         let _mutation_guard = self.mutation_lock(&key).lock().await;
         let buffer_len = buffer.len();
-        let Some(mut entry) = DiskCachedArticle::from_ingest_response_with_tier(buffer, tier)
-        else {
+        let Some(entry) = DiskCachedArticle::from_unframed_ingest_for_test(buffer, tier) else {
             warn!(msg_id = %key, buffer_len, "Cannot cache: invalid status code");
             return;
         };
+        self.upsert_entry_for_slot(key, entry, slot, tier).await;
+    }
+
+    async fn upsert_entry_for_slot(
+        &self,
+        key: String,
+        mut entry: DiskCachedArticle,
+        slot: AvailabilitySlot,
+        tier: super::ttl::CacheTier,
+    ) {
         entry.set_availability_epoch(self.availability_epoch);
         let entry_len = entry.payload_len();
 
@@ -572,6 +616,29 @@ impl HybridArticleCache {
             updated
         } else {
             DiskCachedArticle::availability_only(cacheable_status, tier)
+        };
+        entry.set_availability_epoch(self.availability_epoch);
+
+        self.cache.insert(key, entry);
+    }
+
+    pub(crate) async fn record_stat_for_slot(
+        &self,
+        message_id: MessageId<'_>,
+        slot: AvailabilitySlot,
+        tier: super::ttl::CacheTier,
+    ) {
+        let key = message_id.without_brackets().to_string();
+        let _mutation_guard = self.mutation_lock(&key).lock().await;
+        let mut entry = if let Some(existing) = self.get_fresh_entry_for_mutation(&key).await {
+            if existing.availability().is_missing_slot(slot) {
+                return;
+            }
+            let mut updated = existing;
+            updated.record_backend_stat(tier);
+            updated
+        } else {
+            DiskCachedArticle::stat(tier)
         };
         entry.set_availability_epoch(self.availability_epoch);
 
@@ -714,10 +781,10 @@ mod tests {
     #[test]
     fn hybrid_weight_includes_key_metadata_and_payload_framing() {
         let missing = DiskCachedArticle::missing(super::ttl::CacheTier::new(0));
-        let article = DiskCachedArticle::from_ingest_response_with_tier(
-            b"220 1 <weight@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n"
-                .as_slice()
-                .into(),
+        let article = DiskCachedArticle::from_unframed_ingest_for_test(
+            crate::cache::CacheIngestResponse::from(
+                b"220 1 <weight@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".as_slice(),
+            ),
             super::ttl::CacheTier::new(0),
         )
         .expect("valid cache entry");
@@ -756,7 +823,7 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<test123@example.com>").unwrap();
         let buffer = b"220 0 <test123@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         cache
-            .upsert_ingest(msg_id, buffer.clone(), BackendId::from_index(0), 0.into())
+            .upsert_unframed_ingest(msg_id, buffer.clone(), BackendId::from_index(0), 0.into())
             .await;
 
         // Retrieve it
@@ -823,7 +890,9 @@ mod tests {
         );
 
         let msg_id = MessageId::from_borrowed("<hybrid-permanent-missing@example.com>").unwrap();
-        cache.upsert_ingest(msg_id, buffer, backend, 0.into()).await;
+        cache
+            .upsert_unframed_ingest(msg_id, buffer, backend, 0.into())
+            .await;
 
         let msg_id = MessageId::from_borrowed("<hybrid-permanent-missing@example.com>").unwrap();
         let entry = cache.get(&msg_id).await.unwrap();
@@ -851,7 +920,7 @@ mod tests {
             b"220 0 <expired-missing-upsert@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n"
                 .to_vec();
         cache
-            .upsert_ingest(msg_id, buffer.clone(), backend, 0.into())
+            .upsert_unframed_ingest(msg_id, buffer.clone(), backend, 0.into())
             .await;
 
         let msg_id = MessageId::from_borrowed("<expired-missing-upsert@example.com>").unwrap();
@@ -913,10 +982,11 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<expired-record-missing@example.com>").unwrap();
         let key = msg_id.without_brackets().to_string();
         let backend = BackendId::from_index(0);
-        let mut expired = DiskCachedArticle::from_ingest_response_with_tier(
-            b"220 0 <expired-record-missing@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n"
-                .as_slice()
-                .into(),
+        let mut expired = DiskCachedArticle::from_unframed_ingest_for_test(
+            crate::cache::CacheIngestResponse::from(
+                b"220 0 <expired-record-missing@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n"
+                    .as_slice(),
+            ),
             super::ttl::CacheTier::new(0),
         )
         .expect("valid cache entry");
@@ -976,7 +1046,7 @@ mod tests {
         let buffer =
             b"220 0 <mixed-payload@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
         cache
-            .upsert_ingest(msg_id, buffer.clone(), BackendId::from_index(1), 0.into())
+            .upsert_unframed_ingest(msg_id, buffer.clone(), BackendId::from_index(1), 0.into())
             .await;
 
         let msg_id = MessageId::from_borrowed("<mixed-payload@example.com>").unwrap();
@@ -1009,12 +1079,12 @@ mod tests {
         let body = b"222 0 <complete-replaces-metadata@example.com>\r\nbody\r\n.\r\n".to_vec();
 
         cache
-            .upsert_ingest(msg_id, head, BackendId::from_index(0), 0.into())
+            .upsert_unframed_ingest(msg_id, head, BackendId::from_index(0), 0.into())
             .await;
 
         let msg_id = MessageId::from_borrowed("<complete-replaces-metadata@example.com>").unwrap();
         cache
-            .upsert_ingest(msg_id, body.clone(), BackendId::from_index(1), 0.into())
+            .upsert_unframed_ingest(msg_id, body.clone(), BackendId::from_index(1), 0.into())
             .await;
 
         let msg_id = MessageId::from_borrowed("<complete-replaces-metadata@example.com>").unwrap();

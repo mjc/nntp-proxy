@@ -4,7 +4,9 @@
 
 use divan::Bencher;
 use nntp_proxy::cache::{HybridCacheConfig, UnifiedCache};
+use nntp_proxy::protocol::RequestKind;
 use nntp_proxy::protocol::StatusCode;
+use nntp_proxy::session::benchmark_framed_cache_response;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -73,10 +75,19 @@ fn retained_payload_updates(bencher: Bencher) {
     bencher
         .with_inputs(|| {
             let sequence = sequence.fetch_add(1, Ordering::Relaxed);
-            (message_id(sequence), article_response(sequence))
+            let response = article_response(sequence);
+            (
+                message_id(sequence),
+                benchmark_framed_cache_response(&response, RequestKind::Article, 4096),
+            )
         })
         .bench_values(|(id, response)| {
-            runtime.block_on(cache.upsert_ingest(id, response, BackendId::from_index(0), 0.into()));
+            runtime.block_on(cache.upsert_framed_ingest(
+                id,
+                response,
+                BackendId::from_index(0),
+                0.into(),
+            ));
         });
 
     runtime
@@ -92,10 +103,11 @@ fn mixed_metadata_and_payload_updates(bencher: Bencher) {
     bencher
         .with_inputs(|| {
             let sequence = sequence.fetch_add(2, Ordering::Relaxed);
+            let response = article_response(sequence + 1);
             (
                 message_id(sequence),
                 message_id(sequence + 1),
-                article_response(sequence + 1),
+                benchmark_framed_cache_response(&response, RequestKind::Article, 4096),
             )
         })
         .bench_values(|(metadata_id, payload_id, response)| {
@@ -109,7 +121,7 @@ fn mixed_metadata_and_payload_updates(bencher: Bencher) {
                     )
                     .await;
                 cache
-                    .upsert_ingest(payload_id, response, BackendId::from_index(0), 0.into())
+                    .upsert_framed_ingest(payload_id, response, BackendId::from_index(0), 0.into())
                     .await;
             });
         });

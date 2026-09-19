@@ -1,12 +1,12 @@
-//! Benchmarks for cache ingestion from typed ingest responses.
+//! Benchmarks for cache ingestion through the production framer boundary.
 //!
-//! Run with: cargo bench --bench cache_ingest
+//! Run with: `cargo bench --bench cache_ingest --features framing-bench`
 
 use divan::{Bencher, black_box};
 use nntp_proxy::cache::ArticleCache;
-use nntp_proxy::cache::CacheIngestResponse;
-use nntp_proxy::pool::{BufferPool, ChunkedResponse};
-use nntp_proxy::types::{BackendId, BufferSize, MessageId};
+use nntp_proxy::protocol::RequestKind;
+use nntp_proxy::session::benchmark_framed_cache_response;
+use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
 
 fn main() {
@@ -27,160 +27,66 @@ const BODY_RESPONSE: &[u8] = b"222 42 <bench@example.com>\r\nBody line\r\n.\r\n"
 const STAT_RESPONSE: &[u8] = b"223 42 <bench@example.com>\r\n";
 const MISSING_RESPONSE: &[u8] = b"430 No article\r\n";
 
+fn bench_ingest(bencher: Bencher, response: Vec<u8>, kind: RequestKind) {
+    let runtime = tokio::runtime::Runtime::new().expect("benchmark runtime");
+    let cache = ArticleCache::new(16 * 1024 * 1024, Duration::from_secs(300));
+
+    bencher
+        .counter(divan::counter::BytesCount::new(response.len()))
+        .with_inputs(|| benchmark_framed_cache_response(&response, kind, 4096))
+        .bench_values(|framed| {
+            runtime.block_on(async {
+                let message_id = MessageId::from_borrowed("<bench@example.com>").unwrap();
+                cache
+                    .upsert_framed_ingest(
+                        message_id,
+                        black_box(framed),
+                        BackendId::from_index(0),
+                        0.into(),
+                    )
+                    .await;
+            });
+        });
+}
+
 mod ingest {
     use super::{
-        ArticleCache, BODY_RESPONSE, BackendId, Bencher, Duration, HEAD_RESPONSE, MISSING_RESPONSE,
-        MessageId, STAT_RESPONSE, article_response, black_box,
+        BODY_RESPONSE, Bencher, HEAD_RESPONSE, MISSING_RESPONSE, RequestKind, STAT_RESPONSE,
+        article_response, bench_ingest,
     };
 
-    macro_rules! bench_ingest {
-        ($name:ident, $bytes:expr, $samples:expr) => {
-            #[divan::bench(sample_count = $samples, sample_size = 100)]
-            fn $name(bencher: Bencher) {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                let cache = ArticleCache::new(16 * 1024 * 1024, Duration::from_secs(300));
-                let bytes = $bytes;
-                bencher
-                    .counter(divan::counter::BytesCount::new(bytes.len()))
-                    .bench(|| {
-                        rt.block_on(async {
-                            let msg_id = MessageId::from_borrowed("<bench@example.com>").unwrap();
-                            cache
-                                .upsert_ingest(
-                                    msg_id,
-                                    black_box(bytes.as_slice()),
-                                    BackendId::from_index(0),
-                                    0.into(),
-                                )
-                                .await;
-                        });
-                    });
-            }
-        };
+    #[divan::bench(sample_count = 1000, sample_size = 100)]
+    fn article_small_body(bencher: Bencher) {
+        bench_ingest(bencher, article_response(128), RequestKind::Article);
     }
-
-    bench_ingest!(article_small_body, article_response(128), 1000);
-    bench_ingest!(article_64k_body, article_response(64 * 1024), 200);
-    bench_ingest!(article_1mb_body, article_response(1024 * 1024), 50);
-    bench_ingest!(head_only, HEAD_RESPONSE.to_vec(), 1000);
-    bench_ingest!(body_only, BODY_RESPONSE.to_vec(), 1000);
-    bench_ingest!(stat_only, STAT_RESPONSE.to_vec(), 1000);
-    bench_ingest!(missing_430, MISSING_RESPONSE.to_vec(), 1000);
-}
-
-mod cache_upsert {
-    use super::{
-        ArticleCache, BackendId, Bencher, Duration, MessageId, article_response, black_box,
-    };
-
-    #[divan::bench(sample_count = 100, sample_size = 50)]
-    fn response(bencher: Bencher) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let cache = ArticleCache::new(16 * 1024 * 1024, Duration::from_secs(300));
-        let bytes = article_response(64 * 1024);
-
-        bencher
-            .counter(divan::counter::BytesCount::new(bytes.len()))
-            .bench(|| {
-                rt.block_on(async {
-                    let msg_id = MessageId::from_borrowed("<bench@example.com>").unwrap();
-                    cache
-                        .upsert_ingest(
-                            msg_id,
-                            black_box(bytes.as_slice()),
-                            BackendId::from_index(0),
-                            0.into(),
-                        )
-                        .await;
-                });
-            });
-    }
-}
-
-mod chunked_ingest {
-    use super::{
-        ArticleCache, BackendId, Bencher, BufferPool, BufferSize, CacheIngestResponse,
-        ChunkedResponse, Duration, MessageId, article_response, black_box,
-    };
-
-    fn chunked_response(bytes: &[u8]) -> ChunkedResponse {
-        let pool =
-            BufferPool::new(BufferSize::try_new(1024).unwrap(), 1).with_capture_pool(4096, 8);
-        let mut response = ChunkedResponse::default();
-        response.extend_from_slice(&pool, bytes);
-        assert!(
-            response.iter_chunks().count() > 1,
-            "benchmark requires chunked storage"
-        );
-        response
-    }
-
-    macro_rules! bench_chunked_ingest {
-        ($name:ident, $bytes:expr, $samples:expr) => {
-            #[divan::bench(sample_count = $samples, sample_size = 100)]
-            fn $name(bencher: Bencher) {
-                let rt = tokio::runtime::Runtime::new().unwrap();
-                let cache = ArticleCache::new(16 * 1024 * 1024, Duration::from_secs(300));
-                let bytes = $bytes;
-                bencher
-                    .counter(divan::counter::BytesCount::new(bytes.len()))
-                    .with_inputs(|| chunked_response(&bytes))
-                    .bench_values(|chunked| {
-                        rt.block_on(async {
-                            let msg_id = MessageId::from_borrowed("<bench@example.com>").unwrap();
-                            cache
-                                .upsert_ingest(
-                                    msg_id,
-                                    CacheIngestResponse::Chunked(black_box(chunked)),
-                                    BackendId::from_index(0),
-                                    0.into(),
-                                )
-                                .await;
-                        });
-                    });
-            }
-        };
-    }
-
-    bench_chunked_ingest!(chunked_article_64k_body, article_response(64 * 1024), 200);
-    bench_chunked_ingest!(chunked_article_1mb_body, article_response(1024 * 1024), 50);
-}
-
-#[cfg(feature = "framing-bench")]
-mod framed_chunked_ingest {
-    use super::{
-        ArticleCache, BackendId, Bencher, Duration, MessageId, article_response, black_box,
-    };
-    use nntp_proxy::cache::CacheIngestResponse as PublicCacheIngestResponse;
 
     #[divan::bench(sample_count = 200, sample_size = 100)]
     fn article_64k_body(bencher: Bencher) {
-        bench_framed_article(bencher, article_response(64 * 1024));
+        bench_ingest(bencher, article_response(64 * 1024), RequestKind::Article);
     }
 
-    #[divan::bench(sample_count = 50, sample_size = 20)]
+    #[divan::bench(sample_count = 50, sample_size = 100)]
     fn article_1mb_body(bencher: Bencher) {
-        bench_framed_article(bencher, article_response(1024 * 1024));
+        bench_ingest(bencher, article_response(1024 * 1024), RequestKind::Article);
     }
 
-    fn bench_framed_article(bencher: Bencher, bytes: Vec<u8>) {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let cache = ArticleCache::new(16 * 1024 * 1024, Duration::from_secs(300));
-        bencher
-            .counter(divan::counter::BytesCount::new(bytes.len()))
-            .with_inputs(|| PublicCacheIngestResponse::benchmark_framed_article(&bytes))
-            .bench_values(|response| {
-                rt.block_on(async {
-                    let msg_id = MessageId::from_borrowed("<bench@example.com>").unwrap();
-                    cache
-                        .upsert_ingest(
-                            msg_id,
-                            black_box(response),
-                            BackendId::from_index(0),
-                            0.into(),
-                        )
-                        .await;
-                });
-            });
+    #[divan::bench(sample_count = 1000, sample_size = 100)]
+    fn head_only(bencher: Bencher) {
+        bench_ingest(bencher, HEAD_RESPONSE.to_vec(), RequestKind::Head);
+    }
+
+    #[divan::bench(sample_count = 1000, sample_size = 100)]
+    fn body_only(bencher: Bencher) {
+        bench_ingest(bencher, BODY_RESPONSE.to_vec(), RequestKind::Body);
+    }
+
+    #[divan::bench(sample_count = 1000, sample_size = 100)]
+    fn stat_only(bencher: Bencher) {
+        bench_ingest(bencher, STAT_RESPONSE.to_vec(), RequestKind::Stat);
+    }
+
+    #[divan::bench(sample_count = 1000, sample_size = 100)]
+    fn missing_430(bencher: Bencher) {
+        bench_ingest(bencher, MISSING_RESPONSE.to_vec(), RequestKind::Article);
     }
 }

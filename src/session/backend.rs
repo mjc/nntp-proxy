@@ -199,6 +199,12 @@ pub(crate) async fn execute_request_exchange_timed<'pool>(
     ))
 }
 
+#[cfg(response_contract = "exchange_constructor")]
+#[allow(dead_code)]
+fn exchange_constructor_is_not_a_caller_api() {
+    let _constructor = crate::session::multiline_framing::BackendResponseExchange::new;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,7 +304,7 @@ mod tests {
             .expect("DATE response should be valid");
         assert_eq!(status_code, StatusCode::new(111));
         assert!(!request.has_response_body(status_code));
-        assert_eq!(response.received_bytes(), b"111 20260501173336\r\n");
+        assert_eq!(response.received_len(), b"111 20260501173336\r\n".len());
     }
 
     #[tokio::test]

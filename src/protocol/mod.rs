@@ -32,6 +32,23 @@ pub use request::{
 };
 pub use response::StatusCode;
 
+// This sibling module deliberately sits outside `article` so the negative
+// contract proves that layout fields cannot be constructed or rebound by a
+// caller that can name the crate-private state type but not its representation.
+#[cfg(response_contract)]
+#[allow(dead_code)]
+mod response_contracts {
+    #[cfg(response_contract = "article_layout_rebind")]
+    fn article_layout_rebind() {
+        let layout = crate::protocol::article::ArticleLayout {
+            message_id: 0..1,
+            article_number: None,
+            content: panic!("layout construction must stay private"),
+        };
+        std::hint::black_box(layout);
+    }
+}
+
 // Re-export command construction helpers
 pub use commands::{
     COMPRESS_DEFLATE, QUIT, article_request, authinfo_pass, authinfo_user, body_request,

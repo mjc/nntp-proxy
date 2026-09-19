@@ -279,13 +279,13 @@ mod tests {
         decode_and_checksum(b"..\r\n", &mut actual);
 
         let mut expected = crc32fast::Hasher::new();
-        expected.update(&decode_yenc_line(b".."));
+        expected.update(&yenc::decode_buffer(b".").unwrap());
         assert_eq!(actual.finalize(), expected.finalize());
 
         let mut two_bytes = crc32fast::Hasher::new();
         decode_and_checksum(b"...\r\n", &mut two_bytes);
         let mut expected_two_bytes = crc32fast::Hasher::new();
-        expected_two_bytes.update(&decode_yenc_line(b"..."));
+        expected_two_bytes.update(&yenc::decode_buffer(b"..").unwrap());
         assert_eq!(two_bytes.finalize(), expected_two_bytes.finalize());
     }
 

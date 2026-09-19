@@ -17,10 +17,12 @@ use crate::types::{BackendId, MessageId};
 use futures::{StreamExt, stream::FuturesUnordered};
 
 #[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum PrecheckHit {
-    Payload(crate::cache::CacheIngestResponse),
+    Payload(crate::cache::FramedChunkedResponse),
+    /// A complete single-line response retained only for direct forwarding.
+    /// Cache storage uses the typed STAT operation instead of ingesting these bytes.
+    SingleLine(Box<[u8]>),
     Availability(StatusCode),
 }
 
@@ -28,7 +30,7 @@ impl PrecheckHit {
     #[must_use]
     const fn will_update_cache(&self, cache: &UnifiedCache) -> bool {
         match self {
-            Self::Payload(_) => cache.stores_payload_responses(),
+            Self::Payload(_) | Self::SingleLine(_) => cache.stores_payload_responses(),
             Self::Availability(_) => cache.records_backend_has_status(),
         }
     }
@@ -38,12 +40,17 @@ impl PrecheckHit {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum PrecheckResponse {
     Cached(CachedArticle),
-    Direct(crate::cache::CacheIngestResponse),
+    Direct(DirectResponse),
+}
+
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum DirectResponse {
+    Framed(crate::cache::FramedChunkedResponse),
+    SingleLine(Box<[u8]>),
 }
 
 /// Result of querying a backend for an article.
 #[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum QueryResult {
     Found(BackendId, PrecheckHit),
@@ -96,7 +103,6 @@ fn summarize_tier_results(results: &[QueryResult]) -> TierQuerySummary {
 }
 
 #[derive(Debug)]
-#[cfg_attr(test, derive(PartialEq, Eq))]
 #[allow(clippy::large_enum_variant)]
 enum RacingQueryOutcome {
     Hit(BackendId, PrecheckHit),
@@ -145,7 +151,12 @@ async fn cache_precheck_hit(
 
     match hit {
         PrecheckHit::Payload(data) => {
-            cache.upsert_ingest(msg_id, data, backend, tier).await;
+            cache
+                .upsert_framed_ingest(msg_id, data, backend, tier)
+                .await;
+        }
+        PrecheckHit::SingleLine(_) => {
+            cache.record_backend_stat(msg_id, backend, tier).await;
         }
         PrecheckHit::Availability(status_code) => {
             cache
@@ -246,7 +257,7 @@ async fn execute_backend_query(
             };
             let single_line_payload = exchange
                 .single_line_bytes()
-                .map(crate::cache::CacheIngestResponse::from);
+                .map(|bytes| bytes.to_vec().into_boxed_slice());
 
             let response = match exchange.receiving() {
                 Ok(response) => {
@@ -279,7 +290,7 @@ async fn build_precheck_hit(
     deps: &OwnedDeps,
     request: &RequestContext,
     status_code: StatusCode,
-    single_line_payload: Option<crate::cache::CacheIngestResponse>,
+    single_line_payload: Option<Box<[u8]>>,
     response: crate::session::backend::ReceivingResponse<'_>,
 ) -> Result<PrecheckHit, ()> {
     if request.has_response_body(status_code) {
@@ -288,7 +299,7 @@ async fn build_precheck_hit(
 
     response.complete_single_line().map_err(|_| ())?;
     let hit = if let Some(payload) = single_line_payload {
-        PrecheckHit::Payload(payload)
+        PrecheckHit::SingleLine(payload)
     } else {
         PrecheckHit::Availability(status_code)
     };
@@ -573,7 +584,25 @@ pub(crate) async fn precheck(
                         .await;
                         owned.cache.get(msg_id).await.map(PrecheckResponse::Cached)
                     } else {
-                        Some(PrecheckResponse::Direct(response))
+                        Some(PrecheckResponse::Direct(DirectResponse::Framed(response)))
+                    }
+                }
+                PrecheckHit::SingleLine(response) => {
+                    if owned.cache.stores_payload_responses() {
+                        let tier = crate::cache::ttl::CacheTier::new(0);
+                        cache_precheck_hit(
+                            &owned.cache,
+                            msg_id.to_owned(),
+                            backend,
+                            PrecheckHit::SingleLine(response),
+                            tier,
+                        )
+                        .await;
+                        owned.cache.get(msg_id).await.map(PrecheckResponse::Cached)
+                    } else {
+                        Some(PrecheckResponse::Direct(DirectResponse::SingleLine(
+                            response,
+                        )))
                     }
                 }
                 PrecheckHit::Availability(status_code) => {
@@ -679,21 +708,21 @@ mod tests {
             QueryResult::Missing(eligible(BackendId::from_index(0))),
             QueryResult::Found(
                 BackendId::from_index(1),
-                PrecheckHit::Payload(b"first".to_vec().into()),
+                PrecheckHit::SingleLine(b"223 1 <first@test> exists\r\n".to_vec().into()),
             ),
             QueryResult::Found(
                 BackendId::from_index(2),
-                PrecheckHit::Payload(b"second".to_vec().into()),
+                PrecheckHit::SingleLine(b"223 1 <second@test> exists\r\n".to_vec().into()),
             ),
         ];
         let (found, avail) = summarize(results);
-        assert_eq!(
+        assert!(matches!(
             found,
             Some((
-                BackendId::from_index(1),
-                PrecheckHit::Payload(crate::cache::CacheIngestResponse::from(b"first".to_vec()))
-            ))
-        );
+                id,
+                PrecheckHit::SingleLine(bytes)
+            )) if id == BackendId::from_index(1) && bytes.as_ref() == b"223 1 <first@test> exists\r\n"
+        ));
         assert!(avail.is_missing(BackendId::from_index(0)));
         assert!(!avail.is_missing(BackendId::from_index(1)));
         assert!(!avail.is_missing(BackendId::from_index(2)));
@@ -1016,7 +1045,7 @@ mod tests {
         let request =
             RequestContext::parse(b"ARTICLE <test@example.com>\r\n").expect("valid request line");
         let result = query_backend(&deps, eligible(backend_id), &request).await;
-        assert_eq!(result, QueryResult::Error);
+        assert!(matches!(result, QueryResult::Error));
     }
 
     #[tokio::test]
@@ -1035,7 +1064,7 @@ mod tests {
         let request =
             RequestContext::parse(b"ARTICLE <test@example.com>\r\n").expect("valid request line");
         let result = query_backend(&deps, eligible(backend_id), &request).await;
-        assert_eq!(result, QueryResult::Error);
+        assert!(matches!(result, QueryResult::Error));
     }
 
     #[tokio::test]
@@ -1054,10 +1083,11 @@ mod tests {
             RequestContext::parse(b"ARTICLE <test@example.com>\r\n").expect("valid request line");
         let result = query_backend(&deps, eligible(backend_id), &request).await;
 
-        assert_eq!(
+        assert!(matches!(
             result,
-            QueryResult::Found(backend_id, PrecheckHit::Availability(StatusCode::new(220)))
-        );
+            QueryResult::Found(backend, PrecheckHit::Availability(status))
+                if backend == backend_id && status == StatusCode::new(220)
+        ));
     }
 
     #[tokio::test]
@@ -1081,7 +1111,7 @@ mod tests {
                 &result,
                 QueryResult::Found(
                     id,
-                    PrecheckHit::Payload(crate::cache::CacheIngestResponse::FramedChunked(_))
+                    PrecheckHit::Payload(_)
                 ) if id == &backend_id
             ),
             "unexpected precheck result: {result:?}"

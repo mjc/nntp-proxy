@@ -50,9 +50,10 @@ use anyhow::{Context, Result};
 ///
 /// Zero-allocation design using caller-provided buffer pool.
 /// Share one pool across multiple clients for minimal allocations.
-/// Returns a framer-owned [`FramedArticle`]. Its bytes remain associated with
-/// the boundary established by the response framer; callers obtain a reusable
-/// [`ArticleView`] through the consuming [`FramedArticle::validate`] transition.
+/// Returns a framer-produced [`FramedArticle`] backed by the captured pooled
+/// allocation. Its bytes remain associated with the boundary established by
+/// the response framer; callers obtain a reusable [`ArticleView`] through the
+/// consuming [`FramedArticle::validate`] transition.
 #[derive(Clone)]
 pub struct NntpClient {
     conn_pool: DeadpoolConnectionProvider,
@@ -149,7 +150,7 @@ impl NntpClient {
             .activate();
         let buffer = self.buffer_pool.acquire();
 
-        let mut exchange = execute_request_exchange(
+        let exchange = execute_request_exchange(
             conn,
             &request,
             buffer,
@@ -164,17 +165,7 @@ impl NntpClient {
 
         let result = Self::parse_stat_response(status_code);
         if result.is_ok() {
-            let captured = exchange.receiving()?.capture_isolated().await;
-            let conn = exchange.into_connection();
-            match captured {
-                Ok(_captured) => {
-                    let _reusable = conn.complete_success();
-                }
-                Err(error) => {
-                    conn.fail_backend();
-                    return Err(error);
-                }
-            }
+            exchange.capture_isolated_and_reuse().await?;
         } else {
             exchange.fail_backend();
         }
@@ -205,7 +196,7 @@ impl NntpClient {
             .activate();
         let io_buffer = self.buffer_pool.acquire();
 
-        let mut exchange = execute_request_exchange(
+        let exchange = execute_request_exchange(
             conn,
             &request,
             io_buffer,
@@ -221,15 +212,7 @@ impl NntpClient {
         Self::validate_response(status_code)?;
         Self::validate_article_response_shape(request.kind(), status_code)?;
 
-        let captured = match exchange.receiving()?.capture_isolated().await {
-            Ok(result) => result,
-            Err(error) => {
-                exchange.into_connection_after_failure().fail_backend();
-                return Err(error);
-            }
-        };
-        let conn = exchange.into_connection();
-        let _reusable = conn.complete_success();
+        let captured = exchange.capture_isolated_and_reuse().await?;
         Ok(FramedArticle::from_framed(captured))
     }
 
@@ -316,10 +299,8 @@ impl FramedArticle {
 
     /// Validate NNTP semantics and apply the selected optional yEnc policy.
     pub fn validate_with_yenc(self, policy: YencValidation) -> Result<ValidatedArticle> {
-        let state = self.state.into_inner().validate(policy)?;
-        Ok(ValidatedArticle {
-            state: crate::protocol::ArticleState::new(state),
-        })
+        let state = self.state.validate(policy)?;
+        Ok(ValidatedArticle { state })
     }
 
     /// Consume the framed owner and return its pooled storage.
@@ -710,7 +691,10 @@ mod tests {
 
         let framed = client.fetch_head(&msg_id).await.unwrap();
 
-        assert_eq!(framed.as_bytes(), &response[..response.len() - 5]);
+        assert_eq!(
+            framed.as_bytes(),
+            b"221 0 <test@example.com>\r\nSubject: test\r\nFrom: tester\r\n"
+        );
     }
 
     #[tokio::test]
@@ -722,7 +706,10 @@ mod tests {
 
         let framed = client.fetch_body(&msg_id).await.unwrap();
 
-        assert_eq!(framed.as_bytes(), &response[..response.len() - 5]);
+        assert_eq!(
+            framed.as_bytes(),
+            b"222 0 <test@example.com>\r\nhello world"
+        );
         let validated = framed.validate_with_yenc(YencValidation::Disabled).unwrap();
         assert_eq!(validated.kind(), crate::protocol::RequestKind::Body);
         assert_eq!(validated.status(), StatusCode::new(222));
@@ -885,7 +872,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetch_head_can_be_parsed_by_the_documented_article_api() {
+    async fn stat_capture_failure_retires_packed_response_without_panicking() {
+        let response = b"223 42 <packed-stat@example.com> article exists\r\n\
+            223 43 <next-stat@example.com> article exists\r\n";
+        let addr = spawn_fetch_test_server("STAT <packed-stat@example.com>", response).await;
+        let client = make_test_client(addr);
+        let msg_id = crate::types::MessageId::new("<packed-stat@example.com>".to_string()).unwrap();
+
+        let error = client.stat(&msg_id).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unexpected bytes after isolated single-line response")
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_head_uses_the_canonical_validated_article_view() {
         let response = b"221 0 <test@example.com>\r\nSubject: test\r\nFrom: tester\r\n.\r\n";
         let addr = spawn_fetch_test_server("HEAD <test@example.com>", response).await;
         let client = make_test_client(addr);
@@ -906,7 +909,10 @@ mod tests {
         let msg_id = crate::types::MessageId::new("<dotted@example.com>".to_string()).unwrap();
 
         let framed = client.fetch_body(&msg_id).await.unwrap();
-        assert_eq!(framed.as_bytes(), &response[..response.len() - 5]);
+        assert_eq!(
+            framed.as_bytes(),
+            b"222 0 <dotted@example.com>\r\n..wire-dot"
+        );
         let validated = framed.validate_with_yenc(YencValidation::Disabled).unwrap();
         let article = validated.article();
         assert_eq!(article.body, Some(&b"..wire-dot"[..]));
@@ -934,9 +940,10 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_body_reads_multiline_response_above_retention_limit() {
-        let mut response = Vec::with_capacity((4 * 1024 * 1024) + 64);
-        response.extend_from_slice(b"222 0 <large@example.com>\r\n");
-        response.extend(std::iter::repeat_n(b'x', 4 * 1024 * 1024));
+        let mut expected = Vec::with_capacity((4 * 1024 * 1024) + 64);
+        expected.extend_from_slice(b"222 0 <large@example.com>\r\n");
+        expected.extend(std::iter::repeat_n(b'x', 4 * 1024 * 1024));
+        let mut response = expected.clone();
         response.extend_from_slice(b"\r\n.\r\n");
         let response: &'static [u8] = Box::leak(response.into_boxed_slice());
         let addr = spawn_fetch_test_server("BODY <large@example.com>", response).await;
@@ -945,6 +952,6 @@ mod tests {
 
         let framed = client.fetch_body(&msg_id).await.unwrap();
 
-        assert_eq!(framed.as_bytes(), &response[..response.len() - 5]);
+        assert_eq!(framed.as_bytes(), expected.as_slice());
     }
 }

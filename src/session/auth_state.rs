@@ -204,7 +204,7 @@ impl AuthState {
     /// # Examples
     ///
     /// ```
-    /// use nntp_proxy::session::AuthState;
+    /// use nntp_proxy::session::{AuthState, AuthenticationTransition};
     ///
     /// let auth_state = AuthState::new();
     /// assert!(!auth_state.is_authenticated());
