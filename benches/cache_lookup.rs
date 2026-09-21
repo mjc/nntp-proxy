@@ -65,6 +65,7 @@ mod index_contention {
         Empty,
         Hit,
         Miss,
+        // Adversarial contention controls, not representative Usenet traffic.
         HotKey,
         Skewed,
         Insert,
@@ -137,6 +138,56 @@ mod index_contention {
         Save,
         Load,
         Metrics,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum SnapshotActivity {
+        Idle,
+        ContinuousSave,
+    }
+
+    // Continuous saving is a cold-path interference stress test, not a model
+    // of the application's snapshot frequency.
+    #[divan::bench(consts = [1, 32], args = [SnapshotActivity::Idle, SnapshotActivity::ContinuousSave], threads = [16], sample_count = 100, sample_size = 1000)]
+    fn snapshot_interference<const SHARDS: usize>(bencher: Bencher, activity: SnapshotActivity) {
+        let cache = UnifiedCache::availability_with_benchmark_shards(Duration::MAX, SHARDS);
+        let ids: Vec<_> = (0..1024)
+            .map(|i| MessageId::new(format!("<snapshot-{i}@test>")).unwrap())
+            .collect();
+        for id in &ids {
+            cache
+                .record_availability_missing(id.clone(), AvailabilitySlot::new(0).unwrap())
+                .now_or_never()
+                .unwrap();
+        }
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("availability.idx");
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let saver = match activity {
+                SnapshotActivity::Idle => None,
+                SnapshotActivity::ContinuousSave => Some(scope.spawn(|| {
+                    let mut saves = 0;
+                    while !stop.load(Ordering::Relaxed) {
+                        cache.save_to_disk(&path).unwrap();
+                        saves += 1;
+                    }
+                    saves
+                })),
+            };
+            bencher.bench(|| {
+                let index = CURSOR.with(|cursor| {
+                    let index = cursor.get().wrapping_add(17) % ids.len();
+                    cursor.set(index);
+                    index
+                });
+                black_box(cache.get(&ids[index]).now_or_never().unwrap());
+            });
+            stop.store(true, Ordering::Relaxed);
+            if let Some(saver) = saver {
+                assert!(saver.join().unwrap() > 0);
+            }
+        });
     }
 
     #[divan::bench(consts = [1, 32], args = [Maintenance::Save, Maintenance::Load, Maintenance::Metrics], sample_count = 100, sample_size = 1)]

@@ -181,6 +181,11 @@ name = "availability_index_callgrind"
 harness = false
 
 [[bench]]
+name = "availability_allocations"
+harness = false
+required-features = ["framing-bench"]
+
+[[bench]]
 name = "request_serialization"
 harness = false
 
