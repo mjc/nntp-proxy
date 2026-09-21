@@ -18,6 +18,190 @@ fn main() {
     divan::main();
 }
 
+/// Contention experiment through the real availability cache. Multiple indexes
+/// are a ceiling experiment: each retains the production capacity, so this is
+/// not an equal-memory comparison or a proposed routing implementation.
+mod index_contention {
+    use super::*;
+    use futures::FutureExt;
+    use std::cell::Cell;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::broadcast;
+
+    static NEXT_WORKER: AtomicUsize = AtomicUsize::new(0);
+
+    thread_local! {
+        static CURSOR: Cell<usize> = const { Cell::new(0) };
+        static WORKER: usize = NEXT_WORKER.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[derive(Clone, Copy)]
+    enum Placement {
+        ByArticle,
+        ByWorker,
+    }
+
+    #[divan::bench(consts = [1, 16], args = [0, 10, 1], threads = [1, 2, 4, 8, 16], sample_count = 100, sample_size = 1000)]
+    fn lookup_and_record<const INDEXES: usize>(bencher: Bencher, write_every: usize) {
+        run::<INDEXES>(bencher, write_every, Placement::ByArticle);
+    }
+
+    /// Local-copy ceiling only: deliberately excludes replication work.
+    #[divan::bench(args = [0, 10, 1], threads = [1, 2, 4, 8, 16], sample_count = 100, sample_size = 1000)]
+    fn worker_local_without_replication(bencher: Bencher, write_every: usize) {
+        run::<16>(bencher, write_every, Placement::ByWorker);
+    }
+
+    struct Replica {
+        cache: UnifiedCache,
+        updates: broadcast::Receiver<MessageId<'static>>,
+        operations: usize,
+    }
+
+    impl Replica {
+        fn apply_pending(&mut self, slot: AvailabilitySlot) {
+            loop {
+                match self.updates.try_recv() {
+                    Ok(id) => self
+                        .cache
+                        .record_availability_missing(id, slot)
+                        .now_or_never()
+                        .expect("availability update is synchronous"),
+                    Err(broadcast::error::TryRecvError::Empty) => break,
+                    Err(error) => panic!("replication failed instead of converging: {error}"),
+                }
+            }
+        }
+    }
+
+    /// Includes publication, queue draining, and applying remote updates. The
+    /// bounded queue must not lose updates: lag is a failed experiment. Expiry
+    /// is disabled, as in the other topology experiments. Worker ownership is
+    /// simulated with uncontended locks; this is not a production TLS design.
+    #[divan::bench(consts = [1, 64, 256], args = [0, 10, 1], threads = [1, 2, 4, 8, 16], sample_count = 100, sample_size = 1000)]
+    fn worker_local_with_replication<const SYNC_EVERY: usize>(
+        bencher: Bencher,
+        write_every: usize,
+    ) {
+        let (updates, _) = broadcast::channel(65_536);
+        let replicas: Vec<_> = (0..16)
+            .map(|_| {
+                Mutex::new(Replica {
+                    cache: UnifiedCache::availability(Duration::MAX),
+                    updates: updates.subscribe(),
+                    operations: 0,
+                })
+            })
+            .collect();
+        let ids: Vec<_> = (0..1024)
+            .map(|i| MessageId::new(format!("<contention-{i}@example.com>")).unwrap())
+            .collect();
+        let slot = AvailabilitySlot::new(0).unwrap();
+        // Exercise convergence through the same queue/drain path before timing.
+        assert!(
+            replicas[0]
+                .lock()
+                .unwrap()
+                .cache
+                .get(&ids[0])
+                .now_or_never()
+                .unwrap()
+                .is_none()
+        );
+        for id in &ids {
+            updates.send(id.clone()).unwrap();
+        }
+        for replica in &replicas {
+            let mut replica = replica.lock().unwrap();
+            replica.apply_pending(slot);
+            for id in &ids {
+                assert!(replica.cache.get(id).now_or_never().unwrap().is_some());
+            }
+        }
+        bencher.bench(|| {
+            let worker = WORKER.with(|worker| worker % replicas.len());
+            let mut replica = replicas[worker].lock().unwrap();
+            replica.operations = replica.operations.wrapping_add(1);
+            let cursor = replica.operations;
+            if cursor.is_multiple_of(SYNC_EVERY) {
+                replica.apply_pending(slot);
+            }
+            let id = &ids[cursor.wrapping_mul(17) % ids.len()];
+            if write_every != 0 && cursor.is_multiple_of(write_every) {
+                replica
+                    .cache
+                    .record_availability_missing(id.clone(), slot)
+                    .now_or_never()
+                    .expect("availability update is synchronous");
+                updates
+                    .send(id.clone())
+                    .expect("replicas remain subscribed");
+            } else {
+                black_box(
+                    replica
+                        .cache
+                        .get(black_box(id))
+                        .now_or_never()
+                        .expect("availability lookup is synchronous"),
+                );
+            }
+        });
+        // Finish queued work for participating workers and detect lag even when
+        // it occurred after their last scheduled drain.
+        for replica in &replicas {
+            let mut replica = replica.lock().unwrap();
+            if replica.operations != 0 {
+                replica.apply_pending(slot);
+            }
+        }
+    }
+
+    fn run<const INDEXES: usize>(bencher: Bencher, write_every: usize, placement: Placement) {
+        let caches: Vec<_> = (0..INDEXES)
+            .map(|_| UnifiedCache::availability(Duration::MAX))
+            .collect();
+        let ids: Vec<_> = (0..1024)
+            .map(|i| MessageId::new(format!("<contention-{i}@example.com>")).unwrap())
+            .collect();
+        let slot = AvailabilitySlot::new(0).unwrap();
+        for cache in &caches {
+            for id in &ids {
+                cache
+                    .record_availability_missing(id.clone(), slot)
+                    .now_or_never()
+                    .expect("availability update is synchronous");
+            }
+        }
+        bencher.bench(|| {
+            let cursor = CURSOR.with(|value| {
+                let next = value.get().wrapping_add(1);
+                value.set(next);
+                next
+            });
+            let i = cursor.wrapping_mul(17) % ids.len();
+            let index = match placement {
+                Placement::ByArticle => i % INDEXES,
+                Placement::ByWorker => WORKER.with(|worker| worker % INDEXES),
+            };
+            let cache = &caches[index];
+            if write_every != 0 && cursor.is_multiple_of(write_every) {
+                cache
+                    .record_availability_missing(ids[i].clone(), slot)
+                    .now_or_never()
+                    .expect("availability update is synchronous");
+            } else {
+                black_box(
+                    cache
+                        .get(black_box(&ids[i]))
+                        .now_or_never()
+                        .expect("availability lookup is synchronous"),
+                );
+            }
+        });
+    }
+}
+
 // =============================================================================
 // ArticleAvailability bitset operations
 // =============================================================================
