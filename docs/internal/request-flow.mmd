@@ -2,36 +2,42 @@ sequenceDiagram
     participant C as Client
     participant P as NntpProxy
     participant S as ClientSession
-    participant CL as Classifier
-    participant R as Router
-    participant Pool as ConnectionPool
+    participant H as CommandHandler
+    participant R as BackendSelector
+    participant Pool as ConnectionProvider
+    participant G as ConnectionGuard
+    participant F as MultilineFramer
     participant B as Backend
 
-    C->>P: TCP Connect
-    P->>S: Create Session
-    P->>C: 200 Ready
-    
+    C->>P: TCP connect
+    P->>S: Create session
+    P->>C: NNTP greeting
+
     loop Commands
-        C->>S: ARTICLE <msg-id>
-        S->>CL: parse(command)
-        CL-->>S: NntpCommand::ArticleByMessageId
-        
-        alt Per-Command Mode
-            S->>R: route_command()
-            R-->>S: BackendId(0)
-            S->>Pool: get_pooled_connection()
-            Pool-->>S: ConnectionStream
-            S->>B: Forward Command
-            B-->>S: 220 + Article
-            S->>C: Stream Response
-            S->>Pool: Return Connection
-        else Stateful Mode
-            S->>B: Forward (dedicated)
-            B-->>S: Response
-            S->>C: Forward
+        C->>S: ARTICLE / BODY / other request
+        S->>H: classify_request(RequestContext, auth_access, routing_mode)
+        H-->>S: CommandPlan
+        alt Local response
+            H-->>C: Local status or capabilities response
+        else Per-command route
+            H->>R: Select eligible backend
+            R-->>H: Selected backend
+            H->>Pool: Acquire connection
+            Pool-->>H: ConnectionGuard
+            H->>G: Forward serialized request
+            G->>B: Request bytes
+            B-->>F: Response bytes
+            F-->>C: Write completed response
+            F-->>H: Transfer outcome
+            H->>G: complete_success(), fail_client(), or fail_backend()
+            G-->>Pool: Return reusable connection or remove it
+        else Stateful route
+            S->>B: Forward through dedicated backend connection
+            B-->>F: Response bytes
+            F->>F: Retain pending suffix for the next response
+            F-->>C: Write completed response in order
         end
     end
-    
+
     C->>S: QUIT
-    S->>C: 205 Goodbye
-    S->>P: Session Complete
+    S-->>C: 205 Goodbye

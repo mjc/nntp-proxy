@@ -1,5 +1,8 @@
 # Development
 
+The crate's minimum supported Rust version is 1.95. Use `devenv` for local
+development and validation. Use the Nix flake for packaging and cross-compilation.
+
 ## Common commands
 
 Build:
@@ -17,6 +20,14 @@ devenv shell cargo nextest run
 ```
 
 Use `cargo test` when you need doctests, exact filtering, or `-- --nocapture` debugging output.
+
+Check the public API examples and build the documentation with warnings treated
+as errors:
+
+```bash
+devenv shell cargo test --doc
+devenv shell env RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
+```
 
 Dependency and advisory triage:
 
@@ -44,7 +55,7 @@ Run the full PR-equivalent quality gate with:
 devenv tasks run project:quality-pr
 ```
 
-## Nix
+## Development environment and packaging
 
 The local development environment is managed by devenv:
 
@@ -73,8 +84,11 @@ cross-compilation.
 ## Response Handling Work
 
 Use RFC 3977 and RFC 4643 when protocol behavior is unclear. In this codebase,
-response shape is request-scoped: check `RequestContext::has_response_body()`
+response shape is request-scoped: check `RequestContext::has_response_body(status)`
 instead of inferring multiline behavior from a status code alone.
+
+See the [response contract map](protocol-contract.md) for the framing,
+ownership, coordinate, and validation invariants shared with nntpbench.
 
 Keep multiline response boundary logic in `src/session/multiline_framing.rs`.
 Benchmarks and tests should import production framing and request-classification
@@ -134,12 +148,42 @@ Explicit compiler-contract checks exercise real private types, with successful
 controls and checked diagnostic codes:
 
 ```bash
-nix develop -c bash scripts/check-response-contracts.sh
+devenv shell bash scripts/check-response-contracts.sh
 ```
 
 ### Measurement
 
-Published benchmark numbers were intentionally removed from the docs until they are rerun.
+Divan measures elapsed time in microbenchmarks. Gungraun uses Callgrind for
+deterministic instruction, branch, and cache measurements on supported Linux
+targets. All Callgrind benchmarks in this repository use Gungraun.
+
+Run a Divan benchmark through the managed environment:
+
+```bash
+devenv shell cargo bench --bench response_parsing
+devenv shell cargo bench --features framing-bench --bench multiline_framing
+```
+
+Run a Gungraun benchmark on Linux x86_64 or aarch64:
+
+```bash
+devenv shell cargo bench --bench request_classifier_callgrind
+devenv shell cargo bench --features framing-bench --bench multiline_framing_callgrind
+```
+
+Feature-gated targets must be enabled explicitly. Use the benchmark name from
+`Cargo.toml`; `cargo check --benches` excludes targets whose required features
+are disabled.
+
+To verify every benchmark target without running a measurement:
+
+```bash
+devenv shell cargo bench --no-run --all-features
+```
+
+Record published benchmark results with the tested commit, workload, machine
+class, and toolchain in the release benchmark record. The archived workflow
+description documents how to run measurements.
 
 When you want fresh numbers:
 
