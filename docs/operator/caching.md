@@ -67,6 +67,12 @@ backend that returned them. They do not contain a multiline body and are used to
 avoid retrying a backend already known not to have that message ID until the
 availability entry expires.
 
+Availability identity is the configured backend hostname. Entries with the same
+hostname share authoritative `430` facts across ports, resolved addresses,
+credentials, TLS settings, tiers, and display names; different hostnames remain
+separate. The proxy does not infer provider identity from DNS answers or account
+names: availability describes whether that provider has the requested article.
+
 ## Disk cache
 
 Use `[cache.disk]` only when `store_article_bodies = true`.
@@ -98,6 +104,11 @@ availability_index_path = "/var/cache/nntp-proxy/availability.idx"
 If `[cache]` is configured and `availability_index_path` is unset, the runtime defaults to `availability.idx` next to the config file.
 
 If `[cache]` is omitted entirely, the proxy still uses internal availability tracking but does not resolve an availability persistence path from config.
+
+Availability-only snapshots carry the configured hostnames used for their slots.
+Snapshot formats written before host-only identity encoding are ignored and
+rebuilt with the current configuration rather than being interpreted with a
+different slot layout.
 
 ## CLI overrides
 

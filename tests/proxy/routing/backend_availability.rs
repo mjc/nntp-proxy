@@ -17,9 +17,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::test_helpers::{
-    connect_and_read_greeting, create_test_server_config_with_availability_namespace,
-    send_article_read_multiline_response, setup_proxy_with_backends,
-    spawn_test_proxy_on_random_port, wait_for_server,
+    connect_and_read_greeting, create_test_server_config, send_article_read_multiline_response,
+    setup_proxy_with_backends, spawn_test_proxy_on_random_port, wait_for_server,
 };
 
 async fn read_line(stream: &mut tokio::net::TcpStream, context: &str) -> Result<String> {
@@ -44,7 +43,10 @@ async fn spawn_counting_backend(
     has_article: bool,
     slow_body: bool,
 ) -> Result<(u16, Arc<AtomicUsize>, tokio::task::JoinHandle<()>)> {
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    // Each fake provider gets a distinct configured hostname. Availability is
+    // intentionally shared by same-host entries, so ports alone cannot
+    // distinguish these test providers.
+    let listener = TcpListener::bind("0.0.0.0:0").await?;
     let port = listener.local_addr()?.port();
     let requests = Arc::new(AtomicUsize::new(0));
     let request_count = Arc::clone(&requests);
@@ -228,24 +230,9 @@ async fn test_availability_learned_before_client_disconnect_is_persisted() -> Re
 
     let config = Config {
         servers: vec![
-            create_test_server_config_with_availability_namespace(
-                "127.0.0.1",
-                port0,
-                "Backend0-430",
-                "disconnect-sync-backend-0",
-            ),
-            create_test_server_config_with_availability_namespace(
-                "127.0.0.1",
-                port1,
-                "Backend1-430",
-                "disconnect-sync-backend-1",
-            ),
-            create_test_server_config_with_availability_namespace(
-                "127.0.0.1",
-                port2,
-                "Backend2-Has",
-                "disconnect-sync-backend-2",
-            ),
+            create_test_server_config("127.0.0.1", port0, "Backend0-430"),
+            create_test_server_config("127.0.0.2", port1, "Backend1-430"),
+            create_test_server_config("127.0.0.3", port2, "Backend2-Has"),
         ],
         cache: Some(Cache {
             adaptive_precheck: false,

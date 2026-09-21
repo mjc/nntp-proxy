@@ -483,8 +483,13 @@ pub async fn setup_proxy_with_backends(
         servers: backend_ports
             .iter()
             .zip(backend_configs.iter())
-            .map(|(port, (name, _))| {
-                create_test_server_config_with_auth("127.0.0.1", *port, name, name, name)
+            .enumerate()
+            .map(|(index, (port, (name, _)))| {
+                // Each fake backend represents a different provider. Keep the
+                // configured hosts distinct because availability is shared by
+                // host, not by port or credentials.
+                let host = format!("127.0.0.{}", index + 1);
+                create_test_server_config_with_auth(&host, *port, name, name, name)
             })
             .collect(),
         ..Default::default()
@@ -908,25 +913,6 @@ pub async fn send_command_read_multiline_response(
 pub fn create_test_server_config(host: &str, port: u16, name: &str) -> Server {
     Server::builder(host, Port::try_new(port).unwrap())
         .name(name)
-        .max_connections(MaxConnections::try_new(5).unwrap())
-        .build()
-        .expect("Valid server config")
-}
-
-/// Create a basic server configuration with an explicit availability namespace.
-///
-/// Test backends that share a loopback address but represent different feeds
-/// must not share authoritative article-availability facts.
-#[must_use]
-pub fn create_test_server_config_with_availability_namespace(
-    host: &str,
-    port: u16,
-    name: &str,
-    availability_namespace: &str,
-) -> Server {
-    Server::builder(host, Port::try_new(port).unwrap())
-        .name(name)
-        .availability_namespace(availability_namespace)
         .max_connections(MaxConnections::try_new(5).unwrap())
         .build()
         .expect("Valid server config")

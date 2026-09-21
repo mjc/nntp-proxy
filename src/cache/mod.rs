@@ -28,10 +28,8 @@ mod mock_hybrid;
 
 pub use article::{ArticleCache, CachedArticle};
 pub use availability::{ArticleAvailability, BackendStatus, MAX_BACKENDS};
-pub use availability_identity::AvailabilitySlot;
-pub(crate) use availability_identity::{
-    AccountIdentity, AvailabilityIdentity, AvailabilityLayout, AvailabilityMask,
-};
+pub(crate) use availability_identity::{AvailabilityIdentity, AvailabilityLayout};
+pub use availability_identity::{AvailabilityMask, AvailabilitySlot};
 pub use availability_index::AvailabilityIndex;
 pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
 
@@ -354,7 +352,7 @@ mod tests {
         assert_eq!(entry.payload_len().get(), 0);
         assert!(!entry.has_availability_info());
         assert_eq!(entry.availability().missing_bits(), 0);
-        assert!(entry.should_try_backend(backend_id));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(backend_id.as_index()).unwrap()));
     }
 
     #[tokio::test]
@@ -520,18 +518,22 @@ pub struct UnifiedCache {
 }
 
 impl UnifiedCache {
-    #[cfg(test)]
-    pub async fn record_backend_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
-        let slot = AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap");
-        self.record_availability_missing(message_id, slot).await;
-    }
-
     /// Create an availability-only negative index.
     #[must_use]
     pub fn availability(ttl: std::time::Duration) -> Self {
         Self::new(UnifiedCacheKind::Availability(AvailabilityIndex::with_ttl(
             ttl,
         )))
+    }
+
+    /// Vary lock partitioning without multiplying the production block budget.
+    #[cfg(feature = "framing-bench")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn availability_with_benchmark_shards(ttl: std::time::Duration, shards: usize) -> Self {
+        Self::new(UnifiedCacheKind::Availability(
+            AvailabilityIndex::with_benchmark_shards(ttl, shards),
+        ))
     }
 
     pub(crate) fn availability_with_layout(
@@ -739,7 +741,7 @@ impl UnifiedCache {
         .await;
     }
 
-    /// Record that an article namespace returned an authoritative 430.
+    /// Record that a backend host returned an authoritative 430.
     pub async fn record_availability_missing(
         &self,
         message_id: MessageId<'_>,

@@ -9,8 +9,8 @@ set -euo pipefail
 # The client and backend both come from nntpbench. The harness always feeds the
 # client a synthetic segments file by default so ARTICLE/BODY requests stay on
 # comparable message-ID paths across nntpbench revisions. The measured proxy
-# has no [cache] section: every measured request passes through the front proxy
-# to nntpbench.
+# has no [cache] section: payload caching is disabled, but the default
+# availability index can answer repeated missing-article requests.
 
 RESULT_DIR=${RESULT_DIR:-"target/bench-results"}
 WORK_DIR=${WORK_DIR:-"$RESULT_DIR/release-cache-miss-e2e-work"}
@@ -30,6 +30,10 @@ NNTPBENCH_BODY_BYTES=${NNTPBENCH_BODY_BYTES:-$NNTPBENCH_ARTICLE_BYTES}
 NNTPBENCH_MAX_CONNECTIONS=${NNTPBENCH_MAX_CONNECTIONS:-4096}
 NNTPBENCH_MAX_PIPELINE_DEPTH=${NNTPBENCH_MAX_PIPELINE_DEPTH:-1024}
 NNTPBENCH_START_ID=${NNTPBENCH_START_ID:-1}
+# Optional indexed corpus: an empty directory makes every article return 430,
+# exercising negative-index insertion and subsequent routing-cache hits.
+NNTPBENCH_ARTICLE_DIR=${NNTPBENCH_ARTICLE_DIR:-""}
+PROXY_BIN=${PROXY_BIN:-""}
 NNTPBENCH_SEGMENTS_MODE=${NNTPBENCH_SEGMENTS_MODE:-always}
 NNTPBENCH_SEGMENT_COUNT=${NNTPBENCH_SEGMENT_COUNT:-65536}
 NNTPBENCH_SEGMENTS_FILE=${NNTPBENCH_SEGMENTS_FILE:-"$WORK_DIR/nntpbench-synthetic-segments.tsv"}
@@ -340,7 +344,7 @@ build_proxy_binary() {
         fi
     fi
 
-    BIN="./target/$CARGO_PROFILE/nntp-proxy"
+    BIN="${PROXY_BIN:-./target/$CARGO_PROFILE/nntp-proxy}"
 }
 
 build_nntpbench_binary() {
@@ -352,6 +356,10 @@ build_nntpbench_binary() {
 
 start_upstream() {
     UPSTREAM_PORT=$(reserve_port)
+    local -a corpus_args=()
+    if [ -n "$NNTPBENCH_ARTICLE_DIR" ]; then
+        corpus_args+=(--article-dir "$NNTPBENCH_ARTICLE_DIR")
+    fi
 
     echo "Using flake-provided nntpbench backend at $NNTPBENCH_BIN"
     run_with_optional_taskset_exec "$UPSTREAM_TASKSET" "$NNTPBENCH_BIN" server \
@@ -363,6 +371,7 @@ start_upstream() {
         --socket-recv-buffer "$UPSTREAM_SOCKET_RECV_BUFFER" \
         --socket-send-buffer "$UPSTREAM_SOCKET_SEND_BUFFER" \
         --stats-interval-secs 0 \
+        "${corpus_args[@]}" \
         >"$UPSTREAM_LOG" 2>&1 &
     UPSTREAM_PID=$!
 

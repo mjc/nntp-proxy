@@ -85,7 +85,11 @@ async fn test_unified_cache_memory_record_missing() {
     let result = cache.get(&msg_id).await;
     assert!(result.is_some());
     let entry = result.unwrap();
-    assert!(!entry.should_try_backend(backend_id));
+    assert!(
+        !entry.should_try_slot(
+            nntp_proxy::cache::AvailabilitySlot::new(backend_id.as_index()).unwrap()
+        )
+    );
 }
 
 #[tokio::test]
@@ -102,7 +106,11 @@ async fn test_unified_cache_availability_record_missing() {
         .await;
 
     let entry = cache.get(&msg_id).await.expect("availability entry");
-    assert!(!entry.should_try_backend(backend_id));
+    assert!(
+        !entry.should_try_slot(
+            nntp_proxy::cache::AvailabilitySlot::new(backend_id.as_index()).unwrap()
+        )
+    );
     assert_eq!(entry.availability().missing_bits(), 0b0000_0001);
 }
 
@@ -124,9 +132,13 @@ async fn test_unified_cache_record_missing_preserves_existing_article() {
 
     // Verify backend 1 is now marked as missing
     let result = cache.get(&msg_id).await.unwrap();
-    assert!(!result.should_try_backend(BackendId::from_index(1)));
+    assert!(!result.should_try_slot(nntp_proxy::cache::AvailabilitySlot::new(1).unwrap()));
     // Backend 0 should still be OK (it has the article)
-    assert!(result.should_try_backend(backend_id));
+    assert!(
+        result.should_try_slot(
+            nntp_proxy::cache::AvailabilitySlot::new(backend_id.as_index()).unwrap()
+        )
+    );
 }
 
 #[tokio::test]
@@ -138,8 +150,8 @@ async fn test_unified_cache_availability_records_only_missing_facts() {
         .await;
 
     let result = cache.get(&msg_id).await.expect("availability entry");
-    assert!(!result.should_try_backend(BackendId::from_index(1)));
-    assert!(result.should_try_backend(BackendId::from_index(2)));
+    assert!(!result.should_try_slot(nntp_proxy::cache::AvailabilitySlot::new(1).unwrap()));
+    assert!(result.should_try_slot(nntp_proxy::cache::AvailabilitySlot::new(2).unwrap()));
     assert_eq!(result.availability().missing_bits(), 0b0000_0010);
     assert_eq!(result.availability().missing_bits(), 0b0000_0010);
 }

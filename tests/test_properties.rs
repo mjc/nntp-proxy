@@ -5,7 +5,6 @@
 use nntp_proxy::cache::ArticleAvailability;
 use nntp_proxy::cache::ttl::{CacheTier, CacheTtlMillis, effective_ttl};
 use nntp_proxy::protocol::{Headers, RequestContext, RequestRouteClass, StatusCode};
-use nntp_proxy::router::BackendCount;
 use nntp_proxy::types::{BackendId, MessageId};
 use proptest::prelude::*;
 use std::fmt::Write as _;
@@ -95,9 +94,9 @@ proptest! {
         for (backend_id, op) in ops {
             let id = BackendId::from_index(usize::from(backend_id));
             if op == 0 {
-                avail.record_missing(id);
+                avail.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(id.as_index()).unwrap());
             } else {
-                let _ = avail.is_missing(id);
+                let _ = avail.is_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(id.as_index()).unwrap());
             }
         }
     }
@@ -108,12 +107,12 @@ proptest! {
         let mut avail1 = ArticleAvailability::new();
         let mut avail2 = ArticleAvailability::new();
 
-        avail1.record_missing(id);
-        avail1.record_missing(id);  // Second call
+        avail1.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(id.as_index()).unwrap());
+        avail1.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(id.as_index()).unwrap());  // Second call
 
-        avail2.record_missing(id);  // Only once
+        avail2.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(id.as_index()).unwrap());  // Only once
 
-        prop_assert_eq!(avail1.is_missing(id), avail2.is_missing(id));
+        prop_assert_eq!(avail1.is_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(id.as_index()).unwrap()), avail2.is_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(id.as_index()).unwrap()));
     }
 
     #[test]
@@ -121,12 +120,12 @@ proptest! {
         let id = BackendId::from_index(usize::from(backend_id));
         let mut avail = ArticleAvailability::new();
 
-        avail.record_missing(id);
-        prop_assert!(avail.is_missing(id));
+        avail.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(id.as_index()).unwrap());
+        prop_assert!(avail.is_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(id.as_index()).unwrap()));
 
         let fresh = ArticleAvailability::new();
-        prop_assert!(!fresh.is_missing(id));
-        prop_assert!(avail.is_missing(id));
+        prop_assert!(!fresh.is_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(id.as_index()).unwrap()));
+        prop_assert!(avail.is_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(id.as_index()).unwrap()));
     }
 
     #[test]
@@ -134,13 +133,13 @@ proptest! {
         let id = BackendId::from_index(usize::from(backend_id));
         let mut avail = ArticleAvailability::new();
 
-        prop_assert!(!avail.is_missing(id));
+        prop_assert!(!avail.is_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(id.as_index()).unwrap()));
 
-        avail.record_missing(id);
-        prop_assert!(avail.is_missing(id));
+        avail.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(id.as_index()).unwrap());
+        prop_assert!(avail.is_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(id.as_index()).unwrap()));
 
-        avail.record_missing(id);
-        prop_assert!(avail.is_missing(id));
+        avail.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(id.as_index()).unwrap());
+        prop_assert!(avail.is_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(id.as_index()).unwrap()));
     }
 
     #[test]
@@ -148,19 +147,21 @@ proptest! {
         num_backends in 1..=8usize
     ) {
         let mut avail = ArticleAvailability::new();
-        let count =
-            BackendCount::try_new(num_backends).expect("property backend count fits bitset");
+        let slots = (0..num_backends)
+            .map(|index| nntp_proxy::cache::AvailabilitySlot::new(index).unwrap())
+            .collect::<Vec<_>>();
+        let mask = nntp_proxy::cache::AvailabilityMask::from_slots(&slots);
 
         // Initially not exhausted
-        prop_assert!(!avail.all_exhausted(count));
+        prop_assert!(!avail.all_exhausted(mask));
 
         // Mark all as missing
         for i in 0..num_backends {
-            avail.record_missing(BackendId::from_index(i));
+            avail.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(i).unwrap());
         }
 
         // Now exhausted
-        prop_assert!(avail.all_exhausted(count));
+        prop_assert!(avail.all_exhausted(mask));
     }
 }
 

@@ -16,7 +16,6 @@
 //! allowing the backend count to grow with the target word size.
 
 use super::{AvailabilityMask, AvailabilitySlot};
-use crate::router::BackendCount;
 use crate::types::BackendId;
 
 /// Maximum number of backends supported by `ArticleAvailability` bitset.
@@ -94,18 +93,6 @@ impl ArticleAvailability {
         self.missing & slot.bit() != 0
     }
 
-    /// Check if we should attempt to fetch from this backend
-    ///
-    /// Returns `true` if backend might have the article (not yet marked missing).
-    ///
-    #[inline]
-    #[must_use]
-    pub(crate) fn should_try(&self, backend_id: BackendId) -> bool {
-        !self.is_missing_slot(
-            AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
-        )
-    }
-
     #[inline]
     #[must_use]
     pub(crate) fn should_try_slot(&self, slot: AvailabilitySlot) -> bool {
@@ -119,24 +106,15 @@ impl ArticleAvailability {
         self.missing
     }
 
-    /// Check if all backends in the pool have been tried and returned 430
+    /// Check if every configured provider slot returned an authoritative 430.
     ///
-    /// Check if all backends have been tried and returned 430
+    /// The mask is supplied by the router's identity layout. It must not be
+    /// reconstructed from a transport backend count because several backend
+    /// entries may share one provider slot.
     ///
     #[inline]
     #[must_use]
-    pub fn all_exhausted(&self, backend_count: BackendCount) -> bool {
-        let expected_missing = match backend_count.get() {
-            0 => 0,
-            MAX_BACKENDS => usize::MAX,
-            n => (1usize << n) - 1,
-        };
-        self.missing & expected_missing == expected_missing
-    }
-
-    #[inline]
-    #[must_use]
-    pub(crate) fn all_exhausted_slots(&self, configured: AvailabilityMask) -> bool {
+    pub fn all_exhausted(&self, configured: AvailabilityMask) -> bool {
         self.missing & configured.bits() == configured.bits()
     }
 
@@ -170,21 +148,6 @@ impl ArticleAvailability {
     }
 }
 
-impl ArticleAvailability {
-    pub fn record_missing(&mut self, backend_id: BackendId) -> &mut Self {
-        self.record_missing_slot(
-            AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
-        )
-    }
-
-    #[must_use]
-    pub fn is_missing(&self, backend_id: BackendId) -> bool {
-        self.is_missing_slot(
-            AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
-        )
-    }
-}
-
 impl Default for ArticleAvailability {
     fn default() -> Self {
         Self::new()
@@ -197,59 +160,61 @@ mod tests {
     use super::*;
     use crate::cache::AvailabilityLayout;
     use crate::config::Server;
-    use crate::router::BackendCount;
     use crate::types::Port;
 
-    fn backend_count(count: usize) -> BackendCount {
-        BackendCount::try_new(count).expect("test backend count fits availability bitmap")
+    fn provider_mask(count: usize) -> AvailabilityMask {
+        let slots = (0..count)
+            .map(|index| AvailabilitySlot::new(index).unwrap())
+            .collect::<Vec<_>>();
+        AvailabilityMask::from_slots(&slots)
     }
     use crate::types::BackendId;
 
     #[test]
     fn test_backend_availability_basic() {
         let mut avail = ArticleAvailability::new();
-        let b0 = BackendId::from_index(0);
-        let b1 = BackendId::from_index(1);
+        let b0 = AvailabilitySlot::new(0).unwrap();
+        let b1 = AvailabilitySlot::new(1).unwrap();
 
         // Default: assume all backends have it
-        assert!(avail.should_try(b0));
-        assert!(avail.should_try(b1));
+        assert!(avail.should_try_slot(b0));
+        assert!(avail.should_try_slot(b1));
 
         // Record b0 as missing (returned 430)
-        avail.record_missing(b0);
-        assert!(!avail.should_try(b0)); // Should not try again
-        assert!(avail.should_try(b1)); // Still should try
+        avail.record_missing_slot(b0);
+        assert!(!avail.should_try_slot(b0)); // Should not try again
+        assert!(avail.should_try_slot(b1)); // Still should try
 
         // Record b1 as missing too
-        avail.record_missing(b1);
-        assert!(!avail.should_try(b1));
+        avail.record_missing_slot(b1);
+        assert!(!avail.should_try_slot(b1));
     }
 
     #[test]
     fn missing_backend_is_not_eligible() {
         let mut avail = ArticleAvailability::new();
-        let b0 = BackendId::from_index(0);
+        let b0 = AvailabilitySlot::new(0).unwrap();
 
         // First mark as missing
-        avail.record_missing(b0);
-        assert!(avail.is_missing(b0));
+        avail.record_missing_slot(b0);
+        assert!(avail.is_missing_slot(b0));
 
-        assert!(avail.is_missing(b0));
+        assert!(avail.is_missing_slot(b0));
     }
 
     #[test]
     fn success_observation_does_not_change_availability() {
         let mut cache_state = ArticleAvailability::new();
-        let b0 = BackendId::from_index(0);
-        let b1 = BackendId::from_index(1);
+        let b0 = AvailabilitySlot::new(0).unwrap();
+        let b1 = AvailabilitySlot::new(1).unwrap();
 
-        cache_state.record_missing(b0);
-        cache_state.record_missing(b1);
-        assert!(cache_state.is_missing(b0));
-        assert!(cache_state.is_missing(b1));
+        cache_state.record_missing_slot(b0);
+        cache_state.record_missing_slot(b1);
+        assert!(cache_state.is_missing_slot(b0));
+        assert!(cache_state.is_missing_slot(b1));
 
         let fresh = ArticleAvailability::new();
-        assert!(!fresh.is_missing(b0));
+        assert!(!fresh.is_missing_slot(b0));
 
         assert_eq!(cache_state.missing_bits(), 0b11);
     }
@@ -259,22 +224,22 @@ mod tests {
         let mut avail = ArticleAvailability::new();
 
         // None missing yet
-        assert!(!avail.all_exhausted(backend_count(2)));
-        assert!(!avail.all_exhausted(backend_count(3)));
+        assert!(!avail.all_exhausted(provider_mask(2)));
+        assert!(!avail.all_exhausted(provider_mask(3)));
 
         // Record backends 0 and 1 as missing
-        avail.record_missing(BackendId::from_index(0));
-        avail.record_missing(BackendId::from_index(1));
+        avail.record_missing_slot(AvailabilitySlot::new(0).unwrap());
+        avail.record_missing_slot(AvailabilitySlot::new(1).unwrap());
 
         // All 2 backends exhausted
-        assert!(avail.all_exhausted(backend_count(2)));
+        assert!(avail.all_exhausted(provider_mask(2)));
 
         // But not all 3 backends (backend 2 still untried)
-        assert!(!avail.all_exhausted(backend_count(3)));
+        assert!(!avail.all_exhausted(provider_mask(3)));
     }
 
     #[test]
-    fn same_host_and_account_share_an_availability_slot_across_ports() {
+    fn same_host_shares_an_availability_slot_across_ports_and_accounts() {
         let servers = [
             Server::builder("news.example", Port::try_new(119).unwrap())
                 .username("reader")
@@ -297,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn availability_identity_includes_account_but_not_password() {
+    fn availability_identity_ignores_account_and_port_but_not_host() {
         let servers = [
             Server::builder("news.example", Port::try_new(119).unwrap())
                 .username("reader")
@@ -315,34 +280,40 @@ mod tests {
         ];
         let layout = AvailabilityLayout::from_servers(&servers).unwrap();
 
-        assert_ne!(
+        assert_eq!(
             layout.slot_for_backend(BackendId::from_index(0)),
             layout.slot_for_backend(BackendId::from_index(1))
         );
-        assert_ne!(
+        assert_eq!(
             layout.slot_for_backend(BackendId::from_index(0)),
             layout.slot_for_backend(BackendId::from_index(2))
         );
-        assert_eq!(layout.identity_count(), 3);
+        let different_host = [
+            Server::builder("other.example", Port::try_new(119).unwrap())
+                .username("reader")
+                .password("third-secret")
+                .build()
+                .unwrap(),
+        ];
+        let different_layout =
+            AvailabilityLayout::from_servers(&[servers[0].clone(), different_host[0].clone()])
+                .unwrap();
+        assert_ne!(
+            different_layout.slot_for_backend(BackendId::from_index(0)),
+            different_layout.slot_for_backend(BackendId::from_index(1))
+        );
+        assert_eq!(different_layout.identity_count(), 2);
     }
 
     #[test]
-    fn explicit_namespace_controls_cross_host_sharing() {
+    fn different_hosts_do_not_share_an_availability_slot() {
         let servers = [
             Server::builder("news-a.example", Port::try_new(119).unwrap())
-                .availability_namespace("shared-feed")
                 .username("reader")
                 .password("first-secret")
                 .build()
                 .unwrap(),
             Server::builder("news-b.example", Port::try_new(563).unwrap())
-                .availability_namespace("shared-feed")
-                .username("reader")
-                .password("second-secret")
-                .build()
-                .unwrap(),
-            Server::builder("news-b.example", Port::try_new(119).unwrap())
-                .availability_namespace("different-feed")
                 .username("reader")
                 .password("second-secret")
                 .build()
@@ -350,13 +321,9 @@ mod tests {
         ];
         let layout = AvailabilityLayout::from_servers(&servers).unwrap();
 
-        assert_eq!(
+        assert_ne!(
             layout.slot_for_backend(BackendId::from_index(0)),
             layout.slot_for_backend(BackendId::from_index(1))
-        );
-        assert_ne!(
-            layout.slot_for_backend(BackendId::from_index(1)),
-            layout.slot_for_backend(BackendId::from_index(2))
         );
         assert_eq!(layout.identity_count(), 2);
     }
@@ -384,7 +351,7 @@ mod tests {
         assert_eq!(
             first_slot,
             expanded_layout
-                .slot_for_identity(&AvailabilityIdentity::from_server(&first[0]))
+                .slot_for_identity(&AvailabilityIdentity::from(&first[0].host))
                 .unwrap()
         );
 
@@ -394,7 +361,7 @@ mod tests {
         assert_eq!(
             first_slot,
             reordered_layout
-                .slot_for_identity(&AvailabilityIdentity::from_server(&first[0]))
+                .slot_for_identity(&AvailabilityIdentity::from(&first[0].host))
                 .unwrap()
         );
         let registry = std::fs::read(directory.path().join("availability.registry")).unwrap();

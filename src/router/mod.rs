@@ -1461,7 +1461,7 @@ mod tests {
         selector.mark_backend_pending(BackendId::from_index(1));
 
         let mut availability = ArticleAvailability::new();
-        availability.record_missing(BackendId::from_index(0));
+        availability.record_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap());
         let backend = selector
             .route(RouteRequest::new(ClientId::new()).with_availability(&availability))
             .unwrap();
@@ -1606,8 +1606,8 @@ mod tests {
         }
 
         let mut availability = ArticleAvailability::new();
-        availability.record_missing(BackendId::from_index(0));
-        availability.record_missing(BackendId::from_index(1));
+        availability.record_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap());
+        availability.record_missing_slot(crate::cache::AvailabilitySlot::new(1).unwrap());
 
         let backend = selector
             .route(

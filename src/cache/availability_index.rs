@@ -5,10 +5,19 @@
 //! accepts occasional false negatives from rotation/overwrites. False positives
 //! are pushed down by storing a keyed 64-bit fingerprint plus a keyed 16-bit
 //! confirmation tag per slot.
+//!
+//! Article buckets partition one fixed allocation budget across locks; provider
+//! identity and fingerprints do not depend on worker identity or shard count.
+//! Each shard rotates lazily from its first insert, so generation phases can
+//! differ, but the configured retention bound does not increase. Snapshots lock
+//! shards in order and keep original observation ages when restored.
+//!
+//! Until the first recorded fact, a monotonic publication latch permits a
+//! hash-free miss. Only these initial-miss statistics use worker-selected
+//! stripes; article state is never thread-local. Concurrent metric totals are
+//! approximate across shards, and exact when writes have quiesced.
 
-use super::{
-    AccountIdentity, AvailabilityIdentity, AvailabilityLayout, AvailabilitySlot, MAX_BACKENDS,
-};
+use super::{AvailabilityIdentity, AvailabilityLayout, AvailabilitySlot, MAX_BACKENDS};
 use super::{CachedArticle, ttl};
 use crate::io_util::atomic_replace_file;
 #[cfg(test)]
@@ -19,27 +28,35 @@ use std::fs;
 use std::hash::Hasher;
 use std::mem::size_of;
 use std::path::Path;
-use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use twox_hash::XxHash64;
 
 const DEFAULT_GENERATIONS: usize = 2;
+const DEFAULT_SHARDS: usize = 32;
 const BLOCK_SLOTS: usize = 2;
 const FIXED_ARTICLE_CAPACITY: usize = 256 * 1024;
 const ALL_BACKEND_BITS: usize = usize::MAX;
-const PERSISTENCE_MAGIC: &[u8; 8] = b"ANEGSIM5";
+const PERSISTENCE_MAGIC: &[u8; 8] = b"ANEGSIM6";
 const LEGACY_PERSISTENCE_MAGIC_V1: &[u8; 8] = b"ANEGIDX1";
 const LEGACY_PERSISTENCE_MAGIC_V2: &[u8; 8] = b"ANEGIDX2";
 const LEGACY_PERSISTENCE_MAGIC_V3: &[u8; 8] = b"ANEGSIM1";
 const LEGACY_PERSISTENCE_MAGIC_V4: &[u8; 8] = b"ANEGSIM2";
 const LEGACY_PERSISTENCE_MAGIC_V5: &[u8; 8] = b"ANEGSIM3";
 const LEGACY_PERSISTENCE_MAGIC_V6: &[u8; 8] = b"ANEGSIM4";
+const LEGACY_PERSISTENCE_MAGIC_V7: &[u8; 8] = b"ANEGSIM5";
 const MAX_IDENTITY_FIELD_BYTES: usize = 1024 * 1024;
 
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
+static NEXT_COUNTER_STRIPE: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    // Only statistics use worker identity; article routing is always key-based.
+    static COUNTER_STRIPE: usize = NEXT_COUNTER_STRIPE.fetch_add(1, Ordering::Relaxed);
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 struct Block {
@@ -133,11 +150,73 @@ impl Generation {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct PersistedEntry {
+struct PersistedEntry<Slots = CurrentProviderBits> {
     hash: u64,
     tag: u16,
-    missing: usize,
+    missing: Slots,
     inserted_at: u64,
+}
+
+/// Bits in the snapshot's provider table, never the running index's layout.
+#[derive(Debug)]
+struct StoredProviderBits(usize);
+
+/// Bits produced by the running index or translated into its provider layout.
+#[derive(Clone, Copy, Debug)]
+struct CurrentProviderBits(usize);
+
+/// Parsed entries retain the table that gives their bit positions meaning.
+/// Consuming restoration translates and inserts into the same target index;
+/// callers cannot take remapped entries and apply them to another layout.
+#[derive(Default)]
+struct StoredAvailabilitySnapshot {
+    identities: Vec<AvailabilityIdentity>,
+    entries: Vec<PersistedEntry<StoredProviderBits>>,
+}
+
+impl StoredAvailabilitySnapshot {
+    fn restore_into(mut self, index: &AvailabilityIndex) {
+        self.entries.sort_by_key(|entry| entry.inserted_at);
+        let mut shards = index.lock_all_shards();
+        let now = ttl::now_millis();
+        for shard in &mut shards {
+            shard.filter.reset();
+            shard.counters = ShardCounters::default();
+        }
+        for shard in &index.shards {
+            shard.initial_misses.store(0, Ordering::Relaxed);
+        }
+        for entry in self.entries {
+            let missing = self
+                .identities
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| entry.missing.0 & (1usize << position) != 0)
+                .filter_map(|(_, identity)| index.layout.slot_for_identity(identity))
+                .fold(0, |bits, slot| bits | slot.bit());
+            let mapped = PersistedEntry {
+                hash: entry.hash,
+                tag: entry.tag,
+                missing: CurrentProviderBits(missing),
+                inserted_at: entry.inserted_at,
+            };
+            let (shard, bucket) = index.locate_hash(entry.hash);
+            let state = &mut shards[shard.0];
+            state.counters.evictions +=
+                state.filter.restore_entry(mapped, bucket, now, index.ttl) as u64;
+        }
+        for shard in &mut shards {
+            if shard.filter.live_generations != 0 {
+                shard.filter.reanchor_current_generation();
+            }
+        }
+        if shards
+            .iter()
+            .any(|shard| shard.filter.occupied_slots() != 0)
+        {
+            index.populated.get_or_init(|| ());
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -279,9 +358,8 @@ impl FilterState {
 
     fn lookup_missing_bits(
         &mut self,
-        hash: u64,
-        tag: u16,
-        block_index: usize,
+        fingerprint: ArticleFingerprint,
+        block_index: LocalBlockIndex,
         now: u64,
     ) -> LookupResult {
         let evicted = self.rotate_if_needed(now);
@@ -289,14 +367,13 @@ impl FilterState {
             return LookupResult {
                 missing_bits: 0,
                 evicted,
-                empty_after: true,
             };
         }
 
         let mut missing_bits = 0usize;
         for generation_index in self.active_generation_indices() {
-            missing_bits |=
-                self.generations[generation_index].blocks[block_index].missing_bits(hash, tag);
+            missing_bits |= self.generations[generation_index].blocks[block_index.0]
+                .missing_bits(fingerprint.hash, fingerprint.tag);
             if missing_bits == ALL_BACKEND_BITS {
                 break;
             }
@@ -305,17 +382,14 @@ impl FilterState {
         LookupResult {
             missing_bits,
             evicted,
-            empty_after: self.occupied_slots() == 0,
         }
     }
 
     fn insert_missing_bits(
         &mut self,
-        hash: u64,
-        tag: u16,
+        fingerprint: ArticleFingerprint,
         missing_bits: usize,
-        block_index: usize,
-        victim: usize,
+        block_index: LocalBlockIndex,
         now: u64,
     ) -> StateInsertOutcome {
         let evicted = self.rotate_if_needed(now);
@@ -323,22 +397,23 @@ impl FilterState {
             || missing_bits == 0
             || self.rotation_interval_millis == 0
         {
-            return StateInsertOutcome {
-                changed: false,
-                evicted,
-            };
+            return StateInsertOutcome { evicted };
         }
 
         self.ensure_current_generation_started(now);
         let generation = &mut self.generations[self.current_generation];
-        let block = &mut generation.blocks[block_index];
-        let outcome = block.insert(hash, tag, missing_bits, victim);
+        let block = &mut generation.blocks[block_index.0];
+        let outcome = block.insert(
+            fingerprint.hash,
+            fingerprint.tag,
+            missing_bits,
+            victim_slot(fingerprint.hash),
+        );
         if matches!(outcome, InsertOutcome::Inserted) {
             generation.occupied += 1;
         }
 
         StateInsertOutcome {
-            changed: !matches!(outcome, InsertOutcome::Updated),
             evicted: match outcome {
                 InsertOutcome::Replaced => evicted.saturating_add(1),
                 _ => evicted,
@@ -349,17 +424,14 @@ impl FilterState {
     fn restore_entry(
         &mut self,
         entry: PersistedEntry,
+        block_index: LocalBlockIndex,
         now: u64,
         ttl_millis: ttl::CacheTtlMillis,
     ) -> usize {
         if self.blocks_per_generation == 0
             || entry.hash == 0
-            || entry.missing == 0
-            || ttl::is_expired(
-                ttl::CacheTimestampMillis::new(entry.inserted_at),
-                ttl_millis,
-                ttl::CacheTier::new(0),
-            )
+            || entry.missing.0 == 0
+            || now.saturating_sub(entry.inserted_at) >= ttl_millis.get()
         {
             return 0;
         }
@@ -374,11 +446,8 @@ impl FilterState {
         let generation_index =
             (self.current_generation + self.generations.len() - offset) % self.generations.len();
         let generation = &mut self.generations[generation_index];
-        let started_at = if interval == 0 || interval == u64::MAX {
-            entry.inserted_at
-        } else {
-            now.saturating_sub((offset as u64).saturating_mul(interval))
-        };
+        // Restore must not turn historical 430 evidence into a fresh observation.
+        let started_at = entry.inserted_at;
 
         if generation.started_at == 0 {
             generation.started_at = started_at;
@@ -387,11 +456,11 @@ impl FilterState {
         }
         self.live_generations = self.live_generations.max(offset + 1);
 
-        let block = &mut generation.blocks[block_index(entry.hash, self.blocks_per_generation)];
+        let block = &mut generation.blocks[block_index.0];
         match block.insert(
             entry.hash,
             entry.tag,
-            entry.missing,
+            entry.missing.0,
             victim_slot(entry.hash),
         ) {
             InsertOutcome::Inserted => {
@@ -420,7 +489,7 @@ impl FilterState {
                     entries.push(PersistedEntry {
                         hash,
                         tag: block.tags[slot],
-                        missing,
+                        missing: CurrentProviderBits(missing),
                         inserted_at: generation.started_at,
                     });
                 }
@@ -435,12 +504,10 @@ impl FilterState {
 struct LookupResult {
     missing_bits: usize,
     evicted: usize,
-    empty_after: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct StateInsertOutcome {
-    changed: bool,
     evicted: usize,
 }
 
@@ -452,16 +519,110 @@ struct SnapshotResult {
 
 #[derive(Debug)]
 pub struct AvailabilityIndex {
-    state: Mutex<FilterState>,
+    shards: Box<[AvailabilityShard]>,
+    // Monotonic: once a write has completed, never bypass the locked lookup.
+    // In particular, expiry/metrics cannot race a write by clearing this state.
+    populated: OnceLock<()>,
+    blocks_per_generation: usize,
     layout: AvailabilityLayout,
     capacity_bytes: u64,
-    has_entries: AtomicBool,
-    hits: AtomicU64,
-    misses: AtomicU64,
-    inserts: AtomicU64,
-    dropped: AtomicU64,
-    evictions: AtomicU64,
     ttl: ttl::CacheTtlMillis,
+}
+
+#[derive(Debug)]
+struct AvailabilityShard {
+    state: Mutex<ShardState>,
+    initial_misses: AtomicU64,
+}
+
+impl AvailabilityShard {
+    fn lock(&self) -> std::sync::LockResult<MutexGuard<'_, ShardState>> {
+        self.state.lock()
+    }
+}
+
+#[derive(Debug, Default)]
+struct ShardCounters {
+    hits: u64,
+    misses: u64,
+    evictions: u64,
+}
+
+#[derive(Debug)]
+struct ShardState {
+    filter: FilterState,
+    counters: ShardCounters,
+}
+
+#[derive(Clone, Copy)]
+struct ArticleFingerprint {
+    hash: u64,
+    tag: u16,
+}
+
+impl ArticleFingerprint {
+    fn from_key(key: &str) -> Self {
+        let (hash, tag) = hash_key(key.as_bytes());
+        Self { hash, tag }
+    }
+}
+
+/// Bucket in the original, unpartitioned generation.
+struct GlobalBlockIndex(usize);
+struct ShardIndex(usize);
+/// Bucket relative to a single shard's generation allocation.
+#[derive(Clone, Copy)]
+struct LocalBlockIndex(usize);
+
+#[cfg(response_contract)]
+const _: fn() = || {
+    let mut filter = FilterState::new(1, 2, u64::MAX);
+    #[cfg(not(response_contract = "availability_coordinate"))]
+    let coordinate = LocalBlockIndex(0);
+    #[cfg(response_contract = "availability_coordinate")]
+    let coordinate = GlobalBlockIndex(0);
+    filter.lookup_missing_bits(ArticleFingerprint { hash: 1, tag: 2 }, coordinate, 1);
+};
+
+/// Routing retains the selected resource; no caller pairs a shard with an
+/// independently computed local bucket or fingerprint.
+struct ArticlePartition<'a> {
+    shard: &'a AvailabilityShard,
+    fingerprint: ArticleFingerprint,
+    bucket: LocalBlockIndex,
+}
+
+impl ArticlePartition<'_> {
+    fn lookup(self, now: u64) -> Option<CachedArticle> {
+        let mut shard = self
+            .shard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = shard
+            .filter
+            .lookup_missing_bits(self.fingerprint, self.bucket, now);
+        shard.counters.evictions += result.evicted as u64;
+        if result.missing_bits == 0 {
+            shard.counters.misses += 1;
+            drop(shard);
+            None
+        } else {
+            shard.counters.hits += 1;
+            drop(shard);
+            Some(CachedArticle::negative_only(result.missing_bits))
+        }
+    }
+
+    fn record_missing(self, bits: CurrentProviderBits, now: u64) {
+        let mut shard = self
+            .shard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let result = shard
+            .filter
+            .insert_missing_bits(self.fingerprint, bits.0, self.bucket, now);
+        shard.counters.evictions += result.evicted as u64;
+    }
 }
 
 impl Default for AvailabilityIndex {
@@ -471,12 +632,6 @@ impl Default for AvailabilityIndex {
 }
 
 impl AvailabilityIndex {
-    #[cfg(test)]
-    pub fn record_backend_missing(&self, message_id: &MessageId<'_>, backend_id: BackendId) {
-        let slot = AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap");
-        self.record_availability_missing(message_id, slot);
-    }
-
     #[must_use]
     pub const fn fixed_capacity_bytes() -> u64 {
         FIXED_CAPACITY_BYTES
@@ -490,6 +645,11 @@ impl AvailabilityIndex {
     #[must_use]
     pub fn with_ttl(ttl: Duration) -> Self {
         Self::with_capacity_and_generation_count(FIXED_CAPACITY_BYTES, ttl, DEFAULT_GENERATIONS)
+    }
+
+    #[cfg(feature = "framing-bench")]
+    pub(crate) fn with_benchmark_shards(ttl: Duration, shards: usize) -> Self {
+        Self::with_geometry(FIXED_CAPACITY_BYTES, ttl, DEFAULT_GENERATIONS, shards)
     }
 
     #[must_use]
@@ -517,6 +677,15 @@ impl AvailabilityIndex {
         ttl: Duration,
         generation_count: usize,
     ) -> Self {
+        Self::with_geometry(capacity_bytes, ttl, generation_count, DEFAULT_SHARDS)
+    }
+
+    fn with_geometry(
+        capacity_bytes: u64,
+        ttl: Duration,
+        generation_count: usize,
+        shard_count: usize,
+    ) -> Self {
         let ttl = ttl::CacheTtlMillis::from_duration(ttl);
         let total_blocks = (capacity_bytes as usize) / size_of::<Block>();
         let generation_count = generation_count.max(1).min(total_blocks.max(1));
@@ -531,22 +700,67 @@ impl AvailabilityIndex {
             ttl_millis => (ttl_millis / generation_count as u64).max(1),
         };
 
+        let shard_count = shard_count.max(1).min(blocks_per_generation.max(1));
+        let shards = (0..shard_count)
+            .map(|shard| AvailabilityShard {
+                state: Mutex::new(ShardState {
+                    filter: FilterState::new(
+                        blocks_per_generation / shard_count
+                            + usize::from(shard < blocks_per_generation % shard_count),
+                        generation_count,
+                        rotation_interval_millis,
+                    ),
+                    counters: ShardCounters::default(),
+                }),
+                initial_misses: AtomicU64::new(0),
+            })
+            .collect();
         Self {
-            state: Mutex::new(FilterState::new(
-                blocks_per_generation,
-                generation_count,
-                rotation_interval_millis,
-            )),
+            shards,
+            populated: OnceLock::new(),
+            blocks_per_generation,
             layout: AvailabilityLayout::synthetic(MAX_BACKENDS),
             capacity_bytes,
-            has_entries: AtomicBool::new(false),
-            hits: AtomicU64::new(0),
-            misses: AtomicU64::new(0),
-            inserts: AtomicU64::new(0),
-            dropped: AtomicU64::new(0),
-            evictions: AtomicU64::new(0),
             ttl,
         }
+    }
+
+    fn locate_bucket(&self, global: GlobalBlockIndex) -> (ShardIndex, LocalBlockIndex) {
+        (
+            ShardIndex(global.0 % self.shards.len()),
+            LocalBlockIndex(global.0 / self.shards.len()),
+        )
+    }
+
+    fn locate_hash(&self, hash: u64) -> (ShardIndex, LocalBlockIndex) {
+        let global = if self.blocks_per_generation == 0 {
+            0
+        } else {
+            block_index(hash, self.blocks_per_generation)
+        };
+        self.locate_bucket(GlobalBlockIndex(global))
+    }
+
+    fn partition(&self, fingerprint: ArticleFingerprint) -> ArticlePartition<'_> {
+        let (shard, bucket) = self.locate_hash(fingerprint.hash);
+        ArticlePartition {
+            shard: &self.shards[shard.0],
+            fingerprint,
+            bucket,
+        }
+    }
+
+    /// Only cold snapshot/restore operations hold more than one shard, always
+    /// in allocation order and never during filesystem I/O.
+    fn lock_all_shards(&self) -> Vec<MutexGuard<'_, ShardState>> {
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+            })
+            .collect()
     }
 
     #[must_use]
@@ -576,35 +790,9 @@ impl AvailabilityIndex {
         let data = fs::read(path).with_context(|| {
             format!("Failed to read availability index from {}", path.display())
         })?;
-        let parsed = parse_snapshot(&data)?;
-        let (identities, mut entries) = parsed.unwrap_or_default();
-        for entry in &mut entries {
-            entry.missing = remap_missing_bits(entry.missing, &identities, &self.layout);
-        }
-        entries.sort_by_key(|entry| entry.inserted_at);
-
-        let now = ttl::now_millis();
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.reset();
-        let mut evicted = 0usize;
-        for entry in entries {
-            evicted += state.restore_entry(entry, now, self.ttl);
-        }
-        if state.live_generations != 0 {
-            state.reanchor_current_generation();
-        }
-        let has_entries = state.occupied_slots() != 0;
-        drop(state);
-
-        self.has_entries.store(has_entries, Ordering::Relaxed);
-        self.hits.store(0, Ordering::Relaxed);
-        self.misses.store(0, Ordering::Relaxed);
-        self.inserts.store(0, Ordering::Relaxed);
-        self.dropped.store(0, Ordering::Relaxed);
-        self.evictions.store(evicted as u64, Ordering::Relaxed);
+        parse_snapshot(&data)?
+            .unwrap_or_default()
+            .restore_into(self);
         Ok(true)
     }
 
@@ -624,18 +812,7 @@ impl AvailabilityIndex {
             })?;
         }
 
-        let now = ttl::now_millis();
-        let snapshot = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state.snapshot_entries(now)
-        };
-        if snapshot.evicted != 0 {
-            self.evictions
-                .fetch_add(snapshot.evicted as u64, Ordering::Relaxed);
-        }
+        let snapshot = self.snapshot_entries();
 
         let mut bytes = Vec::with_capacity(
             16 + snapshot.entries.len()
@@ -650,7 +827,7 @@ impl AvailabilityIndex {
         for entry in snapshot.entries {
             bytes.extend_from_slice(&entry.hash.to_le_bytes());
             bytes.extend_from_slice(&entry.tag.to_le_bytes());
-            bytes.extend_from_slice(&availability_bits_to_wire(entry.missing)?.to_le_bytes());
+            bytes.extend_from_slice(&availability_bits_to_wire(entry.missing.0)?.to_le_bytes());
             bytes.extend_from_slice(&entry.inserted_at.to_le_bytes());
         }
 
@@ -681,24 +858,31 @@ impl AvailabilityIndex {
         self.capacity_bytes
     }
 
+    fn snapshot_entries(&self) -> SnapshotResult {
+        let mut shards = self.lock_all_shards();
+        let now = ttl::now_millis();
+        let mut snapshot = SnapshotResult::default();
+        for shard in &mut shards {
+            let mut part = shard.filter.snapshot_entries(now);
+            shard.counters.evictions += part.evicted as u64;
+            snapshot.entries.append(&mut part.entries);
+            snapshot.evicted += part.evicted;
+        }
+        snapshot
+    }
+
     #[must_use]
     pub fn entry_count(&self) -> u64 {
-        if !self.has_entries.load(Ordering::Relaxed) {
-            return 0;
-        }
-        let result = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let evicted = state.rotate_if_needed(ttl::now_millis());
-            (state.occupied_slots() as u64, evicted)
-        };
-        self.has_entries.store(result.0 != 0, Ordering::Relaxed);
-        if result.1 != 0 {
-            self.evictions.fetch_add(result.1 as u64, Ordering::Relaxed);
-        }
-        result.0
+        self.shards
+            .iter()
+            .map(|shard| {
+                let mut shard = shard
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                shard.counters.evictions += shard.filter.rotate_if_needed(ttl::now_millis()) as u64;
+                shard.filter.occupied_slots() as u64
+            })
+            .sum()
     }
 
     #[must_use]
@@ -708,8 +892,16 @@ impl AvailabilityIndex {
 
     #[must_use]
     pub fn hit_rate(&self) -> f64 {
-        let hits = self.hits.load(Ordering::Relaxed);
-        let misses = self.misses.load(Ordering::Relaxed);
+        let (hits, misses) = self.shards.iter().fold((0, 0), |(hits, misses), shard| {
+            let initial_misses = shard.initial_misses.load(Ordering::Relaxed);
+            let shard = shard
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                hits + shard.counters.hits,
+                misses + shard.counters.misses + initial_misses,
+            )
+        });
         let total = hits + misses;
         if total == 0 {
             0.0
@@ -720,50 +912,29 @@ impl AvailabilityIndex {
 
     #[must_use]
     pub fn evictions(&self) -> u64 {
-        self.evictions.load(Ordering::Relaxed)
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .counters
+                    .evictions
+            })
+            .sum()
     }
 
     fn lookup_by_key(&self, key: &str) -> Option<CachedArticle> {
-        if !self.has_entries.load(Ordering::Relaxed) {
-            self.misses.fetch_add(1, Ordering::Relaxed);
+        if self.populated.get().is_none() {
+            COUNTER_STRIPE.with(|stripe| {
+                self.shards[stripe % self.shards.len()]
+                    .initial_misses
+                    .fetch_add(1, Ordering::Relaxed);
+            });
             return None;
         }
-
-        let (hash, tag) = hash_key(key.as_bytes());
-        let now = ttl::now_millis();
-        let lookup = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.blocks_per_generation == 0 {
-                LookupResult {
-                    missing_bits: 0,
-                    evicted: 0,
-                    empty_after: true,
-                }
-            } else {
-                let block_index = block_index(hash, state.blocks_per_generation);
-                let mut lookup = state.lookup_missing_bits(hash, tag, block_index, now);
-                lookup.empty_after = state.occupied_slots() == 0;
-                lookup
-            }
-        };
-        if lookup.empty_after {
-            self.has_entries.store(false, Ordering::Relaxed);
-        }
-        if lookup.evicted != 0 {
-            self.evictions
-                .fetch_add(lookup.evicted as u64, Ordering::Relaxed);
-        }
-
-        if lookup.missing_bits != 0 {
-            self.hits.fetch_add(1, Ordering::Relaxed);
-            Some(CachedArticle::negative_only(lookup.missing_bits))
-        } else {
-            self.misses.fetch_add(1, Ordering::Relaxed);
-            None
-        }
+        self.partition(ArticleFingerprint::from_key(key))
+            .lookup(ttl::now_millis())
     }
 
     fn insert_missing_bits(&self, key: &str, missing_bits: usize) {
@@ -771,36 +942,13 @@ impl AvailabilityIndex {
             return;
         }
 
-        let (hash, tag) = hash_key(key.as_bytes());
-        let outcome = {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if state.blocks_per_generation == 0 {
-                StateInsertOutcome::default()
-            } else {
-                let block_index = block_index(hash, state.blocks_per_generation);
-                let victim = victim_slot(hash);
-                let now = ttl::now_millis();
-                state.insert_missing_bits(hash, tag, missing_bits, block_index, victim, now)
-            }
-        };
-
-        if outcome.evicted != 0 {
-            self.evictions
-                .fetch_add(outcome.evicted as u64, Ordering::Relaxed);
-        }
-        if outcome.changed {
-            self.has_entries.store(true, Ordering::Relaxed);
-            self.inserts.fetch_add(1, Ordering::Relaxed);
-        } else if self.capacity_bytes == 0 {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-        }
+        self.partition(ArticleFingerprint::from_key(key))
+            .record_missing(CurrentProviderBits(missing_bits), ttl::now_millis());
+        self.populated.get_or_init(|| ());
     }
 }
 
-fn parse_snapshot(data: &[u8]) -> Result<Option<(Vec<AvailabilityIdentity>, Vec<PersistedEntry>)>> {
+fn parse_snapshot(data: &[u8]) -> Result<Option<StoredAvailabilitySnapshot>> {
     if data.len() < PERSISTENCE_MAGIC.len() + size_of::<u64>() {
         anyhow::bail!("availability index file too short");
     }
@@ -812,6 +960,7 @@ fn parse_snapshot(data: &[u8]) -> Result<Option<(Vec<AvailabilityIdentity>, Vec<
         || magic == LEGACY_PERSISTENCE_MAGIC_V4
         || magic == LEGACY_PERSISTENCE_MAGIC_V5
         || magic == LEGACY_PERSISTENCE_MAGIC_V6
+        || magic == LEGACY_PERSISTENCE_MAGIC_V7
     {
         return Ok(None);
     }
@@ -855,7 +1004,7 @@ fn parse_snapshot(data: &[u8]) -> Result<Option<(Vec<AvailabilityIdentity>, Vec<
         if missing_wire & !(identity_mask as u64) != 0 {
             anyhow::bail!("availability bits exceed declared identity table");
         }
-        let missing = availability_bits_from_wire(missing_wire)?;
+        let missing = StoredProviderBits(availability_bits_from_wire(missing_wire)?);
         let inserted_at = read_u64(data, &mut cursor)?;
         entries.push(PersistedEntry {
             hash,
@@ -869,57 +1018,22 @@ fn parse_snapshot(data: &[u8]) -> Result<Option<(Vec<AvailabilityIdentity>, Vec<
         anyhow::bail!("trailing bytes in availability index");
     }
 
-    Ok(Some((identities, entries)))
-}
-
-fn remap_missing_bits(
-    missing: usize,
-    old_identities: &[AvailabilityIdentity],
-    current: &AvailabilityLayout,
-) -> usize {
-    old_identities
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| missing & (1usize << index) != 0)
-        .filter_map(|(_, identity)| current.slot_for_identity(identity))
-        .fold(0, |bits, slot| bits | slot.bit())
+    Ok(Some(StoredAvailabilitySnapshot {
+        identities,
+        entries,
+    }))
 }
 
 fn write_identity(bytes: &mut Vec<u8>, identity: &AvailabilityIdentity) -> Result<()> {
-    let namespace = identity.namespace.as_bytes();
-    let namespace_len =
-        u32::try_from(namespace.len()).context("availability namespace too long")?;
-    bytes.extend_from_slice(&namespace_len.to_le_bytes());
-    bytes.extend_from_slice(namespace);
-    match &identity.account {
-        AccountIdentity::Username(username) => {
-            bytes.push(1);
-            let username = username.as_bytes();
-            let username_len =
-                u32::try_from(username.len()).context("availability username too long")?;
-            bytes.extend_from_slice(&username_len.to_le_bytes());
-            bytes.extend_from_slice(username);
-        }
-        AccountIdentity::Anonymous => bytes.push(0),
-    }
+    let host = identity.as_host().as_bytes();
+    let host_len = u32::try_from(host.len()).context("availability host too long")?;
+    bytes.extend_from_slice(&host_len.to_le_bytes());
+    bytes.extend_from_slice(host);
     Ok(())
 }
 
 fn read_identity(data: &[u8], cursor: &mut usize) -> Result<AvailabilityIdentity> {
-    let namespace = read_string(data, cursor, "namespace")?;
-    let has_username = *data
-        .get(*cursor)
-        .ok_or_else(|| anyhow::anyhow!("truncated availability account marker"))?;
-    *cursor += 1;
-    let account = match has_username {
-        0 => None,
-        1 => Some(read_string(data, cursor, "username")?),
-        _ => anyhow::bail!("invalid availability account marker"),
-    };
-    Ok(AvailabilityIdentity {
-        namespace,
-        account: account.map_or(AccountIdentity::Anonymous, AccountIdentity::Username),
-    })
+    AvailabilityIdentity::from_persisted_host(read_string(data, cursor, "host")?)
 }
 
 fn read_string(data: &[u8], cursor: &mut usize, field: &str) -> Result<String> {
@@ -1025,9 +1139,260 @@ mod tests {
         (blocks * generations * size_of::<Block>()) as u64
     }
 
+    #[test]
+    fn restoring_an_observation_preserves_its_original_age() {
+        let now = ttl::now_millis();
+        let inserted_at = now - 25;
+        let mut filter = FilterState::new(1, 2, 100);
+        filter.restore_entry(
+            PersistedEntry {
+                hash: 42,
+                tag: 7,
+                missing: CurrentProviderBits(1),
+                inserted_at,
+            },
+            LocalBlockIndex(0),
+            now,
+            ttl::CacheTtlMillis::new(200),
+        );
+        filter.reanchor_current_generation();
+        assert_eq!(
+            filter.snapshot_entries(now).entries[0].inserted_at,
+            inserted_at
+        );
+        assert_eq!(
+            filter
+                .lookup_missing_bits(
+                    ArticleFingerprint { hash: 42, tag: 7 },
+                    LocalBlockIndex(0),
+                    inserted_at + 200
+                )
+                .missing_bits,
+            0
+        );
+    }
+
+    #[test]
+    fn partitions_preserve_bucket_geometry_and_total_capacity() {
+        for blocks in 0..35 {
+            for requested in [1, 4, 8, 16, 32] {
+                let index = AvailabilityIndex::with_geometry(
+                    test_capacity_for(blocks, 2),
+                    Duration::MAX,
+                    2,
+                    requested,
+                );
+                let actual_blocks: usize = index
+                    .shards
+                    .iter()
+                    .map(|shard| shard.lock().unwrap().filter.blocks_per_generation)
+                    .sum();
+                assert_eq!(actual_blocks, blocks);
+                let mut visited = std::collections::HashSet::new();
+                for bucket in 0..blocks {
+                    let (shard, local) = index.locate_bucket(GlobalBlockIndex(bucket));
+                    assert!(
+                        local.0
+                            < index.shards[shard.0]
+                                .lock()
+                                .unwrap()
+                                .filter
+                                .blocks_per_generation
+                    );
+                    assert!(visited.insert((shard.0, local.0)));
+                }
+                assert_eq!(visited.len(), blocks);
+            }
+        }
+    }
+
+    #[test]
+    fn partitions_merge_concurrent_provider_facts() {
+        let index = AvailabilityIndex::new();
+        let id = MessageId::from_borrowed("<concurrent@example.com>").unwrap();
+        std::thread::scope(|scope| {
+            for provider in 0..16 {
+                let index = &index;
+                let id = &id;
+                scope.spawn(move || {
+                    index.record_availability_missing(id, AvailabilitySlot::new(provider).unwrap())
+                });
+            }
+        });
+        assert_eq!(
+            index.get(&id).unwrap().availability().missing_bits(),
+            0xffff
+        );
+    }
+
+    #[test]
+    fn a_locked_partition_does_not_block_another_article_partition() {
+        let index = AvailabilityIndex::new();
+        let fingerprint = (1..1000)
+            .map(|hash| ArticleFingerprint { hash, tag: 1 })
+            .find(|fingerprint| index.locate_hash(fingerprint.hash).0.0 != 0)
+            .unwrap();
+        let held = index.shards[0].lock().unwrap();
+        std::thread::scope(|scope| {
+            let (send, receive) = std::sync::mpsc::channel();
+            let index = &index;
+            scope.spawn(move || {
+                index
+                    .partition(fingerprint)
+                    .record_missing(CurrentProviderBits(1), 10_000);
+                send.send(index.partition(fingerprint).lookup(10_000).is_some())
+                    .unwrap();
+            });
+            let result = receive.recv_timeout(Duration::from_secs(5));
+            drop(held);
+            assert!(result.unwrap());
+        });
+    }
+
+    #[test]
+    fn partition_expiry_does_not_depend_on_other_partition_activity() {
+        let fingerprint = ArticleFingerprint { hash: 42, tag: 7 };
+        for count in [1, 4, 16] {
+            let index = AvailabilityIndex::with_geometry(
+                FIXED_CAPACITY_BYTES,
+                Duration::from_millis(200),
+                2,
+                count,
+            );
+            index
+                .partition(fingerprint)
+                .record_missing(CurrentProviderBits(1), 10_000);
+            assert!(index.partition(fingerprint).lookup(10_199).is_some());
+            assert!(index.partition(fingerprint).lookup(10_200).is_none());
+            assert!(index.partition(fingerprint).lookup(100_000).is_none());
+            index
+                .partition(fingerprint)
+                .record_missing(CurrentProviderBits(2), 100_000);
+            assert_eq!(
+                index
+                    .partition(fingerprint)
+                    .lookup(100_000)
+                    .unwrap()
+                    .availability()
+                    .missing_bits(),
+                2
+            );
+            assert_eq!(index.evictions(), 1);
+        }
+    }
+
+    #[test]
+    fn snapshot_and_metrics_can_run_alongside_provider_updates() {
+        let index = AvailabilityIndex::new();
+        let id = MessageId::from_borrowed("<snapshot-race@test>").unwrap();
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("concurrent.idx");
+        std::thread::scope(|scope| {
+            for provider in 0..8 {
+                let index = &index;
+                let id = &id;
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        index.record_availability_missing(
+                            id,
+                            AvailabilitySlot::new(provider).unwrap(),
+                        );
+                        assert!(index.get(id).is_some());
+                    }
+                });
+            }
+            for _ in 0..4 {
+                index.save_to_path(&path).unwrap();
+                assert!(index.entry_count() <= 1);
+                assert!(index.hit_rate() <= 100.0);
+            }
+        });
+        index.save_to_path(&path).unwrap();
+        let restored = AvailabilityIndex::new();
+        restored.load_from_path(&path).unwrap();
+        assert_eq!(
+            restored.get(&id).unwrap().availability().missing_bits(),
+            255
+        );
+        assert_eq!(index.hit_rate(), 100.0);
+        assert_eq!(index.evictions(), 0);
+    }
+
+    #[test]
+    fn snapshots_restore_across_partition_counts() {
+        let directory = TempDir::new().unwrap();
+        let path = directory.path().join("partitioned.idx");
+        let ids: Vec<_> = (0..64)
+            .map(|i| MessageId::new(format!("<partition-{i}@test>")).unwrap())
+            .collect();
+        let source = AvailabilityIndex::with_geometry(FIXED_CAPACITY_BYTES, Duration::MAX, 2, 1);
+        for id in &ids {
+            source.record_availability_missing(id, AvailabilitySlot::new(3).unwrap());
+        }
+        source.save_to_path(&path).unwrap();
+        for count in [4, 16, 1] {
+            let restored =
+                AvailabilityIndex::with_geometry(FIXED_CAPACITY_BYTES, Duration::MAX, 2, count);
+            restored.load_from_path(&path).unwrap();
+            for id in &ids {
+                assert!(
+                    !restored
+                        .get(id)
+                        .unwrap()
+                        .should_try_slot(AvailabilitySlot::new(3).unwrap())
+                );
+            }
+            restored.save_to_path(&path).unwrap();
+        }
+    }
+
+    #[test]
+    fn partitioning_preserves_collision_victims_at_equal_capacity() {
+        let capacity = test_capacity_for(67, 2);
+        let single = AvailabilityIndex::with_geometry(capacity, Duration::MAX, 2, 1);
+        let partitioned = AvailabilityIndex::with_geometry(capacity, Duration::MAX, 2, 32);
+        let ids: Vec<_> = (0..4096)
+            .map(|i| MessageId::new(format!("<collision-{i}@test>")).unwrap())
+            .collect();
+        for (i, id) in ids.iter().enumerate() {
+            let slot = AvailabilitySlot::new(i % 8).unwrap();
+            single.record_availability_missing(id, slot);
+            partitioned.record_availability_missing(id, slot);
+        }
+        for id in &ids {
+            let bits = |index: &AvailabilityIndex| {
+                index
+                    .get(id)
+                    .map(|article| article.availability().missing_bits())
+            };
+            assert_eq!(bits(&single), bits(&partitioned));
+        }
+        assert_eq!(single.entry_count(), partitioned.entry_count());
+        assert_eq!(single.evictions(), partitioned.evictions());
+    }
+
+    #[test]
+    fn cold_miss_stripes_remain_visible_in_metrics_after_first_insert() {
+        let index = AvailabilityIndex::new();
+        let id = MessageId::from_borrowed("<cold-stats@test>").unwrap();
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let index = &index;
+                let id = &id;
+                scope.spawn(move || assert!(index.get(id).is_none()));
+            }
+        });
+        index.record_availability_missing(&id, AvailabilitySlot::new(0).unwrap());
+        assert!(index.get(&id).is_some());
+        assert_eq!(index.hit_rate(), 100.0 / 9.0);
+    }
+
     fn rewrite_persisted_inserted_at(path: &std::path::Path, inserted_at: u64) {
         let data = std::fs::read(path).unwrap();
-        let (identities, mut entries) = parse_snapshot(&data).unwrap().unwrap();
+        let StoredAvailabilitySnapshot {
+            identities,
+            mut entries,
+        } = parse_snapshot(&data).unwrap().unwrap();
         assert_eq!(
             entries.len(),
             1,
@@ -1046,7 +1411,7 @@ mod tests {
             bytes.extend_from_slice(&entry.hash.to_le_bytes());
             bytes.extend_from_slice(&entry.tag.to_le_bytes());
             bytes.extend_from_slice(
-                &availability_bits_to_wire(entry.missing)
+                &availability_bits_to_wire(entry.missing.0)
                     .unwrap()
                     .to_le_bytes(),
             );
@@ -1080,11 +1445,14 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<gone@example.com>").unwrap();
         let backend_id = BackendId::from_index(2);
 
-        index.record_backend_missing(&msg_id, backend_id);
+        index.record_availability_missing(
+            &msg_id,
+            AvailabilitySlot::new(backend_id.as_index()).unwrap(),
+        );
 
         let cached = index.get(&msg_id).expect("negative entry");
         assert!(cached.has_availability_info());
-        assert!(!cached.should_try_backend(backend_id));
+        assert!(!cached.should_try_slot(AvailabilitySlot::new(backend_id.as_index()).unwrap()));
         assert_eq!(
             cached.availability().missing_bits(),
             backend_id.availability_bit()
@@ -1140,11 +1508,59 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_restore_discards_removed_providers_and_shares_accounts() {
+        let server = |host, username| {
+            crate::config::Server::builder(host, crate::types::Port::try_new(119).unwrap())
+                .username(username)
+                .password("secret")
+                .build()
+                .unwrap()
+        };
+        let original = AvailabilityIndex::with_layout(
+            Duration::MAX,
+            AvailabilityLayout::from_servers(&[
+                server("removed.example", "first"),
+                server("retained.example", "first"),
+            ])
+            .unwrap(),
+        );
+        let message = MessageId::from_borrowed("<restore@example.com>").unwrap();
+        original.record_availability_missing(
+            &message,
+            original.layout.slot_for_backend(BackendId::from_index(0)),
+        );
+        original.record_availability_missing(
+            &message,
+            original.layout.slot_for_backend(BackendId::from_index(1)),
+        );
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("availability.idx");
+        original.save_to_path(&path).unwrap();
+        let target = AvailabilityIndex::with_layout(
+            Duration::MAX,
+            AvailabilityLayout::from_servers(&[
+                server("retained.example", "second"),
+                server("retained.example", "third"),
+                server("new.example", "first"),
+            ])
+            .unwrap(),
+        );
+        parse_snapshot(&fs::read(path).unwrap())
+            .unwrap()
+            .unwrap()
+            .restore_into(&target);
+        assert_eq!(
+            target.get(&message).unwrap().availability().missing_bits(),
+            1
+        );
+    }
+
+    #[test]
     fn request_message_id_lookup_requires_brackets() {
         let index = AvailabilityIndex::with_test_capacity(test_capacity_for(8, 2));
         let msg_id = MessageId::from_borrowed("<request@example.com>").unwrap();
 
-        index.record_backend_missing(&msg_id, BackendId::from_index(0));
+        index.record_availability_missing(&msg_id, AvailabilitySlot::new(0).unwrap());
 
         assert!(
             index
@@ -1167,7 +1583,7 @@ mod tests {
         );
         let msg_id = MessageId::from_borrowed("<expires@example.com>").unwrap();
 
-        index.record_backend_missing(&msg_id, BackendId::from_index(0));
+        index.record_availability_missing(&msg_id, AvailabilitySlot::new(0).unwrap());
         assert!(index.get(&msg_id).is_some());
 
         std::thread::sleep(std::time::Duration::from_millis(15));
@@ -1181,24 +1597,27 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<highest@example.com>").unwrap();
         let backend_id = BackendId::from_index(8);
 
-        index.record_backend_missing(&msg_id, backend_id);
+        index.record_availability_missing(
+            &msg_id,
+            AvailabilitySlot::new(backend_id.as_index()).unwrap(),
+        );
 
         let cached = index.get(&msg_id).expect("negative entry");
         assert_eq!(cached.availability().missing_bits(), 0b1_0000_0000);
-        assert!(!cached.should_try_backend(backend_id));
+        assert!(!cached.should_try_slot(AvailabilitySlot::new(backend_id.as_index()).unwrap()));
     }
 
     #[test]
     #[cfg(debug_assertions)]
-    fn record_missing_cannot_receive_out_of_range_backend() {
-        assert!(BackendId::try_from_index(usize::BITS as usize).is_none());
+    fn record_missing_cannot_receive_out_of_range_slot() {
+        assert!(AvailabilitySlot::new(usize::BITS as usize).is_none());
     }
 
     #[test]
     fn zero_capacity_index_never_records_entries() {
         let index = AvailabilityIndex::with_test_capacity(0);
         let msg_id = MessageId::from_borrowed("<nocap@example.com>").unwrap();
-        index.record_backend_missing(&msg_id, BackendId::from_index(0));
+        index.record_availability_missing(&msg_id, AvailabilitySlot::new(0).unwrap());
         assert!(index.get(&msg_id).is_none());
     }
 
@@ -1209,7 +1628,10 @@ mod tests {
 
         for idx in 0..128 {
             let msg_id = MessageId::new(format!("<bounded-{idx}@example.com>")).unwrap();
-            index.record_backend_missing(&msg_id, BackendId::from_index(idx % MAX_BACKENDS));
+            index.record_availability_missing(
+                &msg_id,
+                AvailabilitySlot::new(idx % MAX_BACKENDS).unwrap(),
+            );
         }
 
         assert!(index.used_bytes() <= capacity);
@@ -1225,7 +1647,7 @@ mod tests {
 
         assert_eq!(index.used_bytes(), capacity);
 
-        index.record_backend_missing(&msg_id, BackendId::from_index(0));
+        index.record_availability_missing(&msg_id, AvailabilitySlot::new(0).unwrap());
 
         assert_eq!(index.used_bytes(), capacity);
     }
@@ -1237,7 +1659,10 @@ mod tests {
 
         for idx in 0..(BLOCK_SLOTS + 4) {
             let msg_id = MessageId::new(format!("<evict-{idx}@example.com>")).unwrap();
-            index.record_backend_missing(&msg_id, BackendId::from_index(idx % MAX_BACKENDS));
+            index.record_availability_missing(
+                &msg_id,
+                AvailabilitySlot::new(idx % MAX_BACKENDS).unwrap(),
+            );
         }
 
         let latest = MessageId::new(format!("<evict-{}@example.com>", BLOCK_SLOTS + 3)).unwrap();
@@ -1260,8 +1685,8 @@ mod tests {
         let first = MessageId::from_borrowed("<first@example.com>").unwrap();
         let second = MessageId::from_borrowed("<second@example.com>").unwrap();
 
-        index.record_backend_missing(&first, BackendId::from_index(0));
-        index.record_backend_missing(&second, BackendId::from_index(2));
+        index.record_availability_missing(&first, AvailabilitySlot::new(0).unwrap());
+        index.record_availability_missing(&second, AvailabilitySlot::new(2).unwrap());
         index.save_to_path(&path).unwrap();
 
         let restored = AvailabilityIndex::with_test_capacity(test_capacity_for(16, 2));
@@ -1271,13 +1696,13 @@ mod tests {
             !restored
                 .get(&first)
                 .expect("restored first entry")
-                .should_try_backend(BackendId::from_index(0))
+                .should_try_slot(AvailabilitySlot::new(0).unwrap())
         );
         assert!(
             !restored
                 .get(&second)
                 .expect("restored second entry")
-                .should_try_backend(BackendId::from_index(2))
+                .should_try_slot(AvailabilitySlot::new(2).unwrap())
         );
     }
 
@@ -1288,17 +1713,17 @@ mod tests {
         let index = AvailabilityIndex::with_test_capacity(test_capacity_for(16, 2));
         let msg_id = MessageId::from_borrowed("<multi@example.com>").unwrap();
 
-        index.record_backend_missing(&msg_id, BackendId::from_index(1));
-        index.record_backend_missing(&msg_id, BackendId::from_index(3));
+        index.record_availability_missing(&msg_id, AvailabilitySlot::new(1).unwrap());
+        index.record_availability_missing(&msg_id, AvailabilitySlot::new(3).unwrap());
         index.save_to_path(&path).unwrap();
 
         let restored = AvailabilityIndex::with_test_capacity(test_capacity_for(16, 2));
         assert!(restored.load_from_path(&path).unwrap());
 
         let cached = restored.get(&msg_id).expect("restored negative");
-        assert!(!cached.should_try_backend(BackendId::from_index(1)));
-        assert!(!cached.should_try_backend(BackendId::from_index(3)));
-        assert!(cached.should_try_backend(BackendId::from_index(0)));
+        assert!(!cached.should_try_slot(AvailabilitySlot::new(1).unwrap()));
+        assert!(!cached.should_try_slot(AvailabilitySlot::new(3).unwrap()));
+        assert!(cached.should_try_slot(AvailabilitySlot::new(0).unwrap()));
     }
 
     #[test]
@@ -1312,7 +1737,7 @@ mod tests {
         );
         let msg_id = MessageId::from_borrowed("<persisted-expired@example.com>").unwrap();
 
-        index.record_backend_missing(&msg_id, BackendId::from_index(0));
+        index.record_availability_missing(&msg_id, AvailabilitySlot::new(0).unwrap());
         index.save_to_path(&path).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(15));
 
@@ -1337,7 +1762,7 @@ mod tests {
         );
         let msg_id = MessageId::from_borrowed("<persisted-older@example.com>").unwrap();
 
-        index.record_backend_missing(&msg_id, BackendId::from_index(0));
+        index.record_availability_missing(&msg_id, AvailabilitySlot::new(0).unwrap());
         index.save_to_path(&path).unwrap();
         rewrite_persisted_inserted_at(
             &path,
@@ -1359,26 +1784,25 @@ mod tests {
     #[test]
     fn rotated_generation_starts_when_it_receives_a_new_insert() {
         let ttl = std::time::Duration::from_millis(200);
-        let index = AvailabilityIndex::with_capacity_and_generation_count(
-            test_capacity_for(8, 2),
-            ttl,
-            DEFAULT_GENERATIONS,
-        );
+        let index =
+            AvailabilityIndex::with_geometry(test_capacity_for(8, 2), ttl, DEFAULT_GENERATIONS, 1);
         let first = MessageId::from_borrowed("<before-rotate@example.com>").unwrap();
         let second = MessageId::from_borrowed("<after-rotate@example.com>").unwrap();
         let forced_old_started_at = ttl::now_millis().saturating_sub(50);
 
-        index.record_backend_missing(&first, BackendId::from_index(0));
+        index.record_availability_missing(&first, AvailabilitySlot::new(0).unwrap());
         {
-            let mut state = index.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut shard = index.shards[0].lock().unwrap();
+            let state = &mut shard.filter;
             let current_generation = state.current_generation;
             state.generations[current_generation].started_at = forced_old_started_at;
             state.next_rotation_at = ttl::now_millis().saturating_sub(1);
         }
         let before_second_insert = ttl::now_millis();
-        index.record_backend_missing(&second, BackendId::from_index(1));
+        index.record_availability_missing(&second, AvailabilitySlot::new(1).unwrap());
 
-        let state = index.state.lock().unwrap_or_else(|e| e.into_inner());
+        let shard = index.shards[0].lock().unwrap();
+        let state = &shard.filter;
         let current_generation = &state.generations[state.current_generation];
         assert!(
             current_generation.started_at >= before_second_insert,
@@ -1396,7 +1820,7 @@ mod tests {
         let hit = MessageId::from_borrowed("<hit-rate@example.com>").unwrap();
         let miss = MessageId::from_borrowed("<miss-rate@example.com>").unwrap();
 
-        index.record_backend_missing(&hit, BackendId::from_index(0));
+        index.record_availability_missing(&hit, AvailabilitySlot::new(0).unwrap());
         assert!(index.get(&hit).is_some());
         assert!(index.get(&miss).is_none());
 
@@ -1407,8 +1831,18 @@ mod tests {
     fn state_uses_expected_geometry() {
         let capacity = test_capacity_for(6, 3);
         let index = AvailabilityIndex::with_generation_count(capacity, 3);
-        let state = index.state.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(state.generation_count(), 3);
-        assert_eq!(state.blocks_per_generation(), 6);
+        let shards = index.lock_all_shards();
+        assert!(
+            shards
+                .iter()
+                .all(|shard| shard.filter.generation_count() == 3)
+        );
+        assert_eq!(
+            shards
+                .iter()
+                .map(|shard| shard.filter.blocks_per_generation())
+                .sum::<usize>(),
+            6
+        );
     }
 }

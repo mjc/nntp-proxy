@@ -66,7 +66,11 @@ impl MockHybridCache {
 
         // Check for existing entry - don't overwrite larger semantic payloads with smaller ones.
         if let Some(existing) = storage.get(&key) {
-            if existing.availability().is_missing(backend) || existing.payload_len() > entry_len {
+            if existing
+                .availability()
+                .is_missing_slot(crate::cache::AvailabilitySlot::new(backend.as_index()).unwrap())
+                || existing.payload_len() > entry_len
+            {
                 return;
             }
             entry.availability = existing.availability();
@@ -82,12 +86,16 @@ impl MockHybridCache {
         let entry = storage.get(&key).map_or_else(
             || {
                 let mut entry = DiskCachedArticle::missing(super::ttl::CacheTier::new(0));
-                entry.record_backend_missing(backend_id);
+                entry.record_availability_missing(
+                    crate::cache::AvailabilitySlot::new(backend_id.as_index()).unwrap(),
+                );
                 entry
             },
             |existing| {
                 let mut updated = existing.clone();
-                updated.record_backend_missing(backend_id);
+                updated.record_availability_missing(
+                    crate::cache::AvailabilitySlot::new(backend_id.as_index()).unwrap(),
+                );
                 updated
             },
         );
@@ -148,7 +156,7 @@ mod tests {
     fn assert_availability(entry: &DiskCachedArticle, cases: &[(usize, bool)]) {
         for (backend_index, should_try) in cases {
             assert_eq!(
-                entry.should_try_backend(BackendId::from_index(*backend_index)),
+                entry.should_try_slot(crate::cache::AvailabilitySlot::new(*backend_index).unwrap()),
                 *should_try,
                 "backend {backend_index}"
             );
@@ -177,7 +185,7 @@ mod tests {
                 .is_some(),
             "longer metadata-only responses must not replace semantic article payloads"
         );
-        assert!(entry.should_try_backend(BackendId::from_index(1)));
+        assert!(entry.should_try_slot(crate::cache::AvailabilitySlot::new(1).unwrap()));
     }
 
     #[test]
