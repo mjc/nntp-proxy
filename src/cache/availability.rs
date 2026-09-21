@@ -274,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn same_host_and_account_share_an_availability_slot_across_ports() {
+    fn same_host_shares_an_availability_slot_across_ports_and_accounts() {
         let servers = [
             Server::builder("news.example", Port::try_new(119).unwrap())
                 .username("reader")
@@ -297,7 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn availability_identity_includes_account_but_not_password() {
+    fn availability_identity_ignores_account_and_port_but_not_host() {
         let servers = [
             Server::builder("news.example", Port::try_new(119).unwrap())
                 .username("reader")
@@ -315,34 +315,40 @@ mod tests {
         ];
         let layout = AvailabilityLayout::from_servers(&servers).unwrap();
 
-        assert_ne!(
+        assert_eq!(
             layout.slot_for_backend(BackendId::from_index(0)),
             layout.slot_for_backend(BackendId::from_index(1))
         );
-        assert_ne!(
+        assert_eq!(
             layout.slot_for_backend(BackendId::from_index(0)),
             layout.slot_for_backend(BackendId::from_index(2))
         );
-        assert_eq!(layout.identity_count(), 3);
+        let different_host = [
+            Server::builder("other.example", Port::try_new(119).unwrap())
+                .username("reader")
+                .password("third-secret")
+                .build()
+                .unwrap(),
+        ];
+        let different_layout =
+            AvailabilityLayout::from_servers(&[servers[0].clone(), different_host[0].clone()])
+                .unwrap();
+        assert_ne!(
+            different_layout.slot_for_backend(BackendId::from_index(0)),
+            different_layout.slot_for_backend(BackendId::from_index(1))
+        );
+        assert_eq!(different_layout.identity_count(), 2);
     }
 
     #[test]
-    fn explicit_namespace_controls_cross_host_sharing() {
+    fn different_hosts_do_not_share_an_availability_slot() {
         let servers = [
             Server::builder("news-a.example", Port::try_new(119).unwrap())
-                .availability_namespace("shared-feed")
                 .username("reader")
                 .password("first-secret")
                 .build()
                 .unwrap(),
             Server::builder("news-b.example", Port::try_new(563).unwrap())
-                .availability_namespace("shared-feed")
-                .username("reader")
-                .password("second-secret")
-                .build()
-                .unwrap(),
-            Server::builder("news-b.example", Port::try_new(119).unwrap())
-                .availability_namespace("different-feed")
                 .username("reader")
                 .password("second-secret")
                 .build()
@@ -350,13 +356,9 @@ mod tests {
         ];
         let layout = AvailabilityLayout::from_servers(&servers).unwrap();
 
-        assert_eq!(
+        assert_ne!(
             layout.slot_for_backend(BackendId::from_index(0)),
             layout.slot_for_backend(BackendId::from_index(1))
-        );
-        assert_ne!(
-            layout.slot_for_backend(BackendId::from_index(1)),
-            layout.slot_for_backend(BackendId::from_index(2))
         );
         assert_eq!(layout.identity_count(), 2);
     }

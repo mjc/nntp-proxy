@@ -30,7 +30,7 @@ pub use article::{ArticleCache, CachedArticle};
 pub use availability::{ArticleAvailability, BackendStatus, MAX_BACKENDS};
 pub use availability_identity::AvailabilitySlot;
 pub(crate) use availability_identity::{
-    AccountIdentity, AvailabilityIdentity, AvailabilityLayout, AvailabilityMask,
+    AvailabilityIdentity, AvailabilityLayout, AvailabilityMask,
 };
 pub use availability_index::AvailabilityIndex;
 pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
@@ -739,7 +739,7 @@ impl UnifiedCache {
         .await;
     }
 
-    /// Record that an article namespace returned an authoritative 430.
+    /// Record that a backend host returned an authoritative 430.
     pub async fn record_availability_missing(
         &self,
         message_id: MessageId<'_>,

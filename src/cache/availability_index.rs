@@ -6,9 +6,7 @@
 //! are pushed down by storing a keyed 64-bit fingerprint plus a keyed 16-bit
 //! confirmation tag per slot.
 
-use super::{
-    AccountIdentity, AvailabilityIdentity, AvailabilityLayout, AvailabilitySlot, MAX_BACKENDS,
-};
+use super::{AvailabilityIdentity, AvailabilityLayout, AvailabilitySlot, MAX_BACKENDS};
 use super::{CachedArticle, ttl};
 use crate::io_util::atomic_replace_file;
 #[cfg(test)]
@@ -29,13 +27,14 @@ const DEFAULT_GENERATIONS: usize = 2;
 const BLOCK_SLOTS: usize = 2;
 const FIXED_ARTICLE_CAPACITY: usize = 256 * 1024;
 const ALL_BACKEND_BITS: usize = usize::MAX;
-const PERSISTENCE_MAGIC: &[u8; 8] = b"ANEGSIM5";
+const PERSISTENCE_MAGIC: &[u8; 8] = b"ANEGSIM6";
 const LEGACY_PERSISTENCE_MAGIC_V1: &[u8; 8] = b"ANEGIDX1";
 const LEGACY_PERSISTENCE_MAGIC_V2: &[u8; 8] = b"ANEGIDX2";
 const LEGACY_PERSISTENCE_MAGIC_V3: &[u8; 8] = b"ANEGSIM1";
 const LEGACY_PERSISTENCE_MAGIC_V4: &[u8; 8] = b"ANEGSIM2";
 const LEGACY_PERSISTENCE_MAGIC_V5: &[u8; 8] = b"ANEGSIM3";
 const LEGACY_PERSISTENCE_MAGIC_V6: &[u8; 8] = b"ANEGSIM4";
+const LEGACY_PERSISTENCE_MAGIC_V7: &[u8; 8] = b"ANEGSIM5";
 const MAX_IDENTITY_FIELD_BYTES: usize = 1024 * 1024;
 
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
@@ -812,6 +811,7 @@ fn parse_snapshot(data: &[u8]) -> Result<Option<(Vec<AvailabilityIdentity>, Vec<
         || magic == LEGACY_PERSISTENCE_MAGIC_V4
         || magic == LEGACY_PERSISTENCE_MAGIC_V5
         || magic == LEGACY_PERSISTENCE_MAGIC_V6
+        || magic == LEGACY_PERSISTENCE_MAGIC_V7
     {
         return Ok(None);
     }
@@ -886,39 +886,16 @@ fn remap_missing_bits(
 }
 
 fn write_identity(bytes: &mut Vec<u8>, identity: &AvailabilityIdentity) -> Result<()> {
-    let namespace = identity.namespace.as_bytes();
-    let namespace_len =
-        u32::try_from(namespace.len()).context("availability namespace too long")?;
-    bytes.extend_from_slice(&namespace_len.to_le_bytes());
-    bytes.extend_from_slice(namespace);
-    match &identity.account {
-        AccountIdentity::Username(username) => {
-            bytes.push(1);
-            let username = username.as_bytes();
-            let username_len =
-                u32::try_from(username.len()).context("availability username too long")?;
-            bytes.extend_from_slice(&username_len.to_le_bytes());
-            bytes.extend_from_slice(username);
-        }
-        AccountIdentity::Anonymous => bytes.push(0),
-    }
+    let host = identity.host.as_bytes();
+    let host_len = u32::try_from(host.len()).context("availability host too long")?;
+    bytes.extend_from_slice(&host_len.to_le_bytes());
+    bytes.extend_from_slice(host);
     Ok(())
 }
 
 fn read_identity(data: &[u8], cursor: &mut usize) -> Result<AvailabilityIdentity> {
-    let namespace = read_string(data, cursor, "namespace")?;
-    let has_username = *data
-        .get(*cursor)
-        .ok_or_else(|| anyhow::anyhow!("truncated availability account marker"))?;
-    *cursor += 1;
-    let account = match has_username {
-        0 => None,
-        1 => Some(read_string(data, cursor, "username")?),
-        _ => anyhow::bail!("invalid availability account marker"),
-    };
     Ok(AvailabilityIdentity {
-        namespace,
-        account: account.map_or(AccountIdentity::Anonymous, AccountIdentity::Username),
+        host: read_string(data, cursor, "host")?,
     })
 }
 

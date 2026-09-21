@@ -1,4 +1,4 @@
-//! Stable article-availability identities, separate from transport backends.
+//! Stable article-availability identities, separate from transport endpoints.
 
 use crate::config::Server;
 use crate::types::BackendId;
@@ -9,35 +9,20 @@ use std::hash::Hasher;
 use std::path::Path;
 use twox_hash::XxHash64;
 
-const REGISTRY_MAGIC: &[u8; 8] = b"ANEGREG1";
+const REGISTRY_MAGIC: &[u8; 8] = b"ANEGREG2";
 const MAX_REGISTRY_FIELD_BYTES: usize = 1024 * 1024;
 
-/// Account scope used when sharing authoritative article facts.
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Ord, PartialOrd)]
-pub(crate) enum AccountIdentity {
-    Anonymous,
-    Username(String),
-}
-
-/// A backend namespace whose authoritative article facts may be shared.
+/// A configured backend host whose authoritative article facts may be shared.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct AvailabilityIdentity {
-    pub(crate) namespace: String,
-    pub(crate) account: AccountIdentity,
+    pub(crate) host: String,
 }
 
 impl AvailabilityIdentity {
     #[must_use]
     pub(crate) fn from_server(server: &Server) -> Self {
         Self {
-            namespace: server
-                .availability_namespace
-                .as_ref()
-                .map_or_else(|| server.host.to_string(), ToString::to_string),
-            account: server
-                .username
-                .clone()
-                .map_or(AccountIdentity::Anonymous, AccountIdentity::Username),
+            host: server.host.to_string(),
         }
     }
 }
@@ -93,7 +78,7 @@ impl fmt::Display for AvailabilitySlot {
     }
 }
 
-/// Immutable mapping from configured transport backends to article namespaces.
+/// Immutable mapping from configured backend entries to provider host identities.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct AvailabilityLayout {
     backend_slots: Box<[AvailabilitySlot]>,
@@ -107,8 +92,7 @@ impl AvailabilityLayout {
     pub(crate) fn synthetic(count: usize) -> Self {
         let identities = (0..count)
             .map(|index| AvailabilityIdentity {
-                namespace: format!("backend-{index}"),
-                account: AccountIdentity::Anonymous,
+                host: format!("backend-{index}"),
             })
             .collect::<Vec<_>>();
         let backend_slots = (0..count)
@@ -126,7 +110,7 @@ impl AvailabilityLayout {
         }
     }
 
-    /// Build the compact current-process layout, deduplicating host/account pairs.
+    /// Build the compact current-process layout, deduplicating configured hosts.
     pub(crate) fn from_servers(servers: &[Server]) -> Result<Self, AvailabilityLayoutError> {
         let mut identities = Vec::new();
 
@@ -247,16 +231,8 @@ impl AvailabilityLayout {
         let mut identities = self.identities.to_vec();
         identities.sort_unstable();
         for identity in &identities {
-            hasher.write(identity.namespace.as_bytes());
+            hasher.write(identity.host.as_bytes());
             hasher.write_u8(0);
-            match &identity.account {
-                AccountIdentity::Anonymous => hasher.write_u8(0),
-                AccountIdentity::Username(username) => {
-                    hasher.write_u8(1);
-                    hasher.write(username.as_bytes());
-                }
-            }
-            hasher.write_u8(0xff);
         }
         hasher.finish().max(1)
     }
@@ -288,9 +264,7 @@ impl std::error::Error for AvailabilityLayoutError {}
 
 impl Ord for AvailabilityIdentity {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.namespace
-            .cmp(&other.namespace)
-            .then_with(|| self.account.cmp(&other.account))
+        self.host.cmp(&other.host)
     }
 }
 
@@ -317,18 +291,8 @@ fn parse_registry(data: &[u8]) -> Result<(Vec<AvailabilityIdentity>, u64)> {
     }
     let mut identities = Vec::with_capacity(count);
     for _ in 0..count {
-        let namespace = read_string(data, &mut cursor, "namespace")?;
-        let marker = *data
-            .get(cursor)
-            .ok_or_else(|| anyhow::anyhow!("truncated hybrid account marker"))?;
-        cursor += 1;
-        let account = match marker {
-            0 => None,
-            1 => Some(read_string(data, &mut cursor, "username")?),
-            _ => anyhow::bail!("invalid hybrid account marker"),
-        };
-        let account = account.map_or(AccountIdentity::Anonymous, AccountIdentity::Username);
-        let identity = AvailabilityIdentity { namespace, account };
+        let host = read_string(data, &mut cursor, "host")?;
+        let identity = AvailabilityIdentity { host };
         if identities.contains(&identity) {
             anyhow::bail!("duplicate hybrid availability identity");
         }
@@ -346,14 +310,7 @@ fn publish_registry(path: &Path, epoch: u64, identities: &[AvailabilityIdentity]
     data.extend_from_slice(&epoch.to_le_bytes());
     data.extend_from_slice(&(identities.len() as u64).to_le_bytes());
     for identity in identities {
-        write_string(&mut data, &identity.namespace)?;
-        match &identity.account {
-            AccountIdentity::Username(username) => {
-                data.push(1);
-                write_string(&mut data, username)?;
-            }
-            AccountIdentity::Anonymous => data.push(0),
-        }
+        write_string(&mut data, &identity.host)?;
     }
     let temporary = path.with_extension("registry.tmp");
     fs::write(&temporary, data).with_context(|| format!("write {}", temporary.display()))?;

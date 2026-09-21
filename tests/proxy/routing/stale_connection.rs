@@ -8,8 +8,7 @@
 //! This prevents the "overnight 430" bug where all articles fail after idle periods.
 
 use crate::test_helpers::{
-    create_test_server_config, create_test_server_config_with_availability_namespace,
-    spawn_test_proxy_on_random_port, wait_for_server,
+    create_test_server_config, spawn_test_proxy_on_random_port, wait_for_server,
 };
 use anyhow::Result;
 use nntp_proxy::config::BackendSelectionStrategy;
@@ -457,7 +456,9 @@ async fn test_430_cache_is_authoritative() -> Result<()> {
 #[tokio::test]
 async fn test_availability_survives_pool_clearing() -> Result<()> {
     // Backend 0: Returns 430 for our test article
-    let listener0 = TcpListener::bind("127.0.0.1:0").await?;
+    // These are separate provider hosts; ports are deliberately not part of
+    // availability identity.
+    let listener0 = TcpListener::bind("0.0.0.0:0").await?;
     let port0 = listener0.local_addr()?.port();
     let backend0_requests = Arc::new(AtomicUsize::new(0));
     let backend0_requests_clone = backend0_requests.clone();
@@ -493,7 +494,7 @@ async fn test_availability_survives_pool_clearing() -> Result<()> {
     });
 
     // Backend 1: Has the article
-    let listener1 = TcpListener::bind("127.0.0.1:0").await?;
+    let listener1 = TcpListener::bind("0.0.0.0:0").await?;
     let port1 = listener1.local_addr()?.port();
     let backend1_requests = Arc::new(AtomicUsize::new(0));
     let backend1_requests_clone = backend1_requests.clone();
@@ -537,18 +538,8 @@ async fn test_availability_survives_pool_clearing() -> Result<()> {
     // Create proxy with both backends - MUST enable cache for availability tracking!
     let config = Config {
         servers: vec![
-            create_test_server_config_with_availability_namespace(
-                "127.0.0.1",
-                port0,
-                "Backend0-430",
-                "pool-clear-backend-0",
-            ),
-            create_test_server_config_with_availability_namespace(
-                "127.0.0.1",
-                port1,
-                "Backend1-Has",
-                "pool-clear-backend-1",
-            ),
+            create_test_server_config("127.0.0.1", port0, "Backend0-430"),
+            create_test_server_config("127.0.0.2", port1, "Backend1-Has"),
         ],
         cache: Some(Cache {
             adaptive_precheck: false, // Don't precheck, let the request go through normally

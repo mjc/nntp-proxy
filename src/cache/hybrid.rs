@@ -548,7 +548,7 @@ impl HybridArticleCache {
         debug!(msg_id = %key, stored_bytes = entry_len.get(), tier = tier.get(), "Hybrid cache upsert");
     }
 
-    /// Record that an article namespace returned an authoritative 430.
+    /// Record that a backend host returned an authoritative 430.
     pub(crate) async fn record_availability_missing(
         &self,
         message_id: MessageId<'_>,
