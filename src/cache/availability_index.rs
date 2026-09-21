@@ -132,11 +132,68 @@ impl Generation {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct PersistedEntry {
+struct PersistedEntry<Slots = CurrentProviderBits> {
     hash: u64,
     tag: u16,
-    missing: usize,
+    missing: Slots,
     inserted_at: u64,
+}
+
+/// Bits in the snapshot's provider table, never the running index's layout.
+#[derive(Debug)]
+struct StoredProviderBits(usize);
+
+/// Bits produced by the running index or translated into its provider layout.
+#[derive(Clone, Copy, Debug)]
+struct CurrentProviderBits(usize);
+
+/// Parsed entries retain the table that gives their bit positions meaning.
+/// Consuming restoration translates and inserts into the same target index;
+/// callers cannot take remapped entries and apply them to another layout.
+#[derive(Default)]
+struct StoredAvailabilitySnapshot {
+    identities: Vec<AvailabilityIdentity>,
+    entries: Vec<PersistedEntry<StoredProviderBits>>,
+}
+
+impl StoredAvailabilitySnapshot {
+    fn restore_into(mut self, index: &AvailabilityIndex) {
+        self.entries.sort_by_key(|entry| entry.inserted_at);
+        let now = ttl::now_millis();
+        let mut state = index
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.reset();
+        let mut evicted = 0usize;
+        for entry in self.entries {
+            let missing = self
+                .identities
+                .iter()
+                .enumerate()
+                .filter(|(position, _)| entry.missing.0 & (1usize << position) != 0)
+                .filter_map(|(_, identity)| index.layout.slot_for_identity(identity))
+                .fold(0, |bits, slot| bits | slot.bit());
+            let mapped = PersistedEntry {
+                hash: entry.hash,
+                tag: entry.tag,
+                missing: CurrentProviderBits(missing),
+                inserted_at: entry.inserted_at,
+            };
+            evicted += state.restore_entry(mapped, now, index.ttl);
+        }
+        if state.live_generations != 0 {
+            state.reanchor_current_generation();
+        }
+        let has_entries = state.occupied_slots() != 0;
+        drop(state);
+        index.has_entries.store(has_entries, Ordering::Relaxed);
+        index.hits.store(0, Ordering::Relaxed);
+        index.misses.store(0, Ordering::Relaxed);
+        index.inserts.store(0, Ordering::Relaxed);
+        index.dropped.store(0, Ordering::Relaxed);
+        index.evictions.store(evicted as u64, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug)]
@@ -353,7 +410,7 @@ impl FilterState {
     ) -> usize {
         if self.blocks_per_generation == 0
             || entry.hash == 0
-            || entry.missing == 0
+            || entry.missing.0 == 0
             || ttl::is_expired(
                 ttl::CacheTimestampMillis::new(entry.inserted_at),
                 ttl_millis,
@@ -390,7 +447,7 @@ impl FilterState {
         match block.insert(
             entry.hash,
             entry.tag,
-            entry.missing,
+            entry.missing.0,
             victim_slot(entry.hash),
         ) {
             InsertOutcome::Inserted => {
@@ -419,7 +476,7 @@ impl FilterState {
                     entries.push(PersistedEntry {
                         hash,
                         tag: block.tags[slot],
-                        missing,
+                        missing: CurrentProviderBits(missing),
                         inserted_at: generation.started_at,
                     });
                 }
@@ -575,35 +632,9 @@ impl AvailabilityIndex {
         let data = fs::read(path).with_context(|| {
             format!("Failed to read availability index from {}", path.display())
         })?;
-        let parsed = parse_snapshot(&data)?;
-        let (identities, mut entries) = parsed.unwrap_or_default();
-        for entry in &mut entries {
-            entry.missing = remap_missing_bits(entry.missing, &identities, &self.layout);
-        }
-        entries.sort_by_key(|entry| entry.inserted_at);
-
-        let now = ttl::now_millis();
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.reset();
-        let mut evicted = 0usize;
-        for entry in entries {
-            evicted += state.restore_entry(entry, now, self.ttl);
-        }
-        if state.live_generations != 0 {
-            state.reanchor_current_generation();
-        }
-        let has_entries = state.occupied_slots() != 0;
-        drop(state);
-
-        self.has_entries.store(has_entries, Ordering::Relaxed);
-        self.hits.store(0, Ordering::Relaxed);
-        self.misses.store(0, Ordering::Relaxed);
-        self.inserts.store(0, Ordering::Relaxed);
-        self.dropped.store(0, Ordering::Relaxed);
-        self.evictions.store(evicted as u64, Ordering::Relaxed);
+        parse_snapshot(&data)?
+            .unwrap_or_default()
+            .restore_into(self);
         Ok(true)
     }
 
@@ -649,7 +680,7 @@ impl AvailabilityIndex {
         for entry in snapshot.entries {
             bytes.extend_from_slice(&entry.hash.to_le_bytes());
             bytes.extend_from_slice(&entry.tag.to_le_bytes());
-            bytes.extend_from_slice(&availability_bits_to_wire(entry.missing)?.to_le_bytes());
+            bytes.extend_from_slice(&availability_bits_to_wire(entry.missing.0)?.to_le_bytes());
             bytes.extend_from_slice(&entry.inserted_at.to_le_bytes());
         }
 
@@ -799,7 +830,7 @@ impl AvailabilityIndex {
     }
 }
 
-fn parse_snapshot(data: &[u8]) -> Result<Option<(Vec<AvailabilityIdentity>, Vec<PersistedEntry>)>> {
+fn parse_snapshot(data: &[u8]) -> Result<Option<StoredAvailabilitySnapshot>> {
     if data.len() < PERSISTENCE_MAGIC.len() + size_of::<u64>() {
         anyhow::bail!("availability index file too short");
     }
@@ -855,7 +886,7 @@ fn parse_snapshot(data: &[u8]) -> Result<Option<(Vec<AvailabilityIdentity>, Vec<
         if missing_wire & !(identity_mask as u64) != 0 {
             anyhow::bail!("availability bits exceed declared identity table");
         }
-        let missing = availability_bits_from_wire(missing_wire)?;
+        let missing = StoredProviderBits(availability_bits_from_wire(missing_wire)?);
         let inserted_at = read_u64(data, &mut cursor)?;
         entries.push(PersistedEntry {
             hash,
@@ -869,24 +900,14 @@ fn parse_snapshot(data: &[u8]) -> Result<Option<(Vec<AvailabilityIdentity>, Vec<
         anyhow::bail!("trailing bytes in availability index");
     }
 
-    Ok(Some((identities, entries)))
-}
-
-fn remap_missing_bits(
-    missing: usize,
-    old_identities: &[AvailabilityIdentity],
-    current: &AvailabilityLayout,
-) -> usize {
-    old_identities
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| missing & (1usize << index) != 0)
-        .filter_map(|(_, identity)| current.slot_for_identity(identity))
-        .fold(0, |bits, slot| bits | slot.bit())
+    Ok(Some(StoredAvailabilitySnapshot {
+        identities,
+        entries,
+    }))
 }
 
 fn write_identity(bytes: &mut Vec<u8>, identity: &AvailabilityIdentity) -> Result<()> {
-    let host = identity.host.as_bytes();
+    let host = identity.as_host().as_bytes();
     let host_len = u32::try_from(host.len()).context("availability host too long")?;
     bytes.extend_from_slice(&host_len.to_le_bytes());
     bytes.extend_from_slice(host);
@@ -894,9 +915,7 @@ fn write_identity(bytes: &mut Vec<u8>, identity: &AvailabilityIdentity) -> Resul
 }
 
 fn read_identity(data: &[u8], cursor: &mut usize) -> Result<AvailabilityIdentity> {
-    Ok(AvailabilityIdentity {
-        host: read_string(data, cursor, "host")?,
-    })
+    AvailabilityIdentity::from_persisted_host(read_string(data, cursor, "host")?)
 }
 
 fn read_string(data: &[u8], cursor: &mut usize, field: &str) -> Result<String> {
@@ -1004,7 +1023,10 @@ mod tests {
 
     fn rewrite_persisted_inserted_at(path: &std::path::Path, inserted_at: u64) {
         let data = std::fs::read(path).unwrap();
-        let (identities, mut entries) = parse_snapshot(&data).unwrap().unwrap();
+        let StoredAvailabilitySnapshot {
+            identities,
+            mut entries,
+        } = parse_snapshot(&data).unwrap().unwrap();
         assert_eq!(
             entries.len(),
             1,
@@ -1023,7 +1045,7 @@ mod tests {
             bytes.extend_from_slice(&entry.hash.to_le_bytes());
             bytes.extend_from_slice(&entry.tag.to_le_bytes());
             bytes.extend_from_slice(
-                &availability_bits_to_wire(entry.missing)
+                &availability_bits_to_wire(entry.missing.0)
                     .unwrap()
                     .to_le_bytes(),
             );
@@ -1114,6 +1136,54 @@ mod tests {
         restored.load_from_path(&path).unwrap();
         let cached = restored.get(&msg_id).unwrap();
         assert_eq!(cached.availability().missing_bits(), 0b01);
+    }
+
+    #[test]
+    fn snapshot_restore_discards_removed_providers_and_shares_accounts() {
+        let server = |host, username| {
+            crate::config::Server::builder(host, crate::types::Port::try_new(119).unwrap())
+                .username(username)
+                .password("secret")
+                .build()
+                .unwrap()
+        };
+        let original = AvailabilityIndex::with_layout(
+            Duration::MAX,
+            AvailabilityLayout::from_servers(&[
+                server("removed.example", "first"),
+                server("retained.example", "first"),
+            ])
+            .unwrap(),
+        );
+        let message = MessageId::from_borrowed("<restore@example.com>").unwrap();
+        original.record_availability_missing(
+            &message,
+            original.layout.slot_for_backend(BackendId::from_index(0)),
+        );
+        original.record_availability_missing(
+            &message,
+            original.layout.slot_for_backend(BackendId::from_index(1)),
+        );
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("availability.idx");
+        original.save_to_path(&path).unwrap();
+        let target = AvailabilityIndex::with_layout(
+            Duration::MAX,
+            AvailabilityLayout::from_servers(&[
+                server("retained.example", "second"),
+                server("retained.example", "third"),
+                server("new.example", "first"),
+            ])
+            .unwrap(),
+        );
+        parse_snapshot(&fs::read(path).unwrap())
+            .unwrap()
+            .unwrap()
+            .restore_into(&target);
+        assert_eq!(
+            target.get(&message).unwrap().availability().missing_bits(),
+            1
+        );
     }
 
     #[test]

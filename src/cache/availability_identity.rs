@@ -6,24 +6,44 @@ use anyhow::{Context, Result};
 use std::fmt;
 use std::fs;
 use std::hash::Hasher;
+use std::num::NonZeroU64;
 use std::path::Path;
 use twox_hash::XxHash64;
 
 const REGISTRY_MAGIC: &[u8; 8] = b"ANEGREG2";
 const MAX_REGISTRY_FIELD_BYTES: usize = 1024 * 1024;
 
-/// A configured backend host whose authoritative article facts may be shared.
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct AvailabilityIdentity {
-    pub(crate) host: String,
+/// A registry generation cannot use the legacy/unscoped zero value.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RegistryEpoch(NonZeroU64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LayoutEpoch {
+    Derived,
+    Registered(RegistryEpoch),
 }
+
+/// A configured backend host whose authoritative article facts may be shared.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct AvailabilityIdentity(String);
 
 impl AvailabilityIdentity {
     #[must_use]
     pub(crate) fn from_server(server: &Server) -> Self {
-        Self {
-            host: server.host.to_string(),
+        Self(server.host.to_string())
+    }
+
+    /// Persistence preserves the exact configured host, without DNS resolution
+    /// or normalization that could merge previously distinct providers.
+    pub(crate) fn from_persisted_host(host: String) -> Result<Self> {
+        if host.is_empty() || host.len() > MAX_REGISTRY_FIELD_BYTES {
+            anyhow::bail!("invalid availability host length");
         }
+        Ok(Self(host))
+    }
+
+    pub(crate) fn as_host(&self) -> &str {
+        &self.0
     }
 }
 
@@ -84,16 +104,14 @@ pub(crate) struct AvailabilityLayout {
     backend_slots: Box<[AvailabilitySlot]>,
     identities: Box<[AvailabilityIdentity]>,
     mask: AvailabilityMask,
-    epoch: u64,
+    epoch: LayoutEpoch,
 }
 
 impl AvailabilityLayout {
     #[must_use]
     pub(crate) fn synthetic(count: usize) -> Self {
         let identities = (0..count)
-            .map(|index| AvailabilityIdentity {
-                host: format!("backend-{index}"),
-            })
+            .map(|index| AvailabilityIdentity(format!("backend-{index}")))
             .collect::<Vec<_>>();
         let backend_slots = (0..count)
             .map(|index| AvailabilitySlot::new(index).expect("synthetic count fits bitmap"))
@@ -106,7 +124,7 @@ impl AvailabilityLayout {
             backend_slots: backend_slots.into_boxed_slice(),
             identities: identities.into_boxed_slice(),
             mask,
-            epoch: 0,
+            epoch: LayoutEpoch::Derived,
         }
     }
 
@@ -141,7 +159,7 @@ impl AvailabilityLayout {
             backend_slots: backend_slots.into_boxed_slice(),
             identities: identities.into_boxed_slice(),
             mask,
-            epoch: 0,
+            epoch: LayoutEpoch::Derived,
         })
     }
 
@@ -150,13 +168,17 @@ impl AvailabilityLayout {
         fs::create_dir_all(cache_path)
             .with_context(|| format!("create hybrid cache directory {}", cache_path.display()))?;
         let path = cache_path.join("availability.registry");
-        let (mut identities, mut epoch) = match fs::read(&path) {
-            Ok(data) => parse_registry(&data).unwrap_or_else(|_| (Vec::new(), 0)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (Vec::new(), 0),
+        let loaded = match fs::read(&path) {
+            Ok(data) => parse_registry(&data).ok(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(error) => return Err(error).with_context(|| format!("read {}", path.display())),
         };
-        let registry_was_valid = epoch != 0;
-        let mut changed = !registry_was_valid;
+        let mut changed = loaded.is_none();
+        let (mut identities, epoch) = loaded.unwrap_or_else(|| {
+            let epoch =
+                NonZeroU64::new(uuid::Uuid::new_v4().as_u128() as u64).unwrap_or(NonZeroU64::MIN);
+            (Vec::new(), RegistryEpoch(epoch))
+        });
         for server in servers {
             let identity = AvailabilityIdentity::from_server(server);
             if !identities.contains(&identity) {
@@ -166,13 +188,6 @@ impl AvailabilityLayout {
         }
         if identities.len() > usize::BITS as usize {
             anyhow::bail!("hybrid availability registry has no free slot");
-        }
-        if epoch == 0 {
-            epoch = uuid::Uuid::new_v4().as_u128() as u64;
-            if epoch == 0 {
-                epoch = 1;
-            }
-            changed = true;
         }
         if changed {
             publish_registry(&path, epoch, &identities)?;
@@ -195,7 +210,7 @@ impl AvailabilityLayout {
             backend_slots: backend_slots.into_boxed_slice(),
             identities: identities.into_boxed_slice(),
             mask: configured_mask,
-            epoch,
+            epoch: LayoutEpoch::Registered(epoch),
         })
     }
 
@@ -231,7 +246,7 @@ impl AvailabilityLayout {
         let mut identities = self.identities.to_vec();
         identities.sort_unstable();
         for identity in &identities {
-            hasher.write(identity.host.as_bytes());
+            hasher.write(identity.as_host().as_bytes());
             hasher.write_u8(0);
         }
         hasher.finish().max(1)
@@ -239,10 +254,9 @@ impl AvailabilityLayout {
 
     #[must_use]
     pub(crate) fn availability_epoch(&self) -> u64 {
-        if self.epoch == 0 {
-            self.fingerprint()
-        } else {
-            self.epoch
+        match self.epoch {
+            LayoutEpoch::Derived => self.fingerprint(),
+            LayoutEpoch::Registered(epoch) => epoch.0.get(),
         }
     }
 }
@@ -262,29 +276,17 @@ impl fmt::Display for AvailabilityLayoutError {
 
 impl std::error::Error for AvailabilityLayoutError {}
 
-impl Ord for AvailabilityIdentity {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.host.cmp(&other.host)
-    }
-}
-
-impl PartialOrd for AvailabilityIdentity {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-fn parse_registry(data: &[u8]) -> Result<(Vec<AvailabilityIdentity>, u64)> {
+fn parse_registry(data: &[u8]) -> Result<(Vec<AvailabilityIdentity>, RegistryEpoch)> {
     if data.len() < REGISTRY_MAGIC.len() + 2 * size_of::<u64>()
         || &data[..REGISTRY_MAGIC.len()] != REGISTRY_MAGIC
     {
         anyhow::bail!("invalid hybrid availability registry");
     }
     let mut cursor = REGISTRY_MAGIC.len();
-    let epoch = read_u64(data, &mut cursor)?;
-    if epoch == 0 {
-        anyhow::bail!("invalid hybrid availability registry epoch");
-    }
+    let epoch = RegistryEpoch(
+        NonZeroU64::new(read_u64(data, &mut cursor)?)
+            .context("invalid hybrid availability registry epoch")?,
+    );
     let count = usize::try_from(read_u64(data, &mut cursor)?)?;
     if count > usize::BITS as usize {
         anyhow::bail!("hybrid availability registry has too many identities");
@@ -292,7 +294,7 @@ fn parse_registry(data: &[u8]) -> Result<(Vec<AvailabilityIdentity>, u64)> {
     let mut identities = Vec::with_capacity(count);
     for _ in 0..count {
         let host = read_string(data, &mut cursor, "host")?;
-        let identity = AvailabilityIdentity { host };
+        let identity = AvailabilityIdentity::from_persisted_host(host)?;
         if identities.contains(&identity) {
             anyhow::bail!("duplicate hybrid availability identity");
         }
@@ -304,13 +306,17 @@ fn parse_registry(data: &[u8]) -> Result<(Vec<AvailabilityIdentity>, u64)> {
     Ok((identities, epoch))
 }
 
-fn publish_registry(path: &Path, epoch: u64, identities: &[AvailabilityIdentity]) -> Result<()> {
+fn publish_registry(
+    path: &Path,
+    epoch: RegistryEpoch,
+    identities: &[AvailabilityIdentity],
+) -> Result<()> {
     let mut data = Vec::new();
     data.extend_from_slice(REGISTRY_MAGIC);
-    data.extend_from_slice(&epoch.to_le_bytes());
+    data.extend_from_slice(&epoch.0.get().to_le_bytes());
     data.extend_from_slice(&(identities.len() as u64).to_le_bytes());
     for identity in identities {
-        write_string(&mut data, &identity.host)?;
+        write_string(&mut data, identity.as_host())?;
     }
     let temporary = path.with_extension("registry.tmp");
     fs::write(&temporary, data).with_context(|| format!("write {}", temporary.display()))?;
