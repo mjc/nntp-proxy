@@ -285,7 +285,7 @@ impl ClientSession {
             router.backend_count().get()
         );
 
-        while !availability.all_exhausted_slots(router.availability_mask()) {
+        while !availability.all_exhausted(router.availability_mask()) {
             if !is_retry_attempt && !non_primary_tier_prefetch_started {
                 self.spawn_non_primary_tier_stat_prefetch(
                     router,

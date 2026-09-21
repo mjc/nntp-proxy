@@ -8,8 +8,7 @@
 //! Run with: cargo bench --bench `cache_lookup`
 
 use divan::{Bencher, black_box};
-use nntp_proxy::cache::{ArticleAvailability, AvailabilitySlot, UnifiedCache};
-use nntp_proxy::router::BackendCount;
+use nntp_proxy::cache::{ArticleAvailability, AvailabilityMask, AvailabilitySlot, UnifiedCache};
 use nntp_proxy::types::{BackendId, MessageId};
 use std::sync::Arc;
 use std::time::Duration;
@@ -64,9 +63,14 @@ mod index_contention {
     enum Workload {
         Empty,
         Hit,
+        // Cold distributed misses against an empty index.
         Miss,
+        // One absent key per corpus entry against a warm index; representative
+        // distributed misses without a hot shard.
+        DistributedMiss,
         // Adversarial contention controls, not representative Usenet traffic.
         HotKey,
+        HotMiss,
         Skewed,
         Insert,
         Occupancy64K,
@@ -75,7 +79,7 @@ mod index_contention {
         FiniteTtl,
     }
 
-    #[divan::bench(consts = [1, 16, 32], args = [Workload::Empty, Workload::Hit, Workload::Miss, Workload::HotKey, Workload::Skewed, Workload::Insert, Workload::Occupancy64K, Workload::Occupancy256K, Workload::LongIds, Workload::FiniteTtl], threads = [1, 16], sample_count = 100, sample_size = 1000)]
+    #[divan::bench(consts = [1, 16, 32], args = [Workload::Empty, Workload::Hit, Workload::Miss, Workload::DistributedMiss, Workload::HotKey, Workload::HotMiss, Workload::Skewed, Workload::Insert, Workload::Occupancy64K, Workload::Occupancy256K, Workload::LongIds, Workload::FiniteTtl], threads = [1, 16], sample_count = 100, sample_size = 1000)]
     fn partition_workloads<const SHARDS: usize>(bencher: Bencher, workload: Workload) {
         let ttl = match workload {
             Workload::FiniteTtl => Duration::from_secs(300),
@@ -94,9 +98,12 @@ mod index_contention {
         let ids: Vec<_> = (0..count)
             .map(|i| MessageId::new(format!("<load-{padding}{i}@example.com>")).unwrap())
             .collect();
+        let miss_ids: Vec<_> = (0..count)
+            .map(|i| MessageId::new(format!("<miss-{padding}{i}@example.com>")).unwrap())
+            .collect();
         let slot = AvailabilitySlot::new(0).unwrap();
         match workload {
-            Workload::Empty | Workload::Insert => {}
+            Workload::Empty | Workload::Insert | Workload::Miss | Workload::HotMiss => {}
             _ => {
                 for id in &ids {
                     cache
@@ -106,16 +113,23 @@ mod index_contention {
                 }
             }
         }
-        let absent = MessageId::from_borrowed("<absent@example.com>").unwrap();
         bencher.bench(|| {
             let cursor = CURSOR.with(|value| {
                 let next = value.get().wrapping_add(1);
                 value.set(next);
                 next
             });
+            let worker = WORKER.with(|worker| *worker % 16);
             let index = match workload {
-                Workload::HotKey => 0,
+                Workload::HotKey | Workload::HotMiss => 0,
                 Workload::Skewed if !cursor.is_multiple_of(10) => 0,
+                Workload::Insert => {
+                    // Keep each worker on its own corpus partition. This
+                    // measures distributed insertion streams rather than
+                    // repeatedly racing over one shared set of keys.
+                    let partition = ids.len() / 16;
+                    worker * partition + cursor % partition
+                }
                 _ => cursor.wrapping_mul(17) % ids.len(),
             };
             match workload {
@@ -123,7 +137,11 @@ mod index_contention {
                     .record_availability_missing(ids[index].clone(), slot)
                     .now_or_never()
                     .unwrap(),
-                Workload::Miss => {
+                Workload::Miss | Workload::DistributedMiss => {
+                    black_box(cache.get(&miss_ids[index]).now_or_never().unwrap());
+                }
+                Workload::HotMiss => {
+                    let absent = MessageId::from_borrowed("<absent@example.com>").unwrap();
                     black_box(cache.get(&absent).now_or_never().unwrap());
                 }
                 _ => {
@@ -402,7 +420,7 @@ mod index_contention {
 // =============================================================================
 
 mod availability {
-    use super::{ArticleAvailability, AvailabilitySlot, BackendCount, Bencher, black_box};
+    use super::{ArticleAvailability, AvailabilityMask, AvailabilitySlot, Bencher, black_box};
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
     fn record_missing(bencher: Bencher) {
@@ -453,8 +471,12 @@ mod availability {
             avail
                 .record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(i as usize).unwrap());
         }
-        let count = BackendCount::try_new(4).expect("test backend count fits availability bitmap");
-        bencher.bench(|| black_box(black_box(&avail).all_exhausted(black_box(count))));
+        let configured = AvailabilityMask::from_slots(
+            &(0..4)
+                .map(|index| AvailabilitySlot::new(index).unwrap())
+                .collect::<Vec<_>>(),
+        );
+        bencher.bench(|| black_box(black_box(&avail).all_exhausted(black_box(configured))));
     }
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
@@ -464,8 +486,12 @@ mod availability {
             avail
                 .record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(i as usize).unwrap());
         }
-        let count = BackendCount::try_new(4).expect("test backend count fits availability bitmap");
-        bencher.bench(|| black_box(black_box(&avail).all_exhausted(black_box(count))));
+        let configured = AvailabilityMask::from_slots(
+            &(0..4)
+                .map(|index| AvailabilitySlot::new(index).unwrap())
+                .collect::<Vec<_>>(),
+        );
+        bencher.bench(|| black_box(black_box(&avail).all_exhausted(black_box(configured))));
     }
 }
 

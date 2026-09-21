@@ -8,7 +8,6 @@ use crate::protocol::{
     RequestCachePayloadKind, RequestCacheTier, RequestCacheTimestampMillis, RequestKind,
     StatusCode,
 };
-use crate::router::BackendCount;
 use crate::types::{BackendId, MessageId};
 use moka::Entry;
 use moka::future::Cache;
@@ -20,7 +19,7 @@ use std::time::Duration;
 
 use super::availability::ArticleAvailability;
 use super::ttl;
-use super::{AvailabilityLayout, AvailabilitySlot};
+use super::{AvailabilityLayout, AvailabilityMask, AvailabilitySlot};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) struct CachedArticleNumber(u64);
@@ -560,8 +559,8 @@ impl CachedArticle {
 
     /// Check if all backends have been tried and none have the article
     #[must_use]
-    pub fn all_backends_exhausted(&self, total_backends: BackendCount) -> bool {
-        self.backend_availability.all_exhausted(total_backends)
+    pub fn all_backends_exhausted(&self, configured: AvailabilityMask) -> bool {
+        self.backend_availability.all_exhausted(configured)
     }
 
     /// Check if this cache entry has useful availability information
@@ -1455,9 +1454,11 @@ pub struct CacheStats {
 mod tests {
     use super::*;
 
-    fn backend_count(count: usize) -> crate::router::BackendCount {
-        crate::router::BackendCount::try_new(count)
-            .expect("test backend count fits availability bitmap")
+    fn provider_mask(count: usize) -> AvailabilityMask {
+        let slots = (0..count)
+            .map(|index| AvailabilitySlot::new(index).unwrap())
+            .collect::<Vec<_>>();
+        AvailabilityMask::from_slots(&slots)
     }
     use crate::types::MessageId;
     use futures::executor::block_on;
@@ -2095,14 +2096,14 @@ mod tests {
         let mut entry = create_test_cached_article("<test@example.com>");
 
         // Not all exhausted yet
-        assert!(!entry.all_backends_exhausted(backend_count(2)));
+        assert!(!entry.all_backends_exhausted(provider_mask(2)));
 
         // Record both as missing
         entry.record_availability_missing(AvailabilitySlot::new(backend0.as_index()).unwrap());
         entry.record_availability_missing(AvailabilitySlot::new(backend1.as_index()).unwrap());
 
         // Now all 2 backends are exhausted
-        assert!(entry.all_backends_exhausted(backend_count(2)));
+        assert!(entry.all_backends_exhausted(provider_mask(2)));
     }
 
     #[tokio::test]
@@ -2424,7 +2425,7 @@ mod tests {
 
         // Verify all backends exhausted
         assert!(
-            entry.all_backends_exhausted(backend_count(2)),
+            entry.all_backends_exhausted(provider_mask(2)),
             "All backends should be exhausted"
         );
     }

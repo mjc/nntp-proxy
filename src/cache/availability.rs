@@ -16,7 +16,6 @@
 //! allowing the backend count to grow with the target word size.
 
 use super::{AvailabilityMask, AvailabilitySlot};
-use crate::router::BackendCount;
 use crate::types::BackendId;
 
 /// Maximum number of backends supported by `ArticleAvailability` bitset.
@@ -107,24 +106,15 @@ impl ArticleAvailability {
         self.missing
     }
 
-    /// Check if all backends in the pool have been tried and returned 430
+    /// Check if every configured provider slot returned an authoritative 430.
     ///
-    /// Check if all backends have been tried and returned 430
+    /// The mask is supplied by the router's identity layout. It must not be
+    /// reconstructed from a transport backend count because several backend
+    /// entries may share one provider slot.
     ///
     #[inline]
     #[must_use]
-    pub fn all_exhausted(&self, backend_count: BackendCount) -> bool {
-        let expected_missing = match backend_count.get() {
-            0 => 0,
-            MAX_BACKENDS => usize::MAX,
-            n => (1usize << n) - 1,
-        };
-        self.missing & expected_missing == expected_missing
-    }
-
-    #[inline]
-    #[must_use]
-    pub(crate) fn all_exhausted_slots(&self, configured: AvailabilityMask) -> bool {
+    pub fn all_exhausted(&self, configured: AvailabilityMask) -> bool {
         self.missing & configured.bits() == configured.bits()
     }
 
@@ -170,11 +160,13 @@ mod tests {
     use super::*;
     use crate::cache::AvailabilityLayout;
     use crate::config::Server;
-    use crate::router::BackendCount;
     use crate::types::Port;
 
-    fn backend_count(count: usize) -> BackendCount {
-        BackendCount::try_new(count).expect("test backend count fits availability bitmap")
+    fn provider_mask(count: usize) -> AvailabilityMask {
+        let slots = (0..count)
+            .map(|index| AvailabilitySlot::new(index).unwrap())
+            .collect::<Vec<_>>();
+        AvailabilityMask::from_slots(&slots)
     }
     use crate::types::BackendId;
 
@@ -232,18 +224,18 @@ mod tests {
         let mut avail = ArticleAvailability::new();
 
         // None missing yet
-        assert!(!avail.all_exhausted(backend_count(2)));
-        assert!(!avail.all_exhausted(backend_count(3)));
+        assert!(!avail.all_exhausted(provider_mask(2)));
+        assert!(!avail.all_exhausted(provider_mask(3)));
 
         // Record backends 0 and 1 as missing
         avail.record_missing_slot(AvailabilitySlot::new(0).unwrap());
         avail.record_missing_slot(AvailabilitySlot::new(1).unwrap());
 
         // All 2 backends exhausted
-        assert!(avail.all_exhausted(backend_count(2)));
+        assert!(avail.all_exhausted(provider_mask(2)));
 
         // But not all 3 backends (backend 2 still untried)
-        assert!(!avail.all_exhausted(backend_count(3)));
+        assert!(!avail.all_exhausted(provider_mask(3)));
     }
 
     #[test]

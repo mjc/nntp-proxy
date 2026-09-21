@@ -5,7 +5,6 @@
 use nntp_proxy::cache::ArticleAvailability;
 use nntp_proxy::cache::ttl::{CacheTier, CacheTtlMillis, effective_ttl};
 use nntp_proxy::protocol::{Headers, RequestContext, RequestRouteClass, StatusCode};
-use nntp_proxy::router::BackendCount;
 use nntp_proxy::types::{BackendId, MessageId};
 use proptest::prelude::*;
 use std::fmt::Write as _;
@@ -148,11 +147,13 @@ proptest! {
         num_backends in 1..=8usize
     ) {
         let mut avail = ArticleAvailability::new();
-        let count =
-            BackendCount::try_new(num_backends).expect("property backend count fits bitset");
+        let slots = (0..num_backends)
+            .map(|index| nntp_proxy::cache::AvailabilitySlot::new(index).unwrap())
+            .collect::<Vec<_>>();
+        let mask = nntp_proxy::cache::AvailabilityMask::from_slots(&slots);
 
         // Initially not exhausted
-        prop_assert!(!avail.all_exhausted(count));
+        prop_assert!(!avail.all_exhausted(mask));
 
         // Mark all as missing
         for i in 0..num_backends {
@@ -160,7 +161,7 @@ proptest! {
         }
 
         // Now exhausted
-        prop_assert!(avail.all_exhausted(count));
+        prop_assert!(avail.all_exhausted(mask));
     }
 }
 

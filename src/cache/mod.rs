@@ -28,10 +28,8 @@ mod mock_hybrid;
 
 pub use article::{ArticleCache, CachedArticle};
 pub use availability::{ArticleAvailability, BackendStatus, MAX_BACKENDS};
-pub use availability_identity::AvailabilitySlot;
-pub(crate) use availability_identity::{
-    AvailabilityIdentity, AvailabilityLayout, AvailabilityMask,
-};
+pub(crate) use availability_identity::{AvailabilityIdentity, AvailabilityLayout};
+pub use availability_identity::{AvailabilityMask, AvailabilitySlot};
 pub use availability_index::AvailabilityIndex;
 pub use hybrid::{HybridArticleCache, HybridCacheConfig, HybridCacheStats};
 

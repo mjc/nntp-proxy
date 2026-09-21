@@ -1,18 +1,17 @@
 //! Integration tests for the critical 430 caching bug fix
 //!
-//! BUG: `ArticleCache::record_backend_missing` was silently doing nothing when
+//! BUG: recording a provider's 430 was silently doing nothing when
 //! an article wasn't already cached. This caused:
 //! 1. Missing articles to be queried from ALL backends EVERY request
 //! 2. `SABnzbd` reporting "gigabytes of missing articles"
 //! 3. 4xx error metrics not incrementing properly
 //! 4. Only 5 cache entries instead of hundreds
 //!
-//! FIX: `record_backend_missing` now creates cache entries for 430 responses,
+//! FIX: availability recording now creates cache entries for 430 responses,
 //! preventing repeated queries to backends that don't have the article.
 
-use nntp_proxy::cache::{ArticleCache, AvailabilitySlot};
+use nntp_proxy::cache::{ArticleCache, AvailabilityMask, AvailabilitySlot};
 use nntp_proxy::metrics::MetricsCollector;
-use nntp_proxy::router::BackendCount;
 use nntp_proxy::types::{BackendId, MessageId};
 use std::time::Duration;
 
@@ -69,9 +68,10 @@ async fn test_multiple_430s_update_same_entry() {
 
     // All backends exhausted
     assert!(
-        entry.all_backends_exhausted(
-            BackendCount::try_new(2).expect("test backend count fits availability bitmap")
-        ),
+        entry.all_backends_exhausted(AvailabilityMask::from_slots(&[
+            AvailabilitySlot::new(0).unwrap(),
+            AvailabilitySlot::new(1).unwrap(),
+        ])),
         "All backends should be exhausted"
     );
 }

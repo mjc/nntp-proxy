@@ -73,22 +73,35 @@ impl AvailabilitySlot {
     }
 }
 
-/// Set of configured availability slots used for exhaustion decisions.
+/// Set of configured provider slots used for exhaustion decisions.
+///
+/// Slots are provider identities, not transport backend positions. A router
+/// can therefore have duplicate backend entries for one slot and sparse slots
+/// when identities are restored from the registry.
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
-pub(crate) struct AvailabilityMask(usize);
+pub struct AvailabilityMask(usize);
 
 impl AvailabilityMask {
     #[must_use]
-    pub(crate) const fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self(0)
     }
 
-    pub(crate) fn insert(&mut self, slot: AvailabilitySlot) {
+    pub fn insert(&mut self, slot: AvailabilitySlot) {
         self.0 |= slot.bit();
     }
 
     #[must_use]
-    pub(crate) const fn bits(self) -> usize {
+    pub fn from_slots(slots: &[AvailabilitySlot]) -> Self {
+        let mut mask = Self::empty();
+        for &slot in slots {
+            mask.insert(slot);
+        }
+        mask
+    }
+
+    #[must_use]
+    pub const fn bits(self) -> usize {
         self.0
     }
 }

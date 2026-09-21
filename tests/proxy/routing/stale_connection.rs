@@ -391,9 +391,8 @@ async fn test_retry_on_immediate_connection_failure() -> Result<()> {
 /// The cache correctly maintains 430 state until TTL expiry.
 #[tokio::test]
 async fn test_430_cache_is_authoritative() -> Result<()> {
-    use nntp_proxy::cache::{AvailabilitySlot, UnifiedCache, ttl};
+    use nntp_proxy::cache::{AvailabilityMask, AvailabilitySlot, UnifiedCache, ttl};
     use nntp_proxy::protocol::StatusCode;
-    use nntp_proxy::router::BackendCount;
     use nntp_proxy::types::{BackendId, MessageId};
 
     let cache = UnifiedCache::availability(std::time::Duration::MAX);
@@ -409,9 +408,12 @@ async fn test_430_cache_is_authoritative() -> Result<()> {
 
     // Verify all exhausted
     let cached = cache.get(&msg_id).await.unwrap();
-    assert!(cached.all_backends_exhausted(
-        BackendCount::try_new(2).expect("test backend count fits availability bitmap")
-    ));
+    assert!(
+        cached.all_backends_exhausted(AvailabilityMask::from_slots(&[
+            AvailabilitySlot::new(0).unwrap(),
+            AvailabilitySlot::new(1).unwrap(),
+        ]))
+    );
 
     // Try to claim backend 0 "has" the article (unreliable 2xx response).
     let positive = BackendId::from_index(0);
@@ -428,9 +430,10 @@ async fn test_430_cache_is_authoritative() -> Result<()> {
     // The "has" fact is unreliable and should NOT override 430.
     let updated = cache.get(&msg_id).await.unwrap();
     assert!(
-        updated.all_backends_exhausted(
-            BackendCount::try_new(2).expect("test backend count fits availability bitmap")
-        ),
+        updated.all_backends_exhausted(AvailabilityMask::from_slots(&[
+            AvailabilitySlot::new(0).unwrap(),
+            AvailabilitySlot::new(1).unwrap(),
+        ])),
         "430 is authoritative - 'has' should NOT override cached 430"
     );
     assert!(
