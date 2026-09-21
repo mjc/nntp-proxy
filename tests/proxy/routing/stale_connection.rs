@@ -434,7 +434,7 @@ async fn test_430_cache_is_authoritative() -> Result<()> {
         "430 is authoritative - 'has' should NOT override cached 430"
     );
     assert!(
-        !updated.should_try_backend(BackendId::from_index(0)),
+        !updated.should_try_slot(nntp_proxy::cache::AvailabilitySlot::new(0).unwrap()),
         "Backend 0 should STILL be marked missing (430 is authoritative)"
     );
 

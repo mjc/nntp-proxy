@@ -94,18 +94,6 @@ impl ArticleAvailability {
         self.missing & slot.bit() != 0
     }
 
-    /// Check if we should attempt to fetch from this backend
-    ///
-    /// Returns `true` if backend might have the article (not yet marked missing).
-    ///
-    #[inline]
-    #[must_use]
-    pub(crate) fn should_try(&self, backend_id: BackendId) -> bool {
-        !self.is_missing_slot(
-            AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
-        )
-    }
-
     #[inline]
     #[must_use]
     pub(crate) fn should_try_slot(&self, slot: AvailabilitySlot) -> bool {
@@ -170,21 +158,6 @@ impl ArticleAvailability {
     }
 }
 
-impl ArticleAvailability {
-    pub fn record_missing(&mut self, backend_id: BackendId) -> &mut Self {
-        self.record_missing_slot(
-            AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
-        )
-    }
-
-    #[must_use]
-    pub fn is_missing(&self, backend_id: BackendId) -> bool {
-        self.is_missing_slot(
-            AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
-        )
-    }
-}
-
 impl Default for ArticleAvailability {
     fn default() -> Self {
         Self::new()
@@ -208,48 +181,48 @@ mod tests {
     #[test]
     fn test_backend_availability_basic() {
         let mut avail = ArticleAvailability::new();
-        let b0 = BackendId::from_index(0);
-        let b1 = BackendId::from_index(1);
+        let b0 = AvailabilitySlot::new(0).unwrap();
+        let b1 = AvailabilitySlot::new(1).unwrap();
 
         // Default: assume all backends have it
-        assert!(avail.should_try(b0));
-        assert!(avail.should_try(b1));
+        assert!(avail.should_try_slot(b0));
+        assert!(avail.should_try_slot(b1));
 
         // Record b0 as missing (returned 430)
-        avail.record_missing(b0);
-        assert!(!avail.should_try(b0)); // Should not try again
-        assert!(avail.should_try(b1)); // Still should try
+        avail.record_missing_slot(b0);
+        assert!(!avail.should_try_slot(b0)); // Should not try again
+        assert!(avail.should_try_slot(b1)); // Still should try
 
         // Record b1 as missing too
-        avail.record_missing(b1);
-        assert!(!avail.should_try(b1));
+        avail.record_missing_slot(b1);
+        assert!(!avail.should_try_slot(b1));
     }
 
     #[test]
     fn missing_backend_is_not_eligible() {
         let mut avail = ArticleAvailability::new();
-        let b0 = BackendId::from_index(0);
+        let b0 = AvailabilitySlot::new(0).unwrap();
 
         // First mark as missing
-        avail.record_missing(b0);
-        assert!(avail.is_missing(b0));
+        avail.record_missing_slot(b0);
+        assert!(avail.is_missing_slot(b0));
 
-        assert!(avail.is_missing(b0));
+        assert!(avail.is_missing_slot(b0));
     }
 
     #[test]
     fn success_observation_does_not_change_availability() {
         let mut cache_state = ArticleAvailability::new();
-        let b0 = BackendId::from_index(0);
-        let b1 = BackendId::from_index(1);
+        let b0 = AvailabilitySlot::new(0).unwrap();
+        let b1 = AvailabilitySlot::new(1).unwrap();
 
-        cache_state.record_missing(b0);
-        cache_state.record_missing(b1);
-        assert!(cache_state.is_missing(b0));
-        assert!(cache_state.is_missing(b1));
+        cache_state.record_missing_slot(b0);
+        cache_state.record_missing_slot(b1);
+        assert!(cache_state.is_missing_slot(b0));
+        assert!(cache_state.is_missing_slot(b1));
 
         let fresh = ArticleAvailability::new();
-        assert!(!fresh.is_missing(b0));
+        assert!(!fresh.is_missing_slot(b0));
 
         assert_eq!(cache_state.missing_bits(), 0b11);
     }
@@ -263,8 +236,8 @@ mod tests {
         assert!(!avail.all_exhausted(backend_count(3)));
 
         // Record backends 0 and 1 as missing
-        avail.record_missing(BackendId::from_index(0));
-        avail.record_missing(BackendId::from_index(1));
+        avail.record_missing_slot(AvailabilitySlot::new(0).unwrap());
+        avail.record_missing_slot(AvailabilitySlot::new(1).unwrap());
 
         // All 2 backends exhausted
         assert!(avail.all_exhausted(backend_count(2)));
@@ -386,7 +359,7 @@ mod tests {
         assert_eq!(
             first_slot,
             expanded_layout
-                .slot_for_identity(&AvailabilityIdentity::from_server(&first[0]))
+                .slot_for_identity(&AvailabilityIdentity::from(&first[0].host))
                 .unwrap()
         );
 
@@ -396,7 +369,7 @@ mod tests {
         assert_eq!(
             first_slot,
             reordered_layout
-                .slot_for_identity(&AvailabilityIdentity::from_server(&first[0]))
+                .slot_for_identity(&AvailabilityIdentity::from(&first[0].host))
                 .unwrap()
         );
         let registry = std::fs::read(directory.path().join("availability.registry")).unwrap();

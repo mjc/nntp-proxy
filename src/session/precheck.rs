@@ -723,9 +723,9 @@ mod tests {
                 PrecheckHit::SingleLine(bytes)
             )) if id == BackendId::from_index(1) && bytes.as_ref() == b"223 1 <first@test> exists\r\n"
         ));
-        assert!(avail.is_missing(BackendId::from_index(0)));
-        assert!(!avail.is_missing(BackendId::from_index(1)));
-        assert!(!avail.is_missing(BackendId::from_index(2)));
+        assert!(avail.is_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap()));
+        assert!(!avail.is_missing_slot(crate::cache::AvailabilitySlot::new(1).unwrap()));
+        assert!(!avail.is_missing_slot(crate::cache::AvailabilitySlot::new(2).unwrap()));
     }
 
     #[test]
@@ -736,8 +736,8 @@ mod tests {
         ];
         let (found, avail) = summarize(results);
         assert!(found.is_none());
-        assert!(avail.is_missing(BackendId::from_index(0)));
-        assert!(avail.is_missing(BackendId::from_index(1)));
+        assert!(avail.is_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap()));
+        assert!(avail.is_missing_slot(crate::cache::AvailabilitySlot::new(1).unwrap()));
     }
 
     #[test]
@@ -764,7 +764,7 @@ mod tests {
             .get(&msg_id)
             .await
             .expect("missing result should update authoritative availability");
-        assert!(!cached.should_try_backend(BackendId::from_index(0)));
+        assert!(!cached.should_try_slot(crate::cache::AvailabilitySlot::new(0).unwrap()));
     }
 
     #[tokio::test]
@@ -798,8 +798,8 @@ mod tests {
         let TierQuerySummary::Exhausted(availability) = summary else {
             panic!("all-missing tier should be exhausted");
         };
-        assert!(availability.is_missing(BackendId::from_index(0)));
-        assert!(availability.is_missing(BackendId::from_index(1)));
+        assert!(availability.is_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap()));
+        assert!(availability.is_missing_slot(crate::cache::AvailabilitySlot::new(1).unwrap()));
     }
 
     #[test]
@@ -812,8 +812,8 @@ mod tests {
         let TierQuerySummary::Inconclusive(availability) = summary else {
             panic!("tier with backend error should be inconclusive");
         };
-        assert!(availability.is_missing(BackendId::from_index(0)));
-        assert!(!availability.is_missing(BackendId::from_index(1)));
+        assert!(availability.is_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap()));
+        assert!(!availability.is_missing_slot(crate::cache::AvailabilitySlot::new(1).unwrap()));
     }
 
     #[test]

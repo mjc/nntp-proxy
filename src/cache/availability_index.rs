@@ -632,12 +632,6 @@ impl Default for AvailabilityIndex {
 }
 
 impl AvailabilityIndex {
-    #[cfg(test)]
-    pub fn record_backend_missing(&self, message_id: &MessageId<'_>, backend_id: BackendId) {
-        let slot = AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap");
-        self.record_availability_missing(message_id, slot);
-    }
-
     #[must_use]
     pub const fn fixed_capacity_bytes() -> u64 {
         FIXED_CAPACITY_BYTES
@@ -1451,11 +1445,14 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<gone@example.com>").unwrap();
         let backend_id = BackendId::from_index(2);
 
-        index.record_backend_missing(&msg_id, backend_id);
+        index.record_availability_missing(
+            &msg_id,
+            AvailabilitySlot::new(backend_id.as_index()).unwrap(),
+        );
 
         let cached = index.get(&msg_id).expect("negative entry");
         assert!(cached.has_availability_info());
-        assert!(!cached.should_try_backend(backend_id));
+        assert!(!cached.should_try_slot(AvailabilitySlot::new(backend_id.as_index()).unwrap()));
         assert_eq!(
             cached.availability().missing_bits(),
             backend_id.availability_bit()
@@ -1563,7 +1560,7 @@ mod tests {
         let index = AvailabilityIndex::with_test_capacity(test_capacity_for(8, 2));
         let msg_id = MessageId::from_borrowed("<request@example.com>").unwrap();
 
-        index.record_backend_missing(&msg_id, BackendId::from_index(0));
+        index.record_availability_missing(&msg_id, AvailabilitySlot::new(0).unwrap());
 
         assert!(
             index
@@ -1586,7 +1583,7 @@ mod tests {
         );
         let msg_id = MessageId::from_borrowed("<expires@example.com>").unwrap();
 
-        index.record_backend_missing(&msg_id, BackendId::from_index(0));
+        index.record_availability_missing(&msg_id, AvailabilitySlot::new(0).unwrap());
         assert!(index.get(&msg_id).is_some());
 
         std::thread::sleep(std::time::Duration::from_millis(15));
@@ -1600,24 +1597,27 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<highest@example.com>").unwrap();
         let backend_id = BackendId::from_index(8);
 
-        index.record_backend_missing(&msg_id, backend_id);
+        index.record_availability_missing(
+            &msg_id,
+            AvailabilitySlot::new(backend_id.as_index()).unwrap(),
+        );
 
         let cached = index.get(&msg_id).expect("negative entry");
         assert_eq!(cached.availability().missing_bits(), 0b1_0000_0000);
-        assert!(!cached.should_try_backend(backend_id));
+        assert!(!cached.should_try_slot(AvailabilitySlot::new(backend_id.as_index()).unwrap()));
     }
 
     #[test]
     #[cfg(debug_assertions)]
-    fn record_missing_cannot_receive_out_of_range_backend() {
-        assert!(BackendId::try_from_index(usize::BITS as usize).is_none());
+    fn record_missing_cannot_receive_out_of_range_slot() {
+        assert!(AvailabilitySlot::new(usize::BITS as usize).is_none());
     }
 
     #[test]
     fn zero_capacity_index_never_records_entries() {
         let index = AvailabilityIndex::with_test_capacity(0);
         let msg_id = MessageId::from_borrowed("<nocap@example.com>").unwrap();
-        index.record_backend_missing(&msg_id, BackendId::from_index(0));
+        index.record_availability_missing(&msg_id, AvailabilitySlot::new(0).unwrap());
         assert!(index.get(&msg_id).is_none());
     }
 
@@ -1628,7 +1628,10 @@ mod tests {
 
         for idx in 0..128 {
             let msg_id = MessageId::new(format!("<bounded-{idx}@example.com>")).unwrap();
-            index.record_backend_missing(&msg_id, BackendId::from_index(idx % MAX_BACKENDS));
+            index.record_availability_missing(
+                &msg_id,
+                AvailabilitySlot::new(idx % MAX_BACKENDS).unwrap(),
+            );
         }
 
         assert!(index.used_bytes() <= capacity);
@@ -1644,7 +1647,7 @@ mod tests {
 
         assert_eq!(index.used_bytes(), capacity);
 
-        index.record_backend_missing(&msg_id, BackendId::from_index(0));
+        index.record_availability_missing(&msg_id, AvailabilitySlot::new(0).unwrap());
 
         assert_eq!(index.used_bytes(), capacity);
     }
@@ -1656,7 +1659,10 @@ mod tests {
 
         for idx in 0..(BLOCK_SLOTS + 4) {
             let msg_id = MessageId::new(format!("<evict-{idx}@example.com>")).unwrap();
-            index.record_backend_missing(&msg_id, BackendId::from_index(idx % MAX_BACKENDS));
+            index.record_availability_missing(
+                &msg_id,
+                AvailabilitySlot::new(idx % MAX_BACKENDS).unwrap(),
+            );
         }
 
         let latest = MessageId::new(format!("<evict-{}@example.com>", BLOCK_SLOTS + 3)).unwrap();
@@ -1679,8 +1685,8 @@ mod tests {
         let first = MessageId::from_borrowed("<first@example.com>").unwrap();
         let second = MessageId::from_borrowed("<second@example.com>").unwrap();
 
-        index.record_backend_missing(&first, BackendId::from_index(0));
-        index.record_backend_missing(&second, BackendId::from_index(2));
+        index.record_availability_missing(&first, AvailabilitySlot::new(0).unwrap());
+        index.record_availability_missing(&second, AvailabilitySlot::new(2).unwrap());
         index.save_to_path(&path).unwrap();
 
         let restored = AvailabilityIndex::with_test_capacity(test_capacity_for(16, 2));
@@ -1690,13 +1696,13 @@ mod tests {
             !restored
                 .get(&first)
                 .expect("restored first entry")
-                .should_try_backend(BackendId::from_index(0))
+                .should_try_slot(AvailabilitySlot::new(0).unwrap())
         );
         assert!(
             !restored
                 .get(&second)
                 .expect("restored second entry")
-                .should_try_backend(BackendId::from_index(2))
+                .should_try_slot(AvailabilitySlot::new(2).unwrap())
         );
     }
 
@@ -1707,17 +1713,17 @@ mod tests {
         let index = AvailabilityIndex::with_test_capacity(test_capacity_for(16, 2));
         let msg_id = MessageId::from_borrowed("<multi@example.com>").unwrap();
 
-        index.record_backend_missing(&msg_id, BackendId::from_index(1));
-        index.record_backend_missing(&msg_id, BackendId::from_index(3));
+        index.record_availability_missing(&msg_id, AvailabilitySlot::new(1).unwrap());
+        index.record_availability_missing(&msg_id, AvailabilitySlot::new(3).unwrap());
         index.save_to_path(&path).unwrap();
 
         let restored = AvailabilityIndex::with_test_capacity(test_capacity_for(16, 2));
         assert!(restored.load_from_path(&path).unwrap());
 
         let cached = restored.get(&msg_id).expect("restored negative");
-        assert!(!cached.should_try_backend(BackendId::from_index(1)));
-        assert!(!cached.should_try_backend(BackendId::from_index(3)));
-        assert!(cached.should_try_backend(BackendId::from_index(0)));
+        assert!(!cached.should_try_slot(AvailabilitySlot::new(1).unwrap()));
+        assert!(!cached.should_try_slot(AvailabilitySlot::new(3).unwrap()));
+        assert!(cached.should_try_slot(AvailabilitySlot::new(0).unwrap()));
     }
 
     #[test]
@@ -1731,7 +1737,7 @@ mod tests {
         );
         let msg_id = MessageId::from_borrowed("<persisted-expired@example.com>").unwrap();
 
-        index.record_backend_missing(&msg_id, BackendId::from_index(0));
+        index.record_availability_missing(&msg_id, AvailabilitySlot::new(0).unwrap());
         index.save_to_path(&path).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(15));
 
@@ -1756,7 +1762,7 @@ mod tests {
         );
         let msg_id = MessageId::from_borrowed("<persisted-older@example.com>").unwrap();
 
-        index.record_backend_missing(&msg_id, BackendId::from_index(0));
+        index.record_availability_missing(&msg_id, AvailabilitySlot::new(0).unwrap());
         index.save_to_path(&path).unwrap();
         rewrite_persisted_inserted_at(
             &path,
@@ -1784,7 +1790,7 @@ mod tests {
         let second = MessageId::from_borrowed("<after-rotate@example.com>").unwrap();
         let forced_old_started_at = ttl::now_millis().saturating_sub(50);
 
-        index.record_backend_missing(&first, BackendId::from_index(0));
+        index.record_availability_missing(&first, AvailabilitySlot::new(0).unwrap());
         {
             let mut shard = index.shards[0].lock().unwrap();
             let state = &mut shard.filter;
@@ -1793,7 +1799,7 @@ mod tests {
             state.next_rotation_at = ttl::now_millis().saturating_sub(1);
         }
         let before_second_insert = ttl::now_millis();
-        index.record_backend_missing(&second, BackendId::from_index(1));
+        index.record_availability_missing(&second, AvailabilitySlot::new(1).unwrap());
 
         let shard = index.shards[0].lock().unwrap();
         let state = &shard.filter;
@@ -1814,7 +1820,7 @@ mod tests {
         let hit = MessageId::from_borrowed("<hit-rate@example.com>").unwrap();
         let miss = MessageId::from_borrowed("<miss-rate@example.com>").unwrap();
 
-        index.record_backend_missing(&hit, BackendId::from_index(0));
+        index.record_availability_missing(&hit, AvailabilitySlot::new(0).unwrap());
         assert!(index.get(&hit).is_some());
         assert!(index.get(&miss).is_none());
 

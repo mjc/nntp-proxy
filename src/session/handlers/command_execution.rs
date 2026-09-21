@@ -2214,7 +2214,7 @@ mod tests {
             BackendAttemptResult::ArticleNotFound { missing }
                 if missing.backend_id() == BackendId::from_index(0)
         ));
-        assert!(availability.is_missing(BackendId::from_index(0)));
+        assert!(availability.is_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap()));
         assert_eq!(article_commands.load(Ordering::SeqCst), 1);
         finalize_backend_connection(&mut backend_connection);
     }
@@ -2299,8 +2299,8 @@ mod tests {
             .await
             .expect("parallel retry STAT sweep should succeed");
 
-        assert!(availability.is_missing(BackendId::from_index(0)));
-        assert!(availability.is_missing(BackendId::from_index(1)));
+        assert!(availability.is_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap()));
+        assert!(availability.is_missing_slot(crate::cache::AvailabilitySlot::new(1).unwrap()));
         assert_eq!(stat0.load(Ordering::SeqCst), 1);
         assert_eq!(stat1.load(Ordering::SeqCst), 1);
         assert_eq!(body0.load(Ordering::SeqCst), 0);
@@ -2410,11 +2410,15 @@ mod tests {
         .expect("parallel retry STAT sweep should succeed");
 
         assert!(
-            state.availability.is_missing(BackendId::from_index(0)),
+            state
+                .availability
+                .is_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap()),
             "slow STAT=430 backend should still be classified as missing"
         );
         assert!(
-            state.availability.is_missing(BackendId::from_index(1)),
+            state
+                .availability
+                .is_missing_slot(crate::cache::AvailabilitySlot::new(1).unwrap()),
             "fast STAT=430 backend should be classified as missing"
         );
         assert_eq!(
@@ -2506,7 +2510,9 @@ mod tests {
         })
         .await
         .expect("prefetch should update availability index");
-        let has_backend_1 = cached.availability().is_missing(BackendId::from_index(1));
+        let has_backend_1 = cached
+            .availability()
+            .is_missing_slot(crate::cache::AvailabilitySlot::new(1).unwrap());
         assert!(
             has_backend_1,
             "tier-1 backend should be marked missing from STAT=430"
@@ -2608,7 +2614,7 @@ mod tests {
             "STAT probe is retry-only and should not run on first attempt"
         );
         assert_eq!(body_commands.load(Ordering::SeqCst), 1);
-        assert!(!availability.is_missing(BackendId::from_index(0)));
+        assert!(!availability.is_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap()));
         finalize_backend_connection(&mut backend_connection);
     }
 

@@ -354,7 +354,7 @@ mod tests {
         assert_eq!(entry.payload_len().get(), 0);
         assert!(!entry.has_availability_info());
         assert_eq!(entry.availability().missing_bits(), 0);
-        assert!(entry.should_try_backend(backend_id));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(backend_id.as_index()).unwrap()));
     }
 
     #[tokio::test]
@@ -520,12 +520,6 @@ pub struct UnifiedCache {
 }
 
 impl UnifiedCache {
-    #[cfg(test)]
-    pub async fn record_backend_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
-        let slot = AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap");
-        self.record_availability_missing(message_id, slot).await;
-    }
-
     /// Create an availability-only negative index.
     #[must_use]
     pub fn availability(ttl: std::time::Duration) -> Self {

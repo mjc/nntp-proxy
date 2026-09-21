@@ -369,13 +369,6 @@ pub struct CachedArticle {
 }
 
 impl CachedArticle {
-    #[cfg(test)]
-    pub fn record_backend_missing(&mut self, backend_id: BackendId) {
-        self.record_availability_missing(
-            AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
-        );
-    }
-
     /// Create an availability-only cache entry without payload bytes.
     #[must_use]
     pub(crate) fn availability_only(status_code: StatusCode, tier: ttl::CacheTier) -> Self {
@@ -555,16 +548,7 @@ impl CachedArticle {
         self.status_code
     }
 
-    /// Check if we should try fetching from this backend
-    ///
-    /// Returns false if backend is known to not have this article (returned 430 before).
-    #[inline]
     #[must_use]
-    pub fn should_try_backend(&self, backend_id: BackendId) -> bool {
-        self.backend_availability.should_try(backend_id)
-    }
-
-    #[cfg(test)]
     pub fn should_try_slot(&self, slot: AvailabilitySlot) -> bool {
         self.backend_availability.should_try_slot(slot)
     }
@@ -935,12 +919,6 @@ pub struct ArticleCache {
 }
 
 impl ArticleCache {
-    #[cfg(test)]
-    pub async fn record_backend_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
-        let slot = AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap");
-        self.record_availability_missing(message_id, slot).await;
-    }
-
     /// Create a new article cache
     ///
     /// # Arguments
@@ -1880,8 +1858,8 @@ mod tests {
         );
 
         // Default: should try all backends
-        assert!(entry.should_try_backend(BackendId::from_index(0)));
-        assert!(entry.should_try_backend(BackendId::from_index(1)));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(0).unwrap()));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(1).unwrap()));
     }
 
     #[test]
@@ -2099,15 +2077,15 @@ mod tests {
         let mut entry = create_test_cached_article("<test@example.com>");
 
         // Initially should try both
-        assert!(entry.should_try_backend(backend0));
-        assert!(entry.should_try_backend(backend1));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(backend0.as_index()).unwrap()));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(backend1.as_index()).unwrap()));
 
         // Record backend1 as missing (430 response)
-        entry.record_backend_missing(backend1);
+        entry.record_availability_missing(AvailabilitySlot::new(backend1.as_index()).unwrap());
 
         // Should still try backend0, but not backend1
-        assert!(entry.should_try_backend(backend0));
-        assert!(!entry.should_try_backend(backend1));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(backend0.as_index()).unwrap()));
+        assert!(!entry.should_try_slot(AvailabilitySlot::new(backend1.as_index()).unwrap()));
     }
 
     #[test]
@@ -2120,8 +2098,8 @@ mod tests {
         assert!(!entry.all_backends_exhausted(backend_count(2)));
 
         // Record both as missing
-        entry.record_backend_missing(backend0);
-        entry.record_backend_missing(backend1);
+        entry.record_availability_missing(AvailabilitySlot::new(backend0.as_index()).unwrap());
+        entry.record_availability_missing(AvailabilitySlot::new(backend1.as_index()).unwrap());
 
         // Now all 2 backends are exhausted
         assert!(entry.all_backends_exhausted(backend_count(2)));
@@ -2209,8 +2187,8 @@ mod tests {
             buffer
         );
         // Default: should try all backends
-        assert!(retrieved.should_try_backend(BackendId::from_index(0)));
-        assert!(retrieved.should_try_backend(BackendId::from_index(1)));
+        assert!(retrieved.should_try_slot(AvailabilitySlot::new(0).unwrap()));
+        assert!(retrieved.should_try_slot(AvailabilitySlot::new(1).unwrap()));
     }
 
     #[tokio::test]
@@ -2242,8 +2220,8 @@ mod tests {
 
         let retrieved = cache.get(&msgid).await.unwrap();
         // Default: should try all backends
-        assert!(retrieved.should_try_backend(BackendId::from_index(0)));
-        assert!(retrieved.should_try_backend(BackendId::from_index(1)));
+        assert!(retrieved.should_try_slot(AvailabilitySlot::new(0).unwrap()));
+        assert!(retrieved.should_try_slot(AvailabilitySlot::new(1).unwrap()));
     }
 
     #[tokio::test]
@@ -2257,13 +2235,13 @@ mod tests {
 
         // Record backend 1 as missing
         cache
-            .record_backend_missing(msgid.clone(), BackendId::from_index(1))
+            .record_availability_missing(msgid.clone(), AvailabilitySlot::new(1).unwrap())
             .await;
 
         let retrieved = cache.get(&msgid).await.unwrap();
         // Backend 0 should still be tried, backend 1 should not
-        assert!(retrieved.should_try_backend(BackendId::from_index(0)));
-        assert!(!retrieved.should_try_backend(BackendId::from_index(1)));
+        assert!(retrieved.should_try_slot(AvailabilitySlot::new(0).unwrap()));
+        assert!(!retrieved.should_try_slot(AvailabilitySlot::new(1).unwrap()));
     }
 
     #[tokio::test]
@@ -2274,10 +2252,17 @@ mod tests {
         let buffer =
             b"220 0 <permanent-missing@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n".to_vec();
 
-        cache.record_backend_missing(msgid.clone(), backend).await;
+        cache
+            .record_availability_missing(
+                msgid.clone(),
+                AvailabilitySlot::new(backend.as_index()).unwrap(),
+            )
+            .await;
         let retrieved = cache.get(&msgid).await.unwrap();
         assert!(
-            retrieved.availability().is_missing(backend),
+            retrieved
+                .availability()
+                .is_missing_slot(AvailabilitySlot::new(backend.as_index()).unwrap()),
             "cached 430 must not produce an eligible success token"
         );
 
@@ -2287,7 +2272,7 @@ mod tests {
 
         let retrieved = cache.get(&msgid).await.unwrap();
         assert_eq!(retrieved.status_code(), StatusCode::new(430));
-        assert!(!retrieved.should_try_backend(backend));
+        assert!(!retrieved.should_try_slot(AvailabilitySlot::new(backend.as_index()).unwrap()));
         assert!(
             retrieved
                 .cached_response_for(RequestKind::Article, msgid.as_str())
@@ -2301,7 +2286,7 @@ mod tests {
         let msgid = MessageId::from_borrowed("<expired-missing-upsert@example.com>").unwrap();
         let backend = BackendId::from_index(0);
         let mut expired = CachedArticle::missing(ttl::CacheTier::new(0));
-        expired.record_backend_missing(backend);
+        expired.record_availability_missing(AvailabilitySlot::new(backend.as_index()).unwrap());
         expired.inserted_at = ttl::CacheTimestampMillis::new(0);
         cache.insert(msgid.clone(), expired).await;
 
@@ -2317,7 +2302,7 @@ mod tests {
             .await
             .expect("successful fetch should replace expired missing metadata");
         assert_eq!(retrieved.status_code(), StatusCode::new(220));
-        assert!(retrieved.should_try_backend(backend));
+        assert!(retrieved.should_try_slot(AvailabilitySlot::new(backend.as_index()).unwrap()));
         assert_eq!(
             rendered(&retrieved, RequestKind::Article, msgid.as_str()),
             buffer
@@ -2330,7 +2315,7 @@ mod tests {
         let msgid = MessageId::from_borrowed("<expired-missing-status@example.com>").unwrap();
         let backend = BackendId::from_index(0);
         let mut expired = CachedArticle::missing(ttl::CacheTier::new(0));
-        expired.record_backend_missing(backend);
+        expired.record_availability_missing(AvailabilitySlot::new(backend.as_index()).unwrap());
         expired.inserted_at = ttl::CacheTimestampMillis::new(0);
         cache.insert(msgid.clone(), expired).await;
 
@@ -2348,7 +2333,7 @@ mod tests {
             .await
             .expect("successful status should replace expired missing metadata");
         assert_eq!(retrieved.status_code(), StatusCode::new(223));
-        assert!(retrieved.should_try_backend(backend));
+        assert!(retrieved.should_try_slot(AvailabilitySlot::new(backend.as_index()).unwrap()));
         assert_eq!(retrieved.payload_len().get(), 0);
     }
 
@@ -2361,14 +2346,19 @@ mod tests {
         expired.inserted_at = ttl::CacheTimestampMillis::new(0);
         cache.insert(msgid.clone(), expired).await;
 
-        cache.record_backend_missing(msgid.clone(), backend).await;
+        cache
+            .record_availability_missing(
+                msgid.clone(),
+                AvailabilitySlot::new(backend.as_index()).unwrap(),
+            )
+            .await;
 
         let retrieved = cache
             .get(&msgid)
             .await
             .expect("fresh missing fact should replace expired payload");
         assert_eq!(retrieved.status_code(), StatusCode::new(430));
-        assert!(!retrieved.should_try_backend(backend));
+        assert!(!retrieved.should_try_slot(AvailabilitySlot::new(backend.as_index()).unwrap()));
         assert!(matches!(retrieved.payload, CachedPayload::Missing));
         assert_eq!(retrieved.payload_len().get(), 0);
     }
@@ -2393,7 +2383,7 @@ mod tests {
 
         // Record backend 0 returned 430
         cache
-            .record_backend_missing(msgid.clone(), BackendId::from_index(0))
+            .record_availability_missing(msgid.clone(), AvailabilitySlot::new(0).unwrap())
             .await;
 
         // CRITICAL: Cache entry MUST now exist
@@ -2404,13 +2394,13 @@ mod tests {
 
         // Verify backend 0 is marked as missing
         assert!(
-            !entry.should_try_backend(BackendId::from_index(0)),
+            !entry.should_try_slot(AvailabilitySlot::new(0).unwrap()),
             "Backend 0 should be marked missing"
         );
 
         // Verify backend 1 is still available (not tried yet)
         assert!(
-            entry.should_try_backend(BackendId::from_index(1)),
+            entry.should_try_slot(AvailabilitySlot::new(1).unwrap()),
             "Backend 1 should still be available"
         );
 
@@ -2423,14 +2413,14 @@ mod tests {
 
         // Record backend 1 also returned 430
         cache
-            .record_backend_missing(msgid.clone(), BackendId::from_index(1))
+            .record_availability_missing(msgid.clone(), AvailabilitySlot::new(1).unwrap())
             .await;
 
         let entry = cache.get(&msgid).await.unwrap();
 
         // Now both backends should be marked missing
-        assert!(!entry.should_try_backend(BackendId::from_index(0)));
-        assert!(!entry.should_try_backend(BackendId::from_index(1)));
+        assert!(!entry.should_try_slot(AvailabilitySlot::new(0).unwrap()));
+        assert!(!entry.should_try_slot(AvailabilitySlot::new(1).unwrap()));
 
         // Verify all backends exhausted
         assert!(

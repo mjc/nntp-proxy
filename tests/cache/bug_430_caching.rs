@@ -38,10 +38,10 @@ async fn test_430_response_creates_cache_entry() {
         .expect("Cache entry must exist after 430");
 
     // Backend 0 should be marked missing
-    assert!(!entry.should_try_backend(BackendId::from_index(0)));
+    assert!(!entry.should_try_slot(nntp_proxy::cache::AvailabilitySlot::new(0).unwrap()));
 
     // Backend 1 should still be available
-    assert!(entry.should_try_backend(BackendId::from_index(1)));
+    assert!(entry.should_try_slot(nntp_proxy::cache::AvailabilitySlot::new(1).unwrap()));
 }
 
 /// Test that subsequent 430s update the same cache entry
@@ -64,8 +64,8 @@ async fn test_multiple_430s_update_same_entry() {
     let entry = cache.get(&msgid).await.unwrap();
 
     // Both backends should be marked missing
-    assert!(!entry.should_try_backend(BackendId::from_index(0)));
-    assert!(!entry.should_try_backend(BackendId::from_index(1)));
+    assert!(!entry.should_try_slot(nntp_proxy::cache::AvailabilitySlot::new(0).unwrap()));
+    assert!(!entry.should_try_slot(nntp_proxy::cache::AvailabilitySlot::new(1).unwrap()));
 
     // All backends exhausted
     assert!(

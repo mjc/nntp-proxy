@@ -402,9 +402,7 @@ mod index_contention {
 // =============================================================================
 
 mod availability {
-    use super::{
-        ArticleAvailability, AvailabilitySlot, BackendCount, BackendId, Bencher, black_box,
-    };
+    use super::{ArticleAvailability, AvailabilitySlot, BackendCount, Bencher, black_box};
 
     #[divan::bench(sample_count = 1000, sample_size = 1000)]
     fn record_missing(bencher: Bencher) {
@@ -452,7 +450,8 @@ mod availability {
         let mut avail = ArticleAvailability::new();
         // Mark 3 of 4 as missing
         for i in 0..3u8 {
-            avail.record_missing(BackendId::from_index(i as usize));
+            avail
+                .record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(i as usize).unwrap());
         }
         let count = BackendCount::try_new(4).expect("test backend count fits availability bitmap");
         bencher.bench(|| black_box(black_box(&avail).all_exhausted(black_box(count))));
@@ -462,7 +461,8 @@ mod availability {
     fn all_exhausted_yes(bencher: Bencher) {
         let mut avail = ArticleAvailability::new();
         for i in 0..4u8 {
-            avail.record_missing(BackendId::from_index(i as usize));
+            avail
+                .record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(i as usize).unwrap());
         }
         let count = BackendCount::try_new(4).expect("test backend count fits availability bitmap");
         bencher.bench(|| black_box(black_box(&avail).all_exhausted(black_box(count))));

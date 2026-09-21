@@ -158,15 +158,6 @@ impl std::fmt::Debug for HybridArticleCache {
 }
 
 impl HybridArticleCache {
-    #[cfg(test)]
-    pub async fn record_missing(&self, message_id: MessageId<'_>, backend_id: BackendId) {
-        self.record_availability_missing(
-            message_id,
-            AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
-        )
-        .await;
-    }
-
     pub(crate) fn availability_slot(&self, backend: BackendId) -> AvailabilitySlot {
         self.layout.slot_for_backend(backend)
     }
@@ -835,7 +826,7 @@ mod tests {
         let mut rendered = Vec::with_capacity(response.wire_len().get());
         response.write_to(&mut rendered).await.unwrap();
         assert_eq!(rendered, buffer);
-        assert!(entry.should_try_backend(BackendId::from_index(0)));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(0).unwrap()));
 
         // Check stats
         let stats = cache.stats();
@@ -853,7 +844,9 @@ mod tests {
 
         // Record a 430 response
         let msg_id = MessageId::from_borrowed("<missing@example.com>").unwrap();
-        cache.record_missing(msg_id, BackendId::from_index(0)).await;
+        cache
+            .record_availability_missing(msg_id, AvailabilitySlot::new(0).unwrap())
+            .await;
 
         // Check availability
         let msg_id = MessageId::from_borrowed("<missing@example.com>").unwrap();
@@ -863,8 +856,8 @@ mod tests {
             0,
             "missing hybrid cache entries must not retain response payload bytes"
         );
-        assert!(!entry.should_try_backend(BackendId::from_index(0)));
-        assert!(entry.should_try_backend(BackendId::from_index(1)));
+        assert!(!entry.should_try_slot(AvailabilitySlot::new(0).unwrap()));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(1).unwrap()));
 
         cache.close().await.unwrap();
     }
@@ -880,12 +873,16 @@ mod tests {
             b"220 0 <hybrid-permanent-missing@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n"
                 .to_vec();
 
-        cache.record_missing(msg_id, backend).await;
+        cache
+            .record_availability_missing(msg_id, AvailabilitySlot::new(backend.as_index()).unwrap())
+            .await;
 
         let msg_id = MessageId::from_borrowed("<hybrid-permanent-missing@example.com>").unwrap();
         let entry = cache.get(&msg_id).await.unwrap();
         assert!(
-            entry.availability().is_missing(backend),
+            entry
+                .availability()
+                .is_missing_slot(AvailabilitySlot::new(backend.as_index()).unwrap()),
             "cached 430 must not produce an eligible success token"
         );
 
@@ -897,7 +894,7 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<hybrid-permanent-missing@example.com>").unwrap();
         let entry = cache.get(&msg_id).await.unwrap();
         assert_eq!(entry.status_code(), StatusCode::new(430));
-        assert!(!entry.should_try_backend(backend));
+        assert!(!entry.should_try_slot(AvailabilitySlot::new(backend.as_index()).unwrap()));
         assert_eq!(entry.payload_len().get(), 0);
 
         cache.close().await.unwrap();
@@ -912,7 +909,7 @@ mod tests {
         let key = msg_id.without_brackets().to_string();
         let backend = BackendId::from_index(0);
         let mut expired = DiskCachedArticle::missing(super::ttl::CacheTier::new(0));
-        expired.record_backend_missing(backend);
+        expired.record_availability_missing(AvailabilitySlot::new(backend.as_index()).unwrap());
         expired.timestamp = super::ttl::CacheTimestampMillis::new(0);
         cache.cache.insert(key, expired);
 
@@ -929,7 +926,7 @@ mod tests {
             .await
             .expect("successful fetch should replace expired missing metadata");
         assert_eq!(entry.status_code(), StatusCode::new(220));
-        assert!(entry.should_try_backend(backend));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(backend.as_index()).unwrap()));
         let response = entry
             .cached_response_for(crate::protocol::RequestKind::Article, msg_id.as_str())
             .expect("replacement should store a complete article response");
@@ -949,7 +946,7 @@ mod tests {
         let key = msg_id.without_brackets().to_string();
         let backend = BackendId::from_index(0);
         let mut expired = DiskCachedArticle::missing(super::ttl::CacheTier::new(0));
-        expired.record_backend_missing(backend);
+        expired.record_availability_missing(AvailabilitySlot::new(backend.as_index()).unwrap());
         expired.timestamp = super::ttl::CacheTimestampMillis::new(0);
         cache.cache.insert(key, expired);
 
@@ -968,7 +965,7 @@ mod tests {
             .await
             .expect("successful status should replace expired missing metadata");
         assert_eq!(entry.status_code(), StatusCode::new(223));
-        assert!(entry.should_try_backend(backend));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(backend.as_index()).unwrap()));
         assert_eq!(entry.payload_len().get(), 0);
 
         cache.close().await.unwrap();
@@ -993,7 +990,9 @@ mod tests {
         expired.timestamp = super::ttl::CacheTimestampMillis::new(0);
         cache.cache.insert(key, expired);
 
-        cache.record_missing(msg_id, backend).await;
+        cache
+            .record_availability_missing(msg_id, AvailabilitySlot::new(backend.as_index()).unwrap())
+            .await;
 
         let msg_id = MessageId::from_borrowed("<expired-record-missing@example.com>").unwrap();
         let entry = cache
@@ -1001,7 +1000,7 @@ mod tests {
             .await
             .expect("fresh missing fact should replace expired payload");
         assert_eq!(entry.status_code(), StatusCode::new(430));
-        assert!(!entry.should_try_backend(backend));
+        assert!(!entry.should_try_slot(AvailabilitySlot::new(backend.as_index()).unwrap()));
         assert_eq!(entry.payload_len().get(), 0);
 
         cache.close().await.unwrap();
@@ -1013,7 +1012,9 @@ mod tests {
             .await
             .unwrap();
         let msg_id = MessageId::from_borrowed("<mixed@example.com>").unwrap();
-        cache.record_missing(msg_id, BackendId::from_index(0)).await;
+        cache
+            .record_availability_missing(msg_id, AvailabilitySlot::new(0).unwrap())
+            .await;
         let msg_id = MessageId::from_borrowed("<mixed@example.com>").unwrap();
         cache
             .record_has_status(
@@ -1031,8 +1032,8 @@ mod tests {
             .expect("mixed facts should create a status-only entry");
         assert_eq!(entry.status_code(), StatusCode::new(223));
         assert_eq!(entry.payload_len().get(), 0);
-        assert!(!entry.should_try_backend(BackendId::from_index(0)));
-        assert!(entry.should_try_backend(BackendId::from_index(1)));
+        assert!(!entry.should_try_slot(AvailabilitySlot::new(0).unwrap()));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(1).unwrap()));
 
         cache.close().await.unwrap();
     }
@@ -1050,7 +1051,9 @@ mod tests {
             .await;
 
         let msg_id = MessageId::from_borrowed("<mixed-payload@example.com>").unwrap();
-        cache.record_missing(msg_id, BackendId::from_index(0)).await;
+        cache
+            .record_availability_missing(msg_id, AvailabilitySlot::new(0).unwrap())
+            .await;
 
         let msg_id = MessageId::from_borrowed("<mixed-payload@example.com>").unwrap();
         let entry = cache
@@ -1063,8 +1066,8 @@ mod tests {
         let mut rendered = Vec::with_capacity(response.wire_len().get());
         response.write_to(&mut rendered).await.unwrap();
         assert_eq!(rendered, buffer);
-        assert!(!entry.should_try_backend(BackendId::from_index(0)));
-        assert!(entry.should_try_backend(BackendId::from_index(1)));
+        assert!(!entry.should_try_slot(AvailabilitySlot::new(0).unwrap()));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(1).unwrap()));
 
         cache.close().await.unwrap();
     }
@@ -1099,8 +1102,8 @@ mod tests {
                 .is_some(),
             "complete body response should replace larger metadata-only HEAD"
         );
-        assert!(entry.should_try_backend(BackendId::from_index(0)));
-        assert!(entry.should_try_backend(BackendId::from_index(1)));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(0).unwrap()));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(1).unwrap()));
 
         cache.close().await.unwrap();
     }

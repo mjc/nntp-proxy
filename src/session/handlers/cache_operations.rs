@@ -476,7 +476,10 @@ mod tests {
         let msg_id = MessageId::new("<partial@example>".to_string()).expect("valid message id");
         session
             .cache
-            .record_backend_missing(msg_id.clone(), BackendId::from_index(0))
+            .record_availability_missing(
+                msg_id.clone(),
+                crate::cache::AvailabilitySlot::new(0).unwrap(),
+            )
             .await;
         let expected_timestamp = session
             .cache

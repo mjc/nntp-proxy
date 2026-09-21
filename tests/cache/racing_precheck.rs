@@ -43,9 +43,9 @@ fn test_availability_bitset_semantics_for_retry() {
     // Usage pattern in retry loop:
     // 1. Create fresh availability tracker for this request
     // 2. For each backend:
-    //    a. Check if availability.is_missing(backend) → skip
+    //    a. Check if availability.is_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(backend.as_index()).unwrap()) → skip
     //    b. Try backend
-    //    c. If 430: availability.record_missing(backend)
+    //    c. If 430: availability.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(backend.as_index()).unwrap())
     //    d. Continue to next backend
     // 3. When all backends exhausted → send 430 to client
 

@@ -134,8 +134,7 @@ mod least_loaded {
 
 mod availability_routing {
     use super::{
-        BackendId, BackendSelectionStrategy, Bencher, ClientId, RouteRequest, black_box,
-        make_router,
+        BackendSelectionStrategy, Bencher, ClientId, RouteRequest, black_box, make_router,
     };
     use nntp_proxy::cache::ArticleAvailability;
 
@@ -159,8 +158,8 @@ mod availability_routing {
         let client_id = ClientId::new();
         let mut avail = ArticleAvailability::new();
         // Mark first 2 backends as missing
-        avail.record_missing(BackendId::from_index(0));
-        avail.record_missing(BackendId::from_index(1));
+        avail.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(0).unwrap());
+        avail.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(1).unwrap());
         bencher.bench(|| {
             let backend = router
                 .route(RouteRequest::new(black_box(client_id)).with_availability(black_box(&avail)))

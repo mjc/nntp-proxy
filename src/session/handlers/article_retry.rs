@@ -417,7 +417,10 @@ mod tests {
         let msg_id = MessageId::from_borrowed("<ordered-success@example.com>").unwrap();
 
         cache
-            .record_backend_missing(msg_id.clone(), BackendId::from_index(0))
+            .record_availability_missing(
+                msg_id.clone(),
+                crate::cache::AvailabilitySlot::new(0).unwrap(),
+            )
             .await;
         cache
             .record_backend_has_status(
@@ -435,8 +438,8 @@ mod tests {
             .expect("cache facts must preserve mixed success/missing availability");
         assert_eq!(entry.status_code(), StatusCode::new(222));
         assert_eq!(entry.payload_len().get(), 0);
-        assert!(!entry.should_try_backend(BackendId::from_index(0)));
-        assert!(entry.should_try_backend(BackendId::from_index(1)));
+        assert!(!entry.should_try_slot(crate::cache::AvailabilitySlot::new(0).unwrap()));
+        assert!(entry.should_try_slot(crate::cache::AvailabilitySlot::new(1).unwrap()));
         assert_eq!(entry.availability().missing_bits(), 0b0000_0001);
     }
 
@@ -446,9 +449,9 @@ mod tests {
             RequestCacheAvailability::from_bits(0b0000_0110, 0b0000_0010),
         );
 
-        assert!(availability.should_try(BackendId::from_index(0)));
-        assert!(!availability.should_try(BackendId::from_index(1)));
-        assert!(availability.should_try(BackendId::from_index(2)));
+        assert!(availability.should_try_slot(crate::cache::AvailabilitySlot::new(0).unwrap()));
+        assert!(!availability.should_try_slot(crate::cache::AvailabilitySlot::new(1).unwrap()));
+        assert!(availability.should_try_slot(crate::cache::AvailabilitySlot::new(2).unwrap()));
         assert_eq!(availability.missing_bits(), 0b0000_0010);
     }
 }

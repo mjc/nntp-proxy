@@ -14,8 +14,6 @@
 //! ```
 
 use crate::protocol::StatusCode;
-#[cfg(test)]
-use crate::types::BackendId;
 use foyer::Code;
 use std::io::{Read, Write};
 use std::mem::size_of;
@@ -635,8 +633,8 @@ impl DiskCachedArticle {
     #[inline]
     #[must_use]
     #[cfg(test)]
-    pub(crate) fn should_try_backend(&self, backend_id: BackendId) -> bool {
-        self.availability.should_try(backend_id)
+    pub(crate) fn should_try_slot(&self, slot: AvailabilitySlot) -> bool {
+        self.availability.should_try_slot(slot)
     }
 
     pub(crate) fn record_availability_missing(&mut self, slot: AvailabilitySlot) {
@@ -712,13 +710,6 @@ impl DiskCachedArticle {
         &self,
     ) -> [ttl::CacheTimestampMillis; super::MAX_BACKENDS] {
         self.negative_timestamps
-    }
-
-    #[cfg(test)]
-    pub(crate) fn record_backend_missing(&mut self, backend_id: BackendId) {
-        self.record_availability_missing(
-            AvailabilitySlot::new(backend_id.as_index()).expect("backend count fits bitmap"),
-        );
     }
 
     pub(crate) fn expire_stale_availability(&mut self, base_ttl: ttl::CacheTtlMillis) {
@@ -823,7 +814,6 @@ fn compatible_article_numbers(
 mod tests {
     use super::*;
     use crate::protocol::RequestKind;
-    use crate::types::BackendId;
     use futures::executor::block_on;
 
     fn assert_entry_eq(original: &DiskCachedArticle, decoded: &DiskCachedArticle) {
@@ -976,12 +966,12 @@ mod tests {
         );
         assert_eq!(entry.status_code().as_u16(), 220);
 
-        assert!(entry.should_try_backend(BackendId::from_index(0)));
-        assert!(entry.should_try_backend(BackendId::from_index(1)));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(0).unwrap()));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(1).unwrap()));
 
-        entry.record_backend_missing(BackendId::from_index(1));
-        assert!(entry.should_try_backend(BackendId::from_index(0)));
-        assert!(!entry.should_try_backend(BackendId::from_index(1)));
+        entry.record_availability_missing(AvailabilitySlot::new(1).unwrap());
+        assert!(entry.should_try_slot(AvailabilitySlot::new(0).unwrap()));
+        assert!(!entry.should_try_slot(AvailabilitySlot::new(1).unwrap()));
     }
 
     #[test]
@@ -1134,22 +1124,22 @@ mod tests {
         let mut entry = disk_cached_article_from_ingest_bytes(b"220 ok\r\n").expect("valid");
 
         for i in 0..8 {
-            assert!(entry.should_try_backend(BackendId::from_index(i)));
+            assert!(entry.should_try_slot(AvailabilitySlot::new(i).unwrap()));
         }
 
-        entry.record_backend_missing(BackendId::from_index(0));
-        entry.record_backend_missing(BackendId::from_index(2));
-        entry.record_backend_missing(BackendId::from_index(4));
+        entry.record_availability_missing(AvailabilitySlot::new(0).unwrap());
+        entry.record_availability_missing(AvailabilitySlot::new(2).unwrap());
+        entry.record_availability_missing(AvailabilitySlot::new(4).unwrap());
 
-        assert!(!entry.should_try_backend(BackendId::from_index(0)));
-        assert!(entry.should_try_backend(BackendId::from_index(1)));
-        assert!(!entry.should_try_backend(BackendId::from_index(2)));
-        assert!(entry.should_try_backend(BackendId::from_index(3)));
-        assert!(!entry.should_try_backend(BackendId::from_index(4)));
+        assert!(!entry.should_try_slot(AvailabilitySlot::new(0).unwrap()));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(1).unwrap()));
+        assert!(!entry.should_try_slot(AvailabilitySlot::new(2).unwrap()));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(3).unwrap()));
+        assert!(!entry.should_try_slot(AvailabilitySlot::new(4).unwrap()));
 
         let avail = entry.availability();
-        assert!(avail.is_missing(BackendId::from_index(0)));
-        assert!(!avail.is_missing(BackendId::from_index(1)));
+        assert!(avail.is_missing_slot(AvailabilitySlot::new(0).unwrap()));
+        assert!(!avail.is_missing_slot(AvailabilitySlot::new(1).unwrap()));
     }
 
     #[test]
@@ -1341,21 +1331,21 @@ mod tests {
     #[test]
     fn test_code_encode_decode_preserves_availability() {
         let mut entry = disk_cached_article_from_ingest_bytes(b"220 ok\r\n").unwrap();
-        entry.record_backend_missing(BackendId::from_index(2));
+        entry.record_availability_missing(AvailabilitySlot::new(2).unwrap());
 
         let mut encoded = Vec::new();
         entry.encode(&mut encoded).unwrap();
         let decoded = DiskCachedArticle::decode(&mut encoded.as_slice()).unwrap();
 
-        assert!(decoded.should_try_backend(BackendId::from_index(0)));
-        assert!(decoded.should_try_backend(BackendId::from_index(1)));
-        assert!(!decoded.should_try_backend(BackendId::from_index(2)));
+        assert!(decoded.should_try_slot(AvailabilitySlot::new(0).unwrap()));
+        assert!(decoded.should_try_slot(AvailabilitySlot::new(1).unwrap()));
+        assert!(!decoded.should_try_slot(AvailabilitySlot::new(2).unwrap()));
     }
 
     #[test]
     fn test_code_encode_decode_preserves_negative_timestamps() {
         let mut entry = disk_cached_article_from_ingest_bytes(b"220 ok\r\n").unwrap();
-        entry.record_backend_missing(BackendId::from_index(1));
+        entry.record_availability_missing(AvailabilitySlot::new(1).unwrap());
         let mut timestamps = [ttl::CacheTimestampMillis::new(0); crate::cache::MAX_BACKENDS];
         timestamps[1] = ttl::CacheTimestampMillis::new(123_456);
         entry.set_negative_timestamps(timestamps);
@@ -1365,14 +1355,14 @@ mod tests {
         let decoded = DiskCachedArticle::decode(&mut encoded.as_slice()).unwrap();
 
         assert_eq!(decoded.negative_timestamps(), timestamps);
-        assert!(!decoded.should_try_backend(BackendId::from_index(1)));
+        assert!(!decoded.should_try_slot(AvailabilitySlot::new(1).unwrap()));
     }
 
     #[test]
     fn negative_availability_expires_per_backend_after_positive_update() {
         let mut entry = disk_cached_article_from_ingest_bytes(b"220 ok\r\n").unwrap();
-        entry.record_backend_missing(BackendId::from_index(0));
-        entry.record_backend_missing(BackendId::from_index(1));
+        entry.record_availability_missing(AvailabilitySlot::new(0).unwrap());
+        entry.record_availability_missing(AvailabilitySlot::new(1).unwrap());
         entry.negative_timestamps[0] = ttl::CacheTimestampMillis::new(0);
         entry.negative_timestamps[1] =
             ttl::CacheTimestampMillis::new(ttl::now_millis().saturating_add(60_000));
@@ -1380,8 +1370,8 @@ mod tests {
         entry.record_backend_has_status(CacheableStatusCode::Stat, ttl::CacheTier::new(0));
         entry.expire_stale_availability(ttl::CacheTtlMillis::new(1));
 
-        assert!(entry.should_try_backend(BackendId::from_index(0)));
-        assert!(!entry.should_try_backend(BackendId::from_index(1)));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(0).unwrap()));
+        assert!(!entry.should_try_slot(AvailabilitySlot::new(1).unwrap()));
     }
 
     #[test]

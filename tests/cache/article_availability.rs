@@ -15,7 +15,8 @@ fn count(count: usize) -> BackendCount {
 fn availability_with_missing(backends: &[usize]) -> ArticleAvailability {
     let mut avail = ArticleAvailability::new();
     for backend_index in backends {
-        avail.record_missing(backend(*backend_index));
+        avail
+            .record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(*backend_index).unwrap());
     }
     avail
 }
@@ -23,7 +24,8 @@ fn availability_with_missing(backends: &[usize]) -> ArticleAvailability {
 fn assert_should_try(avail: ArticleAvailability, cases: &[(usize, bool)]) {
     for (backend_index, should_try) in cases {
         assert_eq!(
-            !avail.is_missing(backend(*backend_index)),
+            !avail
+                .is_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(*backend_index).unwrap()),
             *should_try,
             "backend {backend_index}"
         );
@@ -67,18 +69,18 @@ fn test_record_missing_is_idempotent_and_encoded_as_bitset() {
     let mut avail = ArticleAvailability::new();
     assert_eq!(avail.missing_bits(), 0b0000_0000);
 
-    avail.record_missing(backend(0));
+    avail.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(0).unwrap());
     assert_eq!(avail.missing_bits(), 0b0000_0001);
 
-    avail.record_missing(backend(1));
+    avail.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(1).unwrap());
     assert_eq!(avail.missing_bits(), 0b0000_0011);
 
-    avail.record_missing(backend(3));
-    avail.record_missing(backend(3));
+    avail.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(3).unwrap());
+    avail.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(3).unwrap());
     assert_eq!(avail.missing_bits(), 0b0000_1011);
-    assert!(avail.is_missing(backend(3)));
+    assert!(avail.is_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(3).unwrap()));
 
-    avail.record_missing(backend(7));
+    avail.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(7).unwrap());
     assert_eq!(avail.missing_bits(), 0b1000_1011);
 }
 
@@ -88,22 +90,22 @@ fn test_all_exhausted_for_backend_counts() {
 
     let mut one = ArticleAvailability::new();
     assert!(!one.all_exhausted(count(1)));
-    one.record_missing(backend(0));
+    one.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(0).unwrap());
     assert!(one.all_exhausted(count(1)));
 
     let mut two = ArticleAvailability::new();
     assert!(!two.all_exhausted(count(2)));
-    two.record_missing(backend(0));
+    two.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(0).unwrap());
     assert!(!two.all_exhausted(count(2)));
-    two.record_missing(backend(1));
+    two.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(1).unwrap());
     assert!(two.all_exhausted(count(2)));
 
     let mut eight = ArticleAvailability::new();
     for backend_index in 0..7 {
-        eight.record_missing(backend(backend_index));
+        eight.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(backend_index).unwrap());
         assert!(!eight.all_exhausted(count(8)));
     }
-    eight.record_missing(backend(7));
+    eight.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(7).unwrap());
     assert!(eight.all_exhausted(count(8)));
 }
 
@@ -113,9 +115,13 @@ fn test_retry_loop_simulations() {
     let mut attempts = Vec::new();
     for backend_index in [0, 1] {
         let backend = backend(backend_index);
-        assert!(!exhausted.is_missing(backend));
+        assert!(!exhausted.is_missing_slot(
+            nntp_proxy::cache::AvailabilitySlot::new(backend.as_index()).unwrap()
+        ));
         attempts.push(backend);
-        exhausted.record_missing(backend);
+        exhausted.record_missing_slot(
+            nntp_proxy::cache::AvailabilitySlot::new(backend.as_index()).unwrap(),
+        );
     }
     assert!(exhausted.all_exhausted(count(2)));
     assert_eq!(attempts, vec![backend(0), backend(1)]);
@@ -123,10 +129,14 @@ fn test_retry_loop_simulations() {
     let mut found = ArticleAvailability::new();
     for backend_index in [0, 1] {
         let backend = backend(backend_index);
-        assert!(!found.is_missing(backend));
-        found.record_missing(backend);
+        assert!(!found.is_missing_slot(
+            nntp_proxy::cache::AvailabilitySlot::new(backend.as_index()).unwrap()
+        ));
+        found.record_missing_slot(
+            nntp_proxy::cache::AvailabilitySlot::new(backend.as_index()).unwrap(),
+        );
     }
-    assert!(!found.is_missing(backend(2)));
+    assert!(!found.is_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(2).unwrap()));
     assert!(!found.all_exhausted(count(4)));
     assert_should_try(found, &[(0, false), (1, false), (2, true), (3, true)]);
 }
@@ -138,7 +148,11 @@ fn test_round_robin_and_cached_availability_skip_missing_backends() {
     let tried = [0, 1, 2, 3, 0]
         .into_iter()
         .map(backend)
-        .filter(|&backend| !avail.is_missing(backend))
+        .filter(|&backend| {
+            !avail.is_missing_slot(
+                nntp_proxy::cache::AvailabilitySlot::new(backend.as_index()).unwrap(),
+            )
+        })
         .collect::<Vec<_>>();
     assert_eq!(tried, vec![backend(0), backend(2), backend(0)]);
 
@@ -156,7 +170,9 @@ fn test_round_robin_and_cached_availability_skip_missing_backends() {
     assert_eq!(
         (0..6)
             .map(backend)
-            .filter(|&backend| !avail.is_missing(backend))
+            .filter(|&backend| !avail.is_missing_slot(
+                nntp_proxy::cache::AvailabilitySlot::new(backend.as_index()).unwrap()
+            ))
             .collect::<Vec<_>>(),
         vec![backend(0), backend(2), backend(4)]
     );
@@ -171,5 +187,5 @@ fn test_all_exhausted_supports_nine_backends() {
 #[test]
 fn test_backend_id_eight_is_supported() {
     let avail = availability_with_missing(&[8]);
-    assert!(avail.is_missing(backend(8)));
+    assert!(avail.is_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(8).unwrap()));
 }

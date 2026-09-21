@@ -128,8 +128,8 @@ fn test_tier_escalation_on_430() {
 
     // Simulate both tier 0 backends returning 430
     let mut availability = ArticleAvailability::new();
-    availability.record_missing(BackendId::from_index(0));
-    availability.record_missing(BackendId::from_index(1));
+    availability.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(0).unwrap());
+    availability.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(1).unwrap());
 
     // Now routing should select tier 1 backend
     let backend = selector
@@ -224,7 +224,7 @@ fn test_partial_tier_exhaustion() {
 
     // Mark only one tier 0 backend as missing
     let mut availability = ArticleAvailability::new();
-    availability.record_missing(BackendId::from_index(0));
+    availability.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(0).unwrap());
 
     // Should still select from tier 0 (the remaining one)
     let backend = selector
@@ -266,8 +266,8 @@ fn test_multiple_tiers() {
 
     // Mark tier 0 and tier 1 as missing
     let mut availability = ArticleAvailability::new();
-    availability.record_missing(BackendId::from_index(0));
-    availability.record_missing(BackendId::from_index(1));
+    availability.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(0).unwrap());
+    availability.record_missing_slot(nntp_proxy::cache::AvailabilitySlot::new(1).unwrap());
 
     // Should escalate to tier 2
     let backend = selector
