@@ -1,15 +1,17 @@
 //! # NNTP Proxy Library
 //!
-//! A high-performance NNTP proxy server and pooled NNTP client with hybrid,
-//! stateful, and per-command routing modes.
+//! A high-performance NNTP proxy application with connection pooling, multiple
+//! backends, optional article caching, and a live terminal dashboard.
 //!
-//! The crate requires Rust 1.91 or newer. The `nntp-proxy` binary is the usual
-//! entry point for running a local proxy; the library API is useful when an
-//! application needs to embed the proxy or fetch article responses directly.
+//! Install the application with `cargo install nntp-proxy --locked`, then follow
+//! the [getting-started guide](https://github.com/mjc/nntp-proxy/blob/main/docs/operator/getting-started.md)
+//! to configure a backend and run `nntp-proxy --config config.toml`.
 //!
-//! Applications embedding the crate can use [`NntpProxy`] and
-//! [`NntpProxyBuilder`] to construct the server, or use [`client::NntpClient`]
-//! to fetch article responses from an upstream server.
+//! The crate requires Rust 1.91 or newer. These pages document the Rust API for
+//! contributors and experimental integrations. The library API is still evolving;
+//! the application is the intended entry point. [`NntpProxy`] and
+//! [`NntpProxyBuilder`] construct the server; [`client::NntpClient`] provides
+//! pooled article fetching.
 //!
 //! ## Architecture
 //!

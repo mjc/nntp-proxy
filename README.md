@@ -1,144 +1,151 @@
 # nntp-proxy
 
-High-throughput NNTP proxy and pooled NNTP client written in Rust.
+**One NNTP endpoint for all your backend servers.**
 
-`nntp-proxy` sits between NNTP clients and one or more backend servers. It gives you a single local endpoint while handling backend selection, pooling, authentication, optional caching, and metrics in one place.
+`nntp-proxy` brings connection pooling, backend selection, optional article
+caching, and a live terminal dashboard into a single application. Point your
+NNTP clients at the proxy and manage your upstream servers in one place.
 
-The crate also includes a standalone pooled client for applications that need to
-fetch and validate article responses without running the proxy listener.
+- **Share connections.** Reuse authenticated backend connections across clients
+  and set a connection limit for each server.
+- **Use multiple providers.** Distribute requests across backends and configure
+  priority tiers for article retries.
+- **Avoid repeated misses.** Remember which backends have reported an article
+  missing, with optional memory and disk caching for article payloads.
+- **See what is happening.** Monitor throughput, connections, cache activity,
+  and logs in the built-in terminal dashboard.
+- **Keep reader sessions working.** Default hybrid routing shares connections
+  until a command needs a dedicated backend session.
 
-## Requirements
+## Install
 
-- Rust 1.91 or newer when building the crate directly.
-- [devenv](https://devenv.sh/getting-started/) for the repository's pinned
-  development tools and reproducible checks.
-
-## What it does
-
-- Shares multiple backend servers across multiple clients
-- Pools and reuses backend connections instead of having every client open its own
-- Supports backend authentication, outbound TLS, health checks, and connection limits
-- Tracks authoritative article-missing responses and can optionally cache article bodies
-- Runs as one binary: `nntp-proxy`
-
-Client-facing connections are plain NNTP only. TLS support is for outbound backend connections, not for the local listener.
-
-## Routing and caching
-
-Hybrid routing is the default. It uses per-command routing for commands that do
-not need reader state and hands the session to a dedicated backend connection
-when stateful protocol context is required. `per-command` keeps every command
-on the stateless path, while `stateful` assigns each client a dedicated backend
-connection. A per-command session returns an NNTP error for commands that
-require state instead of silently routing them with the wrong context.
-
-Routing mode does not change NNTP response semantics. Response shape is derived
-from the request that produced it, so a status code is never treated as
-multiline in isolation. Packed backend responses remain associated with the
-correct request and are consumed in order.
-
-With the default cache settings, the proxy records authoritative `430` article
-misses for routing and retry decisions without retaining article bodies. Set
-`[cache].store_article_bodies = true` to enable payload caching; adding
-`[cache.disk]` provides a memory-to-disk cache tier. The canonical configuration
-names are documented in [Configuration](docs/operator/configuration.md).
-
-Details about routing restrictions, availability namespaces, queue backpressure,
-and cache behavior are in [Runtime and routing](docs/operator/runtime-and-routing.md)
-and [Caching](docs/operator/caching.md).
-
-## Quick start
+With [Rust and Cargo](https://rustup.rs/) installed:
 
 ```bash
-devenv shell cargo build --release
-cp config.minimal.toml config.toml
-./target/release/nntp-proxy --config config.toml
+cargo install nntp-proxy --locked
 ```
 
-Install [devenv](https://devenv.sh/getting-started/). For automatic activation,
-install its native shell hook (for zsh, add `eval "$(devenv hook zsh)"` to
-`~/.zshrc`) and run `devenv allow` once in the repository root. You can always
-use `devenv shell <command>` without the hook. Packaging and cross-platform
-release commands continue to use Nix; see [Development](docs/development.md).
+Building version 0.6 requires Rust 1.91 or newer and a native C/C++ build
+toolchain. Cargo installs the `nntp-proxy` executable into its bin directory;
+make sure that directory is on your `PATH`. See
+[Cargo's installation guide](https://doc.rust-lang.org/cargo/commands/cargo-install.html)
+if your shell cannot find the command.
 
-Then edit `config.toml` so `[[servers]]` points at a real backend and connect your NNTP client to `localhost:8119` unless you changed `[proxy].port`.
+## Configure and run
 
-The binary starts in headless mode and writes logs to stdout. Use `--ui tui` (or
-`--tui`) for the local dashboard. For a separate dashboard process, run the
-server with `--ui headless --tui-listen 127.0.0.1:PORT` and attach with
-`--ui tui --tui-attach 127.0.0.1:PORT`; dashboard listeners and attachments are
-restricted to loopback addresses.
+Save this as `config.toml`, replacing the example backend and credentials with
+those from your provider:
 
-## Library API
+```toml
+[proxy]
+host = "127.0.0.1"
+port = 8119
 
-The crate exposes the proxy builder and a standalone pooled client through the
-Rust library API. `NntpClient` fetches article-family responses into pooled
-storage and keeps response framing separate from semantic article validation:
-
-```rust,no_run
-use nntp_proxy::client::NntpClient;
-use nntp_proxy::protocol::YencValidation;
-
-# async fn example(client: &NntpClient, message_id: &nntp_proxy::types::MessageId<'_>)
-#     -> Result<(), Box<dyn std::error::Error>> {
-let framed = client.fetch_article(message_id).await?;
-let validated = framed.validate_with_yenc(YencValidation::Disabled)?;
-let article = validated.article();
-println!("{}", article.message_id);
-# Ok(())
-# }
+[[servers]]
+name = "Primary"
+host = "news.example.com"
+port = 563
+use_tls = true
+username = "your_username"
+password = "your_password"
+max_connections = 10
 ```
 
-The transition has three deliberately separate guarantees:
+Remove both credential lines if your backend does not require authentication.
+Set `max_connections` to fit your provider's connection allowance.
 
-1. `FramedArticle` owns the complete response bytes after the response boundary
-   has been established. The status line and content are retained; the NNTP
-   multiline terminator is not.
-2. `ValidatedArticle` consumes that owner, validates the request-scoped article
-   shape, and retains the validated layout and transformation requirements.
-3. `ValidatedArticle::article()` returns a reusable borrowed `ArticleView`.
-   Repeated access does not reparse or rediscover plain headers and bodies.
+Start the proxy:
 
-Use `fetch_body` or `fetch_head` when the request only needs one article
-section, and `stat` when you only need an existence check. Use
-`YencValidation::Enabled` only when the application needs yEnc structure
-validated as part of the transition; NNTP framing and article validation remain
-separate from yEnc decoding.
+```bash
+nntp-proxy --config config.toml
+```
 
-The lower-level `Article::parse` API remains available when an application
-already owns complete framed bytes and does not need the pooled client.
+In your NNTP client, use **host `127.0.0.1`, port `8119`, with TLS disabled**.
+No client username or password is needed for this local example. The proxy
+uses your configured credentials and TLS when connecting to the backend;
+backend certificate verification is enabled by default.
 
-The proxy's ordinary `ARTICLE`, `BODY`, and `HEAD` forwarding path is separate
-from this retained client API: it borrows bytes from pooled read storage and
-does not allocate a complete article merely to forward it.
+This example listens only on your computer. To serve other machines, configure
+the listener address and [client authentication](https://github.com/mjc/nntp-proxy/blob/main/docs/operator/configuration.md).
+The client-facing listener uses plain NNTP; TLS support is for backend
+connections. See [Operations](https://github.com/mjc/nntp-proxy/blob/main/docs/operator/operations.md)
+for deployment guidance.
 
-## Performance and development
+## Watch the dashboard
 
-Release benchmark evidence is recorded with its exact commit and workload in
-[CHANGELOG.md](CHANGELOG.md) and the archived benchmark notes when a release
-benchmark has been run. Those measurements describe the listed revisions, not
-a guarantee for every deployment. Follow
-[Development](docs/development.md) for reproducible tests, documentation
-checks, microbenchmarks, Gungraun measurements, and end-to-end benchmark
-commands. The repository development environment is managed by
-[devenv](https://devenv.sh/); use `devenv shell <command>` or activate it with
-`devenv allow`.
+Run the proxy with its terminal dashboard:
 
-## Read next
+```bash
+nntp-proxy --config config.toml --tui
+```
 
-- [Getting started](docs/operator/getting-started.md)
-- [Configuration](docs/operator/configuration.md)
-- [Caching](docs/operator/caching.md)
-- [Operations](docs/operator/operations.md)
-- [Development](docs/development.md)
+Or keep the server headless and attach a dashboard from another terminal:
 
-## Example configs
+```bash
+# Server terminal
+nntp-proxy --config config.toml --tui-listen 127.0.0.1:8120
 
-- [config.minimal.toml](config.minimal.toml)
-- [config.example.toml](config.example.toml)
-- [config.full.toml](config.full.toml)
-- [config.cache.toml](config.cache.toml)
+# Dashboard terminal
+nntp-proxy --tui --tui-attach 127.0.0.1:8120
+```
+
+Dashboard connections are restricted to loopback. Without `--tui`, the server
+runs headless and writes logs to stdout. Use `nntp-proxy --help` for the full
+command-line reference.
+
+## Add backends and choose routing
+
+Add another `[[servers]]` entry for each upstream server. Set `tier = 0` for
+primary servers and a higher tier for fallback servers. For article-missing
+retries, the proxy tries eligible servers in the current tier before moving
+to the next one. Connection limits and TLS settings are configured per server.
+
+Hybrid routing is the default: independent commands share backend connections,
+and commands that need reader state switch the session to a dedicated backend.
+Choose `stateful` to dedicate a backend connection from the start, or
+`per-command` for stateless workloads. Per-command mode returns an NNTP error
+for commands that require session state.
+
+See [Runtime and routing](https://github.com/mjc/nntp-proxy/blob/main/docs/operator/runtime-and-routing.md)
+for backend selection, priority tiers, and queue backpressure.
+
+## Cache articles when useful
+
+By default, the proxy tracks authoritative article-missing (`430`) responses
+without storing article bodies. To retain payloads in memory, add this as a
+top-level section in `config.toml`:
+
+```toml
+[cache]
+store_article_bodies = true
+```
+
+An optional `[cache.disk]` section adds a memory-to-disk payload cache. See
+[Caching](https://github.com/mjc/nntp-proxy/blob/main/docs/operator/caching.md)
+for capacity, expiration, disk storage, and availability tracking settings.
+
+## Documentation
+
+- [Getting started](https://github.com/mjc/nntp-proxy/blob/main/docs/operator/getting-started.md)
+  — installation, configuration, and the first connection.
+- [Configuration](https://github.com/mjc/nntp-proxy/blob/main/docs/operator/configuration.md)
+  — settings, authentication, and environment variables.
+- [Operations](https://github.com/mjc/nntp-proxy/blob/main/docs/operator/operations.md)
+  — running and monitoring the proxy.
+- [Example configuration](https://github.com/mjc/nntp-proxy/blob/main/config.example.toml)
+  — primary and fallback backends.
+- [Full configuration](https://github.com/mjc/nntp-proxy/blob/main/config.full.toml)
+  and [cache configuration](https://github.com/mjc/nntp-proxy/blob/main/config.cache.toml).
+- [Changelog](https://github.com/mjc/nntp-proxy/blob/main/CHANGELOG.md)
+  — release changes.
+
+## Contributing
+
+Repository development uses [devenv](https://devenv.sh/). See the
+[development guide](https://github.com/mjc/nntp-proxy/blob/main/docs/development.md)
+for source builds, tests, profiling, and benchmarks. The Rust library API is
+still evolving; the application is the intended entry point.
 
 ## License
 
-MIT
+[MIT](https://github.com/mjc/nntp-proxy/blob/main/LICENSE)

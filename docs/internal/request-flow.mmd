@@ -2,36 +2,35 @@ sequenceDiagram
     participant C as Client
     participant P as NntpProxy
     participant S as ClientSession
-    participant CL as Classifier
-    participant R as Router
-    participant Pool as ConnectionPool
+    participant H as CommandHandler
+    participant R as BackendSelector
+    participant Pool as ConnectionProvider
+    participant F as MultilineFramer
     participant B as Backend
 
-    C->>P: TCP Connect
-    P->>S: Create Session
-    P->>C: 200 Ready
-    
+    C->>P: TCP connect
+    P->>S: Create authenticated session
+    P->>C: NNTP greeting
+
     loop Commands
-        C->>S: ARTICLE <msg-id>
-        S->>CL: parse(command)
-        CL-->>S: NntpCommand::ArticleByMessageId
-        
-        alt Per-Command Mode
-            S->>R: route_command()
-            R-->>S: BackendId(0)
-            S->>Pool: get_pooled_connection()
-            Pool-->>S: ConnectionStream
-            S->>B: Forward Command
-            B-->>S: 220 + Article
-            S->>C: Stream Response
-            S->>Pool: Return Connection
-        else Stateful Mode
-            S->>B: Forward (dedicated)
-            B-->>S: Response
-            S->>C: Forward
+        C->>S: ARTICLE / BODY / other request
+        S->>H: classify_request(RequestContext, auth_access, routing_mode)
+        H-->>S: CommandPlan
+        alt Local response
+            H-->>C: Local status or capabilities response
+        else Per-command route
+            H->>R: Select eligible backend
+            R-->>Pool: Acquire ConnectionGuard
+            Pool->>B: Forward serialized request
+            B-->>F: Response bytes
+            F-->>C: Write, capture, or observe framed response
+            F-->>Pool: Mark connection reusable or retire it
+        else Stateful route
+            S->>B: Forward through dedicated backend connection
+            B-->>F: Response bytes
+            F-->>C: Preserve response ordering and pending suffix
         end
     end
-    
+
     C->>S: QUIT
-    S->>C: 205 Goodbye
-    S->>P: Session Complete
+    S-->>C: 205 Goodbye

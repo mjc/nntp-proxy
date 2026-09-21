@@ -2371,7 +2371,7 @@ mod tests {
     /// would silently do nothing. This caused repeated queries to all backends
     /// for missing articles, resulting in:
     /// - Massive bandwidth waste
-    /// - `SABnzbd` reporting "gigabytes of missing articles"
+    /// - clients reporting large volumes of missing articles
     /// - 4xx/5xx error counts not increasing (metrics bug)
     #[tokio::test]
     async fn test_record_backend_missing_creates_new_entry() {
