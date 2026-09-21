@@ -34,3 +34,4 @@ check_failure exchange_constructor E0624 'associated function `new` is private'
 check_failure validated_view_mutation E0502 'cannot borrow `bytes` as mutable'
 check_failure validated_storage_reuse E0505 'cannot move out of `article` because it is borrowed'
 check_failure article_layout_rebind E0451 private
+check_failure availability_coordinate E0308 GlobalBlockIndex

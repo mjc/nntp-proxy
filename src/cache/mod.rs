@@ -534,6 +534,16 @@ impl UnifiedCache {
         )))
     }
 
+    /// Vary lock partitioning without multiplying the production block budget.
+    #[cfg(feature = "framing-bench")]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn availability_with_benchmark_shards(ttl: std::time::Duration, shards: usize) -> Self {
+        Self::new(UnifiedCacheKind::Availability(
+            AvailabilityIndex::with_benchmark_shards(ttl, shards),
+        ))
+    }
+
     pub(crate) fn availability_with_layout(
         ttl: std::time::Duration,
         layout: AvailabilityLayout,

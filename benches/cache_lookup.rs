@@ -53,6 +53,141 @@ mod index_contention {
         run::<16>(bencher, write_every, Placement::ByWorker);
     }
 
+    /// Equal block budget and the production fingerprint-to-shard route.
+    #[divan::bench(consts = [1, 4, 8, 16, 32], args = [0, 10, 1], threads = [1, 2, 4, 8, 16], sample_count = 100, sample_size = 1000)]
+    fn partitioned<const SHARDS: usize>(bencher: Bencher, write_every: usize) {
+        let cache = UnifiedCache::availability_with_benchmark_shards(Duration::MAX, SHARDS);
+        run_with_caches(bencher, write_every, Placement::ByArticle, &[cache]);
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Workload {
+        Empty,
+        Hit,
+        Miss,
+        HotKey,
+        Skewed,
+        Insert,
+        Occupancy64K,
+        Occupancy256K,
+        LongIds,
+        FiniteTtl,
+    }
+
+    #[divan::bench(consts = [1, 16, 32], args = [Workload::Empty, Workload::Hit, Workload::Miss, Workload::HotKey, Workload::Skewed, Workload::Insert, Workload::Occupancy64K, Workload::Occupancy256K, Workload::LongIds, Workload::FiniteTtl], threads = [1, 16], sample_count = 100, sample_size = 1000)]
+    fn partition_workloads<const SHARDS: usize>(bencher: Bencher, workload: Workload) {
+        let ttl = match workload {
+            Workload::FiniteTtl => Duration::from_secs(300),
+            _ => Duration::MAX,
+        };
+        let cache = UnifiedCache::availability_with_benchmark_shards(ttl, SHARDS);
+        let count = match workload {
+            Workload::Occupancy64K => 65_536,
+            Workload::Insert | Workload::Occupancy256K => 262_144,
+            _ => 1024,
+        };
+        let padding = match workload {
+            Workload::LongIds => "x".repeat(200),
+            _ => String::new(),
+        };
+        let ids: Vec<_> = (0..count)
+            .map(|i| MessageId::new(format!("<load-{padding}{i}@example.com>")).unwrap())
+            .collect();
+        let slot = AvailabilitySlot::new(0).unwrap();
+        match workload {
+            Workload::Empty | Workload::Insert => {}
+            _ => {
+                for id in &ids {
+                    cache
+                        .record_availability_missing(id.clone(), slot)
+                        .now_or_never()
+                        .unwrap();
+                }
+            }
+        }
+        let absent = MessageId::from_borrowed("<absent@example.com>").unwrap();
+        bencher.bench(|| {
+            let cursor = CURSOR.with(|value| {
+                let next = value.get().wrapping_add(1);
+                value.set(next);
+                next
+            });
+            let index = match workload {
+                Workload::HotKey => 0,
+                Workload::Skewed if !cursor.is_multiple_of(10) => 0,
+                _ => cursor.wrapping_mul(17) % ids.len(),
+            };
+            match workload {
+                Workload::Insert => cache
+                    .record_availability_missing(ids[index].clone(), slot)
+                    .now_or_never()
+                    .unwrap(),
+                Workload::Miss => {
+                    black_box(cache.get(&absent).now_or_never().unwrap());
+                }
+                _ => {
+                    black_box(cache.get(&ids[index]).now_or_never().unwrap());
+                }
+            }
+        });
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Maintenance {
+        Save,
+        Load,
+        Metrics,
+    }
+
+    #[divan::bench(consts = [1, 32], args = [Maintenance::Save, Maintenance::Load, Maintenance::Metrics], sample_count = 100, sample_size = 1)]
+    fn partition_maintenance<const SHARDS: usize>(bencher: Bencher, operation: Maintenance) {
+        let cache = UnifiedCache::availability_with_benchmark_shards(Duration::MAX, SHARDS);
+        for i in 0..1024 {
+            cache
+                .record_availability_missing(
+                    MessageId::new(format!("<save-{i}@test>")).unwrap(),
+                    AvailabilitySlot::new(0).unwrap(),
+                )
+                .now_or_never()
+                .unwrap();
+        }
+        let directory = tempfile::TempDir::new().unwrap();
+        let path = directory.path().join("availability.idx");
+        cache.save_to_disk(&path).unwrap();
+        bencher.bench(|| match operation {
+            Maintenance::Save => {
+                black_box(cache.save_to_disk(&path).unwrap());
+            }
+            Maintenance::Load => {
+                black_box(cache.load_from_disk(&path).unwrap());
+            }
+            Maintenance::Metrics => {
+                black_box((cache.entry_count(), cache.hit_rate(), cache.weighted_size()));
+            }
+        });
+    }
+
+    #[divan::bench(consts = [1, 32], sample_count = 100, sample_size = 1)]
+    fn expired_partition_lookup<const SHARDS: usize>(bencher: Bencher) {
+        let id = MessageId::from_borrowed("<expired@test>").unwrap();
+        bencher
+            .with_inputs(|| {
+                let cache = UnifiedCache::availability_with_benchmark_shards(
+                    Duration::from_millis(2),
+                    SHARDS,
+                );
+                cache
+                    .record_availability_missing(id.clone(), AvailabilitySlot::new(0).unwrap())
+                    .now_or_never()
+                    .unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+                cache
+            })
+            .bench_refs(|cache| {
+                assert!(black_box(cache.get(&id).now_or_never().unwrap()).is_none());
+            });
+    }
+
     struct Replica {
         cache: UnifiedCache,
         updates: broadcast::Receiver<MessageId<'static>>,
@@ -161,11 +296,20 @@ mod index_contention {
         let caches: Vec<_> = (0..INDEXES)
             .map(|_| UnifiedCache::availability(Duration::MAX))
             .collect();
+        run_with_caches(bencher, write_every, placement, &caches);
+    }
+
+    fn run_with_caches(
+        bencher: Bencher,
+        write_every: usize,
+        placement: Placement,
+        caches: &[UnifiedCache],
+    ) {
         let ids: Vec<_> = (0..1024)
             .map(|i| MessageId::new(format!("<contention-{i}@example.com>")).unwrap())
             .collect();
         let slot = AvailabilitySlot::new(0).unwrap();
-        for cache in &caches {
+        for cache in caches {
             for id in &ids {
                 cache
                     .record_availability_missing(id.clone(), slot)
@@ -181,8 +325,8 @@ mod index_contention {
             });
             let i = cursor.wrapping_mul(17) % ids.len();
             let index = match placement {
-                Placement::ByArticle => i % INDEXES,
-                Placement::ByWorker => WORKER.with(|worker| worker % INDEXES),
+                Placement::ByArticle => i % caches.len(),
+                Placement::ByWorker => WORKER.with(|worker| worker % caches.len()),
             };
             let cache = &caches[index];
             if write_every != 0 && cursor.is_multiple_of(write_every) {
