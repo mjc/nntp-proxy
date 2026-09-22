@@ -2633,6 +2633,13 @@ fn find_spanning_terminator(
 
 #[cfg(test)]
 mod tests {
+    mod contract_fixtures {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/response_contract.rs"
+        ));
+    }
+
     use super::*;
     use crate::session::response_transfer::ResponseTransferError;
     use crate::types::BufferSize;
@@ -2641,6 +2648,17 @@ mod tests {
     use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn request_kind(shape: contract_fixtures::RequestShape) -> crate::protocol::RequestKind {
+        match shape {
+            contract_fixtures::RequestShape::Article => crate::protocol::RequestKind::Article,
+            contract_fixtures::RequestShape::Body => crate::protocol::RequestKind::Body,
+            contract_fixtures::RequestShape::Head => crate::protocol::RequestKind::Head,
+            contract_fixtures::RequestShape::Stat => crate::protocol::RequestKind::Stat,
+            contract_fixtures::RequestShape::Group => crate::protocol::RequestKind::Group,
+            contract_fixtures::RequestShape::ListGroup => crate::protocol::RequestKind::ListGroup,
+        }
+    }
 
     const EXHAUSTIVE_BYTES: [u8; 4] = *b"\r\n.x";
 
@@ -2725,6 +2743,61 @@ mod tests {
 
     fn make_pool() -> crate::pool::BufferPool {
         crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2)
+    }
+
+    #[test]
+    fn shared_response_contract_cases_match_production_tracker() {
+        for case in contract_fixtures::CASES {
+            let mut packed = case.response.to_vec();
+            packed.extend_from_slice(case.suffix);
+
+            for chunk_bytes in 1..=packed.len() {
+                let mut tracker = BackendReplyTracker::default();
+                tracker.push_request(request_kind(case.request));
+                if let Some(next_request) = case.suffix_request {
+                    tracker.push_request(request_kind(next_request));
+                }
+
+                let mut forwarded = Vec::new();
+                let mut completed_count = 0;
+                for chunk in packed.chunks(chunk_bytes) {
+                    for output in tracker.accept_backend_bytes(chunk) {
+                        match output {
+                            BackendReplyBytes::CompletedTrackedReply(bytes) => {
+                                completed_count += 1;
+                                forwarded.extend_from_slice(bytes);
+                            }
+                            BackendReplyBytes::ForwardUntracked(bytes) => {
+                                forwarded.extend_from_slice(bytes);
+                            }
+                        }
+                    }
+                }
+
+                match case.disposition {
+                    contract_fixtures::Disposition::Complete => {
+                        assert_eq!(
+                            forwarded, packed,
+                            "{} at chunk size {chunk_bytes}",
+                            case.name
+                        );
+                        assert_eq!(
+                            completed_count,
+                            1 + usize::from(case.suffix_request.is_some()),
+                            "{} completion count at chunk size {chunk_bytes}",
+                            case.name
+                        );
+                    }
+                    contract_fixtures::Disposition::MalformedStatus => {
+                        assert_eq!(
+                            forwarded, case.response,
+                            "{} at chunk size {chunk_bytes}",
+                            case.name
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
