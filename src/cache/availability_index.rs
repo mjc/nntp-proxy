@@ -1,11 +1,11 @@
 //! Bounded availability-only blocked fingerprint index.
 //!
 //! Stores negative-only backend availability using a rotating blocked fingerprint
-//! filter. The filter is bounded by `capacity_bytes`, favors throughput, and
-//! accepts occasional false negatives from rotation/overwrites. Each occupied
-//! slot retains the exact normalized message key alongside its 64-bit
-//! fingerprint and 16-bit confirmation tag, so a matching fingerprint never
-//! authorizes a miss for a different message.
+//! filter. The fixed fingerprint arena is bounded by `capacity_bytes`, favors
+//! throughput, and accepts occasional false negatives from rotation/overwrites.
+//! Each occupied slot also retains one bounded exact message-key sidecar
+//! alongside its 64-bit fingerprint and 16-bit confirmation tag, so a matching
+//! fingerprint never authorizes a miss for a different message.
 //!
 //! Article buckets partition one fixed allocation budget across locks; provider
 //! identity and fingerprints do not depend on worker identity or shard count.
@@ -1798,7 +1798,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_filter_stays_within_capacity() {
+    fn bounded_fingerprint_arena_stays_within_capacity() {
         let capacity = test_capacity_for(4, 2);
         let index = AvailabilityIndex::with_test_capacity(capacity);
 
