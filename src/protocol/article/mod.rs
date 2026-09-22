@@ -54,15 +54,23 @@ pub(crate) struct ArticleLayout {
 enum ArticleContent {
     Article {
         headers: Range<usize>,
+        header_transformation: HeaderTransformation,
         body: Range<usize>,
     },
     Head {
         headers: Range<usize>,
+        header_transformation: HeaderTransformation,
     },
     Body {
         body: Range<usize>,
     },
     Stat,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeaderTransformation {
+    None,
+    Unfold,
 }
 
 impl ArticleLayout {
@@ -137,10 +145,11 @@ impl ArticleLayout {
             220 => {
                 let separator_pos = find_blank_line(framed, content_start)?;
                 let headers_range = content_start..separator_pos;
-                Headers::parse(&framed[headers_range.clone()])?;
+                let header_transformation = Headers::validate(&framed[headers_range.clone()])?;
                 let body_range = separator_pos + 4..content_end;
                 ArticleContent::Article {
                     headers: headers_range,
+                    header_transformation,
                     body: body_range,
                 }
             }
@@ -149,9 +158,10 @@ impl ArticleLayout {
                     return Err(ParseError::UnexpectedBody);
                 }
                 let headers_range = content_start..content_end;
-                Headers::parse(&framed[headers_range.clone()])?;
+                let header_transformation = Headers::validate(&framed[headers_range.clone()])?;
                 ArticleContent::Head {
                     headers: headers_range,
+                    header_transformation,
                 }
             }
             222 => {
@@ -195,13 +205,27 @@ impl ArticleLayout {
         let message_id = std::str::from_utf8(&buf[self.message_id.clone()])
             .expect("validated message ID remains UTF-8");
         let (headers, body) = match &self.content {
-            ArticleContent::Article { headers, body } => (
-                Some(Headers::from_validated(&buf[headers.clone()])),
+            ArticleContent::Article {
+                headers,
+                header_transformation,
+                body,
+            } => (
+                Some(Headers::from_validated(
+                    &buf[headers.clone()],
+                    *header_transformation,
+                )),
                 Some(&buf[body.clone()]),
             ),
-            ArticleContent::Head { headers } => {
-                (Some(Headers::from_validated(&buf[headers.clone()])), None)
-            }
+            ArticleContent::Head {
+                headers,
+                header_transformation,
+            } => (
+                Some(Headers::from_validated(
+                    &buf[headers.clone()],
+                    *header_transformation,
+                )),
+                None,
+            ),
             ArticleContent::Body { body } => (None, Some(&buf[body.clone()])),
             ArticleContent::Stat => (None, None),
         };
@@ -582,7 +606,7 @@ not-a-complete-yenc-body\r\n";
         let folded_article = Article::parse(folded, false).unwrap();
         assert_eq!(
             folded_article.headers.unwrap().get("Subject"),
-            Some(&b"first"[..])
+            Some(&b"first second"[..])
         );
 
         let stuffed = b"222 0 <stuffed@example.com>\r\n..wire-dot\r\n";

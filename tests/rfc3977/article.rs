@@ -169,7 +169,8 @@ fn test_parse_error_cases() {
 #[test]
 fn test_folded_header_and_body_with_headers() {
     let folded = article(FOLDED_HEADER);
-    let subject = folded.headers.unwrap().get("Subject").unwrap();
+    let headers = folded.headers.unwrap();
+    let subject = headers.get("Subject").unwrap();
     assert!(
         std::str::from_utf8(subject)
             .unwrap()

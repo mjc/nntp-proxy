@@ -30,6 +30,11 @@ parsed first-line metadata and transformation requirements, and keeps the
 validated layout tied to its bytes. Plain content can be borrowed; folded
 headers and dot-stuffed bodies are materialized only when required. Optional
 yEnc validation is a policy at this semantic boundary, not a framing rule.
+The framed owner still retains the original wire bytes. nntpbench's validated
+article view uses borrowed data for unchanged sections and an owned `Cow` only
+for a required header-unfold or body-unstuff transformation; the proxy keeps
+its streaming article body as wire bytes and applies only transformations its
+borrowed view can own without moving the pooled response.
 
 ## Coordinates
 

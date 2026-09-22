@@ -382,4 +382,31 @@ mod tests {
         assert_eq!(validated.article().body, Some(&b"body\r\n"[..]));
         assert_eq!(validated.as_bytes(), bytes);
     }
+
+    #[test]
+    fn framed_validation_retains_folded_header_transformation() {
+        let bytes: &[u8] =
+            b"220 1 <article@test> follows\r\nSubject: first\r\n second\r\n\r\n..wire-dot\r\n";
+        let status_line_end = StatusLineEnd::new(b"220 1 <article@test> follows\r\n".len());
+        let framed = Article::new(Framed::new(
+            bytes,
+            RequestKind::Article,
+            StatusCode::new(220),
+            status_line_end,
+            ContentEnd::new(bytes.len()),
+        ));
+
+        let validated = framed
+            .validate(YencValidation::Disabled)
+            .expect("valid folded article");
+        let article = validated.article();
+        assert_eq!(
+            article
+                .headers
+                .as_ref()
+                .and_then(|headers| headers.get("Subject")),
+            Some(&b"first second"[..])
+        );
+        assert_eq!(article.body, Some(&b"..wire-dot\r\n"[..]));
+    }
 }
