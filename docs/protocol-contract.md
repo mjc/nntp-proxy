@@ -110,3 +110,35 @@ production framing boundary in each repository. It covers single-line errors
 and STAT, empty and stuffed multiline bodies, folded HEAD, the
 GROUP/LISTGROUP 211 distinction, packed suffixes, and the deliberate
 malformed-status compatibility case.
+
+## What the branch tests prove
+
+The shared fixture is not a parser-only test. Each repository feeds the cases
+through its production response boundary and checks the resulting status,
+response shape, framed bytes, and retained suffix. The cases deliberately
+include every split position for small frames, one-byte fragments, packed
+responses, an incomplete following response, empty multiline content, and the
+same status code under different request contexts. Article cases additionally
+cover dot-stuffed bodies, folded headers, and malformed content.
+
+The nntpbench tests exercise the buffered receiver's complete operation: it
+owns the pending bytes and decoder, translates chunk progress internally,
+extracts exactly one immutable response, and leaves the suffix for the next
+request. They also check the framed-to-validated article transition, repeated
+typed access, independently allocated value equality, retained first-line and
+transformation metadata, and allocation-free access to plain bodies.
+
+The nntp-proxy tests exercise the streaming framer and its operation-owned
+continuation: consumed append permissions cannot be reused, appended bytes
+remain tied to the pooled buffer, packed suffixes are separated without a
+caller-supplied offset, and write, observe, capture, and cache paths preserve
+the same framing result. Storage tests cover exact, one-byte, and roomy tails,
+compaction, fresh reads, pool return, EOF, I/O errors, and cancellation. The
+article tests verify that validation is tied to the borrowed or owned bytes
+and that forwarding keeps wire data borrowed unless a consumer explicitly
+requests retention.
+
+These tests assert bytes, suffixes, ownership transitions, and error classes;
+they are not satisfied by merely observing that a response parsed. The low-
+level scanner tests remain useful oracles, but production-boundary tests are
+the evidence for the contracts described above.
