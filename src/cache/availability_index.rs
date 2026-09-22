@@ -1,10 +1,11 @@
 //! Bounded availability-only blocked fingerprint index.
 //!
 //! Stores negative-only backend availability using a rotating blocked fingerprint
-//! filter. The filter is bounded by `capacity_bytes`, favors throughput, and
-//! accepts occasional false negatives from rotation/overwrites. False positives
-//! are pushed down by storing a keyed 64-bit fingerprint plus a keyed 16-bit
-//! confirmation tag per slot.
+//! filter. The fixed fingerprint arena is bounded by `capacity_bytes`, favors
+//! throughput, and accepts occasional false negatives from rotation/overwrites.
+//! Each occupied slot also retains one bounded exact message-key sidecar
+//! alongside its 64-bit fingerprint and 16-bit confirmation tag, so a matching
+//! fingerprint never authorizes a miss for a different message.
 //!
 //! Article buckets partition one fixed allocation budget across locks; provider
 //! identity and fingerprints do not depend on worker identity or shard count.
@@ -39,7 +40,7 @@ const DEFAULT_SHARDS: usize = 32;
 const BLOCK_SLOTS: usize = 2;
 const FIXED_ARTICLE_CAPACITY: usize = 256 * 1024;
 const ALL_BACKEND_BITS: usize = usize::MAX;
-const PERSISTENCE_MAGIC: &[u8; 8] = b"ANEGSIM6";
+const PERSISTENCE_MAGIC: &[u8; 8] = b"ANEGSIM7";
 const LEGACY_PERSISTENCE_MAGIC_V1: &[u8; 8] = b"ANEGIDX1";
 const LEGACY_PERSISTENCE_MAGIC_V2: &[u8; 8] = b"ANEGIDX2";
 const LEGACY_PERSISTENCE_MAGIC_V3: &[u8; 8] = b"ANEGSIM1";
@@ -47,7 +48,9 @@ const LEGACY_PERSISTENCE_MAGIC_V4: &[u8; 8] = b"ANEGSIM2";
 const LEGACY_PERSISTENCE_MAGIC_V5: &[u8; 8] = b"ANEGSIM3";
 const LEGACY_PERSISTENCE_MAGIC_V6: &[u8; 8] = b"ANEGSIM4";
 const LEGACY_PERSISTENCE_MAGIC_V7: &[u8; 8] = b"ANEGSIM5";
+const LEGACY_PERSISTENCE_MAGIC_V8: &[u8; 8] = b"ANEGSIM6";
 const MAX_IDENTITY_FIELD_BYTES: usize = 1024 * 1024;
+const MAX_MESSAGE_ID_BYTES: usize = 250;
 
 static SAVE_LOCK: Mutex<()> = Mutex::new(());
 static SAVE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -70,42 +73,6 @@ const FIXED_TOTAL_BLOCKS: usize = FIXED_ARTICLE_CAPACITY / BLOCK_SLOTS;
 const FIXED_CAPACITY_BYTES: u64 = (FIXED_TOTAL_BLOCKS * size_of::<Block>()) as u64;
 
 impl Block {
-    fn missing_bits(&self, hash: u64, tag: u16) -> usize {
-        let mut matched = matching_slots(&self.hashes, &self.tags, hash, tag);
-        let mut missing_bits = 0usize;
-
-        while matched != 0 {
-            let slot = matched.trailing_zeros() as usize;
-            missing_bits |= self.missing[slot];
-            matched &= matched - 1;
-        }
-
-        missing_bits
-    }
-
-    fn insert(&mut self, hash: u64, tag: u16, missing_bits: usize, victim: usize) -> InsertOutcome {
-        debug_assert_ne!(hash, 0, "fingerprint slots use 0 as the empty sentinel");
-
-        let existing = matching_slots(&self.hashes, &self.tags, hash, tag);
-        if existing != 0 {
-            let slot = existing.trailing_zeros() as usize;
-            self.missing[slot] |= missing_bits;
-            return InsertOutcome::Updated;
-        }
-
-        if let Some(empty_slot) = self.hashes.iter().position(|&value| value == 0) {
-            self.hashes[empty_slot] = hash;
-            self.tags[empty_slot] = tag;
-            self.missing[empty_slot] = missing_bits;
-            return InsertOutcome::Inserted;
-        }
-
-        self.hashes[victim] = hash;
-        self.tags[victim] = tag;
-        self.missing[victim] = missing_bits;
-        InsertOutcome::Replaced
-    }
-
     fn clear(&mut self) -> usize {
         let occupied = self.hashes.iter().filter(|&&hash| hash != 0).count();
         self.hashes = [0; BLOCK_SLOTS];
@@ -127,6 +94,7 @@ struct Generation {
     started_at: u64,
     occupied: usize,
     blocks: Box<[Block]>,
+    keys: Box<[Option<Box<str>>]>,
 }
 
 impl Generation {
@@ -135,24 +103,103 @@ impl Generation {
             started_at: 0,
             occupied: 0,
             blocks: vec![Block::default(); blocks_per_generation].into_boxed_slice(),
+            keys: vec![None; blocks_per_generation * BLOCK_SLOTS].into_boxed_slice(),
         }
     }
 
     fn clear(&mut self) -> usize {
         let evicted = self.occupied;
-        for block in &mut self.blocks {
+        for (block_index, block) in self.blocks.iter_mut().enumerate() {
             block.clear();
+            for slot in 0..BLOCK_SLOTS {
+                self.keys[block_index * BLOCK_SLOTS + slot] = None;
+            }
         }
         self.started_at = 0;
         self.occupied = 0;
         evicted
     }
+
+    fn key(&self, block: LocalBlockIndex, slot: usize) -> Option<&str> {
+        self.keys[block.0 * BLOCK_SLOTS + slot].as_deref()
+    }
+
+    fn lookup_missing_bits(
+        &self,
+        fingerprint: ArticleFingerprint,
+        key: &str,
+        block: LocalBlockIndex,
+    ) -> usize {
+        let block_state = &self.blocks[block.0];
+        let matched = matching_slots(
+            &block_state.hashes,
+            &block_state.tags,
+            fingerprint.hash,
+            fingerprint.tag,
+        );
+        let mut missing_bits = 0;
+        let mut candidates = matched;
+        while candidates != 0 {
+            let slot = candidates.trailing_zeros() as usize;
+            if self.key(block, slot) == Some(key) {
+                missing_bits |= block_state.missing[slot];
+            }
+            candidates &= candidates - 1;
+        }
+        missing_bits
+    }
+
+    fn insert_missing_bits(
+        &mut self,
+        fingerprint: ArticleFingerprint,
+        key: &str,
+        missing_bits: usize,
+        block: LocalBlockIndex,
+    ) -> InsertOutcome {
+        debug_assert!(key.len() <= MAX_MESSAGE_ID_BYTES);
+        let block_state = &self.blocks[block.0];
+        let candidates = matching_slots(
+            &block_state.hashes,
+            &block_state.tags,
+            fingerprint.hash,
+            fingerprint.tag,
+        );
+        let mut exact = candidates;
+        while exact != 0 {
+            let slot = exact.trailing_zeros() as usize;
+            if self.key(block, slot) == Some(key) {
+                let block_state = &mut self.blocks[block.0];
+                block_state.missing[slot] |= missing_bits;
+                return InsertOutcome::Updated;
+            }
+            exact &= exact - 1;
+        }
+
+        let slot = self.blocks[block.0]
+            .hashes
+            .iter()
+            .position(|&value| value == 0)
+            .unwrap_or_else(|| victim_slot(fingerprint.hash));
+        let key_index = block.0 * BLOCK_SLOTS + slot;
+        let block_state = &mut self.blocks[block.0];
+        let outcome = if block_state.hashes[slot] == 0 {
+            InsertOutcome::Inserted
+        } else {
+            InsertOutcome::Replaced
+        };
+        block_state.hashes[slot] = fingerprint.hash;
+        block_state.tags[slot] = fingerprint.tag;
+        block_state.missing[slot] = missing_bits;
+        self.keys[key_index] = Some(key.into());
+        outcome
+    }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 struct PersistedEntry<Slots = CurrentProviderBits> {
     hash: u64,
     tag: u16,
+    key: String,
     missing: Slots,
     inserted_at: u64,
 }
@@ -197,6 +244,7 @@ impl StoredAvailabilitySnapshot {
             let mapped = PersistedEntry {
                 hash: entry.hash,
                 tag: entry.tag,
+                key: entry.key,
                 missing: CurrentProviderBits(missing),
                 inserted_at: entry.inserted_at,
             };
@@ -359,6 +407,7 @@ impl FilterState {
     fn lookup_missing_bits(
         &mut self,
         fingerprint: ArticleFingerprint,
+        key: &str,
         block_index: LocalBlockIndex,
         now: u64,
     ) -> LookupResult {
@@ -372,8 +421,11 @@ impl FilterState {
 
         let mut missing_bits = 0usize;
         for generation_index in self.active_generation_indices() {
-            missing_bits |= self.generations[generation_index].blocks[block_index.0]
-                .missing_bits(fingerprint.hash, fingerprint.tag);
+            missing_bits |= self.generations[generation_index].lookup_missing_bits(
+                fingerprint,
+                key,
+                block_index,
+            );
             if missing_bits == ALL_BACKEND_BITS {
                 break;
             }
@@ -388,6 +440,7 @@ impl FilterState {
     fn insert_missing_bits(
         &mut self,
         fingerprint: ArticleFingerprint,
+        key: &str,
         missing_bits: usize,
         block_index: LocalBlockIndex,
         now: u64,
@@ -402,13 +455,7 @@ impl FilterState {
 
         self.ensure_current_generation_started(now);
         let generation = &mut self.generations[self.current_generation];
-        let block = &mut generation.blocks[block_index.0];
-        let outcome = block.insert(
-            fingerprint.hash,
-            fingerprint.tag,
-            missing_bits,
-            victim_slot(fingerprint.hash),
-        );
+        let outcome = generation.insert_missing_bits(fingerprint, key, missing_bits, block_index);
         if matches!(outcome, InsertOutcome::Inserted) {
             generation.occupied += 1;
         }
@@ -456,12 +503,14 @@ impl FilterState {
         }
         self.live_generations = self.live_generations.max(offset + 1);
 
-        let block = &mut generation.blocks[block_index.0];
-        match block.insert(
-            entry.hash,
-            entry.tag,
+        match generation.insert_missing_bits(
+            ArticleFingerprint {
+                hash: entry.hash,
+                tag: entry.tag,
+            },
+            &entry.key,
             entry.missing.0,
-            victim_slot(entry.hash),
+            block_index,
         ) {
             InsertOutcome::Inserted => {
                 generation.occupied += 1;
@@ -479,7 +528,7 @@ impl FilterState {
         for generation_index in self.active_generation_indices() {
             let generation = &self.generations[generation_index];
 
-            for block in &generation.blocks {
+            for (block_index, block) in generation.blocks.iter().enumerate() {
                 for slot in 0..BLOCK_SLOTS {
                     let hash = block.hashes[slot];
                     let missing = block.missing[slot];
@@ -489,6 +538,10 @@ impl FilterState {
                     entries.push(PersistedEntry {
                         hash,
                         tag: block.tags[slot],
+                        key: generation
+                            .key(LocalBlockIndex(block_index), slot)
+                            .expect("occupied availability slot has a message key")
+                            .to_owned(),
                         missing: CurrentProviderBits(missing),
                         inserted_at: generation.started_at,
                     });
@@ -581,7 +634,12 @@ const _: fn() = || {
     let coordinate = LocalBlockIndex(0);
     #[cfg(response_contract = "availability_coordinate")]
     let coordinate = GlobalBlockIndex(0);
-    filter.lookup_missing_bits(ArticleFingerprint { hash: 1, tag: 2 }, coordinate, 1);
+    filter.lookup_missing_bits(
+        ArticleFingerprint { hash: 1, tag: 2 },
+        "contract@example.com",
+        coordinate,
+        1,
+    );
 };
 
 /// Routing retains the selected resource; no caller pairs a shard with an
@@ -593,14 +651,14 @@ struct ArticlePartition<'a> {
 }
 
 impl ArticlePartition<'_> {
-    fn lookup(self, now: u64) -> Option<CachedArticle> {
+    fn lookup(self, key: &str, now: u64) -> Option<CachedArticle> {
         let mut shard = self
             .shard
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let result = shard
             .filter
-            .lookup_missing_bits(self.fingerprint, self.bucket, now);
+            .lookup_missing_bits(self.fingerprint, key, self.bucket, now);
         shard.counters.evictions += result.evicted as u64;
         if result.missing_bits == 0 {
             shard.counters.misses += 1;
@@ -613,14 +671,15 @@ impl ArticlePartition<'_> {
         }
     }
 
-    fn record_missing(self, bits: CurrentProviderBits, now: u64) {
+    fn record_missing(self, key: &str, bits: CurrentProviderBits, now: u64) {
         let mut shard = self
             .shard
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let result = shard
-            .filter
-            .insert_missing_bits(self.fingerprint, bits.0, self.bucket, now);
+        let result =
+            shard
+                .filter
+                .insert_missing_bits(self.fingerprint, key, bits.0, self.bucket, now);
         shard.counters.evictions += result.evicted as u64;
     }
 }
@@ -827,6 +886,7 @@ impl AvailabilityIndex {
         for entry in snapshot.entries {
             bytes.extend_from_slice(&entry.hash.to_le_bytes());
             bytes.extend_from_slice(&entry.tag.to_le_bytes());
+            write_message_key(&mut bytes, &entry.key)?;
             bytes.extend_from_slice(&availability_bits_to_wire(entry.missing.0)?.to_le_bytes());
             bytes.extend_from_slice(&entry.inserted_at.to_le_bytes());
         }
@@ -934,7 +994,7 @@ impl AvailabilityIndex {
             return None;
         }
         self.partition(ArticleFingerprint::from_key(key))
-            .lookup(ttl::now_millis())
+            .lookup(key, ttl::now_millis())
     }
 
     fn insert_missing_bits(&self, key: &str, missing_bits: usize) {
@@ -943,7 +1003,7 @@ impl AvailabilityIndex {
         }
 
         self.partition(ArticleFingerprint::from_key(key))
-            .record_missing(CurrentProviderBits(missing_bits), ttl::now_millis());
+            .record_missing(key, CurrentProviderBits(missing_bits), ttl::now_millis());
         self.populated.get_or_init(|| ());
     }
 }
@@ -961,6 +1021,7 @@ fn parse_snapshot(data: &[u8]) -> Result<Option<StoredAvailabilitySnapshot>> {
         || magic == LEGACY_PERSISTENCE_MAGIC_V5
         || magic == LEGACY_PERSISTENCE_MAGIC_V6
         || magic == LEGACY_PERSISTENCE_MAGIC_V7
+        || magic == LEGACY_PERSISTENCE_MAGIC_V8
     {
         return Ok(None);
     }
@@ -986,7 +1047,7 @@ fn parse_snapshot(data: &[u8]) -> Result<Option<StoredAvailabilitySnapshot>> {
         anyhow::bail!("duplicate availability identity");
     }
     let entry_count = usize::try_from(read_u64(data, &mut cursor)?)?;
-    let entry_width = size_of::<u64>() + size_of::<u16>() + size_of::<u64>() + size_of::<u64>();
+    let entry_width = size_of::<u64>() + 2 * size_of::<u16>() + size_of::<u64>() + size_of::<u64>();
     if entry_count > data.len().saturating_sub(cursor) / entry_width {
         anyhow::bail!("invalid availability entry count");
     }
@@ -995,6 +1056,7 @@ fn parse_snapshot(data: &[u8]) -> Result<Option<StoredAvailabilitySnapshot>> {
     for _ in 0..entry_count {
         let hash = read_u64(data, &mut cursor)?;
         let tag = read_u16(data, &mut cursor)?;
+        let key = read_message_key(data, &mut cursor)?;
         let missing_wire = read_u64(data, &mut cursor)?;
         let identity_mask = if identity_count == usize::BITS as usize {
             usize::MAX
@@ -1009,6 +1071,7 @@ fn parse_snapshot(data: &[u8]) -> Result<Option<StoredAvailabilitySnapshot>> {
         entries.push(PersistedEntry {
             hash,
             tag,
+            key,
             missing,
             inserted_at,
         });
@@ -1029,6 +1092,20 @@ fn write_identity(bytes: &mut Vec<u8>, identity: &AvailabilityIdentity) -> Resul
     let host_len = u32::try_from(host.len()).context("availability host too long")?;
     bytes.extend_from_slice(&host_len.to_le_bytes());
     bytes.extend_from_slice(host);
+    Ok(())
+}
+
+fn write_message_key(bytes: &mut Vec<u8>, key: &str) -> Result<()> {
+    let key_bytes = key.as_bytes();
+    if !(1..=MAX_MESSAGE_ID_BYTES).contains(&key_bytes.len()) {
+        anyhow::bail!("invalid availability message-id length");
+    }
+    bytes.extend_from_slice(
+        &u16::try_from(key_bytes.len())
+            .context("availability message-id is too long")?
+            .to_le_bytes(),
+    );
+    bytes.extend_from_slice(key_bytes);
     Ok(())
 }
 
@@ -1054,6 +1131,21 @@ fn read_string(data: &[u8], cursor: &mut usize, field: &str) -> Result<String> {
         anyhow::bail!("empty availability {field}");
     }
     Ok(value)
+}
+
+fn read_message_key(data: &[u8], cursor: &mut usize) -> Result<String> {
+    let length = usize::from(read_u16(data, cursor)?);
+    if !(1..=MAX_MESSAGE_ID_BYTES).contains(&length) {
+        anyhow::bail!("invalid availability message-id length");
+    }
+    let end = cursor
+        .checked_add(length)
+        .ok_or_else(|| anyhow::anyhow!("availability message-id length overflow"))?;
+    let bytes = data
+        .get(*cursor..end)
+        .ok_or_else(|| anyhow::anyhow!("truncated availability message-id"))?;
+    *cursor = end;
+    String::from_utf8(bytes.to_vec()).context("invalid availability message-id")
 }
 
 fn read_u32(data: &[u8], cursor: &mut usize) -> Result<u32> {
@@ -1148,6 +1240,7 @@ mod tests {
             PersistedEntry {
                 hash: 42,
                 tag: 7,
+                key: "restored@example.com".to_owned(),
                 missing: CurrentProviderBits(1),
                 inserted_at,
             },
@@ -1164,6 +1257,7 @@ mod tests {
             filter
                 .lookup_missing_bits(
                     ArticleFingerprint { hash: 42, tag: 7 },
+                    "restored@example.com",
                     LocalBlockIndex(0),
                     inserted_at + 200
                 )
@@ -1237,11 +1331,18 @@ mod tests {
             let (send, receive) = std::sync::mpsc::channel();
             let index = &index;
             scope.spawn(move || {
-                index
-                    .partition(fingerprint)
-                    .record_missing(CurrentProviderBits(1), 10_000);
-                send.send(index.partition(fingerprint).lookup(10_000).is_some())
-                    .unwrap();
+                index.partition(fingerprint).record_missing(
+                    "partition@example.com",
+                    CurrentProviderBits(1),
+                    10_000,
+                );
+                send.send(
+                    index
+                        .partition(fingerprint)
+                        .lookup("partition@example.com", 10_000)
+                        .is_some(),
+                )
+                .unwrap();
             });
             let result = receive.recv_timeout(Duration::from_secs(5));
             drop(held);
@@ -1259,19 +1360,38 @@ mod tests {
                 2,
                 count,
             );
-            index
-                .partition(fingerprint)
-                .record_missing(CurrentProviderBits(1), 10_000);
-            assert!(index.partition(fingerprint).lookup(10_199).is_some());
-            assert!(index.partition(fingerprint).lookup(10_200).is_none());
-            assert!(index.partition(fingerprint).lookup(100_000).is_none());
-            index
-                .partition(fingerprint)
-                .record_missing(CurrentProviderBits(2), 100_000);
+            index.partition(fingerprint).record_missing(
+                "expiry@example.com",
+                CurrentProviderBits(1),
+                10_000,
+            );
+            assert!(
+                index
+                    .partition(fingerprint)
+                    .lookup("expiry@example.com", 10_199)
+                    .is_some()
+            );
+            assert!(
+                index
+                    .partition(fingerprint)
+                    .lookup("expiry@example.com", 10_200)
+                    .is_none()
+            );
+            assert!(
+                index
+                    .partition(fingerprint)
+                    .lookup("expiry@example.com", 100_000)
+                    .is_none()
+            );
+            index.partition(fingerprint).record_missing(
+                "expiry@example.com",
+                CurrentProviderBits(2),
+                100_000,
+            );
             assert_eq!(
                 index
                     .partition(fingerprint)
-                    .lookup(100_000)
+                    .lookup("expiry@example.com", 100_000)
                     .unwrap()
                     .availability()
                     .missing_bits(),
@@ -1410,6 +1530,42 @@ mod tests {
         for entry in entries {
             bytes.extend_from_slice(&entry.hash.to_le_bytes());
             bytes.extend_from_slice(&entry.tag.to_le_bytes());
+            write_message_key(&mut bytes, &entry.key).unwrap();
+            bytes.extend_from_slice(
+                &availability_bits_to_wire(entry.missing.0)
+                    .unwrap()
+                    .to_le_bytes(),
+            );
+            bytes.extend_from_slice(&entry.inserted_at.to_le_bytes());
+        }
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn rewrite_persisted_key(path: &std::path::Path, key: &str) {
+        let data = std::fs::read(path).unwrap();
+        let StoredAvailabilitySnapshot {
+            identities,
+            mut entries,
+        } = parse_snapshot(&data).unwrap().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "test helper expects exactly one persisted entry"
+        );
+        entries[0].key = key.to_owned();
+
+        let mut bytes = Vec::with_capacity(data.len());
+        bytes.extend_from_slice(PERSISTENCE_MAGIC);
+        bytes.extend_from_slice(&(identities.len() as u64).to_le_bytes());
+        for identity in &identities {
+            write_identity(&mut bytes, identity).unwrap();
+        }
+        bytes.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for entry in entries {
+            bytes.extend_from_slice(&entry.hash.to_le_bytes());
+            bytes.extend_from_slice(&entry.tag.to_le_bytes());
+            write_message_key(&mut bytes, &entry.key).unwrap();
             bytes.extend_from_slice(
                 &availability_bits_to_wire(entry.missing.0)
                     .unwrap()
@@ -1435,8 +1591,8 @@ mod tests {
         block.tags[0] = 7;
         block.missing[0] = 0b0000_0001;
 
-        assert_eq!(block.missing_bits(42, 7), 0b0000_0001);
-        assert_eq!(block.missing_bits(42, 8), 0);
+        assert_ne!(matching_slots(&block.hashes, &block.tags, 42, 7), 0);
+        assert_eq!(matching_slots(&block.hashes, &block.tags, 42, 8), 0);
     }
 
     #[test]
@@ -1505,6 +1661,26 @@ mod tests {
         restored.load_from_path(&path).unwrap();
         let cached = restored.get(&msg_id).unwrap();
         assert_eq!(cached.availability().missing_bits(), 0b01);
+    }
+
+    #[test]
+    fn snapshot_restore_requires_exact_message_id() {
+        let index = AvailabilityIndex::with_test_capacity(test_capacity_for(8, 2));
+        let original = MessageId::from_borrowed("<persisted-key@example.com>").unwrap();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("availability.idx");
+
+        index.record_availability_missing(&original, AvailabilitySlot::new(0).unwrap());
+        index.save_to_path(&path).unwrap();
+        rewrite_persisted_key(&path, "different-persisted-key@example.com");
+
+        let restored = AvailabilityIndex::with_test_capacity(test_capacity_for(8, 2));
+        restored.load_from_path(&path).unwrap();
+
+        assert!(
+            restored.get(&original).is_none(),
+            "restored fingerprints must not authorize a miss for another message ID"
+        );
     }
 
     #[test]
@@ -1622,7 +1798,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_filter_stays_within_capacity() {
+    fn bounded_fingerprint_arena_stays_within_capacity() {
         let capacity = test_capacity_for(4, 2);
         let index = AvailabilityIndex::with_test_capacity(capacity);
 
@@ -1825,6 +2001,25 @@ mod tests {
         assert!(index.get(&miss).is_none());
 
         assert_eq!(index.hit_rate(), 50.0);
+    }
+
+    #[test]
+    fn matching_fingerprint_still_requires_the_message_id() {
+        let mut generation = Generation::new(1);
+        let fingerprint = ArticleFingerprint { hash: 7, tag: 11 };
+        let location = LocalBlockIndex(0);
+
+        generation.insert_missing_bits(fingerprint, "first@example.com", 1, location);
+
+        assert_eq!(
+            generation.lookup_missing_bits(fingerprint, "first@example.com", location),
+            1
+        );
+        assert_eq!(
+            generation.lookup_missing_bits(fingerprint, "different@example.com", location),
+            0,
+            "a fingerprint collision must not suppress a provider for another article"
+        );
     }
 
     #[test]

@@ -418,7 +418,7 @@ impl HybridArticleCache {
         self.upsert_framed_ingest_for_slot(
             message_id,
             buffer,
-            AvailabilitySlot::new(backend.as_index()).expect("backend count fits bitmap"),
+            self.availability_slot(backend),
             tier,
         )
         .await;
@@ -453,7 +453,7 @@ impl HybridArticleCache {
         self.upsert_unframed_ingest_for_slot(
             message_id,
             buffer,
-            AvailabilitySlot::new(backend.as_index()).expect("backend count fits bitmap"),
+            self.availability_slot(backend),
             tier,
         )
         .await;
@@ -574,7 +574,7 @@ impl HybridArticleCache {
         self.record_has_status_for_slot(
             message_id,
             status_code,
-            AvailabilitySlot::new(backend.as_index()).expect("backend count fits bitmap"),
+            self.availability_slot(backend),
             tier,
         )
         .await;

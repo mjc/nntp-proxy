@@ -3,6 +3,7 @@ use std::io::Write;
 use tempfile::NamedTempFile;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::task::AbortHandle;
 use tokio::time::{Duration, Instant, timeout, timeout_at};
 
 use nntp_proxy::config::{ClientAuth, HealthCheck, Proxy, Server};
@@ -802,6 +803,15 @@ fn build_tiered_server(host: &str, port: u16, name: &str, tier: u8) -> Result<Se
         .build()
 }
 
+async fn spawn_tiered_backend_on_host(
+    backend: MockNntpServer,
+    host: &str,
+) -> Result<(u16, AbortHandle)> {
+    let listener = TcpListener::bind(format!("{host}:0")).await?;
+    let port = listener.local_addr()?.port();
+    Ok((port, backend.spawn_on_listener(listener)))
+}
+
 async fn start_tiered_proxy(servers: Vec<Server>) -> Result<u16> {
     let config = Config {
         servers,
@@ -876,19 +886,21 @@ async fn test_tier_0_exhaustion_before_escalation() -> Result<()> {
         .spawn_on_random_port()
         .await?;
 
-    let (backend_2_port, _backend_2) = MockNntpServer::new()
-        .with_name("Backend-2-Tier-1")
-        .on_command(
-            "ARTICLE",
-            "220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody from backend 2\r\n.\r\n",
-        )
-        .spawn_on_random_port()
-        .await?;
+    let (backend_2_port, _backend_2) = spawn_tiered_backend_on_host(
+        MockNntpServer::new()
+            .with_name("Backend-2-Tier-1")
+            .on_command(
+                "ARTICLE",
+                "220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody from backend 2\r\n.\r\n",
+            ),
+        "127.0.0.2",
+    )
+    .await?;
 
     let proxy_port = start_tiered_proxy(vec![
         build_tiered_server("127.0.0.1", backend_0_port, "Backend-0-Tier-0", 0)?,
         build_tiered_server("localhost", backend_1_port, "Backend-1-Tier-0", 0)?,
-        build_tiered_server("LOCALHOST", backend_2_port, "Backend-2-Tier-1", 1)?,
+        build_tiered_server("127.0.0.2", backend_2_port, "Backend-2-Tier-1", 1)?,
     ])
     .await?;
     let mut client = connect_tiered_client(proxy_port).await?;
@@ -945,19 +957,21 @@ async fn test_tier_exhaustion_multi_tier() -> Result<()> {
         .spawn_on_random_port()
         .await?;
 
-    let (backend_2_port, _backend_2) = MockNntpServer::new()
-        .with_name("Backend-2-Tier-1")
-        .on_command(
-            "ARTICLE",
-            "220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody from tier 1\r\n.\r\n", // Backend 2 has it
-        )
-        .spawn_on_random_port()
-        .await?;
+    let (backend_2_port, _backend_2) = spawn_tiered_backend_on_host(
+        MockNntpServer::new()
+            .with_name("Backend-2-Tier-1")
+            .on_command(
+                "ARTICLE",
+                "220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody from tier 1\r\n.\r\n", // Backend 2 has it
+            ),
+        "127.0.0.2",
+    )
+    .await?;
 
     let proxy_port = start_tiered_proxy(vec![
         build_tiered_server("127.0.0.1", backend_0_port, "Backend-0-Tier-0", 0)?,
         build_tiered_server("localhost", backend_1_port, "Backend-1-Tier-0", 0)?,
-        build_tiered_server("LOCALHOST", backend_2_port, "Backend-2-Tier-1", 1)?,
+        build_tiered_server("127.0.0.2", backend_2_port, "Backend-2-Tier-1", 1)?,
     ])
     .await?;
     let mut client = connect_tiered_client(proxy_port).await?;

@@ -67,11 +67,13 @@ backend that returned them. They do not contain a multiline body and are used to
 avoid retrying a backend already known not to have that message ID until the
 availability entry expires.
 
-Availability identity is the configured backend hostname. Entries with the same
-hostname share authoritative `430` facts across ports, resolved addresses,
-credentials, TLS settings, tiers, and display names; different hostnames remain
-separate. The proxy does not infer provider identity from DNS answers or account
-names: availability describes whether that provider has the requested article.
+Availability identity is the configured backend hostname after ASCII
+case-folding and removal of one DNS trailing dot. Entries with the same
+canonical hostname share authoritative `430` facts across ports, resolved
+addresses, credentials, TLS settings, tiers, and display names; different
+hostnames remain separate. The proxy does not resolve DNS to infer provider
+identity or use account names: availability describes whether that provider has
+the requested article.
 
 ## Disk cache
 
@@ -105,10 +107,10 @@ If `[cache]` is configured and `availability_index_path` is unset, the runtime d
 
 If `[cache]` is omitted entirely, the proxy still uses internal availability tracking but does not resolve an availability persistence path from config.
 
-Availability-only snapshots carry the configured hostnames used for their slots.
-Snapshot formats written before host-only identity encoding are ignored and
-rebuilt with the current configuration rather than being interpreted with a
-different slot layout.
+Availability-only snapshots carry the configured hostnames used for their slots
+and the exact message key for each negative fact. Snapshot formats written
+before this keyed-entry encoding are ignored and rebuilt with the current
+configuration rather than being interpreted as exact facts.
 
 ## CLI overrides
 
