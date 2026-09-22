@@ -1542,6 +1542,41 @@ mod tests {
         std::fs::write(path, bytes).unwrap();
     }
 
+    fn rewrite_persisted_key(path: &std::path::Path, key: &str) {
+        let data = std::fs::read(path).unwrap();
+        let StoredAvailabilitySnapshot {
+            identities,
+            mut entries,
+        } = parse_snapshot(&data).unwrap().unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "test helper expects exactly one persisted entry"
+        );
+        entries[0].key = key.to_owned();
+
+        let mut bytes = Vec::with_capacity(data.len());
+        bytes.extend_from_slice(PERSISTENCE_MAGIC);
+        bytes.extend_from_slice(&(identities.len() as u64).to_le_bytes());
+        for identity in &identities {
+            write_identity(&mut bytes, identity).unwrap();
+        }
+        bytes.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for entry in entries {
+            bytes.extend_from_slice(&entry.hash.to_le_bytes());
+            bytes.extend_from_slice(&entry.tag.to_le_bytes());
+            write_message_key(&mut bytes, &entry.key).unwrap();
+            bytes.extend_from_slice(
+                &availability_bits_to_wire(entry.missing.0)
+                    .unwrap()
+                    .to_le_bytes(),
+            );
+            bytes.extend_from_slice(&entry.inserted_at.to_le_bytes());
+        }
+
+        std::fs::write(path, bytes).unwrap();
+    }
+
     #[test]
     fn lookup_miss_returns_none() {
         let index = AvailabilityIndex::with_test_capacity(test_capacity_for(16, 2));
@@ -1626,6 +1661,26 @@ mod tests {
         restored.load_from_path(&path).unwrap();
         let cached = restored.get(&msg_id).unwrap();
         assert_eq!(cached.availability().missing_bits(), 0b01);
+    }
+
+    #[test]
+    fn snapshot_restore_requires_exact_message_id() {
+        let index = AvailabilityIndex::with_test_capacity(test_capacity_for(8, 2));
+        let original = MessageId::from_borrowed("<persisted-key@example.com>").unwrap();
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("availability.idx");
+
+        index.record_availability_missing(&original, AvailabilitySlot::new(0).unwrap());
+        index.save_to_path(&path).unwrap();
+        rewrite_persisted_key(&path, "different-persisted-key@example.com");
+
+        let restored = AvailabilityIndex::with_test_capacity(test_capacity_for(8, 2));
+        restored.load_from_path(&path).unwrap();
+
+        assert!(
+            restored.get(&original).is_none(),
+            "restored fingerprints must not authorize a miss for another message ID"
+        );
     }
 
     #[test]
