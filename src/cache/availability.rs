@@ -1,16 +1,17 @@
-//! Article missing-state tracking across backends
+//! Article missing-state tracking across provider slots.
 //!
-//! Uses bitsets to track which backends definitively do not have a specific article.
-//! This is a self-contained type used by both the cache layer (persistence) and
-//! the retry loop (transient tracking).
+//! A bitset records which provider slots returned `430` for an article. The
+//! cache stores this state across requests; retry loops keep a separate copy
+//! for the current request.
 //!
-//! # NNTP Response Semantics (CRITICAL)
+//! # NNTP response semantics
 //!
-//! **430 "No Such Article" is AUTHORITATIVE** - once a backend returns 430 for
-//! a cache entry, that backend stays missing for the lifetime of that entry.
+//! A `430` ("No Such Article") response marks the provider slot as missing until
+//! that negative fact expires or the cache entry is replaced. A hybrid cache
+//! entry can retain its payload after an expired missing bit has been cleared.
 //!
-//! **2xx success responses are UNRELIABLE** - servers CAN give false positives,
-//! so they are not represented in this structure.
+//! Servers can return false-positive `2xx` responses, so this type records only
+//! misses.
 //!
 //! Availability uses `usize` bitmaps, so local retry checks remain compact while
 //! allowing the backend count to grow with the target word size.
@@ -24,7 +25,7 @@ use crate::types::BackendId;
 /// now because I am tired of being harassed by shitty robots about 8 backends.
 pub const MAX_BACKENDS: usize = BackendId::MAX_COUNT;
 
-/// Status of a backend for a specific article
+/// Status of a provider slot for a specific article.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendStatus {
     /// Backend hasn't been checked yet
@@ -33,27 +34,23 @@ pub enum BackendStatus {
     Missing,
 }
 
-/// Track which backends are known not to have a specific article.
+/// Track which provider slots are known not to have a specific article.
 ///
-/// Uses a `usize` bitset to track which backends returned authoritative 430.
+/// Each bit in the `usize` bitset represents a provider slot that returned `430`.
 ///
-/// # Example with 2 backends
-/// - Initial state: `missing=00` (no backend is known missing)
-/// - After backend 0 returns 430: `missing=01` (backend 0 doesn't have it)
-/// - If both return 430: `missing=11` (all backends exhausted)
+/// # Example with 2 provider slots
+/// - Initial state: `missing=00` (no provider slot is known missing)
+/// - After provider slot 0 returns 430: `missing=01` (slot 0 doesn't have it)
+/// - If both return 430: `missing=11` (all configured provider slots exhausted)
 ///
-/// # Usage Pattern
-/// This type serves two critical purposes:
+/// # Usage
 ///
-/// 1. **Cache persistence** - Track availability across requests (long-lived)
-///    - Store authoritative negative facts in cache entries
-///    - Avoid querying backends known to be missing
-///    - Updated only after 430 responses
+/// Cache entries retain these bits across requests to avoid querying providers
+/// known to be missing an article. Only a `430` response sets a missing bit.
 ///
-/// 2. **430 retry loop** - Track which backends tried during single request (transient)
-///    - Create fresh instance for each ARTICLE request
-///    - Mark backends as missing when they return 430
-///    - Stop when all backends exhausted or one succeeds
+/// Each ARTICLE retry loop starts with a fresh instance and records provider
+/// slots that return `430`. It stops when all configured slots are exhausted
+/// or a request succeeds.
 ///
 /// # Concurrency
 /// Cache entries store this value directly. Memory-cache updates use atomic
@@ -67,7 +64,7 @@ pub struct ArticleAvailability {
 }
 
 impl ArticleAvailability {
-    /// Create empty availability - assume all backends have article until proven otherwise
+    /// Start with every provider slot eligible to be tried.
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
@@ -76,8 +73,9 @@ impl ArticleAvailability {
 
     /// Record that a backend returned 430 (doesn't have the article).
     ///
-    /// Once marked missing, the backend should not be retried for this cache entry.
-    /// Later positive observations do not clear the missing bit.
+    /// The backend should not be retried while this negative fact is valid.
+    /// Later positive observations do not clear the bit; cache expiry handling
+    /// can clear it independently of the payload.
     ///
     #[inline]
     pub fn record_missing_slot(&mut self, slot: AvailabilitySlot) -> &mut Self {
@@ -85,7 +83,7 @@ impl ArticleAvailability {
         self
     }
 
-    /// Check if a backend is known to be missing (returned 430)
+    /// Check if a provider slot is known to be missing (returned 430).
     ///
     #[inline]
     #[must_use]
@@ -125,16 +123,14 @@ impl ArticleAvailability {
         Self { missing }
     }
 
-    /// Check if we have any authoritative backend-missing information.
-    ///
-    /// Returns true if at least one backend is known missing.
+    /// Return whether at least one provider slot has a recorded `430`.
     #[inline]
     #[must_use]
     pub const fn has_availability_info(&self) -> bool {
         self.missing != 0
     }
 
-    /// Query backend availability status
+    /// Query provider-slot availability status.
     ///
     #[inline]
     #[must_use]

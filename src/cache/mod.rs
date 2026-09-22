@@ -1,13 +1,13 @@
-//! Cache module for NNTP article caching
+//! Article availability and payload caching.
 //!
-//! This module provides caching functionality for NNTP articles,
-//! allowing the proxy to cache article content and reduce backend load.
+//! The cache records `430` responses to avoid retrying known misses. It can
+//! also retain article payloads to serve cache hits. Availability tracking
+//! remains active when payload storage is disabled. `[cache.disk]` adds a disk
+//! tier when article bodies are being retained.
 //!
 //! The `ArticleAvailability` type is a negative bitset for authoritative `430`
-//! facts and serves dual purposes:
-//! 1. Cache persistence - track which backends are known missing across requests
-//! 2. Retry tracking - track which backends returned `430` during retry loops
-//!    (transient)
+//! facts. Cache entries use it to track provider misses across requests, and
+//! each retry loop uses a separate copy to track misses for its request.
 //!
 //! ## Cache Implementations
 //!

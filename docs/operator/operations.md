@@ -33,6 +33,16 @@ Common persisted files:
 
 - `stats.json` for metrics persistence when `[proxy].stats_file` is not set
 - `availability.idx` for availability-only cache persistence when `[cache]` is configured, `store_article_bodies = false`, and `[cache].availability_index_path` is not set
+- `availability.registry` beside a hybrid cache's payload directory, when a
+  disk-backed cache is configured; it maps canonical provider hostnames to the
+  slots used for availability tracking. It contains no credentials or
+  message IDs.
+
+The proxy records missing articles by exact message ID and canonical provider
+hostname. The same hostname shares a provider slot across ports, addresses,
+accounts, TLS settings, tiers, and display names. The bounded index can forget
+old facts through expiry, rotation, or replacement. The proxy retries a provider
+once it has forgotten the earlier miss.
 
 If you want explicit paths, configure them directly in `config.toml`.
 
