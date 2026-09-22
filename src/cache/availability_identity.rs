@@ -29,14 +29,15 @@ pub(crate) struct AvailabilityIdentity(String);
 
 impl From<&HostName> for AvailabilityIdentity {
     fn from(host: &HostName) -> Self {
-        Self(host.to_string())
+        Self(canonicalize_host(host.as_ref()))
     }
 }
 
 impl AvailabilityIdentity {
-    /// Persistence preserves the exact configured host, without DNS resolution
-    /// or normalization that could merge previously distinct providers.
+    /// Persistence preserves the configured hostname identity without DNS
+    /// resolution, applying hostname case and trailing-dot canonicalization.
     pub(crate) fn from_persisted_host(host: String) -> Result<Self> {
+        let host = canonicalize_host(&host);
         if host.is_empty() || host.len() > MAX_REGISTRY_FIELD_BYTES {
             anyhow::bail!("invalid availability host length");
         }
@@ -46,6 +47,10 @@ impl AvailabilityIdentity {
     pub(crate) fn as_host(&self) -> &str {
         &self.0
     }
+}
+
+fn canonicalize_host(host: &str) -> String {
+    host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
 }
 
 /// Bit position used by article availability state.

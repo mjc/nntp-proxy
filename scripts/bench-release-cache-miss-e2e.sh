@@ -25,7 +25,7 @@ REQUESTS_PER_SCENARIO=${REQUESTS_PER_SCENARIO:-0}
 NNTPBENCH_FLAKE_REF=${NNTPBENCH_FLAKE_REF:-"git+https://github.com/mjc/nntpbench.git?rev=f4d0c98ca26ffb7bc75377e69a04ef73fd0891db"}
 NNTPBENCH_OUT_LINK=${NNTPBENCH_OUT_LINK:-"$WORK_DIR/nix-nntpbench"}
 NNTPBENCH_BIN=${NNTPBENCH_BIN:-"$NNTPBENCH_OUT_LINK/bin/nntpbench"}
-NNTPBENCH_ARTICLE_BYTES=${NNTPBENCH_ARTICLE_BYTES:-728320}
+NNTPBENCH_ARTICLE_BYTES=${NNTPBENCH_ARTICLE_BYTES:-786432}
 NNTPBENCH_BODY_BYTES=${NNTPBENCH_BODY_BYTES:-$NNTPBENCH_ARTICLE_BYTES}
 NNTPBENCH_MAX_CONNECTIONS=${NNTPBENCH_MAX_CONNECTIONS:-4096}
 NNTPBENCH_MAX_PIPELINE_DEPTH=${NNTPBENCH_MAX_PIPELINE_DEPTH:-1024}
@@ -356,22 +356,23 @@ build_nntpbench_binary() {
 
 start_upstream() {
     UPSTREAM_PORT=$(reserve_port)
-    local -a corpus_args=()
+    local -a upstream_args=(
+        --listen "$HOST:$UPSTREAM_PORT"
+        --body-bytes "$NNTPBENCH_BODY_BYTES"
+        --article-bytes "$NNTPBENCH_ARTICLE_BYTES"
+        --max-connections "$NNTPBENCH_MAX_CONNECTIONS"
+        --max-pipeline-depth "$NNTPBENCH_MAX_PIPELINE_DEPTH"
+        --socket-recv-buffer "$UPSTREAM_SOCKET_RECV_BUFFER"
+        --socket-send-buffer "$UPSTREAM_SOCKET_SEND_BUFFER"
+        --stats-interval-secs 0
+    )
     if [ -n "$NNTPBENCH_ARTICLE_DIR" ]; then
-        corpus_args+=(--article-dir "$NNTPBENCH_ARTICLE_DIR")
+        upstream_args+=(--article-dir "$NNTPBENCH_ARTICLE_DIR")
     fi
 
     echo "Using flake-provided nntpbench backend at $NNTPBENCH_BIN"
     run_with_optional_taskset_exec "$UPSTREAM_TASKSET" "$NNTPBENCH_BIN" server \
-        --listen "$HOST:$UPSTREAM_PORT" \
-        --body-bytes "$NNTPBENCH_BODY_BYTES" \
-        --article-bytes "$NNTPBENCH_ARTICLE_BYTES" \
-        --max-connections "$NNTPBENCH_MAX_CONNECTIONS" \
-        --max-pipeline-depth "$NNTPBENCH_MAX_PIPELINE_DEPTH" \
-        --socket-recv-buffer "$UPSTREAM_SOCKET_RECV_BUFFER" \
-        --socket-send-buffer "$UPSTREAM_SOCKET_SEND_BUFFER" \
-        --stats-interval-secs 0 \
-        "${corpus_args[@]}" \
+        "${upstream_args[@]}" \
         >"$UPSTREAM_LOG" 2>&1 &
     UPSTREAM_PID=$!
 

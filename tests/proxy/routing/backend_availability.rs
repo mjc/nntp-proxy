@@ -17,7 +17,8 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::test_helpers::{
-    connect_and_read_greeting, create_test_server_config, send_article_read_multiline_response,
+    connect_and_read_greeting, create_test_server_config,
+    create_test_server_config_with_max_connections, send_article_read_multiline_response,
     setup_proxy_with_backends, spawn_test_proxy_on_random_port, wait_for_server,
 };
 
@@ -335,6 +336,66 @@ async fn test_partial_backend_availability() -> Result<()> {
     assert!(status.starts_with("220"), "Should find article on Backend2");
     assert!(!body.is_empty());
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn same_hostname_shares_missing_availability_across_ports() -> Result<()> {
+    let (port0, backend0_requests, handle0) =
+        spawn_counting_backend("SameHost-430", false, false).await?;
+    let (port1, backend1_requests, handle1) =
+        spawn_counting_backend("SameHost-430-OtherPort", false, false).await?;
+    wait_for_server(&format!("127.0.0.1:{port0}"), 20).await?;
+    wait_for_server(&format!("127.0.0.1:{port1}"), 20).await?;
+
+    let config = Config {
+        servers: vec![
+            create_test_server_config_with_max_connections("127.0.0.1", port0, "SameHost-430", 1),
+            create_test_server_config_with_max_connections(
+                "127.0.0.1",
+                port1,
+                "SameHost-430-OtherPort",
+                1,
+            ),
+        ],
+        cache: Some(Cache {
+            adaptive_precheck: false,
+            ..Default::default()
+        }),
+        routing: nntp_proxy::config::Routing {
+            backend_selection: BackendSelectionStrategy::WeightedRoundRobin,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let proxy = NntpProxy::new(config, RoutingMode::PerCommand).await?;
+    let proxy_port = spawn_test_proxy_on_random_port(proxy, true).await?;
+    let proxy_addr = format!("127.0.0.1:{proxy_port}");
+    wait_for_server(&proxy_addr, 20).await?;
+
+    let message_id = "<same-host-availability@example.com>";
+    let mut client = connect_and_read_greeting(proxy_port).await?;
+    let (status, body) = send_article_read_multiline_response(&mut client, message_id).await?;
+    assert!(status.starts_with("430"), "both endpoints report missing");
+    assert!(body.is_empty());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        backend0_requests.load(Ordering::SeqCst) + backend1_requests.load(Ordering::SeqCst),
+        1,
+        "a provider-wide miss should be learned from one endpoint"
+    );
+
+    backend0_requests.store(0, Ordering::SeqCst);
+    backend1_requests.store(0, Ordering::SeqCst);
+    let (status, _) = send_article_read_multiline_response(&mut client, message_id).await?;
+    assert!(status.starts_with("430"));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(backend0_requests.load(Ordering::SeqCst), 0);
+    assert_eq!(backend1_requests.load(Ordering::SeqCst), 0);
+
+    handle0.abort();
+    handle1.abort();
     Ok(())
 }
 

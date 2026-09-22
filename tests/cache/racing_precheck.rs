@@ -37,8 +37,8 @@ fn test_availability_bitset_semantics_for_retry() {
     // IMPORTANT: Don't create separate "tried backends" tracking!
     // ArticleAvailability already provides this via methods:
     //
-    // - should_try(backend) == true  → Not yet tried or has article, ATTEMPT IT
-    // - is_missing(backend) == true  → Tried and returned 430, SKIP IT
+    // - should_try_slot(slot) == true  → Not yet tried or has article, ATTEMPT IT
+    // - is_missing_slot(slot) == true  → Tried and returned 430, SKIP IT
     //
     // Usage pattern in retry loop:
     // 1. Create fresh availability tracker for this request

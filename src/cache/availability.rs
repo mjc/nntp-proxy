@@ -262,6 +262,25 @@ mod tests {
     }
 
     #[test]
+    fn host_identity_canonicalizes_dns_case_and_trailing_dot() {
+        let servers = [
+            Server::builder("News.Example", Port::try_new(119).unwrap())
+                .build()
+                .unwrap(),
+            Server::builder("news.example.", Port::try_new(563).unwrap())
+                .build()
+                .unwrap(),
+        ];
+        let layout = AvailabilityLayout::from_servers(&servers).unwrap();
+
+        assert_eq!(
+            layout.slot_for_backend(BackendId::from_index(0)),
+            layout.slot_for_backend(BackendId::from_index(1))
+        );
+        assert_eq!(layout.identity_count(), 1);
+    }
+
+    #[test]
     fn availability_identity_ignores_account_and_port_but_not_host() {
         let servers = [
             Server::builder("news.example", Port::try_new(119).unwrap())
