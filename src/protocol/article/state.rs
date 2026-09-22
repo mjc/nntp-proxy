@@ -409,4 +409,21 @@ mod tests {
         );
         assert_eq!(article.body, Some(&b"..wire-dot\r\n"[..]));
     }
+
+    #[test]
+    fn framed_validation_rejects_nul_body_bytes() {
+        let bytes: &[u8] = b"222 1 <body@test> follows\r\nbad\0body\r\n";
+        let framed = Article::new(Framed::new(
+            bytes,
+            RequestKind::Body,
+            StatusCode::new(222),
+            StatusLineEnd::new(b"222 1 <body@test> follows\r\n".len()),
+            ContentEnd::new(bytes.len()),
+        ));
+
+        assert!(matches!(
+            framed.validate(YencValidation::Disabled),
+            Err(ParseError::InvalidBody)
+        ));
+    }
 }

@@ -90,6 +90,7 @@ impl ArticleLayout {
             message_id,
             article_number,
             buf.len(),
+            false,
         )
     }
 
@@ -125,6 +126,7 @@ impl ArticleLayout {
             message_id,
             article_number,
             content_end,
+            true,
         )
     }
 
@@ -135,6 +137,7 @@ impl ArticleLayout {
         message_id: Range<usize>,
         article_number: Option<u64>,
         content_end: usize,
+        reject_invalid_body: bool,
     ) -> Result<Self, ParseError> {
         let framed = buf.get(..content_end).ok_or(ParseError::BufferTooShort)?;
         let content_start = first_line_end
@@ -147,6 +150,9 @@ impl ArticleLayout {
                 let headers_range = content_start..separator_pos;
                 let header_transformation = Headers::validate(&framed[headers_range.clone()])?;
                 let body_range = separator_pos + 4..content_end;
+                if reject_invalid_body && framed[body_range.clone()].contains(&b'\0') {
+                    return Err(ParseError::InvalidBody);
+                }
                 ArticleContent::Article {
                     headers: headers_range,
                     header_transformation,
@@ -166,6 +172,9 @@ impl ArticleLayout {
             }
             222 => {
                 let body_range = content_start..content_end;
+                if reject_invalid_body && framed[body_range.clone()].contains(&b'\0') {
+                    return Err(ParseError::InvalidBody);
+                }
                 ArticleContent::Body { body: body_range }
             }
             223 => {
