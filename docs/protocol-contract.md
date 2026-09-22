@@ -25,16 +25,15 @@ Both adapters use these wire rules:
   callers do not rescan or reconstruct a boundary.
 
 Article validation is a second guarantee after framing. It accepts the
-request-scoped article forms (ARTICLE, HEAD, BODY, and STAT), retains the
-parsed first-line metadata and transformation requirements, and keeps the
-validated layout tied to its bytes. Plain content can be borrowed; folded
-headers and dot-stuffed bodies are materialized only when required. Optional
+request-scoped article forms (ARTICLE, HEAD, BODY, and STAT), retains parsed
+first-line metadata, and keeps the validated layout tied to its bytes. Optional
 yEnc validation is a policy at this semantic boundary, not a framing rule.
-The framed owner still retains the original wire bytes. nntpbench's validated
-article view uses borrowed data for unchanged sections and an owned `Cow` only
-for a required header-unfold or body-unstuff transformation; the proxy keeps
-its streaming article body as wire bytes and applies only transformations its
-borrowed view can own without moving the pooled response.
+The framed owner always retains the original wire bytes. nntpbench's owned
+validated view records header-unfold and body-unstuff requirements and uses an
+owned `Cow` only when one is needed. The proxy's ordinary pooled view keeps
+body bytes in their wire representation; forwarding never allocates or runs a
+second body-boundary scan, while captured article consumers can choose their
+own materialization policy.
 
 ## Coordinates
 
