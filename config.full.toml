@@ -113,6 +113,8 @@ name = "Example News Server 1"
 # Optional backend authentication
 # username = "your_username"
 # password = "your_password"
+# Availability facts are shared by matching canonical hostnames (case-insensitive
+# with one trailing DNS dot ignored), regardless of port, account, or credentials.
 max_connections = 20
 # Lower tier numbers are tried first. Higher tiers are fallback/archive servers.
 tier = 0

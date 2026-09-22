@@ -6,75 +6,37 @@ flowchart TB
         BackendN["Backend Server N"]
     end
 
-    subgraph Proxy["NntpProxy (proxy.rs)"]
+    subgraph Proxy["NntpProxy"]
         direction TB
-        Accept["Accept Loop<br/>(runtime.rs)"]
-        
+        Accept["Accept loop<br/>(runtime.rs)"]
+
         subgraph Session["ClientSession (session/)"]
-            AuthHandler["AuthHandler<br/>(auth/)"]
-            ModeState["ModeState<br/>Hybrid/Stateful/PerCommand"]
-            
-            subgraph Handlers["Session Handlers"]
-                HybridH["hybrid.rs"]
-                StatefulH["stateful.rs"]
-                PerCommandH["per_command.rs"]
-            end
+            Auth["AuthState / AuthHandler"]
+            Mode["ModeState<br/>Stateful / PerCommand / Hybrid"]
+            Request["RequestContext<br/>(protocol/request.rs)"]
+            Handler["CommandHandler<br/>(command/handler.rs)"]
+            Framer["MultilineFramer<br/>(session/multiline_framing.rs)"]
         end
-        
-        subgraph Command["Command Processing"]
-            Classifier["NntpCommand::parse()<br/>(classifier.rs)"]
-            Handler["CommandHandler<br/>(handler.rs)"]
-        end
-        
-        subgraph Router["BackendSelector (router/)"]
-            RoundRobin["Round Robin"]
-            WeightedRR["Weighted RR"]
-            LeastLoaded["Least Loaded"]
-        end
-        
-        subgraph Pool["Connection Pool (pool/)"]
-            Deadpool["DeadpoolConnectionProvider"]
-            BufferPool["BufferPool"]
-            HealthCheck["Health Checker"]
-        end
-        
-        subgraph Protocol["Protocol (protocol/)"]
-            Response["NntpResponse"]
-            StatusCode["StatusCode"]
-            Article["Article Parser"]
-        end
-        
-        Cache["ArticleCache<br/>(cache/)"]
+
+        Router["BackendSelector<br/>(router/)"]
+        Pools["DeadpoolConnectionProvider<br/>ConnectionGuard"]
+        Buffers["BufferPool / PooledBuffer<br/>(pool/)"]
+        Cache["UnifiedCache<br/>(cache/)"]
         Metrics["MetricsCollector<br/>(metrics/)"]
-        TLS["TlsManager<br/>(tls.rs)"]
+        Stream["ConnectionStream<br/>(stream/)"]
     end
 
-    Client -->|TCP/TLS| Accept
+    Client -->|plain NNTP TCP| Accept
     Accept --> Session
-    Session --> AuthHandler
-    AuthHandler -->|Authenticated| ModeState
-    ModeState -->|Hybrid| HybridH
-    ModeState -->|Stateful| StatefulH
-    ModeState -->|PerCommand| PerCommandH
-    
-    HybridH --> Classifier
-    StatefulH --> Classifier
-    PerCommandH --> Classifier
-    
-    Classifier --> Handler
-    Handler -->|Route| Router
-    
-    Router --> Pool
-    Pool -->|Get Connection| Deadpool
-    Deadpool -->|Plain| Backend1
-    Deadpool -->|TLS| TLS
-    TLS --> Backend2
-    
-    Pool --> HealthCheck
-    HealthCheck -.->|Monitor| Backend1
-    HealthCheck -.->|Monitor| Backend2
-    HealthCheck -.->|Monitor| BackendN
-    
-    Protocol --> Session
-    Cache -.->|Cache Hit| Session
-    Metrics -.->|Record| Session
+    Auth --> Mode --> Request --> Handler
+    Handler -->|route| Router
+    Router --> Pools
+    Pools --> Stream
+    Stream -->|plain| Backend1
+    Stream -->|TLS / compression| Backend2
+    Stream --> BackendN
+    Pools --> Buffers
+    Request --> Framer
+    Framer -->|borrow, capture, or cache| Client
+    Framer --> Cache
+    Session -.-> Metrics

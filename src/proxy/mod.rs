@@ -1,7 +1,10 @@
-//! NNTP Proxy implementation
+//! NNTP proxy construction and runtime orchestration.
 //!
-//! This module contains the main `NntpProxy` struct which orchestrates
-//! connection handling, routing, and resource management.
+//! [`NntpProxy`] accepts local NNTP connections and coordinates authentication,
+//! request classification, backend selection, pooled I/O, caching, metrics,
+//! and shutdown. Construct it with [`NntpProxyBuilder`] when configuration must
+//! be customized; the top-level [`crate::Config`] loader is the usual binary
+//! entry point.
 //!
 //! ## Module structure
 //!

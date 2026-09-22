@@ -18,12 +18,12 @@ Use `devenv tasks run project:audit-advisories` when triaging advisory changes. 
 standard advisory checks and prints dependency paths for the currently ignored
 crates, including runtime-only paths where Cargo can express them.
 
-Dev-only performance tooling may be retained when the warning is limited to
-benchmark dependencies and the reason is documented. `iai-callgrind` is in that
-category: it gives deterministic instruction-count benchmarks for hot paths, so
-the current unmaintained transitive crates are tracked rather than removing the
-tool. Revisit those ignores when `iai-callgrind` releases a version that drops
-`bincode 1` or `proc-macro-error2`.
+Benchmark dependencies are dev-only and are kept separate from the runtime
+dependency surface. Divan supplies wall-clock microbenchmarks. Gungraun supplies
+deterministic Callgrind instruction, branch, and cache measurements on supported
+Linux targets. Keep benchmark-only advisory exceptions tied to the dependency
+that is actually present in `Cargo.lock`; do not carry forward exceptions for
+removed benchmark frameworks.
 
 For dependency maintenance, run the advisory checks during normal PR validation
 and periodically run:
@@ -33,5 +33,5 @@ devenv shell cargo outdated
 devenv tasks run project:audit-advisories
 ```
 
-When `foyer` or `iai-callgrind` publishes a new version, try the upgrade and
+When `foyer`, Divan, or Gungraun publishes a new version, try the upgrade and
 remove any advisory ignores that disappear.

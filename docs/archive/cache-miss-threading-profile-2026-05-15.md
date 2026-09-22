@@ -1,9 +1,9 @@
-# Cache-Miss Threading Profile - 2026-05-15
+# Cache-Miss Threading Profile — May 2026
 
 This note is historical profiling context. Do not quote these numbers as
-current README or release performance claims; later forwarding changes changed
-the cache-miss path. The current conservative README numbers are the 2026-05-20
-100GB `nntpbench` spot checks:
+README or release performance claims; later forwarding changes changed the
+cache-miss path. The following 100GB `nntpbench` spot checks were recorded on
+2026-05-20 for comparison within that investigation.
 
 | Shape | Mean MiB/s | Median MiB/s | Stdev | Min | Max |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -13,6 +13,11 @@ the cache-miss path. The current conservative README numbers are the 2026-05-20
 This note captured an investigation into why adding Tokio worker
 threads and backend connections does not scale the large-article cache-miss
 benchmark cleanly.
+
+The measurements and command lines below are historical observations from this
+investigation. They describe the May 2026 code and harness state and are not
+the release benchmark for 0.6.0. Use the release benchmark record for a result
+that is tied to a later commit and an explicitly recorded workload.
 
 ## Workload
 
@@ -27,7 +32,7 @@ Python benchmark client
 
 Dataset:
 
-- Source NZB: `testfile-10GB-no-rar.nzb`
+- Source article set: 14,746 selected articles from the benchmark fixture
 - Selected articles: 14,746
 - Selected response bytes: 10,739,812,486
 - Minimum article size: 716,800 bytes
@@ -151,8 +156,9 @@ single Python process was the bottleneck at roughly 1.6-1.8 GiB/s.
 
 The harness now supports `CLIENT_PROCESSES=N`, which preserves the same global
 client/request distribution but splits the benchmark readers across multiple OS
-processes. This does not change the proxy topology or the real NZB message IDs;
-it only prevents one Python event loop from being the throughput ceiling.
+processes. This does not change the proxy topology or the selected article
+message IDs; it only prevents one Python event loop from being the throughput
+ceiling.
 
 Corrected direct-upstream command:
 

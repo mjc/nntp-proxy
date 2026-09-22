@@ -1,5 +1,9 @@
 # Development
 
+The crate's minimum supported Rust version is 1.91. Use `devenv` for local
+development and validation; the Nix flake is retained for packaging and
+cross-compilation, not as a second local development shell.
+
 ## Common commands
 
 Build:
@@ -17,6 +21,14 @@ devenv shell cargo nextest run
 ```
 
 Use `cargo test` when you need doctests, exact filtering, or `-- --nocapture` debugging output.
+
+For public API documentation, run both the doctests and the warning-as-error
+documentation build:
+
+```bash
+devenv shell cargo test --doc
+devenv shell env RUSTDOCFLAGS='-D warnings' cargo doc --workspace --all-features --no-deps
+```
 
 Dependency and advisory triage:
 
@@ -44,7 +56,7 @@ Run the full PR-equivalent quality gate with:
 devenv tasks run project:quality-pr
 ```
 
-## Nix
+## Development environment and packaging
 
 The local development environment is managed by devenv:
 
@@ -134,12 +146,42 @@ Explicit compiler-contract checks exercise real private types, with successful
 controls and checked diagnostic codes:
 
 ```bash
-nix develop -c bash scripts/check-response-contracts.sh
+devenv shell bash scripts/check-response-contracts.sh
 ```
 
 ### Measurement
 
-Published benchmark numbers were intentionally removed from the docs until they are rerun.
+Divan provides wall-clock microbenchmarks. Gungraun provides deterministic
+Callgrind instruction, branch, and cache measurements on supported Linux
+targets. Gungraun is the repository's only Callgrind benchmark framework.
+
+Run a Divan benchmark through the managed environment:
+
+```bash
+devenv shell cargo bench --bench response_parsing
+devenv shell cargo bench --features framing-bench --bench multiline_framing
+```
+
+Run a Gungraun benchmark on Linux x86_64 or aarch64:
+
+```bash
+devenv shell cargo bench --bench request_classifier_callgrind
+devenv shell cargo bench --features framing-bench --bench multiline_framing_callgrind
+```
+
+Feature-gated targets must be enabled explicitly. Use the benchmark name from
+`Cargo.toml`; `cargo check --benches` excludes targets whose required features
+are disabled.
+
+To verify every benchmark target without running a measurement:
+
+```bash
+devenv shell cargo bench --no-run --all-features
+```
+
+Published benchmark numbers belong in the release benchmark record with the
+tested commit, workload, machine class, and toolchain. This repository keeps
+the archived workflow description separate from release claims.
 
 When you want fresh numbers:
 

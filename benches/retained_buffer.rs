@@ -1,7 +1,7 @@
 //! Retained-buffer append policy benchmarks.
 //!
 //! Run with:
-//! `nix develop -c cargo bench --features framing-bench --bench retained_buffer`
+//! `devenv shell cargo bench --features framing-bench --bench retained_buffer`
 
 use divan::{Bencher, black_box};
 use nntp_proxy::pool::buffer::retained_append_benchmark;

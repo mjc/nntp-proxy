@@ -123,7 +123,7 @@ pub struct Config {
     pub memory: Memory,
     /// Cache configuration.
     ///
-    /// The proxy uses the cache for backend availability-driven routing/retry
+    /// The proxy uses the cache for provider-slot availability-driven routing/retry
     /// decisions when the configured capacity can hold the fixed availability
     /// index. In availability-only mode, `store_article_bodies` only controls
     /// whether the cache also retains full article bodies.
@@ -272,12 +272,14 @@ impl QueuePressureLimits {
         (hard.get() >= soft.get()).then_some(Self { soft, hard })
     }
 
+    /// Return the soft queue-pressure threshold.
     #[inline]
     #[must_use]
     pub const fn soft(self) -> QueuePressurePercent {
         self.soft
     }
 
+    /// Return the hard queue-pressure threshold.
     #[inline]
     #[must_use]
     pub const fn hard(self) -> QueuePressurePercent {
@@ -383,9 +385,10 @@ pub struct Cache {
     /// Whether to retain ARTICLE/BODY payloads in the response cache (default: false)
     ///
     /// When false:
-    /// - Cache still tracks backend availability for retry/routing
+    /// - Cache still tracks provider-slot availability for retry/routing
     /// - ARTICLE/BODY payload bytes are NOT stored
-    /// - Uses the dedicated availability-only index with bounded LRU eviction
+    /// - Uses the dedicated availability-only index with bounded rotating
+    ///   fingerprint storage and exact message-key confirmation
     /// - Useful for availability-only mode with limited memory
     ///
     /// When true:
@@ -399,7 +402,7 @@ pub struct Cache {
     )]
     pub store_article_bodies: bool,
 
-    /// Disk cache configuration (requires `hybrid-cache` feature)
+    /// Disk cache configuration for the optional memory-to-disk article tier.
     ///
     /// When enabled, articles evicted from memory are written to disk,
     /// creating a two-tier cache (memory → disk → backend).
@@ -409,8 +412,9 @@ pub struct Cache {
     /// Path to the availability index persistence file (optional).
     ///
     /// This is only used in availability-only mode (`store_article_bodies = false`).
-    /// When set, the proxy uses this path to persist backend availability state;
-    /// otherwise it defaults to "availability.idx" alongside the config file.
+    /// When set, the proxy uses this path to persist provider-slot availability
+    /// state and exact message keys; otherwise it defaults to "availability.idx"
+    /// alongside the config file.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -459,7 +463,8 @@ impl std::fmt::Display for CompressionCodec {
 /// - Hot articles in memory (fast, limited capacity)
 /// - Cold articles on disk (slower, larger capacity)
 ///
-/// Requires the `hybrid-cache` feature to be enabled.
+/// Disk caching is available in the default build when this section is
+/// configured; it is independent of the article-cache payload policy.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DiskCache {
     /// Path to disk cache directory
@@ -566,7 +571,9 @@ pub struct ClientAuth {
 /// Individual user credentials
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct UserCredentials {
+    /// Username accepted by the proxy's client authentication layer.
     pub username: String,
+    /// Password paired with [`Self::username`].
     pub password: String,
 }
 
@@ -590,11 +597,16 @@ impl ClientAuth {
 /// Configuration for a single backend server
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Server {
+    /// Backend hostname or IP address.
     pub host: HostName,
+    /// Backend NNTP port.
     pub port: Port,
+    /// Human-readable backend name used in logs and metrics.
     pub name: ServerName,
+    /// Optional username for backend authentication.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub username: Option<String>,
+    /// Optional password for backend authentication.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
     /// Maximum number of concurrent connections to this server
@@ -948,6 +960,7 @@ impl Server {
         ServerBuilder::new(host, port)
     }
 
+    /// Return whether this backend performs a `STAT` probe before article fetches.
     #[must_use]
     pub const fn stat_missing_enabled(&self) -> bool {
         self.stat_missing != 0

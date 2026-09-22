@@ -1,7 +1,7 @@
 //! TCP command pipelining for per-command routing
 //!
-//! When a client sends multiple commands in a single TCP buffer (common with NZB
-//! downloaders batching STAT/ARTICLE commands), this module reads them as a batch
+//! When a client sends multiple commands in a single TCP buffer, this module
+//! reads them as a batch
 //! so they can be processed without blocking on socket reads between each command.
 //!
 //! Single-command batches fall through to the existing sequential path with zero overhead.

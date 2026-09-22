@@ -1,7 +1,9 @@
-//! Configuration module
+//! Configuration types, defaults, and loading.
 //!
-//! This module handles all configuration types and loading
-//! for the NNTP proxy server.
+//! Configuration can be loaded from a TOML file, environment variables, or the
+//! command line. The public types in this module describe the normalized
+//! runtime configuration; legacy field names are migrated at load time so the
+//! rest of the proxy does not need compatibility branches.
 
 mod defaults;
 mod loading;

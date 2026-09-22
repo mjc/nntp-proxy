@@ -563,7 +563,7 @@ impl HybridArticleCache {
         self.cache.insert(key, entry);
     }
 
-    /// Record successful backend availability without storing response payload bytes.
+    /// Record successful provider-slot availability without storing response payload bytes.
     pub async fn record_has_status(
         &self,
         message_id: MessageId<'_>,
