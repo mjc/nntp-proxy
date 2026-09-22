@@ -6,8 +6,6 @@
 //! If a response is incomplete, the same framer state is fed the next backend
 //! buffer until it can produce a typed complete or incomplete response chunk.
 
-#![allow(clippy::disallowed_methods)]
-
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ops::Range;
