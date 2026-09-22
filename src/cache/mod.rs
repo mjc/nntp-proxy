@@ -8,8 +8,8 @@
 //!
 //! The `ArticleAvailability` type is a negative bitset for authoritative `430`
 //! facts and serves dual purposes:
-//! 1. Cache persistence - track which backends are known missing across requests
-//! 2. Retry tracking - track which backends returned `430` during retry loops
+//! 1. Cache persistence - track which provider slots are known missing across requests
+//! 2. Retry tracking - track which provider slots returned `430` during retry loops
 //!    (transient)
 //!
 //! ## Cache Implementations

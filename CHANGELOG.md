@@ -13,7 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added optional per-backend `stat_missing` probes for backends that return authoritative `430` responses. Probes can avoid retrying known misses and can prefill availability from fallback tiers while the primary request continues.
 - Added queue-pressure routing controls under `[routing.queue.backpressure]`.
-- Added explicit availability namespaces and account scoping so authoritative missing-article facts can be shared safely between equivalent backends.
+- Added canonical-host provider slots for availability tracking, so equivalent
+  transport entries share authoritative missing-article facts without storing
+  account names, passwords, ports, or resolved addresses in the provider
+  identity.
+- Added a bounded rotating availability index with exact message-ID sidecars;
+  fingerprint collisions cannot suppress a different article, while rotation
+  and replacement may safely forget old negative facts.
 - Added `FramedArticle`, `ValidatedArticle`, and `ArticleView` for response framing, semantic article validation, and repeated zero-copy typed access.
 - Added Gungraun benchmarks and reproducible framing, cache, retained-buffer, and end-to-end benchmark fixtures.
 - Added worker-thread CPU pinning with `rustix` on Linux.
@@ -42,7 +48,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preserved the classified plan for a trailing pipelined command through direct execution or stateful handoff.
 - Tightened backend cleanup around failed authentication, probes, response writes, and partially completed exchanges.
 - Made DNS lookups TTL-aware and corrected address-family cache refresh behavior after IPv6-unreachable failures.
-- Persisted and restored availability facts by stable host/account identity, while preventing stale identity mappings from being applied to a changed backend layout.
+- Persisted and restored availability facts with canonical host identities,
+  exact message IDs, and provider-slot translation, while preventing stale
+  identity mappings from being applied to a changed backend layout.
 - Fixed cache updates so availability metadata does not replace a larger payload and so cached responses retain exact section boundaries on re-emission.
 - Enforced RFC 3977 message-ID syntax and rejected incomplete backend username/password configuration.
 - Fixed active-session and dashboard counters, reduced TUI render allocations, and cleared prewarmed idle backend pools after their configured timeout.
@@ -51,10 +59,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Upgrade notes
 
 - Queue-pressure routing is enabled by default with soft and hard waiter thresholds of 25% and 50%, plus a 1 ms retry delay when every eligible backend in a tier is hard-saturated. These values are configurable under `[routing.queue.backpressure]`.
-- `availability_namespace` and `NNTP_SERVER_<N>_AVAILABILITY_NAMESPACE` can explicitly define which backends share authoritative missing-article facts. When unset, the configured host and username define the identity; port, TLS, compression, tier, and display name do not.
+- `availability_namespace` and `NNTP_SERVER_<N>_AVAILABILITY_NAMESPACE` were
+  removed. Availability identity is now always the configured hostname after
+  ASCII case-folding and removal of one trailing DNS dot; the same hostname
+  shares a provider slot across ports, addresses, accounts, TLS settings,
+  compression, tiers, and display names.
 - The obsolete CLI aliases `--no-tui`, `--backend-strategy`, `--cache-capacity`, `--cache-ttl`, `--ttl-secs`, `--cache-articles`, and `--store-articles` were removed. Use the canonical flags documented in `docs/operator/runtime-and-routing.md` and `docs/operator/configuration.md`.
 - The legacy `NNTP_PROXY_CACHE_*` environment names were removed in favor of the corresponding `NNTP_PROXY_ARTICLE_CACHE_*` and `NNTP_PROXY_STORE_ARTICLE_BODIES` names.
-- Availability-index files written before stable host/account identity metadata are ignored and rebuilt. Existing hybrid-cache payload entries remain readable, and older payload-section boundaries are normalized during decoding.
+- Availability-index files written before the current canonical-host and
+  exact-message-key format are ignored and rebuilt. Hybrid-cache registries
+  retain canonical-host slot assignments; existing payload entries remain
+  readable, and older payload-section boundaries are normalized during
+  decoding.
 - `NntpClient` article fetches now return `FramedArticle` instead of a raw `PooledBuffer`. Consumers obtain typed access through the framed-to-validated transition; semantic validation and optional yEnc validation are separate operations.
 - The Rust library surface has further breaking changes: the low-level `compression` and `network` modules and `constants::duration_polyfill` are private or removed, `RequestContext` no longer implements payload-dropping `Clone`, `ModeState` construction and transition APIs changed, and connection checkout/finalization now uses explicit idle, active, complete, and reusable states.
 - `Password` no longer implements `Display` or `Deref<str>`, and its `Debug` output is redacted. Explicit `AsRef<str>` access remains available where cleartext is required.
@@ -63,7 +79,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing and documentation
 
-- Added regression coverage for fragmented and packed responses, terminators split across reads, request-scoped response shapes, cancellation and connection reuse, cache boundary preservation, availability identity migration, authentication transitions, typed counters, and retained-buffer ownership.
+- Added regression coverage for fragmented and packed responses, terminators split across reads, request-scoped response shapes, cancellation and connection reuse, cache boundary preservation, canonical-host availability identity, exact-key collision safety, provider-slot snapshot restoration, authentication transitions, typed counters, and retained-buffer ownership.
 - Added devenv quality tasks covering formatting, Clippy, shell and workflow linting, typo checks, coverage, dependency policy, advisories, unused dependencies, and response-contract checks.
 - Updated operator, development, configuration, and release-benchmark documentation for the new routing, cache, framing, and development workflows.
 

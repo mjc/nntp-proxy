@@ -123,7 +123,7 @@ pub struct Config {
     pub memory: Memory,
     /// Cache configuration.
     ///
-    /// The proxy uses the cache for backend availability-driven routing/retry
+    /// The proxy uses the cache for provider-slot availability-driven routing/retry
     /// decisions when the configured capacity can hold the fixed availability
     /// index. In availability-only mode, `store_article_bodies` only controls
     /// whether the cache also retains full article bodies.
@@ -385,9 +385,10 @@ pub struct Cache {
     /// Whether to retain ARTICLE/BODY payloads in the response cache (default: false)
     ///
     /// When false:
-    /// - Cache still tracks backend availability for retry/routing
+    /// - Cache still tracks provider-slot availability for retry/routing
     /// - ARTICLE/BODY payload bytes are NOT stored
-    /// - Uses the dedicated availability-only index with bounded LRU eviction
+    /// - Uses the dedicated availability-only index with bounded rotating
+    ///   fingerprint storage and exact message-key confirmation
     /// - Useful for availability-only mode with limited memory
     ///
     /// When true:
@@ -411,8 +412,9 @@ pub struct Cache {
     /// Path to the availability index persistence file (optional).
     ///
     /// This is only used in availability-only mode (`store_article_bodies = false`).
-    /// When set, the proxy uses this path to persist backend availability state;
-    /// otherwise it defaults to "availability.idx" alongside the config file.
+    /// When set, the proxy uses this path to persist provider-slot availability
+    /// state and exact message keys; otherwise it defaults to "availability.idx"
+    /// alongside the config file.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

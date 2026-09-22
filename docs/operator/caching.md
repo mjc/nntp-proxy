@@ -15,11 +15,17 @@ store_article_bodies = false
 
 This mode:
 
-- keeps backend availability tracking enabled
+- keeps provider-slot availability tracking enabled
 - stores routing/retry knowledge in the availability index
 - does **not** retain article bodies
 - can persist the availability index with `availability_index_path`
 - leaves `[cache.disk]` inactive even if it is configured
+
+The availability index is negative-only and bounded. Each retained entry keeps
+the exact message-ID key together with a compact fingerprint and the provider
+slots known to have returned `430`. Rotation, TTL expiry, and replacement can
+forget an entry (a safe false negative), but a fingerprint collision cannot
+make a different message appear missing.
 
 ### Full article-body caching
 
@@ -95,7 +101,7 @@ Practical guidance:
 
 ## Availability index persistence
 
-In availability-only mode, set `availability_index_path` if you want backend availability knowledge to survive restarts:
+In availability-only mode, set `availability_index_path` if you want provider-slot availability knowledge to survive restarts:
 
 ```toml
 [cache]
@@ -109,8 +115,11 @@ If `[cache]` is omitted entirely, the proxy still uses internal availability tra
 
 Availability-only snapshots carry the configured hostnames used for their slots
 and the exact message key for each negative fact. Snapshot formats written
-before this keyed-entry encoding are ignored and rebuilt with the current
-configuration rather than being interpreted as exact facts.
+before this host-keyed encoding are ignored and rebuilt with the current
+configuration rather than being interpreted as exact facts. In hybrid mode,
+`availability.registry` preserves the stable canonical-host-to-slot mapping
+across restarts and configuration reorderings; it does not contain credentials
+or article data.
 
 ## CLI overrides
 

@@ -1,6 +1,6 @@
 //! Article caching implementation using LRU cache with TTL
 //!
-//! This module provides article caching with per-backend availability tracking.
+//! This module provides article caching with per-provider-slot availability tracking.
 //! The availability tracking type itself lives in [`super::availability`].
 
 use crate::protocol::{
@@ -349,7 +349,7 @@ impl CachedPayload {
 /// wire response bytes are regenerated when serving cache hits.
 #[derive(Clone, Debug)]
 pub struct CachedArticle {
-    /// Backend availability bitset (2 bytes)
+    /// Provider-slot availability bitset.
     ///
     /// No mutex needed: moka clones entries on `get()`, and updates go through
     /// `cache.insert()` which replaces the whole entry atomically.
@@ -557,7 +557,7 @@ impl CachedArticle {
         self.backend_availability.record_missing_slot(slot);
     }
 
-    /// Check if all backends have been tried and none have the article
+    /// Check if all configured provider slots have been tried and none have the article.
     #[must_use]
     pub fn all_backends_exhausted(&self, configured: AvailabilityMask) -> bool {
         self.backend_availability.all_exhausted(configured)
@@ -565,14 +565,14 @@ impl CachedArticle {
 
     /// Check if this cache entry has useful availability information
     ///
-    /// Returns true if at least one backend has returned authoritative 430.
+    /// Returns true if at least one provider slot has returned authoritative 430.
     #[inline]
     #[must_use]
     pub const fn has_availability_info(&self) -> bool {
         self.backend_availability.has_availability_info()
     }
 
-    /// Return the typed backend availability metadata stored with this entry.
+    /// Return the typed provider-slot availability metadata stored with this entry.
     #[inline]
     #[must_use]
     pub const fn availability(&self) -> ArticleAvailability {
@@ -603,8 +603,8 @@ impl CachedArticle {
 
     /// Initialize availability tracker from this cached entry
     ///
-    /// Creates a fresh `ArticleAvailability` with backends marked missing based on
-    /// cached knowledge (backends that previously returned 430).
+    /// Creates a fresh `ArticleAvailability` with provider slots marked missing
+    /// based on cached knowledge (slots that previously returned 430).
     pub(crate) const fn to_availability(&self) -> ArticleAvailability {
         ArticleAvailability::from_missing_bits(self.backend_availability.missing_bits())
     }
@@ -1272,7 +1272,7 @@ impl ArticleCache {
             .await;
     }
 
-    /// Record successful backend availability without storing response payload bytes.
+    /// Record successful provider-slot availability without storing response payload bytes.
     pub async fn record_backend_has_status(
         &self,
         message_id: MessageId<'_>,
@@ -1350,7 +1350,7 @@ impl ArticleCache {
     ///
     /// Note: We don't store the actual backend 430 response because:
     /// 1. We always send a standardized 430 to clients, never the backend's response
-    /// 2. The only info we need is the availability bitset (which backends returned 430)
+    /// 2. The only info we need is the provider-slot availability bitset (which slots returned 430)
     pub async fn record_availability_missing(
         &self,
         message_id: MessageId<'_>,

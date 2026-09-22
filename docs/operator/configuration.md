@@ -83,6 +83,11 @@ These settings control transport memory, not stored article bodies.
 | `store_article_bodies` | `false` | Availability tracking stays on either way |
 | `availability_index_path` | unset | When unset in availability-only mode, defaults to `availability.idx` next to the config file |
 
+The availability-only index is a bounded, rotating negative index. It stores
+the exact message-ID key alongside its compact fingerprint and provider-slot
+bits. Rotation and replacement can forget an old `430` fact, which is a safe
+false negative; a fingerprint match alone never suppresses a different message.
+
 ### `[cache.disk]`
 
 Optional disk tier for article bodies evicted from memory. It is only active when `store_article_bodies = true`.
@@ -119,11 +124,10 @@ password = "reader-password"
 
 | Field | Default | Notes |
 | --- | --- | --- |
-| `host` | required | Backend hostname or IP |
+| `host` | required | Backend hostname or IP; canonical hostname identity used for availability sharing |
 | `port` | required | `119` for plain NNTP, `563` for NNTPS |
 | `name` | required | Friendly name used in logs and the TUI |
 | `username` / `password` | unset | Backend auth |
-| `availability_namespace` | backend host | Explicit identity namespace for sharing availability facts across transport endpoints; the configured username remains part of the identity |
 | `max_connections` | `10` | Per-backend pool size |
 | `stat_missing` | `0` | Probe missing articles with `STAT` before `ARTICLE`/`BODY`/`HEAD` on this backend. Enable it on backends that correctly return `430` to speed up retrying missing articles. |
 | `tier` | `0` | Lower tiers are preferred first |
@@ -138,6 +142,11 @@ password = "reader-password"
 | `compress_level` | unset | Level `0`-`9` when compression is enabled |
 | `backend_idle_timeout` | `600` seconds | Clears idle backend connections after proxy-wide inactivity |
 
+Availability identity is derived from the configured `host` value only; the
+proxy does not resolve DNS to infer provider identity. Hostnames are compared
+case-insensitively after removing one trailing DNS dot. Ports, credentials,
+TLS settings, tiers, and display names do not create separate provider slots.
+
 ## Environment-based backend configuration
 
 Indexed `NNTP_SERVER_<N>_*` variables can define backends without a TOML server list.
@@ -149,7 +158,6 @@ Currently supported backend environment fields:
 - `NAME`
 - `USERNAME`
 - `PASSWORD`
-- `AVAILABILITY_NAMESPACE`
 - `MAX_CONNECTIONS`
 - `STAT_MISSING`
 - `USE_TLS`

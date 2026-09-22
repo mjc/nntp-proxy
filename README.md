@@ -112,8 +112,10 @@ for backend selection, priority tiers, and queue backpressure.
 ## Cache articles when useful
 
 By default, the proxy tracks authoritative article-missing (`430`) responses
-without storing article bodies. To retain payloads in memory, add this as a
-top-level section in `config.toml`:
+without storing article bodies. The bounded negative index keys those facts by
+exact message ID and canonical provider hostname. It may forget old facts as
+entries expire, rotate, or are replaced, so forgotten misses are retried safely.
+To retain payloads in memory, add this as a top-level section in `config.toml`:
 
 ```toml
 [cache]

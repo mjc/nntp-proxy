@@ -135,7 +135,7 @@ impl TryFrom<u16> for CacheableStatusCode {
 /// Implements foyer's `Code` trait manually for efficient serialization:
 /// - Pre-allocates buffer on decode (no vec resizing)
 /// - Simple binary format:
-///   V8/V9 store one negative-availability timestamp per backend immediately
+///   V8/V9 store one negative-availability timestamp per provider slot immediately
 ///   after the missing-bitset, before the entry timestamp and tier. Older V6/V7
 ///   entries omit that array and are decoded with their entry timestamp copied
 ///   into every slot.
@@ -143,12 +143,12 @@ impl TryFrom<u16> for CacheableStatusCode {
 pub struct DiskCachedArticle {
     /// Validated NNTP status code; only cacheable outcomes are representable.
     status_code: CacheableStatusCode,
-    /// Layout fingerprint that scopes persisted negative availability bits.
+    /// Layout epoch that scopes persisted negative availability bits to provider slots.
     availability_epoch: u64,
-    /// Backend availability tracking (authoritative missing bitset)
+    /// Provider-slot availability tracking (authoritative missing bitset)
     pub(super) availability: ArticleAvailability,
-    /// Per-slot timestamps keep one backend's negative fact from being renewed by another.
-    /// In V8/V9 these are persisted in backend-slot order after `availability`.
+    /// Per-slot timestamps keep one provider's negative fact from being renewed by another.
+    /// In V8/V9 these are persisted in provider-slot order after `availability`.
     negative_timestamps: [ttl::CacheTimestampMillis; super::MAX_BACKENDS],
     /// Unix timestamp when availability info was last updated (milliseconds since epoch)
     /// Used to expire stale availability-only entries (missing articles, STAT responses)
@@ -733,7 +733,7 @@ impl DiskCachedArticle {
         self.availability_epoch
     }
 
-    /// Record successful backend availability without storing response payload bytes.
+    /// Record successful provider-slot availability without storing response payload bytes.
     pub(super) fn record_backend_has_status(
         &mut self,
         status_code: CacheableStatusCode,
@@ -778,7 +778,7 @@ impl DiskCachedArticle {
         )
     }
 
-    /// Get backend availability as `ArticleAvailability` struct
+    /// Get provider-slot availability as an `ArticleAvailability` value.
     #[inline]
     #[must_use]
     pub(crate) const fn availability(&self) -> ArticleAvailability {

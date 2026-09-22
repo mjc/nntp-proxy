@@ -33,9 +33,9 @@ port = 119
 name = "Primary"
 username = "your_username"
 password = "your_password"
-# Optional stable identity for sharing 430 availability facts with equivalent
-# endpoints. The username remains part of the identity.
-# availability_namespace = "provider-feed"
+# Availability facts are shared automatically by matching canonical hostnames
+# (case-insensitive, with one trailing DNS dot ignored), regardless of port,
+# credentials, TLS settings, tier, or display name.
 max_connections = 20
 tier = 0
 # Probe misses with STAT before ARTICLE/BODY/HEAD on this backend (0=off, non-zero=on)

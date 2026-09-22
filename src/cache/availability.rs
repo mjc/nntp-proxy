@@ -1,13 +1,13 @@
-//! Article missing-state tracking across backends
+//! Article missing-state tracking across provider slots.
 //!
-//! Uses bitsets to track which backends definitively do not have a specific article.
+//! Uses bitsets to track which provider slots definitively do not have a specific article.
 //! This is a self-contained type used by both the cache layer (persistence) and
 //! the retry loop (transient tracking).
 //!
 //! # NNTP Response Semantics (CRITICAL)
 //!
-//! **430 "No Such Article" is AUTHORITATIVE** - once a backend returns 430 for
-//! a cache entry, that backend stays missing for the lifetime of that entry.
+//! **430 "No Such Article" is AUTHORITATIVE** - once a provider slot returns 430
+//! for a cache entry, that slot stays missing for the lifetime of that entry.
 //!
 //! **2xx success responses are UNRELIABLE** - servers CAN give false positives,
 //! so they are not represented in this structure.
@@ -24,7 +24,7 @@ use crate::types::BackendId;
 /// now because I am tired of being harassed by shitty robots about 8 backends.
 pub const MAX_BACKENDS: usize = BackendId::MAX_COUNT;
 
-/// Status of a backend for a specific article
+/// Status of a provider slot for a specific article.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackendStatus {
     /// Backend hasn't been checked yet
@@ -33,27 +33,28 @@ pub enum BackendStatus {
     Missing,
 }
 
-/// Track which backends are known not to have a specific article.
+/// Track which provider slots are known not to have a specific article.
 ///
-/// Uses a `usize` bitset to track which backends returned authoritative 430.
+/// Uses a `usize` bitset to track which provider slots returned authoritative
+/// `430`.
 ///
-/// # Example with 2 backends
-/// - Initial state: `missing=00` (no backend is known missing)
-/// - After backend 0 returns 430: `missing=01` (backend 0 doesn't have it)
-/// - If both return 430: `missing=11` (all backends exhausted)
+/// # Example with 2 provider slots
+/// - Initial state: `missing=00` (no provider slot is known missing)
+/// - After provider slot 0 returns 430: `missing=01` (slot 0 doesn't have it)
+/// - If both return 430: `missing=11` (all configured provider slots exhausted)
 ///
 /// # Usage Pattern
 /// This type serves two critical purposes:
 ///
-/// 1. **Cache persistence** - Track availability across requests (long-lived)
+/// 1. **Cache persistence** - Track provider-slot availability across requests (long-lived)
 ///    - Store authoritative negative facts in cache entries
-///    - Avoid querying backends known to be missing
+///    - Avoid querying provider slots known to be missing
 ///    - Updated only after 430 responses
 ///
-/// 2. **430 retry loop** - Track which backends tried during single request (transient)
+/// 2. **430 retry loop** - Track which provider slots were tried during a single request (transient)
 ///    - Create fresh instance for each ARTICLE request
-///    - Mark backends as missing when they return 430
-///    - Stop when all backends exhausted or one succeeds
+///    - Mark provider slots as missing when they return 430
+///    - Stop when all configured provider slots are exhausted or one succeeds
 ///
 /// # Concurrency
 /// Cache entries store this value directly. Memory-cache updates use atomic
@@ -67,7 +68,7 @@ pub struct ArticleAvailability {
 }
 
 impl ArticleAvailability {
-    /// Create empty availability - assume all backends have article until proven otherwise
+    /// Create empty availability - assume all provider slots have the article until proven otherwise.
     #[inline]
     #[must_use]
     pub const fn new() -> Self {
@@ -85,7 +86,7 @@ impl ArticleAvailability {
         self
     }
 
-    /// Check if a backend is known to be missing (returned 430)
+    /// Check if a provider slot is known to be missing (returned 430).
     ///
     #[inline]
     #[must_use]
@@ -125,16 +126,16 @@ impl ArticleAvailability {
         Self { missing }
     }
 
-    /// Check if we have any authoritative backend-missing information.
+    /// Check if we have any authoritative provider-slot-missing information.
     ///
-    /// Returns true if at least one backend is known missing.
+    /// Returns true if at least one provider slot is known missing.
     #[inline]
     #[must_use]
     pub const fn has_availability_info(&self) -> bool {
         self.missing != 0
     }
 
-    /// Query backend availability status
+    /// Query provider-slot availability status.
     ///
     #[inline]
     #[must_use]

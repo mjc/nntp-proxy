@@ -113,9 +113,8 @@ name = "Example News Server 1"
 # Optional backend authentication
 # username = "your_username"
 # password = "your_password"
-# Optional availability identity shared by equivalent endpoints. The configured
-# username remains part of the identity; omit this to use the backend host.
-# availability_namespace = "provider-feed"
+# Availability facts are shared by matching canonical hostnames (case-insensitive
+# with one trailing DNS dot ignored), regardless of port, account, or credentials.
 max_connections = 20
 # Lower tier numbers are tried first. Higher tiers are fallback/archive servers.
 tier = 0
