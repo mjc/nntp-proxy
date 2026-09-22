@@ -888,12 +888,7 @@ async fn test_tier_0_exhaustion_before_escalation() -> Result<()> {
     let proxy_port = start_tiered_proxy(vec![
         build_tiered_server("127.0.0.1", backend_0_port, "Backend-0-Tier-0", 0)?,
         build_tiered_server("localhost", backend_1_port, "Backend-1-Tier-0", 0)?,
-        build_tiered_server(
-            "localhost.localdomain",
-            backend_2_port,
-            "Backend-2-Tier-1",
-            1,
-        )?,
+        build_tiered_server("127.0.0.01", backend_2_port, "Backend-2-Tier-1", 1)?,
     ])
     .await?;
     let mut client = connect_tiered_client(proxy_port).await?;
@@ -962,12 +957,7 @@ async fn test_tier_exhaustion_multi_tier() -> Result<()> {
     let proxy_port = start_tiered_proxy(vec![
         build_tiered_server("127.0.0.1", backend_0_port, "Backend-0-Tier-0", 0)?,
         build_tiered_server("localhost", backend_1_port, "Backend-1-Tier-0", 0)?,
-        build_tiered_server(
-            "localhost.localdomain",
-            backend_2_port,
-            "Backend-2-Tier-1",
-            1,
-        )?,
+        build_tiered_server("127.0.0.01", backend_2_port, "Backend-2-Tier-1", 1)?,
     ])
     .await?;
     let mut client = connect_tiered_client(proxy_port).await?;
