@@ -62,10 +62,14 @@ names differ only where the physical adapter has a different input boundary.
 
 ### nntpbench adapter
 
-BufferedResponseReceiver owns the pending BytesMut and its request-scoped
-decoder. The decoder performs the only split/freeze operation and returns one
-framed immutable owner while retaining a packed suffix in the receiver. The
-article typestate transition is:
+BufferedResponseReceiver owns a `PendingInput` (the pending `BytesMut` plus
+its scanned-prefix cursor) and its request-scoped decoder. `PendingInput`
+performs append, read, and consuming frame extraction as one buffer-bound
+operation; the decoder cannot be paired with a different pending allocation.
+The decoder returns one framed immutable owner while retaining a packed suffix
+in the receiver. Article layout ranges are opaque `ArticleFrameRange` values,
+not independently reusable `Range<usize>` coordinates. The article typestate
+transition is:
 
 Article<Framed<Bytes>> -> Article<Validated<Bytes>>
 
