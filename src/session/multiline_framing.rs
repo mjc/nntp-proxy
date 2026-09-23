@@ -1258,7 +1258,7 @@ impl CapturedChunkedResponse {
             status_line_end,
             content_end,
         ));
-        debug_assert_eq!(state.as_inner().content_end().get(), payload_end.as_usize());
+        debug_assert_eq!(state.content_end().get(), payload_end.as_usize());
         state
     }
 
@@ -1267,7 +1267,7 @@ impl CapturedChunkedResponse {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.as_inner().bytes().len()
+        self.bytes().len()
     }
 }
 

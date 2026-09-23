@@ -271,13 +271,13 @@ impl FramedArticle {
     /// Request kind that produced this response.
     #[must_use]
     pub const fn kind(&self) -> crate::protocol::RequestKind {
-        self.state.as_inner().kind()
+        self.state.kind()
     }
 
     /// Parsed status code established by the response framer.
     #[must_use]
     pub const fn status(&self) -> StatusCode {
-        self.state.as_inner().status()
+        self.state.status()
     }
 
     /// Exact framed bytes, including the status line and excluding the

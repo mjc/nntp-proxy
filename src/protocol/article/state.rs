@@ -75,10 +75,6 @@ impl<State> Article<State> {
         Self(state)
     }
 
-    pub(crate) const fn as_inner(&self) -> &State {
-        &self.0
-    }
-
     pub(crate) fn into_inner(self) -> State {
         self.0
     }
@@ -112,8 +108,18 @@ impl<B> Article<Framed<B>> {
         self.0.bytes().as_slice()
     }
 
+    pub(crate) fn bytes(&self) -> &B {
+        self.0.bytes()
+    }
+
     pub(crate) fn into_bytes(self) -> B {
         self.0.into_bytes()
+    }
+}
+
+impl Article<Framed<crate::pool::ChunkedResponse>> {
+    pub(crate) fn iter_chunks(&self) -> impl Iterator<Item = &[u8]> {
+        self.0.bytes().iter_chunks()
     }
 }
 
