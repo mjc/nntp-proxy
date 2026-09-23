@@ -59,11 +59,14 @@ pub(crate) struct ArticleFrameRange {
 }
 
 impl ArticleFrameRange {
-    fn new(range: Range<usize>) -> Self {
-        Self {
+    fn new(range: Range<usize>) -> Result<Self, ParseError> {
+        if range.start > range.end {
+            return Err(ParseError::BufferTooShort);
+        }
+        Ok(Self {
             start: range.start,
             end: range.end,
-        }
+        })
     }
 
     fn range(self) -> Range<usize> {
@@ -175,9 +178,9 @@ impl ArticleLayout {
         let content = match status.as_u16() {
             220 => {
                 let separator_pos = find_blank_line(framed, content_start)?;
-                let headers_range = ArticleFrameRange::new(content_start..separator_pos);
+                let headers_range = ArticleFrameRange::new(content_start..separator_pos)?;
                 let header_transformation = Headers::validate(&framed[headers_range.range()])?;
-                let body_range = ArticleFrameRange::new(separator_pos + 4..content_end);
+                let body_range = ArticleFrameRange::new(separator_pos + 4..content_end)?;
                 if reject_invalid_body && framed[body_range.range()].contains(&b'\0') {
                     return Err(ParseError::InvalidBody);
                 }
@@ -191,7 +194,7 @@ impl ArticleLayout {
                 if find_blank_line(framed, content_start).is_ok() {
                     return Err(ParseError::UnexpectedBody);
                 }
-                let headers_range = ArticleFrameRange::new(content_start..content_end);
+                let headers_range = ArticleFrameRange::new(content_start..content_end)?;
                 let header_transformation = Headers::validate(&framed[headers_range.range()])?;
                 ArticleContent::Head {
                     headers: headers_range,
@@ -199,7 +202,7 @@ impl ArticleLayout {
                 }
             }
             222 => {
-                let body_range = ArticleFrameRange::new(content_start..content_end);
+                let body_range = ArticleFrameRange::new(content_start..content_end)?;
                 if reject_invalid_body && framed[body_range.range()].contains(&b'\0') {
                     return Err(ParseError::InvalidBody);
                 }
@@ -424,7 +427,7 @@ fn parse_first_line_layout(line: &[u8]) -> Result<(ArticleFrameRange, Option<u64
     MessageId::from_borrowed(msg_id_str)?;
 
     Ok((
-        ArticleFrameRange::new(msg_id_start..msg_id_end),
+        ArticleFrameRange::new(msg_id_start..msg_id_end)?,
         article_number,
     ))
 }
@@ -534,7 +537,7 @@ mod tests {
         assert_eq!(
             layout.content,
             ArticleContent::Body {
-                body: ArticleFrameRange::new(status_line_end..frame.len()),
+                body: ArticleFrameRange::new(status_line_end..frame.len()).unwrap(),
             }
         );
     }
