@@ -80,10 +80,6 @@ impl<State> Article<State> {
     }
 }
 
-// These projections are consumed by the public `client::FramedArticle` facade.
-// The generic state is crate-private, so dead-code analysis cannot see those
-// external callers.
-#[allow(dead_code)]
 impl<B> Article<Framed<B>> {
     pub(crate) const fn kind(&self) -> RequestKind {
         self.0.kind()
@@ -91,10 +87,6 @@ impl<B> Article<Framed<B>> {
 
     pub(crate) const fn status(&self) -> StatusCode {
         self.0.status()
-    }
-
-    pub(crate) const fn status_line_end(&self) -> StatusLineEnd {
-        self.0.status_line_end()
     }
 
     pub(crate) const fn content_end(&self) -> ContentEnd {
@@ -110,10 +102,6 @@ impl<B> Article<Framed<B>> {
 
     pub(crate) fn bytes(&self) -> &B {
         self.0.bytes()
-    }
-
-    pub(crate) fn into_bytes(self) -> B {
-        self.0.into_bytes()
     }
 }
 
