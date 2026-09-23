@@ -41,8 +41,11 @@ All endpoints are exclusive:
 
 | Coordinate | Meaning | Owner |
 | --- | --- | --- |
-| ChunkConsumed | Count consumed from one scanner push | Framer/decoder |
-| FrameEnd | Exclusive end in the accumulated logical response window | Receiver/framer |
+| ChunkConsumed | Count consumed from one multiline body-scanner push | Multiline framer |
+| ResponseChunkConsumed | Count consumed from one response-decoder push | Buffered receiver |
+| PendingOffset | Exclusive end of the already-scanned accumulated prefix | Buffered receiver |
+| WindowOffset | Exclusive origin supplied to one streaming scanner push | Streaming framer |
+| FrameEnd | Exclusive end of a complete response in the accumulated logical window | Receiver/framer |
 | StatusLineEnd | Exclusive end of the request-scoped initial line | Framed article state |
 | ContentEnd | Exclusive end before the multiline terminator | Framed article state |
 
@@ -50,6 +53,10 @@ A chunk coordinate is never a frame coordinate. Translation happens once inside
 the receiver/framer operation that owns both origins. Newtypes document the
 coordinate kind, but they do not identify a buffer; resource identity comes
 from the owning state or exclusive borrow.
+
+The buffered adapter uses `PendingOffset + ResponseChunkConsumed -> FrameEnd`;
+the streaming adapter uses `WindowOffset + ChunkConsumed -> FrameEnd`. The
+names differ only where the physical adapter has a different input boundary.
 
 ## Ownership map
 
