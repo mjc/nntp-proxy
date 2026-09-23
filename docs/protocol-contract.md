@@ -106,7 +106,7 @@ These are compatibility decisions, not alternate boundary definitions:
   immutable owned value. The proxy forwards ordinary article responses from
   pooled borrowed bytes and only owns a complete response for capture, cache,
   or other intentional retention.
-- The proxy's transparent forwarding tracker preserves an unparseable status
+- The proxy's transparent forwarding tracker preserves an unparsable status
   line as a tracked wire response for existing connection/order behavior.
   nntpbench's public decoder rejects that malformed initial line. Article
   validation and capture remain strict in both projects. This exception must
