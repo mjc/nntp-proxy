@@ -325,14 +325,26 @@ struct ChunkConsumed(usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChunkPayloadEnd(usize);
 
-/// Translate scanner-local progress into the framer-owned response window.
-impl crate::protocol::FrameEnd {
-    fn after_chunk(self, consumed: ChunkConsumed) -> Self {
-        Self::new(self.get() + consumed.0)
+/// Exclusive origin of the logical response window supplied to one scanner
+/// push. It is not itself proof that a response is complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowOffset(usize);
+
+impl WindowOffset {
+    fn new(value: usize) -> Self {
+        Self(value)
     }
 
-    fn after_payload_chunk(self, payload_end: ChunkPayloadEnd) -> Self {
-        Self::new(self.get() + payload_end.0)
+    fn get(self) -> usize {
+        self.0
+    }
+
+    fn after_chunk(self, consumed: ChunkConsumed) -> crate::protocol::FrameEnd {
+        crate::protocol::FrameEnd::new(self.0 + consumed.0)
+    }
+
+    fn after_payload_chunk(self, payload_end: ChunkPayloadEnd) -> crate::protocol::FrameEnd {
+        crate::protocol::FrameEnd::new(self.0 + payload_end.0)
     }
 }
 
@@ -351,7 +363,7 @@ enum ChunkProgress {
 impl ChunkProgress {
     // Translation lives here; operation contexts supply the origin from their
     // own buffer-bound append result, never from an application caller.
-    fn in_window(self, origin: crate::protocol::FrameEnd, window_len: usize) -> ResponseWindow {
+    fn in_window(self, origin: WindowOffset, window_len: usize) -> ResponseWindow {
         match self {
             Self::Complete(complete) => {
                 let end = origin.after_chunk(complete.consumed);
@@ -426,9 +438,7 @@ impl<'a> ResponseCursor<'a> {
         framer.update(&io_buffer[..status_line_end]);
         let frame = framer
             .split_chunk(&io_buffer[status_line_end..total_len], packed_policy)
-            .map(|progress| {
-                progress.in_window(crate::protocol::FrameEnd::new(status_line_end), total_len)
-            })?;
+            .map(|progress| progress.in_window(WindowOffset::new(status_line_end), total_len))?;
         Ok(Self {
             conn,
             io_buffer,
@@ -2045,7 +2055,7 @@ impl MultilineFramer {
         suffix_policy: PackedPendingBytesPolicy,
     ) -> Result<ResponseWindow, FramingError> {
         self.split_chunk(chunk, suffix_policy)
-            .map(|progress| progress.in_window(crate::protocol::FrameEnd::new(0), chunk.len()))
+            .map(|progress| progress.in_window(WindowOffset::new(0), chunk.len()))
     }
 
     #[cfg(test)]
@@ -2066,7 +2076,7 @@ impl MultilineFramer {
         appended: crate::pool::buffer::AppendedRead<'_>,
         suffix_policy: PackedPendingBytesPolicy,
     ) -> Result<ResponseWindow, FramingError> {
-        let origin = crate::protocol::FrameEnd::new(appended.previous_len());
+        let origin = WindowOffset::new(appended.previous_len());
         let new_bytes = appended.as_new_bytes();
         self.split_chunk(new_bytes, suffix_policy)
             .map(|progress| progress.in_window(origin, origin.get() + new_bytes.len()))
@@ -4461,7 +4471,7 @@ mod contracts {
     use super::*;
 
     fn chunk_coordinate() {
-        let origin = crate::protocol::FrameEnd::new(12);
+        let origin = WindowOffset::new(12);
         let consumed = ChunkConsumed(3);
         #[cfg(response_contract = "chunk_coordinate")]
         let consumed = crate::protocol::FrameEnd::new(consumed.0);
