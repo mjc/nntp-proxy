@@ -520,6 +520,16 @@ mod tests {
     }
 
     #[test]
+    fn article_frame_range_rejects_reversed_bounds() {
+        let start = 8;
+        let end = 7;
+        assert_eq!(
+            ArticleFrameRange::new(start..end),
+            Err(ParseError::BufferTooShort)
+        );
+    }
+
+    #[test]
     fn framed_layout_excludes_packed_response_suffix() {
         let frame = b"222 100 <test@example.com> body\r\nBody content\r\n";
         let suffix = b"223 1 <next@example.com>\r\n";
