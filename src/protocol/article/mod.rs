@@ -42,9 +42,37 @@ pub enum YencValidation {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ArticleLayout {
-    message_id: Range<usize>,
+    message_id: ArticleFrameRange,
     article_number: Option<u64>,
     content: ArticleContent,
+}
+
+/// A byte range inside the one immutable response owner that produced it.
+///
+/// Keeping article layout ranges opaque prevents a message-id range from being
+/// accidentally supplied where a header/body range is expected. Conversion to
+/// `Range<usize>` stays inside this module, at the byte-slicing boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ArticleFrameRange {
+    start: usize,
+    end: usize,
+}
+
+impl ArticleFrameRange {
+    fn new(range: Range<usize>) -> Self {
+        Self {
+            start: range.start,
+            end: range.end,
+        }
+    }
+
+    fn range(self) -> Range<usize> {
+        self.start..self.end
+    }
+
+    fn slice(self, buffer: &[u8]) -> Result<&[u8], ParseError> {
+        buffer.get(self.range()).ok_or(ParseError::BufferTooShort)
+    }
 }
 
 /// Article-family response shape. Keeping the alternatives explicit prevents
@@ -53,16 +81,16 @@ pub(crate) struct ArticleLayout {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ArticleContent {
     Article {
-        headers: Range<usize>,
+        headers: ArticleFrameRange,
         header_transformation: HeaderTransformation,
-        body: Range<usize>,
+        body: ArticleFrameRange,
     },
     Head {
-        headers: Range<usize>,
+        headers: ArticleFrameRange,
         header_transformation: HeaderTransformation,
     },
     Body {
-        body: Range<usize>,
+        body: ArticleFrameRange,
     },
     Stat,
 }
@@ -134,7 +162,7 @@ impl ArticleLayout {
         buf: &[u8],
         status: crate::protocol::StatusCode,
         first_line_end: usize,
-        message_id: Range<usize>,
+        message_id: ArticleFrameRange,
         article_number: Option<u64>,
         content_end: usize,
         reject_invalid_body: bool,
@@ -147,10 +175,10 @@ impl ArticleLayout {
         let content = match status.as_u16() {
             220 => {
                 let separator_pos = find_blank_line(framed, content_start)?;
-                let headers_range = content_start..separator_pos;
-                let header_transformation = Headers::validate(&framed[headers_range.clone()])?;
-                let body_range = separator_pos + 4..content_end;
-                if reject_invalid_body && framed[body_range.clone()].contains(&b'\0') {
+                let headers_range = ArticleFrameRange::new(content_start..separator_pos);
+                let header_transformation = Headers::validate(&framed[headers_range.range()])?;
+                let body_range = ArticleFrameRange::new(separator_pos + 4..content_end);
+                if reject_invalid_body && framed[body_range.range()].contains(&b'\0') {
                     return Err(ParseError::InvalidBody);
                 }
                 ArticleContent::Article {
@@ -163,16 +191,16 @@ impl ArticleLayout {
                 if find_blank_line(framed, content_start).is_ok() {
                     return Err(ParseError::UnexpectedBody);
                 }
-                let headers_range = content_start..content_end;
-                let header_transformation = Headers::validate(&framed[headers_range.clone()])?;
+                let headers_range = ArticleFrameRange::new(content_start..content_end);
+                let header_transformation = Headers::validate(&framed[headers_range.range()])?;
                 ArticleContent::Head {
                     headers: headers_range,
                     header_transformation,
                 }
             }
             222 => {
-                let body_range = content_start..content_end;
-                if reject_invalid_body && framed[body_range.clone()].contains(&b'\0') {
+                let body_range = ArticleFrameRange::new(content_start..content_end);
+                if reject_invalid_body && framed[body_range.range()].contains(&b'\0') {
                     return Err(ParseError::InvalidBody);
                 }
                 ArticleContent::Body { body: body_range }
@@ -200,7 +228,7 @@ impl ArticleLayout {
     pub(crate) fn validate_yenc(&self, buf: &[u8]) -> Result<(), ParseError> {
         let body = match &self.content {
             ArticleContent::Article { body, .. } | ArticleContent::Body { body } => {
-                &buf[body.clone()]
+                &buf[body.range()]
             }
             ArticleContent::Head { .. } | ArticleContent::Stat => return Ok(()),
         };
@@ -211,8 +239,12 @@ impl ArticleLayout {
     }
 
     pub(crate) fn view<'a>(&self, buf: &'a [u8]) -> Article<'a> {
-        let message_id = std::str::from_utf8(&buf[self.message_id.clone()])
-            .expect("validated message ID remains UTF-8");
+        let message_id = std::str::from_utf8(
+            self.message_id
+                .slice(buf)
+                .expect("validated message ID remains within its owner"),
+        )
+        .expect("validated message ID remains UTF-8");
         let (headers, body) = match &self.content {
             ArticleContent::Article {
                 headers,
@@ -220,22 +252,28 @@ impl ArticleLayout {
                 body,
             } => (
                 Some(Headers::from_validated(
-                    &buf[headers.clone()],
+                    &buf[headers.range()],
                     *header_transformation,
                 )),
-                Some(&buf[body.clone()]),
+                Some(&buf[body.range()]),
             ),
             ArticleContent::Head {
                 headers,
                 header_transformation,
             } => (
                 Some(Headers::from_validated(
-                    &buf[headers.clone()],
+                    &buf[headers.range()],
                     *header_transformation,
                 )),
                 None,
             ),
-            ArticleContent::Body { body } => (None, Some(&buf[body.clone()])),
+            ArticleContent::Body { body } => (
+                None,
+                Some(
+                    body.slice(buf)
+                        .expect("validated body remains within its owner"),
+                ),
+            ),
             ArticleContent::Stat => (None, None),
         };
         Article {
@@ -351,7 +389,7 @@ fn parse_status_code(buf: &[u8]) -> Result<u16, ParseError> {
 }
 
 /// Parse first line to extract the message-ID range and optional article number.
-fn parse_first_line_layout(line: &[u8]) -> Result<(Range<usize>, Option<u64>), ParseError> {
+fn parse_first_line_layout(line: &[u8]) -> Result<(ArticleFrameRange, Option<u64>), ParseError> {
     // Format: "220 <number> <message-id> ..." or "220 0 <message-id> ..."
 
     // Find first space (after status code)
@@ -385,7 +423,10 @@ fn parse_first_line_layout(line: &[u8]) -> Result<(Range<usize>, Option<u64>), P
         .map_err(|_| ParseError::InvalidMessageId("Invalid UTF-8 in message-id".to_string()))?;
     MessageId::from_borrowed(msg_id_str)?;
 
-    Ok((msg_id_start..msg_id_end, article_number))
+    Ok((
+        ArticleFrameRange::new(msg_id_start..msg_id_end),
+        article_number,
+    ))
 }
 
 /// Find end of line (\r in \r\n)
@@ -493,7 +534,7 @@ mod tests {
         assert_eq!(
             layout.content,
             ArticleContent::Body {
-                body: status_line_end..frame.len(),
+                body: ArticleFrameRange::new(status_line_end..frame.len()),
             }
         );
     }
