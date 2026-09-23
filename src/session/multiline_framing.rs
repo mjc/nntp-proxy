@@ -895,7 +895,7 @@ impl<'pool> BackendResponseExchange<'pool> {
     /// Taking the response out makes the transition one-shot.  The returned
     /// operation borrows this exchange's connection, so the connection cannot
     /// be released or replaced while framing/forwarding is in progress.
-    pub(crate) fn receiving(&mut self) -> anyhow::Result<ReceivingResponse<'_>> {
+    pub(crate) fn receiving(&mut self) -> anyhow::Result<Receiving<'_>> {
         let response = self
             .response
             .take()
@@ -1028,13 +1028,13 @@ impl ClassifiedResponse {
         conn: &'a mut crate::pool::ConnectionGuard,
         pool: &'a crate::pool::BufferPool,
         backend_id: crate::types::BackendId,
-    ) -> ReceivingResponse<'a> {
-        crate::protocol::ArticleState::new(Receiving {
+    ) -> Receiving<'a> {
+        Receiving {
             response: self,
             conn,
             pool,
             backend_id,
-        })
+        }
     }
 
     pub(crate) fn status_code(&self) -> Option<crate::protocol::StatusCode> {
@@ -1229,9 +1229,6 @@ pub(crate) struct Receiving<'a> {
     backend_id: crate::types::BackendId,
 }
 
-/// An active response operation bound to the connection that supplied it.
-pub(crate) type ReceivingResponse<'a> = crate::protocol::ArticleState<Receiving<'a>>;
-
 /// An intentionally captured response that retains the bytes produced by the
 /// framer. The status, request shape, and owner travel together.
 type CapturedResponse =
@@ -1386,58 +1383,6 @@ impl Receiving<'_> {
         }
         let result = result?;
         Ok(result)
-    }
-}
-
-impl crate::protocol::ArticleState<Receiving<'_>> {
-    #[must_use]
-    pub(crate) fn status_code(&self) -> Option<crate::protocol::StatusCode> {
-        self.as_inner().status_code()
-    }
-
-    pub(crate) async fn capture_isolated(self) -> anyhow::Result<CapturedResponse> {
-        self.into_inner().capture_isolated().await
-    }
-
-    pub(crate) async fn capture_isolated_chunked_optional(
-        self,
-        captured: &mut crate::pool::ChunkedResponse,
-    ) -> anyhow::Result<Option<CapturedChunkedResponse>> {
-        self.into_inner()
-            .capture_isolated_chunked_optional(captured)
-            .await
-    }
-
-    pub(crate) async fn observe_isolated(self) -> anyhow::Result<()> {
-        self.into_inner().observe_isolated().await
-    }
-
-    pub(crate) fn complete_single_line(self) -> anyhow::Result<()> {
-        self.into_inner().complete_single_line()
-    }
-
-    pub(crate) async fn write<W: AsyncWrite + Unpin>(
-        self,
-        writer: &mut W,
-    ) -> Result<u64, crate::session::response_transfer::ResponseTransferError> {
-        self.into_inner().write(writer).await
-    }
-
-    pub(crate) async fn observe(
-        self,
-    ) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
-        self.into_inner().observe().await
-    }
-
-    pub(crate) async fn capture_and_write<W: AsyncWrite + Unpin>(
-        self,
-        writer: &mut W,
-        captured: &mut crate::pool::ChunkedResponse,
-    ) -> Result<
-        (u64, Option<CapturedChunkedResponse>),
-        crate::session::response_transfer::ResponseTransferError,
-    > {
-        self.into_inner().capture_and_write(writer, captured).await
     }
 }
 

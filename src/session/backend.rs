@@ -24,7 +24,7 @@ pub(crate) use crate::session::multiline_framing::BackendResponseOrder;
 pub(crate) use crate::session::multiline_framing::BackendResponseExchange;
 #[cfg(test)]
 pub(crate) use crate::session::multiline_framing::ClassifiedResponse;
-pub(crate) use crate::session::multiline_framing::ReceivingResponse;
+pub(crate) use crate::session::multiline_framing::Receiving;
 pub(crate) use crate::session::multiline_framing::read_exchange_for_already_sent_request;
 
 /// Failure while reading a complete single-line backend reply into caller-owned
