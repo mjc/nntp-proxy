@@ -104,6 +104,12 @@ pub(crate) enum HeaderTransformation {
     Unfold,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidationSource {
+    Standalone,
+    FramedResponse,
+}
+
 impl ArticleLayout {
     pub(crate) fn parse(buf: &[u8]) -> Result<Self, ParseError> {
         let status =
@@ -121,7 +127,7 @@ impl ArticleLayout {
             message_id,
             article_number,
             buf.len(),
-            false,
+            ValidationSource::Standalone,
         )
     }
 
@@ -157,7 +163,7 @@ impl ArticleLayout {
             message_id,
             article_number,
             content_end,
-            true,
+            ValidationSource::FramedResponse,
         )
     }
 
@@ -168,7 +174,7 @@ impl ArticleLayout {
         message_id: ArticleFrameRange,
         article_number: Option<u64>,
         content_end: usize,
-        reject_invalid_body: bool,
+        validation_source: ValidationSource,
     ) -> Result<Self, ParseError> {
         let framed = buf.get(..content_end).ok_or(ParseError::BufferTooShort)?;
         let content_start = first_line_end
@@ -179,9 +185,18 @@ impl ArticleLayout {
             220 => {
                 let separator_pos = find_blank_line(framed, content_start)?;
                 let headers_range = ArticleFrameRange::new(content_start..separator_pos)?;
+                if validation_source == ValidationSource::FramedResponse
+                    && framed[headers_range.range()].contains(&b'\0')
+                {
+                    return Err(ParseError::InvalidHeader(
+                        "NUL byte in framed header".to_owned(),
+                    ));
+                }
                 let header_transformation = Headers::validate(&framed[headers_range.range()])?;
                 let body_range = ArticleFrameRange::new(separator_pos + 4..content_end)?;
-                if reject_invalid_body && framed[body_range.range()].contains(&b'\0') {
+                if validation_source == ValidationSource::FramedResponse
+                    && framed[body_range.range()].contains(&b'\0')
+                {
                     return Err(ParseError::InvalidBody);
                 }
                 ArticleContent::Article {
@@ -195,6 +210,13 @@ impl ArticleLayout {
                     return Err(ParseError::UnexpectedBody);
                 }
                 let headers_range = ArticleFrameRange::new(content_start..content_end)?;
+                if validation_source == ValidationSource::FramedResponse
+                    && framed[headers_range.range()].contains(&b'\0')
+                {
+                    return Err(ParseError::InvalidHeader(
+                        "NUL byte in framed header".to_owned(),
+                    ));
+                }
                 let header_transformation = Headers::validate(&framed[headers_range.range()])?;
                 ArticleContent::Head {
                     headers: headers_range,
@@ -203,7 +225,9 @@ impl ArticleLayout {
             }
             222 => {
                 let body_range = ArticleFrameRange::new(content_start..content_end)?;
-                if reject_invalid_body && framed[body_range.range()].contains(&b'\0') {
+                if validation_source == ValidationSource::FramedResponse
+                    && framed[body_range.range()].contains(&b'\0')
+                {
                     return Err(ParseError::InvalidBody);
                 }
                 ArticleContent::Body { body: body_range }
