@@ -46,6 +46,7 @@ Then edit `config.toml` so `[[servers]]` points at a real backend and connect yo
 - [Configuration](docs/operator/configuration.md)
 - [Caching](docs/operator/caching.md)
 - [Operations](docs/operator/operations.md)
+- [Protocol contract map](docs/protocol-contract.md)
 - [Development](docs/development.md)
 
 ## Example configs

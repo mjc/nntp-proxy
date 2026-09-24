@@ -75,19 +75,11 @@ impl<State> Article<State> {
         Self(state)
     }
 
-    pub(crate) const fn as_inner(&self) -> &State {
-        &self.0
-    }
-
     pub(crate) fn into_inner(self) -> State {
         self.0
     }
 }
 
-// These projections are consumed by the public `client::FramedArticle` facade.
-// The generic state is crate-private, so dead-code analysis cannot see those
-// external callers.
-#[allow(dead_code)]
 impl<B> Article<Framed<B>> {
     pub(crate) const fn kind(&self) -> RequestKind {
         self.0.kind()
@@ -95,10 +87,6 @@ impl<B> Article<Framed<B>> {
 
     pub(crate) const fn status(&self) -> StatusCode {
         self.0.status()
-    }
-
-    pub(crate) const fn status_line_end(&self) -> StatusLineEnd {
-        self.0.status_line_end()
     }
 
     pub(crate) const fn content_end(&self) -> ContentEnd {
@@ -112,8 +100,14 @@ impl<B> Article<Framed<B>> {
         self.0.bytes().as_slice()
     }
 
-    pub(crate) fn into_bytes(self) -> B {
-        self.0.into_bytes()
+    pub(crate) fn bytes(&self) -> &B {
+        self.0.bytes()
+    }
+}
+
+impl Article<Framed<crate::pool::ChunkedResponse>> {
+    pub(crate) fn iter_chunks(&self) -> impl Iterator<Item = &[u8]> {
+        self.0.bytes().iter_chunks()
     }
 }
 
@@ -381,5 +375,94 @@ mod tests {
             .expect("valid article");
         assert_eq!(validated.article().body, Some(&b"body\r\n"[..]));
         assert_eq!(validated.as_bytes(), bytes);
+    }
+
+    #[test]
+    fn framed_validation_retains_folded_header_transformation() {
+        let bytes: &[u8] =
+            b"220 1 <article@test> follows\r\nSubject: first\r\n second\r\n\r\n..wire-dot\r\n";
+        let status_line_end = StatusLineEnd::new(b"220 1 <article@test> follows\r\n".len());
+        let framed = Article::new(Framed::new(
+            bytes,
+            RequestKind::Article,
+            StatusCode::new(220),
+            status_line_end,
+            ContentEnd::new(bytes.len()),
+        ));
+
+        let validated = framed
+            .validate(YencValidation::Disabled)
+            .expect("valid folded article");
+        let article = validated.article();
+        let headers = article.headers.as_ref().expect("ARTICLE has headers");
+        assert_eq!(headers.as_bytes(), b"Subject: first\r\n second");
+        assert_eq!(headers.get("Subject"), Some(&b"first"[..]));
+        assert_eq!(headers.unfolded_bytes().as_ref(), b"Subject: first second");
+        assert_eq!(article.body, Some(&b"..wire-dot\r\n"[..]));
+    }
+
+    #[test]
+    fn framed_validation_rejects_nul_body_bytes() {
+        let bytes: &[u8] = b"222 1 <body@test> follows\r\nbad\0body\r\n";
+        let framed = Article::new(Framed::new(
+            bytes,
+            RequestKind::Body,
+            StatusCode::new(222),
+            StatusLineEnd::new(b"222 1 <body@test> follows\r\n".len()),
+            ContentEnd::new(bytes.len()),
+        ));
+
+        assert!(matches!(
+            framed.validate(YencValidation::Disabled),
+            Err(ParseError::InvalidBody)
+        ));
+    }
+
+    #[test]
+    fn framed_validation_rejects_nul_in_article_and_head_headers() {
+        let cases = [
+            (
+                b"220 1 <article@test> follows\r\nSubject: a\0b\r\n\r\nbody\r\n".as_slice(),
+                RequestKind::Article,
+                StatusCode::new(220),
+                StatusLineEnd::new(b"220 1 <article@test> follows\r\n".len()),
+                ParseError::InvalidHeader("NUL byte in framed header".to_owned()),
+            ),
+            (
+                b"221 1 <head@test> follows\r\nSubject: a\0b\r\n".as_slice(),
+                RequestKind::Head,
+                StatusCode::new(221),
+                StatusLineEnd::new(b"221 1 <head@test> follows\r\n".len()),
+                ParseError::InvalidHeader("NUL byte in framed header".to_owned()),
+            ),
+        ];
+
+        for (bytes, kind, status, status_line_end, expected_error) in cases {
+            let framed = Article::new(Framed::new(
+                bytes,
+                kind,
+                status,
+                status_line_end,
+                ContentEnd::new(bytes.len()),
+            ));
+
+            assert_eq!(
+                framed.validate(YencValidation::Disabled).unwrap_err(),
+                expected_error
+            );
+        }
+    }
+
+    #[test]
+    fn unframed_article_parser_preserves_nul_header_compatibility() {
+        let bytes: &[u8] = b"220 1 <article@test> follows\r\nSubject: a\0b\r\n\r\nbody\r\n";
+
+        let parsed = super::super::Article::parse(bytes, false)
+            .expect("standalone parsing remains permissive for NUL header values");
+
+        assert_eq!(
+            parsed.headers.expect("ARTICLE has headers").get("Subject"),
+            Some(&b"a\0b"[..])
+        );
     }
 }

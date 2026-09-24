@@ -291,7 +291,7 @@ async fn build_precheck_hit(
     request: &RequestContext,
     status_code: StatusCode,
     single_line_payload: Option<Box<[u8]>>,
-    response: crate::session::backend::ReceivingResponse<'_>,
+    response: crate::session::backend::Receiving<'_>,
 ) -> Result<PrecheckHit, ()> {
     if request.has_response_body(status_code) {
         return read_complete_precheck_hit(deps, status_code, response).await;
@@ -309,7 +309,7 @@ async fn build_precheck_hit(
 async fn read_complete_precheck_hit(
     deps: &OwnedDeps,
     status_code: StatusCode,
-    response: crate::session::backend::ReceivingResponse<'_>,
+    response: crate::session::backend::Receiving<'_>,
 ) -> Result<PrecheckHit, ()> {
     let mut captured = deps
         .cache

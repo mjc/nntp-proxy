@@ -1397,7 +1397,7 @@ impl ClientSession {
         &self,
         client_write: &mut W,
         backend_id: BackendId,
-        backend_bytes: crate::session::backend::ReceivingResponse<'_>,
+        backend_bytes: crate::session::backend::Receiving<'_>,
         context: ResponseWriteContext<'_>,
     ) -> Result<ResponseWriteResult, ResponseTransferError>
     where
@@ -1517,7 +1517,7 @@ impl ClientSession {
     async fn write_response_without_retention<W>(
         &self,
         client_write: &mut W,
-        backend_bytes: crate::session::backend::ReceivingResponse<'_>,
+        backend_bytes: crate::session::backend::Receiving<'_>,
     ) -> Result<u64, ResponseTransferError>
     where
         W: AsyncWrite + Unpin,
@@ -1528,7 +1528,7 @@ impl ClientSession {
     async fn write_response_with_retention<W>(
         &self,
         client_write: &mut W,
-        backend_bytes: crate::session::backend::ReceivingResponse<'_>,
+        backend_bytes: crate::session::backend::Receiving<'_>,
         params: ResponseWriteParams<'_>,
         backend_id: BackendId,
     ) -> Result<

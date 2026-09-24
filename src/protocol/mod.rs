@@ -32,6 +32,23 @@ pub use request::{
 };
 pub use response::StatusCode;
 
+/// Exclusive end of a complete response in its accumulated logical window.
+///
+/// The coordinate does not identify an allocation; the framer operation that
+/// carries it also owns the corresponding buffer and continuation state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FrameEnd(usize);
+
+impl FrameEnd {
+    pub(crate) const fn new(value: usize) -> Self {
+        Self(value)
+    }
+
+    pub(crate) const fn get(self) -> usize {
+        self.0
+    }
+}
+
 // This sibling module deliberately sits outside `article` so the negative
 // contract proves that layout fields cannot be constructed or rebound by a
 // caller that can name the crate-private state type but not its representation.

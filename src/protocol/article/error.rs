@@ -15,6 +15,9 @@ pub enum ParseError {
     #[error("HEAD response should not contain body")]
     UnexpectedBody,
 
+    #[error("Invalid article body")]
+    InvalidBody,
+
     #[error("Invalid yenc: {0}")]
     InvalidYenc(String),
 

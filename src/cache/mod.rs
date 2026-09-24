@@ -107,11 +107,8 @@ impl FramedChunkedResponse {
             crate::protocol::FramedArticleState<crate::pool::ChunkedResponse>,
         >,
     ) -> Self {
-        let payload_end = CachePayloadEnd::new(
-            state.as_inner().content_end().get(),
-            state.as_inner().bytes().len(),
-        )
-        .expect("framer established an in-bounds cache payload boundary");
+        let payload_end = CachePayloadEnd::new(state.content_end().get(), state.bytes().len())
+            .expect("framer established an in-bounds cache payload boundary");
         Self { state, payload_end }
     }
 
@@ -121,14 +118,14 @@ impl FramedChunkedResponse {
     {
         use tokio::io::AsyncWriteExt;
 
-        for chunk in self.state.as_inner().bytes().iter_chunks() {
+        for chunk in self.state.iter_chunks() {
             writer.write_all(chunk).await?;
         }
         Ok(())
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.state.as_inner().bytes().len()
+        self.state.bytes().len()
     }
 }
 
@@ -139,7 +136,7 @@ impl CacheIngestResponse {
             Self::Owned(buf) => buf.len(),
             Self::Pooled(buf) => buf.len(),
             Self::Chunked(buf) => buf.len(),
-            Self::FramedChunked(buf) => buf.state.as_inner().bytes().len(),
+            Self::FramedChunked(buf) => buf.state.bytes().len(),
             Self::Inline(buf) => buf.len(),
         }
     }
@@ -164,7 +161,7 @@ impl CacheIngestResponse {
                 buf.copy_prefix_into(3, &mut prefix);
                 StatusCode::parse(&prefix)
             }
-            Self::FramedChunked(buf) => Some(buf.state.as_inner().status()),
+            Self::FramedChunked(buf) => Some(buf.state.status()),
             Self::Inline(buf) => StatusCode::parse(buf),
         }
     }
@@ -178,9 +175,7 @@ impl PartialEq for CacheIngestResponse {
                 CacheIngestResponse::Owned(v) => Box::new(std::iter::once(v.as_ref())),
                 CacheIngestResponse::Pooled(v) => Box::new(std::iter::once(v.as_ref())),
                 CacheIngestResponse::Chunked(v) => Box::new(v.iter_chunks()),
-                CacheIngestResponse::FramedChunked(v) => {
-                    Box::new(v.state.as_inner().bytes().iter_chunks())
-                }
+                CacheIngestResponse::FramedChunked(v) => Box::new(v.state.iter_chunks()),
                 CacheIngestResponse::Inline(v) => Box::new(std::iter::once(v.as_slice())),
             }
         }

@@ -6,8 +6,6 @@
 //! If a response is incomplete, the same framer state is fed the next backend
 //! buffer until it can produce a typed complete or incomplete response chunk.
 
-#![allow(clippy::disallowed_methods)]
-
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ops::Range;
@@ -327,19 +325,26 @@ struct ChunkConsumed(usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChunkPayloadEnd(usize);
 
-/// Exclusive end in the current logical response window, independent of
-/// physical allocation placement. This coordinate alone does not identify a
-/// buffer.
+/// Exclusive origin of the logical response window supplied to one scanner
+/// push. It is not itself proof that a response is complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct FrameEnd(usize);
+struct WindowOffset(usize);
 
-impl FrameEnd {
-    fn after_chunk(self, consumed: ChunkConsumed) -> Self {
-        Self(self.0 + consumed.0)
+impl WindowOffset {
+    fn new(value: usize) -> Self {
+        Self(value)
     }
 
-    fn after_payload_chunk(self, payload_end: ChunkPayloadEnd) -> Self {
-        Self(self.0 + payload_end.0)
+    fn get(self) -> usize {
+        self.0
+    }
+
+    fn after_chunk(self, consumed: ChunkConsumed) -> crate::protocol::FrameEnd {
+        crate::protocol::FrameEnd::new(self.0 + consumed.0)
+    }
+
+    fn after_payload_chunk(self, payload_end: ChunkPayloadEnd) -> crate::protocol::FrameEnd {
+        crate::protocol::FrameEnd::new(self.0 + payload_end.0)
     }
 }
 
@@ -358,14 +363,14 @@ enum ChunkProgress {
 impl ChunkProgress {
     // Translation lives here; operation contexts supply the origin from their
     // own buffer-bound append result, never from an application caller.
-    fn in_window(self, origin: FrameEnd, window_len: usize) -> ResponseWindow {
+    fn in_window(self, origin: WindowOffset, window_len: usize) -> ResponseWindow {
         match self {
             Self::Complete(complete) => {
                 let end = origin.after_chunk(complete.consumed);
                 ResponseWindow::Complete(CompleteResponseWindow {
-                    response: 0..end.0,
-                    capture: 0..origin.after_payload_chunk(complete.payload_end).0,
-                    next_response_input: end.0..window_len,
+                    response: 0..end.get(),
+                    capture: 0..origin.after_payload_chunk(complete.payload_end).get(),
+                    next_response_input: end.get()..window_len,
                 })
             }
             Self::Incomplete => ResponseWindow::Incomplete(IncompleteResponseWindow {
@@ -433,7 +438,7 @@ impl<'a> ResponseCursor<'a> {
         framer.update(&io_buffer[..status_line_end]);
         let frame = framer
             .split_chunk(&io_buffer[status_line_end..total_len], packed_policy)
-            .map(|progress| progress.in_window(FrameEnd(status_line_end), total_len))?;
+            .map(|progress| progress.in_window(WindowOffset::new(status_line_end), total_len))?;
         Ok(Self {
             conn,
             io_buffer,
@@ -890,7 +895,7 @@ impl<'pool> BackendResponseExchange<'pool> {
     /// Taking the response out makes the transition one-shot.  The returned
     /// operation borrows this exchange's connection, so the connection cannot
     /// be released or replaced while framing/forwarding is in progress.
-    pub(crate) fn receiving(&mut self) -> anyhow::Result<ReceivingResponse<'_>> {
+    pub(crate) fn receiving(&mut self) -> anyhow::Result<Receiving<'_>> {
         let response = self
             .response
             .take()
@@ -1023,13 +1028,13 @@ impl ClassifiedResponse {
         conn: &'a mut crate::pool::ConnectionGuard,
         pool: &'a crate::pool::BufferPool,
         backend_id: crate::types::BackendId,
-    ) -> ReceivingResponse<'a> {
-        crate::protocol::ArticleState::new(Receiving {
+    ) -> Receiving<'a> {
+        Receiving {
             response: self,
             conn,
             pool,
             backend_id,
-        })
+        }
     }
 
     pub(crate) fn status_code(&self) -> Option<crate::protocol::StatusCode> {
@@ -1224,9 +1229,6 @@ pub(crate) struct Receiving<'a> {
     backend_id: crate::types::BackendId,
 }
 
-/// An active response operation bound to the connection that supplied it.
-pub(crate) type ReceivingResponse<'a> = crate::protocol::ArticleState<Receiving<'a>>;
-
 /// An intentionally captured response that retains the bytes produced by the
 /// framer. The status, request shape, and owner travel together.
 type CapturedResponse =
@@ -1256,7 +1258,7 @@ impl CapturedChunkedResponse {
             status_line_end,
             content_end,
         ));
-        debug_assert_eq!(state.as_inner().content_end().get(), payload_end.as_usize());
+        debug_assert_eq!(state.content_end().get(), payload_end.as_usize());
         state
     }
 
@@ -1265,7 +1267,7 @@ impl CapturedChunkedResponse {
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.as_inner().bytes().len()
+        self.bytes().len()
     }
 }
 
@@ -1381,58 +1383,6 @@ impl Receiving<'_> {
         }
         let result = result?;
         Ok(result)
-    }
-}
-
-impl crate::protocol::ArticleState<Receiving<'_>> {
-    #[must_use]
-    pub(crate) fn status_code(&self) -> Option<crate::protocol::StatusCode> {
-        self.as_inner().status_code()
-    }
-
-    pub(crate) async fn capture_isolated(self) -> anyhow::Result<CapturedResponse> {
-        self.into_inner().capture_isolated().await
-    }
-
-    pub(crate) async fn capture_isolated_chunked_optional(
-        self,
-        captured: &mut crate::pool::ChunkedResponse,
-    ) -> anyhow::Result<Option<CapturedChunkedResponse>> {
-        self.into_inner()
-            .capture_isolated_chunked_optional(captured)
-            .await
-    }
-
-    pub(crate) async fn observe_isolated(self) -> anyhow::Result<()> {
-        self.into_inner().observe_isolated().await
-    }
-
-    pub(crate) fn complete_single_line(self) -> anyhow::Result<()> {
-        self.into_inner().complete_single_line()
-    }
-
-    pub(crate) async fn write<W: AsyncWrite + Unpin>(
-        self,
-        writer: &mut W,
-    ) -> Result<u64, crate::session::response_transfer::ResponseTransferError> {
-        self.into_inner().write(writer).await
-    }
-
-    pub(crate) async fn observe(
-        self,
-    ) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
-        self.into_inner().observe().await
-    }
-
-    pub(crate) async fn capture_and_write<W: AsyncWrite + Unpin>(
-        self,
-        writer: &mut W,
-        captured: &mut crate::pool::ChunkedResponse,
-    ) -> Result<
-        (u64, Option<CapturedChunkedResponse>),
-        crate::session::response_transfer::ResponseTransferError,
-    > {
-        self.into_inner().capture_and_write(writer, captured).await
     }
 }
 
@@ -2050,7 +2000,7 @@ impl MultilineFramer {
         suffix_policy: PackedPendingBytesPolicy,
     ) -> Result<ResponseWindow, FramingError> {
         self.split_chunk(chunk, suffix_policy)
-            .map(|progress| progress.in_window(FrameEnd(0), chunk.len()))
+            .map(|progress| progress.in_window(WindowOffset::new(0), chunk.len()))
     }
 
     #[cfg(test)]
@@ -2071,10 +2021,10 @@ impl MultilineFramer {
         appended: crate::pool::buffer::AppendedRead<'_>,
         suffix_policy: PackedPendingBytesPolicy,
     ) -> Result<ResponseWindow, FramingError> {
-        let origin = FrameEnd(appended.previous_len());
+        let origin = WindowOffset::new(appended.previous_len());
         let new_bytes = appended.as_new_bytes();
         self.split_chunk(new_bytes, suffix_policy)
-            .map(|progress| progress.in_window(origin, origin.0 + new_bytes.len()))
+            .map(|progress| progress.in_window(origin, origin.get() + new_bytes.len()))
     }
 
     /// Update tail with the last bytes from a chunk
@@ -2633,6 +2583,13 @@ fn find_spanning_terminator(
 
 #[cfg(test)]
 mod tests {
+    mod contract_fixtures {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/response_contract.rs"
+        ));
+    }
+
     use super::*;
     use crate::session::response_transfer::ResponseTransferError;
     use crate::types::BufferSize;
@@ -2641,6 +2598,17 @@ mod tests {
     use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    fn request_kind(shape: contract_fixtures::RequestShape) -> crate::protocol::RequestKind {
+        match shape {
+            contract_fixtures::RequestShape::Article => crate::protocol::RequestKind::Article,
+            contract_fixtures::RequestShape::Body => crate::protocol::RequestKind::Body,
+            contract_fixtures::RequestShape::Head => crate::protocol::RequestKind::Head,
+            contract_fixtures::RequestShape::Stat => crate::protocol::RequestKind::Stat,
+            contract_fixtures::RequestShape::Group => crate::protocol::RequestKind::Group,
+            contract_fixtures::RequestShape::ListGroup => crate::protocol::RequestKind::ListGroup,
+        }
+    }
 
     const EXHAUSTIVE_BYTES: [u8; 4] = *b"\r\n.x";
 
@@ -2725,6 +2693,61 @@ mod tests {
 
     fn make_pool() -> crate::pool::BufferPool {
         crate::pool::BufferPool::new(BufferSize::try_new(65536).unwrap(), 2)
+    }
+
+    #[test]
+    fn shared_response_contract_cases_match_production_tracker() {
+        for case in contract_fixtures::CASES {
+            let mut packed = case.response.to_vec();
+            packed.extend_from_slice(case.suffix);
+
+            for chunk_bytes in 1..=packed.len() {
+                let mut tracker = BackendReplyTracker::default();
+                tracker.push_request(request_kind(case.request));
+                if let Some(next_request) = case.suffix_request {
+                    tracker.push_request(request_kind(next_request));
+                }
+
+                let mut forwarded = Vec::new();
+                let mut completed_count = 0;
+                for chunk in packed.chunks(chunk_bytes) {
+                    for output in tracker.accept_backend_bytes(chunk) {
+                        match output {
+                            BackendReplyBytes::CompletedTrackedReply(bytes) => {
+                                completed_count += 1;
+                                forwarded.extend_from_slice(bytes);
+                            }
+                            BackendReplyBytes::ForwardUntracked(bytes) => {
+                                forwarded.extend_from_slice(bytes);
+                            }
+                        }
+                    }
+                }
+
+                match case.disposition {
+                    contract_fixtures::Disposition::Complete => {
+                        assert_eq!(
+                            forwarded, packed,
+                            "{} at chunk size {chunk_bytes}",
+                            case.name
+                        );
+                        assert_eq!(
+                            completed_count,
+                            1 + usize::from(case.suffix_request.is_some()),
+                            "{} completion count at chunk size {chunk_bytes}",
+                            case.name
+                        );
+                    }
+                    contract_fixtures::Disposition::MalformedStatus => {
+                        assert_eq!(
+                            forwarded, case.response,
+                            "{} at chunk size {chunk_bytes}",
+                            case.name
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -4393,10 +4416,10 @@ mod contracts {
     use super::*;
 
     fn chunk_coordinate() {
-        let origin = FrameEnd(12);
+        let origin = WindowOffset::new(12);
         let consumed = ChunkConsumed(3);
         #[cfg(response_contract = "chunk_coordinate")]
-        let consumed = FrameEnd(consumed.0);
+        let consumed = crate::protocol::FrameEnd::new(consumed.0);
         std::hint::black_box(origin.after_chunk(consumed));
     }
 
