@@ -394,13 +394,10 @@ mod tests {
             .validate(YencValidation::Disabled)
             .expect("valid folded article");
         let article = validated.article();
-        assert_eq!(
-            article
-                .headers
-                .as_ref()
-                .and_then(|headers| headers.get("Subject")),
-            Some(&b"first second"[..])
-        );
+        let headers = article.headers.as_ref().expect("ARTICLE has headers");
+        assert_eq!(headers.as_bytes(), b"Subject: first\r\n second");
+        assert_eq!(headers.get("Subject"), Some(&b"first"[..]));
+        assert_eq!(headers.unfolded_bytes().as_ref(), b"Subject: first second");
         assert_eq!(article.body, Some(&b"..wire-dot\r\n"[..]));
     }
 

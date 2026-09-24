@@ -10,9 +10,10 @@ use std::borrow::Cow;
 /// - Header names: no spaces, ASCII printable except colon
 /// - Folded headers: continuation lines start with space/tab
 /// - Headers end with blank line (CRLF CRLF)
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Headers<'a> {
-    data: Cow<'a, [u8]>,
+    raw: &'a [u8],
+    transformation: super::HeaderTransformation,
 }
 
 impl<'a> Headers<'a> {
@@ -34,10 +35,8 @@ impl<'a> Headers<'a> {
 
     fn from_transformation(data: &'a [u8], transformation: super::HeaderTransformation) -> Self {
         Self {
-            data: match transformation {
-                super::HeaderTransformation::None => Cow::Borrowed(data),
-                super::HeaderTransformation::Unfold => unfold_continuations(data),
-            },
+            raw: data,
+            transformation,
         }
     }
 
@@ -154,14 +153,14 @@ impl<'a> Headers<'a> {
     /// # Returns
     /// Header value slice (trimmed leading/trailing whitespace) or None
     #[must_use]
-    pub fn get(&self, name: &str) -> Option<&[u8]> {
+    pub fn get(&self, name: &str) -> Option<&'a [u8]> {
         let lookup = name.as_bytes();
         let mut pos = 0;
 
-        while pos < self.data.as_ref().len() {
+        while pos < self.raw.len() {
             // Find line end
-            let line_end = Self::find_line_end(self.data.as_ref(), pos).ok()?;
-            let line = &self.data.as_ref()[pos..line_end];
+            let line_end = Self::find_line_end(self.raw, pos).ok()?;
+            let line = &self.raw[pos..line_end];
 
             if line.is_empty() {
                 pos = line_end + 2;
@@ -203,17 +202,30 @@ impl<'a> Headers<'a> {
 
     /// Iterate over all headers (zero-copy)
     #[must_use]
-    pub fn iter(&self) -> HeaderIter<'_> {
+    pub const fn iter(&self) -> HeaderIter<'a> {
         HeaderIter {
-            data: self.data.as_ref(),
+            data: self.raw,
             pos: 0,
         }
     }
 
     /// Get raw header bytes
     #[must_use]
-    pub fn as_bytes(&self) -> &[u8] {
-        self.data.as_ref()
+    pub const fn as_bytes(&self) -> &'a [u8] {
+        self.raw
+    }
+
+    /// Materialize RFC 5322 unfolding for the logical header block.
+    ///
+    /// Validated article views retain the wire bytes and transformation
+    /// requirement without allocating. The allocation for folded headers is
+    /// deferred until a caller explicitly asks for the unfolded block.
+    #[must_use]
+    pub fn unfolded_bytes(&self) -> Cow<'a, [u8]> {
+        match self.transformation {
+            super::HeaderTransformation::None => Cow::Borrowed(self.raw),
+            super::HeaderTransformation::Unfold => unfold_continuations(self.raw),
+        }
     }
 }
 
@@ -226,11 +238,9 @@ fn unfold_continuations(data: &[u8]) -> Cow<'_, [u8]> {
             && data[pos + 1] == b'\n'
             && matches!(data[pos + 2], b' ' | b'\t')
         {
-            unfolded.push(b' ');
-            pos += 3;
-            while pos < data.len() && matches!(data[pos], b' ' | b'\t') {
-                pos += 1;
-            }
+            // RFC 5322 unfolding removes only CRLF; preserve the WSP that
+            // begins the continuation line.
+            pos += 2;
         } else {
             unfolded.push(data[pos]);
             pos += 1;
@@ -239,9 +249,9 @@ fn unfold_continuations(data: &[u8]) -> Cow<'_, [u8]> {
     Cow::Owned(unfolded)
 }
 
-impl<'data, 'headers> IntoIterator for &'headers Headers<'data> {
-    type Item = (&'headers [u8], &'headers [u8]);
-    type IntoIter = HeaderIter<'headers>;
+impl<'a> IntoIterator for &Headers<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+    type IntoIter = HeaderIter<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -343,5 +353,27 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].0, b"Subject");
         assert_eq!(items[0].1, b"Test");
+    }
+
+    #[test]
+    fn raw_and_unfolded_header_bytes_have_distinct_contracts() {
+        let raw = b"Subject: first\r\n \t second\r\n";
+        let headers = Headers::parse(raw).unwrap();
+        let copied = headers;
+
+        assert_eq!(headers.as_bytes(), raw);
+        assert_eq!(copied.as_bytes(), raw);
+        assert_eq!(
+            headers.unfolded_bytes().as_ref(),
+            b"Subject: first \t second\r\n"
+        );
+    }
+
+    #[test]
+    fn plain_unfolded_headers_borrow_the_wire_bytes() {
+        let raw = b"Subject: first\r\n";
+        let headers = Headers::parse(raw).unwrap();
+
+        assert!(matches!(headers.unfolded_bytes(), Cow::Borrowed(bytes) if bytes == raw));
     }
 }

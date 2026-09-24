@@ -667,10 +667,10 @@ not-a-complete-yenc-body\r\n";
     fn compatibility_fixture_matrix_preserves_proxy_wire_sections() {
         let folded = b"220 0 <folded@example.com>\r\nSubject: first\r\n second\r\n\r\nbody\r\n";
         let folded_article = Article::parse(folded, false).unwrap();
-        assert_eq!(
-            folded_article.headers.unwrap().get("Subject"),
-            Some(&b"first second"[..])
-        );
+        let headers = folded_article.headers.unwrap();
+        assert_eq!(headers.as_bytes(), b"Subject: first\r\n second");
+        assert_eq!(headers.get("Subject"), Some(&b"first"[..]));
+        assert_eq!(headers.unfolded_bytes().as_ref(), b"Subject: first second");
 
         let stuffed = b"222 0 <stuffed@example.com>\r\n..wire-dot\r\n";
         let stuffed_article = Article::parse(stuffed, false).unwrap();

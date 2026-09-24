@@ -124,13 +124,14 @@ malformed-status compatibility case.
 
 ## What the branch tests prove
 
-The shared fixture is not a parser-only test. Each repository feeds the cases
-through its production response boundary and checks the resulting status,
-response shape, framed bytes, and retained suffix. The cases deliberately
-include every split position for small frames, one-byte fragments, packed
-responses, an incomplete following response, empty multiline content, and the
-same status code under different request contexts. Article cases additionally
-cover dot-stuffed bodies, folded headers, and malformed content.
+The proxy's `shared_response_contract_cases_match_production_tracker` test
+feeds each fixture through `BackendReplyTracker` at every chunk size from one
+byte through the full packed input. For complete fixtures it asserts that
+forwarded bytes equal the packed input and that the expected number of replies
+completed; for the malformed-status fixture it asserts that the input bytes
+are forwarded. It does not separately assert parsed status, response shape, or
+retained suffix, nor does this fixture include an incomplete following
+response or malformed article content.
 
 The nntpbench tests exercise the buffered receiver's complete operation: it
 owns the pending bytes and decoder, translates chunk progress internally,

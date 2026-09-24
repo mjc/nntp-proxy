@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Added explicit RFC 5322 unfolded-header access through `Headers::unfolded_bytes()` while keeping `Headers::as_bytes()` tied to the original wire bytes.
+
 ## [0.5.2] - 2026-06-11
 
 ### Added
