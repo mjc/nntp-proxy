@@ -129,14 +129,14 @@
 
       gungraunRunner = pkgs.rustPlatform.buildRustPackage rec {
         pname = "gungraun-runner";
-        version = "0.19.4";
+        version = "0.20.0";
         src = pkgs.fetchFromGitHub {
           owner = "gungraun";
           repo = "gungraun";
           rev = "v${version}";
-          hash = "sha256-KWQ4wMNIdKY9FTmPd9ZdlSuCpQQBFhIKD2Ereo3JQaI=";
+          hash = "sha256-sjHAcdBONdMpbpZkgFPeFfE6H46Jr9uPtWVegAPH3BA=";
         };
-        cargoHash = "sha256-+3toaUDLCmExC3EvNv1GEdUbHSBeShurp2Y+zvE/t0k=";
+        cargoHash = "sha256-+7z3VSBR0o5B5pg/hbVDqaR1/higLPsxfHGygHG6eXg=";
         cargoBuildFlags = ["-p" pname];
         cargoInstallFlags = ["-p" pname];
         doCheck = false;
