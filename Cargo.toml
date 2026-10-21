@@ -82,10 +82,10 @@ derive_more = { version = "2.1", features = ["deref", "deref_mut", "display", "f
 
 # TLS dependencies - use ring for smaller binaries (pure Rust, no C dependencies)
 tokio-rustls = { version = "0.26", features = ["early-data", "ring"], default-features = false }  # TLS with ring only
-rustls = { version = "0.23", features = ["ring", "std"], default-features = false }  # Pure Rust TLS with ring only
+rustls = { version = "0.23.46", features = ["ring", "std"], default-features = false }  # Pure Rust TLS with ring only
 rustls-native-certs = "0.8"  # Load system CA certificates
 rustls-pki-types = "1.14"  # PKI types for rustls
-webpki-roots = "1.0.7"  # Mozilla CA certificate bundle fallback
+webpki-roots = "1.0.10"  # Mozilla CA certificate bundle fallback
 crc32fast = "1.5.0"
 yenc = "0.2.2"  # yEnc encoding/decoding - faster and more correct than custom impl
 bytesize = { version = "2.3.1", features = ["serde"] }
