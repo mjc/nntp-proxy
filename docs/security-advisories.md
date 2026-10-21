@@ -22,7 +22,7 @@ The remaining ignored advisories concern `bincode 1` and `paste`, which Foyer
 0.22.6 still requires for cache serialization and internal code generation.
 Recheck these paths when updating Foyer and remove an ignore when the affected
 crate leaves the dependency graph. Gungraun 0.20 no longer needs the old
-`proc-macro-error3` exception.
+`proc-macro-error2` exception.
 
 For dependency maintenance, run the advisory checks during normal PR validation
 and periodically run:
