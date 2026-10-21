@@ -23,7 +23,8 @@ fn benchmark_cache() -> (tokio::runtime::Runtime, TempDir, UnifiedCache) {
     let directory = tempdir().expect("benchmark cache directory");
     let config = HybridCacheConfig {
         memory_capacity: 4 * 1024 * 1024,
-        disk_capacity: 64 * 1024 * 1024,
+        // Leave spare blocks after the four flushers reserve their active blocks.
+        disk_capacity: 1024 * 1024 * 1024,
         disk_path: directory.path().to_path_buf(),
         ttl: Duration::from_secs(300),
         compression: nntp_proxy::config::CompressionCodec::None,

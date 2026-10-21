@@ -11,18 +11,11 @@ all-features = true
 version = 2
 yanked = "deny"
 ignore = [
-  # Runtime via foyer 0.22.3 and dev-only via iai-callgrind 0.16.1.
-  # Keep iai-callgrind for deterministic perf benches. Revisit by 2026-09-15
-  # or on foyer/iai-callgrind upgrade. Upstream: https://github.com/foyer-rs/foyer
-  # and https://github.com/iai-callgrind/iai-callgrind.
+  # Recheck on Foyer releases: https://github.com/foyer-rs/foyer.
+  # Foyer 0.22.6 still requires bincode 1.x for cache serialization.
   "RUSTSEC-2025-0141",
-  # Runtime via foyer 0.22.3. Revisit by 2026-09-15 or on foyer upgrade.
-  # Upstream: https://github.com/foyer-rs/foyer.
+  # Foyer-memory 0.22.6 still uses paste to generate cache internals.
   "RUSTSEC-2024-0436",
-  # Dev-only via iai-callgrind 0.16.1 macro support.
-  # Keep iai-callgrind for deterministic perf benches. Revisit by 2026-09-15
-  # or on iai-callgrind upgrade. Upstream: https://github.com/iai-callgrind/iai-callgrind.
-  "RUSTSEC-2026-0173",
 ]
 
 [licenses]
