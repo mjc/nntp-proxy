@@ -11,6 +11,7 @@ all-features = true
 version = 2
 yanked = "deny"
 ignore = [
+  # Recheck on Foyer releases: https://github.com/foyer-rs/foyer.
   # Foyer 0.22.6 still requires bincode 1.x for cache serialization.
   "RUSTSEC-2025-0141",
   # Foyer-memory 0.22.6 still uses paste to generate cache internals.
