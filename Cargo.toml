@@ -2,7 +2,7 @@
 name = "nntp-proxy"
 version = "0.5.2"
 edition = "2024"
-rust-version = "1.91"
+rust-version = "1.95"
 description = "NNTP proxy server with per-command backend multiplexing, caching, metrics, and TUI dashboard"
 license = "MIT"
 repository = "https://github.com/mjc/nntp-proxy"
