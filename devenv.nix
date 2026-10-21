@@ -1,7 +1,21 @@
-{ pkgs, lib, ... }:
+{ config, pkgs, lib, ... }:
 
 let
   linux = pkgs.stdenv.hostPlatform.isLinux;
+  rustToolchain = config.languages.rust.toolchainPackage;
+  llvmTools = "${rustToolchain}/lib/rustlib/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/bin";
+  # Nixpkgs' compiler and profiling runtime disagree; use one complete toolchain.
+  cargoLlvmCov = (pkgs.cargo-llvm-cov.override {
+    rustPlatform = pkgs.makeRustPlatform {
+      cargo = rustToolchain;
+      rustc = rustToolchain;
+    };
+  }).overrideAttrs (old: {
+    env = old.env // {
+      LLVM_COV = "${llvmTools}/llvm-cov";
+      LLVM_PROFDATA = "${llvmTools}/llvm-profdata";
+    };
+  });
 in
 {
   languages.rust = {
@@ -22,7 +36,7 @@ in
       cargo-mutants
       cargo-careful
       cargo-outdated
-      cargo-llvm-cov
+      cargoLlvmCov
       shellcheck
       actionlint
       zizmor
