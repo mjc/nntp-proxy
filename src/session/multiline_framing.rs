@@ -2443,6 +2443,57 @@ pub(super) mod scanner_experiment {
             }
         }
 
+        pub fn new_yenc(decoded_len: usize, articles: usize) -> Self {
+            let mut random = 0x7ac3_85d1u32;
+            let decoded: Vec<u8> = (0..decoded_len)
+                .map(|_| {
+                    random ^= random << 13;
+                    random ^= random >> 17;
+                    random ^= random << 5;
+                    random.to_le_bytes()[0]
+                })
+                .collect();
+            let length = u64::try_from(decoded_len).expect("fixture length fits u64");
+            let mut bytes = Vec::new();
+            let mut checksum = 0usize;
+            for article in 0..articles {
+                bytes.extend_from_slice(
+                    format!("222 {article} <yenc-{article}@example.com>\r\n").as_bytes(),
+                );
+                yenc::EncodeOptions::new()
+                    .begin(1)
+                    .end(length)
+                    .encode_stream(
+                        std::io::Cursor::new(&decoded),
+                        &mut bytes,
+                        length,
+                        "scanner.bin",
+                    )
+                    .expect("encode binary fixture");
+                bytes.extend_from_slice(b".\r\n");
+                checksum = checksum.wrapping_add(bytes.len());
+            }
+            Self {
+                bytes,
+                expected: (articles, checksum),
+            }
+        }
+
+        pub fn first_read(&self, capacity: usize) -> Self {
+            Self::read_sample(&self.bytes[..self.bytes.len().min(capacity)])
+        }
+
+        pub fn final_read(&self, capacity: usize) -> Self {
+            Self::read_sample(&self.bytes[self.bytes.len().saturating_sub(capacity)..])
+        }
+
+        fn read_sample(data: &[u8]) -> Self {
+            Self {
+                bytes: data.to_vec(),
+                expected: benchmark_memchr_scanner(data),
+            }
+        }
+
         pub fn bytes(&self) -> &[u8] {
             &self.bytes
         }
@@ -2635,15 +2686,15 @@ pub(super) mod scanner_experiment {
         #[test]
         fn simd_scanners_match_at_every_lane_alignment_and_tail() {
             for len in 0usize..544 {
-                for alignment in 0..32 {
+                for alignment in 0..64 {
                     let storage = vec![b'x'; alignment + len];
                     check(&storage[alignment..]);
                 }
             }
             // Cover every candidate lane across two blocks, including matches
             // crossing each block end, without repeating every shorter prefix.
-            for len in [31usize, 67, 131, 259, 515] {
-                for alignment in 0..32 {
+            for len in [31usize, 68, 132, 260, 516] {
+                for alignment in 0..64 {
                     let mut storage = vec![b'x'; alignment + len];
                     for start in 0..len.saturating_sub(4) {
                         storage[alignment + start..alignment + start + 5]
@@ -2674,6 +2725,19 @@ pub(super) mod scanner_experiment {
                 assert_eq!(benchmark_cr_or_cursor_256(input.bytes()), input.expected());
                 assert_eq!(benchmark_lf_pair_64(input.bytes()), input.expected());
                 assert_eq!(benchmark_lf_pair_128(input.bytes()), input.expected());
+            }
+        }
+
+        #[test]
+        fn simd_scanners_match_encoded_articles_and_read_samples() {
+            for decoded_len in [1, 128, 716_800, 768_000] {
+                let input = ScannerBenchmarkInput::new_yenc(decoded_len, 2);
+                assert_eq!(benchmark_memchr_scanner(input.bytes()), input.expected());
+                check(input.bytes());
+                for capacity in [4096, 16 * 1024, 64 * 1024, 1024 * 1024] {
+                    check(input.first_read(capacity).bytes());
+                    check(input.final_read(capacity).bytes());
+                }
             }
         }
 
