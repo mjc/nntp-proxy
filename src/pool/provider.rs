@@ -862,7 +862,6 @@ impl DeadpoolConnectionProvider {
     /// Gracefully shutdown the pool
     pub async fn graceful_shutdown(&self) {
         use deadpool::managed::Object;
-        use tokio::io::AsyncWriteExt;
 
         self.shutdown();
 
@@ -887,9 +886,10 @@ impl DeadpoolConnectionProvider {
 
         shutdown_connections_concurrently(idle_connections, |mut conn| async move {
             // Timeout the write: a half-closed backend connection can block indefinitely
+            let request = crate::protocol::RequestContext::from_verb_args(b"QUIT", b"");
             let _ = tokio::time::timeout(
                 crate::constants::timeout::SHUTDOWN_QUIT_WRITE,
-                conn.write_all(b"QUIT\r\n"),
+                request.send_to(&mut conn),
             )
             .await;
         })
