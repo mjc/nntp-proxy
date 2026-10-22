@@ -2553,11 +2553,7 @@ pub(super) mod scanner_experiment {
     fn first_mask(window: &[u8; 20]) -> u16 {
         let mut mask = 0u16;
         for lane in 0..16 {
-            let matched = (window[lane] == b'\r')
-                & (window[lane + 1] == b'\n')
-                & (window[lane + 2] == b'.')
-                & (window[lane + 3] == b'\r')
-                & (window[lane + 4] == b'\n');
+            let matched = (window[lane] == b'\r') & (window[lane + 3] == b'\r');
             mask |= u16::from(matched) << lane;
         }
         mask
@@ -2567,9 +2563,13 @@ pub(super) mod scanner_experiment {
     fn first_match_mask(block: &[u8]) -> Option<usize> {
         let mut remaining = block;
         while let Some(window) = remaining.first_chunk::<20>() {
-            let mask = first_mask(window);
-            if mask != 0 {
-                return Some(block.len() - remaining.len() + mask.trailing_zeros() as usize);
+            let mut mask = first_mask(window);
+            while mask != 0 {
+                let lane = mask.trailing_zeros() as usize;
+                if window[lane..lane + TERMINATOR.len()] == *TERMINATOR {
+                    return Some(block.len() - remaining.len() + lane);
+                }
+                mask &= mask - 1;
             }
             remaining = &remaining[16..];
         }
