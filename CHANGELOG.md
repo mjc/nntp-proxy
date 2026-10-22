@@ -20,6 +20,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing
 
+- The E2E benchmark accepts `NNTPBENCH_SERVER_THREADS` and records the mock backend's worker count, so proxy scaling comparisons can keep backend capacity fixed.
 - Added adversarial framing properties for arbitrary fragmentation, packed responses, request-scoped response shapes, malformed and overlong statuses, capture and cache round trips, partial writes, backpressure, cancellation, hybrid handoff, and compressed pipelines.
 - Added scanner equivalence properties and ordered-framing benchmarks with encoded articles, mixed single-line/multiline streams, and 16 KiB through 16 MiB reads. All 2,431 tests pass, including a separate 4,096-case run of the scanner properties; none of the 168 paired ordered-framing comparisons has a median regression.
 
