@@ -35,6 +35,39 @@ pub(crate) fn empty_multiline_response_fixture(status: u16) -> Vec<u8> {
     response
 }
 
+#[cfg(test)]
+pub(crate) fn framing_pipeline_fixture(case: usize, body_len: usize) -> (Vec<u8>, Vec<u8>) {
+    let (request, status, multiline): (&[u8], &[u8], bool) = match case {
+        0 => (
+            b"ARTICLE <test@example.com>\r\n",
+            b"220 0 <test@example.com>\r\n",
+            true,
+        ),
+        1 => (
+            b"BODY <test@example.com>\r\n",
+            b"222 0 <test@example.com>\r\n",
+            true,
+        ),
+        2 => (
+            b"HEAD <test@example.com>\r\n",
+            b"221 0 <test@example.com>\r\n",
+            true,
+        ),
+        3 => (b"GROUP example\r\n", b"211 1 1 1 example\r\n", false),
+        4 => (b"LISTGROUP example\r\n", b"211 1 1 1 example\r\n", true),
+        _ => panic!("unknown pipeline fixture"),
+    };
+    let mut response = status.to_vec();
+    if multiline {
+        if body_len > 0 {
+            response.extend(std::iter::repeat_n(b'x', body_len));
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b".\r\n");
+    }
+    (request.to_vec(), response)
+}
+
 pub(crate) const CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE: &[u8] =
     b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nOVER\r\nHDR\r\n.\r\n";
 
@@ -645,6 +678,7 @@ struct PendingRequestFrame {
 #[derive(Debug)]
 enum PendingRequestFrameState {
     AwaitingStatusLine,
+    DiscardingOverlongStatusLine,
     ReadingMultiline { framer: MultilineFramer },
 }
 
@@ -2095,16 +2129,14 @@ impl MultilineFramer {
 
     /// Return the earliest terminator end offset touching the current chunk.
     ///
-    /// Unlike [`find_terminator_end`], this includes terminators split across the
-    /// framer's prior tail and `chunk`.
+    /// Includes terminators split across the framer's prior tail and `chunk`.
     #[must_use]
-    #[cfg(test)]
     fn next_terminator_end(&self, chunk: &[u8]) -> Option<usize> {
         // A spanning hit always ends within the first 4 bytes of `chunk`, while an
         // in-chunk terminator must end at byte 5 or later, so spanning-first is
         // also earliest-first.
         self.find_spanning_terminator(chunk)
-            .or_else(|| find_terminator_end_from(chunk, 0))
+            .or_else(|| terminator_ends_in_chunk(chunk).next())
     }
 
     /// Return the earliest terminator end offset, updating rolling state on miss.
@@ -2116,7 +2148,6 @@ impl MultilineFramer {
     /// should stop using this framer instance after `Some(_)` and start a fresh one
     /// for the next response.
     #[must_use]
-    #[cfg(test)]
     fn advance_to_next_terminator_end(&mut self, chunk: &[u8]) -> Option<usize> {
         let pos = self.next_terminator_end(chunk);
         if pos.is_none() {
@@ -2176,12 +2207,12 @@ impl PendingRequestFrame {
                     if self.status_line.len() + offset_bytes.len()
                         > crate::constants::buffer::COMMAND
                     {
-                        return Some(FramedResponseForRequest {
-                            response: BackendChunkRange::new(
-                                offset,
-                                BackendChunkEnd::new(chunk.len()),
-                            ),
-                        });
+                        // Keep memory bounded without completing a request in
+                        // the middle of its status line. The next request must
+                        // not consume the remainder of this malformed reply.
+                        self.status_line.clear();
+                        self.state = PendingRequestFrameState::DiscardingOverlongStatusLine;
+                        return None;
                     }
                     self.status_line.extend_from_slice(offset_bytes);
                     return None;
@@ -2211,38 +2242,30 @@ impl PendingRequestFrame {
                 let mut framer = MultilineFramer::default();
                 framer.update(self.status_line.as_slice());
                 self.status_line.clear();
-                match framer.split_chunk(
-                    &chunk[end.get()..],
-                    PackedPendingBytesPolicy::AllowIfStatusPrefix,
-                ) {
-                    Ok(ChunkProgress::Complete(complete)) => Some(FramedResponseForRequest {
+                // The next tracked request owns even an invalid status line.
+                match framer.advance_to_next_terminator_end(&chunk[end.get()..]) {
+                    Some(consumed) => Some(FramedResponseForRequest {
                         response: BackendChunkRange::new(
                             offset,
-                            BackendChunkEnd::new(end.get()).after(complete.consumed),
+                            end.after(ChunkConsumed(consumed)),
                         ),
                     }),
-                    Ok(ChunkProgress::Incomplete) => {
+                    None => {
                         self.state = PendingRequestFrameState::ReadingMultiline { framer };
                         None
                     }
-                    Err(_) => Some(FramedResponseForRequest {
-                        response: BackendChunkRange::new(offset, BackendChunkEnd::new(chunk.len())),
-                    }),
                 }
             }
-            PendingRequestFrameState::ReadingMultiline { framer } => {
-                match framer
-                    .split_chunk(offset_bytes, PackedPendingBytesPolicy::AllowIfStatusPrefix)
-                {
-                    Ok(ChunkProgress::Complete(complete)) => Some(FramedResponseForRequest {
-                        response: BackendChunkRange::new(offset, offset.after(complete.consumed)),
-                    }),
-                    Ok(ChunkProgress::Incomplete) => None,
-                    Err(_) => Some(FramedResponseForRequest {
-                        response: BackendChunkRange::new(offset, BackendChunkEnd::new(chunk.len())),
-                    }),
-                }
+            PendingRequestFrameState::DiscardingOverlongStatusLine => {
+                memchr::memchr(b'\n', offset_bytes).map(|pos| FramedResponseForRequest {
+                    response: BackendChunkRange::new(offset, offset.after(ChunkConsumed(pos + 1))),
+                })
             }
+            PendingRequestFrameState::ReadingMultiline { framer } => framer
+                .advance_to_next_terminator_end(offset_bytes)
+                .map(|consumed| FramedResponseForRequest {
+                    response: BackendChunkRange::new(offset, offset.after(ChunkConsumed(consumed))),
+                }),
         }
     }
 }
@@ -2323,6 +2346,20 @@ fn complete_multiline_payload_body(payload: &[u8]) -> Option<&[u8]> {
     complete_multiline_payload_split(payload).map(|split| &payload[split.body()])
 }
 
+/// Split already bounded ARTICLE content, including a headerless article's
+/// single blank line. The cache receives semantic sections without searching
+/// response bytes or mistaking a separator inside the body for the first one.
+pub(crate) fn captured_article_payload_sections(
+    payload: &[u8],
+) -> Option<(Range<usize>, Range<usize>)> {
+    if payload.starts_with(b"\r\n") {
+        Some((0..0, 2..payload.len()))
+    } else {
+        memchr::memmem::find(payload, b"\r\n\r\n")
+            .map(|split| (0..split + 2, split + 4..payload.len()))
+    }
+}
+
 /// Returns the captured semantic payload, retaining its final content CRLF and
 /// excluding only the dot terminator.
 #[must_use]
@@ -2353,9 +2390,765 @@ fn find_terminator_end(data: &[u8]) -> Option<usize> {
 
 #[inline]
 fn terminator_ends_in_chunk(data: &[u8]) -> impl Iterator<Item = usize> + '_ {
-    TERMINATOR_FINDER
-        .find_iter(data)
-        .map(|found| found + TERMINATOR.len())
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "avx2")
+    ))]
+    {
+        let mut remaining = data;
+        std::iter::from_fn(move || {
+            let start = vector_scanner::find(remaining)?;
+            remaining = &remaining[start + TERMINATOR.len()..];
+            Some(data.len() - remaining.len())
+        })
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "avx2")
+    )))]
+    {
+        TERMINATOR_FINDER
+            .find_iter(data)
+            .map(|found| found + TERMINATOR.len())
+    }
+}
+
+// Wider native vector code wins on the measured ARM and x86 targets. Generic
+// x86 keeps Finder's runtime dispatch rather than substituting an SSE scan.
+#[cfg(any(
+    test,
+    feature = "framing-bench",
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_feature = "avx2")
+))]
+mod vector_scanner {
+    use super::{TERMINATOR, TERMINATOR_FINDER};
+    // Keep candidate verification out of the vector loop's register allocation.
+    #[inline(never)]
+    pub(super) fn first_match(block: &[u8]) -> Option<usize> {
+        block
+            .windows(TERMINATOR.len())
+            .position(|bytes| bytes == TERMINATOR)
+    }
+
+    #[cfg(any(
+        test,
+        feature = "framing-bench",
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            not(target_feature = "avx512bw")
+        )
+    ))]
+    #[inline(always)]
+    pub(super) fn find_repeat<const WIDTH: usize, const FIRST: usize, const BYTE: u8>(
+        data: &[u8],
+    ) -> Option<usize> {
+        let mut offset = 0;
+        while data.len() - offset >= WIDTH + 4 {
+            let block = &data[offset..offset + WIDTH + 4];
+            let mut possible = false;
+            for lane in 0..WIDTH {
+                possible |= (block[lane + FIRST] == BYTE) & (block[lane + FIRST + 3] == BYTE);
+            }
+            if possible && let Some(lane) = first_match(block) {
+                return Some(offset + lane);
+            }
+            offset += WIDTH;
+        }
+        TERMINATOR_FINDER
+            .find(&data[offset..])
+            .map(|start| offset + start)
+    }
+
+    #[cfg(any(
+        test,
+        feature = "framing-bench",
+        target_arch = "aarch64",
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            target_feature = "avx512bw"
+        )
+    ))]
+    #[inline(always)]
+    pub(super) fn find_or<const WIDTH: usize, const FIRST: usize, const BYTE: u8>(
+        data: &[u8],
+        verify: impl Fn(&[u8]) -> Option<usize>,
+    ) -> Option<usize> {
+        let mut offset = 0;
+        while data.len() - offset >= WIDTH + 4 {
+            let block = &data[offset..offset + WIDTH + 4];
+            let mut possible = false;
+            for lane in 0..WIDTH {
+                // Repeated terminator bytes always pass; a verifier rejects
+                // any control-byte combinations admitted by the OR predicate.
+                possible |= (block[lane + FIRST] | block[lane + FIRST + 3]) == BYTE;
+            }
+            if possible && let Some(lane) = verify(block) {
+                return Some(offset + lane);
+            }
+            offset += WIDTH;
+        }
+        TERMINATOR_FINDER
+            .find(&data[offset..])
+            .map(|start| offset + start)
+    }
+
+    // Reject control-byte OR collisions in SIMD before the full verifier.
+    #[cfg(any(
+        test,
+        feature = "framing-bench",
+        target_arch = "aarch64",
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            target_feature = "avx512bw"
+        )
+    ))]
+    #[cfg_attr(
+        all(target_arch = "x86_64", target_feature = "avx512bw"),
+        inline(always)
+    )]
+    #[cfg_attr(
+        not(all(target_arch = "x86_64", target_feature = "avx512bw")),
+        inline(never)
+    )]
+    pub(super) fn exact_pair_match<const WIDTH: usize, const FIRST: usize, const BYTE: u8>(
+        block: &[u8],
+    ) -> Option<usize> {
+        let mut possible = false;
+        for lane in 0..WIDTH {
+            possible |= (block[lane + FIRST] == BYTE) & (block[lane + FIRST + 3] == BYTE);
+        }
+        if possible { first_match(block) } else { None }
+    }
+
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "avx2")
+    ))]
+    #[inline]
+    pub(super) fn find(data: &[u8]) -> Option<usize> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            find_or::<128, 0, b'\r'>(data, exact_pair_match::<128, 0, b'\r'>)
+        }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+        {
+            find_or::<256, 1, b'\n'>(data, exact_pair_match::<256, 1, b'\n'>)
+        }
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
+        {
+            find_repeat::<128, 0, b'\r'>(data)
+        }
+    }
+}
+
+#[cfg(any(test, feature = "framing-bench"))]
+pub(super) mod scanner_experiment {
+    use super::vector_scanner::{exact_pair_match, find_or, find_repeat, first_match};
+    use super::{TERMINATOR, TERMINATOR_FINDER};
+
+    pub struct ScannerBenchmarkInput {
+        bytes: Vec<u8>,
+        expected: (usize, usize),
+        requests: Option<Vec<(crate::protocol::RequestKind, usize)>>,
+    }
+
+    impl ScannerBenchmarkInput {
+        pub fn new(body_len: usize, articles: usize) -> Self {
+            let mut bytes = Vec::new();
+            let mut checksum = 0usize;
+            let mut requests = Vec::new();
+            let mut random = 0x7ac3_85d1u32;
+            for article in 0..articles {
+                bytes.extend_from_slice(
+                    format!("222 {article} <scanner-{article}@example.com>\r\n").as_bytes(),
+                );
+                let mut written = 0;
+                while written < body_len {
+                    let line_len = (body_len - written).min(128);
+                    for column in 0..line_len {
+                        random ^= random << 13;
+                        random ^= random >> 17;
+                        random ^= random << 5;
+                        // Varied printable bytes with ordinary dots and stuffed lines.
+                        let byte = if column == 0 && written % 4096 == 0 {
+                            b'.'
+                        } else {
+                            33 + u8::try_from(random % 94).expect("printable byte")
+                        };
+                        if column == 0 && byte == b'.' {
+                            bytes.push(b'.');
+                        }
+                        bytes.push(byte);
+                    }
+                    bytes.extend_from_slice(b"\r\n");
+                    written += line_len;
+                }
+                bytes.extend_from_slice(b".\r\n");
+                checksum = checksum.wrapping_add(bytes.len());
+                requests.push((crate::protocol::RequestKind::Body, bytes.len()));
+            }
+            Self {
+                bytes,
+                expected: (articles, checksum),
+                requests: Some(requests),
+            }
+        }
+
+        pub fn new_yenc(decoded_len: usize, articles: usize) -> Self {
+            let mut random = 0x7ac3_85d1u32;
+            let decoded: Vec<u8> = (0..decoded_len)
+                .map(|_| {
+                    random ^= random << 13;
+                    random ^= random >> 17;
+                    random ^= random << 5;
+                    random.to_le_bytes()[0]
+                })
+                .collect();
+            let length = u64::try_from(decoded_len).expect("fixture length fits u64");
+            let mut bytes = Vec::new();
+            let mut checksum = 0usize;
+            let mut requests = Vec::new();
+            for article in 0..articles {
+                bytes.extend_from_slice(
+                    format!("222 {article} <yenc-{article}@example.com>\r\n").as_bytes(),
+                );
+                yenc::EncodeOptions::new()
+                    .begin(1)
+                    .end(length)
+                    .encode_stream(
+                        std::io::Cursor::new(&decoded),
+                        &mut bytes,
+                        length,
+                        "scanner.bin",
+                    )
+                    .expect("encode binary fixture");
+                bytes.extend_from_slice(b".\r\n");
+                checksum = checksum.wrapping_add(bytes.len());
+                requests.push((crate::protocol::RequestKind::Body, bytes.len()));
+            }
+            Self {
+                bytes,
+                expected: (articles, checksum),
+                requests: Some(requests),
+            }
+        }
+
+        pub fn mixed_yenc(decoded_len: usize, articles: usize) -> Self {
+            use crate::protocol::RequestKind;
+            let article = Self::new_yenc(decoded_len, 1);
+            let mut bytes = Vec::new();
+            let mut checksum = 0usize;
+            let mut requests = Vec::new();
+            for _ in 0..articles {
+                for (reply, kind) in [
+                    (
+                        b"223 42 <stat@example.com>\r\n".as_slice(),
+                        RequestKind::Stat,
+                    ),
+                    (
+                        b"211 100 1 100 alt.binaries.test\r\n".as_slice(),
+                        RequestKind::Group,
+                    ),
+                    (b"430 No such article\r\n".as_slice(), RequestKind::Body),
+                ] {
+                    bytes.extend_from_slice(reply);
+                    requests.push((kind, bytes.len()));
+                }
+                bytes.extend_from_slice(article.bytes());
+                checksum = checksum.wrapping_add(bytes.len());
+                requests.push((RequestKind::Body, bytes.len()));
+                bytes.extend_from_slice(b"111 20261022120000\r\n");
+                requests.push((RequestKind::Date, bytes.len()));
+            }
+            Self {
+                bytes,
+                expected: (articles, checksum),
+                requests: Some(requests),
+            }
+        }
+
+        pub fn first_read(&self, capacity: usize) -> Self {
+            let mut sample = Self::read_sample(&self.bytes[..self.bytes.len().min(capacity)]);
+            sample.requests.clone_from(&self.requests);
+            sample
+        }
+
+        pub fn final_read(&self, capacity: usize) -> Self {
+            Self::read_sample(&self.bytes[self.bytes.len().saturating_sub(capacity)..])
+        }
+
+        fn read_sample(data: &[u8]) -> Self {
+            Self {
+                bytes: data.to_vec(),
+                expected: benchmark_memchr_scanner(data),
+                requests: None,
+            }
+        }
+
+        pub fn bytes(&self) -> &[u8] {
+            &self.bytes
+        }
+
+        pub fn expected(&self) -> (usize, usize) {
+            self.expected
+        }
+    }
+
+    pub fn benchmark_ordered_framing(
+        input: &ScannerBenchmarkInput,
+        chunk_size: usize,
+    ) -> (usize, usize) {
+        let requests = input
+            .requests
+            .as_ref()
+            .expect("ordered input must start with a response");
+        let mut order = super::BackendResponseOrder::default();
+        for &(kind, _) in requests {
+            order.push_request(kind);
+        }
+        let mut written = 0usize;
+        for chunk in input.bytes().chunks(chunk_size) {
+            for bytes in order.client_writes_for_backend_read(chunk) {
+                assert!(matches!(bytes, std::borrow::Cow::Borrowed(_)));
+                written += bytes.len();
+            }
+        }
+        let completed = requests.len() - order.inner.pending.len();
+        assert_eq!(written, input.bytes().len());
+        assert_eq!(
+            completed,
+            requests.iter().filter(|(_, end)| *end <= written).count()
+        );
+        (written, completed)
+    }
+
+    pub fn benchmark_production_scanner(data: &[u8]) -> (usize, usize) {
+        super::terminator_ends_in_chunk(data).fold((0, 0usize), |(count, sum), end| {
+            (count + 1, sum.wrapping_add(end))
+        })
+    }
+
+    pub fn benchmark_memchr_scanner(data: &[u8]) -> (usize, usize) {
+        TERMINATOR_FINDER
+            .find_iter(data)
+            .fold((0, 0usize), |(count, checksum), start| {
+                (count + 1, checksum.wrapping_add(start + TERMINATOR.len()))
+            })
+    }
+
+    fn scan(data: &[u8], find: impl Fn(&[u8]) -> Option<usize>) -> (usize, usize) {
+        let mut offset = 0;
+        let mut count = 0;
+        let mut checksum = 0usize;
+        while let Some(start) = find(&data[offset..]) {
+            offset += start + TERMINATOR.len();
+            count += 1;
+            checksum = checksum.wrapping_add(offset);
+        }
+        (count, checksum)
+    }
+
+    // Preserve candidate lanes as bytes so LLVM can retain both contiguous
+    // vector loads before the caller extracts their positions.
+    #[inline(never)]
+    fn candidate_lanes(window: &[u8; 20]) -> [u8; 16] {
+        let mut lanes = [0u8; 16];
+        for lane in 0..16 {
+            lanes[lane] = u8::from((window[lane] == b'\r') & (window[lane + 3] == b'\r'));
+        }
+        lanes
+    }
+
+    #[inline(never)]
+    fn first_match_mask(block: &[u8]) -> Option<usize> {
+        let mut remaining = block;
+        while let Some(window) = remaining.first_chunk::<20>() {
+            // One low bit per byte avoids packing lane bits into a u16.
+            let mut mask = u128::from_le_bytes(candidate_lanes(window));
+            while mask != 0 {
+                let lane = mask.trailing_zeros() as usize / 8;
+                if window[lane..lane + TERMINATOR.len()] == *TERMINATOR {
+                    return Some(block.len() - remaining.len() + lane);
+                }
+                mask &= mask - 1;
+            }
+            remaining = &remaining[16..];
+        }
+        TERMINATOR_FINDER
+            .find(remaining)
+            .map(|start| block.len() - remaining.len() + start)
+    }
+
+    fn find_repeat_mask<const WIDTH: usize>(data: &[u8]) -> Option<usize> {
+        let mut offset = 0;
+        while data.len() - offset >= WIDTH + 4 {
+            let block = &data[offset..offset + WIDTH + 4];
+            let mut possible = false;
+            for lane in 0..WIDTH {
+                possible |= (block[lane] == b'\r') & (block[lane + 3] == b'\r');
+            }
+            if possible && let Some(lane) = first_match_mask(block) {
+                return Some(offset + lane);
+            }
+            offset += WIDTH;
+        }
+        TERMINATOR_FINDER
+            .find(&data[offset..])
+            .map(|start| offset + start)
+    }
+
+    pub fn benchmark_cr_mask_128(data: &[u8]) -> (usize, usize) {
+        scan(data, find_repeat_mask::<128>)
+    }
+
+    pub fn benchmark_cr_mask_256(data: &[u8]) -> (usize, usize) {
+        scan(data, find_repeat_mask::<256>)
+    }
+
+    fn find_pair<const WIDTH: usize>(data: &[u8]) -> Option<usize> {
+        let mut offset = 0;
+        while data.len() - offset >= WIDTH + 4 {
+            let block = &data[offset..offset + WIDTH + 4];
+            let mut possible = false;
+            for lane in 0..WIDTH {
+                possible |= (block[lane] == b'\r') & (block[lane + 2] == b'.');
+            }
+            if possible && let Some(lane) = first_match(block) {
+                return Some(offset + lane);
+            }
+            offset += WIDTH;
+        }
+        TERMINATOR_FINDER
+            .find(&data[offset..])
+            .map(|start| offset + start)
+    }
+
+    fn find_or_cursor<const WIDTH: usize, const BLOCK: usize>(data: &[u8]) -> Option<usize> {
+        let mut remaining = data;
+        while let Some(block) = remaining.first_chunk::<BLOCK>() {
+            let mut possible = false;
+            for lane in 0..WIDTH {
+                possible |= (block[lane] | block[lane + 3]) == b'\r';
+            }
+            if possible && let Some(lane) = first_match(block) {
+                return Some(data.len() - remaining.len() + lane);
+            }
+            remaining = &remaining[WIDTH..];
+        }
+        TERMINATOR_FINDER
+            .find(remaining)
+            .map(|start| data.len() - remaining.len() + start)
+    }
+
+    pub fn benchmark_cr_or_verified_128(data: &[u8]) -> (usize, usize) {
+        scan(data, |data| {
+            find_or::<128, 0, b'\r'>(data, exact_pair_match::<128, 0, b'\r'>)
+        })
+    }
+
+    pub fn benchmark_cr_or_verified_256(data: &[u8]) -> (usize, usize) {
+        scan(data, |data| {
+            find_or::<256, 0, b'\r'>(data, exact_pair_match::<256, 0, b'\r'>)
+        })
+    }
+
+    pub fn benchmark_lf_or_128(data: &[u8]) -> (usize, usize) {
+        scan(data, |data| find_or::<128, 1, b'\n'>(data, first_match))
+    }
+
+    pub fn benchmark_lf_or_verified_128(data: &[u8]) -> (usize, usize) {
+        scan(data, |data| {
+            find_or::<128, 1, b'\n'>(data, exact_pair_match::<128, 1, b'\n'>)
+        })
+    }
+
+    pub fn benchmark_lf_or_256(data: &[u8]) -> (usize, usize) {
+        scan(data, |data| find_or::<256, 1, b'\n'>(data, first_match))
+    }
+
+    pub fn benchmark_lf_or_verified_256(data: &[u8]) -> (usize, usize) {
+        scan(data, |data| {
+            find_or::<256, 1, b'\n'>(data, exact_pair_match::<256, 1, b'\n'>)
+        })
+    }
+
+    pub fn benchmark_cr_or_cursor_128(data: &[u8]) -> (usize, usize) {
+        scan(data, find_or_cursor::<128, 132>)
+    }
+
+    pub fn benchmark_cr_or_cursor_256(data: &[u8]) -> (usize, usize) {
+        scan(data, find_or_cursor::<256, 260>)
+    }
+
+    pub fn benchmark_cr_or_128(data: &[u8]) -> (usize, usize) {
+        scan(data, |data| find_or::<128, 0, b'\r'>(data, first_match))
+    }
+
+    pub fn benchmark_cr_or_256(data: &[u8]) -> (usize, usize) {
+        scan(data, |data| find_or::<256, 0, b'\r'>(data, first_match))
+    }
+
+    pub fn benchmark_cr_dot_64(data: &[u8]) -> (usize, usize) {
+        scan(data, find_pair::<64>)
+    }
+
+    pub fn benchmark_cr_pair_64(data: &[u8]) -> (usize, usize) {
+        scan(data, find_repeat::<64, 0, b'\r'>)
+    }
+
+    pub fn benchmark_cr_pair_256(data: &[u8]) -> (usize, usize) {
+        scan(data, find_repeat::<256, 0, b'\r'>)
+    }
+
+    pub fn benchmark_cr_pair_128(data: &[u8]) -> (usize, usize) {
+        scan(data, find_repeat::<128, 0, b'\r'>)
+    }
+
+    pub fn benchmark_lf_pair_64(data: &[u8]) -> (usize, usize) {
+        scan(data, find_repeat::<64, 1, b'\n'>)
+    }
+
+    pub fn benchmark_lf_pair_128(data: &[u8]) -> (usize, usize) {
+        scan(data, find_repeat::<128, 1, b'\n'>)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn check(data: &[u8]) {
+            let expected = TERMINATOR_FINDER.find(data);
+            assert_eq!(
+                super::super::terminator_ends_in_chunk(data).next(),
+                expected.map(|start| start + TERMINATOR.len())
+            );
+            assert_eq!(
+                benchmark_production_scanner(data),
+                benchmark_memchr_scanner(data)
+            );
+            assert_eq!(
+                find_or::<128, 1, b'\n'>(data, first_match),
+                expected,
+                "LF OR128: {data:?}"
+            );
+            assert_eq!(
+                find_or::<128, 1, b'\n'>(data, exact_pair_match::<128, 1, b'\n'>),
+                expected,
+                "LF OR128: {data:?}"
+            );
+            assert_eq!(
+                find_or::<256, 1, b'\n'>(data, first_match),
+                expected,
+                "LF OR256: {data:?}"
+            );
+            assert_eq!(
+                find_or::<256, 1, b'\n'>(data, exact_pair_match::<256, 1, b'\n'>),
+                expected,
+                "LF OR256: {data:?}"
+            );
+            assert_eq!(first_match_mask(data), expected, "mask verifier: {data:?}");
+            assert_eq!(
+                find_repeat_mask::<128>(data),
+                expected,
+                "CR mask128: {data:?}"
+            );
+            assert_eq!(
+                find_repeat_mask::<256>(data),
+                expected,
+                "CR mask256: {data:?}"
+            );
+            assert_eq!(
+                find_or::<128, 0, b'\r'>(data, exact_pair_match::<128, 0, b'\r'>),
+                expected,
+                "verified OR128: {data:?}"
+            );
+            assert_eq!(
+                find_or::<256, 0, b'\r'>(data, exact_pair_match::<256, 0, b'\r'>),
+                expected,
+                "verified OR256: {data:?}"
+            );
+            assert_eq!(find_pair::<64>(data), expected, "CR/dot: {data:?}");
+            assert_eq!(
+                find_or::<128, 0, b'\r'>(data, first_match),
+                expected,
+                "CR OR128: {data:?}"
+            );
+            assert_eq!(
+                find_or::<256, 0, b'\r'>(data, first_match),
+                expected,
+                "CR OR256: {data:?}"
+            );
+            assert_eq!(
+                find_repeat::<256, 0, b'\r'>(data),
+                expected,
+                "CR256: {data:?}"
+            );
+            assert_eq!(
+                find_or_cursor::<128, 132>(data),
+                expected,
+                "CR OR128 cursor: {data:?}"
+            );
+            assert_eq!(
+                find_or_cursor::<256, 260>(data),
+                expected,
+                "CR OR256 cursor: {data:?}"
+            );
+            assert_eq!(
+                find_repeat::<64, 0, b'\r'>(data),
+                expected,
+                "CR64: {data:?}"
+            );
+            assert_eq!(
+                find_repeat::<128, 0, b'\r'>(data),
+                expected,
+                "CR128: {data:?}"
+            );
+            assert_eq!(
+                find_repeat::<64, 1, b'\n'>(data),
+                expected,
+                "LF64: {data:?}"
+            );
+            assert_eq!(
+                find_repeat::<128, 1, b'\n'>(data),
+                expected,
+                "LF128: {data:?}"
+            );
+        }
+
+        fn check_lane_alignments(alignments: std::ops::Range<usize>) {
+            for len in 0usize..544 {
+                for alignment in alignments.clone() {
+                    let storage = vec![b'x'; alignment + len];
+                    check(&storage[alignment..]);
+                }
+            }
+            // Cover every candidate lane across two blocks, including matches
+            // crossing each block end, without repeating every shorter prefix.
+            for len in [31usize, 68, 132, 260, 516] {
+                for alignment in alignments.clone() {
+                    let mut storage = vec![b'x'; alignment + len];
+                    for start in 0..len.saturating_sub(4) {
+                        storage[alignment + start..alignment + start + 5]
+                            .copy_from_slice(TERMINATOR);
+                        check(&storage[alignment..]);
+                        for byte in 0..5 {
+                            storage[alignment + start + byte] ^= 0x80;
+                            check(&storage[alignment..]);
+                            storage[alignment + start + byte] ^= 0x80;
+                        }
+                        storage[alignment + start..alignment + start + 5].fill(b'x');
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn simd_scanners_match_at_every_lane_alignment_and_tail() {
+            check_lane_alignments(0..16);
+        }
+
+        #[test]
+        fn simd_scanners_match_alignments_16_through_31() {
+            check_lane_alignments(16..32);
+        }
+
+        #[test]
+        fn simd_scanners_match_alignments_32_through_47() {
+            check_lane_alignments(32..48);
+        }
+
+        #[test]
+        fn simd_scanners_match_alignments_48_through_63() {
+            check_lane_alignments(48..64);
+        }
+
+        #[test]
+        fn simd_scanners_match_packed_stream_checksums() {
+            for len in [1, 15, 16, 17, 31, 64, 127, 128, 1024, 65536] {
+                let input = ScannerBenchmarkInput::new(len, 8);
+                assert_eq!(benchmark_memchr_scanner(input.bytes()), input.expected());
+                assert_eq!(benchmark_cr_dot_64(input.bytes()), input.expected());
+                assert_eq!(benchmark_cr_pair_64(input.bytes()), input.expected());
+                assert_eq!(benchmark_cr_pair_128(input.bytes()), input.expected());
+                assert_eq!(benchmark_cr_pair_256(input.bytes()), input.expected());
+                assert_eq!(benchmark_lf_or_128(input.bytes()), input.expected());
+                assert_eq!(benchmark_lf_or_256(input.bytes()), input.expected());
+                assert_eq!(
+                    benchmark_lf_or_verified_128(input.bytes()),
+                    input.expected()
+                );
+                assert_eq!(
+                    benchmark_lf_or_verified_256(input.bytes()),
+                    input.expected()
+                );
+
+                assert_eq!(benchmark_cr_mask_128(input.bytes()), input.expected());
+                assert_eq!(benchmark_cr_mask_256(input.bytes()), input.expected());
+                assert_eq!(benchmark_cr_or_128(input.bytes()), input.expected());
+                assert_eq!(benchmark_cr_or_256(input.bytes()), input.expected());
+                assert_eq!(
+                    benchmark_cr_or_verified_128(input.bytes()),
+                    input.expected()
+                );
+                assert_eq!(
+                    benchmark_cr_or_verified_256(input.bytes()),
+                    input.expected()
+                );
+                assert_eq!(benchmark_cr_or_cursor_128(input.bytes()), input.expected());
+                assert_eq!(benchmark_cr_or_cursor_256(input.bytes()), input.expected());
+                assert_eq!(benchmark_lf_pair_64(input.bytes()), input.expected());
+                assert_eq!(benchmark_lf_pair_128(input.bytes()), input.expected());
+            }
+        }
+
+        #[test]
+        fn simd_scanners_match_encoded_articles_and_read_samples() {
+            for decoded_len in [1, 128, 716_800, 768_000] {
+                let mixed = ScannerBenchmarkInput::mixed_yenc(decoded_len, 2);
+                for chunk_size in [1, 31, 16 * 1024, 1024 * 1024] {
+                    benchmark_ordered_framing(&mixed, chunk_size);
+                    benchmark_ordered_framing(
+                        &mixed.first_read(mixed.bytes().len() / 2),
+                        chunk_size,
+                    );
+                }
+                assert_eq!(benchmark_memchr_scanner(mixed.bytes()), mixed.expected());
+                check(mixed.bytes());
+                let input = ScannerBenchmarkInput::new_yenc(decoded_len, 2);
+                assert_eq!(benchmark_memchr_scanner(input.bytes()), input.expected());
+                check(input.bytes());
+                for capacity in [4096, 16 * 1024, 64 * 1024, 1024 * 1024] {
+                    check(input.first_read(capacity).bytes());
+                    check(input.final_read(capacity).bytes());
+                }
+            }
+        }
+
+        proptest::proptest! {
+            #[test]
+            fn simd_scanners_match_arbitrary_input(data in proptest::collection::vec(proptest::num::u8::ANY, 0..4096)) {
+                check(&data);
+            }
+
+            #[test]
+            fn simd_scanners_reject_or_predicate_false_positives(data in proptest::collection::vec(
+                proptest::sample::select(vec![0, 1, 2, 4, 5, 8, 9, 12, 13, b'\n', b'.', b'x']), 0..4096
+            )) {
+                check(&data);
+            }
+
+            #[test]
+            fn simd_scanners_match_dense_framing_bytes(data in proptest::collection::vec(
+                proptest::sample::select(vec![b'\r', b'\n', b'.', b'x']), 0..4096
+            )) {
+                check(&data);
+            }
+        }
+    }
 }
 
 #[cfg(feature = "framing-bench")]
@@ -2583,6 +3376,930 @@ mod tests {
 
     const EXHAUSTIVE_BYTES: [u8; 4] = *b"\r\n.x";
 
+    fn multiline_response_sequences() -> impl proptest::strategy::Strategy<Value = Vec<Vec<u8>>> {
+        use proptest::prelude::*;
+
+        prop::collection::vec(
+            (
+                prop::sample::select(vec![100, 101, 211, 215, 220, 221, 222, 224, 225, 230, 231]),
+                any::<bool>(),
+                prop::collection::vec(prop::collection::vec(0x20_u8..=0x7e, 0..24), 0..7),
+            ),
+            1..7,
+        )
+        .prop_map(|responses| {
+            let mut generated = responses
+                .into_iter()
+                .enumerate()
+                .map(|(index, (status, include_dot_lines, mut lines))| {
+                    let mut response = format!("{status:03} generated {index}\r\n").into_bytes();
+                    if include_dot_lines || index == 0 {
+                        lines.push(b".".to_vec());
+                        lines.push(b".leading dot".to_vec());
+                    }
+                    for line in lines {
+                        if line.first() == Some(&b'.') {
+                            response.push(b'.');
+                        }
+                        response.extend_from_slice(&line);
+                        response.extend_from_slice(b"\r\n");
+                    }
+                    response.extend_from_slice(b".\r\n");
+                    response
+                })
+                .collect::<Vec<_>>();
+            let mut responses = [100, 215]
+                .into_iter()
+                .enumerate()
+                .map(|(index, status)| {
+                    let mut response = format!("{status:03} empty {index}\r\n").into_bytes();
+                    response.extend_from_slice(b".\r\n");
+                    response
+                })
+                .collect::<Vec<_>>();
+            responses.append(&mut generated);
+            responses
+        })
+    }
+
+    mod adversarial_properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        #[derive(Clone, Debug)]
+        struct Reply {
+            command: &'static [u8],
+            wire: Vec<u8>,
+        }
+
+        fn body_lines() -> impl Strategy<Value = Vec<Vec<u8>>> {
+            prop::collection::vec(
+                prop::collection::vec(
+                    any::<u8>()
+                        .prop_filter("body line octet", |byte| !matches!(byte, b'\r' | b'\n')),
+                    0..48,
+                ),
+                0..5,
+            )
+        }
+
+        fn reply(case: usize, lines: Vec<Vec<u8>>) -> Reply {
+            // Protocol facts are independent of the production body classifier.
+            let (command, status, multiline): (&[u8], &[u8], bool) = match case {
+                0 => (b"GROUP example\r\n", b"211 selected\r\n", false),
+                1 => (b"LISTGROUP example\r\n", b"211 selected\r\n", true),
+                2 => (b"ARTICLE <missing@example>\r\n", b"430 missing\r\n", false),
+                3 => (b"BODY <a@example>\r\n", b"222 body\r\n", true),
+                4 => (b"STAT <a@example>\r\n", b"223 present\r\n", false),
+                5 => (b"XHDR subject 1-2\r\n", b"221 headers\r\n", true),
+                6 => (b"ARTICLE <a@example>\r\n", b"220 article\r\n", true),
+                7 => (b"HEAD <a@example>\r\n", b"221 head\r\n", true),
+                8 => (b"LIST\r\n", b"215 list\r\n", true),
+                9 => (b"CAPABILITIES\r\n", b"101 capabilities\r\n", true),
+                10 => (b"HELP\r\n", b"100 help\r\n", true),
+                11 => (b"OVER 1-2\r\n", b"224 overview\r\n", true),
+                12 => (b"XOVER 1-2\r\n", b"224 overview\r\n", true),
+                13 => (b"HDR subject 1-2\r\n", b"225 headers\r\n", true),
+                14 => (b"NEWNEWS * 20260101 000000\r\n", b"230 news\r\n", true),
+                15 => (b"NEWGROUPS 20260101 000000\r\n", b"231 groups\r\n", true),
+                16 => (b"BODY <a@example>\r\n", b"500 rejected\r\n", false),
+                17 => (b"BODY <a@example>\r\n", b"220 mismatched status\r\n", false),
+                18 => (b"XEXT\r\n", b"282 extension list\r\n", true),
+                19 => (b"GROUP missing\r\n", b"411 missing\r\n", false),
+                20 => (b"ARTICLE <a@example>\r\n", b"malformed status\r\n", false),
+                21 => (b"BODY <a@example>\r\n", b"\xff\0invalid status\r\n", false),
+                _ => unreachable!("generated reply case"),
+            };
+            let mut wire = status.to_vec();
+            if multiline {
+                for line in lines {
+                    if line.first() == Some(&b'.') {
+                        wire.push(b'.');
+                    }
+                    wire.extend_from_slice(&line);
+                    wire.extend_from_slice(b"\r\n");
+                }
+                wire.extend_from_slice(b".\r\n");
+            }
+            Reply { command, wire }
+        }
+
+        fn replies() -> impl Strategy<Value = Vec<Reply>> {
+            prop::collection::vec((0usize..22, body_lines()), 0..7).prop_map(|generated| {
+                let mut records = vec![
+                    reply(0, vec![]),
+                    reply(1, vec![]),
+                    reply(2, vec![]),
+                    reply(5, vec![b".".to_vec(), b".leading".to_vec()]),
+                    reply(21, vec![]),
+                ];
+                records.extend(
+                    generated
+                        .into_iter()
+                        .map(|(case, lines)| reply(case, lines)),
+                );
+                records.push(reply(3, vec![b".".to_vec(), vec![0, 255]]));
+                records
+            })
+        }
+
+        fn fragments<'a>(bytes: &'a [u8], seeds: &[usize]) -> Vec<&'a [u8]> {
+            let mut cuts = vec![0, 0, bytes.len(), bytes.len()];
+            cuts.extend(seeds.iter().map(|seed| seed % (bytes.len() + 1)));
+            cuts.sort_unstable();
+            cuts.windows(2)
+                .map(|pair| &bytes[pair[0]..pair[1]])
+                .collect()
+        }
+
+        fn expected_client_prefix(
+            records: &[Reply],
+            locals: &[Vec<u8>],
+            delivered: usize,
+        ) -> Vec<u8> {
+            let mut expected = Vec::new();
+            let mut remaining = delivered;
+            for (record, local) in records.iter().zip(locals) {
+                let available = remaining.min(record.wire.len());
+                expected.extend_from_slice(&record.wire[..available]);
+                remaining -= available;
+                if available != record.wire.len() {
+                    break;
+                }
+                expected.extend_from_slice(local);
+            }
+            expected
+        }
+
+        #[test]
+        fn packed_malformed_status_does_not_hide_the_previous_completion() {
+            let mut state = crate::session::SessionLoopState::default();
+            state.mark_backend_request_sent(crate::protocol::RequestKind::Body);
+            state.push_deferred_reply(b"500 local reply\r\n");
+            state.mark_backend_request_sent(crate::protocol::RequestKind::Stat);
+
+            let backend = b"222 body\r\n.\r\nnot-a-status\r\n";
+            let actual = state
+                .client_writes_for_backend_read(backend)
+                .into_iter()
+                .flat_map(|bytes| bytes.into_owned())
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                actual,
+                b"222 body\r\n.\r\n500 local reply\r\nnot-a-status\r\n"
+            );
+            assert!(!state.has_pending_backend_replies());
+            assert!(!state.has_deferred_replies());
+        }
+
+        #[test]
+        fn overlong_status_discards_without_growing_or_completing_early() {
+            let cap = crate::constants::buffer::COMMAND;
+            let mut tracker = BackendReplyTracker::default();
+            tracker.push_request(crate::protocol::RequestKind::Date);
+            let prefix = vec![b'x'; cap - 1];
+            tracker.accept_backend_bytes(&prefix);
+            assert_eq!(tracker.pending.front().unwrap().status_line.len(), cap - 1);
+            for _ in 0..32 {
+                let chunk = vec![b'x'; cap + 1];
+                let writes = tracker.accept_backend_bytes(&chunk);
+                assert!(writes.iter().all(|write| matches!(write, BackendReplyBytes::ForwardUntracked(bytes) if *bytes == chunk)));
+                assert_eq!(tracker.pending.len(), 1);
+                let frame = tracker.pending.front().unwrap();
+                assert!(frame.status_line.is_empty());
+                assert!(!frame.status_line.spilled());
+                assert!(matches!(
+                    frame.state,
+                    PendingRequestFrameState::DiscardingOverlongStatusLine
+                ));
+            }
+            assert!(matches!(
+                tracker.accept_backend_bytes(b"\r\n").as_slice(),
+                [BackendReplyBytes::CompletedTrackedReply(b"\r\n")]
+            ));
+            assert!(tracker.pending.is_empty());
+        }
+
+        proptest! {
+            #[test]
+            fn overlong_status_completion_is_partition_independent(extra in 0usize..64) {
+                const LOCAL: &[u8] = b"500 local\r\n";
+                let cap = crate::constants::buffer::COMMAND;
+                for length in [cap - 1, cap, cap + 1, cap + 4 + extra] {
+                    let mut line = b"223 ".to_vec();
+                    line.resize(length - 2, b'x');
+                    line.extend_from_slice(b"\r\n");
+                    let records = vec![
+                        Reply { command: b"STAT <a>\r\n", wire: line },
+                        reply(3, vec![b"second".to_vec()]),
+                    ];
+                    let stream = records.iter().flat_map(|r| r.wire.iter().copied()).collect::<Vec<_>>();
+                    let byte_cuts = (0..=stream.len()).collect::<Vec<_>>();
+                    for cuts in [&[][..], &[cap + 1][..], byte_cuts.as_slice()] {
+                        let mut state = crate::session::SessionLoopState::default();
+                        for record in &records {
+                            state.mark_backend_request_sent(crate::protocol::RequestContext::parse(record.command).unwrap().kind());
+                            state.push_deferred_reply(LOCAL);
+                        }
+                        let mut delivered = 0;
+                        let mut actual = Vec::new();
+                        for chunk in fragments(&stream, cuts) {
+                            for bytes in state.client_writes_for_backend_read(chunk) {
+                                actual.extend_from_slice(&bytes);
+                            }
+                            delivered += chunk.len();
+                            prop_assert_eq!(&actual, &expected_client_prefix(&records, &vec![LOCAL.to_vec(); 2], delivered),
+                                "status length={}, delivered={}", length, delivered);
+                        }
+                        prop_assert!(!state.has_pending_backend_replies());
+                        prop_assert!(!state.has_deferred_replies());
+                    }
+                }
+            }
+
+            #[test]
+            fn alternating_request_receive_and_local_drain_matches_queue(
+                records in replies(),
+                actions in prop::collection::vec((0u8..5, 0usize..256), 0..80),
+            ) {
+                #[derive(Debug)]
+                enum Pending { Backend { record: usize, delivered: usize }, Local }
+                const LOCAL: &[u8] = b"500 local reply\r\n";
+                let mut state = BackendResponseOrder::default();
+                let mut model = VecDeque::<Pending>::new();
+                let mut sent = 0;
+                let actions = [(0, 0), (1, 0), (2, 1), (1, 0), (3, 0)]
+                    .into_iter().chain(actions).chain([(4, 0), (2, usize::MAX), (3, 0), (3, 0)]);
+                for (action, amount) in actions {
+                    let mut actual = Vec::new();
+                    let mut expected = Vec::new();
+                    match action {
+                        0 | 4 => {
+                            let end = if action == 4 { records.len() } else { (sent + 1).min(records.len()) };
+                            while sent < end {
+                                state.push_request(crate::protocol::RequestContext::parse(records[sent].command).unwrap().kind());
+                                model.push_back(Pending::Backend { record: sent, delivered: 0 });
+                                sent += 1;
+                            }
+                        }
+                        1 => { state.push_deferred_reply(LOCAL); model.push_back(Pending::Local); }
+                        2 | 3 => {
+                            while matches!(model.front(), Some(Pending::Local)) {
+                                model.pop_front(); expected.extend_from_slice(LOCAL);
+                            }
+                            if action == 3 {
+                                for bytes in state.take_ready_deferred_replies() { actual.extend_from_slice(bytes); }
+                            } else {
+                                let input = model.iter().filter_map(|entry| match entry {
+                                    Pending::Backend { record, delivered } => Some(&records[*record].wire[*delivered..]),
+                                    Pending::Local => None,
+                                }).flatten().copied().take(amount).collect::<Vec<_>>();
+                                for bytes in state.client_writes_for_backend_read(&input) { actual.extend_from_slice(&bytes); }
+                                let mut left = input.len();
+                                while left > 0 {
+                                    let Some(Pending::Backend { record, delivered }) = model.front_mut() else { unreachable!() };
+                                    let take = left.min(records[*record].wire.len() - *delivered);
+                                    expected.extend_from_slice(&records[*record].wire[*delivered..*delivered + take]);
+                                    *delivered += take; left -= take;
+                                    if *delivered == records[*record].wire.len() {
+                                        model.pop_front();
+                                        while matches!(model.front(), Some(Pending::Local)) {
+                                            model.pop_front(); expected.extend_from_slice(LOCAL);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                    prop_assert_eq!(actual, expected, "action={}, amount={}", action, amount);
+                    prop_assert_eq!(state.has_pending_backend_replies(), model.iter().any(|e| matches!(e, Pending::Backend { .. })));
+                    prop_assert_eq!(state.has_deferred_replies(), model.iter().any(|e| matches!(e, Pending::Local)));
+                    prop_assert_eq!(state.should_drain_backend_replies(), matches!(model.front(), Some(Pending::Backend { .. })) && model.iter().any(|e| matches!(e, Pending::Local)));
+                }
+                prop_assert!(model.is_empty());
+            }
+        }
+
+        proptest! {
+            #[test]
+            fn adversarial_framer_matches_independent_byte_scan(
+                mut data in prop::collection::vec(prop_oneof![
+                    4 => prop::sample::select(vec![b'\r', b'\n', b'.', b'x', b'2', 0, 255]),
+                    1 => any::<u8>(),
+                ], 0..1024),
+                inject in any::<bool>(),
+                position in 0usize..4096,
+                cuts in prop::collection::vec(0usize..4096, 0..48),
+            ) {
+                if inject {
+                    let at = position % (data.len() + 1);
+                    data.splice(at..at, b"\r\n.\r\n".iter().copied());
+                }
+                let expected_end = data.windows(5)
+                    .position(|window| window == b"\r\n.\r\n")
+                    .map(|start| start + 5);
+                let byte_cuts = (0..=data.len()).collect::<Vec<_>>();
+                for schedule in [cuts.as_slice(), byte_cuts.as_slice(), &[]] {
+                    let mut framer = MultilineFramer::default();
+                    let mut delivered = 0;
+                    let mut stopped = false;
+                    for chunk in fragments(&data, schedule) {
+                        let before = delivered;
+                        delivered += chunk.len();
+                        let expected = match expected_end {
+                            Some(end) if end < delivered => Err(FramingError::UnexpectedTrailingResponseBytes),
+                            Some(end) if end == delivered => Ok(ChunkProgress::Complete(CompleteChunk {
+                                consumed: ChunkConsumed(end - before),
+                            })),
+                            _ => Ok(ChunkProgress::Incomplete),
+                        };
+                        let actual = framer.split_chunk(chunk, PackedPendingBytesPolicy::Reject);
+                        prop_assert_eq!(&actual, &expected, "delivered={}, chunk={:?}", delivered, chunk);
+                        if expected != Ok(ChunkProgress::Incomplete) {
+                            stopped = true;
+                            break;
+                        }
+                    }
+                    prop_assert_eq!(stopped, expected_end.is_some());
+                }
+            }
+
+            #[test]
+            fn adversarial_framer_requires_the_entire_terminator(
+                lines in body_lines(),
+                cuts in prop::collection::vec(0usize..4096, 0..48),
+            ) {
+                let response = reply(3, lines).wire;
+                for missing in 1..=5 {
+                    let split = response.len() - missing;
+                    let mut framer = MultilineFramer::default();
+                    for chunk in fragments(&response[..split], &cuts) {
+                        prop_assert_eq!(framer.split_chunk(chunk, PackedPendingBytesPolicy::Reject),
+                            Ok(ChunkProgress::Incomplete));
+                    }
+                    prop_assert_eq!(framer.split_chunk(&response[split..], PackedPendingBytesPolicy::Reject),
+                        Ok(ChunkProgress::Complete(CompleteChunk { consumed: ChunkConsumed(missing) })));
+                }
+            }
+
+            #[test]
+            fn adversarial_framer_suffix_policies_have_distinct_contracts(
+                lines in body_lines(),
+                suffix in prop::sample::select(vec![
+                    (b"".as_slice(), true), (b"2", true), (b"22", true), (b"222", true),
+                    (b"222 next\r\n", true), (b"222 next\r", true),
+                    (b"x", false), (b"\0", false), (b".", false), (b"\r", false),
+                    (b"0", false), (b"6", false), (b"2x", false), (b"22x", false),
+                    (b"999 invalid\r\n", false),
+                ]),
+            ) {
+                let response = reply(3, lines).wire;
+                for split in [0, response.len() - 1, response.len() - 2, response.len() - 3, response.len() - 4] {
+                    let tail = [&response[split..], suffix.0].concat();
+                    for policy in [PackedPendingBytesPolicy::Reject, PackedPendingBytesPolicy::AllowIfStatusPrefix] {
+                        let mut framer = MultilineFramer::default();
+                        prop_assert_eq!(framer.split_chunk(&response[..split], policy), Ok(ChunkProgress::Incomplete));
+                        let expected = match policy {
+                            PackedPendingBytesPolicy::Reject if !suffix.0.is_empty() => Err(FramingError::UnexpectedTrailingResponseBytes),
+                            PackedPendingBytesPolicy::AllowIfStatusPrefix if !suffix.1 => Ok(ChunkProgress::Incomplete),
+                            _ => Ok(ChunkProgress::Complete(CompleteChunk { consumed: ChunkConsumed(response.len() - split) })),
+                        };
+                        prop_assert_eq!(framer.split_chunk(&tail, policy), expected);
+                        if matches!(policy, PackedPendingBytesPolicy::AllowIfStatusPrefix) && !suffix.1 {
+                            let later = b"ignored payload\r\n.\r\n";
+                            prop_assert_eq!(framer.split_chunk(later, policy),
+                                Ok(ChunkProgress::Complete(CompleteChunk { consumed: ChunkConsumed(later.len()) })));
+                        }
+                    }
+                }
+            }
+
+            #[test]
+            fn adversarial_pipeline_tracks_mixed_reply_boundaries(
+                records in replies(),
+                cuts in prop::collection::vec(0usize..8192, 0..64),
+            ) {
+                let stream = records.iter().flat_map(|record| record.wire.iter().copied()).collect::<Vec<_>>();
+                let ends = records.iter().scan(0, |end, record| {
+                    *end += record.wire.len();
+                    Some(*end)
+                }).collect::<Vec<_>>();
+                let byte_cuts = (0..=stream.len()).collect::<Vec<_>>();
+                for schedule in [cuts.as_slice(), byte_cuts.as_slice(), &[]] {
+                    let mut tracker = BackendReplyTracker::default();
+                    for record in &records {
+                        let request = crate::protocol::RequestContext::parse(record.command).expect("fixture command");
+                        tracker.push_request(request.kind());
+                    }
+                    let mut delivered = 0;
+                    let mut completed = 0;
+                    let mut forwarded = Vec::new();
+                    for chunk in fragments(&stream, schedule) {
+                        let before = delivered;
+                        let mut consumed = 0;
+                        for output in tracker.accept_backend_bytes(chunk) {
+                            let (bytes, complete) = match output {
+                                BackendReplyBytes::CompletedTrackedReply(bytes) => (bytes, true),
+                                BackendReplyBytes::ForwardUntracked(bytes) => (bytes, false),
+                            };
+                            prop_assert_eq!(bytes, &chunk[consumed..consumed + bytes.len()]);
+                            consumed += bytes.len();
+                            forwarded.extend_from_slice(bytes);
+                            if complete {
+                                prop_assert!(completed < ends.len(), "extra completion");
+                                prop_assert_eq!(before + consumed, ends[completed], "reply {}", completed);
+                                completed += 1;
+                            }
+                        }
+                        prop_assert_eq!(consumed, chunk.len());
+                        delivered += chunk.len();
+                        let expected_completed = ends.iter().take_while(|end| **end <= delivered).count();
+                        prop_assert_eq!(completed, expected_completed);
+                        prop_assert_eq!(tracker.pending.len(), records.len() - expected_completed);
+                        prop_assert_eq!(&forwarded, &stream[..delivered]);
+                    }
+                    prop_assert_eq!(completed, records.len());
+                }
+            }
+
+            #[test]
+            fn adversarial_pipeline_defers_local_replies_until_true_completion(
+                records in replies(),
+                cuts in prop::collection::vec(0usize..8192, 0..64),
+                missing in 1usize..=4,
+            ) {
+                const LOCAL: &[u8] = b"500 deferred local reply\r\n";
+                let stream = records.iter().flat_map(|record| record.wire.iter().copied()).collect::<Vec<_>>();
+                let locals = vec![LOCAL.to_vec(); records.len()];
+                let byte_cuts = (0..=stream.len()).collect::<Vec<_>>();
+                for limit in [stream.len(), stream.len() - missing] {
+                    for schedule in [cuts.as_slice(), byte_cuts.as_slice(), &[]] {
+                        let mut state = crate::session::SessionLoopState::default();
+                        for record in &records {
+                            let request = crate::protocol::RequestContext::parse(record.command).expect("fixture command");
+                            state.mark_backend_request_sent(request.kind());
+                            state.push_deferred_reply(LOCAL);
+                        }
+                        let mut delivered = 0;
+                        let mut actual = Vec::new();
+                        for chunk in fragments(&stream[..limit], schedule) {
+                            for write in state.client_writes_for_backend_read(chunk) {
+                                actual.extend_from_slice(&write);
+                            }
+                            delivered += chunk.len();
+                            let expected = expected_client_prefix(&records, &locals, delivered);
+                            prop_assert_eq!(&actual, &expected, "backend bytes delivered={}", delivered);
+                            prop_assert_eq!(state.has_pending_backend_replies(), delivered < stream.len());
+                            prop_assert_eq!(state.has_deferred_replies(), delivered < stream.len());
+                        }
+                        for write in state.client_writes_for_backend_read(&stream[limit..]) {
+                            actual.extend_from_slice(&write);
+                        }
+                        prop_assert_eq!(actual, expected_client_prefix(&records, &locals, stream.len()));
+                        prop_assert!(!state.has_pending_backend_replies());
+                        prop_assert!(!state.has_deferred_replies());
+                        prop_assert!(state.take_ready_deferred_replies().is_empty());
+                    }
+                }
+            }
+        }
+    }
+
+    mod operation_properties {
+        use super::*;
+        use proptest::prelude::*;
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        struct ScriptedBackend {
+            chunks: VecDeque<Vec<u8>>,
+            offset: usize,
+            pending: bool,
+            error: Option<io::ErrorKind>,
+        }
+
+        impl ScriptedBackend {
+            fn new(bytes: &[u8], sizes: &[usize]) -> Self {
+                let mut chunks = VecDeque::new();
+                let mut at = 0;
+                for size in sizes.iter().copied().cycle() {
+                    if at == bytes.len() {
+                        break;
+                    }
+                    let end = (at + size.max(1)).min(bytes.len());
+                    chunks.push_back(bytes[at..end].to_vec());
+                    at = end;
+                }
+                assert_eq!(at, bytes.len());
+                Self {
+                    chunks,
+                    offset: 0,
+                    pending: true,
+                    error: None,
+                }
+            }
+        }
+
+        impl AsyncRead for ScriptedBackend {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                if buf.remaining() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+                if self.pending {
+                    self.pending = false;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                self.pending = true;
+                if let Some(chunk) = self.chunks.front() {
+                    let count = buf.remaining().min(chunk.len() - self.offset);
+                    buf.put_slice(&chunk[self.offset..self.offset + count]);
+                    self.offset += count;
+                    if self.offset == self.chunks.front().unwrap().len() {
+                        self.chunks.pop_front();
+                        self.offset = 0;
+                    }
+                    Poll::Ready(Ok(()))
+                } else if let Some(kind) = self.error.take() {
+                    Poll::Ready(Err(io::Error::new(kind, "scripted backend error")))
+                } else {
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+
+        impl AsyncWrite for ScriptedBackend {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(bytes.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        enum WriteFailure {
+            BrokenPipe,
+            Zero,
+        }
+
+        struct QuotaWriter {
+            bytes: Vec<u8>,
+            quotas: Vec<usize>,
+            calls: usize,
+            pending: bool,
+            fail: Option<(usize, WriteFailure)>,
+            failed: bool,
+            writes_after_failure: usize,
+            addresses: Vec<(usize, usize)>,
+        }
+
+        impl QuotaWriter {
+            fn new(quotas: Vec<usize>, fail: Option<(usize, WriteFailure)>) -> Self {
+                Self {
+                    bytes: Vec::new(),
+                    quotas,
+                    calls: 0,
+                    pending: true,
+                    fail,
+                    failed: false,
+                    writes_after_failure: 0,
+                    addresses: Vec::new(),
+                }
+            }
+        }
+
+        impl AsyncWrite for QuotaWriter {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                if self.failed {
+                    self.writes_after_failure += 1;
+                    return Poll::Ready(Err(io::Error::other("write after failure")));
+                }
+                if let Some((at, failure)) = self.fail
+                    && self.bytes.len() == at
+                {
+                    self.failed = true;
+                    return Poll::Ready(match failure {
+                        WriteFailure::BrokenPipe => Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "scripted client failure",
+                        )),
+                        WriteFailure::Zero => Ok(0),
+                    });
+                }
+                if self.pending {
+                    self.pending = false;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                self.pending = true;
+                let quota = self.quotas[self.calls % self.quotas.len()].max(1);
+                self.calls += 1;
+                let before_failure = self
+                    .fail
+                    .map_or(usize::MAX, |(at, _)| at - self.bytes.len());
+                let count = bytes.len().min(quota).min(before_failure);
+                self.addresses.push((bytes.as_ptr() as usize, count));
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Poll::Ready(Ok(count))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn runtime() -> tokio::runtime::Runtime {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        }
+
+        fn pool(size: usize) -> crate::pool::BufferPool {
+            crate::pool::BufferPool::new(BufferSize::try_new(size).unwrap(), 8)
+        }
+
+        fn body(lines: &[Vec<u8>]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            for line in lines {
+                if line.first() == Some(&b'.') {
+                    bytes.push(b'.');
+                }
+                bytes.extend_from_slice(line);
+                bytes.extend_from_slice(b"\r\n");
+            }
+            bytes
+        }
+
+        async fn read_following_response(
+            conn: &mut crate::stream::ConnectionStream,
+            pool: &crate::pool::BufferPool,
+            case: usize,
+        ) -> Vec<u8> {
+            let command = framing_pipeline_fixture(case, 0).0;
+            let request = crate::protocol::RequestContext::parse(&command).unwrap();
+            let buffer = take_queued_input_or_acquire_empty(conn, pool);
+            let mut response = ClassifiedResponse::read_for_test(conn, &request, buffer)
+                .await
+                .unwrap();
+            let mut writer = RecordingWriter::default();
+            response
+                .stream_for_test(conn, pool, crate::types::BackendId::from_index(0))
+                .unwrap()
+                .write(&mut writer)
+                .await
+                .unwrap();
+            writer.bytes
+        }
+
+        async fn assert_backend_eof(conn: &mut crate::stream::ConnectionStream) {
+            assert_eq!(conn.read(&mut [0; 1]).await.unwrap(), 0);
+        }
+
+        fn lines() -> impl Strategy<Value = Vec<Vec<u8>>> {
+            prop::collection::vec(
+                prop::collection::vec(prop_oneof![Just(b'.'), b'a'..=b'z'], 0..32),
+                0..8,
+            )
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+            #[test]
+            fn retained_append_and_packed_reuse_compose_coordinates(
+                seed in 0usize..256,
+                extra in 1usize..128,
+                records in 2usize..5,
+                sizes in prop::collection::vec(1usize..96, 1..10),
+                quotas in prop::collection::vec(1usize..40, 1..8),
+            ) {
+                runtime().block_on(async {
+                    for layout in 0..3 {
+                        let pool = pool(256);
+                        let records = (0..records).map(|index| framing_pipeline_fixture(1, if index == 0 { if layout == 2 { 512 + extra } else { 32 + extra % 32 } } else { 1 + seed % 60 })).collect::<Vec<_>>();
+                        let stream = records.iter().flat_map(|(_, wire)| wire.iter().copied()).collect::<Vec<_>>();
+                        let status_len = b"222 0 <test@example.com>\r\n".len();
+                        let initial_len = if layout == 2 { 256 } else { status_len + 1 + seed % 20 };
+                        let mut buffer = pool.acquire();
+                        let discarded = match layout { 0 => 1 + seed % 40, _ => buffer.capacity() - initial_len };
+                        let physical = [vec![b'!'; discarded], stream[..initial_len].to_vec()].concat();
+                        buffer.copy_from_slice(&physical);
+                        let allocation = buffer.allocation_ptr() as usize;
+                        if discarded > 0 { buffer.expose_initialized_range_without_copying(discarded..physical.len()); }
+                        let mut conn = crate::stream::ConnectionStream::for_test(ScriptedBackend::new(&stream[initial_len..], &sizes));
+                        for (index, (command, expected)) in records.iter().enumerate() {
+                            if index > 0 { buffer = take_queued_input_or_acquire_empty(&mut conn, &pool); }
+                            let borrowed_allocation = buffer.allocation_ptr() as usize;
+                            let borrowed_capacity = buffer.capacity();
+                            let request = crate::protocol::RequestContext::parse(command).unwrap();
+                            let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, buffer).await.unwrap();
+                            let mut writer = QuotaWriter::new(quotas.clone(), None);
+                            let stats = classified.stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0)).unwrap().write(&mut writer).await.unwrap();
+                            assert_eq!(&writer.bytes, expected, "layout={layout}, record={index}");
+                            assert_eq!(stats.bytes_written_u64() as usize, expected.len());
+                            assert!(writer.addresses[0].0 >= borrowed_allocation && writer.addresses[0].0 < borrowed_allocation + borrowed_capacity);
+                            if index == 0 {
+                                let expected_start = allocation + if layout == 1 { 0 } else { discarded };
+                                assert_eq!(writer.addresses[0].0, expected_start, "retained pass-through must borrow its allocation");
+                            }
+                            buffer = pool.acquire();
+                        }
+                        assert_backend_eof(&mut conn).await;
+                    }
+                });
+            }
+
+            #[test]
+            fn scripted_partial_writes_preserve_next_response_and_drain_ownership(
+                body_len in 1usize..256,
+                split_seed in any::<usize>(),
+                accepted_seed in any::<usize>(),
+                sizes in prop::collection::vec(1usize..64, 1..8),
+                quotas in prop::collection::vec(1usize..32, 1..8),
+            ) {
+                runtime().block_on(async {
+                    let (command, wire) = framing_pipeline_fixture(1, body_len);
+                    let (_, next) = framing_pipeline_fixture(2, 3);
+                    let status_len = b"222 0 <test@example.com>\r\n".len();
+                    let all_bytes = [wire.clone(), next.clone()].concat();
+                    for split in [all_bytes.len(), wire.len(), status_len + split_seed % (wire.len() - status_len)] {
+                        for failure in [None, Some(WriteFailure::BrokenPipe), Some(WriteFailure::Zero)] {
+                            let pool = pool(512);
+                            let packed = all_bytes[split..].to_vec();
+                            let mut conn = crate::stream::ConnectionStream::for_test(ScriptedBackend::new(&packed, &sizes));
+                            let mut buffer = pool.acquire(); buffer.copy_from_slice(&all_bytes[..split]);
+                            let request = crate::protocol::RequestContext::parse(&command).unwrap();
+                            let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, buffer).await.unwrap();
+                            let accepted = accepted_seed % wire.len();
+                            let mut writer = QuotaWriter::new(quotas.clone(), failure.map(|f| (accepted, f)));
+                            let result = classified.stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0)).unwrap().write(&mut writer).await;
+                            match failure {
+                                None => { assert_eq!(result.unwrap().bytes_written_u64() as usize, wire.len()); assert_eq!(writer.bytes, wire); }
+                                Some(failure) => {
+                                    let expected_kind = match failure { WriteFailure::BrokenPipe => io::ErrorKind::BrokenPipe, WriteFailure::Zero => io::ErrorKind::WriteZero };
+                                    assert!(matches!(result, Err(ResponseTransferError::ClientDisconnect(ref e)) if e.kind() == expected_kind));
+                                    assert_eq!(writer.bytes, wire[..accepted]);
+                                    assert!(writer.failed);
+                                }
+                            }
+                            assert_eq!(writer.writes_after_failure, 0);
+                            let remaining = read_following_response(&mut conn, &pool, 2).await;
+                            assert_eq!(remaining, next);
+                            assert_backend_eof(&mut conn).await;
+                        }
+                    }
+                    for backend_error in [None, Some(io::ErrorKind::ConnectionReset)] {
+                        let pool = pool(512);
+                        let cut = status_len + 1;
+                        let mut backend = ScriptedBackend::new(&wire[cut..wire.len()-1], &sizes);
+                        backend.error = backend_error;
+                        let mut conn = crate::stream::ConnectionStream::for_test(backend);
+                        let mut buffer = pool.acquire(); buffer.copy_from_slice(&wire[..cut]);
+                        let request = crate::protocol::RequestContext::parse(&command).unwrap();
+                        let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, buffer).await.unwrap();
+                        let accepted = accepted_seed % cut;
+                        let mut writer = QuotaWriter::new(quotas.clone(), Some((accepted, WriteFailure::BrokenPipe)));
+                        let result = classified.stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0)).unwrap().write(&mut writer).await;
+                        assert_eq!(writer.bytes, wire[..accepted]);
+                        assert_eq!(writer.writes_after_failure, 0);
+                        match backend_error {
+                            None => assert!(matches!(result, Err(ResponseTransferError::BackendEof { .. }))),
+                            Some(_) => assert!(matches!(result, Err(ResponseTransferError::Io(_)))),
+                        }
+                    }
+                });
+            }
+
+            #[test]
+            fn capture_limit_transitions_after_retained_chunks(
+                body_len in 0usize..512,
+                chunk in 8usize..40,
+                quotas in prop::collection::vec(1usize..20, 1..6),
+                failure_seed in any::<usize>(),
+            ) {
+                runtime().block_on(async {
+                    let (command, wire) = framing_pipeline_fixture(0, body_len);
+                    let (_, next) = framing_pipeline_fixture(1, 5);
+                    let first_len = b"220 0 <test@example.com>\r\n".len();
+                    let mut limits = vec![0, first_len - 1, wire.len()-1, wire.len(), wire.len()+1];
+                    limits.extend((first_len..wire.len()).step_by(chunk));
+                    for limit in limits {
+                        for fail in [false, true] {
+                            let pool = pool(512);
+                            let mut conn = crate::stream::ConnectionStream::for_test(ScriptedBackend::new(&[wire[first_len..].to_vec(), next.clone()].concat(), &[chunk]));
+                            let mut buffer = pool.acquire(); buffer.copy_from_slice(&wire[..first_len]);
+                            let request = crate::protocol::RequestContext::parse(&command).unwrap();
+                            let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, buffer).await.unwrap();
+                            let accepted = failure_seed % first_len;
+                            let mut writer = QuotaWriter::new(quotas.clone(), fail.then_some((accepted, WriteFailure::BrokenPipe)));
+                            let mut captured = crate::pool::ChunkedResponse::default();
+                            let result = classified.stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0)).unwrap().capture_and_write(&mut writer, &mut captured, limit).await;
+                            if fail {
+                                assert!(matches!(result, Err(ResponseTransferError::ClientDisconnect(_))));
+                                assert_eq!(writer.bytes, wire[..accepted]);
+                                assert_eq!(writer.writes_after_failure, 0);
+                            } else {
+                                let (written, retained) = result.unwrap();
+                                assert_eq!(written as usize, wire.len()); assert_eq!(writer.bytes, wire);
+                                assert_eq!(retained.is_some(), wire.len() <= limit);
+                                if let Some(retained) = retained { assert_eq!(retained.bytes().to_vec(), wire); }
+                                assert!(captured.is_empty());
+                            }
+                            let remaining = read_following_response(&mut conn, &pool, 1).await;
+                            assert_eq!(remaining, next);
+                            assert_backend_eof(&mut conn).await;
+                        }
+                        let pool = pool(512);
+                        let mut conn = crate::stream::ConnectionStream::for_test(ScriptedBackend::new(&wire[first_len..], &[chunk]));
+                        let mut buffer = pool.acquire(); buffer.copy_from_slice(&wire[..first_len]);
+                        let mut captured = crate::pool::ChunkedResponse::default();
+                        let retained = IsolatedMultilineResponse::begin(&mut conn, &mut buffer).unwrap().capture_chunked_optional(&pool, &mut captured, limit).await.unwrap();
+                        assert_eq!(retained.is_some(), wire.len() <= limit);
+                        if retained.is_some() { assert_eq!(captured.to_vec(), wire); } else { assert!(captured.is_empty()); }
+                        assert_backend_eof(&mut conn).await;
+                    }
+                });
+            }
+
+            #[test]
+            fn captured_semantic_sections_round_trip_through_cache(
+                subject in "[a-zA-Z0-9 ]{0,32}",
+                empty_headers in any::<bool>(),
+                lines in lines(),
+                sizes in prop::collection::vec(1usize..48, 1..8),
+                quotas in prop::collection::vec(1usize..20, 1..8),
+            ) {
+                runtime().block_on(async {
+                    use crate::protocol::RequestKind;
+                    let headers = if empty_headers { Vec::new() } else { format!("Subject: {subject}\r\n").into_bytes() };
+                    let body = body(&lines);
+                    for (kind, code, verb) in [(RequestKind::Article, 220, "ARTICLE"), (RequestKind::Head, 221, "HEAD"), (RequestKind::Body, 222, "BODY")] {
+                        let status = format!("{code} 0 <test@example.com>\r\n").into_bytes();
+                        let payload = match kind {
+                            RequestKind::Article => [headers.clone(), b"\r\n".to_vec(), body.clone()].concat(),
+                            RequestKind::Head => headers.clone(),
+                            RequestKind::Body => body.clone(),
+                            _ => unreachable!(),
+                        };
+                        let wire = [status.clone(), payload, b".\r\n".to_vec()].concat();
+                        let (_, next) = framing_pipeline_fixture(1, 7);
+                        let pool = pool(512);
+                        let mut conn = crate::stream::ConnectionStream::for_test(ScriptedBackend::new(&[wire.clone(), next.clone()].concat(), &sizes));
+                        let mut buffer = pool.acquire(); buffer.read_from(&mut conn).await.unwrap();
+                        let request = crate::protocol::RequestContext::parse(format!("{verb} <test@example.com>\r\n").as_bytes()).unwrap();
+                        let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, buffer).await.unwrap();
+                        let mut captured = crate::pool::ChunkedResponse::default();
+                        let mut writer = QuotaWriter::new(quotas.clone(), None);
+                        let (written, retained) = classified.stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0)).unwrap().capture_and_write(&mut writer, &mut captured, wire.len()).await.unwrap();
+                        assert_eq!(written as usize, wire.len()); assert_eq!(writer.bytes, wire);
+                        let retained = retained.unwrap();
+                        assert_eq!(retained.kind(), kind);
+                        assert_eq!(retained.status(), crate::protocol::StatusCode::new(code));
+                        let entry = crate::cache::CachedArticle::from_unframed_ingest_for_test(crate::cache::CacheIngestResponse::FramedChunked(retained.into_cache_ingest()), crate::cache::ttl::CacheTier::new(0));
+                        let contiguous = crate::cache::CachedArticle::from_unframed_ingest_for_test(
+                            wire.clone(), crate::cache::ttl::CacheTier::new(0));
+                        for entry in [entry, contiguous] {
+                        let variants = match kind { RequestKind::Article => vec![RequestKind::Article, RequestKind::Head, RequestKind::Body], _ => vec![kind] };
+                        for variant in variants {
+                            let (code, payload) = match variant {
+                                RequestKind::Article => (220, if headers.is_empty() && body.is_empty() { Vec::new() } else { [headers.clone(), b"\r\n".to_vec(), body.clone()].concat() }),
+                                RequestKind::Head => (221, headers.clone()),
+                                RequestKind::Body => (222, body.clone()),
+                                _ => unreachable!(),
+                            };
+                            let expected = [format!("{code} 0 <test@example.com>\r\n").into_bytes(), payload, b".\r\n".to_vec()].concat();
+                            let response = entry.cached_response_for(variant, "<test@example.com>").expect("captured section should render");
+                            let mut actual = Vec::new(); response.write_to(&mut actual).await.unwrap();
+                            assert_eq!(actual, expected, "source={kind:?}, target={variant:?}");
+                        }
+                        }
+                        let remaining = read_following_response(&mut conn, &pool, 1).await; assert_eq!(remaining, next);
+                        assert_backend_eof(&mut conn).await;
+                    }
+                });
+            }
+        }
+    }
+
     struct FailingWriter;
 
     #[derive(Default)]
@@ -2717,6 +4434,74 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn multiline_framer_handles_generated_sequences_and_arbitrary_fragments(
+            responses in multiline_response_sequences(),
+            chunk_sizes in proptest::collection::vec(1usize..128, 1..128),
+        ) {
+            use proptest::prelude::*;
+
+            let expected_stream = responses.concat();
+            for first_chunk_size in [64, 1] {
+                let mut stream_offset = 0;
+                let mut chunk_index = 0;
+                let mut response_index = 0;
+                let mut current_response = Vec::new();
+                let mut assembled = Vec::new();
+                let mut framer = MultilineFramer::default();
+
+                while stream_offset < expected_stream.len() {
+                    let chunk_size = if chunk_index == 0 {
+                        first_chunk_size
+                    } else {
+                        chunk_sizes[(chunk_index - 1) % chunk_sizes.len()]
+                    };
+                    let chunk_end = (stream_offset + chunk_size).min(expected_stream.len());
+                    let chunk = &expected_stream[stream_offset..chunk_end];
+                    let mut chunk_offset = 0;
+
+                    while chunk_offset < chunk.len() {
+                        let remaining = &chunk[chunk_offset..];
+                        match framer
+                            .split_chunk(remaining, PackedPendingBytesPolicy::AllowIfStatusPrefix)
+                            .expect("allowing packed status prefixes cannot reject generated input")
+                        {
+                            ChunkProgress::Incomplete => {
+                                current_response.extend_from_slice(remaining);
+                                chunk_offset = chunk.len();
+                            }
+                            ChunkProgress::Complete(complete) => {
+                                let consumed = complete.consumed.0;
+                                prop_assert!(consumed > 0, "a completion must consume input bytes");
+                                prop_assert!(consumed <= remaining.len());
+                                current_response.extend_from_slice(&remaining[..consumed]);
+                                prop_assert_eq!(
+                                    &current_response,
+                                    &responses[response_index],
+                                "response {} must end at its generated record boundary",
+                                response_index
+                                );
+                                assembled.extend_from_slice(&current_response);
+                                current_response.clear();
+                                response_index += 1;
+                                chunk_offset += consumed;
+                                framer = MultilineFramer::default();
+                            }
+                        }
+                    }
+
+                    stream_offset = chunk_end;
+                    chunk_index += 1;
+                }
+
+                prop_assert_eq!(response_index, responses.len());
+                prop_assert!(current_response.is_empty(), "the final generated response must complete");
+                prop_assert_eq!(&assembled, &expected_stream);
             }
         }
     }

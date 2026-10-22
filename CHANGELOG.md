@@ -5,9 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-## [0.6.0] - 2026-10-21
+## [0.6.0]
 
 ### Added
 
@@ -24,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Multiline framing now uses safe Rust autovectorized scans on AArch64 and x86-64 builds targeting AVX2 or AVX-512BW. Generic x86 builds retain the cached `memchr` finder and runtime CPU dispatch.
 - Moved response continuation, packed-response suffixes, and completion into the multiline framer. Normal `ARTICLE`/`BODY`/`HEAD` forwarding borrows pooled bytes directly.
 - Backend connection guards now require proof that a response is fully consumed and no pending bytes remain before allowing reuse. Cancellation and incomplete exchanges retire the connection.
 - Restricted the backend pool to fully initialized connections that have completed greeting, authentication, `MODE READER`, and compression negotiation.
@@ -41,6 +40,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Preserved the next tracked response after a multiline reply even when its status line is malformed, and kept overlong status-line discard bounded until the line completes.
+- Split cached headerless ARTICLE payloads at their initial blank line so body content is retained correctly.
 - Updated `rustls` to 0.23.46, `rustls-webpki` to 0.103.16, and `webpki-roots` to 1.0.10 to address certificate-validation advisories and refresh the bundled CA roots.
 - Increased the hybrid-cache benchmark disk budget to support four active flushers and spare blocks, preventing the fixture from stalling.
 - Preserved backend bytes following a completed response for the next request, including packed single-line and multiline responses.
@@ -81,7 +82,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing and documentation
 
-- Added regression coverage for fragmented and packed responses, terminators split across reads, request-scoped response shapes, cancellation and connection reuse, cache boundary preservation, canonical-host availability identity, exact-key collision safety, provider-slot snapshot restoration, authentication transitions, typed counters, and retained-buffer ownership.
+- Added scanner equivalence properties across lane alignments, tails, and encoded article streams.
+- Added regression coverage for fragmented and packed responses, terminators split across reads, request-scoped response shapes, malformed and overlong statuses, capture round trips, partial writes, backpressure, cancellation and connection reuse, hybrid handoff, compressed streams, cache boundary preservation, canonical-host availability identity, exact-key collision safety, provider-slot snapshot restoration, authentication transitions, typed counters, and retained-buffer ownership.
 - Added devenv quality tasks covering formatting, Clippy, shell and workflow linting, typo checks, coverage, dependency policy, advisories, unused dependencies, and response-contract checks.
 - Updated operator, development, configuration, and release-benchmark documentation for the new routing, cache, framing, and development workflows.
 

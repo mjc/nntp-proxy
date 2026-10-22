@@ -72,6 +72,13 @@ async fn spawn_counting_stat_backend() -> Result<CountingBackend> {
         }
     });
 
+    // The greeting is sent after the accept counter advances. TCP connection
+    // readiness alone can leave a probe pending when tests take their snapshot.
+    let mut readiness = tokio::net::TcpStream::connect(("127.0.0.1", port)).await?;
+    crate::test_helpers::read_line_from_stream(&mut readiness, "counting backend readiness")
+        .await?;
+    drop(readiness);
+
     Ok(CountingBackend {
         port,
         accepts,
@@ -105,7 +112,6 @@ async fn spawn_per_command_proxy(backend_port: u16, max_connections: usize) -> R
 #[tokio::test]
 async fn per_command_releases_backend_connection_between_client_batches() -> Result<()> {
     let backend = spawn_counting_stat_backend().await?;
-    wait_for_server(&format!("127.0.0.1:{}", backend.port), 20).await?;
     let proxy_port = spawn_single_slot_per_command_proxy(backend.port).await?;
     wait_for_server(&format!("127.0.0.1:{proxy_port}"), 20).await?;
 
@@ -136,7 +142,6 @@ async fn per_command_releases_backend_connection_between_client_batches() -> Res
 #[tokio::test]
 async fn per_command_reuses_backend_connection_inside_one_pipeline_batch() -> Result<()> {
     let backend = spawn_counting_stat_backend().await?;
-    wait_for_server(&format!("127.0.0.1:{}", backend.port), 20).await?;
     let proxy_port = spawn_single_slot_per_command_proxy(backend.port).await?;
     wait_for_server(&format!("127.0.0.1:{proxy_port}"), 20).await?;
     let accepts_before_commands = backend.accepts.load(Ordering::SeqCst);
@@ -164,7 +169,6 @@ async fn per_command_reuses_backend_connection_inside_one_pipeline_batch() -> Re
 #[tokio::test]
 async fn per_command_pipeline_uses_idle_pool_capacity_before_reusing_connection() -> Result<()> {
     let backend = spawn_counting_stat_backend().await?;
-    wait_for_server(&format!("127.0.0.1:{}", backend.port), 20).await?;
     let proxy_port = spawn_per_command_proxy(backend.port, 2).await?;
     wait_for_server(&format!("127.0.0.1:{proxy_port}"), 20).await?;
     let accepts_before_commands = backend.accepts.load(Ordering::SeqCst);
@@ -193,7 +197,6 @@ async fn per_command_pipeline_uses_idle_pool_capacity_before_reusing_connection(
 async fn per_command_releases_backend_connection_after_trailing_non_pipelineable_command()
 -> Result<()> {
     let backend = spawn_counting_stat_backend().await?;
-    wait_for_server(&format!("127.0.0.1:{}", backend.port), 20).await?;
     let proxy_port = spawn_single_slot_per_command_proxy(backend.port).await?;
     wait_for_server(&format!("127.0.0.1:{proxy_port}"), 20).await?;
 
@@ -226,7 +229,6 @@ async fn per_command_releases_backend_connection_after_trailing_non_pipelineable
 async fn per_command_releases_backend_connection_after_single_non_pipelineable_command()
 -> Result<()> {
     let backend = spawn_counting_stat_backend().await?;
-    wait_for_server(&format!("127.0.0.1:{}", backend.port), 20).await?;
     let proxy_port = spawn_single_slot_per_command_proxy(backend.port).await?;
     wait_for_server(&format!("127.0.0.1:{proxy_port}"), 20).await?;
 
