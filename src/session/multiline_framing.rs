@@ -2440,6 +2440,7 @@ mod vector_scanner {
             not(target_feature = "avx512bw")
         )
     ))]
+    #[inline(always)]
     pub(super) fn find_repeat<const WIDTH: usize, const FIRST: usize, const BYTE: u8>(
         data: &[u8],
     ) -> Option<usize> {
@@ -2470,6 +2471,7 @@ mod vector_scanner {
             target_feature = "avx512bw"
         )
     ))]
+    #[inline(always)]
     pub(super) fn find_or<const WIDTH: usize, const FIRST: usize, const BYTE: u8>(
         data: &[u8],
         verify: impl Fn(&[u8]) -> Option<usize>,
