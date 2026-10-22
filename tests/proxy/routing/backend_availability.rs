@@ -232,8 +232,16 @@ async fn test_availability_learned_before_client_disconnect_is_persisted() -> Re
     let config = Config {
         servers: vec![
             create_test_server_config("127.0.0.1", port0, "Backend0-430"),
-            create_test_server_config("127.0.0.2", port1, "Backend1-430"),
-            create_test_server_config("127.0.0.3", port2, "Backend2-Has"),
+            create_test_server_config(
+                &crate::test_helpers::independent_provider_host(1),
+                port1,
+                "Backend1-430",
+            ),
+            create_test_server_config(
+                &crate::test_helpers::independent_provider_host(2),
+                port2,
+                "Backend2-Has",
+            ),
         ],
         cache: Some(Cache {
             adaptive_precheck: false,
