@@ -747,7 +747,7 @@ async fn test_per_command_body_window_sends_two_requests_before_first_reply() ->
 #[tokio::test]
 async fn test_per_command_body_window_refills_after_first_response() -> Result<()> {
     const WINDOW: usize = 16;
-    const REQUEST_COUNT: usize = WINDOW + 1;
+    const REQUEST_COUNT: usize = WINDOW + 2;
 
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
@@ -782,31 +782,39 @@ async fn test_per_command_body_window_refills_after_first_response() -> Result<(
             .get_mut()
             .write_all(b"222 rolling-0@example\r\nbody-0\r\n.\r\n")
             .await?;
-        let early_replacement = match timeout(
-            Duration::from_secs(1),
-            read_line(&mut reader, "rolling replacement request"),
-        )
-        .await
-        {
-            Ok(Ok(replacement)) => {
-                commands.push(replacement);
-                true
-            }
-            _ => false,
-        };
+        commands.push(
+            timeout(
+                Duration::from_secs(1),
+                read_line(&mut reader, "rolling replacement request"),
+            )
+            .await??,
+        );
 
-        for index in 1..WINDOW {
+        reader
+            .get_mut()
+            .write_all(b"222 rolling-1@example\r\nbody-1\r\n.\r\n")
+            .await?;
+        commands.push(
+            timeout(
+                Duration::from_secs(1),
+                read_line(&mut reader, "second rolling replacement request"),
+            )
+            .await??,
+        );
+
+        for index in 2..WINDOW {
             let response = format!("222 rolling-{index}@example\r\nbody-{index}\r\n.\r\n");
             reader.get_mut().write_all(response.as_bytes()).await?;
         }
-        if !early_replacement {
-            commands.push(read_line(&mut reader, "rolling replacement after drain").await?);
+        for index in WINDOW..REQUEST_COUNT {
+            reader
+                .get_mut()
+                .write_all(
+                    format!("222 rolling-{index}@example\r\nbody-{index}\r\n.\r\n").as_bytes(),
+                )
+                .await?;
         }
-        reader
-            .get_mut()
-            .write_all(format!("222 rolling-{WINDOW}@example\r\nbody-{WINDOW}\r\n.\r\n").as_bytes())
-            .await?;
-        anyhow::Ok((commands, early_replacement))
+        anyhow::Ok(commands)
     });
 
     let mut config = pipeline_backend_config(backend_port, "ArticleRollingWindow");
@@ -830,12 +838,8 @@ async fn test_per_command_body_window_refills_after_first_response() -> Result<(
     for (index, response) in responses.iter().enumerate() {
         assert_eq!(response.1, vec![format!("body-{index}\r\n")]);
     }
-    let (backend_commands, replacement_was_early) = backend.await??;
+    let backend_commands = backend.await??;
     assert_eq!(backend_commands, commands);
-    assert!(
-        replacement_was_early,
-        "the replacement request should reach the backend after the first response"
-    );
     Ok(())
 }
 
