@@ -846,10 +846,10 @@ impl RequestContext {
         (self.verb.len() + usize::from(!self.args.is_empty()) + self.args.len() + 2).into()
     }
 
-    /// Write the typed request as NNTP wire bytes without building a command buffer.
+    /// Write and flush a request so buffered transports can deliver it before a reply is read.
     ///
     /// # Errors
-    /// Returns any I/O error from writing the request bytes to `writer`.
+    /// Returns any I/O error from writing or flushing `writer`.
     pub async fn write_wire_to<W>(&self, writer: &mut W) -> std::io::Result<()>
     where
         W: tokio::io::AsyncWrite + Unpin,
@@ -858,7 +858,7 @@ impl RequestContext {
 
         if self.args().is_empty() {
             let mut slices = [IoSlice::new(self.verb()), IoSlice::new(b"\r\n")];
-            crate::io_util::write_all_vectored(writer, &mut slices).await
+            crate::io_util::write_all_vectored(writer, &mut slices).await?;
         } else {
             let mut slices = [
                 IoSlice::new(self.verb()),
@@ -866,8 +866,9 @@ impl RequestContext {
                 IoSlice::new(self.args()),
                 IoSlice::new(b"\r\n"),
             ];
-            crate::io_util::write_all_vectored(writer, &mut slices).await
+            crate::io_util::write_all_vectored(writer, &mut slices).await?;
         }
+        tokio::io::AsyncWriteExt::flush(writer).await
     }
 
     /// Return whether this request/status pair carries a multiline response body.
@@ -1259,6 +1260,25 @@ mod tests {
 
         assert_eq!(line.len(), 520);
         assert!(RequestContext::parse(&line).is_none());
+    }
+
+    #[tokio::test]
+    async fn compressed_request_is_visible_without_an_extra_flush() {
+        use tokio::io::AsyncReadExt;
+        let (writer, reader) = tokio::io::duplex(1024);
+        let mut writer = crate::compression::DecompressStream::new(writer);
+        let mut reader = crate::compression::DecompressStream::new(reader);
+        let request = RequestContext::parse(b"DATE\r\n").unwrap();
+        request.write_wire_to(&mut writer).await.unwrap();
+        let mut received = [0; 6];
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            reader.read_exact(&mut received),
+        )
+        .await
+        .expect("request remained buffered in the compressor")
+        .unwrap();
+        assert_eq!(&received, b"DATE\r\n");
     }
 
     #[tokio::test]

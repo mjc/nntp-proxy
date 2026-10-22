@@ -14,8 +14,6 @@ use tracing::{debug, error, warn};
 
 use crate::constants::buffer::READER_CAPACITY;
 
-const MAX_UPSTREAM_PIPELINE_DEPTH: usize = 16;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::session) enum StatefulConnectionDisposition {
     RetireClient,
@@ -447,7 +445,6 @@ impl ClientSession {
         // Keep a small upstream window open while the client is producing
         // commands. Replies are still consumed and ordered by the framer below;
         // this counter only controls when buffered request bytes are flushed.
-        let mut pending_backend_writes = 0usize;
 
         let exit = loop {
             // Periodic metrics flush
@@ -472,13 +469,6 @@ impl ClientSession {
             }
 
             if matches!(state.read_mode(), StatefulReadMode::DrainBackendReplies) {
-                if pending_backend_writes != 0 {
-                    backend_write
-                        .flush()
-                        .await
-                        .map_err(|error| StatefulLoopError::backend(error.into()))?;
-                    pending_backend_writes = 0;
-                }
                 match self.read_stateful_backend_bytes(&mut backend_read).await {
                     Ok(Some((buffer, len))) => {
                         self.write_stateful_backend_bytes(
@@ -505,31 +495,12 @@ impl ClientSession {
                         Ok(StatefulClientLine::Eof) => {
                             break StatefulSessionExit::ClientDisconnected;
                         }
-                        Ok(StatefulClientLine::Oversized) => {
-                            use crate::protocol::COMMAND_TOO_LONG;
-                            client_write
-                                .write_all(COMMAND_TOO_LONG)
-                                .await
-                                .map_err(|error| StatefulLoopError::client(error.into()))?;
-                            client_write
-                                .flush()
-                                .await
-                                .map_err(|error| StatefulLoopError::client(error.into()))?;
-                            state.add_backend_to_client(COMMAND_TOO_LONG.len() as u64);
-                            continue;
-                        }
-                        Ok(StatefulClientLine::Invalid) => {
-                            client_write
-                                .write_all(crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE)
-                                .await
-                                .map_err(|error| StatefulLoopError::client(error.into()))?;
-                            client_write
-                                .flush()
-                                .await
-                                .map_err(|error| StatefulLoopError::client(error.into()))?;
-                            state.add_backend_to_client(
-                                crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE.len() as u64,
-                            );
+                        Ok(line @ (StatefulClientLine::Oversized | StatefulClientLine::Invalid)) => {
+                            let reply = match line {
+                                StatefulClientLine::Oversized => crate::protocol::COMMAND_TOO_LONG,
+                                _ => crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE,
+                            };
+                            state.push_deferred_reply(reply);
                             continue;
                         }
                         Ok(StatefulClientLine::Ready) => {
@@ -546,15 +517,6 @@ impl ClientSession {
                                     &mut state,
                                 )
                                 .await?;
-                                pending_backend_writes =
-                                    pending_backend_writes.saturating_add(1);
-                                if pending_backend_writes >= MAX_UPSTREAM_PIPELINE_DEPTH {
-                                    backend_write
-                                        .flush()
-                                        .await
-                                        .map_err(|error| StatefulLoopError::backend(error.into()))?;
-                                    pending_backend_writes = 0;
-                                }
                             } else {
                                 // Auth path
                                 let auth_result = common::handle_stateful_auth_check(
@@ -585,13 +547,6 @@ impl ClientSession {
 
                 // Backend → Client
                 result = self.read_stateful_backend_bytes(&mut backend_read) => {
-                    if pending_backend_writes != 0 {
-                        backend_write
-                            .flush()
-                            .await
-                            .map_err(|error| StatefulLoopError::backend(error.into()))?;
-                        pending_backend_writes = 0;
-                    }
                     match result {
                         Ok(Some((buffer, len))) => {
                             // Complete output after select! returns so client readiness cannot
@@ -766,6 +721,67 @@ mod tests {
 
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_client_lines_wait_for_prior_backend_replies() {
+        use tokio::io::AsyncReadExt;
+        for invalid in [
+            b"\r\n".to_vec(),
+            [vec![b'X'; 600], b"\r\n".to_vec()].concat(),
+        ] {
+            let session = test_session();
+            let (mut client, proxy_client) = tokio::io::duplex(4096);
+            let (backend, proxy_backend) = tokio::io::duplex(4096);
+            let (mut backend_read, mut backend_write) = tokio::io::split(backend);
+            let (client_read, client_write) = tokio::io::split(proxy_client);
+            let (proxy_backend_read, proxy_backend_write) = tokio::io::split(proxy_backend);
+            let proxy = tokio::spawn(async move {
+                session
+                    .run_stateful_proxy_loop(
+                        BufReader::new(client_read),
+                        client_write,
+                        proxy_backend_read,
+                        proxy_backend_write,
+                        SessionLoopState::new(false),
+                        BackendId::from_index(0),
+                    )
+                    .await
+            });
+            client.write_all(b"DATE\r\n").await.unwrap();
+            let mut command = [0; 6];
+            backend_read.read_exact(&mut command).await.unwrap();
+            assert_eq!(&command, b"DATE\r\n");
+            client.write_all(&invalid).await.unwrap();
+            // No backend reply has been emitted, so no later local reply is ready.
+            let mut first = [0; 1];
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    client.read_exact(&mut first)
+                )
+                .await
+                .is_err()
+            );
+            backend_write.write_all(b"111 earlier\r\n").await.unwrap();
+            let expected_error: &[u8] = if invalid.len() > 512 {
+                crate::protocol::COMMAND_TOO_LONG
+            } else {
+                crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE
+            };
+            let expected = [b"111 earlier\r\n".as_slice(), expected_error].concat();
+            let mut actual = vec![0; expected.len()];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                client.read_exact(&mut actual),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(actual, expected);
+            drop(client);
+            let _ = proxy.await.unwrap().unwrap();
         }
     }
 
