@@ -2509,7 +2509,7 @@ pub(super) mod scanner_experiment {
         scan(data, find_pair::<64>)
     }
 
-    #[inline(always)]
+    #[inline(never)]
     fn byte_mask<const BYTE: u8>(window: &[u8; 16]) -> u16 {
         let mut mask = 0u16;
         for (lane, &byte) in window.iter().enumerate() {
