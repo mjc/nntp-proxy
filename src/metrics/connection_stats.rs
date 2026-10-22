@@ -129,6 +129,11 @@ impl ConnectionStatsAggregator {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn tracked_session_count(&self) -> usize {
+        self.seen_connections.len()
+    }
+
     /// Flush stats if needed
     fn maybe_flush(&self, now: Instant, force: bool) {
         if let Ok(mut last_flush) = self.last_flush.lock() {
