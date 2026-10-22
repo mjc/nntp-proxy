@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Multiline framing now uses safe Rust autovectorized scans on AArch64 and x86-64 builds targeting AVX2 or AVX-512BW. Generic x86 builds retain the cached `memchr` finder and runtime CPU dispatch.
+- With 1 MiB reads, ordered in-memory framing improved from 32.21 to 46.41 GB/s on Apple M1, 53.49 to 72.55 GB/s on Ryzen 9 5950X, and 54.74 to 84.14 GB/s on Ryzen 5 8600G. A 16 MiB stream mixing single-line replies and encoded 768000-byte article parts improved from 30.64 to 41.81, 52.11 to 70.25, and 51.24 to 71.75 GB/s respectively. These are medians from six alternating before/after pairs; x86 results use `-C target-cpu=native`. They measure request tracking and ordered borrowed writes in memory, not network throughput.
+
+### Fixed
+
+- Preserve the next tracked response after a multiline reply even when its status line is malformed, and keep overlong status-line discard bounded until the line completes.
+- Split cached headerless ARTICLE payloads at their initial blank line so body content is retained correctly.
+
+### Testing
+
+- Added adversarial framing properties for arbitrary fragmentation, packed responses, request-scoped response shapes, malformed and overlong statuses, capture and cache round trips, partial writes, backpressure, cancellation, hybrid handoff, and compressed pipelines.
+- Added scanner equivalence properties and ordered-framing benchmarks with encoded articles, mixed single-line/multiline streams, and 16 KiB through 16 MiB reads. All 2,431 tests pass, including a separate 4,096-case run of the scanner properties; none of the 168 paired ordered-framing comparisons has a median regression.
+
 ## [0.6.0] - 2026-10-21
 
 ### Added
