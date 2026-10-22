@@ -2358,6 +2358,207 @@ fn terminator_ends_in_chunk(data: &[u8]) -> impl Iterator<Item = usize> + '_ {
         .map(|found| found + TERMINATOR.len())
 }
 
+#[cfg(any(test, feature = "framing-bench"))]
+pub(super) mod scanner_experiment {
+    use super::{TERMINATOR, TERMINATOR_FINDER};
+
+    pub struct ScannerBenchmarkInput {
+        bytes: Vec<u8>,
+        expected: (usize, usize),
+    }
+
+    impl ScannerBenchmarkInput {
+        pub fn new(body_len: usize, articles: usize) -> Self {
+            let mut bytes = Vec::new();
+            let mut checksum = 0usize;
+            let mut random = 0x7ac3_85d1u32;
+            for article in 0..articles {
+                bytes.extend_from_slice(
+                    format!("222 {article} <scanner-{article}@example.com>\r\n").as_bytes(),
+                );
+                let mut written = 0;
+                while written < body_len {
+                    let line_len = (body_len - written).min(128);
+                    for column in 0..line_len {
+                        random ^= random << 13;
+                        random ^= random >> 17;
+                        random ^= random << 5;
+                        // Varied printable bytes with ordinary dots and stuffed lines.
+                        let byte = if column == 0 && written % 4096 == 0 {
+                            b'.'
+                        } else {
+                            33 + u8::try_from(random % 94).expect("printable byte")
+                        };
+                        if column == 0 && byte == b'.' {
+                            bytes.push(b'.');
+                        }
+                        bytes.push(byte);
+                    }
+                    bytes.extend_from_slice(b"\r\n");
+                    written += line_len;
+                }
+                bytes.extend_from_slice(b".\r\n");
+                checksum = checksum.wrapping_add(bytes.len());
+            }
+            Self {
+                bytes,
+                expected: (articles, checksum),
+            }
+        }
+
+        pub fn bytes(&self) -> &[u8] {
+            &self.bytes
+        }
+
+        pub fn expected(&self) -> (usize, usize) {
+            self.expected
+        }
+    }
+
+    pub fn benchmark_memchr_scanner(data: &[u8]) -> (usize, usize) {
+        TERMINATOR_FINDER
+            .find_iter(data)
+            .fold((0, 0usize), |(count, checksum), start| {
+                (count + 1, checksum.wrapping_add(start + TERMINATOR.len()))
+            })
+    }
+
+    fn scan(data: &[u8], find: impl Fn(&[u8]) -> Option<usize>) -> (usize, usize) {
+        let mut offset = 0;
+        let mut count = 0;
+        let mut checksum = 0usize;
+        while let Some(start) = find(&data[offset..]) {
+            offset += start + TERMINATOR.len();
+            count += 1;
+            checksum = checksum.wrapping_add(offset);
+        }
+        (count, checksum)
+    }
+
+    // Bitwise reductions keep the independent lane predicates vectorizable.
+    #[inline(always)]
+    fn exact_16(data: &[u8]) -> bool {
+        let mut found = false;
+        for lane in 0..16 {
+            found |= (data[lane] == b'\r')
+                & (data[lane + 1] == b'\n')
+                & (data[lane + 2] == b'.')
+                & (data[lane + 3] == b'\r')
+                & (data[lane + 4] == b'\n');
+        }
+        found
+    }
+
+    fn find_fixed(data: &[u8]) -> Option<usize> {
+        let mut offset = 0;
+        while data.len() - offset >= 68 {
+            let block = &data[offset..offset + 68];
+            let found = exact_16(block)
+                | exact_16(&block[16..])
+                | exact_16(&block[32..])
+                | exact_16(&block[48..]);
+            if found {
+                return (0..64)
+                    .find(|&lane| &block[lane..lane + 5] == TERMINATOR)
+                    .map(|lane| offset + lane);
+            }
+            offset += 64;
+        }
+        TERMINATOR_FINDER
+            .find(&data[offset..])
+            .map(|start| offset + start)
+    }
+
+    pub fn benchmark_fixed_scanner(data: &[u8]) -> (usize, usize) {
+        scan(data, find_fixed)
+    }
+
+    fn find_pair<const WIDTH: usize>(data: &[u8]) -> Option<usize> {
+        let mut offset = 0;
+        while data.len() - offset >= WIDTH + 4 {
+            let block = &data[offset..offset + WIDTH + 4];
+            let mut possible = false;
+            for lane in 0..WIDTH {
+                possible |= (block[lane] == b'\r') & (block[lane + 2] == b'.');
+            }
+            if possible
+                && let Some(lane) = (0..WIDTH).find(|&lane| &block[lane..lane + 5] == TERMINATOR)
+            {
+                return Some(offset + lane);
+            }
+            offset += WIDTH;
+        }
+        TERMINATOR_FINDER
+            .find(&data[offset..])
+            .map(|start| offset + start)
+    }
+
+    pub fn benchmark_auto_pair_16(data: &[u8]) -> (usize, usize) {
+        scan(data, find_pair::<16>)
+    }
+
+    pub fn benchmark_auto_pair_32(data: &[u8]) -> (usize, usize) {
+        scan(data, find_pair::<32>)
+    }
+
+    pub fn benchmark_auto_pair_64(data: &[u8]) -> (usize, usize) {
+        scan(data, find_pair::<64>)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn check(data: &[u8]) {
+            let expected = TERMINATOR_FINDER.find(data);
+            assert_eq!(find_fixed(data), expected, "fixed: {data:?}");
+            assert_eq!(find_pair::<16>(data), expected, "pair16: {data:?}");
+            assert_eq!(find_pair::<32>(data), expected, "pair32: {data:?}");
+            assert_eq!(find_pair::<64>(data), expected, "pair64: {data:?}");
+        }
+
+        #[test]
+        fn simd_scanners_match_at_every_lane_alignment_and_tail() {
+            for len in 0usize..160 {
+                for alignment in 0..16 {
+                    let mut storage = vec![b'x'; alignment + len];
+                    check(&storage[alignment..]);
+                    for start in 0..len.saturating_sub(4) {
+                        storage[alignment + start..alignment + start + 5]
+                            .copy_from_slice(TERMINATOR);
+                        check(&storage[alignment..]);
+                        for byte in 0..5 {
+                            storage[alignment + start + byte] ^= 0x80;
+                            check(&storage[alignment..]);
+                            storage[alignment + start + byte] ^= 0x80;
+                        }
+                        storage[alignment + start..alignment + start + 5].fill(b'x');
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn simd_scanners_match_packed_stream_checksums() {
+            for len in [1, 15, 16, 17, 31, 64, 127, 128, 1024, 65536] {
+                let input = ScannerBenchmarkInput::new(len, 8);
+                assert_eq!(benchmark_memchr_scanner(input.bytes()), input.expected());
+                assert_eq!(benchmark_fixed_scanner(input.bytes()), input.expected());
+                assert_eq!(benchmark_auto_pair_16(input.bytes()), input.expected());
+                assert_eq!(benchmark_auto_pair_32(input.bytes()), input.expected());
+                assert_eq!(benchmark_auto_pair_64(input.bytes()), input.expected());
+            }
+        }
+
+        proptest::proptest! {
+            #[test]
+            fn simd_scanners_match_arbitrary_input(data in proptest::collection::vec(proptest::num::u8::ANY, 0..4096)) {
+                check(&data);
+            }
+        }
+    }
+}
+
 #[cfg(feature = "framing-bench")]
 #[must_use]
 pub fn benchmark_multiline_response(body_len: usize) -> Vec<u8> {
