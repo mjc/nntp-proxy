@@ -2599,10 +2599,17 @@ pub(super) mod scanner_experiment {
 
         #[test]
         fn simd_scanners_match_at_every_lane_alignment_and_tail() {
-            for len in 0usize..288 {
-                for alignment in 0..16 {
-                    let mut storage = vec![b'x'; alignment + len];
+            for len in 0usize..544 {
+                for alignment in 0..32 {
+                    let storage = vec![b'x'; alignment + len];
                     check(&storage[alignment..]);
+                }
+            }
+            // Cover every candidate lane across two blocks, including matches
+            // crossing each block end, without repeating every shorter prefix.
+            for len in [31usize, 67, 131, 259, 515] {
+                for alignment in 0..32 {
+                    let mut storage = vec![b'x'; alignment + len];
                     for start in 0..len.saturating_sub(4) {
                         storage[alignment + start..alignment + start + 5]
                             .copy_from_slice(TERMINATOR);
