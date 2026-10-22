@@ -795,22 +795,31 @@ impl managed::Manager for TcpManager {
     type Error = ConnectionError;
 
     async fn create(&self) -> Result<ReadyBackendConnection, ConnectionError> {
-        let mut stream = self.create_optimized_stream().await?;
-        let mut buffer = [0u8; 4096];
+        tokio::time::timeout(crate::constants::timeout::CONNECTION, async {
+            let mut stream = self.create_optimized_stream().await?;
+            let mut buffer = [0u8; 4096];
 
-        self.consume_greeting(&mut stream, &mut buffer).await?;
-        self.negotiate_auth(&mut stream, &mut buffer).await?;
+            self.consume_greeting(&mut stream, &mut buffer).await?;
+            self.negotiate_auth(&mut stream, &mut buffer).await?;
 
-        if self.send_mode_reader {
-            self.negotiate_mode_reader(&mut stream, &mut buffer).await?;
-        }
+            if self.send_mode_reader {
+                self.negotiate_mode_reader(&mut stream, &mut buffer).await?;
+            }
 
-        if self.negotiate_compression(&mut stream, &mut buffer).await? {
-            let level = self.compression.level;
-            stream = stream.into_compressed(level)?;
-        }
+            if self.negotiate_compression(&mut stream, &mut buffer).await? {
+                let level = self.compression.level;
+                stream = stream.into_compressed(level)?;
+            }
 
-        Ok(ReadyBackendConnection::new(stream))
+            Ok(ReadyBackendConnection::new(stream))
+        })
+        .await
+        .map_err(|_| {
+            ConnectionError::IoError(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("Backend '{}' connection setup timed out", self.name),
+            ))
+        })?
     }
 
     async fn recycle(
@@ -841,6 +850,36 @@ mod tests {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn backend_setup_has_a_deadline_when_greeting_stalls() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let manager = TcpManager::new(
+            addr.ip().to_string(),
+            addr.port(),
+            "stalled".into(),
+            TcpManagerOptions {
+                compress: Some(false),
+                ..TcpManagerOptions::default()
+            },
+        )
+        .unwrap();
+        let create = managed::Manager::create(&manager);
+        tokio::pin!(create);
+        let (socket, _) = tokio::select! {
+            accepted = listener.accept() => accepted.unwrap(),
+            result = &mut create => panic!("setup completed before greeting: {result:?}"),
+        };
+        tokio::time::pause();
+        let result = tokio::time::timeout(crate::constants::timeout::CONNECTION * 2, &mut create)
+            .await
+            .expect("backend setup did not enforce its deadline");
+        assert!(
+            matches!(result, Err(ConnectionError::IoError(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+        drop(socket);
+    }
 
     #[test]
     fn test_socket_buffer_size_u32_rejects_oversized_values() {
