@@ -17,22 +17,15 @@
 /// then evaluates `$expr` a second time. If the retry also fails, returns
 /// the **original** error from the first attempt.
 ///
-/// # Usage
-///
-/// ```ignore
-/// // With context fields (lazy evaluation, zero allocation on success path)
-/// let result = retry_once!(
-///     self.execute_backend_attempt(provider, id, cmd, buf).await,
-///     client = self.client_addr,
-///     backend = backend_id.as_index()
-/// );
-///
-/// // Without context (tests)
-/// let result = retry_once!(fallible_op(&counter).await);
-/// ```
-///
 /// The expression is evaluated twice at most, sequentially, so mutable borrows
 /// that span the `.await` work correctly — unlike an `FnMut` closure.
+///
+/// # Usage
+///
+/// This internal example is compiled and run by `tests::documented_retry_example`.
+#[doc = "```text"]
+#[doc = include_str!("retry_example.rs")]
+#[doc = "```"]
 macro_rules! retry_once {
     ($expr:expr $(, $key:ident = $val:expr)* $(,)?) => {{
         match $expr {
@@ -63,8 +56,17 @@ macro_rules! retry_once {
 pub(crate) use retry_once;
 
 #[cfg(test)]
+#[path = "retry_example.rs"]
+mod example;
+
+#[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
+
+    #[tokio::test(start_paused = true)]
+    async fn documented_retry_example() {
+        super::example::run().await;
+    }
 
     fn numbered_fail(c: &AtomicU32) -> Result<(), String> {
         let n = c.fetch_add(1, Ordering::SeqCst);

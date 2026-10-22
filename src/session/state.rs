@@ -22,9 +22,15 @@ pub enum StatefulReadMode {
 /// making it easy to pass around and test in isolation.
 ///
 /// # Example
-/// ```ignore
-/// let state = SessionLoopState::new(auth_enabled)
+/// ```
+/// use nntp_proxy::session::SessionLoopState;
+///
+/// let state = SessionLoopState::new(true)
 ///     .with_initial_bytes(1000, 500);
+/// assert_eq!(state.client_to_backend.as_u64(), 1000);
+/// assert_eq!(state.backend_to_client.as_u64(), 500);
+/// assert_eq!(state.last_reported_c2b, state.client_to_backend);
+/// assert_eq!(state.last_reported_b2c, state.backend_to_client);
 /// ```
 pub struct SessionLoopState {
     /// Bytes sent from client to backend

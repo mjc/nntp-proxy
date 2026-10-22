@@ -23,10 +23,24 @@ use tracing::{debug, info, warn};
 /// only exposes that initialized portion.
 ///
 /// ## Usage
-/// ```ignore
+/// ```
+/// use nntp_proxy::pool::BufferPool;
+/// use nntp_proxy::types::BufferSize;
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let pool = BufferPool::new(BufferSize::try_new(8192)?, 1);
+/// let mut stream = b"hello".as_slice();
 /// let mut buffer = pool.acquire();
-/// let n = buffer.read_from(&mut stream).await?;  // Automatic tracking
-/// process(&*buffer);  // Deref returns only &buffer[..n]
+/// let n = buffer.read_from(&mut stream).await?;
+/// assert_eq!(n, 5);
+/// assert_eq!(&*buffer, b"hello");
+/// assert_eq!(buffer.initialized(), n);
+///
+/// drop(buffer);
+/// assert_eq!(pool.available_buffers(), 1);
+/// # Ok(())
+/// # }
+/// # futures::executor::block_on(example()).unwrap();
 /// ```
 pub struct PooledBuffer {
     buffer: BufferStorage,
