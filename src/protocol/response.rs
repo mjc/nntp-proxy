@@ -1,8 +1,10 @@
 //! NNTP response status parsing.
 //!
 //! This module parses the three-digit status indicator from NNTP responses.
-//! Response shape is request-scoped and lives in `RequestContext`; multiline
-//! boundary handling lives in `src/session/multiline_framing.rs`.
+//! Response shape is request-scoped and lives in
+//! [`crate::protocol::RequestContext`]; the session framer handles response
+//! boundaries. [`StatusCode`] describes the status line. Use the request context
+//! to determine whether a multiline response follows.
 //!
 //! # NNTP Protocol References
 //!

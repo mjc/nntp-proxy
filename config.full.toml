@@ -113,6 +113,9 @@ name = "Example News Server 1"
 # Optional backend authentication
 # username = "your_username"
 # password = "your_password"
+# Servers with the same hostname share recorded article misses across ports,
+# accounts, and credentials. Hostname matching ignores ASCII case and one trailing
+# DNS dot.
 max_connections = 20
 # Lower tier numbers are tried first. Higher tiers are fallback/archive servers.
 tier = 0

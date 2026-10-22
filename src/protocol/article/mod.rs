@@ -1,7 +1,9 @@
-//! Article parsing and validation
+//! Article parsing and semantic validation.
 //!
-//! Provides zero-copy parsing of complete NNTP article responses
-//! (ARTICLE, HEAD, BODY, STAT) with validation of semantic structure.
+//! Provides zero-copy views over complete NNTP article-family responses
+//! (`ARTICLE`, `HEAD`, `BODY`, and `STAT`). Parsing validates the response shape
+//! and retains borrowed ranges; it does not allocate an owned article or decode
+//! yEnc payload bytes.
 
 mod error;
 mod headers;
@@ -15,7 +17,12 @@ use crate::types::protocol::MessageId;
 use std::ops::Range;
 use yenc::validate_yenc_structure;
 
-/// Parsed NNTP article response (zero-copy)
+/// Parsed NNTP article response as borrowed views into a framed response.
+///
+/// The fields present depend on the request-scoped response shape. A complete
+/// `ARTICLE` response has both headers and a body, `HEAD` has headers only,
+/// `BODY` has a body only, and `STAT` has neither. The view borrows the framed
+/// bytes; it does not own or mutate them.
 ///
 /// Different response codes populate different fields:
 /// - 220 ARTICLE: headers + body
@@ -24,19 +31,33 @@ use yenc::validate_yenc_structure;
 /// - 223 STAT: neither (just metadata)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Article<'a> {
+    /// Message ID returned by the server.
     pub message_id: MessageId<'a>,
+    /// Article number returned by the server, when the response supplied one.
     pub article_number: Option<u64>,
+    /// Parsed headers for `ARTICLE` and `HEAD` responses.
     pub headers: Option<Headers<'a>>,
+    /// Article body bytes for `ARTICLE` and `BODY` responses.
     pub body: Option<&'a [u8]>,
 }
 
-/// Consumer-facing view of an article whose framing has already been handled.
+/// Borrowed view of a framed and validated article.
+///
+/// This alias for [`Article`] describes the result of
+/// [`crate::client::ValidatedArticle::article`]. Obtaining the view borrows
+/// existing bytes without allocating, copying, or repeating validation.
 pub type ArticleView<'a> = Article<'a>;
 
 /// Optional yEnc policy applied after NNTP article structure is validated.
+///
+/// Enabling this policy checks yEnc structure when the framed response is
+/// consumed. It does not decode the body; call [`Article::decode`] or
+/// [`Article::decode_into`] when decoded bytes are required.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum YencValidation {
+    /// Validate NNTP structure without inspecting yEnc payload syntax.
     Disabled,
+    /// Validate a body that begins with a yEnc header.
     Enabled,
 }
 

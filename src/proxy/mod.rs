@@ -1,7 +1,9 @@
-//! NNTP Proxy implementation
+//! NNTP proxy construction and runtime.
 //!
-//! This module contains the main `NntpProxy` struct which orchestrates
-//! connection handling, routing, and resource management.
+//! [`NntpProxy`] accepts local NNTP connections and coordinates authentication,
+//! request classification, backend selection, pooled I/O, caching, metrics,
+//! and shutdown. Use [`NntpProxyBuilder`] to configure a proxy in Rust code. The
+//! binary loads its configuration through [`crate::Config`].
 //!
 //! ## Module structure
 //!

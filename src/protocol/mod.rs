@@ -1,6 +1,12 @@
-//! NNTP protocol handling module
+//! NNTP protocol types and wire-format helpers.
 //!
-//! This module contains response parsing and protocol utilities for NNTP communication.
+//! Types for NNTP requests, status codes, article views, and local responses.
+//! Use [`RequestContext::has_response_body`] to determine response shape: the
+//! same status code can be single-line or multiline depending on the request.
+//!
+//! Framing checks response boundaries; article parsing checks article structure.
+//! The pooled client represents these stages with [`crate::client::FramedArticle`]
+//! and [`crate::client::ValidatedArticle`].
 
 use anyhow::Result;
 use tokio::io::AsyncWriteExt;

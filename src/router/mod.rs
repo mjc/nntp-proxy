@@ -1,12 +1,10 @@
 //! Backend server selection and load balancing
 //!
-//! This module handles selecting backend servers using round-robin
-//! with simple load tracking for monitoring.
-//!
-//! # Overview
-//!
-//! The `BackendSelector` provides thread-safe backend selection for routing
-//! NNTP commands across multiple backend servers.
+//! [`BackendSelector`] selects backends with weighted round-robin or
+//! least-loaded routing. It supports concurrent requests and tracks pending
+//! work and connection capacity. Article requests can carry recorded provider
+//! misses, and queue-pressure limits exclude saturated backends while
+//! alternatives remain.
 //!
 //! # Usage
 //!

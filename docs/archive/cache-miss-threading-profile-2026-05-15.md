@@ -1,18 +1,18 @@
-# Cache-Miss Threading Profile - 2026-05-15
+# Cache-Miss Threading Profile — May 2026
 
-This note is historical profiling context. Do not quote these numbers as
-current README or release performance claims; later forwarding changes changed
-the cache-miss path. The current conservative README numbers are the 2026-05-20
-100GB `nntpbench` spot checks:
+This May 2026 investigation examined why adding Tokio workers and backend
+connections did not scale the large-article cache-miss benchmark. Later
+forwarding changes altered that path, so these results do not describe the
+0.6.0 release. Record measurements for later releases with their tested commit
+and workload.
+
+These 100GB `nntpbench` spot checks were recorded on 2026-05-20 for comparison
+within the investigation:
 
 | Shape | Mean MiB/s | Median MiB/s | Stdev | Min | Max |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | `1/1/1` | 3881.42 | 3895.40 | 105.28 | 3690.86 | 4003.93 |
 | `4/8/8` | 8622.58 | 8618.86 | 147.46 | 8326.10 | 8808.85 |
-
-This note captured an investigation into why adding Tokio worker
-threads and backend connections does not scale the large-article cache-miss
-benchmark cleanly.
 
 ## Workload
 
@@ -27,7 +27,7 @@ Python benchmark client
 
 Dataset:
 
-- Source NZB: `testfile-10GB-no-rar.nzb`
+- Source article set: 14,746 selected articles from the benchmark fixture
 - Selected articles: 14,746
 - Selected response bytes: 10,739,812,486
 - Minimum article size: 716,800 bytes
@@ -151,8 +151,8 @@ single Python process was the bottleneck at roughly 1.6-1.8 GiB/s.
 
 The harness now supports `CLIENT_PROCESSES=N`, which preserves the same global
 client/request distribution but splits the benchmark readers across multiple OS
-processes. This does not change the proxy topology or the real NZB message IDs;
-it only prevents one Python event loop from being the throughput ceiling.
+processes. The proxy topology and selected article message IDs stay the same,
+while the readers can use more than one Python event loop.
 
 Corrected direct-upstream command:
 

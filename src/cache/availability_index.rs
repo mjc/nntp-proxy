@@ -1,8 +1,8 @@
 //! Bounded availability-only blocked fingerprint index.
 //!
-//! Stores negative-only backend availability using a rotating blocked fingerprint
-//! filter. The fixed fingerprint arena is bounded by `capacity_bytes`, favors
-//! throughput, and accepts occasional false negatives from rotation/overwrites.
+//! Records provider-slot misses in a rotating blocked fingerprint filter.
+//! `capacity_bytes` bounds the fingerprint storage. Rotation and overwrites can
+//! discard old misses to keep lookups fast.
 //! Each occupied slot also retains one bounded exact message-key sidecar
 //! alongside its 64-bit fingerprint and 16-bit confirmation tag, so a matching
 //! fingerprint never authorizes a miss for a different message.
