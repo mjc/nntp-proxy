@@ -846,10 +846,10 @@ impl RequestContext {
         (self.verb.len() + usize::from(!self.args.is_empty()) + self.args.len() + 2).into()
     }
 
-    /// Write and flush a request so buffered transports can deliver it before a reply is read.
+    /// Write the typed request as NNTP wire bytes without building a command buffer.
     ///
     /// # Errors
-    /// Returns any I/O error from writing or flushing `writer`.
+    /// Returns any I/O error from writing the request bytes to `writer`.
     pub async fn write_wire_to<W>(&self, writer: &mut W) -> std::io::Result<()>
     where
         W: tokio::io::AsyncWrite + Unpin,
@@ -858,7 +858,7 @@ impl RequestContext {
 
         if self.args().is_empty() {
             let mut slices = [IoSlice::new(self.verb()), IoSlice::new(b"\r\n")];
-            crate::io_util::write_all_vectored(writer, &mut slices).await?;
+            crate::io_util::write_all_vectored(writer, &mut slices).await
         } else {
             let mut slices = [
                 IoSlice::new(self.verb()),
@@ -866,8 +866,19 @@ impl RequestContext {
                 IoSlice::new(self.args()),
                 IoSlice::new(b"\r\n"),
             ];
-            crate::io_util::write_all_vectored(writer, &mut slices).await?;
+            crate::io_util::write_all_vectored(writer, &mut slices).await
         }
+    }
+
+    /// Send a request through a buffered transport before waiting for its response.
+    ///
+    /// # Errors
+    /// Returns any I/O error from writing or flushing the request.
+    pub(crate) async fn send_to<W>(&self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        self.write_wire_to(writer).await?;
         tokio::io::AsyncWriteExt::flush(writer).await
     }
 
@@ -1093,6 +1104,7 @@ mod tests {
         bytes: Vec<u8>,
         writes: usize,
         vectored_writes: usize,
+        flushes: usize,
     }
 
     impl AsyncWrite for CountingWriter {
@@ -1123,7 +1135,11 @@ mod tests {
             true
         }
 
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.flushes += 1;
             Poll::Ready(Ok(()))
         }
 
@@ -1263,13 +1279,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn request_window_can_flush_once_after_all_writes() {
+        use tokio::io::AsyncWriteExt;
+        let mut writer = CountingWriter::default();
+        for _ in 0..4 {
+            RequestContext::parse(b"DATE\r\n")
+                .unwrap()
+                .write_wire_to(&mut writer)
+                .await
+                .unwrap();
+        }
+        writer.flush().await.unwrap();
+        assert_eq!(writer.flushes, 1);
+    }
+
+    #[tokio::test]
     async fn compressed_request_is_visible_without_an_extra_flush() {
         use tokio::io::AsyncReadExt;
         let (writer, reader) = tokio::io::duplex(1024);
         let mut writer = crate::compression::DecompressStream::new(writer);
         let mut reader = crate::compression::DecompressStream::new(reader);
         let request = RequestContext::parse(b"DATE\r\n").unwrap();
-        request.write_wire_to(&mut writer).await.unwrap();
+        request.send_to(&mut writer).await.unwrap();
         let mut received = [0; 6];
         tokio::time::timeout(
             std::time::Duration::from_millis(100),

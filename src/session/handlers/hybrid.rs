@@ -185,7 +185,7 @@ impl ClientSession {
         // Forward the triggering request (response handled by proxy loop)
         if let Err(error) = initial_request
             .request()
-            .write_wire_to(backend.connection_mut().stream_mut())
+            .send_to(backend.connection_mut().stream_mut())
             .await
             .context("Failed to send initial request to backend")
         {

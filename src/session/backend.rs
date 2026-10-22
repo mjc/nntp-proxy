@@ -139,7 +139,7 @@ async fn execute_request_classified<C>(
 where
     C: AsyncReadExt + AsyncWriteExt + Unpin,
 {
-    request.write_wire_to(conn).await?;
+    request.send_to(conn).await?;
 
     let n = buffer.read_from(conn).await?;
     if n == 0 {
@@ -159,7 +159,7 @@ pub(crate) async fn execute_request_exchange<'pool>(
     pool: &'pool crate::pool::BufferPool,
     backend_id: crate::types::BackendId,
 ) -> Result<BackendResponseExchange<'pool>> {
-    request.write_wire_to(conn.stream_mut()).await?;
+    request.send_to(conn.stream_mut()).await?;
 
     let n = buffer.read_from(conn.stream_mut()).await?;
     if n == 0 {
@@ -181,7 +181,7 @@ pub(crate) async fn execute_request_exchange_timed<'pool>(
     use std::time::Instant;
 
     let start = Instant::now();
-    request.write_wire_to(conn.stream_mut()).await?;
+    request.send_to(conn.stream_mut()).await?;
     let after_send = Instant::now();
 
     let n = buffer.read_from(conn.stream_mut()).await?;
