@@ -2509,16 +2509,32 @@ pub(super) mod scanner_experiment {
         scan(data, find_pair::<64>)
     }
 
+    #[inline(always)]
+    fn repeat_mask<const FIRST: usize, const BYTE: u8>(window: &[u8; 20]) -> u16 {
+        let mut mask = 0u16;
+        for lane in 0..16 {
+            let candidate = (window[lane + FIRST] == BYTE) & (window[lane + FIRST + 3] == BYTE);
+            mask |= u16::from(candidate) << lane;
+        }
+        mask
+    }
+
     fn find_repeat<const FIRST: usize, const BYTE: u8>(data: &[u8]) -> Option<usize> {
         let mut offset = 0;
         while data.len() - offset >= 68 {
             let block = &data[offset..offset + 68];
-            let mut possible = false;
-            for lane in 0..64 {
-                possible |= (block[lane + FIRST] == BYTE) & (block[lane + FIRST + 3] == BYTE);
-            }
-            if possible && let Some(lane) = first_match(block) {
-                return Some(offset + lane);
+            for base in [0, 16, 32, 48] {
+                let window: &[u8; 20] = block[base..base + 20]
+                    .try_into()
+                    .expect("fixed scan window");
+                let mut mask = repeat_mask::<FIRST, BYTE>(window);
+                while mask != 0 {
+                    let lane = mask.trailing_zeros() as usize;
+                    if &window[lane..lane + 5] == TERMINATOR {
+                        return Some(offset + base + lane);
+                    }
+                    mask &= mask - 1;
+                }
             }
             offset += 64;
         }
