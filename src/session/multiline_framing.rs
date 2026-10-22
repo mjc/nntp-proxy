@@ -2518,6 +2518,34 @@ pub(super) mod scanner_experiment {
             .map(|start| offset + start)
     }
 
+    fn find_or<const WIDTH: usize>(data: &[u8]) -> Option<usize> {
+        let mut offset = 0;
+        while data.len() - offset >= WIDTH + 4 {
+            let block = &data[offset..offset + WIDTH + 4];
+            let mut possible = false;
+            for lane in 0..WIDTH {
+                // Every CR pair passes; control bytes may also pass and are
+                // rejected by the full verifier before a match is returned.
+                possible |= (block[lane] | block[lane + 3]) == b'\r';
+            }
+            if possible && let Some(lane) = first_match(block) {
+                return Some(offset + lane);
+            }
+            offset += WIDTH;
+        }
+        TERMINATOR_FINDER
+            .find(&data[offset..])
+            .map(|start| offset + start)
+    }
+
+    pub fn benchmark_cr_or_128(data: &[u8]) -> (usize, usize) {
+        scan(data, find_or::<128>)
+    }
+
+    pub fn benchmark_cr_or_256(data: &[u8]) -> (usize, usize) {
+        scan(data, find_or::<256>)
+    }
+
     pub fn benchmark_cr_dot_64(data: &[u8]) -> (usize, usize) {
         scan(data, find_pair::<64>)
     }
@@ -2545,6 +2573,8 @@ pub(super) mod scanner_experiment {
         fn check(data: &[u8]) {
             let expected = TERMINATOR_FINDER.find(data);
             assert_eq!(find_pair::<64>(data), expected, "CR/dot: {data:?}");
+            assert_eq!(find_or::<128>(data), expected, "CR OR128: {data:?}");
+            assert_eq!(find_or::<256>(data), expected, "CR OR256: {data:?}");
             assert_eq!(
                 find_repeat::<64, 0, b'\r'>(data),
                 expected,
@@ -2569,7 +2599,7 @@ pub(super) mod scanner_experiment {
 
         #[test]
         fn simd_scanners_match_at_every_lane_alignment_and_tail() {
-            for len in 0usize..160 {
+            for len in 0usize..288 {
                 for alignment in 0..16 {
                     let mut storage = vec![b'x'; alignment + len];
                     check(&storage[alignment..]);
@@ -2596,6 +2626,8 @@ pub(super) mod scanner_experiment {
                 assert_eq!(benchmark_cr_dot_64(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_pair_64(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_pair_128(input.bytes()), input.expected());
+                assert_eq!(benchmark_cr_or_128(input.bytes()), input.expected());
+                assert_eq!(benchmark_cr_or_256(input.bytes()), input.expected());
                 assert_eq!(benchmark_lf_pair_64(input.bytes()), input.expected());
                 assert_eq!(benchmark_lf_pair_128(input.bytes()), input.expected());
             }
@@ -2604,6 +2636,13 @@ pub(super) mod scanner_experiment {
         proptest::proptest! {
             #[test]
             fn simd_scanners_match_arbitrary_input(data in proptest::collection::vec(proptest::num::u8::ANY, 0..4096)) {
+                check(&data);
+            }
+
+            #[test]
+            fn simd_scanners_reject_or_predicate_false_positives(data in proptest::collection::vec(
+                proptest::sample::select(vec![0, 1, 4, 5, 8, 9, 12, 13, b'\n', b'.', b'x']), 0..4096
+            )) {
                 check(&data);
             }
 
