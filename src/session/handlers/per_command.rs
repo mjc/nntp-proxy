@@ -908,11 +908,10 @@ impl ClientSession {
         conn: &mut crate::pool::ConnectionGuard,
     ) -> std::io::Result<usize> {
         let mut in_flight = 0;
-        for (i, request_route) in requests
-            .iter_mut()
-            .take(MAX_UPSTREAM_ARTICLE_WINDOW)
-            .enumerate()
-        {
+        for (i, request_route) in requests.iter_mut().enumerate() {
+            if in_flight == MAX_UPSTREAM_ARTICLE_WINDOW {
+                break;
+            }
             if let ArticleWindowRequest::SendUpstream { sent, .. } = request_route {
                 let request = batch.context(i).request();
                 self.metrics.record_command(backend_id);

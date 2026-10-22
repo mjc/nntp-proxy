@@ -958,6 +958,100 @@ async fn test_per_command_body_window_keeps_cached_430_after_earlier_success() -
 }
 
 #[tokio::test]
+async fn test_per_command_body_window_counts_upstream_requests_not_cached_misses() -> Result<()> {
+    const CACHED_MISSES: usize = 16;
+
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let (_connection_count, seen_commands) = spawn_delayed_pipeline_backend(
+        backend_listener,
+        &[
+            (
+                "BODY <window-after-misses-1@example>",
+                "222 1 <window-after-misses-1@example>\r\nfirst-line\r\n.\r\n",
+            ),
+            (
+                "BODY <window-after-misses-2@example>",
+                "222 2 <window-after-misses-2@example>\r\nsecond-line\r\n.\r\n",
+            ),
+        ],
+        &[(
+            "BODY <window-cached-missing@example>",
+            "430 No such article\r\n",
+        )],
+    );
+
+    let proxy_port = spawn_proxy_with_config(
+        pipeline_backend_config(backend_port, "BodyWindowCountsUpstream"),
+        RoutingMode::PerCommand,
+    )
+    .await?;
+    let client = connect_and_read_greeting(proxy_port).await?;
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    for _ in 0..CACHED_MISSES {
+        write_commands(
+            &mut write_half,
+            &["BODY <window-cached-missing@example>\r\n"],
+        )
+        .await?;
+        assert_eq!(
+            read_line(&mut reader, "cached-miss warmup response").await?,
+            "430 No such article\r\n"
+        );
+    }
+
+    let mut commands = vec!["BODY <window-cached-missing@example>\r\n"; CACHED_MISSES];
+    commands.extend([
+        "BODY <window-after-misses-1@example>\r\n",
+        "BODY <window-after-misses-2@example>\r\n",
+    ]);
+    write_commands(&mut write_half, &commands).await?;
+
+    for _ in 0..CACHED_MISSES {
+        assert_eq!(
+            read_line(&mut reader, "cached-miss response").await?,
+            "430 No such article\r\n"
+        );
+    }
+    assert_eq!(
+        timeout(
+            Duration::from_secs(3),
+            read_multiline_responses(&mut reader, 2)
+        )
+        .await??,
+        vec![
+            (
+                "222 1 <window-after-misses-1@example>\r\n".to_string(),
+                vec!["first-line\r\n".to_string()],
+            ),
+            (
+                "222 2 <window-after-misses-2@example>\r\n".to_string(),
+                vec!["second-line\r\n".to_string()],
+            ),
+        ]
+    );
+
+    let seen_commands = seen_commands.lock().await;
+    assert_eq!(
+        seen_commands
+            .iter()
+            .filter(|command| command.as_str() == "BODY <window-after-misses-1@example>")
+            .count(),
+        1,
+    );
+    assert_eq!(
+        seen_commands
+            .iter()
+            .filter(|command| command.as_str() == "BODY <window-after-misses-2@example>")
+            .count(),
+        1,
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_body_pipelining_pairs_four_responses_on_single_backend_connection() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
