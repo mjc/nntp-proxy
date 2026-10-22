@@ -191,10 +191,6 @@ When you want fresh numbers:
 - end-to-end cache-miss benchmarking uses `scripts/bench-release-cache-miss-e2e.sh`
 - profiling helpers include `scripts/parse_perfdata` and `scripts/parse_flamegraph`
 
-The E2E script accepts `NNTPBENCH_SERVER_THREADS` to set the mock backend's
-worker count; it defaults to `1`. Hold backend workers, client workers,
-connection counts, and CPU allocations fixed when comparing proxy worker counts.
-
 Do not treat old README benchmark values as current project guarantees.
 
 ## Manual smoke test
