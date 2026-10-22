@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Multiline framing now uses safe Rust autovectorized scans on AArch64 and x86-64 builds targeting AVX2 or AVX-512BW. Generic x86 builds retain the cached `memchr` finder and runtime CPU dispatch.
 - With 1 MiB reads, ordered in-memory framing improved from 32.21 to 46.41 GB/s on Apple M1, 53.49 to 72.55 GB/s on Ryzen 9 5950X, and 54.74 to 84.14 GB/s on Ryzen 5 8600G. A 16 MiB stream mixing single-line replies and encoded 768000-byte article parts improved from 30.64 to 41.81, 52.11 to 70.25, and 51.24 to 71.75 GB/s respectively. These are medians from six alternating before/after pairs; x86 results use `-C target-cpu=native`. They measure request tracking and ordered borrowed writes in memory, not network throughput.
+- Verified nntpbench E2E runs on Ryzen 9 5950X completed 50 accepted transfers of at least 100 GiB each with 768 KiB articles and full verification. Native builds showed approximately +0.9% median paired throughput and 2.0%/2.9% lower proxy CPU seconds per GiB for single-client/16-client workloads. Throughput ranges crossed zero, and host variation prevents a precise E2E speedup claim. All transfers completed without incomplete requests or connection timeouts; three additional fully verified transfers were excluded from timing because of ffmpeg interference and replaced with clean retries.
 
 ### Fixed
 
