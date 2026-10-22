@@ -100,8 +100,6 @@ impl std::ops::AddAssign for ResponseWriteStats {
 enum PackedPendingBytesPolicy {
     Reject,
     AllowIfStatusPrefix,
-    // Tracked replies must leave even malformed next status lines for their request.
-    AllowAnySuffix,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2045,7 +2043,6 @@ impl MultilineFramer {
     ) -> Result<ChunkProgress, FramingError> {
         if let Some(end) = self.find_spanning_terminator(chunk) {
             if end == chunk.len()
-                || matches!(suffix_policy, PackedPendingBytesPolicy::AllowAnySuffix)
                 || matches!(suffix_policy, PackedPendingBytesPolicy::AllowIfStatusPrefix)
                     && plausible_status_prefix(&chunk[end..])
             {
@@ -2065,11 +2062,6 @@ impl MultilineFramer {
             }
 
             match suffix_policy {
-                PackedPendingBytesPolicy::AllowAnySuffix => {
-                    return Ok(ChunkProgress::Complete(CompleteChunk {
-                        consumed: ChunkConsumed(end),
-                    }));
-                }
                 PackedPendingBytesPolicy::Reject => {
                     return Err(FramingError::UnexpectedTrailingResponseBytes);
                 }
@@ -2103,16 +2095,14 @@ impl MultilineFramer {
 
     /// Return the earliest terminator end offset touching the current chunk.
     ///
-    /// Unlike [`find_terminator_end`], this includes terminators split across the
-    /// framer's prior tail and `chunk`.
+    /// Includes terminators split across the framer's prior tail and `chunk`.
     #[must_use]
-    #[cfg(test)]
     fn next_terminator_end(&self, chunk: &[u8]) -> Option<usize> {
         // A spanning hit always ends within the first 4 bytes of `chunk`, while an
         // in-chunk terminator must end at byte 5 or later, so spanning-first is
         // also earliest-first.
         self.find_spanning_terminator(chunk)
-            .or_else(|| find_terminator_end_from(chunk, 0))
+            .or_else(|| terminator_ends_in_chunk(chunk).next())
     }
 
     /// Return the earliest terminator end offset, updating rolling state on miss.
@@ -2124,7 +2114,6 @@ impl MultilineFramer {
     /// should stop using this framer instance after `Some(_)` and start a fresh one
     /// for the next response.
     #[must_use]
-    #[cfg(test)]
     fn advance_to_next_terminator_end(&mut self, chunk: &[u8]) -> Option<usize> {
         let pos = self.next_terminator_end(chunk);
         if pos.is_none() {
@@ -2219,36 +2208,25 @@ impl PendingRequestFrame {
                 let mut framer = MultilineFramer::default();
                 framer.update(self.status_line.as_slice());
                 self.status_line.clear();
-                match framer.split_chunk(
-                    &chunk[end.get()..],
-                    PackedPendingBytesPolicy::AllowAnySuffix,
-                ) {
-                    Ok(ChunkProgress::Complete(complete)) => Some(FramedResponseForRequest {
+                // The next tracked request owns even an invalid status line.
+                match framer.advance_to_next_terminator_end(&chunk[end.get()..]) {
+                    Some(consumed) => Some(FramedResponseForRequest {
                         response: BackendChunkRange::new(
                             offset,
-                            BackendChunkEnd::new(end.get()).after(complete.consumed),
+                            end.after(ChunkConsumed(consumed)),
                         ),
                     }),
-                    Ok(ChunkProgress::Incomplete) => {
+                    None => {
                         self.state = PendingRequestFrameState::ReadingMultiline { framer };
                         None
                     }
-                    Err(_) => Some(FramedResponseForRequest {
-                        response: BackendChunkRange::new(offset, BackendChunkEnd::new(chunk.len())),
-                    }),
                 }
             }
-            PendingRequestFrameState::ReadingMultiline { framer } => {
-                match framer.split_chunk(offset_bytes, PackedPendingBytesPolicy::AllowAnySuffix) {
-                    Ok(ChunkProgress::Complete(complete)) => Some(FramedResponseForRequest {
-                        response: BackendChunkRange::new(offset, offset.after(complete.consumed)),
-                    }),
-                    Ok(ChunkProgress::Incomplete) => None,
-                    Err(_) => Some(FramedResponseForRequest {
-                        response: BackendChunkRange::new(offset, BackendChunkEnd::new(chunk.len())),
-                    }),
-                }
-            }
+            PendingRequestFrameState::ReadingMultiline { framer } => framer
+                .advance_to_next_terminator_end(offset_bytes)
+                .map(|consumed| FramedResponseForRequest {
+                    response: BackendChunkRange::new(offset, offset.after(ChunkConsumed(consumed))),
+                }),
         }
     }
 }
