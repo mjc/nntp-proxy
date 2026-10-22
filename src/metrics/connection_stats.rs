@@ -112,7 +112,6 @@ pub struct ConnectionStatsAggregator {
     connection_stats: Arc<DashMap<String, UserConnectionStats>>,
     disconnection_stats: Arc<DashMap<String, UserConnectionStats>>,
     seen_connections: Arc<DashSet<ClientId>>,
-    seen_disconnections: Arc<DashSet<ClientId>>,
     last_flush: Arc<Mutex<Instant>>,
 }
 
@@ -124,7 +123,6 @@ impl ConnectionStatsAggregator {
             connection_stats: Arc::new(DashMap::new()),
             disconnection_stats: Arc::new(DashMap::new()),
             seen_connections: Arc::new(DashSet::new()),
-            seen_disconnections: Arc::new(DashSet::new()),
             last_flush: Arc::new(Mutex::new(Instant::now())),
         }
     }
@@ -155,7 +153,6 @@ impl ConnectionStatsAggregator {
                     &self.disconnection_stats,
                     UserConnectionStats::log_disconnection,
                 );
-                self.seen_disconnections.clear();
                 *last_flush = now;
             }
         }
@@ -218,10 +215,9 @@ impl ConnectionStatsAggregator {
         username: Option<&str>,
         routing_mode: &'static str,
     ) {
-        if !self.seen_disconnections.insert(client_id) {
+        if self.seen_connections.remove(&client_id).is_none() {
             return;
         }
-        self.seen_connections.remove(&client_id);
         self.record_event(username, routing_mode, ConnectionEvent::Disconnected);
     }
 
@@ -569,13 +565,44 @@ mod tests {
     }
 
     #[test]
-    fn test_record_session_disconnection_deduplicates_same_client() {
+    fn untracked_session_disconnection_does_not_record_an_event() {
         let aggregator = ConnectionStatsAggregator::new();
         let client_id = ClientId::new();
 
         aggregator.record_session_disconnection(client_id, Some("alice"), "hybrid");
+        assert!(aggregator.disconnection_stats.is_empty());
+
+        // An early close attempt must not suppress a later correctly paired event.
+        aggregator.record_session_connection(client_id, Some("alice"), "hybrid");
+        aggregator.record_session_disconnection(client_id, Some("alice"), "hybrid");
+        assert_eq!(
+            aggregator
+                .disconnection_stats
+                .get("alice")
+                .unwrap()
+                .get_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_record_session_disconnection_deduplicates_same_client() {
+        let aggregator = ConnectionStatsAggregator::new();
+        let client_id = ClientId::new();
+        aggregator.record_session_connection(client_id, Some("alice"), "hybrid");
+        aggregator.flush();
+
+        aggregator.record_session_disconnection(client_id, Some("alice"), "hybrid");
         aggregator.record_session_disconnection(client_id, Some("alice"), "hybrid");
 
-        assert_eq!(aggregator.user_count(), 0);
+        let stats = aggregator.disconnection_stats.get("alice").unwrap();
+        assert_eq!(stats.get_count(), 1);
+        assert_eq!(stats.routing_mode, "hybrid");
+        drop(stats);
+        assert_eq!(aggregator.tracked_session_count(), 0);
+
+        aggregator.flush();
+        aggregator.record_session_disconnection(client_id, Some("alice"), "hybrid");
+        assert!(aggregator.disconnection_stats.is_empty());
     }
 }
