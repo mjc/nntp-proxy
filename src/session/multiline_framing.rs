@@ -2506,7 +2506,14 @@ mod vector_scanner {
             target_feature = "avx512bw"
         )
     ))]
-    #[inline(never)]
+    #[cfg_attr(
+        all(target_arch = "x86_64", target_feature = "avx512bw"),
+        inline(always)
+    )]
+    #[cfg_attr(
+        not(all(target_arch = "x86_64", target_feature = "avx512bw")),
+        inline(never)
+    )]
     pub(super) fn exact_pair_match<const WIDTH: usize, const FIRST: usize, const BYTE: u8>(
         block: &[u8],
     ) -> Option<usize> {
