@@ -2402,12 +2402,14 @@ pub(super) mod scanner_experiment {
     pub struct ScannerBenchmarkInput {
         bytes: Vec<u8>,
         expected: (usize, usize),
+        requests: Option<Vec<(crate::protocol::RequestKind, usize)>>,
     }
 
     impl ScannerBenchmarkInput {
         pub fn new(body_len: usize, articles: usize) -> Self {
             let mut bytes = Vec::new();
             let mut checksum = 0usize;
+            let mut requests = Vec::new();
             let mut random = 0x7ac3_85d1u32;
             for article in 0..articles {
                 bytes.extend_from_slice(
@@ -2436,10 +2438,12 @@ pub(super) mod scanner_experiment {
                 }
                 bytes.extend_from_slice(b".\r\n");
                 checksum = checksum.wrapping_add(bytes.len());
+                requests.push((crate::protocol::RequestKind::Body, bytes.len()));
             }
             Self {
                 bytes,
                 expected: (articles, checksum),
+                requests: Some(requests),
             }
         }
 
@@ -2456,6 +2460,7 @@ pub(super) mod scanner_experiment {
             let length = u64::try_from(decoded_len).expect("fixture length fits u64");
             let mut bytes = Vec::new();
             let mut checksum = 0usize;
+            let mut requests = Vec::new();
             for article in 0..articles {
                 bytes.extend_from_slice(
                     format!("222 {article} <yenc-{article}@example.com>\r\n").as_bytes(),
@@ -2472,31 +2477,53 @@ pub(super) mod scanner_experiment {
                     .expect("encode binary fixture");
                 bytes.extend_from_slice(b".\r\n");
                 checksum = checksum.wrapping_add(bytes.len());
+                requests.push((crate::protocol::RequestKind::Body, bytes.len()));
             }
             Self {
                 bytes,
                 expected: (articles, checksum),
+                requests: Some(requests),
             }
         }
 
         pub fn mixed_yenc(decoded_len: usize, articles: usize) -> Self {
+            use crate::protocol::RequestKind;
             let article = Self::new_yenc(decoded_len, 1);
             let mut bytes = Vec::new();
             let mut checksum = 0usize;
+            let mut requests = Vec::new();
             for _ in 0..articles {
-                bytes.extend_from_slice(b"223 42 <stat@example.com>\r\n211 100 1 100 alt.binaries.test\r\n430 No such article\r\n");
+                for (reply, kind) in [
+                    (
+                        b"223 42 <stat@example.com>\r\n".as_slice(),
+                        RequestKind::Stat,
+                    ),
+                    (
+                        b"211 100 1 100 alt.binaries.test\r\n".as_slice(),
+                        RequestKind::Group,
+                    ),
+                    (b"430 No such article\r\n".as_slice(), RequestKind::Body),
+                ] {
+                    bytes.extend_from_slice(reply);
+                    requests.push((kind, bytes.len()));
+                }
                 bytes.extend_from_slice(article.bytes());
                 checksum = checksum.wrapping_add(bytes.len());
+                requests.push((RequestKind::Body, bytes.len()));
                 bytes.extend_from_slice(b"111 20261022120000\r\n");
+                requests.push((RequestKind::Date, bytes.len()));
             }
             Self {
                 bytes,
                 expected: (articles, checksum),
+                requests: Some(requests),
             }
         }
 
         pub fn first_read(&self, capacity: usize) -> Self {
-            Self::read_sample(&self.bytes[..self.bytes.len().min(capacity)])
+            let mut sample = Self::read_sample(&self.bytes[..self.bytes.len().min(capacity)]);
+            sample.requests.clone_from(&self.requests);
+            sample
         }
 
         pub fn final_read(&self, capacity: usize) -> Self {
@@ -2507,6 +2534,7 @@ pub(super) mod scanner_experiment {
             Self {
                 bytes: data.to_vec(),
                 expected: benchmark_memchr_scanner(data),
+                requests: None,
             }
         }
 
@@ -2517,6 +2545,34 @@ pub(super) mod scanner_experiment {
         pub fn expected(&self) -> (usize, usize) {
             self.expected
         }
+    }
+
+    pub fn benchmark_ordered_framing(
+        input: &ScannerBenchmarkInput,
+        chunk_size: usize,
+    ) -> (usize, usize) {
+        let requests = input
+            .requests
+            .as_ref()
+            .expect("ordered input must start with a response");
+        let mut order = super::BackendResponseOrder::default();
+        for &(kind, _) in requests {
+            order.push_request(kind);
+        }
+        let mut written = 0usize;
+        for chunk in input.bytes().chunks(chunk_size) {
+            for bytes in order.client_writes_for_backend_read(chunk) {
+                assert!(matches!(bytes, std::borrow::Cow::Borrowed(_)));
+                written += bytes.len();
+            }
+        }
+        let completed = requests.len() - order.inner.pending.len();
+        assert_eq!(written, input.bytes().len());
+        assert_eq!(
+            completed,
+            requests.iter().filter(|(_, end)| *end <= written).count()
+        );
+        (written, completed)
     }
 
     pub fn benchmark_memchr_scanner(data: &[u8]) -> (usize, usize) {
@@ -2642,7 +2698,7 @@ pub(super) mod scanner_experiment {
             .map(|start| offset + start)
     }
 
-    fn find_or<const WIDTH: usize>(
+    fn find_or<const WIDTH: usize, const FIRST: usize, const BYTE: u8>(
         data: &[u8],
         verify: impl Fn(&[u8]) -> Option<usize>,
     ) -> Option<usize> {
@@ -2651,9 +2707,9 @@ pub(super) mod scanner_experiment {
             let block = &data[offset..offset + WIDTH + 4];
             let mut possible = false;
             for lane in 0..WIDTH {
-                // Every CR pair passes; control bytes may also pass and are
-                // rejected by the full verifier before a match is returned.
-                possible |= (block[lane] | block[lane + 3]) == b'\r';
+                // Repeated terminator bytes always pass; a verifier rejects
+                // any control-byte combinations admitted by the OR predicate.
+                possible |= (block[lane + FIRST] | block[lane + FIRST + 3]) == BYTE;
             }
             if possible && let Some(lane) = verify(block) {
                 return Some(offset + lane);
@@ -2685,20 +2741,46 @@ pub(super) mod scanner_experiment {
     // yEnc may satisfy the OR predicate without either byte being CR. Keep
     // those candidates in SIMD before calling the full five-byte verifier.
     #[inline(never)]
-    fn exact_pair_match<const WIDTH: usize>(block: &[u8]) -> Option<usize> {
+    fn exact_pair_match<const WIDTH: usize, const FIRST: usize, const BYTE: u8>(
+        block: &[u8],
+    ) -> Option<usize> {
         let mut possible = false;
         for lane in 0..WIDTH {
-            possible |= (block[lane] == b'\r') & (block[lane + 3] == b'\r');
+            possible |= (block[lane + FIRST] == BYTE) & (block[lane + FIRST + 3] == BYTE);
         }
         if possible { first_match(block) } else { None }
     }
 
     pub fn benchmark_cr_or_verified_128(data: &[u8]) -> (usize, usize) {
-        scan(data, |data| find_or::<128>(data, exact_pair_match::<128>))
+        scan(data, |data| {
+            find_or::<128, 0, b'\r'>(data, exact_pair_match::<128, 0, b'\r'>)
+        })
     }
 
     pub fn benchmark_cr_or_verified_256(data: &[u8]) -> (usize, usize) {
-        scan(data, |data| find_or::<256>(data, exact_pair_match::<256>))
+        scan(data, |data| {
+            find_or::<256, 0, b'\r'>(data, exact_pair_match::<256, 0, b'\r'>)
+        })
+    }
+
+    pub fn benchmark_lf_or_128(data: &[u8]) -> (usize, usize) {
+        scan(data, |data| find_or::<128, 1, b'\n'>(data, first_match))
+    }
+
+    pub fn benchmark_lf_or_verified_128(data: &[u8]) -> (usize, usize) {
+        scan(data, |data| {
+            find_or::<128, 1, b'\n'>(data, exact_pair_match::<128, 1, b'\n'>)
+        })
+    }
+
+    pub fn benchmark_lf_or_256(data: &[u8]) -> (usize, usize) {
+        scan(data, |data| find_or::<256, 1, b'\n'>(data, first_match))
+    }
+
+    pub fn benchmark_lf_or_verified_256(data: &[u8]) -> (usize, usize) {
+        scan(data, |data| {
+            find_or::<256, 1, b'\n'>(data, exact_pair_match::<256, 1, b'\n'>)
+        })
     }
 
     pub fn benchmark_cr_or_cursor_128(data: &[u8]) -> (usize, usize) {
@@ -2710,11 +2792,11 @@ pub(super) mod scanner_experiment {
     }
 
     pub fn benchmark_cr_or_128(data: &[u8]) -> (usize, usize) {
-        scan(data, |data| find_or::<128>(data, first_match))
+        scan(data, |data| find_or::<128, 0, b'\r'>(data, first_match))
     }
 
     pub fn benchmark_cr_or_256(data: &[u8]) -> (usize, usize) {
-        scan(data, |data| find_or::<256>(data, first_match))
+        scan(data, |data| find_or::<256, 0, b'\r'>(data, first_match))
     }
 
     pub fn benchmark_cr_dot_64(data: &[u8]) -> (usize, usize) {
@@ -2747,6 +2829,26 @@ pub(super) mod scanner_experiment {
 
         fn check(data: &[u8]) {
             let expected = TERMINATOR_FINDER.find(data);
+            assert_eq!(
+                find_or::<128, 1, b'\n'>(data, first_match),
+                expected,
+                "LF OR128: {data:?}"
+            );
+            assert_eq!(
+                find_or::<128, 1, b'\n'>(data, exact_pair_match::<128, 1, b'\n'>),
+                expected,
+                "LF OR128: {data:?}"
+            );
+            assert_eq!(
+                find_or::<256, 1, b'\n'>(data, first_match),
+                expected,
+                "LF OR256: {data:?}"
+            );
+            assert_eq!(
+                find_or::<256, 1, b'\n'>(data, exact_pair_match::<256, 1, b'\n'>),
+                expected,
+                "LF OR256: {data:?}"
+            );
             assert_eq!(first_match_mask(data), expected, "mask verifier: {data:?}");
             assert_eq!(
                 find_repeat_mask::<128>(data),
@@ -2759,23 +2861,23 @@ pub(super) mod scanner_experiment {
                 "CR mask256: {data:?}"
             );
             assert_eq!(
-                find_or::<128>(data, exact_pair_match::<128>),
+                find_or::<128, 0, b'\r'>(data, exact_pair_match::<128, 0, b'\r'>),
                 expected,
                 "verified OR128: {data:?}"
             );
             assert_eq!(
-                find_or::<256>(data, exact_pair_match::<256>),
+                find_or::<256, 0, b'\r'>(data, exact_pair_match::<256, 0, b'\r'>),
                 expected,
                 "verified OR256: {data:?}"
             );
             assert_eq!(find_pair::<64>(data), expected, "CR/dot: {data:?}");
             assert_eq!(
-                find_or::<128>(data, first_match),
+                find_or::<128, 0, b'\r'>(data, first_match),
                 expected,
                 "CR OR128: {data:?}"
             );
             assert_eq!(
-                find_or::<256>(data, first_match),
+                find_or::<256, 0, b'\r'>(data, first_match),
                 expected,
                 "CR OR256: {data:?}"
             );
@@ -2872,6 +2974,17 @@ pub(super) mod scanner_experiment {
                 assert_eq!(benchmark_cr_pair_64(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_pair_128(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_pair_256(input.bytes()), input.expected());
+                assert_eq!(benchmark_lf_or_128(input.bytes()), input.expected());
+                assert_eq!(benchmark_lf_or_256(input.bytes()), input.expected());
+                assert_eq!(
+                    benchmark_lf_or_verified_128(input.bytes()),
+                    input.expected()
+                );
+                assert_eq!(
+                    benchmark_lf_or_verified_256(input.bytes()),
+                    input.expected()
+                );
+
                 assert_eq!(benchmark_cr_mask_128(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_mask_256(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_or_128(input.bytes()), input.expected());
@@ -2895,6 +3008,13 @@ pub(super) mod scanner_experiment {
         fn simd_scanners_match_encoded_articles_and_read_samples() {
             for decoded_len in [1, 128, 716_800, 768_000] {
                 let mixed = ScannerBenchmarkInput::mixed_yenc(decoded_len, 2);
+                for chunk_size in [1, 31, 16 * 1024, 1024 * 1024] {
+                    benchmark_ordered_framing(&mixed, chunk_size);
+                    benchmark_ordered_framing(
+                        &mixed.first_read(mixed.bytes().len() / 2),
+                        chunk_size,
+                    );
+                }
                 assert_eq!(benchmark_memchr_scanner(mixed.bytes()), mixed.expected());
                 check(mixed.bytes());
                 let input = ScannerBenchmarkInput::new_yenc(decoded_len, 2);
@@ -2915,7 +3035,7 @@ pub(super) mod scanner_experiment {
 
             #[test]
             fn simd_scanners_reject_or_predicate_false_positives(data in proptest::collection::vec(
-                proptest::sample::select(vec![0, 1, 4, 5, 8, 9, 12, 13, b'\n', b'.', b'x']), 0..4096
+                proptest::sample::select(vec![0, 1, 2, 4, 5, 8, 9, 12, 13, b'\n', b'.', b'x']), 0..4096
             )) {
                 check(&data);
             }

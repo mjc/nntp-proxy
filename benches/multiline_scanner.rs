@@ -5,8 +5,10 @@ use nntp_proxy::session::{
     ScannerBenchmarkInput, benchmark_cr_dot_64, benchmark_cr_mask_128, benchmark_cr_mask_256,
     benchmark_cr_or_128, benchmark_cr_or_256, benchmark_cr_or_cursor_128,
     benchmark_cr_or_cursor_256, benchmark_cr_or_verified_128, benchmark_cr_or_verified_256,
-    benchmark_cr_pair_64, benchmark_cr_pair_128, benchmark_cr_pair_256, benchmark_lf_pair_64,
-    benchmark_lf_pair_128, benchmark_memchr_scanner,
+    benchmark_cr_pair_64, benchmark_cr_pair_128, benchmark_cr_pair_256, benchmark_lf_or_128,
+    benchmark_lf_or_256, benchmark_lf_or_verified_128, benchmark_lf_or_verified_256,
+    benchmark_lf_pair_64, benchmark_lf_pair_128, benchmark_memchr_scanner,
+    benchmark_ordered_framing,
 };
 use std::sync::LazyLock;
 
@@ -29,6 +31,16 @@ static INPUTS: LazyLock<[ScannerBenchmarkInput; 13]> = LazyLock::new(|| {
         ScannerBenchmarkInput::mixed_yenc(768_000, 24).first_read(16 * 1024 * 1024),
     ];
     for input in &inputs {
+        assert_eq!(benchmark_lf_or_128(input.bytes()), input.expected());
+        assert_eq!(benchmark_lf_or_256(input.bytes()), input.expected());
+        assert_eq!(
+            benchmark_lf_or_verified_128(input.bytes()),
+            input.expected()
+        );
+        assert_eq!(
+            benchmark_lf_or_verified_256(input.bytes()),
+            input.expected()
+        );
         assert_eq!(benchmark_memchr_scanner(input.bytes()), input.expected());
         assert_eq!(benchmark_cr_dot_64(input.bytes()), input.expected());
         assert_eq!(benchmark_cr_pair_64(input.bytes()), input.expected());
@@ -178,4 +190,44 @@ fn cr_mask_256(bencher: Bencher, input: usize) {
     bencher
         .counter(BytesCount::new(input.bytes().len()))
         .bench(|| black_box(benchmark_cr_mask_256(black_box(input.bytes()))));
+}
+
+#[divan::bench(args = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], sample_count = 200, sample_size = 1)]
+fn lf_or_128(bencher: Bencher, input: usize) {
+    let input = &INPUTS[input];
+    bencher
+        .counter(BytesCount::new(input.bytes().len()))
+        .bench(|| black_box(benchmark_lf_or_128(black_box(input.bytes()))));
+}
+
+#[divan::bench(args = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], sample_count = 200, sample_size = 1)]
+fn lf_or_256(bencher: Bencher, input: usize) {
+    let input = &INPUTS[input];
+    bencher
+        .counter(BytesCount::new(input.bytes().len()))
+        .bench(|| black_box(benchmark_lf_or_256(black_box(input.bytes()))));
+}
+
+#[divan::bench(args = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], sample_count = 200, sample_size = 1)]
+fn lf_or_verified_128(bencher: Bencher, input: usize) {
+    let input = &INPUTS[input];
+    bencher
+        .counter(BytesCount::new(input.bytes().len()))
+        .bench(|| black_box(benchmark_lf_or_verified_128(black_box(input.bytes()))));
+}
+
+#[divan::bench(args = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], sample_count = 200, sample_size = 1)]
+fn lf_or_verified_256(bencher: Bencher, input: usize) {
+    let input = &INPUTS[input];
+    bencher
+        .counter(BytesCount::new(input.bytes().len()))
+        .bench(|| black_box(benchmark_lf_or_verified_256(black_box(input.bytes()))));
+}
+
+#[divan::bench(args = [4, 5, 6, 8, 10, 11, 12], consts = [16384usize, 65536, 1048576, 16777216], sample_count = 100, sample_size = 1)]
+fn ordered<const CHUNK: usize>(bencher: Bencher, input: usize) {
+    let input = &INPUTS[input];
+    bencher
+        .counter(BytesCount::new(input.bytes().len()))
+        .bench(|| black_box(benchmark_ordered_framing(black_box(input), CHUNK)));
 }
