@@ -133,13 +133,6 @@ impl CompleteMultilinePayloadSplit {
 #[derive(Debug, PartialEq, Eq)]
 struct CompleteResponseWindow {
     response: Range<usize>,
-    /// The response bytes intended for isolated capture.
-    ///
-    /// Multiline framing proves the terminator while producing this window,
-    /// so capture can use the already-known payload boundary without scanning
-    /// the completed bytes a second time. Single-line responses use their
-    /// complete response range here.
-    capture: Range<usize>,
     next_response_input: Range<usize>,
 }
 
@@ -159,10 +152,6 @@ impl CompleteResponseWindow {
 
     fn extend_capture_from(&self, source: &[u8], capture: &mut crate::pool::PooledBuffer) {
         capture.extend_from_slice(&source[self.response.clone()]);
-    }
-
-    fn extend_payload_capture_from(&self, source: &[u8], capture: &mut crate::pool::PooledBuffer) {
-        capture.extend_from_slice(&source[self.capture.clone()]);
     }
 
     fn push_isolated_buffer_to(
@@ -320,11 +309,6 @@ impl IncompleteResponseWindow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChunkConsumed(usize);
 
-/// Exclusive payload end from one scanner push, excluding the wire
-/// terminator. It is distinct from the response end consumed by the framer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ChunkPayloadEnd(usize);
-
 /// Exclusive origin of the logical response window supplied to one scanner
 /// push. It is not itself proof that a response is complete.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,16 +326,11 @@ impl WindowOffset {
     fn after_chunk(self, consumed: ChunkConsumed) -> crate::protocol::FrameEnd {
         crate::protocol::FrameEnd::new(self.0 + consumed.0)
     }
-
-    fn after_payload_chunk(self, payload_end: ChunkPayloadEnd) -> crate::protocol::FrameEnd {
-        crate::protocol::FrameEnd::new(self.0 + payload_end.0)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CompleteChunk {
     consumed: ChunkConsumed,
-    payload_end: ChunkPayloadEnd,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -369,7 +348,6 @@ impl ChunkProgress {
                 let end = origin.after_chunk(complete.consumed);
                 ResponseWindow::Complete(CompleteResponseWindow {
                     response: 0..end.get(),
-                    capture: 0..origin.after_payload_chunk(complete.payload_end).get(),
                     next_response_input: end.get()..window_len,
                 })
             }
@@ -1096,7 +1074,7 @@ impl ClassifiedResponse {
                 let mut capture = pool.acquire_capture();
                 IsolatedMultilineResponse::begin(conn.stream_mut(), &mut buffer)
                     .map_err(isolated_multiline_error)?
-                    .capture_payload_into(&mut capture)
+                    .capture_payload_into(&mut capture, status_line_end)
                     .await?;
                 conn.mark_response_complete();
                 let content_end = crate::protocol::ContentEnd::new(capture.initialized());
@@ -1506,30 +1484,33 @@ impl<'a> IsolatedMultilineResponse<'a> {
         })
     }
 
-    #[cfg(test)]
-    async fn capture_into(self, capture: &mut crate::pool::PooledBuffer) -> anyhow::Result<()> {
-        self.capture_into_mode::<true>(capture).await
-    }
-
     async fn capture_payload_into(
         self,
         capture: &mut crate::pool::PooledBuffer,
+        status_line_end: crate::protocol::StatusLineEnd,
     ) -> anyhow::Result<()> {
-        self.capture_into_mode::<false>(capture).await
+        self.capture_into(capture).await?;
+        // Trim once after completion so a split terminator can overlap earlier
+        // reads, while an empty body keeps the status line's shared CRLF.
+        let content_end = capture
+            .initialized()
+            .checked_sub(TERMINATOR.len())
+            .map(|end| end.max(status_line_end.get()))
+            .filter(|end| *end <= capture.initialized())
+            .ok_or_else(|| isolated_multiline_error(FramingError::InvalidFrameMetadata))?;
+        if content_end == 0 {
+            capture.clear();
+        } else {
+            capture.expose_initialized_range_without_copying(0..content_end);
+        }
+        Ok(())
     }
 
-    async fn capture_into_mode<const INCLUDE_TERMINATOR: bool>(
-        mut self,
-        capture: &mut crate::pool::PooledBuffer,
-    ) -> anyhow::Result<()> {
+    async fn capture_into(mut self, capture: &mut crate::pool::PooledBuffer) -> anyhow::Result<()> {
         loop {
             match &self.cursor.frame {
                 ResponseWindow::Complete(chunk) => {
-                    if INCLUDE_TERMINATOR {
-                        chunk.extend_capture_from(self.cursor.io_buffer, capture);
-                    } else {
-                        chunk.extend_payload_capture_from(self.cursor.io_buffer, capture);
-                    }
+                    chunk.extend_capture_from(self.cursor.io_buffer, capture);
                     return Ok(());
                 }
                 ResponseWindow::Incomplete(chunk) => {
@@ -1685,7 +1666,6 @@ impl<'a> StreamingResponse<'a> {
                     io_buffer,
                     framer: MultilineFramer::default(),
                     frame: ResponseWindow::Complete(CompleteResponseWindow {
-                        capture: framed.response.clone(),
                         response: framed.response,
                         next_response_input: framed.next_response_input,
                     }),
@@ -2068,7 +2048,6 @@ impl MultilineFramer {
             {
                 return Ok(ChunkProgress::Complete(CompleteChunk {
                     consumed: ChunkConsumed(end),
-                    payload_end: ChunkPayloadEnd(0),
                 }));
             }
             if matches!(suffix_policy, PackedPendingBytesPolicy::Reject) {
@@ -2079,10 +2058,6 @@ impl MultilineFramer {
             if end == chunk.len() {
                 return Ok(ChunkProgress::Complete(CompleteChunk {
                     consumed: ChunkConsumed(end),
-                    payload_end: ChunkPayloadEnd(
-                        end.checked_sub(TERMINATOR.len())
-                            .expect("complete multiline response includes its terminator"),
-                    ),
                 }));
             }
 
@@ -2095,10 +2070,6 @@ impl MultilineFramer {
                 {
                     return Ok(ChunkProgress::Complete(CompleteChunk {
                         consumed: ChunkConsumed(end),
-                        payload_end: ChunkPayloadEnd(
-                            end.checked_sub(TERMINATOR.len())
-                                .expect("complete multiline response includes its terminator"),
-                        ),
                     }));
                 }
                 PackedPendingBytesPolicy::AllowIfStatusPrefix => {}
@@ -3049,6 +3020,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn isolated_payload_capture_excludes_terminator_at_every_split() {
+        let response = b"220 Article follows\r\nSubject: test\r\n\r\nbody\r\n.\r\n";
+        let expected = &response[..response.len() - TERMINATOR.len()];
+        assert_isolated_payload_capture_at_every_split(response, expected).await;
+    }
+
+    #[tokio::test]
+    async fn isolated_empty_payload_capture_preserves_status_line_at_every_split() {
+        assert_isolated_payload_capture_at_every_split(
+            b"222 Body follows\r\n.\r\n",
+            b"222 Body follows\r\n",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn isolated_payload_capture_rejects_invalid_status_line_end() {
+        let response = b"222 Body follows\r\nbody\r\n.\r\n";
+        let pool = make_pool();
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(response);
+        let mut capture = pool.acquire_capture();
+        let mut conn = mock_backend_conn(vec![]).await;
+
+        let error = IsolatedMultilineResponse::begin(&mut conn, &mut io_buffer)
+            .unwrap()
+            .capture_payload_into(
+                &mut capture,
+                crate::protocol::StatusLineEnd::new(response.len() + 1),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("metadata"));
+    }
+
+    async fn assert_isolated_payload_capture_at_every_split(response: &[u8], expected: &[u8]) {
+        for split in 0..=response.len() {
+            let pool = make_pool();
+            let mut io_buffer = pool.acquire();
+            io_buffer.copy_from_slice(&response[..split]);
+            let mut capture = pool.acquire_capture();
+            let mut conn = mock_backend_conn(vec![response[split..].to_vec()]).await;
+
+            IsolatedMultilineResponse::begin(&mut conn, &mut io_buffer)
+                .unwrap()
+                .capture_payload_into(
+                    &mut capture,
+                    crate::protocol::StatusLineEnd::new(status_line_len(response).unwrap()),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(&capture[..], expected, "split={split}");
+        }
+    }
+
+    #[tokio::test]
     async fn capture_response_returns_complete_multiline_response() {
         let response = b"220 Article follows\r\nLine 1\r\nLine 2\r\n.\r\n";
         let pool = make_pool();
@@ -3339,7 +3368,6 @@ mod tests {
         let response_len = b"220 article\r\nbody\r\n.\r\n".len();
         let framed = CompleteResponseWindow {
             response: 0..response_len,
-            capture: 0..response_len,
             next_response_input: response_len..chunk.len(),
         };
         let pool = make_pool();
@@ -3397,7 +3425,6 @@ mod tests {
         let response_len = b"220 article\r\nbody\r\n.\r\n".len();
         let framed = CompleteResponseWindow {
             response: 0..response_len,
-            capture: 0..response_len,
             next_response_input: response_len..chunk.len(),
         };
         let pool = make_pool();
@@ -4197,7 +4224,6 @@ mod tests {
             split,
             Ok(ChunkProgress::Complete(CompleteChunk {
                 consumed: ChunkConsumed(b"220 article\r\nbody\r\n.\r\n".len()),
-                payload_end: ChunkPayloadEnd(b"220 article\r\nbody".len()),
             }))
         );
     }
@@ -4213,7 +4239,6 @@ mod tests {
             split,
             Ok(ChunkProgress::Complete(CompleteChunk {
                 consumed: ChunkConsumed(b"220 article\r\nbody\r\n.\r\n".len()),
-                payload_end: ChunkPayloadEnd(b"220 article\r\nbody".len()),
             }))
         );
     }
@@ -4239,7 +4264,6 @@ mod tests {
             split,
             Ok(ChunkProgress::Complete(CompleteChunk {
                 consumed: ChunkConsumed(chunk.len()),
-                payload_end: ChunkPayloadEnd(chunk.len() - TERMINATOR.len()),
             }))
         );
     }
@@ -4255,7 +4279,6 @@ mod tests {
             split,
             Ok(ChunkProgress::Complete(CompleteChunk {
                 consumed: ChunkConsumed(b".\r\n".len()),
-                payload_end: ChunkPayloadEnd(0),
             }))
         );
     }
