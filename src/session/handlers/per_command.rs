@@ -154,11 +154,14 @@ struct PerCommandLoopState {
     auth_access: AuthenticationAccess,
 }
 
+const MAX_UPSTREAM_ARTICLE_WINDOW: usize = 16;
+
 enum ArticleWindowRequest {
     SendUpstream {
         backend: crate::router::ArticleBackend,
         availability: crate::cache::ArticleAvailability,
-        guard: crate::router::CommandGuard,
+        guard: Option<crate::router::CommandGuard>,
+        sent: bool,
     },
     KnownMissing,
 }
@@ -179,13 +182,13 @@ struct UpstreamRequestIndex(usize);
 
 struct RoutedArticleWindow<'a> {
     target: SingleBackendArticleWindow<'a>,
-    requests: SmallVec<[ArticleWindowRequest; 16]>,
+    requests: SmallVec<[ArticleWindowRequest; 32]>,
     first_upstream_request: UpstreamRequestIndex,
 }
 
 #[expect(
     clippy::large_enum_variant,
-    reason = "routing keeps its small request window inline on the forwarding hot path"
+    reason = "routing keeps its bounded request window inline on the forwarding hot path"
 )]
 enum ArticleWindowRouting<'a> {
     AllKnownMissing { request_count: usize },
@@ -194,7 +197,8 @@ enum ArticleWindowRouting<'a> {
 
 struct SentArticleWindow {
     backend_id: crate::types::BackendId,
-    requests: SmallVec<[ArticleWindowRequest; 16]>,
+    requests: SmallVec<[ArticleWindowRequest; 32]>,
+    in_flight: usize,
     conn: crate::pool::ConnectionGuard,
 }
 
@@ -854,7 +858,11 @@ impl ClientSession {
             requests.push(ArticleWindowRequest::SendUpstream {
                 backend,
                 availability,
-                guard: BackendSelector::guard_for_manual_backend(router.clone(), target.backend_id),
+                guard: Some(BackendSelector::guard_for_manual_backend(
+                    router.clone(),
+                    target.backend_id,
+                )),
+                sent: false,
             });
         }
         let Some(first_upstream_request) = requests
@@ -895,19 +903,27 @@ impl ClientSession {
     async fn write_and_flush_article_window_requests(
         &self,
         backend_id: crate::types::BackendId,
-        requests: &[ArticleWindowRequest],
+        requests: &mut [ArticleWindowRequest],
         batch: &crate::session::handlers::pipeline::RequestBatch,
         conn: &mut crate::pool::ConnectionGuard,
-    ) -> std::io::Result<()> {
-        for (i, request_route) in requests.iter().enumerate() {
-            if request_route.needs_upstream_request() {
+    ) -> std::io::Result<usize> {
+        let mut in_flight = 0;
+        for (i, request_route) in requests
+            .iter_mut()
+            .take(MAX_UPSTREAM_ARTICLE_WINDOW)
+            .enumerate()
+        {
+            if let ArticleWindowRequest::SendUpstream { sent, .. } = request_route {
                 let request = batch.context(i).request();
                 self.metrics.record_command(backend_id);
                 self.metrics.user_command(self.username());
                 request.write_wire_to(conn.stream_mut()).await?;
+                *sent = true;
+                in_flight += 1;
             }
         }
-        conn.stream_mut().flush().await
+        conn.stream_mut().flush().await?;
+        Ok(in_flight)
     }
 
     fn record_article_window_request_bytes(
@@ -1024,7 +1040,7 @@ impl ClientSession {
     ) -> ArticleWindowSend {
         let RoutedArticleWindow {
             target,
-            requests,
+            mut requests,
             first_upstream_request: UpstreamRequestIndex(first_upstream_request),
         } = routed;
         let first_request = batch.context(first_upstream_request).request();
@@ -1041,18 +1057,26 @@ impl ClientSession {
             Err(_) => return ArticleWindowSend::RetryAllSequentially,
         };
 
-        if self
-            .write_and_flush_article_window_requests(target.backend_id, &requests, batch, &mut conn)
+        let in_flight = match self
+            .write_and_flush_article_window_requests(
+                target.backend_id,
+                &mut requests,
+                batch,
+                &mut conn,
+            )
             .await
-            .is_err()
         {
-            conn.fail_backend();
-            return ArticleWindowSend::RetryAllSequentially;
-        }
+            Ok(in_flight) => in_flight,
+            Err(_) => {
+                conn.fail_backend();
+                return ArticleWindowSend::RetryAllSequentially;
+            }
+        };
         Self::record_article_window_request_bytes(state, batch);
         ArticleWindowSend::Sent(SentArticleWindow {
             backend_id: target.backend_id,
             requests,
+            in_flight,
             conn,
         })
     }
@@ -1064,8 +1088,9 @@ impl ClientSession {
     ) -> Result<(), SessionError> {
         let SentArticleWindow {
             backend_id,
-            requests,
-            mut conn,
+            mut requests,
+            mut in_flight,
+            conn,
         } = sent;
         let PipelineCommandParams {
             router,
@@ -1074,9 +1099,10 @@ impl ClientSession {
             batch,
             backend_connection,
         } = params;
-        let mut unread_requests = requests.into_iter().enumerate();
-        while let Some((i, request_route)) = unread_requests.next() {
-            match request_route {
+        let mut conn = Some(conn);
+        let mut i = 0;
+        while i < requests.len() {
+            match &mut requests[i] {
                 ArticleWindowRequest::KnownMissing => {
                     self.send_430_to_client(
                         client_writer.get_mut(),
@@ -1086,18 +1112,30 @@ impl ClientSession {
                 }
                 ArticleWindowRequest::SendUpstream {
                     backend,
-                    mut availability,
+                    availability,
                     guard,
+                    sent,
                 } => {
+                    if !*sent {
+                        let request = batch.context(i).request();
+                        self.metrics.record_command(backend_id);
+                        self.metrics.user_command(self.username());
+                        let connection = conn.as_mut().expect("backend connection is live");
+                        request.write_wire_to(connection.stream_mut()).await?;
+                        connection.stream_mut().flush().await?;
+                        *sent = true;
+                        in_flight += 1;
+                    }
+                    let response_conn = conn.take().expect("backend connection is live");
                     let result = batch
                         .with_context_mut(i, |mut request| async {
                             let result = self
                                 .forward_response_for_already_sent_request(
-                                    conn,
+                                    response_conn,
                                     client_writer.get_mut(),
-                                    &backend,
+                                    backend,
                                     &mut request,
-                                    &mut availability,
+                                    availability,
                                     &mut state.backend_to_client_bytes,
                                 )
                                 .await;
@@ -1111,8 +1149,12 @@ impl ClientSession {
                         })?;
                     match result {
                         Ok(next_conn) => {
-                            conn = next_conn;
-                            guard.complete();
+                            conn = Some(next_conn);
+                            guard
+                                .take()
+                                .expect("sent request retains its command guard")
+                                .complete();
+                            in_flight -= 1;
                         }
                         Err(
                             crate::session::handlers::command_execution::AlreadySentResponseError::Read(
@@ -1125,8 +1167,7 @@ impl ClientSession {
                                 error = %error,
                                 "Upstream window response read failed; retrying unread requests sequentially"
                             );
-                            drop(guard);
-                            drop(unread_requests);
+                            drop(requests);
                             self.execute_pipelineable_commands_with_recorded_request_bytes_from(
                                 AccountedPipelineCommandIndex(i),
                                 PipelineCommandParams {
@@ -1150,7 +1191,54 @@ impl ClientSession {
                     }
                 }
             }
+
+            if matches!(
+                &requests[i],
+                ArticleWindowRequest::SendUpstream { sent: true, .. }
+            ) {
+                let mut refilled = false;
+                while in_flight < MAX_UPSTREAM_ARTICLE_WINDOW {
+                    let next_unsent = requests.iter().enumerate().skip(i + 1).find_map(
+                        |(index, request_route)| {
+                            matches!(
+                                request_route,
+                                ArticleWindowRequest::SendUpstream { sent: false, .. }
+                            )
+                            .then_some(index)
+                        },
+                    );
+                    let Some(next_index) = next_unsent else {
+                        break;
+                    };
+                    let ArticleWindowRequest::SendUpstream { sent, .. } = &mut requests[next_index]
+                    else {
+                        unreachable!("selected an upstream request")
+                    };
+                    let request = batch.context(next_index).request();
+                    self.metrics.record_command(backend_id);
+                    self.metrics.user_command(self.username());
+                    request
+                        .write_wire_to(
+                            conn.as_mut()
+                                .expect("backend connection is live")
+                                .stream_mut(),
+                        )
+                        .await?;
+                    *sent = true;
+                    in_flight += 1;
+                    refilled = true;
+                }
+                if refilled {
+                    conn.as_mut()
+                        .expect("backend connection is live")
+                        .stream_mut()
+                        .flush()
+                        .await?;
+                }
+            }
+            i += 1;
         }
+        let conn = conn.expect("all sent responses retain the backend connection");
         client_writer.get_mut().flush().await?;
 
         if conn.has_pending_bytes() {

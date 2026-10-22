@@ -14,7 +14,7 @@ use std::future::Future;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
 /// Maximum pipeline depth (number of commands read from client buffer at once)
-const MAX_PIPELINE_DEPTH: usize = 16;
+const MAX_PIPELINE_DEPTH: usize = 32;
 const COMMAND_LINE_CAPACITY: usize = crate::protocol::MAX_COMMAND_LINE_OCTETS;
 type BatchContexts = SmallVec<[PipelineableRequest; MAX_PIPELINE_DEPTH]>;
 
@@ -842,7 +842,7 @@ mod tests {
     }
     #[test]
     fn pipeline_products_keep_the_inline_batch_capacity() {
-        assert_eq!(MAX_PIPELINE_DEPTH, 16);
+        assert_eq!(MAX_PIPELINE_DEPTH, 32);
         assert!(std::mem::size_of::<RequestBatch>() > 0);
         assert!(std::mem::size_of::<BatchTail>() > 0);
     }

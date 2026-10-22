@@ -745,6 +745,101 @@ async fn test_per_command_body_window_sends_two_requests_before_first_reply() ->
 }
 
 #[tokio::test]
+async fn test_per_command_body_window_refills_after_first_response() -> Result<()> {
+    const WINDOW: usize = 16;
+    const REQUEST_COUNT: usize = WINDOW + 1;
+
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let backend = tokio::spawn(async move {
+        let (stream, _) = backend_listener.accept().await?;
+        let mut reader = BufReader::new(stream);
+        reader
+            .get_mut()
+            .write_all(b"200 RollingWindow Ready\r\n")
+            .await?;
+        let mode_reader = read_line(&mut reader, "backend reader mode").await?;
+        assert_eq!(mode_reader, "MODE READER\r\n");
+        reader
+            .get_mut()
+            .write_all(b"200 Posting prohibited\r\n")
+            .await?;
+
+        let mut commands = Vec::with_capacity(REQUEST_COUNT);
+        while commands.len() < WINDOW {
+            let command = read_line(&mut reader, "initial upstream window").await?;
+            if command.starts_with("BODY ") {
+                commands.push(command);
+            } else {
+                reader
+                    .get_mut()
+                    .write_all(b"111 20261022000000\r\n")
+                    .await?;
+            }
+        }
+
+        reader
+            .get_mut()
+            .write_all(b"222 rolling-0@example\r\nbody-0\r\n.\r\n")
+            .await?;
+        let early_replacement = match timeout(
+            Duration::from_secs(1),
+            read_line(&mut reader, "rolling replacement request"),
+        )
+        .await
+        {
+            Ok(Ok(replacement)) => {
+                commands.push(replacement);
+                true
+            }
+            _ => false,
+        };
+
+        for index in 1..WINDOW {
+            let response = format!("222 rolling-{index}@example\r\nbody-{index}\r\n.\r\n");
+            reader.get_mut().write_all(response.as_bytes()).await?;
+        }
+        if !early_replacement {
+            commands.push(read_line(&mut reader, "rolling replacement after drain").await?);
+        }
+        reader
+            .get_mut()
+            .write_all(format!("222 rolling-{WINDOW}@example\r\nbody-{WINDOW}\r\n.\r\n").as_bytes())
+            .await?;
+        anyhow::Ok((commands, early_replacement))
+    });
+
+    let mut config = pipeline_backend_config(backend_port, "ArticleRollingWindow");
+    config.servers[0].compress = Some(false);
+    let proxy_port = spawn_proxy_with_config(config, RoutingMode::PerCommand).await?;
+    let client = connect_and_read_greeting(proxy_port).await?;
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
+    let commands = (0..REQUEST_COUNT)
+        .map(|index| format!("BODY <rolling-{index}@example>\r\n"))
+        .collect::<Vec<_>>();
+    write_half.write_all(commands.concat().as_bytes()).await?;
+
+    let responses = timeout(
+        Duration::from_secs(5),
+        read_multiline_responses(&mut reader, REQUEST_COUNT),
+    )
+    .await??;
+    assert_eq!(responses.len(), REQUEST_COUNT);
+    assert_eq!(responses[0].0, "222 rolling-0@example\r\n");
+    for (index, response) in responses.iter().enumerate() {
+        assert_eq!(response.1, vec![format!("body-{index}\r\n")]);
+    }
+    let (backend_commands, replacement_was_early) = backend.await??;
+    assert_eq!(backend_commands, commands);
+    assert!(
+        replacement_was_early,
+        "the replacement request should reach the backend after the first response"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_per_command_body_window_keeps_430_before_following_success() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
