@@ -2479,6 +2479,22 @@ pub(super) mod scanner_experiment {
             }
         }
 
+        pub fn mixed_yenc(decoded_len: usize, articles: usize) -> Self {
+            let article = Self::new_yenc(decoded_len, 1);
+            let mut bytes = Vec::new();
+            let mut checksum = 0usize;
+            for _ in 0..articles {
+                bytes.extend_from_slice(b"223 42 <stat@example.com>\r\n211 100 1 100 alt.binaries.test\r\n430 No such article\r\n");
+                bytes.extend_from_slice(article.bytes());
+                checksum = checksum.wrapping_add(bytes.len());
+                bytes.extend_from_slice(b"111 20261022120000\r\n");
+            }
+            Self {
+                bytes,
+                expected: (articles, checksum),
+            }
+        }
+
         pub fn first_read(&self, capacity: usize) -> Self {
             Self::read_sample(&self.bytes[..self.bytes.len().min(capacity)])
         }
@@ -2630,6 +2646,10 @@ pub(super) mod scanner_experiment {
         scan(data, find_repeat::<64, 0, b'\r'>)
     }
 
+    pub fn benchmark_cr_pair_256(data: &[u8]) -> (usize, usize) {
+        scan(data, find_repeat::<256, 0, b'\r'>)
+    }
+
     pub fn benchmark_cr_pair_128(data: &[u8]) -> (usize, usize) {
         scan(data, find_repeat::<128, 0, b'\r'>)
     }
@@ -2651,6 +2671,11 @@ pub(super) mod scanner_experiment {
             assert_eq!(find_pair::<64>(data), expected, "CR/dot: {data:?}");
             assert_eq!(find_or::<128>(data), expected, "CR OR128: {data:?}");
             assert_eq!(find_or::<256>(data), expected, "CR OR256: {data:?}");
+            assert_eq!(
+                find_repeat::<256, 0, b'\r'>(data),
+                expected,
+                "CR256: {data:?}"
+            );
             assert_eq!(
                 find_or_cursor::<128, 132>(data),
                 expected,
@@ -2683,10 +2708,9 @@ pub(super) mod scanner_experiment {
             );
         }
 
-        #[test]
-        fn simd_scanners_match_at_every_lane_alignment_and_tail() {
+        fn check_lane_alignments(alignments: std::ops::Range<usize>) {
             for len in 0usize..544 {
-                for alignment in 0..64 {
+                for alignment in alignments.clone() {
                     let storage = vec![b'x'; alignment + len];
                     check(&storage[alignment..]);
                 }
@@ -2694,7 +2718,7 @@ pub(super) mod scanner_experiment {
             // Cover every candidate lane across two blocks, including matches
             // crossing each block end, without repeating every shorter prefix.
             for len in [31usize, 68, 132, 260, 516] {
-                for alignment in 0..64 {
+                for alignment in alignments.clone() {
                     let mut storage = vec![b'x'; alignment + len];
                     for start in 0..len.saturating_sub(4) {
                         storage[alignment + start..alignment + start + 5]
@@ -2712,6 +2736,26 @@ pub(super) mod scanner_experiment {
         }
 
         #[test]
+        fn simd_scanners_match_at_every_lane_alignment_and_tail() {
+            check_lane_alignments(0..16);
+        }
+
+        #[test]
+        fn simd_scanners_match_alignments_16_through_31() {
+            check_lane_alignments(16..32);
+        }
+
+        #[test]
+        fn simd_scanners_match_alignments_32_through_47() {
+            check_lane_alignments(32..48);
+        }
+
+        #[test]
+        fn simd_scanners_match_alignments_48_through_63() {
+            check_lane_alignments(48..64);
+        }
+
+        #[test]
         fn simd_scanners_match_packed_stream_checksums() {
             for len in [1, 15, 16, 17, 31, 64, 127, 128, 1024, 65536] {
                 let input = ScannerBenchmarkInput::new(len, 8);
@@ -2719,6 +2763,7 @@ pub(super) mod scanner_experiment {
                 assert_eq!(benchmark_cr_dot_64(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_pair_64(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_pair_128(input.bytes()), input.expected());
+                assert_eq!(benchmark_cr_pair_256(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_or_128(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_or_256(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_or_cursor_128(input.bytes()), input.expected());
@@ -2731,6 +2776,9 @@ pub(super) mod scanner_experiment {
         #[test]
         fn simd_scanners_match_encoded_articles_and_read_samples() {
             for decoded_len in [1, 128, 716_800, 768_000] {
+                let mixed = ScannerBenchmarkInput::mixed_yenc(decoded_len, 2);
+                assert_eq!(benchmark_memchr_scanner(mixed.bytes()), mixed.expected());
+                check(mixed.bytes());
                 let input = ScannerBenchmarkInput::new_yenc(decoded_len, 2);
                 assert_eq!(benchmark_memchr_scanner(input.bytes()), input.expected());
                 check(input.bytes());
