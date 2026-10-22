@@ -184,7 +184,7 @@ pub use multiline_framing::scanner_experiment::{
     benchmark_cr_pair_64, benchmark_cr_pair_128, benchmark_cr_pair_256, benchmark_lf_or_128,
     benchmark_lf_or_256, benchmark_lf_or_verified_128, benchmark_lf_or_verified_256,
     benchmark_lf_pair_64, benchmark_lf_pair_128, benchmark_memchr_scanner,
-    benchmark_ordered_framing,
+    benchmark_ordered_framing, benchmark_production_scanner,
 };
 #[cfg(feature = "framing-bench")]
 pub use multiline_framing::{

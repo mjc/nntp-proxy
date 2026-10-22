@@ -8,7 +8,7 @@ use nntp_proxy::session::{
     benchmark_cr_pair_64, benchmark_cr_pair_128, benchmark_cr_pair_256, benchmark_lf_or_128,
     benchmark_lf_or_256, benchmark_lf_or_verified_128, benchmark_lf_or_verified_256,
     benchmark_lf_pair_64, benchmark_lf_pair_128, benchmark_memchr_scanner,
-    benchmark_ordered_framing,
+    benchmark_ordered_framing, benchmark_production_scanner,
 };
 use std::sync::LazyLock;
 
@@ -39,6 +39,10 @@ static INPUTS: LazyLock<[ScannerBenchmarkInput; 13]> = LazyLock::new(|| {
         );
         assert_eq!(
             benchmark_lf_or_verified_256(input.bytes()),
+            input.expected()
+        );
+        assert_eq!(
+            benchmark_production_scanner(input.bytes()),
             input.expected()
         );
         assert_eq!(benchmark_memchr_scanner(input.bytes()), input.expected());
@@ -230,4 +234,12 @@ fn ordered<const CHUNK: usize>(bencher: Bencher, input: usize) {
     bencher
         .counter(BytesCount::new(input.bytes().len()))
         .bench(|| black_box(benchmark_ordered_framing(black_box(input), CHUNK)));
+}
+
+#[divan::bench(args = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], sample_count = 200, sample_size = 1)]
+fn production(bencher: Bencher, input: usize) {
+    let input = &INPUTS[input];
+    bencher
+        .counter(BytesCount::new(input.bytes().len()))
+        .bench(|| black_box(benchmark_production_scanner(black_box(input.bytes()))));
 }

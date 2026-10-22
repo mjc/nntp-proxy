@@ -2390,13 +2390,155 @@ fn find_terminator_end(data: &[u8]) -> Option<usize> {
 
 #[inline]
 fn terminator_ends_in_chunk(data: &[u8]) -> impl Iterator<Item = usize> + '_ {
-    TERMINATOR_FINDER
-        .find_iter(data)
-        .map(|found| found + TERMINATOR.len())
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "avx2")
+    ))]
+    {
+        let mut remaining = data;
+        std::iter::from_fn(move || {
+            let start = vector_scanner::find(remaining)?;
+            remaining = &remaining[start + TERMINATOR.len()..];
+            Some(data.len() - remaining.len())
+        })
+    }
+    #[cfg(not(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "avx2")
+    )))]
+    {
+        TERMINATOR_FINDER
+            .find_iter(data)
+            .map(|found| found + TERMINATOR.len())
+    }
+}
+
+// Wider native vector code wins on the measured ARM and x86 targets. Generic
+// x86 keeps Finder's runtime dispatch rather than substituting an SSE scan.
+#[cfg(any(
+    test,
+    feature = "framing-bench",
+    target_arch = "aarch64",
+    all(target_arch = "x86_64", target_feature = "avx2")
+))]
+mod vector_scanner {
+    use super::{TERMINATOR, TERMINATOR_FINDER};
+    // Keep candidate verification out of the vector loop's register allocation.
+    #[inline(never)]
+    pub(super) fn first_match(block: &[u8]) -> Option<usize> {
+        block
+            .windows(TERMINATOR.len())
+            .position(|bytes| bytes == TERMINATOR)
+    }
+
+    #[cfg(any(
+        test,
+        feature = "framing-bench",
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            not(target_feature = "avx512bw")
+        )
+    ))]
+    pub(super) fn find_repeat<const WIDTH: usize, const FIRST: usize, const BYTE: u8>(
+        data: &[u8],
+    ) -> Option<usize> {
+        let mut offset = 0;
+        while data.len() - offset >= WIDTH + 4 {
+            let block = &data[offset..offset + WIDTH + 4];
+            let mut possible = false;
+            for lane in 0..WIDTH {
+                possible |= (block[lane + FIRST] == BYTE) & (block[lane + FIRST + 3] == BYTE);
+            }
+            if possible && let Some(lane) = first_match(block) {
+                return Some(offset + lane);
+            }
+            offset += WIDTH;
+        }
+        TERMINATOR_FINDER
+            .find(&data[offset..])
+            .map(|start| offset + start)
+    }
+
+    #[cfg(any(
+        test,
+        feature = "framing-bench",
+        target_arch = "aarch64",
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            target_feature = "avx512bw"
+        )
+    ))]
+    pub(super) fn find_or<const WIDTH: usize, const FIRST: usize, const BYTE: u8>(
+        data: &[u8],
+        verify: impl Fn(&[u8]) -> Option<usize>,
+    ) -> Option<usize> {
+        let mut offset = 0;
+        while data.len() - offset >= WIDTH + 4 {
+            let block = &data[offset..offset + WIDTH + 4];
+            let mut possible = false;
+            for lane in 0..WIDTH {
+                // Repeated terminator bytes always pass; a verifier rejects
+                // any control-byte combinations admitted by the OR predicate.
+                possible |= (block[lane + FIRST] | block[lane + FIRST + 3]) == BYTE;
+            }
+            if possible && let Some(lane) = verify(block) {
+                return Some(offset + lane);
+            }
+            offset += WIDTH;
+        }
+        TERMINATOR_FINDER
+            .find(&data[offset..])
+            .map(|start| offset + start)
+    }
+
+    // Reject control-byte OR collisions in SIMD before the full verifier.
+    #[cfg(any(
+        test,
+        feature = "framing-bench",
+        target_arch = "aarch64",
+        all(
+            target_arch = "x86_64",
+            target_feature = "avx2",
+            target_feature = "avx512bw"
+        )
+    ))]
+    #[inline(never)]
+    pub(super) fn exact_pair_match<const WIDTH: usize, const FIRST: usize, const BYTE: u8>(
+        block: &[u8],
+    ) -> Option<usize> {
+        let mut possible = false;
+        for lane in 0..WIDTH {
+            possible |= (block[lane + FIRST] == BYTE) & (block[lane + FIRST + 3] == BYTE);
+        }
+        if possible { first_match(block) } else { None }
+    }
+
+    #[cfg(any(
+        target_arch = "aarch64",
+        all(target_arch = "x86_64", target_feature = "avx2")
+    ))]
+    #[inline]
+    pub(super) fn find(data: &[u8]) -> Option<usize> {
+        #[cfg(target_arch = "aarch64")]
+        {
+            find_or::<128, 0, b'\r'>(data, exact_pair_match::<128, 0, b'\r'>)
+        }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512bw"))]
+        {
+            find_or::<256, 1, b'\n'>(data, exact_pair_match::<256, 1, b'\n'>)
+        }
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "avx512bw")))]
+        {
+            find_repeat::<128, 0, b'\r'>(data)
+        }
+    }
 }
 
 #[cfg(any(test, feature = "framing-bench"))]
 pub(super) mod scanner_experiment {
+    use super::vector_scanner::{exact_pair_match, find_or, find_repeat, first_match};
     use super::{TERMINATOR, TERMINATOR_FINDER};
 
     pub struct ScannerBenchmarkInput {
@@ -2575,6 +2717,12 @@ pub(super) mod scanner_experiment {
         (written, completed)
     }
 
+    pub fn benchmark_production_scanner(data: &[u8]) -> (usize, usize) {
+        super::terminator_ends_in_chunk(data).fold((0, 0usize), |(count, sum), end| {
+            (count + 1, sum.wrapping_add(end))
+        })
+    }
+
     pub fn benchmark_memchr_scanner(data: &[u8]) -> (usize, usize) {
         TERMINATOR_FINDER
             .find_iter(data)
@@ -2593,14 +2741,6 @@ pub(super) mod scanner_experiment {
             checksum = checksum.wrapping_add(offset);
         }
         (count, checksum)
-    }
-
-    // Keep candidate verification out of the vector loop's register allocation.
-    #[inline(never)]
-    fn first_match(block: &[u8]) -> Option<usize> {
-        block
-            .windows(TERMINATOR.len())
-            .position(|bytes| bytes == TERMINATOR)
     }
 
     // Preserve candidate lanes as bytes so LLVM can retain both contiguous
@@ -2678,49 +2818,6 @@ pub(super) mod scanner_experiment {
             .map(|start| offset + start)
     }
 
-    fn find_repeat<const WIDTH: usize, const FIRST: usize, const BYTE: u8>(
-        data: &[u8],
-    ) -> Option<usize> {
-        let mut offset = 0;
-        while data.len() - offset >= WIDTH + 4 {
-            let block = &data[offset..offset + WIDTH + 4];
-            let mut possible = false;
-            for lane in 0..WIDTH {
-                possible |= (block[lane + FIRST] == BYTE) & (block[lane + FIRST + 3] == BYTE);
-            }
-            if possible && let Some(lane) = first_match(block) {
-                return Some(offset + lane);
-            }
-            offset += WIDTH;
-        }
-        TERMINATOR_FINDER
-            .find(&data[offset..])
-            .map(|start| offset + start)
-    }
-
-    fn find_or<const WIDTH: usize, const FIRST: usize, const BYTE: u8>(
-        data: &[u8],
-        verify: impl Fn(&[u8]) -> Option<usize>,
-    ) -> Option<usize> {
-        let mut offset = 0;
-        while data.len() - offset >= WIDTH + 4 {
-            let block = &data[offset..offset + WIDTH + 4];
-            let mut possible = false;
-            for lane in 0..WIDTH {
-                // Repeated terminator bytes always pass; a verifier rejects
-                // any control-byte combinations admitted by the OR predicate.
-                possible |= (block[lane + FIRST] | block[lane + FIRST + 3]) == BYTE;
-            }
-            if possible && let Some(lane) = verify(block) {
-                return Some(offset + lane);
-            }
-            offset += WIDTH;
-        }
-        TERMINATOR_FINDER
-            .find(&data[offset..])
-            .map(|start| offset + start)
-    }
-
     fn find_or_cursor<const WIDTH: usize, const BLOCK: usize>(data: &[u8]) -> Option<usize> {
         let mut remaining = data;
         while let Some(block) = remaining.first_chunk::<BLOCK>() {
@@ -2736,19 +2833,6 @@ pub(super) mod scanner_experiment {
         TERMINATOR_FINDER
             .find(remaining)
             .map(|start| data.len() - remaining.len() + start)
-    }
-
-    // yEnc may satisfy the OR predicate without either byte being CR. Keep
-    // those candidates in SIMD before calling the full five-byte verifier.
-    #[inline(never)]
-    fn exact_pair_match<const WIDTH: usize, const FIRST: usize, const BYTE: u8>(
-        block: &[u8],
-    ) -> Option<usize> {
-        let mut possible = false;
-        for lane in 0..WIDTH {
-            possible |= (block[lane + FIRST] == BYTE) & (block[lane + FIRST + 3] == BYTE);
-        }
-        if possible { first_match(block) } else { None }
     }
 
     pub fn benchmark_cr_or_verified_128(data: &[u8]) -> (usize, usize) {
@@ -2829,6 +2913,14 @@ pub(super) mod scanner_experiment {
 
         fn check(data: &[u8]) {
             let expected = TERMINATOR_FINDER.find(data);
+            assert_eq!(
+                super::super::terminator_ends_in_chunk(data).next(),
+                expected.map(|start| start + TERMINATOR.len())
+            );
+            assert_eq!(
+                benchmark_production_scanner(data),
+                benchmark_memchr_scanner(data)
+            );
             assert_eq!(
                 find_or::<128, 1, b'\n'>(data, first_match),
                 expected,
