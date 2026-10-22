@@ -506,25 +506,15 @@ impl ClientSession {
         ));
 
         loop {
-            // Avoid returning the inline batch through another async wrapper.
-            let mut batch = match self
-                .read_command_batch(&mut client_reader, &mut command_buf)
+            let Some(mut batch) = self
+                .read_next_batch(
+                    &mut client_reader,
+                    &mut command_buf,
+                    state.transfer_metrics(),
+                )
                 .await
-            {
-                Ok(batch) => batch,
-                Err(error) => {
-                    if let Some(io_error) = error.downcast_ref::<std::io::Error>() {
-                        connection::log_client_error(
-                            self.client_addr,
-                            self.username(),
-                            io_error,
-                            state.transfer_metrics(),
-                        );
-                    } else {
-                        debug!("Client {} read error: {}", self.client_addr, error);
-                    }
-                    break;
-                }
+            else {
+                break;
             };
 
             match self
@@ -549,6 +539,30 @@ impl ClientSession {
         }
 
         Ok(state.transfer_metrics())
+    }
+
+    async fn read_next_batch(
+        &self,
+        client_reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
+        command_buf: &mut [u8; crate::protocol::MAX_COMMAND_LINE_OCTETS],
+        metrics: TransferMetrics,
+    ) -> Option<crate::session::handlers::pipeline::RequestBatch> {
+        match self.read_command_batch(client_reader, command_buf).await {
+            Ok(batch) => Some(batch),
+            Err(e) => {
+                if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+                    connection::log_client_error(
+                        self.client_addr,
+                        self.username(),
+                        io_err,
+                        metrics,
+                    );
+                } else {
+                    debug!("Client {} read error: {}", self.client_addr, e);
+                }
+                None
+            }
+        }
     }
 
     async fn handle_command_batch(
