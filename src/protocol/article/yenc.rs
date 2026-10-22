@@ -1,34 +1,34 @@
 //! yEnc validation utilities
 //!
 //! Validates yenc-encoded binary data structure and checksums.
-//! Uses the `yenc` crate for decoding - it's faster and more correct than custom implementations.
+//! Decodes wire dot stuffing and yEnc escapes in a single pass.
 
 use super::ParseError;
 use std::io::{BufRead, BufReader};
 
-/// Decode yenc-encoded line to raw bytes using the yenc crate
-///
-/// yEnc encoding: `encoded = (original + 42) % 256`
-/// Special handling:
-/// - `=` is escape: next byte uses `(byte - 64) % 256` instead of 42
-/// - Leading `..` collapses to `.` (NNTP dot-stuffing)
-/// - CR, LF, NUL are ignored
-///
-/// Delegates to yenc crate which is faster and handles all edge cases correctly
+/// Decode a wire yEnc data line, removing one leading stuffed dot.
 #[inline]
 #[must_use]
 pub fn decode_yenc_line(input: &[u8]) -> Vec<u8> {
-    // NNTP dot-stuffs a data line that begins with a dot. Remove only the
-    // protocol-added dot; a second leading dot is part of the yEnc payload.
     let input = if input.get(..2) == Some(b"..") {
         &input[1..]
     } else {
         input
     };
-
-    // yenc crate returns Result but decoding never actually fails
-    // (it just returns empty/partial on malformed input)
-    yenc::decode_buffer(input).unwrap_or_default()
+    let mut bytes = input.iter().copied();
+    let mut output = Vec::with_capacity(input.len());
+    while let Some(byte) = bytes.next() {
+        let encoded = match byte {
+            b'\r' | b'\n' | 0 => continue,
+            b'=' => match bytes.next() {
+                Some(escaped) => escaped.wrapping_sub(64),
+                None => break,
+            },
+            byte => byte,
+        };
+        output.push(encoded.wrapping_sub(42));
+    }
+    output
 }
 
 /// yEnc header metadata extracted from =ybegin line
@@ -57,19 +57,20 @@ impl YencHeader {
             is_multipart,
         })
     }
+}
 
-    /// Validate footer size matches header
-    #[inline]
-    fn validate_size(&self, footer: &YencFooter) -> Result<(), ParseError> {
-        footer
-            .size
-            .filter(|&size| size != self.expected_size)
-            .map_or(Ok(()), |size| {
-                Err(ParseError::InvalidYenc(format!(
-                    "Size mismatch: header={}, footer={}",
-                    self.expected_size, size
-                )))
-            })
+/// Inclusive, one-based byte range within the complete file.
+fn parse_part_size(line: &[u8], file_size: usize) -> Result<usize, ParseError> {
+    let line = String::from_utf8_lossy(line);
+    let begin = extract_param(&line, "begin").and_then(|v| v.parse::<usize>().ok());
+    let end = extract_param(&line, "end").and_then(|v| v.parse::<usize>().ok());
+    match (begin, end) {
+        (Some(begin), Some(end)) if begin > 0 && end >= begin && end <= file_size => {
+            Ok(end - begin + 1)
+        }
+        _ => Err(ParseError::InvalidYenc(
+            "Invalid =ypart byte range".to_string(),
+        )),
     }
 }
 
@@ -171,7 +172,7 @@ impl Iterator for YencLines<'_> {
 /// - `=ybegin` header line with required parameters (name, size)
 /// - `=yend` footer line
 /// - CRC32 checksums if provided (pcrc32 or crc32)
-/// - Size matches between header and footer
+/// - Decoded size matches the part range (multipart) or file size (single part)
 /// - Proper line encoding (validates actual yenc data)
 ///
 /// Does NOT write to disk - validates in-memory only.
@@ -192,28 +193,49 @@ pub fn validate_yenc_structure(body: &[u8]) -> Result<(), ParseError> {
         })
         .ok_or_else(|| ParseError::InvalidYenc("Missing =ybegin header".to_string()))?;
 
-    let (footer, checksum) = lines.try_fold(
-        (None, crc32fast::Hasher::new()),
-        |(footer, mut checksum), line| -> Result<_, ParseError> {
-            let line = line?;
-            match YencLine::classify(&line) {
-                YencLine::Part => Ok((footer, checksum)),
-                YencLine::End => {
-                    let parsed_footer = YencFooter::parse(&line, header.is_multipart);
-                    Ok((Some(parsed_footer), checksum))
-                }
-                YencLine::Data => {
-                    decode_and_checksum(&line, &mut checksum);
-                    Ok((footer, checksum))
-                }
+    let mut expected_size = if header.is_multipart {
+        None
+    } else {
+        Some(header.expected_size)
+    };
+    let mut checksum = crc32fast::Hasher::new();
+    let mut decoded_size = 0usize;
+    let mut footer = None;
+    for line in lines {
+        let line = line?;
+        match YencLine::classify(&line) {
+            YencLine::Part if header.is_multipart && expected_size.is_none() => {
+                expected_size = Some(parse_part_size(&line, header.expected_size)?);
             }
-        },
-    )?;
-
+            YencLine::Part => {
+                return Err(ParseError::InvalidYenc(
+                    "Unexpected =ypart header".to_string(),
+                ));
+            }
+            YencLine::End => {
+                footer = Some(YencFooter::parse(&line, header.is_multipart));
+                break;
+            }
+            YencLine::Data => {
+                if expected_size.is_none() {
+                    return Err(ParseError::InvalidYenc("Missing =ypart header".to_string()));
+                }
+                decoded_size = decoded_size
+                    .checked_add(decode_and_checksum(&line, &mut checksum))
+                    .ok_or_else(|| ParseError::InvalidYenc("Decoded size overflow".to_string()))?;
+            }
+        }
+    }
     let footer =
         footer.ok_or_else(|| ParseError::InvalidYenc("Missing =yend footer".to_string()))?;
-
-    header.validate_size(&footer)?;
+    let expected_size = expected_size
+        .ok_or_else(|| ParseError::InvalidYenc("Missing =ypart header".to_string()))?;
+    if footer.size != Some(expected_size) || decoded_size != expected_size {
+        return Err(ParseError::InvalidYenc(format!(
+            "Size mismatch: expected={expected_size}, footer={:?}, decoded={decoded_size}",
+            footer.size
+        )));
+    }
     footer.validate_checksum(&checksum)?;
 
     Ok(())
@@ -221,7 +243,7 @@ pub fn validate_yenc_structure(body: &[u8]) -> Result<(), ParseError> {
 
 /// Decode a yenc data line and update checksum
 #[inline]
-fn decode_and_checksum(line: &[u8], checksum: &mut crc32fast::Hasher) {
+fn decode_and_checksum(line: &[u8], checksum: &mut crc32fast::Hasher) -> usize {
     let decoded = line
         .strip_suffix(b"\r\n")
         .or_else(|| line.strip_suffix(b"\n"))
@@ -229,14 +251,15 @@ fn decode_and_checksum(line: &[u8], checksum: &mut crc32fast::Hasher) {
         .pipe(decode_yenc_line);
 
     checksum.update(&decoded);
+    decoded.len()
 }
 
 /// Extract a parameter value from a yenc metadata line
 #[inline]
 fn extract_param<'a>(line: &'a str, param: &str) -> Option<&'a str> {
-    line.find(&format!("{param}="))
-        .map(|start| &line[start + param.len() + 1..])
-        .and_then(|rest| rest.split_whitespace().next())
+    let prefix = format!("{param}=");
+    line.split_whitespace()
+        .find_map(|word| word.strip_prefix(&prefix))
 }
 
 /// Pipe combinator for method chaining
@@ -257,6 +280,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn multipart_yenc_validates_part_sizes_and_checksums() {
+        let crc = crc32fast::hash(b"ABCDEF");
+        for (part, begin, end) in [(1, 1, 6), (2, 7, 12), (3, 13, 18)] {
+            let body = format!(
+                "=ybegin part={part} total=3 line=128 size=18 name=sample.bin\r\n=ypart begin={begin} end={end}\r\nklmnop\r\n=yend size=6 part={part} pcrc32={crc:08x} crc32=00000000\r\n"
+            );
+            validate_yenc_structure(body.as_bytes())
+                .expect("part size differs from whole file size");
+        }
+    }
+
+    #[test]
+    fn yenc_rejects_payload_size_mismatches_without_checksums() {
+        for body in [
+            "=ybegin size=12 name=file\r\nklmnop\r\n=yend size=12\r\n",
+            "=ybegin part=1 size=12 name=file\r\n=ypart begin=1 end=12\r\nklmnop\r\n=yend size=12\r\n",
+            "=ybegin part=1 size=12 name=file\r\n=ypart begin=1 end=6\r\nklmnop\r\n=yend size=5\r\n",
+            "=ybegin part=1 size=12 name=file\r\n=ypart begin=0 end=5\r\nklmnop\r\n=yend size=6\r\n",
+            "=ybegin part=1 size=12 name=file\r\n=ypart begin=8 end=13\r\nklmnop\r\n=yend size=6\r\n",
+            "=ybegin part=1 size=6 name=file\r\nklmnop\r\n=yend size=6\r\n",
+        ] {
+            assert!(
+                validate_yenc_structure(body.as_bytes()).is_err(),
+                "accepted {body:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_valid_yenc() {
         let data = b"=ybegin line=128 size=12 name=test.txt\r\nr\x8f\x96\x96\x99VJ\xa3o\x98\x8dK\r\n=yend size=12 crc32=0337ab3d\r\n";
 
@@ -269,8 +321,22 @@ mod tests {
         let once_stuffed = decode_yenc_line(b"..encoded");
         let twice_stuffed = decode_yenc_line(b"...encoded");
 
-        assert_eq!(once_stuffed, yenc::decode_buffer(b".encoded").unwrap());
-        assert_eq!(twice_stuffed, yenc::decode_buffer(b"..encoded").unwrap());
+        assert_eq!(
+            once_stuffed,
+            [
+                vec![4],
+                b"encoded".iter().map(|b| b.wrapping_sub(42)).collect()
+            ]
+            .concat()
+        );
+        assert_eq!(
+            twice_stuffed,
+            [
+                vec![4, 4],
+                b"encoded".iter().map(|b| b.wrapping_sub(42)).collect()
+            ]
+            .concat()
+        );
     }
 
     #[test]
@@ -279,13 +345,13 @@ mod tests {
         decode_and_checksum(b"..\r\n", &mut actual);
 
         let mut expected = crc32fast::Hasher::new();
-        expected.update(&yenc::decode_buffer(b".").unwrap());
+        expected.update(&[4]);
         assert_eq!(actual.finalize(), expected.finalize());
 
         let mut two_bytes = crc32fast::Hasher::new();
         decode_and_checksum(b"...\r\n", &mut two_bytes);
         let mut expected_two_bytes = crc32fast::Hasher::new();
-        expected_two_bytes.update(&yenc::decode_buffer(b"..").unwrap());
+        expected_two_bytes.update(&[4, 4]);
         assert_eq!(two_bytes.finalize(), expected_two_bytes.finalize());
     }
 
