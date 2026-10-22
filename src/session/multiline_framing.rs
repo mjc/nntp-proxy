@@ -2547,6 +2547,63 @@ pub(super) mod scanner_experiment {
             .position(|bytes| bytes == TERMINATOR)
     }
 
+    // Like the BCJ2 encoder's marker mask, retain lane positions instead of
+    // reducing to a boolean and rescanning the matching half.
+    #[inline(never)]
+    fn first_mask(window: &[u8; 20]) -> u16 {
+        let mut mask = 0u16;
+        for lane in 0..16 {
+            let matched = (window[lane] == b'\r')
+                & (window[lane + 1] == b'\n')
+                & (window[lane + 2] == b'.')
+                & (window[lane + 3] == b'\r')
+                & (window[lane + 4] == b'\n');
+            mask |= u16::from(matched) << lane;
+        }
+        mask
+    }
+
+    #[inline(never)]
+    fn first_match_mask(block: &[u8]) -> Option<usize> {
+        let mut remaining = block;
+        while let Some(window) = remaining.first_chunk::<20>() {
+            let mask = first_mask(window);
+            if mask != 0 {
+                return Some(block.len() - remaining.len() + mask.trailing_zeros() as usize);
+            }
+            remaining = &remaining[16..];
+        }
+        TERMINATOR_FINDER
+            .find(remaining)
+            .map(|start| block.len() - remaining.len() + start)
+    }
+
+    fn find_repeat_mask<const WIDTH: usize>(data: &[u8]) -> Option<usize> {
+        let mut offset = 0;
+        while data.len() - offset >= WIDTH + 4 {
+            let block = &data[offset..offset + WIDTH + 4];
+            let mut possible = false;
+            for lane in 0..WIDTH {
+                possible |= (block[lane] == b'\r') & (block[lane + 3] == b'\r');
+            }
+            if possible && let Some(lane) = first_match_mask(block) {
+                return Some(offset + lane);
+            }
+            offset += WIDTH;
+        }
+        TERMINATOR_FINDER
+            .find(&data[offset..])
+            .map(|start| offset + start)
+    }
+
+    pub fn benchmark_cr_mask_128(data: &[u8]) -> (usize, usize) {
+        scan(data, find_repeat_mask::<128>)
+    }
+
+    pub fn benchmark_cr_mask_256(data: &[u8]) -> (usize, usize) {
+        scan(data, find_repeat_mask::<256>)
+    }
+
     fn find_pair<const WIDTH: usize>(data: &[u8]) -> Option<usize> {
         let mut offset = 0;
         while data.len() - offset >= WIDTH + 4 {
@@ -2690,6 +2747,17 @@ pub(super) mod scanner_experiment {
 
         fn check(data: &[u8]) {
             let expected = TERMINATOR_FINDER.find(data);
+            assert_eq!(first_match_mask(data), expected, "mask verifier: {data:?}");
+            assert_eq!(
+                find_repeat_mask::<128>(data),
+                expected,
+                "CR mask128: {data:?}"
+            );
+            assert_eq!(
+                find_repeat_mask::<256>(data),
+                expected,
+                "CR mask256: {data:?}"
+            );
             assert_eq!(
                 find_or::<128>(data, exact_pair_match::<128>),
                 expected,
@@ -2804,6 +2872,8 @@ pub(super) mod scanner_experiment {
                 assert_eq!(benchmark_cr_pair_64(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_pair_128(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_pair_256(input.bytes()), input.expected());
+                assert_eq!(benchmark_cr_mask_128(input.bytes()), input.expected());
+                assert_eq!(benchmark_cr_mask_256(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_or_128(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_or_256(input.bytes()), input.expected());
                 assert_eq!(
