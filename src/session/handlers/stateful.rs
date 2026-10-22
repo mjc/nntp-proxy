@@ -720,6 +720,103 @@ mod tests {
             });
             prop_assert_eq!(actual, expected);
         }
+
+        #[test]
+        fn prop_stateful_multiline_output_survives_client_readiness_during_backpressure(
+            first_case in 0usize..5,
+            first_body_len in 0usize..4096,
+            second_case in 0usize..5,
+            second_body_len in 0usize..4096,
+            accepted_prefix in 1usize..64,
+            reader_capacity in prop_oneof![1usize..40, Just(511), Just(512)],
+        ) {
+            let (first_request, first_response) =
+                crate::session::multiline_framing::framing_pipeline_fixture(first_case, first_body_len);
+            let (second_request, second_response) =
+                crate::session::multiline_framing::framing_pipeline_fixture(second_case, second_body_len);
+            let backend_first_request = first_request.clone();
+            let backend_second_request = second_request.clone();
+            let (keep_backend_open_tx, keep_backend_open_rx) = tokio::sync::oneshot::channel();
+            let expected = [
+                first_response.as_slice(),
+                crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE,
+                second_response.as_slice(),
+            ].concat();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    let session = test_session();
+                    let (mut client, proxy_client) = tokio::io::duplex(16_384);
+                    let (backend, proxy_backend) = tokio::io::duplex(16_384);
+                    let backend_task = tokio::spawn(async move {
+                        let (backend_read, mut backend_write) = tokio::io::split(backend);
+                        let mut reader = BufReader::new(backend_read);
+                        let mut command = Vec::new();
+                        reader.read_until(b'\n', &mut command).await.unwrap();
+                        assert_eq!(command, backend_first_request);
+                        backend_write.write_all(&first_response).await.unwrap();
+                        backend_write.flush().await.unwrap();
+                        command.clear();
+                        reader.read_until(b'\n', &mut command).await.unwrap();
+                        assert_eq!(command, backend_second_request);
+                        backend_write.write_all(&second_response).await.unwrap();
+                        backend_write.flush().await.unwrap();
+                        let _ = keep_backend_open_rx.await;
+                    });
+
+                    let partial = Arc::new(Notify::new());
+                    let complete = Arc::new(Notify::new());
+                    let writer = GateWriter::with_first_accept_limit(
+                        expected.len(),
+                        Arc::clone(&partial),
+                        Arc::clone(&complete),
+                        Some(accepted_prefix),
+                    );
+                    let writer_control = writer.control();
+                    let (proxy_client_read, _) = tokio::io::split(proxy_client);
+                    let (backend_read, backend_write) = tokio::io::split(proxy_backend);
+                    let proxy = tokio::spawn(async move {
+                        session.run_stateful_proxy_loop(
+                            BufReader::with_capacity(reader_capacity, proxy_client_read),
+                            writer,
+                            backend_read,
+                            backend_write,
+                            SessionLoopState::new(false),
+                            BackendId::from_index(0),
+                        ).await
+                    });
+
+                    client.write_all(&first_request).await.unwrap();
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        writer_control.partial.notified(),
+                    ).await.expect("first backend response did not reach gated writer");
+
+                    // These bytes become readable while the first response write
+                    // is suspended; completing that response must retain priority.
+                    client.write_all(b"\r\n").await.unwrap();
+                    client.write_all(&second_request).await.unwrap();
+                    writer_control.release();
+
+                    tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        writer_control.complete.notified(),
+                    ).await.expect("ordered multiline output did not finish");
+                    assert_eq!(writer_control.bytes(), expected);
+                    drop(client);
+                    let result = tokio::time::timeout(std::time::Duration::from_secs(5), proxy)
+                        .await.expect("stateful proxy did not stop")
+                        .expect("stateful proxy task panicked")
+                        .expect("stateful proxy failed");
+                    assert_eq!(result.disposition(), super::StatefulConnectionDisposition::RetireClient);
+                    let _ = keep_backend_open_tx.send(());
+                    backend_task.await.unwrap();
+                }).await.expect("gated multiline property stalled");
+            });
+        }
     }
 
     #[test]
@@ -751,10 +848,20 @@ mod tests {
         partial: Arc<Notify>,
         complete: Arc<Notify>,
         expected_len: usize,
+        first_accept_limit: Option<usize>,
     }
 
     impl GateWriter {
         fn new(expected_len: usize, partial: Arc<Notify>, complete: Arc<Notify>) -> Self {
+            Self::with_first_accept_limit(expected_len, partial, complete, None)
+        }
+
+        fn with_first_accept_limit(
+            expected_len: usize,
+            partial: Arc<Notify>,
+            complete: Arc<Notify>,
+            first_accept_limit: Option<usize>,
+        ) -> Self {
             Self {
                 state: Arc::new(Mutex::new(GateWriterState {
                     bytes: Vec::new(),
@@ -765,6 +872,7 @@ mod tests {
                 partial,
                 complete,
                 expected_len,
+                first_accept_limit,
             }
         }
 
@@ -793,6 +901,7 @@ mod tests {
                 partial: Arc::clone(&self.partial),
                 complete: Arc::clone(&self.complete),
                 expected_len: self.expected_len,
+                first_accept_limit: self.first_accept_limit,
             }
         }
     }
@@ -811,7 +920,10 @@ mod tests {
             }
 
             if state.first_write && bytes.len() > 1 {
-                let accepted = (bytes.len() / 2).max(1).min(bytes.len() - 1);
+                let accepted = this
+                    .first_accept_limit
+                    .unwrap_or_else(|| (bytes.len() / 2).max(1))
+                    .min(bytes.len() - 1);
                 state.bytes.extend_from_slice(&bytes[..accepted]);
                 state.first_write = false;
                 state.blocked = true;

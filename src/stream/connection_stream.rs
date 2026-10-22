@@ -110,6 +110,18 @@ enum ConnectionTransport {
     CompressedPlain(Box<DecompressStream<TcpStream>>),
     /// Compressed TLS connection (RFC 8054 / XFEATURE COMPRESS GZIP)
     CompressedTls(Box<DecompressStream<TlsStream<TcpStream>>>),
+    #[cfg(test)]
+    Test(TestStream),
+}
+
+#[cfg(test)]
+struct TestStream(Box<dyn AsyncStream>);
+
+#[cfg(test)]
+impl std::fmt::Debug for TestStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestStream(..)")
+    }
 }
 
 /// Unified stream type that can represent different connection types.
@@ -157,6 +169,11 @@ impl ConnectionStream {
         )))
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test(stream: impl AsyncStream + 'static) -> Self {
+        Self::new(ConnectionTransport::Test(TestStream(Box::new(stream))))
+    }
+
     fn new(transport: ConnectionTransport) -> Self {
         Self {
             transport,
@@ -182,6 +199,13 @@ impl ConnectionStream {
                     "cannot enable compression on an already-compressed connection",
                 ));
             }
+            #[cfg(test)]
+            ConnectionTransport::Test(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "cannot enable compression on a test connection",
+                ));
+            }
         };
 
         Ok(Self {
@@ -198,6 +222,8 @@ impl ConnectionStream {
             ConnectionTransport::Tls(_) => "TLS",
             ConnectionTransport::CompressedPlain(_) => "TCP+COMPRESS",
             ConnectionTransport::CompressedTls(_) => "TLS+COMPRESS",
+            #[cfg(test)]
+            ConnectionTransport::Test(_) => "TEST",
         }
     }
 
@@ -215,10 +241,12 @@ impl ConnectionStream {
     #[inline]
     #[must_use]
     pub const fn is_unencrypted(&self) -> bool {
-        matches!(
-            &self.transport,
-            ConnectionTransport::Plain(_) | ConnectionTransport::CompressedPlain(_)
-        )
+        match &self.transport {
+            ConnectionTransport::Plain(_) | ConnectionTransport::CompressedPlain(_) => true,
+            #[cfg(test)]
+            ConnectionTransport::Test(_) => true,
+            _ => false,
+        }
     }
 
     /// Returns true if this connection uses wire compression
@@ -280,6 +308,8 @@ impl ConnectionStream {
             ConnectionTransport::Tls(tls) => tls.get_ref().0,
             ConnectionTransport::CompressedPlain(cs) => cs.get_ref(),
             ConnectionTransport::CompressedTls(cs) => cs.get_ref().get_ref().0,
+            #[cfg(test)]
+            ConnectionTransport::Test(_) => panic!("test transport has no underlying TCP stream"),
         }
     }
 
@@ -411,6 +441,8 @@ impl AsyncRead for ConnectionStream {
             ConnectionTransport::CompressedTls(stream) => {
                 Pin::new(stream.as_mut()).poll_read(cx, buf)
             }
+            #[cfg(test)]
+            ConnectionTransport::Test(stream) => Pin::new(&mut *stream.0).poll_read(cx, buf),
         }
     }
 }
@@ -430,6 +462,8 @@ impl AsyncWrite for ConnectionStream {
             ConnectionTransport::CompressedTls(stream) => {
                 Pin::new(stream.as_mut()).poll_write(cx, buf)
             }
+            #[cfg(test)]
+            ConnectionTransport::Test(stream) => Pin::new(&mut *stream.0).poll_write(cx, buf),
         }
     }
 
@@ -449,6 +483,10 @@ impl AsyncWrite for ConnectionStream {
             ConnectionTransport::CompressedTls(stream) => {
                 Pin::new(stream.as_mut()).poll_write_vectored(cx, bufs)
             }
+            #[cfg(test)]
+            ConnectionTransport::Test(stream) => {
+                Pin::new(&mut *stream.0).poll_write_vectored(cx, bufs)
+            }
         }
     }
 
@@ -458,6 +496,8 @@ impl AsyncWrite for ConnectionStream {
             ConnectionTransport::Tls(stream) => stream.is_write_vectored(),
             ConnectionTransport::CompressedPlain(stream) => stream.is_write_vectored(),
             ConnectionTransport::CompressedTls(stream) => stream.is_write_vectored(),
+            #[cfg(test)]
+            ConnectionTransport::Test(stream) => stream.0.is_write_vectored(),
         }
     }
 
@@ -469,6 +509,8 @@ impl AsyncWrite for ConnectionStream {
                 Pin::new(stream.as_mut()).poll_flush(cx)
             }
             ConnectionTransport::CompressedTls(stream) => Pin::new(stream.as_mut()).poll_flush(cx),
+            #[cfg(test)]
+            ConnectionTransport::Test(stream) => Pin::new(&mut *stream.0).poll_flush(cx),
         }
     }
 
@@ -482,6 +524,8 @@ impl AsyncWrite for ConnectionStream {
             ConnectionTransport::CompressedTls(stream) => {
                 Pin::new(stream.as_mut()).poll_shutdown(cx)
             }
+            #[cfg(test)]
+            ConnectionTransport::Test(stream) => Pin::new(&mut *stream.0).poll_shutdown(cx),
         }
     }
 }
@@ -489,7 +533,225 @@ impl AsyncWrite for ConnectionStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+    use std::collections::VecDeque;
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    #[derive(Clone, Debug)]
+    enum PendingQueueOp {
+        CopyFront(Vec<u8>),
+        CopyBack(Vec<u8>),
+        PoolFront {
+            prefix: Vec<u8>,
+            bytes: Vec<u8>,
+            suffix: Vec<u8>,
+        },
+        Read(usize),
+        TakePooled,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PendingSegmentKind {
+        Copied,
+        Pooled { range_start: usize },
+    }
+
+    #[derive(Debug)]
+    struct PendingSegmentModel {
+        bytes: Vec<u8>,
+        pos: usize,
+        kind: PendingSegmentKind,
+    }
+
+    impl PendingSegmentModel {
+        fn remaining(&self) -> &[u8] {
+            &self.bytes[self.pos..]
+        }
+    }
+
+    fn pending_queue_operations() -> impl Strategy<Value = Vec<PendingQueueOp>> {
+        let copied = prop::collection::vec(any::<u8>(), 0..20);
+        let pooled = (
+            prop::collection::vec(any::<u8>(), 1..5),
+            prop::collection::vec(any::<u8>(), 1..20),
+            prop::collection::vec(any::<u8>(), 0..5),
+        );
+        prop::collection::vec(
+            prop_oneof![
+                3 => copied.clone().prop_map(PendingQueueOp::CopyFront),
+                3 => copied.prop_map(PendingQueueOp::CopyBack),
+                3 => pooled.prop_map(|(prefix, bytes, suffix)| PendingQueueOp::PoolFront {
+                    prefix,
+                    bytes,
+                    suffix,
+                }),
+                4 => (0usize..9).prop_map(PendingQueueOp::Read),
+                2 => Just(PendingQueueOp::TakePooled),
+            ],
+            0..80,
+        )
+    }
+
+    fn model_queue_bytes(queue: &VecDeque<PendingSegmentModel>) -> usize {
+        queue.iter().map(|segment| segment.remaining().len()).sum()
+    }
+
+    async fn exercise_pending_queue_model(operations: Vec<PendingQueueOp>) {
+        let (server, _client) = tokio::io::duplex(1);
+        let pool =
+            crate::pool::BufferPool::new(crate::types::BufferSize::try_new(1024).unwrap(), 2);
+        let mut conn = ConnectionStream::for_test(server);
+        let mut model = VecDeque::<PendingSegmentModel>::new();
+        let mut observed = Vec::new();
+
+        // Keep more than the inline segment count queued together. The order
+        // also places a copied segment ahead of a pooled one for the take check.
+        let mut scripted = vec![
+            PendingQueueOp::CopyBack(vec![0, 255]),
+            PendingQueueOp::PoolFront {
+                prefix: vec![0xaa, 0xbb],
+                bytes: vec![1, 2, 3, 4],
+                suffix: vec![0xcc],
+            },
+            PendingQueueOp::CopyBack(vec![8, 9]),
+            PendingQueueOp::CopyFront(vec![10, 11, 12]),
+            PendingQueueOp::PoolFront {
+                prefix: vec![0x80],
+                bytes: vec![13, 14, 15],
+                suffix: vec![],
+            },
+            PendingQueueOp::Read(2),
+            PendingQueueOp::TakePooled,
+            PendingQueueOp::TakePooled,
+            PendingQueueOp::Read(0),
+        ];
+        scripted.extend(operations);
+
+        for operation in scripted {
+            match operation {
+                PendingQueueOp::CopyFront(bytes) => {
+                    conn.queue_pending_bytes_first(&bytes).unwrap();
+                    if !bytes.is_empty() {
+                        model.push_front(PendingSegmentModel {
+                            bytes,
+                            pos: 0,
+                            kind: PendingSegmentKind::Copied,
+                        });
+                    }
+                }
+                PendingQueueOp::CopyBack(bytes) => {
+                    conn.queue_pending_bytes(&bytes).unwrap();
+                    if !bytes.is_empty() {
+                        model.push_back(PendingSegmentModel {
+                            bytes,
+                            pos: 0,
+                            kind: PendingSegmentKind::Copied,
+                        });
+                    }
+                }
+                PendingQueueOp::PoolFront {
+                    prefix,
+                    bytes,
+                    suffix,
+                } => {
+                    let mut backing = pool.acquire();
+                    backing.extend_from_slice(&prefix);
+                    let start = backing.initialized();
+                    backing.extend_from_slice(&bytes);
+                    let end = backing.initialized();
+                    backing.extend_from_slice(&suffix);
+                    conn.queue_pooled_pending_bytes_first(backing, start..end)
+                        .unwrap();
+                    model.push_front(PendingSegmentModel {
+                        bytes,
+                        pos: 0,
+                        kind: PendingSegmentKind::Pooled { range_start: start },
+                    });
+                }
+                PendingQueueOp::Read(size) => {
+                    if size == 0 {
+                        let count = conn.read(&mut []).await.unwrap();
+                        assert_eq!(count, 0);
+                    } else if let Some(front) = model.front_mut() {
+                        let mut actual = vec![0; size];
+                        let count = conn.read(&mut actual).await.unwrap();
+                        let expected_len = size.min(front.remaining().len());
+                        assert_eq!(count, expected_len);
+                        assert_eq!(&actual[..count], &front.remaining()[..count]);
+                        observed.extend_from_slice(&actual[..count]);
+                        front.pos += count;
+                        if front.remaining().is_empty() {
+                            model.pop_front();
+                        }
+                    }
+                }
+                PendingQueueOp::TakePooled => {
+                    let pooled_front = matches!(
+                        model.front().map(|segment| segment.kind),
+                        Some(PendingSegmentKind::Pooled { .. })
+                    );
+                    let taken = conn.take_leading_pooled_pending_input();
+                    assert_eq!(taken.is_some(), pooled_front);
+                    if let Some((buffer, range)) = taken {
+                        let segment = model.pop_front().expect("modeled pooled front");
+                        let PendingSegmentKind::Pooled { range_start } = segment.kind else {
+                            unreachable!("pooled front was checked above")
+                        };
+                        let expected_range =
+                            range_start + segment.pos..range_start + segment.bytes.len();
+                        assert_eq!(range, expected_range);
+                        assert_eq!(&buffer[range.clone()], segment.remaining());
+                        observed.extend_from_slice(&buffer[range]);
+                    }
+                }
+            }
+
+            assert_eq!(conn.pending_bytes_len(), model_queue_bytes(&model));
+            assert_eq!(conn.has_pending_bytes(), !model.is_empty());
+        }
+
+        while let Some(front) = model.front() {
+            if matches!(front.kind, PendingSegmentKind::Pooled { .. }) {
+                let (buffer, range) = conn
+                    .take_leading_pooled_pending_input()
+                    .expect("modeled pooled segment should be takeable at front");
+                let segment = model.pop_front().unwrap();
+                assert_eq!(&buffer[range.clone()], segment.remaining());
+                observed.extend_from_slice(&buffer[range]);
+            } else {
+                let mut actual = [0; 64];
+                let count = conn.read(&mut actual).await.unwrap();
+                let segment = model.front_mut().unwrap();
+                let expected_len = actual.len().min(segment.remaining().len());
+                assert_eq!(count, expected_len);
+                assert_eq!(&actual[..count], &segment.remaining()[..count]);
+                observed.extend_from_slice(&actual[..count]);
+                segment.pos += count;
+                if segment.remaining().is_empty() {
+                    model.pop_front();
+                }
+            }
+            assert_eq!(conn.pending_bytes_len(), model_queue_bytes(&model));
+            assert_eq!(conn.has_pending_bytes(), !model.is_empty());
+        }
+
+        assert!(!conn.has_pending_bytes());
+        assert_eq!(conn.pending_bytes_len(), 0);
+        assert!(!observed.is_empty());
+    }
+
+    proptest! {
+        #[test]
+        fn pending_input_queue_matches_opaque_segment_model(
+            operations in pending_queue_operations(),
+        ) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(exercise_pending_queue_model(operations));
+        }
+    }
 
     #[tokio::test]
     async fn test_connection_stream_plain_tcp() {

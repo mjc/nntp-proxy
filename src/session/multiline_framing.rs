@@ -35,6 +35,39 @@ pub(crate) fn empty_multiline_response_fixture(status: u16) -> Vec<u8> {
     response
 }
 
+#[cfg(test)]
+pub(crate) fn framing_pipeline_fixture(case: usize, body_len: usize) -> (Vec<u8>, Vec<u8>) {
+    let (request, status, multiline): (&[u8], &[u8], bool) = match case {
+        0 => (
+            b"ARTICLE <test@example.com>\r\n",
+            b"220 0 <test@example.com>\r\n",
+            true,
+        ),
+        1 => (
+            b"BODY <test@example.com>\r\n",
+            b"222 0 <test@example.com>\r\n",
+            true,
+        ),
+        2 => (
+            b"HEAD <test@example.com>\r\n",
+            b"221 0 <test@example.com>\r\n",
+            true,
+        ),
+        3 => (b"GROUP example\r\n", b"211 1 1 1 example\r\n", false),
+        4 => (b"LISTGROUP example\r\n", b"211 1 1 1 example\r\n", true),
+        _ => panic!("unknown pipeline fixture"),
+    };
+    let mut response = status.to_vec();
+    if multiline {
+        if body_len > 0 {
+            response.extend(std::iter::repeat_n(b'x', body_len));
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b".\r\n");
+    }
+    (request.to_vec(), response)
+}
+
 pub(crate) const CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE: &[u8] =
     b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nOVER\r\nHDR\r\n.\r\n";
 
@@ -645,6 +678,7 @@ struct PendingRequestFrame {
 #[derive(Debug)]
 enum PendingRequestFrameState {
     AwaitingStatusLine,
+    DiscardingOverlongStatusLine,
     ReadingMultiline { framer: MultilineFramer },
 }
 
@@ -2173,12 +2207,12 @@ impl PendingRequestFrame {
                     if self.status_line.len() + offset_bytes.len()
                         > crate::constants::buffer::COMMAND
                     {
-                        return Some(FramedResponseForRequest {
-                            response: BackendChunkRange::new(
-                                offset,
-                                BackendChunkEnd::new(chunk.len()),
-                            ),
-                        });
+                        // Keep memory bounded without completing a request in
+                        // the middle of its status line. The next request must
+                        // not consume the remainder of this malformed reply.
+                        self.status_line.clear();
+                        self.state = PendingRequestFrameState::DiscardingOverlongStatusLine;
+                        return None;
                     }
                     self.status_line.extend_from_slice(offset_bytes);
                     return None;
@@ -2221,6 +2255,11 @@ impl PendingRequestFrame {
                         None
                     }
                 }
+            }
+            PendingRequestFrameState::DiscardingOverlongStatusLine => {
+                memchr::memchr(b'\n', offset_bytes).map(|pos| FramedResponseForRequest {
+                    response: BackendChunkRange::new(offset, offset.after(ChunkConsumed(pos + 1))),
+                })
             }
             PendingRequestFrameState::ReadingMultiline { framer } => framer
                 .advance_to_next_terminator_end(offset_bytes)
@@ -2305,6 +2344,20 @@ fn complete_multiline_payload_split(payload: &[u8]) -> Option<CompleteMultilineP
 #[must_use]
 fn complete_multiline_payload_body(payload: &[u8]) -> Option<&[u8]> {
     complete_multiline_payload_split(payload).map(|split| &payload[split.body()])
+}
+
+/// Split already bounded ARTICLE content, including a headerless article's
+/// single blank line. The cache receives semantic sections without searching
+/// response bytes or mistaking a separator inside the body for the first one.
+pub(crate) fn captured_article_payload_sections(
+    payload: &[u8],
+) -> Option<(Range<usize>, Range<usize>)> {
+    if payload.starts_with(b"\r\n") {
+        Some((0..0, 2..payload.len()))
+    } else {
+        memchr::memmem::find(payload, b"\r\n\r\n")
+            .map(|split| (0..split + 2, split + 4..payload.len()))
+    }
 }
 
 /// Returns the captured semantic payload, retaining its final content CRLF and
@@ -2968,6 +3021,107 @@ mod tests {
 
         proptest! {
             #[test]
+            fn overlong_status_completion_is_partition_independent(extra in 0usize..64) {
+                const LOCAL: &[u8] = b"500 local\r\n";
+                let cap = crate::constants::buffer::COMMAND;
+                for length in [cap - 1, cap, cap + 1, cap + 4 + extra] {
+                    let mut line = b"223 ".to_vec();
+                    line.resize(length - 2, b'x');
+                    line.extend_from_slice(b"\r\n");
+                    let records = vec![
+                        Reply { command: b"STAT <a>\r\n", wire: line },
+                        reply(3, vec![b"second".to_vec()]),
+                    ];
+                    let stream = records.iter().flat_map(|r| r.wire.iter().copied()).collect::<Vec<_>>();
+                    let byte_cuts = (0..=stream.len()).collect::<Vec<_>>();
+                    for cuts in [&[][..], &[cap + 1][..], byte_cuts.as_slice()] {
+                        let mut state = crate::session::SessionLoopState::default();
+                        for record in &records {
+                            state.mark_backend_request_sent(crate::protocol::RequestContext::parse(record.command).unwrap().kind());
+                            state.push_deferred_reply(LOCAL);
+                        }
+                        let mut delivered = 0;
+                        let mut actual = Vec::new();
+                        for chunk in fragments(&stream, cuts) {
+                            for bytes in state.client_writes_for_backend_read(chunk) {
+                                actual.extend_from_slice(&bytes);
+                            }
+                            delivered += chunk.len();
+                            prop_assert_eq!(&actual, &expected_client_prefix(&records, &vec![LOCAL.to_vec(); 2], delivered),
+                                "status length={}, delivered={}", length, delivered);
+                        }
+                        prop_assert!(!state.has_pending_backend_replies());
+                        prop_assert!(!state.has_deferred_replies());
+                    }
+                }
+            }
+
+            #[test]
+            fn alternating_request_receive_and_local_drain_matches_queue(
+                records in replies(),
+                actions in prop::collection::vec((0u8..5, 0usize..256), 0..80),
+            ) {
+                #[derive(Debug)]
+                enum Pending { Backend { record: usize, delivered: usize }, Local }
+                const LOCAL: &[u8] = b"500 local reply\r\n";
+                let mut state = BackendResponseOrder::default();
+                let mut model = VecDeque::<Pending>::new();
+                let mut sent = 0;
+                let actions = [(0, 0), (1, 0), (2, 1), (1, 0), (3, 0)]
+                    .into_iter().chain(actions).chain([(4, 0), (2, usize::MAX), (3, 0), (3, 0)]);
+                for (action, amount) in actions {
+                    let mut actual = Vec::new();
+                    let mut expected = Vec::new();
+                    match action {
+                        0 | 4 => {
+                            let end = if action == 4 { records.len() } else { (sent + 1).min(records.len()) };
+                            while sent < end {
+                                state.push_request(crate::protocol::RequestContext::parse(records[sent].command).unwrap().kind());
+                                model.push_back(Pending::Backend { record: sent, delivered: 0 });
+                                sent += 1;
+                            }
+                        }
+                        1 => { state.push_deferred_reply(LOCAL); model.push_back(Pending::Local); }
+                        2 | 3 => {
+                            while matches!(model.front(), Some(Pending::Local)) {
+                                model.pop_front(); expected.extend_from_slice(LOCAL);
+                            }
+                            if action == 3 {
+                                for bytes in state.take_ready_deferred_replies() { actual.extend_from_slice(bytes); }
+                            } else {
+                                let input = model.iter().filter_map(|entry| match entry {
+                                    Pending::Backend { record, delivered } => Some(&records[*record].wire[*delivered..]),
+                                    Pending::Local => None,
+                                }).flatten().copied().take(amount).collect::<Vec<_>>();
+                                for bytes in state.client_writes_for_backend_read(&input) { actual.extend_from_slice(&bytes); }
+                                let mut left = input.len();
+                                while left > 0 {
+                                    let Some(Pending::Backend { record, delivered }) = model.front_mut() else { unreachable!() };
+                                    let take = left.min(records[*record].wire.len() - *delivered);
+                                    expected.extend_from_slice(&records[*record].wire[*delivered..*delivered + take]);
+                                    *delivered += take; left -= take;
+                                    if *delivered == records[*record].wire.len() {
+                                        model.pop_front();
+                                        while matches!(model.front(), Some(Pending::Local)) {
+                                            model.pop_front(); expected.extend_from_slice(LOCAL);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                    prop_assert_eq!(actual, expected, "action={}, amount={}", action, amount);
+                    prop_assert_eq!(state.has_pending_backend_replies(), model.iter().any(|e| matches!(e, Pending::Backend { .. })));
+                    prop_assert_eq!(state.has_deferred_replies(), model.iter().any(|e| matches!(e, Pending::Local)));
+                    prop_assert_eq!(state.should_drain_backend_replies(), matches!(model.front(), Some(Pending::Backend { .. })) && model.iter().any(|e| matches!(e, Pending::Local)));
+                }
+                prop_assert!(model.is_empty());
+            }
+        }
+
+        proptest! {
+            #[test]
             fn adversarial_framer_matches_independent_byte_scan(
                 mut data in prop::collection::vec(prop_oneof![
                     4 => prop::sample::select(vec![b'\r', b'\n', b'.', b'x', b'2', 0, 255]),
@@ -3147,6 +3301,435 @@ mod tests {
                         prop_assert!(state.take_ready_deferred_replies().is_empty());
                     }
                 }
+            }
+        }
+    }
+
+    mod operation_properties {
+        use super::*;
+        use proptest::prelude::*;
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        struct ScriptedBackend {
+            chunks: VecDeque<Vec<u8>>,
+            offset: usize,
+            pending: bool,
+            error: Option<io::ErrorKind>,
+        }
+
+        impl ScriptedBackend {
+            fn new(bytes: &[u8], sizes: &[usize]) -> Self {
+                let mut chunks = VecDeque::new();
+                let mut at = 0;
+                for size in sizes.iter().copied().cycle() {
+                    if at == bytes.len() {
+                        break;
+                    }
+                    let end = (at + size.max(1)).min(bytes.len());
+                    chunks.push_back(bytes[at..end].to_vec());
+                    at = end;
+                }
+                assert_eq!(at, bytes.len());
+                Self {
+                    chunks,
+                    offset: 0,
+                    pending: true,
+                    error: None,
+                }
+            }
+        }
+
+        impl AsyncRead for ScriptedBackend {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &mut ReadBuf<'_>,
+            ) -> Poll<io::Result<()>> {
+                if buf.remaining() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+                if self.pending {
+                    self.pending = false;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                self.pending = true;
+                if let Some(chunk) = self.chunks.front() {
+                    let count = buf.remaining().min(chunk.len() - self.offset);
+                    buf.put_slice(&chunk[self.offset..self.offset + count]);
+                    self.offset += count;
+                    if self.offset == self.chunks.front().unwrap().len() {
+                        self.chunks.pop_front();
+                        self.offset = 0;
+                    }
+                    Poll::Ready(Ok(()))
+                } else if let Some(kind) = self.error.take() {
+                    Poll::Ready(Err(io::Error::new(kind, "scripted backend error")))
+                } else {
+                    Poll::Ready(Ok(()))
+                }
+            }
+        }
+
+        impl AsyncWrite for ScriptedBackend {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                Poll::Ready(Ok(bytes.len()))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        #[derive(Clone, Copy)]
+        enum WriteFailure {
+            BrokenPipe,
+            Zero,
+        }
+
+        struct QuotaWriter {
+            bytes: Vec<u8>,
+            quotas: Vec<usize>,
+            calls: usize,
+            pending: bool,
+            fail: Option<(usize, WriteFailure)>,
+            failed: bool,
+            writes_after_failure: usize,
+            addresses: Vec<(usize, usize)>,
+        }
+
+        impl QuotaWriter {
+            fn new(quotas: Vec<usize>, fail: Option<(usize, WriteFailure)>) -> Self {
+                Self {
+                    bytes: Vec::new(),
+                    quotas,
+                    calls: 0,
+                    pending: true,
+                    fail,
+                    failed: false,
+                    writes_after_failure: 0,
+                    addresses: Vec::new(),
+                }
+            }
+        }
+
+        impl AsyncWrite for QuotaWriter {
+            fn poll_write(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                bytes: &[u8],
+            ) -> Poll<io::Result<usize>> {
+                if self.failed {
+                    self.writes_after_failure += 1;
+                    return Poll::Ready(Err(io::Error::other("write after failure")));
+                }
+                if let Some((at, failure)) = self.fail
+                    && self.bytes.len() == at
+                {
+                    self.failed = true;
+                    return Poll::Ready(match failure {
+                        WriteFailure::BrokenPipe => Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "scripted client failure",
+                        )),
+                        WriteFailure::Zero => Ok(0),
+                    });
+                }
+                if self.pending {
+                    self.pending = false;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                self.pending = true;
+                let quota = self.quotas[self.calls % self.quotas.len()].max(1);
+                self.calls += 1;
+                let before_failure = self
+                    .fail
+                    .map_or(usize::MAX, |(at, _)| at - self.bytes.len());
+                let count = bytes.len().min(quota).min(before_failure);
+                self.addresses.push((bytes.as_ptr() as usize, count));
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Poll::Ready(Ok(count))
+            }
+            fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+            fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<io::Result<()>> {
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        fn runtime() -> tokio::runtime::Runtime {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+        }
+
+        fn pool(size: usize) -> crate::pool::BufferPool {
+            crate::pool::BufferPool::new(BufferSize::try_new(size).unwrap(), 8)
+        }
+
+        fn body(lines: &[Vec<u8>]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            for line in lines {
+                if line.first() == Some(&b'.') {
+                    bytes.push(b'.');
+                }
+                bytes.extend_from_slice(line);
+                bytes.extend_from_slice(b"\r\n");
+            }
+            bytes
+        }
+
+        async fn read_following_response(
+            conn: &mut crate::stream::ConnectionStream,
+            pool: &crate::pool::BufferPool,
+            case: usize,
+        ) -> Vec<u8> {
+            let command = framing_pipeline_fixture(case, 0).0;
+            let request = crate::protocol::RequestContext::parse(&command).unwrap();
+            let buffer = take_queued_input_or_acquire_empty(conn, pool);
+            let mut response = ClassifiedResponse::read_for_test(conn, &request, buffer)
+                .await
+                .unwrap();
+            let mut writer = RecordingWriter::default();
+            response
+                .stream_for_test(conn, pool, crate::types::BackendId::from_index(0))
+                .unwrap()
+                .write(&mut writer)
+                .await
+                .unwrap();
+            writer.bytes
+        }
+
+        async fn assert_backend_eof(conn: &mut crate::stream::ConnectionStream) {
+            assert_eq!(conn.read(&mut [0; 1]).await.unwrap(), 0);
+        }
+
+        fn lines() -> impl Strategy<Value = Vec<Vec<u8>>> {
+            prop::collection::vec(
+                prop::collection::vec(prop_oneof![Just(b'.'), b'a'..=b'z'], 0..32),
+                0..8,
+            )
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(64))]
+            #[test]
+            fn retained_append_and_packed_reuse_compose_coordinates(
+                seed in 0usize..256,
+                extra in 1usize..128,
+                records in 2usize..5,
+                sizes in prop::collection::vec(1usize..96, 1..10),
+                quotas in prop::collection::vec(1usize..40, 1..8),
+            ) {
+                runtime().block_on(async {
+                    for layout in 0..3 {
+                        let pool = pool(256);
+                        let records = (0..records).map(|index| framing_pipeline_fixture(1, if index == 0 { if layout == 2 { 512 + extra } else { 32 + extra % 32 } } else { 1 + seed % 60 })).collect::<Vec<_>>();
+                        let stream = records.iter().flat_map(|(_, wire)| wire.iter().copied()).collect::<Vec<_>>();
+                        let status_len = b"222 0 <test@example.com>\r\n".len();
+                        let initial_len = if layout == 2 { 256 } else { status_len + 1 + seed % 20 };
+                        let mut buffer = pool.acquire();
+                        let discarded = match layout { 0 => 1 + seed % 40, _ => buffer.capacity() - initial_len };
+                        let physical = [vec![b'!'; discarded], stream[..initial_len].to_vec()].concat();
+                        buffer.copy_from_slice(&physical);
+                        let allocation = buffer.allocation_ptr() as usize;
+                        if discarded > 0 { buffer.expose_initialized_range_without_copying(discarded..physical.len()); }
+                        let mut conn = crate::stream::ConnectionStream::for_test(ScriptedBackend::new(&stream[initial_len..], &sizes));
+                        for (index, (command, expected)) in records.iter().enumerate() {
+                            if index > 0 { buffer = take_queued_input_or_acquire_empty(&mut conn, &pool); }
+                            let request = crate::protocol::RequestContext::parse(command).unwrap();
+                            let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, buffer).await.unwrap();
+                            let mut writer = QuotaWriter::new(quotas.clone(), None);
+                            let stats = classified.stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0)).unwrap().write(&mut writer).await.unwrap();
+                            assert_eq!(&writer.bytes, expected, "layout={layout}, record={index}");
+                            assert_eq!(stats.bytes_written_u64() as usize, expected.len());
+                            if index == 0 {
+                                let expected_start = allocation + if layout == 1 { 0 } else { discarded };
+                                assert_eq!(writer.addresses[0].0, expected_start, "retained pass-through must borrow its allocation");
+                            }
+                            buffer = pool.acquire();
+                        }
+                        assert_backend_eof(&mut conn).await;
+                    }
+                });
+            }
+
+            #[test]
+            fn scripted_partial_writes_preserve_next_response_and_drain_ownership(
+                body_len in 1usize..256,
+                split_seed in any::<usize>(),
+                accepted_seed in any::<usize>(),
+                sizes in prop::collection::vec(1usize..64, 1..8),
+                quotas in prop::collection::vec(1usize..32, 1..8),
+            ) {
+                runtime().block_on(async {
+                    let (command, wire) = framing_pipeline_fixture(1, body_len);
+                    let (_, next) = framing_pipeline_fixture(2, 3);
+                    let status_len = b"222 0 <test@example.com>\r\n".len();
+                    for split in [wire.len(), status_len + split_seed % (wire.len() - status_len)] {
+                        for failure in [None, Some(WriteFailure::BrokenPipe), Some(WriteFailure::Zero)] {
+                            let pool = pool(512);
+                            let packed = [wire[split..].to_vec(), next.clone()].concat();
+                            let mut conn = crate::stream::ConnectionStream::for_test(ScriptedBackend::new(&packed, &sizes));
+                            let mut buffer = pool.acquire(); buffer.copy_from_slice(&wire[..split]);
+                            let request = crate::protocol::RequestContext::parse(&command).unwrap();
+                            let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, buffer).await.unwrap();
+                            let accepted = accepted_seed % wire.len();
+                            let mut writer = QuotaWriter::new(quotas.clone(), failure.map(|f| (accepted, f)));
+                            let result = classified.stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0)).unwrap().write(&mut writer).await;
+                            match failure {
+                                None => { assert_eq!(result.unwrap().bytes_written_u64() as usize, wire.len()); assert_eq!(writer.bytes, wire); }
+                                Some(failure) => {
+                                    let expected_kind = match failure { WriteFailure::BrokenPipe => io::ErrorKind::BrokenPipe, WriteFailure::Zero => io::ErrorKind::WriteZero };
+                                    assert!(matches!(result, Err(ResponseTransferError::ClientDisconnect(ref e)) if e.kind() == expected_kind));
+                                    assert_eq!(writer.bytes, wire[..accepted]);
+                                    assert!(writer.failed);
+                                }
+                            }
+                            assert_eq!(writer.writes_after_failure, 0);
+                            let remaining = read_following_response(&mut conn, &pool, 2).await;
+                            assert_eq!(remaining, next);
+                            assert_backend_eof(&mut conn).await;
+                        }
+                    }
+                    for backend_error in [None, Some(io::ErrorKind::ConnectionReset)] {
+                        let pool = pool(512);
+                        let cut = status_len + 1;
+                        let mut backend = ScriptedBackend::new(&wire[cut..wire.len()-1], &sizes);
+                        backend.error = backend_error;
+                        let mut conn = crate::stream::ConnectionStream::for_test(backend);
+                        let mut buffer = pool.acquire(); buffer.copy_from_slice(&wire[..cut]);
+                        let request = crate::protocol::RequestContext::parse(&command).unwrap();
+                        let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, buffer).await.unwrap();
+                        let accepted = accepted_seed % cut;
+                        let mut writer = QuotaWriter::new(quotas.clone(), Some((accepted, WriteFailure::BrokenPipe)));
+                        let result = classified.stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0)).unwrap().write(&mut writer).await;
+                        assert_eq!(writer.bytes, wire[..accepted]);
+                        assert_eq!(writer.writes_after_failure, 0);
+                        match backend_error {
+                            None => assert!(matches!(result, Err(ResponseTransferError::BackendEof { .. }))),
+                            Some(_) => assert!(matches!(result, Err(ResponseTransferError::Io(_)))),
+                        }
+                    }
+                });
+            }
+
+            #[test]
+            fn capture_limit_transitions_after_retained_chunks(
+                body_len in 0usize..512,
+                chunk in 8usize..40,
+                quotas in prop::collection::vec(1usize..20, 1..6),
+                failure_seed in any::<usize>(),
+            ) {
+                runtime().block_on(async {
+                    let (command, wire) = framing_pipeline_fixture(0, body_len);
+                    let (_, next) = framing_pipeline_fixture(1, 5);
+                    let first_len = b"220 0 <test@example.com>\r\n".len();
+                    let mut limits = vec![0, first_len - 1, wire.len()-1, wire.len(), wire.len()+1];
+                    limits.extend((first_len..wire.len()).step_by(chunk));
+                    for limit in limits {
+                        for fail in [false, true] {
+                            let pool = pool(512);
+                            let mut conn = crate::stream::ConnectionStream::for_test(ScriptedBackend::new(&[wire[first_len..].to_vec(), next.clone()].concat(), &[chunk]));
+                            let mut buffer = pool.acquire(); buffer.copy_from_slice(&wire[..first_len]);
+                            let request = crate::protocol::RequestContext::parse(&command).unwrap();
+                            let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, buffer).await.unwrap();
+                            let accepted = failure_seed % first_len;
+                            let mut writer = QuotaWriter::new(quotas.clone(), fail.then_some((accepted, WriteFailure::BrokenPipe)));
+                            let mut captured = crate::pool::ChunkedResponse::default();
+                            let result = classified.stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0)).unwrap().capture_and_write(&mut writer, &mut captured, limit).await;
+                            if fail {
+                                assert!(matches!(result, Err(ResponseTransferError::ClientDisconnect(_))));
+                                assert_eq!(writer.bytes, wire[..accepted]);
+                                assert_eq!(writer.writes_after_failure, 0);
+                            } else {
+                                let (written, retained) = result.unwrap();
+                                assert_eq!(written as usize, wire.len()); assert_eq!(writer.bytes, wire);
+                                assert_eq!(retained.is_some(), wire.len() <= limit);
+                                if let Some(retained) = retained { assert_eq!(retained.bytes().to_vec(), wire); }
+                                assert!(captured.is_empty());
+                            }
+                            let remaining = read_following_response(&mut conn, &pool, 1).await;
+                            assert_eq!(remaining, next);
+                            assert_backend_eof(&mut conn).await;
+                        }
+                        let pool = pool(512);
+                        let mut conn = crate::stream::ConnectionStream::for_test(ScriptedBackend::new(&wire[first_len..], &[chunk]));
+                        let mut buffer = pool.acquire(); buffer.copy_from_slice(&wire[..first_len]);
+                        let mut captured = crate::pool::ChunkedResponse::default();
+                        let retained = IsolatedMultilineResponse::begin(&mut conn, &mut buffer).unwrap().capture_chunked_optional(&pool, &mut captured, limit).await.unwrap();
+                        assert_eq!(retained.is_some(), wire.len() <= limit);
+                        if retained.is_some() { assert_eq!(captured.to_vec(), wire); } else { assert!(captured.is_empty()); }
+                        assert_backend_eof(&mut conn).await;
+                    }
+                });
+            }
+
+            #[test]
+            fn captured_semantic_sections_round_trip_through_cache(
+                subject in "[a-zA-Z0-9 ]{0,32}",
+                empty_headers in any::<bool>(),
+                lines in lines(),
+                sizes in prop::collection::vec(1usize..48, 1..8),
+                quotas in prop::collection::vec(1usize..20, 1..8),
+            ) {
+                runtime().block_on(async {
+                    use crate::protocol::RequestKind;
+                    let headers = if empty_headers { Vec::new() } else { format!("Subject: {subject}\r\n").into_bytes() };
+                    let body = body(&lines);
+                    for (kind, code, verb) in [(RequestKind::Article, 220, "ARTICLE"), (RequestKind::Head, 221, "HEAD"), (RequestKind::Body, 222, "BODY")] {
+                        let status = format!("{code} 0 <test@example.com>\r\n").into_bytes();
+                        let payload = match kind {
+                            RequestKind::Article => [headers.clone(), b"\r\n".to_vec(), body.clone()].concat(),
+                            RequestKind::Head => headers.clone(),
+                            RequestKind::Body => body.clone(),
+                            _ => unreachable!(),
+                        };
+                        let wire = [status.clone(), payload, b".\r\n".to_vec()].concat();
+                        let (_, next) = framing_pipeline_fixture(1, 7);
+                        let pool = pool(512);
+                        let mut conn = crate::stream::ConnectionStream::for_test(ScriptedBackend::new(&[wire.clone(), next.clone()].concat(), &sizes));
+                        let mut buffer = pool.acquire(); buffer.read_from(&mut conn).await.unwrap();
+                        let request = crate::protocol::RequestContext::parse(format!("{verb} <test@example.com>\r\n").as_bytes()).unwrap();
+                        let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, buffer).await.unwrap();
+                        let mut captured = crate::pool::ChunkedResponse::default();
+                        let mut writer = QuotaWriter::new(quotas.clone(), None);
+                        let (written, retained) = classified.stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0)).unwrap().capture_and_write(&mut writer, &mut captured, wire.len()).await.unwrap();
+                        assert_eq!(written as usize, wire.len()); assert_eq!(writer.bytes, wire);
+                        let retained = retained.unwrap();
+                        assert_eq!(retained.kind(), kind);
+                        assert_eq!(retained.status(), crate::protocol::StatusCode::new(code));
+                        let entry = crate::cache::CachedArticle::from_unframed_ingest_for_test(crate::cache::CacheIngestResponse::FramedChunked(retained.into_cache_ingest()), crate::cache::ttl::CacheTier::new(0));
+                        let contiguous = crate::cache::CachedArticle::from_unframed_ingest_for_test(
+                            wire.clone(), crate::cache::ttl::CacheTier::new(0));
+                        for entry in [entry, contiguous] {
+                        let variants = match kind { RequestKind::Article => vec![RequestKind::Article, RequestKind::Head, RequestKind::Body], _ => vec![kind] };
+                        for variant in variants {
+                            let (code, payload) = match variant {
+                                RequestKind::Article => (220, if headers.is_empty() && body.is_empty() { Vec::new() } else { [headers.clone(), b"\r\n".to_vec(), body.clone()].concat() }),
+                                RequestKind::Head => (221, headers.clone()),
+                                RequestKind::Body => (222, body.clone()),
+                                _ => unreachable!(),
+                            };
+                            let expected = [format!("{code} 0 <test@example.com>\r\n").into_bytes(), payload, b".\r\n".to_vec()].concat();
+                            let response = entry.cached_response_for(variant, "<test@example.com>").expect("captured section should render");
+                            let mut actual = Vec::new(); response.write_to(&mut actual).await.unwrap();
+                            assert_eq!(actual, expected, "source={kind:?}, target={variant:?}");
+                        }
+                        }
+                        let remaining = read_following_response(&mut conn, &pool, 1).await; assert_eq!(remaining, next);
+                        assert_backend_eof(&mut conn).await;
+                    }
+                });
             }
         }
     }

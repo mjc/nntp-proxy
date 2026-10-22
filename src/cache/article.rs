@@ -853,9 +853,11 @@ fn payload_for_status_owned(
 ) -> CachedPayload {
     match code {
         220 => {
-            if let Some(split) = memchr::memmem::find(&payload, b"\r\n\r\n") {
-                let body = payload.split_off(split + 4);
-                payload.truncate(split + 2);
+            if let Some((headers, body)) =
+                crate::session::multiline_framing::captured_article_payload_sections(&payload)
+            {
+                let body = payload.split_off(body.start);
+                payload.truncate(headers.end);
                 CachedPayload::Article {
                     article_number,
                     headers: Arc::from(payload.into_boxed_slice()),
@@ -901,11 +903,13 @@ fn payload_for_status(
 ) -> CachedPayload {
     match code {
         220 => {
-            if let Some(split) = memchr::memmem::find(payload, b"\r\n\r\n") {
+            if let Some((headers, body)) =
+                crate::session::multiline_framing::captured_article_payload_sections(payload)
+            {
                 CachedPayload::Article {
                     article_number,
-                    headers: payload[..split + 2].into(),
-                    body: payload[split + 4..].into(),
+                    headers: payload[headers].into(),
+                    body: payload[body].into(),
                 }
             } else {
                 CachedPayload::Article {

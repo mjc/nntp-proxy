@@ -292,16 +292,59 @@ impl ClientSession {
 #[cfg(test)]
 mod tests {
     use crate::auth::AuthHandler;
-    use crate::command::CommandHandler;
+    use crate::command::{AuthenticationAccess, CommandHandler};
     use crate::config::RoutingMode;
     use crate::metrics::MetricsCollector;
-    use crate::pool::BufferPool;
+    use crate::pool::{BufferPool, DeadpoolConnectionProvider};
     use crate::protocol::RequestContext;
     use crate::router::BackendSelector;
     use crate::session::{ClientSession, SessionMode};
-    use crate::types::{BufferSize, ClientAddress};
+    use crate::types::{BufferSize, ClientAddress, ServerName};
+    use proptest::prelude::*;
     use std::sync::Arc;
-    use tokio::io::BufReader;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    fn handoff_fixture(
+        case: usize,
+        body_len: usize,
+    ) -> (Vec<u8>, Vec<u8>, crate::command::StatefulHandoff) {
+        let (request, response) =
+            crate::session::multiline_framing::framing_pipeline_fixture(case, body_len);
+        let parsed = RequestContext::parse(&request).expect("valid fixture request");
+        let handoff = CommandHandler::prepare_stateful_handoff(
+            parsed,
+            AuthenticationAccess::Unrestricted,
+            RoutingMode::Hybrid,
+        )
+        .expect("fixture request should trigger hybrid handoff");
+        (request, response, handoff)
+    }
+
+    fn test_router(port: u16, max_connections: usize) -> Arc<BackendSelector> {
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(max_connections)
+            .build()
+            .unwrap();
+        let mut router = BackendSelector::new();
+        router.add_backend(
+            ServerName::try_new("test-backend".to_owned()).unwrap(),
+            provider,
+            0,
+        );
+        Arc::new(router)
+    }
+
+    fn test_hybrid_session(router: Arc<BackendSelector>) -> ClientSession {
+        let addr: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        ClientSession::new_with_router(
+            ClientAddress::from(addr),
+            BufferPool::new(BufferSize::try_new(8192).unwrap(), 4),
+            router,
+            RoutingMode::Hybrid,
+            Arc::new(AuthHandler::new(None, None).unwrap()),
+            MetricsCollector::new(1),
+        )
+    }
 
     #[test]
     fn test_error_messages_are_descriptive() {
@@ -358,5 +401,232 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(session.mode(), SessionMode::PerCommand);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config::with_cases(32))]
+        #[test]
+        fn prop_hybrid_handoff_preserves_backpressured_multiline_and_local_order(
+            first_body_len in 128usize..4096,
+            second_case in 3usize..5,
+            second_body_len in 0usize..2048,
+            reader_capacity in prop_oneof![1usize..40, proptest::prelude::Just(511), proptest::prelude::Just(512)],
+        ) {
+            let (first_request, first_response, handoff) = handoff_fixture(4, first_body_len);
+            let (second_request, second_response, _) = handoff_fixture(second_case, second_body_len);
+            let backend_second_request = second_request.clone();
+            let expected = [
+                first_response.as_slice(),
+                crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE,
+                second_response.as_slice(),
+            ].concat();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                    let port = listener.local_addr().unwrap().port();
+                    let router = test_router(port, 1);
+                    let mut session = test_hybrid_session(router);
+                    let backend = tokio::spawn(async move {
+                        let (stream, _) = listener.accept().await.unwrap();
+                        let (read, mut write) = tokio::io::split(stream);
+                        write.write_all(b"200 test backend ready\r\n").await.unwrap();
+                        let mut reader = BufReader::new(read);
+                        let mut command = Vec::new();
+                        reader.read_until(b'\n', &mut command).await.unwrap();
+                        assert_eq!(command, b"MODE READER\r\n");
+                        write.write_all(b"200 reader mode\r\n").await.unwrap();
+                        command.clear();
+                        reader.read_until(b'\n', &mut command).await.unwrap();
+                        assert_eq!(command, b"COMPRESS DEFLATE\r\n");
+                        write.write_all(b"500 compression unavailable\r\n").await.unwrap();
+                        command.clear();
+                        reader.read_until(b'\n', &mut command).await.unwrap();
+                        assert_eq!(command, first_request);
+                        write.write_all(&first_response).await.unwrap();
+                        write.flush().await.unwrap();
+                        command.clear();
+                        reader.read_until(b'\n', &mut command).await.unwrap();
+                        assert_eq!(command, backend_second_request);
+                        write.write_all(&second_response).await.unwrap();
+                        write.flush().await.unwrap();
+                    });
+
+                    let (mut client, proxy_client) = tokio::io::duplex(64);
+                    let (proxy_read, proxy_write) = tokio::io::split(proxy_client);
+                    let proxy = tokio::spawn(async move {
+                        session.switch_to_stateful_mode(
+                            BufReader::with_capacity(reader_capacity, proxy_read),
+                            proxy_write,
+                            handoff,
+                            0,
+                            0,
+                        ).await
+                    });
+
+                    let mut actual = vec![0; 8];
+                    client.read_exact(&mut actual).await.unwrap();
+                    client.write_all(b"\r\n").await.unwrap();
+                    client.write_all(&second_request).await.unwrap();
+
+                    let mut remainder = vec![0; expected.len() - actual.len()];
+                    client.read_exact(&mut remainder).await.unwrap();
+                    actual.extend_from_slice(&remainder);
+                    assert_eq!(actual, expected);
+
+                    drop(client);
+                    proxy.await.unwrap().unwrap();
+                    backend.await.unwrap();
+                }).await.expect("hybrid handoff backpressure case stalled");
+            });
+        }
+    }
+
+    #[tokio::test]
+    async fn delayed_reply_after_client_disconnect_does_not_reuse_one_slot_backend() {
+        let (old_request, old_response, old_handoff) = handoff_fixture(4, 128);
+        let (new_request, new_response, new_handoff) = handoff_fixture(4, 192);
+        let expected_second_response = new_response.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_by_server = Arc::clone(&accepted);
+        let (first_seen_tx, first_seen_rx) = tokio::sync::oneshot::channel();
+        let (release_old_tx, release_old_rx) = tokio::sync::oneshot::channel();
+        let (old_attempted_tx, old_attempted_rx) = tokio::sync::oneshot::channel();
+        let backend = tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            accepted_by_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (first_read, mut first_write) = tokio::io::split(first);
+            first_write
+                .write_all(b"200 test backend ready\r\n")
+                .await
+                .unwrap();
+            let mut first_reader = BufReader::new(first_read);
+            let mut command = Vec::new();
+            first_reader.read_until(b'\n', &mut command).await.unwrap();
+            assert_eq!(command, b"MODE READER\r\n");
+            first_write.write_all(b"200 reader mode\r\n").await.unwrap();
+            command.clear();
+            first_reader.read_until(b'\n', &mut command).await.unwrap();
+            assert_eq!(command, b"COMPRESS DEFLATE\r\n");
+            first_write
+                .write_all(b"500 compression unavailable\r\n")
+                .await
+                .unwrap();
+            command.clear();
+            first_reader.read_until(b'\n', &mut command).await.unwrap();
+            assert_eq!(command, old_request);
+            let _ = first_seen_tx.send(());
+
+            let _ = release_old_rx.await;
+            let _ = first_write.write_all(&old_response).await;
+            let _ = first_write.flush().await;
+            let _ = old_attempted_tx.send(());
+
+            command.clear();
+            let count = match first_reader.read_until(b'\n', &mut command).await {
+                Ok(count) => count,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::BrokenPipe
+                            | std::io::ErrorKind::UnexpectedEof
+                    ) =>
+                {
+                    0
+                }
+                Err(error) => panic!("unexpected first backend read error: {error}"),
+            };
+            if count > 0 {
+                first_write.write_all(&new_response).await.unwrap();
+                first_write.flush().await.unwrap();
+            } else {
+                let (second, _) = listener.accept().await.unwrap();
+                accepted_by_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (second_read, mut second_write) = tokio::io::split(second);
+                second_write
+                    .write_all(b"200 test backend ready\r\n")
+                    .await
+                    .unwrap();
+                let mut second_reader = BufReader::new(second_read);
+                command.clear();
+                second_reader.read_until(b'\n', &mut command).await.unwrap();
+                assert_eq!(command, b"MODE READER\r\n");
+                second_write
+                    .write_all(b"200 reader mode\r\n")
+                    .await
+                    .unwrap();
+                command.clear();
+                second_reader.read_until(b'\n', &mut command).await.unwrap();
+                if command == b"COMPRESS DEFLATE\r\n" {
+                    second_write
+                        .write_all(b"500 compression unavailable\r\n")
+                        .await
+                        .unwrap();
+                    command.clear();
+                    second_reader.read_until(b'\n', &mut command).await.unwrap();
+                }
+                assert_eq!(command, new_request);
+                second_write.write_all(&new_response).await.unwrap();
+                second_write.flush().await.unwrap();
+            }
+        });
+
+        let router = test_router(port, 1);
+        let mut first_session = test_hybrid_session(Arc::clone(&router));
+        let (client, proxy_client) = tokio::io::duplex(64);
+        drop(client);
+        let (proxy_read, proxy_write) = tokio::io::split(proxy_client);
+        let first = tokio::spawn(async move {
+            first_session
+                .switch_to_stateful_mode(BufReader::new(proxy_read), proxy_write, old_handoff, 0, 0)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), first_seen_rx)
+            .await
+            .expect("first backend request was not received")
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), first)
+            .await
+            .expect("disconnected hybrid session did not retire")
+            .unwrap()
+            .unwrap();
+        release_old_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), old_attempted_rx)
+            .await
+            .expect("delayed old response was not attempted")
+            .unwrap();
+
+        let mut second_session = test_hybrid_session(router);
+        let (mut client, proxy_client) = tokio::io::duplex(4096);
+        let (proxy_read, proxy_write) = tokio::io::split(proxy_client);
+        let second = tokio::spawn(async move {
+            second_session
+                .switch_to_stateful_mode(BufReader::new(proxy_read), proxy_write, new_handoff, 0, 0)
+                .await
+        });
+        let mut actual = vec![0; expected_second_response.len()];
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_exact(&mut actual),
+        )
+        .await
+        .expect("second hybrid reply did not arrive")
+        .unwrap();
+        assert_eq!(actual, expected_second_response);
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 2);
+        drop(client);
+        tokio::time::timeout(std::time::Duration::from_secs(5), second)
+            .await
+            .expect("second hybrid session did not stop")
+            .unwrap()
+            .unwrap();
+        backend.await.unwrap();
     }
 }
