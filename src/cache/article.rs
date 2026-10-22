@@ -1596,15 +1596,83 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
         #[test]
+        fn prop_reobserving_missing_refreshes_only_that_provider(
+            initial_bits in prop_oneof![Just(0usize), Just(usize::MAX), any::<usize>()],
+            mut repeated in prop::collection::vec(0usize..super::super::MAX_BACKENDS, 0..128),
+        ) {
+            let mut entry = CachedArticle::negative_only(initial_bits);
+            for (_, timestamp) in &mut entry.negative_timestamps {
+                *timestamp = ttl::CacheTimestampMillis::new(0);
+            }
+            repeated.push(super::super::MAX_BACKENDS - 1);
+            let mut refreshed = std::collections::BTreeSet::new();
+            for index in repeated {
+                let slot = AvailabilitySlot::new(index).unwrap();
+                entry.record_availability_missing(slot);
+                refreshed.insert(index);
+                let unique: std::collections::BTreeSet<_> = entry.negative_timestamps.iter().map(|(slot, _)| slot.index()).collect();
+                prop_assert_eq!(unique.len(), entry.negative_timestamps.len());
+            }
+            entry.expire_stale_availability(ttl::CacheTtlMillis::new(300_000));
+            for index in 0..super::super::MAX_BACKENDS {
+                prop_assert_eq!(!entry.should_try_slot(AvailabilitySlot::new(index).unwrap()), refreshed.contains(&index));
+            }
+            prop_assert_eq!(entry.negative_timestamps.len(), refreshed.len());
+            let remaining = entry.negative_timestamps.clone();
+            entry.expire_stale_availability(ttl::CacheTtlMillis::new(300_000));
+            prop_assert_eq!(entry.negative_timestamps, remaining);
+        }
+
+        #[test]
+        fn prop_same_provider_positive_updates_respect_negative_fact_expiry(
+            mut observations in prop::collection::vec((any::<bool>(), any::<bool>()), super::super::MAX_BACKENDS),
+            target in prop_oneof![Just(0usize), Just(super::super::MAX_BACKENDS - 1), 0usize..super::super::MAX_BACKENDS],
+            fresh in any::<bool>(),
+            tier in any::<u8>(),
+        ) {
+            observations[target] = (true, fresh);
+            let mut entry = CachedArticle::missing(0.into());
+            for (index, &(missing, fresh)) in observations.iter().enumerate() {
+                if missing {
+                    entry.record_availability_missing(AvailabilitySlot::new(index).unwrap());
+                    entry.negative_timestamps.last_mut().unwrap().1 = ttl::CacheTimestampMillis::new(if fresh { u64::MAX } else { 0 });
+                }
+            }
+            let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
+            let message = MessageId::from_borrowed("<same-provider@example.com>").unwrap();
+            let slot = AvailabilitySlot::new(target).unwrap();
+            block_on(async {
+                cache.insert(message.clone(), entry).await;
+                for status in [221, 223, 222] {
+                    match status {
+                        221 => cache.record_has_status_for_slot(message.clone(), StatusCode::new(status), slot, tier.into()).await,
+                        223 => cache.record_stat_for_slot(message.clone(), slot, tier.into()).await,
+                        _ => cache.upsert_cached_entry_for_slot(message.clone(), CachedArticle::from_parts(
+                            StatusCode::new(status), CachedPayload::Body { article_number: None, body: Arc::from(b"body".as_slice()) },
+                            ArticleAvailability::new(), tier.into(), ttl::now_millis(), Vec::new(),
+                        ), slot).await,
+                    }
+                    let retrieved = cache.get(&message).await.unwrap();
+                    for (index, &(missing, fresh)) in observations.iter().enumerate() {
+                        prop_assert_eq!(!retrieved.should_try_slot(AvailabilitySlot::new(index).unwrap()), missing && fresh);
+                    }
+                    prop_assert_eq!(retrieved.status_code(), StatusCode::new(if fresh { 430 } else { status }));
+                }
+                Ok(())
+            })?;
+        }
+
+        #[test]
         fn prop_disk_conversion_preserves_negative_observation_times(
             observations in prop::collection::vec((any::<bool>(), any::<bool>()), 0..=super::super::MAX_BACKENDS),
             tier in any::<u8>(),
+            unmarked_timestamp in any::<u64>(),
         ) {
             use foyer::Code;
             use super::super::hybrid_codec::{CacheableStatusCode, DiskCachedArticle};
 
             let mut disk = DiskCachedArticle::missing(0.into());
-            let mut timestamps = [ttl::CacheTimestampMillis::new(0); super::super::MAX_BACKENDS];
+            let mut timestamps = [ttl::CacheTimestampMillis::new(unmarked_timestamp); super::super::MAX_BACKENDS];
             let mut expected = Vec::new();
             for (index, &(missing, fresh)) in observations.iter().enumerate() {
                 if missing {

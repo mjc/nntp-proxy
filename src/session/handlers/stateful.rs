@@ -608,6 +608,7 @@ impl ClientSession {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -635,6 +636,90 @@ mod tests {
             metrics,
         )
         .build()
+    }
+
+    #[derive(Clone, Debug)]
+    enum PipelineCommand {
+        Date,
+        SyntaxError,
+        Oversized,
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn prop_compressed_stateful_pipeline_orders_mixed_local_errors(
+            extra in prop::collection::vec(prop_oneof![
+                Just(PipelineCommand::Date), Just(PipelineCommand::SyntaxError), Just(PipelineCommand::Oversized),
+            ], 0..8),
+            oversized_len in 511usize..800,
+            reader_capacity in prop_oneof![1usize..32, Just(511), Just(512)],
+        ) {
+            let mut commands = vec![PipelineCommand::Date, PipelineCommand::SyntaxError, PipelineCommand::Oversized];
+            commands.extend(extra);
+            commands.push(PipelineCommand::Date);
+            let mut wire = Vec::new();
+            let mut expected = Vec::new();
+            let mut backend_count = 0;
+            for command in commands {
+                match command {
+                    PipelineCommand::Date => {
+                        wire.extend_from_slice(b"DATE\r\n");
+                        expected.extend_from_slice(format!("111 {backend_count:014}\r\n").as_bytes());
+                        backend_count += 1;
+                    }
+                    PipelineCommand::SyntaxError => {
+                        wire.extend_from_slice(b"\r\n");
+                        expected.extend_from_slice(crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE);
+                    }
+                    PipelineCommand::Oversized => {
+                        wire.extend(std::iter::repeat_n(b'X', oversized_len));
+                        wire.extend_from_slice(b"\r\n");
+                        expected.extend_from_slice(crate::protocol::COMMAND_TOO_LONG);
+                    }
+                }
+            }
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let actual = runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    use tokio::io::AsyncReadExt;
+                    let session = test_session();
+                    let (mut client, proxy_client) = tokio::io::duplex(16_384);
+                    let (backend, proxy_backend) = tokio::io::duplex(16_384);
+                    let mut backend = crate::compression::DecompressStream::new(backend);
+                    let proxy_backend = crate::compression::DecompressStream::new(proxy_backend);
+                    let (client_read, client_write) = tokio::io::split(proxy_client);
+                    let (backend_read, backend_write) = tokio::io::split(proxy_backend);
+                    let proxy = tokio::spawn(async move {
+                        session.run_stateful_proxy_loop(
+                            BufReader::with_capacity(reader_capacity, client_read), client_write,
+                            backend_read, backend_write, SessionLoopState::new(false), BackendId::from_index(0),
+                        ).await
+                    });
+                    let client_exchange = async {
+                        client.write_all(&wire).await.unwrap();
+                        let mut actual = vec![0; expected.len()];
+                        client.read_exact(&mut actual).await.unwrap();
+                        drop(client);
+                        actual
+                    };
+                    let backend_exchange = async {
+                        for index in 0..backend_count {
+                            let mut command = [0; 6];
+                            backend.read_exact(&mut command).await.unwrap();
+                            assert_eq!(&command, b"DATE\r\n");
+                            backend.write_all(format!("111 {index:014}\r\n").as_bytes()).await.unwrap();
+                            backend.flush().await.unwrap();
+                        }
+                    };
+                    let (actual, ()) = tokio::join!(client_exchange, backend_exchange);
+                    let result = proxy.await.unwrap().unwrap();
+                    assert_eq!(result.disposition(), super::StatefulConnectionDisposition::RetireClient);
+                    actual
+                }).await.expect("mixed compressed pipeline stalled")
+            });
+            prop_assert_eq!(actual, expected);
+        }
     }
 
     #[test]

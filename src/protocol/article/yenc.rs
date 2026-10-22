@@ -296,7 +296,112 @@ mod tests {
         wire
     }
 
+    fn encode_wire_yenc_payload(data: &[u8], line_width: usize) -> Vec<u8> {
+        let mut body = Vec::new();
+        for line in data.chunks(line_width) {
+            body.extend(encode_wire_yenc_line(line));
+            body.extend_from_slice(b"\r\n");
+        }
+        body
+    }
+
     proptest! {
+        #[test]
+        fn prop_singlepart_yenc_checks_decoded_sizes_without_checksums(
+            payload in prop_oneof![Just(Vec::new()), prop::collection::vec(any::<u8>(), 1..256)],
+            line_width in 1usize..=64,
+        ) {
+            let encoded = encode_wire_yenc_payload(&payload, line_width);
+            let size = payload.len();
+            let mut valid = format!("=ybegin xsize={} xpart=9 line=128 size={size} name=property.bin\r\n", size + 1).into_bytes();
+            valid.extend_from_slice(&encoded);
+            valid.extend_from_slice(format!("=yend size={size}\r\n").as_bytes());
+            prop_assert!(validate_yenc_structure(&valid).is_ok());
+            let mut response = b"222 0 <property@example.com> body\r\n".to_vec();
+            response.extend(valid);
+            let article = super::super::Article::parse(&response, true).unwrap();
+            let mut decoded = vec![0xff; payload.len() + 17];
+            prop_assert!(article.decode_into(&mut decoded));
+            prop_assert_eq!(&decoded, &payload);
+
+            // Matching metadata must still fail when it disagrees with the payload.
+            for (header_size, footer_size) in [(size + 1, size), (size, size + 1), (size + 1, size + 1)] {
+                let mut body = format!("=ybegin line=128 size={header_size} name=property.bin\r\n").into_bytes();
+                body.extend_from_slice(&encoded);
+                body.extend_from_slice(format!("=yend size={footer_size}\r\n").as_bytes());
+                prop_assert!(validate_yenc_structure(&body).is_err());
+            }
+        }
+
+        #[test]
+        fn prop_multipart_yenc_rejects_invalid_and_overflowing_ranges(
+            payload in prop::collection::vec(any::<u8>(), 1..128),
+            prefix_len in 1usize..64,
+            suffix_len in 1usize..64,
+        ) {
+            let file_size = prefix_len + payload.len() + suffix_len;
+            let begin = prefix_len + 1;
+            let end = prefix_len + payload.len();
+            let encoded = encode_wire_yenc_payload(&payload, 32);
+            let part_lines = [
+                format!("=ypart begin=0 end={end}\r\n"),
+                format!("=ypart begin={} end={begin}\r\n", end + 1),
+                format!("=ypart begin={begin} end={}\r\n", file_size + 1),
+                format!("=ypart end={end}\r\n"),
+                format!("=ypart begin={begin}\r\n"),
+                format!("=ypart begin={}0 end={end}\r\n", usize::MAX),
+                format!("=ypart begin={begin} end={}0\r\n", usize::MAX),
+            ];
+            for part_line in part_lines {
+                let mut body = format!("=ybegin part=2 total=3 line=128 size={file_size} name=property.bin\r\n{part_line}").into_bytes();
+                body.extend_from_slice(&encoded);
+                body.extend_from_slice(format!("=yend size={} part=2\r\n", payload.len()).as_bytes());
+                prop_assert!(validate_yenc_structure(&body).is_err());
+            }
+        }
+
+        #[test]
+        fn prop_multipart_yenc_requires_exactly_one_part_header_before_data(
+            payload in prop::collection::vec(any::<u8>(), 1..128),
+            prefix_len in 1usize..64,
+        ) {
+            let header = format!("=ybegin part=2 total=3 line=128 size={} name=property.bin\r\n", prefix_len + payload.len() + 1);
+            let part = format!("=ypart begin={} end={}\r\n", prefix_len + 1, prefix_len + payload.len());
+            let data = encode_wire_yenc_payload(&payload, 32);
+            let footer = format!("=yend size={} part=2\r\n", payload.len());
+            let valid = [header.as_bytes(), part.as_bytes(), &data, footer.as_bytes()].concat();
+            prop_assert!(validate_yenc_structure(&valid).is_ok());
+            for body in [
+                [header.as_bytes(), &data, footer.as_bytes()].concat(),
+                [header.as_bytes(), part.as_bytes(), part.as_bytes(), &data, footer.as_bytes()].concat(),
+                [header.as_bytes(), &data, part.as_bytes(), footer.as_bytes()].concat(),
+            ] {
+                prop_assert!(validate_yenc_structure(&body).is_err());
+            }
+        }
+
+        #[test]
+        fn prop_yenc_checksum_parameters_are_scoped_to_part_kind(
+            payload in prop::collection::vec(any::<u8>(), 1..256),
+            line_width in 1usize..=64,
+        ) {
+            let data = encode_wire_yenc_payload(&payload, line_width);
+            let size = payload.len();
+            let crc = crc32fast::hash(&payload);
+            let wrong = crc ^ 1;
+            let single = format!("=ybegin line=128 size={size} name=property.bin\r\n");
+            let multipart = format!("=ybegin part=1 total=2 line=128 size={} name=property.bin\r\n=ypart begin=1 end={size}\r\n", size + 1);
+            for (header, valid_footer, invalid_footer) in [
+                (single, format!("=yend size={size} pcrc32={wrong:08x} crc32={crc:08x}\r\n"), format!("=yend size={size} pcrc32={crc:08x} crc32={wrong:08x}\r\n")),
+                (multipart, format!("=yend size={size} part=1 crc32={wrong:08x} pcrc32={crc:08x}\r\n"), format!("=yend size={size} part=1 crc32={crc:08x} pcrc32={wrong:08x}\r\n")),
+            ] {
+                let valid = [header.as_bytes(), &data, valid_footer.as_bytes()].concat();
+                let invalid = [header.as_bytes(), &data, invalid_footer.as_bytes()].concat();
+                prop_assert!(validate_yenc_structure(&valid).is_ok());
+                prop_assert!(validate_yenc_structure(&invalid).is_err());
+            }
+        }
+
         #[test]
         fn prop_yenc_roundtrip_preserves_arbitrary_bytes(
             leading_dots in 0usize..5,

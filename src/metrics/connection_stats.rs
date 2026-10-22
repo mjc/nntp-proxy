@@ -262,6 +262,52 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn prop_concurrent_duplicate_session_events_are_counted_once(
+            client_count in 1usize..24,
+            worker_count in 2usize..5,
+            username in prop::option::of("[a-zé猫]{0,12}"),
+            mode in prop_oneof![Just("hybrid"), Just("stateful"), Just("per-command")],
+        ) {
+            let aggregator = ConnectionStatsAggregator::new();
+            let ids: Vec<_> = (0..client_count).map(|_| ClientId::new()).collect();
+            let opened = std::sync::Barrier::new(worker_count + 1);
+            let close = std::sync::Barrier::new(worker_count + 1);
+            let tracked_while_open = std::thread::scope(|scope| {
+                for _ in 0..worker_count {
+                    let actor = aggregator.clone();
+                    let ids = &ids;
+                    let username = username.as_deref();
+                    let opened = &opened;
+                    let close = &close;
+                    scope.spawn(move || {
+                        for id in ids {
+                            actor.record_session_connection(*id, username, mode);
+                        }
+                        opened.wait();
+                        close.wait();
+                        for id in ids.iter().rev() {
+                            actor.record_session_disconnection(*id, username, mode);
+                        }
+                    });
+                }
+                opened.wait();
+                let tracked = aggregator.tracked_session_count();
+                close.wait();
+                tracked
+            });
+            let key = username.as_deref().unwrap_or(ANONYMOUS);
+            prop_assert_eq!(tracked_while_open, client_count);
+            prop_assert_eq!(aggregator.tracked_session_count(), 0);
+            prop_assert_eq!(aggregator.connection_count(key), Some(client_count as u64));
+            let disconnects = aggregator.disconnection_stats.get(key).unwrap();
+            prop_assert_eq!(disconnects.get_count(), client_count as u64);
+            prop_assert_eq!(disconnects.routing_mode, mode);
+        }
+    }
+
+    proptest! {
         #[test]
         fn prop_session_events_match_registered_connections(
             events in prop::collection::vec((prop_oneof![
