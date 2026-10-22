@@ -379,22 +379,6 @@ mod tests {
     }
 
     #[test]
-    fn test_pending_backend_reply_tracking_cap_prevents_unbounded_growth() {
-        let mut state = SessionLoopState::new(false);
-        state.mark_backend_request_sent(RequestKind::Date);
-
-        drain_backend_bytes(
-            &mut state,
-            &vec![b'x'; crate::constants::buffer::COMMAND + 1],
-        );
-
-        assert!(
-            !state.has_pending_backend_replies(),
-            "oversized replies should stop pending bookkeeping instead of growing forever"
-        );
-    }
-
-    #[test]
     fn test_deferred_local_reply_flushes_before_later_backend_reply() {
         let mut state = SessionLoopState::new(false);
         let deferred = b"101 Capability list:\r\n.\r\n";

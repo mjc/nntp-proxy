@@ -3019,6 +3019,34 @@ mod tests {
             assert!(!state.has_deferred_replies());
         }
 
+        #[test]
+        fn overlong_status_discards_without_growing_or_completing_early() {
+            let cap = crate::constants::buffer::COMMAND;
+            let mut tracker = BackendReplyTracker::default();
+            tracker.push_request(crate::protocol::RequestKind::Date);
+            let prefix = vec![b'x'; cap - 1];
+            tracker.accept_backend_bytes(&prefix);
+            assert_eq!(tracker.pending.front().unwrap().status_line.len(), cap - 1);
+            for _ in 0..32 {
+                let chunk = vec![b'x'; cap + 1];
+                let writes = tracker.accept_backend_bytes(&chunk);
+                assert!(writes.iter().all(|write| matches!(write, BackendReplyBytes::ForwardUntracked(bytes) if *bytes == chunk)));
+                assert_eq!(tracker.pending.len(), 1);
+                let frame = tracker.pending.front().unwrap();
+                assert!(frame.status_line.is_empty());
+                assert!(!frame.status_line.spilled());
+                assert!(matches!(
+                    frame.state,
+                    PendingRequestFrameState::DiscardingOverlongStatusLine
+                ));
+            }
+            assert!(matches!(
+                tracker.accept_backend_bytes(b"\r\n").as_slice(),
+                [BackendReplyBytes::CompletedTrackedReply(b"\r\n")]
+            ));
+            assert!(tracker.pending.is_empty());
+        }
+
         proptest! {
             #[test]
             fn overlong_status_completion_is_partition_independent(extra in 0usize..64) {
@@ -3546,12 +3574,15 @@ mod tests {
                         let mut conn = crate::stream::ConnectionStream::for_test(ScriptedBackend::new(&stream[initial_len..], &sizes));
                         for (index, (command, expected)) in records.iter().enumerate() {
                             if index > 0 { buffer = take_queued_input_or_acquire_empty(&mut conn, &pool); }
+                            let borrowed_allocation = buffer.allocation_ptr() as usize;
+                            let borrowed_capacity = buffer.capacity();
                             let request = crate::protocol::RequestContext::parse(command).unwrap();
                             let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, buffer).await.unwrap();
                             let mut writer = QuotaWriter::new(quotas.clone(), None);
                             let stats = classified.stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0)).unwrap().write(&mut writer).await.unwrap();
                             assert_eq!(&writer.bytes, expected, "layout={layout}, record={index}");
                             assert_eq!(stats.bytes_written_u64() as usize, expected.len());
+                            assert!(writer.addresses[0].0 >= borrowed_allocation && writer.addresses[0].0 < borrowed_allocation + borrowed_capacity);
                             if index == 0 {
                                 let expected_start = allocation + if layout == 1 { 0 } else { discarded };
                                 assert_eq!(writer.addresses[0].0, expected_start, "retained pass-through must borrow its allocation");
@@ -3575,12 +3606,13 @@ mod tests {
                     let (command, wire) = framing_pipeline_fixture(1, body_len);
                     let (_, next) = framing_pipeline_fixture(2, 3);
                     let status_len = b"222 0 <test@example.com>\r\n".len();
-                    for split in [wire.len(), status_len + split_seed % (wire.len() - status_len)] {
+                    let all_bytes = [wire.clone(), next.clone()].concat();
+                    for split in [all_bytes.len(), wire.len(), status_len + split_seed % (wire.len() - status_len)] {
                         for failure in [None, Some(WriteFailure::BrokenPipe), Some(WriteFailure::Zero)] {
                             let pool = pool(512);
-                            let packed = [wire[split..].to_vec(), next.clone()].concat();
+                            let packed = all_bytes[split..].to_vec();
                             let mut conn = crate::stream::ConnectionStream::for_test(ScriptedBackend::new(&packed, &sizes));
-                            let mut buffer = pool.acquire(); buffer.copy_from_slice(&wire[..split]);
+                            let mut buffer = pool.acquire(); buffer.copy_from_slice(&all_bytes[..split]);
                             let request = crate::protocol::RequestContext::parse(&command).unwrap();
                             let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, buffer).await.unwrap();
                             let accepted = accepted_seed % wire.len();
