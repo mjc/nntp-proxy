@@ -2805,6 +2805,52 @@ mod tests {
 
     const EXHAUSTIVE_BYTES: [u8; 4] = *b"\r\n.x";
 
+    fn multiline_response_sequences() -> impl proptest::strategy::Strategy<Value = Vec<Vec<u8>>> {
+        use proptest::prelude::*;
+
+        prop::collection::vec(
+            (
+                prop::sample::select(vec![100, 101, 211, 215, 220, 221, 222, 224, 225, 230, 231]),
+                any::<bool>(),
+                prop::collection::vec(prop::collection::vec(0x20_u8..=0x7e, 0..24), 0..7),
+            ),
+            1..7,
+        )
+        .prop_map(|responses| {
+            let mut generated = responses
+                .into_iter()
+                .enumerate()
+                .map(|(index, (status, include_dot_lines, mut lines))| {
+                    let mut response = format!("{status:03} generated {index}\r\n").into_bytes();
+                    if include_dot_lines || index == 0 {
+                        lines.push(b".".to_vec());
+                        lines.push(b".leading dot".to_vec());
+                    }
+                    for line in lines {
+                        if line.first() == Some(&b'.') {
+                            response.push(b'.');
+                        }
+                        response.extend_from_slice(&line);
+                        response.extend_from_slice(b"\r\n");
+                    }
+                    response.extend_from_slice(b".\r\n");
+                    response
+                })
+                .collect::<Vec<_>>();
+            let mut responses = [100, 215]
+                .into_iter()
+                .enumerate()
+                .map(|(index, status)| {
+                    let mut response = format!("{status:03} empty {index}\r\n").into_bytes();
+                    response.extend_from_slice(b".\r\n");
+                    response
+                })
+                .collect::<Vec<_>>();
+            responses.append(&mut generated);
+            responses
+        })
+    }
+
     struct FailingWriter;
 
     #[derive(Default)]
@@ -2939,6 +2985,74 @@ mod tests {
                         );
                     }
                 }
+            }
+        }
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn multiline_framer_handles_generated_sequences_and_arbitrary_fragments(
+            responses in multiline_response_sequences(),
+            chunk_sizes in proptest::collection::vec(1usize..128, 1..128),
+        ) {
+            use proptest::prelude::*;
+
+            let expected_stream = responses.concat();
+            for first_chunk_size in [64, 1] {
+                let mut stream_offset = 0;
+                let mut chunk_index = 0;
+                let mut response_index = 0;
+                let mut current_response = Vec::new();
+                let mut assembled = Vec::new();
+                let mut framer = MultilineFramer::default();
+
+                while stream_offset < expected_stream.len() {
+                    let chunk_size = if chunk_index == 0 {
+                        first_chunk_size
+                    } else {
+                        chunk_sizes[(chunk_index - 1) % chunk_sizes.len()]
+                    };
+                    let chunk_end = (stream_offset + chunk_size).min(expected_stream.len());
+                    let chunk = &expected_stream[stream_offset..chunk_end];
+                    let mut chunk_offset = 0;
+
+                    while chunk_offset < chunk.len() {
+                        let remaining = &chunk[chunk_offset..];
+                        match framer
+                            .split_chunk(remaining, PackedPendingBytesPolicy::AllowIfStatusPrefix)
+                            .expect("allowing packed status prefixes cannot reject generated input")
+                        {
+                            ChunkProgress::Incomplete => {
+                                current_response.extend_from_slice(remaining);
+                                chunk_offset = chunk.len();
+                            }
+                            ChunkProgress::Complete(complete) => {
+                                let consumed = complete.consumed.0;
+                                prop_assert!(consumed > 0, "a completion must consume input bytes");
+                                prop_assert!(consumed <= remaining.len());
+                                current_response.extend_from_slice(&remaining[..consumed]);
+                                prop_assert_eq!(
+                                    &current_response,
+                                    &responses[response_index],
+                                "response {} must end at its generated record boundary",
+                                response_index
+                                );
+                                assembled.extend_from_slice(&current_response);
+                                current_response.clear();
+                                response_index += 1;
+                                chunk_offset += consumed;
+                                framer = MultilineFramer::default();
+                            }
+                        }
+                    }
+
+                    stream_offset = chunk_end;
+                    chunk_index += 1;
+                }
+
+                prop_assert_eq!(response_index, responses.len());
+                prop_assert!(current_response.is_empty(), "the final generated response must complete");
+                prop_assert_eq!(&assembled, &expected_stream);
             }
         }
     }
