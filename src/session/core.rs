@@ -379,6 +379,13 @@ impl ClientSession {
 
 impl Drop for ClientSession {
     fn drop(&mut self) {
+        if let Some(stats) = self.connection_stats() {
+            stats.record_session_disconnection(
+                self.client_id(),
+                self.username(),
+                self.mode_state.routing_mode().short_name(),
+            );
+        }
         if let Ok(current) = self.user_connection_username.lock() {
             self.metrics.user_connection_closed(current.as_deref());
         }

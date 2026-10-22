@@ -112,7 +112,6 @@ pub struct ConnectionStatsAggregator {
     connection_stats: Arc<DashMap<String, UserConnectionStats>>,
     disconnection_stats: Arc<DashMap<String, UserConnectionStats>>,
     seen_connections: Arc<DashSet<ClientId>>,
-    seen_disconnections: Arc<DashSet<ClientId>>,
     last_flush: Arc<Mutex<Instant>>,
 }
 
@@ -124,9 +123,13 @@ impl ConnectionStatsAggregator {
             connection_stats: Arc::new(DashMap::new()),
             disconnection_stats: Arc::new(DashMap::new()),
             seen_connections: Arc::new(DashSet::new()),
-            seen_disconnections: Arc::new(DashSet::new()),
             last_flush: Arc::new(Mutex::new(Instant::now())),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracked_session_count(&self) -> usize {
+        self.seen_connections.len()
     }
 
     /// Flush stats if needed
@@ -150,7 +153,6 @@ impl ConnectionStatsAggregator {
                     &self.disconnection_stats,
                     UserConnectionStats::log_disconnection,
                 );
-                self.seen_disconnections.clear();
                 *last_flush = now;
             }
         }
@@ -213,10 +215,9 @@ impl ConnectionStatsAggregator {
         username: Option<&str>,
         routing_mode: &'static str,
     ) {
-        if !self.seen_disconnections.insert(client_id) {
+        if self.seen_connections.remove(&client_id).is_none() {
             return;
         }
-        self.seen_connections.remove(&client_id);
         self.record_event(username, routing_mode, ConnectionEvent::Disconnected);
     }
 
@@ -251,6 +252,106 @@ impl ConnectionStatsAggregator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    #[derive(Clone, Debug)]
+    enum SessionEvent {
+        Open(usize),
+        Close(usize),
+        Flush,
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn prop_concurrent_duplicate_session_events_are_counted_once(
+            client_count in 1usize..24,
+            worker_count in 2usize..5,
+            username in prop::option::of("[a-zé猫]{0,12}"),
+            mode in prop_oneof![Just("hybrid"), Just("stateful"), Just("per-command")],
+        ) {
+            let aggregator = ConnectionStatsAggregator::new();
+            let ids: Vec<_> = (0..client_count).map(|_| ClientId::new()).collect();
+            let opened = std::sync::Barrier::new(worker_count + 1);
+            let close = std::sync::Barrier::new(worker_count + 1);
+            let tracked_while_open = std::thread::scope(|scope| {
+                for _ in 0..worker_count {
+                    let actor = aggregator.clone();
+                    let ids = &ids;
+                    let username = username.as_deref();
+                    let opened = &opened;
+                    let close = &close;
+                    scope.spawn(move || {
+                        for id in ids {
+                            actor.record_session_connection(*id, username, mode);
+                        }
+                        opened.wait();
+                        close.wait();
+                        for id in ids.iter().rev() {
+                            actor.record_session_disconnection(*id, username, mode);
+                        }
+                    });
+                }
+                opened.wait();
+                let tracked = aggregator.tracked_session_count();
+                close.wait();
+                tracked
+            });
+            let key = username.as_deref().unwrap_or(ANONYMOUS);
+            prop_assert_eq!(tracked_while_open, client_count);
+            prop_assert_eq!(aggregator.tracked_session_count(), 0);
+            prop_assert_eq!(aggregator.connection_count(key), Some(client_count as u64));
+            let disconnects = aggregator.disconnection_stats.get(key).unwrap();
+            prop_assert_eq!(disconnects.get_count(), client_count as u64);
+            prop_assert_eq!(disconnects.routing_mode, mode);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_session_events_match_registered_connections(
+            events in prop::collection::vec((prop_oneof![
+                (0usize..8).prop_map(SessionEvent::Open),
+                (0usize..8).prop_map(SessionEvent::Close),
+                Just(SessionEvent::Flush),
+            ], any::<bool>()), 0..200),
+        ) {
+            let aggregator = ConnectionStatsAggregator::new();
+            let cloned = aggregator.clone();
+            let ids: [ClientId; 8] = std::array::from_fn(|_| ClientId::new());
+            let usernames: [String; 8] = std::array::from_fn(|index| format!("user{index}"));
+            let mut active = std::collections::BTreeSet::new();
+            let mut opened = [0u64; 8];
+            let mut closed = [0u64; 8];
+            for (event, use_clone) in events {
+                // Explicit flush events control the model's aggregation windows.
+                *aggregator.last_flush.lock().unwrap() = Instant::now();
+                let actor = if use_clone { &cloned } else { &aggregator };
+                match event {
+                    SessionEvent::Open(index) => {
+                        actor.record_session_connection(ids[index], Some(&usernames[index]), "hybrid");
+                        if active.insert(index) { opened[index] += 1; }
+                    }
+                    SessionEvent::Close(index) => {
+                        actor.record_session_disconnection(ids[index], Some(&usernames[index]), "hybrid");
+                        if active.remove(&index) { closed[index] += 1; }
+                    }
+                    SessionEvent::Flush => {
+                        actor.flush();
+                        opened.fill(0);
+                        closed.fill(0);
+                    }
+                }
+                prop_assert_eq!(aggregator.tracked_session_count(), active.len());
+                for index in 0..8 {
+                    prop_assert_eq!(aggregator.connection_count(&usernames[index]).unwrap_or(0), opened[index]);
+                    let disconnects = aggregator.disconnection_stats.get(&usernames[index])
+                        .map_or(0, |stats| stats.get_count());
+                    prop_assert_eq!(disconnects, closed[index]);
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_user_connection_stats_new() {
@@ -564,13 +665,44 @@ mod tests {
     }
 
     #[test]
-    fn test_record_session_disconnection_deduplicates_same_client() {
+    fn untracked_session_disconnection_does_not_record_an_event() {
         let aggregator = ConnectionStatsAggregator::new();
         let client_id = ClientId::new();
 
         aggregator.record_session_disconnection(client_id, Some("alice"), "hybrid");
+        assert!(aggregator.disconnection_stats.is_empty());
+
+        // An early close attempt must not suppress a later correctly paired event.
+        aggregator.record_session_connection(client_id, Some("alice"), "hybrid");
+        aggregator.record_session_disconnection(client_id, Some("alice"), "hybrid");
+        assert_eq!(
+            aggregator
+                .disconnection_stats
+                .get("alice")
+                .unwrap()
+                .get_count(),
+            1
+        );
+    }
+
+    #[test]
+    fn test_record_session_disconnection_deduplicates_same_client() {
+        let aggregator = ConnectionStatsAggregator::new();
+        let client_id = ClientId::new();
+        aggregator.record_session_connection(client_id, Some("alice"), "hybrid");
+        aggregator.flush();
+
+        aggregator.record_session_disconnection(client_id, Some("alice"), "hybrid");
         aggregator.record_session_disconnection(client_id, Some("alice"), "hybrid");
 
-        assert_eq!(aggregator.user_count(), 0);
+        let stats = aggregator.disconnection_stats.get("alice").unwrap();
+        assert_eq!(stats.get_count(), 1);
+        assert_eq!(stats.routing_mode, "hybrid");
+        drop(stats);
+        assert_eq!(aggregator.tracked_session_count(), 0);
+
+        aggregator.flush();
+        aggregator.record_session_disconnection(client_id, Some("alice"), "hybrid");
+        assert!(aggregator.disconnection_stats.is_empty());
     }
 }

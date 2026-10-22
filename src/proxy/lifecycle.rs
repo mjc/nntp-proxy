@@ -29,6 +29,23 @@ fn elapsed_nanos_u64(start: std::time::Instant) -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
+struct ClientConnectionGuard<'a>(&'a NntpProxy);
+
+impl<'a> ClientConnectionGuard<'a> {
+    fn new(proxy: &'a NntpProxy) -> Self {
+        proxy.increment_active_clients();
+        proxy.record_connection_opened();
+        Self(proxy)
+    }
+}
+
+impl Drop for ClientConnectionGuard<'_> {
+    fn drop(&mut self) {
+        self.0.record_connection_closed();
+        self.0.decrement_active_clients();
+    }
+}
+
 impl NntpProxy {
     // Helper methods for session management
 
@@ -147,16 +164,10 @@ impl NntpProxy {
         client_addr: ClientAddress,
         session_id: &str,
         session: &ClientSession,
-        routing_mode: crate::config::RoutingMode,
         metrics: &types::TransferMetrics,
     ) {
-        self.connection_stats.record_session_disconnection(
-            session.client_id(),
-            session.username(),
-            routing_mode.short_name(),
-        );
-
         debug!(
+            mode = ?session.mode(),
             "Session {} [{}] ↑{} ↓{}",
             client_addr,
             session_id,
@@ -197,13 +208,15 @@ impl NntpProxy {
         &self,
         client_stream: &mut TcpStream,
         client_addr: ClientAddress,
-    ) -> Result<crate::types::BackendId> {
-        self.record_connection_opened();
-
+    ) -> Result<(crate::types::BackendId, crate::router::CommandGuard)> {
         let client_id = types::ClientId::new();
         let backend_id = self
             .router
             .route(crate::router::RouteRequest::new(client_id))?;
+        let reservation = crate::router::BackendSelector::guard_for_routed_backend(
+            Arc::clone(&self.router),
+            backend_id,
+        );
         let server_idx = backend_id.as_index();
 
         self.log_routing_selection(client_addr, backend_id, &self.servers[server_idx]);
@@ -211,7 +224,7 @@ impl NntpProxy {
         self.log_pool_status(server_idx);
         self.apply_tcp_optimizations(client_stream);
 
-        Ok(backend_id)
+        Ok((backend_id, reservation))
     }
 
     /// Prepare per-command connection - record, greet, optimize
@@ -220,7 +233,6 @@ impl NntpProxy {
         client_stream: &mut TcpStream,
         client_addr: ClientAddress,
     ) -> Result<()> {
-        self.record_connection_opened();
         crate::protocol::send_proxy_greeting(client_stream, client_addr).await?;
         self.apply_tcp_optimizations(client_stream);
         Ok(())
@@ -270,10 +282,7 @@ impl NntpProxy {
         backend_id: crate::types::BackendId,
     ) -> Result<(), SessionError> {
         self.record_connection_if_unauthenticated(session);
-        self.router.complete_command(backend_id);
-        self.record_session_metrics(metrics, client_addr, session_id, session, Some(backend_id))?;
-        self.record_connection_closed();
-        Ok(())
+        self.record_session_metrics(metrics, client_addr, session_id, session, Some(backend_id))
     }
 
     /// Finalize per-command session with logging and cleanup
@@ -284,9 +293,7 @@ impl NntpProxy {
         session_id: &str,
         session: &ClientSession,
     ) -> Result<(), SessionError> {
-        self.record_session_metrics(metrics, client_addr, session_id, session, None)?;
-        self.record_connection_closed();
-        Ok(())
+        self.record_session_metrics(metrics, client_addr, session_id, session, None)
     }
 
     /// Record connection for unauthenticated sessions only
@@ -313,13 +320,7 @@ impl NntpProxy {
     ) -> Result<(), SessionError> {
         match metrics {
             Ok(m) => {
-                self.log_session_completion(
-                    client_addr,
-                    session_id,
-                    session,
-                    self.routing_mode,
-                    &m,
-                );
+                self.log_session_completion(client_addr, session_id, session, &m);
 
                 if let Some(bid) = backend_id {
                     self.metrics
@@ -367,10 +368,10 @@ impl NntpProxy {
 
         // Check for stale pools before handling (lazy recreation after idle)
         self.check_and_clear_stale_pools();
-        self.increment_active_clients();
+        let _connection_guard = ClientConnectionGuard::new(self);
 
-        let result: Result<(), SessionError> = async {
-            let backend_id = self
+        async {
+            let (backend_id, _backend_reservation) = self
                 .prepare_stateful_connection(&mut client_stream, client_addr)
                 .await
                 .map_err(SessionError::from)?;
@@ -392,10 +393,7 @@ impl NntpProxy {
 
             self.finalize_stateful_session(metrics, client_addr, &session_id, &session, backend_id)
         }
-        .await;
-
-        self.decrement_active_clients();
-        result
+        .await
     }
 
     /// Handle client connection using per-command routing mode
@@ -412,14 +410,10 @@ impl NntpProxy {
         Box::pin(async move {
             // Check for stale pools before handling (lazy recreation after idle)
             self.check_and_clear_stale_pools();
-            self.increment_active_clients();
+            let _connection_guard = ClientConnectionGuard::new(self);
 
-            let result = self
-                .handle_per_command_client(client_stream, client_addr)
-                .await;
-
-            self.decrement_active_clients();
-            result
+            self.handle_per_command_client(client_stream, client_addr)
+                .await
         })
     }
 
@@ -500,6 +494,56 @@ mod tests {
 
     fn create_test_config() -> crate::config::Config {
         super::super::tests::create_test_config()
+    }
+
+    #[tokio::test]
+    async fn cancelled_handlers_release_both_connection_counters() {
+        for mode in [
+            RoutingMode::Stateful,
+            RoutingMode::PerCommand,
+            RoutingMode::Hybrid,
+        ] {
+            let proxy = NntpProxy::new_sync(create_test_config(), mode).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (stream, addr) = listener.accept().await.unwrap();
+            let mut handler = Box::pin(async {
+                match mode {
+                    RoutingMode::Stateful => proxy.handle_client(stream, addr.into()).await,
+                    _ => {
+                        proxy
+                            .handle_client_per_command_routing(stream, addr.into())
+                            .await
+                    }
+                }
+            });
+            assert!(futures::poll!(&mut handler).is_pending());
+            assert_eq!(proxy.active_clients.load(Ordering::Relaxed), 1);
+            drop(handler);
+            drop(client);
+            assert_eq!(proxy.active_clients.load(Ordering::Relaxed), 0);
+            assert_eq!(proxy.metrics.snapshot(None).active_connections.get(), 0);
+        }
+    }
+
+    #[test]
+    fn errored_sessions_release_aggregator_bookkeeping_on_drop() {
+        let proxy = NntpProxy::new_sync(create_test_config(), RoutingMode::PerCommand).unwrap();
+        let addr = ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
+        for error in [
+            SessionError::Backend(anyhow::anyhow!("test")),
+            SessionError::ClientDisconnect(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+        ] {
+            let session = proxy.create_session(addr, Some(proxy.router.clone()));
+            proxy.record_connection_if_unauthenticated(&session);
+            assert_eq!(proxy.connection_stats.tracked_session_count(), 1);
+            let result = proxy.finalize_per_command_session(Err(error), addr, "session", &session);
+            assert!(result.is_err());
+            drop(session);
+            assert_eq!(proxy.connection_stats.tracked_session_count(), 0);
+        }
     }
 
     #[test]

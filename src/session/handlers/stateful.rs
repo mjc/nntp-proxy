@@ -498,6 +498,16 @@ impl ClientSession {
                 }
             }
 
+            // Flush the buffered window before waiting for more client bytes.
+            // A partial next command must not hold already complete requests.
+            if pending_backend_writes != 0 && !client_reader.buffer().contains(&b'\n') {
+                backend_write
+                    .flush()
+                    .await
+                    .map_err(|error| StatefulLoopError::backend(error.into()))?;
+                pending_backend_writes = 0;
+            }
+
             tokio::select! {
                 // Client → Backend
                 result = command_reader.read_next(&mut client_reader) => {
@@ -505,31 +515,12 @@ impl ClientSession {
                         Ok(StatefulClientLine::Eof) => {
                             break StatefulSessionExit::ClientDisconnected;
                         }
-                        Ok(StatefulClientLine::Oversized) => {
-                            use crate::protocol::COMMAND_TOO_LONG;
-                            client_write
-                                .write_all(COMMAND_TOO_LONG)
-                                .await
-                                .map_err(|error| StatefulLoopError::client(error.into()))?;
-                            client_write
-                                .flush()
-                                .await
-                                .map_err(|error| StatefulLoopError::client(error.into()))?;
-                            state.add_backend_to_client(COMMAND_TOO_LONG.len() as u64);
-                            continue;
-                        }
-                        Ok(StatefulClientLine::Invalid) => {
-                            client_write
-                                .write_all(crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE)
-                                .await
-                                .map_err(|error| StatefulLoopError::client(error.into()))?;
-                            client_write
-                                .flush()
-                                .await
-                                .map_err(|error| StatefulLoopError::client(error.into()))?;
-                            state.add_backend_to_client(
-                                crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE.len() as u64,
-                            );
+                        Ok(line @ (StatefulClientLine::Oversized | StatefulClientLine::Invalid)) => {
+                            let reply = match line {
+                                StatefulClientLine::Oversized => crate::protocol::COMMAND_TOO_LONG,
+                                _ => crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE,
+                            };
+                            state.push_deferred_reply(reply);
                             continue;
                         }
                         Ok(StatefulClientLine::Ready) => {
@@ -585,13 +576,6 @@ impl ClientSession {
 
                 // Backend → Client
                 result = self.read_stateful_backend_bytes(&mut backend_read) => {
-                    if pending_backend_writes != 0 {
-                        backend_write
-                            .flush()
-                            .await
-                            .map_err(|error| StatefulLoopError::backend(error.into()))?;
-                        pending_backend_writes = 0;
-                    }
                     match result {
                         Ok(Some((buffer, len))) => {
                             // Complete output after select! returns so client readiness cannot
@@ -624,6 +608,7 @@ impl ClientSession {
 
 #[cfg(test)]
 mod tests {
+    use proptest::prelude::*;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -651,6 +636,90 @@ mod tests {
             metrics,
         )
         .build()
+    }
+
+    #[derive(Clone, Debug)]
+    enum PipelineCommand {
+        Date,
+        SyntaxError,
+        Oversized,
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+        #[test]
+        fn prop_compressed_stateful_pipeline_orders_mixed_local_errors(
+            extra in prop::collection::vec(prop_oneof![
+                Just(PipelineCommand::Date), Just(PipelineCommand::SyntaxError), Just(PipelineCommand::Oversized),
+            ], 0..8),
+            oversized_len in 511usize..800,
+            reader_capacity in prop_oneof![1usize..32, Just(511), Just(512)],
+        ) {
+            let mut commands = vec![PipelineCommand::Date, PipelineCommand::SyntaxError, PipelineCommand::Oversized];
+            commands.extend(extra);
+            commands.push(PipelineCommand::Date);
+            let mut wire = Vec::new();
+            let mut expected = Vec::new();
+            let mut backend_count = 0;
+            for command in commands {
+                match command {
+                    PipelineCommand::Date => {
+                        wire.extend_from_slice(b"DATE\r\n");
+                        expected.extend_from_slice(format!("111 {backend_count:014}\r\n").as_bytes());
+                        backend_count += 1;
+                    }
+                    PipelineCommand::SyntaxError => {
+                        wire.extend_from_slice(b"\r\n");
+                        expected.extend_from_slice(crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE);
+                    }
+                    PipelineCommand::Oversized => {
+                        wire.extend(std::iter::repeat_n(b'X', oversized_len));
+                        wire.extend_from_slice(b"\r\n");
+                        expected.extend_from_slice(crate::protocol::COMMAND_TOO_LONG);
+                    }
+                }
+            }
+            let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            let actual = runtime.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    use tokio::io::AsyncReadExt;
+                    let session = test_session();
+                    let (mut client, proxy_client) = tokio::io::duplex(16_384);
+                    let (backend, proxy_backend) = tokio::io::duplex(16_384);
+                    let mut backend = crate::compression::DecompressStream::new(backend);
+                    let proxy_backend = crate::compression::DecompressStream::new(proxy_backend);
+                    let (client_read, client_write) = tokio::io::split(proxy_client);
+                    let (backend_read, backend_write) = tokio::io::split(proxy_backend);
+                    let proxy = tokio::spawn(async move {
+                        session.run_stateful_proxy_loop(
+                            BufReader::with_capacity(reader_capacity, client_read), client_write,
+                            backend_read, backend_write, SessionLoopState::new(false), BackendId::from_index(0),
+                        ).await
+                    });
+                    let client_exchange = async {
+                        client.write_all(&wire).await.unwrap();
+                        let mut actual = vec![0; expected.len()];
+                        client.read_exact(&mut actual).await.unwrap();
+                        drop(client);
+                        actual
+                    };
+                    let backend_exchange = async {
+                        for index in 0..backend_count {
+                            let mut command = [0; 6];
+                            backend.read_exact(&mut command).await.unwrap();
+                            assert_eq!(&command, b"DATE\r\n");
+                            backend.write_all(format!("111 {index:014}\r\n").as_bytes()).await.unwrap();
+                            backend.flush().await.unwrap();
+                        }
+                    };
+                    let (actual, ()) = tokio::join!(client_exchange, backend_exchange);
+                    let result = proxy.await.unwrap().unwrap();
+                    assert_eq!(result.disposition(), super::StatefulConnectionDisposition::RetireClient);
+                    actual
+                }).await.expect("mixed compressed pipeline stalled")
+            });
+            prop_assert_eq!(actual, expected);
+        }
     }
 
     #[test]
@@ -766,6 +835,116 @@ mod tests {
 
         fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn compressed_stateful_request_flushes_a_partial_window() {
+        use tokio::io::AsyncReadExt;
+        let session = test_session();
+        let (mut client, proxy_client) = tokio::io::duplex(4096);
+        let (backend, proxy_backend) = tokio::io::duplex(4096);
+        let mut backend = crate::compression::DecompressStream::new(backend);
+        let proxy_backend = crate::compression::DecompressStream::new(proxy_backend);
+        let (client_read, client_write) = tokio::io::split(proxy_client);
+        let (backend_read, backend_write) = tokio::io::split(proxy_backend);
+        let proxy = tokio::spawn(async move {
+            session
+                .run_stateful_proxy_loop(
+                    BufReader::new(client_read),
+                    client_write,
+                    backend_read,
+                    backend_write,
+                    SessionLoopState::new(false),
+                    BackendId::from_index(0),
+                )
+                .await
+        });
+        for commands in [b"DATE\r\n".as_slice(), b"DATE\r\nDA".as_slice()] {
+            client.write_all(commands).await.unwrap();
+            let mut command = [0; 6];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                backend.read_exact(&mut command),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(&command, b"DATE\r\n");
+            backend.write_all(b"111 ready\r\n").await.unwrap();
+            backend.flush().await.unwrap();
+            let mut reply = [0; 11];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                client.read_exact(&mut reply),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(&reply, b"111 ready\r\n");
+        }
+        drop(client);
+        let _ = proxy.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_client_lines_wait_for_prior_backend_replies() {
+        use tokio::io::AsyncReadExt;
+        for invalid in [
+            b"\r\n".to_vec(),
+            [vec![b'X'; 600], b"\r\n".to_vec()].concat(),
+        ] {
+            let session = test_session();
+            let (mut client, proxy_client) = tokio::io::duplex(4096);
+            let (backend, proxy_backend) = tokio::io::duplex(4096);
+            let (mut backend_read, mut backend_write) = tokio::io::split(backend);
+            let (client_read, client_write) = tokio::io::split(proxy_client);
+            let (proxy_backend_read, proxy_backend_write) = tokio::io::split(proxy_backend);
+            let proxy = tokio::spawn(async move {
+                session
+                    .run_stateful_proxy_loop(
+                        BufReader::new(client_read),
+                        client_write,
+                        proxy_backend_read,
+                        proxy_backend_write,
+                        SessionLoopState::new(false),
+                        BackendId::from_index(0),
+                    )
+                    .await
+            });
+            client.write_all(b"DATE\r\n").await.unwrap();
+            let mut command = [0; 6];
+            backend_read.read_exact(&mut command).await.unwrap();
+            assert_eq!(&command, b"DATE\r\n");
+            client.write_all(&invalid).await.unwrap();
+            // No backend reply has been emitted, so no later local reply is ready.
+            let mut first = [0; 1];
+            assert!(
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    client.read_exact(&mut first)
+                )
+                .await
+                .is_err()
+            );
+            backend_write.write_all(b"111 earlier\r\n").await.unwrap();
+            let expected_error: &[u8] = if invalid.len() > 512 {
+                crate::protocol::COMMAND_TOO_LONG
+            } else {
+                crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE
+            };
+            let expected = [b"111 earlier\r\n".as_slice(), expected_error].concat();
+            let mut actual = vec![0; expected.len()];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                client.read_exact(&mut actual),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(actual, expected);
+            drop(client);
+            let _ = proxy.await.unwrap().unwrap();
         }
     }
 

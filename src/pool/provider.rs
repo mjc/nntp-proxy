@@ -526,7 +526,10 @@ impl DeadpoolConnectionProvider {
         &self,
     ) -> Result<PooledConnection, crate::connection_error::ConnectionError> {
         use crate::connection_error::ConnectionError;
-        self.pool.get().await.map_err(|e| {
+        let result = tokio::time::timeout(crate::constants::timeout::CONNECTION, self.pool.get())
+            .await
+            .unwrap_or_else(|_| Err(managed::PoolError::Timeout(managed::TimeoutType::Wait)));
+        result.map_err(|e| {
             let status = self.pool.status();
             let err = match e {
                 deadpool::managed::PoolError::Backend(conn_err) => conn_err,
@@ -859,7 +862,6 @@ impl DeadpoolConnectionProvider {
     /// Gracefully shutdown the pool
     pub async fn graceful_shutdown(&self) {
         use deadpool::managed::Object;
-        use tokio::io::AsyncWriteExt;
 
         self.shutdown();
 
@@ -884,9 +886,10 @@ impl DeadpoolConnectionProvider {
 
         shutdown_connections_concurrently(idle_connections, |mut conn| async move {
             // Timeout the write: a half-closed backend connection can block indefinitely
+            let request = crate::protocol::RequestContext::from_verb_args(b"QUIT", b"");
             let _ = tokio::time::timeout(
                 crate::constants::timeout::SHUTDOWN_QUIT_WRITE,
-                conn.write_all(b"QUIT\r\n"),
+                request.send_to(&mut conn),
             )
             .await;
         })
@@ -946,6 +949,24 @@ impl ConnectionProvider for DeadpoolConnectionProvider {
 #[allow(clippy::float_cmp)] // These tests compare exact derived failure-rate fixtures.
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn saturated_pool_acquisition_has_a_deadline() {
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 1, None);
+        let held = provider.get_pooled_connection().await.unwrap();
+        tokio::time::pause();
+        let result = tokio::time::timeout(
+            crate::constants::timeout::CONNECTION * 2,
+            provider.get_pooled_connection(),
+        )
+        .await
+        .expect("pool acquisition did not enforce its deadline");
+        assert!(result.is_err());
+        drop(held);
+        tokio::time::resume();
+        assert!(provider.get_pooled_connection().await.is_ok());
+    }
 
     #[test]
     fn test_builder_new() {

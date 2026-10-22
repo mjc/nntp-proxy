@@ -133,8 +133,6 @@ async fn test_hybrid_mode_command_error_in_stateful_mode() -> Result<()> {
         }
     });
 
-    wait_for_server(&format!("127.0.0.1:{mock_port}"), 20).await?;
-
     let server = Server::builder("127.0.0.1", Port::try_new(mock_port).unwrap())
         .name("Mock Server")
         .max_connections(MaxConnections::try_new(5).unwrap())

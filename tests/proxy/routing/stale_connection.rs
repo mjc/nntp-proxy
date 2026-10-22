@@ -542,7 +542,11 @@ async fn test_availability_survives_pool_clearing() -> Result<()> {
     let config = Config {
         servers: vec![
             create_test_server_config("127.0.0.1", port0, "Backend0-430"),
-            create_test_server_config("127.0.0.2", port1, "Backend1-Has"),
+            create_test_server_config(
+                &crate::test_helpers::independent_provider_host(1),
+                port1,
+                "Backend1-Has",
+            ),
         ],
         cache: Some(Cache {
             adaptive_precheck: false, // Don't precheck, let the request go through normally

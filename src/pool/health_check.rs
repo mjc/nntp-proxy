@@ -8,12 +8,11 @@
 use deadpool::managed;
 use std::sync::atomic::{AtomicU64, Ordering};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
 
 use crate::constants::pool::{
-    DATE_COMMAND, EXPECTED_DATE_RESPONSE_PREFIX, HEALTH_CHECK_BUFFER_SIZE, HEALTH_CHECK_TIMEOUT,
-    TCP_PEEK_BUFFER_SIZE,
+    HEALTH_CHECK_BUFFER_SIZE, HEALTH_CHECK_TIMEOUT, TCP_PEEK_BUFFER_SIZE,
 };
 use crate::stream::ConnectionStream;
 
@@ -164,15 +163,13 @@ pub fn check_tcp_alive(
     Ok(())
 }
 
-/// Validate DATE command response
-///
-/// Returns Ok(()) if the response starts with "111 " (`EXPECTED_DATE_RESPONSE_PREFIX`),
-/// otherwise returns an error with the actual response.
-///
-/// This is a pure function extracted for testability.
+/// Require the DATE status and its mandatory text separator.
 #[inline]
 fn validate_date_response(response: &str) -> Result<(), HealthCheckError> {
-    if response.starts_with(EXPECTED_DATE_RESPONSE_PREFIX) {
+    if crate::protocol::StatusCode::parse(response.as_bytes())
+        == Some(crate::protocol::StatusCode::new(111))
+        && response.as_bytes().get(3) == Some(&b' ')
+    {
         Ok(())
     } else {
         Err(HealthCheckError::UnexpectedResponse(response.to_string()))
@@ -223,7 +220,8 @@ where
     // Wrap entire health check in single timeout
     let health_check = async {
         // Send DATE command
-        conn.write_all(DATE_COMMAND)
+        crate::protocol::RequestContext::from_verb_args(b"DATE", b"")
+            .send_to(conn)
             .await
             .map_err(HealthCheckError::WriteError)?;
 
@@ -241,6 +239,7 @@ where
 #[allow(clippy::float_cmp)] // These tests assert exact health-check failure rates from fixed counters.
 mod tests {
     use super::*;
+    use crate::constants::pool::DATE_COMMAND;
     use std::collections::VecDeque;
     use std::pin::Pin;
     use std::task::{Context, Poll};
@@ -357,6 +356,27 @@ mod tests {
         assert_eq!(metrics.connections_checked(), 50);
         assert_eq!(metrics.connections_failed(), 5);
         assert_eq!(metrics.failure_rate(), 0.1);
+    }
+
+    #[tokio::test]
+    async fn compressed_date_check_flushes_before_waiting_for_reply() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (proxy, backend) = tokio::io::duplex(1024);
+        let mut proxy = crate::compression::DecompressStream::new(proxy);
+        let mut backend = crate::compression::DecompressStream::new(backend);
+        let server = tokio::spawn(async move {
+            let mut command = [0; 6];
+            backend.read_exact(&mut command).await.unwrap();
+            assert_eq!(&command, b"DATE\r\n");
+            backend.write_all(b"111 20261022000000\r\n").await.unwrap();
+            backend.flush().await.unwrap();
+        });
+        let result = check_date_response(&mut proxy).await;
+        if result.is_err() {
+            server.abort();
+        }
+        assert!(result.is_ok(), "compressed health check failed: {result:?}");
+        server.await.unwrap();
     }
 
     #[tokio::test]

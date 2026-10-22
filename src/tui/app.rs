@@ -222,21 +222,41 @@ struct UserRateEstimators {
 ///
 /// # Examples
 ///
-/// ```ignore
-/// use nntp_proxy::tui::TuiAppBuilder;
+/// ```
+/// use nntp_proxy::config::Server;
+/// use nntp_proxy::metrics::MetricsCollector;
+/// use nntp_proxy::router::BackendSelector;
+/// use nntp_proxy::tui::{LogBuffer, TuiAppBuilder};
+/// use nntp_proxy::types::{Port, tui::HistorySize};
+/// use std::sync::Arc;
+///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+/// let metrics = MetricsCollector::new(1);
+/// let router = Arc::new(BackendSelector::new());
+/// let servers: Arc<[Server]> = vec![
+///     Server::builder("news.example.com", Port::try_new(119)?)
+///         .build()?,
+/// ].into();
 ///
 /// // Basic app
-/// let app = TuiAppBuilder::new(metrics, router, servers).build();
+/// let app = TuiAppBuilder::new(metrics.clone(), router.clone(), servers.clone()).build();
+/// assert_eq!(app.snapshot_state().backend_views.len(), 1);
 ///
 /// // With log buffer
-/// let app = TuiAppBuilder::new(metrics, router, servers)
+/// let log_buffer = LogBuffer::new();
+/// log_buffer.push("connected".to_string());
+/// let app = TuiAppBuilder::new(metrics.clone(), router.clone(), servers.clone())
 ///     .with_log_buffer(log_buffer)
 ///     .build();
+/// assert_eq!(app.snapshot_state().log_lines, vec!["connected".to_string()]);
 ///
 /// // With custom history size
 /// let app = TuiAppBuilder::new(metrics, router, servers)
 ///     .with_history_size(HistorySize::new(120))
 ///     .build();
+/// assert_eq!(app.snapshot_state().backend_views.len(), 1);
+/// # Ok(())
+/// # }
 /// ```
 pub struct TuiAppBuilder {
     metrics: MetricsCollector,

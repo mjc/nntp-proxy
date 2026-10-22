@@ -427,6 +427,16 @@ pub fn create_test_addr() -> std::net::SocketAddr {
 // Proxy Setup Helpers
 // ============================================================================
 
+/// Distinct configured provider identities that all reach IPv4 localhost.
+/// IPv4-mapped literals work without installing extra loopback aliases on macOS.
+pub fn independent_provider_host(index: usize) -> String {
+    let zeros = (0..5)
+        .map(|position| "0".repeat(1 + ((index >> (2 * position)) & 3)))
+        .collect::<Vec<_>>()
+        .join(":");
+    format!("{zeros}:ffff:7f00:1")
+}
+
 /// Setup a proxy with mock backends and return ports + handles
 ///
 /// This eliminates the boilerplate of:
@@ -488,7 +498,7 @@ pub async fn setup_proxy_with_backends(
                 // Each fake backend represents a different provider. Keep the
                 // configured hosts distinct because availability is shared by
                 // host, not by port or credentials.
-                let host = format!("127.0.0.{}", index + 1);
+                let host = independent_provider_host(index);
                 create_test_server_config_with_auth(&host, *port, name, name, name)
             })
             .collect(),
@@ -1017,6 +1027,18 @@ pub fn create_test_config_with_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_hosts_are_distinct_mapped_loopback_literals() {
+        let hosts = (0..nntp_proxy::types::BackendId::MAX_COUNT)
+            .map(super::independent_provider_host)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(hosts.len(), nntp_proxy::types::BackendId::MAX_COUNT);
+        for host in hosts {
+            let ip: std::net::Ipv6Addr = host.parse().unwrap();
+            assert_eq!(ip.to_ipv4_mapped(), Some(std::net::Ipv4Addr::LOCALHOST));
+        }
+    }
 
     #[tokio::test]
     async fn test_mock_server_basic() {

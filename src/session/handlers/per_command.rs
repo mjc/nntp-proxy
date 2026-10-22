@@ -4,9 +4,9 @@
 //! command can be routed to a different backend. The actual routing, backend
 //! execution, and cache logic are split into sub-modules:
 //!
-//! - [`article_retry`]: Availability-aware backend selection and retry logic
-//! - [`command_execution`]: Single-backend command execution and response writing
-//! - [`cache_operations`]: Cache lookups, upserts, and tier helpers
+//! - [`article_retry`](super::article_retry): Availability-aware backend selection and retry logic
+//! - [`command_execution`](super::command_execution): Single-backend command execution and response writing
+//! - [`cache_operations`](super::cache_operations): Cache lookups, upserts, and tier helpers
 
 use super::BackendLease;
 

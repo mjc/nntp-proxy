@@ -870,6 +870,18 @@ impl RequestContext {
         }
     }
 
+    /// Send a request through a buffered transport before waiting for its response.
+    ///
+    /// # Errors
+    /// Returns any I/O error from writing or flushing the request.
+    pub(crate) async fn send_to<W>(&self, writer: &mut W) -> std::io::Result<()>
+    where
+        W: tokio::io::AsyncWrite + Unpin,
+    {
+        self.write_wire_to(writer).await?;
+        tokio::io::AsyncWriteExt::flush(writer).await
+    }
+
     /// Return whether this request/status pair carries a multiline response body.
     ///
     /// RFC 3977 defines multiline responses per command, not by status code
@@ -1082,16 +1094,176 @@ const fn status_implies_response_body(code: u16) -> bool {
 mod tests {
     use super::*;
     use futures::executor::block_on;
+    use proptest::prelude::*;
     use std::io::IoSlice;
     use std::pin::Pin;
     use std::task::{Context, Poll};
     use tokio::io::AsyncWrite;
+
+    #[derive(Clone, Copy)]
+    enum WriteFault {
+        Error(std::io::ErrorKind),
+        Zero,
+    }
+
+    enum PollPhase {
+        Yield,
+        Ready,
+    }
+
+    struct FragmentedWriter {
+        bytes: Vec<u8>,
+        width: usize,
+        failure: Option<(usize, WriteFault)>,
+        flush_error: Option<std::io::ErrorKind>,
+        flushes: usize,
+        phase: PollPhase,
+    }
+
+    impl FragmentedWriter {
+        fn new(width: usize) -> Self {
+            Self {
+                bytes: Vec::new(),
+                width,
+                failure: None,
+                flush_error: None,
+                flushes: 0,
+                phase: PollPhase::Yield,
+            }
+        }
+
+        fn poll_capacity(&mut self, cx: &mut Context<'_>) -> Poll<std::io::Result<usize>> {
+            match self.phase {
+                PollPhase::Yield => {
+                    self.phase = PollPhase::Ready;
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
+                }
+                PollPhase::Ready => self.phase = PollPhase::Yield,
+            }
+            let capacity = match self.failure {
+                Some((at, fault)) if self.bytes.len() == at => {
+                    return Poll::Ready(match fault {
+                        WriteFault::Error(kind) => Err(kind.into()),
+                        WriteFault::Zero => Ok(0),
+                    });
+                }
+                Some((at, _)) => self.width.min(at - self.bytes.len()),
+                None => self.width,
+            };
+            Poll::Ready(Ok(capacity))
+        }
+    }
+
+    impl AsyncWrite for FragmentedWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let written = std::task::ready!(self.poll_capacity(cx))?.min(buf.len());
+            self.bytes.extend_from_slice(&buf[..written]);
+            Poll::Ready(Ok(written))
+        }
+
+        fn poll_write_vectored(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            bufs: &[IoSlice<'_>],
+        ) -> Poll<std::io::Result<usize>> {
+            let capacity = std::task::ready!(self.poll_capacity(cx))?;
+            let mut written = 0;
+            for buf in bufs {
+                let take = (capacity - written).min(buf.len());
+                self.bytes.extend_from_slice(&buf[..take]);
+                written += take;
+                if written == capacity {
+                    break;
+                }
+            }
+            Poll::Ready(Ok(written))
+        }
+
+        fn is_write_vectored(&self) -> bool {
+            true
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            if let PollPhase::Yield = self.phase {
+                self.phase = PollPhase::Ready;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.phase = PollPhase::Yield;
+            self.flushes += 1;
+            Poll::Ready(self.flush_error.map_or(Ok(()), |kind| Err(kind.into())))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_send_to_preserves_requests_across_short_writes(
+            verb in prop_oneof![Just("DATE"), Just("QUIT"), Just("BODY"), Just("AUTHINFO")],
+            args in "[a-zA-Z0-9 <>@._-]{0,120}",
+            width in 1usize..32,
+        ) {
+            let request = RequestContext::from_verb_args(verb.as_bytes(), args.as_bytes());
+            let expected = if args.is_empty() { format!("{verb}\r\n") } else { format!("{verb} {args}\r\n") };
+            let mut writer = FragmentedWriter::new(width);
+            block_on(request.send_to(&mut writer)).unwrap();
+            prop_assert_eq!(writer.bytes, expected.as_bytes());
+            prop_assert_eq!(writer.flushes, 1);
+        }
+
+        #[test]
+        fn prop_send_to_stops_without_flushing_after_partial_write_failure(
+            args in "[a-zA-Z0-9@._-]{0,120}",
+            width in 1usize..32,
+            offset in any::<usize>(),
+        ) {
+            let expected = if args.is_empty() { "BODY\r\n".to_string() } else { format!("BODY {args}\r\n") };
+            let fail_at = offset % expected.len();
+            let request = RequestContext::from_verb_args(b"BODY", args.as_bytes());
+            for (fault, kind) in [
+                (WriteFault::Error(std::io::ErrorKind::BrokenPipe), std::io::ErrorKind::BrokenPipe),
+                (WriteFault::Error(std::io::ErrorKind::ConnectionReset), std::io::ErrorKind::ConnectionReset),
+                (WriteFault::Zero, std::io::ErrorKind::WriteZero),
+            ] {
+                let mut writer = FragmentedWriter::new(width);
+                writer.failure = Some((fail_at, fault));
+                let error = block_on(request.send_to(&mut writer)).unwrap_err();
+                prop_assert_eq!(error.kind(), kind);
+                prop_assert_eq!(writer.bytes, &expected.as_bytes()[..fail_at]);
+                prop_assert_eq!(writer.flushes, 0);
+            }
+        }
+
+        #[test]
+        fn prop_send_to_reports_flush_failure_after_the_complete_request(
+            args in "[a-zA-Z0-9@._-]{0,120}",
+            width in 1usize..32,
+        ) {
+            let request = RequestContext::from_verb_args(b"STAT", args.as_bytes());
+            let expected = if args.is_empty() { "STAT\r\n".to_string() } else { format!("STAT {args}\r\n") };
+            let mut writer = FragmentedWriter::new(width);
+            writer.flush_error = Some(std::io::ErrorKind::ConnectionReset);
+            let error = block_on(request.send_to(&mut writer)).unwrap_err();
+            prop_assert_eq!(error.kind(), std::io::ErrorKind::ConnectionReset);
+            prop_assert_eq!(writer.bytes, expected.as_bytes());
+            prop_assert_eq!(writer.flushes, 1);
+        }
+    }
 
     #[derive(Default)]
     struct CountingWriter {
         bytes: Vec<u8>,
         writes: usize,
         vectored_writes: usize,
+        flushes: usize,
     }
 
     impl AsyncWrite for CountingWriter {
@@ -1122,7 +1294,11 @@ mod tests {
             true
         }
 
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.flushes += 1;
             Poll::Ready(Ok(()))
         }
 
@@ -1259,6 +1435,40 @@ mod tests {
 
         assert_eq!(line.len(), 520);
         assert!(RequestContext::parse(&line).is_none());
+    }
+
+    #[tokio::test]
+    async fn request_window_can_flush_once_after_all_writes() {
+        use tokio::io::AsyncWriteExt;
+        let mut writer = CountingWriter::default();
+        for _ in 0..4 {
+            RequestContext::parse(b"DATE\r\n")
+                .unwrap()
+                .write_wire_to(&mut writer)
+                .await
+                .unwrap();
+        }
+        writer.flush().await.unwrap();
+        assert_eq!(writer.flushes, 1);
+    }
+
+    #[tokio::test]
+    async fn compressed_request_is_visible_without_an_extra_flush() {
+        use tokio::io::AsyncReadExt;
+        let (writer, reader) = tokio::io::duplex(1024);
+        let mut writer = crate::compression::DecompressStream::new(writer);
+        let mut reader = crate::compression::DecompressStream::new(reader);
+        let request = RequestContext::parse(b"DATE\r\n").unwrap();
+        request.send_to(&mut writer).await.unwrap();
+        let mut received = [0; 6];
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            reader.read_exact(&mut received),
+        )
+        .await
+        .expect("request remained buffered in the compressor")
+        .unwrap();
+        assert_eq!(&received, b"DATE\r\n");
     }
 
     #[tokio::test]

@@ -15,8 +15,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-use tokio::sync::Notify;
+use tokio::sync::OnceCell;
 
 use crate::connection_error::ConnectionError;
 use crate::protocol::{RequestContext, authinfo_pass, authinfo_user};
@@ -112,15 +111,6 @@ enum CompressionSupport {
     Unsupported,
 }
 
-#[derive(Debug, Default)]
-enum CompressionSupportState {
-    #[default]
-    Unknown,
-    Probing(Arc<Notify>),
-    Supported,
-    Unsupported,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompressionMode {
     Disabled,
@@ -208,7 +198,7 @@ pub struct TcpManager {
     pub(crate) recv_buffer_size: usize,
     pub(crate) send_buffer_size: usize,
     compression: CompressionPolicy,
-    compression_support: Arc<Mutex<CompressionSupportState>>,
+    compression_support: Arc<OnceCell<CompressionSupport>>,
     /// Whether to send MODE READER after authentication (RFC 3977 §5.3)
     pub(crate) send_mode_reader: bool,
 }
@@ -328,7 +318,7 @@ impl TcpManager {
             recv_buffer_size: options.recv_buffer_size,
             send_buffer_size: options.send_buffer_size,
             compression,
-            compression_support: Arc::new(Mutex::new(CompressionSupportState::Unknown)),
+            compression_support: Arc::new(OnceCell::new()),
             send_mode_reader: options.send_mode_reader,
         })
     }
@@ -585,67 +575,25 @@ impl TcpManager {
                 .map(|support| matches!(support, CompressionSupport::Supported));
         }
 
-        loop {
-            let probe_waiter = {
-                let mut cached_support = self.compression_support.lock().await;
-                match &*cached_support {
-                    CompressionSupportState::Unsupported => {
-                        tracing::debug!(
-                            backend = %self.name,
-                            "Skipping COMPRESS DEFLATE; backend previously reported it unsupported"
-                        );
-                        return Ok(false);
-                    }
-                    CompressionSupportState::Supported => {
-                        drop(cached_support);
-                        return self
-                            .probe_compression_with_timeout(stream, buffer)
-                            .await
-                            .map(|support| matches!(support, CompressionSupport::Supported));
-                    }
-                    CompressionSupportState::Probing(notify) => {
-                        Some(notify.clone().notified_owned())
-                    }
-                    CompressionSupportState::Unknown => {
-                        let notify = Arc::new(Notify::new());
-                        *cached_support = CompressionSupportState::Probing(notify);
-                        None
-                    }
-                }
-            };
+        let mut negotiated = None;
+        let support = *self
+            .compression_support
+            .get_or_try_init(|| async {
+                let support = self.probe_compression_with_timeout(stream, buffer).await?;
+                negotiated = Some(support);
+                Ok::<_, ConnectionError>(support)
+            })
+            .await?;
 
-            if let Some(waiter) = probe_waiter {
-                waiter.await;
-                continue;
-            }
-
-            let support = self.probe_compression_with_timeout(stream, buffer).await;
-            let mut cached_support = self.compression_support.lock().await;
-            let notify = match std::mem::take(&mut *cached_support) {
-                CompressionSupportState::Probing(notify) => notify,
-                state => {
-                    *cached_support = state;
-                    return support.map(|support| matches!(support, CompressionSupport::Supported));
-                }
-            };
-
-            match support {
-                Ok(CompressionSupport::Supported) => {
-                    *cached_support = CompressionSupportState::Supported;
-                    notify.notify_waiters();
-                    return Ok(true);
-                }
-                Ok(CompressionSupport::Unsupported) => {
-                    *cached_support = CompressionSupportState::Unsupported;
-                    notify.notify_waiters();
-                    return Ok(false);
-                }
-                Err(err) => {
-                    *cached_support = CompressionSupportState::Unknown;
-                    notify.notify_waiters();
-                    return Err(err);
-                }
-            }
+        if let Some(support) = negotiated {
+            return Ok(support == CompressionSupport::Supported);
+        }
+        match support {
+            CompressionSupport::Unsupported => Ok(false),
+            CompressionSupport::Supported => self
+                .probe_compression_with_timeout(stream, buffer)
+                .await
+                .map(|support| support == CompressionSupport::Supported),
         }
     }
 
@@ -795,22 +743,31 @@ impl managed::Manager for TcpManager {
     type Error = ConnectionError;
 
     async fn create(&self) -> Result<ReadyBackendConnection, ConnectionError> {
-        let mut stream = self.create_optimized_stream().await?;
-        let mut buffer = [0u8; 4096];
+        tokio::time::timeout(crate::constants::timeout::CONNECTION, async {
+            let mut stream = self.create_optimized_stream().await?;
+            let mut buffer = [0u8; 4096];
 
-        self.consume_greeting(&mut stream, &mut buffer).await?;
-        self.negotiate_auth(&mut stream, &mut buffer).await?;
+            self.consume_greeting(&mut stream, &mut buffer).await?;
+            self.negotiate_auth(&mut stream, &mut buffer).await?;
 
-        if self.send_mode_reader {
-            self.negotiate_mode_reader(&mut stream, &mut buffer).await?;
-        }
+            if self.send_mode_reader {
+                self.negotiate_mode_reader(&mut stream, &mut buffer).await?;
+            }
 
-        if self.negotiate_compression(&mut stream, &mut buffer).await? {
-            let level = self.compression.level;
-            stream = stream.into_compressed(level)?;
-        }
+            if self.negotiate_compression(&mut stream, &mut buffer).await? {
+                let level = self.compression.level;
+                stream = stream.into_compressed(level)?;
+            }
 
-        Ok(ReadyBackendConnection::new(stream))
+            Ok(ReadyBackendConnection::new(stream))
+        })
+        .await
+        .map_err(|_| {
+            ConnectionError::IoError(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!("Backend '{}' connection setup timed out", self.name),
+            ))
+        })?
     }
 
     async fn recycle(
@@ -841,6 +798,83 @@ mod tests {
     use std::sync::atomic::Ordering;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn cancelled_compression_probe_allows_the_next_connection_to_probe() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let manager = TcpManager::new(
+            addr.ip().to_string(),
+            addr.port(),
+            "cancelled-probe".into(),
+            TcpManagerOptions::default(),
+        )
+        .unwrap();
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let mut stream = ConnectionStream::plain(tcp);
+        let mut buffer = [0; 128];
+        let mut probe = Box::pin(manager.negotiate_compression(&mut stream, &mut buffer));
+        let mut command = [0; 18];
+        tokio::select! {
+            result = peer.read_exact(&mut command) => { result.unwrap(); },
+            result = &mut probe => panic!("probe completed without reply: {result:?}"),
+        }
+        assert_eq!(&command, crate::protocol::COMPRESS_DEFLATE);
+        // Dropping the scope containing the pinned future cancels its ownership.
+        drop(probe);
+        drop(stream);
+        drop(peer);
+        let tcp = TcpStream::connect(addr).await.unwrap();
+        let (mut peer, _) = listener.accept().await.unwrap();
+        let reply = tokio::spawn(async move {
+            let mut command = [0; 18];
+            peer.read_exact(&mut command).await.unwrap();
+            peer.write_all(b"500 unsupported\r\n").await.unwrap();
+        });
+        let mut stream = ConnectionStream::plain(tcp);
+        let mut buffer = [0; 128];
+        assert!(
+            !tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                manager.negotiate_compression(&mut stream, &mut buffer)
+            )
+            .await
+            .expect("cancelled probe stranded shared initialization")
+            .unwrap()
+        );
+        reply.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn backend_setup_has_a_deadline_when_greeting_stalls() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let manager = TcpManager::new(
+            addr.ip().to_string(),
+            addr.port(),
+            "stalled".into(),
+            TcpManagerOptions {
+                compress: Some(false),
+                ..TcpManagerOptions::default()
+            },
+        )
+        .unwrap();
+        let create = managed::Manager::create(&manager);
+        tokio::pin!(create);
+        let (socket, _) = tokio::select! {
+            accepted = listener.accept() => accepted.unwrap(),
+            result = &mut create => panic!("setup completed before greeting: {result:?}"),
+        };
+        tokio::time::pause();
+        let result = tokio::time::timeout(crate::constants::timeout::CONNECTION * 2, &mut create)
+            .await
+            .expect("backend setup did not enforce its deadline");
+        assert!(
+            matches!(result, Err(ConnectionError::IoError(error)) if error.kind() == std::io::ErrorKind::TimedOut)
+        );
+        drop(socket);
+    }
 
     #[test]
     fn test_socket_buffer_size_u32_rejects_oversized_values() {

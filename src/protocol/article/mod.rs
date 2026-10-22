@@ -412,13 +412,14 @@ impl<'a> Article<'a> {
 
         output.clear();
 
-        // Skip the =ybegin line, strip trailing CRs, stop at =yend/=ypart,
+        // Skip metadata, strip trailing CRs, stop at =yend,
         // and decode each line into the output buffer.
         for byte in body
             .split(|&b| b == b'\n')
             .skip(1) // Skip =ybegin line
             .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
-            .take_while(|line| !line.starts_with(b"=yend") && !line.starts_with(b"=ypart"))
+            .skip_while(|line| line.starts_with(b"=ypart "))
+            .take_while(|line| !line.starts_with(b"=yend "))
             .flat_map(yenc::decode_yenc_line)
         {
             output.push(byte);
@@ -501,6 +502,23 @@ fn find_blank_line(buf: &[u8], start: usize) -> Result<usize, ParseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multipart_yenc_preserves_escaped_and_dot_stuffed_data() {
+        let wire = b"222 0 <sample@example.com> body\r\n=ybegin part=1 total=2 line=128 size=4 name=sample.bin\r\n=ypart begin=1 end=2\r\n..=@\r\n=yend size=2 part=1\r\n";
+        let article = Article::parse(wire, true).unwrap();
+        assert_eq!(article.decode().unwrap(), [4, 214]);
+    }
+
+    #[test]
+    fn multipart_yenc_decodes_after_part_header() {
+        let wire = b"222 0 <sample@example.com> body follows\r\n=ybegin part=1 total=2 line=128 size=12 name=sample.bin\r\n=ypart begin=1 end=6\r\nklmnop\r\n=yend size=6 part=1\r\n";
+        let article = Article::parse(wire, false).unwrap();
+        assert_eq!(article.decode().unwrap(), b"ABCDEF");
+        let mut output = vec![0xff; 100];
+        assert!(article.decode_into(&mut output));
+        assert_eq!(output, b"ABCDEF");
+    }
 
     #[test]
     fn test_parse_status_code() {

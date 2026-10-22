@@ -807,7 +807,7 @@ async fn spawn_tiered_backend_on_host(
     backend: MockNntpServer,
     host: &str,
 ) -> Result<(u16, AbortHandle)> {
-    let listener = TcpListener::bind(format!("{host}:0")).await?;
+    let listener = TcpListener::bind((host, 0)).await?;
     let port = listener.local_addr()?.port();
     Ok((port, backend.spawn_on_listener(listener)))
 }
@@ -893,14 +893,19 @@ async fn test_tier_0_exhaustion_before_escalation() -> Result<()> {
                 "ARTICLE",
                 "220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody from backend 2\r\n.\r\n",
             ),
-        "127.0.0.2",
+        &independent_provider_host(2),
     )
     .await?;
 
     let proxy_port = start_tiered_proxy(vec![
         build_tiered_server("127.0.0.1", backend_0_port, "Backend-0-Tier-0", 0)?,
         build_tiered_server("localhost", backend_1_port, "Backend-1-Tier-0", 0)?,
-        build_tiered_server("127.0.0.2", backend_2_port, "Backend-2-Tier-1", 1)?,
+        build_tiered_server(
+            &independent_provider_host(2),
+            backend_2_port,
+            "Backend-2-Tier-1",
+            1,
+        )?,
     ])
     .await?;
     let mut client = connect_tiered_client(proxy_port).await?;
@@ -964,14 +969,19 @@ async fn test_tier_exhaustion_multi_tier() -> Result<()> {
                 "ARTICLE",
                 "220 0 <test@example.com>\r\nSubject: Test\r\n\r\nBody from tier 1\r\n.\r\n", // Backend 2 has it
             ),
-        "127.0.0.2",
+        &independent_provider_host(2),
     )
     .await?;
 
     let proxy_port = start_tiered_proxy(vec![
         build_tiered_server("127.0.0.1", backend_0_port, "Backend-0-Tier-0", 0)?,
         build_tiered_server("localhost", backend_1_port, "Backend-1-Tier-0", 0)?,
-        build_tiered_server("127.0.0.2", backend_2_port, "Backend-2-Tier-1", 1)?,
+        build_tiered_server(
+            &independent_provider_host(2),
+            backend_2_port,
+            "Backend-2-Tier-1",
+            1,
+        )?,
     ])
     .await?;
     let mut client = connect_tiered_client(proxy_port).await?;
