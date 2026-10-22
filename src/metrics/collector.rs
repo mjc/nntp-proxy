@@ -19,7 +19,7 @@ use std::time::Instant;
 /// Backend metrics wrapper: live gauges only
 ///
 /// Live gauges (`active_connections`, `health_status`) are ephemeral.
-/// Cumulative counters are stored in `MetricsStore.backend_stores`[idx].
+/// Cumulative counters are stored in `MetricsStore.backend_stores[idx]`.
 #[derive(Debug)]
 struct BackendMetrics {
     active_connections: AtomicUsize,
