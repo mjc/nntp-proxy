@@ -2585,7 +2585,10 @@ pub(super) mod scanner_experiment {
             .map(|start| offset + start)
     }
 
-    fn find_or<const WIDTH: usize>(data: &[u8]) -> Option<usize> {
+    fn find_or<const WIDTH: usize>(
+        data: &[u8],
+        verify: impl Fn(&[u8]) -> Option<usize>,
+    ) -> Option<usize> {
         let mut offset = 0;
         while data.len() - offset >= WIDTH + 4 {
             let block = &data[offset..offset + WIDTH + 4];
@@ -2595,7 +2598,7 @@ pub(super) mod scanner_experiment {
                 // rejected by the full verifier before a match is returned.
                 possible |= (block[lane] | block[lane + 3]) == b'\r';
             }
-            if possible && let Some(lane) = first_match(block) {
+            if possible && let Some(lane) = verify(block) {
                 return Some(offset + lane);
             }
             offset += WIDTH;
@@ -2622,6 +2625,25 @@ pub(super) mod scanner_experiment {
             .map(|start| data.len() - remaining.len() + start)
     }
 
+    // yEnc may satisfy the OR predicate without either byte being CR. Keep
+    // those candidates in SIMD before calling the full five-byte verifier.
+    #[inline(never)]
+    fn exact_pair_match<const WIDTH: usize>(block: &[u8]) -> Option<usize> {
+        let mut possible = false;
+        for lane in 0..WIDTH {
+            possible |= (block[lane] == b'\r') & (block[lane + 3] == b'\r');
+        }
+        if possible { first_match(block) } else { None }
+    }
+
+    pub fn benchmark_cr_or_verified_128(data: &[u8]) -> (usize, usize) {
+        scan(data, |data| find_or::<128>(data, exact_pair_match::<128>))
+    }
+
+    pub fn benchmark_cr_or_verified_256(data: &[u8]) -> (usize, usize) {
+        scan(data, |data| find_or::<256>(data, exact_pair_match::<256>))
+    }
+
     pub fn benchmark_cr_or_cursor_128(data: &[u8]) -> (usize, usize) {
         scan(data, find_or_cursor::<128, 132>)
     }
@@ -2631,11 +2653,11 @@ pub(super) mod scanner_experiment {
     }
 
     pub fn benchmark_cr_or_128(data: &[u8]) -> (usize, usize) {
-        scan(data, find_or::<128>)
+        scan(data, |data| find_or::<128>(data, first_match))
     }
 
     pub fn benchmark_cr_or_256(data: &[u8]) -> (usize, usize) {
-        scan(data, find_or::<256>)
+        scan(data, |data| find_or::<256>(data, first_match))
     }
 
     pub fn benchmark_cr_dot_64(data: &[u8]) -> (usize, usize) {
@@ -2668,9 +2690,27 @@ pub(super) mod scanner_experiment {
 
         fn check(data: &[u8]) {
             let expected = TERMINATOR_FINDER.find(data);
+            assert_eq!(
+                find_or::<128>(data, exact_pair_match::<128>),
+                expected,
+                "verified OR128: {data:?}"
+            );
+            assert_eq!(
+                find_or::<256>(data, exact_pair_match::<256>),
+                expected,
+                "verified OR256: {data:?}"
+            );
             assert_eq!(find_pair::<64>(data), expected, "CR/dot: {data:?}");
-            assert_eq!(find_or::<128>(data), expected, "CR OR128: {data:?}");
-            assert_eq!(find_or::<256>(data), expected, "CR OR256: {data:?}");
+            assert_eq!(
+                find_or::<128>(data, first_match),
+                expected,
+                "CR OR128: {data:?}"
+            );
+            assert_eq!(
+                find_or::<256>(data, first_match),
+                expected,
+                "CR OR256: {data:?}"
+            );
             assert_eq!(
                 find_repeat::<256, 0, b'\r'>(data),
                 expected,
@@ -2766,6 +2806,14 @@ pub(super) mod scanner_experiment {
                 assert_eq!(benchmark_cr_pair_256(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_or_128(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_or_256(input.bytes()), input.expected());
+                assert_eq!(
+                    benchmark_cr_or_verified_128(input.bytes()),
+                    input.expected()
+                );
+                assert_eq!(
+                    benchmark_cr_or_verified_256(input.bytes()),
+                    input.expected()
+                );
                 assert_eq!(benchmark_cr_or_cursor_128(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_or_cursor_256(input.bytes()), input.expected());
                 assert_eq!(benchmark_lf_pair_64(input.bytes()), input.expected());
