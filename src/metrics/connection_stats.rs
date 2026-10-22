@@ -252,6 +252,60 @@ impl ConnectionStatsAggregator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    #[derive(Clone, Debug)]
+    enum SessionEvent {
+        Open(usize),
+        Close(usize),
+        Flush,
+    }
+
+    proptest! {
+        #[test]
+        fn prop_session_events_match_registered_connections(
+            events in prop::collection::vec((prop_oneof![
+                (0usize..8).prop_map(SessionEvent::Open),
+                (0usize..8).prop_map(SessionEvent::Close),
+                Just(SessionEvent::Flush),
+            ], any::<bool>()), 0..200),
+        ) {
+            let aggregator = ConnectionStatsAggregator::new();
+            let cloned = aggregator.clone();
+            let ids: [ClientId; 8] = std::array::from_fn(|_| ClientId::new());
+            let usernames: [String; 8] = std::array::from_fn(|index| format!("user{index}"));
+            let mut active = std::collections::BTreeSet::new();
+            let mut opened = [0u64; 8];
+            let mut closed = [0u64; 8];
+            for (event, use_clone) in events {
+                // Explicit flush events control the model's aggregation windows.
+                *aggregator.last_flush.lock().unwrap() = Instant::now();
+                let actor = if use_clone { &cloned } else { &aggregator };
+                match event {
+                    SessionEvent::Open(index) => {
+                        actor.record_session_connection(ids[index], Some(&usernames[index]), "hybrid");
+                        if active.insert(index) { opened[index] += 1; }
+                    }
+                    SessionEvent::Close(index) => {
+                        actor.record_session_disconnection(ids[index], Some(&usernames[index]), "hybrid");
+                        if active.remove(&index) { closed[index] += 1; }
+                    }
+                    SessionEvent::Flush => {
+                        actor.flush();
+                        opened.fill(0);
+                        closed.fill(0);
+                    }
+                }
+                prop_assert_eq!(aggregator.tracked_session_count(), active.len());
+                for index in 0..8 {
+                    prop_assert_eq!(aggregator.connection_count(&usernames[index]).unwrap_or(0), opened[index]);
+                    let disconnects = aggregator.disconnection_stats.get(&usernames[index])
+                        .map_or(0, |stats| stats.get_count());
+                    prop_assert_eq!(disconnects, closed[index]);
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_user_connection_stats_new() {

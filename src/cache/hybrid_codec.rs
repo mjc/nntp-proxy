@@ -819,6 +819,7 @@ mod tests {
     use super::*;
     use crate::protocol::RequestKind;
     use futures::executor::block_on;
+    use proptest::prelude::*;
 
     fn assert_entry_eq(original: &DiskCachedArticle, decoded: &DiskCachedArticle) {
         assert_eq!(original.status_code, decoded.status_code);
@@ -843,6 +844,29 @@ mod tests {
     // =========================================================================
     // CacheableStatusCode enum tests
     // =========================================================================
+
+    proptest! {
+        #[test]
+        fn prop_hybrid_positive_tiers_preserve_negative_fact_lifetimes(
+            observations in prop::collection::vec((any::<bool>(), any::<bool>()), 0..=crate::cache::MAX_BACKENDS),
+            tiers in prop::collection::vec(any::<u8>(), 1..16),
+        ) {
+            let mut entry = disk_cached_article_from_ingest_bytes(b"430 missing\r\n").unwrap();
+            for (index, &(missing, fresh)) in observations.iter().enumerate() {
+                if missing {
+                    entry.record_availability_missing(AvailabilitySlot::new(index).unwrap());
+                    entry.negative_timestamps[index] = ttl::CacheTimestampMillis::new(if fresh { u64::MAX } else { 0 });
+                }
+            }
+            for tier in tiers {
+                entry.record_backend_has_status(CacheableStatusCode::Head, tier.into());
+                entry.expire_stale_availability(ttl::CacheTtlMillis::new(300_000));
+                for (index, &(missing, fresh)) in observations.iter().enumerate() {
+                    prop_assert_eq!(!entry.should_try_slot(AvailabilitySlot::new(index).unwrap()), missing && fresh);
+                }
+            }
+        }
+    }
 
     #[test]
     fn higher_tier_positive_does_not_extend_a_negative_observation() {

@@ -1506,6 +1506,7 @@ pub struct CacheStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn provider_mask(count: usize) -> AvailabilityMask {
         let slots = (0..count)
@@ -1592,6 +1593,45 @@ mod tests {
                 "serve decision for {request_kind:?}"
             );
         });
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(128))]
+        #[test]
+        fn prop_positive_updates_preserve_independent_negative_expiry(
+            observations in prop::collection::vec((any::<bool>(), any::<bool>()), 0..super::super::MAX_BACKENDS),
+            updates in prop::collection::vec((0u8..3, 0u8..8), 1..16),
+        ) {
+            let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
+            let message = MessageId::from_borrowed("<property@example.com>").unwrap();
+            let mut entry = CachedArticle::missing(0.into());
+            for (index, &(missing, fresh)) in observations.iter().enumerate() {
+                if missing {
+                    entry.record_availability_missing(AvailabilitySlot::new(index).unwrap());
+                    entry.negative_timestamps.last_mut().unwrap().1 = ttl::CacheTimestampMillis::new(if fresh { u64::MAX } else { 0 });
+                }
+            }
+            let positive_slot = AvailabilitySlot::new(super::super::MAX_BACKENDS - 1).unwrap();
+            block_on(async {
+                cache.insert(message.clone(), entry).await;
+                for (kind, tier) in updates {
+                    match kind {
+                        0 => cache.record_has_status_for_slot(message.clone(), StatusCode::new(221), positive_slot, tier.into()).await,
+                        1 => cache.record_stat_for_slot(message.clone(), positive_slot, tier.into()).await,
+                        _ => cache.upsert_cached_entry_for_slot(message.clone(), CachedArticle::from_parts(
+                            StatusCode::new(222), CachedPayload::Body { article_number: None, body: Arc::from(b"body".as_slice()) },
+                            ArticleAvailability::new(), tier.into(), ttl::now_millis(),
+                        ), positive_slot).await,
+                    }
+                    let retrieved = cache.get(&message).await.unwrap();
+                    for (index, &(missing, fresh)) in observations.iter().enumerate() {
+                        prop_assert_eq!(retrieved.availability().is_missing_slot(AvailabilitySlot::new(index).unwrap()), missing && fresh);
+                    }
+                    prop_assert!(retrieved.should_try_slot(positive_slot));
+                }
+                Ok(())
+            })?;
+        }
     }
 
     #[tokio::test]

@@ -278,6 +278,70 @@ impl<T> Pipe for T {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
+
+    fn encode_wire_yenc_line(data: &[u8]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        for byte in data {
+            let encoded = byte.wrapping_add(42);
+            if [0, 10, 13, b'='].contains(&encoded) {
+                wire.extend_from_slice(&[b'=', encoded.wrapping_add(64)]);
+            } else {
+                wire.push(encoded);
+            }
+        }
+        if wire.first() == Some(&b'.') {
+            wire.insert(0, b'.');
+        }
+        wire
+    }
+
+    proptest! {
+        #[test]
+        fn prop_yenc_roundtrip_preserves_arbitrary_bytes(
+            leading_dots in 0usize..5,
+            payload in prop::collection::vec(any::<u8>(), 0..1024),
+        ) {
+            let mut plain = vec![4; leading_dots];
+            plain.extend(payload);
+            prop_assert_eq!(decode_yenc_line(&encode_wire_yenc_line(&plain)), plain);
+        }
+
+        #[test]
+        fn prop_multipart_yenc_roundtrip_validates_part_checksum(
+            payload in prop::collection::vec(any::<u8>(), 1..512),
+            prefix_len in 0usize..1024,
+            suffix_len in 0usize..1024,
+        ) {
+            let suffix_len = suffix_len.max(usize::from(prefix_len == 0));
+            let part = if prefix_len == 0 { 1 } else { 2 };
+            let total = part + usize::from(suffix_len != 0);
+            let mut body = format!(
+                "=ybegin part={part} total={total} line=128 size={} name=property.bin\r\n=ypart begin={} end={}\r\n",
+                prefix_len + payload.len() + suffix_len,
+                prefix_len + 1, prefix_len + payload.len(),
+            ).into_bytes();
+            // Escaping can double a line's length, so 64 decoded bytes fit line=128.
+            for line in payload.chunks(64) {
+                body.extend(encode_wire_yenc_line(line));
+                body.extend_from_slice(b"\r\n");
+            }
+            let crc = crc32fast::hash(&payload);
+            let footer = format!("=yend size={} part={part} pcrc32={crc:08x}\r\n", payload.len());
+            let mut valid = body.clone();
+            valid.extend_from_slice(footer.as_bytes());
+            prop_assert!(validate_yenc_structure(&valid).is_ok());
+            let mut response = b"222 0 <property@example.com> body\r\n".to_vec();
+            response.extend(valid);
+            let article = super::super::Article::parse(&response, true).unwrap();
+            let decoded = article.decode().unwrap();
+            prop_assert_eq!(&decoded, &payload);
+
+            let wrong_crc = crc ^ 1;
+            body.extend_from_slice(format!("=yend size={} part={part} pcrc32={wrong_crc:08x}\r\n", payload.len()).as_bytes());
+            prop_assert!(validate_yenc_structure(&body).is_err());
+        }
+    }
 
     #[test]
     fn multipart_yenc_validates_part_sizes_and_checksums() {
