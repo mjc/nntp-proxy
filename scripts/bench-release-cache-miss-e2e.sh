@@ -28,7 +28,6 @@ NNTPBENCH_BIN=${NNTPBENCH_BIN:-"$NNTPBENCH_OUT_LINK/bin/nntpbench"}
 NNTPBENCH_ARTICLE_BYTES=${NNTPBENCH_ARTICLE_BYTES:-786432}
 NNTPBENCH_BODY_BYTES=${NNTPBENCH_BODY_BYTES:-$NNTPBENCH_ARTICLE_BYTES}
 NNTPBENCH_MAX_CONNECTIONS=${NNTPBENCH_MAX_CONNECTIONS:-4096}
-NNTPBENCH_SERVER_THREADS=${NNTPBENCH_SERVER_THREADS:-1}
 NNTPBENCH_MAX_PIPELINE_DEPTH=${NNTPBENCH_MAX_PIPELINE_DEPTH:-1024}
 NNTPBENCH_START_ID=${NNTPBENCH_START_ID:-1}
 # Optional indexed corpus: an empty directory makes every article return 430,
@@ -362,7 +361,6 @@ start_upstream() {
         --body-bytes "$NNTPBENCH_BODY_BYTES"
         --article-bytes "$NNTPBENCH_ARTICLE_BYTES"
         --max-connections "$NNTPBENCH_MAX_CONNECTIONS"
-        --threads "$NNTPBENCH_SERVER_THREADS"
         --max-pipeline-depth "$NNTPBENCH_MAX_PIPELINE_DEPTH"
         --socket-recv-buffer "$UPSTREAM_SOCKET_RECV_BUFFER"
         --socket-send-buffer "$UPSTREAM_SOCKET_SEND_BUFFER"
@@ -380,7 +378,7 @@ start_upstream() {
 
     wait_for_port "$HOST" "$UPSTREAM_PORT" 60
     echo "Using nntpbench backend on $HOST:$UPSTREAM_PORT"
-    echo "nntpbench_article_bytes=$NNTPBENCH_ARTICLE_BYTES nntpbench_server_threads=$NNTPBENCH_SERVER_THREADS nntpbench_max_connections=$NNTPBENCH_MAX_CONNECTIONS nntpbench_max_pipeline_depth=$NNTPBENCH_MAX_PIPELINE_DEPTH"
+    echo "nntpbench_article_bytes=$NNTPBENCH_ARTICLE_BYTES nntpbench_max_connections=$NNTPBENCH_MAX_CONNECTIONS nntpbench_max_pipeline_depth=$NNTPBENCH_MAX_PIPELINE_DEPTH"
 }
 
 stop_measured_processes() {
