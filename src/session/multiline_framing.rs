@@ -2547,25 +2547,25 @@ pub(super) mod scanner_experiment {
             .position(|bytes| bytes == TERMINATOR)
     }
 
-    // Like the BCJ2 encoder's marker mask, retain lane positions instead of
-    // reducing to a boolean and rescanning the matching half.
+    // Preserve candidate lanes as bytes so LLVM can retain both contiguous
+    // vector loads before the caller extracts their positions.
     #[inline(never)]
-    fn first_mask(window: &[u8; 20]) -> u16 {
-        let mut mask = 0u16;
+    fn candidate_lanes(window: &[u8; 20]) -> [u8; 16] {
+        let mut lanes = [0u8; 16];
         for lane in 0..16 {
-            let matched = (window[lane] == b'\r') & (window[lane + 3] == b'\r');
-            mask |= u16::from(matched) << lane;
+            lanes[lane] = u8::from((window[lane] == b'\r') & (window[lane + 3] == b'\r'));
         }
-        mask
+        lanes
     }
 
     #[inline(never)]
     fn first_match_mask(block: &[u8]) -> Option<usize> {
         let mut remaining = block;
         while let Some(window) = remaining.first_chunk::<20>() {
-            let mut mask = first_mask(window);
+            // One low bit per byte avoids packing lane bits into a u16.
+            let mut mask = u128::from_le_bytes(candidate_lanes(window));
             while mask != 0 {
-                let lane = mask.trailing_zeros() as usize;
+                let lane = mask.trailing_zeros() as usize / 8;
                 if window[lane..lane + TERMINATOR.len()] == *TERMINATOR {
                     return Some(block.len() - remaining.len() + lane);
                 }
