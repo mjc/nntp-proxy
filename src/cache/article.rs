@@ -456,13 +456,11 @@ impl CachedArticle {
         backend_availability: ArticleAvailability,
         tier: ttl::CacheTier,
         inserted_at: u64,
+        negative_timestamps: Vec<(AvailabilitySlot, ttl::CacheTimestampMillis)>,
     ) -> Self {
         Self {
             backend_availability,
-            negative_timestamps: Self::negative_timestamps_for_bits(
-                backend_availability.missing_bits(),
-                ttl::CacheTimestampMillis::new(inserted_at),
-            ),
+            negative_timestamps,
             status_code,
             payload,
             tier,
@@ -1598,6 +1596,40 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
         #[test]
+        fn prop_disk_conversion_preserves_negative_observation_times(
+            observations in prop::collection::vec((any::<bool>(), any::<bool>()), 0..=super::super::MAX_BACKENDS),
+            tier in any::<u8>(),
+        ) {
+            use foyer::Code;
+            use super::super::hybrid_codec::{CacheableStatusCode, DiskCachedArticle};
+
+            let mut disk = DiskCachedArticle::missing(0.into());
+            let mut timestamps = [ttl::CacheTimestampMillis::new(0); super::super::MAX_BACKENDS];
+            let mut expected = Vec::new();
+            for (index, &(missing, fresh)) in observations.iter().enumerate() {
+                if missing {
+                    let slot = AvailabilitySlot::new(index).unwrap();
+                    disk.record_availability_missing(slot);
+                    timestamps[index] = ttl::CacheTimestampMillis::new(if fresh { u64::MAX } else { 0 });
+                    expected.push((slot, timestamps[index]));
+                }
+            }
+            disk.set_negative_timestamps(timestamps);
+            disk.record_backend_has_status(CacheableStatusCode::Stat, tier.into());
+            let mut encoded = Vec::new();
+            disk.encode(&mut encoded).unwrap();
+            let decoded = DiskCachedArticle::decode(&mut encoded.as_slice()).unwrap();
+            let mut converted = decoded.into_cached_article();
+            prop_assert_eq!(&converted.negative_timestamps, &expected);
+            prop_assert_eq!(converted.status_code, StatusCode::new(223));
+            prop_assert_eq!(converted.tier.get(), tier);
+            converted.expire_stale_availability(ttl::CacheTtlMillis::new(300_000));
+            for (index, &(missing, fresh)) in observations.iter().enumerate() {
+                prop_assert_eq!(converted.availability().is_missing_slot(AvailabilitySlot::new(index).unwrap()), missing && fresh);
+            }
+        }
+
+        #[test]
         fn prop_positive_updates_preserve_independent_negative_expiry(
             observations in prop::collection::vec((any::<bool>(), any::<bool>()), 0..super::super::MAX_BACKENDS),
             updates in prop::collection::vec((0u8..3, 0u8..8), 1..16),
@@ -1620,7 +1652,7 @@ mod tests {
                         1 => cache.record_stat_for_slot(message.clone(), positive_slot, tier.into()).await,
                         _ => cache.upsert_cached_entry_for_slot(message.clone(), CachedArticle::from_parts(
                             StatusCode::new(222), CachedPayload::Body { article_number: None, body: Arc::from(b"body".as_slice()) },
-                            ArticleAvailability::new(), tier.into(), ttl::now_millis(),
+                            ArticleAvailability::new(), tier.into(), ttl::now_millis(), Vec::new(),
                         ), positive_slot).await,
                     }
                     let retrieved = cache.get(&message).await.unwrap();
@@ -1677,6 +1709,7 @@ mod tests {
                                 ArticleAvailability::new(),
                                 0.into(),
                                 ttl::now_millis(),
+                                Vec::new(),
                             ),
                             positive_slot,
                         )
@@ -1967,6 +2000,7 @@ mod tests {
             availability,
             tier,
             inserted_at,
+            Vec::new(),
         );
         let body = CachedArticle::from_parts(
             StatusCode::new(222),
@@ -1977,6 +2011,7 @@ mod tests {
             availability,
             tier,
             inserted_at,
+            Vec::new(),
         );
         let slot = cache.availability_slot(backend);
 

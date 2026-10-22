@@ -619,6 +619,16 @@ impl DiskCachedArticle {
             self.availability,
             self.tier,
             self.timestamp.get(),
+            self.negative_timestamps
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, timestamp)| {
+                    let slot = AvailabilitySlot::new(index)?;
+                    self.availability
+                        .is_missing_slot(slot)
+                        .then_some((slot, timestamp))
+                })
+                .collect(),
         )
     }
 
