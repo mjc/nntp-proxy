@@ -719,7 +719,11 @@ impl DiskCachedArticle {
                 continue;
             };
             if self.availability.is_missing_slot(slot)
-                && ttl::is_expired(self.negative_timestamps[index], base_ttl, self.tier)
+                && ttl::is_expired(
+                    self.negative_timestamps[index],
+                    base_ttl,
+                    ttl::CacheTier::new(0),
+                )
             {
                 missing_bits &= !slot.bit();
                 self.negative_timestamps[index] = ttl::CacheTimestampMillis::new(0);
@@ -839,6 +843,18 @@ mod tests {
     // =========================================================================
     // CacheableStatusCode enum tests
     // =========================================================================
+
+    #[test]
+    fn higher_tier_positive_does_not_extend_a_negative_observation() {
+        let mut entry = disk_cached_article_from_ingest_bytes(b"430 missing\r\n").unwrap();
+        let slot = AvailabilitySlot::new(0).unwrap();
+        entry.record_availability_missing(slot);
+        entry.negative_timestamps[0] =
+            ttl::CacheTimestampMillis::new(ttl::now_millis().saturating_sub(2000));
+        entry.record_backend_has_status(CacheableStatusCode::Head, ttl::CacheTier::new(3));
+        entry.expire_stale_availability(ttl::CacheTtlMillis::new(1000));
+        assert!(entry.should_try_slot(slot));
+    }
 
     #[test]
     fn test_cacheable_status_code_as_u16() {
