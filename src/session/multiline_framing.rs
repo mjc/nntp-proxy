@@ -2510,44 +2510,53 @@ pub(super) mod scanner_experiment {
     }
 
     #[inline(always)]
-    fn repeat_mask<const FIRST: usize, const BYTE: u8>(window: &[u8; 20]) -> u16 {
+    fn byte_mask<const BYTE: u8>(window: &[u8; 16]) -> u16 {
         let mut mask = 0u16;
-        for lane in 0..16 {
-            let candidate = (window[lane + FIRST] == BYTE) & (window[lane + FIRST + 3] == BYTE);
-            mask |= u16::from(candidate) << lane;
+        for (lane, &byte) in window.iter().enumerate() {
+            mask |= u16::from(byte == BYTE) << lane;
         }
         mask
     }
 
     fn find_repeat<const FIRST: usize, const BYTE: u8>(data: &[u8]) -> Option<usize> {
         let mut offset = 0;
-        while data.len() - offset >= 68 {
-            let block = &data[offset..offset + 68];
-            for base in [0, 16, 32, 48] {
-                let window: &[u8; 20] = block[base..base + 20]
-                    .try_into()
-                    .expect("fixed scan window");
-                let mut mask = repeat_mask::<FIRST, BYTE>(window);
-                while mask != 0 {
-                    let lane = mask.trailing_zeros() as usize;
-                    if &window[lane..lane + 5] == TERMINATOR {
-                        return Some(offset + base + lane);
-                    }
-                    mask &= mask - 1;
+        let mut carry = 0u32;
+        while data.len() - offset >= 16 {
+            let window: &[u8; 16] = data[offset..offset + 16]
+                .try_into()
+                .expect("fixed scan window");
+            let mask = byte_mask::<BYTE>(window);
+            // Retaining three comparison bits avoids loading the same bytes
+            // again to check the second occurrence in each pair.
+            let joined = (u32::from(mask) << 3) | carry;
+            let mut candidates = joined & (joined >> 3);
+            while candidates != 0 {
+                let lane = candidates.trailing_zeros() as usize;
+                candidates &= candidates - 1;
+                let Some(start) = (offset + lane).checked_sub(3 + FIRST) else {
+                    continue;
+                };
+                if data
+                    .get(start..)
+                    .is_some_and(|bytes| bytes.starts_with(TERMINATOR))
+                {
+                    return Some(start);
                 }
             }
-            offset += 64;
+            carry = u32::from(mask >> 13);
+            offset += 16;
         }
+        let remaining = offset.saturating_sub(3 + FIRST);
         TERMINATOR_FINDER
-            .find(&data[offset..])
-            .map(|start| offset + start)
+            .find(&data[remaining..])
+            .map(|start| remaining + start)
     }
 
-    pub fn benchmark_auto_cr_pair_64(data: &[u8]) -> (usize, usize) {
+    pub fn benchmark_auto_cr_mask(data: &[u8]) -> (usize, usize) {
         scan(data, find_repeat::<0, b'\r'>)
     }
 
-    pub fn benchmark_auto_lf_pair_64(data: &[u8]) -> (usize, usize) {
+    pub fn benchmark_auto_lf_mask(data: &[u8]) -> (usize, usize) {
         scan(data, find_repeat::<1, b'\n'>)
     }
 
@@ -2595,14 +2604,21 @@ pub(super) mod scanner_experiment {
                 assert_eq!(benchmark_auto_pair_16(input.bytes()), input.expected());
                 assert_eq!(benchmark_auto_pair_32(input.bytes()), input.expected());
                 assert_eq!(benchmark_auto_pair_64(input.bytes()), input.expected());
-                assert_eq!(benchmark_auto_cr_pair_64(input.bytes()), input.expected());
-                assert_eq!(benchmark_auto_lf_pair_64(input.bytes()), input.expected());
+                assert_eq!(benchmark_auto_cr_mask(input.bytes()), input.expected());
+                assert_eq!(benchmark_auto_lf_mask(input.bytes()), input.expected());
             }
         }
 
         proptest::proptest! {
             #[test]
             fn simd_scanners_match_arbitrary_input(data in proptest::collection::vec(proptest::num::u8::ANY, 0..4096)) {
+                check(&data);
+            }
+
+            #[test]
+            fn simd_scanners_match_dense_framing_bytes(data in proptest::collection::vec(
+                proptest::sample::select(vec![b'\r', b'\n', b'.', b'x']), 0..4096
+            )) {
                 check(&data);
             }
         }
