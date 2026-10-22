@@ -2435,42 +2435,6 @@ pub(super) mod scanner_experiment {
         (count, checksum)
     }
 
-    // Bitwise reductions keep the independent lane predicates vectorizable.
-    #[inline(always)]
-    fn exact_16(data: &[u8]) -> bool {
-        let mut found = false;
-        for lane in 0..16 {
-            found |= (data[lane] == b'\r')
-                & (data[lane + 1] == b'\n')
-                & (data[lane + 2] == b'.')
-                & (data[lane + 3] == b'\r')
-                & (data[lane + 4] == b'\n');
-        }
-        found
-    }
-
-    fn find_fixed(data: &[u8]) -> Option<usize> {
-        let mut offset = 0;
-        while data.len() - offset >= 68 {
-            let block = &data[offset..offset + 68];
-            let found = exact_16(block)
-                | exact_16(&block[16..])
-                | exact_16(&block[32..])
-                | exact_16(&block[48..]);
-            if found {
-                return first_match(block).map(|lane| offset + lane);
-            }
-            offset += 64;
-        }
-        TERMINATOR_FINDER
-            .find(&data[offset..])
-            .map(|start| offset + start)
-    }
-
-    pub fn benchmark_fixed_scanner(data: &[u8]) -> (usize, usize) {
-        scan(data, find_fixed)
-    }
-
     // Keep candidate verification out of the vector loop's register allocation.
     #[inline(never)]
     fn first_match(block: &[u8]) -> Option<usize> {
@@ -2497,67 +2461,44 @@ pub(super) mod scanner_experiment {
             .map(|start| offset + start)
     }
 
-    pub fn benchmark_auto_pair_16(data: &[u8]) -> (usize, usize) {
-        scan(data, find_pair::<16>)
+    fn find_repeat<const WIDTH: usize, const FIRST: usize, const BYTE: u8>(
+        data: &[u8],
+    ) -> Option<usize> {
+        let mut offset = 0;
+        while data.len() - offset >= WIDTH + 4 {
+            let block = &data[offset..offset + WIDTH + 4];
+            let mut possible = false;
+            for lane in 0..WIDTH {
+                possible |= (block[lane + FIRST] == BYTE) & (block[lane + FIRST + 3] == BYTE);
+            }
+            if possible && let Some(lane) = first_match(block) {
+                return Some(offset + lane);
+            }
+            offset += WIDTH;
+        }
+        TERMINATOR_FINDER
+            .find(&data[offset..])
+            .map(|start| offset + start)
     }
 
-    pub fn benchmark_auto_pair_32(data: &[u8]) -> (usize, usize) {
-        scan(data, find_pair::<32>)
-    }
-
-    pub fn benchmark_auto_pair_64(data: &[u8]) -> (usize, usize) {
+    pub fn benchmark_cr_dot_64(data: &[u8]) -> (usize, usize) {
         scan(data, find_pair::<64>)
     }
 
-    #[inline(never)]
-    fn byte_mask<const BYTE: u8>(window: &[u8; 16]) -> u16 {
-        let mut mask = 0u16;
-        for (lane, &byte) in window.iter().enumerate() {
-            mask |= u16::from(byte == BYTE) << lane;
-        }
-        mask
+    pub fn benchmark_cr_pair_64(data: &[u8]) -> (usize, usize) {
+        scan(data, find_repeat::<64, 0, b'\r'>)
     }
 
-    fn find_repeat<const FIRST: usize, const BYTE: u8>(data: &[u8]) -> Option<usize> {
-        let mut offset = 0;
-        let mut carry = 0u32;
-        while data.len() - offset >= 16 {
-            let window: &[u8; 16] = data[offset..offset + 16]
-                .try_into()
-                .expect("fixed scan window");
-            let mask = byte_mask::<BYTE>(window);
-            // Retaining three comparison bits avoids loading the same bytes
-            // again to check the second occurrence in each pair.
-            let joined = (u32::from(mask) << 3) | carry;
-            let mut candidates = joined & (joined >> 3);
-            while candidates != 0 {
-                let lane = candidates.trailing_zeros() as usize;
-                candidates &= candidates - 1;
-                let Some(start) = (offset + lane).checked_sub(3 + FIRST) else {
-                    continue;
-                };
-                if data
-                    .get(start..)
-                    .is_some_and(|bytes| bytes.starts_with(TERMINATOR))
-                {
-                    return Some(start);
-                }
-            }
-            carry = u32::from(mask >> 13);
-            offset += 16;
-        }
-        let remaining = offset.saturating_sub(3 + FIRST);
-        TERMINATOR_FINDER
-            .find(&data[remaining..])
-            .map(|start| remaining + start)
+    pub fn benchmark_cr_pair_128(data: &[u8]) -> (usize, usize) {
+        scan(data, find_repeat::<128, 0, b'\r'>)
     }
 
-    pub fn benchmark_auto_cr_mask(data: &[u8]) -> (usize, usize) {
-        scan(data, find_repeat::<0, b'\r'>)
+    pub fn benchmark_lf_pair_64(data: &[u8]) -> (usize, usize) {
+        scan(data, find_repeat::<64, 1, b'\n'>)
     }
 
-    pub fn benchmark_auto_lf_mask(data: &[u8]) -> (usize, usize) {
-        scan(data, find_repeat::<1, b'\n'>)
+    pub fn benchmark_lf_pair_128(data: &[u8]) -> (usize, usize) {
+        scan(data, find_repeat::<128, 1, b'\n'>)
     }
 
     #[cfg(test)]
@@ -2566,12 +2507,27 @@ pub(super) mod scanner_experiment {
 
         fn check(data: &[u8]) {
             let expected = TERMINATOR_FINDER.find(data);
-            assert_eq!(find_fixed(data), expected, "fixed: {data:?}");
-            assert_eq!(find_pair::<16>(data), expected, "pair16: {data:?}");
-            assert_eq!(find_pair::<32>(data), expected, "pair32: {data:?}");
-            assert_eq!(find_pair::<64>(data), expected, "pair64: {data:?}");
-            assert_eq!(find_repeat::<0, b'\r'>(data), expected, "cr pair: {data:?}");
-            assert_eq!(find_repeat::<1, b'\n'>(data), expected, "lf pair: {data:?}");
+            assert_eq!(find_pair::<64>(data), expected, "CR/dot: {data:?}");
+            assert_eq!(
+                find_repeat::<64, 0, b'\r'>(data),
+                expected,
+                "CR64: {data:?}"
+            );
+            assert_eq!(
+                find_repeat::<128, 0, b'\r'>(data),
+                expected,
+                "CR128: {data:?}"
+            );
+            assert_eq!(
+                find_repeat::<64, 1, b'\n'>(data),
+                expected,
+                "LF64: {data:?}"
+            );
+            assert_eq!(
+                find_repeat::<128, 1, b'\n'>(data),
+                expected,
+                "LF128: {data:?}"
+            );
         }
 
         #[test]
@@ -2600,12 +2556,11 @@ pub(super) mod scanner_experiment {
             for len in [1, 15, 16, 17, 31, 64, 127, 128, 1024, 65536] {
                 let input = ScannerBenchmarkInput::new(len, 8);
                 assert_eq!(benchmark_memchr_scanner(input.bytes()), input.expected());
-                assert_eq!(benchmark_fixed_scanner(input.bytes()), input.expected());
-                assert_eq!(benchmark_auto_pair_16(input.bytes()), input.expected());
-                assert_eq!(benchmark_auto_pair_32(input.bytes()), input.expected());
-                assert_eq!(benchmark_auto_pair_64(input.bytes()), input.expected());
-                assert_eq!(benchmark_auto_cr_mask(input.bytes()), input.expected());
-                assert_eq!(benchmark_auto_lf_mask(input.bytes()), input.expected());
+                assert_eq!(benchmark_cr_dot_64(input.bytes()), input.expected());
+                assert_eq!(benchmark_cr_pair_64(input.bytes()), input.expected());
+                assert_eq!(benchmark_cr_pair_128(input.bytes()), input.expected());
+                assert_eq!(benchmark_lf_pair_64(input.bytes()), input.expected());
+                assert_eq!(benchmark_lf_pair_128(input.bytes()), input.expected());
             }
         }
 

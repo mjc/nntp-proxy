@@ -178,9 +178,8 @@ mod mode_state;
 pub(crate) mod multiline_framing;
 #[cfg(feature = "framing-bench")]
 pub use multiline_framing::scanner_experiment::{
-    ScannerBenchmarkInput, benchmark_auto_cr_mask, benchmark_auto_lf_mask, benchmark_auto_pair_16,
-    benchmark_auto_pair_32, benchmark_auto_pair_64, benchmark_fixed_scanner,
-    benchmark_memchr_scanner,
+    ScannerBenchmarkInput, benchmark_cr_dot_64, benchmark_cr_pair_64, benchmark_cr_pair_128,
+    benchmark_lf_pair_64, benchmark_lf_pair_128, benchmark_memchr_scanner,
 };
 #[cfg(feature = "framing-bench")]
 pub use multiline_framing::{
