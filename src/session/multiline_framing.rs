@@ -162,6 +162,21 @@ impl CompleteResponseWindow {
     }
 
     fn extend_payload_capture_from(&self, source: &[u8], capture: &mut crate::pool::PooledBuffer) {
+        // A spanning terminator can begin in bytes retained by an earlier read.
+        let retained_terminator_prefix = TERMINATOR
+            .len()
+            .saturating_sub(self.response.len() - self.capture.len());
+        if retained_terminator_prefix != 0 {
+            let retained_len = capture
+                .initialized()
+                .checked_sub(retained_terminator_prefix)
+                .expect("spanning terminator prefix is already captured");
+            if retained_len == 0 {
+                capture.clear();
+            } else {
+                capture.expose_initialized_range_without_copying(0..retained_len);
+            }
+        }
         capture.extend_from_slice(&source[self.capture.clone()]);
     }
 
@@ -3046,6 +3061,28 @@ mod tests {
 
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         crate::stream::ConnectionStream::plain(stream)
+    }
+
+    #[tokio::test]
+    async fn isolated_payload_capture_excludes_terminator_at_every_split() {
+        let response = b"220 Article follows\r\nSubject: test\r\n\r\nbody\r\n.\r\n";
+        let expected = &response[..response.len() - TERMINATOR.len()];
+
+        for split in 0..=response.len() {
+            let pool = make_pool();
+            let mut io_buffer = pool.acquire();
+            io_buffer.copy_from_slice(&response[..split]);
+            let mut capture = pool.acquire_capture();
+            let mut conn = mock_backend_conn(vec![response[split..].to_vec()]).await;
+
+            IsolatedMultilineResponse::begin(&mut conn, &mut io_buffer)
+                .unwrap()
+                .capture_payload_into(&mut capture)
+                .await
+                .unwrap();
+
+            assert_eq!(&capture[..], expected, "split={split}");
+        }
     }
 
     #[tokio::test]

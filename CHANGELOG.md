@@ -44,6 +44,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated `rustls` to 0.23.46, `rustls-webpki` to 0.103.16, and `webpki-roots` to 1.0.10 to address certificate-validation advisories and refresh the bundled CA roots.
 - Increased the hybrid-cache benchmark disk budget to support four active flushers and spare blocks, preventing the fixture from stalling.
 - Preserved backend bytes following a completed response for the next request, including packed single-line and multiline responses.
+- Removed terminator bytes from isolated article captures when the terminator is split across backend reads.
 - Made stateful forwarding cancellation-safe so a client becoming ready cannot cancel an already-started backend write or leave the connection falsely reusable.
 - Corrected explicit stateful sessions so they begin in stateful mode, and deferred hybrid-mode stateful handoff until the handoff succeeds.
 - Client `AUTHINFO` state now changes only after its protocol response is written successfully, so a failed client write leaves authentication state unchanged.
