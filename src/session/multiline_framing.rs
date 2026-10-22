@@ -2538,6 +2538,31 @@ pub(super) mod scanner_experiment {
             .map(|start| offset + start)
     }
 
+    fn find_or_cursor<const WIDTH: usize, const BLOCK: usize>(data: &[u8]) -> Option<usize> {
+        let mut remaining = data;
+        while let Some(block) = remaining.first_chunk::<BLOCK>() {
+            let mut possible = false;
+            for lane in 0..WIDTH {
+                possible |= (block[lane] | block[lane + 3]) == b'\r';
+            }
+            if possible && let Some(lane) = first_match(block) {
+                return Some(data.len() - remaining.len() + lane);
+            }
+            remaining = &remaining[WIDTH..];
+        }
+        TERMINATOR_FINDER
+            .find(remaining)
+            .map(|start| data.len() - remaining.len() + start)
+    }
+
+    pub fn benchmark_cr_or_cursor_128(data: &[u8]) -> (usize, usize) {
+        scan(data, find_or_cursor::<128, 132>)
+    }
+
+    pub fn benchmark_cr_or_cursor_256(data: &[u8]) -> (usize, usize) {
+        scan(data, find_or_cursor::<256, 260>)
+    }
+
     pub fn benchmark_cr_or_128(data: &[u8]) -> (usize, usize) {
         scan(data, find_or::<128>)
     }
@@ -2575,6 +2600,16 @@ pub(super) mod scanner_experiment {
             assert_eq!(find_pair::<64>(data), expected, "CR/dot: {data:?}");
             assert_eq!(find_or::<128>(data), expected, "CR OR128: {data:?}");
             assert_eq!(find_or::<256>(data), expected, "CR OR256: {data:?}");
+            assert_eq!(
+                find_or_cursor::<128, 132>(data),
+                expected,
+                "CR OR128 cursor: {data:?}"
+            );
+            assert_eq!(
+                find_or_cursor::<256, 260>(data),
+                expected,
+                "CR OR256 cursor: {data:?}"
+            );
             assert_eq!(
                 find_repeat::<64, 0, b'\r'>(data),
                 expected,
@@ -2635,6 +2670,8 @@ pub(super) mod scanner_experiment {
                 assert_eq!(benchmark_cr_pair_128(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_or_128(input.bytes()), input.expected());
                 assert_eq!(benchmark_cr_or_256(input.bytes()), input.expected());
+                assert_eq!(benchmark_cr_or_cursor_128(input.bytes()), input.expected());
+                assert_eq!(benchmark_cr_or_cursor_256(input.bytes()), input.expected());
                 assert_eq!(benchmark_lf_pair_64(input.bytes()), input.expected());
                 assert_eq!(benchmark_lf_pair_128(input.bytes()), input.expected());
             }

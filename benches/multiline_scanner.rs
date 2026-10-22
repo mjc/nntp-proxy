@@ -3,8 +3,8 @@
 use divan::{Bencher, black_box, counter::BytesCount};
 use nntp_proxy::session::{
     ScannerBenchmarkInput, benchmark_cr_dot_64, benchmark_cr_or_128, benchmark_cr_or_256,
-    benchmark_cr_pair_64, benchmark_cr_pair_128, benchmark_lf_pair_64, benchmark_lf_pair_128,
-    benchmark_memchr_scanner,
+    benchmark_cr_or_cursor_128, benchmark_cr_or_cursor_256, benchmark_cr_pair_64,
+    benchmark_cr_pair_128, benchmark_lf_pair_64, benchmark_lf_pair_128, benchmark_memchr_scanner,
 };
 use std::sync::LazyLock;
 
@@ -22,6 +22,8 @@ static INPUTS: LazyLock<[ScannerBenchmarkInput; 4]> = LazyLock::new(|| {
         assert_eq!(benchmark_cr_pair_128(input.bytes()), input.expected());
         assert_eq!(benchmark_cr_or_128(input.bytes()), input.expected());
         assert_eq!(benchmark_cr_or_256(input.bytes()), input.expected());
+        assert_eq!(benchmark_cr_or_cursor_128(input.bytes()), input.expected());
+        assert_eq!(benchmark_cr_or_cursor_256(input.bytes()), input.expected());
         assert_eq!(benchmark_lf_pair_64(input.bytes()), input.expected());
         assert_eq!(benchmark_lf_pair_128(input.bytes()), input.expected());
     }
@@ -96,4 +98,20 @@ fn cr_or_256(bencher: Bencher, input: usize) {
     bencher
         .counter(BytesCount::new(input.bytes().len()))
         .bench(|| black_box(benchmark_cr_or_256(black_box(input.bytes()))));
+}
+
+#[divan::bench(args = [0, 1, 2, 3], sample_count = 200, sample_size = 1)]
+fn cr_or_cursor_128(bencher: Bencher, input: usize) {
+    let input = &INPUTS[input];
+    bencher
+        .counter(BytesCount::new(input.bytes().len()))
+        .bench(|| black_box(benchmark_cr_or_cursor_128(black_box(input.bytes()))));
+}
+
+#[divan::bench(args = [0, 1, 2, 3], sample_count = 200, sample_size = 1)]
+fn cr_or_cursor_256(bencher: Bencher, input: usize) {
+    let input = &INPUTS[input];
+    bencher
+        .counter(BytesCount::new(input.bytes().len()))
+        .bench(|| black_box(benchmark_cr_or_cursor_256(black_box(input.bytes()))));
 }
