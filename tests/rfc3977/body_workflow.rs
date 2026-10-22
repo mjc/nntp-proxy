@@ -172,9 +172,10 @@ async fn write_commands<W>(stream: &mut W, commands: &[&str]) -> Result<()>
 where
     W: AsyncWrite + Unpin,
 {
-    for command in commands {
-        stream.write_all(command.as_bytes()).await?;
-    }
+    // Submit the buffered window together: the fixture backend withholds its
+    // replies until the entire window arrives.
+    let batch = commands.concat();
+    stream.write_all(batch.as_bytes()).await?;
     stream.flush().await?;
     Ok(())
 }
