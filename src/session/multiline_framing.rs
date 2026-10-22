@@ -100,6 +100,8 @@ impl std::ops::AddAssign for ResponseWriteStats {
 enum PackedPendingBytesPolicy {
     Reject,
     AllowIfStatusPrefix,
+    // Tracked replies must leave even malformed next status lines for their request.
+    AllowAnySuffix,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2043,6 +2045,7 @@ impl MultilineFramer {
     ) -> Result<ChunkProgress, FramingError> {
         if let Some(end) = self.find_spanning_terminator(chunk) {
             if end == chunk.len()
+                || matches!(suffix_policy, PackedPendingBytesPolicy::AllowAnySuffix)
                 || matches!(suffix_policy, PackedPendingBytesPolicy::AllowIfStatusPrefix)
                     && plausible_status_prefix(&chunk[end..])
             {
@@ -2062,6 +2065,11 @@ impl MultilineFramer {
             }
 
             match suffix_policy {
+                PackedPendingBytesPolicy::AllowAnySuffix => {
+                    return Ok(ChunkProgress::Complete(CompleteChunk {
+                        consumed: ChunkConsumed(end),
+                    }));
+                }
                 PackedPendingBytesPolicy::Reject => {
                     return Err(FramingError::UnexpectedTrailingResponseBytes);
                 }
@@ -2213,7 +2221,7 @@ impl PendingRequestFrame {
                 self.status_line.clear();
                 match framer.split_chunk(
                     &chunk[end.get()..],
-                    PackedPendingBytesPolicy::AllowIfStatusPrefix,
+                    PackedPendingBytesPolicy::AllowAnySuffix,
                 ) {
                     Ok(ChunkProgress::Complete(complete)) => Some(FramedResponseForRequest {
                         response: BackendChunkRange::new(
@@ -2231,9 +2239,7 @@ impl PendingRequestFrame {
                 }
             }
             PendingRequestFrameState::ReadingMultiline { framer } => {
-                match framer
-                    .split_chunk(offset_bytes, PackedPendingBytesPolicy::AllowIfStatusPrefix)
-                {
+                match framer.split_chunk(offset_bytes, PackedPendingBytesPolicy::AllowAnySuffix) {
                     Ok(ChunkProgress::Complete(complete)) => Some(FramedResponseForRequest {
                         response: BackendChunkRange::new(offset, offset.after(complete.consumed)),
                     }),
@@ -2849,6 +2855,322 @@ mod tests {
             responses.append(&mut generated);
             responses
         })
+    }
+
+    mod adversarial_properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        #[derive(Clone, Debug)]
+        struct Reply {
+            command: &'static [u8],
+            wire: Vec<u8>,
+        }
+
+        fn body_lines() -> impl Strategy<Value = Vec<Vec<u8>>> {
+            prop::collection::vec(
+                prop::collection::vec(
+                    any::<u8>()
+                        .prop_filter("body line octet", |byte| !matches!(byte, b'\r' | b'\n')),
+                    0..48,
+                ),
+                0..5,
+            )
+        }
+
+        fn reply(case: usize, lines: Vec<Vec<u8>>) -> Reply {
+            // Protocol facts are independent of the production body classifier.
+            let (command, status, multiline): (&[u8], &[u8], bool) = match case {
+                0 => (b"GROUP example\r\n", b"211 selected\r\n", false),
+                1 => (b"LISTGROUP example\r\n", b"211 selected\r\n", true),
+                2 => (b"ARTICLE <missing@example>\r\n", b"430 missing\r\n", false),
+                3 => (b"BODY <a@example>\r\n", b"222 body\r\n", true),
+                4 => (b"STAT <a@example>\r\n", b"223 present\r\n", false),
+                5 => (b"XHDR subject 1-2\r\n", b"221 headers\r\n", true),
+                6 => (b"ARTICLE <a@example>\r\n", b"220 article\r\n", true),
+                7 => (b"HEAD <a@example>\r\n", b"221 head\r\n", true),
+                8 => (b"LIST\r\n", b"215 list\r\n", true),
+                9 => (b"CAPABILITIES\r\n", b"101 capabilities\r\n", true),
+                10 => (b"HELP\r\n", b"100 help\r\n", true),
+                11 => (b"OVER 1-2\r\n", b"224 overview\r\n", true),
+                12 => (b"XOVER 1-2\r\n", b"224 overview\r\n", true),
+                13 => (b"HDR subject 1-2\r\n", b"225 headers\r\n", true),
+                14 => (b"NEWNEWS * 20260101 000000\r\n", b"230 news\r\n", true),
+                15 => (b"NEWGROUPS 20260101 000000\r\n", b"231 groups\r\n", true),
+                16 => (b"BODY <a@example>\r\n", b"500 rejected\r\n", false),
+                17 => (b"BODY <a@example>\r\n", b"220 mismatched status\r\n", false),
+                18 => (b"XEXT\r\n", b"282 extension list\r\n", true),
+                19 => (b"GROUP missing\r\n", b"411 missing\r\n", false),
+                20 => (b"ARTICLE <a@example>\r\n", b"malformed status\r\n", false),
+                21 => (b"BODY <a@example>\r\n", b"\xff\0invalid status\r\n", false),
+                _ => unreachable!("generated reply case"),
+            };
+            let mut wire = status.to_vec();
+            if multiline {
+                for line in lines {
+                    if line.first() == Some(&b'.') {
+                        wire.push(b'.');
+                    }
+                    wire.extend_from_slice(&line);
+                    wire.extend_from_slice(b"\r\n");
+                }
+                wire.extend_from_slice(b".\r\n");
+            }
+            Reply { command, wire }
+        }
+
+        fn replies() -> impl Strategy<Value = Vec<Reply>> {
+            prop::collection::vec((0usize..22, body_lines()), 0..7).prop_map(|generated| {
+                let mut records = vec![
+                    reply(0, vec![]),
+                    reply(1, vec![]),
+                    reply(2, vec![]),
+                    reply(5, vec![b".".to_vec(), b".leading".to_vec()]),
+                    reply(21, vec![]),
+                ];
+                records.extend(
+                    generated
+                        .into_iter()
+                        .map(|(case, lines)| reply(case, lines)),
+                );
+                records.push(reply(3, vec![b".".to_vec(), vec![0, 255]]));
+                records
+            })
+        }
+
+        fn fragments<'a>(bytes: &'a [u8], seeds: &[usize]) -> Vec<&'a [u8]> {
+            let mut cuts = vec![0, 0, bytes.len(), bytes.len()];
+            cuts.extend(seeds.iter().map(|seed| seed % (bytes.len() + 1)));
+            cuts.sort_unstable();
+            cuts.windows(2)
+                .map(|pair| &bytes[pair[0]..pair[1]])
+                .collect()
+        }
+
+        fn expected_client_prefix(
+            records: &[Reply],
+            locals: &[Vec<u8>],
+            delivered: usize,
+        ) -> Vec<u8> {
+            let mut expected = Vec::new();
+            let mut remaining = delivered;
+            for (record, local) in records.iter().zip(locals) {
+                let available = remaining.min(record.wire.len());
+                expected.extend_from_slice(&record.wire[..available]);
+                remaining -= available;
+                if available != record.wire.len() {
+                    break;
+                }
+                expected.extend_from_slice(local);
+            }
+            expected
+        }
+
+        #[test]
+        fn packed_malformed_status_does_not_hide_the_previous_completion() {
+            let mut state = crate::session::SessionLoopState::default();
+            state.mark_backend_request_sent(crate::protocol::RequestKind::Body);
+            state.push_deferred_reply(b"500 local reply\r\n");
+            state.mark_backend_request_sent(crate::protocol::RequestKind::Stat);
+
+            let backend = b"222 body\r\n.\r\nnot-a-status\r\n";
+            let actual = state
+                .client_writes_for_backend_read(backend)
+                .into_iter()
+                .flat_map(|bytes| bytes.into_owned())
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                actual,
+                b"222 body\r\n.\r\n500 local reply\r\nnot-a-status\r\n"
+            );
+            assert!(!state.has_pending_backend_replies());
+            assert!(!state.has_deferred_replies());
+        }
+
+        proptest! {
+            #[test]
+            fn adversarial_framer_matches_independent_byte_scan(
+                mut data in prop::collection::vec(prop_oneof![
+                    4 => prop::sample::select(vec![b'\r', b'\n', b'.', b'x', b'2', 0, 255]),
+                    1 => any::<u8>(),
+                ], 0..1024),
+                inject in any::<bool>(),
+                position in 0usize..4096,
+                cuts in prop::collection::vec(0usize..4096, 0..48),
+            ) {
+                if inject {
+                    let at = position % (data.len() + 1);
+                    data.splice(at..at, b"\r\n.\r\n".iter().copied());
+                }
+                let expected_end = data.windows(5)
+                    .position(|window| window == b"\r\n.\r\n")
+                    .map(|start| start + 5);
+                let byte_cuts = (0..=data.len()).collect::<Vec<_>>();
+                for schedule in [cuts.as_slice(), byte_cuts.as_slice(), &[]] {
+                    let mut framer = MultilineFramer::default();
+                    let mut delivered = 0;
+                    let mut stopped = false;
+                    for chunk in fragments(&data, schedule) {
+                        let before = delivered;
+                        delivered += chunk.len();
+                        let expected = match expected_end {
+                            Some(end) if end < delivered => Err(FramingError::UnexpectedTrailingResponseBytes),
+                            Some(end) if end == delivered => Ok(ChunkProgress::Complete(CompleteChunk {
+                                consumed: ChunkConsumed(end - before),
+                            })),
+                            _ => Ok(ChunkProgress::Incomplete),
+                        };
+                        let actual = framer.split_chunk(chunk, PackedPendingBytesPolicy::Reject);
+                        prop_assert_eq!(&actual, &expected, "delivered={}, chunk={:?}", delivered, chunk);
+                        if expected != Ok(ChunkProgress::Incomplete) {
+                            stopped = true;
+                            break;
+                        }
+                    }
+                    prop_assert_eq!(stopped, expected_end.is_some());
+                }
+            }
+
+            #[test]
+            fn adversarial_framer_requires_the_entire_terminator(
+                lines in body_lines(),
+                cuts in prop::collection::vec(0usize..4096, 0..48),
+            ) {
+                let response = reply(3, lines).wire;
+                for missing in 1..=5 {
+                    let split = response.len() - missing;
+                    let mut framer = MultilineFramer::default();
+                    for chunk in fragments(&response[..split], &cuts) {
+                        prop_assert_eq!(framer.split_chunk(chunk, PackedPendingBytesPolicy::Reject),
+                            Ok(ChunkProgress::Incomplete));
+                    }
+                    prop_assert_eq!(framer.split_chunk(&response[split..], PackedPendingBytesPolicy::Reject),
+                        Ok(ChunkProgress::Complete(CompleteChunk { consumed: ChunkConsumed(missing) })));
+                }
+            }
+
+            #[test]
+            fn adversarial_framer_suffix_policies_have_distinct_contracts(
+                lines in body_lines(),
+                suffix in prop::sample::select(vec![
+                    (b"".as_slice(), true), (b"2", true), (b"22", true), (b"222", true),
+                    (b"222 next\r\n", true), (b"222 next\r", true),
+                    (b"x", false), (b"\0", false), (b".", false), (b"\r", false),
+                    (b"0", false), (b"6", false), (b"2x", false), (b"22x", false),
+                    (b"999 invalid\r\n", false),
+                ]),
+            ) {
+                let response = reply(3, lines).wire;
+                for split in [0, response.len() - 1, response.len() - 2, response.len() - 3, response.len() - 4] {
+                    let tail = [&response[split..], suffix.0].concat();
+                    for policy in [PackedPendingBytesPolicy::Reject, PackedPendingBytesPolicy::AllowIfStatusPrefix] {
+                        let mut framer = MultilineFramer::default();
+                        prop_assert_eq!(framer.split_chunk(&response[..split], policy), Ok(ChunkProgress::Incomplete));
+                        let expected = match policy {
+                            PackedPendingBytesPolicy::Reject if !suffix.0.is_empty() => Err(FramingError::UnexpectedTrailingResponseBytes),
+                            PackedPendingBytesPolicy::AllowIfStatusPrefix if !suffix.1 => Ok(ChunkProgress::Incomplete),
+                            _ => Ok(ChunkProgress::Complete(CompleteChunk { consumed: ChunkConsumed(response.len() - split) })),
+                        };
+                        prop_assert_eq!(framer.split_chunk(&tail, policy), expected);
+                        if matches!(policy, PackedPendingBytesPolicy::AllowIfStatusPrefix) && !suffix.1 {
+                            let later = b"ignored payload\r\n.\r\n";
+                            prop_assert_eq!(framer.split_chunk(later, policy),
+                                Ok(ChunkProgress::Complete(CompleteChunk { consumed: ChunkConsumed(later.len()) })));
+                        }
+                    }
+                }
+            }
+
+            #[test]
+            fn adversarial_pipeline_tracks_mixed_reply_boundaries(
+                records in replies(),
+                cuts in prop::collection::vec(0usize..8192, 0..64),
+            ) {
+                let stream = records.iter().flat_map(|record| record.wire.iter().copied()).collect::<Vec<_>>();
+                let ends = records.iter().scan(0, |end, record| {
+                    *end += record.wire.len();
+                    Some(*end)
+                }).collect::<Vec<_>>();
+                let byte_cuts = (0..=stream.len()).collect::<Vec<_>>();
+                for schedule in [cuts.as_slice(), byte_cuts.as_slice(), &[]] {
+                    let mut tracker = BackendReplyTracker::default();
+                    for record in &records {
+                        let request = crate::protocol::RequestContext::parse(record.command).expect("fixture command");
+                        tracker.push_request(request.kind());
+                    }
+                    let mut delivered = 0;
+                    let mut completed = 0;
+                    let mut forwarded = Vec::new();
+                    for chunk in fragments(&stream, schedule) {
+                        let before = delivered;
+                        let mut consumed = 0;
+                        for output in tracker.accept_backend_bytes(chunk) {
+                            let (bytes, complete) = match output {
+                                BackendReplyBytes::CompletedTrackedReply(bytes) => (bytes, true),
+                                BackendReplyBytes::ForwardUntracked(bytes) => (bytes, false),
+                            };
+                            prop_assert_eq!(bytes, &chunk[consumed..consumed + bytes.len()]);
+                            consumed += bytes.len();
+                            forwarded.extend_from_slice(bytes);
+                            if complete {
+                                prop_assert!(completed < ends.len(), "extra completion");
+                                prop_assert_eq!(before + consumed, ends[completed], "reply {}", completed);
+                                completed += 1;
+                            }
+                        }
+                        prop_assert_eq!(consumed, chunk.len());
+                        delivered += chunk.len();
+                        let expected_completed = ends.iter().take_while(|end| **end <= delivered).count();
+                        prop_assert_eq!(completed, expected_completed);
+                        prop_assert_eq!(tracker.pending.len(), records.len() - expected_completed);
+                        prop_assert_eq!(&forwarded, &stream[..delivered]);
+                    }
+                    prop_assert_eq!(completed, records.len());
+                }
+            }
+
+            #[test]
+            fn adversarial_pipeline_defers_local_replies_until_true_completion(
+                records in replies(),
+                cuts in prop::collection::vec(0usize..8192, 0..64),
+                missing in 1usize..=4,
+            ) {
+                const LOCAL: &[u8] = b"500 deferred local reply\r\n";
+                let stream = records.iter().flat_map(|record| record.wire.iter().copied()).collect::<Vec<_>>();
+                let locals = vec![LOCAL.to_vec(); records.len()];
+                let byte_cuts = (0..=stream.len()).collect::<Vec<_>>();
+                for limit in [stream.len(), stream.len() - missing] {
+                    for schedule in [cuts.as_slice(), byte_cuts.as_slice(), &[]] {
+                        let mut state = crate::session::SessionLoopState::default();
+                        for record in &records {
+                            let request = crate::protocol::RequestContext::parse(record.command).expect("fixture command");
+                            state.mark_backend_request_sent(request.kind());
+                            state.push_deferred_reply(LOCAL);
+                        }
+                        let mut delivered = 0;
+                        let mut actual = Vec::new();
+                        for chunk in fragments(&stream[..limit], schedule) {
+                            for write in state.client_writes_for_backend_read(chunk) {
+                                actual.extend_from_slice(&write);
+                            }
+                            delivered += chunk.len();
+                            let expected = expected_client_prefix(&records, &locals, delivered);
+                            prop_assert_eq!(&actual, &expected, "backend bytes delivered={}", delivered);
+                            prop_assert_eq!(state.has_pending_backend_replies(), delivered < stream.len());
+                            prop_assert_eq!(state.has_deferred_replies(), delivered < stream.len());
+                        }
+                        for write in state.client_writes_for_backend_read(&stream[limit..]) {
+                            actual.extend_from_slice(&write);
+                        }
+                        prop_assert_eq!(actual, expected_client_prefix(&records, &locals, stream.len()));
+                        prop_assert!(!state.has_pending_backend_replies());
+                        prop_assert!(!state.has_deferred_replies());
+                        prop_assert!(state.take_ready_deferred_replies().is_empty());
+                    }
+                }
+            }
+        }
     }
 
     struct FailingWriter;
