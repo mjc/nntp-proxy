@@ -2458,9 +2458,7 @@ pub(super) mod scanner_experiment {
                 | exact_16(&block[32..])
                 | exact_16(&block[48..]);
             if found {
-                return (0..64)
-                    .find(|&lane| &block[lane..lane + 5] == TERMINATOR)
-                    .map(|lane| offset + lane);
+                return first_match(block).map(|lane| offset + lane);
             }
             offset += 64;
         }
@@ -2473,6 +2471,14 @@ pub(super) mod scanner_experiment {
         scan(data, find_fixed)
     }
 
+    // Keep candidate verification out of the vector loop's register allocation.
+    #[inline(never)]
+    fn first_match(block: &[u8]) -> Option<usize> {
+        block
+            .windows(TERMINATOR.len())
+            .position(|bytes| bytes == TERMINATOR)
+    }
+
     fn find_pair<const WIDTH: usize>(data: &[u8]) -> Option<usize> {
         let mut offset = 0;
         while data.len() - offset >= WIDTH + 4 {
@@ -2481,9 +2487,7 @@ pub(super) mod scanner_experiment {
             for lane in 0..WIDTH {
                 possible |= (block[lane] == b'\r') & (block[lane + 2] == b'.');
             }
-            if possible
-                && let Some(lane) = (0..WIDTH).find(|&lane| &block[lane..lane + 5] == TERMINATOR)
-            {
+            if possible && let Some(lane) = first_match(block) {
                 return Some(offset + lane);
             }
             offset += WIDTH;
@@ -2505,6 +2509,32 @@ pub(super) mod scanner_experiment {
         scan(data, find_pair::<64>)
     }
 
+    fn find_repeat<const FIRST: usize, const BYTE: u8>(data: &[u8]) -> Option<usize> {
+        let mut offset = 0;
+        while data.len() - offset >= 68 {
+            let block = &data[offset..offset + 68];
+            let mut possible = false;
+            for lane in 0..64 {
+                possible |= (block[lane + FIRST] == BYTE) & (block[lane + FIRST + 3] == BYTE);
+            }
+            if possible && let Some(lane) = first_match(block) {
+                return Some(offset + lane);
+            }
+            offset += 64;
+        }
+        TERMINATOR_FINDER
+            .find(&data[offset..])
+            .map(|start| offset + start)
+    }
+
+    pub fn benchmark_auto_cr_pair_64(data: &[u8]) -> (usize, usize) {
+        scan(data, find_repeat::<0, b'\r'>)
+    }
+
+    pub fn benchmark_auto_lf_pair_64(data: &[u8]) -> (usize, usize) {
+        scan(data, find_repeat::<1, b'\n'>)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -2515,6 +2545,8 @@ pub(super) mod scanner_experiment {
             assert_eq!(find_pair::<16>(data), expected, "pair16: {data:?}");
             assert_eq!(find_pair::<32>(data), expected, "pair32: {data:?}");
             assert_eq!(find_pair::<64>(data), expected, "pair64: {data:?}");
+            assert_eq!(find_repeat::<0, b'\r'>(data), expected, "cr pair: {data:?}");
+            assert_eq!(find_repeat::<1, b'\n'>(data), expected, "lf pair: {data:?}");
         }
 
         #[test]
@@ -2547,6 +2579,8 @@ pub(super) mod scanner_experiment {
                 assert_eq!(benchmark_auto_pair_16(input.bytes()), input.expected());
                 assert_eq!(benchmark_auto_pair_32(input.bytes()), input.expected());
                 assert_eq!(benchmark_auto_pair_64(input.bytes()), input.expected());
+                assert_eq!(benchmark_auto_cr_pair_64(input.bytes()), input.expected());
+                assert_eq!(benchmark_auto_lf_pair_64(input.bytes()), input.expected());
             }
         }
 
