@@ -354,6 +354,7 @@ pub struct CachedArticle {
     /// No mutex needed: moka clones entries on `get()`, and updates go through
     /// `cache.insert()` which replaces the whole entry atomically.
     backend_availability: ArticleAvailability,
+    negative_timestamps: Vec<(AvailabilitySlot, ttl::CacheTimestampMillis)>,
 
     status_code: StatusCode,
     payload: CachedPayload,
@@ -368,11 +369,36 @@ pub struct CachedArticle {
 }
 
 impl CachedArticle {
+    fn negative_timestamps_for_bits(
+        bits: usize,
+        timestamp: ttl::CacheTimestampMillis,
+    ) -> Vec<(AvailabilitySlot, ttl::CacheTimestampMillis)> {
+        (0..super::MAX_BACKENDS)
+            .filter_map(AvailabilitySlot::new)
+            .filter(|slot| bits & slot.bit() != 0)
+            .map(|slot| (slot, timestamp))
+            .collect()
+    }
+
+    fn expire_stale_availability(&mut self, base_ttl: ttl::CacheTtlMillis) {
+        let mut missing_bits = self.backend_availability.missing_bits();
+        self.negative_timestamps.retain(|(slot, timestamp)| {
+            if ttl::is_expired(*timestamp, base_ttl, ttl::CacheTier::new(0)) {
+                missing_bits &= !slot.bit();
+                false
+            } else {
+                true
+            }
+        });
+        self.backend_availability = ArticleAvailability::from_missing_bits(missing_bits);
+    }
+
     /// Create an availability-only cache entry without payload bytes.
     #[must_use]
     pub(crate) fn availability_only(status_code: StatusCode, tier: ttl::CacheTier) -> Self {
         Self {
             backend_availability: ArticleAvailability::new(),
+            negative_timestamps: Vec::new(),
             status_code,
             payload: CachedPayload::AvailabilityOnly,
             tier,
@@ -386,6 +412,7 @@ impl CachedArticle {
     pub(crate) fn stat(tier: ttl::CacheTier) -> Self {
         Self {
             backend_availability: ArticleAvailability::new(),
+            negative_timestamps: Vec::new(),
             status_code: StatusCode::new(223),
             payload: CachedPayload::Stat {
                 article_number: None,
@@ -399,6 +426,7 @@ impl CachedArticle {
     pub(crate) fn missing(tier: ttl::CacheTier) -> Self {
         Self {
             backend_availability: ArticleAvailability::new(),
+            negative_timestamps: Vec::new(),
             status_code: StatusCode::new(430),
             payload: CachedPayload::Missing,
             tier,
@@ -410,6 +438,10 @@ impl CachedArticle {
     pub(crate) fn negative_only(missing_bits: usize) -> Self {
         Self {
             backend_availability: ArticleAvailability::from_missing_bits(missing_bits),
+            negative_timestamps: Self::negative_timestamps_for_bits(
+                missing_bits,
+                ttl::CacheTimestampMillis::now(),
+            ),
             status_code: StatusCode::new(430),
             payload: CachedPayload::Missing,
             tier: ttl::CacheTier::new(0),
@@ -418,7 +450,7 @@ impl CachedArticle {
     }
 
     #[must_use]
-    pub(crate) const fn from_parts(
+    pub(crate) fn from_parts(
         status_code: StatusCode,
         payload: CachedPayload,
         backend_availability: ArticleAvailability,
@@ -427,6 +459,10 @@ impl CachedArticle {
     ) -> Self {
         Self {
             backend_availability,
+            negative_timestamps: Self::negative_timestamps_for_bits(
+                backend_availability.missing_bits(),
+                ttl::CacheTimestampMillis::new(inserted_at),
+            ),
             status_code,
             payload,
             tier,
@@ -442,6 +478,7 @@ impl CachedArticle {
         let payload = parse_payload(status_code, response);
         Self {
             backend_availability: ArticleAvailability::new(),
+            negative_timestamps: Vec::new(),
             status_code,
             payload,
             tier,
@@ -461,6 +498,7 @@ impl CachedArticle {
         let payload = parse_framed_chunked_payload(status, status_line_end, &response, payload_end);
         Self {
             backend_availability: ArticleAvailability::new(),
+            negative_timestamps: Vec::new(),
             status_code: status,
             payload,
             tier,
@@ -555,6 +593,16 @@ impl CachedArticle {
     /// Record that a backend returned 430 (doesn't have this article)
     pub fn record_availability_missing(&mut self, slot: AvailabilitySlot) {
         self.backend_availability.record_missing_slot(slot);
+        if let Some((_, timestamp)) = self
+            .negative_timestamps
+            .iter_mut()
+            .find(|(recorded, _)| *recorded == slot)
+        {
+            *timestamp = ttl::CacheTimestampMillis::now();
+        } else {
+            self.negative_timestamps
+                .push((slot, ttl::CacheTimestampMillis::now()));
+        }
     }
 
     /// Check if all configured provider slots have been tried and none have the article.
@@ -960,7 +1008,7 @@ impl ArticleCache {
                 // Our observed ratio: 362MB RSS / 36MB weighted = 10x
                 //
                 const ARC_STR_OVERHEAD: usize = 16 + 16; // Arc control block + allocator
-                const ENTRY_STRUCT: usize = 64; // CachedArticle inline metadata and enum tag
+                const ENTRY_STRUCT: usize = std::mem::size_of::<CachedArticle>(); // CachedArticle inline metadata and enum tag
                 const PAYLOAD_OVERHEAD: usize = 2 * (16 + 16); // Up to headers/body shared slices + allocators
                 // Moka internal structures - empirically measured to address memory reporting gap.
                 // See moka issue #473: https://github.com/moka-rs/moka/issues/473
@@ -969,7 +1017,10 @@ impl ArticleCache {
 
                 let key_size = ARC_STR_OVERHEAD + key.len();
                 let buffer_size = PAYLOAD_OVERHEAD + entry.payload_len().get();
-                let base_size = key_size + buffer_size + ENTRY_STRUCT + MOKA_OVERHEAD;
+                let negative_size = entry.negative_timestamps.capacity()
+                    * std::mem::size_of::<(AvailabilitySlot, ttl::CacheTimestampMillis)>();
+                let base_size =
+                    key_size + buffer_size + ENTRY_STRUCT + negative_size + MOKA_OVERHEAD;
 
                 // Availability-only entries have higher relative overhead
                 // due to allocator fragmentation on small allocations.
@@ -1034,7 +1085,8 @@ impl ArticleCache {
         let result = self.cache.get(key).await;
 
         match result {
-            Some(entry) if !entry.is_expired(self.ttl_millis) => {
+            Some(mut entry) if !entry.is_expired(self.ttl_millis) => {
+                entry.expire_stale_availability(self.ttl_millis);
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 Some(entry)
             }
@@ -1155,7 +1207,8 @@ impl ArticleCache {
         maybe_entry: Option<Entry<Arc<str>, CachedArticle>>,
         ttl_millis: ttl::CacheTtlMillis,
     ) -> Option<CachedArticle> {
-        let entry = maybe_entry?.into_value();
+        let mut entry = maybe_entry?.into_value();
+        entry.expire_stale_availability(ttl_millis);
         (!entry.is_expired(ttl_millis)).then_some(entry)
     }
 
@@ -1539,6 +1592,72 @@ mod tests {
                 "serve decision for {request_kind:?}"
             );
         });
+    }
+
+    #[tokio::test]
+    async fn memory_negative_freshness_survives_positive_updates_independently() {
+        for update in 0..3 {
+            let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
+            let msgid = MessageId::from_borrowed("<freshness@example.com>").unwrap();
+            let expired_slot = AvailabilitySlot::new(0).unwrap();
+            let fresh_slot = AvailabilitySlot::new(1).unwrap();
+            let positive_slot = AvailabilitySlot::new(2).unwrap();
+            let mut entry = CachedArticle::missing(ttl::CacheTier::new(0));
+            entry.record_availability_missing(expired_slot);
+            entry.record_availability_missing(fresh_slot);
+            entry.negative_timestamps[0].1 = ttl::CacheTimestampMillis::new(0);
+            entry.negative_timestamps[1].1 = ttl::CacheTimestampMillis::new(u64::MAX);
+            cache.insert(msgid.clone(), entry).await;
+            match update {
+                0 => {
+                    cache
+                        .record_has_status_for_slot(
+                            msgid.clone(),
+                            StatusCode::new(221),
+                            positive_slot,
+                            0.into(),
+                        )
+                        .await
+                }
+                1 => {
+                    cache
+                        .record_stat_for_slot(msgid.clone(), positive_slot, 0.into())
+                        .await
+                }
+                _ => {
+                    cache
+                        .upsert_cached_entry_for_slot(
+                            msgid.clone(),
+                            CachedArticle::from_parts(
+                                StatusCode::new(222),
+                                CachedPayload::Body {
+                                    article_number: None,
+                                    body: Arc::from(b"body".as_slice()),
+                                },
+                                ArticleAvailability::new(),
+                                0.into(),
+                                ttl::now_millis(),
+                            ),
+                            positive_slot,
+                        )
+                        .await
+                }
+            }
+            let entry = cache.get(&msgid).await.unwrap();
+            assert!(
+                entry.should_try_slot(expired_slot),
+                "positive update renewed a different provider's 430"
+            );
+            assert!(!entry.should_try_slot(fresh_slot));
+            assert_eq!(
+                entry.status_code(),
+                StatusCode::new(match update {
+                    0 => 221,
+                    1 => 223,
+                    _ => 222,
+                })
+            );
+        }
     }
 
     #[tokio::test]
