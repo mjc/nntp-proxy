@@ -745,6 +745,193 @@ async fn test_per_command_body_window_sends_two_requests_before_first_reply() ->
 }
 
 #[tokio::test]
+async fn test_per_command_body_window_refills_after_first_response() -> Result<()> {
+    const WINDOW: usize = 16;
+    const REQUEST_COUNT: usize = WINDOW + 2;
+
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let backend = tokio::spawn(async move {
+        let (stream, _) = backend_listener.accept().await?;
+        let mut reader = BufReader::new(stream);
+        reader
+            .get_mut()
+            .write_all(b"200 RollingWindow Ready\r\n")
+            .await?;
+        let mode_reader = read_line(&mut reader, "backend reader mode").await?;
+        assert_eq!(mode_reader, "MODE READER\r\n");
+        reader
+            .get_mut()
+            .write_all(b"200 Posting prohibited\r\n")
+            .await?;
+
+        let mut commands = Vec::with_capacity(REQUEST_COUNT);
+        while commands.len() < WINDOW {
+            let command = read_line(&mut reader, "initial upstream window").await?;
+            if command.starts_with("BODY ") {
+                commands.push(command);
+            } else {
+                reader
+                    .get_mut()
+                    .write_all(b"111 20261022000000\r\n")
+                    .await?;
+            }
+        }
+
+        assert!(
+            timeout(Duration::from_millis(50), reader.fill_buf())
+                .await
+                .is_err(),
+            "proxy sent a replacement request before a response freed an upstream-window slot",
+        );
+
+        reader
+            .get_mut()
+            .write_all(b"222 rolling-0@example\r\nbody-0\r\n.\r\n")
+            .await?;
+        commands.push(
+            timeout(
+                Duration::from_secs(1),
+                read_line(&mut reader, "rolling replacement request"),
+            )
+            .await??,
+        );
+
+        reader
+            .get_mut()
+            .write_all(b"222 rolling-1@example\r\nbody-1\r\n.\r\n")
+            .await?;
+        commands.push(
+            timeout(
+                Duration::from_secs(1),
+                read_line(&mut reader, "second rolling replacement request"),
+            )
+            .await??,
+        );
+
+        for index in 2..WINDOW {
+            let response = format!("222 rolling-{index}@example\r\nbody-{index}\r\n.\r\n");
+            reader.get_mut().write_all(response.as_bytes()).await?;
+        }
+        for index in WINDOW..REQUEST_COUNT {
+            reader
+                .get_mut()
+                .write_all(
+                    format!("222 rolling-{index}@example\r\nbody-{index}\r\n.\r\n").as_bytes(),
+                )
+                .await?;
+        }
+        anyhow::Ok(commands)
+    });
+
+    let mut config = pipeline_backend_config(backend_port, "ArticleRollingWindow");
+    config.servers[0].compress = Some(false);
+    let proxy_port = spawn_proxy_with_config(config, RoutingMode::PerCommand).await?;
+    let client = connect_and_read_greeting(proxy_port).await?;
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
+    let commands = (0..REQUEST_COUNT)
+        .map(|index| format!("BODY <rolling-{index}@example>\r\n"))
+        .collect::<Vec<_>>();
+    write_half.write_all(commands.concat().as_bytes()).await?;
+
+    let responses = timeout(
+        Duration::from_secs(5),
+        read_multiline_responses(&mut reader, REQUEST_COUNT),
+    )
+    .await??;
+    assert_eq!(responses.len(), REQUEST_COUNT);
+    assert_eq!(responses[0].0, "222 rolling-0@example\r\n");
+    for (index, response) in responses.iter().enumerate() {
+        assert_eq!(response.1, vec![format!("body-{index}\r\n")]);
+    }
+    let backend_commands = backend.await??;
+    assert_eq!(backend_commands, commands);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_per_command_body_window_retries_after_refill_write_failure() -> Result<()> {
+    const WINDOW: usize = 16;
+    const REQUEST_COUNT: usize = WINDOW + 2;
+
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let backend = tokio::spawn(async move {
+        let (stream, _) = backend_listener.accept().await?;
+        let mut reader = BufReader::new(stream);
+        reader
+            .get_mut()
+            .write_all(b"200 RollingWindow Ready\r\n")
+            .await?;
+        let mode_reader = read_line(&mut reader, "backend reader mode").await?;
+        assert_eq!(mode_reader, "MODE READER\r\n");
+        reader
+            .get_mut()
+            .write_all(b"200 Posting prohibited\r\n")
+            .await?;
+
+        for index in 0..WINDOW {
+            let command = read_line(&mut reader, "initial upstream window").await?;
+            assert_eq!(command, format!("BODY <retry-{index}@example>\r\n"));
+        }
+
+        reader
+            .get_mut()
+            .write_all(b"222 retry-0@example\r\nbody-0\r\n.\r\n")
+            .await?;
+        socket2::SockRef::from(reader.get_ref()).set_linger(Some(Duration::ZERO))?;
+        drop(reader);
+
+        let (stream, _) = timeout(Duration::from_secs(2), backend_listener.accept()).await??;
+        let mut reader = BufReader::new(stream);
+        reader
+            .get_mut()
+            .write_all(b"200 RollingWindow Retry\r\n")
+            .await?;
+        let mode_reader = read_line(&mut reader, "retry backend reader mode").await?;
+        assert_eq!(mode_reader, "MODE READER\r\n");
+        reader
+            .get_mut()
+            .write_all(b"200 Posting prohibited\r\n")
+            .await?;
+
+        for index in 1..REQUEST_COUNT {
+            let command = read_line(&mut reader, "sequentially retried BODY request").await?;
+            assert_eq!(command, format!("BODY <retry-{index}@example>\r\n"));
+            let response = format!("222 retry-{index}@example\r\nbody-{index}\r\n.\r\n");
+            reader.get_mut().write_all(response.as_bytes()).await?;
+        }
+
+        anyhow::Ok(())
+    });
+
+    let mut config = pipeline_backend_config(backend_port, "ArticleRollingWindowRetry");
+    config.servers[0].compress = Some(false);
+    let proxy_port = spawn_proxy_with_config(config, RoutingMode::PerCommand).await?;
+    let client = connect_and_read_greeting(proxy_port).await?;
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
+    let commands = (0..REQUEST_COUNT)
+        .map(|index| format!("BODY <retry-{index}@example>\r\n"))
+        .collect::<Vec<_>>();
+    write_half.write_all(commands.concat().as_bytes()).await?;
+
+    let responses = timeout(
+        Duration::from_secs(5),
+        read_multiline_responses(&mut reader, REQUEST_COUNT),
+    )
+    .await??;
+    assert_eq!(responses.len(), REQUEST_COUNT);
+    for (index, response) in responses.iter().enumerate() {
+        assert_eq!(response.0, format!("222 retry-{index}@example\r\n"));
+        assert_eq!(response.1, vec![format!("body-{index}\r\n")]);
+    }
+    backend.await??;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_per_command_body_window_keeps_430_before_following_success() -> Result<()> {
     let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend_listener.local_addr()?.port();
@@ -859,6 +1046,100 @@ async fn test_per_command_body_window_keeps_cached_430_after_earlier_success() -
         "known-missing request must not be sent upstream again",
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_per_command_body_window_counts_upstream_requests_not_cached_misses() -> Result<()> {
+    const CACHED_MISSES: usize = 16;
+
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let (_connection_count, seen_commands) = spawn_delayed_pipeline_backend(
+        backend_listener,
+        &[
+            (
+                "BODY <window-after-misses-1@example>",
+                "222 1 <window-after-misses-1@example>\r\nfirst-line\r\n.\r\n",
+            ),
+            (
+                "BODY <window-after-misses-2@example>",
+                "222 2 <window-after-misses-2@example>\r\nsecond-line\r\n.\r\n",
+            ),
+        ],
+        &[(
+            "BODY <window-cached-missing@example>",
+            "430 No such article\r\n",
+        )],
+    );
+
+    let proxy_port = spawn_proxy_with_config(
+        pipeline_backend_config(backend_port, "BodyWindowCountsUpstream"),
+        RoutingMode::PerCommand,
+    )
+    .await?;
+    let client = connect_and_read_greeting(proxy_port).await?;
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
+
+    for _ in 0..CACHED_MISSES {
+        write_commands(
+            &mut write_half,
+            &["BODY <window-cached-missing@example>\r\n"],
+        )
+        .await?;
+        assert_eq!(
+            read_line(&mut reader, "cached-miss warmup response").await?,
+            "430 No such article\r\n"
+        );
+    }
+
+    let mut commands = vec!["BODY <window-cached-missing@example>\r\n"; CACHED_MISSES];
+    commands.extend([
+        "BODY <window-after-misses-1@example>\r\n",
+        "BODY <window-after-misses-2@example>\r\n",
+    ]);
+    write_commands(&mut write_half, &commands).await?;
+
+    for _ in 0..CACHED_MISSES {
+        assert_eq!(
+            read_line(&mut reader, "cached-miss response").await?,
+            "430 No such article\r\n"
+        );
+    }
+    assert_eq!(
+        timeout(
+            Duration::from_secs(3),
+            read_multiline_responses(&mut reader, 2)
+        )
+        .await??,
+        vec![
+            (
+                "222 1 <window-after-misses-1@example>\r\n".to_string(),
+                vec!["first-line\r\n".to_string()],
+            ),
+            (
+                "222 2 <window-after-misses-2@example>\r\n".to_string(),
+                vec!["second-line\r\n".to_string()],
+            ),
+        ]
+    );
+
+    let seen_commands = seen_commands.lock().await;
+    assert_eq!(
+        seen_commands
+            .iter()
+            .filter(|command| command.as_str() == "BODY <window-after-misses-1@example>")
+            .count(),
+        1,
+    );
+    assert_eq!(
+        seen_commands
+            .iter()
+            .filter(|command| command.as_str() == "BODY <window-after-misses-2@example>")
+            .count(),
+        1,
+    );
     Ok(())
 }
 
