@@ -1196,6 +1196,7 @@ impl ClientSession {
                 ArticleWindowRequest::SendUpstream { sent: true, .. }
             ) {
                 let mut refilled = false;
+                let mut refill_error = None;
                 while in_flight < MAX_UPSTREAM_ARTICLE_WINDOW {
                     let next_unsent = requests.iter().enumerate().skip(i + 1).find_map(
                         |(index, request_route)| {
@@ -1216,23 +1217,53 @@ impl ClientSession {
                     let request = batch.context(next_index).request();
                     self.metrics.record_command(backend_id);
                     self.metrics.user_command(self.username());
-                    request
+                    if let Err(error) = request
                         .write_wire_to(
                             conn.as_mut()
                                 .expect("backend connection is live")
                                 .stream_mut(),
                         )
-                        .await?;
+                        .await
+                    {
+                        refill_error = Some(error);
+                        break;
+                    }
                     *sent = true;
                     in_flight += 1;
                     refilled = true;
                 }
-                if refilled {
-                    conn.as_mut()
+                if refill_error.is_none() && refilled {
+                    refill_error = conn
+                        .as_mut()
                         .expect("backend connection is live")
                         .stream_mut()
                         .flush()
-                        .await?;
+                        .await
+                        .err();
+                }
+                if let Some(error) = refill_error {
+                    debug!(
+                        client = %self.client_addr,
+                        backend = backend_id.as_index(),
+                        error = %error,
+                        "Upstream window refill write failed; retrying unread requests sequentially"
+                    );
+                    conn.take()
+                        .expect("backend connection is live")
+                        .fail_backend();
+                    drop(requests);
+                    self.execute_pipelineable_commands_with_recorded_request_bytes_from(
+                        AccountedPipelineCommandIndex(i + 1),
+                        PipelineCommandParams {
+                            router,
+                            client_writer,
+                            state,
+                            batch,
+                            backend_connection,
+                        },
+                    )
+                    .await?;
+                    return Ok(());
                 }
             }
             i += 1;
