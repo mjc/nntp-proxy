@@ -778,6 +778,13 @@ async fn test_per_command_body_window_refills_after_first_response() -> Result<(
             }
         }
 
+        assert!(
+            timeout(Duration::from_millis(50), reader.fill_buf())
+                .await
+                .is_err(),
+            "proxy sent a replacement request before a response freed an upstream-window slot",
+        );
+
         reader
             .get_mut()
             .write_all(b"222 rolling-0@example\r\nbody-0\r\n.\r\n")
