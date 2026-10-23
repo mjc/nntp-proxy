@@ -1119,9 +1119,37 @@ impl ClientSession {
                         let request = batch.context(i).request();
                         self.metrics.record_command(backend_id);
                         self.metrics.user_command(self.username());
-                        let connection = conn.as_mut().expect("backend connection is live");
-                        request.write_wire_to(connection.stream_mut()).await?;
-                        connection.stream_mut().flush().await?;
+                        let write_result = {
+                            let connection = conn.as_mut().expect("backend connection is live");
+                            match request.write_wire_to(connection.stream_mut()).await {
+                                Ok(()) => connection.stream_mut().flush().await,
+                                Err(error) => Err(error),
+                            }
+                        };
+                        if let Err(error) = write_result {
+                            debug!(
+                                client = %self.client_addr,
+                                backend = backend_id.as_index(),
+                                error = %error,
+                                "Unsent upstream window request write failed; retrying unread requests sequentially"
+                            );
+                            conn.take()
+                                .expect("backend connection is live")
+                                .fail_backend();
+                            drop(requests);
+                            self.execute_pipelineable_commands_with_recorded_request_bytes_from(
+                                AccountedPipelineCommandIndex(i),
+                                PipelineCommandParams {
+                                    router,
+                                    client_writer,
+                                    state,
+                                    batch,
+                                    backend_connection,
+                                },
+                            )
+                            .await?;
+                            return Ok(());
+                        }
                         *sent = true;
                         in_flight += 1;
                     }
