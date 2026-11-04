@@ -62,6 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A status-only cache update keeps cached HEAD, BODY, ARTICLE, and STAT sections. A HEAD and a BODY for the same message ID are merged into one article. When their article numbers differ, neither number is kept.
 - Connection setup, including connect, TLS, authentication, and `MODE READER`, fails when it exceeds its deadline. The pool slot is released and routing tries the next backend.
 - The hybrid cache counts the key and the cached record toward its memory budget. Missing, availability-only, and STAT entries are evicted under pressure, including after they expire.
+- The dashboard keeps running when process CPU and memory statistics cannot be read. Those readings stay at zero.
 
 ### Security
 
