@@ -672,13 +672,11 @@ impl DiskCachedArticle {
                     article_number: right_number,
                     body,
                 },
-            ) if compatible_article_numbers(*left_number, *right_number) => {
-                Some(CachedPayload::Article {
-                    article_number: (*left_number).or(*right_number),
-                    headers: headers.clone(),
-                    body: body.clone(),
-                })
-            }
+            ) => Some(CachedPayload::Article {
+                article_number: retained_article_number(*left_number, *right_number),
+                headers: headers.clone(),
+                body: body.clone(),
+            }),
             (
                 CachedPayload::Body {
                     article_number: left_number,
@@ -688,13 +686,11 @@ impl DiskCachedArticle {
                     article_number: right_number,
                     headers,
                 },
-            ) if compatible_article_numbers(*left_number, *right_number) => {
-                Some(CachedPayload::Article {
-                    article_number: (*left_number).or(*right_number),
-                    headers: headers.clone(),
-                    body: body.clone(),
-                })
-            }
+            ) => Some(CachedPayload::Article {
+                article_number: retained_article_number(*left_number, *right_number),
+                headers: headers.clone(),
+                body: body.clone(),
+            }),
             _ => None,
         };
 
@@ -817,11 +813,17 @@ impl DiskCachedArticle {
     }
 }
 
-fn compatible_article_numbers(
+/// Article numbers are backend-local. Keep one only when the sections agree
+/// or one side has no number. A disagreement still merges the bytes.
+fn retained_article_number(
     left: Option<CachedArticleNumber>,
     right: Option<CachedArticleNumber>,
-) -> bool {
-    left.is_none() || right.is_none() || left == right
+) -> Option<CachedArticleNumber> {
+    match (left, right) {
+        (Some(left_number), Some(right_number)) if left_number == right_number => Some(left_number),
+        (Some(number), None) | (None, Some(number)) => Some(number),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1461,36 +1463,58 @@ mod tests {
 
     #[test]
     fn successful_status_update_preserves_cached_head() {
-        let mut entry =
-            disk_cached_article_from_ingest_bytes(b"221 0 <id>\r\nH: V\r\n.\r\n").unwrap();
+        let head = b"221 0 <id>\r\nH: V\r\n.\r\n";
+        let mut entry = disk_cached_article_from_ingest_bytes(head).unwrap();
 
         entry.record_backend_has_status(CacheableStatusCode::Stat, ttl::CacheTier::new(0));
 
-        assert!(
-            entry
-                .cached_response_for(RequestKind::Head, "<id>")
-                .is_some()
+        assert_eq!(
+            render_response(&entry, RequestKind::Head, "<id>").as_deref(),
+            Some(head.as_slice())
         );
     }
 
     #[test]
     fn compatible_head_and_body_sections_merge() {
-        let mut head =
-            disk_cached_article_from_ingest_bytes(b"221 0 <id>\r\nH: V\r\n.\r\n").unwrap();
-        let body = disk_cached_article_from_ingest_bytes(b"222 0 <id>\r\nB\r\n.\r\n").unwrap();
+        let head_bytes = b"221 0 <id>\r\nH: V\r\n.\r\n";
+        let body_bytes = b"222 0 <id>\r\nB\r\n.\r\n";
+        let mut head = disk_cached_article_from_ingest_bytes(head_bytes).unwrap();
+        let body = disk_cached_article_from_ingest_bytes(body_bytes).unwrap();
 
         assert!(head.merge_compatible_sections(&body));
-        assert!(
-            head.cached_response_for(RequestKind::Head, "<id>")
-                .is_some()
+        assert_eq!(
+            render_response(&head, RequestKind::Head, "<id>").as_deref(),
+            Some(head_bytes.as_slice())
         );
-        assert!(
-            head.cached_response_for(RequestKind::Body, "<id>")
-                .is_some()
+        assert_eq!(
+            render_response(&head, RequestKind::Body, "<id>").as_deref(),
+            Some(body_bytes.as_slice())
         );
-        assert!(
-            head.cached_response_for(RequestKind::Article, "<id>")
-                .is_some()
+        assert_eq!(
+            render_response(&head, RequestKind::Article, "<id>").as_deref(),
+            Some(b"220 0 <id>\r\nH: V\r\n\r\nB\r\n.\r\n".as_slice())
+        );
+    }
+
+    #[test]
+    fn compatible_body_then_head_sections_merge() {
+        let head_bytes = b"221 0 <id>\r\nH: V\r\n.\r\n";
+        let body_bytes = b"222 0 <id>\r\nB\r\n.\r\n";
+        let mut body = disk_cached_article_from_ingest_bytes(body_bytes).unwrap();
+        let head = disk_cached_article_from_ingest_bytes(head_bytes).unwrap();
+
+        assert!(body.merge_compatible_sections(&head));
+        assert_eq!(
+            render_response(&body, RequestKind::Head, "<id>").as_deref(),
+            Some(head_bytes.as_slice())
+        );
+        assert_eq!(
+            render_response(&body, RequestKind::Body, "<id>").as_deref(),
+            Some(body_bytes.as_slice())
+        );
+        assert_eq!(
+            render_response(&body, RequestKind::Article, "<id>").as_deref(),
+            Some(b"220 0 <id>\r\nH: V\r\n\r\nB\r\n.\r\n".as_slice())
         );
     }
 
@@ -1512,7 +1536,7 @@ mod tests {
     }
 
     #[test]
-    fn incompatible_article_numbers_do_not_merge_sections() {
+    fn disagreeing_article_numbers_merge_without_either_number() {
         let mut head = DiskCachedArticle::from_contiguous_ingest_with_tier(
             b"221 10 <id>\r\nH: V\r\n.\r\n",
             ttl::CacheTier::new(0),
@@ -1524,10 +1548,30 @@ mod tests {
         )
         .unwrap();
 
-        assert!(!head.merge_compatible_sections(&body));
-        assert!(
-            head.cached_response_for(RequestKind::Article, "<id>")
-                .is_none()
+        assert!(head.merge_compatible_sections(&body));
+        assert_eq!(
+            render_response(&head, RequestKind::Head, "<id>").as_deref(),
+            Some(b"221 0 <id>\r\nH: V\r\n.\r\n".as_slice())
+        );
+        assert_eq!(
+            render_response(&head, RequestKind::Body, "<id>").as_deref(),
+            Some(b"222 0 <id>\r\nB\r\n.\r\n".as_slice())
+        );
+        assert_eq!(
+            render_response(&head, RequestKind::Article, "<id>").as_deref(),
+            Some(b"220 0 <id>\r\nH: V\r\n\r\nB\r\n.\r\n".as_slice())
+        );
+    }
+
+    #[test]
+    fn one_article_number_is_kept_when_the_other_section_has_none() {
+        let mut head = disk_cached_article_from_ingest_bytes(b"221 <id>\r\nH: V\r\n.\r\n").unwrap();
+        let body = disk_cached_article_from_ingest_bytes(b"222 7 <id>\r\nB\r\n.\r\n").unwrap();
+
+        assert!(head.merge_compatible_sections(&body));
+        assert_eq!(
+            render_response(&head, RequestKind::Article, "<id>").as_deref(),
+            Some(b"220 7 <id>\r\nH: V\r\n\r\nB\r\n.\r\n".as_slice())
         );
     }
 
