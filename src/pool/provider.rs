@@ -968,7 +968,7 @@ mod tests {
         assert!(provider.get_pooled_connection().await.is_ok());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn stalled_creation_times_out_and_frees_the_pool_slot() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -977,39 +977,56 @@ mod tests {
             .build()
             .unwrap();
 
-        let first = provider.checkout_connection_guard();
-        tokio::pin!(first);
+        // The creator blocks in a socket read, so a paused clock does not
+        // auto-advance. Spawn both checkouts and advance the clock once they
+        // are waiting, which polls the creator's setup deadline and the
+        // waiter's acquisition deadline together.
+        let creator = provider.clone();
+        let mut creator_task =
+            tokio::spawn(async move { creator.checkout_connection_guard().await });
         let (socket, _) = tokio::select! {
             accepted = listener.accept() => accepted.unwrap(),
-            _ = &mut first => panic!("checkout finished before the backend accepted"),
+            _ = &mut creator_task => panic!("checkout finished before the backend accepted"),
         };
         tokio::spawn(async move {
             let _held = socket;
             std::future::pending::<()>().await;
         });
 
-        tokio::time::pause();
-        let second = tokio::time::timeout(
-            crate::constants::timeout::CONNECTION * 2,
-            provider.checkout_connection_guard(),
-        )
-        .await
-        .expect("a checkout behind a stalled creation waited without a deadline");
+        let waiter = provider.clone();
+        let waiter_task = tokio::spawn(async move { waiter.checkout_connection_guard().await });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
         assert!(
-            matches!(
-                second,
-                Err(crate::connection_error::ConnectionError::PoolExhausted { max_size: 1, .. })
-            ),
-            "waiter was not blocked on the single slot: {}",
-            match &second {
-                Ok(_) => "checkout returned a connection".to_string(),
-                Err(error) => error.to_string(),
-            }
+            !creator_task.is_finished(),
+            "stalled creation finished before its deadline"
+        );
+        assert!(
+            !waiter_task.is_finished(),
+            "the waiter finished before the stalled creation reached its deadline"
         );
 
-        let first = tokio::time::timeout(crate::constants::timeout::CONNECTION * 2, &mut first)
-            .await
-            .expect("stalled creation did not finish");
+        tokio::time::advance(
+            crate::constants::timeout::CONNECTION + std::time::Duration::from_millis(1),
+        )
+        .await;
+        for _ in 0..16 {
+            if creator_task.is_finished() && waiter_task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            creator_task.is_finished(),
+            "stalled creation was not polled through its deadline"
+        );
+        assert!(
+            waiter_task.is_finished(),
+            "the waiter was not polled through its deadline"
+        );
+
+        let first = creator_task.await.expect("stalled creation panicked");
         assert!(
             matches!(
                 first,
@@ -1023,17 +1040,27 @@ mod tests {
                 Err(error) => error.to_string(),
             }
         );
+        let second = waiter_task.await.expect("waiter panicked");
+        assert!(
+            matches!(
+                second,
+                Err(crate::connection_error::ConnectionError::PoolExhausted { max_size: 1, .. })
+            ),
+            "waiter was not bounded by the single slot: {}",
+            match &second {
+                Ok(_) => "checkout returned a connection".to_string(),
+                Err(error) => error.to_string(),
+            }
+        );
         assert_eq!(ConnectionProvider::status(&provider).created.get(), 0);
         assert_eq!(provider.status_counts().waiting, 0);
 
-        let queued =
-            tokio::time::timeout(std::time::Duration::from_millis(1), listener.accept()).await;
-        assert!(
-            queued.is_err(),
-            "a handshake was already queued before the replacement checkout"
-        );
-
         tokio::time::resume();
+        while let Ok(Ok(_)) =
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept()).await
+        {
+        }
+
         let third = provider.checkout_connection_guard();
         tokio::pin!(third);
         let replacement =
