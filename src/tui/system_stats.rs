@@ -39,11 +39,13 @@ impl SystemMonitor {
     /// Create a new system monitor for the current process
     ///
     /// # Panics
-    /// Panics if `sysinfo` cannot determine the current process ID.
+    /// Panics if `sysinfo` cannot initialize process statistics on this
+    /// operating system, or cannot determine the current process ID.
     #[must_use]
     pub fn new() -> Self {
         let mut system =
-            System::new_with_specifics(RefreshKind::nothing().with_processes(Self::refresh_kind()));
+            System::new_with_specifics(RefreshKind::nothing().with_processes(Self::refresh_kind()))
+                .expect("Failed to initialize sysinfo process statistics");
         let pid = sysinfo::get_current_pid().expect("Failed to get current PID");
         system.refresh_processes_specifics(
             ProcessesToUpdate::Some(&[pid]),

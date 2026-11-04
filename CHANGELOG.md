@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A single reducer now updates client authentication state, and the authenticated identity can be set only once. Password diagnostics are redacted; password parsing and serialization are unchanged.
 - Response-write metrics are configurable through `[proxy].response_write_metrics_secs` (disabled by default). Session, dashboard, and routing counters now use typed metric values.
 - Migrated development and CI workflows to `devenv`, reduced crate visibility, and removed obsolete compatibility code and unused large-transfer paths.
-- Refreshed runtime and development dependencies, including `foyer` 0.22.6, `nutype` 0.8, Tokio 1.54.1, Hickory 0.26.3, `toml` 1.2, `uuid` 1.29, `bytes` 1.12, `smallvec` 1.16, `webpki-roots` 1.0.11, and `bytesize` 2.7.
+- Refreshed runtime and development dependencies, including `foyer` 0.22.6, `nutype` 0.8, Tokio 1.54.1, Hickory 0.26.3, `toml` 1.2, `uuid` 1.29, `bytes` 1.12, `smallvec` 1.16, `webpki-roots` 1.0.11, `bytesize` 2.7, and `sysinfo` 0.40.1.
 - Updated Gungraun and its Nix-packaged runner to 0.20 and removed the obsolete benchmark advisory exception.
 
 ### Fixed
