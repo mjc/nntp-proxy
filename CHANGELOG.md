@@ -42,8 +42,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Preserved the next tracked response after a multiline reply even when its status line is malformed, and kept overlong status-line discard bounded until the line completes.
 - Split cached headerless ARTICLE payloads at their initial blank line so body content is retained correctly.
-- Updated `rustls` to 0.23.46, `rustls-webpki` to 0.103.16, and `webpki-roots` to 1.0.10 to address certificate-validation advisories and refresh the bundled CA roots.
-- Increased the hybrid-cache benchmark disk budget to support four active flushers and spare blocks, preventing the fixture from stalling.
 - Preserved backend bytes following a completed response for the next request, including packed single-line and multiline responses.
 - Removed terminator bytes from isolated article captures across backend reads while preserving the status line for empty bodies.
 - Made stateful forwarding cancellation-safe so a client becoming ready cannot cancel an already-started backend write or leave the connection falsely reusable.
@@ -62,6 +60,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fixed active-session and dashboard counters, reduced TUI render allocations, and cleared prewarmed idle backend pools after their configured timeout.
 - Fixed retry routing, queue-pressure validation, backend selection based on available capacity, and response completion checks.
 - A status-only cache update keeps cached HEAD, BODY, ARTICLE, and STAT sections. A HEAD and a BODY for the same message ID are merged into one article. When their article numbers differ, neither number is kept.
+- Connection setup, including connect, TLS, authentication, and `MODE READER`, fails when it exceeds its deadline. The pool slot is released and routing tries the next backend.
+- The hybrid cache counts the key and the cached record toward its memory budget. Missing, availability-only, and STAT entries are evicted under pressure, including after they expire.
+
+### Security
+
+- Updated `rustls` to 0.23.46, `rustls-webpki` to 0.103.16, and `webpki-roots` to 1.0.10.
 
 ### Upgrade notes
 
@@ -82,16 +86,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `zlib-ng` Cargo feature was removed. RFC 8054 DEFLATE support now uses the `zlib-rs` backend.
 - The minimum supported Rust version is now 1.95 to cover the resolved dependencies. The pinned toolchain remains 1.98.1.
 
-### Testing and documentation
+### Docs
 
-- Added scanner equivalence properties across lane alignments, tails, and encoded article streams.
-- Added regression coverage for fragmented and packed responses, terminators split across reads, request-scoped response shapes, malformed and overlong statuses, capture round trips, partial writes, backpressure, cancellation and connection reuse, hybrid handoff, compressed streams, cache boundary preservation, canonical-host availability identity, exact-key collision safety, provider-slot snapshot restoration, authentication transitions, typed counters, and retained-buffer ownership.
-- Added devenv quality tasks covering formatting, Clippy, shell and workflow linting, typo checks, coverage, dependency policy, advisories, unused dependencies, and response-contract checks.
-- Updated operator, development, configuration, and release-benchmark documentation for the new routing, cache, framing, and development workflows.
-- Held the availability clock in restore tests so an older generation that is still inside its TTL is not dropped because the wall clock moved.
-- Added regression coverage for connection setup deadlines when connect, TLS, authentication, or `MODE READER` stalls, including pool-slot release and routing fallback to the next backend.
-- Proved a status-only success leaves a cached HEAD response byte-for-byte, that a HEAD and a BODY for the same message ID answer both request kinds in either order, and that disagreeing article numbers are omitted from the merged response.
-- Proved missing, availability-only, and STAT cache entries consume hybrid memory capacity and are evicted under pressure, including after they expire.
+- Operator, development, configuration, and release-benchmark documentation covers the routing, cache, framing, and development workflow changes.
 
 ## [0.5.2] - 2026-06-11
 
