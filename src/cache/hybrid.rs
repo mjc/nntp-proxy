@@ -825,8 +825,8 @@ mod tests {
 
     /// Inserts enough positive-weight metadata to force eviction.
     ///
-    /// Proves missing, availability-only, and STAT entries consume the memory
-    /// budget and stay within it. Does not measure process RSS or the disk tier.
+    /// Proves a mix of missing, availability-only, and STAT entries stays inside
+    /// the memory budget. Does not measure process RSS or the disk tier.
     #[tokio::test]
     async fn metadata_entries_stay_within_memory_capacity() {
         let unit = metadata_unit_weight();
@@ -859,7 +859,23 @@ mod tests {
         );
     }
 
-    /// Expired metadata still occupies weight, then yields that weight under pressure.
+    /// Each metadata variant is retained when the budget can hold all three.
+    #[tokio::test]
+    async fn each_metadata_type_is_admitted() {
+        let cache = HybridArticleCache::new_memory_only(1 << 20)
+            .await
+            .expect("memory cache");
+
+        for index in 0..3 {
+            cache
+                .cache
+                .insert(format!("kind-{index}"), metadata_sample(index));
+        }
+
+        assert_eq!(cache.cache.memory().entries(), 3);
+    }
+
+    /// Expired missing, availability-only, and STAT entries keep their weight until pressure evicts them.
     #[tokio::test]
     async fn expired_metadata_is_reclaimed_under_pressure() {
         let unit = metadata_unit_weight();
@@ -869,7 +885,7 @@ mod tests {
             .expect("memory cache");
 
         for index in 0..3 {
-            let mut expired = DiskCachedArticle::missing(super::ttl::CacheTier::new(0));
+            let mut expired = metadata_sample(index);
             expired.timestamp = super::ttl::CacheTimestampMillis::new(0);
             cache.cache.insert(format!("old-{index}"), expired);
         }
