@@ -1906,20 +1906,23 @@ mod tests {
     fn load_from_path_skips_expired_entries() {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("availability-expired.idx");
+        let ttl = std::time::Duration::from_millis(5);
+        let now = 1_800_000_000_000;
+        let clock = ttl::hold_now_millis(now);
         let index = AvailabilityIndex::with_capacity_and_generation_count(
             test_capacity_for(8, 2),
-            std::time::Duration::from_millis(5),
+            ttl,
             DEFAULT_GENERATIONS,
         );
         let msg_id = MessageId::from_borrowed("<persisted-expired@example.com>").unwrap();
 
         index.record_availability_missing(&msg_id, AvailabilitySlot::new(0).unwrap());
         index.save_to_path(&path).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(15));
+        clock.set(now + ttl.as_millis() as u64 + 10);
 
         let restored = AvailabilityIndex::with_capacity_and_generation_count(
             test_capacity_for(8, 2),
-            std::time::Duration::from_millis(5),
+            ttl,
             DEFAULT_GENERATIONS,
         );
         assert!(restored.load_from_path(&path).unwrap());
@@ -1931,6 +1934,12 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         let path = temp_dir.path().join("availability-older-generation.idx");
         let ttl = std::time::Duration::from_millis(200);
+        // Age stays at half the TTL plus 20 ms. Two generations rotate every
+        // 100 ms, so this observation belongs to the older generation and is
+        // still inside the TTL. A wall clock would expire it if the runner
+        // stalled before lookup.
+        let now = 1_800_000_000_000;
+        let _clock = ttl::hold_now_millis(now);
         let index = AvailabilityIndex::with_capacity_and_generation_count(
             test_capacity_for(8, 2),
             ttl,
@@ -1940,10 +1949,7 @@ mod tests {
 
         index.record_availability_missing(&msg_id, AvailabilitySlot::new(0).unwrap());
         index.save_to_path(&path).unwrap();
-        rewrite_persisted_inserted_at(
-            &path,
-            ttl::now_millis().saturating_sub((ttl.as_millis() as u64 / 2) + 20),
-        );
+        rewrite_persisted_inserted_at(&path, now - ((ttl.as_millis() as u64 / 2) + 20));
 
         let restored = AvailabilityIndex::with_capacity_and_generation_count(
             test_capacity_for(8, 2),

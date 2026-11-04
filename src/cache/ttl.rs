@@ -128,9 +128,46 @@ pub const fn effective_ttl(base_ttl: CacheTtlMillis, tier: CacheTier) -> CacheTt
 #[inline]
 #[must_use]
 pub fn now_millis() -> u64 {
+    #[cfg(test)]
+    if let Some(now) = TEST_NOW_MILLIS.with(std::cell::Cell::get) {
+        return now;
+    }
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, duration_millis_u64)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_NOW_MILLIS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Hold `now_millis` at one value until the guard drops.
+///
+/// Availability tests use this so an entry's age stays at the value the test
+/// wrote, instead of moving when the runner is slow.
+#[cfg(test)]
+#[must_use]
+pub(crate) fn hold_now_millis(now: u64) -> TestNowGuard {
+    TEST_NOW_MILLIS.with(|cell| cell.set(Some(now)));
+    TestNowGuard
+}
+
+#[cfg(test)]
+pub(crate) struct TestNowGuard;
+
+#[cfg(test)]
+impl TestNowGuard {
+    pub(crate) fn set(&self, now: u64) {
+        TEST_NOW_MILLIS.with(|cell| cell.set(Some(now)));
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestNowGuard {
+    fn drop(&mut self) {
+        TEST_NOW_MILLIS.with(|cell| cell.set(None));
+    }
 }
 
 #[allow(clippy::cast_possible_truncation)] // `Duration::as_millis` is saturated back into our u64 TTL counter.
