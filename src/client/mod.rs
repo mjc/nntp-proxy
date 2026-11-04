@@ -555,10 +555,7 @@ mod tests {
             },
         )
         .unwrap();
-        crate::pool::deadpool_connection::Pool::builder(manager)
-            .max_size(2)
-            .build()
-            .unwrap()
+        crate::pool::deadpool_connection::configured_pool(manager, 2)
     }
 
     fn make_test_client_with_buffer_size(

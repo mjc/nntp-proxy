@@ -302,6 +302,33 @@ impl StackStatusLine {
 }
 
 impl CachedPayload {
+    /// Request kinds this payload can answer. Article covers every kind. A
+    /// missing or availability-only marker covers none.
+    const fn answer_bits(&self) -> u8 {
+        const ARTICLE: u8 = 1;
+        const HEAD: u8 = 2;
+        const BODY: u8 = 4;
+        const STAT: u8 = 8;
+        match self {
+            Self::Article { .. } => ARTICLE | HEAD | BODY | STAT,
+            Self::Head { .. } => HEAD | STAT,
+            Self::Body { .. } => BODY | STAT,
+            Self::Stat { .. } => STAT,
+            Self::Missing | Self::AvailabilityOnly => 0,
+        }
+    }
+
+    /// `self` can answer every request `existing` can, and at least one more.
+    ///
+    /// Equal length is not a richer copy of the same sections. An empty body
+    /// still replaces a missing marker, and a body still replaces a STAT entry.
+    #[must_use]
+    pub(crate) const fn strictly_more_useful_than(&self, existing: &Self) -> bool {
+        let new_bits = self.answer_bits();
+        let existing_bits = existing.answer_bits();
+        new_bits & existing_bits == existing_bits && new_bits != existing_bits
+    }
+
     #[must_use]
     pub(crate) fn len(&self) -> CachedPayloadLen {
         let len = match self {
@@ -625,26 +652,21 @@ impl CachedArticle {
         self.backend_availability
     }
 
-    /// Check if this cache entry contains a complete article (220) or body (222)
+    /// Check if this entry can be served as an article.
     ///
-    /// Returns true if:
-    /// 1. Status code is 220 (ARTICLE) or 222 (BODY)
-    /// 2. Buffer contains actual content (not just a status line like "220\r\n")
-    ///
-    /// This is used by the full article cache to determine if we can serve
-    /// directly from cache or need to fetch additional data.
+    /// A `220` ARTICLE with headers or a body qualifies. A `222` BODY does not:
+    /// it cannot answer ARTICLE or HEAD, and it must not suppress availability
+    /// probes or block a later article.
     #[inline]
     #[must_use]
     pub fn is_complete_article(&self) -> bool {
-        let code = self.status_code();
-        matches!(
-            (&self.payload, code.as_u16()),
-            (CachedPayload::Article { headers, body, .. }, 220)
-                if !headers.is_empty() || !body.is_empty()
-        ) || matches!(
-            (&self.payload, code.as_u16()),
-            (CachedPayload::Body { body, .. }, 222) if !body.is_empty()
-        )
+        if self.status_code().as_u16() != 220 {
+            return false;
+        }
+        let CachedPayload::Article { headers, body, .. } = &self.payload else {
+            return false;
+        };
+        !headers.is_empty() || !body.is_empty()
     }
 
     /// Initialize availability tracker from this cached entry
@@ -842,6 +864,17 @@ fn copy_payload_bytes(response: &crate::pool::ChunkedResponse, range: Range<usiz
     copied
 }
 
+/// Keep the stored payload when it is longer, or when an equal-length update
+/// cannot answer any additional request.
+pub(crate) fn keep_same_completeness(
+    existing_len: CachedPayloadLen,
+    new_len: CachedPayloadLen,
+    existing: &CachedPayload,
+    new: &CachedPayload,
+) -> bool {
+    existing_len > new_len || (existing_len == new_len && !new.strictly_more_useful_than(existing))
+}
+
 fn payload_for_status_owned(
     code: u16,
     article_number: Option<CachedArticleNumber>,
@@ -1014,6 +1047,9 @@ impl ArticleCache {
                 const ARC_STR_OVERHEAD: usize = 16 + 16; // Arc control block + allocator
                 const ENTRY_STRUCT: usize = std::mem::size_of::<CachedArticle>(); // CachedArticle inline metadata and enum tag
                 const PAYLOAD_OVERHEAD: usize = 2 * (16 + 16); // Up to headers/body shared slices + allocators
+                // A payload at least this large dominates allocator overhead.
+                // Smaller entries, including status-only records, pay the multiplier below.
+                const CONTENT_DOMINATED_PAYLOAD: usize = 10 * 1024;
                 // Moka internal structures - empirically measured to address memory reporting gap.
                 // See moka issue #473: https://github.com/moka-rs/moka/issues/473
                 // Observed ratio: 362MB RSS / 36MB weighted_size() = 10x
@@ -1026,10 +1062,10 @@ impl ArticleCache {
                 let base_size =
                     key_size + buffer_size + ENTRY_STRUCT + negative_size + MOKA_OVERHEAD;
 
-                // Availability-only entries have higher relative overhead
-                // due to allocator fragmentation on small allocations.
-                // Complete articles are dominated by content size, so no multiplier needed.
-                let weighted_size = if entry.is_complete_article() {
+                // Small allocations pay for allocator fragmentation. A large body
+                // or article is dominated by its bytes, whether or not it is a
+                // complete article.
+                let weighted_size = if entry.payload_len().get() >= CONTENT_DOMINATED_PAYLOAD {
                     base_size
                 } else {
                     // Small allocations have ~50% more overhead from allocator fragmentation.
@@ -1129,18 +1165,21 @@ impl ArticleCache {
             let should_replace = match (existing_complete, new_complete) {
                 (false, true) => true,
                 (true, false) => false,
-                (true, true) | (false, false) => {
-                    new_entry_template.payload_len() > entry.payload_len()
-                }
+                (true, true) | (false, false) => !keep_same_completeness(
+                    entry.payload_len(),
+                    new_entry_template.payload_len(),
+                    &entry.payload,
+                    &new_entry_template.payload,
+                ),
             };
 
             if should_replace {
                 entry.status_code = new_entry_template.status_code;
                 entry.payload = new_entry_template.payload.clone();
                 entry.tier = new_entry_template.tier;
+                entry.inserted_at = ttl::CacheTimestampMillis::now();
             }
 
-            entry.inserted_at = ttl::CacheTimestampMillis::now();
             entry
         } else {
             new_entry_template.clone()
@@ -1970,14 +2009,141 @@ mod tests {
     }
 
     #[test]
-    fn body_payload_completeness_requires_semantic_body() {
+    fn body_payload_is_not_a_complete_article() {
         let complete =
             cached_article_from_ingest_bytes(b"222 0 <test@example.com>\r\nBody content\r\n.\r\n");
         let metadata_only =
             cached_article_from_ingest_bytes(b"222 0 <test@example.com>\r\n".as_slice());
 
-        assert!(complete.is_complete_article());
+        assert!(!complete.is_complete_article());
         assert!(!metadata_only.is_complete_article());
+        assert!(
+            complete
+                .cached_response_for(RequestKind::Body, "<test@example.com>")
+                .is_some()
+        );
+        assert!(
+            complete
+                .cached_response_for(RequestKind::Article, "<test@example.com>")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_body_keeps_its_cache_time_and_article_replaces_it() {
+        let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
+        let msg_id = MessageId::from_str_or_wrap("replace-body@example.com").unwrap();
+        let backend = BackendId::from_index(0);
+        let mut body = CachedArticle::from_unframed_ingest_for_test(
+            b"222 0 <replace-body@example.com>\r\nBody content that is long enough\r\n.\r\n"
+                .to_vec(),
+            ttl::CacheTier::new(0),
+        );
+        // Still inside the 300s TTL. An ancient timestamp is expired and is
+        // replaced outright, which does not exercise a rejected fresh payload.
+        let stored_at = ttl::now_millis().saturating_sub(60_000);
+        body.inserted_at = ttl::CacheTimestampMillis::new(stored_at);
+        cache.insert(msg_id.clone(), body).await;
+
+        cache
+            .upsert_unframed_ingest(
+                msg_id.clone(),
+                b"222 0 <replace-body@example.com>\r\nBody content that is long enough\r\n.\r\n"
+                    .to_vec(),
+                backend,
+                0.into(),
+            )
+            .await;
+        let kept = cache.get(&msg_id).await.expect("equal-length body stays");
+        assert_eq!(kept.inserted_at().get(), stored_at);
+
+        cache
+            .upsert_unframed_ingest(
+                msg_id.clone(),
+                b"222 0 <replace-body@example.com>\r\nshort\r\n.\r\n".to_vec(),
+                backend,
+                0.into(),
+            )
+            .await;
+        let kept = cache.get(&msg_id).await.expect("body stays cached");
+        assert_eq!(kept.inserted_at().get(), stored_at);
+        assert!(!kept.is_complete_article());
+
+        cache
+            .upsert_unframed_ingest(
+                msg_id.clone(),
+                b"220 0 <replace-body@example.com>\r\nSubject: T\r\n\r\nHi\r\n.\r\n".to_vec(),
+                backend,
+                0.into(),
+            )
+            .await;
+        let replaced = cache.get(&msg_id).await.expect("article replaced body");
+        assert!(replaced.is_complete_article());
+        assert_ne!(replaced.inserted_at().get(), stored_at);
+        assert!(
+            replaced
+                .cached_response_for(RequestKind::Article, msg_id.as_str())
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn empty_body_replaces_a_missing_marker_and_a_stat_entry() {
+        let missing = CachedPayload::Missing;
+        let stat = CachedPayload::Stat {
+            article_number: None,
+        };
+        let body = CachedPayload::Body {
+            article_number: None,
+            body: std::sync::Arc::from([]),
+        };
+        assert!(
+            !keep_same_completeness(missing.len(), body.len(), &missing, &body),
+            "an empty body answers BODY and must replace a missing marker"
+        );
+        assert!(
+            !keep_same_completeness(stat.len(), body.len(), &stat, &body),
+            "an empty body answers BODY and must replace a STAT entry"
+        );
+        assert!(
+            keep_same_completeness(body.len(), body.len(), &body, &body),
+            "an equal-length body is not a richer copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_body_replaces_missing_marker_from_another_backend() {
+        let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
+        let msg_id = MessageId::from_str_or_wrap("empty-body@example.com").unwrap();
+        cache
+            .record_availability_missing(msg_id.clone(), AvailabilitySlot::new(0).unwrap())
+            .await;
+
+        cache
+            .upsert_unframed_ingest(
+                msg_id.clone(),
+                b"222 0 <empty-body@example.com>\r\n.\r\n".to_vec(),
+                BackendId::from_index(1),
+                0.into(),
+            )
+            .await;
+
+        let entry = cache.get(&msg_id).await.expect("empty body is cached");
+        assert!(
+            entry
+                .cached_response_for(RequestKind::Body, msg_id.as_str())
+                .is_some()
+        );
+        assert!(
+            !entry
+                .availability()
+                .should_try_slot(AvailabilitySlot::new(0).unwrap())
+        );
+        assert!(
+            entry
+                .availability()
+                .should_try_slot(AvailabilitySlot::new(1).unwrap())
+        );
     }
 
     #[tokio::test]

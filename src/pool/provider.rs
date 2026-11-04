@@ -21,6 +21,11 @@ use std::sync::atomic::Ordering;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
+enum AcquisitionFailure {
+    Pool(deadpool::managed::PoolError<crate::connection_error::ConnectionError>),
+    Deadline,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatMissingPolicy {
     Disabled,
@@ -409,10 +414,7 @@ impl DeadpoolConnectionProvider {
         max_size: usize,
         stat_missing: StatMissingPolicy,
     ) -> Self {
-        let pool = Pool::builder(manager)
-            .max_size(max_size)
-            .build()
-            .expect("Failed to create connection pool");
+        let pool = super::deadpool_connection::configured_pool(manager, max_size);
 
         Self {
             pool,
@@ -471,10 +473,7 @@ impl DeadpoolConnectionProvider {
             },
         )?;
         let max_size = server.max_connections.get();
-        let pool = Pool::builder(manager)
-            .max_size(max_size)
-            .build()
-            .expect("Failed to create connection pool");
+        let pool = super::deadpool_connection::configured_pool(manager, max_size);
 
         let keepalive_interval = server.connection_keepalive;
 
@@ -526,29 +525,65 @@ impl DeadpoolConnectionProvider {
         &self,
     ) -> Result<PooledConnection, crate::connection_error::ConnectionError> {
         use crate::connection_error::ConnectionError;
-        let result = tokio::time::timeout(crate::constants::timeout::CONNECTION, self.pool.get())
-            .await
-            .unwrap_or_else(|_| Err(managed::PoolError::Timeout(managed::TimeoutType::Wait)));
-        result.map_err(|e| {
-            let status = self.pool.status();
-            let err = match e {
+
+        // The pool's own wait timer ends once a slot is taken. A checkout that
+        // is still running when the connection deadline elapses — including a
+        // waiter that takes a slot in that same instant — stays an empty-pool
+        // failure. A setup or recycle timeout that has already completed stays
+        // that failure.
+        let limit = crate::constants::timeout::CONNECTION;
+        let failure = match tokio::time::timeout(limit, self.pool.get()).await {
+            Ok(Ok(connection)) => return Ok(connection),
+            Ok(Err(error)) => AcquisitionFailure::Pool(error),
+            Err(_elapsed) => AcquisitionFailure::Deadline,
+        };
+        let status = self.pool.status();
+        let err = match failure {
+            AcquisitionFailure::Deadline => ConnectionError::PoolExhausted {
+                backend: self.name.to_string(),
+                max_size: status.max_size,
+            },
+            AcquisitionFailure::Pool(error) => match error {
                 deadpool::managed::PoolError::Backend(conn_err) => conn_err,
-                _other => ConnectionError::PoolExhausted {
+                deadpool::managed::PoolError::Timeout(managed::TimeoutType::Wait) => {
+                    ConnectionError::PoolExhausted {
+                        backend: self.name.to_string(),
+                        max_size: status.max_size,
+                    }
+                }
+                deadpool::managed::PoolError::Timeout(
+                    managed::TimeoutType::Create | managed::TimeoutType::Recycle,
+                ) => ConnectionError::IoError(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("Backend '{}' connection setup timed out", self.name),
+                )),
+                deadpool::managed::PoolError::Closed => ConnectionError::PoolClosed {
                     backend: self.name.to_string(),
-                    max_size: status.max_size,
                 },
-            };
-            warn!(
-                pool = %self.name,
-                max_size = status.max_size,
-                available = status.available,
-                current_size = status.size,
-                waiting = status.waiting,
-                error = %err,
-                "Connection acquisition failed"
-            );
-            err
-        })
+                deadpool::managed::PoolError::NoRuntimeSpecified => {
+                    ConnectionError::IoError(std::io::Error::other(format!(
+                        "Backend '{}' pool has no async runtime",
+                        self.name
+                    )))
+                }
+                deadpool::managed::PoolError::PostCreateHook(hook) => match hook {
+                    deadpool::managed::HookError::Backend(conn_err) => conn_err,
+                    deadpool::managed::HookError::Message(message) => {
+                        ConnectionError::IoError(std::io::Error::other(message.to_string()))
+                    }
+                },
+            },
+        };
+        warn!(
+            pool = %self.name,
+            max_size = status.max_size,
+            available = status.available,
+            current_size = status.size,
+            waiting = status.waiting,
+            error = %err,
+            "Connection acquisition failed"
+        );
+        Err(err)
     }
 
     /// Checkout a pooled connection in the idle state.
@@ -998,6 +1033,24 @@ mod tests {
             let _held = socket;
             std::future::pending::<()>().await;
         });
+    }
+
+    #[tokio::test]
+    async fn closed_pool_is_not_an_empty_pool() {
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", 1)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        provider.pool.close();
+
+        let error = provider.get_pooled_connection().await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                crate::connection_error::ConnectionError::PoolClosed { .. }
+            ),
+            "closed pool was reported as {error}"
+        );
     }
 
     #[tokio::test]
@@ -1567,7 +1620,7 @@ mod tests {
         )
         .unwrap();
 
-        let pool = Pool::builder(manager).max_size(max_size).build().unwrap();
+        let pool = crate::pool::deadpool_connection::configured_pool(manager, max_size);
 
         DeadpoolConnectionProvider {
             pool,

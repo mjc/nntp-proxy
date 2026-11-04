@@ -51,6 +51,9 @@ pub enum ConnectionError {
     #[error("Connection pool exhausted for backend '{backend}' (max size: {max_size})")]
     PoolExhausted { backend: String, max_size: usize },
 
+    #[error("Connection pool for backend '{backend}' is closed")]
+    PoolClosed { backend: String },
+
     #[error("I/O error: {0}")]
     IoError(#[from] std::io::Error),
 

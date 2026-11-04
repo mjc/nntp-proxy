@@ -8,9 +8,14 @@ use std::fmt;
 
 /// Session-level error that carries the client-disconnect signal through the handler stack.
 ///
-/// Only two cases matter for control flow:
+/// Control flow:
 /// - `ClientDisconnect` — client closed connection; don't log, don't retry, propagate cleanly
-/// - `Backend` — log, maybe retry, handle as backend/protocol error
+/// - `Backend` — log, and retry only when the client has not already been written
+///
+/// A failed client write is a `Backend` error so it is not reported as a
+/// disconnect. [`SessionError::blocks_another_response`] stops a later attempt
+/// from writing another response onto that stream. That includes a client
+/// write failure and a backend failure after response bytes were already sent.
 #[derive(Debug)]
 pub enum SessionError {
     /// Client disconnected (`BrokenPipe`, `ConnectionReset`).
@@ -28,6 +33,53 @@ impl fmt::Display for SessionError {
             Self::ClientDisconnect(e) => write!(f, "client disconnected: {e}"),
             Self::Backend(e) => write!(f, "{e}"),
         }
+    }
+}
+
+impl SessionError {
+    /// A client write failed after the proxy may already have sent response bytes.
+    ///
+    /// The attempt must stop so the next backend, a backend-error reply, or
+    /// `430` is not written after it. Pool fate is separate: a preserved
+    /// backend response stays reusable.
+    pub(crate) fn is_failed_client_write(&self) -> bool {
+        let Self::Backend(error) = self else {
+            return false;
+        };
+        let Some(transfer) =
+            error.downcast_ref::<crate::session::response_transfer::ResponseTransferError>()
+        else {
+            return false;
+        };
+        if let crate::session::response_transfer::ResponseTransferError::ClientWrite(_)
+        | crate::session::response_transfer::ResponseTransferError::ClientWriteUnpreserved(_) =
+            transfer
+        {
+            return true;
+        }
+        false
+    }
+
+    /// The client may already have response bytes, so another response must not
+    /// be written after this error.
+    pub(crate) fn blocks_another_response(&self) -> bool {
+        if self.is_failed_client_write() {
+            return true;
+        }
+        let Self::Backend(error) = self else {
+            return false;
+        };
+        let Some(transfer) =
+            error.downcast_ref::<crate::session::response_transfer::ResponseTransferError>()
+        else {
+            return false;
+        };
+        if let crate::session::response_transfer::ResponseTransferError::DeliveredPrefix(_) =
+            transfer
+        {
+            return true;
+        }
+        false
     }
 }
 
@@ -85,9 +137,24 @@ impl From<crate::session::response_transfer::ResponseTransferError> for SessionE
             crate::session::response_transfer::ResponseTransferError::ClientDisconnect(io_err) => {
                 Self::ClientDisconnect(io_err)
             }
-            crate::session::response_transfer::ResponseTransferError::ClientWrite(io_err) => {
+            crate::session::response_transfer::ResponseTransferError::ClientWrite(io_err)
+            | crate::session::response_transfer::ResponseTransferError::ClientWriteUnpreserved(
+                io_err,
+            ) if crate::connection_error::is_disconnect_kind(io_err.kind()) => {
                 Self::ClientDisconnect(io_err)
             }
+            crate::session::response_transfer::ResponseTransferError::ClientWrite(io_err) => {
+                Self::Backend(anyhow::Error::new(
+                    crate::session::response_transfer::ResponseTransferError::ClientWrite(io_err),
+                ))
+            }
+            crate::session::response_transfer::ResponseTransferError::ClientWriteUnpreserved(
+                io_err,
+            ) => Self::Backend(anyhow::Error::new(
+                crate::session::response_transfer::ResponseTransferError::ClientWriteUnpreserved(
+                    io_err,
+                ),
+            )),
             other => Self::Backend(anyhow::Error::new(other)),
         }
     }
@@ -160,5 +227,49 @@ mod tests {
             crate::session::response_transfer::ResponseTransferError::ClientWrite(io_err);
         let e = SessionError::from(response_transfer_err);
         assert!(matches!(e, SessionError::ClientDisconnect(_)));
+    }
+
+    #[test]
+    fn timed_out_client_write_stays_a_backend_error() {
+        let io_err = std::io::Error::new(ErrorKind::TimedOut, "timed out");
+        let response_transfer_err =
+            crate::session::response_transfer::ResponseTransferError::ClientWrite(io_err);
+        let e = SessionError::from(response_transfer_err);
+        assert!(e.is_failed_client_write());
+        let SessionError::Backend(error) = e else {
+            panic!("timed-out client write was reported as a disconnect");
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains("client write failed"), "{rendered}");
+        assert!(!rendered.contains("client disconnected"), "{rendered}");
+    }
+
+    #[test]
+    fn unpreserved_client_write_stops_the_attempt() {
+        let io_err = std::io::Error::new(ErrorKind::TimedOut, "timed out");
+        let response_transfer_err =
+            crate::session::response_transfer::ResponseTransferError::ClientWriteUnpreserved(
+                io_err,
+            );
+        let error = SessionError::from(response_transfer_err);
+        assert!(error.is_failed_client_write());
+        assert!(error.blocks_another_response());
+    }
+
+    #[test]
+    fn delivered_prefix_stops_another_response_without_a_client_write() {
+        let eof = crate::session::response_transfer::ResponseTransferError::BackendEof {
+            backend_id: crate::types::BackendId::from_index(0),
+            bytes_received: 12,
+        };
+        let delivered = eof.after_client_delivery();
+        let error = SessionError::from(delivered);
+        assert!(error.blocks_another_response());
+        assert!(!error.is_failed_client_write());
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("client already received response bytes"),
+            "{rendered}"
+        );
     }
 }
