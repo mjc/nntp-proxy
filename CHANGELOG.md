@@ -52,6 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preserved the classified plan for a trailing pipelined command through direct execution or stateful handoff.
 - Tightened backend cleanup around failed authentication, probes, response writes, and partially completed exchanges.
 - Made DNS lookups TTL-aware and corrected address-family cache refresh behavior after IPv6-unreachable failures.
+- When `/etc/resolv.conf` is missing, hostname lookup uses the system hosts file. One lookup five minutes later tries the system file again, then stays on the hosts file if it is still absent.
 - Saved and restored availability facts using canonical hostnames, exact message
   IDs, and provider-slot translation. Stale identity mappings cannot be applied
   after the backend layout changes.
