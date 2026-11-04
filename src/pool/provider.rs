@@ -968,6 +968,87 @@ mod tests {
         assert!(provider.get_pooled_connection().await.is_ok());
     }
 
+    #[tokio::test]
+    async fn stalled_creation_times_out_and_frees_the_pool_slot() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let provider = DeadpoolConnectionProvider::builder(addr.ip().to_string(), addr.port())
+            .max_connections(1)
+            .build()
+            .unwrap();
+
+        let first = provider.checkout_connection_guard();
+        tokio::pin!(first);
+        let (socket, _) = tokio::select! {
+            accepted = listener.accept() => accepted.unwrap(),
+            _ = &mut first => panic!("checkout finished before the backend accepted"),
+        };
+        tokio::spawn(async move {
+            let _held = socket;
+            std::future::pending::<()>().await;
+        });
+
+        tokio::time::pause();
+        let second = tokio::time::timeout(
+            crate::constants::timeout::CONNECTION * 2,
+            provider.checkout_connection_guard(),
+        )
+        .await
+        .expect("a checkout behind a stalled creation waited without a deadline");
+        assert!(
+            matches!(
+                second,
+                Err(crate::connection_error::ConnectionError::PoolExhausted { max_size: 1, .. })
+            ),
+            "waiter was not blocked on the single slot: {}",
+            match &second {
+                Ok(_) => "checkout returned a connection".to_string(),
+                Err(error) => error.to_string(),
+            }
+        );
+
+        let first = tokio::time::timeout(crate::constants::timeout::CONNECTION * 2, &mut first)
+            .await
+            .expect("stalled creation did not finish");
+        assert!(
+            matches!(
+                first,
+                Err(crate::connection_error::ConnectionError::IoError(ref error))
+                    if error.kind() == std::io::ErrorKind::TimedOut
+                        && error.to_string().contains("connection setup timed out")
+            ),
+            "stalled greeting did not surface the setup deadline: {}",
+            match &first {
+                Ok(_) => "checkout returned a connection".to_string(),
+                Err(error) => error.to_string(),
+            }
+        );
+        assert_eq!(ConnectionProvider::status(&provider).created.get(), 0);
+        assert_eq!(provider.status_counts().waiting, 0);
+
+        let queued =
+            tokio::time::timeout(std::time::Duration::from_millis(1), listener.accept()).await;
+        assert!(
+            queued.is_err(),
+            "a handshake was already queued before the replacement checkout"
+        );
+
+        tokio::time::resume();
+        let third = provider.checkout_connection_guard();
+        tokio::pin!(third);
+        let replacement =
+            tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept());
+        tokio::pin!(replacement);
+        tokio::select! {
+            accepted = &mut replacement => {
+                accepted
+                    .expect("the stalled creation still occupied the only pool slot")
+                    .unwrap();
+            }
+            _ = &mut third => panic!("replacement checkout finished before the backend accepted"),
+        }
+    }
+
     #[test]
     fn test_builder_new() {
         let builder = Builder::new("news.example.com", 119);
