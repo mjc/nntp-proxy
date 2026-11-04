@@ -1158,7 +1158,12 @@ impl ArticleCache {
         if entry.backend_availability.is_missing_slot(slot) {
             return entry;
         }
-        if !entry.is_complete_article() {
+        // A status-only success records availability. It replaces only entries
+        // that have no retained section. HEAD, BODY, ARTICLE, and STAT stay.
+        if matches!(
+            entry.payload,
+            CachedPayload::Missing | CachedPayload::AvailabilityOnly
+        ) {
             entry.status_code = status_code;
             entry.tier = tier;
             entry.payload = CachedPayload::AvailabilityOnly;
@@ -2111,6 +2116,152 @@ mod tests {
                 .cached_response_for(RequestKind::Body, msg_id.as_str())
                 .is_some()
         );
+    }
+
+    /// A status-only success must leave an ingested HEAD response byte-for-byte.
+    #[tokio::test]
+    async fn status_update_keeps_cached_head_bytes() {
+        let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
+        let msg_id = MessageId::from_str_or_wrap("head@example.com").unwrap();
+        let head = b"221 4 <head@example.com>\r\nSubject: Kept\r\nX-Trace: yes\r\n.\r\n".to_vec();
+
+        cache
+            .upsert_unframed_ingest(
+                msg_id.clone(),
+                head.clone(),
+                BackendId::from_index(0),
+                0.into(),
+            )
+            .await;
+        cache
+            .record_backend_has_status(
+                msg_id.clone(),
+                StatusCode::new(223),
+                BackendId::from_index(1),
+                0.into(),
+            )
+            .await;
+
+        let cached = cache.get(&msg_id).await.expect("head remains cached");
+        assert_eq!(
+            rendered(&cached, RequestKind::Head, msg_id.as_str()),
+            head,
+            "status-only success must keep the cached HEAD response"
+        );
+        assert!(
+            cached
+                .cached_response_for(RequestKind::Body, msg_id.as_str())
+                .is_none(),
+            "a HEAD entry still cannot answer BODY"
+        );
+    }
+
+    /// Compatible header and body sections answer both kinds in either order.
+    #[tokio::test]
+    async fn compatible_sections_answer_both_request_kinds_in_either_order() {
+        let head = b"221 7 <sections@example.com>\r\nSubject: Kept\r\n.\r\n";
+        let body = b"222 7 <sections@example.com>\r\nkept-body\r\n.\r\n";
+        let article = b"220 7 <sections@example.com>\r\nSubject: Kept\r\n\r\nkept-body\r\n.\r\n";
+
+        for head_first in [true, false] {
+            let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
+            let msg_id = MessageId::from_str_or_wrap("sections@example.com").unwrap();
+            let backend = BackendId::from_index(0);
+            let first: &[u8] = if head_first { head } else { body };
+            let second: &[u8] = if head_first { body } else { head };
+            cache
+                .upsert_unframed_ingest(msg_id.clone(), first.to_vec(), backend, 0.into())
+                .await;
+            cache
+                .upsert_unframed_ingest(msg_id.clone(), second.to_vec(), backend, 0.into())
+                .await;
+
+            let cached = cache.get(&msg_id).await.expect("merged sections");
+            assert_eq!(
+                rendered(&cached, RequestKind::Head, msg_id.as_str()),
+                head,
+                "head first={head_first}"
+            );
+            assert_eq!(
+                rendered(&cached, RequestKind::Body, msg_id.as_str()),
+                body,
+                "head first={head_first}"
+            );
+            assert_eq!(
+                rendered(&cached, RequestKind::Article, msg_id.as_str()),
+                article,
+                "head first={head_first}"
+            );
+        }
+    }
+
+    /// Disagreeing article numbers stay uncombined; the complete body is kept.
+    #[tokio::test]
+    async fn disagreeing_article_numbers_are_not_combined() {
+        let head = b"221 10 <split@example.com>\r\nSubject: Left\r\n.\r\n";
+        let body = b"222 11 <split@example.com>\r\nright-body\r\n.\r\n";
+
+        for head_first in [true, false] {
+            let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
+            let msg_id = MessageId::from_str_or_wrap("split@example.com").unwrap();
+            let backend = BackendId::from_index(0);
+            let first: &[u8] = if head_first { head } else { body };
+            let second: &[u8] = if head_first { body } else { head };
+            cache
+                .upsert_unframed_ingest(msg_id.clone(), first.to_vec(), backend, 0.into())
+                .await;
+            cache
+                .upsert_unframed_ingest(msg_id.clone(), second.to_vec(), backend, 0.into())
+                .await;
+
+            let cached = cache.get(&msg_id).await.expect("replacement entry");
+            assert!(
+                cached
+                    .cached_response_for(RequestKind::Article, msg_id.as_str())
+                    .is_none(),
+                "head first={head_first}"
+            );
+            assert!(
+                cached
+                    .cached_response_for(RequestKind::Head, msg_id.as_str())
+                    .is_none(),
+                "head first={head_first}"
+            );
+            assert_eq!(
+                rendered(&cached, RequestKind::Body, msg_id.as_str()),
+                body,
+                "head first={head_first}"
+            );
+        }
+    }
+
+    /// A missing-slot update keeps a full ARTICLE and records that slot.
+    #[tokio::test]
+    async fn missing_update_keeps_article_bytes_and_marks_slot() {
+        let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
+        let msg_id = MessageId::from_str_or_wrap("full@example.com").unwrap();
+        let article =
+            b"220 3 <full@example.com>\r\nSubject: Full\r\n\r\nbody-text\r\n.\r\n".to_vec();
+
+        cache
+            .upsert_unframed_ingest(
+                msg_id.clone(),
+                article.clone(),
+                BackendId::from_index(1),
+                0.into(),
+            )
+            .await;
+        cache
+            .record_availability_missing(msg_id.clone(), AvailabilitySlot::new(0).unwrap())
+            .await;
+
+        let cached = cache.get(&msg_id).await.expect("article remains cached");
+        assert_eq!(
+            rendered(&cached, RequestKind::Article, msg_id.as_str()),
+            article
+        );
+        assert!(!cached.should_try_slot(AvailabilitySlot::new(0).unwrap()));
+        assert!(cached.should_try_slot(AvailabilitySlot::new(1).unwrap()));
     }
 
     #[test]

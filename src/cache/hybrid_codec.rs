@@ -1461,36 +1461,58 @@ mod tests {
 
     #[test]
     fn successful_status_update_preserves_cached_head() {
-        let mut entry =
-            disk_cached_article_from_ingest_bytes(b"221 0 <id>\r\nH: V\r\n.\r\n").unwrap();
+        let head = b"221 0 <id>\r\nH: V\r\n.\r\n";
+        let mut entry = disk_cached_article_from_ingest_bytes(head).unwrap();
 
         entry.record_backend_has_status(CacheableStatusCode::Stat, ttl::CacheTier::new(0));
 
-        assert!(
-            entry
-                .cached_response_for(RequestKind::Head, "<id>")
-                .is_some()
+        assert_eq!(
+            render_response(&entry, RequestKind::Head, "<id>").as_deref(),
+            Some(head.as_slice())
         );
     }
 
     #[test]
     fn compatible_head_and_body_sections_merge() {
-        let mut head =
-            disk_cached_article_from_ingest_bytes(b"221 0 <id>\r\nH: V\r\n.\r\n").unwrap();
-        let body = disk_cached_article_from_ingest_bytes(b"222 0 <id>\r\nB\r\n.\r\n").unwrap();
+        let head_bytes = b"221 0 <id>\r\nH: V\r\n.\r\n";
+        let body_bytes = b"222 0 <id>\r\nB\r\n.\r\n";
+        let mut head = disk_cached_article_from_ingest_bytes(head_bytes).unwrap();
+        let body = disk_cached_article_from_ingest_bytes(body_bytes).unwrap();
 
         assert!(head.merge_compatible_sections(&body));
-        assert!(
-            head.cached_response_for(RequestKind::Head, "<id>")
-                .is_some()
+        assert_eq!(
+            render_response(&head, RequestKind::Head, "<id>").as_deref(),
+            Some(head_bytes.as_slice())
         );
-        assert!(
-            head.cached_response_for(RequestKind::Body, "<id>")
-                .is_some()
+        assert_eq!(
+            render_response(&head, RequestKind::Body, "<id>").as_deref(),
+            Some(body_bytes.as_slice())
         );
-        assert!(
-            head.cached_response_for(RequestKind::Article, "<id>")
-                .is_some()
+        assert_eq!(
+            render_response(&head, RequestKind::Article, "<id>").as_deref(),
+            Some(b"220 0 <id>\r\nH: V\r\n\r\nB\r\n.\r\n".as_slice())
+        );
+    }
+
+    #[test]
+    fn compatible_body_then_head_sections_merge() {
+        let head_bytes = b"221 0 <id>\r\nH: V\r\n.\r\n";
+        let body_bytes = b"222 0 <id>\r\nB\r\n.\r\n";
+        let mut body = disk_cached_article_from_ingest_bytes(body_bytes).unwrap();
+        let head = disk_cached_article_from_ingest_bytes(head_bytes).unwrap();
+
+        assert!(body.merge_compatible_sections(&head));
+        assert_eq!(
+            render_response(&body, RequestKind::Head, "<id>").as_deref(),
+            Some(head_bytes.as_slice())
+        );
+        assert_eq!(
+            render_response(&body, RequestKind::Body, "<id>").as_deref(),
+            Some(body_bytes.as_slice())
+        );
+        assert_eq!(
+            render_response(&body, RequestKind::Article, "<id>").as_deref(),
+            Some(b"220 0 <id>\r\nH: V\r\n\r\nB\r\n.\r\n".as_slice())
         );
     }
 
@@ -1525,10 +1547,12 @@ mod tests {
         .unwrap();
 
         assert!(!head.merge_compatible_sections(&body));
-        assert!(
-            head.cached_response_for(RequestKind::Article, "<id>")
-                .is_none()
+        assert_eq!(
+            render_response(&head, RequestKind::Head, "<id>").as_deref(),
+            Some(b"221 10 <id>\r\nH: V\r\n.\r\n".as_slice())
         );
+        assert!(render_response(&head, RequestKind::Body, "<id>").is_none());
+        assert!(render_response(&head, RequestKind::Article, "<id>").is_none());
     }
 
     #[test]
