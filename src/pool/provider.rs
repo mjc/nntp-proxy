@@ -1128,8 +1128,17 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn backend_setup_has_a_deadline_when_connect_stalls() {
-        // TEST-NET-1 (RFC 5737) does not answer. A closed local port resets
-        // immediately, which never reaches the setup deadline.
+        // TEST-NET-1 (RFC 5737) does not answer when the host has a route to it.
+        // A closed local port resets immediately. Without a route, connect fails
+        // at once with an unreachable error and never reaches the setup deadline.
+        // UDP connect only checks that route; it does not send a packet.
+        if std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|socket| socket.connect("192.0.2.1:9"))
+            .is_err()
+        {
+            eprintln!("skipping: no route to 192.0.2.1");
+            return;
+        }
         let provider = DeadpoolConnectionProvider::builder("192.0.2.1", 9)
             .max_connections(1)
             .build()
