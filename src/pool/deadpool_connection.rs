@@ -5,6 +5,9 @@
 
 use deadpool::managed;
 use hickory_resolver::TokioResolver;
+use hickory_resolver::config::{ResolveHosts, ResolverConfig};
+use hickory_resolver::net::NetError;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::proto::rr::RecordType;
 use smallvec::SmallVec;
 use std::io;
@@ -90,19 +93,44 @@ static NEXT_ADDR_START: AtomicUsize = AtomicUsize::new(0);
 static NEXT_IPV4_ROTATION: AtomicUsize = AtomicUsize::new(0);
 
 /// Initialize or return the shared DNS resolver.
+///
+/// Hickory reads `/etc/resolv.conf` for the upstream nameservers. A Nix
+/// sandbox has no such file. In that case the resolver answers from the
+/// system hosts file and does not query an upstream server.
 fn dns_resolver() -> Result<&'static TokioResolver, ConnectionError> {
     if let Some(resolver) = DNS_RESOLVER.get() {
         return Ok(resolver);
     }
 
-    let resolver = TokioResolver::builder_tokio()
-        .map_err(|error| ConnectionError::dns_resolver_init("global", error))?
-        .build()
-        .map_err(|error| ConnectionError::dns_resolver_build("global", error))?;
+    let resolver = match TokioResolver::builder_tokio() {
+        Ok(builder) => builder
+            .build()
+            .map_err(|error| ConnectionError::dns_resolver_build("global", error))?,
+        Err(error) if system_resolv_conf_missing(&error) => hosts_file_resolver()?,
+        Err(error) => return Err(ConnectionError::dns_resolver_init("global", error)),
+    };
     let _ = DNS_RESOLVER.set(resolver);
     Ok(DNS_RESOLVER
         .get()
         .expect("DNS resolver should be initialized after set"))
+}
+
+fn system_resolv_conf_missing(error: &NetError) -> bool {
+    matches!(
+        error,
+        NetError::Io(io_error) if io_error.kind() == io::ErrorKind::NotFound
+    )
+}
+
+fn hosts_file_resolver() -> Result<TokioResolver, ConnectionError> {
+    let mut builder = TokioResolver::builder_with_config(
+        ResolverConfig::from_name_servers(Vec::new()),
+        TokioRuntimeProvider::default(),
+    );
+    builder.options_mut().use_hosts_file = ResolveHosts::Always;
+    builder
+        .build()
+        .map_err(|error| ConnectionError::dns_resolver_build("global", error))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -979,6 +1007,33 @@ mod tests {
         let _accepted = accept.await.unwrap();
 
         assert_eq!(stream.peer_addr().unwrap(), live_addr);
+    }
+
+    #[test]
+    fn missing_resolv_conf_is_a_not_found_io_error() {
+        let missing = hickory_resolver::net::NetError::Io(std::sync::Arc::new(io::Error::new(
+            io::ErrorKind::NotFound,
+            "missing",
+        )));
+        let denied = hickory_resolver::net::NetError::Io(std::sync::Arc::new(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "denied",
+        )));
+
+        assert!(super::system_resolv_conf_missing(&missing));
+        assert!(!super::system_resolv_conf_missing(&denied));
+    }
+
+    #[tokio::test]
+    async fn hosts_file_resolver_maps_localhost_without_a_nameserver() {
+        let resolver = super::hosts_file_resolver().unwrap();
+        let lookup = resolver.lookup_ip("localhost").await.unwrap();
+        let addresses: Vec<_> = lookup.iter().collect();
+
+        assert!(
+            addresses.contains(&IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            "localhost should come from the hosts file, got {addresses:?}"
+        );
     }
 
     #[tokio::test]
