@@ -21,20 +21,6 @@ use std::sync::atomic::Ordering;
 use tokio::sync::broadcast;
 use tracing::{debug, info, warn};
 
-enum AcquisitionFailure {
-    Pool(deadpool::managed::PoolError<crate::connection_error::ConnectionError>),
-    Deadline,
-}
-
-/// Deadpool starts its create timer after this checkout timer. The slack lets
-/// a setup that is already running report its own timeout. A wait that never
-/// takes a slot still ends as an empty pool at the connection deadline.
-const CHECKOUT_DEADLINE_SLACK: std::time::Duration = std::time::Duration::from_millis(250);
-
-fn checkout_deadline() -> std::time::Duration {
-    crate::constants::timeout::CONNECTION.saturating_add(CHECKOUT_DEADLINE_SLACK)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatMissingPolicy {
     Disabled,
@@ -535,28 +521,18 @@ impl DeadpoolConnectionProvider {
     ) -> Result<PooledConnection, crate::connection_error::ConnectionError> {
         use crate::connection_error::ConnectionError;
 
-        // The pool's wait timer ends once a slot is taken. The checkout
-        // deadline is slightly later than setup, so a stalled create or
-        // recycle reports that timeout. A checkout that is still waiting for
-        // a slot, including one that takes a slot in the same instant the
-        // deadline elapses, stays an empty-pool failure.
-        let failure = match tokio::time::timeout(checkout_deadline(), self.pool.get()).await {
-            Ok(Ok(connection)) => return Ok(connection),
-            Ok(Err(error)) => AcquisitionFailure::Pool(error),
-            Err(_elapsed) => AcquisitionFailure::Deadline,
-        };
-        let status = self.pool.status();
-        let err = match failure {
-            AcquisitionFailure::Deadline => ConnectionError::PoolExhausted {
-                backend: self.name.to_string(),
-                max_size: status.max_size,
-            },
-            AcquisitionFailure::Pool(error) => match error {
+        // Deadpool's wait timer ends when a slot is taken, and its create
+        // timer starts then. A checkout that never takes a slot is an empty
+        // pool. A setup that starts after the wait, including one that takes
+        // the slot as the wait timer elapses, keeps the setup timeout.
+        let err = match self.pool.get().await {
+            Ok(connection) => return Ok(connection),
+            Err(error) => match error {
                 deadpool::managed::PoolError::Backend(conn_err) => conn_err,
                 deadpool::managed::PoolError::Timeout(managed::TimeoutType::Wait) => {
                     ConnectionError::PoolExhausted {
                         backend: self.name.to_string(),
-                        max_size: status.max_size,
+                        max_size: self.pool.status().max_size,
                     }
                 }
                 deadpool::managed::PoolError::Timeout(
@@ -582,6 +558,7 @@ impl DeadpoolConnectionProvider {
                 },
             },
         };
+        let status = self.pool.status();
         warn!(
             pool = %self.name,
             max_size = status.max_size,
@@ -1073,10 +1050,77 @@ mod tests {
         )
         .await
         .expect("pool acquisition did not enforce its deadline");
-        assert!(result.is_err());
+        let error = result.expect_err("a saturated pool must not return a connection");
+        assert!(
+            matches!(
+                error,
+                crate::connection_error::ConnectionError::PoolExhausted { max_size: 1, .. }
+            ),
+            "a wait for the only slot was reported as {error}"
+        );
         drop(held);
         tokio::time::resume();
         assert!(provider.get_pooled_connection().await.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn setup_that_starts_after_waiting_is_a_setup_timeout() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let provider = DeadpoolConnectionProvider::builder(addr.ip().to_string(), addr.port())
+            .max_connections(1)
+            .build()
+            .unwrap();
+
+        let holder = provider.clone();
+        let mut holder_task = tokio::spawn(async move { holder.checkout_connection_guard().await });
+        let (socket, _) = tokio::select! {
+            accepted = listener.accept() => accepted.unwrap(),
+            _ = &mut holder_task => panic!("holder finished before the backend accepted"),
+        };
+        hold_socket(socket);
+
+        let waiter = provider.clone();
+        let mut waiter_task = tokio::spawn(async move { waiter.checkout_connection_guard().await });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !waiter_task.is_finished(),
+            "the waiter finished while the slot was held"
+        );
+
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        holder_task.abort();
+        let _ = holder_task.await;
+
+        let (socket, _) = tokio::select! {
+            accepted = listener.accept() => accepted.unwrap(),
+            _ = &mut waiter_task => panic!("the waiter finished when the slot became free"),
+        };
+        hold_socket(socket);
+        assert!(
+            !waiter_task.is_finished(),
+            "setup was reported before its own deadline"
+        );
+
+        tokio::time::advance(
+            crate::constants::timeout::CONNECTION + std::time::Duration::from_millis(1),
+        )
+        .await;
+        for _ in 0..16 {
+            if waiter_task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            waiter_task.is_finished(),
+            "setup that started after the wait was not polled through its deadline"
+        );
+        let result = waiter_task.await.expect("waiter panicked");
+        assert_setup_deadline(&result);
+        assert_eq!(ConnectionProvider::status(&provider).created.get(), 0);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1089,9 +1133,9 @@ mod tests {
             .unwrap();
 
         // The creator blocks in a socket read, so a paused clock does not
-        // auto-advance. Spawn both checkouts and advance the clock once they
-        // are waiting, which polls the creator's setup deadline and the
-        // waiter's acquisition deadline together.
+        // auto-advance. The creator's setup deadline and the waiter's wait
+        // deadline start together. If the waiter takes the freed slot in that
+        // same instant, its setup timer starts then and needs another deadline.
         let creator = provider.clone();
         let mut creator_task =
             tokio::spawn(async move { creator.checkout_connection_guard().await });
@@ -1118,9 +1162,10 @@ mod tests {
             "the waiter finished before the stalled creation reached its deadline"
         );
 
-        tokio::time::advance(checkout_deadline() + std::time::Duration::from_millis(1)).await;
+        let step = crate::constants::timeout::CONNECTION + std::time::Duration::from_millis(1);
+        tokio::time::advance(step).await;
         for _ in 0..16 {
-            if creator_task.is_finished() && waiter_task.is_finished() {
+            if creator_task.is_finished() {
                 break;
             }
             tokio::task::yield_now().await;
@@ -1129,31 +1174,35 @@ mod tests {
             creator_task.is_finished(),
             "stalled creation was not polled through its deadline"
         );
+        if !waiter_task.is_finished() {
+            tokio::time::advance(step).await;
+            for _ in 0..16 {
+                if waiter_task.is_finished() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        }
         assert!(
             waiter_task.is_finished(),
             "the waiter was not polled through its deadline"
         );
 
         let first = creator_task.await.expect("stalled creation panicked");
-        assert!(
-            matches!(
-                first,
-                Err(crate::connection_error::ConnectionError::IoError(ref error))
-                    if error.kind() == std::io::ErrorKind::TimedOut
-                        && error.to_string().contains("connection setup timed out")
-            ),
-            "stalled greeting did not surface the setup deadline: {}",
-            match &first {
-                Ok(_) => "checkout returned a connection".to_string(),
-                Err(error) => error.to_string(),
-            }
-        );
+        assert_setup_deadline(&first);
         let second = waiter_task.await.expect("waiter panicked");
+        let waited_for_the_slot = matches!(
+            second,
+            Err(crate::connection_error::ConnectionError::PoolExhausted { max_size: 1, .. })
+        );
+        let started_setup = matches!(
+            &second,
+            Err(crate::connection_error::ConnectionError::IoError(error))
+                if error.kind() == std::io::ErrorKind::TimedOut
+                    && error.to_string().contains("connection setup timed out")
+        );
         assert!(
-            matches!(
-                second,
-                Err(crate::connection_error::ConnectionError::PoolExhausted { max_size: 1, .. })
-            ),
+            waited_for_the_slot || started_setup,
             "waiter was not bounded by the single slot: {}",
             match &second {
                 Ok(_) => "checkout returned a connection".to_string(),
