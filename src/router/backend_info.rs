@@ -175,7 +175,7 @@ impl StatefulCount {
     /// Returns `Err(0)` when the counter is already zero and cannot be decremented.
     pub fn release(&self) -> Result<usize, usize> {
         self.0
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
                 if current == 0 {
                     None
                 } else {

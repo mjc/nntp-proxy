@@ -2,7 +2,8 @@
 //!
 //! Tracks CPU usage and memory consumption for the proxy process.
 
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System};
+use tracing::warn;
 
 /// System resource statistics for the current process
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -17,13 +18,21 @@ pub struct SystemStats {
     pub peak_memory_bytes: u64,
 }
 
+/// A live `sysinfo` sample for this process.
+struct ProcessSample {
+    system: System,
+    pid: Pid,
+}
+
 /// System resource monitor
 ///
-/// Efficiently tracks process-specific metrics using sysinfo.
+/// Tracks process-specific metrics using sysinfo.
 /// Call `update()` periodically (e.g., every TUI frame) to refresh stats.
+///
+/// When process statistics cannot be initialized, the monitor stays inert and
+/// reports zeros.
 pub struct SystemMonitor {
-    system: System,
-    pid: sysinfo::Pid,
+    sample: Option<ProcessSample>,
     peak_cpu: f32,
     peak_memory: u64,
 }
@@ -36,24 +45,25 @@ impl SystemMonitor {
             .without_tasks()
     }
 
-    /// Create a new system monitor for the current process
+    /// Create a new system monitor for the current process.
     ///
-    /// # Panics
-    /// Panics if `sysinfo` cannot determine the current process ID.
+    /// If process statistics cannot be initialized, later reads stay at zero
+    /// and the dashboard keeps running.
     #[must_use]
     pub fn new() -> Self {
-        let mut system =
-            System::new_with_specifics(RefreshKind::nothing().with_processes(Self::refresh_kind()));
-        let pid = sysinfo::get_current_pid().expect("Failed to get current PID");
-        system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[pid]),
-            true,
-            Self::refresh_kind(),
-        );
+        let sample = match ProcessSample::open() {
+            Ok(sample) => Some(sample),
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "Process CPU and memory statistics are unavailable"
+                );
+                None
+            }
+        };
 
         Self {
-            system,
-            pid,
+            sample,
             peak_cpu: 0.0,
             peak_memory: 0,
         }
@@ -63,49 +73,76 @@ impl SystemMonitor {
     ///
     /// Should be called at regular intervals (e.g., TUI update rate of ~4Hz).
     /// First call may return zero for CPU usage - sysinfo needs 2+ samples.
+    /// Returns zeros when statistics are unavailable.
     #[must_use]
     pub fn update(&mut self) -> SystemStats {
-        self.system.refresh_processes_specifics(
-            ProcessesToUpdate::Some(&[self.pid]),
-            true,
-            Self::refresh_kind(),
-        );
-
-        if let Some(process) = self.system.process(self.pid) {
-            let cpu = process.cpu_usage();
-            let memory = process.memory();
-
-            if cpu > self.peak_cpu {
-                self.peak_cpu = cpu;
-            }
-            if memory > self.peak_memory {
-                self.peak_memory = memory;
-            }
-
-            SystemStats {
-                cpu_usage: cpu,
-                peak_cpu_usage: self.peak_cpu,
-                memory_bytes: memory,
-                peak_memory_bytes: self.peak_memory,
-            }
-        } else {
-            SystemStats::default()
-        }
+        let Some(sample) = self.sample.as_mut() else {
+            return SystemStats::default();
+        };
+        sample.refresh();
+        let Some(process) = sample.system.process(sample.pid) else {
+            return SystemStats::default();
+        };
+        let cpu = process.cpu_usage();
+        let memory = process.memory();
+        self.record(cpu, memory)
     }
 
     /// Get current stats without refreshing
     ///
     /// Returns the last refreshed stats. Useful if you just called `update()`.
+    /// Returns zeros when statistics are unavailable.
     #[must_use]
     pub fn current(&self) -> SystemStats {
-        self.system
-            .process(self.pid)
-            .map_or_else(SystemStats::default, |process| SystemStats {
-                cpu_usage: process.cpu_usage(),
-                peak_cpu_usage: self.peak_cpu,
-                memory_bytes: process.memory(),
-                peak_memory_bytes: self.peak_memory,
-            })
+        let Some(sample) = &self.sample else {
+            return SystemStats::default();
+        };
+        let Some(process) = sample.system.process(sample.pid) else {
+            return SystemStats::default();
+        };
+        self.snapshot(process.cpu_usage(), process.memory())
+    }
+
+    fn record(&mut self, cpu: f32, memory: u64) -> SystemStats {
+        if cpu > self.peak_cpu {
+            self.peak_cpu = cpu;
+        }
+        if memory > self.peak_memory {
+            self.peak_memory = memory;
+        }
+        self.snapshot(cpu, memory)
+    }
+
+    fn snapshot(&self, cpu: f32, memory: u64) -> SystemStats {
+        SystemStats {
+            cpu_usage: cpu,
+            peak_cpu_usage: self.peak_cpu,
+            memory_bytes: memory,
+            peak_memory_bytes: self.peak_memory,
+        }
+    }
+}
+
+impl ProcessSample {
+    fn open() -> Result<Self, sysinfo::Error> {
+        let mut system = System::new_with_specifics(
+            RefreshKind::nothing().with_processes(SystemMonitor::refresh_kind()),
+        )?;
+        let pid = sysinfo::get_current_pid()?;
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            true,
+            SystemMonitor::refresh_kind(),
+        );
+        Ok(Self { system, pid })
+    }
+
+    fn refresh(&mut self) {
+        self.system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[self.pid]),
+            true,
+            SystemMonitor::refresh_kind(),
+        );
     }
 }
 
@@ -169,6 +206,25 @@ mod tests {
         // Should return same values without update
         assert_eq!(stats1.memory_bytes, stats2.memory_bytes);
         assert_eq!(stats1.cpu_usage, stats2.cpu_usage);
+    }
+
+    #[test]
+    fn unavailable_monitor_reports_zeros() {
+        let mut monitor = SystemMonitor {
+            sample: None,
+            peak_cpu: 0.0,
+            peak_memory: 0,
+        };
+
+        let updated = monitor.update();
+        let current = monitor.current();
+
+        assert_eq!(updated.cpu_usage, 0.0);
+        assert_eq!(updated.peak_cpu_usage, 0.0);
+        assert_eq!(updated.memory_bytes, 0);
+        assert_eq!(updated.peak_memory_bytes, 0);
+        assert_eq!(current.cpu_usage, 0.0);
+        assert_eq!(current.memory_bytes, 0);
     }
 
     #[test]

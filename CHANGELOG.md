@@ -35,7 +35,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A single reducer now updates client authentication state, and the authenticated identity can be set only once. Password diagnostics are redacted; password parsing and serialization are unchanged.
 - Response-write metrics are configurable through `[proxy].response_write_metrics_secs` (disabled by default). Session, dashboard, and routing counters now use typed metric values.
 - Migrated development and CI workflows to `devenv`, reduced crate visibility, and removed obsolete compatibility code and unused large-transfer paths.
-- Refreshed runtime and development dependencies, including `foyer` 0.22.6, `nutype` 0.8, Tokio 1.54.1, and Hickory 0.26.3.
+- Refreshed runtime and development dependencies, including `foyer` 0.22.6, `nutype` 0.8, Tokio 1.54.1, Hickory 0.26.3, `toml` 1.2, `uuid` 1.29, `bytes` 1.12, `smallvec` 1.16, `webpki-roots` 1.0.11, `bytesize` 2.7, and `sysinfo` 0.40.1.
 - Updated Gungraun and its Nix-packaged runner to 0.20 and removed the obsolete benchmark advisory exception.
 
 ### Fixed
@@ -62,6 +62,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A status-only cache update keeps cached HEAD, BODY, ARTICLE, and STAT sections. A HEAD and a BODY for the same message ID are merged into one article. When their article numbers differ, neither number is kept.
 - Connection setup, including connect, TLS, authentication, and `MODE READER`, fails when it exceeds its deadline. The pool slot is released and routing tries the next backend.
 - The hybrid cache counts the key and the cached record toward its memory budget. Missing, availability-only, and STAT entries are evicted under pressure, including after they expire.
+- The dashboard keeps running when process CPU and memory statistics cannot be read. Those readings stay at zero.
 
 ### Security
 
@@ -84,7 +85,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Other breaking Rust API changes: the low-level `compression` and `network` modules and `constants::duration_polyfill` are private or removed; `RequestContext` no longer implements `Clone`, which dropped payloads; `ModeState` construction and transition APIs changed; and connection checkout/finalization now uses idle, active, complete, and reusable states.
 - `Password` no longer implements `Display` or `Deref<str>`, and its `Debug` output is redacted. Explicit `AsRef<str>` access remains available where cleartext is required.
 - The `zlib-ng` Cargo feature was removed. RFC 8054 DEFLATE support now uses the `zlib-rs` backend.
-- The minimum supported Rust version is now 1.95 to cover the resolved dependencies. The pinned toolchain remains 1.98.1.
+- The minimum supported Rust version is 1.95. The pinned toolchain is 1.99.1.
 
 ### Docs
 
