@@ -203,11 +203,7 @@ enum RetryStatProbeOutcome {
 /// A disconnect can leave a fully read backend connection reusable. Any other
 /// write failure retires that connection.
 fn classify_response_write_err(e: std::io::Error) -> ResponseTransferError {
-    if crate::connection_error::is_disconnect_kind(e.kind()) {
-        ResponseTransferError::ClientDisconnect(e)
-    } else {
-        ResponseTransferError::ClientWrite(e)
-    }
+    ResponseTransferError::from_client_write(e)
 }
 
 const fn can_discard_response_after_write(

@@ -38,6 +38,16 @@ pub(super) enum BackendConnectionOutcome {
 }
 
 impl ResponseTransferError {
+    /// A disconnect can leave a fully read backend connection reusable.
+    /// Any other client write failure retires that connection.
+    pub(crate) fn from_client_write(error: std::io::Error) -> Self {
+        if crate::connection_error::is_disconnect_kind(error.kind()) {
+            Self::ClientDisconnect(error)
+        } else {
+            Self::ClientWrite(error)
+        }
+    }
+
     /// Derive the backend connection fate from the response-transfer outcome.
     ///
     /// A plain client disconnect after a complete response has been captured is

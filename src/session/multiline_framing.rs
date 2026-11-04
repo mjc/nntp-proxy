@@ -308,7 +308,7 @@ where
     if let Err(err) = writer.write_all(chunk).await {
         window.queue_pooled_next_response_input(io_buffer, conn, pool)?;
         return Err(
-            crate::session::response_transfer::ResponseTransferError::ClientDisconnect(err),
+            crate::session::response_transfer::ResponseTransferError::from_client_write(err),
         );
     }
     let mut stats = ResponseWriteStats::default();
@@ -1857,7 +1857,11 @@ impl<'a> StreamingResponse<'a> {
                     let bytes = &self.cursor.io_buffer[chunk.response.clone()];
                     if let Err(error) = writer.write_all(bytes).await {
                         self.drain().await?;
-                        return Err(crate::session::response_transfer::ResponseTransferError::ClientDisconnect(error));
+                        return Err(
+                            crate::session::response_transfer::ResponseTransferError::from_client_write(
+                                error,
+                            ),
+                        );
                     }
                     stats.add_chunk(bytes.len());
                     self.read_next_chunk().await?;
@@ -1893,7 +1897,7 @@ impl<'a> StreamingResponse<'a> {
                 if let Err(error) = response.write_all_to_recording(writer).await {
                     self.observe().await?;
                     return Err(
-                        crate::session::response_transfer::ResponseTransferError::ClientDisconnect(
+                        crate::session::response_transfer::ResponseTransferError::from_client_write(
                             error,
                         ),
                     );
@@ -1915,7 +1919,7 @@ impl<'a> StreamingResponse<'a> {
                     let mut stats = ResponseWriteStats::default();
                     stats.add_buffered_response(response);
                     response.write_all_to_recording(writer).await.map_err(
-                        crate::session::response_transfer::ResponseTransferError::ClientDisconnect,
+                        crate::session::response_transfer::ResponseTransferError::from_client_write,
                     )?;
                     stats.record();
                     let payload_end = match self.shape {
@@ -4154,9 +4158,21 @@ mod tests {
                             let result = classified.stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0)).unwrap().write(&mut writer).await;
                             match failure {
                                 None => { assert_eq!(result.unwrap().bytes_written_u64() as usize, wire.len()); assert_eq!(writer.bytes, wire); }
-                                Some(failure) => {
-                                    let expected_kind = match failure { WriteFailure::BrokenPipe => io::ErrorKind::BrokenPipe, WriteFailure::Zero => io::ErrorKind::WriteZero };
-                                    assert!(matches!(result, Err(ResponseTransferError::ClientDisconnect(ref e)) if e.kind() == expected_kind));
+                                Some(WriteFailure::BrokenPipe) => {
+                                    assert!(matches!(
+                                        result,
+                                        Err(ResponseTransferError::ClientDisconnect(ref error))
+                                            if error.kind() == io::ErrorKind::BrokenPipe
+                                    ));
+                                    assert_eq!(writer.bytes, wire[..accepted]);
+                                    assert!(writer.failed);
+                                }
+                                Some(WriteFailure::Zero) => {
+                                    assert!(matches!(
+                                        result,
+                                        Err(ResponseTransferError::ClientWrite(ref error))
+                                            if error.kind() == io::ErrorKind::WriteZero
+                                    ));
                                     assert_eq!(writer.bytes, wire[..accepted]);
                                     assert!(writer.failed);
                                 }
