@@ -949,6 +949,56 @@ impl ConnectionProvider for DeadpoolConnectionProvider {
 #[allow(clippy::float_cmp)] // These tests compare exact derived failure-rate fixtures.
 mod tests {
     use super::*;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+    fn assert_setup_deadline(
+        result: &Result<
+            crate::pool::connection_guard::IdleConnection,
+            crate::connection_error::ConnectionError,
+        >,
+    ) {
+        assert!(
+            matches!(
+                result,
+                Err(crate::connection_error::ConnectionError::IoError(error))
+                    if error.kind() == std::io::ErrorKind::TimedOut
+                        && error.to_string().contains("connection setup timed out")
+            ),
+            "setup did not surface its deadline: {}",
+            match result {
+                Ok(_) => "checkout returned a connection".to_string(),
+                Err(error) => error.to_string(),
+            }
+        );
+    }
+
+    async fn arm_setup_deadline<T>(task: &tokio::task::JoinHandle<T>) {
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!task.is_finished(), "setup finished before its deadline");
+        tokio::time::advance(
+            crate::constants::timeout::CONNECTION + std::time::Duration::from_millis(1),
+        )
+        .await;
+        for _ in 0..16 {
+            if task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            task.is_finished(),
+            "setup was not polled through its deadline"
+        );
+    }
+
+    fn hold_socket(socket: tokio::net::TcpStream) {
+        tokio::spawn(async move {
+            let _held = socket;
+            std::future::pending::<()>().await;
+        });
+    }
 
     #[tokio::test]
     async fn saturated_pool_acquisition_has_a_deadline() {
@@ -1074,6 +1124,155 @@ mod tests {
             }
             _ = &mut third => panic!("replacement checkout finished before the backend accepted"),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_setup_has_a_deadline_when_connect_stalls() {
+        // TEST-NET-1 (RFC 5737) does not answer when the host has a route to it.
+        // A closed local port resets immediately. Without a route, connect fails
+        // at once with an unreachable error and never reaches the setup deadline.
+        // UDP connect only checks that route; it does not send a packet.
+        if std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|socket| socket.connect("192.0.2.1:9"))
+            .is_err()
+        {
+            eprintln!("skipping: no route to 192.0.2.1");
+            return;
+        }
+        let provider = DeadpoolConnectionProvider::builder("192.0.2.1", 9)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let checkout = provider.clone();
+        let task = tokio::spawn(async move { checkout.checkout_connection_guard().await });
+
+        arm_setup_deadline(&task).await;
+
+        let result = task.await.expect("connect stall panicked");
+        assert_setup_deadline(&result);
+        assert_eq!(ConnectionProvider::status(&provider).created.get(), 0);
+        assert_eq!(provider.status_counts().waiting, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_setup_has_a_deadline_when_tls_handshake_stalls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let provider = DeadpoolConnectionProvider::builder(addr.ip().to_string(), addr.port())
+            .max_connections(1)
+            .tls_config(
+                TlsConfig::builder()
+                    .enabled(true)
+                    .verify_cert(false)
+                    .build(),
+            )
+            .build()
+            .unwrap();
+        let checkout = provider.clone();
+        let mut task = tokio::spawn(async move { checkout.checkout_connection_guard().await });
+        let (mut socket, _) = tokio::select! {
+            accepted = listener.accept() => accepted.unwrap(),
+            _ = &mut task => panic!("checkout finished before the backend accepted"),
+        };
+        let mut hello = [0u8; 1];
+        tokio::select! {
+            read = socket.read(&mut hello) => {
+                assert_eq!(read.expect("client hello read"), 1);
+                assert_eq!(hello[0], 0x16, "expected a TLS handshake record");
+            }
+            _ = &mut task => panic!("checkout finished before the TLS handshake started"),
+        }
+        hold_socket(socket);
+
+        arm_setup_deadline(&task).await;
+
+        let result = task.await.expect("tls stall panicked");
+        assert_setup_deadline(&result);
+        assert_eq!(ConnectionProvider::status(&provider).created.get(), 0);
+        assert_eq!(provider.status_counts().waiting, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_setup_has_a_deadline_when_auth_stalls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let provider = DeadpoolConnectionProvider::builder(addr.ip().to_string(), addr.port())
+            .username("stall-user")
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let checkout = provider.clone();
+        let mut task = tokio::spawn(async move { checkout.checkout_connection_guard().await });
+        let (socket, _) = tokio::select! {
+            accepted = listener.accept() => accepted.unwrap(),
+            _ = &mut task => panic!("checkout finished before the backend accepted"),
+        };
+        let (read, mut write) = socket.into_split();
+        let mut reader = tokio::io::BufReader::new(read);
+        write.write_all(b"200 Ready\r\n").await.unwrap();
+        let mut line = String::new();
+        tokio::select! {
+            read = reader.read_line(&mut line) => {
+                assert!(read.expect("auth command read") > 0, "backend closed before AUTHINFO");
+            }
+            _ = &mut task => panic!("checkout finished before AUTHINFO USER"),
+        }
+        assert_eq!(
+            line.trim(),
+            "AUTHINFO USER stall-user",
+            "stall was not at authentication"
+        );
+        tokio::spawn(async move {
+            let _held_read = reader;
+            let _held_write = write;
+            std::future::pending::<()>().await;
+        });
+
+        arm_setup_deadline(&task).await;
+
+        let result = task.await.expect("auth stall panicked");
+        assert_setup_deadline(&result);
+        assert_eq!(ConnectionProvider::status(&provider).created.get(), 0);
+        assert_eq!(provider.status_counts().waiting, 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn backend_setup_has_a_deadline_when_mode_reader_stalls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let provider = DeadpoolConnectionProvider::builder(addr.ip().to_string(), addr.port())
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let checkout = provider.clone();
+        let mut task = tokio::spawn(async move { checkout.checkout_connection_guard().await });
+        let (socket, _) = tokio::select! {
+            accepted = listener.accept() => accepted.unwrap(),
+            _ = &mut task => panic!("checkout finished before the backend accepted"),
+        };
+        let (read, mut write) = socket.into_split();
+        let mut reader = tokio::io::BufReader::new(read);
+        write.write_all(b"200 Ready\r\n").await.unwrap();
+        let mut line = String::new();
+        tokio::select! {
+            read = reader.read_line(&mut line) => {
+                assert!(read.expect("mode reader read") > 0, "backend closed before MODE READER");
+            }
+            _ = &mut task => panic!("checkout finished before MODE READER"),
+        }
+        assert_eq!(line.trim(), "MODE READER", "stall was not at MODE READER");
+        tokio::spawn(async move {
+            let _held_read = reader;
+            let _held_write = write;
+            std::future::pending::<()>().await;
+        });
+
+        arm_setup_deadline(&task).await;
+
+        let result = task.await.expect("mode reader stall panicked");
+        assert_setup_deadline(&result);
+        assert_eq!(ConnectionProvider::status(&provider).created.get(), 0);
+        assert_eq!(provider.status_counts().waiting, 0);
     }
 
     #[test]

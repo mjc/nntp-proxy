@@ -2808,6 +2808,144 @@ mod tests {
         assert_eq!(written, good_response);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn setup_timeout_uses_the_next_backend() {
+        let stalled_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_addr = stalled_listener.local_addr().unwrap();
+        let good_response = b"222 0 <found@example.com> body follows\r\npayload\r\n.\r\n";
+        let (good_port, good_article_commands) = spawn_article_response_server(good_response).await;
+        let stalled =
+            DeadpoolConnectionProvider::builder(stalled_addr.ip().to_string(), stalled_addr.port())
+                .max_connections(1)
+                .build()
+                .unwrap();
+        let router = router_with_tiered_backends([
+            (stalled.clone(), 0),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", good_port)
+                    .max_connections(1)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+        ]);
+        let session = test_session();
+        let (mut client_writer, mut client_read, _client_write) = client_writer_pair().await;
+        let mut request = request_context(b"BODY <found@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+
+        let mut attempt = tokio::spawn(async move {
+            let mut state = ArticleAttemptState {
+                availability: &mut availability,
+                client_to_backend_bytes: &mut client_to_backend_bytes,
+                backend_connection: &mut backend_connection,
+                unavailable_backends: &mut unavailable_backends,
+            };
+            let first = session
+                .try_backend_for_article(
+                    &router,
+                    &mut request,
+                    &mut client_writer,
+                    &mut state,
+                    false,
+                )
+                .await;
+            let second = session
+                .try_backend_for_article(
+                    &router,
+                    &mut request,
+                    &mut client_writer,
+                    &mut state,
+                    true,
+                )
+                .await;
+            let mut written = vec![0; good_response.len()];
+            let read = client_read.read_exact(&mut written).await;
+            (
+                first,
+                second,
+                state.unavailable_backends.bits(),
+                written,
+                read,
+                request.backend_id(),
+            )
+        });
+
+        let (first_socket, _) = tokio::select! {
+            accepted = stalled_listener.accept() => accepted.unwrap(),
+            _ = &mut attempt => panic!("attempt finished before the stalled backend accepted"),
+        };
+        tokio::spawn(async move {
+            let _held = first_socket;
+            std::future::pending::<()>().await;
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !attempt.is_finished(),
+            "setup timeout finished before its deadline"
+        );
+
+        tokio::time::advance(crate::constants::timeout::CONNECTION + Duration::from_millis(1))
+            .await;
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_millis(10)).await;
+
+        let (retry_socket, _) = tokio::select! {
+            accepted = stalled_listener.accept() => accepted.unwrap(),
+            _ = &mut attempt => panic!("attempt finished before the setup retry connected"),
+        };
+        tokio::spawn(async move {
+            let _held = retry_socket;
+            std::future::pending::<()>().await;
+        });
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !attempt.is_finished(),
+            "the setup retry finished before its deadline"
+        );
+
+        tokio::time::advance(crate::constants::timeout::CONNECTION + Duration::from_millis(1))
+            .await;
+        for _ in 0..32 {
+            if attempt.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            attempt.is_finished(),
+            "the next backend was not reached after the setup deadline"
+        );
+
+        let (first, second, unavailable_bits, written, read, backend_id) =
+            attempt.await.expect("backend fallback panicked");
+        let first = first.expect("setup timeout should stay a backend failure");
+        assert!(matches!(first, BackendAttemptResult::BackendUnavailable));
+        assert_eq!(unavailable_bits, 0b0000_0001);
+        assert_eq!(
+            crate::pool::ConnectionProvider::status(&stalled)
+                .created
+                .get(),
+            0,
+            "a timed-out setup returned a connection to the pool"
+        );
+        let second = second.expect("the next backend should serve the article");
+        assert!(matches!(second, BackendAttemptResult::Success));
+        assert_eq!(backend_id, Some(BackendId::from_index(1)));
+        assert_eq!(good_article_commands.load(Ordering::SeqCst), 1);
+        read.expect("client read should succeed");
+        assert_eq!(written, good_response);
+    }
+
     #[tokio::test]
     async fn backend_eof_after_status_suppresses_backend_for_current_request() {
         let session = test_session();
