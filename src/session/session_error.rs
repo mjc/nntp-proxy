@@ -8,9 +8,13 @@ use std::fmt;
 
 /// Session-level error that carries the client-disconnect signal through the handler stack.
 ///
-/// Only two cases matter for control flow:
+/// Control flow:
 /// - `ClientDisconnect` — client closed connection; don't log, don't retry, propagate cleanly
-/// - `Backend` — log, maybe retry, handle as backend/protocol error
+/// - `Backend` — log, and retry only when the client has not already been written
+///
+/// A failed client write is a `Backend` error so it is not reported as a
+/// disconnect. [`SessionError::is_failed_client_write`] stops a later attempt
+/// from writing another response onto that stream.
 #[derive(Debug)]
 pub enum SessionError {
     /// Client disconnected (`BrokenPipe`, `ConnectionReset`).
@@ -28,6 +32,27 @@ impl fmt::Display for SessionError {
             Self::ClientDisconnect(e) => write!(f, "client disconnected: {e}"),
             Self::Backend(e) => write!(f, "{e}"),
         }
+    }
+}
+
+impl SessionError {
+    /// A client write failed after the proxy may already have sent response bytes.
+    ///
+    /// The backend connection is retired separately. The attempt must stop so
+    /// the next backend, a backend-error reply, or `430` is not written after it.
+    pub(crate) fn is_failed_client_write(&self) -> bool {
+        let Self::Backend(error) = self else {
+            return false;
+        };
+        let Some(transfer) =
+            error.downcast_ref::<crate::session::response_transfer::ResponseTransferError>()
+        else {
+            return false;
+        };
+        if let crate::session::response_transfer::ResponseTransferError::ClientWrite(_) = transfer {
+            return true;
+        }
+        false
     }
 }
 
@@ -175,6 +200,7 @@ mod tests {
         let response_transfer_err =
             crate::session::response_transfer::ResponseTransferError::ClientWrite(io_err);
         let e = SessionError::from(response_transfer_err);
+        assert!(e.is_failed_client_write());
         let SessionError::Backend(error) = e else {
             panic!("timed-out client write was reported as a disconnect");
         };

@@ -361,6 +361,14 @@ impl ClientSession {
                     );
                     return Err(e);
                 }
+                Err(error) if error.is_failed_client_write() => {
+                    debug!(
+                        client = %self.client_addr,
+                        error = %error,
+                        "Client write failed during article retry; not sending another response"
+                    );
+                    return Err(error);
+                }
                 Err(SessionError::Backend(e)) => {
                     warn!(
                         client = %self.client_addr,
