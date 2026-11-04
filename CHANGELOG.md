@@ -87,6 +87,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added regression coverage for fragmented and packed responses, terminators split across reads, request-scoped response shapes, malformed and overlong statuses, capture round trips, partial writes, backpressure, cancellation and connection reuse, hybrid handoff, compressed streams, cache boundary preservation, canonical-host availability identity, exact-key collision safety, provider-slot snapshot restoration, authentication transitions, typed counters, and retained-buffer ownership.
 - Added devenv quality tasks covering formatting, Clippy, shell and workflow linting, typo checks, coverage, dependency policy, advisories, unused dependencies, and response-contract checks.
 - Updated operator, development, configuration, and release-benchmark documentation for the new routing, cache, framing, and development workflows.
+- Held the availability clock in restore tests so an older generation that is still inside its TTL is not dropped because the wall clock moved.
 
 ## [0.5.2] - 2026-06-11
 
