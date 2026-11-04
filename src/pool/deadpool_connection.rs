@@ -12,11 +12,10 @@ use hickory_resolver::proto::rr::RecordType;
 use smallvec::SmallVec;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::ops::Deref;
 use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::OnceCell;
@@ -88,57 +87,89 @@ impl tokio::io::AsyncWrite for ReadyBackendConnection {
 pub type Pool = managed::Pool<TcpManager>;
 pub(crate) type PooledConnection = managed::Object<TcpManager>;
 
-/// Shared DNS resolver instance for all managers.
-static DNS_RESOLVER: OnceLock<TokioResolver> = OnceLock::new();
+/// Shared DNS resolver. A hosts-file fallback records when to look for
+/// `/etc/resolv.conf` again. A system resolver has no retry time.
+struct CachedResolver {
+    resolver: Arc<TokioResolver>,
+    retry_system_at: Option<Instant>,
+}
+
+static DNS_RESOLVER: Mutex<Option<CachedResolver>> = Mutex::new(None);
 static NEXT_ADDR_START: AtomicUsize = AtomicUsize::new(0);
 static NEXT_IPV4_ROTATION: AtomicUsize = AtomicUsize::new(0);
 
-/// A system resolver kept for the process, or a hosts-file resolver built
-/// for this lookup because `/etc/resolv.conf` is still missing.
-enum ActiveResolver {
-    Shared(&'static TokioResolver),
-    HostsOnly(Box<TokioResolver>),
-}
-
-impl Deref for ActiveResolver {
-    type Target = TokioResolver;
-
-    fn deref(&self) -> &Self::Target {
-        match self {
-            Self::Shared(resolver) => resolver,
-            Self::HostsOnly(resolver) => resolver,
-        }
-    }
-}
+const RESOLV_CONF_RETRY: Duration = Duration::from_secs(60);
+const RESOLV_CONF_JITTER_MILLIS: u64 = 15_000;
 
 /// Return the DNS resolver for this lookup.
 ///
 /// Hickory reads `/etc/resolv.conf` for upstream nameservers. When that file
-/// is missing, the lookup uses the system hosts file and is not stored. The
-/// next lookup tries the system file again. A resolver built from
-/// `resolv.conf` stays in `DNS_RESOLVER`.
-fn dns_resolver() -> Result<ActiveResolver, ConnectionError> {
-    if let Some(resolver) = DNS_RESOLVER.get() {
-        return Ok(ActiveResolver::Shared(resolver));
+/// is missing, the lookup uses the system hosts file. That fallback is reused
+/// for a minute plus up to 15 seconds of jitter, then the system file is
+/// tried again. A resolver built from `resolv.conf` stays for the process.
+fn dns_resolver() -> Result<Arc<TokioResolver>, ConnectionError> {
+    if let Some(resolver) = cached_resolver() {
+        return Ok(resolver);
     }
 
     match TokioResolver::builder_tokio() {
         Ok(builder) => {
-            let resolver = builder
-                .build()
-                .map_err(|error| ConnectionError::dns_resolver_build("global", error))?;
-            let _ = DNS_RESOLVER.set(resolver);
-            Ok(ActiveResolver::Shared(
-                DNS_RESOLVER
-                    .get()
-                    .expect("DNS resolver should be initialized after set"),
-            ))
+            let resolver = Arc::new(
+                builder
+                    .build()
+                    .map_err(|error| ConnectionError::dns_resolver_build("global", error))?,
+            );
+            Ok(store_resolver(resolver, None))
         }
         Err(error) if system_resolv_conf_missing(&error) => {
-            Ok(ActiveResolver::HostsOnly(Box::new(hosts_file_resolver()?)))
+            let resolver = Arc::new(hosts_file_resolver()?);
+            let retry_at = Instant::now() + resolv_conf_retry_delay();
+            Ok(store_resolver(resolver, Some(retry_at)))
         }
         Err(error) => Err(ConnectionError::dns_resolver_init("global", error)),
     }
+}
+
+fn cached_resolver() -> Option<Arc<TokioResolver>> {
+    let cache = resolver_cache();
+    let cached = cache.as_ref()?;
+    if cached
+        .retry_system_at
+        .is_some_and(|retry_at| Instant::now() >= retry_at)
+    {
+        return None;
+    }
+    Some(Arc::clone(&cached.resolver))
+}
+
+fn store_resolver(
+    resolver: Arc<TokioResolver>,
+    retry_system_at: Option<Instant>,
+) -> Arc<TokioResolver> {
+    let mut cache = resolver_cache();
+    if let Some(existing) = cache
+        .as_ref()
+        .filter(|cached| cached.retry_system_at.is_none())
+    {
+        return Arc::clone(&existing.resolver);
+    }
+    *cache = Some(CachedResolver {
+        resolver: Arc::clone(&resolver),
+        retry_system_at,
+    });
+    resolver
+}
+
+fn resolver_cache() -> std::sync::MutexGuard<'static, Option<CachedResolver>> {
+    DNS_RESOLVER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn resolv_conf_retry_delay() -> Duration {
+    use rand::RngExt as _;
+    let mut rng = rand::rng();
+    RESOLV_CONF_RETRY + Duration::from_millis(rng.random_range(0..RESOLV_CONF_JITTER_MILLIS))
 }
 
 fn system_resolv_conf_missing(error: &NetError) -> bool {
@@ -1048,6 +1079,17 @@ mod tests {
 
         assert!(super::system_resolv_conf_missing(&missing));
         assert!(!super::system_resolv_conf_missing(&denied));
+    }
+
+    #[test]
+    fn resolv_conf_retry_waits_about_a_minute() {
+        for _ in 0..32 {
+            let delay = super::resolv_conf_retry_delay();
+            assert!(
+                (Duration::from_secs(60)..Duration::from_secs(75)).contains(&delay),
+                "retry delay {delay:?} should be a minute plus less than 15 seconds"
+            );
+        }
     }
 
     #[tokio::test]
