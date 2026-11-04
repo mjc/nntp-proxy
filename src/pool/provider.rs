@@ -26,6 +26,15 @@ enum AcquisitionFailure {
     Deadline,
 }
 
+/// Deadpool starts its create timer after this checkout timer. The slack lets
+/// a setup that is already running report its own timeout. A wait that never
+/// takes a slot still ends as an empty pool at the connection deadline.
+const CHECKOUT_DEADLINE_SLACK: std::time::Duration = std::time::Duration::from_millis(250);
+
+fn checkout_deadline() -> std::time::Duration {
+    crate::constants::timeout::CONNECTION.saturating_add(CHECKOUT_DEADLINE_SLACK)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatMissingPolicy {
     Disabled,
@@ -526,13 +535,12 @@ impl DeadpoolConnectionProvider {
     ) -> Result<PooledConnection, crate::connection_error::ConnectionError> {
         use crate::connection_error::ConnectionError;
 
-        // The pool's own wait timer ends once a slot is taken. A checkout that
-        // is still running when the connection deadline elapses — including a
-        // waiter that takes a slot in that same instant — stays an empty-pool
-        // failure. A setup or recycle timeout that has already completed stays
-        // that failure.
-        let limit = crate::constants::timeout::CONNECTION;
-        let failure = match tokio::time::timeout(limit, self.pool.get()).await {
+        // The pool's wait timer ends once a slot is taken. The checkout
+        // deadline is slightly later than setup, so a stalled create or
+        // recycle reports that timeout. A checkout that is still waiting for
+        // a slot, including one that takes a slot in the same instant the
+        // deadline elapses, stays an empty-pool failure.
+        let failure = match tokio::time::timeout(checkout_deadline(), self.pool.get()).await {
             Ok(Ok(connection)) => return Ok(connection),
             Ok(Err(error)) => AcquisitionFailure::Pool(error),
             Err(_elapsed) => AcquisitionFailure::Deadline,
@@ -1110,10 +1118,7 @@ mod tests {
             "the waiter finished before the stalled creation reached its deadline"
         );
 
-        tokio::time::advance(
-            crate::constants::timeout::CONNECTION + std::time::Duration::from_millis(1),
-        )
-        .await;
+        tokio::time::advance(checkout_deadline() + std::time::Duration::from_millis(1)).await;
         for _ in 0..16 {
             if creator_task.is_finished() && waiter_task.is_finished() {
                 break;

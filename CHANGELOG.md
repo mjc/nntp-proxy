@@ -64,7 +64,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The hybrid cache counts the key and the cached record toward its memory budget. Missing, availability-only, and STAT entries are evicted under pressure, including after they expire.
 - The dashboard keeps running when process CPU and memory statistics cannot be read. Those readings stay at zero.
 - A cached body no longer counts as a complete article. A later article replaces it, and a rejected cache update leaves the stored entry's lifetime unchanged. An empty body still replaces a missing-article marker. Availability probes still run when only a body is cached.
-- A connection-setup timeout, a closed pool, and a post-create hook failure are reported as those failures. A checkout that is still running when the connection deadline elapses, including during setup, is reported as an empty pool.
+- A connection-setup timeout, a closed pool, and a post-create hook failure are reported as those failures. A wait for a free pool slot is reported as an empty pool.
 - A client write that is not a disconnect stops that attempt and is not reported as a client disconnect. A backend failure after response bytes have already reached the client also stops that attempt. A fully consumed backend response stays reusable. The backend connection is retired when the response is incomplete, still has queued bytes, or could not be preserved after the write failed.
 
 ### Security
