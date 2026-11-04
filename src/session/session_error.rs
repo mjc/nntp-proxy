@@ -38,8 +38,9 @@ impl fmt::Display for SessionError {
 impl SessionError {
     /// A client write failed after the proxy may already have sent response bytes.
     ///
-    /// The backend connection is retired separately. The attempt must stop so
-    /// the next backend, a backend-error reply, or `430` is not written after it.
+    /// The attempt must stop so the next backend, a backend-error reply, or
+    /// `430` is not written after it. Pool fate is separate: a preserved
+    /// backend response stays reusable.
     pub(crate) fn is_failed_client_write(&self) -> bool {
         let Self::Backend(error) = self else {
             return false;
@@ -49,7 +50,10 @@ impl SessionError {
         else {
             return false;
         };
-        if let crate::session::response_transfer::ResponseTransferError::ClientWrite(_) = transfer {
+        if let crate::session::response_transfer::ResponseTransferError::ClientWrite(_)
+        | crate::session::response_transfer::ResponseTransferError::ClientWriteUnpreserved(_) =
+            transfer
+        {
             return true;
         }
         false
@@ -111,8 +115,9 @@ impl From<crate::session::response_transfer::ResponseTransferError> for SessionE
                 Self::ClientDisconnect(io_err)
             }
             crate::session::response_transfer::ResponseTransferError::ClientWrite(io_err)
-                if crate::connection_error::is_disconnect_kind(io_err.kind()) =>
-            {
+            | crate::session::response_transfer::ResponseTransferError::ClientWriteUnpreserved(
+                io_err,
+            ) if crate::connection_error::is_disconnect_kind(io_err.kind()) => {
                 Self::ClientDisconnect(io_err)
             }
             crate::session::response_transfer::ResponseTransferError::ClientWrite(io_err) => {
@@ -120,6 +125,13 @@ impl From<crate::session::response_transfer::ResponseTransferError> for SessionE
                     crate::session::response_transfer::ResponseTransferError::ClientWrite(io_err),
                 ))
             }
+            crate::session::response_transfer::ResponseTransferError::ClientWriteUnpreserved(
+                io_err,
+            ) => Self::Backend(anyhow::Error::new(
+                crate::session::response_transfer::ResponseTransferError::ClientWriteUnpreserved(
+                    io_err,
+                ),
+            )),
             other => Self::Backend(anyhow::Error::new(other)),
         }
     }
@@ -207,5 +219,16 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("client write failed"), "{rendered}");
         assert!(!rendered.contains("client disconnected"), "{rendered}");
+    }
+
+    #[test]
+    fn unpreserved_client_write_stops_the_attempt() {
+        let io_err = std::io::Error::new(ErrorKind::TimedOut, "timed out");
+        let response_transfer_err =
+            crate::session::response_transfer::ResponseTransferError::ClientWriteUnpreserved(
+                io_err,
+            );
+        let error = SessionError::from(response_transfer_err);
+        assert!(error.is_failed_client_write());
     }
 }

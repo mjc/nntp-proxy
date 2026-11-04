@@ -306,9 +306,11 @@ where
     let total_len = io_buffer.initialized();
     let chunk = &io_buffer[..total_len][window.response.clone()];
     if let Err(err) = writer.write_all(chunk).await {
-        window.queue_pooled_next_response_input(io_buffer, conn, pool)?;
+        let cleanup = window.queue_pooled_next_response_input(io_buffer, conn, pool);
         return Err(
-            crate::session::response_transfer::ResponseTransferError::from_client_write(err),
+            crate::session::response_transfer::ResponseTransferError::from_client_write_after_cleanup(
+                err, cleanup,
+            ),
         );
     }
     let mut stats = ResponseWriteStats::default();
@@ -1856,10 +1858,10 @@ impl<'a> StreamingResponse<'a> {
                 ResponseWindow::Incomplete(chunk) => {
                     let bytes = &self.cursor.io_buffer[chunk.response.clone()];
                     if let Err(error) = writer.write_all(bytes).await {
-                        self.drain().await?;
+                        let cleanup = self.drain().await;
                         return Err(
-                            crate::session::response_transfer::ResponseTransferError::from_client_write(
-                                error,
+                            crate::session::response_transfer::ResponseTransferError::from_client_write_after_cleanup(
+                                error, cleanup,
                             ),
                         );
                     }
@@ -1895,10 +1897,10 @@ impl<'a> StreamingResponse<'a> {
                 let mut stats = ResponseWriteStats::default();
                 stats.add_buffered_response(response);
                 if let Err(error) = response.write_all_to_recording(writer).await {
-                    self.observe().await?;
+                    let cleanup = self.observe().await;
                     return Err(
-                        crate::session::response_transfer::ResponseTransferError::from_client_write(
-                            error,
+                        crate::session::response_transfer::ResponseTransferError::from_client_write_after_cleanup(
+                            error, cleanup,
                         ),
                     );
                 }
@@ -4197,10 +4199,14 @@ mod tests {
                         let result = classified.stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0)).unwrap().write(&mut writer).await;
                         assert_eq!(writer.bytes, wire[..accepted]);
                         assert_eq!(writer.writes_after_failure, 0);
-                        match backend_error {
-                            None => assert!(matches!(result, Err(ResponseTransferError::BackendEof { .. }))),
-                            Some(_) => assert!(matches!(result, Err(ResponseTransferError::Io(_)))),
-                        }
+                        assert!(
+                            matches!(
+                                result,
+                                Err(ResponseTransferError::ClientWriteUnpreserved(ref error))
+                                    if error.kind() == io::ErrorKind::BrokenPipe
+                            ),
+                            "backend {backend_error:?} during drain replaced the client write: {result:?}"
+                        );
                     }
                 });
             }

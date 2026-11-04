@@ -14,9 +14,15 @@ pub(crate) enum ResponseTransferError {
 
     /// Client write failed for a reason other than the client disconnecting.
     ///
-    /// The backend connection is retired. A partial client write must not leave
-    /// that connection looking healthy.
+    /// The attempt stops. A fully consumed backend response stays reusable.
+    /// An incomplete response or queued bytes still retire the connection.
     ClientWrite(std::io::Error),
+
+    /// Client write failed, and the backend response was not preserved.
+    ///
+    /// The attempt stops and the backend connection is retired even when the
+    /// frame had already looked complete.
+    ClientWriteUnpreserved(std::io::Error),
 
     /// Backend closed connection before sending a complete multiline response.
     BackendEof {
@@ -38,8 +44,8 @@ pub(super) enum BackendConnectionOutcome {
 }
 
 impl ResponseTransferError {
-    /// A disconnect can leave a fully read backend connection reusable.
-    /// Any other client write failure retires that connection.
+    /// A disconnect or another client write failure can leave a fully read
+    /// backend connection reusable. The reuse state decides the pool fate.
     pub(crate) fn from_client_write(error: std::io::Error) -> Self {
         if crate::connection_error::is_disconnect_kind(error.kind()) {
             Self::ClientDisconnect(error)
@@ -48,23 +54,48 @@ impl ResponseTransferError {
         }
     }
 
+    /// Keep the client-write failure when preserving the backend response fails.
+    ///
+    /// The cleanup error must not replace the write error. Replacing it lets
+    /// the article loop treat a partial client write as a retryable backend
+    /// failure and send another response.
+    pub(crate) fn from_client_write_after_cleanup(
+        write_error: std::io::Error,
+        cleanup: Result<(), Self>,
+    ) -> Self {
+        if let Err(cleanup_error) = cleanup {
+            tracing::warn!(
+                %write_error,
+                %cleanup_error,
+                "client write failed and the backend response was not preserved"
+            );
+            return Self::ClientWriteUnpreserved(write_error);
+        }
+        Self::from_client_write(write_error)
+    }
+
     /// Derive the backend connection fate from the response-transfer outcome.
     ///
-    /// A plain client disconnect after a complete response has been captured is
-    /// safe for connection reuse. Backend EOF and other I/O errors may leave
-    /// unread bytes in flight and must retire it. If the connection still has
-    /// queued bytes after the transfer, it is dirty even when the transfer
-    /// itself only saw a client disconnect.
+    /// A client disconnect or other client write, after a complete response has
+    /// been captured, is safe for connection reuse. Backend EOF, a write whose
+    /// backend response was not preserved, and other I/O errors may leave
+    /// unread bytes in flight and must retire it. Queued bytes make the
+    /// connection dirty even when the transfer itself only saw a client write.
     pub(super) const fn pool_fate(
         &self,
         reuse: ResponseConnectionReuse,
     ) -> BackendConnectionOutcome {
+        if let Self::ClientWriteUnpreserved(_) = self {
+            return BackendConnectionOutcome::BackendFailed;
+        }
         match reuse {
             ResponseConnectionReuse::Incomplete => BackendConnectionOutcome::BackendFailed,
             ResponseConnectionReuse::QueuedBytes { .. } => BackendConnectionOutcome::BackendDirty,
             ResponseConnectionReuse::Reusable => match self {
-                Self::ClientDisconnect(_) => BackendConnectionOutcome::BackendHealthy,
-                Self::ClientWrite(_) | Self::BackendEof { .. } | Self::Io(_) => {
+                Self::ClientDisconnect(_) | Self::ClientWrite(_) => {
+                    BackendConnectionOutcome::BackendHealthy
+                }
+                Self::ClientWriteUnpreserved(_) | Self::BackendEof { .. } | Self::Io(_) => {
                     BackendConnectionOutcome::BackendFailed
                 }
             },
@@ -76,7 +107,9 @@ impl std::fmt::Display for ResponseTransferError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ClientDisconnect(e) => write!(f, "client disconnected: {e}"),
-            Self::ClientWrite(e) => write!(f, "client write failed: {e}"),
+            Self::ClientWrite(e) | Self::ClientWriteUnpreserved(e) => {
+                write!(f, "client write failed: {e}")
+            }
             Self::BackendEof {
                 backend_id,
                 bytes_received,
@@ -93,8 +126,9 @@ impl std::fmt::Display for ResponseTransferError {
 impl std::error::Error for ResponseTransferError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::ClientDisconnect(e) => Some(e),
-            Self::ClientWrite(e) => Some(e),
+            Self::ClientDisconnect(e) | Self::ClientWrite(e) | Self::ClientWriteUnpreserved(e) => {
+                Some(e)
+            }
             Self::BackendEof { .. } => None,
             Self::Io(e) => e.source(),
         }
@@ -175,6 +209,21 @@ mod tests {
         );
         assert_eq!(
             client_write.pool_fate(ResponseConnectionReuse::Reusable),
+            BackendConnectionOutcome::BackendHealthy
+        );
+        assert_eq!(
+            client_write.pool_fate(ResponseConnectionReuse::Incomplete),
+            BackendConnectionOutcome::BackendFailed
+        );
+        assert_eq!(
+            client_write.pool_fate(ResponseConnectionReuse::QueuedBytes { len: 1 }),
+            BackendConnectionOutcome::BackendDirty
+        );
+        let unpreserved = ResponseTransferError::ClientWriteUnpreserved(std::io::Error::from(
+            std::io::ErrorKind::TimedOut,
+        ));
+        assert_eq!(
+            unpreserved.pool_fate(ResponseConnectionReuse::Reusable),
             BackendConnectionOutcome::BackendFailed
         );
         assert_eq!(
