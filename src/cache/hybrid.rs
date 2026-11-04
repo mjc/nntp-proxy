@@ -517,19 +517,16 @@ impl HybridArticleCache {
             let keep_existing = match (existing_complete, new_complete) {
                 (true, false) => true,
                 (false, true) => false,
-                (true, true) | (false, false) => existing_len > entry_len,
+                (true, true) | (false, false) => existing_len >= entry_len,
             };
             if keep_existing {
-                // Existing entry is larger - refresh TTL without changing negative availability.
-                let mut updated = existing;
-                updated.timestamp = ttl::CacheTimestampMillis::now();
-                updated.set_availability_epoch(self.availability_epoch);
-                self.cache.insert(key.clone(), updated);
+                // The stored payload stays, and its lifetime stays with it.
+                // Refreshing the timestamp here would keep a rejected entry from expiring.
                 debug!(
                     msg_id = %key,
                     existing_bytes = existing_len.get(),
                     new_bytes = entry_len.get(),
-                    "Hybrid cache upsert: preserved larger existing entry"
+                    "Hybrid cache upsert: preserved existing entry"
                 );
                 return;
             }
@@ -1219,10 +1216,60 @@ mod tests {
             entry
                 .cached_response_for(crate::protocol::RequestKind::Body, msg_id.as_str())
                 .is_some(),
-            "complete body response should replace larger metadata-only HEAD"
+            "HEAD and BODY for the same message should merge into an article"
         );
         assert!(entry.should_try_slot(AvailabilitySlot::new(0).unwrap()));
         assert!(entry.should_try_slot(AvailabilitySlot::new(1).unwrap()));
+
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejected_body_keeps_its_cache_time_and_article_replaces_it() {
+        let cache = HybridArticleCache::new_memory_only(1024 * 1024)
+            .await
+            .unwrap();
+        let msg_id = MessageId::from_borrowed("<hybrid-replace-body@example.com>").unwrap();
+        let key = msg_id.without_brackets().to_string();
+        let mut body = DiskCachedArticle::from_unframed_ingest_for_test(
+            b"222 0 <hybrid-replace-body@example.com>\r\nBody content that is long enough\r\n.\r\n"
+                .to_vec()
+                .into(),
+            super::ttl::CacheTier::new(0),
+        )
+        .expect("body ingest");
+        // Still inside the one-hour memory-only TTL. An ancient timestamp is
+        // expired and is replaced outright.
+        let stored_at = super::ttl::now_millis().saturating_sub(60_000);
+        body.timestamp = super::ttl::CacheTimestampMillis::new(stored_at);
+        cache.cache.insert(key, body);
+
+        cache
+            .upsert_unframed_ingest(
+                msg_id,
+                b"222 0 <hybrid-replace-body@example.com>\r\nshort\r\n.\r\n".to_vec(),
+                BackendId::from_index(0),
+                0.into(),
+            )
+            .await;
+        let msg_id = MessageId::from_borrowed("<hybrid-replace-body@example.com>").unwrap();
+        let kept = cache.get(&msg_id).await.expect("body stays cached");
+        assert_eq!(kept.timestamp.get(), stored_at);
+        assert!(!kept.is_complete_article());
+
+        cache
+            .upsert_unframed_ingest(
+                msg_id,
+                b"220 0 <hybrid-replace-body@example.com>\r\nSubject: T\r\n\r\nHi\r\n.\r\n"
+                    .to_vec(),
+                BackendId::from_index(0),
+                0.into(),
+            )
+            .await;
+        let msg_id = MessageId::from_borrowed("<hybrid-replace-body@example.com>").unwrap();
+        let replaced = cache.get(&msg_id).await.expect("article replaced body");
+        assert!(replaced.is_complete_article());
+        assert_ne!(replaced.timestamp.get(), stored_at);
 
         cache.close().await.unwrap();
     }

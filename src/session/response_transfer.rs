@@ -12,10 +12,10 @@ pub(crate) enum ResponseTransferError {
     /// backend response and started writing it locally.
     ClientDisconnect(std::io::Error),
 
-    /// Client write failed after backend response ownership was already established.
+    /// Client write failed for a reason other than the client disconnecting.
     ///
-    /// A complete response with no queued backend bytes leaves the backend
-    /// reusable even when the client disappears during the final write.
+    /// The backend connection is retired. A partial client write must not leave
+    /// that connection looking healthy.
     ClientWrite(std::io::Error),
 
     /// Backend closed connection before sending a complete multiline response.
@@ -54,8 +54,9 @@ impl ResponseTransferError {
             ResponseConnectionReuse::QueuedBytes { .. } => BackendConnectionOutcome::BackendDirty,
             ResponseConnectionReuse::Reusable => match self {
                 Self::ClientDisconnect(_) => BackendConnectionOutcome::BackendHealthy,
-                Self::ClientWrite(_) => BackendConnectionOutcome::BackendHealthy,
-                Self::BackendEof { .. } | Self::Io(_) => BackendConnectionOutcome::BackendFailed,
+                Self::ClientWrite(_) | Self::BackendEof { .. } | Self::Io(_) => {
+                    BackendConnectionOutcome::BackendFailed
+                }
             },
         }
     }
@@ -164,7 +165,7 @@ mod tests {
         );
         assert_eq!(
             client_write.pool_fate(ResponseConnectionReuse::Reusable),
-            BackendConnectionOutcome::BackendHealthy
+            BackendConnectionOutcome::BackendFailed
         );
         assert_eq!(
             eof.pool_fate(ResponseConnectionReuse::Reusable),

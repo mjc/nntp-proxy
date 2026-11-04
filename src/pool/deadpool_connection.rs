@@ -87,6 +87,25 @@ impl tokio::io::AsyncWrite for ReadyBackendConnection {
 pub type Pool = managed::Pool<TcpManager>;
 pub(crate) type PooledConnection = managed::Object<TcpManager>;
 
+/// Build a pool whose wait, create, and recycle deadlines match connection setup.
+///
+/// Deadpool reports those deadlines as distinct timeout kinds. Callers can tell
+/// a full pool from a setup timeout instead of treating every failure as an
+/// empty pool.
+pub(crate) fn configured_pool(manager: TcpManager, max_size: usize) -> Pool {
+    let limit = crate::constants::timeout::CONNECTION;
+    Pool::builder(manager)
+        .max_size(max_size)
+        .timeouts(managed::Timeouts {
+            wait: Some(limit),
+            create: Some(limit),
+            recycle: Some(limit),
+        })
+        .runtime(deadpool::Runtime::Tokio1)
+        .build()
+        .expect("Failed to create connection pool")
+}
+
 /// Shared DNS resolver. The hosts-file fallback is tried against
 /// `/etc/resolv.conf` once more, then left in place.
 struct CachedResolver {

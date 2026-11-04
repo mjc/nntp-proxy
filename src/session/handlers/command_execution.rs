@@ -198,12 +198,16 @@ enum RetryStatProbeOutcome {
     Unavailable(BackendId),
 }
 
-/// Any client write failure after response ownership is established is terminal.
+/// Classify a client write failure after the backend response is owned.
 ///
-/// This must retire the backend connection to prevent protocol desync from
-/// partially-written client responses.
-const fn classify_response_write_err(e: std::io::Error) -> ResponseTransferError {
-    ResponseTransferError::ClientWrite(e)
+/// A disconnect can leave a fully read backend connection reusable. Any other
+/// write failure retires that connection.
+fn classify_response_write_err(e: std::io::Error) -> ResponseTransferError {
+    if crate::connection_error::is_disconnect_kind(e.kind()) {
+        ResponseTransferError::ClientDisconnect(e)
+    } else {
+        ResponseTransferError::ClientWrite(e)
+    }
 }
 
 const fn can_discard_response_after_write(

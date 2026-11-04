@@ -85,8 +85,15 @@ impl From<crate::session::response_transfer::ResponseTransferError> for SessionE
             crate::session::response_transfer::ResponseTransferError::ClientDisconnect(io_err) => {
                 Self::ClientDisconnect(io_err)
             }
-            crate::session::response_transfer::ResponseTransferError::ClientWrite(io_err) => {
+            crate::session::response_transfer::ResponseTransferError::ClientWrite(io_err)
+                if crate::connection_error::is_disconnect_kind(io_err.kind()) =>
+            {
                 Self::ClientDisconnect(io_err)
+            }
+            crate::session::response_transfer::ResponseTransferError::ClientWrite(io_err) => {
+                Self::Backend(anyhow::Error::new(
+                    crate::session::response_transfer::ResponseTransferError::ClientWrite(io_err),
+                ))
             }
             other => Self::Backend(anyhow::Error::new(other)),
         }
@@ -160,5 +167,19 @@ mod tests {
             crate::session::response_transfer::ResponseTransferError::ClientWrite(io_err);
         let e = SessionError::from(response_transfer_err);
         assert!(matches!(e, SessionError::ClientDisconnect(_)));
+    }
+
+    #[test]
+    fn timed_out_client_write_stays_a_backend_error() {
+        let io_err = std::io::Error::new(ErrorKind::TimedOut, "timed out");
+        let response_transfer_err =
+            crate::session::response_transfer::ResponseTransferError::ClientWrite(io_err);
+        let e = SessionError::from(response_transfer_err);
+        let SessionError::Backend(error) = e else {
+            panic!("timed-out client write was reported as a disconnect");
+        };
+        let rendered = error.to_string();
+        assert!(rendered.contains("client write failed"), "{rendered}");
+        assert!(!rendered.contains("client disconnected"), "{rendered}");
     }
 }

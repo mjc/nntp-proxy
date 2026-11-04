@@ -774,18 +774,19 @@ impl DiskCachedArticle {
         self.timestamp = ttl::CacheTimestampMillis::now();
     }
 
-    /// Check if this cache entry contains a complete article (220) or body (222)
+    /// Check if this entry can be served as an article.
+    ///
+    /// A `220` ARTICLE with headers or a body qualifies. A `222` BODY does not.
     #[inline]
     #[must_use]
     pub(crate) fn is_complete_article(&self) -> bool {
-        matches!(
-            (&self.payload, self.status_code.as_u16()),
-            (CachedPayload::Article { headers, body, .. }, 220)
-                if !headers.is_empty() || !body.is_empty()
-        ) || matches!(
-            (&self.payload, self.status_code.as_u16()),
-            (CachedPayload::Body { body, .. }, 222) if !body.is_empty()
-        )
+        if self.status_code.as_u16() != 220 {
+            return false;
+        }
+        let CachedPayload::Article { headers, body, .. } = &self.payload else {
+            return false;
+        };
+        !headers.is_empty() || !body.is_empty()
     }
 
     /// Get provider-slot availability as an `ArticleAvailability` value.
@@ -1451,7 +1452,7 @@ mod tests {
         let entry =
             disk_cached_article_from_ingest_bytes(b"222 0 <t@x>\r\n\r\nBody content\r\n.\r\n")
                 .unwrap();
-        assert!(entry.is_complete_article());
+        assert!(!entry.is_complete_article());
     }
 
     #[test]
