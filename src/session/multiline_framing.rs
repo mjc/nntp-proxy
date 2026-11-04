@@ -1866,7 +1866,13 @@ impl<'a> StreamingResponse<'a> {
                         );
                     }
                     stats.add_chunk(bytes.len());
-                    self.read_next_chunk().await?;
+                    if let Err(error) = self.read_next_chunk().await {
+                        return Err(if stats.bytes_written > 0 {
+                            error.after_client_delivery()
+                        } else {
+                            error
+                        });
+                    }
                 }
             }
         }
@@ -4185,28 +4191,34 @@ mod tests {
                             assert_backend_eof(&mut conn).await;
                         }
                     }
-                    for backend_error in [None, Some(io::ErrorKind::ConnectionReset)] {
-                        let pool = pool(512);
-                        let cut = status_len + 1;
-                        let mut backend = ScriptedBackend::new(&wire[cut..wire.len()-1], &sizes);
-                        backend.error = backend_error;
-                        let mut conn = crate::stream::ConnectionStream::for_test(backend);
-                        let mut buffer = pool.acquire(); buffer.copy_from_slice(&wire[..cut]);
-                        let request = crate::protocol::RequestContext::parse(&command).unwrap();
-                        let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, buffer).await.unwrap();
-                        let accepted = accepted_seed % cut;
-                        let mut writer = QuotaWriter::new(quotas.clone(), Some((accepted, WriteFailure::BrokenPipe)));
-                        let result = classified.stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0)).unwrap().write(&mut writer).await;
-                        assert_eq!(writer.bytes, wire[..accepted]);
-                        assert_eq!(writer.writes_after_failure, 0);
-                        assert!(
-                            matches!(
-                                result,
-                                Err(ResponseTransferError::ClientWriteUnpreserved(ref error))
-                                    if error.kind() == io::ErrorKind::BrokenPipe
-                            ),
-                            "backend {backend_error:?} during drain replaced the client write: {result:?}"
-                        );
+                    for write_failure in [WriteFailure::BrokenPipe, WriteFailure::Zero] {
+                        let expected_kind = match &write_failure {
+                            WriteFailure::BrokenPipe => io::ErrorKind::BrokenPipe,
+                            WriteFailure::Zero => io::ErrorKind::WriteZero,
+                        };
+                        for backend_error in [None, Some(io::ErrorKind::ConnectionReset)] {
+                            let pool = pool(512);
+                            let cut = status_len + 1;
+                            let mut backend = ScriptedBackend::new(&wire[cut..wire.len()-1], &sizes);
+                            backend.error = backend_error;
+                            let mut conn = crate::stream::ConnectionStream::for_test(backend);
+                            let mut buffer = pool.acquire(); buffer.copy_from_slice(&wire[..cut]);
+                            let request = crate::protocol::RequestContext::parse(&command).unwrap();
+                            let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, buffer).await.unwrap();
+                            let accepted = accepted_seed % cut;
+                            let mut writer = QuotaWriter::new(quotas.clone(), Some((accepted, write_failure)));
+                            let result = classified.stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0)).unwrap().write(&mut writer).await;
+                            assert_eq!(writer.bytes, wire[..accepted]);
+                            assert_eq!(writer.writes_after_failure, 0);
+                            assert!(
+                                matches!(
+                                    result,
+                                    Err(ResponseTransferError::ClientWriteUnpreserved(ref error))
+                                        if error.kind() == expected_kind
+                                ),
+                                "backend {backend_error:?} during drain replaced the client write: {result:?}"
+                            );
+                        }
                     }
                 });
             }
@@ -5693,6 +5705,38 @@ mod tests {
 
         crate::pool::buffer::set_response_write_metrics_enabled(false);
         crate::pool::buffer::reset_response_write_metrics();
+    }
+
+    #[tokio::test]
+    async fn backend_eof_after_a_written_prefix_stops_another_response() {
+        let pool = make_pool();
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(b"220 article\r\n");
+        let mut conn = mock_backend_conn(vec![b"partial".to_vec()]).await;
+        let request = crate::protocol::RequestContext::parse(b"ARTICLE <test@example>\r\n")
+            .expect("valid request");
+        let mut writer = Vec::new();
+
+        let error = write_response(
+            &request,
+            io_buffer,
+            &mut conn,
+            &mut writer,
+            &pool,
+            crate::types::BackendId::from_index(1),
+        )
+        .await
+        .expect_err("backend closed after the client received a prefix");
+
+        assert_eq!(writer, b"220 article\r\npartial");
+        assert!(matches!(
+            error,
+            ResponseTransferError::DeliveredPrefix(ref inner)
+                if matches!(inner.as_ref(), ResponseTransferError::BackendEof { .. })
+        ));
+        let session = crate::session::session_error::SessionError::from(error);
+        assert!(session.blocks_another_response());
+        assert!(!session.is_failed_client_write());
     }
 
     #[tokio::test]

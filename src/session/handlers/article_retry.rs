@@ -361,11 +361,11 @@ impl ClientSession {
                     );
                     return Err(e);
                 }
-                Err(error) if error.is_failed_client_write() => {
+                Err(error) if error.blocks_another_response() => {
                     debug!(
                         client = %self.client_addr,
                         error = %error,
-                        "Client write failed during article retry; not sending another response"
+                        "Response already reached the client; not sending another response"
                     );
                     return Err(error);
                 }

@@ -13,8 +13,9 @@ use std::fmt;
 /// - `Backend` — log, and retry only when the client has not already been written
 ///
 /// A failed client write is a `Backend` error so it is not reported as a
-/// disconnect. [`SessionError::is_failed_client_write`] stops a later attempt
-/// from writing another response onto that stream.
+/// disconnect. [`SessionError::blocks_another_response`] stops a later attempt
+/// from writing another response onto that stream. That includes a client
+/// write failure and a backend failure after response bytes were already sent.
 #[derive(Debug)]
 pub enum SessionError {
     /// Client disconnected (`BrokenPipe`, `ConnectionReset`).
@@ -52,6 +53,28 @@ impl SessionError {
         };
         if let crate::session::response_transfer::ResponseTransferError::ClientWrite(_)
         | crate::session::response_transfer::ResponseTransferError::ClientWriteUnpreserved(_) =
+            transfer
+        {
+            return true;
+        }
+        false
+    }
+
+    /// The client may already have response bytes, so another response must not
+    /// be written after this error.
+    pub(crate) fn blocks_another_response(&self) -> bool {
+        if self.is_failed_client_write() {
+            return true;
+        }
+        let Self::Backend(error) = self else {
+            return false;
+        };
+        let Some(transfer) =
+            error.downcast_ref::<crate::session::response_transfer::ResponseTransferError>()
+        else {
+            return false;
+        };
+        if let crate::session::response_transfer::ResponseTransferError::DeliveredPrefix(_) =
             transfer
         {
             return true;
@@ -230,5 +253,23 @@ mod tests {
             );
         let error = SessionError::from(response_transfer_err);
         assert!(error.is_failed_client_write());
+        assert!(error.blocks_another_response());
+    }
+
+    #[test]
+    fn delivered_prefix_stops_another_response_without_a_client_write() {
+        let eof = crate::session::response_transfer::ResponseTransferError::BackendEof {
+            backend_id: crate::types::BackendId::from_index(0),
+            bytes_received: 12,
+        };
+        let delivered = eof.after_client_delivery();
+        let error = SessionError::from(delivered);
+        assert!(error.blocks_another_response());
+        assert!(!error.is_failed_client_write());
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("client already received response bytes"),
+            "{rendered}"
+        );
     }
 }

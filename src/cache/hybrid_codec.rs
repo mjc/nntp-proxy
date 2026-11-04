@@ -605,6 +605,16 @@ impl DiskCachedArticle {
         self.payload.len()
     }
 
+    #[must_use]
+    pub(super) fn keep_over_same_completeness(&self, new: &Self) -> bool {
+        super::article::keep_same_completeness(
+            self.payload_len(),
+            new.payload_len(),
+            &self.payload,
+            &new.payload,
+        )
+    }
+
     /// Size of the serialized value, including metadata and payload framing.
     #[must_use]
     pub(crate) fn encoded_len(&self) -> usize {

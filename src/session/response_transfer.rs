@@ -24,6 +24,10 @@ pub(crate) enum ResponseTransferError {
     /// frame had already looked complete.
     ClientWriteUnpreserved(std::io::Error),
 
+    /// Response bytes were already written to the client, and the backend then
+    /// failed. The attempt stops so another response is not appended.
+    DeliveredPrefix(Box<Self>),
+
     /// Backend closed connection before sending a complete multiline response.
     BackendEof {
         backend_id: crate::types::BackendId,
@@ -74,6 +78,18 @@ impl ResponseTransferError {
         Self::from_client_write(write_error)
     }
 
+    /// The client already has response bytes, so a later backend failure must
+    /// not be retried as a fresh attempt.
+    pub(crate) fn after_client_delivery(self) -> Self {
+        match self {
+            Self::ClientDisconnect(_)
+            | Self::ClientWrite(_)
+            | Self::ClientWriteUnpreserved(_)
+            | Self::DeliveredPrefix(_) => self,
+            Self::BackendEof { .. } | Self::Io(_) => Self::DeliveredPrefix(Box::new(self)),
+        }
+    }
+
     /// Derive the backend connection fate from the response-transfer outcome.
     ///
     /// A client disconnect or other client write, after a complete response has
@@ -85,7 +101,7 @@ impl ResponseTransferError {
         &self,
         reuse: ResponseConnectionReuse,
     ) -> BackendConnectionOutcome {
-        if let Self::ClientWriteUnpreserved(_) = self {
+        if let Self::ClientWriteUnpreserved(_) | Self::DeliveredPrefix(_) = self {
             return BackendConnectionOutcome::BackendFailed;
         }
         match reuse {
@@ -95,9 +111,10 @@ impl ResponseTransferError {
                 Self::ClientDisconnect(_) | Self::ClientWrite(_) => {
                     BackendConnectionOutcome::BackendHealthy
                 }
-                Self::ClientWriteUnpreserved(_) | Self::BackendEof { .. } | Self::Io(_) => {
-                    BackendConnectionOutcome::BackendFailed
-                }
+                Self::ClientWriteUnpreserved(_)
+                | Self::DeliveredPrefix(_)
+                | Self::BackendEof { .. }
+                | Self::Io(_) => BackendConnectionOutcome::BackendFailed,
             },
         }
     }
@@ -109,6 +126,9 @@ impl std::fmt::Display for ResponseTransferError {
             Self::ClientDisconnect(e) => write!(f, "client disconnected: {e}"),
             Self::ClientWrite(e) | Self::ClientWriteUnpreserved(e) => {
                 write!(f, "client write failed: {e}")
+            }
+            Self::DeliveredPrefix(error) => {
+                write!(f, "client already received response bytes: {error}")
             }
             Self::BackendEof {
                 backend_id,
@@ -129,6 +149,7 @@ impl std::error::Error for ResponseTransferError {
             Self::ClientDisconnect(e) | Self::ClientWrite(e) | Self::ClientWriteUnpreserved(e) => {
                 Some(e)
             }
+            Self::DeliveredPrefix(error) => error.source(),
             Self::BackendEof { .. } => None,
             Self::Io(e) => e.source(),
         }
@@ -228,6 +249,11 @@ mod tests {
         );
         assert_eq!(
             eof.pool_fate(ResponseConnectionReuse::Reusable),
+            BackendConnectionOutcome::BackendFailed
+        );
+        let delivered = eof.after_client_delivery();
+        assert_eq!(
+            delivered.pool_fate(ResponseConnectionReuse::Reusable),
             BackendConnectionOutcome::BackendFailed
         );
         assert_eq!(

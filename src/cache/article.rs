@@ -302,6 +302,33 @@ impl StackStatusLine {
 }
 
 impl CachedPayload {
+    /// Request kinds this payload can answer. Article covers every kind. A
+    /// missing or availability-only marker covers none.
+    const fn answer_bits(&self) -> u8 {
+        const ARTICLE: u8 = 1;
+        const HEAD: u8 = 2;
+        const BODY: u8 = 4;
+        const STAT: u8 = 8;
+        match self {
+            Self::Article { .. } => ARTICLE | HEAD | BODY | STAT,
+            Self::Head { .. } => HEAD | STAT,
+            Self::Body { .. } => BODY | STAT,
+            Self::Stat { .. } => STAT,
+            Self::Missing | Self::AvailabilityOnly => 0,
+        }
+    }
+
+    /// `self` can answer every request `existing` can, and at least one more.
+    ///
+    /// Equal length is not a richer copy of the same sections. An empty body
+    /// still replaces a missing marker, and a body still replaces a STAT entry.
+    #[must_use]
+    pub(crate) const fn strictly_more_useful_than(&self, existing: &Self) -> bool {
+        let new_bits = self.answer_bits();
+        let existing_bits = existing.answer_bits();
+        new_bits & existing_bits == existing_bits && new_bits != existing_bits
+    }
+
     #[must_use]
     pub(crate) fn len(&self) -> CachedPayloadLen {
         let len = match self {
@@ -837,6 +864,17 @@ fn copy_payload_bytes(response: &crate::pool::ChunkedResponse, range: Range<usiz
     copied
 }
 
+/// Keep the stored payload when it is longer, or when an equal-length update
+/// cannot answer any additional request.
+pub(crate) fn keep_same_completeness(
+    existing_len: CachedPayloadLen,
+    new_len: CachedPayloadLen,
+    existing: &CachedPayload,
+    new: &CachedPayload,
+) -> bool {
+    existing_len > new_len || (existing_len == new_len && !new.strictly_more_useful_than(existing))
+}
+
 fn payload_for_status_owned(
     code: u16,
     article_number: Option<CachedArticleNumber>,
@@ -1127,9 +1165,12 @@ impl ArticleCache {
             let should_replace = match (existing_complete, new_complete) {
                 (false, true) => true,
                 (true, false) => false,
-                (true, true) | (false, false) => {
-                    new_entry_template.payload_len() > entry.payload_len()
-                }
+                (true, true) | (false, false) => !keep_same_completeness(
+                    entry.payload_len(),
+                    new_entry_template.payload_len(),
+                    &entry.payload,
+                    &new_entry_template.payload,
+                ),
             };
 
             if should_replace {
@@ -2007,6 +2048,18 @@ mod tests {
         cache
             .upsert_unframed_ingest(
                 msg_id.clone(),
+                b"222 0 <replace-body@example.com>\r\nBody content that is long enough\r\n.\r\n"
+                    .to_vec(),
+                backend,
+                0.into(),
+            )
+            .await;
+        let kept = cache.get(&msg_id).await.expect("equal-length body stays");
+        assert_eq!(kept.inserted_at().get(), stored_at);
+
+        cache
+            .upsert_unframed_ingest(
+                msg_id.clone(),
                 b"222 0 <replace-body@example.com>\r\nshort\r\n.\r\n".to_vec(),
                 backend,
                 0.into(),
@@ -2031,6 +2084,65 @@ mod tests {
             replaced
                 .cached_response_for(RequestKind::Article, msg_id.as_str())
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn empty_body_replaces_a_missing_marker_and_a_stat_entry() {
+        let missing = CachedPayload::Missing;
+        let stat = CachedPayload::Stat {
+            article_number: None,
+        };
+        let body = CachedPayload::Body {
+            article_number: None,
+            body: std::sync::Arc::from([]),
+        };
+        assert!(
+            !keep_same_completeness(missing.len(), body.len(), &missing, &body),
+            "an empty body answers BODY and must replace a missing marker"
+        );
+        assert!(
+            !keep_same_completeness(stat.len(), body.len(), &stat, &body),
+            "an empty body answers BODY and must replace a STAT entry"
+        );
+        assert!(
+            keep_same_completeness(body.len(), body.len(), &body, &body),
+            "an equal-length body is not a richer copy"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_body_replaces_missing_marker_from_another_backend() {
+        let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
+        let msg_id = MessageId::from_str_or_wrap("empty-body@example.com").unwrap();
+        cache
+            .record_availability_missing(msg_id.clone(), AvailabilitySlot::new(0).unwrap())
+            .await;
+
+        cache
+            .upsert_unframed_ingest(
+                msg_id.clone(),
+                b"222 0 <empty-body@example.com>\r\n.\r\n".to_vec(),
+                BackendId::from_index(1),
+                0.into(),
+            )
+            .await;
+
+        let entry = cache.get(&msg_id).await.expect("empty body is cached");
+        assert!(
+            entry
+                .cached_response_for(RequestKind::Body, msg_id.as_str())
+                .is_some()
+        );
+        assert!(
+            !entry
+                .availability()
+                .should_try_slot(AvailabilitySlot::new(0).unwrap())
+        );
+        assert!(
+            entry
+                .availability()
+                .should_try_slot(AvailabilitySlot::new(1).unwrap())
         );
     }
 

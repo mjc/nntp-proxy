@@ -517,7 +517,7 @@ impl HybridArticleCache {
             let keep_existing = match (existing_complete, new_complete) {
                 (true, false) => true,
                 (false, true) => false,
-                (true, true) | (false, false) => existing_len >= entry_len,
+                (true, true) | (false, false) => existing.keep_over_same_completeness(&entry),
             };
             if keep_existing {
                 // The stored payload stays, and its lifetime stays with it.
@@ -1247,6 +1247,19 @@ mod tests {
         cache
             .upsert_unframed_ingest(
                 msg_id,
+                b"222 0 <hybrid-replace-body@example.com>\r\nBody content that is long enough\r\n.\r\n"
+                    .to_vec(),
+                BackendId::from_index(0),
+                0.into(),
+            )
+            .await;
+        let msg_id = MessageId::from_borrowed("<hybrid-replace-body@example.com>").unwrap();
+        let kept = cache.get(&msg_id).await.expect("equal-length body stays");
+        assert_eq!(kept.timestamp.get(), stored_at);
+
+        cache
+            .upsert_unframed_ingest(
+                msg_id,
                 b"222 0 <hybrid-replace-body@example.com>\r\nshort\r\n.\r\n".to_vec(),
                 BackendId::from_index(0),
                 0.into(),
@@ -1270,6 +1283,39 @@ mod tests {
         let replaced = cache.get(&msg_id).await.expect("article replaced body");
         assert!(replaced.is_complete_article());
         assert_ne!(replaced.timestamp.get(), stored_at);
+
+        cache.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_body_replaces_missing_marker_from_another_backend() {
+        let cache = HybridArticleCache::new_memory_only(1024 * 1024)
+            .await
+            .unwrap();
+        let msg_id = MessageId::from_borrowed("<hybrid-empty-body@example.com>").unwrap();
+        cache
+            .record_availability_missing(msg_id, AvailabilitySlot::new(0).unwrap())
+            .await;
+
+        let msg_id = MessageId::from_borrowed("<hybrid-empty-body@example.com>").unwrap();
+        cache
+            .upsert_unframed_ingest(
+                msg_id,
+                b"222 0 <hybrid-empty-body@example.com>\r\n.\r\n".to_vec(),
+                BackendId::from_index(1),
+                0.into(),
+            )
+            .await;
+
+        let msg_id = MessageId::from_borrowed("<hybrid-empty-body@example.com>").unwrap();
+        let entry = cache.get(&msg_id).await.expect("empty body is cached");
+        assert!(
+            entry
+                .cached_response_for(crate::protocol::RequestKind::Body, msg_id.as_str())
+                .is_some()
+        );
+        assert!(!entry.should_try_slot(AvailabilitySlot::new(0).unwrap()));
+        assert!(entry.should_try_slot(AvailabilitySlot::new(1).unwrap()));
 
         cache.close().await.unwrap();
     }
