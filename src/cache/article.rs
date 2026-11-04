@@ -672,13 +672,11 @@ impl CachedArticle {
                     article_number: right_number,
                     body,
                 },
-            ) if compatible_article_numbers(*left_number, *right_number) => {
-                Some(CachedPayload::Article {
-                    article_number: (*left_number).or(*right_number),
-                    headers: headers.clone(),
-                    body: body.clone(),
-                })
-            }
+            ) => Some(CachedPayload::Article {
+                article_number: retained_article_number(*left_number, *right_number),
+                headers: headers.clone(),
+                body: body.clone(),
+            }),
             (
                 CachedPayload::Body {
                     article_number: left_number,
@@ -688,13 +686,11 @@ impl CachedArticle {
                     article_number: right_number,
                     headers,
                 },
-            ) if compatible_article_numbers(*left_number, *right_number) => {
-                Some(CachedPayload::Article {
-                    article_number: (*left_number).or(*right_number),
-                    headers: headers.clone(),
-                    body: body.clone(),
-                })
-            }
+            ) => Some(CachedPayload::Article {
+                article_number: retained_article_number(*left_number, *right_number),
+                headers: headers.clone(),
+                body: body.clone(),
+            }),
             _ => None,
         };
 
@@ -942,11 +938,17 @@ fn parse_article_number(status_line: &[u8]) -> Option<CachedArticleNumber> {
         .map(CachedArticleNumber::new)
 }
 
-fn compatible_article_numbers(
+/// Article numbers are backend-local. Keep one only when the sections agree
+/// or one side has no number. A disagreement still merges the bytes.
+fn retained_article_number(
     left: Option<CachedArticleNumber>,
     right: Option<CachedArticleNumber>,
-) -> bool {
-    left.is_none() || right.is_none() || left == right
+) -> Option<CachedArticleNumber> {
+    match (left, right) {
+        (Some(left_number), Some(right_number)) if left_number == right_number => Some(left_number),
+        (Some(number), None) | (None, Some(number)) => Some(number),
+        _ => None,
+    }
 }
 
 /// Article cache using LRU eviction with TTL
@@ -2195,18 +2197,29 @@ mod tests {
         }
     }
 
-    /// Disagreeing article numbers stay uncombined; the complete body is kept.
+    /// The same message ID merges even when the backend article numbers differ.
+    ///
+    /// Neither number is served, because each number belongs to one backend.
     #[tokio::test]
-    async fn disagreeing_article_numbers_are_not_combined() {
-        let head = b"221 10 <split@example.com>\r\nSubject: Left\r\n.\r\n";
-        let body = b"222 11 <split@example.com>\r\nright-body\r\n.\r\n";
+    async fn disagreeing_article_numbers_merge_without_either_number() {
+        let head = b"221 0 <split@example.com>\r\nSubject: Left\r\n.\r\n";
+        let body = b"222 0 <split@example.com>\r\nright-body\r\n.\r\n";
+        let article = b"220 0 <split@example.com>\r\nSubject: Left\r\n\r\nright-body\r\n.\r\n";
 
         for head_first in [true, false] {
             let cache = ArticleCache::new(1_000_000, Duration::from_secs(300));
             let msg_id = MessageId::from_str_or_wrap("split@example.com").unwrap();
             let backend = BackendId::from_index(0);
-            let first: &[u8] = if head_first { head } else { body };
-            let second: &[u8] = if head_first { body } else { head };
+            let first: &[u8] = if head_first {
+                b"221 10 <split@example.com>\r\nSubject: Left\r\n.\r\n".as_slice()
+            } else {
+                b"222 11 <split@example.com>\r\nright-body\r\n.\r\n".as_slice()
+            };
+            let second: &[u8] = if head_first {
+                b"222 11 <split@example.com>\r\nright-body\r\n.\r\n".as_slice()
+            } else {
+                b"221 10 <split@example.com>\r\nSubject: Left\r\n.\r\n".as_slice()
+            };
             cache
                 .upsert_unframed_ingest(msg_id.clone(), first.to_vec(), backend, 0.into())
                 .await;
@@ -2214,22 +2227,20 @@ mod tests {
                 .upsert_unframed_ingest(msg_id.clone(), second.to_vec(), backend, 0.into())
                 .await;
 
-            let cached = cache.get(&msg_id).await.expect("replacement entry");
-            assert!(
-                cached
-                    .cached_response_for(RequestKind::Article, msg_id.as_str())
-                    .is_none(),
-                "head first={head_first}"
-            );
-            assert!(
-                cached
-                    .cached_response_for(RequestKind::Head, msg_id.as_str())
-                    .is_none(),
+            let cached = cache.get(&msg_id).await.expect("merged sections");
+            assert_eq!(
+                rendered(&cached, RequestKind::Head, msg_id.as_str()),
+                head,
                 "head first={head_first}"
             );
             assert_eq!(
                 rendered(&cached, RequestKind::Body, msg_id.as_str()),
                 body,
+                "head first={head_first}"
+            );
+            assert_eq!(
+                rendered(&cached, RequestKind::Article, msg_id.as_str()),
+                article,
                 "head first={head_first}"
             );
         }

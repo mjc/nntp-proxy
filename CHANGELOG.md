@@ -61,7 +61,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Rejected NUL bytes in framed ARTICLE and HEAD headers, as required for NNTP multi-line article data, without changing standalone parser compatibility.
 - Fixed active-session and dashboard counters, reduced TUI render allocations, and cleared prewarmed idle backend pools after their configured timeout.
 - Fixed retry routing, queue-pressure validation, backend selection based on available capacity, and response completion checks.
-- A status-only cache update keeps cached HEAD, BODY, ARTICLE, and STAT sections. Compatible header and body sections still combine only when their article numbers agree.
+- A status-only cache update keeps cached HEAD, BODY, ARTICLE, and STAT sections. A HEAD and a BODY for the same message ID are merged into one article. When their article numbers differ, neither number is kept.
 
 ### Upgrade notes
 
@@ -90,7 +90,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Updated operator, development, configuration, and release-benchmark documentation for the new routing, cache, framing, and development workflows.
 - Held the availability clock in restore tests so an older generation that is still inside its TTL is not dropped because the wall clock moved.
 - Added regression coverage for connection setup deadlines when connect, TLS, authentication, or `MODE READER` stalls, including pool-slot release and routing fallback to the next backend.
-- Proved a status-only success leaves a cached HEAD response byte-for-byte, that compatible header and body sections answer both request kinds in either order, and that disagreeing article numbers stay uncombined.
+- Proved a status-only success leaves a cached HEAD response byte-for-byte, that a HEAD and a BODY for the same message ID answer both request kinds in either order, and that disagreeing article numbers are omitted from the merged response.
 
 ## [0.5.2] - 2026-06-11
 
