@@ -91,6 +91,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Held the availability clock in restore tests so an older generation that is still inside its TTL is not dropped because the wall clock moved.
 - Added regression coverage for connection setup deadlines when connect, TLS, authentication, or `MODE READER` stalls, including pool-slot release and routing fallback to the next backend.
 - Proved a status-only success leaves a cached HEAD response byte-for-byte, that a HEAD and a BODY for the same message ID answer both request kinds in either order, and that disagreeing article numbers are omitted from the merged response.
+- Proved missing, availability-only, and STAT cache entries consume hybrid memory capacity and are evicted under pressure, including after they expire.
 
 ## [0.5.2] - 2026-06-11
 

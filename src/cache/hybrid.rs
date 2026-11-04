@@ -65,6 +65,13 @@ use super::{AvailabilityLayout, AvailabilitySlot};
 
 const HYBRID_CACHE_NAME: &str = "nntp-article-cache-v4";
 
+/// Weight charged to the hybrid memory budget.
+///
+/// Payload length alone is zero for missing, availability-only, and STAT
+/// entries. Each entry still owns its key and the cached article record, so
+/// those costs are always charged. Foyer's byte capacity is the only limit:
+/// a separate metadata count is unnecessary while this weight stays positive.
+/// Expired entries keep that weight until capacity pressure evicts them.
 fn hybrid_entry_weight(key: &String, value: &DiskCachedArticle) -> usize {
     size_of::<String>()
         .saturating_add(key.capacity())
@@ -797,6 +804,118 @@ mod tests {
         let mut overallocated_key = String::from("a");
         overallocated_key.reserve(128);
         assert!(hybrid_entry_weight(&overallocated_key, &missing) > missing_weight);
+    }
+
+    fn metadata_sample(index: usize) -> DiskCachedArticle {
+        let tier = super::ttl::CacheTier::new(0);
+        match index % 3 {
+            0 => DiskCachedArticle::missing(tier),
+            1 => DiskCachedArticle::availability_only(super::CacheableStatusCode::Missing, tier),
+            _ => DiskCachedArticle::stat(tier),
+        }
+    }
+
+    fn metadata_unit_weight() -> usize {
+        let key = "meta-0000".to_string();
+        (0..3)
+            .map(|index| hybrid_entry_weight(&key, &metadata_sample(index)))
+            .max()
+            .expect("three metadata samples")
+    }
+
+    /// Inserts enough positive-weight metadata to force eviction.
+    ///
+    /// Proves a mix of missing, availability-only, and STAT entries stays inside
+    /// the memory budget. Does not measure process RSS or the disk tier.
+    #[tokio::test]
+    async fn metadata_entries_stay_within_memory_capacity() {
+        let unit = metadata_unit_weight();
+        let capacity = unit.saturating_mul(4);
+        let cache = HybridArticleCache::new_memory_only(capacity as u64)
+            .await
+            .expect("memory cache");
+        let inserted = 48;
+
+        for index in 0..inserted {
+            let key = format!("meta-{index:04}");
+            cache.cache.insert(key, metadata_sample(index));
+        }
+
+        let entries = cache.cache.memory().entries();
+        let usage = cache.cache.memory().usage();
+        assert!(entries > 0, "metadata should be admitted");
+        assert!(
+            entries < inserted,
+            "metadata count {entries} should be bounded below {inserted}"
+        );
+        assert!(
+            usage <= capacity,
+            "weighted usage {usage} exceeded capacity {capacity}"
+        );
+        assert!(
+            entries <= capacity / unit,
+            "entries {entries} exceed capacity/unit {}",
+            capacity / unit
+        );
+    }
+
+    /// Each metadata variant is retained when the budget can hold all three.
+    #[tokio::test]
+    async fn each_metadata_type_is_admitted() {
+        let cache = HybridArticleCache::new_memory_only(1 << 20)
+            .await
+            .expect("memory cache");
+
+        for index in 0..3 {
+            cache
+                .cache
+                .insert(format!("kind-{index}"), metadata_sample(index));
+        }
+
+        assert_eq!(cache.cache.memory().entries(), 3);
+    }
+
+    /// Expired missing, availability-only, and STAT entries keep their weight until pressure evicts them.
+    #[tokio::test]
+    async fn expired_metadata_is_reclaimed_under_pressure() {
+        let unit = metadata_unit_weight();
+        let capacity = unit.saturating_mul(3);
+        let cache = HybridArticleCache::new_memory_only(capacity as u64)
+            .await
+            .expect("memory cache");
+
+        for index in 0..3 {
+            let mut expired = metadata_sample(index);
+            expired.timestamp = super::ttl::CacheTimestampMillis::new(0);
+            cache.cache.insert(format!("old-{index}"), expired);
+        }
+
+        let occupied = cache.cache.memory().usage();
+        assert!(
+            occupied > 0,
+            "expired metadata must not be free in the memory budget"
+        );
+
+        for index in 0..24 {
+            cache
+                .cache
+                .insert(format!("new-{index:04}"), metadata_sample(index));
+        }
+
+        assert!(cache.cache.memory().usage() <= capacity);
+        assert!(cache.cache.memory().entries() <= capacity / unit);
+        for index in 0..3 {
+            let still_present = cache
+                .cache
+                .get(&format!("old-{index}"))
+                .await
+                .expect("cache get")
+                .is_some();
+            assert!(
+                !still_present,
+                "expired metadata old-{index} should be evicted under pressure"
+            );
+        }
     }
 
     #[test]
