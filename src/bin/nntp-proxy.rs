@@ -375,25 +375,21 @@ fn send_shutdown_signal(tx: &mpsc::Sender<()>) {
 }
 
 async fn await_ui_task_with_timeout(handle: TuiHandle, label: &str) -> Result<()> {
-    match tokio::time::timeout(
+    if let Ok(join_result) = tokio::time::timeout(
         nntp_proxy::constants::timeout::SHUTDOWN_UI_TASK_JOIN,
         handle,
     )
     .await
     {
-        Ok(join_result) => {
-            join_result?;
-            Ok(())
-        }
-        Err(_) => {
-            warn!(
-                task = label,
-                timeout_secs = nntp_proxy::constants::timeout::SHUTDOWN_UI_TASK_JOIN.as_secs(),
-                "Timed out waiting for UI task during shutdown"
-            );
-            Ok(())
-        }
+        join_result?;
+    } else {
+        warn!(
+            task = label,
+            timeout_secs = nntp_proxy::constants::timeout::SHUTDOWN_UI_TASK_JOIN.as_secs(),
+            "Timed out waiting for UI task during shutdown"
+        );
     }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -61,7 +61,7 @@ fn test_release_stateful_when_count_is_zero() {
         0, // tier
     );
 
-    // Release without acquiring should not underflow (fetch_update prevents it)
+    // Release without acquiring should not underflow (try_update prevents it)
     router.release_stateful(backend_id);
     assert_eq!(router.stateful_count(backend_id).map(|c| c.get()), Some(0));
 
