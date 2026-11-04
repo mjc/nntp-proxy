@@ -12,6 +12,7 @@ use hickory_resolver::proto::rr::RecordType;
 use smallvec::SmallVec;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -92,27 +93,52 @@ static DNS_RESOLVER: OnceLock<TokioResolver> = OnceLock::new();
 static NEXT_ADDR_START: AtomicUsize = AtomicUsize::new(0);
 static NEXT_IPV4_ROTATION: AtomicUsize = AtomicUsize::new(0);
 
-/// Initialize or return the shared DNS resolver.
+/// A system resolver kept for the process, or a hosts-file resolver built
+/// for this lookup because `/etc/resolv.conf` is still missing.
+enum ActiveResolver {
+    Shared(&'static TokioResolver),
+    HostsOnly(Box<TokioResolver>),
+}
+
+impl Deref for ActiveResolver {
+    type Target = TokioResolver;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Shared(resolver) => resolver,
+            Self::HostsOnly(resolver) => resolver,
+        }
+    }
+}
+
+/// Return the DNS resolver for this lookup.
 ///
-/// Hickory reads `/etc/resolv.conf` for the upstream nameservers. A Nix
-/// sandbox has no such file. In that case the resolver answers from the
-/// system hosts file and does not query an upstream server.
-fn dns_resolver() -> Result<&'static TokioResolver, ConnectionError> {
+/// Hickory reads `/etc/resolv.conf` for upstream nameservers. When that file
+/// is missing, the lookup uses the system hosts file and is not stored. The
+/// next lookup tries the system file again. A resolver built from
+/// `resolv.conf` stays in `DNS_RESOLVER`.
+fn dns_resolver() -> Result<ActiveResolver, ConnectionError> {
     if let Some(resolver) = DNS_RESOLVER.get() {
-        return Ok(resolver);
+        return Ok(ActiveResolver::Shared(resolver));
     }
 
-    let resolver = match TokioResolver::builder_tokio() {
-        Ok(builder) => builder
-            .build()
-            .map_err(|error| ConnectionError::dns_resolver_build("global", error))?,
-        Err(error) if system_resolv_conf_missing(&error) => hosts_file_resolver()?,
-        Err(error) => return Err(ConnectionError::dns_resolver_init("global", error)),
-    };
-    let _ = DNS_RESOLVER.set(resolver);
-    Ok(DNS_RESOLVER
-        .get()
-        .expect("DNS resolver should be initialized after set"))
+    match TokioResolver::builder_tokio() {
+        Ok(builder) => {
+            let resolver = builder
+                .build()
+                .map_err(|error| ConnectionError::dns_resolver_build("global", error))?;
+            let _ = DNS_RESOLVER.set(resolver);
+            Ok(ActiveResolver::Shared(
+                DNS_RESOLVER
+                    .get()
+                    .expect("DNS resolver should be initialized after set"),
+            ))
+        }
+        Err(error) if system_resolv_conf_missing(&error) => {
+            Ok(ActiveResolver::HostsOnly(Box::new(hosts_file_resolver()?)))
+        }
+        Err(error) => Err(ConnectionError::dns_resolver_init("global", error)),
+    }
 }
 
 fn system_resolv_conf_missing(error: &NetError) -> bool {
@@ -1031,7 +1057,7 @@ mod tests {
         let addresses: Vec<_> = lookup.iter().collect();
 
         assert!(
-            addresses.contains(&IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)),
+            addresses.iter().any(IpAddr::is_loopback),
             "localhost should come from the hosts file, got {addresses:?}"
         );
     }
