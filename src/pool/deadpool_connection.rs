@@ -5,14 +5,17 @@
 
 use deadpool::managed;
 use hickory_resolver::TokioResolver;
+use hickory_resolver::config::{ResolveHosts, ResolverConfig};
+use hickory_resolver::net::NetError;
+use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::proto::rr::RecordType;
 use smallvec::SmallVec;
 use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::OnceLock;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::OnceCell;
@@ -84,25 +87,134 @@ impl tokio::io::AsyncWrite for ReadyBackendConnection {
 pub type Pool = managed::Pool<TcpManager>;
 pub(crate) type PooledConnection = managed::Object<TcpManager>;
 
-/// Shared DNS resolver instance for all managers.
-static DNS_RESOLVER: OnceLock<TokioResolver> = OnceLock::new();
+/// Shared DNS resolver. The hosts-file fallback is tried against
+/// `/etc/resolv.conf` once more, then left in place.
+struct CachedResolver {
+    resolver: Arc<TokioResolver>,
+    kind: CacheKind,
+}
+
+#[derive(Clone, Copy)]
+enum CacheKind {
+    System,
+    HostsPending(Instant),
+    HostsFinal,
+}
+
+static DNS_RESOLVER: Mutex<Option<CachedResolver>> = Mutex::new(None);
 static NEXT_ADDR_START: AtomicUsize = AtomicUsize::new(0);
 static NEXT_IPV4_ROTATION: AtomicUsize = AtomicUsize::new(0);
 
-/// Initialize or return the shared DNS resolver.
-fn dns_resolver() -> Result<&'static TokioResolver, ConnectionError> {
-    if let Some(resolver) = DNS_RESOLVER.get() {
+const RESOLV_CONF_RETRY: Duration = Duration::from_secs(5 * 60);
+
+/// Return the DNS resolver for this lookup.
+///
+/// Hickory reads `/etc/resolv.conf` for upstream nameservers. When that file
+/// is missing, the lookup uses the system hosts file. Five minutes later one
+/// lookup tries the system file again. If it is still missing, later lookups
+/// stay on the hosts file. A resolver built from `resolv.conf` stays for the
+/// process.
+fn dns_resolver() -> Result<Arc<TokioResolver>, ConnectionError> {
+    if let Some(resolver) = cached_resolver() {
         return Ok(resolver);
     }
 
-    let resolver = TokioResolver::builder_tokio()
-        .map_err(|error| ConnectionError::dns_resolver_init("global", error))?
+    match TokioResolver::builder_tokio() {
+        Ok(builder) => {
+            let resolver = Arc::new(
+                builder
+                    .build()
+                    .map_err(|error| ConnectionError::dns_resolver_build("global", error))?,
+            );
+            Ok(store_system_resolver(resolver))
+        }
+        Err(error) if system_resolv_conf_missing(&error) => {
+            let resolver = Arc::new(hosts_file_resolver()?);
+            Ok(store_hosts_resolver(resolver))
+        }
+        Err(error) => Err(ConnectionError::dns_resolver_init("global", error)),
+    }
+}
+
+fn cached_resolver() -> Option<Arc<TokioResolver>> {
+    let cache = resolver_cache();
+    let cached = cache.as_ref()?;
+    if matches!(cached.kind, CacheKind::HostsPending(retry_at) if Instant::now() >= retry_at) {
+        return None;
+    }
+    Some(Arc::clone(&cached.resolver))
+}
+
+fn store_system_resolver(resolver: Arc<TokioResolver>) -> Arc<TokioResolver> {
+    let mut cache = resolver_cache();
+    if let Some(existing) = cache
+        .as_ref()
+        .filter(|cached| matches!(cached.kind, CacheKind::System))
+    {
+        return Arc::clone(&existing.resolver);
+    }
+    *cache = Some(CachedResolver {
+        resolver: Arc::clone(&resolver),
+        kind: CacheKind::System,
+    });
+    resolver
+}
+
+fn store_hosts_resolver(resolver: Arc<TokioResolver>) -> Arc<TokioResolver> {
+    let mut cache = resolver_cache();
+    let now = Instant::now();
+    let existing = cache.as_ref().map(|cached| cached.kind);
+    let keep_existing = match existing {
+        Some(CacheKind::System | CacheKind::HostsFinal) => true,
+        Some(CacheKind::HostsPending(retry_at)) => now < retry_at,
+        None => false,
+    };
+    if keep_existing {
+        return Arc::clone(
+            &cache
+                .as_ref()
+                .expect("cache entry was just matched")
+                .resolver,
+        );
+    }
+    *cache = Some(CachedResolver {
+        resolver: Arc::clone(&resolver),
+        kind: hosts_cache_after_miss(existing, now, RESOLV_CONF_RETRY),
+    });
+    resolver
+}
+
+fn hosts_cache_after_miss(existing: Option<CacheKind>, now: Instant, delay: Duration) -> CacheKind {
+    match existing {
+        Some(CacheKind::HostsPending(retry_at)) if now >= retry_at => CacheKind::HostsFinal,
+        Some(CacheKind::HostsPending(retry_at)) => CacheKind::HostsPending(retry_at),
+        Some(CacheKind::HostsFinal) => CacheKind::HostsFinal,
+        Some(CacheKind::System) | None => CacheKind::HostsPending(now + delay),
+    }
+}
+
+fn resolver_cache() -> std::sync::MutexGuard<'static, Option<CachedResolver>> {
+    DNS_RESOLVER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn system_resolv_conf_missing(error: &NetError) -> bool {
+    matches!(
+        error,
+        NetError::Io(io_error) if io_error.kind() == io::ErrorKind::NotFound
+    )
+}
+
+fn hosts_file_resolver() -> Result<TokioResolver, ConnectionError> {
+    let mut builder = TokioResolver::builder_with_config(
+        ResolverConfig::from_name_servers(Vec::new()),
+        TokioRuntimeProvider::default(),
+    );
+    builder.options_mut().use_hosts_file = ResolveHosts::Always;
+    builder
         .build()
-        .map_err(|error| ConnectionError::dns_resolver_build("global", error))?;
-    let _ = DNS_RESOLVER.set(resolver);
-    Ok(DNS_RESOLVER
-        .get()
-        .expect("DNS resolver should be initialized after set"))
+        .map_err(|error| ConnectionError::dns_resolver_build("global", error))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -979,6 +1091,56 @@ mod tests {
         let _accepted = accept.await.unwrap();
 
         assert_eq!(stream.peer_addr().unwrap(), live_addr);
+    }
+
+    #[test]
+    fn missing_resolv_conf_is_a_not_found_io_error() {
+        let missing = hickory_resolver::net::NetError::Io(std::sync::Arc::new(io::Error::new(
+            io::ErrorKind::NotFound,
+            "missing",
+        )));
+        let denied = hickory_resolver::net::NetError::Io(std::sync::Arc::new(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "denied",
+        )));
+
+        assert!(super::system_resolv_conf_missing(&missing));
+        assert!(!super::system_resolv_conf_missing(&denied));
+    }
+
+    #[test]
+    fn missing_resolv_conf_is_retried_once_after_five_minutes() {
+        let now = Instant::now();
+        let delay = super::RESOLV_CONF_RETRY;
+        assert_eq!(delay, Duration::from_secs(5 * 60));
+
+        let first = super::hosts_cache_after_miss(None, now, delay);
+        let super::CacheKind::HostsPending(retry_at) = first else {
+            panic!("first miss should schedule one retry");
+        };
+        assert_eq!(retry_at, now + delay);
+
+        let waiting =
+            super::hosts_cache_after_miss(Some(first), now + Duration::from_secs(30), delay);
+        assert!(matches!(waiting, super::CacheKind::HostsPending(at) if at == retry_at));
+
+        let second = super::hosts_cache_after_miss(Some(first), retry_at, delay);
+        assert!(matches!(second, super::CacheKind::HostsFinal));
+
+        let later = super::hosts_cache_after_miss(Some(second), retry_at + delay, delay);
+        assert!(matches!(later, super::CacheKind::HostsFinal));
+    }
+
+    #[tokio::test]
+    async fn hosts_file_resolver_maps_localhost_without_a_nameserver() {
+        let resolver = super::hosts_file_resolver().unwrap();
+        let lookup = resolver.lookup_ip("localhost").await.unwrap();
+        let addresses: Vec<_> = lookup.iter().collect();
+
+        assert!(
+            addresses.iter().any(IpAddr::is_loopback),
+            "localhost should come from the hosts file, got {addresses:?}"
+        );
     }
 
     #[tokio::test]
