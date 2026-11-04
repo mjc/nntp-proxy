@@ -87,26 +87,33 @@ impl tokio::io::AsyncWrite for ReadyBackendConnection {
 pub type Pool = managed::Pool<TcpManager>;
 pub(crate) type PooledConnection = managed::Object<TcpManager>;
 
-/// Shared DNS resolver. A hosts-file fallback records when to look for
-/// `/etc/resolv.conf` again. A system resolver has no retry time.
+/// Shared DNS resolver. The hosts-file fallback is tried against
+/// `/etc/resolv.conf` once more, then left in place.
 struct CachedResolver {
     resolver: Arc<TokioResolver>,
-    retry_system_at: Option<Instant>,
+    kind: CacheKind,
+}
+
+#[derive(Clone, Copy)]
+enum CacheKind {
+    System,
+    HostsPending(Instant),
+    HostsFinal,
 }
 
 static DNS_RESOLVER: Mutex<Option<CachedResolver>> = Mutex::new(None);
 static NEXT_ADDR_START: AtomicUsize = AtomicUsize::new(0);
 static NEXT_IPV4_ROTATION: AtomicUsize = AtomicUsize::new(0);
 
-const RESOLV_CONF_RETRY: Duration = Duration::from_secs(60);
-const RESOLV_CONF_JITTER_MILLIS: u64 = 15_000;
+const RESOLV_CONF_RETRY: Duration = Duration::from_secs(5 * 60);
 
 /// Return the DNS resolver for this lookup.
 ///
 /// Hickory reads `/etc/resolv.conf` for upstream nameservers. When that file
-/// is missing, the lookup uses the system hosts file. That fallback is reused
-/// for a minute plus up to 15 seconds of jitter, then the system file is
-/// tried again. A resolver built from `resolv.conf` stays for the process.
+/// is missing, the lookup uses the system hosts file. Five minutes later one
+/// lookup tries the system file again. If it is still missing, later lookups
+/// stay on the hosts file. A resolver built from `resolv.conf` stays for the
+/// process.
 fn dns_resolver() -> Result<Arc<TokioResolver>, ConnectionError> {
     if let Some(resolver) = cached_resolver() {
         return Ok(resolver);
@@ -119,12 +126,11 @@ fn dns_resolver() -> Result<Arc<TokioResolver>, ConnectionError> {
                     .build()
                     .map_err(|error| ConnectionError::dns_resolver_build("global", error))?,
             );
-            Ok(store_resolver(resolver, None))
+            Ok(store_system_resolver(resolver))
         }
         Err(error) if system_resolv_conf_missing(&error) => {
             let resolver = Arc::new(hosts_file_resolver()?);
-            let retry_at = Instant::now() + resolv_conf_retry_delay();
-            Ok(store_resolver(resolver, Some(retry_at)))
+            Ok(store_hosts_resolver(resolver))
         }
         Err(error) => Err(ConnectionError::dns_resolver_init("global", error)),
     }
@@ -133,43 +139,64 @@ fn dns_resolver() -> Result<Arc<TokioResolver>, ConnectionError> {
 fn cached_resolver() -> Option<Arc<TokioResolver>> {
     let cache = resolver_cache();
     let cached = cache.as_ref()?;
-    if cached
-        .retry_system_at
-        .is_some_and(|retry_at| Instant::now() >= retry_at)
-    {
+    if matches!(cached.kind, CacheKind::HostsPending(retry_at) if Instant::now() >= retry_at) {
         return None;
     }
     Some(Arc::clone(&cached.resolver))
 }
 
-fn store_resolver(
-    resolver: Arc<TokioResolver>,
-    retry_system_at: Option<Instant>,
-) -> Arc<TokioResolver> {
+fn store_system_resolver(resolver: Arc<TokioResolver>) -> Arc<TokioResolver> {
     let mut cache = resolver_cache();
     if let Some(existing) = cache
         .as_ref()
-        .filter(|cached| cached.retry_system_at.is_none())
+        .filter(|cached| matches!(cached.kind, CacheKind::System))
     {
         return Arc::clone(&existing.resolver);
     }
     *cache = Some(CachedResolver {
         resolver: Arc::clone(&resolver),
-        retry_system_at,
+        kind: CacheKind::System,
     });
     resolver
+}
+
+fn store_hosts_resolver(resolver: Arc<TokioResolver>) -> Arc<TokioResolver> {
+    let mut cache = resolver_cache();
+    let now = Instant::now();
+    let existing = cache.as_ref().map(|cached| cached.kind);
+    let keep_existing = match existing {
+        Some(CacheKind::System | CacheKind::HostsFinal) => true,
+        Some(CacheKind::HostsPending(retry_at)) => now < retry_at,
+        None => false,
+    };
+    if keep_existing {
+        return Arc::clone(
+            &cache
+                .as_ref()
+                .expect("cache entry was just matched")
+                .resolver,
+        );
+    }
+    *cache = Some(CachedResolver {
+        resolver: Arc::clone(&resolver),
+        kind: hosts_cache_after_miss(existing, now, RESOLV_CONF_RETRY),
+    });
+    resolver
+}
+
+fn hosts_cache_after_miss(existing: Option<CacheKind>, now: Instant, delay: Duration) -> CacheKind {
+    match existing {
+        Some(CacheKind::HostsPending(retry_at)) if now >= retry_at => CacheKind::HostsFinal,
+        Some(CacheKind::HostsPending(retry_at)) => CacheKind::HostsPending(retry_at),
+        Some(CacheKind::HostsFinal) => CacheKind::HostsFinal,
+        Some(CacheKind::System) | None => CacheKind::HostsPending(now + delay),
+    }
 }
 
 fn resolver_cache() -> std::sync::MutexGuard<'static, Option<CachedResolver>> {
     DNS_RESOLVER
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn resolv_conf_retry_delay() -> Duration {
-    use rand::RngExt as _;
-    let mut rng = rand::rng();
-    RESOLV_CONF_RETRY + Duration::from_millis(rng.random_range(0..RESOLV_CONF_JITTER_MILLIS))
 }
 
 fn system_resolv_conf_missing(error: &NetError) -> bool {
@@ -1082,14 +1109,26 @@ mod tests {
     }
 
     #[test]
-    fn resolv_conf_retry_waits_about_a_minute() {
-        for _ in 0..32 {
-            let delay = super::resolv_conf_retry_delay();
-            assert!(
-                (Duration::from_secs(60)..Duration::from_secs(75)).contains(&delay),
-                "retry delay {delay:?} should be a minute plus less than 15 seconds"
-            );
-        }
+    fn missing_resolv_conf_is_retried_once_after_five_minutes() {
+        let now = Instant::now();
+        let delay = super::RESOLV_CONF_RETRY;
+        assert_eq!(delay, Duration::from_secs(5 * 60));
+
+        let first = super::hosts_cache_after_miss(None, now, delay);
+        let super::CacheKind::HostsPending(retry_at) = first else {
+            panic!("first miss should schedule one retry");
+        };
+        assert_eq!(retry_at, now + delay);
+
+        let waiting =
+            super::hosts_cache_after_miss(Some(first), now + Duration::from_secs(30), delay);
+        assert!(matches!(waiting, super::CacheKind::HostsPending(at) if at == retry_at));
+
+        let second = super::hosts_cache_after_miss(Some(first), retry_at, delay);
+        assert!(matches!(second, super::CacheKind::HostsFinal));
+
+        let later = super::hosts_cache_after_miss(Some(second), retry_at + delay, delay);
+        assert!(matches!(later, super::CacheKind::HostsFinal));
     }
 
     #[tokio::test]
