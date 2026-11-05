@@ -12,22 +12,19 @@ activity, and logs.
 
 ## Install
 
-With [Rust and Cargo](https://rustup.rs/) installed:
-
 ```bash
 cargo install nntp-proxy --locked
 ```
 
-Building version 0.6 requires Rust 1.95 or newer and a native C/C++ build
-toolchain. Cargo installs the `nntp-proxy` executable into its bin directory;
-make sure that directory is on your `PATH`. See
-[Cargo's installation guide](https://doc.rust-lang.org/cargo/commands/cargo-install.html)
-if your shell cannot find the command.
+Build this checkout with devenv:
 
-## Configure and run
+```bash
+devenv shell cargo build
+```
 
-Save this as `config.toml`, replacing the example backend and credentials with
-those from your provider:
+## Configure and connect
+
+Save this as `config.toml`, replacing the backend host and credentials with your provider's details:
 
 ```toml
 [proxy]
@@ -44,8 +41,10 @@ password = "your_password"
 max_connections = 10
 ```
 
-Remove both credential lines if your backend does not require authentication.
-Set `max_connections` to fit your provider's connection allowance.
+The sample is NNTPS. Plain NNTP is port `119` with `use_tls = false`. Backend
+certificate verification stays on unless you turn it off.
+
+Remove both credential lines if your provider does not require authentication. Set `max_connections` within your provider's connection allowance.
 
 Start the proxy:
 
@@ -53,95 +52,62 @@ Start the proxy:
 nntp-proxy --config config.toml
 ```
 
-In your NNTP client, use **host `127.0.0.1`, port `8119`, with TLS disabled**.
-No client username or password is needed for this local example. The proxy
-uses your configured credentials and TLS when connecting to the backend;
-backend certificate verification is enabled by default.
+If `config.toml` does not exist and `NNTP_SERVER_*` is unset, the proxy writes a placeholder for `news.example.com` port `119` with TLS off and listens on `0.0.0.0`. Edit that file before you connect a client.
 
-This example listens only on your computer. To serve other machines, configure
-the listener address and [client authentication](https://github.com/mjc/nntp-proxy/blob/main/docs/operator/configuration.md).
-Use a trusted network or an encrypted tunnel for remote clients: the plain
-NNTP listener exposes credentials and traffic on an untrusted network. TLS
-support applies to backend connections. See [Operations](https://github.com/mjc/nntp-proxy/blob/main/docs/operator/operations.md)
-for deployment guidance.
+Configure your NNTP client with:
 
-## Dashboard
+- Host: `127.0.0.1`
+- Port: `8119`
+- TLS: disabled
+- Username and password: none for this example
 
-Run the proxy with its terminal dashboard:
+The proxy uses the backend credentials from `config.toml`.
 
-```bash
-nntp-proxy --config config.toml --tui
-```
+This example accepts connections only from your computer. Keep `[proxy].host` explicit when adapting another config: its default is `0.0.0.0`, which listens on all IPv4 interfaces. [config.example.toml](config.example.toml) omits this field. Add `host = "127.0.0.1"` under `[proxy]` for local use.
 
-Or keep the server headless and attach a dashboard from another terminal:
+To serve other machines, configure the listener address and [client authentication](docs/operator/configuration.md). The client listener supports plain NNTP only. TLS applies to backend connections. Use a trusted network or an encrypted tunnel for remote clients because client credentials and traffic are unencrypted. See [Operations](docs/operator/operations.md).
 
-```bash
-# Server terminal
-nntp-proxy --config config.toml --tui-listen 127.0.0.1:8120
+## Providers and routing
 
-# Dashboard terminal
-nntp-proxy --tui --tui-attach 127.0.0.1:8120
-```
+Add a `[[servers]]` entry for each backend, with its own credentials, TLS settings, and connection limit. Set `tier = 0` for primary servers and a higher tier for fallbacks.
 
-Dashboard connections are restricted to loopback. Without `--tui`, the server
-runs headless and writes logs to stdout. Use `nntp-proxy --help` for the full
-command-line reference.
+For an article lookup, the proxy tries the next tier after every eligible server in the current tier has returned `430`. A remaining server in the current tier is tried first. A busy server, or a server that fails for that attempt, does not move the lookup to the next tier.
 
-## Backends and routing
-
-Add another `[[servers]]` entry for each upstream server. Set `tier = 0` for
-primary servers and a higher tier for fallback servers. For article-missing
-retries, the proxy tries eligible servers in the current tier before moving
-to the next one. Connection limits and TLS settings are configured per server.
-
-Hybrid routing is the default: independent commands share backend connections,
-and commands that need reader state switch the session to a dedicated backend.
-Choose `stateful` to dedicate a backend connection from the start, or
-`per-command` for stateless workloads. Per-command mode returns an NNTP error
-for commands that require session state.
-
-See [Runtime and routing](https://github.com/mjc/nntp-proxy/blob/main/docs/operator/runtime-and-routing.md)
-for backend selection, priority tiers, and queue backpressure.
+Hybrid routing is the default. Independent commands share backend connections, and a command that needs reader state, such as `GROUP`, switches that client to a dedicated backend. `stateful` dedicates a backend connection from the start. `per-command` is for stateless commands such as `ARTICLE <message-id>`. `per-command` rejects a command that needs reader state. Select either explicit mode with `--routing-mode <MODE>`. See [Runtime and routing](docs/operator/runtime-and-routing.md). Selection and queue settings are in [Configuration](docs/operator/configuration.md).
 
 ## Caching
 
-By default, the proxy remembers `430` responses by exact message ID and
-canonical provider hostname without storing article bodies. This index has a
-fixed capacity. Entries can expire, rotate out, or be replaced; the proxy
-retries a provider once it has forgotten the earlier miss.
-To retain payloads in memory, add this as a top-level section in `config.toml`:
+By default, the proxy remembers article-missing (`430`) responses without storing article bodies. Misses are recorded by exact message ID and configured backend hostname. The same hostname shares misses across accounts, ports, TLS settings, tiers, and display names. Hostname matching ignores ASCII case and one trailing DNS dot. Different hostnames stay separate.
+
+The miss index has a fixed capacity. A full index can replace an old entry. Once an entry is forgotten, the proxy can retry that provider.
+
+To retain article payloads in memory, add this top-level section to `config.toml`:
 
 ```toml
 [cache]
 store_article_bodies = true
 ```
 
-An optional `[cache.disk]` section adds a memory-to-disk payload cache. See
-[Caching](https://github.com/mjc/nntp-proxy/blob/main/docs/operator/caching.md)
-for capacity, expiration, disk storage, and availability tracking settings.
+An optional `[cache.disk]` section writes article payloads to disk when they are inserted. It stays inactive unless `store_article_bodies = true`. See [Caching](docs/operator/caching.md) for capacity, expiration, and persistence.
 
-## Documentation
+## Dashboard and documentation
 
-- [Getting started](https://github.com/mjc/nntp-proxy/blob/main/docs/operator/getting-started.md)
-  — installation, configuration, and the first connection.
-- [Configuration](https://github.com/mjc/nntp-proxy/blob/main/docs/operator/configuration.md)
-  — settings, authentication, and environment variables.
-- [Operations](https://github.com/mjc/nntp-proxy/blob/main/docs/operator/operations.md)
-  — running and monitoring the proxy.
-- [Example configuration](https://github.com/mjc/nntp-proxy/blob/main/config.example.toml)
-  — primary and fallback backends.
-- [Full configuration](https://github.com/mjc/nntp-proxy/blob/main/config.full.toml)
-  and [cache configuration](https://github.com/mjc/nntp-proxy/blob/main/config.cache.toml).
-- [Changelog](https://github.com/mjc/nntp-proxy/blob/main/CHANGELOG.md)
-  — release changes.
+For the terminal dashboard, run:
 
-## Contributing
+```bash
+nntp-proxy --config config.toml --tui
+```
 
-Repository development uses [devenv](https://devenv.sh/). See the
-[development guide](https://github.com/mjc/nntp-proxy/blob/main/docs/development.md)
-for source builds, tests, profiling, and benchmarks. Use the application for
-normal operation; the Rust library API is still evolving.
+Without `--tui`, the server runs headless. The [runtime guide](docs/operator/runtime-and-routing.md) explains how to attach a read-only dashboard from another terminal over loopback.
+
+- [Getting started](docs/operator/getting-started.md)
+- [Configuration](docs/operator/configuration.md): settings, credentials, and environment variables
+- [Operations](docs/operator/operations.md): Docker, persisted files, and troubleshooting
+- [Caching](docs/operator/caching.md)
+- [Example configuration](config.example.toml), [full configuration](config.full.toml), and [cache configuration](config.cache.toml)
+- [Changelog](CHANGELOG.md)
+- [Development guide](docs/development.md)
 
 ## License
 
-[MIT](https://github.com/mjc/nntp-proxy/blob/main/LICENSE)
+[MIT](LICENSE)
