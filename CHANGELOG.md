@@ -9,90 +9,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Added optional per-backend `stat_missing` probes for backends that return authoritative `430` responses. Probes can avoid retrying known misses and can prefill availability from fallback tiers while the primary request continues.
-- Added queue-pressure routing controls under `[routing.queue.backpressure]`.
-- Added provider slots for availability tracking, so entries configured with
-  the same canonical hostname share recorded article misses
-  regardless of transport details, accounts, or resolved addresses.
-- Added an availability index with fixed capacity and exact message-ID checks.
-  Fingerprint collisions cannot mark a different article as missing; rotation
-  and replacement can remove old misses, allowing them to be retried.
-- Added `FramedArticle`, `ValidatedArticle`, and `ArticleView` to separate response framing from article validation and allow repeated zero-copy access to validated articles.
-- Added Gungraun benchmarks and reproducible framing, cache, retained-buffer, and end-to-end benchmark fixtures.
+- Optional per-backend `stat_missing` probes for backends that answer with an authoritative `430`. A probe can skip a known miss, and it can record availability from a fallback tier while the primary request continues.
+- Queue-pressure routing controls under `[routing.queue.backpressure]`.
+- Provider slots for availability tracking. Entries with the same canonical hostname share recorded article misses across transport, account, and resolved address.
+- An availability index with a fixed capacity and exact message-ID checks. A fingerprint collision cannot mark a different article missing. Rotation and replacement can drop an old miss, and that article can be tried again.
+- `FramedArticle`, `ValidatedArticle`, and `ArticleView`. Framing stays separate from validation, and a validated article can be read again without a copy.
+- Gungraun benchmarks, with reproducible fixtures for framing, the cache, retained buffers, and end-to-end runs.
 
 ### Changed
 
-- Multiline framing now uses safe Rust autovectorized scans on AArch64 and x86-64 builds targeting AVX2 or AVX-512BW. Generic x86 builds retain the cached `memchr` finder and runtime CPU dispatch.
-- Moved response continuation, packed-response suffixes, and completion into the multiline framer. Normal `ARTICLE`/`BODY`/`HEAD` forwarding borrows pooled bytes directly.
-- Backend connection guards now require proof that a response is fully consumed and no pending bytes remain before allowing reuse. Cancellation and incomplete exchanges retire the connection.
-- Restricted the backend pool to fully initialized connections that have completed greeting, authentication, `MODE READER`, and compression negotiation.
-- Retained-buffer reads now consume an append permission and return a result tied to the buffer, allowing storage reuse across compaction and subsequent reads with fewer copies.
-- Added article windows for requests to the same backend, reuse of pooled suffix bytes, and a bounded stateful upstream request window to reduce round trips and copying on eligible pipelines.
-- Cached response sections now retain their wire boundaries, including the final content CRLF and empty multiline sections.
-- Requests now carry response shape metadata so status codes such as `211` are interpreted according to the command that produced them.
-- Kept `Headers::as_bytes()` tied to the received wire bytes and added lazy RFC 5322 continuation unfolding through `Headers::unfolded_bytes()`.
-- Command classification now produces plans that retain their payloads through pipeline execution and hybrid handoff, avoiding reclassification of accepted commands.
-- A single reducer now updates client authentication state, and the authenticated identity can be set only once. Password diagnostics are redacted; password parsing and serialization are unchanged.
-- Response-write metrics are configurable through `[proxy].response_write_metrics_secs` (disabled by default). Session, dashboard, and routing counters now use typed metric values.
-- Migrated development and CI workflows to `devenv`, reduced crate visibility, and removed obsolete compatibility code and unused large-transfer paths.
-- Refreshed runtime and development dependencies, including `foyer` 0.22.6, `nutype` 0.8, Tokio 1.54.1, Hickory 0.26.3, `toml` 1.2, `uuid` 1.29, `bytes` 1.12, `smallvec` 1.16, `webpki-roots` 1.0.11, `bytesize` 2.7, and `sysinfo` 0.40.1.
-- Updated Gungraun and its Nix-packaged runner to 0.20 and removed the obsolete benchmark advisory exception.
+- Multiline framing uses safe Rust autovectorized scans on AArch64 and on x86-64 builds that target AVX2 or AVX-512BW. A generic x86 build keeps the cached `memchr` finder and runtime CPU dispatch.
+- The multiline framer owns response continuation, packed-response suffixes, and completion. Ordinary `ARTICLE`, `BODY`, and `HEAD` forwarding borrows pooled bytes directly.
+- A backend connection is reusable only after its response is fully consumed and no bytes are still pending. Cancellation and an incomplete exchange retire the connection.
+- The backend pool accepts a connection only after greeting, authentication, `MODE READER`, and compression negotiation have finished.
+- A retained-buffer read takes an append permission and returns a result bound to that buffer. The same storage can be reused across compaction and later reads, with fewer copies.
+- Requests for the same backend can share an article window and pooled suffix bytes. A bounded stateful upstream window shortens eligible pipelines by cutting round trips and copying.
+- A cached response section keeps its wire boundaries, including the final content CRLF and an empty multiline section.
+- A request carries the shape of the response it expects, so a status such as `211` is read according to the command that produced it.
+- `Headers::as_bytes()` remains the received wire bytes. `Headers::unfolded_bytes()` unfolds RFC 5322 continuations when they are read.
+- Command classification produces a plan that keeps its payload through pipeline execution and hybrid handoff. An accepted command is not classified again.
+- One reducer updates client authentication state, and the authenticated identity can be set only once. Password diagnostics are redacted. Password parsing and serialization are the same.
+- `[proxy].response_write_metrics_secs` controls response-write metrics. They are off by default. Session, dashboard, and routing counters use typed metric values.
+- Development and CI run through `devenv`. Crate visibility is narrower. Obsolete compatibility code and the unused large-transfer paths are gone.
+- Runtime and development dependencies are current: `foyer` 0.22.6, `nutype` 0.8, Tokio 1.54.1, Hickory 0.26.3, `toml` 1.2, `uuid` 1.29, `bytes` 1.12, `smallvec` 1.16, `webpki-roots` 1.0.11, `bytesize` 2.7, and `sysinfo` 0.40.1.
+- Gungraun and its Nix-packaged runner are 0.20. The old benchmark advisory exception is removed.
 
 ### Fixed
 
-- Preserved the next tracked response after a multiline reply even when its status line is malformed, and kept overlong status-line discard bounded until the line completes.
-- Split cached headerless ARTICLE payloads at their initial blank line so body content is retained correctly.
-- Preserved backend bytes following a completed response for the next request, including packed single-line and multiline responses.
-- Removed terminator bytes from isolated article captures across backend reads while preserving the status line for empty bodies.
-- Made stateful forwarding cancellation-safe so a client becoming ready cannot cancel an already-started backend write or leave the connection falsely reusable.
-- Corrected explicit stateful sessions so they begin in stateful mode, and deferred hybrid-mode stateful handoff until the handoff succeeds.
-- Client `AUTHINFO` state now changes only after its protocol response is written successfully, so a failed client write leaves authentication state unchanged.
-- Preserved the classified plan for a trailing pipelined command through direct execution or stateful handoff.
-- Tightened backend cleanup around failed authentication, probes, response writes, and partially completed exchanges.
-- Made DNS lookups TTL-aware and corrected address-family cache refresh behavior after IPv6-unreachable failures.
-- When `/etc/resolv.conf` is missing, hostname lookup uses the system hosts file. One lookup five minutes later tries the system file again, then stays on the hosts file if it is still absent.
-- Saved and restored availability facts using canonical hostnames, exact message
-  IDs, and provider-slot translation. Stale identity mappings cannot be applied
-  after the backend layout changes.
-- Fixed cache updates so availability metadata does not replace a larger payload and so cached responses retain exact section boundaries on re-emission.
-- Enforced RFC 3977 message-ID syntax and rejected incomplete backend username/password configuration.
-- Rejected NUL bytes in framed ARTICLE and HEAD headers, as required for NNTP multi-line article data, without changing standalone parser compatibility.
-- Fixed active-session and dashboard counters, reduced TUI render allocations, and cleared prewarmed idle backend pools after their configured timeout.
-- Fixed retry routing, queue-pressure validation, backend selection based on available capacity, and response completion checks.
-- A status-only cache update keeps cached HEAD, BODY, ARTICLE, and STAT sections. A HEAD and a BODY for the same message ID are merged into one article. When their article numbers differ, neither number is kept.
-- Connection setup, including connect, TLS, authentication, and `MODE READER`, fails when it exceeds its deadline. The pool slot is released and routing tries the next backend.
-- The hybrid cache counts the key and the cached record toward its memory budget. Missing, availability-only, and STAT entries are evicted under pressure, including after they expire.
-- The dashboard keeps running when process CPU and memory statistics cannot be read. Those readings stay at zero.
-- A cached body no longer counts as a complete article. A later article replaces it, and a rejected cache update leaves the stored entry's lifetime unchanged. An empty body still replaces a missing-article marker. Availability probes still run when only a body is cached.
-- A connection-setup timeout, a closed pool, and a post-create hook failure are reported as those failures. A wait for a free pool slot is reported as an empty pool. A setup that starts after that wait still gets the setup timeout.
-- A client write that is not a disconnect stops that attempt and is not reported as a client disconnect. A backend failure after response bytes have already reached the client also stops that attempt. A fully consumed backend response stays reusable. The backend connection is retired when the response is incomplete, still has queued bytes, or could not be preserved after the write failed.
+- Stateful forwarding survives cancellation. A client becoming ready does not cancel a backend write that has already started, and that connection is not treated as reusable.
+- An explicit stateful session starts in stateful mode. In hybrid mode the session waits until the stateful handoff succeeds.
+- Client `AUTHINFO` state changes only after its protocol response is written. A failed client write leaves that state as it was.
+- The classified plan for a trailing pipelined command survives direct execution and stateful handoff.
+- DNS lookups follow record TTLs. An IPv6-unreachable failure does not clear a usable IPv4 address.
+- Availability facts follow the backend host and the exact message ID. A changed backend layout does not reuse another backend's miss.
+- A cached body is not a complete article. A later article can replace it, and an availability probe still runs when the cache holds only a body.
+- A cache update that keeps the stored payload leaves that entry's lifetime unchanged.
+- A status-only update keeps a cached HEAD instead of replacing it with an availability marker.
+- A HEAD and a BODY for the same message ID become one article.
+- Message IDs must match RFC 3977. A backend whose username or password is incomplete is rejected.
+- A framed ARTICLE or HEAD header that contains a NUL byte is rejected.
+- Connection setup fails when it passes its deadline. The pool slot is released, and routing tries the next backend. A closed pool is reported as closed. Waiting for a free pool slot is reported as an empty pool.
+- The hybrid cache counts the key and the cached record toward its memory budget.
+- Active-session and dashboard counters agree. The TUI allocates less while rendering, and a prewarmed idle backend pool is cleared after its configured timeout.
 
 ### Security
 
-- Updated `rustls` to 0.23.46, `rustls-webpki` to 0.103.16, and `webpki-roots` to 1.0.11 to address certificate-validation advisories and refresh the bundled CA roots.
+- `rustls` is 0.23.46, `rustls-webpki` is 0.103.16, and `webpki-roots` is 1.0.11. That covers the certificate-validation advisories and refreshes the bundled CA roots.
 
 ### Upgrade notes
 
-- Queue-pressure routing is enabled by default with soft and hard waiter thresholds of 25% and 50%, plus a 1 ms retry delay when every eligible backend in a tier is hard-saturated. These values are configurable under `[routing.queue.backpressure]`.
-- Availability facts are keyed by the configured hostname after ASCII
-  case-folding and removal of one trailing DNS dot. The same hostname shares a
-  provider slot across ports, addresses, accounts, TLS settings, compression,
-  tiers, and display names; DNS resolution and account names do not affect
-  provider identity.
-- Availability-index snapshots written before the format that records hostnames
-  and exact message IDs are ignored; the proxy rebuilds the index. Hybrid-cache
-  registries retain canonical-host slot assignments, while existing payload
-  entries remain readable and older payload-section boundaries are normalized
-  during decoding.
-- `NntpClient` article fetches now return `FramedArticle` instead of a raw `PooledBuffer`. Validate it to obtain typed article access. Article validation and optional yEnc validation are separate operations.
-- Other breaking Rust API changes: the low-level `compression` and `network` modules and `constants::duration_polyfill` are private or removed; `RequestContext` no longer implements `Clone`, which dropped payloads; `ModeState` construction and transition APIs changed; and connection checkout/finalization now uses idle, active, complete, and reusable states.
-- `Password` no longer implements `Display` or `Deref<str>`, and its `Debug` output is redacted. Explicit `AsRef<str>` access remains available where cleartext is required.
-- The `zlib-ng` Cargo feature was removed. RFC 8054 DEFLATE support now uses the `zlib-rs` backend.
+- Queue-pressure routing is on by default. The soft waiter threshold is 25%, the hard threshold is 50%, and the retry delay is 1 ms when every eligible backend in a tier is hard-saturated. These values are under `[routing.queue.backpressure]`.
+- An availability fact is keyed by the configured hostname after ASCII case-folding and removal of one trailing DNS dot. That hostname shares one provider slot across ports, addresses, accounts, TLS settings, compression, tiers, and display names. DNS resolution and account names do not change provider identity.
+- An availability-index snapshot from before hostnames and exact message IDs were recorded is ignored, and the proxy rebuilds the index. A hybrid-cache registry keeps its canonical-host slot assignments. Existing payload entries stay readable, and older payload-section boundaries are normalized while decoding.
+- `NntpClient` article fetches return `FramedArticle` instead of a raw `PooledBuffer`. Validate that value for typed article access. Article validation and optional yEnc validation are separate.
+- Other breaking Rust API changes: the low-level `compression` and `network` modules and `constants::duration_polyfill` are private or removed; `RequestContext` no longer implements `Clone`, which dropped payloads; `ModeState` construction and transition APIs changed; connection checkout and finalization use idle, active, complete, and reusable states.
+- `Password` no longer implements `Display` or `Deref<str>`, and its `Debug` output is redacted. `AsRef<str>` remains where the cleartext is required.
+- The `zlib-ng` Cargo feature is removed. RFC 8054 DEFLATE uses the `zlib-rs` backend.
 - The minimum supported Rust version is 1.95. The pinned toolchain is 1.99.1.
 
 ### Docs
 
-- Operator, development, configuration, and release-benchmark documentation covers the routing, cache, framing, and development workflow changes.
+- Operator, development, configuration, and release-benchmark documentation covers the routing, cache, framing, and development-workflow changes.
 
 ## [0.5.2] - 2026-06-11
 
