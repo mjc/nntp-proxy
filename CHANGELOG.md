@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- `XFEATURE COMPRESS GZIP`, with or without `TERMINATOR`, gets `503` in every routing mode. Hybrid and stateful sessions used to forward it, and a backend that accepted it sent overview data the proxy could not frame.
+- `CAPABILITIES` in `per-command` mode no longer lists `OVER` and `HDR`, which that mode rejects. It still lists `READER` because `MODE READER` is still forwarded.
+
 ## [0.6.0] - 2026-11-05
 
 ### Added

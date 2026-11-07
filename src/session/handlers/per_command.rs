@@ -339,8 +339,10 @@ impl ClientSession {
             "Client {} decision: InterceptCapabilities",
             self.client_addr
         );
-        let capabilities =
-            crate::session::backend::capabilities_response(!auth_access.can_access_backend());
+        let capabilities = crate::session::backend::capabilities_response(
+            !auth_access.can_access_backend(),
+            self.mode_state.routing_mode(),
+        );
         let client_write = client_writer.get_mut();
         client_write.write_all(capabilities).await?;
         record_local_response(request, codes::CAPABILITY_LIST, capabilities);

@@ -74,6 +74,16 @@ pub(crate) const CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE: &[u8] =
 pub(crate) const CAPABILITIES_WITH_AUTHINFO_RESPONSE: &[u8] =
     b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nAUTHINFO USER PASS\r\nOVER\r\nHDR\r\n.\r\n";
 
+/// Per-command routing rejects every `OVER` and `HDR` form, so it must not
+/// advertise them. `READER` stays because per-command still forwards
+/// `MODE READER`, and RFC 3977 §5.3.2 requires a server without `READER` to
+/// answer that command with `502` and close the connection.
+pub(crate) const PER_COMMAND_CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE: &[u8] =
+    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\n.\r\n";
+
+pub(crate) const PER_COMMAND_CAPABILITIES_WITH_AUTHINFO_RESPONSE: &[u8] =
+    b"101 Capability list:\r\nVERSION 2\r\nREADER\r\nAUTHINFO USER PASS\r\n.\r\n";
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ResponseWriteStats {
     chunk_count: usize,

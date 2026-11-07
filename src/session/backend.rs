@@ -83,12 +83,27 @@ where
 }
 
 /// Capabilities response for the local proxy capability command.
+///
+/// The list depends on the routing mode because per-command routing cannot
+/// serve the group-state commands that hybrid and stateful sessions reach.
 #[must_use]
-pub(crate) const fn capabilities_response(auth_enabled: bool) -> &'static [u8] {
-    if auth_enabled {
-        crate::session::multiline_framing::CAPABILITIES_WITH_AUTHINFO_RESPONSE
-    } else {
-        crate::session::multiline_framing::CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE
+pub(crate) const fn capabilities_response(
+    auth_enabled: bool,
+    routing_mode: crate::config::RoutingMode,
+) -> &'static [u8] {
+    use crate::config::RoutingMode;
+    use crate::session::multiline_framing as framing;
+    match (routing_mode, auth_enabled) {
+        (RoutingMode::PerCommand, true) => framing::PER_COMMAND_CAPABILITIES_WITH_AUTHINFO_RESPONSE,
+        (RoutingMode::PerCommand, false) => {
+            framing::PER_COMMAND_CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE
+        }
+        (RoutingMode::Hybrid | RoutingMode::Stateful, true) => {
+            framing::CAPABILITIES_WITH_AUTHINFO_RESPONSE
+        }
+        (RoutingMode::Hybrid | RoutingMode::Stateful, false) => {
+            framing::CAPABILITIES_WITHOUT_AUTHINFO_RESPONSE
+        }
     }
 }
 
