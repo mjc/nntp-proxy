@@ -449,8 +449,9 @@ fn load_config_from_env_provider<E: EnvProvider>(env: &E) -> Result<Config> {
 
     apply_credentials_overlay_from_env(&mut config, env)?;
 
-    // Validate the loaded configuration
-    config.validate()?;
+    // The routing mode may still be overridden from the command line, so the
+    // mode-dependent checks wait for the builder.
+    config.validate_independent_of_mode()?;
 
     Ok(config)
 }
@@ -560,8 +561,9 @@ fn load_config_with_env_provider<E: EnvProvider>(config_path: &str, env: &E) -> 
 
     apply_credentials_overlay_from_env(&mut config, env)?;
 
-    // Validate the loaded configuration
-    config.validate()?;
+    // The routing mode may still be overridden from the command line, so the
+    // mode-dependent checks wait for the builder.
+    config.validate_independent_of_mode()?;
 
     Ok(config)
 }
@@ -1097,7 +1099,7 @@ stateful_sessions = "excluded"
     }
 
     #[test]
-    fn test_load_config_rejects_hybrid_without_allowed_backend() {
+    fn test_load_config_leaves_mode_dependent_checks_to_the_effective_mode() {
         let mut config_file = NamedTempFile::new().unwrap();
         config_file
             .write_all(
@@ -1112,13 +1114,16 @@ stateful_sessions = "excluded"
             .unwrap();
         config_file.flush().unwrap();
 
-        let error =
+        // `--routing-mode per-command` is applied after loading, so a file
+        // that only works in per-command mode must still load.
+        let config =
             load_config_with_env_provider(config_file.path().to_str().unwrap(), &MockEnv::new())
-                .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("stateful_sessions"),
-            "{error:#}"
-        );
+                .unwrap();
+        assert!(config.validate_for_mode(RoutingMode::PerCommand).is_ok());
+        let error = config
+            .validate_for_mode(config.routing.routing_mode)
+            .unwrap_err();
+        assert!(error.to_string().contains("stateful_sessions"), "{error:#}");
     }
 
     #[test]

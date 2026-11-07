@@ -9,11 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Per-backend `stateful_sessions = "excluded"` (and `NNTP_SERVER_<N>_STATEFUL_SESSIONS`) keeps a backend out of hybrid and stateful session pinning and out of replies that carry article numbers, such as `LIST ACTIVE` and `LIST COUNTS`. The backend still serves message-ID requests. Indexers that store `GROUP`/`XOVER` article numbers can now share a tier with providers that number articles differently. Startup logs each excluded backend and rejects `hybrid` or `stateful` mode when no backend is allowed.
+- Per-backend `stateful_sessions = "excluded"` (and `NNTP_SERVER_<N>_STATEFUL_SESSIONS`) keeps a backend out of hybrid and stateful session pinning and out of replies that carry article numbers, such as `LIST ACTIVE` and `LIST COUNTS`. The backend still serves message-ID requests. Indexers that store `GROUP`/`XOVER` article numbers can now share a tier with providers that number articles differently. Startup logs each excluded backend and rejects `hybrid` or `stateful` mode when no backend is allowed. That check uses the effective mode, so `--routing-mode per-command` or `NNTP_PROXY_ROUTING_MODE=per-command` can still start a config whose backends are all excluded.
 - Unknown keys in `[[servers]]` and `[routing]` are logged as warnings at startup instead of being silently ignored.
 
 ### Fixed
 
+- Messages logged while the binary loads its config, such as the backend list and legacy-schema migration notices, used to be dropped because logging was not set up yet. They are now held until logging starts, and printed to stderr if loading fails.
 - A hybrid session that can't get a backend for its first stateful command now receives `400 Backend server unavailable` instead of a silently closed connection.
 
 ## [0.6.0] - 2026-11-05

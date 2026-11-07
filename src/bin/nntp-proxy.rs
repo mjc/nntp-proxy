@@ -42,7 +42,19 @@ fn main() -> Result<()> {
         None
     };
 
-    let (mut config, _) = runtime::load_and_log_config(args.common.config.as_str())?;
+    // Logging is configured from the loaded config, so hold back what loading
+    // logs (ignored keys, migrations, the backend list) until it exists.
+    let (loaded, startup_events) = nntp_proxy::logging::capture_startup_events(|| {
+        runtime::load_and_log_config(args.common.config.as_str())
+    });
+    let (mut config, _) = match loaded {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            drop(startup_tui);
+            startup_events.print_to_stderr();
+            return Err(error);
+        }
+    };
 
     // Apply CLI argument overrides to config
     args.common.apply_overrides(&mut config);
@@ -63,6 +75,7 @@ fn main() -> Result<()> {
         capture_in_memory_logs,
         write_debug_log,
     );
+    startup_events.replay();
 
     let threads = args.common.threads.or(Some(config.proxy.threads));
     RuntimeConfig::from_args(threads)

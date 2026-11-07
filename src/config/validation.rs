@@ -38,6 +38,32 @@ impl Config {
     /// # Errors
     /// Returns an error if semantic validation fails.
     pub fn validate_for_mode(&self, routing_mode: RoutingMode) -> Result<()> {
+        self.validate_independent_of_mode()?;
+
+        if routing_mode.supports_stateful_commands()
+            && !self
+                .servers
+                .iter()
+                .any(|server| server.stateful_sessions.is_allowed())
+        {
+            return Err(anyhow::anyhow!(
+                "routing mode \"{}\" needs at least one server with stateful_sessions = \"allowed\"",
+                routing_mode.short_name()
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Validate everything that does not depend on the routing mode.
+    ///
+    /// Config loaders run before `--routing-mode` / `NNTP_PROXY_ROUTING_MODE`
+    /// are applied, so they cannot know the effective mode; the mode-dependent
+    /// checks run in [`Self::validate_for_mode`] when the proxy is built.
+    ///
+    /// # Errors
+    /// Returns an error if semantic validation fails.
+    pub fn validate_independent_of_mode(&self) -> Result<()> {
         if self.servers.is_empty() {
             return Err(anyhow::anyhow!(
                 "Configuration must have at least one server"
@@ -67,18 +93,6 @@ impl Config {
 
         for server in &self.servers {
             validate_server(server)?;
-        }
-
-        if routing_mode.supports_stateful_commands()
-            && !self
-                .servers
-                .iter()
-                .any(|server| server.stateful_sessions.is_allowed())
-        {
-            return Err(anyhow::anyhow!(
-                "routing mode \"{}\" needs at least one server with stateful_sessions = \"allowed\"",
-                routing_mode.short_name()
-            ));
         }
 
         Ok(())
@@ -215,6 +229,17 @@ mod tests {
         assert!(config.validate_for_mode(RoutingMode::Stateful).is_err());
         config.routing.routing_mode = RoutingMode::Stateful;
         assert!(config.validate_for_mode(RoutingMode::PerCommand).is_ok());
+    }
+
+    #[test]
+    fn test_mode_independent_validation_leaves_exclusions_to_the_effective_mode() {
+        let config = Config {
+            servers: vec![excluded_server("excluded")],
+            ..Default::default()
+        };
+        assert_eq!(config.routing.routing_mode, RoutingMode::Hybrid);
+        assert!(config.validate_independent_of_mode().is_ok());
+        assert!(config.validate().is_err());
     }
 
     #[test]
