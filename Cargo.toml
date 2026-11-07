@@ -158,6 +158,7 @@ required-features = ["framing-bench"]
 [[bench]]
 name = "capture_retention"
 harness = false
+required-features = ["framing-bench"]
 
 [[bench]]
 name = "yenc_decoding"

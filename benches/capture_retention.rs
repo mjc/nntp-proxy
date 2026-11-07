@@ -7,7 +7,7 @@
 //! pool fallback counters from `hot_path_allocation_metrics_snapshot`.
 //!
 //! Run with:
-//! `cargo bench --bench capture_retention`
+//! `cargo bench --features framing-bench --bench capture_retention`
 //!
 //! Options (all `--key=value`): `geometry=sparse|dense`, `concurrency`,
 //! `requests` (per client), `size` (article bytes), `segment` (sparse backend
@@ -18,6 +18,7 @@
 use nntp_proxy::config::{Cache, Config, Memory, Server};
 use nntp_proxy::pool::hot_path_allocation_metrics_snapshot;
 use nntp_proxy::protocol::StatusCode;
+use nntp_proxy::session::benchmark_article_response_into;
 use nntp_proxy::types::{CacheCapacity, MaxConnections, Port};
 use nntp_proxy::{NntpProxy, RoutingMode};
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -158,19 +159,6 @@ impl Scenario {
     }
 }
 
-/// Build an article into a reused buffer so harness allocations stay flat
-/// and the peak reflects the proxy.
-fn article_into(response: &mut Vec<u8>, id: &str, size: usize) {
-    response.clear();
-    response.extend_from_slice(format!("220 0 {id}\r\nMessage-ID: {id}\r\n\r\n").as_bytes());
-    let line = [b'x'; 126];
-    while response.len() + 128 <= size {
-        response.extend_from_slice(&line);
-        response.extend_from_slice(b"\r\n");
-    }
-    response.extend_from_slice(b".\r\n");
-}
-
 fn spawn_backend(listener: TcpListener, scenario: Scenario) {
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
@@ -196,7 +184,7 @@ async fn serve_backend(stream: TcpStream, scenario: Scenario) {
         }
         let command = line.trim_end();
         let written = if let Some(id) = command.strip_prefix("ARTICLE ") {
-            article_into(&mut response, id, scenario.size);
+            benchmark_article_response_into(&mut response, id, scenario.size);
             match scenario.geometry {
                 Geometry::Dense => write_half.write_all(&response).await,
                 Geometry::Sparse => write_paced(&mut write_half, &response, scenario).await,
@@ -263,7 +251,7 @@ async fn run_client(
     let mut received = 0;
     for request in 0..scenario.requests {
         let id = format!("<c{client}-r{request}@capture.bench>");
-        article_into(&mut expected, &id, scenario.size);
+        benchmark_article_response_into(&mut expected, &id, scenario.size);
         stream
             .write_all(format!("ARTICLE {id}\r\n").as_bytes())
             .await?;

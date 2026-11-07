@@ -3198,6 +3198,32 @@ pub fn benchmark_multiline_response(body_len: usize) -> Vec<u8> {
     response
 }
 
+/// Build an ARTICLE wire response of about `size` bytes into a reused buffer.
+///
+/// The capture-retention harness both serves and verifies this fixture, so the
+/// terminator comes from here rather than from a second framing definition in
+/// the benchmark; reusing the caller's buffer keeps harness allocations out of
+/// the proxy's peak-heap measurement.
+#[cfg(feature = "framing-bench")]
+pub fn benchmark_article_response_into(response: &mut Vec<u8>, message_id: &str, size: usize) {
+    const LINE: [u8; 128] = {
+        let mut line = [b'x'; 128];
+        line[126] = b'\r';
+        line[127] = b'\n';
+        line
+    };
+    response.clear();
+    response.extend_from_slice(b"220 0 ");
+    response.extend_from_slice(message_id.as_bytes());
+    response.extend_from_slice(b"\r\nMessage-ID: ");
+    response.extend_from_slice(message_id.as_bytes());
+    response.extend_from_slice(b"\r\n\r\n");
+    while response.len() + LINE.len() <= size {
+        response.extend_from_slice(&LINE);
+    }
+    response.extend_from_slice(DOT_TERMINATOR);
+}
+
 /// Measure the production-path baseline while retaining only its rolling tail.
 #[cfg(feature = "framing-bench")]
 #[must_use]
