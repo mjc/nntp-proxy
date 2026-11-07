@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unknown keys in `[[servers]]` and `[routing]` are logged as warnings at startup instead of being silently ignored.
 - Per-backend `prewarm_connections` (and `NNTP_SERVER_<N>_PREWARM_CONNECTIONS`) sets how many connections open at startup. The default still opens all `max_connections`; `0` fills the pool on demand, and a value above `max_connections` fails validation. Lowering it keeps idle pooled connections from using up the per-account limit of a provider shared with other clients.
 
+### Changed
+
+- A cache-miss `ARTICLE`, `BODY`, or `HEAD` with `store_article_bodies = true` now reaches the client as the backend sends it. The proxy used to capture the whole response, up to 4 MiB, before writing its first byte. Each read is now written first and then kept for the cache. A response that outgrows the retention limit keeps streaming and is not cached. A client that disconnects partway leaves nothing in the cache, and the backend response is still drained so the connection can be reused.
+
 ### Fixed
 
 - A hybrid session that can't get a backend for its first stateful command now receives `400 Backend server unavailable` instead of a silently closed connection.
