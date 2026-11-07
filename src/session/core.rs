@@ -46,6 +46,22 @@ pub struct ClientSession {
 
     /// Whether to use adaptive availability prechecking for STAT/HEAD
     pub(super) adaptive_precheck: bool,
+
+    /// What a pinned hybrid reader does after its backend answers `430` to a
+    /// message-ID lookup.
+    pub(super) reader_message_id_recovery: ReaderMessageIdRecovery,
+}
+
+/// Recovery policy for message-ID lookups sent over a pinned reader connection.
+///
+/// Resolved once at build time so the stateful loop never has to re-derive it
+/// from routing mode and router presence on every forwarded command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReaderMessageIdRecovery {
+    /// The pinned backend's reply is final (stateful mode, or failover disabled).
+    PinnedOnly,
+    /// A pinned `430` is retried through tier-aware message-ID routing.
+    RoutedAfterPinnedMiss,
 }
 
 /// Builder for constructing `ClientSession` instances
@@ -91,6 +107,7 @@ pub struct ClientSessionBuilder {
     connection_stats: Option<crate::metrics::ConnectionStatsAggregator>,
     cache: BuilderCache,
     adaptive_precheck: bool,
+    reader_message_id_failover: bool,
 }
 
 enum BuilderCache {
@@ -161,6 +178,14 @@ impl ClientSessionBuilder {
         self
     }
 
+    /// Let hybrid reader sessions recover pinned message-ID misses through
+    /// tier-aware routing. Has no effect in per-command or stateful mode.
+    #[must_use]
+    pub const fn with_reader_message_id_failover(mut self, enable: bool) -> Self {
+        self.reader_message_id_failover = enable;
+        self
+    }
+
     /// Build the client session
     ///
     /// Creates a new `ClientSession` with a unique client ID and the configured
@@ -173,6 +198,15 @@ impl ClientSessionBuilder {
             // Stateful mode with a router, or no router: always Stateful.
             (Some(_), RoutingMode::Stateful) | (None, _) => RoutingMode::Stateful,
         };
+
+        // Only hybrid sessions have both a pinned reader backend and a router
+        // that can reach the other backends.
+        let reader_message_id_recovery =
+            if self.reader_message_id_failover && routing_mode == RoutingMode::Hybrid {
+                ReaderMessageIdRecovery::RoutedAfterPinnedMiss
+            } else {
+                ReaderMessageIdRecovery::PinnedOnly
+            };
 
         let metrics = self.metrics;
         metrics.user_connection_opened(None);
@@ -190,6 +224,7 @@ impl ClientSessionBuilder {
             connection_stats: self.connection_stats,
             cache,
             adaptive_precheck: self.adaptive_precheck,
+            reader_message_id_recovery,
         }
     }
 }
@@ -224,6 +259,7 @@ impl ClientSession {
             connection_stats: None,
             cache: Self::default_cache(),
             adaptive_precheck: false,
+            reader_message_id_recovery: ReaderMessageIdRecovery::PinnedOnly,
         }
     }
 
@@ -254,6 +290,7 @@ impl ClientSession {
             connection_stats: None,
             cache: Self::default_cache(),
             adaptive_precheck: false,
+            reader_message_id_recovery: ReaderMessageIdRecovery::PinnedOnly,
         }
     }
 
@@ -295,6 +332,7 @@ impl ClientSession {
             connection_stats: None,
             cache: BuilderCache::DefaultAvailability,
             adaptive_precheck: false,
+            reader_message_id_failover: false,
         }
     }
 

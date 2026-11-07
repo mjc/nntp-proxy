@@ -30,6 +30,9 @@ log_file_level = "warn"
 mode = "hybrid"
 # Backend selection strategy: "least-loaded" (default) or "weighted-round-robin"
 backend_selection = "least-loaded"
+# Hybrid only: answer a 430 from a client's pinned reader backend for
+# ARTICLE/BODY/HEAD/STAT <message-id> from another backend (default: false)
+reader_message_id_failover = false
 # Enable adaptive availability prechecking for STAT/HEAD commands
 adaptive_precheck = false
 
@@ -119,6 +122,12 @@ name = "Example News Server 1"
 max_connections = 20
 # Lower tier numbers are tried first. Higher tiers are fallback/archive servers.
 tier = 0
+# "allowed" (default) or "excluded". Excluded servers never get a stateful
+# session (GROUP, XOVER, article numbers) or a LIST reply, but still serve
+# message-ID requests. Providers number articles differently, so an indexer
+# that stores article numbers should exclude every server whose numbering
+# differs from the rest.
+# stateful_sessions = "allowed"
 # Probe misses with STAT before ARTICLE/BODY/HEAD (0 = disabled, non-zero = enabled).
 # Default is 0; this example enables it on all tiers.
 stat_missing = 1

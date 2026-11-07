@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Per-backend `stateful_sessions = "excluded"` (and `NNTP_SERVER_<N>_STATEFUL_SESSIONS`) keeps a backend out of hybrid and stateful session pinning and out of replies that carry article numbers, such as `LIST ACTIVE` and `LIST COUNTS`. The backend still serves message-ID requests. Indexers that store `GROUP`/`XOVER` article numbers can now share a tier with providers that number articles differently. Startup logs each excluded backend and rejects `hybrid` or `stateful` mode when no backend is allowed. That check uses the effective mode, so `--routing-mode per-command` or `NNTP_PROXY_ROUTING_MODE=per-command` can still start a config whose backends are all excluded.
+- Unknown keys in `[[servers]]` and `[routing]` are logged as warnings at startup instead of being silently ignored.
+- `[routing] reader_message_id_failover = true` lets a hybrid client that is pinned to a backend after `GROUP` recover a `430` for `ARTICLE`, `BODY`, `HEAD`, or `STAT <message-id>`. The miss is recorded for the pinned backend, and the request is answered from a matching cached response or through the normal tier-ordered message-ID retry. The group, the article pointer, and numbered commands stay on the pinned backend. Off by default.
+
+### Fixed
+
+- Messages logged while the binary loads its config, such as the backend list and legacy-schema migration notices, used to be dropped because logging was not set up yet. They are now held until logging starts, and printed to stderr if loading fails.
+- A hybrid session that can't get a backend for its first stateful command now receives `400 Backend server unavailable` instead of a silently closed connection.
+
 ## [0.6.0] - 2026-11-05
 
 ### Added
