@@ -4,7 +4,9 @@
 //! buffer is 1 MiB, so per-read buffer ownership can make a capture hold far
 //! more memory than the article it contains. Wall time alone cannot show that,
 //! so this harness reports the peak live heap of the whole proxy alongside the
-//! pool fallback counters from `hot_path_allocation_metrics_snapshot`.
+//! pool fallback counters from `hot_path_allocation_metrics_snapshot`, and
+//! the client's time to first byte, which shows whether a cache-miss capture
+//! holds the response back until the backend finishes it.
 //!
 //! Run with:
 //! `cargo bench --features framing-bench --bench capture_retention`
@@ -230,11 +232,17 @@ fn spawn_proxy(listener: TcpListener, proxy: NntpProxy) {
     });
 }
 
+/// Bytes received and per-request time to first byte for one client.
+struct ClientResult {
+    bytes: usize,
+    first_byte: Vec<Duration>,
+}
+
 async fn run_client(
     address: std::net::SocketAddr,
     client: usize,
     scenario: Scenario,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<ClientResult> {
     let mut stream = TcpStream::connect(address).await?;
     stream.set_nodelay(true)?;
     let mut reader = BufReader::new(&mut stream);
@@ -249,18 +257,30 @@ async fn run_client(
     let mut expected = Vec::with_capacity(scenario.size);
     let mut response = Vec::with_capacity(scenario.size);
     let mut received = 0;
+    let mut first_byte = Vec::with_capacity(scenario.requests);
     for request in 0..scenario.requests {
         let id = format!("<c{client}-r{request}@capture.bench>");
         benchmark_article_response_into(&mut expected, &id, scenario.size);
         stream
             .write_all(format!("ARTICLE {id}\r\n").as_bytes())
             .await?;
+        let sent = Instant::now();
         response.resize(expected.len(), 0);
-        stream.read_exact(&mut response).await?;
+        stream.read_exact(&mut response[..1]).await?;
+        first_byte.push(sent.elapsed());
+        stream.read_exact(&mut response[1..]).await?;
         anyhow::ensure!(response == expected, "response for {id} differs");
         received += response.len();
     }
-    Ok(received)
+    Ok(ClientResult {
+        bytes: received,
+        first_byte,
+    })
+}
+
+fn percentile_ms(sorted: &[Duration], percentile: usize) -> f64 {
+    let index = (sorted.len() * percentile / 100).min(sorted.len() - 1);
+    sorted[index].as_secs_f64() * 1000.0
 }
 
 async fn run(scenario: Scenario) -> anyhow::Result<()> {
@@ -321,16 +341,20 @@ async fn run(scenario: Scenario) -> anyhow::Result<()> {
         clients.spawn(run_client(address, client, scenario));
     }
     let mut bytes = 0;
+    let mut first_byte = Vec::with_capacity(scenario.concurrency * scenario.requests);
     while let Some(result) = clients.join_next().await {
-        bytes += result??;
+        let client = result??;
+        bytes += client.bytes;
+        first_byte.extend(client.first_byte);
     }
+    first_byte.sort_unstable();
 
     let elapsed = started.elapsed();
     let peak = PEAK.load(Ordering::Relaxed);
     let after = hot_path_allocation_metrics_snapshot();
     let articles = scenario.concurrency * scenario.requests;
     println!(
-        "{:<6} c={:<3} articles={:<4} size={}KiB capture_pool={}x{}KiB | peak_heap_above_baseline={:>8.1} MiB per_capture={:>6.2} MiB | regular_fallbacks={:<6} capture_fallbacks={:<6} metadata_spills={:<5} | {:>7.1} ms {:>7.1} MiB/s",
+        "{:<6} c={:<3} articles={:<4} size={}KiB capture_pool={}x{}KiB | peak_heap_above_baseline={:>8.1} MiB per_capture={:>6.2} MiB | regular_fallbacks={:<6} capture_fallbacks={:<6} metadata_spills={:<5} | ttfb p50={:>6.2} ms p99={:>6.2} ms | {:>7.1} ms {:>7.1} MiB/s",
         format!("{:?}", scenario.geometry).to_lowercase(),
         scenario.concurrency,
         articles,
@@ -342,6 +366,8 @@ async fn run(scenario: Scenario) -> anyhow::Result<()> {
         after.regular_pool_fallback_allocations - before.regular_pool_fallback_allocations,
         after.capture_pool_fallback_allocations - before.capture_pool_fallback_allocations,
         after.chunked_response_metadata_spills - before.chunked_response_metadata_spills,
+        percentile_ms(&first_byte, 50),
+        percentile_ms(&first_byte, 99),
         elapsed.as_secs_f64() * 1000.0,
         bytes as f64 / MIB / elapsed.as_secs_f64(),
     );

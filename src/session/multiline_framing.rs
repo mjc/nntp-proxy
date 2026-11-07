@@ -98,12 +98,6 @@ impl ResponseWriteStats {
         self.small_chunk_bytes += small_chunk_bytes;
     }
 
-    fn add_buffered_response(&mut self, response: &crate::pool::ChunkedResponse) {
-        for chunk in response.iter_chunks() {
-            self.add_chunk(chunk.len());
-        }
-    }
-
     fn record(self) {
         crate::pool::buffer::record_response_write_metrics_internal(
             self.chunk_count,
@@ -258,6 +252,37 @@ impl CompleteResponseWindow {
             }
         }
         Ok(())
+    }
+
+    /// Write the final response window, then hand it to the capture.
+    ///
+    /// The capture may move the read buffer, so the borrowed packet bytes must
+    /// reach the client first. On a client error the packed suffix is still
+    /// queued so the backend connection stays at a response boundary.
+    async fn write_then_retain<W>(
+        &self,
+        writer: &mut W,
+        io_buffer: &mut crate::pool::PooledBuffer,
+        conn: &mut crate::stream::ConnectionStream,
+        response: &mut crate::pool::ChunkedResponse,
+        pool: &crate::pool::BufferPool,
+    ) -> Result<ResponseWriteStats, crate::session::response_transfer::ResponseTransferError>
+    where
+        W: AsyncWrite + Unpin,
+    {
+        let chunk = &io_buffer[self.response.clone()];
+        if let Err(err) = writer.write_all(chunk).await {
+            let cleanup = self.queue_pooled_next_response_input(io_buffer, conn, pool);
+            return Err(
+                crate::session::response_transfer::ResponseTransferError::from_client_write_after_cleanup(
+                    err, cleanup,
+                ),
+            );
+        }
+        let mut stats = ResponseWriteStats::default();
+        stats.add_chunk(chunk.len());
+        self.push_from_buffer(io_buffer, conn, response, pool)?;
+        Ok(stats)
     }
 
     fn observe_from_buffer(
@@ -1904,6 +1929,13 @@ impl<'a> StreamingResponse<'a> {
         }
     }
 
+    /// Forward each backend read to the client as it arrives and retain it for
+    /// the payload cache only after it was written.
+    ///
+    /// Writing the capture only once the response completed made a cold-cache
+    /// client wait for the whole article, up to the retention limit, before
+    /// its first byte. Retention still follows `ReadRetention`, so a read
+    /// buffer moves into the capture only after its borrowed bytes were sent.
     async fn capture_and_write<W: AsyncWrite + Unpin>(
         &mut self,
         writer: &mut W,
@@ -1913,7 +1945,19 @@ impl<'a> StreamingResponse<'a> {
         (u64, Option<CapturedChunkedResponse>),
         crate::session::response_transfer::ResponseTransferError,
     > {
+        /// A failed or cancelled transfer must not leave a partial capture
+        /// that a caller could mistake for a cache payload.
+        struct ClearOnDrop<'r>(&'r mut crate::pool::ChunkedResponse);
+        impl Drop for ClearOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.clear();
+            }
+        }
+
         response.clear();
+        let partial = ClearOnDrop(response);
+        let response = &mut *partial.0;
+        let mut stats = ResponseWriteStats::default();
         loop {
             let chunk_len = match &self.cursor.frame {
                 ResponseWindow::Complete(chunk) => chunk.response.len(),
@@ -1926,35 +1970,35 @@ impl<'a> StreamingResponse<'a> {
                 }
             };
             if exceeds_limit {
-                let mut stats = ResponseWriteStats::default();
-                stats.add_buffered_response(response);
-                if let Err(error) = response.write_all_to_recording(writer).await {
-                    let cleanup = self.observe().await;
-                    return Err(
-                        crate::session::response_transfer::ResponseTransferError::from_client_write_after_cleanup(
-                            error, cleanup,
-                        ),
-                    );
-                }
+                // The retained prefix was already forwarded; drop only its
+                // cache ownership and keep streaming the rest.
                 response.clear();
-                stats += self.write_current_and_remaining_chunks(writer).await?;
+                let delivered = stats.bytes_written > 0;
+                stats += self
+                    .write_current_and_remaining_chunks(writer)
+                    .await
+                    .map_err(|error| {
+                        if delivered {
+                            error.after_client_delivery()
+                        } else {
+                            error
+                        }
+                    })?;
                 stats.record();
                 return Ok((stats.bytes_written_u64(), None));
             }
 
             match &self.cursor.frame {
                 ResponseWindow::Complete(chunk) => {
-                    chunk.push_from_buffer(
-                        self.cursor.io_buffer,
-                        self.cursor.conn,
-                        response,
-                        self.pool,
-                    )?;
-                    let mut stats = ResponseWriteStats::default();
-                    stats.add_buffered_response(response);
-                    response.write_all_to_recording(writer).await.map_err(
-                        crate::session::response_transfer::ResponseTransferError::from_client_write,
-                    )?;
+                    stats += chunk
+                        .write_then_retain(
+                            writer,
+                            self.cursor.io_buffer,
+                            self.cursor.conn,
+                            response,
+                            self.pool,
+                        )
+                        .await?;
                     stats.record();
                     let payload_end = match self.shape {
                         ResponseShape::SingleLine => response.len(),
@@ -1976,8 +2020,23 @@ impl<'a> StreamingResponse<'a> {
                     return Ok((stats.bytes_written_u64(), Some(captured)));
                 }
                 ResponseWindow::Incomplete(chunk) => {
+                    let bytes = &self.cursor.io_buffer[chunk.response.clone()];
+                    if let Err(error) = writer.write_all(bytes).await {
+                        // Release the partial capture before draining the
+                        // rest of a response that may still be large.
+                        response.clear();
+                        let cleanup = self.drain().await;
+                        return Err(
+                            crate::session::response_transfer::ResponseTransferError::from_client_write_after_cleanup(
+                                error, cleanup,
+                            ),
+                        );
+                    }
+                    stats.add_chunk(bytes.len());
                     chunk.push_buffer_to(response, self.pool, self.cursor.io_buffer);
-                    self.read_next_chunk().await?;
+                    self.read_next_chunk()
+                        .await
+                        .map_err(|error| error.after_client_delivery())?;
                 }
             }
         }
@@ -4924,6 +4983,271 @@ mod tests {
         let mut output = Vec::new();
         rendered.write_to(&mut output).await.unwrap();
         assert_eq!(output, response);
+    }
+
+    /// Accepts `allowance` bytes, then fails like a client that closed.
+    struct ClosingWriter {
+        bytes: Vec<u8>,
+        allowance: usize,
+    }
+
+    impl AsyncWrite for ClosingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.allowance == 0 {
+                return Poll::Ready(Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "client closed mid-response",
+                )));
+            }
+            let accepted = self.allowance.min(buf.len());
+            self.bytes.extend_from_slice(&buf[..accepted]);
+            self.allowance -= accepted;
+            Poll::Ready(Ok(accepted))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Render a capture the way a later cache hit would serve it.
+    async fn render_cached(
+        captured: CapturedChunkedResponse,
+        kind: crate::protocol::RequestKind,
+        message_id: &str,
+    ) -> Vec<u8> {
+        let entry = crate::cache::CachedArticle::from_unframed_ingest_for_test(
+            crate::cache::CacheIngestResponse::FramedChunked(captured.into_cache_ingest()),
+            crate::cache::ttl::CacheTier::new(0),
+        );
+        let mut rendered = Vec::new();
+        entry
+            .cached_response_for(kind, message_id)
+            .expect("cached response")
+            .write_to(&mut rendered)
+            .await
+            .unwrap();
+        rendered
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum CaptureLimit {
+        FitsResponse,
+        ExceededAfterPrefix,
+    }
+
+    #[tokio::test]
+    async fn capture_and_write_forwards_prefix_before_backend_completes() {
+        let id = "<first-byte@capture.test>";
+        let first = b"220 0 <first-byte@capture.test>\r\nSubject: s\r\n\r\nprefix line\r\n";
+        let tail = b"tail line\r\n.\r\n";
+        let wire = [first.as_slice(), tail.as_slice()].concat();
+        for limit in [
+            CaptureLimit::FitsResponse,
+            CaptureLimit::ExceededAfterPrefix,
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let backend = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                release_rx.await.unwrap();
+                stream.write_all(tail).await.unwrap();
+                stream.shutdown().await.unwrap();
+            });
+            let mut conn = crate::stream::ConnectionStream::plain(
+                tokio::net::TcpStream::connect(address).await.unwrap(),
+            );
+            let pool = make_pool();
+            let request =
+                crate::protocol::RequestContext::parse(b"ARTICLE <first-byte@capture.test>\r\n")
+                    .unwrap();
+            let mut io_buffer = pool.acquire();
+            io_buffer.copy_from_slice(first);
+            let retention_limit = match limit {
+                CaptureLimit::FitsResponse => wire.len(),
+                CaptureLimit::ExceededAfterPrefix => first.len(),
+            };
+            let (mut writer, mut client) = tokio::io::duplex(wire.len());
+            let forwarding = tokio::spawn(async move {
+                let mut classified =
+                    ClassifiedResponse::read_for_test(&mut conn, &request, io_buffer)
+                        .await
+                        .unwrap();
+                let mut captured = crate::pool::ChunkedResponse::default();
+                let result = classified
+                    .stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0))
+                    .unwrap()
+                    .capture_and_write(&mut writer, &mut captured, retention_limit)
+                    .await
+                    .unwrap();
+                assert!(captured.is_empty());
+                result
+            });
+
+            let mut received = vec![0; wire.len()];
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                client.read_exact(&mut received[..first.len()]),
+            )
+            .await
+            .expect("capture must forward the received prefix while the backend is still sending")
+            .unwrap();
+            assert_eq!(&received[..first.len()], first, "{limit:?}");
+
+            release_tx.send(()).unwrap();
+            client
+                .read_exact(&mut received[first.len()..])
+                .await
+                .unwrap();
+            assert_eq!(received, wire, "{limit:?}");
+            let (bytes_written, retained) = forwarding.await.unwrap();
+            backend.await.unwrap();
+            assert_eq!(bytes_written as usize, wire.len(), "{limit:?}");
+            match limit {
+                CaptureLimit::FitsResponse => {
+                    let retained = retained.expect("response within the limit is retained");
+                    assert_eq!(
+                        render_cached(retained, crate::protocol::RequestKind::Article, id).await,
+                        wire
+                    );
+                }
+                CaptureLimit::ExceededAfterPrefix => assert!(
+                    retained.is_none(),
+                    "an oversized response streams through without a cache payload"
+                ),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_and_write_caches_forwarded_bytes_at_every_backend_split() {
+        let id = "<split@capture.test>";
+        let wire =
+            b"222 0 <split@capture.test>\r\nline one\r\n..dot-stuffed\r\nline three\r\n.\r\n";
+        let next = b"223 0 <next@capture.test>\r\n";
+        let request = crate::protocol::RequestContext::parse(b"BODY <split@capture.test>\r\n")
+            .expect("valid request");
+        for split in 1..wire.len() {
+            let pool = make_pool();
+            let mut io_buffer = pool.acquire();
+            io_buffer.copy_from_slice(&wire[..split]);
+            let rest = [&wire[split..], next.as_slice()].concat();
+            let mut conn = mock_backend_conn(vec![rest]).await;
+            let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, io_buffer)
+                .await
+                .unwrap();
+            let mut captured = crate::pool::ChunkedResponse::default();
+            let mut writer = RecordingWriter::default();
+            let (bytes_written, retained) = classified
+                .stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0))
+                .unwrap()
+                .capture_and_write(&mut writer, &mut captured, wire.len())
+                .await
+                .unwrap();
+            assert_eq!(bytes_written as usize, wire.len(), "split={split}");
+            assert_eq!(writer.bytes, wire, "split={split}");
+            let retained = retained.expect("response within the limit is retained");
+            assert_eq!(
+                render_cached(retained, crate::protocol::RequestKind::Body, id).await,
+                wire,
+                "split={split}"
+            );
+            let mut following = vec![0; next.len()];
+            conn.read_exact(&mut following).await.unwrap();
+            assert_eq!(following, next, "packed next response, split={split}");
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_and_write_client_disconnect_drains_backend_and_caches_nothing() {
+        let first = b"222 0 <disconnect@capture.test>\r\nfirst line\r\n";
+        let tail = b"second line\r\nthird line\r\n.\r\n";
+        let next = b"223 0 <next@capture.test>\r\n";
+        let request = crate::protocol::RequestContext::parse(b"BODY <disconnect@capture.test>\r\n")
+            .expect("valid request");
+        // Fail on the first read, partway through a later read, and on the
+        // final window that would complete the capture.
+        for allowance in [0, first.len() + 4, first.len() + tail.len() - 1] {
+            let pool = make_pool();
+            let mut io_buffer = pool.acquire();
+            io_buffer.copy_from_slice(first);
+            let mut conn = mock_backend_conn(vec![
+                tail[..tail.len() / 2].to_vec(),
+                [&tail[tail.len() / 2..], next.as_slice()].concat(),
+            ])
+            .await;
+            let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, io_buffer)
+                .await
+                .unwrap();
+            let mut captured = crate::pool::ChunkedResponse::default();
+            let mut writer = ClosingWriter {
+                bytes: Vec::new(),
+                allowance,
+            };
+            {
+                let mut streaming = classified
+                    .stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0))
+                    .unwrap();
+                let error = streaming
+                    .capture_and_write(&mut writer, &mut captured, 4096)
+                    .await
+                    .expect_err("client write failure must fail the transfer");
+                assert!(
+                    matches!(error, ResponseTransferError::ClientDisconnect(_)),
+                    "allowance={allowance}: {error:?}"
+                );
+                assert!(
+                    streaming.is_complete(),
+                    "allowance={allowance}: the backend response must be drained to its end"
+                );
+            }
+            assert!(captured.is_empty(), "allowance={allowance}");
+            assert_eq!(
+                writer.bytes,
+                [first.as_slice(), tail.as_slice()].concat()[..allowance],
+                "allowance={allowance}"
+            );
+            let mut following = vec![0; next.len()];
+            conn.read_exact(&mut following).await.unwrap();
+            assert_eq!(following, next, "allowance={allowance}");
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_and_write_backend_eof_after_forwarding_is_not_retryable() {
+        let first = b"222 0 <eof@capture.test>\r\nfirst line\r\n";
+        let pool = make_pool();
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(first);
+        let mut conn = mock_backend_conn(vec![b"truncated".to_vec()]).await;
+        let request = crate::protocol::RequestContext::parse(b"BODY <eof@capture.test>\r\n")
+            .expect("valid request");
+        let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, io_buffer)
+            .await
+            .unwrap();
+        let mut captured = crate::pool::ChunkedResponse::default();
+        let mut writer = RecordingWriter::default();
+        let error = classified
+            .stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0))
+            .unwrap()
+            .capture_and_write(&mut writer, &mut captured, 4096)
+            .await
+            .expect_err("truncated backend response must fail");
+        assert!(
+            matches!(error, ResponseTransferError::DeliveredPrefix(_)),
+            "a client that already has bytes must not receive a retried response: {error:?}"
+        );
+        assert_eq!(writer.bytes, [first.as_slice(), b"truncated"].concat());
+        assert!(captured.is_empty());
     }
 
     #[tokio::test]
