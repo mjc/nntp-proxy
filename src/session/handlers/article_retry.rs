@@ -346,6 +346,22 @@ impl ClientSession {
                     is_retry_attempt = true;
                 }
                 Ok(BackendAttemptResult::NoRetryableBackend) => {
+                    // Availability holds only authoritative 430 facts, so a
+                    // set bit means a backend really reported the article
+                    // missing and the rest were merely busy or failing.
+                    // Clients treat 430 as "try another source" but 503 as a
+                    // server failure to retry, so prefer the 430.
+                    if availability.has_availability_info() {
+                        trace!(
+                            "Client {} no retryable backend left after 430 for {:?}, sending 430",
+                            self.client_addr,
+                            request.message_id_value()
+                        );
+                        let client_write = io.client_writer.get_mut();
+                        self.send_430_to_client(client_write, io.backend_to_client_bytes)
+                            .await?;
+                        return Ok(());
+                    }
                     let bytes_written = {
                         let client_write = io.client_writer.get_mut();
                         Self::write_backend_error_response(client_write).await?
