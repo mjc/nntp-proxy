@@ -123,16 +123,16 @@ struct CommandExecutionParams<'a> {
 }
 
 #[derive(Default)]
-struct BatchBackendConnection {
+pub(super) struct BatchBackendConnection {
     conn: Option<BackendLease>,
 }
 
 impl BatchBackendConnection {
-    fn slot(&mut self) -> &mut Option<BackendLease> {
+    pub(super) fn slot(&mut self) -> &mut Option<BackendLease> {
         &mut self.conn
     }
 
-    fn complete_success(&mut self) {
+    pub(super) fn complete_success(&mut self) {
         if let Some(lease) = self.conn.take() {
             lease.complete_success();
         }

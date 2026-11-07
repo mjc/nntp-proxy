@@ -7,7 +7,9 @@ use crate::command::AuthenticationAccess;
 use crate::protocol::RequestKind;
 use crate::session::ClientAuthState;
 use crate::session::backend::BackendResponseOrder;
-use crate::session::multiline_framing::{OrderedClientWrites, ReadyDeferredReplies};
+use crate::session::multiline_framing::{
+    OrderedClientActions, OrderedClientWrites, ReadyDeferredReplies,
+};
 use crate::types::{BackendToClientBytes, ClientToBackendBytes, TransferMetrics};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,6 +190,42 @@ impl SessionLoopState {
     #[inline]
     pub fn mark_backend_request_sent(&mut self, kind: RequestKind) {
         self.backend_replies.push_request(kind);
+    }
+
+    /// Mark a forwarded message-ID lookup whose `430` the session will recover
+    /// from another backend instead of forwarding.
+    pub(in crate::session) fn mark_recoverable_backend_request_sent(
+        &mut self,
+        request: crate::protocol::RequestContext,
+    ) {
+        self.backend_replies.push_recoverable_request(request);
+    }
+
+    /// Return ordered client actions made ready by a backend read, including
+    /// pinned misses that must be recovered before any later write.
+    #[must_use]
+    pub(in crate::session) fn client_actions_for_backend_read<'a>(
+        &mut self,
+        backend_read: &'a [u8],
+    ) -> OrderedClientActions<'a> {
+        self.backend_replies
+            .client_actions_for_backend_read(backend_read)
+    }
+
+    /// Fold an exchange whose provider and user metrics were already reported
+    /// into the session totals, without reporting it again.
+    ///
+    /// Callers flush pending deltas first: advancing the watermarks here would
+    /// otherwise hide unreported pinned-backend bytes.
+    pub(in crate::session) fn add_reported_transfer(&mut self, transfer: TransferMetrics) {
+        self.client_to_backend = self
+            .client_to_backend
+            .add_u64(transfer.client_to_backend.as_u64());
+        self.backend_to_client = self
+            .backend_to_client
+            .add_u64(transfer.backend_to_client.as_u64());
+        self.last_reported_c2b = self.client_to_backend;
+        self.last_reported_b2c = self.backend_to_client;
     }
 
     /// Whether earlier forwarded backend replies are still ahead of any deferred local replies.

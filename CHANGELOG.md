@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - A cache-miss `ARTICLE`, `BODY`, or `HEAD` with `store_article_bodies = true` now reaches the client as the backend sends it. The proxy used to capture the whole response, up to 4 MiB, before writing its first byte. Each read is now written first and then kept for the cache. A response that outgrows the retention limit keeps streaming and is not cached. A client that disconnects partway leaves nothing in the cache, and the backend response is still drained so the connection can be reused.
+- `[routing] reader_message_id_failover = true` lets a hybrid client that is pinned to a backend after `GROUP` recover a `430` for `ARTICLE`, `BODY`, `HEAD`, or `STAT <message-id>`. The miss is recorded for the pinned backend, and the request is answered from a matching cached response or through the normal tier-ordered message-ID retry. The group, the article pointer, and numbered commands stay on the pinned backend. Off by default.
 
 ### Fixed
 

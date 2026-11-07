@@ -49,6 +49,7 @@ See [../../config.full.toml](../../config.full.toml) for a complete example.
 | `mode` | `hybrid` | `hybrid` is the default; `per-command` and `stateful` remain available explicit modes |
 | `backend_selection` | `least-loaded` | Or `weighted-round-robin` |
 | `adaptive_precheck` | `false` | Adaptive availability precheck for `STAT`/`HEAD` |
+| `reader_message_id_failover` | `false` | In hybrid mode, answer a pinned backend's `430` for a message-ID lookup from another backend. See [Runtime and routing](runtime-and-routing.md#message-id-lookups-in-a-reader-session) |
 
 ### `[routing.queue.backpressure]`
 

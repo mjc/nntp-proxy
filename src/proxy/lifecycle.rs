@@ -147,7 +147,8 @@ impl NntpProxy {
         .with_routing_mode(routing_mode)
         .with_connection_stats(self.connection_stats.clone())
         .with_cache(cache)
-        .with_adaptive_precheck(self.adaptive_precheck);
+        .with_adaptive_precheck(self.adaptive_precheck)
+        .with_reader_message_id_failover(self.reader_message_id_failover);
 
         // Apply optional router
         let builder = match router {
