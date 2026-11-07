@@ -1028,11 +1028,17 @@ mod tests {
             .set("NNTP_SERVER_1_STATEFUL_SESSIONS", "Excluded");
 
         assert_eq!(
-            parse_server_from_env(0, &env).unwrap().stateful_sessions,
+            parse_server_from_env(0, &env)
+                .unwrap()
+                .unwrap()
+                .stateful_sessions,
             crate::config::StatefulSessions::Allowed
         );
         assert_eq!(
-            parse_server_from_env(1, &env).unwrap().stateful_sessions,
+            parse_server_from_env(1, &env)
+                .unwrap()
+                .unwrap()
+                .stateful_sessions,
             crate::config::StatefulSessions::Excluded
         );
     }

@@ -2749,6 +2749,7 @@ mod tests {
             client_to_backend_bytes: &mut client_to_backend_bytes,
             backend_connection: &mut backend_connection,
             unavailable_backends: &mut unavailable_backends,
+            request_origin: ArticleRequestOrigin::Frontend,
         };
         session
             .parallel_retry_stat_sweep(&router, &request, &mut state)
