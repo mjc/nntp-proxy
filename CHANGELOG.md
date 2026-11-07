@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Background `STAT` probes (the non-primary-tier prefetch and the retry sweep) no longer close a healthy backend connection after every probe. They dropped the connection instead of returning it to the pool, so each probe counted as a backend failure, shrank the pool for the replacement cooldown, and forced a new TLS login. Under a 120-connection NZBGet load this retired about 6 connections a second (389 in 60 s).
+
 ## [0.6.0] - 2026-11-05
 
 ### Added
