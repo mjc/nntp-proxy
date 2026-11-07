@@ -6,7 +6,7 @@
 use anyhow::Result;
 use std::time::Duration;
 
-use super::types::{Config, Server};
+use super::types::{Config, RoutingMode, Server};
 use crate::cache::MAX_BACKENDS;
 use crate::constants::pool::{MAX_RECOMMENDED_KEEPALIVE_SECS, MIN_RECOMMENDED_KEEPALIVE_SECS};
 
@@ -21,10 +21,49 @@ impl Config {
     /// This checks remaining semantic constraints:
     /// - At least one server configured
     /// - Keep-alive intervals are in recommended ranges
+    /// - Hybrid and stateful modes have a backend that accepts stateful sessions
     ///
     /// # Errors
     /// Returns an error if semantic validation fails after deserialization.
     pub fn validate(&self) -> Result<()> {
+        self.validate_for_mode(self.routing.routing_mode)
+    }
+
+    /// Validate against the routing mode the proxy actually runs with.
+    ///
+    /// `NntpProxyBuilder::with_routing_mode` overrides `routing.mode` without
+    /// touching the config, and whether stateful exclusions leave a usable
+    /// backend depends on the effective mode.
+    ///
+    /// # Errors
+    /// Returns an error if semantic validation fails.
+    pub fn validate_for_mode(&self, routing_mode: RoutingMode) -> Result<()> {
+        self.validate_independent_of_mode()?;
+
+        if routing_mode.supports_stateful_commands()
+            && !self
+                .servers
+                .iter()
+                .any(|server| server.stateful_sessions.is_allowed())
+        {
+            return Err(anyhow::anyhow!(
+                "routing mode \"{}\" needs at least one server with stateful_sessions = \"allowed\"",
+                routing_mode.short_name()
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Validate everything that does not depend on the routing mode.
+    ///
+    /// Config loaders run before `--routing-mode` / `NNTP_PROXY_ROUTING_MODE`
+    /// are applied, so they cannot know the effective mode; the mode-dependent
+    /// checks run in [`Self::validate_for_mode`] when the proxy is built.
+    ///
+    /// # Errors
+    /// Returns an error if semantic validation fails.
+    pub fn validate_independent_of_mode(&self) -> Result<()> {
         if self.servers.is_empty() {
             return Err(anyhow::anyhow!(
                 "Configuration must have at least one server"
@@ -133,6 +172,73 @@ mod tests {
             servers: vec![],
             ..Default::default()
         };
+        assert!(config.validate().is_err());
+    }
+
+    fn excluded_server(name: &str) -> Server {
+        Server::builder("localhost", Port::try_new(119).unwrap())
+            .name(name)
+            .stateful_sessions(crate::config::StatefulSessions::Excluded)
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn test_validate_rejects_stateful_capable_mode_without_allowed_server() {
+        for mode in [RoutingMode::Hybrid, RoutingMode::Stateful] {
+            let mut config = Config {
+                servers: vec![excluded_server("a"), excluded_server("b")],
+                ..Default::default()
+            };
+            config.routing.routing_mode = mode;
+            let error = config.validate().unwrap_err().to_string();
+            assert!(error.contains("stateful_sessions"), "{error}");
+            assert!(error.contains(mode.short_name()), "{error}");
+        }
+    }
+
+    #[test]
+    fn test_validate_allows_excluded_servers_alongside_an_allowed_one() {
+        let config = Config {
+            servers: vec![
+                create_test_server("allowed", None),
+                excluded_server("excluded"),
+            ],
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_per_command_mode_ignores_stateful_exclusions() {
+        let mut config = Config {
+            servers: vec![excluded_server("excluded")],
+            ..Default::default()
+        };
+        config.routing.routing_mode = RoutingMode::PerCommand;
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_for_mode_uses_the_effective_mode() {
+        let mut config = Config {
+            servers: vec![excluded_server("excluded")],
+            ..Default::default()
+        };
+        config.routing.routing_mode = RoutingMode::PerCommand;
+        assert!(config.validate_for_mode(RoutingMode::Stateful).is_err());
+        config.routing.routing_mode = RoutingMode::Stateful;
+        assert!(config.validate_for_mode(RoutingMode::PerCommand).is_ok());
+    }
+
+    #[test]
+    fn test_mode_independent_validation_leaves_exclusions_to_the_effective_mode() {
+        let config = Config {
+            servers: vec![excluded_server("excluded")],
+            ..Default::default()
+        };
+        assert_eq!(config.routing.routing_mode, RoutingMode::Hybrid);
+        assert!(config.validate_independent_of_mode().is_ok());
         assert!(config.validate().is_err());
     }
 

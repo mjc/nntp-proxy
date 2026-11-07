@@ -210,9 +210,114 @@ pub fn init_logging(
     }
 }
 
+/// Log events recorded before the process-wide subscriber exists.
+///
+/// The binary needs the loaded config (log level, UI mode) to build its
+/// subscriber, so anything logged while loading it (ignored config keys,
+/// legacy-schema migrations, the backend list) would otherwise have no
+/// subscriber and be dropped.
+#[derive(Debug, Default)]
+#[must_use = "replay the events once logging is initialized, or print them if startup fails"]
+pub struct StartupEvents(Vec<(tracing::Level, String)>);
+
+/// Run `load` with every log event it emits held back for [`StartupEvents::replay`].
+pub fn capture_startup_events<T>(load: impl FnOnce() -> T) -> (T, StartupEvents) {
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::registry().with(StartupCaptureLayer(events.clone()));
+    let result = tracing::subscriber::with_default(subscriber, load);
+    let events = std::mem::take(
+        &mut *events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    (result, StartupEvents(events))
+}
+
+impl StartupEvents {
+    /// Re-emit the held events through the now-initialized subscriber, which
+    /// applies its own filters.
+    pub fn replay(self) {
+        for (level, text) in self.0 {
+            match level {
+                tracing::Level::ERROR => tracing::error!(target: STARTUP_TARGET, "{text}"),
+                tracing::Level::WARN => tracing::warn!(target: STARTUP_TARGET, "{text}"),
+                tracing::Level::INFO => tracing::info!(target: STARTUP_TARGET, "{text}"),
+                tracing::Level::DEBUG => tracing::debug!(target: STARTUP_TARGET, "{text}"),
+                tracing::Level::TRACE => tracing::trace!(target: STARTUP_TARGET, "{text}"),
+            }
+        }
+    }
+
+    /// Startup failed before logging could be set up: print warnings and
+    /// errors so the reason is not lost.
+    pub fn print_to_stderr(self) {
+        for (level, text) in self.0 {
+            if level <= tracing::Level::WARN {
+                eprintln!("{level:>5} {text}");
+            }
+        }
+    }
+}
+
+const STARTUP_TARGET: &str = "nntp_proxy::startup";
+
+struct StartupCaptureLayer(std::sync::Arc<std::sync::Mutex<Vec<(tracing::Level, String)>>>);
+
+impl<S: tracing::Subscriber> Layer<S> for StartupCaptureLayer {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        let mut text = EventText::default();
+        event.record(&mut text);
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((*event.metadata().level(), text.0));
+    }
+}
+
+#[derive(Default)]
+struct EventText(String);
+
+impl tracing::field::Visit for EventText {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        use std::fmt::Write;
+        if !self.0.is_empty() {
+            self.0.push(' ');
+        }
+        let _ = if field.name() == "message" {
+            write!(self.0, "{value:?}")
+        } else {
+            write!(self.0, "{}={value:?}", field.name())
+        };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_events_are_held_until_replayed() {
+        let (value, events) = capture_startup_events(|| {
+            tracing::warn!("Ignoring unknown config key '{}'", "servers.0.tierr");
+            tracing::info!(count = 2, "Loaded backends");
+            7
+        });
+        assert_eq!(value, 7);
+        assert_eq!(
+            events.0,
+            [
+                (
+                    tracing::Level::WARN,
+                    "Ignoring unknown config key 'servers.0.tierr'".to_string()
+                ),
+                (tracing::Level::INFO, "Loaded backends count=2".to_string()),
+            ]
+        );
+    }
 
     #[test]
     fn should_write_debug_log_requires_local_tui_and_debug_level() {
