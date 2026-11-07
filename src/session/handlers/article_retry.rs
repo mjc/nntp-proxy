@@ -464,7 +464,7 @@ impl ClientSession {
                             self.client_addr,
                             request.message_id_value()
                         );
-                        let client_write = io.client_writer.get_mut();
+                        let client_write = &mut *io.client_writer;
                         self.send_430_to_client(client_write, io.backend_to_client_bytes)
                             .await?;
                         return Ok(());
