@@ -293,14 +293,24 @@ impl ClientSession {
         state: &mut ArticleAttemptState<'_>,
         is_retry_attempt: bool,
     ) -> Result<BackendAttemptResult, SessionError> {
-        if let Some(delay) = router
-            .queue_backpressure_delay_for_article(state.availability, *state.unavailable_backends)
-        {
+        // Only message-ID requests are numbering-independent. Anything else
+        // (for example LIST ACTIVE and LIST COUNTS) can carry article numbers,
+        // so it must come from a backend whose numbering matches stateful sessions.
+        let excluded_backends = if request.has_message_id() {
+            SuppressedBackends::empty()
+        } else {
+            router.stateful_exclusions()
+        };
+        if let Some(delay) = router.queue_backpressure_delay_for_article(
+            state.availability,
+            state.unavailable_backends.union(excluded_backends),
+        ) {
             tokio::time::sleep(delay).await;
         }
         let route_request = crate::router::RouteRequest::new(self.client_id)
             .with_availability(state.availability)
-            .suppressing_backends(*state.unavailable_backends);
+            .suppressing_backends(*state.unavailable_backends)
+            .excluding_backends(excluded_backends);
         let backend = match router.route(route_request) {
             Ok(backend) => backend,
             Err(err) => {
@@ -2217,6 +2227,129 @@ mod tests {
         assert!(availability.is_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap()));
         assert_eq!(article_commands.load(Ordering::SeqCst), 1);
         finalize_backend_connection(&mut backend_connection);
+    }
+
+    /// Answers LIST and BODY, counting each, so tests can see which backend a
+    /// request reached.
+    async fn spawn_list_and_body_server() -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let list_commands = Arc::new(AtomicUsize::new(0));
+        let body_commands = Arc::new(AtomicUsize::new(0));
+        let lists = Arc::clone(&list_commands);
+        let bodies = Arc::clone(&body_commands);
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let lists = Arc::clone(&lists);
+                let bodies = Arc::clone(&bodies);
+                tokio::spawn(async move {
+                    let (read_half, mut write_half) = stream.into_split();
+                    let mut reader = BufReader::new(read_half);
+                    if write_half.write_all(b"200 Ready\r\n").await.is_err() {
+                        return;
+                    }
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                let cmd = line.trim().to_ascii_uppercase();
+                                let reply: &[u8] = match cmd.split(' ').next() {
+                                    Some("LIST") => {
+                                        lists.fetch_add(1, Ordering::SeqCst);
+                                        b"215 list follows\r\nalt.test 10 1 y\r\n.\r\n"
+                                    }
+                                    Some("BODY") => {
+                                        bodies.fetch_add(1, Ordering::SeqCst);
+                                        b"222 0 <id@example.com>\r\nbody\r\n.\r\n"
+                                    }
+                                    Some("QUIT") => b"205 Goodbye\r\n",
+                                    Some("COMPRESS") => b"500 Not supported\r\n",
+                                    _ => b"200 OK\r\n",
+                                };
+                                if write_half.write_all(reply).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        (port, list_commands, body_commands)
+    }
+
+    async fn attempt_once(
+        session: &crate::session::ClientSession,
+        router: &Arc<BackendSelector>,
+        line: &[u8],
+    ) -> BackendAttemptResult {
+        let mut request = request_context(line);
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+        };
+        let result = session
+            .try_backend_for_article(router, &mut request, &mut client_writer, &mut state, false)
+            .await
+            .expect("attempt should not hit a transport error");
+        finalize_backend_connection(&mut backend_connection);
+        result
+    }
+
+    #[tokio::test]
+    async fn numbered_replies_avoid_stateful_excluded_backends_but_message_ids_do_not() {
+        let session = test_session();
+        let (allowed_port, allowed_lists, allowed_bodies) = spawn_list_and_body_server().await;
+        let (excluded_port, excluded_lists, excluded_bodies) = spawn_list_and_body_server().await;
+        let mut router =
+            BackendSelector::with_strategy(crate::config::BackendSelectionStrategy::LeastLoaded);
+        for (index, port) in [allowed_port, excluded_port].into_iter().enumerate() {
+            router.add_backend(
+                ServerName::try_new(format!("backend-{index}")).unwrap(),
+                DeadpoolConnectionProvider::builder("127.0.0.1", port)
+                    .max_connections(2)
+                    .build()
+                    .unwrap(),
+                0,
+            );
+        }
+        router.exclude_from_stateful_sessions(BackendId::from_index(1));
+        // Load the allowed backend so least-loaded would otherwise pick the excluded one.
+        for _ in 0..8 {
+            router.mark_backend_pending(BackendId::from_index(0));
+        }
+        let router = Arc::new(router);
+
+        for line in [
+            b"LIST ACTIVE alt.test\r\n".as_slice(),
+            b"LIST COUNTS alt.test\r\n".as_slice(),
+            b"LIST\r\n".as_slice(),
+        ] {
+            let result = attempt_once(&session, &router, line).await;
+            assert!(matches!(result, BackendAttemptResult::Success));
+        }
+        assert_eq!(allowed_lists.load(Ordering::SeqCst), 3);
+        assert_eq!(excluded_lists.load(Ordering::SeqCst), 0);
+
+        let result = attempt_once(&session, &router, b"BODY <id@example.com>\r\n").await;
+        assert!(matches!(result, BackendAttemptResult::Success));
+        assert_eq!(
+            excluded_bodies.load(Ordering::SeqCst),
+            1,
+            "message-ID requests may still use the excluded, less-loaded backend"
+        );
+        assert_eq!(allowed_bodies.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Per-backend `stateful_sessions = "excluded"` (and `NNTP_SERVER_<N>_STATEFUL_SESSIONS`) keeps a backend out of hybrid and stateful session pinning and out of replies that carry article numbers, such as `LIST ACTIVE` and `LIST COUNTS`. The backend still serves message-ID requests. Indexers that store `GROUP`/`XOVER` article numbers can now share a tier with providers that number articles differently. Startup logs each excluded backend and rejects `hybrid` or `stateful` mode when no backend is allowed.
+- Unknown keys in `[[servers]]` and `[routing]` are logged as warnings at startup instead of being silently ignored.
+
+### Fixed
+
+- A hybrid session that can't get a backend for its first stateful command now receives `400 Backend server unavailable` instead of a silently closed connection.
+
 ## [0.6.0] - 2026-11-05
 
 ### Added

@@ -210,9 +210,7 @@ impl NntpProxy {
         client_addr: ClientAddress,
     ) -> Result<(crate::types::BackendId, crate::router::CommandGuard)> {
         let client_id = types::ClientId::new();
-        let backend_id = self
-            .router
-            .route(crate::router::RouteRequest::new(client_id))?;
+        let backend_id = self.router.route_stateful_session(client_id)?;
         let reservation = crate::router::BackendSelector::guard_for_routed_backend(
             Arc::clone(&self.router),
             backend_id,
