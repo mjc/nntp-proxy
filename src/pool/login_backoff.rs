@@ -56,7 +56,7 @@ struct State {
     retry_not_before: Option<Instant>,
     probe: ProbeSlot,
     /// Bumped whenever the schedule moves (a refused window opens or a login
-    /// succeeds). An attempt only moves the schedule if nothing else has moved
+    /// succeeds after refusals). An attempt only moves the schedule if nothing else has moved
     /// it since the attempt was admitted.
     epoch: u64,
 }
@@ -119,7 +119,7 @@ impl LoginBackoff {
         let now = Instant::now();
         let mut state = self.lock();
         if role == AttemptRole::Probe {
-            state.probe = ProbeSlot::Free;
+            Self::release_probe_held_since(&mut state, admitted_in);
         }
         if admitted_in != state.epoch {
             return state.retry_not_before.map_or(Duration::ZERO, |deadline| {
@@ -133,8 +133,14 @@ impl LoginBackoff {
         delay
     }
 
+    /// With no refusal on record there is no schedule to reset, and moving the
+    /// epoch would make a concurrent login's first refusal look stale, leaving
+    /// the gate open while the backend refuses.
     fn record_success(&self) {
         let mut state = self.lock();
+        if state.refusals == 0 {
+            return;
+        }
         let epoch = state.epoch.wrapping_add(1);
         *state = State {
             epoch,
@@ -149,8 +155,16 @@ impl LoginBackoff {
         self.lock().retry_not_before = None;
     }
 
-    fn release_probe(&self) {
-        self.lock().probe = ProbeSlot::Free;
+    fn release_probe(&self, admitted_in: u64) {
+        Self::release_probe_held_since(&mut self.lock(), admitted_in);
+    }
+
+    /// A probe from an earlier epoch no longer owns the slot: a success has
+    /// since reset the gate and a newer probe may hold it.
+    fn release_probe_held_since(state: &mut State, admitted_in: u64) {
+        if admitted_in == state.epoch {
+            state.probe = ProbeSlot::Free;
+        }
     }
 }
 
@@ -210,7 +224,7 @@ impl<'a> LoginAttempt<'a> {
 impl Drop for LoginAttempt<'_> {
     fn drop(&mut self) {
         if self.outcome == Outcome::Pending && self.role == AttemptRole::Probe {
-            self.gate.release_probe();
+            self.gate.release_probe(self.admitted_in);
         }
     }
 }
@@ -320,6 +334,49 @@ mod tests {
         expect_role(&gate, AttemptRole::Probe).succeeded();
         assert_eq!(slow.refused(), Duration::ZERO);
         drop(expect_role(&gate, AttemptRole::Normal));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refusal_racing_a_normal_success_still_opens_a_window() {
+        let gate = LoginBackoff::default();
+        let lucky = expect_role(&gate, AttemptRole::Normal);
+        let refused = expect_role(&gate, AttemptRole::Normal);
+
+        lucky.succeeded();
+        assert_eq!(refused.refused(), INITIAL_DELAY);
+        assert_eq!(wait_time(&gate), Some(INITIAL_DELAY));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_probe_does_not_free_a_newer_probes_slot() {
+        let gate = LoginBackoff::default();
+        let slow_normal = expect_role(&gate, AttemptRole::Normal);
+        tokio::time::advance(refuse(&gate)).await;
+        let stale_probe = expect_role(&gate, AttemptRole::Probe);
+
+        slow_normal.succeeded();
+        tokio::time::advance(refuse(&gate)).await;
+        let current_probe = expect_role(&gate, AttemptRole::Probe);
+
+        drop(stale_probe);
+        assert_eq!(wait_time(&gate), Some(PROBE_RETRY));
+        drop(current_probe);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stale_probe_refusal_does_not_free_a_newer_probes_slot() {
+        let gate = LoginBackoff::default();
+        let slow_normal = expect_role(&gate, AttemptRole::Normal);
+        tokio::time::advance(refuse(&gate)).await;
+        let stale_probe = expect_role(&gate, AttemptRole::Probe);
+
+        slow_normal.succeeded();
+        tokio::time::advance(refuse(&gate)).await;
+        let current_probe = expect_role(&gate, AttemptRole::Probe);
+
+        assert_eq!(stale_probe.refused(), Duration::ZERO);
+        assert_eq!(wait_time(&gate), Some(PROBE_RETRY));
+        drop(current_probe);
     }
 
     #[tokio::test(start_paused = true)]
