@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - A hybrid session that can't get a backend for its first stateful command now receives `400 Backend server unavailable` instead of a silently closed connection.
+- Per-backend `prewarm_connections` (and `NNTP_SERVER_<N>_PREWARM_CONNECTIONS`) sets how many connections open at startup. The default still opens all `max_connections`; `0` fills the pool on demand, and a value above `max_connections` fails validation. Lowering it keeps idle pooled connections from using up the per-account limit of a provider shared with other clients.
 
 ## [0.6.0] - 2026-11-05
 
@@ -668,6 +669,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Docker support
   - Development documentation
 
+[Unreleased]: https://github.com/mjc/nntp-proxy/compare/v0.6.0...HEAD
 [0.6.0]: https://github.com/mjc/nntp-proxy/compare/v0.5.1...v0.6.0
 [0.5.1]: https://github.com/mjc/nntp-proxy/compare/v0.5.0...v0.5.1
 [0.5.2]: https://github.com/mjc/nntp-proxy/compare/v0.5.1...v0.5.2
