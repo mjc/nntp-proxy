@@ -519,13 +519,20 @@ impl DeadpoolConnectionProvider {
     pub(in crate::pool) async fn get_pooled_connection(
         &self,
     ) -> Result<PooledConnection, crate::connection_error::ConnectionError> {
+        self.get_pooled_connection_with(&self.pool.timeouts()).await
+    }
+
+    async fn get_pooled_connection_with(
+        &self,
+        timeouts: &managed::Timeouts,
+    ) -> Result<PooledConnection, crate::connection_error::ConnectionError> {
         use crate::connection_error::ConnectionError;
 
         // Deadpool's wait timer ends when a slot is taken, and its create
         // timer starts then. A checkout that never takes a slot is an empty
         // pool. A setup that starts after the wait, including one that takes
         // the slot as the wait timer elapses, keeps the setup timeout.
-        let err = match self.pool.get().await {
+        let err = match self.pool.timeout_get(timeouts).await {
             Ok(connection) => return Ok(connection),
             Err(error) => match error {
                 deadpool::managed::PoolError::Backend(conn_err) => conn_err,
@@ -575,7 +582,11 @@ impl DeadpoolConnectionProvider {
     /// `limit` with [`crate::connection_error::ConnectionError::PoolExhausted`].
     ///
     /// Article routing can try another backend, so it should not sit in one
-    /// full pool for the pool's whole wait timeout.
+    /// full pool for the pool's whole wait timeout. Only deadpool's wait for a
+    /// slot is shortened: once a slot is taken, connection setup and recycling
+    /// keep their own deadlines. Cancelling the whole checkout instead would
+    /// abort a TLS handshake or authentication part-way and waste the backend
+    /// connection it was building.
     ///
     /// # Errors
     /// Returns [`crate::connection_error::ConnectionError`] when no healthy backend
@@ -587,13 +598,15 @@ impl DeadpoolConnectionProvider {
         crate::pool::connection_guard::IdleConnection,
         crate::connection_error::ConnectionError,
     > {
-        match tokio::time::timeout(limit, self.checkout_connection_guard()).await {
-            Ok(result) => result,
-            Err(_elapsed) => Err(crate::connection_error::ConnectionError::PoolExhausted {
-                backend: self.name.to_string(),
-                max_size: self.pool.status().max_size,
-            }),
-        }
+        let timeouts = managed::Timeouts {
+            wait: Some(limit),
+            ..self.pool.timeouts()
+        };
+        let conn = self.get_pooled_connection_with(&timeouts).await?;
+        Ok(crate::pool::connection_guard::IdleConnection::new(
+            conn,
+            self.clone(),
+        ))
     }
 
     /// Checkout a pooled connection in the idle state.
@@ -1086,6 +1099,44 @@ mod tests {
         drop(held);
         tokio::time::resume();
         assert!(provider.get_pooled_connection().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn bounded_checkout_wait_does_not_cancel_connection_setup() {
+        let wait = std::time::Duration::from_millis(50);
+        let addr = spawn_mock_nntp_server_greeting_after(wait * 6).await;
+        let provider = provider_with_cooldown(addr, 1, None);
+
+        let conn = provider
+            .checkout_connection_guard_within(wait)
+            .await
+            .expect("setup past the slot wait keeps its own deadline");
+        conn.release();
+        assert_eq!(
+            provider.pool.status().size,
+            1,
+            "the new connection is pooled"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_checkout_wait_reports_a_full_pool() {
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 1, None);
+        let _held = provider.get_pooled_connection().await.unwrap();
+
+        let started = std::time::Instant::now();
+        let result = provider
+            .checkout_connection_guard_within(std::time::Duration::from_millis(50))
+            .await;
+        assert!(
+            matches!(
+                result,
+                Err(crate::connection_error::ConnectionError::PoolExhausted { max_size: 1, .. })
+            ),
+            "a full pool must surface as PoolExhausted"
+        );
+        assert!(started.elapsed() < crate::constants::timeout::CONNECTION);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1639,6 +1690,14 @@ mod tests {
     /// Helper: spawn a mock NNTP server that greets each connection and keeps it alive.
     /// Returns the address to connect to.
     async fn spawn_mock_nntp_server() -> std::net::SocketAddr {
+        spawn_mock_nntp_server_greeting_after(std::time::Duration::ZERO).await
+    }
+
+    /// Like [`spawn_mock_nntp_server`], but each connection waits `delay`
+    /// before greeting, so connection setup outlasts short checkout waits.
+    async fn spawn_mock_nntp_server_greeting_after(
+        delay: std::time::Duration,
+    ) -> std::net::SocketAddr {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::TcpListener;
 
@@ -1648,6 +1707,7 @@ mod tests {
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
                     let (read_half, mut write_half) = stream.into_split();
                     let mut reader = BufReader::new(read_half);
 
