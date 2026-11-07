@@ -11,19 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Per-backend `stateful_sessions = "excluded"` (and `NNTP_SERVER_<N>_STATEFUL_SESSIONS`) keeps a backend out of hybrid and stateful session pinning and out of replies that carry article numbers, such as `LIST ACTIVE` and `LIST COUNTS`. The backend still serves message-ID requests. Indexers that store `GROUP`/`XOVER` article numbers can now share a tier with providers that number articles differently. Startup logs each excluded backend and rejects `hybrid` or `stateful` mode when no backend is allowed.
 - Unknown keys in `[[servers]]` and `[routing]` are logged as warnings at startup instead of being silently ignored.
+- Per-backend `prewarm_connections` (and `NNTP_SERVER_<N>_PREWARM_CONNECTIONS`) sets how many connections open at startup. The default still opens all `max_connections`; `0` fills the pool on demand, and a value above `max_connections` fails validation. Lowering it keeps idle pooled connections from using up the per-account limit of a provider shared with other clients.
 
 ### Fixed
 
 - A hybrid session that can't get a backend for its first stateful command now receives `400 Backend server unavailable` instead of a silently closed connection.
-- Per-backend `prewarm_connections` (and `NNTP_SERVER_<N>_PREWARM_CONNECTIONS`) sets how many connections open at startup. The default still opens all `max_connections`; `0` fills the pool on demand, and a value above `max_connections` fails validation. Lowering it keeps idle pooled connections from using up the per-account limit of a provider shared with other clients.
-### Fixed
-
 - A backend that refuses a login, for example with `502 connection limit reached`, a bad greeting, or a failed `AUTHINFO`, is no longer asked to log in again for every request. New connections to it fail locally for 5 s, doubling up to 60 s while the refusals continue. When a window closes, one probe login decides whether to resume, and a successful login resets the backoff. Network errors do not start it.
-### Fixed
-
 - An article request answers `430` instead of `503` when a backend has returned `430` and every other eligible backend is only busy or failing. Clients such as NZBGet treat `430` as a missing article and `503` as a server failure.
-### Fixed
-
 - A backend that accepts a command and never answers can no longer hold a request forever. The first reply bytes must arrive within 30 seconds, and each adaptive precheck attempt must finish within 2 seconds. A timeout retries once on a fresh connection, removes the stuck connection from the pool, and is never recorded as a `430`.
 
 ## [0.6.0] - 2026-11-05
