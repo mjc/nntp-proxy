@@ -28,7 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A cache-miss capture with `store_article_bodies = true` no longer keeps a whole 1 MiB read buffer for every backend read. TLS reads deliver at most about 16 KiB, so a ~750 KB article held about 47 MiB and exhausted the read-buffer pool. A read buffer now moves into the capture only when the read fills at least half of it. Smaller reads are copied into capture buffers, which keeps a capture's memory within about twice the article size plus one capture buffer.
 - `XFEATURE COMPRESS GZIP`, with or without `TERMINATOR`, gets `503` in every routing mode. Hybrid and stateful sessions used to forward it, and a backend that accepted it sent overview data the proxy could not frame.
 - `CAPABILITIES` in `per-command` mode no longer lists `OVER` and `HDR`, which that mode rejects. It still lists `READER` because `MODE READER` is still forwarded.
-
+- Under load, a missing article could take 12–44 s to answer `430`, longer than NZBGet's 30-second article timeout, so the downloader recorded timeouts and blocked the server. Article requests now wait at most 3 s for a free connection on a backend, and `STAT` probes at most 2 s, before moving to the next backend. Previously each request waited the full 10-second pool timeout. A full pool is also no longer retried, which had doubled each wait.
 ## [0.6.0] - 2026-11-05
 
 ### Added
