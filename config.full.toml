@@ -56,7 +56,9 @@ socket_send_buffer_size = 16777216
 # Pooled streaming buffers
 buffer_pool_size = 1048576
 buffer_pool_count = 100
-# Capture buffers used by cache ingest/response assembly
+# Capture buffers used by cache ingest/response assembly. With
+# store_article_bodies = true, raise capture_pool_count toward the total backend
+# max_connections if "Capture buffer pool exhausted" warnings are frequent.
 capture_pool_size = 1048576
 capture_pool_count = 16
 
