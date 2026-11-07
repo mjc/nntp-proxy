@@ -1680,7 +1680,7 @@ mod tests {
     use crate::cache::{ArticleAvailability, UnifiedCache};
     use crate::metrics::MetricsCollector;
     use crate::pool::{BufferPool, DeadpoolConnectionProvider};
-    use crate::protocol::{RequestContext, StatusCode};
+    use crate::protocol::{RequestContext, RequestKind, StatusCode};
     use crate::router::{ArticleBackend, BackendSelector, SuppressedBackends};
     use crate::session::SessionError;
     use crate::session::routing::CacheAction;
@@ -1830,6 +1830,51 @@ mod tests {
         });
 
         (port, article_commands)
+    }
+
+    /// Backend that completes connection setup but never answers an article
+    /// command. Returns the port, accepted connections, and article commands.
+    async fn spawn_silent_article_server() -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let article_commands = Arc::new(AtomicUsize::new(0));
+        let accept_count = Arc::clone(&accepts);
+        let count = Arc::clone(&article_commands);
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                accept_count.fetch_add(1, Ordering::SeqCst);
+                let count = Arc::clone(&count);
+                tokio::spawn(async move {
+                    let (read_half, mut write_half) = stream.into_split();
+                    let mut reader = BufReader::new(read_half);
+
+                    if write_half.write_all(b"200 Ready\r\n").await.is_err() {
+                        return;
+                    }
+
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        match reader.read_line(&mut line).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                let kind = RequestContext::parse(line.as_bytes())
+                                    .map(|request| request.kind());
+                                if matches!(kind, Some(RequestKind::Article | RequestKind::Body)) {
+                                    count.fetch_add(1, Ordering::SeqCst);
+                                } else {
+                                    let _ = write_half.write_all(b"200 OK\r\n").await;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        (port, accepts, article_commands)
     }
 
     async fn spawn_stat_missing_probe_server() -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
@@ -2944,6 +2989,66 @@ mod tests {
         assert_eq!(good_article_commands.load(Ordering::SeqCst), 1);
         read.expect("client read should succeed");
         assert_eq!(written, good_response);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silent_backend_times_out_retries_fresh_and_is_not_pooled() {
+        let (port, accepts, article_commands) = spawn_silent_article_server().await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(2)
+            .build()
+            .unwrap();
+        let router = router_with_backend(provider.clone());
+        let session = test_session();
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
+        let mut request = request_context(b"BODY <silent@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+        };
+
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            crate::constants::timeout::BACKEND_READ * 4,
+            session.try_backend_for_article(
+                &router,
+                &mut request,
+                &mut client_writer,
+                &mut state,
+                false,
+            ),
+        )
+        .await
+        .expect("a silent backend must not hold the request forever")
+        .expect("a first-byte timeout should stay a backend failure");
+
+        assert!(matches!(result, BackendAttemptResult::BackendUnavailable));
+        assert!(started.elapsed() >= crate::constants::timeout::BACKEND_READ * 2);
+        assert_eq!(state.unavailable_backends.bits(), 0b0000_0001);
+        assert_eq!(
+            state.availability.missing_bits(),
+            0,
+            "a timeout is not a 430 fact"
+        );
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "retry uses a fresh connection"
+        );
+        assert_eq!(article_commands.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            crate::pool::ConnectionProvider::status(&provider)
+                .created
+                .get(),
+            0,
+            "a timed-out connection was returned to the pool"
+        );
     }
 
     #[tokio::test]

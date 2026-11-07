@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A backend that accepts a command and never answers can no longer hold a request forever. The first reply bytes must arrive within 30 seconds, and each adaptive precheck attempt must finish within 2 seconds. A timeout retries once on a fresh connection, removes the stuck connection from the pool, and is never recorded as a `430`.
+
 ## [0.6.0] - 2026-11-05
 
 ### Added
