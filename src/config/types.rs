@@ -257,6 +257,14 @@ pub struct Routing {
     /// Queue behavior for routing decisions.
     #[serde(default)]
     pub queue: RoutingQueue,
+    /// In hybrid mode, retry a message-ID lookup through tier-aware routing
+    /// after the client's pinned reader backend answers `430` (default: false).
+    ///
+    /// Indexers often select a group and then fetch PAR2/NFO metadata by
+    /// message-ID on the same connection. Without this, the pinned backend's
+    /// miss is final even when another provider has the article.
+    #[serde(default)]
+    pub reader_message_id_failover: bool,
 }
 
 impl Default for Routing {
@@ -266,6 +274,7 @@ impl Default for Routing {
             backend_selection: BackendSelectionStrategy::default(),
             adaptive_precheck: defaults::adaptive_precheck(),
             queue: RoutingQueue::default(),
+            reader_message_id_failover: false,
         }
     }
 }

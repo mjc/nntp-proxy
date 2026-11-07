@@ -20,6 +20,9 @@ threads = 1
 mode = "hybrid"
 # Backend selection strategy: "least-loaded" (default) or "weighted-round-robin"
 backend_selection = "least-loaded"
+# Hybrid only: answer a 430 from a client's pinned reader backend for
+# ARTICLE/BODY/HEAD/STAT <message-id> from another backend (default: false)
+reader_message_id_failover = false
 
 [health_check]
 interval = 30

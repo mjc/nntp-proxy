@@ -550,20 +550,47 @@ impl BackendChunkRange {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum BackendReplyBytes<'a> {
     CompletedTrackedReply(&'a [u8]),
     ForwardUntracked(&'a [u8]),
+    /// Status-line bytes held back from earlier reads while a recoverable
+    /// lookup's status was still unknown. Bounded by the status-line limit.
+    ReleasedStatusPrefix(Box<[u8]>),
+    /// The complete reply was an authoritative `430` for a recoverable lookup
+    /// and none of its bytes were forwarded.
+    SuppressedMissing,
 }
 
 #[derive(Debug)]
 enum OrderedResponse {
     Backend,
+    /// A backend reply whose `430` is withheld so the request can be retried
+    /// elsewhere and answered in this same position.
+    RecoverableBackend(Box<crate::protocol::RequestContext>),
     Local(&'static [u8]),
+}
+
+impl OrderedResponse {
+    const fn awaits_backend(&self) -> bool {
+        matches!(self, Self::Backend | Self::RecoverableBackend(_))
+    }
 }
 
 pub(crate) type OrderedClientWrites<'a> = SmallVec<[Cow<'a, [u8]>; 4]>;
 pub(crate) type ReadyDeferredReplies = SmallVec<[&'static [u8]; 2]>;
+
+/// One ordered step for the client after a backend read.
+#[derive(Debug)]
+pub(crate) enum OrderedClientAction<'a> {
+    /// Write these bytes to the client.
+    Write(Cow<'a, [u8]>),
+    /// The pinned backend answered `430`; answer this request from elsewhere
+    /// before writing any later action.
+    RecoverMissing(Box<crate::protocol::RequestContext>),
+}
+
+pub(crate) type OrderedClientActions<'a> = SmallVec<[OrderedClientAction<'a>; 4]>;
 
 /// Request-aware ordering layer for pipelined backend bytes and local replies.
 ///
@@ -583,12 +610,23 @@ impl BackendResponseOrder {
         self.ordered.push_back(OrderedResponse::Backend);
     }
 
+    /// Register a message-ID lookup whose `430` should be handed back to the
+    /// session for recovery instead of being forwarded.
+    ///
+    /// Any other reply, including a malformed or overlong status line, is
+    /// forwarded unchanged. Replies for this registration must be read through
+    /// [`Self::client_actions_for_backend_read`].
+    pub(crate) fn push_recoverable_request(&mut self, request: crate::protocol::RequestContext) {
+        self.inner
+            .push_request_with(request.kind(), StatusForwarding::WithholdUntilStatus);
+        self.ordered
+            .push_back(OrderedResponse::RecoverableBackend(Box::new(request)));
+    }
+
     /// Whether at least one registered backend reply still needs backend bytes.
     #[inline]
     pub(crate) fn has_pending_backend_replies(&self) -> bool {
-        self.ordered
-            .iter()
-            .any(|reply| matches!(reply, OrderedResponse::Backend))
+        self.ordered.iter().any(OrderedResponse::awaits_backend)
     }
 
     /// Queue a local reply that must be written only after earlier backend
@@ -613,7 +651,9 @@ impl BackendResponseOrder {
             .skip(1)
             .any(|reply| matches!(reply, OrderedResponse::Local(_)));
 
-        matches!(self.ordered.front(), Some(OrderedResponse::Backend))
+        self.ordered
+            .front()
+            .is_some_and(OrderedResponse::awaits_backend)
             && has_deferred_reply_behind_front
     }
 
@@ -648,7 +688,11 @@ impl BackendResponseOrder {
             match reply {
                 BackendReplyBytes::CompletedTrackedReply(bytes) => {
                     writes.push(Cow::Borrowed(bytes));
-                    if matches!(self.ordered.front(), Some(OrderedResponse::Backend)) {
+                    if self
+                        .ordered
+                        .front()
+                        .is_some_and(OrderedResponse::awaits_backend)
+                    {
                         self.ordered.pop_front();
                     }
                     for reply in self.take_ready_deferred_replies() {
@@ -658,10 +702,75 @@ impl BackendResponseOrder {
                 BackendReplyBytes::ForwardUntracked(bytes) => {
                     writes.push(Cow::Borrowed(bytes));
                 }
+                BackendReplyBytes::ReleasedStatusPrefix(_)
+                | BackendReplyBytes::SuppressedMissing => {
+                    unreachable!(
+                        "recoverable requests are read through client_actions_for_backend_read"
+                    )
+                }
             }
         }
 
         writes
+    }
+
+    /// Convert raw backend bytes into ordered client actions, including
+    /// pinned misses that the session must answer before any later write.
+    pub(crate) fn client_actions_for_backend_read<'a>(
+        &mut self,
+        backend_read: &'a [u8],
+    ) -> OrderedClientActions<'a> {
+        let mut actions = SmallVec::new();
+        self.emit_client_actions(backend_read, |action| actions.push(action));
+        actions
+    }
+
+    /// Kept apart from `client_writes_for_backend_read`, which stays a plain
+    /// write list for sessions that never register recoverable requests.
+    #[inline]
+    fn emit_client_actions<'a>(
+        &mut self,
+        backend_read: &'a [u8],
+        mut emit: impl FnMut(OrderedClientAction<'a>),
+    ) {
+        for reply in self.take_ready_deferred_replies() {
+            emit(OrderedClientAction::Write(Cow::Borrowed(reply)));
+        }
+
+        for reply in self.inner.accept_backend_bytes(backend_read) {
+            match reply {
+                BackendReplyBytes::CompletedTrackedReply(bytes) => {
+                    emit(OrderedClientAction::Write(Cow::Borrowed(bytes)));
+                    if self
+                        .ordered
+                        .front()
+                        .is_some_and(OrderedResponse::awaits_backend)
+                    {
+                        self.ordered.pop_front();
+                    }
+                    for reply in self.take_ready_deferred_replies() {
+                        emit(OrderedClientAction::Write(Cow::Borrowed(reply)));
+                    }
+                }
+                BackendReplyBytes::ForwardUntracked(bytes) => {
+                    emit(OrderedClientAction::Write(Cow::Borrowed(bytes)));
+                }
+                BackendReplyBytes::ReleasedStatusPrefix(bytes) => {
+                    emit(OrderedClientAction::Write(Cow::Owned(bytes.into_vec())));
+                }
+                BackendReplyBytes::SuppressedMissing => {
+                    let Some(OrderedResponse::RecoverableBackend(request)) =
+                        self.ordered.pop_front()
+                    else {
+                        unreachable!("only recoverable requests suppress a missing reply");
+                    };
+                    emit(OrderedClientAction::RecoverMissing(request));
+                    for reply in self.take_ready_deferred_replies() {
+                        emit(OrderedClientAction::Write(Cow::Borrowed(reply)));
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -675,6 +784,19 @@ struct PendingRequestFrame {
     kind: crate::protocol::RequestKind,
     state: PendingRequestFrameState,
     status_line: smallvec::SmallVec<[u8; crate::constants::buffer::COMMAND]>,
+    status_forwarding: StatusForwarding,
+    released_status_prefix: Option<Box<[u8]>>,
+}
+
+/// Whether a tracked reply's bytes may reach the client before its status is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StatusForwarding {
+    /// Forward bytes as they arrive.
+    PassThrough,
+    /// Hold status-line bytes until the status shows whether this is a `430`.
+    WithholdUntilStatus,
+    /// The reply is a complete `430` that must not be forwarded.
+    SuppressedMissing,
 }
 
 #[derive(Debug)]
@@ -2171,10 +2293,20 @@ impl MultilineFramer {
 
 impl BackendReplyTracker {
     fn push_request(&mut self, kind: crate::protocol::RequestKind) {
+        self.push_request_with(kind, StatusForwarding::PassThrough);
+    }
+
+    fn push_request_with(
+        &mut self,
+        kind: crate::protocol::RequestKind,
+        status_forwarding: StatusForwarding,
+    ) {
         self.pending.push_back(PendingRequestFrame {
             kind,
             state: PendingRequestFrameState::AwaitingStatusLine,
             status_line: smallvec::SmallVec::new(),
+            status_forwarding,
+            released_status_prefix: None,
         });
     }
 
@@ -2190,15 +2322,25 @@ impl BackendReplyTracker {
                 output.push(BackendReplyBytes::ForwardUntracked(&chunk[offset.get()..]));
                 break;
             };
-            let Some(framed) = front.consume(chunk, offset) else {
-                output.push(BackendReplyBytes::ForwardUntracked(&chunk[offset.get()..]));
+            let framed = front.consume(chunk, offset);
+            if let Some(prefix) = front.released_status_prefix.take() {
+                output.push(BackendReplyBytes::ReleasedStatusPrefix(prefix));
+            }
+            let Some(framed) = framed else {
+                if front.status_forwarding == StatusForwarding::PassThrough {
+                    output.push(BackendReplyBytes::ForwardUntracked(&chunk[offset.get()..]));
+                }
                 break;
             };
 
             offset = framed.end();
-            output.push(BackendReplyBytes::CompletedTrackedReply(
-                framed.backend_bytes(chunk),
-            ));
+            if front.status_forwarding == StatusForwarding::SuppressedMissing {
+                output.push(BackendReplyBytes::SuppressedMissing);
+            } else {
+                output.push(BackendReplyBytes::CompletedTrackedReply(
+                    framed.backend_bytes(chunk),
+                ));
+            }
             self.pending.pop_front();
         }
 
@@ -2207,6 +2349,18 @@ impl BackendReplyTracker {
 }
 
 impl PendingRequestFrame {
+    /// Stop withholding this reply. Bytes buffered from earlier reads must
+    /// reach the client ahead of the current read's bytes.
+    fn release_withheld_status(&mut self, buffered_len: usize) {
+        if self.status_forwarding != StatusForwarding::WithholdUntilStatus {
+            return;
+        }
+        self.status_forwarding = StatusForwarding::PassThrough;
+        if buffered_len != 0 {
+            self.released_status_prefix = Some(self.status_line[..buffered_len].into());
+        }
+    }
+
     fn consume(
         &mut self,
         chunk: &[u8],
@@ -2215,10 +2369,13 @@ impl PendingRequestFrame {
         let offset_bytes = &chunk[offset.get()..];
         match &mut self.state {
             PendingRequestFrameState::AwaitingStatusLine => {
+                let buffered_len = self.status_line.len();
                 let Some(pos) = memchr::memchr(b'\n', offset_bytes) else {
                     if self.status_line.len() + offset_bytes.len()
                         > crate::constants::buffer::COMMAND
                     {
+                        // An overlong status line can't prove a miss.
+                        self.release_withheld_status(buffered_len);
                         // Keep memory bounded without completing a request in
                         // the middle of its status line. The next request must
                         // not consume the remainder of this malformed reply.
@@ -2233,6 +2390,7 @@ impl PendingRequestFrame {
                 if self.status_line.len() + end.get() - offset.get()
                     > crate::constants::buffer::COMMAND
                 {
+                    self.release_withheld_status(buffered_len);
                     return Some(FramedResponseForRequest {
                         response: BackendChunkRange::new(offset, end),
                     });
@@ -2241,10 +2399,18 @@ impl PendingRequestFrame {
                     .extend_from_slice(&chunk[offset.get()..end.get()]);
                 let Some(status) = crate::protocol::StatusCode::parse(self.status_line.as_slice())
                 else {
+                    self.release_withheld_status(buffered_len);
                     return Some(FramedResponseForRequest {
                         response: BackendChunkRange::new(offset, end),
                     });
                 };
+                if self.status_forwarding == StatusForwarding::WithholdUntilStatus {
+                    if status.as_u16() == crate::protocol::codes::NO_SUCH_ARTICLE_ID {
+                        self.status_forwarding = StatusForwarding::SuppressedMissing;
+                    } else {
+                        self.release_withheld_status(buffered_len);
+                    }
+                }
                 if !crate::protocol::request_kind_has_response_body(self.kind, status) {
                     return Some(FramedResponseForRequest {
                         response: BackendChunkRange::new(offset, end),
@@ -3815,6 +3981,10 @@ mod tests {
                             let (bytes, complete) = match output {
                                 BackendReplyBytes::CompletedTrackedReply(bytes) => (bytes, true),
                                 BackendReplyBytes::ForwardUntracked(bytes) => (bytes, false),
+                                BackendReplyBytes::ReleasedStatusPrefix(_)
+                                | BackendReplyBytes::SuppressedMissing => {
+                                    unreachable!("plain requests never withhold status bytes")
+                                }
                             };
                             prop_assert_eq!(bytes, &chunk[consumed..consumed + bytes.len()]);
                             consumed += bytes.len();
@@ -4441,6 +4611,10 @@ mod tests {
                             }
                             BackendReplyBytes::ForwardUntracked(bytes) => {
                                 forwarded.extend_from_slice(bytes);
+                            }
+                            BackendReplyBytes::ReleasedStatusPrefix(_)
+                            | BackendReplyBytes::SuppressedMissing => {
+                                unreachable!("plain requests never withhold status bytes")
                             }
                         }
                     }
@@ -5840,6 +6014,148 @@ mod tests {
         assert_eq!(&writes[0][..], b"100 Help follows\r\nfirst line\r\n.\r\n");
         assert_eq!(&writes[1][..], b"111 20260520120000\r\n");
         assert!(!order.has_pending_backend_replies());
+    }
+
+    fn recoverable_body_order() -> BackendResponseOrder {
+        let mut order = BackendResponseOrder::default();
+        order.push_recoverable_request(
+            crate::protocol::RequestContext::parse(b"BODY <Case@ID>\r\n").expect("valid request"),
+        );
+        order
+    }
+
+    /// Collect forwarded bytes, failing if the framer asked for recovery.
+    fn forwarded_without_recovery(actions: OrderedClientActions<'_>) -> Vec<u8> {
+        let mut forwarded = Vec::new();
+        for action in actions {
+            match action {
+                OrderedClientAction::Write(bytes) => forwarded.extend_from_slice(&bytes),
+                OrderedClientAction::RecoverMissing(_) => {
+                    panic!("only a well-formed 430 may be recovered")
+                }
+            }
+        }
+        forwarded
+    }
+
+    #[test]
+    fn recoverable_request_withholds_430_at_every_split() {
+        let status = b"430 No Such Article\r\n";
+        for split in 0..status.len() {
+            let mut order = recoverable_body_order();
+            let first = order.client_actions_for_backend_read(&status[..split]);
+            assert!(first.is_empty(), "split {split} leaked bytes");
+            let actions = order.client_actions_for_backend_read(&status[split..]);
+            assert_eq!(actions.len(), 1, "split {split}");
+            let OrderedClientAction::RecoverMissing(request) = &actions[0] else {
+                panic!("split {split}: a pinned 430 must not reach the client");
+            };
+            assert_eq!(request.message_id(), Some("<Case@ID>"));
+            assert!(!order.has_pending_backend_replies());
+        }
+    }
+
+    #[test]
+    fn recoverable_request_forwards_other_statuses_byte_for_byte_at_every_split() {
+        for status in [
+            b"423 No article with that number\r\n".as_slice(),
+            b"412 No newsgroup selected\r\n",
+            b"400 Service discontinued\r\n",
+            b"223 0 <Case@ID>\r\n",
+            b"not-a-status\r\n",
+        ] {
+            for split in 0..=status.len() {
+                let mut order = recoverable_body_order();
+                let mut forwarded = forwarded_without_recovery(
+                    order.client_actions_for_backend_read(&status[..split]),
+                );
+                forwarded.extend(forwarded_without_recovery(
+                    order.client_actions_for_backend_read(&status[split..]),
+                ));
+                assert_eq!(forwarded, status, "split {split}");
+                assert!(!order.has_pending_backend_replies());
+            }
+        }
+    }
+
+    #[test]
+    fn recoverable_request_releases_an_overlong_status_prefix() {
+        let mut status = vec![b'4'; crate::constants::buffer::COMMAND + 1];
+        status.extend_from_slice(b"\r\n");
+        for split in [1, 10, crate::constants::buffer::COMMAND] {
+            let mut order = recoverable_body_order();
+            let mut forwarded =
+                forwarded_without_recovery(order.client_actions_for_backend_read(&status[..split]));
+            forwarded.extend(forwarded_without_recovery(
+                order.client_actions_for_backend_read(&status[split..]),
+            ));
+            assert_eq!(forwarded, status, "split {split}");
+        }
+    }
+
+    #[test]
+    fn recoverable_request_keeps_payload_borrowed_from_the_read_buffer() {
+        let mut first = b"222 0 <Case@ID>\r\n".to_vec();
+        first.resize(64 * 1024, b'x');
+        let mut rest = vec![b'x'; 256 * 1024];
+        rest.extend_from_slice(b"\r\n.\r\n");
+        let mut order = recoverable_body_order();
+        for read in [&first[..], &rest[..]] {
+            let actions = order.client_actions_for_backend_read(read);
+            assert_eq!(actions.len(), 1);
+            assert!(matches!(
+                &actions[0],
+                OrderedClientAction::Write(Cow::Borrowed(bytes))
+                    if bytes.as_ptr() == read.as_ptr() && bytes.len() == read.len()
+            ));
+        }
+        assert!(!order.has_pending_backend_replies());
+    }
+
+    #[test]
+    fn recoverable_miss_keeps_pipeline_order_with_packed_and_deferred_replies() {
+        let mut order = BackendResponseOrder::default();
+        order.push_request(crate::protocol::RequestKind::Body);
+        order.push_recoverable_request(
+            crate::protocol::RequestContext::parse(b"BODY <Case@ID>\r\n").expect("valid request"),
+        );
+        order.push_deferred_reply(b"502 local\r\n");
+        order.push_request(crate::protocol::RequestKind::Stat);
+        assert!(order.should_drain_backend_replies());
+
+        let read = b"222 42 <prior>\r\nprior\r\n.\r\n430 Missing\r\n223 42 <current>\r\n";
+        let actions = order.client_actions_for_backend_read(read);
+
+        assert_eq!(actions.len(), 4);
+        assert!(matches!(
+            &actions[0],
+            OrderedClientAction::Write(Cow::Borrowed(bytes))
+                if *bytes == b"222 42 <prior>\r\nprior\r\n.\r\n"
+        ));
+        assert!(matches!(
+            &actions[1],
+            OrderedClientAction::RecoverMissing(request)
+                if request.message_id() == Some("<Case@ID>")
+        ));
+        assert!(matches!(
+            &actions[2],
+            OrderedClientAction::Write(Cow::Borrowed(bytes)) if *bytes == b"502 local\r\n"
+        ));
+        assert!(matches!(
+            &actions[3],
+            OrderedClientAction::Write(Cow::Borrowed(bytes)) if *bytes == b"223 42 <current>\r\n"
+        ));
+        assert!(!order.has_pending_backend_replies());
+        assert!(!order.has_deferred_replies());
+    }
+
+    #[test]
+    fn plain_requests_forward_430_unchanged() {
+        let mut order = BackendResponseOrder::default();
+        order.push_request(crate::protocol::RequestKind::Body);
+        let writes = order.client_writes_for_backend_read(b"430 No Such Article\r\n");
+        assert_eq!(writes.len(), 1);
+        assert_eq!(&writes[0][..], b"430 No Such Article\r\n");
     }
 
     fn for_each_critical_byte_sequence(max_len: usize, f: &mut impl FnMut(&[u8])) {
