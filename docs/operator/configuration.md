@@ -72,6 +72,18 @@ These settings control transport memory, not stored article bodies.
 | `capture_pool_size` | `1048576` |
 | `capture_pool_count` | `16` |
 
+With `store_article_bodies = true`, each cache miss copies its response into
+capture buffers until the cache stores it. A read that fills at least half of
+its read buffer moves that buffer into the capture instead. A capture that
+finds the capture pool empty allocates a fresh buffer and logs
+`Capture buffer pool exhausted`. The default of 16 covers 16 concurrent
+captures of articles up to `capture_pool_size`. If cache misses routinely run
+on more backend connections than that, raise `capture_pool_count` toward your
+total backend `max_connections`. Pooled buffers are allocated on first use and
+kept afterward, so this costs up to `capture_pool_count × capture_pool_size`
+of memory. The fallback allocations are freed when each capture finishes, so
+leaving the default only costs allocator churn, not unbounded memory.
+
 ### `[cache]`
 
 `[cache]` is optional. If you omit it entirely, the runtime still uses availability tracking internally.

@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A backend that refuses a login, for example with `502 connection limit reached`, a bad greeting, or a failed `AUTHINFO`, is no longer asked to log in again for every request. New connections to it fail locally for 5 s, doubling up to 60 s while the refusals continue. When a window closes, one probe login decides whether to resume, and a successful login resets the backoff. Network errors do not start it.
 - An article request answers `430` instead of `503` when a backend has returned `430` and every other eligible backend is only busy or failing. Clients such as NZBGet treat `430` as a missing article and `503` as a server failure.
 - A backend that accepts a command and never answers can no longer hold a request forever. The first reply bytes must arrive within 30 seconds, and each adaptive precheck attempt must finish within 2 seconds. A timeout retries once on a fresh connection, removes the stuck connection from the pool, and is never recorded as a `430`.
+- A cache-miss capture with `store_article_bodies = true` no longer keeps a whole 1 MiB read buffer for every backend read. TLS reads deliver at most about 16 KiB, so a ~750 KB article held about 47 MiB and exhausted the read-buffer pool. A read buffer now moves into the capture only when the read fills at least half of it. Smaller reads are copied into capture buffers, which keeps a capture's memory within about twice the article size plus one capture buffer.
 
 ## [0.6.0] - 2026-11-05
 
