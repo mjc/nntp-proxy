@@ -15,6 +15,8 @@ use anyhow::Context;
 use smallvec::SmallVec;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 
+use crate::pool::buffer::ReadRetention;
+
 const TERMINATOR: &[u8; 5] = b"\r\n.\r\n";
 const DOT_TERMINATOR: &[u8; 3] = b".\r\n";
 const TERMINATOR_TAIL_SIZE: usize = 4;
@@ -193,8 +195,17 @@ impl CompleteResponseWindow {
         pool: &crate::pool::BufferPool,
         buffer: &mut crate::pool::PooledBuffer,
     ) {
-        let old = std::mem::replace(buffer, pool.acquire());
-        response.push_buffer_range(old, self.response.clone());
+        match response.read_retention(self.response.len(), buffer.capacity()) {
+            ReadRetention::MoveBuffer => {
+                let old = std::mem::replace(buffer, pool.acquire());
+                response.push_buffer_range(old, self.response.clone());
+            }
+            // Isolated responses reject packed suffixes, so nothing else in
+            // the read buffer needs preserving.
+            ReadRetention::CopyBytes => {
+                response.extend_from_slice(pool, &buffer[self.response.clone()]);
+            }
+        }
     }
 
     fn queue_next_response_input(
@@ -231,14 +242,21 @@ impl CompleteResponseWindow {
         response: &mut crate::pool::ChunkedResponse,
         pool: &crate::pool::BufferPool,
     ) -> Result<(), crate::session::response_transfer::ResponseTransferError> {
-        let total_len = io_buffer.initialized();
-        let old = std::mem::replace(io_buffer, pool.acquire());
-        if self.next_response_input.start < total_len {
-            conn.queue_pending_bytes_first(&old[self.next_response_input.clone()])
-                .map_err(crate::session::response_transfer::ResponseTransferError::Io)?;
+        match response.read_retention(self.response.len(), io_buffer.capacity()) {
+            ReadRetention::MoveBuffer => {
+                let total_len = io_buffer.initialized();
+                let old = std::mem::replace(io_buffer, pool.acquire());
+                if self.next_response_input.start < total_len {
+                    conn.queue_pending_bytes_first(&old[self.next_response_input.clone()])
+                        .map_err(crate::session::response_transfer::ResponseTransferError::Io)?;
+                }
+                response.push_buffer_range(old, self.response.clone());
+            }
+            ReadRetention::CopyBytes => {
+                response.extend_from_slice(pool, &io_buffer[self.response.clone()]);
+                self.queue_pooled_next_response_input(io_buffer, conn, pool)?;
+            }
         }
-
-        response.push_buffer_range(old, self.response.clone());
         Ok(())
     }
 
@@ -335,8 +353,16 @@ impl IncompleteResponseWindow {
         pool: &crate::pool::BufferPool,
         buffer: &mut crate::pool::PooledBuffer,
     ) {
-        let old = std::mem::replace(buffer, pool.acquire());
-        response.push_buffer_range(old, self.response.clone());
+        match response.read_retention(self.response.len(), buffer.capacity()) {
+            ReadRetention::MoveBuffer => {
+                let old = std::mem::replace(buffer, pool.acquire());
+                response.push_buffer_range(old, self.response.clone());
+            }
+            // The next read clears and refills the same buffer.
+            ReadRetention::CopyBytes => {
+                response.extend_from_slice(pool, &buffer[self.response.clone()]);
+            }
+        }
     }
 }
 
@@ -4331,6 +4357,133 @@ mod tests {
                     }
                 });
             }
+
+            #[test]
+            fn captures_stay_compact_for_any_read_geometry(
+                body_len in 0usize..32 * 1024,
+                read_buffer in prop::sample::select(vec![4096usize, 8192]),
+                capture_chunk in prop::sample::select(vec![64usize, 1024, 8192]),
+                reads in prop::collection::vec(1usize..=8192, 1..12),
+            ) {
+                runtime().block_on(async {
+                    let pool = crate::pool::BufferPool::new(BufferSize::try_new(read_buffer).unwrap(), 8)
+                        .with_capture_pool(capture_chunk, 8);
+                    let (command, wire) = framing_pipeline_fixture(0, body_len);
+                    for captured in capture_with_reads(&pool, &command, &wire, &reads).await {
+                        assert_compact_capture(&pool, &captured, &wire);
+                    }
+                });
+            }
+        }
+
+        /// Capture `wire` through both production capture operations, with the
+        /// backend delivering it in `reads`-sized reads.
+        async fn capture_with_reads(
+            pool: &crate::pool::BufferPool,
+            command: &[u8],
+            wire: &[u8],
+            reads: &[usize],
+        ) -> [crate::pool::ChunkedResponse; 2] {
+            let request = crate::protocol::RequestContext::parse(command).unwrap();
+            let mut conn =
+                crate::stream::ConnectionStream::for_test(ScriptedBackend::new(wire, reads));
+            let mut buffer = pool.acquire();
+            buffer.read_from(&mut conn).await.unwrap();
+            let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, buffer)
+                .await
+                .unwrap();
+            let mut writer = Vec::new();
+            let mut scratch = crate::pool::ChunkedResponse::default();
+            let (written, retained) = classified
+                .stream_for_test(&mut conn, pool, crate::types::BackendId::from_index(0))
+                .unwrap()
+                .capture_and_write(&mut writer, &mut scratch, wire.len())
+                .await
+                .unwrap();
+            assert_eq!(written as usize, wire.len());
+            assert_eq!(writer, wire);
+            let streamed = retained
+                .expect("response within the limit is retained")
+                .into_inner()
+                .into_bytes();
+            assert_backend_eof(&mut conn).await;
+
+            let mut conn =
+                crate::stream::ConnectionStream::for_test(ScriptedBackend::new(wire, reads));
+            let mut buffer = pool.acquire();
+            buffer.read_from(&mut conn).await.unwrap();
+            let mut isolated = crate::pool::ChunkedResponse::default();
+            IsolatedMultilineResponse::begin(&mut conn, &mut buffer)
+                .unwrap()
+                .capture_chunked_optional(pool, &mut isolated, wire.len())
+                .await
+                .unwrap()
+                .expect("response within the limit is retained");
+            assert_backend_eof(&mut conn).await;
+            [streamed, isolated]
+        }
+
+        fn assert_compact_capture(
+            pool: &crate::pool::BufferPool,
+            captured: &crate::pool::ChunkedResponse,
+            wire: &[u8],
+        ) {
+            assert_eq!(captured.to_vec(), wire);
+            let chunks: Vec<_> = captured.chunk_fill_for_test().collect();
+            if let Some((_, sealed)) = chunks.split_last() {
+                for &(len, capacity) in sealed {
+                    assert!(
+                        len >= capacity.div_ceil(2),
+                        "sealed chunk holds {len} of {capacity} bytes: {chunks:?}"
+                    );
+                }
+            }
+            let bound = 2 * captured.len() + pool.acquire_capture().capacity();
+            assert!(
+                captured.retained_backing_capacity() <= bound,
+                "retained {} bytes for {} captured: {chunks:?}",
+                captured.retained_backing_capacity(),
+                captured.len()
+            );
+        }
+
+        #[test]
+        fn sparse_reads_do_not_retain_whole_read_buffers() {
+            runtime().block_on(async {
+                // 4 KiB reads into 64 KiB buffers, the shape of TLS records
+                // arriving in 1 MiB buffers. Moving every read buffer retained
+                // about 16x the captured length.
+                let pool = crate::pool::BufferPool::new(BufferSize::try_new(64 * 1024).unwrap(), 4)
+                    .with_capture_pool(64 * 1024, 4);
+                let (command, wire) = framing_pipeline_fixture(0, 256 * 1024);
+                for captured in capture_with_reads(&pool, &command, &wire, &[4096]).await {
+                    assert_compact_capture(&pool, &captured, &wire);
+                    assert!(captured.retained_backing_capacity() <= wire.len() + 64 * 1024);
+                }
+            });
+        }
+
+        #[test]
+        fn dense_reads_keep_zero_copy_buffer_ownership() {
+            runtime().block_on(async {
+                let read_buffer = 64 * 1024;
+                let pool =
+                    crate::pool::BufferPool::new(BufferSize::try_new(read_buffer).unwrap(), 4)
+                        .with_capture_pool(8 * 1024, 4);
+                let (command, wire) = framing_pipeline_fixture(0, 4 * read_buffer);
+                for captured in capture_with_reads(&pool, &command, &wire, &[read_buffer]).await {
+                    assert_compact_capture(&pool, &captured, &wire);
+                    let chunks: Vec<_> = captured.chunk_fill_for_test().collect();
+                    let (_, full_reads) = chunks.split_last().unwrap();
+                    assert_eq!(full_reads.len(), wire.len() / read_buffer, "{chunks:?}");
+                    assert!(
+                        full_reads
+                            .iter()
+                            .all(|&(len, capacity)| len == read_buffer && capacity == read_buffer),
+                        "full reads move their buffers instead of copying: {chunks:?}"
+                    );
+                }
+            });
         }
     }
 
@@ -4986,7 +5139,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn capture_response_moves_scratch_buffers_across_chunks() {
+    async fn capture_response_copies_sparse_reads_and_returns_read_buffers() {
         let header = b"220 Article follows\r\n";
         let mut body_chunk = vec![b'x'; 94];
         body_chunk.extend_from_slice(b"\r\n");
@@ -5016,10 +5169,12 @@ mod tests {
         .expect("multiline response capture should succeed");
 
         assert_eq!(captured.to_vec(), expected_response);
+        // Each read fills a sliver of its page-aligned read buffer, so keeping
+        // those buffers would retain far more memory than the response.
         assert_eq!(
-            pool.available_buffers(),
+            pool.buffers_in_use(),
             0,
-            "captured multiline response should hold pooled read buffers instead of copying into capture buffers"
+            "sparse reads are copied into capture buffers, not retained as read buffers"
         );
     }
 

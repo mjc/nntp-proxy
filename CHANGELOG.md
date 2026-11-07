@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A cache-miss capture with `store_article_bodies = true` no longer keeps a whole 1 MiB read buffer for every backend read. TLS reads deliver at most about 16 KiB, so a ~750 KB article held about 47 MiB and exhausted the read-buffer pool. A read buffer now moves into the capture only when the read fills at least half of it. Smaller reads are copied into capture buffers, which keeps a capture's memory within about twice the article size plus one capture buffer.
+
 ## [0.6.0] - 2026-11-05
 
 ### Added
