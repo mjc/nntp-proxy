@@ -281,11 +281,17 @@ impl EnvProvider for StdEnvProvider {
 /// * `env` - Environment variable provider
 ///
 /// # Returns
-/// Some(Server) if HOST variable exists, None otherwise
-pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Server> {
+/// `Ok(Some(Server))` if HOST variable exists, `Ok(None)` otherwise
+///
+/// # Errors
+/// Returns an error if `NNTP_SERVER_{index}_PREWARM_CONNECTIONS` is not a
+/// non-negative integer.
+pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Result<Option<Server>> {
     // Check if this server index exists by looking for HOST
     let host_key = format!("NNTP_SERVER_{index}_HOST");
-    let host = env.get(&host_key)?;
+    let Some(host) = env.get(&host_key) else {
+        return Ok(None);
+    };
 
     // Parse port (required)
     let port_key = format!("NNTP_SERVER_{index}_PORT");
@@ -369,13 +375,16 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
     // Fail loudly: a typo silently falling back to "open every connection"
     // would defeat the point of lowering it.
     let prewarm_key = format!("NNTP_SERVER_{index}_PREWARM_CONNECTIONS");
-    let prewarm_connections = env.get(&prewarm_key).map(|value| {
-        value.parse::<usize>().unwrap_or_else(|_| {
-            panic!("Invalid {prewarm_key}: '{value}' (must be a non-negative integer)")
+    let prewarm_connections = env
+        .get(&prewarm_key)
+        .map(|value| {
+            value.parse::<usize>().map_err(|_| {
+                anyhow::anyhow!("Invalid {prewarm_key}: '{value}' (must be a non-negative integer)")
+            })
         })
-    });
+        .transpose()?;
 
-    Some(Server {
+    Ok(Some(Server {
         host: crate::types::HostName::try_new(host.clone())
             .unwrap_or_else(|_| panic!("Invalid hostname in {host_key}: '{host}'")),
         port: crate::types::Port::try_new(port)
@@ -398,20 +407,23 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         compress_level: None,
         backend_idle_timeout: crate::config::defaults::backend_idle_timeout(),
         prewarm_connections,
-    })
+    }))
 }
 
 /// Load servers using a custom environment provider (testable version)
-pub fn load_servers_from_env_provider<E: EnvProvider>(env: &E) -> Option<Vec<Server>> {
-    let servers: Vec<Server> = (0..)
-        .map_while(|index| parse_server_from_env(index, env))
-        .collect();
-
-    if servers.is_empty() {
-        None
-    } else {
-        Some(servers)
+///
+/// # Errors
+/// Returns the first server parse error encountered.
+pub fn load_servers_from_env_provider<E: EnvProvider>(env: &E) -> Result<Option<Vec<Server>>> {
+    let mut servers = Vec::new();
+    for index in 0.. {
+        let Some(server) = parse_server_from_env(index, env)? else {
+            break;
+        };
+        servers.push(server);
     }
+
+    Ok((!servers.is_empty()).then_some(servers))
 }
 
 /// Check if any backend server environment variables are set
@@ -436,7 +448,7 @@ pub fn load_config_from_env() -> Result<Config> {
 fn load_config_from_env_provider<E: EnvProvider>(env: &E) -> Result<Config> {
     use anyhow::Context;
 
-    let servers = load_servers_from_env_provider(env)
+    let servers = load_servers_from_env_provider(env)?
         .context("No backend servers configured via environment variables. Set NNTP_SERVER_0_HOST, NNTP_SERVER_0_PORT, etc.")?;
 
     let mut config = Config {
@@ -502,7 +514,7 @@ fn load_config_with_env_provider<E: EnvProvider>(config_path: &str, env: &E) -> 
 
     // Check for environment variable server overrides after migration so
     // canonical file rewrites never discard container-provided backends.
-    if let Some(env_servers) = load_servers_from_env_provider(env) {
+    if let Some(env_servers) = load_servers_from_env_provider(env)? {
         tracing::info!(
             "Using {} backend server(s) from environment variables (overriding config file)",
             env_servers.len()
@@ -690,7 +702,7 @@ mod tests {
         let mut env = MockEnv::new();
         env.set("NNTP_SERVER_0_HOST", "news.example.com");
 
-        let server = parse_server_from_env(0, &env);
+        let server = parse_server_from_env(0, &env).unwrap();
         assert!(server.is_some());
 
         let server = server.unwrap();
@@ -713,7 +725,7 @@ mod tests {
             .set("NNTP_SERVER_0_USE_TLS", "true")
             .set("NNTP_SERVER_0_TLS_VERIFY_CERT", "false");
 
-        let server = parse_server_from_env(0, &env).unwrap();
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
         assert_eq!(server.host.as_str(), "secure.example.com");
         assert_eq!(server.port.get(), 563);
         assert_eq!(server.name.as_str(), "Secure News");
@@ -727,7 +739,7 @@ mod tests {
     #[test]
     fn test_parse_server_from_env_no_host() {
         let env = MockEnv::new();
-        let server = parse_server_from_env(0, &env);
+        let server = parse_server_from_env(0, &env).unwrap();
         assert!(server.is_none());
     }
 
@@ -737,7 +749,7 @@ mod tests {
         env.set("NNTP_SERVER_0_HOST", "news.example.com")
             .set("NNTP_SERVER_0_PORT", "invalid");
 
-        let server = parse_server_from_env(0, &env).unwrap();
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
         assert_eq!(server.port.get(), 119); // Falls back to default
     }
 
@@ -747,7 +759,7 @@ mod tests {
         env.set("NNTP_SERVER_0_HOST", "news.example.com")
             .set("NNTP_SERVER_0_MAX_CONNECTIONS", "not_a_number");
 
-        let server = parse_server_from_env(0, &env).unwrap();
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
         assert_eq!(server.max_connections.get(), 10); // Default
     }
 
@@ -757,7 +769,7 @@ mod tests {
         env.set("NNTP_SERVER_0_HOST", "news.example.com")
             .set("NNTP_SERVER_0_MAX_CONNECTIONS", "0");
 
-        let server = parse_server_from_env(0, &env).unwrap();
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
         assert_eq!(server.max_connections.get(), 10); // Falls back to default (NonZero rejects 0)
     }
 
@@ -767,7 +779,7 @@ mod tests {
         env.set("NNTP_SERVER_0_HOST", "news.example.com")
             .set("NNTP_SERVER_0_CONNECTION_KEEPALIVE", "300");
 
-        let server = parse_server_from_env(0, &env).unwrap();
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
         assert_eq!(
             server.connection_keepalive,
             Some(std::time::Duration::from_secs(300))
@@ -784,27 +796,47 @@ mod tests {
             .set("NNTP_SERVER_2_PREWARM_CONNECTIONS", "4");
 
         assert_eq!(
-            parse_server_from_env(0, &env).unwrap().prewarm_connections,
+            parse_server_from_env(0, &env)
+                .unwrap()
+                .unwrap()
+                .prewarm_connections,
             None
         );
         assert_eq!(
-            parse_server_from_env(1, &env).unwrap().prewarm_connections,
+            parse_server_from_env(1, &env)
+                .unwrap()
+                .unwrap()
+                .prewarm_connections,
             Some(0)
         );
         assert_eq!(
-            parse_server_from_env(2, &env).unwrap().prewarm_connections,
+            parse_server_from_env(2, &env)
+                .unwrap()
+                .unwrap()
+                .prewarm_connections,
             Some(4)
         );
     }
 
     #[test]
-    #[should_panic(expected = "NNTP_SERVER_0_PREWARM_CONNECTIONS")]
-    fn test_parse_server_from_env_invalid_prewarm_connections_panics() {
+    fn test_parse_server_from_env_invalid_prewarm_connections_errors() {
         let mut env = MockEnv::new();
         env.set("NNTP_SERVER_0_HOST", "news.example.com")
             .set("NNTP_SERVER_0_PREWARM_CONNECTIONS", "-1");
 
-        let _ = parse_server_from_env(0, &env);
+        let err = parse_server_from_env(0, &env).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("NNTP_SERVER_0_PREWARM_CONNECTIONS"),
+            "unexpected error: {err}"
+        );
+
+        let err = load_config_from_env_provider(&env).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("NNTP_SERVER_0_PREWARM_CONNECTIONS"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
@@ -814,7 +846,7 @@ mod tests {
             .set("NNTP_SERVER_0_HEALTH_CHECK_MAX_PER_CYCLE", "5")
             .set("NNTP_SERVER_0_HEALTH_CHECK_POOL_TIMEOUT", "15");
 
-        let server = parse_server_from_env(0, &env).unwrap();
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
         assert_eq!(server.health_check_max_per_cycle, 5);
         assert_eq!(
             server.health_check_pool_timeout,
@@ -829,7 +861,7 @@ mod tests {
             .set("NNTP_SERVER_0_USE_TLS", "true")
             .set("NNTP_SERVER_0_TLS_CERT_PATH", "/path/to/ca.pem");
 
-        let server = parse_server_from_env(0, &env).unwrap();
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
         assert!(server.use_tls);
         assert_eq!(server.tls_cert_path, Some("/path/to/ca.pem".to_string()));
     }
@@ -837,7 +869,7 @@ mod tests {
     #[test]
     fn test_load_servers_from_env_provider_empty() {
         let env = MockEnv::new();
-        let servers = load_servers_from_env_provider(&env);
+        let servers = load_servers_from_env_provider(&env).unwrap();
         assert!(servers.is_none());
     }
 
@@ -846,7 +878,7 @@ mod tests {
         let mut env = MockEnv::new();
         env.set("NNTP_SERVER_0_HOST", "news1.example.com");
 
-        let servers = load_servers_from_env_provider(&env);
+        let servers = load_servers_from_env_provider(&env).unwrap();
         assert!(servers.is_some());
 
         let servers = servers.unwrap();
@@ -864,7 +896,7 @@ mod tests {
             .set("NNTP_SERVER_1_USE_TLS", "true")
             .set("NNTP_SERVER_2_HOST", "news3.example.com");
 
-        let servers = load_servers_from_env_provider(&env);
+        let servers = load_servers_from_env_provider(&env).unwrap();
         assert!(servers.is_some());
 
         let servers = servers.unwrap();
@@ -883,7 +915,7 @@ mod tests {
         env.set("NNTP_SERVER_0_HOST", "news1.example.com")
             .set("NNTP_SERVER_2_HOST", "news3.example.com");
 
-        let servers = load_servers_from_env_provider(&env);
+        let servers = load_servers_from_env_provider(&env).unwrap();
         assert!(servers.is_some());
 
         let servers = servers.unwrap();
@@ -899,7 +931,7 @@ mod tests {
             .set("NNTP_SERVER_0_USE_TLS", "True")
             .set("NNTP_SERVER_0_TLS_VERIFY_CERT", "FALSE");
 
-        let server = parse_server_from_env(0, &env).unwrap();
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
         // Rust's parse::<bool>() requires exact "true"/"false" lowercase
         // So these should fail to parse and use defaults
         assert!(!server.use_tls); // Defaults to false
@@ -913,7 +945,7 @@ mod tests {
             .set("NNTP_SERVER_0_USE_TLS", "true")
             .set("NNTP_SERVER_0_TLS_VERIFY_CERT", "false");
 
-        let server = parse_server_from_env(0, &env).unwrap();
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
         assert!(server.use_tls);
         assert!(!server.tls_verify_cert);
     }
@@ -924,7 +956,7 @@ mod tests {
         env.set("NNTP_SERVER_0_HOST", "news.example.com")
             .set("NNTP_SERVER_0_STAT_MISSING", "3");
 
-        let server = parse_server_from_env(0, &env).unwrap();
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
         assert_eq!(server.stat_missing, 3);
     }
 
@@ -934,7 +966,7 @@ mod tests {
         env.set("NNTP_SERVER_0_HOST", "news.example.com")
             .set("NNTP_SERVER_0_STAT_MISSING", "not_a_number");
 
-        let server = parse_server_from_env(0, &env).unwrap();
+        let server = parse_server_from_env(0, &env).unwrap().unwrap();
         assert_eq!(server.stat_missing, defaults::stat_missing());
     }
 
