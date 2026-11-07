@@ -169,6 +169,20 @@ pub mod pool {
     /// Connection pool timeout for getting a connection
     pub const GET_TIMEOUT_SECS: u64 = 5;
 
+    /// Longest an article request waits for a free connection on one backend
+    /// before treating it as unavailable for that request and moving on.
+    ///
+    /// The pool's own wait is [`super::timeout::CONNECTION`] (10 s). A missing
+    /// article visits every backend, and under load the small pools are always
+    /// full, so waiting the full pool timeout at each one adds up to more than
+    /// a downloader's article timeout (NZBGet: 30 s). The downloader then sees a
+    /// timeout instead of a `430` and blocks the whole server.
+    pub const ARTICLE_CHECKOUT_WAIT: Duration = Duration::from_secs(3);
+
+    /// Longest a background `STAT` probe waits for a free connection. A probe is
+    /// an optimisation; a busy backend should be skipped, not waited on.
+    pub const STAT_PROBE_CHECKOUT_WAIT: Duration = Duration::from_secs(2);
+
     /// Buffer size for TCP peek during health checks
     /// Only 1 byte needed to detect if connection is readable/closed
     pub const TCP_PEEK_BUFFER_SIZE: usize = 1;

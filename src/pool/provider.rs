@@ -571,6 +571,31 @@ impl DeadpoolConnectionProvider {
         Err(err)
     }
 
+    /// Checkout like [`Self::checkout_connection_guard`], but give up after
+    /// `limit` with [`crate::connection_error::ConnectionError::PoolExhausted`].
+    ///
+    /// Article routing can try another backend, so it should not sit in one
+    /// full pool for the pool's whole wait timeout.
+    ///
+    /// # Errors
+    /// Returns [`crate::connection_error::ConnectionError`] when no healthy backend
+    /// connection can be acquired within `limit`.
+    pub async fn checkout_connection_guard_within(
+        &self,
+        limit: std::time::Duration,
+    ) -> Result<
+        crate::pool::connection_guard::IdleConnection,
+        crate::connection_error::ConnectionError,
+    > {
+        match tokio::time::timeout(limit, self.checkout_connection_guard()).await {
+            Ok(result) => result,
+            Err(_elapsed) => Err(crate::connection_error::ConnectionError::PoolExhausted {
+                backend: self.name.to_string(),
+                max_size: self.pool.status().max_size,
+            }),
+        }
+    }
+
     /// Checkout a pooled connection in the idle state.
     ///
     /// Callers outside `crate::pool` should use this entrypoint instead of accessing
