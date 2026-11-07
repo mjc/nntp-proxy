@@ -136,6 +136,11 @@ tls_verify_cert = true
 # Clear idle connections after this many seconds of proxy-wide inactivity (default: 600)
 # Prevents stale connections accumulating overnight. Set to 0 to disable.
 # backend_idle_timeout = 600
+# Connections to open at startup (default: max_connections; must not exceed it).
+# 0 opens none and the pool fills as requests arrive. Lower it when the account
+# is shared with other clients, so idle pooled connections don't use up the
+# provider's per-account connection limit.
+# prewarm_connections = 10
 
 [[servers]]
 host = "nntp.example.org"

@@ -45,6 +45,7 @@ The sample is NNTPS. Plain NNTP is port `119` with `use_tls = false`. Backend
 certificate verification stays on unless you turn it off.
 
 Remove both credential lines if your provider does not require authentication. Set `max_connections` within your provider's connection allowance.
+The proxy opens every pooled connection at startup; if other downloaders share the account, set `prewarm_connections` lower (or `0`) so idle pooled connections don't use up its connection limit.
 
 Start the proxy:
 

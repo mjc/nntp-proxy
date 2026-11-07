@@ -366,6 +366,15 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         .and_then(|value| value.parse::<u8>().ok())
         .unwrap_or_else(defaults::stat_missing);
 
+    // Fail loudly: a typo silently falling back to "open every connection"
+    // would defeat the point of lowering it.
+    let prewarm_key = format!("NNTP_SERVER_{index}_PREWARM_CONNECTIONS");
+    let prewarm_connections = env.get(&prewarm_key).map(|value| {
+        value.parse::<usize>().unwrap_or_else(|_| {
+            panic!("Invalid {prewarm_key}: '{value}' (must be a non-negative integer)")
+        })
+    });
+
     Some(Server {
         host: crate::types::HostName::try_new(host.clone())
             .unwrap_or_else(|_| panic!("Invalid hostname in {host_key}: '{host}'")),
@@ -388,6 +397,7 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         compress: None,
         compress_level: None,
         backend_idle_timeout: crate::config::defaults::backend_idle_timeout(),
+        prewarm_connections,
     })
 }
 
@@ -637,6 +647,7 @@ pub fn create_default_config() -> Config {
             compress: None,
             compress_level: None,
             backend_idle_timeout: defaults::backend_idle_timeout(),
+            prewarm_connections: None,
         }],
         ..Default::default()
     }
@@ -761,6 +772,39 @@ mod tests {
             server.connection_keepalive,
             Some(std::time::Duration::from_secs(300))
         );
+    }
+
+    #[test]
+    fn test_parse_server_from_env_prewarm_connections() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_1_HOST", "news2.example.com")
+            .set("NNTP_SERVER_1_PREWARM_CONNECTIONS", "0")
+            .set("NNTP_SERVER_2_HOST", "news3.example.com")
+            .set("NNTP_SERVER_2_PREWARM_CONNECTIONS", "4");
+
+        assert_eq!(
+            parse_server_from_env(0, &env).unwrap().prewarm_connections,
+            None
+        );
+        assert_eq!(
+            parse_server_from_env(1, &env).unwrap().prewarm_connections,
+            Some(0)
+        );
+        assert_eq!(
+            parse_server_from_env(2, &env).unwrap().prewarm_connections,
+            Some(4)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "NNTP_SERVER_0_PREWARM_CONNECTIONS")]
+    fn test_parse_server_from_env_invalid_prewarm_connections_panics() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_0_PREWARM_CONNECTIONS", "-1");
+
+        let _ = parse_server_from_env(0, &env);
     }
 
     #[test]
@@ -1091,6 +1135,58 @@ username = "backend-user"
                 .to_string()
                 .contains("references unknown server 'Missing'")
         );
+    }
+
+    #[test]
+    fn test_load_config_reads_prewarm_connections_from_toml() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        let config_content = r#"
+[[servers]]
+host = "news.example.com"
+port = 563
+name = "Shared"
+max_connections = 20
+prewarm_connections = 5
+
+[[servers]]
+host = "news2.example.com"
+port = 563
+name = "Default"
+"#;
+        config_file.write_all(config_content.as_bytes()).unwrap();
+        config_file.flush().unwrap();
+
+        let config =
+            load_config_with_env_provider(config_file.path().to_str().unwrap(), &MockEnv::new())
+                .unwrap();
+
+        assert_eq!(config.servers[0].prewarm_connections, Some(5));
+        assert_eq!(config.servers[1].prewarm_connections, None);
+    }
+
+    #[test]
+    fn test_load_config_env_prewarm_connections_override_is_validated() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        let config_content = r#"
+[[servers]]
+host = "news.example.com"
+port = 563
+name = "File"
+"#;
+        config_file.write_all(config_content.as_bytes()).unwrap();
+        config_file.flush().unwrap();
+        let path = config_file.path().to_str().unwrap();
+
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "env.example.com")
+            .set("NNTP_SERVER_0_MAX_CONNECTIONS", "8")
+            .set("NNTP_SERVER_0_PREWARM_CONNECTIONS", "2");
+        let config = load_config_with_env_provider(path, &env).unwrap();
+        assert_eq!(config.servers[0].prewarm_connections, Some(2));
+
+        env.set("NNTP_SERVER_0_PREWARM_CONNECTIONS", "9");
+        let error = load_config_with_env_provider(path, &env).unwrap_err();
+        assert!(error.to_string().contains("prewarm_connections"));
     }
 
     #[test]
