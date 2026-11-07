@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - An article request answers `430` instead of `503` when a backend has returned `430` and every other eligible backend is only busy or failing. Clients such as NZBGet treat `430` as a missing article and `503` as a server failure.
+### Fixed
+
+- A backend that accepts a command and never answers can no longer hold a request forever. The first reply bytes must arrive within 30 seconds, and each adaptive precheck attempt must finish within 2 seconds. A timeout retries once on a fresh connection, removes the stuck connection from the pool, and is never recorded as a `430`.
 
 ## [0.6.0] - 2026-11-05
 

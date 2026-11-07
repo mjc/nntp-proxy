@@ -122,7 +122,7 @@ pub mod socket {
 pub mod timeout {
     use super::Duration;
 
-    /// Timeout for reading responses from backend servers
+    /// Timeout for the first reply bytes after a command is sent to a backend
     pub const BACKEND_READ: Duration = Duration::from_secs(30);
 
     /// Timeout for executing a command on backend
@@ -132,8 +132,8 @@ pub mod timeout {
     pub const CONNECTION: Duration = Duration::from_secs(10);
 
     /// Timeout for adaptive precheck queries (STAT/HEAD)
-    /// If a backend doesn't respond within this time, treat as 430 (missing)
-    /// This prevents slow backends from blocking all client connections
+    /// An attempt that runs longer is a transport error (inconclusive, never a
+    /// 430 fact), so a slow backend cannot stall the precheck
     pub const PRECHECK_QUERY: Duration = Duration::from_secs(2);
 
     /// Timeout for closing the cache during graceful shutdown

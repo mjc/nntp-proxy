@@ -149,6 +149,28 @@ where
     ClassifiedResponse::read_for_test(conn, request, buffer).await
 }
 
+/// Read the first bytes of the reply to a request already sent on `stream`,
+/// giving up after [`crate::constants::timeout::BACKEND_READ`].
+///
+/// A backend that accepts a command and never answers would otherwise hold the
+/// client request, and the pooled connection, forever. The timeout is an
+/// ordinary backend error: it is never a 430 fact, and the caller's
+/// `ConnectionGuard` drops the connection dirty instead of returning it to the
+/// pool.
+pub(crate) async fn read_first_response_bytes(
+    buffer: &mut PooledBuffer,
+    stream: &mut crate::stream::ConnectionStream,
+) -> Result<()> {
+    let timeout = crate::constants::timeout::BACKEND_READ;
+    let n = tokio::time::timeout(timeout, buffer.read_from(stream))
+        .await
+        .map_err(|_| anyhow::anyhow!("Backend sent no response within {timeout:?}"))??;
+    if n == 0 {
+        anyhow::bail!("Backend connection closed unexpectedly");
+    }
+    Ok(())
+}
+
 /// Execute a direct request and return the response bound to the connection
 /// that supplied it.  The exchange owns both values until a consuming
 /// forwarding, capture, or observation operation is selected.
@@ -161,10 +183,7 @@ pub(crate) async fn execute_request_exchange<'pool>(
 ) -> Result<BackendResponseExchange<'pool>> {
     request.send_to(conn.stream_mut()).await?;
 
-    let n = buffer.read_from(conn.stream_mut()).await?;
-    if n == 0 {
-        anyhow::bail!("Backend connection closed unexpectedly");
-    }
+    read_first_response_bytes(&mut buffer, conn.stream_mut()).await?;
 
     BackendResponseExchange::read(conn, request, buffer, pool, backend_id).await
 }
@@ -184,10 +203,7 @@ pub(crate) async fn execute_request_exchange_timed<'pool>(
     request.send_to(conn.stream_mut()).await?;
     let after_send = Instant::now();
 
-    let n = buffer.read_from(conn.stream_mut()).await?;
-    if n == 0 {
-        anyhow::bail!("Backend connection closed unexpectedly");
-    }
+    read_first_response_bytes(&mut buffer, conn.stream_mut()).await?;
 
     let exchange = BackendResponseExchange::read(conn, request, buffer, pool, backend_id).await?;
     let after_recv = Instant::now();

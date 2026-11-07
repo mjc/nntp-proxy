@@ -281,10 +281,7 @@ pub(crate) async fn read_exchange_for_already_sent_request<'pool>(
 ) -> anyhow::Result<BackendResponseExchange<'pool>> {
     let mut buffer = take_queued_input_or_acquire_empty(conn.stream_mut(), pool);
     if buffer.initialized() == 0 {
-        let n = buffer.read_from(conn.stream_mut()).await?;
-        if n == 0 {
-            anyhow::bail!("Backend connection closed unexpectedly");
-        }
+        crate::session::backend::read_first_response_bytes(&mut buffer, conn.stream_mut()).await?;
     }
 
     let response = ClassifiedResponse::read_unbound(conn.stream_mut(), request, buffer).await?;

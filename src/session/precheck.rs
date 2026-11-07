@@ -198,7 +198,7 @@ async fn query_backend(
 
     // Retry once on backend error (fresh connection on second attempt)
     let query_result = crate::session::retry::retry_once!(
-        execute_backend_query(deps, provider, &backend, request).await,
+        bounded_backend_query(deps, provider, &backend, request).await,
         backend = backend_id.as_index()
     )
     .unwrap_or(QueryAttemptResult::Error);
@@ -211,6 +211,28 @@ async fn query_backend(
         QueryAttemptResult::Missing => QueryResult::Missing(backend),
         QueryAttemptResult::Error => QueryResult::Error,
     }
+}
+
+/// Run one precheck attempt, giving up after
+/// [`crate::constants::timeout::PRECHECK_QUERY`].
+///
+/// A tier is only reported missing after every backend in it has answered, so
+/// one silent backend would otherwise stall the whole precheck. A timeout is a
+/// transport error, so the caller retries once on a fresh connection, and it
+/// is never a 430 fact. Cancelling the attempt drops its `ConnectionGuard`,
+/// which removes the stuck connection instead of returning it to the pool.
+async fn bounded_backend_query(
+    deps: &OwnedDeps,
+    provider: &crate::pool::DeadpoolConnectionProvider,
+    backend: &ArticleBackend,
+    request: &RequestContext,
+) -> Result<QueryAttemptResult, ()> {
+    tokio::time::timeout(
+        crate::constants::timeout::PRECHECK_QUERY,
+        execute_backend_query(deps, provider, backend, request),
+    )
+    .await
+    .unwrap_or(Err(()))
 }
 
 /// Execute a single backend query attempt
@@ -1027,6 +1049,102 @@ mod tests {
             0,
         );
         (selector, backend_id)
+    }
+
+    /// Backend that completes setup but never answers `STAT`. Returns its
+    /// address and the number of connections accepted.
+    async fn spawn_silent_stat_server()
+    -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accept_count = Arc::clone(&accepts);
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                accept_count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut reader = BufReader::new(stream);
+                    if reader.get_mut().write_all(b"200 mock\r\n").await.is_err() {
+                        return;
+                    }
+                    let mut command = Vec::new();
+                    loop {
+                        command.clear();
+                        match reader.read_until(b'\n', &mut command).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        let kind = crate::protocol::RequestContext::parse(&command)
+                            .map(|request| request.kind());
+                        if matches!(kind, Some(crate::protocol::RequestKind::Stat)) {
+                            continue;
+                        }
+                        if reader
+                            .get_mut()
+                            .write_all(b"200 mock setup complete\r\n")
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        (addr, accepts)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn query_backend_times_out_and_retries_when_backend_never_answers() {
+        use std::sync::atomic::Ordering;
+
+        let (addr, accepts) = spawn_silent_stat_server().await;
+        let (selector, backend_id) = selector_with_backend(addr, 2);
+        let provider = selector
+            .backend_provider(backend_id)
+            .expect("backend has a provider")
+            .clone();
+
+        let deps = OwnedDeps {
+            router: Arc::new(selector),
+            cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
+            buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 2),
+            metrics: MetricsCollector::new(1),
+        };
+
+        let request =
+            RequestContext::parse(b"STAT <silent@example.com>\r\n").expect("valid request line");
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(
+            crate::constants::timeout::BACKEND_READ,
+            query_backend(&deps, eligible(backend_id), &request),
+        )
+        .await
+        .expect("a silent backend must not stall the precheck");
+
+        assert!(
+            matches!(result, QueryResult::Error),
+            "a timeout is inconclusive, never a missing fact"
+        );
+        assert!(started.elapsed() >= crate::constants::timeout::PRECHECK_QUERY * 2);
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            2,
+            "retry uses a fresh connection"
+        );
+        assert_eq!(
+            crate::pool::ConnectionProvider::status(&provider)
+                .created
+                .get(),
+            0,
+            "a timed-out connection was returned to the pool"
+        );
     }
 
     #[tokio::test]
