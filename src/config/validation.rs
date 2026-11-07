@@ -79,6 +79,18 @@ fn validate_server(server: &Server) -> Result<()> {
         ));
     }
 
+    // Rejected rather than capped: a value above the pool size usually means
+    // max_connections was lowered and prewarm_connections was forgotten.
+    if let Some(prewarm) = server.prewarm_connections
+        && prewarm > server.max_connections.get()
+    {
+        return Err(anyhow::anyhow!(
+            "backend '{}' prewarm_connections ({prewarm}) must be <= max_connections ({})",
+            server.name.as_str(),
+            server.max_connections.get()
+        ));
+    }
+
     // Name, host, port, max_connections validations now enforced by types:
     // - HostName/ServerName cannot be empty (validated at construction)
     // - Port cannot be 0 (NonZeroU16)
@@ -158,6 +170,33 @@ mod tests {
             .validate()
             .expect_err("incomplete credentials must fail");
         assert!(error.to_string().contains("configured together"));
+    }
+
+    #[test]
+    fn test_validate_prewarm_connections_bounded_by_max_connections() {
+        let config_with_prewarm = |prewarm: usize| {
+            let server = Server::builder("localhost", Port::try_new(119).unwrap())
+                .name("test")
+                .max_connections(crate::types::MaxConnections::try_new(4).unwrap())
+                .prewarm_connections(prewarm)
+                .build()
+                .unwrap();
+            Config {
+                servers: vec![server],
+                ..Default::default()
+            }
+        };
+
+        assert!(config_with_prewarm(0).validate().is_ok());
+        assert!(config_with_prewarm(4).validate().is_ok());
+        let error = config_with_prewarm(5)
+            .validate()
+            .expect_err("prewarm above max_connections must fail");
+        assert!(
+            error
+                .to_string()
+                .contains("prewarm_connections (5) must be <= max_connections (4)")
+        );
     }
 
     #[test]
