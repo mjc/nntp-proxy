@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- A cache-miss `ARTICLE`, `BODY`, or `HEAD` with `store_article_bodies = true` now reaches the client as the backend sends it. The proxy used to capture the whole response, up to 4 MiB, before writing its first byte. Each read is now written first and then kept for the cache. A response that outgrows the retention limit keeps streaming and is not cached. A client that disconnects partway leaves nothing in the cache, and the backend response is still drained so the connection can be reused.
+
+### Fixed
+
+- A cache-miss capture with `store_article_bodies = true` no longer keeps a whole 1 MiB read buffer for every backend read. TLS reads deliver at most about 16 KiB, so a ~750 KB article held about 47 MiB and exhausted the read-buffer pool. A read buffer now moves into the capture only when the read fills at least half of it. Smaller reads are copied into capture buffers, which keeps a capture's memory within about twice the article size plus one capture buffer.
+
 ## [0.6.0] - 2026-11-05
 
 ### Added
