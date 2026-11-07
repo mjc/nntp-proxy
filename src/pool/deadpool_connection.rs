@@ -924,12 +924,22 @@ impl managed::Manager for TcpManager {
             Ok(_) => attempt.succeeded(),
             Err(error) if error.is_login_refusal() => {
                 let retry_in = attempt.refused();
-                tracing::warn!(
-                    backend = %self.name,
-                    retry_in_secs = retry_in.as_secs(),
-                    error = %error,
-                    "Backend refused login; pausing new connections to it"
-                );
+                if retry_in.is_zero() {
+                    // A late refusal from before a successful login: the gate
+                    // stays open, so claiming a pause would mislead.
+                    tracing::warn!(
+                        backend = %self.name,
+                        error = %error,
+                        "Backend refused login; refusal predates the current schedule, not pausing"
+                    );
+                } else {
+                    tracing::warn!(
+                        backend = %self.name,
+                        retry_in_secs = retry_in.as_secs(),
+                        error = %error,
+                        "Backend refused login; pausing new connections to it"
+                    );
+                }
             }
             // A network failure or timeout says nothing about the account;
             // dropping the attempt hands any probe slot to the next caller.
