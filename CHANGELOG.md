@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- An article request answers `430` instead of `503` when a backend has returned `430` and every other eligible backend is only busy or failing. Clients such as NZBGet treat `430` as a missing article and `503` as a server failure.
+
 ## [0.6.0] - 2026-11-05
 
 ### Added

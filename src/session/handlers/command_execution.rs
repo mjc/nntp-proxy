@@ -3131,6 +3131,84 @@ mod tests {
         finalize_backend_connection(&mut backend_connection);
     }
 
+    /// Route one BODY request through the full retry loop against a tier-0 pair
+    /// plus a tier-1 backup, returning the first `reply_len` client-visible
+    /// bytes and how many article commands the backup received.
+    async fn route_with_unavailable_tier_peer(
+        primary_reply: &'static [u8],
+        reply_len: usize,
+    ) -> (Vec<u8>, usize) {
+        let session = test_session();
+        let (primary_port, _) = spawn_article_response_server(primary_reply).await;
+        let (bad_port, _) = spawn_article_response_server(b"bad reply\r\n").await;
+        let (backup_port, backup_article_commands) =
+            spawn_article_response_server(b"222 0 <backup@example.com>\r\npayload\r\n.\r\n").await;
+        let router =
+            router_with_tiered_backends([primary_port, bad_port, backup_port].map(|port| {
+                let tier = u8::from(port == backup_port);
+                (
+                    DeadpoolConnectionProvider::builder("127.0.0.1", port)
+                        .max_connections(1)
+                        .build()
+                        .unwrap(),
+                    tier,
+                )
+            }));
+        let (mut client_writer, mut client_read, _client_write) = client_writer_pair().await;
+        let mut request = request_context(b"BODY <tier-peer@example.com>\r\n");
+        let mut backend_connection = None;
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_to_client_bytes = crate::types::BackendToClientBytes::zero();
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            session.route_and_execute_request(
+                router,
+                &mut request,
+                &mut client_writer,
+                &mut backend_connection,
+                &mut client_to_backend_bytes,
+                &mut backend_to_client_bytes,
+            ),
+        )
+        .await
+        .expect("retry loop should finish")
+        .expect("retry loop should answer the client");
+        finalize_backend_connection(&mut backend_connection);
+        drop(client_writer);
+
+        let mut reply = vec![0; reply_len];
+        client_read.read_exact(&mut reply).await.unwrap();
+        (reply, backup_article_commands.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn real_430_with_only_unavailable_tier_peers_answers_430() {
+        let (reply, backup_article_commands) = route_with_unavailable_tier_peer(
+            b"430 No such article\r\n",
+            crate::protocol::NO_SUCH_ARTICLE.len(),
+        )
+        .await;
+
+        assert_eq!(reply, crate::protocol::NO_SUCH_ARTICLE);
+        assert_eq!(
+            backup_article_commands, 0,
+            "an unavailable tier-0 peer must still block escalation to tier 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_430_with_only_unavailable_tier_peers_still_answers_503() {
+        let (reply, backup_article_commands) = route_with_unavailable_tier_peer(
+            b"bad primary reply\r\n",
+            crate::protocol::BACKEND_ERROR.len(),
+        )
+        .await;
+
+        assert_eq!(reply, crate::protocol::BACKEND_ERROR);
+        assert_eq!(backup_article_commands, 0);
+    }
+
     #[tokio::test]
     async fn flush_disconnect_after_owned_response_reuses_backend_connection() {
         let session = test_session();
