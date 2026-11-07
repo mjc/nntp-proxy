@@ -29,6 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `XFEATURE COMPRESS GZIP`, with or without `TERMINATOR`, gets `503` in every routing mode. Hybrid and stateful sessions used to forward it, and a backend that accepted it sent overview data the proxy could not frame.
 - `CAPABILITIES` in `per-command` mode no longer lists `OVER` and `HDR`, which that mode rejects. It still lists `READER` because `MODE READER` is still forwarded.
 - Under load, a missing article could take 12–44 s to answer `430`, longer than NZBGet's 30-second article timeout, so the downloader recorded timeouts and blocked the server. Article requests now wait at most 3 s for a free connection on a backend, and `STAT` probes at most 2 s, before moving to the next backend. Previously each request waited the full 10-second pool timeout. A full pool is also no longer retried, which had doubled each wait.
+- Background `STAT` probes (the non-primary-tier prefetch and the retry sweep) no longer close a healthy backend connection after every probe. They dropped the connection instead of returning it to the pool, so each probe counted as a backend failure, shrank the pool for the replacement cooldown, and forced a new TLS login. Under a 120-connection NZBGet load this retired about 6 connections a second (389 in 60 s).
 ## [0.6.0] - 2026-11-05
 
 ### Added
