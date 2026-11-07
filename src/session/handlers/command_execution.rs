@@ -443,7 +443,12 @@ impl ClientSession {
             let stat_request = stat_request.clone_for_background_probe();
             probes.push(async move {
                 let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
-                let conn = match provider.checkout_connection_guard().await {
+                let conn = match provider
+                    .checkout_connection_guard_within(
+                        crate::constants::pool::STAT_PROBE_CHECKOUT_WAIT,
+                    )
+                    .await
+                {
                     Ok(conn) => conn.activate(),
                     Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
                 };
@@ -564,7 +569,12 @@ impl ClientSession {
                         .availability_slot(backend_id)
                         .expect("probe backend is registered");
                     let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
-                    let conn = match provider.checkout_connection_guard().await {
+                    let conn = match provider
+                        .checkout_connection_guard_within(
+                            crate::constants::pool::STAT_PROBE_CHECKOUT_WAIT,
+                        )
+                        .await
+                    {
                         Ok(conn) => conn.activate(),
                         Err(_) => return,
                     };
@@ -635,6 +645,7 @@ impl ClientSession {
             "Preparing direct backend attempt"
         );
         let attempt = match retry_once!(
+            unless = is_busy_backend;
             self.execute_backend_attempt(
                 provider,
                 backend,
@@ -983,7 +994,12 @@ impl ClientSession {
                         pool_waiting = checkout_status.waiting,
                         "Requesting pooled connection after retiring unhealthy cached batch connection"
                     );
-                    provider.checkout_connection_guard().await?.activate()
+                    provider
+                        .checkout_connection_guard_within(
+                            crate::constants::pool::ARTICLE_CHECKOUT_WAIT,
+                        )
+                        .await?
+                        .activate()
                 } else if can_expand_or_use_idle {
                     debug!(
                         client = %self.client_addr,
@@ -1000,7 +1016,12 @@ impl ClientSession {
                         "Using idle pool capacity before reusing cached batch connection"
                     );
                     *backend_connection = Some(BackendLease::new(cached_backend_id, guard));
-                    match provider.checkout_connection_guard().await {
+                    match provider
+                        .checkout_connection_guard_within(
+                            crate::constants::pool::ARTICLE_CHECKOUT_WAIT,
+                        )
+                        .await
+                    {
                         Ok(conn) => conn.activate(),
                         Err(err) => {
                             debug!(
@@ -1065,7 +1086,10 @@ impl ClientSession {
                     pool_waiting = checkout_status.waiting,
                     "Requesting pooled connection after backend switch"
                 );
-                let conn = provider.checkout_connection_guard().await?.activate();
+                let conn = provider
+                    .checkout_connection_guard_within(crate::constants::pool::ARTICLE_CHECKOUT_WAIT)
+                    .await?
+                    .activate();
                 let checkout_status = provider.status_counts();
                 trace!(
                     client = %self.client_addr,
@@ -1097,7 +1121,10 @@ impl ClientSession {
                     pool_waiting = checkout_status.waiting,
                     "Requesting pooled connection"
                 );
-                let conn = provider.checkout_connection_guard().await?.activate();
+                let conn = provider
+                    .checkout_connection_guard_within(crate::constants::pool::ARTICLE_CHECKOUT_WAIT)
+                    .await?
+                    .activate();
                 let checkout_status = provider.status_counts();
                 trace!(
                     client = %self.client_addr,
@@ -1664,6 +1691,15 @@ impl ClientSession {
         self.metrics
             .user_bytes_received(self.username(), resp_bytes);
     }
+}
+
+/// A full pool is still full a few milliseconds later, so retrying the same
+/// backend only doubles the wait; the router should move on to another one.
+fn is_busy_backend(error: &anyhow::Error) -> bool {
+    matches!(
+        error.downcast_ref::<crate::connection_error::ConnectionError>(),
+        Some(crate::connection_error::ConnectionError::PoolExhausted { .. })
+    )
 }
 
 #[cfg(test)]
@@ -2696,6 +2732,45 @@ mod tests {
         assert_eq!(article_commands.load(Ordering::SeqCst), 1);
         assert_eq!(availability.missing_bits(), 0);
         assert_eq!(availability.missing_bits(), 0);
+        assert_eq!(unavailable_backends.bits(), 0b0000_0001);
+    }
+
+    #[tokio::test]
+    async fn full_pool_is_skipped_after_the_article_checkout_wait() {
+        let session = test_session();
+        let (port, _accepts) = spawn_greeting_server().await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let _held = provider.checkout_connection_guard().await.unwrap();
+        let router = router_with_backend(provider);
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
+
+        let mut request = request_context(b"BODY <busy-backend@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+        };
+
+        let started = std::time::Instant::now();
+        let result = session
+            .try_backend_for_article(&router, &mut request, &mut client_writer, &mut state, false)
+            .await
+            .expect("a busy backend is unavailable, not a session error");
+
+        assert!(matches!(result, BackendAttemptResult::BackendUnavailable));
+        assert!(
+            started.elapsed() < crate::constants::pool::ARTICLE_CHECKOUT_WAIT * 2,
+            "a busy backend costs one bounded wait, not a pool timeout or a retried wait"
+        );
+        assert_eq!(availability.missing_bits(), 0, "busy is not a 430 fact");
         assert_eq!(unavailable_backends.bits(), 0b0000_0001);
     }
 

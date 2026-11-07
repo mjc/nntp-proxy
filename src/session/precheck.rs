@@ -224,7 +224,10 @@ async fn execute_backend_query(
     request: &RequestContext,
 ) -> Result<QueryAttemptResult, ()> {
     let backend_id = backend.backend_id();
-    let Ok(conn) = provider.checkout_connection_guard().await else {
+    let Ok(conn) = provider
+        .checkout_connection_guard_within(crate::constants::pool::STAT_PROBE_CHECKOUT_WAIT)
+        .await
+    else {
         return Ok(QueryAttemptResult::Error);
     };
     let conn = conn.activate();
