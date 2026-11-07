@@ -558,6 +558,12 @@ impl DeadpoolConnectionProvider {
                 },
             },
         };
+        // A backend in login backoff fails every checkout by design until its
+        // window closes; the refusal that opened the window was already logged.
+        if matches!(err, ConnectionError::LoginBackoff { .. }) {
+            debug!(pool = %self.name, error = %err, "Connection acquisition skipped");
+            return Err(err);
+        }
         let status = self.pool.status();
         warn!(
             pool = %self.name,

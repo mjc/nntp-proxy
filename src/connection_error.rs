@@ -45,6 +45,12 @@ pub enum ConnectionError {
     #[error("Connection limit exceeded for backend '{backend}': {response}")]
     ConnectionLimitExceeded { backend: String, response: String },
 
+    #[error("Backend '{backend}' refused a recent login; not retrying for {retry_in:?}")]
+    LoginBackoff {
+        backend: String,
+        retry_in: std::time::Duration,
+    },
+
     #[error("Invalid greeting from backend '{backend}': {greeting}")]
     InvalidGreeting { backend: String, greeting: String },
 
@@ -100,6 +106,21 @@ pub enum ConnectionError {
 }
 
 impl ConnectionError {
+    /// The backend answered but would not let this session in.
+    ///
+    /// Unlike a network error, an immediate retry gets the same answer, so the
+    /// pool backs off instead of logging in again for every request.
+    #[must_use]
+    pub const fn is_login_refusal(&self) -> bool {
+        matches!(
+            self,
+            Self::AuthenticationFailed { .. }
+                | Self::ConnectionLimitExceeded { .. }
+                | Self::InvalidGreeting { .. }
+                | Self::UnexpectedAuthResponse { .. }
+        )
+    }
+
     pub fn dns_resolver_init(
         backend: impl Into<String>,
         source: impl StdError + Send + Sync + 'static,
@@ -137,6 +158,43 @@ impl ConnectionError {
 mod tests {
     use super::*;
     use std::error::Error;
+
+    #[test]
+    fn login_refusals_are_classified() {
+        let backend = || "b".to_string();
+        let refusals = [
+            ConnectionError::AuthenticationFailed {
+                backend: backend(),
+                response: "502 connection limit (10) reached".into(),
+            },
+            ConnectionError::ConnectionLimitExceeded {
+                backend: backend(),
+                response: "482".into(),
+            },
+            ConnectionError::InvalidGreeting {
+                backend: backend(),
+                greeting: "502 too many connections".into(),
+            },
+            ConnectionError::UnexpectedAuthResponse {
+                backend: backend(),
+                response: "500".into(),
+            },
+        ];
+        assert!(refusals.iter().all(ConnectionError::is_login_refusal));
+
+        let not_refusals = [
+            ConnectionError::IoError(std::io::Error::other("reset")),
+            ConnectionError::LoginBackoff {
+                backend: backend(),
+                retry_in: std::time::Duration::from_secs(5),
+            },
+            ConnectionError::PoolExhausted {
+                backend: backend(),
+                max_size: 1,
+            },
+        ];
+        assert!(!not_refusals.iter().any(ConnectionError::is_login_refusal));
+    }
 
     #[test]
     fn test_authentication_failed_error() {
