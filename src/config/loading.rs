@@ -366,6 +366,18 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         .and_then(|value| value.parse::<u8>().ok())
         .unwrap_or_else(defaults::stat_missing);
 
+    // Fail loudly: silently ignoring an exclusion would let stateful sessions
+    // reach a backend with different article numbering.
+    let stateful_sessions_key = format!("NNTP_SERVER_{index}_STATEFUL_SESSIONS");
+    let stateful_sessions = env.get(&stateful_sessions_key).map_or_else(
+        crate::config::StatefulSessions::default,
+        |value| {
+            value
+                .parse()
+                .unwrap_or_else(|error| panic!("Invalid {stateful_sessions_key}: {error}"))
+        },
+    );
+
     Some(Server {
         host: crate::types::HostName::try_new(host.clone())
             .unwrap_or_else(|_| panic!("Invalid hostname in {host_key}: '{host}'")),
@@ -385,6 +397,7 @@ pub fn parse_server_from_env<E: EnvProvider>(index: usize, env: &E) -> Option<Se
         health_check_max_per_cycle,
         health_check_pool_timeout,
         tier,
+        stateful_sessions,
         compress: None,
         compress_level: None,
         backend_idle_timeout: crate::config::defaults::backend_idle_timeout(),
@@ -460,6 +473,48 @@ pub fn load_config(config_path: &str) -> Result<Config> {
     load_config_with_env_provider(config_path, &StdEnvProvider)
 }
 
+/// Top-level tables whose unknown keys are reported.
+///
+/// A misspelled server or routing key silently changes behavior (an ignored
+/// `stateful_sessions` lets indexer sessions reach the wrong provider), so these
+/// are surfaced. Other tables are left alone: legacy layouts such as `[proxy]`
+/// are read from the raw TOML by the migration code and would otherwise produce
+/// false warnings.
+const UNKNOWN_KEY_REPORTED_TABLES: &[&str] = &["servers", "routing"];
+
+/// Deserialize a config file and return the unknown keys in
+/// [`UNKNOWN_KEY_REPORTED_TABLES`] as dotted paths such as `servers.1.tierr`.
+///
+/// Unknown keys are reported rather than rejected so configs that worked
+/// before keep loading.
+fn parse_config_reporting_unknown_keys(
+    content: &str,
+) -> Result<(Config, Vec<String>), toml::de::Error> {
+    fn top_level_table<'p>(path: &'p serde_ignored::Path<'p>) -> Option<&'p str> {
+        match path {
+            serde_ignored::Path::Root => None,
+            serde_ignored::Path::Map {
+                parent: serde_ignored::Path::Root,
+                key,
+            } => Some(key),
+            serde_ignored::Path::Map { parent, .. }
+            | serde_ignored::Path::Seq { parent, .. }
+            | serde_ignored::Path::Some { parent }
+            | serde_ignored::Path::NewtypeStruct { parent }
+            | serde_ignored::Path::NewtypeVariant { parent } => top_level_table(parent),
+        }
+    }
+
+    let mut unknown_keys = Vec::new();
+    let config = serde_ignored::deserialize(toml::Deserializer::parse(content)?, |path| {
+        if top_level_table(&path).is_some_and(|table| UNKNOWN_KEY_REPORTED_TABLES.contains(&table))
+        {
+            unknown_keys.push(path.to_string());
+        }
+    })?;
+    Ok((config, unknown_keys))
+}
+
 fn load_config_with_env_provider<E: EnvProvider>(config_path: &str, env: &E) -> Result<Config> {
     use anyhow::Context;
 
@@ -469,8 +524,11 @@ fn load_config_with_env_provider<E: EnvProvider>(config_path: &str, env: &E) -> 
     let raw_config: toml::Value = toml::from_str(&config_content)
         .with_context(|| format!("Failed to parse config file '{config_path}'"))?;
 
-    let mut config: Config = toml::from_str(&config_content)
+    let (mut config, unknown_keys) = parse_config_reporting_unknown_keys(&config_content)
         .with_context(|| format!("Failed to parse config file '{config_path}'"))?;
+    for key in &unknown_keys {
+        tracing::warn!("Ignoring unknown config key '{}' in '{}'", key, config_path);
+    }
 
     let mut file_config = config.clone();
     let migrated = migrate_legacy_config(&mut file_config, &raw_config);
@@ -634,6 +692,7 @@ pub fn create_default_config() -> Config {
             health_check_max_per_cycle: defaults::health_check_max_per_cycle(),
             health_check_pool_timeout: defaults::health_check_pool_timeout(),
             tier: 0,
+            stateful_sessions: crate::config::StatefulSessions::default(),
             compress: None,
             compress_level: None,
             backend_idle_timeout: defaults::backend_idle_timeout(),
@@ -882,6 +941,184 @@ mod tests {
 
         let server = parse_server_from_env(0, &env).unwrap();
         assert_eq!(server.stat_missing, 3);
+    }
+
+    #[test]
+    fn test_parse_server_from_env_stateful_sessions() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_1_HOST", "news2.example.com")
+            .set("NNTP_SERVER_1_STATEFUL_SESSIONS", "Excluded");
+
+        assert_eq!(
+            parse_server_from_env(0, &env).unwrap().stateful_sessions,
+            crate::config::StatefulSessions::Allowed
+        );
+        assert_eq!(
+            parse_server_from_env(1, &env).unwrap().stateful_sessions,
+            crate::config::StatefulSessions::Excluded
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "NNTP_SERVER_0_STATEFUL_SESSIONS")]
+    fn test_parse_server_from_env_invalid_stateful_sessions_panics() {
+        let mut env = MockEnv::new();
+        env.set("NNTP_SERVER_0_HOST", "news.example.com")
+            .set("NNTP_SERVER_0_STATEFUL_SESSIONS", "never");
+
+        let _ = parse_server_from_env(0, &env);
+    }
+
+    #[test]
+    fn test_unknown_server_and_routing_keys_are_reported() {
+        let (config, mut unknown) = parse_config_reporting_unknown_keys(
+            r#"
+[[servers]]
+host = "news.example.com"
+port = 563
+name = "Primary"
+
+[[servers]]
+host = "news2.example.com"
+port = 563
+name = "Download-only"
+stateful_session = "excluded"
+
+[routing]
+mode = "hybrid"
+strategy = "least-loaded"
+retry_tiers = true
+
+[routing.queue.backpressure]
+enabled = true
+sleepy = 1
+"#,
+        )
+        .unwrap();
+
+        unknown.sort();
+        assert_eq!(
+            unknown,
+            [
+                "routing.queue.backpressure.sleepy",
+                "routing.retry_tiers",
+                "servers.1.stateful_session",
+            ]
+        );
+        // Unknown keys are reported, not fatal, and known aliases still apply.
+        assert_eq!(config.servers.len(), 2);
+        assert_eq!(config.routing.routing_mode, RoutingMode::Hybrid);
+        assert_eq!(
+            config.routing.backend_selection,
+            BackendSelectionStrategy::LeastLoaded
+        );
+    }
+
+    #[test]
+    fn test_unknown_keys_outside_reported_tables_are_not_reported() {
+        // `[proxy]` is a legacy table the migration reads from raw TOML, so
+        // warning about it would be noise.
+        let (_, unknown) = parse_config_reporting_unknown_keys(
+            r#"
+[proxy]
+routing_mode = "stateful"
+
+[[servers]]
+host = "news.example.com"
+port = 563
+name = "Primary"
+stateful_sessions = "allowed"
+"#,
+        )
+        .unwrap();
+
+        assert!(unknown.is_empty(), "{unknown:?}");
+    }
+
+    #[test]
+    fn test_load_config_with_unknown_server_key_still_loads() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        config_file
+            .write_all(
+                br#"
+[[servers]]
+host = "news.example.com"
+port = 563
+name = "Primary"
+max_conections = 5
+"#,
+            )
+            .unwrap();
+        config_file.flush().unwrap();
+
+        let config =
+            load_config_with_env_provider(config_file.path().to_str().unwrap(), &MockEnv::new())
+                .unwrap();
+        assert_eq!(config.servers.len(), 1);
+        assert_eq!(
+            config.servers[0].max_connections,
+            crate::config::defaults::max_connections()
+        );
+    }
+
+    #[test]
+    fn test_load_config_parses_stateful_sessions() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        config_file
+            .write_all(
+                br#"
+[[servers]]
+host = "news.example.com"
+port = 563
+name = "Primary"
+
+[[servers]]
+host = "news2.example.com"
+port = 563
+name = "Download-only"
+stateful_sessions = "excluded"
+"#,
+            )
+            .unwrap();
+        config_file.flush().unwrap();
+
+        let config =
+            load_config_with_env_provider(config_file.path().to_str().unwrap(), &MockEnv::new())
+                .unwrap();
+        assert_eq!(
+            config.servers[0].stateful_sessions,
+            crate::config::StatefulSessions::Allowed
+        );
+        assert_eq!(
+            config.servers[1].stateful_sessions,
+            crate::config::StatefulSessions::Excluded
+        );
+    }
+
+    #[test]
+    fn test_load_config_rejects_hybrid_without_allowed_backend() {
+        let mut config_file = NamedTempFile::new().unwrap();
+        config_file
+            .write_all(
+                br#"
+[[servers]]
+host = "news.example.com"
+port = 563
+name = "Download-only"
+stateful_sessions = "excluded"
+"#,
+            )
+            .unwrap();
+        config_file.flush().unwrap();
+
+        let error =
+            load_config_with_env_provider(config_file.path().to_str().unwrap(), &MockEnv::new())
+                .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("stateful_sessions"),
+            "{error:#}"
+        );
     }
 
     #[test]

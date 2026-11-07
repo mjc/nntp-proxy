@@ -20,7 +20,7 @@
 use crate::session::ClientSession;
 use crate::types::TransferMetrics;
 use anyhow::{Context, Result};
-use tokio::io::BufReader;
+use tokio::io::{AsyncWriteExt, BufReader};
 use tracing::info;
 
 /// Error context for hybrid mode operations
@@ -159,7 +159,7 @@ impl ClientSession {
     pub(super) async fn switch_to_stateful_mode<R, W>(
         &mut self,
         client_reader: BufReader<R>,
-        client_write: W,
+        mut client_write: W,
         initial_request: crate::command::StatefulHandoff,
         client_to_backend_bytes: u64,
         backend_to_client_bytes: u64,
@@ -168,10 +168,26 @@ impl ClientSession {
         R: tokio::io::AsyncRead + Unpin,
         W: tokio::io::AsyncWrite + Unpin,
     {
-        let mut backend = self
-            .acquire_stateful_backend()
-            .await
-            .context("Failed to acquire backend for stateful mode")?;
+        let mut backend = match self.acquire_stateful_backend().await {
+            Ok(backend) => backend,
+            Err(error) => {
+                // Answer like stateful mode does: a silently closed socket looks
+                // like a network fault, so the client can't tell a retry is the
+                // right response. If this write fails the client already left,
+                // which is a normal disconnect rather than a backend error.
+                client_write
+                    .write_all(crate::protocol::BACKEND_UNAVAILABLE)
+                    .await
+                    .map_err(crate::session::SessionError::from)?;
+                client_write
+                    .flush()
+                    .await
+                    .map_err(crate::session::SessionError::from)?;
+                return Err(crate::session::SessionError::from(
+                    error.context("Failed to acquire backend for stateful mode"),
+                ));
+            }
+        };
 
         // Start stateful session metrics tracking
         let _session_guard = StatefulSessionGuard::start(&self.metrics);
@@ -267,7 +283,7 @@ impl ClientSession {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!(error::ROUTER_REQUIRED))?;
 
-        let backend_id = router.route(crate::router::RouteRequest::new(self.client_id))?;
+        let backend_id = router.route_stateful_session(self.client_id)?;
 
         // Guard pending_count immediately — if get_pooled_connection fails,
         // the guard drops and decrements automatically
@@ -387,12 +403,63 @@ mod tests {
             RoutingMode::Hybrid,
         )
         .expect("GROUP starts a hybrid stateful handoff");
-        let (client_write, client_read) = tokio::io::duplex(64);
+        let (_client_input, session_input) = tokio::io::duplex(64);
+        let (session_output, mut client_output) = tokio::io::duplex(64);
 
         let result = session
             .switch_to_stateful_mode(
-                BufReader::new(client_read),
-                client_write,
+                BufReader::new(session_input),
+                session_output,
+                stateful_request,
+                0,
+                0,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::session::SessionError::Backend(_))
+        ));
+        assert_eq!(session.mode(), SessionMode::PerCommand);
+
+        let mut reply = vec![0; crate::protocol::BACKEND_UNAVAILABLE.len()];
+        client_output
+            .read_exact(&mut reply)
+            .await
+            .expect("client receives a status line after the failed handoff");
+        assert_eq!(reply, crate::protocol::BACKEND_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn hybrid_handoff_never_pins_a_stateful_excluded_backend() {
+        // The only backend is excluded, so the handoff must answer 400 rather
+        // than pin the session to it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut router = BackendSelector::new();
+        router.add_backend(
+            ServerName::try_new("download-only".to_owned()).unwrap(),
+            DeadpoolConnectionProvider::builder("127.0.0.1", listener.local_addr().unwrap().port())
+                .max_connections(2)
+                .build()
+                .unwrap(),
+            0,
+        );
+        router.exclude_from_stateful_sessions(crate::types::BackendId::from_index(0));
+        let mut session = test_hybrid_session(Arc::new(router));
+        let request = RequestContext::parse(b"GROUP alt.test\r\n").expect("valid request");
+        let stateful_request = CommandHandler::prepare_stateful_handoff(
+            request,
+            crate::command::AuthenticationAccess::Unrestricted,
+            RoutingMode::Hybrid,
+        )
+        .expect("GROUP starts a hybrid stateful handoff");
+        let (_client_input, session_input) = tokio::io::duplex(64);
+        let (session_output, mut client_output) = tokio::io::duplex(64);
+
+        let result = session
+            .switch_to_stateful_mode(
+                BufReader::new(session_input),
+                session_output,
                 stateful_request,
                 0,
                 0,
@@ -401,6 +468,50 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(session.mode(), SessionMode::PerCommand);
+        let mut reply = vec![0; crate::protocol::BACKEND_UNAVAILABLE.len()];
+        client_output.read_exact(&mut reply).await.unwrap();
+        assert_eq!(reply, crate::protocol::BACKEND_UNAVAILABLE);
+        let accepted =
+            tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept()).await;
+        assert!(accepted.is_err(), "excluded backend must not be dialed");
+    }
+
+    #[tokio::test]
+    async fn failed_hybrid_handoff_reply_to_departed_client_is_a_disconnect() {
+        let addr: std::net::SocketAddr = "127.0.0.1:119".parse().expect("valid client address");
+        let mut session = ClientSession::new_with_router(
+            ClientAddress::from(addr),
+            BufferPool::new(BufferSize::try_new(1024).expect("valid buffer size"), 1),
+            Arc::new(BackendSelector::new()),
+            RoutingMode::Hybrid,
+            Arc::new(AuthHandler::new(None, None).expect("valid auth handler")),
+            MetricsCollector::new(1),
+        );
+        let request = RequestContext::parse(b"GROUP alt.test\r\n").expect("valid request");
+        let stateful_request = CommandHandler::prepare_stateful_handoff(
+            request,
+            crate::command::AuthenticationAccess::Unrestricted,
+            RoutingMode::Hybrid,
+        )
+        .expect("GROUP starts a hybrid stateful handoff");
+        let (_client_input, session_input) = tokio::io::duplex(64);
+        let (session_output, client_output) = tokio::io::duplex(64);
+        drop(client_output);
+
+        let result = session
+            .switch_to_stateful_mode(
+                BufReader::new(session_input),
+                session_output,
+                stateful_request,
+                0,
+                0,
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(crate::session::SessionError::ClientDisconnect(_))
+        ));
     }
 
     proptest::proptest! {

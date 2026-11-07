@@ -94,6 +94,7 @@ rand = "0.10"  # Jittered backoff for stale-connection retries
 flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }  # RFC 8054 COMPRESS DEFLATE
 pin-project-lite = "0.2"  # Safe pin projection (already in dep tree via tokio)
 hickory-resolver = { version = "0.26", features = ["tokio", "system-config"] }  # DNS lookups with TTL-aware caching from system resolver config
+serde_ignored = "0.1"  # Report unknown [[servers]]/[routing] config keys instead of silently ignoring them
 
 [dev-dependencies]
 tokio = { version = "1.54", features = ["test-util"] }  # Paused time for deterministic async tests

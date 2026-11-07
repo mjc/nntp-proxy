@@ -75,6 +75,8 @@ For an article lookup, the proxy tries the next tier after every eligible server
 
 Hybrid routing is the default. Independent commands share backend connections, and a command that needs reader state, such as `GROUP`, switches that client to a dedicated backend. `stateful` dedicates a backend connection from the start. `per-command` is for stateless commands such as `ARTICLE <message-id>`. `per-command` rejects a command that needs reader state. Select either explicit mode with `--routing-mode <MODE>`. See [Runtime and routing](docs/operator/runtime-and-routing.md). Selection and queue settings are in [Configuration](docs/operator/configuration.md).
 
+Providers number articles independently. If a client stores article numbers, such as an indexer that tracks `GROUP`/`XOVER` positions, set `stateful_sessions = "excluded"` on each server whose numbering differs. That server still serves message-ID requests but never gets a dedicated session or a `LIST` reply. See [Article numbering across providers](docs/operator/configuration.md#article-numbering-across-providers).
+
 ## Caching
 
 By default, the proxy remembers article-missing (`430`) responses without storing article bodies. Misses are recorded by exact message ID and configured backend hostname. The same hostname shares misses across accounts, ports, TLS settings, tiers, and display names. Hostname matching ignores ASCII case and one trailing DNS dot. Different hostnames stay separate.

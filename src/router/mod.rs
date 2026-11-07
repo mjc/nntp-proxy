@@ -67,6 +67,9 @@ struct SelectedBackend<'a> {
 pub struct RouteRequest<'a, Mode = RawRoute> {
     _client_id: ClientId,
     suppressed_backends: SuppressedBackends,
+    /// Backends this request may never use, unlike transient suppressions.
+    /// A tier made up only of excluded backends falls through to the next tier.
+    excluded_backends: SuppressedBackends,
     mode: Mode,
     _lifetime: std::marker::PhantomData<&'a ()>,
 }
@@ -103,6 +106,13 @@ impl SuppressedBackends {
     #[must_use]
     pub const fn bits(self) -> usize {
         self.bits
+    }
+
+    #[must_use]
+    pub const fn union(self, other: Self) -> Self {
+        Self {
+            bits: self.bits | other.bits,
+        }
     }
 }
 
@@ -179,6 +189,7 @@ impl RouteRequest<'_, RawRoute> {
         Self {
             _client_id: client_id,
             suppressed_backends: SuppressedBackends::empty(),
+            excluded_backends: SuppressedBackends::empty(),
             mode: RawRoute,
             _lifetime: std::marker::PhantomData,
         }
@@ -192,6 +203,7 @@ impl RouteRequest<'_, RawRoute> {
         RouteRequest {
             _client_id: self._client_id,
             suppressed_backends: self.suppressed_backends,
+            excluded_backends: self.excluded_backends,
             mode: ArticleRoute { availability },
             _lifetime: std::marker::PhantomData,
         }
@@ -202,12 +214,24 @@ impl RouteRequest<'_, RawRoute> {
         self.suppressed_backends = suppressed_backends;
         self
     }
+
+    #[must_use]
+    pub const fn excluding_backends(mut self, excluded_backends: SuppressedBackends) -> Self {
+        self.excluded_backends = excluded_backends;
+        self
+    }
 }
 
 impl RouteRequest<'_, ArticleRoute<'_>> {
     #[must_use]
     pub fn suppressing_backends(mut self, suppressed_backends: SuppressedBackends) -> Self {
         self.suppressed_backends = suppressed_backends;
+        self
+    }
+
+    #[must_use]
+    pub const fn excluding_backends(mut self, excluded_backends: SuppressedBackends) -> Self {
+        self.excluded_backends = excluded_backends;
         self
     }
 }
@@ -486,6 +510,8 @@ pub struct BackendSelector {
     queue_backpressure_limits: QueuePressureLimits,
     /// Delay to apply when all eligible backends in a tier are hard-saturated.
     queue_backpressure_all_busy_sleep_ms: u64,
+    /// Backends configured with `stateful_sessions = "excluded"`.
+    stateful_exclusions: SuppressedBackends,
 }
 
 impl Default for BackendSelector {
@@ -582,6 +608,7 @@ impl BackendSelector {
             queue_backpressure_limits: QueuePressureLimits::default(),
             queue_backpressure_all_busy_sleep_ms:
                 Self::DEFAULT_QUEUE_BACKPRESSURE_ALL_BUSY_SLEEP_MS,
+            stateful_exclusions: SuppressedBackends::empty(),
         }
     }
 
@@ -690,6 +717,7 @@ impl BackendSelector {
         &self,
         availability: Option<&ArticleAvailability>,
         suppressed_backends: &SuppressedBackends,
+        excluded_backends: &SuppressedBackends,
     ) -> Option<SelectedBackend<'_>> {
         if self.backends.is_empty() {
             return None;
@@ -698,6 +726,7 @@ impl BackendSelector {
         // Availability check closure
         let is_available = |backend: &&BackendInfo| {
             !suppressed_backends.contains(backend.id)
+                && !excluded_backends.contains(backend.id)
                 && availability.is_none_or(|avail| avail.should_try_slot(backend.availability_slot))
         };
 
@@ -791,6 +820,7 @@ impl BackendSelector {
             if availability.is_some()
                 && self.backends.iter().any(|backend| {
                     backend.tier == tier
+                        && !excluded_backends.contains(backend.id)
                         && availability
                             .is_none_or(|avail| avail.should_try_slot(backend.availability_slot))
                 })
@@ -1125,7 +1155,11 @@ impl BackendSelector {
         loop {
             let availability = Mode::availability(request);
             let selected = self
-                .select_backend(availability, &request.suppressed_backends)
+                .select_backend(
+                    availability,
+                    &request.suppressed_backends,
+                    &request.excluded_backends,
+                )
                 .ok_or_else(|| {
                     anyhow::anyhow!(
                         "No backends available for routing (total backends: {})",
@@ -1152,6 +1186,32 @@ impl BackendSelector {
 
             return Ok(output);
         }
+    }
+
+    /// Never pin a stateful session to this backend.
+    ///
+    /// The backend keeps serving message-ID requests. See
+    /// [`crate::config::StatefulSessions`] for why indexers need this.
+    pub fn exclude_from_stateful_sessions(&mut self, backend_id: BackendId) {
+        self.stateful_exclusions.suppress(backend_id);
+    }
+
+    /// Backends that must not answer requests whose replies can carry article
+    /// numbers, which is every request not addressed by message-ID.
+    #[must_use]
+    pub const fn stateful_exclusions(&self) -> SuppressedBackends {
+        self.stateful_exclusions
+    }
+
+    /// Route a client that is about to hold a backend for stateful commands.
+    ///
+    /// Excluded backends are skipped, and a tier made up only of excluded
+    /// backends falls through to the next tier.
+    ///
+    /// # Errors
+    /// Returns an error when every backend is excluded or unavailable.
+    pub fn route_stateful_session(&self, client_id: ClientId) -> Result<BackendId> {
+        self.route(RouteRequest::new(client_id).excluding_backends(self.stateful_exclusions))
     }
 
     /// Mark a command as complete, decrementing the pending count
@@ -1680,5 +1740,122 @@ mod tests {
             .unwrap();
 
         assert_ne!(selected, BackendId::from_index(8));
+    }
+
+    fn tiered_selector(backends: &[(&str, u8)]) -> BackendSelector {
+        let mut selector = BackendSelector::with_strategy(BackendSelectionStrategy::LeastLoaded);
+        for &(name, tier) in backends {
+            selector.add_backend(
+                ServerName::try_new(name.to_string()).unwrap(),
+                crate::pool::DeadpoolConnectionProvider::new(
+                    "localhost".to_string(),
+                    119,
+                    name.to_string(),
+                    10,
+                    None,
+                    None,
+                ),
+                tier,
+            );
+        }
+        selector
+    }
+
+    #[test]
+    fn stateful_sessions_never_route_to_excluded_backends() {
+        let mut selector =
+            tiered_selector(&[("numbering-a", 0), ("other-numbering", 0), ("backup", 1)]);
+        selector.exclude_from_stateful_sessions(BackendId::from_index(1));
+
+        // Each route leaves its backend pending, so least-loaded would
+        // otherwise move on to the idle excluded peer.
+        for _ in 0..32 {
+            let backend = selector.route_stateful_session(ClientId::new()).unwrap();
+            assert_eq!(backend, BackendId::from_index(0));
+        }
+    }
+
+    #[test]
+    fn excluded_backends_still_serve_message_id_routing() {
+        let mut selector = tiered_selector(&[("numbering-a", 0), ("other-numbering", 0)]);
+        selector.exclude_from_stateful_sessions(BackendId::from_index(1));
+
+        let availability = ArticleAvailability::new();
+        let routed: std::collections::HashSet<_> = (0..32)
+            .map(|_| {
+                selector
+                    .route(RouteRequest::new(ClientId::new()).with_availability(&availability))
+                    .unwrap()
+                    .backend_id()
+            })
+            .collect();
+        assert!(routed.contains(&BackendId::from_index(1)));
+    }
+
+    #[test]
+    fn stateful_sessions_fall_through_an_all_excluded_tier() {
+        let mut selector = tiered_selector(&[("download-only", 0), ("indexer", 1)]);
+        selector.exclude_from_stateful_sessions(BackendId::from_index(0));
+
+        assert_eq!(
+            selector.route_stateful_session(ClientId::new()).unwrap(),
+            BackendId::from_index(1)
+        );
+    }
+
+    #[test]
+    fn stateful_sessions_error_when_every_backend_is_excluded() {
+        let mut selector = tiered_selector(&[("a", 0), ("b", 1)]);
+        selector.exclude_from_stateful_sessions(BackendId::from_index(0));
+        selector.exclude_from_stateful_sessions(BackendId::from_index(1));
+
+        assert!(selector.route_stateful_session(ClientId::new()).is_err());
+    }
+
+    #[test]
+    fn article_routing_skips_excluded_backends_and_escalates_past_an_excluded_tier() {
+        let selector = tiered_selector(&[("allowed", 0), ("excluded", 0), ("excluded-only", 1)]);
+        let availability = ArticleAvailability::new();
+        let excluded = suppressed(&[BackendId::from_index(1)]);
+        for _ in 0..16 {
+            let backend = selector
+                .route(
+                    RouteRequest::new(ClientId::new())
+                        .with_availability(&availability)
+                        .excluding_backends(excluded),
+                )
+                .unwrap();
+            assert_eq!(backend.backend_id(), BackendId::from_index(0));
+        }
+
+        let selector = tiered_selector(&[("excluded-a", 0), ("excluded-b", 0), ("allowed", 1)]);
+        let excluded = suppressed(&[BackendId::from_index(0), BackendId::from_index(1)]);
+        let backend = selector
+            .route(
+                RouteRequest::new(ClientId::new())
+                    .with_availability(&availability)
+                    .excluding_backends(excluded),
+            )
+            .unwrap();
+        assert_eq!(
+            backend.backend_id(),
+            BackendId::from_index(2),
+            "permanent exclusions are not transient failures, so the next tier is eligible"
+        );
+    }
+
+    #[test]
+    fn transient_suppression_in_a_tier_still_blocks_escalation_with_exclusions() {
+        // Excluding one backend must not let a transient failure of the other
+        // backend in the tier skip ahead to a lower-priority tier.
+        let selector = tiered_selector(&[("allowed", 0), ("excluded", 0), ("fallback", 1)]);
+        let availability = ArticleAvailability::new();
+        let result = selector.route(
+            RouteRequest::new(ClientId::new())
+                .with_availability(&availability)
+                .suppressing_backends(suppressed(&[BackendId::from_index(0)]))
+                .excluding_backends(suppressed(&[BackendId::from_index(1)])),
+        );
+        assert!(result.is_err());
     }
 }
