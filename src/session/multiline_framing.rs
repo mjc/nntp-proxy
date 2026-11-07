@@ -281,7 +281,12 @@ impl CompleteResponseWindow {
         }
         let mut stats = ResponseWriteStats::default();
         stats.add_chunk(chunk.len());
-        self.push_from_buffer(io_buffer, conn, response, pool)?;
+        // The client already has this whole response, so a retention failure
+        // (such as an oversized packed suffix) must not be retried.
+        self.push_from_buffer(io_buffer, conn, response, pool)
+            .map_err(
+                crate::session::response_transfer::ResponseTransferError::after_client_delivery,
+            )?;
         Ok(stats)
     }
 
@@ -5247,6 +5252,50 @@ mod tests {
             "a client that already has bytes must not receive a retried response: {error:?}"
         );
         assert_eq!(writer.bytes, [first.as_slice(), b"truncated"].concat());
+        assert!(captured.is_empty());
+    }
+
+    #[tokio::test]
+    async fn capture_and_write_retention_failure_after_complete_write_is_not_retryable() {
+        // A dense read moves its buffer into the capture, which then has to
+        // copy the packed next response into the pending queue. A suffix over
+        // the pending limit fails that copy only after the client already has
+        // the whole response.
+        const BUFFER: usize = 512 * 1024;
+        let mut response = b"222 0 <dense@capture.test>\r\n".to_vec();
+        while response.len() < BUFFER / 2 {
+            response.extend_from_slice(&[b'x'; 1022]);
+            response.extend_from_slice(b"\r\n");
+        }
+        response.extend_from_slice(b".\r\n");
+        let mut suffix = b"222 1 <next@capture.test>\r\n".to_vec();
+        suffix.resize(
+            crate::constants::buffer::MAX_PENDING_BACKEND_BYTES + 1,
+            b'y',
+        );
+
+        let pool = crate::pool::BufferPool::new(BufferSize::try_new(BUFFER).unwrap(), 2);
+        let mut io_buffer = pool.acquire();
+        io_buffer.copy_from_slice(&[response.as_slice(), suffix.as_slice()].concat());
+        let mut conn = mock_backend_conn(vec![]).await;
+        let request = crate::protocol::RequestContext::parse(b"BODY <dense@capture.test>\r\n")
+            .expect("valid request");
+        let mut classified = ClassifiedResponse::read_for_test(&mut conn, &request, io_buffer)
+            .await
+            .unwrap();
+        let mut captured = crate::pool::ChunkedResponse::default();
+        let mut writer = RecordingWriter::default();
+        let error = classified
+            .stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0))
+            .unwrap()
+            .capture_and_write(&mut writer, &mut captured, 4 * 1024 * 1024)
+            .await
+            .expect_err("an oversized packed suffix cannot be queued");
+        assert!(
+            matches!(error, ResponseTransferError::DeliveredPrefix(_)),
+            "a client that already has the response must not receive a retry: {error:?}"
+        );
+        assert_eq!(writer.bytes, response);
         assert!(captured.is_empty());
     }
 
