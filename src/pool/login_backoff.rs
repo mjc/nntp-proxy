@@ -55,6 +55,10 @@ struct State {
     /// No login may start before this instant.
     retry_not_before: Option<Instant>,
     probe: ProbeSlot,
+    /// Bumped whenever the schedule moves (a refused window opens or a login
+    /// succeeds). An attempt only moves the schedule if nothing else has moved
+    /// it since the attempt was admitted.
+    epoch: u64,
 }
 
 impl Default for State {
@@ -63,6 +67,7 @@ impl Default for State {
             refusals: 0,
             retry_not_before: None,
             probe: ProbeSlot::Free,
+            epoch: 0,
         }
     }
 }
@@ -95,37 +100,46 @@ impl LoginBackoff {
             return Admission::Wait(left);
         }
         if state.refusals == 0 {
-            return Admission::Proceed(LoginAttempt::new(self, AttemptRole::Normal));
+            return Admission::Proceed(LoginAttempt::new(self, AttemptRole::Normal, state.epoch));
         }
         if state.probe == ProbeSlot::Taken {
             return Admission::Wait(PROBE_RETRY);
         }
         state.probe = ProbeSlot::Taken;
-        Admission::Proceed(LoginAttempt::new(self, AttemptRole::Probe))
+        Admission::Proceed(LoginAttempt::new(self, AttemptRole::Probe, state.epoch))
     }
 
-    /// Attempts already in flight when a window opens fail together; only the
-    /// first of them moves the schedule, so a pool of N concurrent creators
-    /// does not jump N steps.
-    fn record_refusal(&self, role: AttemptRole) -> Duration {
+    /// Attempts admitted together fail together; only the first of them moves
+    /// the schedule, so a pool of N concurrent creators does not jump N steps.
+    /// The rest are matched by epoch rather than by the window's deadline: a
+    /// refusal can arrive after the window it belongs to has already closed
+    /// (setup timeouts outlast the first window), and it must not open a new
+    /// one when no probe has failed.
+    fn record_refusal(&self, role: AttemptRole, admitted_in: u64) -> Duration {
         let now = Instant::now();
         let mut state = self.lock();
         if role == AttemptRole::Probe {
             state.probe = ProbeSlot::Free;
         }
-        if let Some(deadline) = state.retry_not_before
-            && now < deadline
-        {
-            return deadline - now;
+        if admitted_in != state.epoch {
+            return state.retry_not_before.map_or(Duration::ZERO, |deadline| {
+                deadline.saturating_duration_since(now)
+            });
         }
         let delay = delay_after(state.refusals);
         state.refusals = state.refusals.saturating_add(1);
         state.retry_not_before = Some(now + delay);
+        state.epoch = state.epoch.wrapping_add(1);
         delay
     }
 
     fn record_success(&self) {
-        *self.lock() = State::default();
+        let mut state = self.lock();
+        let epoch = state.epoch.wrapping_add(1);
+        *state = State {
+            epoch,
+            ..State::default()
+        };
     }
 
     /// Close the current window without waiting it out, keeping the refusals
@@ -155,6 +169,7 @@ fn delay_after(refusals: u32) -> Duration {
 pub(crate) struct LoginAttempt<'a> {
     gate: &'a LoginBackoff,
     role: AttemptRole,
+    admitted_in: u64,
     outcome: Outcome,
 }
 
@@ -165,10 +180,11 @@ enum Outcome {
 }
 
 impl<'a> LoginAttempt<'a> {
-    const fn new(gate: &'a LoginBackoff, role: AttemptRole) -> Self {
+    const fn new(gate: &'a LoginBackoff, role: AttemptRole, admitted_in: u64) -> Self {
         Self {
             gate,
             role,
+            admitted_in,
             outcome: Outcome::Pending,
         }
     }
@@ -187,7 +203,7 @@ impl<'a> LoginAttempt<'a> {
     /// The backend refused this login. Returns how long new logins now wait.
     pub(crate) fn refused(mut self) -> Duration {
         self.outcome = Outcome::Reported;
-        self.gate.record_refusal(self.role)
+        self.gate.record_refusal(self.role, self.admitted_in)
     }
 }
 
@@ -276,6 +292,34 @@ mod tests {
             Duration::from_secs(10),
             "the next window is the second step, not the fourth"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_refusal_from_the_same_batch_does_not_open_a_new_window() {
+        let gate = LoginBackoff::default();
+        let first = expect_role(&gate, AttemptRole::Normal);
+        let slow = expect_role(&gate, AttemptRole::Normal);
+
+        assert_eq!(first.refused(), INITIAL_DELAY);
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert_eq!(
+            slow.refused(),
+            Duration::ZERO,
+            "the window this login belonged to has already closed"
+        );
+        drop(expect_role(&gate, AttemptRole::Probe));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn late_refusal_after_a_successful_probe_is_ignored() {
+        let gate = LoginBackoff::default();
+        let first = expect_role(&gate, AttemptRole::Normal);
+        let slow = expect_role(&gate, AttemptRole::Normal);
+
+        tokio::time::advance(first.refused()).await;
+        expect_role(&gate, AttemptRole::Probe).succeeded();
+        assert_eq!(slow.refused(), Duration::ZERO);
+        drop(expect_role(&gate, AttemptRole::Normal));
     }
 
     #[tokio::test(start_paused = true)]
