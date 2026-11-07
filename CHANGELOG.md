@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A backend that refuses a login, for example with `502 connection limit reached`, a bad greeting, or a failed `AUTHINFO`, is no longer asked to log in again for every request. New connections to it fail locally for 5 s, doubling up to 60 s while the refusals continue. When a window closes, one probe login decides whether to resume, and a successful login resets the backoff. Network errors do not start it.
+
 ## [0.6.0] - 2026-11-05
 
 ### Added
