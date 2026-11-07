@@ -465,12 +465,14 @@ impl ClientSession {
                 let Ok(conn) = exchange.observe_and_reuse().await else {
                     return RetryStatProbeOutcome::Unavailable(backend_id);
                 };
-                if release_observed_probe_connection(conn).is_err() {
-                    return RetryStatProbeOutcome::Unavailable(backend_id);
-                }
+                let release = release_observed_probe_connection(conn, backend_id);
 
+                // The STAT reply was fully framed before any stray bytes, so a
+                // 430 stays authoritative even when the socket must be retired.
                 if status_code.is_some_and(|status| status.as_u16() == 430) {
                     RetryStatProbeOutcome::Missing(backend_id)
+                } else if release.is_err() {
+                    RetryStatProbeOutcome::Unavailable(backend_id)
                 } else {
                     RetryStatProbeOutcome::Present
                 }
@@ -588,9 +590,9 @@ impl ClientSession {
                     let Ok(conn) = exchange.observe_and_reuse().await else {
                         return;
                     };
-                    if release_observed_probe_connection(conn).is_err() {
-                        return;
-                    }
+                    // Retirement does not invalidate the already-framed reply,
+                    // so a 430 is still recorded below.
+                    let _ = release_observed_probe_connection(conn, backend_id);
 
                     if status_code.is_some_and(|status| status.as_u16() == 430)
                         && let Ok(msg_id) = crate::types::MessageId::new(msg_id_text)
@@ -1679,14 +1681,29 @@ impl ClientSession {
 /// guard instead closes a healthy socket, counts it as a backend failure, and
 /// shrinks the pool for the replacement cooldown, so every successful probe
 /// used to cost a connection and a fresh TLS login.
-fn release_observed_probe_connection(conn: crate::pool::ConnectionGuard) -> Result<(), ()> {
-    if conn.pending_bytes_len() == 0 {
+///
+/// Queued bytes after the reply mean the backend sent something unrequested,
+/// so the socket cannot be trusted for another command and is retired.
+fn release_observed_probe_connection(
+    conn: crate::pool::ConnectionGuard,
+    backend_id: BackendId,
+) -> Result<(), SessionError> {
+    let pending_bytes = conn.pending_bytes_len();
+    if pending_bytes == 0 {
         drop(conn.complete_success());
-        Ok(())
-    } else {
-        conn.fail_backend();
-        Err(())
+        return Ok(());
     }
+    warn!(
+        backend = backend_id.as_index(),
+        connection_type = conn.connection_type(),
+        pending_bytes,
+        "Background STAT probe left queued backend bytes; retiring connection"
+    );
+    conn.fail_backend();
+    Err(SessionError::Backend(anyhow::anyhow!(
+        "backend {} left {pending_bytes} queued bytes after a STAT probe",
+        backend_id.as_index()
+    )))
 }
 
 #[cfg(test)]
@@ -1856,6 +1873,14 @@ mod tests {
     }
 
     async fn spawn_stat_missing_probe_server() -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        spawn_stat_probe_server(b"430 Missing\r\n").await
+    }
+
+    /// The whole STAT reply goes out in one write so any unrequested bytes
+    /// after the status line land in the same read and stay queued.
+    async fn spawn_stat_probe_server(
+        stat_reply: &'static [u8],
+    ) -> (u16, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let stat_commands = Arc::new(AtomicUsize::new(0));
@@ -1886,7 +1911,7 @@ mod tests {
                                     let _ = write_half.write_all(b"200 Posting allowed\r\n").await;
                                 } else if cmd.starts_with("STAT ") {
                                     stat_count.fetch_add(1, Ordering::SeqCst);
-                                    let _ = write_half.write_all(b"430 Missing\r\n").await;
+                                    let _ = write_half.write_all(stat_reply).await;
                                 } else if cmd.starts_with("BODY") || cmd.starts_with("ARTICLE") {
                                     body_count.fetch_add(1, Ordering::SeqCst);
                                     let _ = write_half.write_all(
@@ -2447,6 +2472,122 @@ mod tests {
         .expect("prefetch probes should finish and return their connections");
         assert_connection_returned_idle(&router, 1);
         assert_connection_returned_idle(&router, 2);
+    }
+
+    /// Unrequested bytes queued behind the STAT reply. The 430 itself was
+    /// fully framed, so it must still count while the socket is retired.
+    const STAT_430_WITH_STRAY_REPLY: &[u8] = b"430 Missing\r\n223 0 <stray@example.com>\r\n";
+
+    fn assert_connection_retired(router: &BackendSelector, backend: usize) {
+        let status = router
+            .backend_provider(BackendId::from_index(backend))
+            .expect("backend is registered")
+            .status_counts();
+        assert_eq!(
+            (status.size, status.available),
+            (0, 0),
+            "backend {backend}: a probe connection with queued bytes must be retired"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_stat_sweep_keeps_430_when_probe_connection_is_retired() {
+        let session = test_session();
+        let (port0, stat0, _body0) = spawn_stat_probe_server(STAT_430_WITH_STRAY_REPLY).await;
+        let (port1, stat1, _body1) = spawn_stat_probe_server(STAT_430_WITH_STRAY_REPLY).await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+        ]);
+
+        let request = request_context(b"BODY <missing@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+        };
+        session
+            .parallel_retry_stat_sweep(&router, &request, &mut state)
+            .await
+            .expect("parallel retry STAT sweep should succeed");
+
+        assert_eq!(stat0.load(Ordering::SeqCst), 1);
+        assert_eq!(stat1.load(Ordering::SeqCst), 1);
+        assert!(availability.is_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap()));
+        assert!(availability.is_missing_slot(crate::cache::AvailabilitySlot::new(1).unwrap()));
+        assert_connection_retired(&router, 0);
+        assert_connection_retired(&router, 1);
+    }
+
+    #[tokio::test]
+    async fn non_primary_stat_prefetch_keeps_430_when_probe_connection_is_retired() {
+        let session = test_session();
+        let (port0, _stat0, _body0) = spawn_stat_missing_probe_server().await;
+        let (port1, stat1, _body1) = spawn_stat_probe_server(STAT_430_WITH_STRAY_REPLY).await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+        ]);
+
+        let request = request_context(b"BODY <missing@example.com>\r\n");
+        session.spawn_non_primary_tier_stat_prefetch(
+            &router,
+            &request,
+            &ArticleAvailability::new(),
+            SuppressedBackends::empty(),
+        );
+
+        let msg_id = MessageId::new("<missing@example.com>".to_string()).expect("valid message id");
+        let cached = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(cached) = session.cache.get(&msg_id).await {
+                    break cached;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("prefetch should record the 430 despite retiring the connection");
+        assert_eq!(stat1.load(Ordering::SeqCst), 1);
+        assert!(
+            cached
+                .availability()
+                .is_missing_slot(crate::cache::AvailabilitySlot::new(1).unwrap())
+        );
+        assert_connection_retired(&router, 1);
     }
 
     #[tokio::test]
