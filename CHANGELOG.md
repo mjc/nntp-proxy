@@ -20,6 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - An article request answers `430` instead of `503` when a backend has returned `430` and every other eligible backend is only busy or failing. Clients such as NZBGet treat `430` as a missing article and `503` as a server failure.
 - A backend that accepts a command and never answers can no longer hold a request forever. The first reply bytes must arrive within 30 seconds, and each adaptive precheck attempt must finish within 2 seconds. A timeout retries once on a fresh connection, removes the stuck connection from the pool, and is never recorded as a `430`.
 - A cache-miss capture with `store_article_bodies = true` no longer keeps a whole 1 MiB read buffer for every backend read. TLS reads deliver at most about 16 KiB, so a ~750 KB article held about 47 MiB and exhausted the read-buffer pool. A read buffer now moves into the capture only when the read fills at least half of it. Smaller reads are copied into capture buffers, which keeps a capture's memory within about twice the article size plus one capture buffer.
+- `XFEATURE COMPRESS GZIP`, with or without `TERMINATOR`, gets `503` in every routing mode. Hybrid and stateful sessions used to forward it, and a backend that accepted it sent overview data the proxy could not frame.
+- `CAPABILITIES` in `per-command` mode no longer lists `OVER` and `HDR`, which that mode rejects. It still lists `READER` because `MODE READER` is still forwarded.
 
 ## [0.6.0] - 2026-11-05
 

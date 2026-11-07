@@ -63,6 +63,17 @@ lookups such as:
 
 Commands that depend on selected group or current article state are not a good fit for `per-command` mode.
 
+`CAPABILITIES` in `per-command` mode leaves out `OVER` and `HDR` because that
+mode rejects them. It still lists `READER`, because `MODE READER` is forwarded
+and RFC 3977 §5.3.2 requires a server that omits `READER` to answer it with
+`502` and close the connection. Hybrid and stateful modes list `READER`,
+`OVER`, and `HDR`.
+
+Every routing mode answers `XFEATURE COMPRESS GZIP`, with or without
+`TERMINATOR`, with `503`. A backend that accepted it would send compressed
+overview data that the proxy cannot frame. Backend RFC 8054 `COMPRESS DEFLATE`
+is still controlled by the server `compress` setting.
+
 ## Response Handling
 
 Routing code works with typed request metadata, not raw command strings. The
