@@ -462,7 +462,10 @@ impl ClientSession {
                 };
 
                 let status_code = exchange.status_code();
-                if exchange.observe_and_reuse().await.is_err() {
+                let Ok(conn) = exchange.observe_and_reuse().await else {
+                    return RetryStatProbeOutcome::Unavailable(backend_id);
+                };
+                if release_observed_probe_connection(conn).is_err() {
                     return RetryStatProbeOutcome::Unavailable(backend_id);
                 }
 
@@ -582,7 +585,10 @@ impl ClientSession {
                         Err(_) => return,
                     };
                     let status_code = exchange.status_code();
-                    if exchange.observe_and_reuse().await.is_err() {
+                    let Ok(conn) = exchange.observe_and_reuse().await else {
+                        return;
+                    };
+                    if release_observed_probe_connection(conn).is_err() {
                         return;
                     }
 
@@ -1666,6 +1672,23 @@ impl ClientSession {
     }
 }
 
+/// Hand a background probe's connection back to the pool once its `STAT`
+/// reply has been fully observed.
+///
+/// `observe_and_reuse` leaves pool ownership with the caller. Dropping the
+/// guard instead closes a healthy socket, counts it as a backend failure, and
+/// shrinks the pool for the replacement cooldown, so every successful probe
+/// used to cost a connection and a fresh TLS login.
+fn release_observed_probe_connection(conn: crate::pool::ConnectionGuard) -> Result<(), ()> {
+    if conn.pending_bytes_len() == 0 {
+        drop(conn.complete_success());
+        Ok(())
+    } else {
+        conn.fail_backend();
+        Err(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ArticleAttemptState;
@@ -2305,6 +2328,125 @@ mod tests {
         assert_eq!(stat1.load(Ordering::SeqCst), 1);
         assert_eq!(body0.load(Ordering::SeqCst), 0);
         assert_eq!(body1.load(Ordering::SeqCst), 0);
+    }
+
+    fn assert_connection_returned_idle(router: &BackendSelector, backend: usize) {
+        let status = router
+            .backend_provider(BackendId::from_index(backend))
+            .expect("backend is registered")
+            .status_counts();
+        assert_eq!(
+            (status.size, status.available, status.max_size),
+            (1, 1, 1),
+            "backend {backend}: the probe connection must go back to the pool idle, not be closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_stat_sweep_returns_probe_connections_to_the_pool() {
+        let session = test_session();
+        let (port0, stat0, _body0) = spawn_stat_missing_probe_server().await;
+        let (port1, stat1, _body1) = spawn_stat_missing_probe_server().await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+        ]);
+
+        let request = request_context(b"BODY <missing@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+        };
+        session
+            .parallel_retry_stat_sweep(&router, &request, &mut state)
+            .await
+            .expect("parallel retry STAT sweep should succeed");
+
+        assert_eq!(stat0.load(Ordering::SeqCst), 1);
+        assert_eq!(stat1.load(Ordering::SeqCst), 1);
+        assert_connection_returned_idle(&router, 0);
+        assert_connection_returned_idle(&router, 1);
+    }
+
+    #[tokio::test]
+    async fn non_primary_stat_prefetch_returns_probe_connections_to_the_pool() {
+        let session = test_session();
+        let (port0, _stat0, _body0) = spawn_stat_missing_probe_server().await;
+        let (port1, stat1, _body1) = spawn_stat_missing_probe_server().await;
+        let (port2, stat2, _body2) = spawn_stat_missing_probe_server().await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port2)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+        ]);
+
+        let request = request_context(b"BODY <missing@example.com>\r\n");
+        session.spawn_non_primary_tier_stat_prefetch(
+            &router,
+            &request,
+            &ArticleAvailability::new(),
+            SuppressedBackends::empty(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let probed = stat1.load(Ordering::SeqCst) == 1 && stat2.load(Ordering::SeqCst) == 1;
+                let settled = [1, 2].iter().all(|&backend| {
+                    router
+                        .backend_provider(BackendId::from_index(backend))
+                        .is_some_and(|provider| provider.status_counts().available == 1)
+                });
+                if probed && settled {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("prefetch probes should finish and return their connections");
+        assert_connection_returned_idle(&router, 1);
+        assert_connection_returned_idle(&router, 2);
     }
 
     #[tokio::test]
