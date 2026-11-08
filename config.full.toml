@@ -74,6 +74,9 @@ backlog_skip_percent = 100
 # (default) or "430". Only a request every eligible backend answered with 430
 # gets 430 regardless of this setting.
 # unavailable_reply = "503"
+# After this many 503s for one message-id, while every backend that answered said
+# 430, the next unfinished lookup answers 430 so dead articles fail fast. 0 = never.
+unfinished_replies_before_430 = 2
 # When every backend left in the tier that should serve a request was skipped
 # as backlogged: "wait-shortest" queues on the one with the shortest estimated
 # wait (bounded by checkout_wait_ms and the deadline); "give-up" ends the

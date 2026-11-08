@@ -525,6 +525,9 @@ pub struct BackendSelector {
     article_admission: crate::pool::admission::ArticleAdmission,
     /// When ARTICLE/BODY requests probe lower tiers with background STATs.
     lower_tier_stat_prefetch: LowerTierStatPrefetch,
+    /// Recent unfinished lookups per message-id, for
+    /// `unfinished_replies_before_430`.
+    unfinished_lookups: crate::pool::admission::UnfinishedLookups,
 }
 
 impl Default for BackendSelector {
@@ -624,6 +627,7 @@ impl BackendSelector {
             stateful_exclusions: SuppressedBackends::empty(),
             article_admission: crate::pool::admission::ArticleAdmission::default(),
             lower_tier_stat_prefetch: LowerTierStatPrefetch::default(),
+            unfinished_lookups: crate::pool::admission::UnfinishedLookups::new(),
         }
     }
 
@@ -635,6 +639,36 @@ impl BackendSelector {
     ) -> Self {
         self.article_admission = admission;
         self
+    }
+
+    /// Reply for a lookup that ended before every eligible backend returned
+    /// `430`. Answers `430` once the message-id has already had
+    /// `unfinished_replies_before_430` such replies and every backend that
+    /// answered it (at least one) said `430`.
+    #[must_use]
+    pub fn unfinished_lookup_reply(
+        &self,
+        message_id: Option<&str>,
+        availability: &crate::cache::ArticleAvailability,
+    ) -> crate::pool::admission::UnavailableReply {
+        use crate::pool::admission::UnavailableReply;
+        let admission = self.article_admission;
+        let reply = admission.unavailable_reply();
+        let limit = admission.unfinished_replies_before_430();
+        if reply == UnavailableReply::NoSuchArticle
+            || limit == 0
+            || availability.missing_bits() == 0
+        {
+            return reply;
+        }
+        let Some(message_id) = message_id else {
+            return reply;
+        };
+        if self.unfinished_lookups.record(message_id) > limit {
+            UnavailableReply::NoSuchArticle
+        } else {
+            reply
+        }
     }
 
     /// Deadline, checkout wait, and backlog skipping for article requests.

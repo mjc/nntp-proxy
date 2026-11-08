@@ -499,11 +499,12 @@ impl ClientSession {
                     BackendAttemptResult::DeadlineExpired
                     | BackendAttemptResult::NoRetryableBackend,
                 ) => {
-                    return Self::write_unavailable_reply(
-                        router.article_admission().unavailable_reply(),
-                        io,
-                    )
-                    .await;
+                    let message_id = request.message_id_value();
+                    let reply = router.unfinished_lookup_reply(
+                        message_id.as_ref().map(|id| id.as_str()),
+                        &availability,
+                    );
+                    return Self::write_unavailable_reply(reply, io).await;
                 }
                 Err(e @ SessionError::ClientDisconnect(_)) => {
                     debug!(

@@ -4330,6 +4330,59 @@ mod tests {
         assert_eq!(status, 503, "the skipped backend was never asked");
     }
 
+    async fn skipped_peer_router(
+        admission: crate::pool::admission::ArticleAdmission,
+    ) -> Arc<BackendSelector> {
+        let (missing_port, _) = spawn_article_response_server(b"430 No such article\r\n").await;
+        let missing = DeadpoolConnectionProvider::builder("127.0.0.1", missing_port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        router_with_admission_backends(vec![missing, backlogged_pool().await], admission)
+    }
+
+    /// The dead-release regression: a slow backend that is always busy never
+    /// confirms the miss, so every retry got `503` and a dead release took
+    /// minutes to fail. After two `503`s the next unfinished lookup answers
+    /// `430`, because the only backend that answered said `430`.
+    #[tokio::test]
+    async fn repeated_unfinished_lookups_with_only_430_answers_become_430() {
+        let router = skipped_peer_router(give_up_admission()).await;
+        let mut statuses = Vec::new();
+        for _ in 0..3 {
+            let (status, _) =
+                route_and_read_status(&router, b"BODY <dead-everywhere@example.com>\r\n").await;
+            statuses.push(status);
+        }
+        assert_eq!(statuses, [503, 503, 430]);
+
+        let (status, _) =
+            route_and_read_status(&router, b"BODY <other-article@example.com>\r\n").await;
+        assert_eq!(status, 503, "the count is per message-id");
+    }
+
+    #[tokio::test]
+    async fn unfinished_replies_before_430_zero_keeps_answering_503() {
+        let router =
+            skipped_peer_router(give_up_admission().with_unfinished_replies_before_430(0)).await;
+        for _ in 0..4 {
+            let (status, _) =
+                route_and_read_status(&router, b"BODY <never-converted@example.com>\r\n").await;
+            assert_eq!(status, 503);
+        }
+    }
+
+    #[tokio::test]
+    async fn unfinished_lookups_without_any_430_stay_503() {
+        let provider = backlogged_pool().await;
+        let router = router_with_admission(provider, give_up_admission());
+        for _ in 0..4 {
+            let (status, _) =
+                route_and_read_status(&router, b"BODY <nobody-answered@example.com>\r\n").await;
+            assert_eq!(status, 503, "no backend has said the article is missing");
+        }
+    }
+
     #[tokio::test]
     async fn unavailable_reply_430_applies_when_every_backend_is_skipped() {
         let provider = backlogged_pool().await;

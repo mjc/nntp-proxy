@@ -72,6 +72,7 @@ Time limits for `ARTICLE`, `BODY`, `HEAD`, and `STAT` lookups by message-id.
 | `backlog_skip` | `true` | Skip a backend at once, without queueing, when its estimated connection wait is too long |
 | `backlog_skip_percent` | `100` | Skip when the estimated wait is longer than this percentage of the attempt's wait. Lower values skip sooner |
 | `unavailable_reply` | `"503"` | `"503"` or `"430"`: the reply when a request ends before every eligible backend returned `430`, either because `deadline_ms` ran out or because every remaining backend was busy, skipped, refused the lookup with a non-`430` error, or failed. A request that every eligible backend answered with `430` always gets `430` |
+| `unfinished_replies_before_430` | `2` | How many `503`s one message-id may get, while every backend that answered it said `430`, before the next unfinished lookup answers `430`. `0` keeps answering `unavailable_reply`. Ignored when `unavailable_reply` is `"430"` |
 | `backlog_last_resort` | `"wait-shortest"` | What a request does when backlog skipping leaves no other backend to try in the tier that should serve it. `"wait-shortest"` queues on the skipped backend with the shortest estimated wait, bounded by `checkout_wait_ms` and what is left of `deadline_ms`; `"give-up"` ends the request with `unavailable_reply` |
 
 The estimated wait is `(requests ahead in the pool queue) × (average time one
@@ -105,12 +106,20 @@ the article is missing, so it gets `503 Backend error` by default and the
 downloader retries.
 Set `unavailable_reply = "430"` to fail such requests fast instead.
 
+Answering only `503` makes a truly dead article slow to fail when a small,
+busy backend can never confirm the miss in time: the downloader retries it
+again and again. So once a message-id has had `unfinished_replies_before_430`
+`503`s, the next unfinished lookup answers `430` if at least one backend
+answered and every backend that answered said `430`. The count lives in a
+fixed 64K-slot table (512 KiB); a slot collision only restarts a count.
+
 | How the request ended | Reply |
 | --- | --- |
 | A backend returned the article (or `223` for `STAT`) | the backend's reply |
 | Every eligible backend returned `430` (or has a cached `430` fact) | `430` |
 | `deadline_ms` ran out | `unavailable_reply` (`503`) |
 | Every backend left was busy, skipped, refused with a non-`430` error (such as `451`), or failed, even if others returned `430` | `unavailable_reply` (`503`) |
+| Either of the two above, after `unfinished_replies_before_430` earlier `503`s for this message-id, with only `430` answers | `430` |
 
 Skips and checkout timeouts are summarised at `info` once per backend every
 10 seconds instead of logged per request.

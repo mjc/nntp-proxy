@@ -191,6 +191,14 @@ pub mod pool {
     /// room for the exchange already in flight when it expires.
     pub const ARTICLE_DEADLINE: Duration = Duration::from_secs(20);
 
+    /// Default `[routing.article].unfinished_replies_before_430`.
+    ///
+    /// Two `503`s give a busy backend two more chances to be reached, then the
+    /// third unfinished lookup answers `430` if every backend that answered
+    /// said `430`. Without it, a client that retries `503`
+    /// many times takes minutes to give up on a truly missing article.
+    pub const UNFINISHED_REPLIES_BEFORE_430: u8 = 2;
+
     /// Longest a background `STAT` probe waits for a free connection. A probe is
     /// an optimisation; a busy backend should be skipped, not waited on.
     pub const STAT_PROBE_CHECKOUT_WAIT: Duration = Duration::from_secs(2);

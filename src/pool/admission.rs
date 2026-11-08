@@ -378,6 +378,78 @@ impl UnavailableReply {
     }
 }
 
+/// Counts recent unfinished lookups per message-id, so an article that keeps
+/// ending unfinished can be reported missing.
+///
+/// A truly dead article has to be confirmed `430` by every backend, and on a
+/// busy multi-tier setup a small, slow backend may never be reached within the
+/// deadline. Each unfinished lookup answers `503`, so a downloader retries it
+/// many times and a dead release takes minutes to fail. After a bounded number
+/// of `503`s the proxy answers `430` instead, but only while every backend
+/// that answered said `430`.
+///
+/// Fixed-size and lock-free: each slot packs a 56-bit message-id hash tag and
+/// an 8-bit count. A collision replaces the slot and restarts the count, which
+/// errs towards more `503`s rather than a false `430`.
+#[derive(Debug)]
+pub struct UnfinishedLookups {
+    slots: Box<[std::sync::atomic::AtomicU64]>,
+}
+
+impl UnfinishedLookups {
+    const SLOTS: usize = 1 << 16;
+    const COUNT_BITS: u32 = 8;
+    const COUNT_MASK: u64 = (1 << Self::COUNT_BITS) - 1;
+
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            slots: (0..Self::SLOTS)
+                .map(|_| std::sync::atomic::AtomicU64::new(0))
+                .collect(),
+        }
+    }
+
+    fn hash(message_id: &str) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        message_id.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// Record one unfinished lookup and return how many this message-id has
+    /// had, including this one.
+    pub fn record(&self, message_id: &str) -> u8 {
+        use std::sync::atomic::Ordering;
+        let hash = Self::hash(message_id);
+        let tag = hash & !Self::COUNT_MASK;
+        let slot = &self.slots[usize::try_from(hash).unwrap_or_default() % Self::SLOTS];
+        let mut current = slot.load(Ordering::Relaxed);
+        loop {
+            let count = if current & !Self::COUNT_MASK == tag {
+                ((current & Self::COUNT_MASK) + 1).min(Self::COUNT_MASK)
+            } else {
+                1
+            };
+            match slot.compare_exchange_weak(
+                current,
+                tag | count,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return u8::try_from(count).unwrap_or(u8::MAX),
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
+impl Default for UnfinishedLookups {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Article routing limits from `[routing.article]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArticleAdmission {
@@ -386,6 +458,7 @@ pub struct ArticleAdmission {
     backlog: BacklogPolicy,
     unavailable_reply: UnavailableReply,
     last_resort: BacklogLastResort,
+    unfinished_replies_before_430: u8,
 }
 
 impl Default for ArticleAdmission {
@@ -412,7 +485,22 @@ impl ArticleAdmission {
             backlog,
             unavailable_reply: UnavailableReply::BackendError,
             last_resort: BacklogLastResort::WaitShortest,
+            unfinished_replies_before_430: crate::constants::pool::UNFINISHED_REPLIES_BEFORE_430,
         }
+    }
+
+    /// How many `503` replies one message-id may get, while every backend that
+    /// answered it said `430`, before the next unfinished lookup answers `430`.
+    /// `0` never converts.
+    #[must_use]
+    pub const fn with_unfinished_replies_before_430(mut self, replies: u8) -> Self {
+        self.unfinished_replies_before_430 = replies;
+        self
+    }
+
+    #[must_use]
+    pub const fn unfinished_replies_before_430(&self) -> u8 {
+        self.unfinished_replies_before_430
     }
 
     /// What a request does when backlog skipping leaves it no other backend.
@@ -735,6 +823,34 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(budget.is_expired());
         assert_eq!(budget.checkout().wait(), Duration::ZERO);
+    }
+
+    #[test]
+    fn unfinished_lookups_count_per_message_id() {
+        let lookups = UnfinishedLookups::new();
+        assert_eq!(lookups.record("<a@b>"), 1);
+        assert_eq!(lookups.record("<a@b>"), 2);
+        assert_eq!(lookups.record("<c@d>"), 1);
+        assert_eq!(lookups.record("<a@b>"), 3);
+        for _ in 0..300 {
+            lookups.record("<e@f>");
+        }
+        assert_eq!(lookups.record("<e@f>"), u8::MAX);
+    }
+
+    #[test]
+    fn unfinished_replies_before_430_defaults_and_overrides() {
+        let default = ArticleAdmission::default();
+        assert_eq!(
+            default.unfinished_replies_before_430(),
+            crate::constants::pool::UNFINISHED_REPLIES_BEFORE_430
+        );
+        assert_eq!(
+            default
+                .with_unfinished_replies_before_430(0)
+                .unfinished_replies_before_430(),
+            0
+        );
     }
 
     #[test]

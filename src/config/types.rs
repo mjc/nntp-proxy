@@ -361,6 +361,13 @@ pub struct RoutingArticle {
     /// skipped backend with the shortest estimated wait (bounded by
     /// `checkout_wait_ms` and the deadline); `"give-up"` ends the request.
     pub backlog_last_resort: crate::pool::admission::BacklogLastResort,
+    /// How many `503` replies one message-id may get, while every backend that
+    /// answered said `430`, before an unfinished lookup answers `430`. Stops a
+    /// dead article that a slow, busy backend never confirms from being
+    /// retried by the downloader for minutes. `0` keeps answering
+    /// `unavailable_reply`. Ignored when `unavailable_reply` is `"430"`.
+    #[serde(default = "super::defaults::article_unfinished_replies_before_430")]
+    pub unfinished_replies_before_430: u8,
 }
 
 impl Default for RoutingArticle {
@@ -372,6 +379,7 @@ impl Default for RoutingArticle {
             backlog_skip_percent: defaults::article_backlog_skip_percent(),
             unavailable_reply: crate::pool::admission::UnavailableReply::BackendError,
             backlog_last_resort: crate::pool::admission::BacklogLastResort::default(),
+            unfinished_replies_before_430: defaults::article_unfinished_replies_before_430(),
         }
     }
 }
@@ -397,6 +405,7 @@ impl RoutingArticle {
         )
         .with_unavailable_reply(self.unavailable_reply)
         .with_backlog_last_resort(self.backlog_last_resort)
+        .with_unfinished_replies_before_430(self.unfinished_replies_before_430)
     }
 }
 
@@ -1197,6 +1206,17 @@ mod tests {
         assert_eq!(wait.backlog_last_resort, BacklogLastResort::WaitShortest);
 
         assert!(toml::from_str::<RoutingArticle>("backlog_last_resort = \"wait\"").is_err());
+    }
+
+    #[test]
+    fn routing_article_unfinished_replies_before_430_parses() {
+        let defaults = RoutingArticle::default();
+        assert_eq!(
+            defaults.admission().unfinished_replies_before_430(),
+            crate::constants::pool::UNFINISHED_REPLIES_BEFORE_430
+        );
+        let set: RoutingArticle = toml::from_str("unfinished_replies_before_430 = 0").unwrap();
+        assert_eq!(set.admission().unfinished_replies_before_430(), 0);
     }
 
     #[test]

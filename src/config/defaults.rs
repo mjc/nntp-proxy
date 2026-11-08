@@ -138,6 +138,11 @@ pub const fn article_backlog_skip_percent() -> u16 {
     100
 }
 
+#[must_use]
+pub const fn article_unfinished_replies_before_430() -> u8 {
+    crate::constants::pool::UNFINISHED_REPLIES_BEFORE_430
+}
+
 #[allow(clippy::cast_possible_truncation)] // Compile-time constants of a few seconds.
 const fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis() as u64
