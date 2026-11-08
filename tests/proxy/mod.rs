@@ -10,3 +10,4 @@ pub mod hybrid_mode;
 pub mod metrics;
 pub mod reader_message_id_failover;
 pub mod routing;
+pub mod stat_failover;
