@@ -45,7 +45,7 @@ use std::time::Duration;
 use tracing::{debug, info};
 
 use crate::cache::{ArticleAvailability, AvailabilityMask, AvailabilitySlot};
-use crate::config::{BackendSelectionStrategy, QueuePressureLimits};
+use crate::config::{BackendSelectionStrategy, LowerTierStatPrefetch, QueuePressureLimits};
 use crate::pool::DeadpoolConnectionProvider;
 use crate::types::{BackendId, ClientId, ServerName};
 use strategies::{LeastLoaded, WeightedRoundRobin};
@@ -514,6 +514,8 @@ pub struct BackendSelector {
     stateful_exclusions: SuppressedBackends,
     /// Deadline, checkout wait, and backlog skipping for article requests.
     article_admission: crate::pool::admission::ArticleAdmission,
+    /// When ARTICLE/BODY requests probe lower tiers with background STATs.
+    lower_tier_stat_prefetch: LowerTierStatPrefetch,
 }
 
 impl Default for BackendSelector {
@@ -612,6 +614,7 @@ impl BackendSelector {
                 Self::DEFAULT_QUEUE_BACKPRESSURE_ALL_BUSY_SLEEP_MS,
             stateful_exclusions: SuppressedBackends::empty(),
             article_admission: crate::pool::admission::ArticleAdmission::default(),
+            lower_tier_stat_prefetch: LowerTierStatPrefetch::default(),
         }
     }
 
@@ -629,6 +632,26 @@ impl BackendSelector {
     #[must_use]
     pub const fn article_admission(&self) -> crate::pool::admission::ArticleAdmission {
         self.article_admission
+    }
+
+    /// Configure background lower-tier STAT probes for ARTICLE/BODY requests.
+    #[must_use]
+    pub const fn with_lower_tier_stat_prefetch(mut self, policy: LowerTierStatPrefetch) -> Self {
+        self.lower_tier_stat_prefetch = policy;
+        self
+    }
+
+    #[inline]
+    pub(crate) const fn lower_tier_stat_prefetch(&self) -> LowerTierStatPrefetch {
+        self.lower_tier_stat_prefetch
+    }
+
+    /// Whether the availability facts already show a tier-0 backend returning `430`.
+    pub(crate) fn has_primary_tier_miss(&self, availability: &ArticleAvailability) -> bool {
+        self.backend_ids_in_tier(0).any(|backend_id| {
+            self.availability_slot(backend_id)
+                .is_some_and(|slot| availability.is_missing_slot(slot))
+        })
     }
 
     /// Configure queue-pressure routing behavior.

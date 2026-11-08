@@ -35,6 +35,14 @@ backend_selection = "least-loaded"
 reader_message_id_failover = false
 # Enable adaptive availability prechecking for STAT/HEAD commands
 adaptive_precheck = false
+# Background STAT probes that ARTICLE/BODY send to tier >0 backends with
+# stat_missing enabled, so a primary-tier 430 can skip lower-tier misses:
+#   "first-attempt" (default) - probe each eligible lower-tier backend once per request
+#   "after-primary-miss"      - probe only when a tier-0 430 is already recorded
+#                               for the message ID
+#   "off"                     - never prefetch; the retry STAT sweep after a
+#                               primary-tier 430 still runs
+lower_tier_stat_prefetch = "first-attempt"
 
 # Queue backpressure keeps article routing from piling more work onto
 # already-saturated backend connection pools.

@@ -5,6 +5,7 @@
 
 use super::BackendLease;
 
+use crate::config::LowerTierStatPrefetch;
 use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata, StatusCode};
 use crate::router::{ArticleBackend, BackendSelector, SuppressedBackends};
 use crate::session::SessionError;
@@ -585,6 +586,13 @@ impl ClientSession {
             || !request.has_message_id()
         {
             return;
+        }
+
+        match router.lower_tier_stat_prefetch() {
+            LowerTierStatPrefetch::FirstAttempt => {}
+            LowerTierStatPrefetch::AfterPrimaryMiss
+                if router.has_primary_tier_miss(availability) => {}
+            LowerTierStatPrefetch::AfterPrimaryMiss | LowerTierStatPrefetch::Off => return,
         }
 
         let Some(stat_request) = Self::stat_probe_request(request) else {
@@ -1796,6 +1804,7 @@ mod tests {
     use super::classify_response_write_err;
     use crate::auth::AuthHandler;
     use crate::cache::{ArticleAvailability, UnifiedCache};
+    use crate::config::LowerTierStatPrefetch;
     use crate::metrics::MetricsCollector;
     use crate::pool::{BufferPool, DeadpoolConnectionProvider};
     use crate::protocol::{RequestContext, RequestKind, StatusCode};
@@ -2205,9 +2214,10 @@ mod tests {
     fn router_with_tiered_backends(
         backends: impl IntoIterator<Item = (DeadpoolConnectionProvider, u8)>,
     ) -> Arc<BackendSelector> {
-        router_with_tiered_backends_and_admission(
+        router_with_tiered_backends_configured(
             backends,
             crate::pool::admission::ArticleAdmission::default(),
+            LowerTierStatPrefetch::default(),
         )
     }
 
@@ -2215,7 +2225,32 @@ mod tests {
         backends: impl IntoIterator<Item = (DeadpoolConnectionProvider, u8)>,
         admission: crate::pool::admission::ArticleAdmission,
     ) -> Arc<BackendSelector> {
-        let mut router = BackendSelector::new().with_article_admission(admission);
+        router_with_tiered_backends_configured(
+            backends,
+            admission,
+            LowerTierStatPrefetch::default(),
+        )
+    }
+
+    fn router_with_tiered_backends_and_prefetch(
+        prefetch: LowerTierStatPrefetch,
+        backends: impl IntoIterator<Item = (DeadpoolConnectionProvider, u8)>,
+    ) -> Arc<BackendSelector> {
+        router_with_tiered_backends_configured(
+            backends,
+            crate::pool::admission::ArticleAdmission::default(),
+            prefetch,
+        )
+    }
+
+    fn router_with_tiered_backends_configured(
+        backends: impl IntoIterator<Item = (DeadpoolConnectionProvider, u8)>,
+        admission: crate::pool::admission::ArticleAdmission,
+        prefetch: LowerTierStatPrefetch,
+    ) -> Arc<BackendSelector> {
+        let mut router = BackendSelector::new()
+            .with_article_admission(admission)
+            .with_lower_tier_stat_prefetch(prefetch);
         for (index, (provider, tier)) in backends.into_iter().enumerate() {
             router.add_backend(
                 ServerName::try_new(format!("backend-{index}")).unwrap(),
@@ -3073,6 +3108,142 @@ mod tests {
             has_backend_1,
             "tier-1 backend should be marked missing from STAT=430"
         );
+    }
+
+    /// Serves one BODY through the real per-command request path with a
+    /// primary that has the article and a lower tier that answers STAT `430`.
+    /// Returns the lower-tier STAT count once background probes have settled.
+    async fn lower_tier_stats_for_routed_body(prefetch: LowerTierStatPrefetch) -> usize {
+        let session = test_session();
+        let (primary_port, primary_body) = spawn_article_response_server(
+            b"222 0 <found@example.com> body follows\r\npayload\r\n.\r\n",
+        )
+        .await;
+        let (lower_port, lower_stat, lower_body) = spawn_stat_missing_probe_server().await;
+        let router = router_with_tiered_backends_and_prefetch(
+            prefetch,
+            [
+                (
+                    DeadpoolConnectionProvider::builder("127.0.0.1", primary_port)
+                        .max_connections(1)
+                        .build()
+                        .unwrap(),
+                    0,
+                ),
+                (
+                    DeadpoolConnectionProvider::builder("127.0.0.1", lower_port)
+                        .max_connections(2)
+                        .stat_missing(true)
+                        .build()
+                        .unwrap(),
+                    1,
+                ),
+            ],
+        );
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
+        let mut request = request_context(b"BODY <found@example.com>\r\n");
+        let mut backend_connection = None;
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_to_client_bytes = BackendToClientBytes::zero();
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            session.route_and_execute_request(
+                Arc::clone(&router),
+                &mut request,
+                &mut client_writer,
+                &mut backend_connection,
+                &mut client_to_backend_bytes,
+                &mut backend_to_client_bytes,
+            ),
+        )
+        .await
+        .expect("routed BODY should not hang")
+        .expect("routed BODY should succeed");
+        finalize_backend_connection(&mut backend_connection);
+
+        assert_eq!(primary_body.load(Ordering::SeqCst), 1);
+        assert_eq!(lower_body.load(Ordering::SeqCst), 0);
+        settled_stat_count(&lower_stat).await
+    }
+
+    /// Lets background probes land, then reads the STAT count; a duplicate
+    /// dispatch would arrive within the same window as the first.
+    async fn settled_stat_count(stat_commands: &AtomicUsize) -> usize {
+        let _ = tokio::time::timeout(Duration::from_secs(1), async {
+            while stat_commands.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        stat_commands.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn routed_body_request_prefetches_each_lower_tier_backend_once() {
+        assert_eq!(
+            lower_tier_stats_for_routed_body(LowerTierStatPrefetch::FirstAttempt).await,
+            1,
+            "one request must probe each lower-tier backend at most once"
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_body_request_skips_lower_tier_prefetch_when_off() {
+        assert_eq!(
+            lower_tier_stats_for_routed_body(LowerTierStatPrefetch::Off).await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn routed_body_request_skips_lower_tier_prefetch_without_primary_miss() {
+        assert_eq!(
+            lower_tier_stats_for_routed_body(LowerTierStatPrefetch::AfterPrimaryMiss).await,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn after_primary_miss_prefetch_probes_once_a_tier_zero_miss_is_known() {
+        let session = test_session();
+        let (port0, stat0, _body0) = spawn_stat_missing_probe_server().await;
+        let (port1, stat1, _body1) = spawn_stat_missing_probe_server().await;
+        let router = router_with_tiered_backends_and_prefetch(
+            LowerTierStatPrefetch::AfterPrimaryMiss,
+            [
+                (
+                    DeadpoolConnectionProvider::builder("127.0.0.1", port0)
+                        .max_connections(1)
+                        .stat_missing(true)
+                        .build()
+                        .unwrap(),
+                    0,
+                ),
+                (
+                    DeadpoolConnectionProvider::builder("127.0.0.1", port1)
+                        .max_connections(1)
+                        .stat_missing(true)
+                        .build()
+                        .unwrap(),
+                    1,
+                ),
+            ],
+        );
+        let request = request_context(b"BODY <missing@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        availability.record_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap());
+
+        session.spawn_non_primary_tier_stat_prefetch(
+            &router,
+            &request,
+            &availability,
+            SuppressedBackends::empty(),
+        );
+
+        assert_eq!(settled_stat_count(&stat1).await, 1);
+        assert_eq!(stat0.load(Ordering::SeqCst), 0, "tier 0 must not be probed");
     }
 
     #[test]

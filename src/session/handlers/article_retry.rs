@@ -237,6 +237,9 @@ impl ClientSession {
                 .is_some()
                 .then(ArticleAvailability::new)
         });
+        // The only lower-tier prefetch dispatch for this request: running it
+        // before precheck and routing gives the probes the most head start, and
+        // the retry loop must not dispatch a second round to the same pools.
         if let Some(availability) = availability.as_ref() {
             self.spawn_non_primary_tier_stat_prefetch(
                 router,
@@ -389,7 +392,6 @@ impl ClientSession {
         // normal answer, and the client has not yet waited on any retry.
         let budget = router.article_admission().start_request();
         let mut is_retry_attempt = reader_recovery;
-        let mut non_primary_tier_prefetch_started = false;
         let mut retry_stat_sweep_done = reader_recovery;
         trace!(
             "Client {} availability routing: missing_bits={:08b}, backend_count={}",
@@ -399,16 +401,6 @@ impl ClientSession {
         );
 
         while !availability.all_exhausted(router.availability_mask()) {
-            if !is_retry_attempt && !non_primary_tier_prefetch_started {
-                self.spawn_non_primary_tier_stat_prefetch(
-                    router,
-                    request,
-                    &availability,
-                    unavailable_backends,
-                );
-                non_primary_tier_prefetch_started = true;
-            }
-
             if is_retry_attempt && !retry_stat_sweep_done {
                 self.parallel_retry_stat_sweep(
                     router,

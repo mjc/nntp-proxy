@@ -16,8 +16,8 @@ pub use loading::{
 };
 pub use types::{
     BackendSelectionStrategy, Cache, ClientAuth, CompressionCodec, Config, DiskCache, HealthCheck,
-    Memory, Proxy, QueuePressureLimits, Routing, RoutingArticle, RoutingMode, Server,
-    StatefulSessions, UserCredentials,
+    LowerTierStatPrefetch, Memory, Proxy, QueuePressureLimits, Routing, RoutingArticle,
+    RoutingMode, Server, StatefulSessions, UserCredentials,
 };
 
 // Re-export default functions for use in tests and other modules

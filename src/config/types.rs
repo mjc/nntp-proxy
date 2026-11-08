@@ -150,6 +150,46 @@ impl std::fmt::Display for BackendSelectionStrategy {
     }
 }
 
+/// When ARTICLE/BODY requests dispatch background STAT probes to lower tiers.
+///
+/// The probes record lower-tier `430`s before the primary tier answers, so a
+/// primary miss can skip straight to a lower-tier backend that has the
+/// article. When the primary tier almost always has the article they are pure
+/// overhead, and they compete with real failover traffic on the small
+/// connection pools lower tiers usually have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LowerTierStatPrefetch {
+    /// Probe every eligible lower-tier backend once per request.
+    #[default]
+    #[serde(alias = "first_attempt")]
+    FirstAttempt,
+    /// Probe only when the availability index already records a tier-0
+    /// backend returning `430` for this message ID.
+    #[serde(alias = "after_primary_miss")]
+    AfterPrimaryMiss,
+    /// Never prefetch; the retry sweep after a primary-tier `430` still runs.
+    Off,
+}
+
+impl LowerTierStatPrefetch {
+    /// Get the configuration spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::FirstAttempt => "first-attempt",
+            Self::AfterPrimaryMiss => "after-primary-miss",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl std::fmt::Display for LowerTierStatPrefetch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Main proxy configuration
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct Config {
@@ -254,6 +294,9 @@ pub struct Routing {
     /// Enable adaptive availability prechecking for STAT/HEAD commands (default: false)
     #[serde(default = "super::defaults::adaptive_precheck")]
     pub adaptive_precheck: bool,
+    /// Background lower-tier STAT probes for ARTICLE/BODY requests.
+    #[serde(default)]
+    pub lower_tier_stat_prefetch: LowerTierStatPrefetch,
     /// Queue behavior for routing decisions.
     #[serde(default)]
     pub queue: RoutingQueue,
@@ -276,6 +319,7 @@ impl Default for Routing {
             routing_mode: RoutingMode::default(),
             backend_selection: BackendSelectionStrategy::default(),
             adaptive_precheck: defaults::adaptive_precheck(),
+            lower_tier_stat_prefetch: LowerTierStatPrefetch::default(),
             queue: RoutingQueue::default(),
             reader_message_id_failover: false,
             article: RoutingArticle::default(),
@@ -1610,5 +1654,40 @@ mod tests {
         "#;
         let disk_cache: DiskCache = toml::from_str(toml).unwrap();
         assert_eq!(disk_cache.compression, CompressionCodec::None);
+    }
+
+    #[test]
+    fn test_routing_lower_tier_stat_prefetch_defaults_to_first_attempt() {
+        let routing: Routing = toml::from_str("mode = \"hybrid\"").unwrap();
+        assert_eq!(
+            routing.lower_tier_stat_prefetch,
+            LowerTierStatPrefetch::FirstAttempt
+        );
+        assert_eq!(
+            Routing::default().lower_tier_stat_prefetch,
+            LowerTierStatPrefetch::FirstAttempt
+        );
+    }
+
+    #[test]
+    fn test_routing_lower_tier_stat_prefetch_accepts_each_mode() {
+        for (spelling, expected) in [
+            ("first-attempt", LowerTierStatPrefetch::FirstAttempt),
+            ("first_attempt", LowerTierStatPrefetch::FirstAttempt),
+            (
+                "after-primary-miss",
+                LowerTierStatPrefetch::AfterPrimaryMiss,
+            ),
+            (
+                "after_primary_miss",
+                LowerTierStatPrefetch::AfterPrimaryMiss,
+            ),
+            ("off", LowerTierStatPrefetch::Off),
+        ] {
+            let routing: Routing =
+                toml::from_str(&format!("lower_tier_stat_prefetch = \"{spelling}\"")).unwrap();
+            assert_eq!(routing.lower_tier_stat_prefetch, expected, "{spelling}");
+        }
+        assert!(toml::from_str::<Routing>("lower_tier_stat_prefetch = \"always\"").is_err());
     }
 }

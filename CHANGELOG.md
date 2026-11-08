@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Backlog skipping (`backlog_skip`, `backlog_skip_percent`): a backend whose connection queue would not serve the request within its wait is skipped at once instead of queued on. Under heavy client load, small fallback pools could hold hundreds of waiters, each sitting out the full wait before failing. A skipped backend is not recorded as missing the article.
 - `[routing.article].unavailable_reply` (`"430"` or `"503"`) sets the reply when a request ends before every eligible backend returned `430`: an expired deadline, or no backend left because the rest were busy, skipped, or failed. Unset keeps `430` for the deadline, `430` when no backend is left but at least one returned `430`, and `503` when none did. A request every eligible backend answered with `430` still gets `430`.
 - Per-backend `admission` counters in the stats file: backlog skips, checkout timeouts, deadline expiries, and the service-time average.
+- `[routing].lower_tier_stat_prefetch` controls the background lower-tier `STAT` probes for `ARTICLE`/`BODY`: `"first-attempt"` (default), `"after-primary-miss"`, or `"off"`. The probes are overhead on small lower-tier pools when the primary tier rarely misses.
 
 ### Changed
 
@@ -35,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `CAPABILITIES` in `per-command` mode no longer lists `OVER` and `HDR`, which that mode rejects. It still lists `READER` because `MODE READER` is still forwarded.
 - Under load, a missing article could take 12–44 s to answer `430`, longer than a typical 30-second client article timeout, so the downloader recorded timeouts and blocked the server. Article requests now wait at most 3 s for a free connection on a backend, and `STAT` probes at most 2 s, before moving to the next backend. Previously each request waited the full 10-second pool timeout. A full pool is also no longer retried, which had doubled each wait.
 - Background `STAT` probes (the non-primary-tier prefetch and the retry sweep) no longer close a healthy backend connection after every probe. They dropped the connection instead of returning it to the pool, so each probe counted as a backend failure, shrank the pool for the replacement cooldown, and forced a new TLS login. Under a 120-connection NZBGet load this retired about 6 connections a second (389 in 60 s).
+- An `ARTICLE`/`BODY` request sends at most one background `STAT` probe to each lower-tier backend. The probes were dispatched both before routing and again on the first backend attempt.
+
 ## [0.6.0] - 2026-11-05
 
 ### Added
