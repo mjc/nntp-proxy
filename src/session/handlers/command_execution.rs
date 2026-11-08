@@ -742,12 +742,7 @@ impl ClientSession {
         let backend_id = attempt.exchange.backend_id();
         let status_code = attempt.status_code();
         state.unavailable_backends.suppress(backend_id);
-        match determine_metrics_action_for_request(request, status_code) {
-            MetricsAction::Error4xx => self.metrics.record_error_4xx(backend_id),
-            MetricsAction::Error5xx => self.metrics.record_error_5xx(backend_id),
-            MetricsAction::Article | MetricsAction::None => {}
-        }
-        self.metrics.record_error_reply_failover(backend_id);
+        self.record_article_error_reply_metrics(backend_id, request, status_code);
 
         let conn = attempt.observe().await?;
         match error_reply {
@@ -781,6 +776,22 @@ impl ClientSession {
             }
         }
         Ok(())
+    }
+
+    /// Count a non-430 error reply that the proxy retried elsewhere instead of
+    /// forwarding: in the error class it belongs to, and as a failover.
+    pub(super) fn record_article_error_reply_metrics(
+        &self,
+        backend_id: BackendId,
+        request: &RequestContext,
+        status_code: StatusCode,
+    ) {
+        match determine_metrics_action_for_request(request, status_code) {
+            MetricsAction::Error4xx => self.metrics.record_error_4xx(backend_id),
+            MetricsAction::Error5xx => self.metrics.record_error_5xx(backend_id),
+            MetricsAction::Article | MetricsAction::None => {}
+        }
+        self.metrics.record_error_reply_failover(backend_id);
     }
 
     async fn write_successful_retry_response<W: AsyncWrite + Unpin>(

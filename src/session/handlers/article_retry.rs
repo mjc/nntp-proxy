@@ -24,6 +24,7 @@ use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tracing::{debug, trace, warn};
 
 use crate::protocol::RequestContext;
+use crate::session::multiline_framing::WithheldLookupReply;
 use crate::session::precheck;
 
 /// Client-side write state shared across cache, precheck, and direct routing paths.
@@ -47,11 +48,14 @@ pub(super) enum PreparedRequest {
 
 impl ClientSession {
     /// Answer a message-ID lookup that the client's pinned reader backend
-    /// just answered with `430`, without touching the pinned connection.
+    /// just answered with an error, without touching the pinned connection.
     ///
-    /// The pinned miss is authoritative, so it is recorded before anything
-    /// else. Recovery then serves a compatible cached response or runs the
-    /// normal tier-aware retry loop, which writes exactly one reply (a
+    /// A pinned `430` is authoritative, so it is recorded before anything
+    /// else. Any other error reply only says the pinned backend cannot serve
+    /// this lookup now, so the pinned backend is skipped for this request
+    /// without recording a miss, exactly as the per-command retry loop treats
+    /// such a reply. Recovery then serves a compatible cached response or runs
+    /// the normal tier-aware retry loop, which writes exactly one reply (a
     /// backend's, or the proxy's own `430`/backend error) to `client_writer`.
     ///
     /// Provider and user metrics for the recovered reply are reported here.
@@ -62,6 +66,7 @@ impl ClientSession {
         request: &mut RequestContext,
         client_writer: &mut W,
         pinned_backend: crate::types::BackendId,
+        pinned_reply: WithheldLookupReply,
     ) -> Result<crate::types::TransferMetrics, SessionError> {
         let router = self.router.as_ref().ok_or_else(|| {
             SessionError::Backend(anyhow::anyhow!(
@@ -78,19 +83,38 @@ impl ClientSession {
                 "pinned backend {pinned_backend:?} has no availability slot"
             ))
         })?;
-        self.cache
-            .record_availability_missing(message_id.clone(), slot)
-            .await;
-        // A 430 is normal retry traffic, but operators expect to see it per backend.
-        self.metrics.record_error_4xx(pinned_backend);
+        let mut unavailable_backends = SuppressedBackends::empty();
+        match pinned_reply {
+            WithheldLookupReply::Missing => {
+                self.cache
+                    .record_availability_missing(message_id.clone(), slot)
+                    .await;
+                // A 430 is normal retry traffic, but operators expect to see it per backend.
+                self.metrics.record_error_4xx(pinned_backend);
+            }
+            WithheldLookupReply::Refused(status_code) => {
+                debug!(
+                    client = %self.client_addr,
+                    backend = pinned_backend.as_index(),
+                    command_verb = ?request.verb(),
+                    msg_id = ?request.message_id_value(),
+                    status_code = status_code.as_u16(),
+                    "Pinned reader backend refused message-ID lookup with a non-430 error; trying another backend"
+                );
+                self.record_article_error_reply_metrics(pinned_backend, request, status_code);
+                unavailable_backends.suppress(pinned_backend);
+            }
+        }
 
-        // Look up after recording so the entry already carries the pinned miss.
+        // Look up after recording so the entry already carries a pinned miss.
         let cached = self.cache.get(&message_id).await;
         let mut availability = cached
             .as_ref()
             .map(crate::cache::CachedArticle::to_availability)
             .unwrap_or_default();
-        availability.record_missing_slot(slot);
+        if pinned_reply == WithheldLookupReply::Missing {
+            availability.record_missing_slot(slot);
+        }
 
         let mut client_to_backend_bytes = ClientToBackendBytes::zero();
         let mut backend_to_client_bytes = BackendToClientBytes::zero();
@@ -121,6 +145,7 @@ impl ClientSession {
             router,
             request,
             Some(availability),
+            unavailable_backends,
             &mut RequestExecutionIo {
                 request_origin: ArticleRequestOrigin::ReaderAfterPinnedMiss,
                 client_writer,
@@ -185,8 +210,14 @@ impl ClientSession {
             PreparedRequest::Continue { availability } => availability,
         };
 
-        self.execute_article_retry_loop(&router, request, availability, &mut io)
-            .await
+        self.execute_article_retry_loop(
+            &router,
+            request,
+            availability,
+            SuppressedBackends::empty(),
+            &mut io,
+        )
+        .await
     }
 
     fn log_route_request(&self, request: &RequestContext) {
@@ -371,6 +402,7 @@ impl ClientSession {
         router: &Arc<BackendSelector>,
         request: &mut RequestContext,
         availability: Option<ArticleAvailability>,
+        mut unavailable_backends: SuppressedBackends,
         io: &mut RequestExecutionIo<'_, W>,
     ) -> Result<(), SessionError> {
         trace!(
@@ -381,8 +413,8 @@ impl ClientSession {
         );
 
         let mut availability = availability.unwrap_or_default();
-        let mut unavailable_backends = SuppressedBackends::empty();
-        // Reader recovery starts after a real 430, so it is already a retry:
+        // Reader recovery starts after the pinned backend failed the lookup, so
+        // it is already a retry:
         // each selected backend may be STAT-probed before its lookup. It skips
         // the parallel sweep, which waits on every STAT-capable backend in
         // every tier and would let an unrelated slow provider hold up a hit

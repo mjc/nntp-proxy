@@ -31,6 +31,8 @@ type CommandLog = Arc<Mutex<Vec<(&'static str, String)>>>;
 enum Lookup {
     Has,
     Missing,
+    /// Refuses with a non-430 error, as some providers do with `451`.
+    Refuses,
 }
 
 struct Backend {
@@ -109,6 +111,7 @@ async fn spawn_backend(backend: &Backend, log: CommandLog) -> Result<(u16, Abort
                             match lookup {
                                 Lookup::Has => lookup_reply(name, verb),
                                 Lookup::Missing => missing_reply(name),
+                                Lookup::Refuses => format!("451 0 {ID}\r\n"),
                             }
                         }
                         Some(("GROUP", group)) => {
@@ -491,6 +494,62 @@ async fn exhausted_recovery_answers_430_and_keeps_the_session() -> Result<()> {
         .exchange("STAT", &pointer_reply("pinned", 40))
         .await?;
     assert_eq!(harness.missing_bits().await, 0b11);
+    Ok(())
+}
+
+#[tokio::test]
+async fn pinned_refusal_is_answered_by_a_same_tier_peer_without_recording_a_miss() -> Result<()> {
+    let mut harness = Harness::start(
+        &[
+            Backend::pinned(Lookup::Refuses),
+            Backend::other("peer", 0, Lookup::Has),
+            Backend::other("fallback", 1, Lookup::Has),
+        ],
+        true,
+    )
+    .await?;
+    harness.select_group().await?;
+    let lookup = format!("BODY {ID}");
+    harness
+        .exchange(&lookup, &lookup_reply("peer", "BODY"))
+        .await?;
+    harness
+        .exchange("STAT", &pointer_reply("pinned", 40))
+        .await?;
+
+    assert_eq!(harness.backends_sent(&lookup), ["pinned", "peer"]);
+    assert_eq!(
+        harness.missing_bits().await,
+        0,
+        "a refusal is not a 430, so no backend is recorded missing"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn pinned_refusal_does_not_open_a_lower_tier() -> Result<()> {
+    let mut harness = Harness::start(
+        &[
+            Backend::pinned(Lookup::Refuses),
+            Backend::other("fallback", 1, Lookup::Has),
+        ],
+        true,
+    )
+    .await?;
+    harness.select_group().await?;
+    let lookup = format!("BODY {ID}");
+    harness
+        .exchange(
+            &lookup,
+            std::str::from_utf8(nntp_proxy::protocol::BACKEND_ERROR)?,
+        )
+        .await?;
+    harness
+        .exchange("STAT", &pointer_reply("pinned", 40))
+        .await?;
+
+    assert_eq!(harness.backends_sent(&lookup), ["pinned"]);
+    assert_eq!(harness.missing_bits().await, 0);
     Ok(())
 }
 

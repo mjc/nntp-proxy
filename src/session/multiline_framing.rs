@@ -629,9 +629,9 @@ enum RecoverableReplyBytes<'a> {
     /// Status-line bytes held back from earlier reads while a recoverable
     /// lookup's status was still unknown. Bounded by the status-line limit.
     ReleasedStatusPrefix(Box<[u8]>),
-    /// The complete reply was an authoritative `430` for a recoverable lookup
-    /// and none of its bytes were forwarded.
-    SuppressedMissing,
+    /// The complete reply was an error for a recoverable lookup and none of
+    /// its bytes were forwarded.
+    Suppressed(WithheldLookupReply),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -654,14 +654,29 @@ impl OrderedResponse {
 pub(crate) type OrderedClientWrites<'a> = SmallVec<[Cow<'a, [u8]>; 4]>;
 pub(crate) type ReadyDeferredReplies = SmallVec<[&'static [u8]; 2]>;
 
+/// Why the pinned backend's reply to a recoverable lookup was withheld.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WithheldLookupReply {
+    /// An authoritative `430`: the pinned backend does not have the article.
+    Missing,
+    /// Any other error reply. Some providers refuse lookups they cannot serve
+    /// with a code other than `430` (for example `451`), so this says
+    /// only that the pinned backend cannot serve the lookup now; it must not be
+    /// recorded as a miss.
+    Refused(crate::protocol::StatusCode),
+}
+
 /// One ordered step for the client after a backend read.
 #[derive(Debug)]
 pub(crate) enum OrderedClientAction<'a> {
     /// Write these bytes to the client.
     Write(Cow<'a, [u8]>),
-    /// The pinned backend answered `430`; answer this request from elsewhere
-    /// before writing any later action.
-    RecoverMissing(Box<crate::protocol::RequestContext>),
+    /// The pinned backend answered with an error; answer this request from
+    /// elsewhere before writing any later action.
+    Recover {
+        request: Box<crate::protocol::RequestContext>,
+        reply: WithheldLookupReply,
+    },
 }
 
 pub(crate) type OrderedClientActions<'a> = SmallVec<[OrderedClientAction<'a>; 4]>;
@@ -686,8 +701,9 @@ impl BackendResponseOrder {
         self.ordered.push_back(OrderedResponse::Backend);
     }
 
-    /// Register a message-ID lookup whose `430` should be handed back to the
-    /// session for recovery instead of being forwarded.
+    /// Register a message-ID lookup whose error reply (`430` or any other
+    /// 4xx/5xx) should be handed back to the session for recovery instead of
+    /// being forwarded.
     ///
     /// Any other reply, including a malformed or overlong status line, is
     /// forwarded unchanged. Replies for this registration must be read through
@@ -827,13 +843,16 @@ impl BackendResponseOrder {
                 RecoverableReplyBytes::ReleasedStatusPrefix(bytes) => {
                     emit(OrderedClientAction::Write(Cow::Owned(bytes.into_vec())));
                 }
-                RecoverableReplyBytes::SuppressedMissing => {
+                RecoverableReplyBytes::Suppressed(reply) => {
                     let (Some(OrderedResponse::RecoverableBackend), Some(request)) =
                         (self.ordered.pop_front(), self.recoverable.pop_front())
                     else {
-                        unreachable!("only recoverable requests suppress a missing reply");
+                        unreachable!("only recoverable requests suppress an error reply");
                     };
-                    emit(OrderedClientAction::RecoverMissing(Box::new(request)));
+                    emit(OrderedClientAction::Recover {
+                        request: Box::new(request),
+                        reply,
+                    });
                     for reply in self.take_ready_deferred_replies() {
                         emit(OrderedClientAction::Write(Cow::Borrowed(reply)));
                     }
@@ -861,10 +880,10 @@ struct PendingRequestFrame {
 enum StatusForwarding {
     /// Forward bytes as they arrive.
     PassThrough,
-    /// Hold status-line bytes until the status shows whether this is a `430`.
+    /// Hold status-line bytes until the status shows whether this is an error.
     WithholdUntilStatus,
-    /// The reply is a complete `430` that must not be forwarded.
-    SuppressedMissing,
+    /// The reply is a complete error reply that must not be forwarded.
+    Suppressed(WithheldLookupReply),
 }
 
 #[derive(Debug)]
@@ -2473,8 +2492,8 @@ impl BackendReplyTracker {
             };
 
             offset = framed.end();
-            if front.status_forwarding == StatusForwarding::SuppressedMissing {
-                output.push(RecoverableReplyBytes::SuppressedMissing);
+            if let StatusForwarding::Suppressed(reply) = front.status_forwarding {
+                output.push(RecoverableReplyBytes::Suppressed(reply));
             } else {
                 output.push(RecoverableReplyBytes::Forward(
                     BackendReplyBytes::CompletedTrackedReply(framed.backend_bytes(chunk)),
@@ -2542,8 +2561,10 @@ impl StatusLinePolicy for WithheldStatus {
         if *forwarding != StatusForwarding::WithholdUntilStatus {
             return;
         }
-        if status.as_u16() == crate::protocol::codes::NO_SUCH_ARTICLE_ID {
-            *forwarding = StatusForwarding::SuppressedMissing;
+        if status.is_article_missing() {
+            *forwarding = StatusForwarding::Suppressed(WithheldLookupReply::Missing);
+        } else if status.is_error() {
+            *forwarding = StatusForwarding::Suppressed(WithheldLookupReply::Refused(status));
         } else {
             self.release(forwarding, buffered);
         }
@@ -6679,8 +6700,8 @@ mod tests {
         for action in actions {
             match action {
                 OrderedClientAction::Write(bytes) => forwarded.extend_from_slice(&bytes),
-                OrderedClientAction::RecoverMissing(_) => {
-                    panic!("only a well-formed 430 may be recovered")
+                OrderedClientAction::Recover { .. } => {
+                    panic!("only a well-formed error reply may be recovered")
                 }
             }
         }
@@ -6696,23 +6717,47 @@ mod tests {
             assert!(first.is_empty(), "split {split} leaked bytes");
             let actions = order.client_actions_for_backend_read(&status[split..]);
             assert_eq!(actions.len(), 1, "split {split}");
-            let OrderedClientAction::RecoverMissing(request) = &actions[0] else {
+            let OrderedClientAction::Recover { request, reply } = &actions[0] else {
                 panic!("split {split}: a pinned 430 must not reach the client");
             };
             assert_eq!(request.message_id(), Some("<Case@ID>"));
+            assert_eq!(*reply, WithheldLookupReply::Missing);
             assert!(!order.has_pending_backend_replies());
         }
     }
 
     #[test]
-    fn recoverable_request_forwards_other_statuses_byte_for_byte_at_every_split() {
-        for status in [
-            b"423 No article with that number\r\n".as_slice(),
-            b"412 No newsgroup selected\r\n",
-            b"400 Service discontinued\r\n",
-            b"223 0 <Case@ID>\r\n",
-            b"not-a-status\r\n",
+    fn recoverable_request_withholds_non_430_errors_as_refusals_at_every_split() {
+        for (status, code) in [
+            (b"451 0 <Case@ID>\r\n".as_slice(), 451),
+            (b"423 No article with that number\r\n", 423),
+            (b"412 No newsgroup selected\r\n", 412),
+            (b"400 Service discontinued\r\n", 400),
+            (b"480 Authentication required\r\n", 480),
+            (b"503 Program fault\r\n", 503),
         ] {
+            for split in 0..status.len() {
+                let mut order = recoverable_body_order();
+                let first = order.client_actions_for_backend_read(&status[..split]);
+                assert!(first.is_empty(), "{code} split {split} leaked bytes");
+                let actions = order.client_actions_for_backend_read(&status[split..]);
+                assert_eq!(actions.len(), 1, "{code} split {split}");
+                let OrderedClientAction::Recover { request, reply } = &actions[0] else {
+                    panic!("{code} split {split}: a pinned refusal must not reach the client");
+                };
+                assert_eq!(request.message_id(), Some("<Case@ID>"));
+                assert_eq!(
+                    *reply,
+                    WithheldLookupReply::Refused(crate::protocol::StatusCode::new(code))
+                );
+                assert!(!order.has_pending_backend_replies());
+            }
+        }
+    }
+
+    #[test]
+    fn recoverable_request_forwards_other_statuses_byte_for_byte_at_every_split() {
+        for status in [b"223 0 <Case@ID>\r\n".as_slice(), b"not-a-status\r\n"] {
             for split in 0..=status.len() {
                 let mut order = recoverable_body_order();
                 let mut forwarded = forwarded_without_recovery(
@@ -6783,8 +6828,10 @@ mod tests {
         ));
         assert!(matches!(
             &actions[1],
-            OrderedClientAction::RecoverMissing(request)
-                if request.message_id() == Some("<Case@ID>")
+            OrderedClientAction::Recover {
+                request,
+                reply: WithheldLookupReply::Missing,
+            } if request.message_id() == Some("<Case@ID>")
         ));
         assert!(matches!(
             &actions[2],

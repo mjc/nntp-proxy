@@ -369,7 +369,7 @@ impl ClientSession {
                                 .map_err(|error| StatefulLoopError::client(error.into()))?;
                             state.add_backend_to_client(write.len() as u64);
                         }
-                        OrderedClientAction::RecoverMissing(mut request) => {
+                        OrderedClientAction::Recover { mut request, reply } => {
                             // Report pinned-backend bytes before the recovered
                             // transfer advances the session watermarks.
                             state.flush_byte_deltas(&self.metrics, backend_id, self.username());
@@ -378,6 +378,7 @@ impl ClientSession {
                                     &mut request,
                                     client_write,
                                     backend_id,
+                                    reply,
                                 )
                                 .await
                                 .map_err(|error| StatefulLoopError::client(error.into()))?;
