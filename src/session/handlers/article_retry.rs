@@ -490,35 +490,20 @@ impl ClientSession {
                 Ok(BackendAttemptResult::BackendUnavailable) => {
                     is_retry_attempt = true;
                 }
-                // No miss was recorded for the backends left untried, so a
-                // later request still tries them.
-                Ok(BackendAttemptResult::DeadlineExpired) => {
+                // Some eligible backend never answered 430: it was busy,
+                // skipped, failed, or the deadline ran out first. No
+                // miss was recorded for it, so a later request still tries it,
+                // and the reply must not claim the article is missing unless
+                // the operator chose `430` for this case.
+                Ok(
+                    BackendAttemptResult::DeadlineExpired
+                    | BackendAttemptResult::NoRetryableBackend,
+                ) => {
                     return Self::write_unavailable_reply(
-                        router.article_admission().deadline_reply(),
+                        router.article_admission().unavailable_reply(),
                         io,
                     )
                     .await;
-                }
-                Ok(BackendAttemptResult::NoRetryableBackend) => {
-                    // Availability holds only authoritative 430 facts, so a
-                    // set bit means a backend really reported the article
-                    // missing and the rest were merely busy or failing.
-                    // Clients treat 430 as "try another source" but 503 as a
-                    // server failure to retry, so prefer the 430 unless the
-                    // operator chose a reply for unfinished lookups.
-                    let admission = router.article_admission();
-                    let reply = match admission.unavailable_reply() {
-                        None if availability.has_availability_info() => {
-                            trace!(
-                                "Client {} no retryable backend left after 430 for {:?}, sending 430",
-                                self.client_addr,
-                                request.message_id_value()
-                            );
-                            crate::pool::admission::UnavailableReply::NoSuchArticle
-                        }
-                        _ => admission.no_backend_reply(),
-                    };
-                    return Self::write_unavailable_reply(reply, io).await;
                 }
                 Err(e @ SessionError::ClientDisconnect(_)) => {
                     debug!(

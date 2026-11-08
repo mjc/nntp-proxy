@@ -335,7 +335,7 @@ impl Default for Routing {
 #[serde(default)]
 pub struct RoutingArticle {
     /// Total time one client request may spend across all backend attempts
-    /// before the proxy answers `430`. `0` disables the deadline.
+    /// before the proxy answers with `unavailable_reply`. `0` disables the deadline.
     #[serde(default = "super::defaults::article_deadline_ms")]
     pub deadline_ms: u64,
     /// Longest one attempt waits for a free connection on a backend before
@@ -350,13 +350,12 @@ pub struct RoutingArticle {
     /// wait. Lower values skip sooner. Must be greater than zero.
     #[serde(default = "super::defaults::article_backlog_skip_percent")]
     pub backlog_skip_percent: u16,
-    /// Reply (`"430"` or `"503"`) when a request ends before every eligible
-    /// backend returned `430`: its deadline expired, or every remaining
-    /// backend was busy, skipped, or failed. Unset keeps `430` for an expired
-    /// deadline and, when no backend is left, `430` if some backend returned
-    /// `430` for the request and `503` otherwise.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub unavailable_reply: Option<crate::pool::admission::UnavailableReply>,
+    /// Reply (`"430"` or `"503"`, default `"503"`) when a request ends before
+    /// every eligible backend returned `430`: its deadline expired, or every
+    /// remaining backend was busy, skipped, or failed. A
+    /// request every eligible backend answered with `430` always gets `430`.
+    #[serde(default)]
+    pub unavailable_reply: crate::pool::admission::UnavailableReply,
     /// What to do when backlog skipping leaves no other backend to try in the
     /// tier that should serve the request: `"wait-shortest"` queues on the
     /// skipped backend with the shortest estimated wait (bounded by
@@ -371,7 +370,7 @@ impl Default for RoutingArticle {
             checkout_wait_ms: defaults::article_checkout_wait_ms(),
             backlog_skip: defaults::article_backlog_skip(),
             backlog_skip_percent: defaults::article_backlog_skip_percent(),
-            unavailable_reply: None,
+            unavailable_reply: crate::pool::admission::UnavailableReply::BackendError,
             backlog_last_resort: crate::pool::admission::BacklogLastResort::default(),
         }
     }
@@ -1201,30 +1200,22 @@ mod tests {
     }
 
     #[test]
-    fn routing_article_unavailable_reply_parses_and_defaults_to_unset() {
+    fn routing_article_unavailable_reply_parses_and_defaults_to_503() {
         use crate::pool::admission::UnavailableReply;
 
         let defaults: RoutingArticle = toml::from_str("").unwrap();
-        assert_eq!(defaults.unavailable_reply, None);
+        assert_eq!(defaults.unavailable_reply, UnavailableReply::BackendError);
         assert_eq!(
-            defaults.admission().deadline_reply(),
-            UnavailableReply::NoSuchArticle
-        );
-        assert_eq!(
-            defaults.admission().no_backend_reply(),
+            defaults.admission().unavailable_reply(),
             UnavailableReply::BackendError
         );
 
         let set: RoutingArticle = toml::from_str("unavailable_reply = \"503\"").unwrap();
-        assert_eq!(set.unavailable_reply, Some(UnavailableReply::BackendError));
-        assert_eq!(
-            set.admission().deadline_reply(),
-            UnavailableReply::BackendError
-        );
+        assert_eq!(set.unavailable_reply, UnavailableReply::BackendError);
 
         let set: RoutingArticle = toml::from_str("unavailable_reply = \"430\"").unwrap();
         assert_eq!(
-            set.admission().no_backend_reply(),
+            set.admission().unavailable_reply(),
             UnavailableReply::NoSuchArticle
         );
 

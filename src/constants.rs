@@ -182,7 +182,7 @@ pub mod pool {
     pub const ARTICLE_CHECKOUT_WAIT: Duration = Duration::from_secs(3);
 
     /// Default total time one client article request may spend across all
-    /// backend attempts before the proxy answers `430`
+    /// backend attempts before the proxy answers with the unavailable reply
     /// (`[routing.article].deadline_ms`).
     ///
     /// Twenty seconds is far more than a healthy lookup needs (a few backends

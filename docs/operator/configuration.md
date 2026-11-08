@@ -67,11 +67,11 @@ Time limits for `ARTICLE`, `BODY`, `HEAD`, and `STAT` lookups by message-id.
 
 | Field | Default | Notes |
 | --- | --- | --- |
-| `deadline_ms` | `20000` | Total time one client request may spend across all backend attempts. When it runs out the proxy answers `430`. `0` disables the deadline. Set the client's article timeout a little above this |
+| `deadline_ms` | `20000` | Total time one client request may spend across all backend attempts. When it runs out the proxy answers with `unavailable_reply`. `0` disables the deadline. Set the client's article timeout a little above this |
 | `checkout_wait_ms` | `3000` | Longest one attempt waits for a free connection on a backend, also cut to what is left of `deadline_ms` |
 | `backlog_skip` | `true` | Skip a backend at once, without queueing, when its estimated connection wait is too long |
 | `backlog_skip_percent` | `100` | Skip when the estimated wait is longer than this percentage of the attempt's wait. Lower values skip sooner |
-| `unavailable_reply` | unset | `"430"` or `"503"`: the reply when a request ends before every eligible backend returned `430`, either because `deadline_ms` ran out or because every remaining backend was busy, skipped, or failed. Unset answers `430` for an expired deadline; when no backend is left it answers `430` if any backend returned `430` for the request, otherwise `503 Backend error`. A request that every eligible backend answered with `430` always gets `430` |
+| `unavailable_reply` | `"503"` | `"503"` or `"430"`: the reply when a request ends before every eligible backend returned `430`, either because `deadline_ms` ran out or because every remaining backend was busy, skipped, refused the lookup with a non-`430` error, or failed. A request that every eligible backend answered with `430` always gets `430` |
 | `backlog_last_resort` | `"wait-shortest"` | What a request does when backlog skipping leaves no other backend to try in the tier that should serve it. `"wait-shortest"` queues on the skipped backend with the shortest estimated wait, bounded by `checkout_wait_ms` and what is left of `deadline_ms`; `"give-up"` ends the request with `unavailable_reply` |
 
 The estimated wait is `(requests ahead in the pool queue) × (average time one
@@ -95,9 +95,22 @@ as before. A backend that
 answered `430` or failed is never a last-resort candidate, and background
 `STAT` probes always skip.
 
-Downloaders treat the two replies differently. a typical downloader stops
-trying an article on a server after `430` but retries it later after other
-errors, so `unavailable_reply` lets you compare both.
+The proxy answers `430` only when every backend that may serve the request
+returned `430`, either during this request or as a cached availability fact.
+Downloaders take `430` as final: a typical downloader stops trying an article
+on a server after `430` but retries it later after other errors. A request that
+ended because a backend was busy, skipped, refused the lookup with a non-`430`
+error, or failed, or because the deadline ran out, has not established that
+the article is missing, so it gets `503 Backend error` by default and the
+downloader retries.
+Set `unavailable_reply = "430"` to fail such requests fast instead.
+
+| How the request ended | Reply |
+| --- | --- |
+| A backend returned the article (or `223` for `STAT`) | the backend's reply |
+| Every eligible backend returned `430` (or has a cached `430` fact) | `430` |
+| `deadline_ms` ran out | `unavailable_reply` (`503`) |
+| Every backend left was busy, skipped, refused with a non-`430` error (such as `451`), or failed, even if others returned `430` | `unavailable_reply` (`503`) |
 
 Skips and checkout timeouts are summarised at `info` once per backend every
 10 seconds instead of logged per request.

@@ -349,15 +349,20 @@ fn interval_ms() -> u64 {
 /// returned `430`: its deadline ran out, or every remaining backend was busy,
 /// skipped, or failed.
 ///
-/// Downloaders treat the two codes differently. Many give up on
-/// an article on that server after `430` but retries it later after other
-/// errors, so the right choice is worth measuring rather than fixing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// `430` is a claim that the article does not exist on any backend that could
+/// serve it. Downloaders act on that claim: a typical client gives up on the article on
+/// that server, so a `430` sent while a backend that has the article was only
+/// queued or skipped turns a busy moment into a permanent miss. `503` says the
+/// proxy could not answer now, and the downloader retries later. The default
+/// is therefore `503`; `430` is available for operators who prefer fast
+/// failure over retries.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum UnavailableReply {
     /// `430 No such article`.
     #[serde(rename = "430")]
     NoSuchArticle,
     /// `503 Backend error`.
+    #[default]
     #[serde(rename = "503")]
     BackendError,
 }
@@ -379,9 +384,7 @@ pub struct ArticleAdmission {
     deadline: Option<Duration>,
     checkout_wait: Duration,
     backlog: BacklogPolicy,
-    /// `None` keeps the historical replies: `430` for an expired deadline and
-    /// `503` when no backend is left to try.
-    unavailable_reply: Option<UnavailableReply>,
+    unavailable_reply: UnavailableReply,
     last_resort: BacklogLastResort,
 }
 
@@ -407,7 +410,7 @@ impl ArticleAdmission {
             deadline,
             checkout_wait,
             backlog,
-            unavailable_reply: None,
+            unavailable_reply: UnavailableReply::BackendError,
             last_resort: BacklogLastResort::WaitShortest,
         }
     }
@@ -425,33 +428,18 @@ impl ArticleAdmission {
     }
 
     /// Use `reply` both when the deadline expires and when no backend is left
-    /// to try. `None` keeps the default for each case.
+    /// to try.
     #[must_use]
-    pub const fn with_unavailable_reply(mut self, reply: Option<UnavailableReply>) -> Self {
+    pub const fn with_unavailable_reply(mut self, reply: UnavailableReply) -> Self {
         self.unavailable_reply = reply;
         self
     }
 
-    /// The operator's reply for unfinished lookups, if one was configured.
+    /// Reply for a request that ended before every eligible backend returned
+    /// `430`, whether its deadline expired or no backend was left to try.
     #[must_use]
-    pub const fn unavailable_reply(&self) -> Option<UnavailableReply> {
+    pub const fn unavailable_reply(&self) -> UnavailableReply {
         self.unavailable_reply
-    }
-
-    /// Reply when the request's deadline expires.
-    #[must_use]
-    pub fn deadline_reply(&self) -> UnavailableReply {
-        self.unavailable_reply
-            .unwrap_or(UnavailableReply::NoSuchArticle)
-    }
-
-    /// Reply when every backend still eligible for the request was busy,
-    /// skipped, or failed for this request, so none is left to try. Unset,
-    /// the retry loop still prefers `430` when some backend returned one.
-    #[must_use]
-    pub fn no_backend_reply(&self) -> UnavailableReply {
-        self.unavailable_reply
-            .unwrap_or(UnavailableReply::BackendError)
     }
 
     /// Start the clock for one client article request.
@@ -750,18 +738,17 @@ mod tests {
     }
 
     #[test]
-    fn unavailable_reply_defaults_per_case_and_overrides_both() {
+    fn unavailable_reply_defaults_to_503_and_can_be_overridden() {
         let default = ArticleAdmission::default();
-        assert_eq!(default.deadline_reply(), UnavailableReply::NoSuchArticle);
-        assert_eq!(default.no_backend_reply(), UnavailableReply::BackendError);
+        assert_eq!(default.unavailable_reply(), UnavailableReply::BackendError);
+        assert_eq!(UnavailableReply::default(), UnavailableReply::BackendError);
 
         for reply in [
             UnavailableReply::NoSuchArticle,
             UnavailableReply::BackendError,
         ] {
-            let set = default.with_unavailable_reply(Some(reply));
-            assert_eq!(set.deadline_reply(), reply);
-            assert_eq!(set.no_backend_reply(), reply);
+            let set = default.with_unavailable_reply(reply);
+            assert_eq!(set.unavailable_reply(), reply);
         }
     }
 
