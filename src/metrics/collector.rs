@@ -250,6 +250,30 @@ impl MetricsCollector {
         });
     }
 
+    /// Count a non-430 error reply to an article lookup that was retried on
+    /// another backend instead of being sent to the client.
+    ///
+    /// Kept apart from `errors_4xx`/`errors_5xx` because those also include
+    /// authoritative 430s, which would hide a provider that refuses lookups
+    /// with a non-standard code.
+    #[inline]
+    pub fn record_error_reply_failover(&self, backend_id: BackendId) {
+        self.with_backend_store(backend_id, |store| {
+            store.error_reply_failovers.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn error_reply_failovers(&self, backend_id: BackendId) -> u64 {
+        self.inner
+            .store
+            .backend_stores
+            .get(backend_id.as_index())
+            .map_or(0, |store| {
+                store.error_reply_failovers.load(Ordering::Relaxed)
+            })
+    }
+
     #[inline]
     pub fn record_error(&self, backend_id: BackendId) {
         self.with_backend_store(backend_id, |store| {

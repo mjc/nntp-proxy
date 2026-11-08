@@ -340,3 +340,106 @@ async fn test_ordered_retry_transient_exhaustion_returns_in_order_replies() -> R
 
     Ok(())
 }
+
+/// Send BODY and read its status line plus any multiline body.
+async fn send_body_read_response(
+    client: &mut tokio::net::TcpStream,
+    message_id: &str,
+) -> Result<(String, Vec<String>)> {
+    client
+        .write_all(format!("BODY {message_id}\r\n").as_bytes())
+        .await?;
+    client.flush().await?;
+    let status = read_line_from_stream(client, "BODY status line").await?;
+    let mut body = Vec::new();
+    if status.starts_with("222") {
+        loop {
+            let line = read_line_from_stream(client, "BODY body").await?;
+            if line == ".\r\n" {
+                break;
+            }
+            body.push(line);
+        }
+    }
+    Ok((status, body))
+}
+
+#[tokio::test]
+async fn test_non_430_error_reply_fails_over_to_backend_with_article() -> Result<()> {
+    // Newsgroupdirect answers lookups it cannot serve with `451 0 <id>`.
+    let (refusing_port, _refusing) = MockNntpServer::new()
+        .with_name("Refuses451")
+        .on_command("DATE", "111 20251203120000\r\n")
+        .on_command("BODY", "451 0 <refused@example.com>\r\n")
+        .spawn_on_random_port()
+        .await?;
+    let (good_port, _good) = MockNntpServer::new()
+        .with_name("HasArticle")
+        .on_command("DATE", "111 20251203120000\r\n")
+        .on_command("BODY", "222 0 <found@example.com>\r\nBody line\r\n.\r\n")
+        .spawn_on_random_port()
+        .await?;
+
+    let config = create_test_config(vec![
+        (refusing_port, "Refuses451"),
+        (good_port, "HasArticle"),
+    ]);
+    let proxy_port = spawn_proxy_with_config(config, RoutingMode::PerCommand).await?;
+    let mut client = connect_and_read_greeting(proxy_port).await?;
+
+    // Several lookups so the refusing backend is picked first at least once,
+    // whatever order the selector starts in.
+    for index in 0..4 {
+        let (status, body) =
+            send_body_read_response(&mut client, &format!("<failover-{index}@example.com>"))
+                .await?;
+        assert!(
+            status.starts_with("222"),
+            "lookup {index} should be served by the backend that has it, got: {status}"
+        );
+        assert_eq!(body, vec!["Body line\r\n".to_string()]);
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_non_430_error_replies_from_every_backend_return_fallback() -> Result<()> {
+    let (first_port, _first) = MockNntpServer::new()
+        .with_name("Refuses451A")
+        .on_command("DATE", "111 20251203120000\r\n")
+        .on_command("BODY", "451 0 <refused@example.com>\r\n")
+        .spawn_on_random_port()
+        .await?;
+    let (second_port, _second) = MockNntpServer::new()
+        .with_name("Refuses451B")
+        .on_command("DATE", "111 20251203120000\r\n")
+        .on_command("BODY", "451 0 <refused@example.com>\r\n")
+        .spawn_on_random_port()
+        .await?;
+
+    let config = create_test_config(vec![
+        (first_port, "Refuses451A"),
+        (second_port, "Refuses451B"),
+    ]);
+    let proxy_port = spawn_proxy_with_config(config, RoutingMode::PerCommand).await?;
+    let mut client = connect_and_read_greeting(proxy_port).await?;
+
+    let (status, body) = send_body_read_response(&mut client, "<refused@example.com>").await?;
+    // No backend reported the article missing, so the reply is the one the
+    // retry loop gives when no backend can take the request, not the
+    // provider-specific 451.
+    assert!(
+        status.starts_with("503"),
+        "every backend refusing should return the no-backend reply, got: {status}"
+    );
+    assert!(body.is_empty());
+
+    let date = send_command_read_line(&mut client, "DATE").await?;
+    assert!(
+        date.starts_with("111"),
+        "session should remain usable after every backend refused, got: {date}"
+    );
+
+    Ok(())
+}

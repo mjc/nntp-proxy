@@ -46,6 +46,10 @@ pub(super) enum BackendAttemptResult {
         missing: AuthoritativeArticleMissing,
     },
     /// Backend was unavailable or returned an error that allows another attempt.
+    ///
+    /// This includes non-430 error replies to message-id lookups: they say the
+    /// backend cannot serve this request now, not that the article is missing,
+    /// so they suppress the backend for this request without recording a miss.
     BackendUnavailable,
     /// No backend is retryable without violating tier or availability rules.
     NoRetryableBackend,
@@ -115,6 +119,45 @@ impl AuthoritativeArticleMissing {
 
     pub(super) const fn availability_slot(&self) -> crate::cache::AvailabilitySlot {
         self.availability_slot
+    }
+}
+
+/// How a non-430 error reply to a message-id lookup leaves the backend session.
+///
+/// Some providers refuse lookups they cannot serve with codes other than 430
+/// (for example `451 0 <message-id>`). Forwarding such a reply ends
+/// the request even when another backend has the article, and recording it as
+/// a 430 would poison availability for later requests, so the retry loop treats
+/// it like a busy backend: suppressed for this request only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ArticleErrorReply {
+    /// The provider declined this lookup but the session can serve the next one.
+    SessionUsable,
+    /// The reply says the session itself is unusable: the service is closing
+    /// (400) or the pre-authenticated session lost its authorization (48x,
+    /// 502). Reusing it would fail the next request the same way.
+    SessionUnusable,
+}
+
+impl ArticleErrorReply {
+    pub(super) fn classify(request: &RequestContext, status_code: StatusCode) -> Option<Self> {
+        use crate::protocol::codes;
+
+        if crate::command::CommandHandler::article_lookup_request(request).is_none()
+            || !status_code.is_error()
+            || status_code.is_article_missing()
+        {
+            return None;
+        }
+        Some(match status_code.as_u16() {
+            codes::SERVICE_UNAVAILABLE
+            | codes::AUTH_REQUIRED
+            | codes::AUTH_REJECTED
+            | codes::AUTH_OUT_OF_SEQUENCE
+            | codes::ENCRYPTION_REQUIRED
+            | codes::ACCESS_DENIED => Self::SessionUnusable,
+            _ => Self::SessionUsable,
+        })
     }
 }
 
@@ -408,6 +451,12 @@ impl ClientSession {
             return Ok(BackendAttemptResult::ArticleNotFound { missing });
         }
 
+        if let Some(error_reply) = ArticleErrorReply::classify(request, status_code) {
+            self.discard_article_error_reply(attempt, error_reply, request, state)
+                .await?;
+            return Ok(BackendAttemptResult::BackendUnavailable);
+        }
+
         let response = match self
             .write_successful_retry_response(
                 attempt,
@@ -677,6 +726,61 @@ impl ClientSession {
             }
             while probes.next().await.is_some() {}
         });
+    }
+
+    /// Consume a non-430 error reply without sending it to the client.
+    ///
+    /// The backend is suppressed before the response is drained so that a
+    /// failed drain still keeps this request away from it.
+    async fn discard_article_error_reply(
+        &self,
+        attempt: PreparedBackendAttempt<'_>,
+        error_reply: ArticleErrorReply,
+        request: &RequestContext,
+        state: &mut ArticleAttemptState<'_>,
+    ) -> Result<(), SessionError> {
+        let backend_id = attempt.exchange.backend_id();
+        let status_code = attempt.status_code();
+        state.unavailable_backends.suppress(backend_id);
+        match determine_metrics_action_for_request(request, status_code) {
+            MetricsAction::Error4xx => self.metrics.record_error_4xx(backend_id),
+            MetricsAction::Error5xx => self.metrics.record_error_5xx(backend_id),
+            MetricsAction::Article | MetricsAction::None => {}
+        }
+        self.metrics.record_error_reply_failover(backend_id);
+
+        let conn = attempt.observe().await?;
+        match error_reply {
+            ArticleErrorReply::SessionUsable => {
+                debug!(
+                    client = %self.client_addr,
+                    backend = backend_id.as_index(),
+                    command_verb = ?request.verb(),
+                    msg_id = ?request.message_id_value(),
+                    status_code = status_code.as_u16(),
+                    unavailable_backends = format_args!("{:08b}", state.unavailable_backends.bits()),
+                    "Backend refused article lookup with a non-430 error; trying another backend"
+                );
+                self.release_or_reuse_connection(
+                    conn,
+                    backend_id,
+                    request,
+                    Some(state.backend_connection),
+                );
+            }
+            ArticleErrorReply::SessionUnusable => {
+                warn!(
+                    client = %self.client_addr,
+                    backend = backend_id.as_index(),
+                    command_verb = ?request.verb(),
+                    msg_id = ?request.message_id_value(),
+                    status_code = status_code.as_u16(),
+                    "Backend reply says its session is unusable; retiring connection and trying another backend"
+                );
+                conn.fail_backend();
+            }
+        }
+        Ok(())
     }
 
     async fn write_successful_retry_response<W: AsyncWrite + Unpin>(
@@ -1794,6 +1898,7 @@ fn release_observed_probe_connection(
 #[cfg(test)]
 mod tests {
     use super::ArticleAttemptState;
+    use super::ArticleErrorReply;
     use super::ArticleRequestOrigin;
     use super::AuthoritativeArticleMissing;
     use super::BackendAttemptResult;
@@ -1845,6 +1950,20 @@ mod tests {
         let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 4);
         let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
         let metrics = MetricsCollector::new(1);
+        crate::session::ClientSession::builder(
+            ClientAddress::from(addr),
+            buffer_pool,
+            auth_handler,
+            metrics,
+        )
+        .build()
+    }
+
+    fn test_session_with_backend_metrics(backend_count: usize) -> crate::session::ClientSession {
+        let addr: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+        let buffer_pool = BufferPool::new(BufferSize::try_new(8192).unwrap(), 4);
+        let auth_handler = Arc::new(AuthHandler::new(None, None).unwrap());
+        let metrics = MetricsCollector::new(backend_count);
         crate::session::ClientSession::builder(
             ClientAddress::from(addr),
             buffer_pool,
@@ -4267,9 +4386,18 @@ mod tests {
         reply_len: usize,
         admission: crate::pool::admission::ArticleAdmission,
     ) -> (Vec<u8>, usize) {
+        route_with_tier_peer_reply(primary_reply, b"bad reply\r\n", reply_len, admission).await
+    }
+
+    async fn route_with_tier_peer_reply(
+        primary_reply: &'static [u8],
+        peer_reply: &'static [u8],
+        reply_len: usize,
+        admission: crate::pool::admission::ArticleAdmission,
+    ) -> (Vec<u8>, usize) {
         let session = test_session();
         let (primary_port, _) = spawn_article_response_server(primary_reply).await;
-        let (bad_port, _) = spawn_article_response_server(b"bad reply\r\n").await;
+        let (bad_port, _) = spawn_article_response_server(peer_reply).await;
         let (backup_port, backup_article_commands) =
             spawn_article_response_server(b"222 0 <backup@example.com>\r\npayload\r\n.\r\n").await;
         let router = router_with_tiered_backends_and_admission(
@@ -4311,6 +4439,27 @@ mod tests {
         let mut reply = vec![0; reply_len];
         client_read.read_exact(&mut reply).await.unwrap();
         (reply, backup_article_commands.load(Ordering::SeqCst))
+    }
+
+    #[tokio::test]
+    async fn real_430_with_refusing_tier_peer_answers_430_not_the_refusal() {
+        let (reply, backup_article_commands) = route_with_tier_peer_reply(
+            b"430 No such article\r\n",
+            b"451 0 <tier-peer@example.com>\r\n",
+            crate::protocol::NO_SUCH_ARTICLE.len(),
+            crate::pool::admission::ArticleAdmission::default(),
+        )
+        .await;
+
+        assert_eq!(
+            reply,
+            crate::protocol::NO_SUCH_ARTICLE,
+            "a refusing peer counts as unavailable, so the real 430 decides the reply"
+        );
+        assert_eq!(
+            backup_article_commands, 0,
+            "a refusing tier-0 peer must still block escalation to tier 1"
+        );
     }
 
     #[tokio::test]
@@ -4357,6 +4506,256 @@ mod tests {
 
         assert_eq!(reply, crate::protocol::BACKEND_ERROR);
         assert_eq!(backup_article_commands, 0);
+    }
+
+    #[test]
+    fn article_error_reply_covers_non_430_errors_on_message_id_lookups() {
+        let body = request_context(b"BODY <id@example.com>\r\n");
+        let classify = |request: &RequestContext, code| {
+            ArticleErrorReply::classify(request, StatusCode::new(code))
+        };
+
+        for code in [403, 411, 412, 423, 451, 500, 501, 503] {
+            assert_eq!(
+                classify(&body, code),
+                Some(ArticleErrorReply::SessionUsable),
+                "{code} should fail over and keep the session"
+            );
+        }
+        for code in [400, 480, 481, 482, 483, 502] {
+            assert_eq!(
+                classify(&body, code),
+                Some(ArticleErrorReply::SessionUnusable),
+                "{code} should fail over and retire the session"
+            );
+        }
+        for code in [220, 221, 222, 223, 111, 381, 430] {
+            assert_eq!(classify(&body, code), None, "{code} is not a refusal");
+        }
+        for line in [
+            b"ARTICLE <id@example.com>\r\n".as_slice(),
+            b"HEAD <id@example.com>\r\n",
+            b"STAT <id@example.com>\r\n",
+        ] {
+            assert_eq!(
+                classify(&request_context(line), 451),
+                Some(ArticleErrorReply::SessionUsable)
+            );
+        }
+        // Article numbers depend on the selected group, which differs per
+        // backend, so a refusal there is the client's answer.
+        assert_eq!(classify(&request_context(b"BODY 123\r\n"), 451), None);
+        assert_eq!(classify(&request_context(b"GROUP alt.test\r\n"), 451), None);
+    }
+
+    #[tokio::test]
+    async fn non_430_error_reply_retries_next_same_tier_without_recording_missing() {
+        let session = test_session_with_backend_metrics(2);
+        let (refusing_port, refusing_commands) =
+            spawn_article_response_server(b"451 0 <found@example.com>\r\n").await;
+        let good_response = b"222 0 <found@example.com> body follows\r\npayload\r\n.\r\n";
+        let (good_port, good_commands) = spawn_article_response_server(good_response).await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", refusing_port)
+                    .max_connections(1)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", good_port)
+                    .max_connections(1)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+        ]);
+        let (mut client_writer, mut client_read, _client_write) = client_writer_pair().await;
+
+        let mut request = request_context(b"BODY <found@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
+        };
+
+        let first = session
+            .try_backend_for_article(&router, &mut request, &mut client_writer, &mut state, false)
+            .await
+            .expect("451 reply should be handled");
+        assert!(matches!(first, BackendAttemptResult::BackendUnavailable));
+        assert_eq!(state.availability.missing_bits(), 0);
+        assert_eq!(state.unavailable_backends.bits(), 0b0000_0001);
+        assert_eq!(
+            state
+                .backend_connection
+                .as_ref()
+                .map(|lease| lease.backend_id),
+            Some(BackendId::from_index(0)),
+            "a clean refusal leaves the connection reusable"
+        );
+        assert_eq!(
+            session
+                .metrics
+                .error_reply_failovers(BackendId::from_index(0)),
+            1
+        );
+
+        let second = session
+            .try_backend_for_article(&router, &mut request, &mut client_writer, &mut state, true)
+            .await
+            .expect("same-tier retry should succeed");
+        assert!(matches!(second, BackendAttemptResult::Success));
+        assert_eq!(refusing_commands.load(Ordering::SeqCst), 1);
+        assert_eq!(good_commands.load(Ordering::SeqCst), 1);
+        assert_eq!(availability.missing_bits(), 0);
+        assert_eq!(request.backend_id(), Some(BackendId::from_index(1)));
+        finalize_backend_connection(&mut backend_connection);
+
+        let mut written = vec![0; good_response.len()];
+        tokio::time::timeout(Duration::from_secs(1), client_read.read_exact(&mut written))
+            .await
+            .expect("client response should be readable")
+            .expect("client read should succeed");
+        assert_eq!(
+            written, good_response,
+            "the 451 must not reach the client ahead of the article"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_error_reply_retires_connection_and_suppresses_backend() {
+        let session = test_session();
+        let (port, article_commands) =
+            spawn_article_response_server(b"480 Authentication required\r\n").await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let router = router_with_backend(provider.clone());
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
+
+        let mut request = request_context(b"BODY <auth@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
+        };
+
+        let result = session
+            .try_backend_for_article(&router, &mut request, &mut client_writer, &mut state, false)
+            .await
+            .expect("480 reply should be handled");
+        assert!(matches!(result, BackendAttemptResult::BackendUnavailable));
+        assert_eq!(article_commands.load(Ordering::SeqCst), 1);
+        assert_eq!(availability.missing_bits(), 0);
+        assert_eq!(unavailable_backends.bits(), 0b0000_0001);
+        assert!(
+            backend_connection.is_none(),
+            "a session that lost authorization must not be kept for the batch"
+        );
+        assert_eq!(
+            provider.status_counts().size,
+            0,
+            "a session that lost authorization must not return to the pool"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_430_error_replies_do_not_escalate_to_backup_tier() {
+        let session = test_session();
+        let (refusing0_port, refusing0_commands) =
+            spawn_article_response_server(b"451 0 <refused@example.com>\r\n").await;
+        let (refusing1_port, refusing1_commands) =
+            spawn_article_response_server(b"503 Program fault\r\n").await;
+        let (backup_port, backup_commands) =
+            spawn_article_response_server(b"222 0 <refused@example.com>\r\npayload\r\n.\r\n").await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", refusing0_port)
+                    .max_connections(1)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", refusing1_port)
+                    .max_connections(1)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", backup_port)
+                    .max_connections(1)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+        ]);
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
+
+        let mut request = request_context(b"BODY <refused@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
+        };
+
+        for (index, expected_mask) in [0b0000_0001, 0b0000_0011].into_iter().enumerate() {
+            let result = session
+                .try_backend_for_article(
+                    &router,
+                    &mut request,
+                    &mut client_writer,
+                    &mut state,
+                    index > 0,
+                )
+                .await
+                .expect("error reply should be handled");
+            assert!(matches!(result, BackendAttemptResult::BackendUnavailable));
+            assert_eq!(state.unavailable_backends.bits(), expected_mask);
+            finalize_backend_connection(state.backend_connection);
+        }
+
+        let exhausted = session
+            .try_backend_for_article(&router, &mut request, &mut client_writer, &mut state, true)
+            .await
+            .expect("tier exhaustion should be reported without transport failure");
+        assert!(matches!(
+            exhausted,
+            BackendAttemptResult::NoRetryableBackend
+        ));
+        assert_eq!(refusing0_commands.load(Ordering::SeqCst), 1);
+        assert_eq!(refusing1_commands.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            backup_commands.load(Ordering::SeqCst),
+            0,
+            "a refusal is not a 430, so the backup tier stays closed"
+        );
+        assert_eq!(availability.missing_bits(), 0);
     }
 
     #[tokio::test]
