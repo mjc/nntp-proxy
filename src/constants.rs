@@ -177,7 +177,19 @@ pub mod pool {
     /// full, so waiting the full pool timeout at each one adds up to more than
     /// a downloader's article timeout (NZBGet: 30 s). The downloader then sees a
     /// timeout instead of a `430` and blocks the whole server.
+    ///
+    /// Default for `[routing.article].checkout_wait_ms`.
     pub const ARTICLE_CHECKOUT_WAIT: Duration = Duration::from_secs(3);
+
+    /// Default total time one client article request may spend across all
+    /// backend attempts before the proxy answers `430`
+    /// (`[routing.article].deadline_ms`).
+    ///
+    /// Twenty seconds is far more than a healthy lookup needs (a few backends
+    /// at up to [`ARTICLE_CHECKOUT_WAIT`] each), so it rarely changes today's
+    /// behaviour, and it stays under a typical 30-second client article timeout with
+    /// room for the exchange already in flight when it expires.
+    pub const ARTICLE_DEADLINE: Duration = Duration::from_secs(20);
 
     /// Longest a background `STAT` probe waits for a free connection. A probe is
     /// an optimisation; a busy backend should be skipped, not waited on.

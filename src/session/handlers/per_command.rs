@@ -180,6 +180,12 @@ struct SingleBackendArticleWindow<'a> {
 
 struct UpstreamRequestIndex(usize);
 
+/// The batch connection a window may reuse, and the bound on a fresh checkout.
+struct ArticleWindowConnection<'a> {
+    lease: &'a mut BatchBackendConnection,
+    budget: crate::pool::admission::CheckoutBudget,
+}
+
 struct RoutedArticleWindow<'a> {
     target: SingleBackendArticleWindow<'a>,
     requests: SmallVec<[ArticleWindowRequest; 32]>,
@@ -1010,7 +1016,18 @@ impl ClientSession {
         };
 
         let sent = match self
-            .transition_routed_article_window_to_sent(routed, state, batch, backend_connection)
+            .transition_routed_article_window_to_sent(
+                routed,
+                state,
+                batch,
+                ArticleWindowConnection {
+                    lease: backend_connection,
+                    // The window is sent before any per-request deadline
+                    // starts; a request that falls back to sequential retry
+                    // gets its own.
+                    budget: router.article_admission().start_request().checkout(),
+                },
+            )
             .await
         {
             ArticleWindowSend::Sent(sent) => sent,
@@ -1037,8 +1054,12 @@ impl ClientSession {
         routed: RoutedArticleWindow<'_>,
         state: &mut PerCommandLoopState,
         batch: &crate::session::handlers::pipeline::RequestBatch,
-        backend_connection: &mut BatchBackendConnection,
+        connection: ArticleWindowConnection<'_>,
     ) -> ArticleWindowSend {
+        let ArticleWindowConnection {
+            lease: backend_connection,
+            budget,
+        } = connection;
         let RoutedArticleWindow {
             target,
             mut requests,
@@ -1050,7 +1071,10 @@ impl ClientSession {
                 target.provider,
                 target.backend_id,
                 first_request,
-                backend_connection.slot(),
+                super::command_execution::BackendAttemptConnection {
+                    lease: backend_connection.slot(),
+                    budget,
+                },
             )
             .await
         {

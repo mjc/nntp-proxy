@@ -247,7 +247,7 @@ async fn execute_backend_query(
 ) -> Result<QueryAttemptResult, ()> {
     let backend_id = backend.backend_id();
     let Ok(conn) = provider
-        .checkout_connection_guard_within(crate::constants::pool::STAT_PROBE_CHECKOUT_WAIT)
+        .checkout_for_attempt(deps.router.article_admission().probe())
         .await
     else {
         return Ok(QueryAttemptResult::Error);

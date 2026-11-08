@@ -63,6 +63,8 @@ pub struct DeadpoolConnectionProvider {
     replacement_cooldown: Option<std::time::Duration>,
     /// Set once process shutdown begins so teardown doesn't look like backend damage.
     is_shutting_down: Arc<std::sync::atomic::AtomicBool>,
+    /// Service-time estimate and busy counters shared by every clone.
+    load: Arc<super::admission::BackendLoad>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,6 +423,7 @@ impl DeadpoolConnectionProvider {
             active_cooldowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             replacement_cooldown: None, // Default: no cooldown
             is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            load: Arc::default(),
         }
     }
 
@@ -508,6 +511,7 @@ impl DeadpoolConnectionProvider {
             active_cooldowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             replacement_cooldown: server.replacement_cooldown,
             is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            load: Arc::default(),
         })
     }
 
@@ -519,7 +523,31 @@ impl DeadpoolConnectionProvider {
     pub(in crate::pool) async fn get_pooled_connection(
         &self,
     ) -> Result<PooledConnection, crate::connection_error::ConnectionError> {
-        self.get_pooled_connection_with(&self.pool.timeouts()).await
+        self.get_pooled_connection_with(&self.pool.timeouts())
+            .await
+            .inspect_err(|err| self.log_acquisition_failure(err))
+    }
+
+    fn log_acquisition_failure(&self, err: &crate::connection_error::ConnectionError) {
+        // A backend in login backoff fails every checkout by design until its
+        // window closes; the refusal that opened the window was already logged.
+        if matches!(
+            err,
+            crate::connection_error::ConnectionError::LoginBackoff { .. }
+        ) {
+            debug!(pool = %self.name, error = %err, "Connection acquisition skipped");
+            return;
+        }
+        let status = self.pool.status();
+        warn!(
+            pool = %self.name,
+            max_size = status.max_size,
+            available = status.available,
+            current_size = status.size,
+            waiting = status.waiting,
+            error = %err,
+            "Connection acquisition failed"
+        );
     }
 
     async fn get_pooled_connection_with(
@@ -565,34 +593,11 @@ impl DeadpoolConnectionProvider {
                 },
             },
         };
-        // A backend in login backoff fails every checkout by design until its
-        // window closes; the refusal that opened the window was already logged.
-        if matches!(err, ConnectionError::LoginBackoff { .. }) {
-            debug!(pool = %self.name, error = %err, "Connection acquisition skipped");
-            return Err(err);
-        }
-        let status = self.pool.status();
-        warn!(
-            pool = %self.name,
-            max_size = status.max_size,
-            available = status.available,
-            current_size = status.size,
-            waiting = status.waiting,
-            error = %err,
-            "Connection acquisition failed"
-        );
         Err(err)
     }
 
     /// Checkout like [`Self::checkout_connection_guard`], but give up after
     /// `limit` with [`crate::connection_error::ConnectionError::PoolExhausted`].
-    ///
-    /// Article routing can try another backend, so it should not sit in one
-    /// full pool for the pool's whole wait timeout. Only deadpool's wait for a
-    /// slot is shortened: once a slot is taken, connection setup and recycling
-    /// keep their own deadlines. Cancelling the whole checkout instead would
-    /// abort a TLS handshake or authentication part-way and waste the backend
-    /// connection it was building.
     ///
     /// # Errors
     /// Returns [`crate::connection_error::ConnectionError`] when no healthy backend
@@ -604,15 +609,122 @@ impl DeadpoolConnectionProvider {
         crate::pool::connection_guard::IdleConnection,
         crate::connection_error::ConnectionError,
     > {
+        self.checkout_for_attempt(super::admission::CheckoutBudget::new(
+            limit,
+            super::admission::BacklogPolicy::Queue,
+        ))
+        .await
+    }
+
+    /// Checkout for a routed attempt that can move on to another backend.
+    ///
+    /// When the budget allows it and the pool's queue is too long to serve
+    /// this checkout within its wait, fail at once with
+    /// [`crate::connection_error::ConnectionError::Backlogged`] instead of
+    /// joining the queue. Otherwise wait at most `budget.wait()` for a slot.
+    ///
+    /// Only deadpool's wait for a slot is shortened: once a slot is taken,
+    /// connection setup and recycling keep their own deadlines. Cancelling the
+    /// whole checkout instead would abort a TLS handshake or authentication
+    /// part-way and waste the backend connection it was building.
+    ///
+    /// Both busy outcomes are expected under load and the caller routes
+    /// around them, so they are counted and summarised per backend instead of
+    /// logged per request.
+    ///
+    /// # Errors
+    /// Returns [`crate::connection_error::ConnectionError`] when the backend is
+    /// skipped as backlogged or no healthy connection is acquired in time.
+    pub async fn checkout_for_attempt(
+        &self,
+        budget: super::admission::CheckoutBudget,
+    ) -> Result<
+        crate::pool::connection_guard::IdleConnection,
+        crate::connection_error::ConnectionError,
+    > {
+        use crate::connection_error::ConnectionError;
+
+        if let super::admission::Admission::Skip { estimated_wait } = self.admission(budget) {
+            if let Some(summary) = self.load.note_backlog_skip() {
+                self.log_skip_summary(summary);
+            }
+            return Err(ConnectionError::Backlogged {
+                backend: Arc::clone(&self.name),
+                estimated_wait,
+            });
+        }
+
         let timeouts = managed::Timeouts {
-            wait: Some(limit),
+            wait: Some(budget.wait()),
             ..self.pool.timeouts()
         };
-        let conn = self.get_pooled_connection_with(&timeouts).await?;
-        Ok(crate::pool::connection_guard::IdleConnection::new(
-            conn,
-            self.clone(),
-        ))
+        match self.get_pooled_connection_with(&timeouts).await {
+            Ok(conn) => Ok(crate::pool::connection_guard::IdleConnection::new(
+                conn,
+                self.clone(),
+            )),
+            Err(err @ ConnectionError::PoolExhausted { .. }) => {
+                if let Some(summary) = self.load.note_busy_timeout() {
+                    self.log_skip_summary(summary);
+                }
+                Err(err)
+            }
+            Err(err) => {
+                self.log_acquisition_failure(&err);
+                Err(err)
+            }
+        }
+    }
+
+    fn admission(&self, budget: super::admission::CheckoutBudget) -> super::admission::Admission {
+        if budget.backlog() == super::admission::BacklogPolicy::Queue {
+            return super::admission::Admission::Queue;
+        }
+        // Without a sample nothing can be skipped; avoid reading pool status.
+        let Some(service_time) = self.load.service_time() else {
+            return super::admission::Admission::Queue;
+        };
+        super::admission::admit(
+            super::admission::estimate_wait(self.status_counts(), Some(service_time)),
+            budget,
+        )
+    }
+
+    /// Info, not warn: skipping a busy backend is load shedding working as
+    /// intended, and the request was routed elsewhere or answered. Operators
+    /// still see at the default level which backends are undersized.
+    fn log_skip_summary(&self, summary: super::admission::SkipSummary) {
+        let status = self.status_counts();
+        let service_time = self.load.service_time();
+        let estimated_wait = super::admission::estimate_wait(status, service_time);
+        info!(
+            pool = %self.name,
+            backlog_skips = summary.backlog_skips,
+            busy_timeouts = summary.busy_timeouts,
+            service_time_ms = service_time.unwrap_or_default().as_millis(),
+            estimated_wait_ms = estimated_wait.as_millis(),
+            max_size = status.max_size,
+            available = status.available,
+            waiting = status.waiting,
+            interval_secs = super::admission::SKIP_SUMMARY_INTERVAL.as_secs(),
+            "Backend busy; requests skipped it or timed out waiting for a connection"
+        );
+    }
+
+    /// Record how long one command held a connection from this pool.
+    pub(crate) fn record_service_time(&self, held: std::time::Duration) {
+        self.load.record_service_time(held);
+    }
+
+    /// Count a request whose deadline ran out with this backend next in line.
+    pub fn note_deadline_expiry(&self) {
+        self.load.note_deadline_expiry();
+    }
+
+    /// Shared admission counters for this backend, for the stats file.
+    #[must_use]
+    pub fn load(&self) -> Arc<super::admission::BackendLoad> {
+        Arc::clone(&self.load)
     }
 
     /// Checkout a pooled connection in the idle state.
@@ -1143,6 +1255,67 @@ mod tests {
             "a full pool must surface as PoolExhausted"
         );
         assert!(started.elapsed() < crate::constants::timeout::CONNECTION);
+    }
+
+    #[tokio::test]
+    async fn backlogged_checkout_fails_at_once_without_queueing() {
+        use crate::pool::admission::{BacklogPolicy, CheckoutBudget};
+
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 1, None);
+        let _held = provider.get_pooled_connection().await.unwrap();
+        provider.record_service_time(std::time::Duration::from_secs(5));
+        let budget = CheckoutBudget::new(
+            std::time::Duration::from_secs(2),
+            BacklogPolicy::SkipAbove { percent: 100 },
+        );
+
+        let started = std::time::Instant::now();
+        let result = provider.checkout_for_attempt(budget).await;
+        assert!(
+            matches!(
+                result,
+                Err(crate::connection_error::ConnectionError::Backlogged { .. })
+            ),
+            "a pool that cannot serve within the budget is skipped"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
+        assert_eq!(provider.load().snapshot().backlog_skips, 1);
+
+        let queued = provider
+            .checkout_for_attempt(CheckoutBudget::new(
+                std::time::Duration::from_millis(50),
+                BacklogPolicy::Queue,
+            ))
+            .await;
+        assert!(
+            matches!(
+                queued,
+                Err(crate::connection_error::ConnectionError::PoolExhausted { .. })
+            ),
+            "with skipping off the checkout waits its limit"
+        );
+        assert_eq!(provider.load().snapshot().busy_timeouts, 1);
+    }
+
+    #[tokio::test]
+    async fn completed_exchange_feeds_the_service_time_estimate() {
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 1, None);
+        assert_eq!(provider.load().service_time(), None);
+
+        let mut conn = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+        let _ = conn.stream_mut();
+        conn.mark_response_complete();
+        let _ = conn.complete_success();
+        assert!(
+            provider.load().service_time().is_some(),
+            "a finished command records how long it held the connection"
+        );
     }
 
     #[tokio::test(start_paused = true)]
@@ -1777,6 +1950,7 @@ mod tests {
             active_cooldowns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             replacement_cooldown: cooldown,
             is_shutting_down: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            load: Arc::default(),
         }
     }
 

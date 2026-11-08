@@ -195,6 +195,15 @@ impl MetricsCollector {
         self.inner.store.save(path, server_names)
     }
 
+    /// Write these providers' backlog admission counters (server order) to
+    /// the stats file on every save.
+    pub fn attach_backend_loads(
+        &self,
+        loads: Vec<std::sync::Arc<crate::pool::admission::BackendLoad>>,
+    ) {
+        self.inner.store.attach_backend_loads(loads);
+    }
+
     // Connection lifecycle tracking
 
     #[inline]

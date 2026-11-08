@@ -343,19 +343,24 @@ impl ClientSession {
             .map_err(|e| SessionError::from(anyhow::Error::from(e)))
     }
 
-    async fn write_backend_error_response<W>(client_write: &mut W) -> Result<usize, SessionError>
-    where
-        W: AsyncWrite + Unpin,
-    {
+    /// Answer a request that ended before every eligible backend returned
+    /// `430`.
+    async fn write_unavailable_reply<W: AsyncWrite + Unpin>(
+        reply: crate::pool::admission::UnavailableReply,
+        io: &mut RequestExecutionIo<'_, W>,
+    ) -> Result<(), SessionError> {
+        let response = reply.response();
+        let client_write = &mut *io.client_writer;
         client_write
-            .write_all(crate::protocol::BACKEND_ERROR)
+            .write_all(response)
             .await
             .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
         client_write
             .flush()
             .await
-            .map(|()| crate::protocol::BACKEND_ERROR.len())
-            .map_err(|e| SessionError::from(anyhow::Error::from(e)))
+            .map_err(|e| SessionError::from(anyhow::Error::from(e)))?;
+        *io.backend_to_client_bytes = io.backend_to_client_bytes.add(response.len());
+        Ok(())
     }
 
     async fn execute_article_retry_loop<W: AsyncWrite + Unpin>(
@@ -380,6 +385,9 @@ impl ClientSession {
         // every tier and would let an unrelated slow provider hold up a hit
         // in the current tier.
         let reader_recovery = io.request_origin == ArticleRequestOrigin::ReaderAfterPinnedMiss;
+        // Recovery gets a fresh deadline: the pinned backend's 430 was a
+        // normal answer, and the client has not yet waited on any retry.
+        let budget = router.article_admission().start_request();
         let mut is_retry_attempt = reader_recovery;
         let mut non_primary_tier_prefetch_started = false;
         let mut retry_stat_sweep_done = reader_recovery;
@@ -411,6 +419,7 @@ impl ClientSession {
                         client_to_backend_bytes: io.client_to_backend_bytes,
                         backend_connection: io.backend_connection,
                         unavailable_backends: &mut unavailable_backends,
+                        budget,
                     },
                 )
                 .await?;
@@ -428,6 +437,7 @@ impl ClientSession {
                         client_to_backend_bytes: io.client_to_backend_bytes,
                         backend_connection: io.backend_connection,
                         unavailable_backends: &mut unavailable_backends,
+                        budget,
                     },
                     is_retry_attempt,
                 )
@@ -452,29 +462,35 @@ impl ClientSession {
                 Ok(BackendAttemptResult::BackendUnavailable) => {
                     is_retry_attempt = true;
                 }
+                // No miss was recorded for the backends left untried, so a
+                // later request still tries them.
+                Ok(BackendAttemptResult::DeadlineExpired) => {
+                    return Self::write_unavailable_reply(
+                        router.article_admission().deadline_reply(),
+                        io,
+                    )
+                    .await;
+                }
                 Ok(BackendAttemptResult::NoRetryableBackend) => {
                     // Availability holds only authoritative 430 facts, so a
                     // set bit means a backend really reported the article
                     // missing and the rest were merely busy or failing.
                     // Clients treat 430 as "try another source" but 503 as a
-                    // server failure to retry, so prefer the 430.
-                    if availability.has_availability_info() {
-                        trace!(
-                            "Client {} no retryable backend left after 430 for {:?}, sending 430",
-                            self.client_addr,
-                            request.message_id_value()
-                        );
-                        let client_write = &mut *io.client_writer;
-                        self.send_430_to_client(client_write, io.backend_to_client_bytes)
-                            .await?;
-                        return Ok(());
-                    }
-                    let bytes_written = {
-                        let client_write = &mut *io.client_writer;
-                        Self::write_backend_error_response(client_write).await?
+                    // server failure to retry, so prefer the 430 unless the
+                    // operator chose a reply for unfinished lookups.
+                    let admission = router.article_admission();
+                    let reply = match admission.unavailable_reply() {
+                        None if availability.has_availability_info() => {
+                            trace!(
+                                "Client {} no retryable backend left after 430 for {:?}, sending 430",
+                                self.client_addr,
+                                request.message_id_value()
+                            );
+                            crate::pool::admission::UnavailableReply::NoSuchArticle
+                        }
+                        _ => admission.no_backend_reply(),
                     };
-                    *io.backend_to_client_bytes = io.backend_to_client_bytes.add(bytes_written);
-                    return Ok(());
+                    return Self::write_unavailable_reply(reply, io).await;
                 }
                 Err(e @ SessionError::ClientDisconnect(_)) => {
                     debug!(

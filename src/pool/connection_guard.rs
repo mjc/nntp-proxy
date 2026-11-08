@@ -78,6 +78,9 @@ pub struct ConnectionGuard {
     conn: Option<PooledConnection>,
     provider: DeadpoolConnectionProvider,
     phase: ConnectionPhase,
+    /// When the current exchange began, so a completed exchange can feed the
+    /// pool's service-time estimate.
+    exchange_started: Option<std::time::Instant>,
 }
 
 /// A checked-out connection that has not started protocol I/O.
@@ -180,7 +183,10 @@ impl ConnectionGuard {
     ///
     /// Panics if the guard has already been consumed.
     pub(crate) fn get_mut(&mut self) -> &mut PooledConnection {
-        self.phase = ConnectionPhase::InFlight;
+        if self.phase != ConnectionPhase::InFlight {
+            self.phase = ConnectionPhase::InFlight;
+            self.exchange_started = Some(std::time::Instant::now());
+        }
         self.conn
             .as_mut()
             .expect("ConnectionGuard already consumed")
@@ -207,9 +213,21 @@ impl ConnectionGuard {
     /// The phase is kept on the guard that owns the socket. This removes the
     /// old detached zero-sized completion token, which could be paired with a
     /// different connection by a caller.
+    ///
+    /// The first protocol I/O to response completion is how long one command
+    /// keeps a pool slot busy, which is what backlog admission needs to know
+    /// how fast a queue drains. It is measured here, per exchange, rather than
+    /// from checkout to release: a stateful session holds its connection for
+    /// the whole session, and a batch lease idles between client commands,
+    /// and neither says how long a command takes.
     pub(crate) fn mark_response_complete(&mut self) {
         match self.phase {
-            ConnectionPhase::InFlight => self.phase = ConnectionPhase::Complete,
+            ConnectionPhase::InFlight => {
+                self.phase = ConnectionPhase::Complete;
+                if let Some(started) = self.exchange_started.take() {
+                    self.provider.record_service_time(started.elapsed());
+                }
+            }
             ConnectionPhase::Complete => {}
             ConnectionPhase::Idle => {
                 panic!("response completion requires an active connection")
@@ -273,6 +291,7 @@ impl IdleConnection {
                 conn: Some(conn),
                 provider,
                 phase: ConnectionPhase::Idle,
+                exchange_started: None,
             },
         }
     }

@@ -109,6 +109,40 @@ pub const fn queue_backpressure_all_busy_sleep_ms() -> u64 {
     1
 }
 
+/// Default article request deadline in milliseconds.
+#[inline]
+#[must_use]
+pub const fn article_deadline_ms() -> u64 {
+    duration_ms(crate::constants::pool::ARTICLE_DEADLINE)
+}
+
+/// Default per-backend checkout wait for an article attempt in milliseconds.
+#[inline]
+#[must_use]
+pub const fn article_checkout_wait_ms() -> u64 {
+    duration_ms(crate::constants::pool::ARTICLE_CHECKOUT_WAIT)
+}
+
+/// Default backlog skipping toggle for article attempts.
+#[inline]
+#[must_use]
+pub const fn article_backlog_skip() -> bool {
+    true
+}
+
+/// Default backlog skip threshold: skip when the estimated wait is longer
+/// than the whole checkout wait, i.e. when waiting would most likely time out.
+#[inline]
+#[must_use]
+pub const fn article_backlog_skip_percent() -> u16 {
+    100
+}
+
+#[allow(clippy::cast_possible_truncation)] // Compile-time constants of a few seconds.
+const fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis() as u64
+}
+
 /// Default socket receive buffer size
 #[inline]
 #[must_use]

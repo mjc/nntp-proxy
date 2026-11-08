@@ -50,6 +50,23 @@ hard_waiters_per_connection_percent = 50
 # in the preferred tier is above the hard threshold.
 all_busy_sleep_ms = 1
 
+# Time limits for ARTICLE/BODY/HEAD/STAT lookups by message-id.
+[routing.article]
+# Total time one client request may spend across all backends before the proxy
+# answers 430. 0 disables the deadline. Set the client's article timeout just above.
+deadline_ms = 20000
+# Longest one attempt waits for a free connection on a backend.
+checkout_wait_ms = 3000
+# Skip a backend without queueing when its estimated connection wait is longer
+# than backlog_skip_percent of the attempt's wait.
+backlog_skip = true
+backlog_skip_percent = 100
+# Reply when a request ends before every eligible backend returned 430 (deadline
+# expired, or every remaining backend busy/skipped/failed): "430" or "503".
+# Unset: 430 for an expired deadline; when no backend is left, 430 if any
+# backend returned 430 for the request, else 503.
+# unavailable_reply = "503"
+
 # Memory Configuration
 # These settings affect transport buffers and buffer pools, not article storage.
 [memory]

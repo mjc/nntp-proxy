@@ -9,6 +9,7 @@
 //! connection is reusable only after its response exchange has completed and
 //! all pending bytes have been consumed.
 
+pub mod admission;
 pub mod buffer;
 pub mod connection_guard;
 pub mod connection_trait;

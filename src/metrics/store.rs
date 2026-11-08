@@ -65,9 +65,39 @@ pub(crate) struct PersistedBackend {
     send_micros_total: u64,
     recv_micros_total: u64,
     connection_failures: u64,
+    /// Live backlog-admission counters since process start. Written for
+    /// external tools such as benchmark harnesses and never restored: the
+    /// service-time average describes the running process only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    admission: Option<PersistedAdmission>,
     // Future v2 (retention tracking PR):
     //   oldest_served_article_age_secs, newest_missing_article_age_secs,
     //   retention_sample_count (for confidence interval calculation)
+}
+
+/// Per-backend backlog admission counters in the stats file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PersistedAdmission {
+    /// Checkouts that skipped this backend because its queue was too long.
+    backlog_skips: u64,
+    /// Bounded checkouts that waited their whole limit without a connection.
+    busy_timeouts: u64,
+    /// Client requests whose deadline ran out with this backend next.
+    deadline_expiries: u64,
+    /// Average time one command holds a connection, in microseconds (0 = no
+    /// sample yet).
+    service_time_ewma_micros: u64,
+}
+
+impl From<crate::pool::admission::BackendLoadSnapshot> for PersistedAdmission {
+    fn from(snapshot: crate::pool::admission::BackendLoadSnapshot) -> Self {
+        Self {
+            backlog_skips: snapshot.backlog_skips,
+            busy_timeouts: snapshot.busy_timeouts,
+            deadline_expiries: snapshot.deadline_expiries,
+            service_time_ewma_micros: snapshot.service_time_ewma_micros,
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -151,6 +181,7 @@ impl BackendStore {
             send_micros_total: self.send_micros_total.load(Ordering::Relaxed),
             recv_micros_total: self.recv_micros_total.load(Ordering::Relaxed),
             connection_failures: self.connection_failures.load(Ordering::Relaxed),
+            admission: None,
         }
     }
 
@@ -202,6 +233,9 @@ pub struct MetricsStore {
     pub pipeline_commands: AtomicU64,
     pub pipeline_requests_queued: AtomicU64,
     pub pipeline_requests_completed: AtomicU64,
+    /// Each backend provider's admission counters, in server order, once the
+    /// proxy has built its pools.
+    backend_loads: std::sync::OnceLock<Box<[std::sync::Arc<crate::pool::admission::BackendLoad>]>>,
 }
 
 /// User metrics (internal storage)
@@ -319,7 +353,17 @@ impl MetricsStore {
             pipeline_commands: AtomicU64::new(0),
             pipeline_requests_queued: AtomicU64::new(0),
             pipeline_requests_completed: AtomicU64::new(0),
+            backend_loads: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Include these providers' admission counters, in server order, in every
+    /// later save. Only the first call takes effect.
+    pub fn attach_backend_loads(
+        &self,
+        loads: Vec<std::sync::Arc<crate::pool::admission::BackendLoad>>,
+    ) {
+        let _ = self.backend_loads.set(loads.into_boxed_slice());
     }
 
     /// Load from persisted file, mapping backends by server name
@@ -452,7 +496,15 @@ impl MetricsStore {
                             server_names.len()
                         )
                     })
-                    .map(|store| store.to_persisted(name))
+                    .map(|store| {
+                        let mut persisted = store.to_persisted(name);
+                        persisted.admission = self
+                            .backend_loads
+                            .get()
+                            .and_then(|loads| loads.get(i))
+                            .map(|load| load.snapshot().into());
+                        persisted
+                    })
             })
             .collect::<Result<Vec<_>>>()?
             .into();
@@ -636,6 +688,39 @@ mod tests {
         assert_eq!(user.bytes_received, BytesReceived::new(250));
         assert_eq!(user.total_commands, CommandCount::new(1));
         assert_eq!(user.errors, ErrorCount::new(1));
+    }
+
+    #[test]
+    fn stats_file_reports_attached_backend_admission_counters() {
+        let temp_dir = TempDir::new().unwrap();
+        let stats_path = temp_dir.path().join("stats.json");
+        let server_names = vec!["primary".to_string(), "small".to_string()];
+
+        let store = MetricsStore::new(2);
+        let primary = std::sync::Arc::new(crate::pool::admission::BackendLoad::default());
+        let small = std::sync::Arc::new(crate::pool::admission::BackendLoad::default());
+        small.record_service_time(std::time::Duration::from_millis(250));
+        let _ = small.note_backlog_skip();
+        let _ = small.note_busy_timeout();
+        small.note_deadline_expiry();
+        store.attach_backend_loads(vec![primary, small]);
+        store.save(&stats_path, &server_names).unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&stats_path).unwrap()).unwrap();
+        let small = &json["backends"][1]["admission"];
+        assert_eq!(small["backlog_skips"], 1);
+        assert_eq!(small["busy_timeouts"], 1);
+        assert_eq!(small["deadline_expiries"], 1);
+        assert_eq!(small["service_time_ewma_micros"], 250_000);
+        assert_eq!(json["backends"][0]["admission"]["backlog_skips"], 0);
+
+        assert!(
+            MetricsStore::load(&stats_path, &server_names)
+                .unwrap()
+                .is_some(),
+            "a file with admission counters still loads"
+        );
     }
 
     #[test]

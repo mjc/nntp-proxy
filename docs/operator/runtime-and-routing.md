@@ -148,3 +148,16 @@ Metrics are persisted to:
 - otherwise `stats.json` next to the config file
 
 The dashboard uses that persisted state to survive restarts.
+
+Each backend entry also carries an `admission` object with live counters since
+the process started. They are written for external tools and are not restored
+on restart:
+
+| Field | Meaning |
+| --- | --- |
+| `backlog_skips` | Checkouts that skipped the backend because its queue was too long |
+| `busy_timeouts` | Checkouts that waited their whole limit without a connection |
+| `deadline_expiries` | Client requests whose `[routing.article].deadline_ms` ran out with this backend next |
+| `service_time_ewma_micros` | Running average of how long one command holds a connection (`0` before the first command) |
+
+The file is rewritten every 30 seconds and on shutdown.

@@ -91,6 +91,17 @@ impl Config {
             ));
         }
 
+        if self.routing.article.checkout_wait_ms == 0 {
+            return Err(anyhow::anyhow!(
+                "routing.article.checkout_wait_ms must be greater than 0"
+            ));
+        }
+        if self.routing.article.backlog_skip_percent == 0 {
+            return Err(anyhow::anyhow!(
+                "routing.article.backlog_skip_percent must be greater than 0; set backlog_skip = false to always queue"
+            ));
+        }
+
         for server in &self.servers {
             validate_server(server)?;
         }
@@ -392,6 +403,24 @@ mod tests {
                 .to_string()
                 .contains("memory.socket_send_buffer_size")
         );
+    }
+
+    #[test]
+    fn test_validate_article_limits() {
+        let mut config = Config {
+            servers: vec![create_test_server("test", None)],
+            ..Default::default()
+        };
+        assert!(config.validate().is_ok());
+
+        config.routing.article.checkout_wait_ms = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("routing.article.checkout_wait_ms"));
+
+        config.routing.article.checkout_wait_ms = 500;
+        config.routing.article.backlog_skip_percent = 0;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("routing.article.backlog_skip_percent"));
     }
 
     #[test]

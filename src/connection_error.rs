@@ -57,6 +57,14 @@ pub enum ConnectionError {
     #[error("Connection pool exhausted for backend '{backend}' (max size: {max_size})")]
     PoolExhausted { backend: String, max_size: usize },
 
+    /// The pool's queue is too long to serve this checkout within its wait,
+    /// so the checkout did not join it.
+    #[error("Backend '{backend}' is backlogged (estimated wait {estimated_wait:?})")]
+    Backlogged {
+        backend: std::sync::Arc<str>,
+        estimated_wait: std::time::Duration,
+    },
+
     #[error("Connection pool for backend '{backend}' is closed")]
     PoolClosed { backend: String },
 
