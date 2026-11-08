@@ -643,8 +643,10 @@ impl BackendSelector {
 
     /// Reply for a lookup that ended before every eligible backend returned
     /// `430`. Answers `430` once the message-id has already had
-    /// `unfinished_replies_before_430` such replies and every backend that
-    /// answered it (at least one) said `430`.
+    /// `unfinished_replies_before_430` such replies and at least one backend
+    /// has returned `430` for it (now or as a cached fact). Backends that
+    /// were busy, skipped, failed, or refused with another error say nothing
+    /// about the article either way.
     #[must_use]
     pub fn unfinished_lookup_reply(
         &self,

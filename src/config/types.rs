@@ -361,8 +361,9 @@ pub struct RoutingArticle {
     /// skipped backend with the shortest estimated wait (bounded by
     /// `checkout_wait_ms` and the deadline); `"give-up"` ends the request.
     pub backlog_last_resort: crate::pool::admission::BacklogLastResort,
-    /// How many `503` replies one message-id may get, while every backend that
-    /// answered said `430`, before an unfinished lookup answers `430`. Stops a
+    /// How many `503` replies one message-id may get, while at least one
+    /// backend has returned `430` for it and none returned it, before an
+    /// unfinished lookup answers `430`. Stops a
     /// dead article that a slow, busy backend never confirms from being
     /// retried by the downloader for minutes. `0` keeps answering
     /// `unavailable_reply`. Ignored when `unavailable_reply` is `"430"`.

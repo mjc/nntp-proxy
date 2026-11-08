@@ -385,8 +385,8 @@ impl UnavailableReply {
 /// busy multi-tier setup a small, slow backend may never be reached within the
 /// deadline. Each unfinished lookup answers `503`, so a downloader retries it
 /// many times and a dead release takes minutes to fail. After a bounded number
-/// of `503`s the proxy answers `430` instead, but only while every backend
-/// that answered said `430`.
+/// of `503`s the proxy answers `430` instead, but only once at least one
+/// backend has returned `430` for the article.
 ///
 /// Fixed-size and lock-free: each slot packs a 56-bit message-id hash tag and
 /// an 8-bit count. A collision replaces the slot and restarts the count, which
@@ -489,8 +489,8 @@ impl ArticleAdmission {
         }
     }
 
-    /// How many `503` replies one message-id may get, while every backend that
-    /// answered it said `430`, before the next unfinished lookup answers `430`.
+    /// How many `503` replies one message-id may get, once at least one backend
+    /// returned `430` for it, before the next unfinished lookup answers `430`.
     /// `0` never converts.
     #[must_use]
     pub const fn with_unfinished_replies_before_430(mut self, replies: u8) -> Self {

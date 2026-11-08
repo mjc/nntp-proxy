@@ -194,8 +194,8 @@ pub mod pool {
     /// Default `[routing.article].unfinished_replies_before_430`.
     ///
     /// Two `503`s give a busy backend two more chances to be reached, then the
-    /// third unfinished lookup answers `430` if every backend that answered
-    /// said `430`. Without it, a client that retries `503`
+    /// third unfinished lookup answers `430` if at least one backend has
+    /// returned `430` for the article. Without it, a client that retries `503`
     /// many times takes minutes to give up on a truly missing article.
     pub const UNFINISHED_REPLIES_BEFORE_430: u8 = 2;
 
