@@ -12,6 +12,10 @@
 //! skipped backend is unavailable for that request only; it is not an article
 //! miss and is not recorded as one.
 //!
+//! Skipping only helps when another backend can answer. When every backend
+//! left in the tier is backlogged, a client request queues on the one expected
+//! to free a slot first ([`BacklogLastResort`]) instead of failing outright.
+//!
 //! Everything on the checkout path is a few relaxed atomic loads; nothing here
 //! allocates or takes a lock.
 
@@ -38,6 +42,29 @@ pub enum BacklogPolicy {
     /// Skip the backend when the estimated wait is longer than this
     /// percentage of the checkout's wait limit.
     SkipAbove { percent: u16 },
+    /// Queue whatever the backlog, because every other backend that could
+    /// still serve the request was skipped as backlogged. Counted apart from
+    /// ordinary checkouts so operators can see how often skipping left a
+    /// request with nowhere else to go.
+    LastResort,
+}
+
+/// What an article request does when backlog skipping has left no other
+/// backend to try in the tier that should serve it.
+///
+/// Skipping a backlogged backend saves time only when another backend can
+/// answer instead. When the article's remaining sources are all busy,
+/// giving up turns a slow answer into a certain failure, and the client then
+/// spends one of its own retries asking again.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BacklogLastResort {
+    /// Queue on the skipped backend with the shortest estimated wait, bounded
+    /// by the checkout wait and what is left of the deadline.
+    #[default]
+    WaitShortest,
+    /// End the request as soon as no unskipped backend is left.
+    GiveUp,
 }
 
 /// What limited a checkout's wait.
@@ -140,7 +167,7 @@ pub fn estimate_wait(status: DeadpoolStatusCounts, service_time: Option<Duration
 #[must_use]
 pub fn admit(estimated_wait: Duration, budget: CheckoutBudget) -> Admission {
     match budget.backlog {
-        BacklogPolicy::Queue => Admission::Queue,
+        BacklogPolicy::Queue | BacklogPolicy::LastResort => Admission::Queue,
         BacklogPolicy::SkipAbove { percent } => {
             let limit = budget.wait.saturating_mul(u32::from(percent)) / 100;
             if estimated_wait > limit {
@@ -166,6 +193,9 @@ pub struct BackendLoadSnapshot {
     pub busy_timeouts: u64,
     pub deadline_expiries: u64,
     pub service_time_ewma_micros: u64,
+    pub last_resort_waits: u64,
+    pub last_resort_connected: u64,
+    pub last_resort_timeouts: u64,
 }
 
 /// Per-backend service-time estimate and busy-outcome counters.
@@ -181,6 +211,9 @@ pub struct BackendLoad {
     backlog_skips: AtomicU64,
     busy_timeouts: AtomicU64,
     deadline_expiries: AtomicU64,
+    last_resort_waits: AtomicU64,
+    last_resort_connected: AtomicU64,
+    last_resort_timeouts: AtomicU64,
     unlogged_backlog_skips: AtomicU64,
     unlogged_busy_timeouts: AtomicU64,
     /// Milliseconds since `epoch`, offset by one interval so the first skip
@@ -196,6 +229,9 @@ impl Default for BackendLoad {
             backlog_skips: AtomicU64::new(0),
             busy_timeouts: AtomicU64::new(0),
             deadline_expiries: AtomicU64::new(0),
+            last_resort_waits: AtomicU64::new(0),
+            last_resort_connected: AtomicU64::new(0),
+            last_resort_timeouts: AtomicU64::new(0),
             unlogged_backlog_skips: AtomicU64::new(0),
             unlogged_busy_timeouts: AtomicU64::new(0),
             last_summary_ms: AtomicU64::new(0),
@@ -256,6 +292,21 @@ impl BackendLoad {
         self.deadline_expiries.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count a last-resort checkout joining this backend's queue.
+    pub fn note_last_resort_wait(&self) {
+        self.last_resort_waits.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a last-resort checkout that got a connection.
+    pub fn note_last_resort_connected(&self) {
+        self.last_resort_connected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a last-resort checkout that waited its whole limit.
+    pub fn note_last_resort_timeout(&self) {
+        self.last_resort_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> BackendLoadSnapshot {
         BackendLoadSnapshot {
@@ -263,6 +314,9 @@ impl BackendLoad {
             busy_timeouts: self.busy_timeouts.load(Ordering::Relaxed),
             deadline_expiries: self.deadline_expiries.load(Ordering::Relaxed),
             service_time_ewma_micros: self.service_time_micros.load(Ordering::Relaxed),
+            last_resort_waits: self.last_resort_waits.load(Ordering::Relaxed),
+            last_resort_connected: self.last_resort_connected.load(Ordering::Relaxed),
+            last_resort_timeouts: self.last_resort_timeouts.load(Ordering::Relaxed),
         }
     }
 
@@ -328,6 +382,7 @@ pub struct ArticleAdmission {
     /// `None` keeps the historical replies: `430` for an expired deadline and
     /// `503` when no backend is left to try.
     unavailable_reply: Option<UnavailableReply>,
+    last_resort: BacklogLastResort,
 }
 
 impl Default for ArticleAdmission {
@@ -353,7 +408,20 @@ impl ArticleAdmission {
             checkout_wait,
             backlog,
             unavailable_reply: None,
+            last_resort: BacklogLastResort::WaitShortest,
         }
+    }
+
+    /// What a request does when backlog skipping leaves it no other backend.
+    #[must_use]
+    pub const fn with_backlog_last_resort(mut self, last_resort: BacklogLastResort) -> Self {
+        self.last_resort = last_resort;
+        self
+    }
+
+    #[must_use]
+    pub const fn backlog_last_resort(&self) -> BacklogLastResort {
+        self.last_resort
     }
 
     /// Use `reply` both when the deadline expires and when no backend is left
@@ -395,6 +463,7 @@ impl ArticleAdmission {
                 .map(|deadline| tokio::time::Instant::now() + deadline),
             checkout_wait: self.checkout_wait,
             backlog: self.backlog,
+            last_resort: self.last_resort,
         }
     }
 
@@ -430,6 +499,7 @@ pub struct ArticleBudget {
     expires_at: Option<tokio::time::Instant>,
     checkout_wait: Duration,
     backlog: BacklogPolicy,
+    last_resort: BacklogLastResort,
 }
 
 impl ArticleBudget {
@@ -450,6 +520,22 @@ impl ArticleBudget {
     #[must_use]
     pub fn checkout(&self) -> CheckoutBudget {
         self.bounded(CheckoutBudget::new(self.checkout_wait, self.backlog))
+    }
+
+    /// Budget for queueing on a backend that was skipped as backlogged,
+    /// because no other backend is left to try. Bounded like any other
+    /// article checkout, so a last resort never outlives the deadline.
+    #[must_use]
+    pub fn last_resort_checkout(&self) -> CheckoutBudget {
+        self.bounded(CheckoutBudget::new(
+            self.checkout_wait,
+            BacklogPolicy::LastResort,
+        ))
+    }
+
+    #[must_use]
+    pub const fn last_resort(&self) -> BacklogLastResort {
+        self.last_resort
     }
 
     /// Budget for a `STAT` probe that runs inside this request.
@@ -635,6 +721,9 @@ mod tests {
                 busy_timeouts: 1,
                 deadline_expiries: 0,
                 service_time_ewma_micros: 0,
+                last_resort_waits: 0,
+                last_resort_connected: 0,
+                last_resort_timeouts: 0,
             }
         );
     }
@@ -674,6 +763,50 @@ mod tests {
             assert_eq!(set.deadline_reply(), reply);
             assert_eq!(set.no_backend_reply(), reply);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn last_resort_checkout_queues_within_the_deadline() {
+        let admission = ArticleAdmission::new(
+            Some(Duration::from_secs(5)),
+            Duration::from_secs(3),
+            BacklogPolicy::SkipAbove { percent: 10 },
+        );
+        assert_eq!(
+            admission.backlog_last_resort(),
+            BacklogLastResort::WaitShortest
+        );
+        let budget = admission.start_request();
+        let last_resort = budget.last_resort_checkout();
+        assert_eq!(last_resort.backlog(), BacklogPolicy::LastResort);
+        assert_eq!(last_resort.wait(), Duration::from_secs(3));
+        assert_eq!(
+            admit(Duration::MAX, last_resort),
+            Admission::Queue,
+            "a last resort queues however long the backlog"
+        );
+
+        tokio::time::advance(Duration::from_secs(4)).await;
+        assert_eq!(budget.last_resort_checkout().wait(), Duration::from_secs(1));
+        assert_eq!(budget.last_resort_checkout().bound(), WaitBound::Deadline);
+
+        let give_up = admission
+            .with_backlog_last_resort(BacklogLastResort::GiveUp)
+            .start_request();
+        assert_eq!(give_up.last_resort(), BacklogLastResort::GiveUp);
+    }
+
+    #[test]
+    fn last_resort_counters_reach_the_snapshot() {
+        let load = BackendLoad::default();
+        load.note_last_resort_wait();
+        load.note_last_resort_wait();
+        load.note_last_resort_connected();
+        load.note_last_resort_timeout();
+        let snapshot = load.snapshot();
+        assert_eq!(snapshot.last_resort_waits, 2);
+        assert_eq!(snapshot.last_resort_connected, 1);
+        assert_eq!(snapshot.last_resort_timeouts, 1);
     }
 
     #[tokio::test(start_paused = true)]

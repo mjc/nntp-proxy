@@ -644,6 +644,10 @@ impl DeadpoolConnectionProvider {
     > {
         use crate::connection_error::ConnectionError;
 
+        let last_resort = budget.backlog() == super::admission::BacklogPolicy::LastResort;
+        if last_resort {
+            self.load.note_last_resort_wait();
+        }
         if let super::admission::Admission::Skip { estimated_wait } = self.admission(budget) {
             if let Some(summary) = self.load.note_backlog_skip() {
                 self.log_skip_summary(summary);
@@ -659,11 +663,19 @@ impl DeadpoolConnectionProvider {
             ..self.pool.timeouts()
         };
         match self.get_pooled_connection_with(&timeouts).await {
-            Ok(conn) => Ok(crate::pool::connection_guard::IdleConnection::new(
-                conn,
-                self.clone(),
-            )),
+            Ok(conn) => {
+                if last_resort {
+                    self.load.note_last_resort_connected();
+                }
+                Ok(crate::pool::connection_guard::IdleConnection::new(
+                    conn,
+                    self.clone(),
+                ))
+            }
             Err(err @ ConnectionError::PoolExhausted { .. }) => {
+                if last_resort {
+                    self.load.note_last_resort_timeout();
+                }
                 if let Some(summary) = self.load.note_busy_timeout() {
                     self.log_skip_summary(summary);
                 }
@@ -677,7 +689,10 @@ impl DeadpoolConnectionProvider {
     }
 
     fn admission(&self, budget: super::admission::CheckoutBudget) -> super::admission::Admission {
-        if budget.backlog() == super::admission::BacklogPolicy::Queue {
+        if matches!(
+            budget.backlog(),
+            super::admission::BacklogPolicy::Queue | super::admission::BacklogPolicy::LastResort
+        ) {
             return super::admission::Admission::Queue;
         }
         // Without a sample nothing can be skipped; avoid reading pool status.
@@ -709,6 +724,13 @@ impl DeadpoolConnectionProvider {
             interval_secs = super::admission::SKIP_SUMMARY_INTERVAL.as_secs(),
             "Backend busy; requests skipped it or timed out waiting for a connection"
         );
+    }
+
+    /// How long a checkout joining this pool's queue now would wait, for
+    /// choosing the least backlogged of several busy backends.
+    #[must_use]
+    pub fn estimated_wait(&self) -> std::time::Duration {
+        super::admission::estimate_wait(self.status_counts(), self.load.service_time())
     }
 
     /// Record how long one command held a connection from this pool.

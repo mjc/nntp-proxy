@@ -16,6 +16,7 @@ use crate::session::handlers::cache_operations::{
 };
 use crate::session::handlers::command_execution::{
     ArticleAttemptState, ArticleRequestOrigin, AuthoritativeArticleMissing, BackendAttemptResult,
+    BackloggedBackends,
 };
 use crate::types::{BackendToClientBytes, ClientToBackendBytes};
 use anyhow::Result;
@@ -422,6 +423,7 @@ impl ClientSession {
         let reader_recovery = io.request_origin == ArticleRequestOrigin::ReaderAfterPinnedMiss;
         // Recovery gets a fresh deadline: the pinned backend's 430 was a
         // normal answer, and the client has not yet waited on any retry.
+        let mut backlogged = BackloggedBackends::default();
         let budget = router.article_admission().start_request();
         let mut is_retry_attempt = reader_recovery;
         let mut retry_stat_sweep_done = reader_recovery;
@@ -443,6 +445,7 @@ impl ClientSession {
                         client_to_backend_bytes: io.client_to_backend_bytes,
                         backend_connection: io.backend_connection,
                         unavailable_backends: &mut unavailable_backends,
+                        backlogged: &mut backlogged,
                         budget,
                     },
                 )
@@ -461,6 +464,7 @@ impl ClientSession {
                         client_to_backend_bytes: io.client_to_backend_bytes,
                         backend_connection: io.backend_connection,
                         unavailable_backends: &mut unavailable_backends,
+                        backlogged: &mut backlogged,
                         budget,
                     },
                     is_retry_attempt,

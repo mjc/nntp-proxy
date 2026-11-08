@@ -94,6 +94,15 @@ impl SuppressedBackends {
         Self { bits: 0 }
     }
 
+    /// Every backend but `backend_id`, to route one request to that backend
+    /// alone while keeping the router's availability and tier checks.
+    #[must_use]
+    pub fn all_except(backend_id: BackendId) -> Self {
+        Self {
+            bits: !backend_id.availability_bit(),
+        }
+    }
+
     pub fn suppress(&mut self, backend_id: BackendId) {
         self.bits |= backend_id.availability_bit();
     }

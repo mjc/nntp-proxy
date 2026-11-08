@@ -74,6 +74,11 @@ backlog_skip_percent = 100
 # Unset: 430 for an expired deadline; when no backend is left, 430 if any
 # backend returned 430 for the request, else 503.
 # unavailable_reply = "503"
+# When every backend left in the tier that should serve a request was skipped
+# as backlogged: "wait-shortest" queues on the one with the shortest estimated
+# wait (bounded by checkout_wait_ms and the deadline); "give-up" ends the
+# request with unavailable_reply.
+backlog_last_resort = "wait-shortest"
 
 # Memory Configuration
 # These settings affect transport buffers and buffer pools, not article storage.

@@ -90,6 +90,16 @@ pub(crate) struct PersistedAdmission {
     /// Average time one command holds a connection, in microseconds (0 = no
     /// sample yet).
     service_time_ewma_micros: u64,
+    /// Checkouts that queued here anyway because every other backend left
+    /// for the request had been skipped as backlogged.
+    #[serde(default)]
+    last_resort_waits: u64,
+    /// Last-resort checkouts that got a connection.
+    #[serde(default)]
+    last_resort_connected: u64,
+    /// Last-resort checkouts that waited their whole limit without one.
+    #[serde(default)]
+    last_resort_timeouts: u64,
 }
 
 impl From<crate::pool::admission::BackendLoadSnapshot> for PersistedAdmission {
@@ -99,6 +109,9 @@ impl From<crate::pool::admission::BackendLoadSnapshot> for PersistedAdmission {
             busy_timeouts: snapshot.busy_timeouts,
             deadline_expiries: snapshot.deadline_expiries,
             service_time_ewma_micros: snapshot.service_time_ewma_micros,
+            last_resort_waits: snapshot.last_resort_waits,
+            last_resort_connected: snapshot.last_resort_connected,
+            last_resort_timeouts: snapshot.last_resort_timeouts,
         }
     }
 }
@@ -729,6 +742,8 @@ mod tests {
         let _ = small.note_backlog_skip();
         let _ = small.note_busy_timeout();
         small.note_deadline_expiry();
+        small.note_last_resort_wait();
+        small.note_last_resort_connected();
         store.attach_backend_loads(vec![primary, small]);
         store.save(&stats_path, &server_names).unwrap();
 
@@ -739,6 +754,9 @@ mod tests {
         assert_eq!(small["busy_timeouts"], 1);
         assert_eq!(small["deadline_expiries"], 1);
         assert_eq!(small["service_time_ewma_micros"], 250_000);
+        assert_eq!(small["last_resort_waits"], 1);
+        assert_eq!(small["last_resort_connected"], 1);
+        assert_eq!(small["last_resort_timeouts"], 0);
         assert_eq!(json["backends"][0]["admission"]["backlog_skips"], 0);
 
         assert!(

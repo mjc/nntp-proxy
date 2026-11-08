@@ -72,6 +72,7 @@ Time limits for `ARTICLE`, `BODY`, `HEAD`, and `STAT` lookups by message-id.
 | `backlog_skip` | `true` | Skip a backend at once, without queueing, when its estimated connection wait is too long |
 | `backlog_skip_percent` | `100` | Skip when the estimated wait is longer than this percentage of the attempt's wait. Lower values skip sooner |
 | `unavailable_reply` | unset | `"430"` or `"503"`: the reply when a request ends before every eligible backend returned `430`, either because `deadline_ms` ran out or because every remaining backend was busy, skipped, or failed. Unset answers `430` for an expired deadline; when no backend is left it answers `430` if any backend returned `430` for the request, otherwise `503 Backend error`. A request that every eligible backend answered with `430` always gets `430` |
+| `backlog_last_resort` | `"wait-shortest"` | What a request does when backlog skipping leaves no other backend to try in the tier that should serve it. `"wait-shortest"` queues on the skipped backend with the shortest estimated wait, bounded by `checkout_wait_ms` and what is left of `deadline_ms`; `"give-up"` ends the request with `unavailable_reply` |
 
 The estimated wait is `(requests ahead in the pool queue) × (average time one
 command holds a connection) / (pool size)`. The average is a running mean of
@@ -84,6 +85,15 @@ A skipped or timed-out backend is unavailable for that request only. It is not
 recorded as missing the article, and the next request tries it again. As with
 any busy backend, a skip does not move the lookup to a lower-priority tier
 while another backend in the current tier has not answered `430`.
+
+Skipping saves time only when another backend can answer instead. When every
+backend left in the tier was skipped as backlogged, the default
+`backlog_last_resort = "wait-shortest"` queues on the one expected to free a
+connection first rather than failing the request. That wait is bounded like any
+other checkout, and if it times out the request ends with `unavailable_reply`
+as before. A backend that
+answered `430` or failed is never a last-resort candidate, and background
+`STAT` probes always skip.
 
 Downloaders treat the two replies differently. a typical downloader stops
 trying an article on a server after `430` but retries it later after other

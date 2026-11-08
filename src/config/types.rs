@@ -357,6 +357,11 @@ pub struct RoutingArticle {
     /// `430` for the request and `503` otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_reply: Option<crate::pool::admission::UnavailableReply>,
+    /// What to do when backlog skipping leaves no other backend to try in the
+    /// tier that should serve the request: `"wait-shortest"` queues on the
+    /// skipped backend with the shortest estimated wait (bounded by
+    /// `checkout_wait_ms` and the deadline); `"give-up"` ends the request.
+    pub backlog_last_resort: crate::pool::admission::BacklogLastResort,
 }
 
 impl Default for RoutingArticle {
@@ -367,6 +372,7 @@ impl Default for RoutingArticle {
             backlog_skip: defaults::article_backlog_skip(),
             backlog_skip_percent: defaults::article_backlog_skip_percent(),
             unavailable_reply: None,
+            backlog_last_resort: crate::pool::admission::BacklogLastResort::default(),
         }
     }
 }
@@ -391,6 +397,7 @@ impl RoutingArticle {
             backlog,
         )
         .with_unavailable_reply(self.unavailable_reply)
+        .with_backlog_last_resort(self.backlog_last_resort)
     }
 }
 
@@ -1167,6 +1174,32 @@ mod tests {
     use super::*;
 
     // RoutingMode tests
+    #[test]
+    fn routing_article_backlog_last_resort_parses_and_defaults_to_wait_shortest() {
+        use crate::pool::admission::BacklogLastResort;
+
+        let defaults: RoutingArticle = toml::from_str("").unwrap();
+        assert_eq!(
+            defaults.backlog_last_resort,
+            BacklogLastResort::WaitShortest
+        );
+        assert_eq!(
+            defaults.admission().backlog_last_resort(),
+            BacklogLastResort::WaitShortest
+        );
+
+        let give_up: RoutingArticle = toml::from_str("backlog_last_resort = \"give-up\"").unwrap();
+        assert_eq!(
+            give_up.admission().backlog_last_resort(),
+            BacklogLastResort::GiveUp
+        );
+        let wait: RoutingArticle =
+            toml::from_str("backlog_last_resort = \"wait-shortest\"").unwrap();
+        assert_eq!(wait.backlog_last_resort, BacklogLastResort::WaitShortest);
+
+        assert!(toml::from_str::<RoutingArticle>("backlog_last_resort = \"wait\"").is_err());
+    }
+
     #[test]
     fn routing_article_unavailable_reply_parses_and_defaults_to_unset() {
         use crate::pool::admission::UnavailableReply;
