@@ -227,6 +227,10 @@ harness = false
 name = "client_stat"
 harness = false
 
+[[bench]]
+name = "client_command_counters"
+harness = false
+
 [profile.dev]
 debug = 0             # Use the profiling/bench profiles when symbols are needed
 incremental = false   # Avoid retaining a second full set of object files

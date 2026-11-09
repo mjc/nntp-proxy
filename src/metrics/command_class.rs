@@ -103,21 +103,62 @@ impl CommandClass {
     }
 }
 
-/// One relaxed counter per command class.
-///
-/// A fixed array indexed by the enum keeps recording to a single atomic add
-/// with no hashing or allocation.
+/// Stripes the counters are spread over. Each thread adds to one stripe, so
+/// worker threads rarely share a cache line; a scrape sums all of them.
+const STRIPES: usize = 16;
+
+/// One stripe of per-class counters, alone on its cache lines.
 #[derive(Debug, Default)]
-pub(crate) struct CommandClassCounters([AtomicU64; CommandClass::COUNT]);
+#[repr(align(128))]
+struct Stripe([AtomicU64; CommandClass::COUNT]);
+
+/// Relaxed per-class counters, striped across threads.
+///
+/// Every client command adds here from whatever worker handles it. A single
+/// shared array made every core fight over the same cache line; with one
+/// stripe per thread (up to [`STRIPES`]) the add stays an uncontended relaxed
+/// increment, and the cost moves to the scrape, which sums the stripes.
+#[derive(Debug)]
+pub(crate) struct CommandClassCounters(Box<[Stripe; STRIPES]>);
+
+impl Default for CommandClassCounters {
+    fn default() -> Self {
+        Self(Box::new(std::array::from_fn(|_| Stripe::default())))
+    }
+}
+
+/// This thread's stripe, assigned round-robin on first use.
+fn thread_stripe() -> usize {
+    use std::cell::Cell;
+    use std::sync::atomic::AtomicUsize;
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static STRIPE: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+    STRIPE.with(|stripe| {
+        let current = stripe.get();
+        if current != usize::MAX {
+            return current;
+        }
+        let assigned = NEXT.fetch_add(1, Ordering::Relaxed) % STRIPES;
+        stripe.set(assigned);
+        assigned
+    })
+}
 
 impl CommandClassCounters {
     #[inline]
     pub(crate) fn record(&self, class: CommandClass) {
-        self.0[class.index()].fetch_add(1, Ordering::Relaxed);
+        self.0[thread_stripe()].0[class.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn snapshot(&self) -> [u64; CommandClass::COUNT] {
-        std::array::from_fn(|i| self.0[i].load(Ordering::Relaxed))
+        std::array::from_fn(|i| {
+            self.0
+                .iter()
+                .map(|stripe| stripe.0[i].load(Ordering::Relaxed))
+                .sum()
+        })
     }
 }
 
@@ -158,6 +199,32 @@ mod tests {
             CommandClass::from_kind(RequestKind::Unknown),
             CommandClass::Other
         );
+    }
+
+    #[test]
+    fn counts_from_many_threads_sum_across_stripes() {
+        let counters = std::sync::Arc::new(CommandClassCounters::default());
+        let threads: Vec<_> = (0..STRIPES + 3)
+            .map(|_| {
+                let counters = std::sync::Arc::clone(&counters);
+                std::thread::spawn(move || {
+                    for _ in 0..100 {
+                        counters.record(CommandClass::Article);
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let expected = 100 * (STRIPES as u64 + 3);
+        assert_eq!(counters.snapshot()[CommandClass::Article.index()], expected);
+    }
+
+    #[test]
+    fn stripes_do_not_share_cache_lines() {
+        assert!(std::mem::align_of::<Stripe>() >= 128);
+        assert!(std::mem::size_of::<Stripe>().is_multiple_of(128));
     }
 
     #[test]

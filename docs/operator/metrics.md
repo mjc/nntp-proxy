@@ -32,7 +32,7 @@ The endpoint has no authentication or TLS. Backend names, pool sizes, and traffi
 
 Values come from counters the proxy already keeps for its dashboard and stats file. A scrape reads them with relaxed atomic loads, takes the availability cache's shard locks briefly to sum hits and misses, and reads a few files under `/proc`. Rendering runs on a blocking thread, not on the proxy's async workers. Between scrapes the endpoint does no work.
 
-Request handling adds a single relaxed atomic increment per client command (command class counter) and per authoritative `430` (missing-article counter). Pinned (stateful) sessions classify each backend reply as it is framed and add the totals to the per-backend counters once per backend read. Each latency histogram observation is a binary search over 13 fixed bounds plus two relaxed atomic increments, with no allocation or lock. Connection churn counters change once per backend connection opened or closed.
+Request handling adds a single relaxed atomic increment per client command (command class counter, spread over per-thread stripes so worker threads do not contend on one cache line) and per authoritative `430` (missing-article counter). Pinned (stateful) sessions classify each backend reply as it is framed and add the totals to the per-backend counters once per backend read. Each latency histogram observation is a binary search over 13 fixed bounds plus two relaxed atomic increments, with no allocation or lock. Connection churn counters change once per backend connection opened or closed.
 
 ## Labels
 
