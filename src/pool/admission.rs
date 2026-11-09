@@ -218,6 +218,9 @@ pub enum FallbackOutcome {
     NotFound,
 }
 
+/// One in this many pass-overs of an unlikely rescuer is let through.
+pub const RESCUE_PROBE_EVERY: u64 = 16;
+
 /// Fallback lookups a backend must have answered before its rescue rate is
 /// trusted. Below this the backend is always waited on as before.
 pub const MIN_FALLBACK_LOOKUPS: u64 = 100;
@@ -242,6 +245,9 @@ pub struct BackendLoad {
     /// article, in parts per million.
     rescue_ppm: AtomicU32,
     fallback_lookups: AtomicU64,
+    /// Times this backend was passed over for a low rescue rate; every
+    /// [`RESCUE_PROBE_EVERY`]th is let through so the rate keeps updating.
+    unlikely_rescue_skips: AtomicU64,
     unlogged_backlog_skips: AtomicU64,
     unlogged_busy_timeouts: AtomicU64,
     /// Milliseconds since `epoch`, offset by one interval so the first skip
@@ -265,6 +271,7 @@ impl Default for BackendLoad {
             last_resort_timeouts: AtomicU64::new(0),
             rescue_ppm: AtomicU32::new(0),
             fallback_lookups: AtomicU64::new(0),
+            unlikely_rescue_skips: AtomicU64::new(0),
             unlogged_backlog_skips: AtomicU64::new(0),
             unlogged_busy_timeouts: AtomicU64::new(0),
             last_summary_ms: AtomicU64::new(0),
@@ -366,14 +373,26 @@ impl BackendLoad {
         };
         let samples = self.fallback_lookups.fetch_add(1, Ordering::Relaxed);
         let current = self.rescue_ppm.load(Ordering::Relaxed);
-        let next = if samples == 0 {
-            sample
-        } else if sample >= current {
-            current + ((sample - current) >> RESCUE_EWMA_SHIFT)
+        // A running mean until the window is full, then the exponential
+        // average, so the first sample does not dominate the early estimate.
+        let divisor = u32::try_from(samples.saturating_add(1))
+            .unwrap_or(u32::MAX)
+            .min(1 << RESCUE_EWMA_SHIFT);
+        let next = if sample >= current {
+            current + (sample - current) / divisor
         } else {
-            current - ((current - sample) >> RESCUE_EWMA_SHIFT)
+            current - (current - sample) / divisor
         };
         self.rescue_ppm.store(next, Ordering::Relaxed);
+    }
+
+    /// Whether this pass-over of an unlikely rescuer should instead be let
+    /// through as a probe. A backend that is only ever passed over would
+    /// never be sampled again, so its rate could not recover when the
+    /// workload changes.
+    pub fn take_rescue_probe(&self) -> bool {
+        self.unlikely_rescue_skips.fetch_add(1, Ordering::Relaxed) % RESCUE_PROBE_EVERY
+            == RESCUE_PROBE_EVERY - 1
     }
 
     /// Share of recent fallback lookups that found the article, in parts per
@@ -577,6 +596,7 @@ impl ArticleAdmission {
     /// backends lack. `percent` of zero disables; values above 100 act as 100.
     #[must_use]
     pub const fn with_rescue_floor_percent(mut self, percent: u8) -> Self {
+        // Config validation rejects values over 100; clamp for direct callers.
         let percent = if percent > 100 { 100 } else { percent as u32 };
         self.rescue_floor_ppm = percent * 10_000;
         self
@@ -946,6 +966,24 @@ mod tests {
             load.rescue_ppm().unwrap() > 990_000,
             "converges towards always found"
         );
+    }
+
+    #[test]
+    fn rescue_rate_warm_up_is_a_running_mean() {
+        let load = BackendLoad::default();
+        load.note_fallback_lookup(FallbackOutcome::Found);
+        for _ in 0..99 {
+            load.note_fallback_lookup(FallbackOutcome::NotFound);
+        }
+        let ppm = load.rescue_ppm().unwrap();
+        assert!(ppm < 30_000, "one early hit must not dominate: {ppm}");
+    }
+
+    #[test]
+    fn every_sixteenth_pass_over_is_a_probe() {
+        let load = BackendLoad::default();
+        let probes = (0..64).filter(|_| load.take_rescue_probe()).count();
+        assert_eq!(probes, 4);
     }
 
     #[test]

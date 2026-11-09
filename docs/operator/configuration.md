@@ -124,7 +124,7 @@ fixed 64K-slot table (512 KiB); a slot collision only restarts a count.
 | `deadline_ms` ran out | `unavailable_reply` (`503`) |
 | Every backend left was busy, skipped, refused with a non-`430` error (such as `451`), or failed, even if others returned `430` | `unavailable_reply` (`503`) |
 | Either of the two above, after `unfinished_replies_before_430` earlier `503`s for this message-id, with at least one `430` | `430` |
-| Either of the two above, when every backend that has not answered `430` is under `rescue_floor_percent` | `430` |
+| Either of the two above, when every backend that has not answered `430` was skipped as busy and is under `rescue_floor_percent` | `430` |
 
 #### Rescue-rate floor
 
@@ -133,14 +133,25 @@ missing by every backend before the proxy can answer `430`. A small or slow
 fallback backend then becomes the bottleneck: every lookup queues on it, and
 the client waits out checkout timeouts and retries for each missing article.
 
-The proxy keeps, per backend, an exponential average (weight 1/64) of how often
-a lookup sent after another backend's `430` found the article. It is trusted
-after 100 such lookups. With `rescue_floor_percent` set, a backend under the
-floor is treated as optional while it is busy: requests do not queue on it as
-a last resort, and if it is the only kind of backend left unconfirmed the
-lookup answers `430` without waiting. When the backend is not busy it is still
-asked normally, so its rate keeps tracking the workload and recovers as soon
-as it starts finding articles again.
+The proxy keeps, per backend, an exponential average (weight 1/64, a running
+mean for the first 64 samples) of how often a lookup sent after another
+backend's `430` found the article. Direct attempts and the `STAT` probes that
+follow a `430` both count. The rate is trusted after 100 such lookups.
+
+With `rescue_floor_percent` set, and only once some backend has answered `430`
+for the article:
+
+- a backend under the floor that this request skipped as backlogged is not
+  waited on as a last resort, unless the request could not be served by any
+  lower tier either, so the tier rule (no lower tier before every eligible
+  backend in this tier answered `430`) still holds;
+- if every backend that has not answered `430` was skipped as backlogged and
+  is under the floor, the lookup answers `430` at once. A backend that failed,
+  refused, or ran out of time instead keeps the normal `503` handling.
+
+One in every 16 pass-overs still waits on the backend, and a backend that is
+not busy is asked normally, so its rate keeps tracking the workload and
+recovers when it starts finding articles again.
 
 The trade-off is an article that only that backend has, while its rate is
 below the floor. A low floor such as `2` limits that to roughly one article in

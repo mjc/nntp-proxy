@@ -755,6 +755,12 @@ impl DeadpoolConnectionProvider {
         admission.is_unlikely_to_rescue(&self.load)
     }
 
+    /// Whether a pass-over of this unlikely rescuer should be let through as a
+    /// probe instead.
+    pub fn take_rescue_probe(&self) -> bool {
+        self.load.take_rescue_probe()
+    }
+
     /// Shared admission counters for this backend, for the stats file.
     #[must_use]
     pub fn load(&self) -> Arc<super::admission::BackendLoad> {

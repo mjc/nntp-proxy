@@ -652,6 +652,7 @@ impl BackendSelector {
         &self,
         message_id: Option<&str>,
         availability: &crate::cache::ArticleAvailability,
+        backlogged: SuppressedBackends,
     ) -> crate::pool::admission::UnavailableReply {
         use crate::pool::admission::UnavailableReply;
         let admission = self.article_admission;
@@ -660,7 +661,7 @@ impl BackendSelector {
         if reply == UnavailableReply::NoSuchArticle || availability.missing_bits() == 0 {
             return reply;
         }
-        if self.only_unlikely_rescuers_unconfirmed(availability) {
+        if self.only_unlikely_rescuers_unconfirmed(availability, backlogged) {
             return UnavailableReply::NoSuchArticle;
         }
         if limit == 0 {
@@ -676,13 +677,16 @@ impl BackendSelector {
         }
     }
 
-    /// Whether every backend that has not answered `430` for this article is
-    /// one whose recent rescue rate is under the configured floor. Waiting
-    /// for such a backend to confirm the miss is what makes downloads of
-    /// articles gone everywhere slow, and it would almost never have them.
+    /// Whether every backend that has not answered `430` for this article was
+    /// skipped as backlogged by this request and has a recent rescue rate
+    /// under the configured floor. Waiting for such a backend to confirm the
+    /// miss is what makes downloads of articles gone everywhere slow, and it
+    /// would almost never have them. A backend that failed, refused, or
+    /// timed out rather than being busy keeps the normal `503` handling.
     fn only_unlikely_rescuers_unconfirmed(
         &self,
         availability: &crate::cache::ArticleAvailability,
+        backlogged: SuppressedBackends,
     ) -> bool {
         let admission = self.article_admission;
         let mut unconfirmed = false;
@@ -691,7 +695,9 @@ impl BackendSelector {
                 continue;
             }
             unconfirmed = true;
-            if !backend.provider.is_unlikely_to_rescue(&admission) {
+            if !backlogged.contains(backend.id)
+                || !backend.provider.is_unlikely_to_rescue(&admission)
+            {
                 return false;
             }
         }

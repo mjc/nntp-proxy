@@ -503,6 +503,7 @@ impl ClientSession {
                     let reply = router.unfinished_lookup_reply(
                         message_id.as_ref().map(|id| id.as_str()),
                         &availability,
+                        backlogged.skipped(),
                     );
                     return Self::write_unavailable_reply(reply, io).await;
                 }
