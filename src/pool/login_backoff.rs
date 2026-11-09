@@ -109,15 +109,19 @@ impl LoginBackoff {
         Admission::Proceed(LoginAttempt::new(self, AttemptRole::Probe, state.epoch))
     }
 
-    /// Whether a backoff window is open right now, so new logins fail
-    /// locally. Based on the window's deadline rather than the refusal count,
-    /// which stays set until a later login succeeds and would keep the gauge
-    /// up long after the window closed. Read at scrape time only.
+    /// Whether [`Self::admit`] would refuse a new login right now: a backoff
+    /// window is open, or the window has closed but the single probe it
+    /// allows is already in flight. Mirrors `admit` rather than the refusal
+    /// count, which stays set until a later login succeeds and would keep
+    /// the gauge up after logins are allowed again. Read at scrape time only.
     pub(crate) fn is_waiting(&self) -> bool {
         let now = Instant::now();
-        self.lock()
+        let state = self.lock();
+        let window_open = state
             .retry_not_before
-            .is_some_and(|deadline| deadline > now)
+            .is_some_and(|deadline| deadline > now);
+        let probe_in_flight = state.refusals > 0 && state.probe == ProbeSlot::Taken;
+        window_open || probe_in_flight
     }
 
     /// Attempts admitted together fail together; only the first of them moves
@@ -434,7 +438,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn waiting_reflects_the_open_window_not_the_refusal_count() {
+    async fn waiting_mirrors_whether_admit_would_refuse() {
         let gate = LoginBackoff::default();
         assert!(!gate.is_waiting());
         let delay = refuse(&gate);
@@ -442,7 +446,17 @@ mod tests {
         tokio::time::advance(delay + Duration::from_millis(1)).await;
         assert!(
             !gate.is_waiting(),
-            "window closed even though no login succeeded"
+            "window closed and the probe slot is free"
         );
+
+        // Once the probe is admitted, every other create waits for it.
+        let probe = expect_role(&gate, AttemptRole::Probe);
+        assert!(wait_time(&gate).is_some());
+        assert!(
+            gate.is_waiting(),
+            "probe in flight still refuses other logins"
+        );
+        probe.succeeded();
+        assert!(!gate.is_waiting());
     }
 }

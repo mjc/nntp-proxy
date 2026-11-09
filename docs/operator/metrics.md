@@ -18,7 +18,7 @@ The endpoint answers:
 | Request | Response |
 | --- | --- |
 | `GET /metrics` | `200`, `Content-Type: text/plain; version=0.0.4; charset=utf-8` |
-| `HEAD /metrics` | `200` headers only, without rendering the metrics |
+| `HEAD /metrics` | `200` headers only. It does not render the metrics, so it shows the listener is up, not that a scrape would succeed; use `GET` for that. |
 | any other path | `404` |
 | any other method | `405` |
 
@@ -115,7 +115,7 @@ Every backend metric has the labels `backend` and `tier`, plus any listed here.
 | `nntp_proxy_backend_stateful_sessions` | gauge | | Client sessions pinned to the backend. |
 | `nntp_proxy_backend_connect_attempts_total` | counter | `outcome` = `created`, `failed`, `login_refused`, `backoff_denied` | Attempts to open a connection. `backoff_denied` attempts were refused locally during login backoff without contacting the backend. |
 | `nntp_proxy_backend_connections_closed_total` | counter | `reason` = `backend_error`, `cancelled`, `client_abort`, `health_check`, `stale`, `idle` | Connections closed, counted when the connection is destroyed, so `created` minus all closes is the live connection count. `cancelled`: the request using it was cancelled mid-exchange (deadline expiry or a dropped request). `health_check`: the periodic health check found it dead. `stale`: it failed the liveness check when taken from the pool. `idle`: the pool dropped it itself (idle-timeout clearing, a pool shrinking during replacement cooldown, or shutdown). |
-| `nntp_proxy_backend_login_backoff` | gauge | | `1` while a login backoff window is open and new connections fail locally. Returns to `0` when the window ends, even before a later login succeeds. |
+| `nntp_proxy_backend_login_backoff` | gauge | | `1` while login backoff makes new connections to the backend fail locally: a backoff window is open, or the window has ended and the one probe login it allows is still in flight. `0` once logins are allowed again, even before a later login succeeds. |
 | `nntp_proxy_backend_health_checks_total` | counter | | Idle connections checked by the periodic health check. |
 | `nntp_proxy_backend_health_check_failures_total` | counter | | Idle connections that failed it. |
 

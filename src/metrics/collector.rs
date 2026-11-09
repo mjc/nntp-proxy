@@ -302,11 +302,7 @@ impl MetricsCollector {
     /// exported 430 ratio is not mixed with refused commands.
     #[inline]
     pub fn record_article_missing(&self, backend_id: BackendId) {
-        self.with_backend_store(backend_id, |store| {
-            store.article_missing.fetch_add(1, Ordering::Relaxed);
-            store.errors_4xx.fetch_add(1, Ordering::Relaxed);
-            store.errors.fetch_add(1, Ordering::Relaxed);
-        });
+        self.with_backend_store(backend_id, |store| add_article_missing(store, 1));
     }
 
     /// Fold a stateful session's locally counted reply outcomes into this
@@ -329,22 +325,13 @@ impl MetricsCollector {
                     .fetch_add(tally.article_bytes, Ordering::Relaxed);
             }
             if tally.article_missing != 0 {
-                store
-                    .article_missing
-                    .fetch_add(tally.article_missing, Ordering::Relaxed);
+                add_article_missing(store, tally.article_missing);
             }
-            let errors_4xx = tally.errors_4xx + tally.article_missing;
-            if errors_4xx != 0 {
-                store.errors_4xx.fetch_add(errors_4xx, Ordering::Relaxed);
+            if tally.errors_4xx != 0 {
+                add_error_4xx(store, tally.errors_4xx);
             }
             if tally.errors_5xx != 0 {
-                store
-                    .errors_5xx
-                    .fetch_add(tally.errors_5xx, Ordering::Relaxed);
-            }
-            let errors = errors_4xx + tally.errors_5xx;
-            if errors != 0 {
-                store.errors.fetch_add(errors, Ordering::Relaxed);
+                add_error_5xx(store, tally.errors_5xx);
             }
         });
     }
@@ -467,18 +454,12 @@ impl MetricsCollector {
 
     #[inline]
     pub fn record_error_4xx(&self, backend_id: BackendId) {
-        self.with_backend_store(backend_id, |store| {
-            store.errors_4xx.fetch_add(1, Ordering::Relaxed);
-            store.errors.fetch_add(1, Ordering::Relaxed);
-        });
+        self.with_backend_store(backend_id, |store| add_error_4xx(store, 1));
     }
 
     #[inline]
     pub fn record_error_5xx(&self, backend_id: BackendId) {
-        self.with_backend_store(backend_id, |store| {
-            store.errors_5xx.fetch_add(1, Ordering::Relaxed);
-            store.errors.fetch_add(1, Ordering::Relaxed);
-        });
+        self.with_backend_store(backend_id, |store| add_error_5xx(store, 1));
     }
 
     #[inline]
@@ -753,6 +734,28 @@ impl MetricsCollector {
             start_time: inner.start_wall,
         }
     }
+}
+
+/// Add authoritative `430`s. A `430` is also a 4xx reply and an error, so
+/// every path that counts one comes through here and the rule lives once.
+#[inline]
+fn add_article_missing(store: &BackendStore, count: u64) {
+    store.article_missing.fetch_add(count, Ordering::Relaxed);
+    add_error_4xx(store, count);
+}
+
+/// Add 4xx error replies; each is also counted in the error total.
+#[inline]
+fn add_error_4xx(store: &BackendStore, count: u64) {
+    store.errors_4xx.fetch_add(count, Ordering::Relaxed);
+    store.errors.fetch_add(count, Ordering::Relaxed);
+}
+
+/// Add 5xx error replies; each is also counted in the error total.
+#[inline]
+fn add_error_5xx(store: &BackendStore, count: u64) {
+    store.errors_5xx.fetch_add(count, Ordering::Relaxed);
+    store.errors.fetch_add(count, Ordering::Relaxed);
 }
 
 /// Response outcomes counted locally by a stateful session between reads.

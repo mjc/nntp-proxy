@@ -453,6 +453,20 @@ pub struct CacheScrapeStats {
     pub disk: Option<DiskDisplayStats>,
 }
 
+impl From<&HybridCacheStats> for DiskDisplayStats {
+    fn from(stats: &HybridCacheStats) -> Self {
+        Self {
+            disk_hits: stats.disk_hits,
+            disk_hit_rate: stats.disk_hit_rate(),
+            capacity: stats.disk_capacity,
+            bytes_written: stats.disk_write_bytes,
+            bytes_read: stats.disk_read_bytes,
+            write_ios: stats.disk_write_ios,
+            read_ios: stats.disk_read_ios,
+        }
+    }
+}
+
 /// Trait for getting cache statistics for TUI display
 pub trait CacheStatsProvider: Send + Sync {
     /// Get statistics for TUI display
@@ -488,15 +502,7 @@ impl CacheStatsProvider for HybridArticleCache {
             entry_count: 0,                    // foyer doesn't expose entry count easily
             size_bytes: stats.memory_capacity, // Use configured capacity
             hit_rate: stats.hit_rate(),
-            disk: Some(DiskDisplayStats {
-                disk_hits: stats.disk_hits,
-                disk_hit_rate: stats.disk_hit_rate(),
-                capacity: stats.disk_capacity,
-                bytes_written: stats.disk_write_bytes,
-                bytes_read: stats.disk_read_bytes,
-                write_ios: stats.disk_write_ios,
-                read_ios: stats.disk_read_ios,
-            }),
+            disk: Some(DiskDisplayStats::from(&stats)),
         }
     }
 }
@@ -925,15 +931,7 @@ impl UnifiedCache {
                     capacity_bytes: stats.memory_capacity,
                     hits: stats.hits,
                     misses: stats.misses,
-                    disk: Some(DiskDisplayStats {
-                        disk_hits: stats.disk_hits,
-                        disk_hit_rate: stats.disk_hit_rate(),
-                        capacity: stats.disk_capacity,
-                        bytes_written: stats.disk_write_bytes,
-                        bytes_read: stats.disk_read_bytes,
-                        write_ios: stats.disk_write_ios,
-                        read_ios: stats.disk_read_ios,
-                    }),
+                    disk: Some(DiskDisplayStats::from(&stats)),
                 }
             }
         }

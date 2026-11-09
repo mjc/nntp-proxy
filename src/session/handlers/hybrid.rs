@@ -132,11 +132,19 @@ impl Drop for StatefulSessionGuard<'_> {
     }
 }
 
-fn stateful_initial_client_bytes(
+/// Per-backend watermark for the client-to-backend bytes carried into the
+/// stateful loop.
+///
+/// The per-command phase already added the handoff command to the session
+/// total when it read it, but never reported it to a backend because it was
+/// not sent there. Leaving it above the watermark makes the first flush count
+/// it as sent to the pinned backend, exactly once.
+fn handoff_reported_client_bytes(
     carried_client_to_backend_bytes: u64,
     initial_request: &crate::command::StatefulHandoff,
 ) -> u64 {
-    carried_client_to_backend_bytes + initial_request.request().request_wire_len().as_u64()
+    carried_client_to_backend_bytes
+        .saturating_sub(initial_request.request().request_wire_len().as_u64())
 }
 
 impl ClientSession {
@@ -211,17 +219,19 @@ impl ClientSession {
             return Err(crate::session::SessionError::from(error));
         }
 
-        // Build initial state with carried-over byte counts
-        let initial_bytes =
-            stateful_initial_client_bytes(client_to_backend_bytes, &initial_request);
+        // Build initial state with carried-over byte counts. The carried
+        // client total already includes the handoff command.
         let mut state = crate::session::state::SessionLoopState::from_initial_bytes(
-            initial_bytes,
+            client_to_backend_bytes,
             backend_to_client_bytes,
             self.auth_handler.is_enabled(),
         );
         state.mark_backend_request_sent(initial_request.request().kind());
         // The per-command phase recorded its own client bytes when it handed off.
         state.set_client_bytes_recorded(client_to_backend_bytes, backend_to_client_bytes);
+        state.last_reported_c2b = crate::types::ClientToBackendBytes::new(
+            handoff_reported_client_bytes(client_to_backend_bytes, &initial_request),
+        );
 
         match self.mode_state.switch_to_stateful() {
             crate::session::ModeTransition::Switched => {}
@@ -372,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn stateful_initial_client_bytes_uses_typed_wire_len() {
+    fn handoff_command_stays_above_the_reported_watermark() {
         let request = RequestContext::parse(b"group alt.test\r\n").expect("valid request line");
         let handoff = CommandHandler::prepare_stateful_handoff(
             request,
@@ -381,10 +391,8 @@ mod tests {
         )
         .expect("GROUP must prepare a stateful handoff");
 
-        assert_eq!(
-            super::stateful_initial_client_bytes(10, &handoff),
-            10 + "group alt.test\r\n".len() as u64
-        );
+        let carried = 10 + "group alt.test\r\n".len() as u64;
+        assert_eq!(super::handoff_reported_client_bytes(carried, &handoff), 10);
     }
 
     #[tokio::test]

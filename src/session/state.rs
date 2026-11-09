@@ -55,6 +55,12 @@ pub struct SessionLoopState {
     /// (the per-command phase before a hybrid switch), so the stateful loop
     /// adds only its own share on exit.
     client_bytes_recorded: (u64, u64),
+    /// Bytes the proxy itself wrote to the client (rejections, auth and
+    /// capability replies). Part of `backend_to_client`, but never reported
+    /// as received from the pinned backend.
+    local_to_client: u64,
+    /// `local_to_client` at the last per-backend flush.
+    last_reported_local: u64,
 }
 
 impl Default for SessionLoopState {
@@ -80,6 +86,8 @@ impl SessionLoopState {
             auth_access: AuthenticationAccess::from_auth_enabled(auth_enabled),
             backend_replies: BackendResponseOrder::default(),
             client_bytes_recorded: (0, 0),
+            local_to_client: 0,
+            last_reported_local: 0,
         }
     }
 
@@ -150,6 +158,20 @@ impl SessionLoopState {
         self.backend_to_client = self.backend_to_client.add_u64(bytes);
     }
 
+    /// Add bytes of a reply the proxy wrote itself: they count toward the
+    /// client totals but not toward bytes received from the backend.
+    #[inline]
+    pub const fn add_local_to_client(&mut self, bytes: u64) {
+        self.backend_to_client = self.backend_to_client.add_u64(bytes);
+        self.local_to_client += bytes;
+    }
+
+    /// Note local replies the reply order released since the last call.
+    /// Their bytes are added to the totals as they are written.
+    fn absorb_released_local_bytes(&mut self) {
+        self.local_to_client += self.backend_replies.take_released_local_bytes();
+    }
+
     /// Flush accumulated byte deltas to the metrics collector.
     ///
     /// Reports the difference since the last flush and updates the last-reported watermarks.
@@ -168,18 +190,23 @@ impl SessionLoopState {
             .backend_to_client
             .as_u64()
             .saturating_sub(self.last_reported_b2c.as_u64());
+        let delta_local = self.local_to_client - self.last_reported_local;
+        let delta_from_backend = delta_b2c.saturating_sub(delta_local);
 
         if delta_c2b > 0 {
             metrics.record_client_to_backend_bytes_for(backend_id, delta_c2b);
             metrics.user_bytes_sent(username, delta_c2b);
         }
+        if delta_from_backend > 0 {
+            metrics.record_backend_to_client_bytes_for(backend_id, delta_from_backend);
+        }
         if delta_b2c > 0 {
-            metrics.record_backend_to_client_bytes_for(backend_id, delta_b2c);
             metrics.user_bytes_received(username, delta_b2c);
         }
 
         self.last_reported_c2b = self.client_to_backend;
         self.last_reported_b2c = self.backend_to_client;
+        self.last_reported_local = self.local_to_client;
     }
 
     /// Convert to final transfer metrics
@@ -202,7 +229,7 @@ impl SessionLoopState {
     /// Returns the bytes written for convenience in chaining.
     pub fn apply_auth_result(&mut self, result: &super::common::AuthHandlerResult) -> u64 {
         let bytes = result.bytes_written();
-        self.add_backend_to_client(bytes);
+        self.add_local_to_client(bytes);
         if result.should_skip_further_checks() {
             self.mark_authenticated();
         }
@@ -231,8 +258,11 @@ impl SessionLoopState {
         &mut self,
         backend_read: &'a [u8],
     ) -> OrderedClientActions<'a> {
-        self.backend_replies
-            .client_actions_for_backend_read(backend_read)
+        let actions = self
+            .backend_replies
+            .client_actions_for_backend_read(backend_read);
+        self.absorb_released_local_bytes();
+        actions
     }
 
     /// Fold an exchange whose provider and user metrics were already reported
@@ -249,6 +279,7 @@ impl SessionLoopState {
             .add_u64(transfer.backend_to_client.as_u64());
         self.last_reported_c2b = self.client_to_backend;
         self.last_reported_b2c = self.backend_to_client;
+        self.last_reported_local = self.local_to_client;
     }
 
     /// Take the outcomes of backend replies completed since the last call.
@@ -272,8 +303,11 @@ impl SessionLoopState {
         &mut self,
         backend_read: &'a [u8],
     ) -> OrderedClientWrites<'a> {
-        self.backend_replies
-            .client_writes_for_backend_read(backend_read)
+        let writes = self
+            .backend_replies
+            .client_writes_for_backend_read(backend_read);
+        self.absorb_released_local_bytes();
+        writes
     }
 
     /// Queue a local reply until earlier backend output has been sent.
@@ -301,7 +335,9 @@ impl SessionLoopState {
     /// Drain deferred local replies that are ready at the front of the ordered queue.
     #[must_use]
     pub fn take_ready_deferred_replies(&mut self) -> ReadyDeferredReplies {
-        self.backend_replies.take_ready_deferred_replies()
+        let replies = self.backend_replies.take_ready_deferred_replies();
+        self.absorb_released_local_bytes();
+        replies
     }
 }
 

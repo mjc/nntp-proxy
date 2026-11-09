@@ -706,7 +706,7 @@ fn render_backends(out: &mut Exposition, backends: &[BackendScrape]) {
         (
             "nntp_proxy_backend_login_backoff",
             Gauge,
-            "1 while the backend's recent login refusals keep new connections paused.",
+            "1 while login backoff makes new connections fail locally (window open, or its single probe login in flight).",
         ),
         |b| match b.login_gate {
             LoginGate::Open => 0,

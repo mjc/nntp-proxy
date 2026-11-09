@@ -243,6 +243,14 @@ fn classify_authenticated_stateful_action(
     }
 }
 
+/// The four stream halves of a stateful session, borrowed for one loop run.
+struct StatefulLoopIo<'a, R, W, BR, BW> {
+    client_reader: &'a mut BufReader<R>,
+    client_write: &'a mut W,
+    backend_read: &'a mut BR,
+    backend_write: &'a mut BW,
+}
+
 impl ClientSession {
     async fn handle_authenticated_stateful_request<W, BW>(
         &self,
@@ -283,7 +291,7 @@ impl ClientSession {
                         .flush()
                         .await
                         .map_err(|error| StatefulLoopError::client(error.into()))?;
-                    state.add_backend_to_client(AUTH_ALREADY_AUTHENTICATED.len() as u64);
+                    state.add_local_to_client(AUTH_ALREADY_AUTHENTICATED.len() as u64);
                 }
             }
             AuthenticatedStatefulAction::InterceptCapabilities => {
@@ -300,7 +308,7 @@ impl ClientSession {
                         .flush()
                         .await
                         .map_err(|error| StatefulLoopError::client(error.into()))?;
-                    state.add_backend_to_client(capabilities.len() as u64);
+                    state.add_local_to_client(capabilities.len() as u64);
                 }
             }
             AuthenticatedStatefulAction::Reject(response) => {
@@ -315,7 +323,7 @@ impl ClientSession {
                         .flush()
                         .await
                         .map_err(|error| StatefulLoopError::client(error.into()))?;
-                    state.add_backend_to_client(response.len() as u64);
+                    state.add_local_to_client(response.len() as u64);
                 }
             }
         }
@@ -500,17 +508,58 @@ impl ClientSession {
         BR: tokio::io::AsyncRead + Unpin,
         BW: tokio::io::AsyncWrite + Unpin,
     {
+        // The loop lives in its own function so its `?` exits still reach
+        // the final byte flush below: an erroring session must report the
+        // same totals as one that ends cleanly.
+        let exit = self
+            .stateful_loop_until_exit(
+                StatefulLoopIo {
+                    client_reader: &mut client_reader,
+                    client_write: &mut client_write,
+                    backend_read: &mut backend_read,
+                    backend_write: &mut backend_write,
+                },
+                &mut state,
+                backend_id,
+            )
+            .await;
+
+        // Final metrics - report any remaining byte deltas
+        state.flush_byte_deltas(&self.metrics, backend_id, self.username());
+        let (received, sent) = state.unrecorded_client_bytes();
+        self.metrics.record_client_session_bytes(received, sent);
+        let exit = exit?;
+
+        let disposition = exit.disposition();
+        Ok(StatefulLoopResult::new(state.into_metrics(), disposition))
+    }
+
+    /// Proxy commands and replies until the session ends.
+    async fn stateful_loop_until_exit<R, W, BR, BW>(
+        &self,
+        io: StatefulLoopIo<'_, R, W, BR, BW>,
+        state: &mut crate::session::state::SessionLoopState,
+        backend_id: crate::types::BackendId,
+    ) -> std::result::Result<StatefulSessionExit, StatefulLoopError>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+        W: tokio::io::AsyncWrite + Unpin,
+        BR: tokio::io::AsyncRead + Unpin,
+        BW: tokio::io::AsyncWrite + Unpin,
+    {
+        let StatefulLoopIo {
+            client_reader,
+            client_write,
+            backend_read,
+            backend_write,
+        } = io;
         let mut command_reader = StatefulCommandReader::new();
         // Keep a small upstream window open while the client is producing
         // commands. Replies are still consumed and ordered by the framer below;
         // this counter only controls when buffered request bytes are flushed.
         let mut pending_backend_writes = 0usize;
 
-        // The loop runs inside a block so its `?` exits still reach the final
-        // byte flush below: an erroring session must report the same totals
-        // as one that ends cleanly.
-        let exit = async {
-        let exit = loop {
+        loop {
             // Periodic metrics flush
             if state.check_and_maybe_flush_metrics() {
                 state.flush_byte_deltas(&self.metrics, backend_id, self.username());
@@ -540,22 +589,22 @@ impl ClientSession {
                         .map_err(|error| StatefulLoopError::backend(error.into()))?;
                     pending_backend_writes = 0;
                 }
-                match self.read_stateful_backend_bytes(&mut backend_read).await {
+                match self.read_stateful_backend_bytes(backend_read).await {
                     Ok(Some((buffer, len))) => {
                         self.write_stateful_backend_bytes(
-                            &mut client_write,
+                            client_write,
                             &buffer,
                             len,
-                            &mut state,
+                            state,
                             backend_id,
                         )
                         .await?;
                         continue;
                     }
-                    Ok(None) => break StatefulSessionExit::BackendDisconnected,
+                    Ok(None) => return Ok(StatefulSessionExit::BackendDisconnected),
                     Err(e) => {
                         warn!(client = %self.client_addr, error = %e, "Backend read error");
-                        break StatefulSessionExit::BackendReadError;
+                        return Ok(StatefulSessionExit::BackendReadError);
                     }
                 }
             }
@@ -572,10 +621,10 @@ impl ClientSession {
 
             tokio::select! {
                 // Client → Backend
-                result = command_reader.read_next(&mut client_reader) => {
+                result = command_reader.read_next(client_reader) => {
                     match result {
                         Ok(StatefulClientLine::Eof) => {
-                            break StatefulSessionExit::ClientDisconnected;
+                            return Ok(StatefulSessionExit::ClientDisconnected);
                         }
                         Ok(line @ (StatefulClientLine::Oversized | StatefulClientLine::Invalid)) => {
                             self.metrics.record_client_rejected_line();
@@ -596,9 +645,9 @@ impl ClientSession {
                             if state.auth_access.can_access_backend() {
                                 self.handle_authenticated_stateful_request(
                                     request,
-                                    &mut client_write,
-                                    &mut backend_write,
-                                    &mut state,
+                                    client_write,
+                                    backend_write,
+                                    state,
                                 )
                                 .await?;
                                 pending_backend_writes =
@@ -614,7 +663,7 @@ impl ClientSession {
                                 // Auth path
                                 let auth_result = common::handle_stateful_auth_check(
                                     &request,
-                                    &mut client_write,
+                                    client_write,
                                     &mut state.auth_username,
                                     &common::AuthCheckContext {
                                         client_id: self.client_id(),
@@ -633,47 +682,35 @@ impl ClientSession {
                         }
                         Err(e) => {
                             warn!(client = %self.client_addr, error = %e, "Client read error");
-                            break StatefulSessionExit::ClientReadError;
+                            return Ok(StatefulSessionExit::ClientReadError);
                         }
                     }
                 }
 
                 // Backend → Client
-                result = self.read_stateful_backend_bytes(&mut backend_read) => {
+                result = self.read_stateful_backend_bytes(backend_read) => {
                     match result {
                         Ok(Some((buffer, len))) => {
                             // Complete output after select! returns so client readiness cannot
                             // cancel a partially completed write.
                             self.write_stateful_backend_bytes(
-                                &mut client_write,
+                                client_write,
                                 &buffer,
                                 len,
-                                &mut state,
+                                state,
                                 backend_id,
                             )
                             .await?;
                         }
-                        Ok(None) => break StatefulSessionExit::BackendDisconnected,
+                        Ok(None) => return Ok(StatefulSessionExit::BackendDisconnected),
                         Err(e) => {
                             warn!(client = %self.client_addr, error = %e, "Backend read error");
-                            break StatefulSessionExit::BackendReadError;
+                            return Ok(StatefulSessionExit::BackendReadError);
                         }
                     }
                 }
             }
-        };
-        Ok::<_, StatefulLoopError>(exit)
         }
-        .await;
-
-        // Final metrics - report any remaining byte deltas
-        state.flush_byte_deltas(&self.metrics, backend_id, self.username());
-        let (received, sent) = state.unrecorded_client_bytes();
-        self.metrics.record_client_session_bytes(received, sent);
-        let exit = exit?;
-
-        let disposition = exit.disposition();
-        Ok(StatefulLoopResult::new(state.into_metrics(), disposition))
     }
 }
 

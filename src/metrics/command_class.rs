@@ -5,7 +5,7 @@
 //! the series count without limit.
 
 use crate::protocol::RequestKind;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Command group used as the `command` label on exported metrics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,8 +103,7 @@ impl CommandClass {
     }
 }
 
-/// Stripes the counters are spread over. Each thread adds to one stripe, so
-/// worker threads rarely share a cache line; a scrape sums all of them.
+/// Stripes the counters are spread over; a scrape sums all of them.
 const STRIPES: usize = 16;
 
 /// One stripe of per-class counters, alone on its cache lines.
@@ -115,8 +114,8 @@ struct Stripe([AtomicU64; CommandClass::COUNT]);
 /// Relaxed per-class counters, striped across threads.
 ///
 /// Every client command adds here from whatever worker handles it. A single
-/// shared array made every core fight over the same cache line; with one
-/// stripe per thread (up to [`STRIPES`]) the add stays an uncontended relaxed
+/// shared array made every core fight over the same cache line; with its own
+/// stripe per recording thread the add stays an uncontended relaxed
 /// increment, and the cost moves to the scrape, which sums the stripes.
 #[derive(Debug)]
 pub(crate) struct CommandClassCounters(Box<[Stripe; STRIPES]>);
@@ -127,23 +126,82 @@ impl Default for CommandClassCounters {
     }
 }
 
-/// This thread's stripe, assigned round-robin on first use.
-fn thread_stripe() -> usize {
-    use std::cell::Cell;
-    use std::sync::atomic::AtomicUsize;
-    static NEXT: AtomicUsize = AtomicUsize::new(0);
-    thread_local! {
-        static STRIPE: Cell<usize> = const { Cell::new(usize::MAX) };
-    }
-    STRIPE.with(|stripe| {
-        let current = stripe.get();
-        if current != usize::MAX {
-            return current;
+/// Stripes currently owned by a live thread, one bit per stripe.
+static CLAIMED_STRIPES: AtomicU32 = AtomicU32::new(0);
+/// Round-robin fallback once every stripe is owned.
+static OVERFLOW_STRIPE: AtomicUsize = AtomicUsize::new(0);
+
+/// A thread's stripe. An owned stripe is released when the thread exits, so a
+/// replacement worker can take it.
+struct StripeClaim {
+    index: usize,
+    ownership: StripeOwnership,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StripeOwnership {
+    /// This thread alone adds to the stripe.
+    Exclusive,
+    /// All stripes were owned; this thread shares one round-robin.
+    Shared,
+}
+
+impl StripeClaim {
+    /// Take the lowest free stripe, or share one when all are owned.
+    ///
+    /// Stripes are claimed on a thread's first recorded command rather than
+    /// keyed on a tokio worker index, which tokio does not expose on stable.
+    /// Only threads that record take a stripe, and client commands are
+    /// recorded from session tasks on the runtime's workers, so with up to
+    /// [`STRIPES`] workers no two of them share one; blocking-pool threads
+    /// never record and never take a stripe.
+    fn claim() -> Self {
+        let mut claimed = CLAIMED_STRIPES.load(Ordering::Relaxed);
+        loop {
+            let free = !claimed & ((1u32 << STRIPES) - 1);
+            if free == 0 {
+                return Self {
+                    index: OVERFLOW_STRIPE.fetch_add(1, Ordering::Relaxed) % STRIPES,
+                    ownership: StripeOwnership::Shared,
+                };
+            }
+            let index = free.trailing_zeros() as usize;
+            match CLAIMED_STRIPES.compare_exchange_weak(
+                claimed,
+                claimed | (1 << index),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Self {
+                        index,
+                        ownership: StripeOwnership::Exclusive,
+                    };
+                }
+                Err(current) => claimed = current,
+            }
         }
-        let assigned = NEXT.fetch_add(1, Ordering::Relaxed) % STRIPES;
-        stripe.set(assigned);
-        assigned
-    })
+    }
+}
+
+impl Drop for StripeClaim {
+    fn drop(&mut self) {
+        if self.ownership == StripeOwnership::Exclusive {
+            CLAIMED_STRIPES.fetch_and(!(1 << self.index), Ordering::Relaxed);
+        }
+    }
+}
+
+thread_local! {
+    static THREAD_STRIPE: StripeClaim = StripeClaim::claim();
+}
+
+/// This thread's stripe, claimed on first use.
+#[inline]
+fn thread_stripe() -> usize {
+    // A thread recording during its own teardown, after the claim was
+    // dropped, falls back to stripe 0; the count is still kept.
+    THREAD_STRIPE.try_with(|claim| claim.index).unwrap_or(0)
 }
 
 impl CommandClassCounters {
@@ -219,6 +277,34 @@ mod tests {
         }
         let expected = 100 * (STRIPES as u64 + 3);
         assert_eq!(counters.snapshot()[CommandClass::Article.index()], expected);
+    }
+
+    #[test]
+    fn live_threads_get_distinct_stripes_and_release_them_on_exit() {
+        use std::sync::{Arc, Barrier};
+        // Other tests may hold stripes; only ask for as many as are free now.
+        let free = STRIPES - CLAIMED_STRIPES.load(Ordering::Relaxed).count_ones() as usize;
+        let threads = free.min(8);
+        let barrier = Arc::new(Barrier::new(threads));
+        // Every thread must be running before any is joined, or the barrier
+        // would never release.
+        let mut handles = Vec::with_capacity(threads);
+        for _ in 0..threads {
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                let stripe = thread_stripe();
+                // Hold every claim until all threads have one.
+                barrier.wait();
+                stripe
+            }));
+        }
+        let mut stripes = Vec::with_capacity(threads);
+        for handle in handles {
+            stripes.push(handle.join().unwrap());
+        }
+        stripes.sort_unstable();
+        stripes.dedup();
+        assert_eq!(stripes.len(), threads, "concurrent threads shared a stripe");
     }
 
     #[test]

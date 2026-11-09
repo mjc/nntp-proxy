@@ -692,6 +692,9 @@ pub(crate) struct BackendResponseOrder {
     ordered: VecDeque<OrderedResponse>,
     /// Requests for `OrderedResponse::RecoverableBackend` entries, in order.
     recoverable: VecDeque<crate::protocol::RequestContext>,
+    /// Bytes of local replies released for writing since the session last
+    /// asked, so they are not reported as bytes from the backend.
+    released_local_bytes: u64,
 }
 
 impl BackendResponseOrder {
@@ -762,9 +765,15 @@ impl BackendResponseOrder {
             let Some(OrderedResponse::Local(reply)) = self.ordered.pop_front() else {
                 break;
             };
+            self.released_local_bytes += reply.len() as u64;
             replies.push(reply);
         }
         replies
+    }
+
+    /// Bytes of local replies released since the last call.
+    pub(crate) fn take_released_local_bytes(&mut self) -> u64 {
+        std::mem::take(&mut self.released_local_bytes)
     }
 
     /// Convert raw backend bytes into ordered client writes.

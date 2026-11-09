@@ -12,6 +12,8 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
+const MISSING_REPLY: &str = "430 No such article\r\n";
+const NO_GROUP_REPLY: &str = "411 No such group\r\n";
 const ARTICLE: &str = "220 0 <present@example.com>\r\nSubject: Test\r\n\r\nBody\r\n.\r\n";
 
 /// HTTP responses end when the server closes; `read_to_end` is banned in
@@ -208,8 +210,8 @@ async fn stateful_sessions_count_replies_and_bytes_once() -> Result<()> {
         .with_name("backend-a")
         .on_command("DATE", "111 20250101000000\r\n")
         .on_command("ARTICLE", ARTICLE)
-        .on_command("ARTICLE <MISSING", "430 No such article\r\n")
-        .on_command("GROUP", "411 No such group\r\n")
+        .on_command("ARTICLE <MISSING", MISSING_REPLY)
+        .on_command("GROUP", NO_GROUP_REPLY)
         .spawn_on_listener(backend_listener);
 
     let config = create_test_config(vec![(backend_port, "backend-a")]);
@@ -271,16 +273,77 @@ async fn stateful_sessions_count_replies_and_bytes_once() -> Result<()> {
         1.0
     );
 
-    // In stateful mode every byte to the client crosses the pinned backend
-    // session, so the two totals must match exactly; a double count would
-    // make the backend side twice as large.
-    let to_client = value("nntp_proxy_client_bytes_total", &[("direction", "sent")]);
+    // Bytes received from the backend are exactly its replies, counted once:
+    // a double count would double them, and the proxy's own 501 for the
+    // over-long line must not be attributed to the backend.
+    let backend_reply_bytes = 2 * ARTICLE.len() + MISSING_REPLY.len() + NO_GROUP_REPLY.len();
     let from_backend = value(
         "nntp_proxy_backend_bytes_total",
         &[("backend", "backend-a"), ("direction", "received")],
     );
-    assert!(to_client > 0.0);
-    assert_eq!(from_backend, to_client);
+    assert_eq!(from_backend, backend_reply_bytes as f64);
+    let to_client = value("nntp_proxy_client_bytes_total", &[("direction", "sent")]);
+    assert!(
+        to_client > from_backend,
+        "client totals include the proxy's own 501"
+    );
+
+    metrics_task.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn hybrid_handoff_command_is_counted_once_as_sent_to_the_backend() -> Result<()> {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let _backend = MockNntpServer::new()
+        .with_name("backend-a")
+        .on_command("DATE", "111 20250101000000\r\n")
+        .on_command("ARTICLE", ARTICLE)
+        .on_command("GROUP", NO_GROUP_REPLY)
+        .spawn_on_listener(backend_listener);
+
+    let config = create_test_config(vec![(backend_port, "backend-a")]);
+    let proxy = NntpProxy::new(config, RoutingMode::Hybrid).await?;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_port = spawn_test_proxy_on_listener(proxy.clone(), proxy_listener, true);
+    let (metrics_addr, metrics_task) =
+        nntp_proxy::metrics::prometheus::spawn_endpoint("127.0.0.1:0".parse()?, Arc::new(proxy))
+            .await?;
+
+    let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).await?;
+    let mut greeting = [0u8; 256];
+    let _ = client.read(&mut greeting).await?;
+    let article = "ARTICLE <present@example.com>";
+    let group = "GROUP alt.none";
+    let (status, _) =
+        send_article_read_multiline_response(&mut client, "<present@example.com>").await?;
+    assert!(status.starts_with("220"), "{status}");
+    // GROUP switches the session to a pinned backend.
+    let status = send_command_read_line(&mut client, group).await?;
+    assert!(status.starts_with("411"), "{status}");
+    let (status, _) =
+        send_article_read_multiline_response(&mut client, "<present@example.com>").await?;
+    assert!(status.starts_with("220"), "{status}");
+    drop(client);
+
+    let body = scrape_after_sessions_end(metrics_addr).await?;
+    let sent_to_backend = sample_value(
+        &body,
+        "nntp_proxy_backend_bytes_total",
+        &[("backend", "backend-a"), ("direction", "sent")],
+    )
+    .expect("backend bytes present");
+    let command_bytes = 2 * (article.len() + 2) + group.len() + 2;
+    assert_eq!(sent_to_backend, command_bytes as f64);
+    assert_eq!(
+        sample_value(
+            &body,
+            "nntp_proxy_client_bytes_total",
+            &[("direction", "received")]
+        ),
+        Some(command_bytes as f64)
+    );
 
     metrics_task.abort();
     Ok(())

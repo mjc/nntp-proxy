@@ -132,8 +132,9 @@ async fn handle_connection<S: ScrapeSource>(
     drop(head);
 
     let response = match route {
-        // HEAD only checks the endpoint is up; rendering would read every
-        // collector for a body that is never sent.
+        // HEAD is deliberately a listener check, not a render check:
+        // rendering would read every collector for a body that is never sent.
+        // A monitor that wants proof a scrape works should use GET.
         Route::Metrics {
             body: ResponseBody::Omit,
         } => metrics_head_response(),
