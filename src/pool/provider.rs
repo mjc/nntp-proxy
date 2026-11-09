@@ -743,6 +743,18 @@ impl DeadpoolConnectionProvider {
         self.load.note_deadline_expiry();
     }
 
+    /// Fold a lookup sent after another backend answered `430` into this
+    /// backend's rescue rate.
+    pub fn note_fallback_lookup(&self, outcome: super::admission::FallbackOutcome) {
+        self.load.note_fallback_lookup(outcome);
+    }
+
+    /// Whether `admission` says this backend is not worth waiting on when busy.
+    #[must_use]
+    pub fn is_unlikely_to_rescue(&self, admission: &super::admission::ArticleAdmission) -> bool {
+        admission.is_unlikely_to_rescue(&self.load)
+    }
+
     /// Shared admission counters for this backend, for the stats file.
     #[must_use]
     pub fn load(&self) -> Arc<super::admission::BackendLoad> {

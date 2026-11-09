@@ -20,7 +20,7 @@
 //! allocates or takes a lock.
 
 use super::provider::DeadpoolStatusCounts;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Weight of a new sample in the service-time average, as a right shift
@@ -28,6 +28,11 @@ use std::time::{Duration, Instant};
 /// moves the estimate a little, while a backend that really slows down
 /// dominates it within a few dozen commands.
 const EWMA_SHIFT: u32 = 3;
+
+/// Weight 1/64 for the rescue-rate average: slow enough that one lucky hit
+/// does not reset it, fast enough to follow a change of workload within a few
+/// hundred lookups.
+const RESCUE_EWMA_SHIFT: u32 = 6;
 
 /// Shortest gap between two skip summaries for one backend. A backlogged
 /// backend can be skipped thousands of times a minute; one line per backend
@@ -196,7 +201,26 @@ pub struct BackendLoadSnapshot {
     pub last_resort_waits: u64,
     pub last_resort_connected: u64,
     pub last_resort_timeouts: u64,
+    /// Running share of fallback lookups this backend answered with the
+    /// article, in parts per million. See [`BackendLoad::note_fallback_lookup`].
+    pub rescue_ppm: u32,
+    /// Fallback lookups folded into `rescue_ppm`.
+    pub fallback_lookups: u64,
 }
+
+/// Outcome of a lookup sent to a backend after another backend had already
+/// answered `430` for the same article.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FallbackOutcome {
+    /// The backend had the article.
+    Found,
+    /// The backend answered `430` or refused the lookup.
+    NotFound,
+}
+
+/// Fallback lookups a backend must have answered before its rescue rate is
+/// trusted. Below this the backend is always waited on as before.
+pub const MIN_FALLBACK_LOOKUPS: u64 = 100;
 
 /// Per-backend service-time estimate and busy-outcome counters.
 ///
@@ -214,6 +238,10 @@ pub struct BackendLoad {
     last_resort_waits: AtomicU64,
     last_resort_connected: AtomicU64,
     last_resort_timeouts: AtomicU64,
+    /// Exponential average (weight 1/64) of fallback lookups that found the
+    /// article, in parts per million.
+    rescue_ppm: AtomicU32,
+    fallback_lookups: AtomicU64,
     unlogged_backlog_skips: AtomicU64,
     unlogged_busy_timeouts: AtomicU64,
     /// Milliseconds since `epoch`, offset by one interval so the first skip
@@ -235,6 +263,8 @@ impl Default for BackendLoad {
             last_resort_waits: AtomicU64::new(0),
             last_resort_connected: AtomicU64::new(0),
             last_resort_timeouts: AtomicU64::new(0),
+            rescue_ppm: AtomicU32::new(0),
+            fallback_lookups: AtomicU64::new(0),
             unlogged_backlog_skips: AtomicU64::new(0),
             unlogged_busy_timeouts: AtomicU64::new(0),
             last_summary_ms: AtomicU64::new(0),
@@ -323,6 +353,37 @@ impl BackendLoad {
         self.exchange_duration.snapshot()
     }
 
+    /// Fold one fallback lookup into this backend's rescue rate.
+    ///
+    /// A fallback lookup is one sent after another backend already answered
+    /// `430` for the article, so the rate estimates how often waiting on this
+    /// backend turns a miss into a hit. Like the service-time average this is
+    /// a plain load and store: a sample lost to a race does not matter.
+    pub fn note_fallback_lookup(&self, outcome: FallbackOutcome) {
+        let sample: u32 = match outcome {
+            FallbackOutcome::Found => 1_000_000,
+            FallbackOutcome::NotFound => 0,
+        };
+        let samples = self.fallback_lookups.fetch_add(1, Ordering::Relaxed);
+        let current = self.rescue_ppm.load(Ordering::Relaxed);
+        let next = if samples == 0 {
+            sample
+        } else if sample >= current {
+            current + ((sample - current) >> RESCUE_EWMA_SHIFT)
+        } else {
+            current - ((current - sample) >> RESCUE_EWMA_SHIFT)
+        };
+        self.rescue_ppm.store(next, Ordering::Relaxed);
+    }
+
+    /// Share of recent fallback lookups that found the article, in parts per
+    /// million, or `None` until [`MIN_FALLBACK_LOOKUPS`] have been seen.
+    #[must_use]
+    pub fn rescue_ppm(&self) -> Option<u32> {
+        (self.fallback_lookups.load(Ordering::Relaxed) >= MIN_FALLBACK_LOOKUPS)
+            .then(|| self.rescue_ppm.load(Ordering::Relaxed))
+    }
+
     #[must_use]
     pub fn snapshot(&self) -> BackendLoadSnapshot {
         BackendLoadSnapshot {
@@ -333,6 +394,8 @@ impl BackendLoad {
             last_resort_waits: self.last_resort_waits.load(Ordering::Relaxed),
             last_resort_connected: self.last_resort_connected.load(Ordering::Relaxed),
             last_resort_timeouts: self.last_resort_timeouts.load(Ordering::Relaxed),
+            rescue_ppm: self.rescue_ppm.load(Ordering::Relaxed),
+            fallback_lookups: self.fallback_lookups.load(Ordering::Relaxed),
         }
     }
 
@@ -475,6 +538,10 @@ pub struct ArticleAdmission {
     unavailable_reply: UnavailableReply,
     last_resort: BacklogLastResort,
     unfinished_replies_before_430: u8,
+    /// Rescue rate (parts per million) below which a backlogged backend is
+    /// neither waited on as a last resort nor waited for before answering
+    /// `430`. Zero disables.
+    rescue_floor_ppm: u32,
 }
 
 impl Default for ArticleAdmission {
@@ -502,7 +569,27 @@ impl ArticleAdmission {
             unavailable_reply: UnavailableReply::BackendError,
             last_resort: BacklogLastResort::WaitShortest,
             unfinished_replies_before_430: crate::constants::pool::UNFINISHED_REPLIES_BEFORE_430,
+            rescue_floor_ppm: 0,
         }
+    }
+
+    /// Stop waiting on busy backends that rarely have an article other
+    /// backends lack. `percent` of zero disables; values above 100 act as 100.
+    #[must_use]
+    pub const fn with_rescue_floor_percent(mut self, percent: u8) -> Self {
+        let percent = if percent > 100 { 100 } else { percent as u32 };
+        self.rescue_floor_ppm = percent * 10_000;
+        self
+    }
+
+    /// Whether `load`'s backend has, over enough recent fallback lookups,
+    /// found the article so rarely that waiting on it is not worth the time.
+    #[must_use]
+    pub fn is_unlikely_to_rescue(&self, load: &BackendLoad) -> bool {
+        self.rescue_floor_ppm > 0
+            && load
+                .rescue_ppm()
+                .is_some_and(|ppm| ppm < self.rescue_floor_ppm)
     }
 
     /// How many `503` replies one message-id may get, once at least one backend
@@ -816,6 +903,8 @@ mod tests {
                 last_resort_waits: 0,
                 last_resort_connected: 0,
                 last_resort_timeouts: 0,
+                rescue_ppm: 0,
+                fallback_lookups: 0,
             }
         );
     }
@@ -839,6 +928,44 @@ mod tests {
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(budget.is_expired());
         assert_eq!(budget.checkout().wait(), Duration::ZERO);
+    }
+
+    #[test]
+    fn rescue_rate_needs_enough_samples_and_follows_outcomes() {
+        let load = BackendLoad::default();
+        for _ in 0..MIN_FALLBACK_LOOKUPS - 1 {
+            load.note_fallback_lookup(FallbackOutcome::NotFound);
+        }
+        assert_eq!(load.rescue_ppm(), None, "too few samples to trust");
+        load.note_fallback_lookup(FallbackOutcome::NotFound);
+        assert_eq!(load.rescue_ppm(), Some(0));
+        for _ in 0..400 {
+            load.note_fallback_lookup(FallbackOutcome::Found);
+        }
+        assert!(
+            load.rescue_ppm().unwrap() > 990_000,
+            "converges towards always found"
+        );
+    }
+
+    #[test]
+    fn rescue_floor_is_off_by_default_and_compares_in_ppm() {
+        let load = BackendLoad::default();
+        for _ in 0..200 {
+            load.note_fallback_lookup(FallbackOutcome::NotFound);
+        }
+        assert!(!ArticleAdmission::default().is_unlikely_to_rescue(&load));
+        assert!(
+            ArticleAdmission::default()
+                .with_rescue_floor_percent(1)
+                .is_unlikely_to_rescue(&load)
+        );
+        assert_eq!(
+            ArticleAdmission::default()
+                .with_rescue_floor_percent(250)
+                .rescue_floor_ppm,
+            1_000_000
+        );
     }
 
     #[test]

@@ -657,10 +657,13 @@ impl BackendSelector {
         let admission = self.article_admission;
         let reply = admission.unavailable_reply();
         let limit = admission.unfinished_replies_before_430();
-        if reply == UnavailableReply::NoSuchArticle
-            || limit == 0
-            || availability.missing_bits() == 0
-        {
+        if reply == UnavailableReply::NoSuchArticle || availability.missing_bits() == 0 {
+            return reply;
+        }
+        if self.only_unlikely_rescuers_unconfirmed(availability) {
+            return UnavailableReply::NoSuchArticle;
+        }
+        if limit == 0 {
             return reply;
         }
         let Some(message_id) = message_id else {
@@ -671,6 +674,28 @@ impl BackendSelector {
         } else {
             reply
         }
+    }
+
+    /// Whether every backend that has not answered `430` for this article is
+    /// one whose recent rescue rate is under the configured floor. Waiting
+    /// for such a backend to confirm the miss is what makes downloads of
+    /// articles gone everywhere slow, and it would almost never have them.
+    fn only_unlikely_rescuers_unconfirmed(
+        &self,
+        availability: &crate::cache::ArticleAvailability,
+    ) -> bool {
+        let admission = self.article_admission;
+        let mut unconfirmed = false;
+        for backend in &self.backends {
+            if !availability.should_try_slot(backend.availability_slot) {
+                continue;
+            }
+            unconfirmed = true;
+            if !backend.provider.is_unlikely_to_rescue(&admission) {
+                return false;
+            }
+        }
+        unconfirmed
     }
 
     /// Deadline, checkout wait, and backlog skipping for article requests.

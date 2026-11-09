@@ -101,6 +101,11 @@ impl Config {
                 "routing.article.backlog_skip_percent must be greater than 0; set backlog_skip = false to always queue"
             ));
         }
+        if self.routing.article.rescue_floor_percent > 100 {
+            return Err(anyhow::anyhow!(
+                "routing.article.rescue_floor_percent must be between 0 and 100"
+            ));
+        }
 
         for server in &self.servers {
             validate_server(server)?;

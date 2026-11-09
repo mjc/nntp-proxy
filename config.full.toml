@@ -77,6 +77,9 @@ backlog_skip_percent = 100
 # After this many 503s for one message-id, once some backend has said 430 for it,
 # the next unfinished lookup answers 430 so dead articles fail fast. 0 = never.
 unfinished_replies_before_430 = 2
+# Rescue-rate floor in percent (0 = off). A busy backend that has found under this
+# share of recent articles other backends lacked is not waited for before 430.
+# rescue_floor_percent = 2
 # When every backend left in the tier that should serve a request was skipped
 # as backlogged: "wait-shortest" queues on the one with the shortest estimated
 # wait (bounded by checkout_wait_ms and the deadline); "give-up" ends the

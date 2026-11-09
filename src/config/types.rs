@@ -390,6 +390,15 @@ pub struct RoutingArticle {
     /// `unavailable_reply`. Ignored when `unavailable_reply` is `"430"`.
     #[serde(default = "super::defaults::article_unfinished_replies_before_430")]
     pub unfinished_replies_before_430: u8,
+    /// Rescue-rate floor in percent (default `0`, off). A backend's rescue
+    /// rate is how often it had an article after another backend answered
+    /// `430` for it, averaged over recent lookups. A busy backend below the
+    /// floor is not waited on as a last resort, and when only such backends
+    /// are left unconfirmed the lookup answers `430` at once. Saves minutes on
+    /// downloads whose articles are gone everywhere, at the cost of the rare
+    /// article only that backend had.
+    #[serde(default)]
+    pub rescue_floor_percent: u8,
 }
 
 impl Default for RoutingArticle {
@@ -402,6 +411,7 @@ impl Default for RoutingArticle {
             unavailable_reply: crate::pool::admission::UnavailableReply::BackendError,
             backlog_last_resort: crate::pool::admission::BacklogLastResort::default(),
             unfinished_replies_before_430: defaults::article_unfinished_replies_before_430(),
+            rescue_floor_percent: 0,
         }
     }
 }
@@ -428,6 +438,7 @@ impl RoutingArticle {
         .with_unavailable_reply(self.unavailable_reply)
         .with_backlog_last_resort(self.backlog_last_resort)
         .with_unfinished_replies_before_430(self.unfinished_replies_before_430)
+        .with_rescue_floor_percent(self.rescue_floor_percent)
     }
 }
 

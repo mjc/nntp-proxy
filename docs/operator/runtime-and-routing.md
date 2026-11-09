@@ -162,5 +162,7 @@ on restart:
 | `last_resort_waits` | Checkouts that queued on this backend anyway because every other backend left for the request had been skipped as backlogged (`backlog_last_resort = "wait-shortest"`) |
 | `last_resort_connected` | Last-resort checkouts that got a connection |
 | `last_resort_timeouts` | Last-resort checkouts that waited their whole limit without one (also counted in `busy_timeouts`) |
+| `fallback_lookups` | Lookups sent to this backend after another backend had answered `430` for the article |
+| `rescue_ppm` | Recent share of those lookups that found the article, in parts per million (exponential average) |
 
 The file is rewritten every 30 seconds and on shutdown.

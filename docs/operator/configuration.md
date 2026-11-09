@@ -73,6 +73,7 @@ Time limits for `ARTICLE`, `BODY`, `HEAD`, and `STAT` lookups by message-id.
 | `backlog_skip` | `true` | Skip a backend at once, without queueing, when its estimated connection wait is too long |
 | `backlog_skip_percent` | `100` | Skip when the estimated wait is longer than this percentage of the attempt's wait. Lower values skip sooner |
 | `unavailable_reply` | `"503"` | `"503"` or `"430"`: the reply when a request ends before every eligible backend returned `430`, either because `deadline_ms` ran out or because every remaining backend was busy, skipped, refused the lookup with a non-`430` error, or failed. A request that every eligible backend answered with `430` always gets `430` |
+| `rescue_floor_percent` | `0` | Rescue-rate floor (0-100, `0` = off). A backend's rescue rate is the share of its recent lookups, made after another backend had answered `430`, that found the article. A busy backend under the floor is not waited on as a last resort, and a lookup whose only unconfirmed backends are under it answers `430` at once. See below |
 | `unfinished_replies_before_430` | `2` | How many `503`s one message-id may get, once at least one backend returned `430` for it, before the next unfinished lookup answers `430`. `0` keeps answering `unavailable_reply`. Ignored when `unavailable_reply` is `"430"` |
 | `backlog_last_resort` | `"wait-shortest"` | What a request does when backlog skipping leaves no other backend to try in the tier that should serve it. `"wait-shortest"` queues on the skipped backend with the shortest estimated wait, bounded by `checkout_wait_ms` and what is left of `deadline_ms`; `"give-up"` ends the request with `unavailable_reply` |
 
@@ -123,6 +124,27 @@ fixed 64K-slot table (512 KiB); a slot collision only restarts a count.
 | `deadline_ms` ran out | `unavailable_reply` (`503`) |
 | Every backend left was busy, skipped, refused with a non-`430` error (such as `451`), or failed, even if others returned `430` | `unavailable_reply` (`503`) |
 | Either of the two above, after `unfinished_replies_before_430` earlier `503`s for this message-id, with at least one `430` | `430` |
+| Either of the two above, when every backend that has not answered `430` is under `rescue_floor_percent` | `430` |
+
+#### Rescue-rate floor
+
+When articles are gone from every provider, each one must still be confirmed
+missing by every backend before the proxy can answer `430`. A small or slow
+fallback backend then becomes the bottleneck: every lookup queues on it, and
+the client waits out checkout timeouts and retries for each missing article.
+
+The proxy keeps, per backend, an exponential average (weight 1/64) of how often
+a lookup sent after another backend's `430` found the article. It is trusted
+after 100 such lookups. With `rescue_floor_percent` set, a backend under the
+floor is treated as optional while it is busy: requests do not queue on it as
+a last resort, and if it is the only kind of backend left unconfirmed the
+lookup answers `430` without waiting. When the backend is not busy it is still
+asked normally, so its rate keeps tracking the workload and recovers as soon
+as it starts finding articles again.
+
+The trade-off is an article that only that backend has, while its rate is
+below the floor. A low floor such as `2` limits that to roughly one article in
+fifty such lookups.
 
 Skips and checkout timeouts are summarised at `info` once per backend every
 10 seconds instead of logged per request.

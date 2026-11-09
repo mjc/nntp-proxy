@@ -513,6 +513,9 @@ impl ClientSession {
         };
 
         let status_code = attempt.status_code();
+        // A lookup after another backend already answered 430 measures how
+        // often this backend rescues a miss.
+        let fallback_lookup = state.availability.missing_bits() != 0;
 
         if let Ok(missing) = AuthoritativeArticleMissing::from_status_code(backend, status_code) {
             trace!(
@@ -522,6 +525,9 @@ impl ClientSession {
                 msg_id = ?request.message_id_value(),
                 "Direct backend attempt returned 430 before writing response"
             );
+            if fallback_lookup {
+                provider.note_fallback_lookup(crate::pool::admission::FallbackOutcome::NotFound);
+            }
             self.record_authoritative_article_missing(&missing, state.availability);
             if let Some(article_request) =
                 crate::command::CommandHandler::article_lookup_request(request)
@@ -544,9 +550,17 @@ impl ClientSession {
         }
 
         if let Some(error_reply) = ArticleErrorReply::classify(request, status_code) {
+            // A refusal of the lookup itself says the backend will not serve
+            // the article; a broken session says nothing about the article.
+            if fallback_lookup && error_reply == ArticleErrorReply::SessionUsable {
+                provider.note_fallback_lookup(crate::pool::admission::FallbackOutcome::NotFound);
+            }
             self.discard_article_error_reply(attempt, error_reply, request, state)
                 .await?;
             return Ok(BackendAttemptResult::BackendUnavailable);
+        }
+        if fallback_lookup {
+            provider.note_fallback_lookup(crate::pool::admission::FallbackOutcome::Found);
         }
 
         let response = match self
@@ -621,6 +635,9 @@ impl ClientSession {
                 let Some(provider) = router.backend_provider(backend_id) else {
                     continue;
                 };
+                if provider.is_unlikely_to_rescue(&router.article_admission()) {
+                    continue;
+                }
                 let wait = provider.estimated_wait();
                 if shortest.is_none_or(|(best, _)| wait < best) {
                     shortest = Some((wait, backend_id));
@@ -4341,6 +4358,134 @@ mod tests {
             .build()
             .unwrap();
         router_with_admission_backends(vec![missing, backlogged_pool().await], admission)
+    }
+
+    /// A backlogged backend whose recent fallback lookups (`samples`) all
+    /// came back with or without the article.
+    async fn backlogged_pool_with_rescue_history(
+        found: bool,
+        samples: u64,
+    ) -> DeadpoolConnectionProvider {
+        use crate::pool::admission::FallbackOutcome;
+        let provider = backlogged_pool().await;
+        let outcome = if found {
+            FallbackOutcome::Found
+        } else {
+            FallbackOutcome::NotFound
+        };
+        for _ in 0..samples {
+            provider.note_fallback_lookup(outcome);
+        }
+        provider
+    }
+
+    async fn missing_and_backlogged_router(
+        backlogged: DeadpoolConnectionProvider,
+        admission: crate::pool::admission::ArticleAdmission,
+    ) -> Arc<BackendSelector> {
+        let (missing_port, _) = spawn_article_response_server(b"430 No such article\r\n").await;
+        let missing = DeadpoolConnectionProvider::builder("127.0.0.1", missing_port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        router_with_admission_backends(vec![missing, backlogged], admission)
+    }
+
+    /// Articles gone everywhere: the only unconfirmed backend is busy and has
+    /// not had an article another backend lacked in its recent fallback
+    /// lookups, so the first lookup answers 430 instead of waiting for it.
+    #[tokio::test]
+    async fn busy_backend_below_the_rescue_floor_does_not_hold_up_a_430() {
+        let busy = backlogged_pool_with_rescue_history(false, 200).await;
+        let router = missing_and_backlogged_router(
+            busy.clone(),
+            crate::pool::admission::ArticleAdmission::default().with_rescue_floor_percent(2),
+        )
+        .await;
+
+        let (status, elapsed) =
+            route_and_read_status(&router, b"BODY <gone-everywhere@example.com>\r\n").await;
+
+        assert_eq!(status, 430);
+        assert!(elapsed < crate::constants::pool::ARTICLE_CHECKOUT_WAIT / 3);
+        assert_eq!(
+            busy.load().snapshot().last_resort_waits,
+            0,
+            "an unlikely rescuer is not a last resort"
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_backend_that_rescues_is_still_waited_for() {
+        let busy = backlogged_pool_with_rescue_history(true, 200).await;
+        let router = missing_and_backlogged_router(
+            busy.clone(),
+            give_up_admission().with_rescue_floor_percent(2),
+        )
+        .await;
+
+        let (status, _) =
+            route_and_read_status(&router, b"BODY <only-on-busy@example.com>\r\n").await;
+
+        assert_eq!(status, 503, "this backend often has what others lack");
+    }
+
+    #[tokio::test]
+    async fn rescue_floor_needs_enough_samples() {
+        let busy = backlogged_pool_with_rescue_history(
+            false,
+            crate::pool::admission::MIN_FALLBACK_LOOKUPS - 1,
+        )
+        .await;
+        let router =
+            missing_and_backlogged_router(busy, give_up_admission().with_rescue_floor_percent(2))
+                .await;
+
+        let (status, _) =
+            route_and_read_status(&router, b"BODY <too-few-samples@example.com>\r\n").await;
+
+        assert_eq!(status, 503);
+    }
+
+    #[tokio::test]
+    async fn rescue_floor_off_by_default() {
+        let busy = backlogged_pool_with_rescue_history(false, 200).await;
+        let router = missing_and_backlogged_router(busy, give_up_admission()).await;
+
+        let (status, _) = route_and_read_status(&router, b"BODY <floor-off@example.com>\r\n").await;
+
+        assert_eq!(status, 503);
+    }
+
+    /// A lookup after another backend's 430 is a fallback lookup and feeds
+    /// the rescue rate of the backend that answered it.
+    #[tokio::test]
+    async fn fallback_lookups_feed_the_rescue_rate() {
+        let (missing_port, _) = spawn_article_response_server(b"430 No such article\r\n").await;
+        let first = DeadpoolConnectionProvider::builder("127.0.0.1", missing_port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let (second_port, _) = spawn_article_response_server(b"430 No such article\r\n").await;
+        let second = DeadpoolConnectionProvider::builder("127.0.0.1", second_port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let router = router_with_admission_backends(
+            vec![first.clone(), second.clone()],
+            crate::pool::admission::ArticleAdmission::default(),
+        );
+
+        let (status, _) =
+            route_and_read_status(&router, b"BODY <fallback-sample@example.com>\r\n").await;
+
+        assert_eq!(status, 430);
+        let total =
+            first.load().snapshot().fallback_lookups + second.load().snapshot().fallback_lookups;
+        assert_eq!(
+            total, 1,
+            "only the lookup after the first 430 is a fallback lookup"
+        );
     }
 
     /// The dead-release regression: a slow backend that is always busy never

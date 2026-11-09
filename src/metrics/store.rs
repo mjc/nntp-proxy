@@ -103,6 +103,13 @@ pub(crate) struct PersistedAdmission {
     /// Last-resort checkouts that waited their whole limit without one.
     #[serde(default)]
     last_resort_timeouts: u64,
+    /// Share of recent lookups after another backend's 430 that this backend
+    /// answered with the article, in parts per million.
+    #[serde(default)]
+    rescue_ppm: u32,
+    /// Lookups sent here after another backend had answered 430.
+    #[serde(default)]
+    fallback_lookups: u64,
 }
 
 impl From<crate::pool::admission::BackendLoadSnapshot> for PersistedAdmission {
@@ -115,6 +122,8 @@ impl From<crate::pool::admission::BackendLoadSnapshot> for PersistedAdmission {
             last_resort_waits: snapshot.last_resort_waits,
             last_resort_connected: snapshot.last_resort_connected,
             last_resort_timeouts: snapshot.last_resort_timeouts,
+            rescue_ppm: snapshot.rescue_ppm,
+            fallback_lookups: snapshot.fallback_lookups,
         }
     }
 }
