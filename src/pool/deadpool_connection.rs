@@ -21,6 +21,7 @@ use tokio::net::TcpStream;
 use tokio::sync::OnceCell;
 
 use crate::connection_error::ConnectionError;
+use crate::pool::churn::{CloseReason, ConnectOutcome};
 use crate::pool::login_backoff::{Admission, LoginBackoff};
 use crate::protocol::{RequestContext, authinfo_pass, authinfo_user};
 use crate::stream::ConnectionStream;
@@ -335,9 +336,16 @@ pub struct TcpManager {
     pub(crate) send_mode_reader: bool,
     /// Stops repeated logins while the backend keeps refusing them.
     login_backoff: Arc<LoginBackoff>,
+    /// Connection births and deaths, shared with the provider for export.
+    pub(crate) churn: Arc<crate::pool::churn::ConnectionChurn>,
 }
 
 impl TcpManager {
+    /// Whether login backoff is currently keeping new connections away.
+    pub(crate) fn login_backoff_active(&self) -> bool {
+        self.login_backoff.is_waiting()
+    }
+
     fn socket_buffer_size_u32(size: usize, label: &str) -> Result<u32, ConnectionError> {
         u32::try_from(size).map_err(|_| {
             ConnectionError::IoError(io::Error::new(
@@ -455,6 +463,7 @@ impl TcpManager {
             compression_support: Arc::new(OnceCell::new()),
             send_mode_reader: options.send_mode_reader,
             login_backoff: Arc::default(),
+            churn: Arc::default(),
         })
     }
 
@@ -912,6 +921,7 @@ impl managed::Manager for TcpManager {
         let attempt = match self.login_backoff.admit() {
             Admission::Proceed(attempt) => attempt,
             Admission::Wait(retry_in) => {
+                self.churn.note_connect(ConnectOutcome::BackoffDenied);
                 return Err(ConnectionError::LoginBackoff {
                     backend: self.name.clone(),
                     retry_in,
@@ -921,8 +931,12 @@ impl managed::Manager for TcpManager {
 
         let result = self.setup_session().await;
         match &result {
-            Ok(_) => attempt.succeeded(),
+            Ok(_) => {
+                self.churn.note_connect(ConnectOutcome::Created);
+                attempt.succeeded();
+            }
             Err(error) if error.is_login_refusal() => {
+                self.churn.note_connect(ConnectOutcome::LoginRefused);
                 let retry_in = attempt.refused();
                 if retry_in.is_zero() {
                     // A late refusal from before a successful login: the gate
@@ -943,7 +957,10 @@ impl managed::Manager for TcpManager {
             }
             // A network failure or timeout says nothing about the account;
             // dropping the attempt hands any probe slot to the next caller.
-            Err(_) => drop(attempt),
+            Err(_) => {
+                self.churn.note_connect(ConnectOutcome::Failed);
+                drop(attempt);
+            }
         }
         result
     }
@@ -957,6 +974,7 @@ impl managed::Manager for TcpManager {
         match check_tcp_alive(&mut conn.0) {
             Ok(()) => Ok(()),
             Err(e) => {
+                self.churn.note_close(CloseReason::Stale);
                 // Shut down TCP immediately so backend releases the slot
                 // before deadpool drops this and creates a replacement.
                 let _ = socket2::SockRef::from(conn.underlying_tcp_stream())

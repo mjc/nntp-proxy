@@ -22,9 +22,10 @@ Keep the config ordered from general settings to concrete identities:
 5. `[cache]`
 6. `[cache.disk]`
 7. `[health_check]`
-8. `[client_auth]`
-9. `[[client_auth.users]]`
-10. `[[servers]]`
+8. `[metrics]`
+9. `[client_auth]`
+10. `[[client_auth.users]]`
+11. `[[servers]]`
 
 See [../../config.full.toml](../../config.full.toml) for a complete example.
 
@@ -185,6 +186,21 @@ Optional disk tier for article bodies evicted from memory. It is only active whe
 | `interval` | `30` seconds |
 | `timeout` | `5` seconds |
 | `unhealthy_threshold` | `3` failures |
+
+### `[metrics]`
+
+Serves Prometheus metrics at `http://<listen>/metrics`. Without this section, no metrics port is opened.
+
+| Field | Default |
+| --- | --- |
+| `listen` | `"127.0.0.1:9469"` |
+
+```toml
+[metrics]
+listen = "127.0.0.1:9469"
+```
+
+`--metrics-listen <IP:PORT>` or `NNTP_PROXY_METRICS_LISTEN=<IP:PORT>` sets the address and turns the endpoint on even when the config file has no `[metrics]` section. The endpoint has no authentication. Keep it on loopback or a private network. See [Metrics](metrics.md) for the metric reference and scrape examples.
 
 ### `[client_auth]` and `[[client_auth.users]]`
 

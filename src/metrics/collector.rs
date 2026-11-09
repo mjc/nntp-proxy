@@ -1,5 +1,6 @@
 //! Lock-free metrics collector
 
+use super::command_class::{CommandClass, CommandClassCounters};
 use super::store::{BackendStore, MetricsStore, UserMetrics};
 use super::types::{
     CacheEntries, DiskHits, DiskReadIos, DiskWriteIos, PipelineBatches, PipelineCommands,
@@ -9,7 +10,7 @@ use super::{BackendHealthStatus, BackendStats, MetricsSnapshot, UserStats};
 use crate::types::{BackendId, BackendToClientBytes, ClientToBackendBytes};
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 // ============================================================================
@@ -90,6 +91,15 @@ struct MetricsInner {
     stateful_sessions: AtomicUsize,
     backend_metrics: Vec<BackendMetrics>,
     start_time: Instant,
+    /// Wall-clock start, so a scrape can report when this process began.
+    start_wall: std::time::SystemTime,
+    /// Client commands by class since process start. Not persisted: a
+    /// per-process counter is what a scraper's `rate()` needs.
+    client_commands: CommandClassCounters,
+    /// Bytes read from clients in sessions that have ended.
+    client_bytes_received: AtomicU64,
+    /// Bytes written to clients in sessions that have ended.
+    client_bytes_sent: AtomicU64,
     // Note: client_to_backend_bytes and backend_to_client_bytes are calculated
     // from backend_metrics sums, not stored separately
 }
@@ -182,6 +192,10 @@ impl MetricsCollector {
                 stateful_sessions: AtomicUsize::new(0),
                 backend_metrics,
                 start_time: Instant::now(),
+                start_wall: std::time::SystemTime::now(),
+                client_commands: CommandClassCounters::default(),
+                client_bytes_received: AtomicU64::new(0),
+                client_bytes_sent: AtomicU64::new(0),
             }),
         }
     }
@@ -272,6 +286,42 @@ impl MetricsCollector {
             .map_or(0, |store| {
                 store.error_reply_failovers.load(Ordering::Relaxed)
             })
+    }
+
+    /// Count an authoritative `430` from this backend.
+    ///
+    /// Still counted in `errors_4xx` so the dashboard's per-backend 4xx column
+    /// keeps showing article distribution, plus a dedicated counter so an
+    /// exported 430 ratio is not mixed with refused commands.
+    #[inline]
+    pub fn record_article_missing(&self, backend_id: BackendId) {
+        self.with_backend_store(backend_id, |store| {
+            store.article_missing.fetch_add(1, Ordering::Relaxed);
+            store.errors_4xx.fetch_add(1, Ordering::Relaxed);
+            store.errors.fetch_add(1, Ordering::Relaxed);
+        });
+    }
+
+    /// Count one client command by class.
+    #[inline]
+    pub fn record_client_command(&self, kind: crate::protocol::RequestKind) {
+        self.inner
+            .client_commands
+            .record(CommandClass::from_kind(kind));
+    }
+
+    /// Add a finished session's client byte totals.
+    ///
+    /// Recorded once per session rather than per write so the response path
+    /// gains no shared-counter traffic; per-backend byte counters carry live
+    /// throughput.
+    pub fn record_client_session_bytes(&self, received: u64, sent: u64) {
+        self.inner
+            .client_bytes_received
+            .fetch_add(received, Ordering::Relaxed);
+        self.inner
+            .client_bytes_sent
+            .fetch_add(sent, Ordering::Relaxed);
     }
 
     #[inline]
@@ -598,6 +648,73 @@ impl MetricsCollector {
     pub fn num_backends(&self) -> usize {
         self.inner.backend_metrics.len()
     }
+
+    /// Plain copy of one backend's cumulative counters for the scrape
+    /// endpoint. Avoids building a full [`MetricsSnapshot`], which clones
+    /// every user entry.
+    #[must_use]
+    pub fn backend_counters(&self, backend_id: BackendId) -> Option<BackendCounters> {
+        let store = self.inner.store.backend_stores.get(backend_id.as_index())?;
+        Some(BackendCounters {
+            commands: store.total_commands.load(Ordering::Relaxed),
+            bytes_to_backend: store.bytes_sent.load(Ordering::Relaxed),
+            bytes_from_backend: store.bytes_received.load(Ordering::Relaxed),
+            errors: store.errors.load(Ordering::Relaxed),
+            errors_4xx: store.errors_4xx.load(Ordering::Relaxed),
+            errors_5xx: store.errors_5xx.load(Ordering::Relaxed),
+            article_missing: store.article_missing.load(Ordering::Relaxed),
+            articles: store.article_count.load(Ordering::Relaxed),
+            article_bytes: store.article_bytes_total.load(Ordering::Relaxed),
+        })
+    }
+
+    /// Plain copy of the proxy-wide counters for the scrape endpoint.
+    #[must_use]
+    pub fn proxy_counters(&self) -> ProxyCounters {
+        let inner = &self.inner;
+        ProxyCounters {
+            client_sessions_total: inner.store.total_connections.load(Ordering::Relaxed),
+            client_sessions_active: inner.active_connections.load(Ordering::Relaxed) as u64,
+            stateful_sessions_active: inner.stateful_sessions.load(Ordering::Relaxed) as u64,
+            client_commands: inner.client_commands.snapshot(),
+            client_bytes_received: inner.client_bytes_received.load(Ordering::Relaxed),
+            client_bytes_sent: inner.client_bytes_sent.load(Ordering::Relaxed),
+            pipeline_batches: inner.store.pipeline_batches.load(Ordering::Relaxed),
+            pipeline_commands: inner.store.pipeline_commands.load(Ordering::Relaxed),
+            start_time: inner.start_wall,
+        }
+    }
+}
+
+/// One backend's cumulative counters, read with relaxed loads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BackendCounters {
+    pub commands: u64,
+    pub bytes_to_backend: u64,
+    pub bytes_from_backend: u64,
+    /// Every recorded error: 4xx (including 430), 5xx, and transport failures.
+    pub errors: u64,
+    /// 4xx replies, including authoritative 430s.
+    pub errors_4xx: u64,
+    pub errors_5xx: u64,
+    pub article_missing: u64,
+    /// Successful ARTICLE/BODY/HEAD payload responses.
+    pub articles: u64,
+    pub article_bytes: u64,
+}
+
+/// Proxy-wide counters and gauges, read with relaxed loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProxyCounters {
+    pub client_sessions_total: u64,
+    pub client_sessions_active: u64,
+    pub stateful_sessions_active: u64,
+    pub client_commands: [u64; CommandClass::COUNT],
+    pub client_bytes_received: u64,
+    pub client_bytes_sent: u64,
+    pub pipeline_batches: u64,
+    pub pipeline_commands: u64,
+    pub start_time: std::time::SystemTime,
 }
 
 #[cfg(test)]

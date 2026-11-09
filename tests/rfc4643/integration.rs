@@ -210,6 +210,7 @@ fn test_config_auth_round_trip() {
             }],
             greeting: Some("Custom Auth Required".to_string()),
         },
+        metrics: None,
     };
 
     // Verify config

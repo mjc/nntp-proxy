@@ -218,6 +218,27 @@ pub struct Config {
     /// List of backend NNTP servers
     #[serde(default)]
     pub servers: Vec<Server>,
+    /// Prometheus scrape endpoint. Absent means no endpoint is opened, so a
+    /// proxy that nobody monitors exposes no extra port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<MetricsEndpoint>,
+}
+
+/// Prometheus scrape endpoint settings (`[metrics]`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MetricsEndpoint {
+    /// Address the `/metrics` HTTP listener binds to. The endpoint has no
+    /// authentication, so the default stays on loopback.
+    #[serde(default = "defaults::metrics_listen")]
+    pub listen: std::net::SocketAddr,
+}
+
+impl Default for MetricsEndpoint {
+    fn default() -> Self {
+        Self {
+            listen: defaults::metrics_listen(),
+        }
+    }
 }
 
 /// Proxy server settings

@@ -950,9 +950,10 @@ impl AvailabilityIndex {
         self.capacity_bytes
     }
 
+    /// Lookup hits and misses since the index was built or restored.
     #[must_use]
-    pub fn hit_rate(&self) -> f64 {
-        let (hits, misses) = self.shards.iter().fold((0, 0), |(hits, misses), shard| {
+    pub fn lookup_counts(&self) -> (u64, u64) {
+        self.shards.iter().fold((0, 0), |(hits, misses), shard| {
             let initial_misses = shard.initial_misses.load(Ordering::Relaxed);
             let shard = shard
                 .lock()
@@ -961,7 +962,12 @@ impl AvailabilityIndex {
                 hits + shard.counters.hits,
                 misses + shard.counters.misses + initial_misses,
             )
-        });
+        })
+    }
+
+    #[must_use]
+    pub fn hit_rate(&self) -> f64 {
+        let (hits, misses) = self.lookup_counts();
         let total = hits + misses;
         if total == 0 {
             0.0

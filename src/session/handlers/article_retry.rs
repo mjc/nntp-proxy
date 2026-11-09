@@ -91,7 +91,7 @@ impl ClientSession {
                     .record_availability_missing(message_id.clone(), slot)
                     .await;
                 // A 430 is normal retry traffic, but operators expect to see it per backend.
-                self.metrics.record_error_4xx(pinned_backend);
+                self.metrics.record_article_missing(pinned_backend);
             }
             WithheldLookupReply::Refused(status_code) => {
                 debug!(
@@ -557,10 +557,9 @@ impl ClientSession {
         let backend_id = missing.backend_id();
         availability.record_missing_slot(missing.availability_slot());
 
-        // Track 430 responses in 4xx metrics for visibility in TUI
-        // While 430 is normal retry behavior (not a failure), users want to see
-        // these counted to understand backend article distribution
-        self.metrics.record_error_4xx(backend_id);
+        // 430 is normal retry behavior, not a failure, but operators want it
+        // counted per backend to understand article distribution.
+        self.metrics.record_article_missing(backend_id);
     }
 }
 

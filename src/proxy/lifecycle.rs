@@ -320,6 +320,10 @@ impl NntpProxy {
         match metrics {
             Ok(m) => {
                 self.log_session_completion(client_addr, session_id, session, &m);
+                self.metrics.record_client_session_bytes(
+                    m.client_to_backend.as_u64(),
+                    m.backend_to_client.as_u64(),
+                );
 
                 if let Some(bid) = backend_id {
                     self.metrics

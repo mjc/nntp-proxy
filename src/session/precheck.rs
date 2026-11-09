@@ -380,7 +380,7 @@ fn classify_precheck_result(
             QueryAttemptResult::Found(Box::new(response))
         }
         430 => {
-            deps.metrics.record_error_4xx(backend_id);
+            deps.metrics.record_article_missing(backend_id);
             QueryAttemptResult::Missing
         }
         400..=499 => {

@@ -7,6 +7,17 @@ use crate::types::{CacheCapacity, MaxConnections, MaxErrors, QueuePressurePercen
 use std::path::PathBuf;
 use std::time::Duration;
 
+/// Default Prometheus scrape address: loopback only, because the endpoint is
+/// unauthenticated and backend names can reveal which providers are in use.
+#[inline]
+#[must_use]
+pub const fn metrics_listen() -> std::net::SocketAddr {
+    std::net::SocketAddr::V4(std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::LOCALHOST,
+        crate::constants::metrics::DEFAULT_PORT,
+    ))
+}
+
 /// Default maximum connections per server
 ///
 /// # Panics

@@ -248,6 +248,31 @@ pub mod session {
     pub const METRICS_FLUSH_INTERVAL: u32 = 100;
 }
 
+/// Prometheus scrape endpoint limits
+pub mod metrics {
+    use std::time::Duration;
+
+    /// Default scrape port when `[metrics]` is present without `listen`.
+    /// Chosen from the unallocated part of the exporter port range.
+    pub const DEFAULT_PORT: u16 = 9469;
+
+    /// Largest request head accepted from a scraper. A scrape request is a
+    /// few hundred bytes; anything larger is not a scraper and is refused
+    /// before it can make the proxy buffer more.
+    pub const MAX_REQUEST_HEAD_BYTES: usize = 8 * 1024;
+
+    /// How long a scraper may take to send its request head. Keeps an idle or
+    /// deliberately slow client from holding a scrape slot.
+    pub const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+    /// How long writing one response may take before the connection is dropped.
+    pub const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Scrape connections served at once. Extra connections are closed
+    /// immediately instead of queueing, so a scrape storm cannot pile up work.
+    pub const MAX_CONCURRENT_SCRAPES: usize = 32;
+}
+
 /// Display strings for user metrics and logging
 pub mod user {
     /// Display name for anonymous/unauthenticated users

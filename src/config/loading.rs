@@ -502,7 +502,7 @@ pub fn load_config(config_path: &str) -> Result<Config> {
 /// are surfaced. Other tables are left alone: legacy layouts such as `[proxy]`
 /// are read from the raw TOML by the migration code and would otherwise produce
 /// false warnings.
-const UNKNOWN_KEY_REPORTED_TABLES: &[&str] = &["servers", "routing"];
+const UNKNOWN_KEY_REPORTED_TABLES: &[&str] = &["servers", "routing", "metrics"];
 
 /// Deserialize a config file and return the unknown keys in
 /// [`UNKNOWN_KEY_REPORTED_TABLES`] as dotted paths such as `servers.1.tierr`.

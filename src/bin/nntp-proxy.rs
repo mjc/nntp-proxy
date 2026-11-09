@@ -98,6 +98,7 @@ async fn run_proxy(
         .map(Duration::from_secs);
     args.common
         .validate_dashboard_listen(&launch.host, launch.port)?;
+    let metrics_listen = config.metrics.map(|endpoint| endpoint.listen);
 
     let proxy = build_proxy(config, launch.routing_mode, launch.metrics_store).await?;
 
@@ -106,6 +107,10 @@ async fn run_proxy(
     if let Some(path) = launch.availability_path.as_ref() {
         let _ = runtime::load_availability_from_disk(proxy.cache(), path);
     }
+
+    // Started after the availability restore, which resets cache counters,
+    // so no scrape can see a counter go backwards.
+    let metrics_endpoint = launch_metrics_endpoint(metrics_listen, &proxy).await?;
 
     let listener = runtime::bind_listener(&launch.host, launch.port, launch.routing_mode).await?;
 
@@ -178,6 +183,9 @@ async fn run_proxy(
         dashboard_handle,
     )
     .await?;
+    if let Some(handle) = metrics_endpoint {
+        handle.abort();
+    }
 
     if let Err(e) = runtime::persist_runtime_state(
         &proxy,
@@ -311,6 +319,28 @@ fn launch_tui(
     (Some(handle), Some(tui_shutdown_tx))
 }
 
+/// Serve Prometheus scrapes when `[metrics]` or `--metrics-listen` is set.
+///
+/// # Errors
+/// Returns an error when the configured address cannot be bound, so a typo
+/// fails startup instead of leaving the proxy silently unmonitored.
+async fn launch_metrics_endpoint(
+    listen: Option<SocketAddr>,
+    proxy: &Arc<NntpProxy>,
+) -> Result<Option<TuiHandle>> {
+    let Some(listen) = listen else {
+        return Ok(None);
+    };
+    let (bound, handle) =
+        nntp_proxy::metrics::prometheus::spawn_endpoint(listen, Arc::clone(proxy))
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("failed to bind metrics endpoint on {listen}: {error}")
+            })?;
+    info!("Serving Prometheus metrics on http://{}/metrics", bound);
+    Ok(Some(handle))
+}
+
 /// Launch the websocket dashboard publisher when `--tui-listen` is configured.
 ///
 /// # Errors
@@ -429,6 +459,7 @@ mod tests {
             article_cache_ttl_secs: None,
             store_article_bodies: None,
             threads: None,
+            metrics_listen: None,
         }
     }
 

@@ -810,6 +810,10 @@ impl DeadpoolConnectionProvider {
     /// unread backend response bytes in flight, making the socket dirty without
     /// implying that replacement connections should be throttled.
     pub(super) fn remove_without_cooldown(&self, conn: PooledConnection) {
+        self.pool
+            .manager()
+            .churn
+            .note_close(super::churn::CloseReason::ClientAbort);
         shutdown_and_drop(conn);
     }
 
@@ -836,6 +840,10 @@ impl DeadpoolConnectionProvider {
             shutdown_and_drop(conn);
             return;
         }
+        self.pool
+            .manager()
+            .churn
+            .note_close(super::churn::CloseReason::BackendError);
 
         // If cooldown is disabled (None or zero duration), just shut down and drop
         let Some(cooldown) = self.replacement_cooldown.filter(|d| !d.is_zero()) else {
@@ -944,6 +952,24 @@ impl DeadpoolConnectionProvider {
     #[inline]
     pub fn port(&self) -> u16 {
         self.pool.manager().port
+    }
+
+    /// Connection churn counters for this backend.
+    #[must_use]
+    pub fn connection_churn(&self) -> super::churn::ConnectionChurnSnapshot {
+        self.pool.manager().churn.snapshot()
+    }
+
+    /// Whether login backoff is currently keeping new connections away.
+    #[must_use]
+    pub fn login_backoff_active(&self) -> bool {
+        self.pool.manager().login_backoff_active()
+    }
+
+    /// Pool slots temporarily withheld after broken connections.
+    #[must_use]
+    pub fn active_cooldowns(&self) -> usize {
+        self.active_cooldowns.load(Ordering::Relaxed)
     }
 
     /// Get a reference to the health check metrics

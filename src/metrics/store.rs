@@ -73,6 +73,9 @@ pub(crate) struct PersistedBackend {
     /// Older stats files predate this counter, so it defaults to zero.
     #[serde(default)]
     error_reply_failovers: u64,
+    /// Authoritative `430` replies. Older stats files predate this counter.
+    #[serde(default)]
+    article_missing: u64,
     // Future v2 (retention tracking PR):
     //   oldest_served_article_age_secs, newest_missing_article_age_secs,
     //   retention_sample_count (for confidence interval calculation)
@@ -158,6 +161,10 @@ pub struct BackendStore {
     pub recv_micros_total: AtomicU64,
     pub connection_failures: AtomicU64,
     pub error_reply_failovers: AtomicU64,
+    /// Authoritative `430` replies. Also counted in `errors_4xx`, which the
+    /// dashboard shows, but kept apart so a scrape can tell a missing article
+    /// from a refused command.
+    pub article_missing: AtomicU64,
 }
 
 impl Default for BackendStore {
@@ -177,6 +184,7 @@ impl Default for BackendStore {
             recv_micros_total: AtomicU64::new(0),
             connection_failures: AtomicU64::new(0),
             error_reply_failovers: AtomicU64::new(0),
+            article_missing: AtomicU64::new(0),
         }
     }
 }
@@ -201,6 +209,7 @@ impl BackendStore {
             connection_failures: self.connection_failures.load(Ordering::Relaxed),
             admission: None,
             error_reply_failovers: self.error_reply_failovers.load(Ordering::Relaxed),
+            article_missing: self.article_missing.load(Ordering::Relaxed),
         }
     }
 
@@ -233,6 +242,8 @@ impl BackendStore {
             .store(persisted.connection_failures, Ordering::Relaxed);
         self.error_reply_failovers
             .store(persisted.error_reply_failovers, Ordering::Relaxed);
+        self.article_missing
+            .store(persisted.article_missing, Ordering::Relaxed);
     }
 }
 

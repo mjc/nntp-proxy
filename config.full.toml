@@ -128,6 +128,12 @@ interval = 30
 timeout = 5
 unhealthy_threshold = 3
 
+# Prometheus metrics endpoint (optional). Without this section no metrics port
+# is opened. The endpoint is unauthenticated: keep it on loopback or a private
+# network. Override with --metrics-listen or NNTP_PROXY_METRICS_LISTEN.
+[metrics]
+listen = "127.0.0.1:9469"
+
 # Client Authentication Configuration
 # Place auth near the concrete server entries. It is optional.
 #

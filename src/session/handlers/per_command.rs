@@ -560,7 +560,10 @@ impl ClientSession {
         metrics: TransferMetrics,
     ) -> Option<crate::session::handlers::pipeline::RequestBatch> {
         match self.read_command_batch(client_reader, command_buf).await {
-            Ok(batch) => Some(batch),
+            Ok(batch) => {
+                batch.for_each_request_kind(|kind| self.metrics.record_client_command(kind));
+                Some(batch)
+            }
             Err(e) => {
                 if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
                     connection::log_client_error(

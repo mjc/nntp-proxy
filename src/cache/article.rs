@@ -1520,6 +1520,15 @@ impl ArticleCache {
         self.cache.weighted_size()
     }
 
+    /// Lookup hits and misses since the cache was created.
+    #[must_use]
+    pub fn lookup_counts(&self) -> (u64, u64) {
+        (
+            self.hits.load(Ordering::Relaxed),
+            self.misses.load(Ordering::Relaxed),
+        )
+    }
+
     /// Get cache hit rate as percentage (0.0 to 100.0)
     #[inline]
     #[must_use]

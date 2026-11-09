@@ -577,6 +577,7 @@ impl ClientSession {
                             let request = command_reader
                                 .take_request()
                                 .expect("ready command should have parsed request");
+                            self.metrics.record_client_command(request.kind());
                             state.auth_access = self.authentication_access(state.auth_access);
 
                             if state.auth_access.can_access_backend() {

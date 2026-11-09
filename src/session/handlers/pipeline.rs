@@ -242,6 +242,22 @@ impl RequestBatch {
         }
     }
 
+    /// Visit the kind of every parsed request in the batch, including the
+    /// trailing one, so each client command is counted once when it is read.
+    pub(super) fn for_each_request_kind(
+        &self,
+        mut visit: impl FnMut(crate::protocol::RequestKind),
+    ) {
+        if let BatchContents::Contexts(contexts) = &self.contents {
+            for context in contexts {
+                visit(context.request().kind());
+            }
+        }
+        if let BatchTail::Context(context) = &self.trailing {
+            visit(context.kind());
+        }
+    }
+
     /// Number of pipelineable commands
     pub(super) fn len(&self) -> usize {
         match &self.contents {

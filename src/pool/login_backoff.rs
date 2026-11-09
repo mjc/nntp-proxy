@@ -109,6 +109,12 @@ impl LoginBackoff {
         Admission::Proceed(LoginAttempt::new(self, AttemptRole::Probe, state.epoch))
     }
 
+    /// Whether refusals are on record, so new logins are paused or limited
+    /// to a single probe. Read at scrape time only.
+    pub(crate) fn is_waiting(&self) -> bool {
+        self.lock().refusals > 0
+    }
+
     /// Attempts admitted together fail together; only the first of them moves
     /// the schedule, so a pool of N concurrent creators does not jump N steps.
     /// The rest are matched by epoch rather than by the window's deadline: a

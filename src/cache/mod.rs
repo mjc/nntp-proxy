@@ -872,6 +872,28 @@ impl UnifiedCache {
         }
     }
 
+    /// Cache lookup hits and misses, as monotonic counters for export.
+    #[must_use]
+    pub fn lookup_counts(&self) -> (u64, u64) {
+        match &self.kind {
+            UnifiedCacheKind::Availability(index) => index.lookup_counts(),
+            UnifiedCacheKind::Memory(cache) => cache.lookup_counts(),
+            UnifiedCacheKind::Hybrid(cache) => {
+                let stats = cache.stats();
+                (stats.hits, stats.misses)
+            }
+        }
+    }
+
+    /// Disk-tier statistics, present only for the hybrid cache.
+    #[must_use]
+    pub fn disk_stats(&self) -> Option<DiskDisplayStats> {
+        match &self.kind {
+            UnifiedCacheKind::Hybrid(cache) => cache.display_stats().disk,
+            UnifiedCacheKind::Availability(_) | UnifiedCacheKind::Memory(_) => None,
+        }
+    }
+
     /// Check if this is a hybrid cache (has disk tier)
     #[must_use]
     pub const fn is_hybrid(&self) -> bool {
