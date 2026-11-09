@@ -442,6 +442,17 @@ pub struct DiskDisplayStats {
     pub read_ios: u64,
 }
 
+/// Cache state for one scrape; see [`UnifiedCache::scrape_stats`].
+#[derive(Debug, Clone, Default)]
+pub struct CacheScrapeStats {
+    pub entries: Option<u64>,
+    pub size_bytes: Option<u64>,
+    pub capacity_bytes: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub disk: Option<DiskDisplayStats>,
+}
+
 /// Trait for getting cache statistics for TUI display
 pub trait CacheStatsProvider: Send + Sync {
     /// Get statistics for TUI display
@@ -872,25 +883,59 @@ impl UnifiedCache {
         }
     }
 
-    /// Cache lookup hits and misses, as monotonic counters for export.
+    /// Everything the scrape endpoint exports about the cache, read once.
+    ///
+    /// Each statistic source is consulted a single time per call, and nothing
+    /// here rotates or evicts entries. Fields a cache kind cannot measure are
+    /// `None` and are left out of the scrape rather than filled with the
+    /// configured capacity.
     #[must_use]
-    pub fn lookup_counts(&self) -> (u64, u64) {
+    pub fn scrape_stats(&self) -> CacheScrapeStats {
         match &self.kind {
-            UnifiedCacheKind::Availability(index) => index.lookup_counts(),
-            UnifiedCacheKind::Memory(cache) => cache.lookup_counts(),
+            UnifiedCacheKind::Availability(index) => {
+                let counts = index.scrape_counts();
+                CacheScrapeStats {
+                    entries: Some(counts.entries),
+                    // The index preallocates its whole table, so it has no
+                    // separate usage figure to report.
+                    size_bytes: None,
+                    capacity_bytes: index.capacity_bytes(),
+                    hits: counts.hits,
+                    misses: counts.misses,
+                    disk: None,
+                }
+            }
+            UnifiedCacheKind::Memory(cache) => {
+                let (hits, misses) = cache.lookup_counts();
+                CacheScrapeStats {
+                    entries: Some(cache.entry_count()),
+                    size_bytes: Some(cache.weighted_size()),
+                    capacity_bytes: cache.capacity(),
+                    hits,
+                    misses,
+                    disk: None,
+                }
+            }
             UnifiedCacheKind::Hybrid(cache) => {
                 let stats = cache.stats();
-                (stats.hits, stats.misses)
+                CacheScrapeStats {
+                    // foyer exposes neither an entry count nor memory usage.
+                    entries: None,
+                    size_bytes: None,
+                    capacity_bytes: stats.memory_capacity,
+                    hits: stats.hits,
+                    misses: stats.misses,
+                    disk: Some(DiskDisplayStats {
+                        disk_hits: stats.disk_hits,
+                        disk_hit_rate: stats.disk_hit_rate(),
+                        capacity: stats.disk_capacity,
+                        bytes_written: stats.disk_write_bytes,
+                        bytes_read: stats.disk_read_bytes,
+                        write_ios: stats.disk_write_ios,
+                        read_ios: stats.disk_read_ios,
+                    }),
+                }
             }
-        }
-    }
-
-    /// Disk-tier statistics, present only for the hybrid cache.
-    #[must_use]
-    pub fn disk_stats(&self) -> Option<DiskDisplayStats> {
-        match &self.kind {
-            UnifiedCacheKind::Hybrid(cache) => cache.display_stats().disk,
-            UnifiedCacheKind::Availability(_) | UnifiedCacheKind::Memory(_) => None,
         }
     }
 

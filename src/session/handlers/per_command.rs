@@ -517,40 +517,56 @@ impl ClientSession {
             self.auth_handler.is_enabled(),
         ));
 
-        loop {
-            let Some(mut batch) = self
-                .read_next_batch(
-                    &mut client_reader,
-                    &mut command_buf,
-                    state.transfer_metrics(),
-                )
-                .await
-            else {
-                break;
-            };
+        // The loop runs inside a block so error exits still record the
+        // session's client byte totals below.
+        let outcome = async {
+            loop {
+                let Some(mut batch) = self
+                    .read_next_batch(
+                        &mut client_reader,
+                        &mut command_buf,
+                        state.transfer_metrics(),
+                    )
+                    .await
+                else {
+                    return Ok(None);
+                };
 
-            match self
-                .handle_command_batch(router, &mut client_writer, &mut state, &mut batch)
-                .await?
-            {
-                BatchLoopAction::Continue => {}
-                BatchLoopAction::Break => break,
-                BatchLoopAction::SwitchToStateful(initial_request) => {
-                    let client_write = client_writer.into_inner();
-                    return self
-                        .switch_to_stateful_mode(
-                            client_reader,
-                            client_write,
-                            initial_request,
-                            state.client_to_backend_bytes.into(),
-                            state.backend_to_client_bytes.into(),
-                        )
-                        .await;
+                match self
+                    .handle_command_batch(router, &mut client_writer, &mut state, &mut batch)
+                    .await?
+                {
+                    BatchLoopAction::Continue => {}
+                    BatchLoopAction::Break => return Ok(None),
+                    BatchLoopAction::SwitchToStateful(initial_request) => {
+                        return Ok(Some(initial_request));
+                    }
                 }
             }
         }
+        .await;
 
-        Ok(state.transfer_metrics())
+        // Recorded before any hybrid switch, so a switch that fails before
+        // its stateful loop starts still counts this phase's bytes.
+        let totals = state.transfer_metrics();
+        self.metrics.record_client_session_bytes(
+            totals.client_to_backend.as_u64(),
+            totals.backend_to_client.as_u64(),
+        );
+        match outcome {
+            Ok(Some(initial_request)) => {
+                let client_write = client_writer.into_inner();
+                self.switch_to_stateful_mode(
+                    client_reader,
+                    client_write,
+                    initial_request,
+                    state.client_to_backend_bytes.into(),
+                    state.backend_to_client_bytes.into(),
+                )
+                .await
+            }
+            outcome => outcome.map(|_| totals),
+        }
     }
 
     async fn read_next_batch(
@@ -562,6 +578,9 @@ impl ClientSession {
         match self.read_command_batch(client_reader, command_buf).await {
             Ok(batch) => {
                 batch.for_each_request_kind(|kind| self.metrics.record_client_command(kind));
+                for _ in 0..batch.rejected_lines() {
+                    self.metrics.record_client_rejected_line();
+                }
                 Some(batch)
             }
             Err(e) => {

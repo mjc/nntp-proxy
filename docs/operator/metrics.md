@@ -18,7 +18,7 @@ The endpoint answers:
 | Request | Response |
 | --- | --- |
 | `GET /metrics` | `200`, `Content-Type: text/plain; version=0.0.4; charset=utf-8` |
-| `HEAD /metrics` | `200` headers only |
+| `HEAD /metrics` | `200` headers only, without rendering the metrics |
 | any other path | `404` |
 | any other method | `405` |
 
@@ -32,7 +32,7 @@ The endpoint has no authentication or TLS. Backend names, pool sizes, and traffi
 
 Values come from counters the proxy already keeps for its dashboard and stats file. A scrape reads them with relaxed atomic loads, takes the availability cache's shard locks briefly to sum hits and misses, and reads a few files under `/proc`. Rendering runs on a blocking thread, not on the proxy's async workers. Between scrapes the endpoint does no work.
 
-Request handling adds a single relaxed atomic increment per client command (command class counter) and per authoritative `430` (missing-article counter). Each latency histogram observation is a binary search over 13 fixed bounds plus two relaxed atomic increments, with no allocation or lock. Connection churn counters change once per backend connection opened or closed.
+Request handling adds a single relaxed atomic increment per client command (command class counter) and per authoritative `430` (missing-article counter). Pinned (stateful) sessions classify each backend reply as it is framed and add the totals to the per-backend counters once per backend read. Each latency histogram observation is a binary search over 13 fixed bounds plus two relaxed atomic increments, with no allocation or lock. Connection churn counters change once per backend connection opened or closed.
 
 ## Labels
 
@@ -42,7 +42,7 @@ Labels are bounded so the number of series does not grow with traffic:
 | --- | --- |
 | `backend` | Configured server `name`. If two servers share a name, the later one gets `#<index>` appended so their series stay distinct. |
 | `tier` | Configured server `tier`. |
-| `command` | `article`, `body`, `head`, `stat`, `group`, `overview`, `list`, `post`, `auth`, `session`, `other` |
+| `command` | `article`, `body`, `head`, `stat`, `group`, `overview`, `list`, `post`, `auth`, `session`, `other` (unrecognised verbs), `rejected` (lines refused as over-long or invalid) |
 | `code_class` | `4xx`, `5xx` |
 | `direction`, `state`, `outcome`, `reason`, `result` | Fixed values listed with each metric. |
 
@@ -75,7 +75,7 @@ On platforms without `/proc`, the `nntp_proxy_process_*` metrics are omitted.
 | `nntp_proxy_client_sessions_total` | counter | | Client connections accepted. |
 | `nntp_proxy_stateful_sessions_active` | gauge | | Client sessions pinned to one backend connection. |
 | `nntp_proxy_client_commands_total` | counter | `command` | Commands read from clients, by class. Cache hits and locally answered commands are included. |
-| `nntp_proxy_client_bytes_total` | counter | `direction` = `received`, `sent` | Bytes exchanged with clients. Added when each session ends, so long sessions show up late; use `nntp_proxy_backend_bytes_total` for live throughput. |
+| `nntp_proxy_client_bytes_total` | counter | `direction` = `received`, `sent` | Bytes exchanged with clients. Added when each session ends, however it ends, so long sessions show up late; use the backend byte counters for live throughput. |
 | `nntp_proxy_pipeline_batches_total` | counter | | Pipelined batches of more than one client command. |
 | `nntp_proxy_pipeline_commands_total` | counter | | Commands carried in those batches. |
 
@@ -83,8 +83,8 @@ On platforms without `/proc`, the `nntp_proxy_process_*` metrics are omitted.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `nntp_proxy_cache_entries` | gauge | | Entries in the article/availability cache. `0` for the hybrid disk cache, which does not count entries. |
-| `nntp_proxy_cache_size_bytes` | gauge | | Memory used by the cache. |
+| `nntp_proxy_cache_entries` | gauge | | Entries in the memory cache or availability index. The availability index may still count entries past their TTL that it has not rotated out yet; a scrape never triggers rotation. Omitted for the hybrid disk cache, which cannot count entries. |
+| `nntp_proxy_cache_size_bytes` | gauge | | Memory used by the memory cache. Omitted for the availability index (its table is allocated up front, so use the capacity) and for the hybrid disk cache (which does not report usage). |
 | `nntp_proxy_cache_capacity_bytes` | gauge | | Configured memory capacity. |
 | `nntp_proxy_cache_lookups_total` | counter | `result` = `hit`, `miss` | Cache lookups. |
 | `nntp_proxy_cache_disk_hits_total` | counter | | Hits served from the disk tier. Disk cache only. |
@@ -93,6 +93,8 @@ On platforms without `/proc`, the `nntp_proxy_process_*` metrics are omitted.
 | `nntp_proxy_cache_disk_ios_total` | counter | `direction` = `read`, `written` | Disk I/O operations. Disk cache only. |
 
 ### Backends
+
+Per-backend counters cover every routing mode. Pinned (stateful) sessions count commands, successful articles, `430`s, and error replies per reply, like per-command traffic, so `nntp_proxy_backend_article_bytes_total` and `nntp_proxy_backend_articles_total` update as each article completes in every mode.
 
 Every backend metric has the labels `backend` and `tier`, plus any listed here.
 
@@ -104,7 +106,7 @@ Every backend metric has the labels `backend` and `tier`, plus any listed here.
 | `nntp_proxy_backend_article_missing_total` | counter | | Authoritative `430 No such article` replies. |
 | `nntp_proxy_backend_error_replies_total` | counter | `code_class` = `4xx`, `5xx` | Error status replies. `4xx` includes the `430`s above; subtract them for refused commands. |
 | `nntp_proxy_backend_errors_total` | counter | | All errors attributed to the backend: `4xx` and `5xx` replies plus transport and session failures. |
-| `nntp_proxy_backend_bytes_total` | counter | `direction` = `sent`, `received` | Bytes sent to and received from the backend. Stateful sessions add their bytes when the session ends. |
+| `nntp_proxy_backend_bytes_total` | counter | `direction` = `sent`, `received` | Bytes sent to and received from the backend. Per-command traffic is added per response; pinned (stateful) sessions add theirs every 100 loop iterations and when the session ends. |
 | `nntp_proxy_backend_pool_connections` | gauge | `state` = `idle`, `in_use` | Pooled connections. |
 | `nntp_proxy_backend_pool_max_connections` | gauge | | Current pool limit. Lower than `max_connections` while replacement cooldowns are active. |
 | `nntp_proxy_backend_pool_waiters` | gauge | | Checkouts waiting for a connection. |
@@ -112,8 +114,8 @@ Every backend metric has the labels `backend` and `tier`, plus any listed here.
 | `nntp_proxy_backend_pending_commands` | gauge | | Commands routed to the backend and not finished. |
 | `nntp_proxy_backend_stateful_sessions` | gauge | | Client sessions pinned to the backend. |
 | `nntp_proxy_backend_connect_attempts_total` | counter | `outcome` = `created`, `failed`, `login_refused`, `backoff_denied` | Attempts to open a connection. `backoff_denied` attempts were refused locally during login backoff without contacting the backend. |
-| `nntp_proxy_backend_connections_closed_total` | counter | `reason` = `backend_error`, `client_abort`, `stale` | Connections closed instead of reused. `stale` connections failed the liveness check when taken from the pool. |
-| `nntp_proxy_backend_login_backoff` | gauge | | `1` while recent login refusals keep new connections paused. |
+| `nntp_proxy_backend_connections_closed_total` | counter | `reason` = `backend_error`, `cancelled`, `client_abort`, `health_check`, `stale`, `idle` | Connections closed, counted when the connection is destroyed, so `created` minus all closes is the live connection count. `cancelled`: the request using it was cancelled mid-exchange (deadline expiry or a dropped request). `health_check`: the periodic health check found it dead. `stale`: it failed the liveness check when taken from the pool. `idle`: the pool dropped it itself (idle-timeout clearing, a pool shrinking during replacement cooldown, or shutdown). |
+| `nntp_proxy_backend_login_backoff` | gauge | | `1` while a login backoff window is open and new connections fail locally. Returns to `0` when the window ends, even before a later login succeeds. |
 | `nntp_proxy_backend_health_checks_total` | counter | | Idle connections checked by the periodic health check. |
 | `nntp_proxy_backend_health_check_failures_total` | counter | | Idle connections that failed it. |
 

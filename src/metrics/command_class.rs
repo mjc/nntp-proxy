@@ -28,10 +28,13 @@ pub enum CommandClass {
     Session,
     /// Verbs the parser does not recognise.
     Other,
+    /// Lines the proxy refused before classifying them: over the RFC 3977
+    /// length limit or not a valid command line.
+    Rejected,
 }
 
 impl CommandClass {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Article,
         Self::Body,
         Self::Head,
@@ -43,6 +46,7 @@ impl CommandClass {
         Self::Auth,
         Self::Session,
         Self::Other,
+        Self::Rejected,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -90,6 +94,7 @@ impl CommandClass {
             Self::Auth => "auth",
             Self::Session => "session",
             Self::Other => "other",
+            Self::Rejected => "rejected",
         }
     }
 

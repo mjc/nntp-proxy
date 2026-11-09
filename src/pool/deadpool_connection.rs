@@ -29,11 +29,40 @@ use crate::tls::{TlsConfig, TlsManager, TlsPolicy};
 
 /// A backend connection that has completed all setup negotiations.
 #[derive(Debug)]
-pub struct ReadyBackendConnection(ConnectionStream);
+pub struct ReadyBackendConnection(ConnectionStream, CloseTracking);
+
+/// Counts this connection's close in its backend's churn counters when the
+/// object is destroyed, under the first reason anyone tagged it with.
+#[derive(Debug)]
+struct CloseTracking {
+    churn: Arc<crate::pool::churn::ConnectionChurn>,
+    reason: Option<CloseReason>,
+}
+
+impl Drop for CloseTracking {
+    fn drop(&mut self) {
+        self.churn
+            .note_close(self.reason.unwrap_or(CloseReason::Idle));
+    }
+}
 
 impl ReadyBackendConnection {
-    fn new(stream: ConnectionStream) -> Self {
-        Self(stream)
+    fn new(stream: ConnectionStream, churn: Arc<crate::pool::churn::ConnectionChurn>) -> Self {
+        Self(
+            stream,
+            CloseTracking {
+                churn,
+                reason: None,
+            },
+        )
+    }
+
+    /// Record why this connection is being retired. Later tags are ignored so
+    /// the cause that started the retirement is the one counted.
+    pub(crate) const fn tag_close_reason(&mut self, reason: CloseReason) {
+        if self.1.reason.is_none() {
+            self.1.reason = Some(reason);
+        }
     }
 }
 
@@ -897,7 +926,7 @@ impl TcpManager {
                 stream = stream.into_compressed(level)?;
             }
 
-            Ok(ReadyBackendConnection::new(stream))
+            Ok(ReadyBackendConnection::new(stream, Arc::clone(&self.churn)))
         })
         .await
         .map_err(|_| {
@@ -974,7 +1003,7 @@ impl managed::Manager for TcpManager {
         match check_tcp_alive(&mut conn.0) {
             Ok(()) => Ok(()),
             Err(e) => {
-                self.churn.note_close(CloseReason::Stale);
+                conn.tag_close_reason(CloseReason::Stale);
                 // Shut down TCP immediately so backend releases the slot
                 // before deadpool drops this and creates a replacement.
                 let _ = socket2::SockRef::from(conn.underlying_tcp_stream())

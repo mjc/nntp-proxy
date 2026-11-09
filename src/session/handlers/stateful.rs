@@ -351,7 +351,12 @@ impl ClientSession {
     {
         match self.reader_message_id_recovery {
             ReaderMessageIdRecovery::PinnedOnly => {
-                for write in state.client_writes_for_backend_read(&buffer[..len]) {
+                let writes = state.client_writes_for_backend_read(&buffer[..len]);
+                // Counted before writing so a failed client write still
+                // records what the backend delivered.
+                self.metrics
+                    .record_response_tally(backend_id, state.take_reply_outcomes());
+                for write in writes {
                     client_write
                         .write_all(write.as_ref())
                         .await
@@ -360,7 +365,10 @@ impl ClientSession {
                 }
             }
             ReaderMessageIdRecovery::RoutedAfterPinnedMiss => {
-                for action in state.client_actions_for_backend_read(&buffer[..len]) {
+                let actions = state.client_actions_for_backend_read(&buffer[..len]);
+                self.metrics
+                    .record_response_tally(backend_id, state.take_reply_outcomes());
+                for action in actions {
                     match action {
                         OrderedClientAction::Write(write) => {
                             client_write
@@ -498,6 +506,10 @@ impl ClientSession {
         // this counter only controls when buffered request bytes are flushed.
         let mut pending_backend_writes = 0usize;
 
+        // The loop runs inside a block so its `?` exits still reach the final
+        // byte flush below: an erroring session must report the same totals
+        // as one that ends cleanly.
+        let exit = async {
         let exit = loop {
             // Periodic metrics flush
             if state.check_and_maybe_flush_metrics() {
@@ -566,6 +578,7 @@ impl ClientSession {
                             break StatefulSessionExit::ClientDisconnected;
                         }
                         Ok(line @ (StatefulClientLine::Oversized | StatefulClientLine::Invalid)) => {
+                            self.metrics.record_client_rejected_line();
                             let reply = match line {
                                 StatefulClientLine::Oversized => crate::protocol::COMMAND_TOO_LONG,
                                 _ => crate::protocol::COMMAND_SYNTAX_ERROR_RESPONSE,
@@ -649,9 +662,15 @@ impl ClientSession {
                 }
             }
         };
+        Ok::<_, StatefulLoopError>(exit)
+        }
+        .await;
 
         // Final metrics - report any remaining byte deltas
         state.flush_byte_deltas(&self.metrics, backend_id, self.username());
+        let (received, sent) = state.unrecorded_client_bytes();
+        self.metrics.record_client_session_bytes(received, sent);
+        let exit = exit?;
 
         let disposition = exit.disposition();
         Ok(StatefulLoopResult::new(state.into_metrics(), disposition))

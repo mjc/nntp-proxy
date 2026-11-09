@@ -109,10 +109,15 @@ impl LoginBackoff {
         Admission::Proceed(LoginAttempt::new(self, AttemptRole::Probe, state.epoch))
     }
 
-    /// Whether refusals are on record, so new logins are paused or limited
-    /// to a single probe. Read at scrape time only.
+    /// Whether a backoff window is open right now, so new logins fail
+    /// locally. Based on the window's deadline rather than the refusal count,
+    /// which stays set until a later login succeeds and would keep the gauge
+    /// up long after the window closed. Read at scrape time only.
     pub(crate) fn is_waiting(&self) -> bool {
-        self.lock().refusals > 0
+        let now = Instant::now();
+        self.lock()
+            .retry_not_before
+            .is_some_and(|deadline| deadline > now)
     }
 
     /// Attempts admitted together fail together; only the first of them moves
@@ -426,5 +431,18 @@ mod tests {
     fn huge_refusal_counts_do_not_overflow() {
         assert_eq!(delay_after(u32::MAX), MAX_DELAY);
         assert_eq!(delay_after(40), MAX_DELAY);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn waiting_reflects_the_open_window_not_the_refusal_count() {
+        let gate = LoginBackoff::default();
+        assert!(!gate.is_waiting());
+        let delay = refuse(&gate);
+        assert!(gate.is_waiting());
+        tokio::time::advance(delay + Duration::from_millis(1)).await;
+        assert!(
+            !gate.is_waiting(),
+            "window closed even though no login succeeded"
+        );
     }
 }

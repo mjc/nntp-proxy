@@ -309,12 +309,58 @@ impl MetricsCollector {
         });
     }
 
+    /// Fold a stateful session's locally counted reply outcomes into this
+    /// backend's counters.
+    #[inline]
+    pub fn record_response_tally(&self, backend_id: BackendId, tally: ResponseTally) {
+        if tally.is_empty() {
+            return;
+        }
+        self.with_backend_store(backend_id, |store| {
+            store
+                .total_commands
+                .fetch_add(tally.replies, Ordering::Relaxed);
+            if tally.articles != 0 {
+                store
+                    .article_count
+                    .fetch_add(tally.articles, Ordering::Relaxed);
+                store
+                    .article_bytes_total
+                    .fetch_add(tally.article_bytes, Ordering::Relaxed);
+            }
+            if tally.article_missing != 0 {
+                store
+                    .article_missing
+                    .fetch_add(tally.article_missing, Ordering::Relaxed);
+            }
+            let errors_4xx = tally.errors_4xx + tally.article_missing;
+            if errors_4xx != 0 {
+                store.errors_4xx.fetch_add(errors_4xx, Ordering::Relaxed);
+            }
+            if tally.errors_5xx != 0 {
+                store
+                    .errors_5xx
+                    .fetch_add(tally.errors_5xx, Ordering::Relaxed);
+            }
+            let errors = errors_4xx + tally.errors_5xx;
+            if errors != 0 {
+                store.errors.fetch_add(errors, Ordering::Relaxed);
+            }
+        });
+    }
+
     /// Count one client command by class.
     #[inline]
     pub fn record_client_command(&self, kind: crate::protocol::RequestKind) {
         self.inner
             .client_commands
             .record(CommandClass::from_kind(kind));
+    }
+
+    /// Count a client line refused before it could be classified.
+    #[inline]
+    pub fn record_client_rejected_line(&self) {
+        self.inner.client_commands.record(CommandClass::Rejected);
     }
 
     /// Add a finished session's client byte totals.
@@ -706,6 +752,28 @@ impl MetricsCollector {
             pipeline_commands: inner.store.pipeline_commands.load(Ordering::Relaxed),
             start_time: inner.start_wall,
         }
+    }
+}
+
+/// Response outcomes counted locally by a stateful session between reads.
+///
+/// The reply tracker classifies every completed reply into this plain struct,
+/// and the session folds it into the shared counters once per backend read,
+/// so a read carrying many small replies costs a few atomic adds in total.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResponseTally {
+    pub replies: u64,
+    pub articles: u64,
+    pub article_bytes: u64,
+    pub article_missing: u64,
+    pub errors_4xx: u64,
+    pub errors_5xx: u64,
+}
+
+impl ResponseTally {
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.replies == 0
     }
 }
 

@@ -1,7 +1,7 @@
 //! Gathering a [`Scrape`] from a running proxy.
 
 use super::process::ProcessStats;
-use super::scrape::{BackendScrape, BuildInfo, CacheScrape, LoginGate, PoolScrape, Scrape};
+use super::scrape::{BackendScrape, BuildInfo, LoginGate, PoolScrape, Scrape};
 use crate::NntpProxy;
 use crate::types::BackendId;
 
@@ -25,7 +25,6 @@ pub fn gather(proxy: &NntpProxy) -> Scrape {
     let metrics = proxy.metrics();
     let router = proxy.router();
     let cache = proxy.cache();
-    let (hits, misses) = cache.lookup_counts();
 
     let mut seen_names = std::collections::HashSet::new();
     let backends = proxy
@@ -75,29 +74,23 @@ pub fn gather(proxy: &NntpProxy) -> Scrape {
         build: BuildInfo::current(),
         process: ProcessStats::read(),
         proxy: metrics.proxy_counters(),
-        cache: CacheScrape {
-            entries: cache.entry_count(),
-            size_bytes: cache.weighted_size(),
-            capacity_bytes: cache.capacity(),
-            hits,
-            misses,
-            disk: cache.disk_stats(),
-        },
+        cache: cache.scrape_stats(),
         backends,
     }
 }
 
 /// Two servers with the same name would export the same series twice, which
-/// makes a scraper reject the whole response. The later one gets its index
-/// appended instead.
+/// makes a scraper reject the whole response. The later one gets `#<n>`
+/// appended, starting at its index and counting up past any name already
+/// taken, including configured names that happen to look generated.
 fn unique_name(seen: &mut std::collections::HashSet<String>, name: &str, index: usize) -> String {
     if seen.insert(name.to_string()) {
-        name.to_string()
-    } else {
-        let renamed = format!("{name}#{index}");
-        seen.insert(renamed.clone());
-        renamed
+        return name.to_string();
     }
+    (index..)
+        .map(|n| format!("{name}#{n}"))
+        .find(|candidate| seen.insert(candidate.clone()))
+        .expect("an unbounded suffix range always finds a free name")
 }
 
 #[cfg(test)]
@@ -110,5 +103,16 @@ mod tests {
         assert_eq!(unique_name(&mut seen, "backend-a", 0), "backend-a");
         assert_eq!(unique_name(&mut seen, "backend-b", 1), "backend-b");
         assert_eq!(unique_name(&mut seen, "backend-a", 2), "backend-a#2");
+    }
+
+    #[test]
+    fn generated_names_skip_configured_names_that_look_generated() {
+        let mut seen = std::collections::HashSet::new();
+        let names: Vec<String> = ["a", "a#2", "a"]
+            .iter()
+            .enumerate()
+            .map(|(i, name)| unique_name(&mut seen, name, i))
+            .collect();
+        assert_eq!(names, ["a", "a#2", "a#3"]);
     }
 }

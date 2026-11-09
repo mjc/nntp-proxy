@@ -220,6 +220,8 @@ impl ClientSession {
             self.auth_handler.is_enabled(),
         );
         state.mark_backend_request_sent(initial_request.request().kind());
+        // The per-command phase recorded its own client bytes when it handed off.
+        state.set_client_bytes_recorded(client_to_backend_bytes, backend_to_client_bytes);
 
         match self.mode_state.switch_to_stateful() {
             crate::session::ModeTransition::Switched => {}

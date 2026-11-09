@@ -6,7 +6,6 @@
 
 use super::process::ProcessStats;
 use super::text::{Exposition, MetricKind};
-use crate::cache::DiskDisplayStats;
 use crate::metrics::histogram::HistogramSnapshot;
 use crate::metrics::{BackendCounters, CommandClass, ProxyCounters};
 use crate::pool::admission::BackendLoadSnapshot;
@@ -79,15 +78,7 @@ pub struct BackendScrape {
 }
 
 /// Article/availability cache state at scrape time.
-#[derive(Debug, Clone)]
-pub struct CacheScrape {
-    pub entries: u64,
-    pub size_bytes: u64,
-    pub capacity_bytes: u64,
-    pub hits: u64,
-    pub misses: u64,
-    pub disk: Option<DiskDisplayStats>,
-}
+pub type CacheScrape = crate::cache::CacheScrapeStats;
 
 /// One complete scrape.
 #[derive(Debug, Clone)]
@@ -261,18 +252,22 @@ fn render_proxy(out: &mut Exposition, proxy: &ProxyCounters) {
 }
 
 fn render_cache(out: &mut Exposition, cache: &CacheScrape) {
-    out.family(
-        "nntp_proxy_cache_entries",
-        MetricKind::Gauge,
-        "Entries in the article/availability cache (0 when the cache cannot count them).",
-    );
-    out.sample("nntp_proxy_cache_entries", &[], cache.entries);
-    out.family(
-        "nntp_proxy_cache_size_bytes",
-        MetricKind::Gauge,
-        "Memory used by the article/availability cache.",
-    );
-    out.sample("nntp_proxy_cache_size_bytes", &[], cache.size_bytes);
+    if let Some(entries) = cache.entries {
+        out.family(
+            "nntp_proxy_cache_entries",
+            MetricKind::Gauge,
+            "Entries in the article/availability cache.",
+        );
+        out.sample("nntp_proxy_cache_entries", &[], entries);
+    }
+    if let Some(size_bytes) = cache.size_bytes {
+        out.family(
+            "nntp_proxy_cache_size_bytes",
+            MetricKind::Gauge,
+            "Memory used by the article cache.",
+        );
+        out.sample("nntp_proxy_cache_size_bytes", &[], size_bytes);
+    }
     out.family(
         "nntp_proxy_cache_capacity_bytes",
         MetricKind::Gauge,
@@ -693,13 +688,16 @@ fn render_backends(out: &mut Exposition, backends: &[BackendScrape]) {
         (
             "nntp_proxy_backend_connections_closed_total",
             Counter,
-            "Backend connections closed instead of reused, by reason.",
+            "Backend connections closed, by reason. Created minus all closes is the live connection count.",
         ),
         "reason",
         &[
             ("backend_error", |b| b.churn.closed_backend_error),
+            ("cancelled", |b| b.churn.closed_cancelled),
             ("client_abort", |b| b.churn.closed_client_abort),
+            ("health_check", |b| b.churn.closed_health_check),
             ("stale", |b| b.churn.closed_stale),
+            ("idle", |b| b.churn.closed_idle),
         ],
     );
     backend_family(
@@ -781,12 +779,12 @@ pub(crate) mod tests {
                 start_time: std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000),
             },
             cache: CacheScrape {
-                entries: 1,
-                size_bytes: 2,
+                entries: Some(1),
+                size_bytes: Some(2),
                 capacity_bytes: 3,
                 hits: 4,
                 misses: 5,
-                disk: Some(DiskDisplayStats::default()),
+                disk: Some(crate::cache::DiskDisplayStats::default()),
             },
             backends: names
                 .iter()
@@ -1088,10 +1086,14 @@ pub(crate) mod tests {
         let mut scrape = sample_scrape(&["backend-a"]);
         scrape.process = None;
         scrape.cache.disk = None;
+        scrape.cache.entries = None;
+        scrape.cache.size_bytes = None;
         let text = render(&scrape);
         validate_exposition(&text);
         assert!(!text.contains("nntp_proxy_process_"));
         assert!(!text.contains("nntp_proxy_cache_disk_"));
+        assert!(!text.contains("nntp_proxy_cache_entries"));
+        assert!(!text.contains("nntp_proxy_cache_size_bytes"));
     }
 
     #[test]

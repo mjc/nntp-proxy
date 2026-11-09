@@ -809,11 +809,8 @@ impl DeadpoolConnectionProvider {
     /// the backend did not fail. For example, a client disconnect can leave
     /// unread backend response bytes in flight, making the socket dirty without
     /// implying that replacement connections should be throttled.
-    pub(super) fn remove_without_cooldown(&self, conn: PooledConnection) {
-        self.pool
-            .manager()
-            .churn
-            .note_close(super::churn::CloseReason::ClientAbort);
+    pub(super) fn remove_without_cooldown(&self, mut conn: PooledConnection) {
+        conn.tag_close_reason(super::churn::CloseReason::ClientAbort);
         shutdown_and_drop(conn);
     }
 
@@ -835,15 +832,16 @@ impl DeadpoolConnectionProvider {
     /// either [`shutdown_and_drop`] or [`resize_then_drop`], so the caller cannot
     /// accidentally `drop(conn)` before `pool.resize()`. Any attempt to reorder
     /// would be a use-after-move error.
-    pub(super) fn remove_with_cooldown(&self, conn: PooledConnection) {
+    pub(super) fn remove_with_cooldown(
+        &self,
+        mut conn: PooledConnection,
+        reason: super::churn::CloseReason,
+    ) {
+        conn.tag_close_reason(reason);
         if self.is_shutting_down.load(Ordering::Acquire) {
             shutdown_and_drop(conn);
             return;
         }
-        self.pool
-            .manager()
-            .churn
-            .note_close(super::churn::CloseReason::BackendError);
 
         // If cooldown is disabled (None or zero duration), just shut down and drop
         let Some(cooldown) = self.replacement_cooldown.filter(|d| !d.is_zero()) else {
@@ -1051,6 +1049,7 @@ impl DeadpoolConnectionProvider {
                     // Perform DATE health check
                     if let Err(e) = check_date_response(&mut *conn_obj).await {
                         failed += 1;
+                        conn_obj.tag_close_reason(super::churn::CloseReason::HealthCheck);
                         warn!(
                             pool = %name,
                             error = %e,
@@ -2016,7 +2015,7 @@ mod tests {
         assert_eq!(provider.pool.status().max_size, max_size);
 
         // Remove with cooldown — this should reduce max_size BEFORE dropping conn
-        provider.remove_with_cooldown(conn);
+        provider.remove_with_cooldown(conn, crate::pool::churn::CloseReason::BackendError);
 
         // After remove_with_cooldown, max_size must be reduced immediately
         let status = provider.pool.status();
@@ -2043,14 +2042,14 @@ mod tests {
         let conn2 = provider.get_pooled_connection().await.unwrap();
         let conn3 = provider.get_pooled_connection().await.unwrap();
 
-        provider.remove_with_cooldown(conn1);
+        provider.remove_with_cooldown(conn1, crate::pool::churn::CloseReason::BackendError);
         assert_eq!(provider.pool.status().max_size, 3);
 
-        provider.remove_with_cooldown(conn2);
+        provider.remove_with_cooldown(conn2, crate::pool::churn::CloseReason::BackendError);
         assert_eq!(provider.pool.status().max_size, 2);
 
         // Third removal should NOT further reduce (at cap)
-        provider.remove_with_cooldown(conn3);
+        provider.remove_with_cooldown(conn3, crate::pool::churn::CloseReason::BackendError);
         assert_eq!(
             provider.pool.status().max_size,
             2,
@@ -2066,11 +2065,45 @@ mod tests {
         let provider = provider_with_cooldown(addr, max_size, None);
 
         let conn = provider.get_pooled_connection().await.unwrap();
-        provider.remove_with_cooldown(conn);
+        provider.remove_with_cooldown(conn, crate::pool::churn::CloseReason::BackendError);
 
         // With cooldown disabled, max_size should NOT be reduced
         assert_eq!(provider.pool.status().max_size, max_size);
         assert_eq!(provider.active_cooldowns.load(Ordering::Acquire), 0);
+    }
+
+    /// Every close is counted once with the reason its retirer gave, and an
+    /// idle connection dropped by the pool itself counts as `idle`, so
+    /// `created` minus all closes equals the live pool size.
+    #[tokio::test]
+    async fn churn_counts_each_close_under_its_reason() {
+        use crate::pool::churn::CloseReason;
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 4, None);
+
+        let a = provider.get_pooled_connection().await.unwrap();
+        let b = provider.get_pooled_connection().await.unwrap();
+        let c = provider.get_pooled_connection().await.unwrap();
+        let d = provider.get_pooled_connection().await.unwrap();
+        provider.remove_with_cooldown(a, CloseReason::BackendError);
+        provider.remove_with_cooldown(b, CloseReason::Cancelled);
+        provider.remove_without_cooldown(c);
+        drop(d); // back to the pool, idle
+        provider.clear_idle_connections();
+
+        let churn = provider.connection_churn();
+        assert_eq!(churn.created, 4);
+        assert_eq!(churn.closed_backend_error, 1);
+        assert_eq!(churn.closed_cancelled, 1);
+        assert_eq!(churn.closed_client_abort, 1);
+        assert_eq!(churn.closed_idle, 1);
+        let closed = churn.closed_backend_error
+            + churn.closed_cancelled
+            + churn.closed_client_abort
+            + churn.closed_health_check
+            + churn.closed_stale
+            + churn.closed_idle;
+        assert_eq!(churn.created - closed, provider.pool.status().size as u64);
     }
 
     /// Verify explicit no-cooldown removal closes a dirty connection without
@@ -2104,7 +2137,7 @@ mod tests {
         let provider = provider_with_cooldown(addr, max_size, Some(cooldown));
 
         let conn = provider.get_pooled_connection().await.unwrap();
-        provider.remove_with_cooldown(conn);
+        provider.remove_with_cooldown(conn, crate::pool::churn::CloseReason::BackendError);
 
         assert_eq!(provider.pool.status().max_size, 3);
         assert_eq!(provider.active_cooldowns.load(Ordering::Acquire), 1);
@@ -2130,7 +2163,7 @@ mod tests {
         provider.shutdown();
 
         let conn = provider.get_pooled_connection().await.unwrap();
-        provider.remove_with_cooldown(conn);
+        provider.remove_with_cooldown(conn, crate::pool::churn::CloseReason::BackendError);
 
         assert_eq!(provider.pool.status().max_size, max_size);
         assert_eq!(provider.active_cooldowns.load(Ordering::Acquire), 0);

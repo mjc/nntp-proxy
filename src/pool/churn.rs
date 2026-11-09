@@ -4,6 +4,12 @@
 //! request counters alone until the pool runs dry. These counters record each
 //! connection's birth and death so a dashboard can show churn before it turns
 //! into failed requests. They change once per connection, not per command.
+//!
+//! Closes are counted when the connection object is destroyed, whichever
+//! path destroys it (including deadpool dropping idle objects when a pool
+//! shrinks), so `created` minus the sum of closes is the live connection
+//! count. Code that retires a connection tags it with a reason first; the
+//! first tag wins.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -20,15 +26,23 @@ pub enum ConnectOutcome {
     BackoffDenied,
 }
 
-/// Why a pooled connection was closed instead of returned for reuse.
+/// Why a backend connection was closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CloseReason {
     /// The backend misbehaved or the connection broke.
     BackendError,
+    /// The request using it was cancelled (deadline expiry or a dropped
+    /// future) mid-exchange, leaving unread bytes on the socket.
+    Cancelled,
     /// The client went away mid-response, leaving the socket unreusable.
     ClientAbort,
-    /// A recycled idle connection failed its liveness check.
+    /// The periodic health check found it dead.
+    HealthCheck,
+    /// A pooled idle connection failed its liveness check on checkout.
     Stale,
+    /// The pool dropped it without a tag: idle-timeout clearing, a pool
+    /// shrinking during replacement cooldown, or shutdown.
+    Idle,
 }
 
 /// Per-backend connection lifecycle counters, shared by every pool slot.
@@ -39,8 +53,11 @@ pub struct ConnectionChurn {
     login_refused: AtomicU64,
     backoff_denied: AtomicU64,
     closed_backend_error: AtomicU64,
+    closed_cancelled: AtomicU64,
     closed_client_abort: AtomicU64,
+    closed_health_check: AtomicU64,
     closed_stale: AtomicU64,
+    closed_idle: AtomicU64,
 }
 
 /// Plain copy of [`ConnectionChurn`] for the scrape endpoint.
@@ -51,8 +68,11 @@ pub struct ConnectionChurnSnapshot {
     pub login_refused: u64,
     pub backoff_denied: u64,
     pub closed_backend_error: u64,
+    pub closed_cancelled: u64,
     pub closed_client_abort: u64,
+    pub closed_health_check: u64,
     pub closed_stale: u64,
+    pub closed_idle: u64,
 }
 
 impl ConnectionChurn {
@@ -69,8 +89,11 @@ impl ConnectionChurn {
     pub fn note_close(&self, reason: CloseReason) {
         let counter = match reason {
             CloseReason::BackendError => &self.closed_backend_error,
+            CloseReason::Cancelled => &self.closed_cancelled,
             CloseReason::ClientAbort => &self.closed_client_abort,
+            CloseReason::HealthCheck => &self.closed_health_check,
             CloseReason::Stale => &self.closed_stale,
+            CloseReason::Idle => &self.closed_idle,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -83,8 +106,11 @@ impl ConnectionChurn {
             login_refused: self.login_refused.load(Ordering::Relaxed),
             backoff_denied: self.backoff_denied.load(Ordering::Relaxed),
             closed_backend_error: self.closed_backend_error.load(Ordering::Relaxed),
+            closed_cancelled: self.closed_cancelled.load(Ordering::Relaxed),
             closed_client_abort: self.closed_client_abort.load(Ordering::Relaxed),
+            closed_health_check: self.closed_health_check.load(Ordering::Relaxed),
             closed_stale: self.closed_stale.load(Ordering::Relaxed),
+            closed_idle: self.closed_idle.load(Ordering::Relaxed),
         }
     }
 }
@@ -102,9 +128,12 @@ mod tests {
         churn.note_connect(ConnectOutcome::LoginRefused);
         churn.note_connect(ConnectOutcome::BackoffDenied);
         churn.note_close(CloseReason::BackendError);
+        churn.note_close(CloseReason::Cancelled);
         churn.note_close(CloseReason::ClientAbort);
+        churn.note_close(CloseReason::HealthCheck);
         churn.note_close(CloseReason::Stale);
         churn.note_close(CloseReason::Stale);
+        churn.note_close(CloseReason::Idle);
 
         assert_eq!(
             churn.snapshot(),
@@ -114,8 +143,11 @@ mod tests {
                 login_refused: 1,
                 backoff_denied: 1,
                 closed_backend_error: 1,
+                closed_cancelled: 1,
                 closed_client_abort: 1,
+                closed_health_check: 1,
                 closed_stale: 2,
+                closed_idle: 1,
             }
         );
     }

@@ -132,7 +132,14 @@ async fn handle_connection<S: ScrapeSource>(
     drop(head);
 
     let response = match route {
-        Route::Metrics { body } => {
+        // HEAD only checks the endpoint is up; rendering would read every
+        // collector for a body that is never sent.
+        Route::Metrics {
+            body: ResponseBody::Omit,
+        } => metrics_head_response(),
+        Route::Metrics {
+            body: ResponseBody::Include,
+        } => {
             let rendered = match tokio::task::spawn_blocking(move || source.render()).await {
                 Ok(rendered) => rendered,
                 Err(error) => {
@@ -142,7 +149,7 @@ async fn handle_connection<S: ScrapeSource>(
                     return write_with_timeout(&mut stream, &response, limits.write_timeout).await;
                 }
             };
-            metrics_response(&rendered, body)
+            metrics_response(&rendered)
         }
         Route::NotFound { body } => simple_response("404 Not Found", body),
         Route::MethodNotAllowed => simple_response("405 Method Not Allowed", ResponseBody::Include),
@@ -208,17 +215,24 @@ fn route(head: &[u8]) -> Route {
     }
 }
 
-fn metrics_response(rendered: &str, body: ResponseBody) -> Vec<u8> {
+fn metrics_response(rendered: &str) -> Vec<u8> {
     let header = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {CONTENT_TYPE}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
         rendered.len()
     );
     let mut response = Vec::with_capacity(header.len() + rendered.len());
     response.extend_from_slice(header.as_bytes());
-    if body == ResponseBody::Include {
-        response.extend_from_slice(rendered.as_bytes());
-    }
+    response.extend_from_slice(rendered.as_bytes());
     response
+}
+
+/// Headers for `HEAD /metrics`. No `Content-Length`: the body length is
+/// unknown without rendering, and HTTP lets a HEAD response omit it.
+fn metrics_head_response() -> Vec<u8> {
+    format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {CONTENT_TYPE}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+    )
+    .into_bytes()
 }
 
 fn simple_response(status: &str, body: ResponseBody) -> Vec<u8> {
@@ -367,6 +381,31 @@ mod tests {
         assert_eq!(status_line(&response), "HTTP/1.1 200 OK");
         let (_, body) = response.split_once("\r\n\r\n").unwrap();
         assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn head_metrics_does_not_render() {
+        struct CountingSource(std::sync::atomic::AtomicUsize);
+        impl ScrapeSource for CountingSource {
+            fn render(&self) -> String {
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                String::new()
+            }
+        }
+        let source = Arc::new(CountingSource(std::sync::atomic::AtomicUsize::new(0)));
+        let listener = bind("127.0.0.1:0".parse().unwrap()).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(
+            listener,
+            Arc::clone(&source),
+            ServerLimits::default(),
+        ));
+
+        let response = exchange(addr, b"HEAD /metrics HTTP/1.1\r\n\r\n").await;
+        assert_eq!(status_line(&response), "HTTP/1.1 200 OK");
+        assert_eq!(source.0.load(std::sync::atomic::Ordering::Relaxed), 0);
+        let _ = exchange(addr, b"GET /metrics HTTP/1.1\r\n\r\n").await;
+        assert_eq!(source.0.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

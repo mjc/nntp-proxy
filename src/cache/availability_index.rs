@@ -215,6 +215,14 @@ struct CurrentProviderBits(usize);
 /// Parsed entries retain the table that gives their bit positions meaning.
 /// Consuming restoration translates and inserts into the same target index;
 /// callers cannot take remapped entries and apply them to another layout.
+/// Entry and lookup counts read in one pass for the scrape endpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AvailabilityScrapeCounts {
+    pub entries: u64,
+    pub hits: u64,
+    pub misses: u64,
+}
+
 #[derive(Default)]
 struct StoredAvailabilitySnapshot {
     identities: Vec<AvailabilityIdentity>,
@@ -948,6 +956,26 @@ impl AvailabilityIndex {
     #[must_use]
     pub fn used_bytes(&self) -> u64 {
         self.capacity_bytes
+    }
+
+    /// Entries and lookup counts in one pass over the shards, for the scrape
+    /// endpoint. Unlike [`Self::entry_count`] this never rotates generations,
+    /// so a scrape cannot evict anything; entries past their TTL but not yet
+    /// rotated out are still counted.
+    #[must_use]
+    pub fn scrape_counts(&self) -> AvailabilityScrapeCounts {
+        self.shards
+            .iter()
+            .fold(AvailabilityScrapeCounts::default(), |mut acc, shard| {
+                let initial_misses = shard.initial_misses.load(Ordering::Relaxed);
+                let shard = shard
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                acc.entries += shard.filter.occupied_slots() as u64;
+                acc.hits += shard.counters.hits;
+                acc.misses += shard.counters.misses + initial_misses;
+                acc
+            })
     }
 
     /// Lookup hits and misses since the index was built or restored.

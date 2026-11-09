@@ -51,6 +51,10 @@ pub struct SessionLoopState {
     pub auth_access: AuthenticationAccess,
     /// Forwarded backend replies and deferred local replies in client-visible order.
     backend_replies: BackendResponseOrder,
+    /// Client byte totals an earlier phase of this session already recorded
+    /// (the per-command phase before a hybrid switch), so the stateful loop
+    /// adds only its own share on exit.
+    client_bytes_recorded: (u64, u64),
 }
 
 impl Default for SessionLoopState {
@@ -75,7 +79,26 @@ impl SessionLoopState {
             auth_username: ClientAuthState::anonymous(),
             auth_access: AuthenticationAccess::from_auth_enabled(auth_enabled),
             backend_replies: BackendResponseOrder::default(),
+            client_bytes_recorded: (0, 0),
         }
+    }
+
+    /// Note client byte totals that an earlier session phase already recorded.
+    pub(in crate::session) const fn set_client_bytes_recorded(&mut self, c2b: u64, b2c: u64) {
+        self.client_bytes_recorded = (c2b, b2c);
+    }
+
+    /// Client bytes this loop has not yet recorded: totals minus what an
+    /// earlier phase already recorded.
+    pub(in crate::session) const fn unrecorded_client_bytes(&self) -> (u64, u64) {
+        (
+            self.client_to_backend
+                .as_u64()
+                .saturating_sub(self.client_bytes_recorded.0),
+            self.backend_to_client
+                .as_u64()
+                .saturating_sub(self.client_bytes_recorded.1),
+        )
     }
 
     /// Create session loop state with initial byte counts
@@ -226,6 +249,11 @@ impl SessionLoopState {
             .add_u64(transfer.backend_to_client.as_u64());
         self.last_reported_c2b = self.client_to_backend;
         self.last_reported_b2c = self.backend_to_client;
+    }
+
+    /// Take the outcomes of backend replies completed since the last call.
+    pub(in crate::session) fn take_reply_outcomes(&mut self) -> crate::metrics::ResponseTally {
+        self.backend_replies.take_reply_outcomes()
     }
 
     /// Whether earlier forwarded backend replies are still ahead of any deferred local replies.

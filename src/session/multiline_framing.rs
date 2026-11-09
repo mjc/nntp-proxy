@@ -715,6 +715,12 @@ impl BackendResponseOrder {
         self.recoverable.push_back(request);
     }
 
+    /// Take the outcomes of replies completed since the last call, so the
+    /// session can add them to the shared per-backend counters.
+    pub(crate) fn take_reply_outcomes(&mut self) -> crate::metrics::ResponseTally {
+        self.inner.take_outcomes()
+    }
+
     /// Whether at least one registered backend reply still needs backend bytes.
     #[inline]
     pub(crate) fn has_pending_backend_replies(&self) -> bool {
@@ -865,6 +871,8 @@ impl BackendResponseOrder {
 #[derive(Default, Debug)]
 struct BackendReplyTracker {
     pending: VecDeque<PendingRequestFrame>,
+    /// Outcomes of replies completed since the session last took them.
+    outcomes: crate::metrics::ResponseTally,
 }
 
 #[derive(Debug)]
@@ -873,6 +881,10 @@ struct PendingRequestFrame {
     state: PendingRequestFrameState,
     status_line: smallvec::SmallVec<[u8; crate::constants::buffer::COMMAND]>,
     status_forwarding: StatusForwarding,
+    /// Parsed status, kept so the completed reply can be counted.
+    status: Option<crate::protocol::StatusCode>,
+    /// Reply bytes framed so far, for per-article byte counts.
+    received: u64,
 }
 
 /// Whether a tracked reply's bytes may reach the client before its status is known.
@@ -2427,7 +2439,51 @@ impl BackendReplyTracker {
             state: PendingRequestFrameState::AwaitingStatusLine,
             status_line: smallvec::SmallVec::new(),
             status_forwarding,
+            status: None,
+            received: 0,
         });
+    }
+
+    /// Count a reply that has just been framed completely.
+    ///
+    /// Classification happens here because only the framer knows where a
+    /// reply ends; the session folds the totals into shared counters once
+    /// per backend read.
+    #[inline]
+    fn count_completed(&mut self, frame: &PendingRequestFrame, forwarded: ReplyDelivery) {
+        use crate::session::routing::{MetricsAction, determine_metrics_action_for_kind};
+        let outcomes = &mut self.outcomes;
+        outcomes.replies += 1;
+        let Some(status) = frame.status else {
+            return;
+        };
+        match determine_metrics_action_for_kind(frame.kind, status) {
+            MetricsAction::Article => {
+                outcomes.articles += 1;
+                outcomes.article_bytes += frame.received;
+            }
+            // A withheld miss is recorded by the recovery path.
+            MetricsAction::ArticleMissing => {
+                if forwarded == ReplyDelivery::Forwarded {
+                    outcomes.article_missing += 1;
+                }
+            }
+            MetricsAction::Error4xx => {
+                if forwarded == ReplyDelivery::Forwarded {
+                    outcomes.errors_4xx += 1;
+                }
+            }
+            MetricsAction::Error5xx => {
+                if forwarded == ReplyDelivery::Forwarded {
+                    outcomes.errors_5xx += 1;
+                }
+            }
+            MetricsAction::None => {}
+        }
+    }
+
+    fn take_outcomes(&mut self) -> crate::metrics::ResponseTally {
+        std::mem::take(&mut self.outcomes)
     }
 
     /// Frame replies for sessions that never register recoverable requests.
@@ -2456,7 +2512,9 @@ impl BackendReplyTracker {
             output.push(BackendReplyBytes::CompletedTrackedReply(
                 framed.backend_bytes(chunk),
             ));
-            self.pending.pop_front();
+            if let Some(frame) = self.pending.pop_front() {
+                self.count_completed(&frame, ReplyDelivery::Forwarded);
+            }
         }
 
         output
@@ -2492,14 +2550,18 @@ impl BackendReplyTracker {
             };
 
             offset = framed.end();
-            if let StatusForwarding::Suppressed(reply) = front.status_forwarding {
+            let delivery = if let StatusForwarding::Suppressed(reply) = front.status_forwarding {
                 output.push(RecoverableReplyBytes::Suppressed(reply));
+                ReplyDelivery::Withheld
             } else {
                 output.push(RecoverableReplyBytes::Forward(
                     BackendReplyBytes::CompletedTrackedReply(framed.backend_bytes(chunk)),
                 ));
+                ReplyDelivery::Forwarded
+            };
+            if let Some(frame) = self.pending.pop_front() {
+                self.count_completed(&frame, delivery);
             }
-            self.pending.pop_front();
         }
 
         output
@@ -2571,9 +2633,33 @@ impl StatusLinePolicy for WithheldStatus {
     }
 }
 
+/// Whether a completed reply reached the client or was withheld for recovery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyDelivery {
+    Forwarded,
+    Withheld,
+}
+
 impl PendingRequestFrame {
+    /// Frame the next part of this reply and count the bytes it consumed.
     #[inline]
     fn consume(
+        &mut self,
+        chunk: &[u8],
+        offset: BackendChunkEnd,
+        policy: &mut impl StatusLinePolicy,
+    ) -> Option<FramedResponseForRequest> {
+        let framed = self.consume_frame(chunk, offset, policy);
+        let consumed = framed
+            .as_ref()
+            .map_or(chunk.len(), |framed| framed.end().get())
+            - offset.get();
+        self.received += consumed as u64;
+        framed
+    }
+
+    #[inline]
+    fn consume_frame(
         &mut self,
         chunk: &[u8],
         offset: BackendChunkEnd,
@@ -2620,6 +2706,7 @@ impl PendingRequestFrame {
                         response: BackendChunkRange::new(offset, end),
                     });
                 };
+                self.status = Some(status);
                 policy.classify(
                     &mut self.status_forwarding,
                     status,

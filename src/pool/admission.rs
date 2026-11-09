@@ -247,13 +247,14 @@ impl Default for BackendLoad {
 }
 
 impl BackendLoad {
-    /// Fold one command's connection hold time into the average and the
-    /// exported histogram.
+    /// Fold one command's connection hold time into the average.
     ///
-    /// The average uses a plain load and store rather than a compare-and-swap
-    /// loop: two commands finishing at once can drop one sample, which does
-    /// not matter for an average over many commands. The histogram adds two
-    /// relaxed increments, so the whole update stays a handful of atomics.
+    /// A plain load and store rather than a compare-and-swap loop: two
+    /// commands finishing at once can drop one sample, which does not matter
+    /// for an average over many commands, and the average stays one load and
+    /// one store. The same hold time is also observed into the exported
+    /// exchange-duration histogram, which adds two relaxed increments and no
+    /// lock or allocation.
     pub fn record_service_time(&self, held: Duration) {
         let held_micros = u64::try_from(held.as_micros()).unwrap_or(u64::MAX);
         self.exchange_duration.observe_micros(held_micros);

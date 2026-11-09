@@ -31,7 +31,7 @@ pub mod types;
 mod user_stats;
 
 pub use backend_stats::BackendStats;
-pub use collector::{BackendCounters, MetricsCollector, ProxyCounters};
+pub use collector::{BackendCounters, MetricsCollector, ProxyCounters, ResponseTally};
 pub use command_class::CommandClass;
 pub use connection_stats::ConnectionStatsAggregator;
 pub use snapshot::{DiskCacheStats, MetricsSnapshot};

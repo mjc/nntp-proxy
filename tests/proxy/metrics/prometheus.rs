@@ -186,3 +186,102 @@ async fn scrape_reflects_article_and_stat_traffic() -> Result<()> {
     metrics_task.abort();
     Ok(())
 }
+
+/// Poll the endpoint until no client session is open, so session-end totals
+/// have been recorded.
+async fn scrape_after_sessions_end(addr: SocketAddr) -> Result<String> {
+    for _ in 0..100 {
+        let body = scrape(addr).await?;
+        if sample_value(&body, "nntp_proxy_client_sessions_active", &[]) == Some(0.0) {
+            return Ok(body);
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    anyhow::bail!("client session never ended")
+}
+
+#[tokio::test]
+async fn stateful_sessions_count_replies_and_bytes_once() -> Result<()> {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let _backend = MockNntpServer::new()
+        .with_name("backend-a")
+        .on_command("DATE", "111 20250101000000\r\n")
+        .on_command("ARTICLE", ARTICLE)
+        .on_command("ARTICLE <MISSING", "430 No such article\r\n")
+        .on_command("GROUP", "411 No such group\r\n")
+        .spawn_on_listener(backend_listener);
+
+    let config = create_test_config(vec![(backend_port, "backend-a")]);
+    let proxy = NntpProxy::new(config, RoutingMode::Stateful).await?;
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let proxy_port = spawn_test_proxy_on_listener(proxy.clone(), proxy_listener, false);
+    let (metrics_addr, metrics_task) =
+        nntp_proxy::metrics::prometheus::spawn_endpoint("127.0.0.1:0".parse()?, Arc::new(proxy))
+            .await?;
+
+    let mut client = TcpStream::connect(("127.0.0.1", proxy_port)).await?;
+    let mut greeting = [0u8; 256];
+    let _ = client.read(&mut greeting).await?;
+    for _ in 0..2 {
+        let (status, _) =
+            send_article_read_multiline_response(&mut client, "<present@example.com>").await?;
+        assert!(status.starts_with("220"), "{status}");
+    }
+    let (status, _) =
+        send_article_read_multiline_response(&mut client, "<missing@example.com>").await?;
+    assert!(status.starts_with("430"), "{status}");
+    let status = send_command_read_line(&mut client, "GROUP alt.none").await?;
+    assert!(status.starts_with("411"), "{status}");
+    // A line over the 512-byte limit is refused locally.
+    let status = send_command_read_line(&mut client, &format!("XFOO {}", "x".repeat(600))).await?;
+    assert!(status.starts_with("501"), "{status}");
+    drop(client);
+
+    let body = scrape_after_sessions_end(metrics_addr).await?;
+    let backend = [("backend", "backend-a")];
+    let value = |name: &str, labels: &[(&str, &str)]| {
+        sample_value(&body, name, labels)
+            .unwrap_or_else(|| panic!("{name} {labels:?} missing from scrape:\n{body}"))
+    };
+
+    assert_eq!(value("nntp_proxy_backend_commands_total", &backend), 4.0);
+    assert_eq!(value("nntp_proxy_backend_articles_total", &backend), 2.0);
+    assert_eq!(
+        value("nntp_proxy_backend_article_bytes_total", &backend),
+        2.0 * ARTICLE.len() as f64
+    );
+    assert_eq!(
+        value("nntp_proxy_backend_article_missing_total", &backend),
+        1.0
+    );
+    assert_eq!(
+        value(
+            "nntp_proxy_backend_error_replies_total",
+            &[("backend", "backend-a"), ("code_class", "4xx")]
+        ),
+        2.0,
+        "the 430 and the 411"
+    );
+    assert_eq!(
+        value(
+            "nntp_proxy_client_commands_total",
+            &[("command", "rejected")]
+        ),
+        1.0
+    );
+
+    // In stateful mode every byte to the client crosses the pinned backend
+    // session, so the two totals must match exactly; a double count would
+    // make the backend side twice as large.
+    let to_client = value("nntp_proxy_client_bytes_total", &[("direction", "sent")]);
+    let from_backend = value(
+        "nntp_proxy_backend_bytes_total",
+        &[("backend", "backend-a"), ("direction", "received")],
+    );
+    assert!(to_client > 0.0);
+    assert_eq!(from_backend, to_client);
+
+    metrics_task.abort();
+    Ok(())
+}

@@ -174,7 +174,8 @@ impl ConnectionGuard {
             .conn
             .take()
             .expect("ConnectionGuard::fail_backend() called on consumed guard");
-        self.provider.remove_with_cooldown(conn);
+        self.provider
+            .remove_with_cooldown(conn, crate::pool::churn::CloseReason::BackendError);
     }
 
     /// Get mutable reference to the connection
@@ -318,7 +319,8 @@ impl Drop for ConnectionGuard {
                 pending_bytes = conn.pending_bytes_len(),
                 "ConnectionGuard dropping unreleased pooled connection; removing backend connection with cooldown"
             );
-            self.provider.remove_with_cooldown(conn);
+            self.provider
+                .remove_with_cooldown(conn, crate::pool::churn::CloseReason::Cancelled);
         }
     }
 }
@@ -361,7 +363,7 @@ pub(crate) async fn salvage_with_health_check(
             warn!("DATE health check failed after Invalid response: {}", e);
             // Unconditional: this is a pool-level operation with no client involved.
             // DATE failure means the connection is in an unknown/dirty state.
-            provider.remove_with_cooldown(conn);
+            provider.remove_with_cooldown(conn, crate::pool::churn::CloseReason::BackendError);
             None
         }
     }

@@ -943,6 +943,7 @@ impl ClientSession {
         match determine_metrics_action_for_request(request, status_code) {
             MetricsAction::Error4xx => self.metrics.record_error_4xx(backend_id),
             MetricsAction::Error5xx => self.metrics.record_error_5xx(backend_id),
+            MetricsAction::ArticleMissing => self.metrics.record_article_missing(backend_id),
             MetricsAction::Article | MetricsAction::None => {}
         }
         self.metrics.record_error_reply_failover(backend_id);
@@ -2004,6 +2005,7 @@ impl ClientSession {
             MetricsAction::Error4xx => self.metrics.record_error_4xx(backend_id),
             MetricsAction::Error5xx => self.metrics.record_error_5xx(backend_id),
             MetricsAction::Article => self.metrics.record_article(backend_id, resp_bytes),
+            MetricsAction::ArticleMissing => self.metrics.record_article_missing(backend_id),
             MetricsAction::None => {}
         }
 

@@ -319,18 +319,9 @@ impl NntpProxy {
     ) -> Result<(), SessionError> {
         match metrics {
             Ok(m) => {
+                // Byte totals were already reported by the session loops:
+                // per-backend bytes as they flowed, client totals on exit.
                 self.log_session_completion(client_addr, session_id, session, &m);
-                self.metrics.record_client_session_bytes(
-                    m.client_to_backend.as_u64(),
-                    m.backend_to_client.as_u64(),
-                );
-
-                if let Some(bid) = backend_id {
-                    self.metrics
-                        .record_client_to_backend_bytes_for(bid, m.client_to_backend.as_u64());
-                    self.metrics
-                        .record_backend_to_client_bytes_for(bid, m.backend_to_client.as_u64());
-                }
                 Ok(())
             }
             Err(e) => {
