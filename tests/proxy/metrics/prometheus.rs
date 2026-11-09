@@ -145,6 +145,17 @@ async fn scrape_reflects_article_and_stat_traffic() -> Result<()> {
     );
     at_least("nntp_proxy_backend_pool_max_connections", &backend, 1.0);
     at_least("nntp_proxy_build_info", &[], 1.0);
+    at_least("nntp_proxy_backend_backlog_skips_total", &backend, 0.0);
+    at_least(
+        "nntp_proxy_backend_error_reply_failovers_total",
+        &backend,
+        0.0,
+    );
+    assert!(
+        sample_value(&after, "nntp_proxy_backend_service_time_seconds", &backend)
+            .is_some_and(|seconds| seconds > 0.0),
+        "service-time average is sampled after completed exchanges"
+    );
     at_least("nntp_proxy_backend_first_byte_seconds_count", &backend, 1.0);
     at_least(
         "nntp_proxy_backend_first_byte_seconds_bucket",

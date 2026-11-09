@@ -9,6 +9,7 @@ use super::text::{Exposition, MetricKind};
 use crate::cache::DiskDisplayStats;
 use crate::metrics::histogram::HistogramSnapshot;
 use crate::metrics::{BackendCounters, CommandClass, ProxyCounters};
+use crate::pool::admission::BackendLoadSnapshot;
 use crate::pool::churn::ConnectionChurnSnapshot;
 
 /// Compile-time build identity.
@@ -71,6 +72,10 @@ pub struct BackendScrape {
     pub first_byte: HistogramSnapshot,
     /// Time one command held a connection, first write to end of response.
     pub exchange_duration: HistogramSnapshot,
+    /// Backlog admission counters and the service-time average.
+    pub admission: BackendLoadSnapshot,
+    /// How long a checkout joining the pool queue now would wait.
+    pub estimated_wait_seconds: f64,
 }
 
 /// Article/availability cache state at scrape time.
@@ -415,6 +420,110 @@ fn backend_histogram(
     }
 }
 
+/// Backlog admission and failover counters: why requests skipped, waited
+/// on, or gave up on a backend without it returning `430`.
+fn render_admission(out: &mut Exposition, backends: &[BackendScrape]) {
+    use MetricKind::{Counter, Gauge};
+
+    backend_family(
+        out,
+        backends,
+        (
+            "nntp_proxy_backend_backlog_skips_total",
+            Counter,
+            "Checkouts that skipped the backend because its connection queue would not serve them in time.",
+        ),
+        |b| b.admission.backlog_skips,
+    );
+    backend_family(
+        out,
+        backends,
+        (
+            "nntp_proxy_backend_busy_timeouts_total",
+            Counter,
+            "Bounded checkouts that waited their whole limit without getting a connection.",
+        ),
+        |b| b.admission.busy_timeouts,
+    );
+    backend_family(
+        out,
+        backends,
+        (
+            "nntp_proxy_backend_deadline_expiries_total",
+            Counter,
+            "Client requests whose deadline ran out with this backend next in line.",
+        ),
+        |b| b.admission.deadline_expiries,
+    );
+    backend_family(
+        out,
+        backends,
+        (
+            "nntp_proxy_backend_last_resort_waits_total",
+            Counter,
+            "Checkouts that queued on the backend because every other backend left for the request was backlogged.",
+        ),
+        |b| b.admission.last_resort_waits,
+    );
+    backend_family(
+        out,
+        backends,
+        (
+            "nntp_proxy_backend_last_resort_connected_total",
+            Counter,
+            "Last-resort checkouts that got a connection.",
+        ),
+        |b| b.admission.last_resort_connected,
+    );
+    backend_family(
+        out,
+        backends,
+        (
+            "nntp_proxy_backend_last_resort_timeouts_total",
+            Counter,
+            "Last-resort checkouts that waited their whole limit without a connection.",
+        ),
+        |b| b.admission.last_resort_timeouts,
+    );
+    backend_family(
+        out,
+        backends,
+        (
+            "nntp_proxy_backend_error_reply_failovers_total",
+            Counter,
+            "Non-430 error replies to article lookups that were retried on another backend instead of sent to the client.",
+        ),
+        |b| b.counters.error_reply_failovers,
+    );
+
+    out.family(
+        "nntp_proxy_backend_service_time_seconds",
+        Gauge,
+        "Moving average of how long one command holds a connection, used for backlog admission; 0 before the first sample.",
+    );
+    for backend in backends {
+        #[allow(clippy::cast_precision_loss)] // A smoothed average; exact micros are not needed.
+        let seconds = backend.admission.service_time_ewma_micros as f64 / 1_000_000.0;
+        out.sample(
+            "nntp_proxy_backend_service_time_seconds",
+            &[("backend", &backend.name), ("tier", &backend.tier)],
+            seconds,
+        );
+    }
+    out.family(
+        "nntp_proxy_backend_estimated_wait_seconds",
+        Gauge,
+        "Estimated wait for a connection if a checkout joined the backend's queue now.",
+    );
+    for backend in backends {
+        out.sample(
+            "nntp_proxy_backend_estimated_wait_seconds",
+            &[("backend", &backend.name), ("tier", &backend.tier)],
+            backend.estimated_wait_seconds,
+        );
+    }
+}
+
 fn render_backends(out: &mut Exposition, backends: &[BackendScrape]) {
     use MetricKind::{Counter, Gauge};
 
@@ -616,6 +725,7 @@ fn render_backends(out: &mut Exposition, backends: &[BackendScrape]) {
         ),
         |b| b.health_checks,
     );
+    render_admission(out, backends);
     backend_histogram(
         out,
         backends,
@@ -711,6 +821,12 @@ pub(crate) mod tests {
                         h.snapshot()
                     },
                     exchange_duration: HistogramSnapshot::empty(&EXCHANGE_BUCKETS),
+                    admission: BackendLoadSnapshot {
+                        backlog_skips: 7,
+                        service_time_ewma_micros: 250_000,
+                        ..BackendLoadSnapshot::default()
+                    },
+                    estimated_wait_seconds: 1.25,
                 })
                 .collect(),
         }
@@ -919,6 +1035,18 @@ pub(crate) mod tests {
         assert_eq!(
             value("nntp_proxy_backend_article_missing_total", None),
             Some(3.0)
+        );
+        assert_eq!(
+            value("nntp_proxy_backend_backlog_skips_total", None),
+            Some(7.0)
+        );
+        assert_eq!(
+            value("nntp_proxy_backend_service_time_seconds", None),
+            Some(0.25)
+        );
+        assert_eq!(
+            value("nntp_proxy_backend_estimated_wait_seconds", None),
+            Some(1.25)
         );
     }
 

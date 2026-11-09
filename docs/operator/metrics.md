@@ -117,6 +117,22 @@ Every backend metric has the labels `backend` and `tier`, plus any listed here.
 | `nntp_proxy_backend_health_checks_total` | counter | | Idle connections checked by the periodic health check. |
 | `nntp_proxy_backend_health_check_failures_total` | counter | | Idle connections that failed it. |
 
+### Backend admission and failover
+
+These explain requests that skipped, waited on, or gave up on a backend without it returning `430`. All have the labels `backend` and `tier`. The admission counters start at zero with each process; `nntp_proxy_backend_error_reply_failovers_total` is restored from the stats file.
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `nntp_proxy_backend_backlog_skips_total` | counter | Checkouts that skipped the backend because its connection queue would not serve them within their wait (`backlog_skip`). |
+| `nntp_proxy_backend_busy_timeouts_total` | counter | Bounded checkouts that waited their whole limit (`checkout_wait_ms`) without a connection. |
+| `nntp_proxy_backend_deadline_expiries_total` | counter | Client requests whose deadline (`deadline_ms`) ran out with this backend next in line. |
+| `nntp_proxy_backend_last_resort_waits_total` | counter | Checkouts that queued here anyway because every other backend left for the request was backlogged (`backlog_last_resort = "wait-shortest"`). |
+| `nntp_proxy_backend_last_resort_connected_total` | counter | Last-resort checkouts that got a connection. |
+| `nntp_proxy_backend_last_resort_timeouts_total` | counter | Last-resort checkouts that waited their whole limit without one. |
+| `nntp_proxy_backend_error_reply_failovers_total` | counter | Non-`430` error replies to article lookups that were retried on another backend instead of sent to the client. Shows a backend that refuses lookups with a non-standard code. |
+| `nntp_proxy_backend_service_time_seconds` | gauge | Moving average of how long one command holds a connection, used to estimate queue waits. `0` before the first sample. |
+| `nntp_proxy_backend_estimated_wait_seconds` | gauge | Estimated wait for a connection if a checkout joined the queue now. |
+
 ### Backend latency histograms
 
 Both histograms have the labels `backend` and `tier` and expose `_bucket` (with `le`), `_sum` (seconds), and `_count` series. Buckets are fixed. They start empty at each process start and are not saved in the stats file.
@@ -202,6 +218,15 @@ Alert when requests queue for connections on a backend for several minutes:
 
 ```promql
 min_over_time(nntp_proxy_backend_pool_waiters[5m]) > 0
+```
+
+Requests turned away from busy backends, per second:
+
+```promql
+sum by (backend) (
+    rate(nntp_proxy_backend_backlog_skips_total[5m])
+  + rate(nntp_proxy_backend_busy_timeouts_total[5m])
+  + rate(nntp_proxy_backend_deadline_expiries_total[5m]))
 ```
 
 Connection churn per minute, by reason:

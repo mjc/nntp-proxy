@@ -687,6 +687,7 @@ impl MetricsCollector {
             article_missing: store.article_missing.load(Ordering::Relaxed),
             articles: store.article_count.load(Ordering::Relaxed),
             article_bytes: store.article_bytes_total.load(Ordering::Relaxed),
+            error_reply_failovers: store.error_reply_failovers.load(Ordering::Relaxed),
         })
     }
 
@@ -723,6 +724,8 @@ pub struct BackendCounters {
     /// Successful ARTICLE/BODY/HEAD payload responses.
     pub articles: u64,
     pub article_bytes: u64,
+    /// Non-430 error replies to article lookups retried on another backend.
+    pub error_reply_failovers: u64,
 }
 
 /// Proxy-wide counters and gauges, read with relaxed loads.

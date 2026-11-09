@@ -37,6 +37,7 @@ pub fn gather(proxy: &NntpProxy) -> Scrape {
             let backend_id = BackendId::from_index(index);
             let status = provider.status_counts();
             let health = provider.health_check_metrics();
+            let load = provider.load();
             BackendScrape {
                 name: unique_name(&mut seen_names, server.name.as_str(), index),
                 tier: server.tier.to_string(),
@@ -63,7 +64,9 @@ pub fn gather(proxy: &NntpProxy) -> Scrape {
                 health_checks: health.connections_checked(),
                 health_check_failures: health.connections_failed(),
                 first_byte: metrics.first_byte_histogram(backend_id),
-                exchange_duration: provider.load().exchange_duration(),
+                exchange_duration: load.exchange_duration(),
+                admission: load.snapshot(),
+                estimated_wait_seconds: provider.estimated_wait().as_secs_f64(),
             }
         })
         .collect();
