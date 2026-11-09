@@ -145,6 +145,17 @@ async fn scrape_reflects_article_and_stat_traffic() -> Result<()> {
     );
     at_least("nntp_proxy_backend_pool_max_connections", &backend, 1.0);
     at_least("nntp_proxy_build_info", &[], 1.0);
+    at_least("nntp_proxy_backend_first_byte_seconds_count", &backend, 1.0);
+    at_least(
+        "nntp_proxy_backend_first_byte_seconds_bucket",
+        &[("backend", "backend-a"), ("le", "+Inf")],
+        1.0,
+    );
+    at_least(
+        "nntp_proxy_backend_exchange_duration_seconds_count",
+        &backend,
+        4.0,
+    );
 
     // Every non-comment line is a well-formed `name[{labels}] value` sample.
     for line in after.lines().filter(|line| !line.is_empty()) {

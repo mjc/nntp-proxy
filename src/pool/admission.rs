@@ -220,6 +220,9 @@ pub struct BackendLoad {
     /// is reported at once, at which the last summary was claimed.
     last_summary_ms: AtomicU64,
     epoch: Instant,
+    /// Distribution of the same hold times the average is built from, so a
+    /// scrape can see the tail the average hides.
+    exchange_duration: crate::metrics::histogram::LatencyHistogram,
 }
 
 impl Default for BackendLoad {
@@ -236,20 +239,26 @@ impl Default for BackendLoad {
             unlogged_busy_timeouts: AtomicU64::new(0),
             last_summary_ms: AtomicU64::new(0),
             epoch: Instant::now(),
+            exchange_duration: crate::metrics::histogram::LatencyHistogram::new(
+                &crate::metrics::histogram::EXCHANGE_BUCKETS,
+            ),
         }
     }
 }
 
 impl BackendLoad {
-    /// Fold one command's connection hold time into the average.
+    /// Fold one command's connection hold time into the average and the
+    /// exported histogram.
     ///
-    /// A plain load and store rather than a compare-and-swap loop: two
-    /// commands finishing at once can drop one sample, which does not matter
-    /// for an average over many commands, and the hot path stays one load and
-    /// one store.
+    /// The average uses a plain load and store rather than a compare-and-swap
+    /// loop: two commands finishing at once can drop one sample, which does
+    /// not matter for an average over many commands. The histogram adds two
+    /// relaxed increments, so the whole update stays a handful of atomics.
     pub fn record_service_time(&self, held: Duration) {
+        let held_micros = u64::try_from(held.as_micros()).unwrap_or(u64::MAX);
+        self.exchange_duration.observe_micros(held_micros);
         // Never store zero, which means "no sample".
-        let sample = u64::try_from(held.as_micros()).unwrap_or(u64::MAX).max(1);
+        let sample = held_micros.max(1);
         let current = self.service_time_micros.load(Ordering::Relaxed);
         let next = if current == 0 {
             sample
@@ -305,6 +314,12 @@ impl BackendLoad {
     /// Count a last-resort checkout that waited its whole limit.
     pub fn note_last_resort_timeout(&self) {
         self.last_resort_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Distribution of command hold times, for the scrape endpoint.
+    #[must_use]
+    pub fn exchange_duration(&self) -> crate::metrics::histogram::HistogramSnapshot {
+        self.exchange_duration.snapshot()
     }
 
     #[must_use]

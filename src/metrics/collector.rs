@@ -1,6 +1,7 @@
 //! Lock-free metrics collector
 
 use super::command_class::{CommandClass, CommandClassCounters};
+use super::histogram::{FIRST_BYTE_BUCKETS, HistogramSnapshot, LatencyHistogram};
 use super::store::{BackendStore, MetricsStore, UserMetrics};
 use super::types::{
     CacheEntries, DiskHits, DiskReadIos, DiskWriteIos, PipelineBatches, PipelineCommands,
@@ -100,6 +101,9 @@ struct MetricsInner {
     client_bytes_received: AtomicU64,
     /// Bytes written to clients in sessions that have ended.
     client_bytes_sent: AtomicU64,
+    /// Per-backend time-to-first-byte distribution. Not persisted: bucket
+    /// counts from an older process would mix with this one's.
+    first_byte: Box<[LatencyHistogram]>,
     // Note: client_to_backend_bytes and backend_to_client_bytes are calculated
     // from backend_metrics sums, not stored separately
 }
@@ -196,6 +200,9 @@ impl MetricsCollector {
                 client_commands: CommandClassCounters::default(),
                 client_bytes_received: AtomicU64::new(0),
                 client_bytes_sent: AtomicU64::new(0),
+                first_byte: (0..num_backends)
+                    .map(|_| LatencyHistogram::new(&FIRST_BYTE_BUCKETS))
+                    .collect(),
             }),
         }
     }
@@ -444,6 +451,21 @@ impl MetricsCollector {
             store.ttfb_micros_total.fetch_add(micros, Ordering::Relaxed);
             store.ttfb_count.fetch_add(1, Ordering::Relaxed);
         });
+        if let Some(histogram) = self.inner.first_byte.get(backend_id.as_index()) {
+            histogram.observe_micros(micros);
+        }
+    }
+
+    /// Time-to-first-byte distribution for one backend.
+    #[must_use]
+    pub fn first_byte_histogram(&self, backend_id: BackendId) -> HistogramSnapshot {
+        self.inner
+            .first_byte
+            .get(backend_id.as_index())
+            .map_or_else(
+                || HistogramSnapshot::empty(&FIRST_BYTE_BUCKETS),
+                LatencyHistogram::snapshot,
+            )
     }
 
     #[inline]

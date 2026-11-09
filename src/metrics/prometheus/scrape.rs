@@ -7,6 +7,7 @@
 use super::process::ProcessStats;
 use super::text::{Exposition, MetricKind};
 use crate::cache::DiskDisplayStats;
+use crate::metrics::histogram::HistogramSnapshot;
 use crate::metrics::{BackendCounters, CommandClass, ProxyCounters};
 use crate::pool::churn::ConnectionChurnSnapshot;
 
@@ -66,6 +67,10 @@ pub struct BackendScrape {
     pub login_gate: LoginGate,
     pub health_checks: u64,
     pub health_check_failures: u64,
+    /// Time from sending a command to its first response bytes.
+    pub first_byte: HistogramSnapshot,
+    /// Time one command held a connection, first write to end of response.
+    pub exchange_duration: HistogramSnapshot,
 }
 
 /// Article/availability cache state at scrape time.
@@ -378,6 +383,38 @@ fn backend_family_by(
     }
 }
 
+/// Emit one per-backend histogram family.
+fn backend_histogram(
+    out: &mut Exposition,
+    backends: &[BackendScrape],
+    name: &str,
+    help: &str,
+    histogram: fn(&BackendScrape) -> &HistogramSnapshot,
+) {
+    let bucket = format!("{name}_bucket");
+    let sum = format!("{name}_sum");
+    let count = format!("{name}_count");
+    out.family(name, MetricKind::Histogram, help);
+    for backend in backends {
+        let snapshot = histogram(backend);
+        let labels = [
+            ("backend", backend.name.as_str()),
+            ("tier", backend.tier.as_str()),
+        ];
+        let mut cumulative = 0;
+        for (le, in_bucket) in snapshot.bounds.labels.iter().zip(snapshot.counts) {
+            cumulative += in_bucket;
+            out.sample(&bucket, &[labels[0], labels[1], ("le", le)], cumulative);
+        }
+        let total = snapshot.count();
+        out.sample(&bucket, &[labels[0], labels[1], ("le", "+Inf")], total);
+        #[allow(clippy::cast_precision_loss)] // Seconds sums are approximate by nature.
+        let sum_seconds = snapshot.sum_micros as f64 / 1_000_000.0;
+        out.sample(&sum, &labels, sum_seconds);
+        out.sample(&count, &labels, total);
+    }
+}
+
 fn render_backends(out: &mut Exposition, backends: &[BackendScrape]) {
     use MetricKind::{Counter, Gauge};
 
@@ -579,6 +616,20 @@ fn render_backends(out: &mut Exposition, backends: &[BackendScrape]) {
         ),
         |b| b.health_checks,
     );
+    backend_histogram(
+        out,
+        backends,
+        "nntp_proxy_backend_first_byte_seconds",
+        "Time from sending a command to the backend until its first response bytes arrive.",
+        |b| &b.first_byte,
+    );
+    backend_histogram(
+        out,
+        backends,
+        "nntp_proxy_backend_exchange_duration_seconds",
+        "Time one command held a backend connection, from its first write to the end of the response. For article fetches this is the whole transfer.",
+        |b| &b.exchange_duration,
+    );
     backend_family(
         out,
         backends,
@@ -594,6 +645,7 @@ fn render_backends(out: &mut Exposition, backends: &[BackendScrape]) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::metrics::histogram::{EXCHANGE_BUCKETS, FIRST_BYTE_BUCKETS, LatencyHistogram};
 
     pub(crate) fn sample_scrape(names: &[&str]) -> Scrape {
         Scrape {
@@ -651,6 +703,14 @@ pub(crate) mod tests {
                     login_gate: LoginGate::BackingOff,
                     health_checks: 0,
                     health_check_failures: 0,
+                    first_byte: {
+                        let h = LatencyHistogram::new(&FIRST_BYTE_BUCKETS);
+                        h.observe_micros(3_000);
+                        h.observe_micros(3_000);
+                        h.observe_micros(20_000_000);
+                        h.snapshot()
+                    },
+                    exchange_duration: HistogramSnapshot::empty(&EXCHANGE_BUCKETS),
                 })
                 .collect(),
         }
@@ -859,6 +919,39 @@ pub(crate) mod tests {
         assert_eq!(
             value("nntp_proxy_backend_article_missing_total", None),
             Some(3.0)
+        );
+    }
+
+    #[test]
+    fn histogram_buckets_are_cumulative_and_end_with_count() {
+        let text = render(&sample_scrape(&["backend-a"]));
+        let samples = validate_exposition(&text);
+        let buckets: Vec<(String, f64)> = samples
+            .iter()
+            .filter(|s| s.name == "nntp_proxy_backend_first_byte_seconds_bucket")
+            .map(|s| {
+                let le = s.labels.iter().find(|(k, _)| k == "le").unwrap().1.clone();
+                (le, s.value)
+            })
+            .collect();
+        assert_eq!(buckets.len(), crate::metrics::histogram::BUCKETS + 1);
+        // 3 ms lands at le=0.005; nothing more until the 20 s outlier.
+        assert_eq!(buckets[0], ("0.001".to_string(), 0.0));
+        assert_eq!(buckets[2], ("0.005".to_string(), 2.0));
+        assert_eq!(buckets[12], ("10".to_string(), 2.0));
+        assert_eq!(buckets[13], ("+Inf".to_string(), 3.0));
+        assert!(
+            buckets
+                .iter()
+                .zip(buckets.iter().skip(1))
+                .all(|(a, b)| a.1 <= b.1)
+        );
+        let find = |name: &str| samples.iter().find(|s| s.name == name).unwrap().value;
+        assert!((find("nntp_proxy_backend_first_byte_seconds_sum") - 20.006).abs() < 1e-9);
+        assert_eq!(find("nntp_proxy_backend_first_byte_seconds_count"), 3.0);
+        assert_eq!(
+            find("nntp_proxy_backend_exchange_duration_seconds_count"),
+            0.0
         );
     }
 

@@ -32,7 +32,7 @@ The endpoint has no authentication or TLS. Backend names, pool sizes, and traffi
 
 Values come from counters the proxy already keeps for its dashboard and stats file. A scrape reads them with relaxed atomic loads, takes the availability cache's shard locks briefly to sum hits and misses, and reads a few files under `/proc`. Rendering runs on a blocking thread, not on the proxy's async workers. Between scrapes the endpoint does no work.
 
-Request handling adds a single relaxed atomic increment per client command (command class counter) and per authoritative `430` (missing-article counter). Connection churn counters change once per backend connection opened or closed.
+Request handling adds a single relaxed atomic increment per client command (command class counter) and per authoritative `430` (missing-article counter). Each latency histogram observation is a binary search over 13 fixed bounds plus two relaxed atomic increments, with no allocation or lock. Connection churn counters change once per backend connection opened or closed.
 
 ## Labels
 
@@ -117,6 +117,15 @@ Every backend metric has the labels `backend` and `tier`, plus any listed here.
 | `nntp_proxy_backend_health_checks_total` | counter | | Idle connections checked by the periodic health check. |
 | `nntp_proxy_backend_health_check_failures_total` | counter | | Idle connections that failed it. |
 
+### Backend latency histograms
+
+Both histograms have the labels `backend` and `tier` and expose `_bucket` (with `le`), `_sum` (seconds), and `_count` series. Buckets are fixed. They start empty at each process start and are not saved in the stats file.
+
+| Metric | Buckets (seconds) | Meaning |
+| --- | --- | --- |
+| `nntp_proxy_backend_first_byte_seconds` | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 | Time from sending a command until the backend's first response bytes arrive. Only commands the proxy times one at a time are included: retries and failover attempts, adaptive `STAT`/`HEAD` prechecks, and other commands sent on their own. Commands sent in a pipelined window are not timed individually, so `_count` can be well below `nntp_proxy_backend_commands_total`. |
+| `nntp_proxy_backend_exchange_duration_seconds` | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60 | Time a backend connection was busy with one exchange, from its first write to the end of the response. For an article fetch this is the whole transfer. A pipelined window of several commands on one connection counts as one exchange. This is the same measurement that backlog admission averages. |
+
 ## Scrape configuration
 
 ### Prometheus
@@ -165,6 +174,20 @@ Refused commands (non-`430` 4xx replies) per second:
 sum by (backend) (rate(nntp_proxy_backend_error_replies_total{code_class="4xx"}[5m]))
 -
 sum by (backend) (rate(nntp_proxy_backend_article_missing_total[5m]))
+```
+
+95th percentile time to first byte per backend:
+
+```promql
+histogram_quantile(0.95,
+  sum by (backend, le) (rate(nntp_proxy_backend_first_byte_seconds_bucket[5m])))
+```
+
+Median article transfer time per backend:
+
+```promql
+histogram_quantile(0.5,
+  sum by (backend, le) (rate(nntp_proxy_backend_exchange_duration_seconds_bucket[5m])))
 ```
 
 Pool saturation, from 0 (idle) to 1 (every connection busy):

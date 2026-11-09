@@ -62,6 +62,8 @@ pub fn gather(proxy: &NntpProxy) -> Scrape {
                 },
                 health_checks: health.connections_checked(),
                 health_check_failures: health.connections_failed(),
+                first_byte: metrics.first_byte_histogram(backend_id),
+                exchange_duration: provider.load().exchange_duration(),
             }
         })
         .collect();

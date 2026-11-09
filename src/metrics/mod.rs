@@ -23,6 +23,7 @@ mod backend_stats;
 mod collector;
 mod command_class;
 mod connection_stats;
+pub mod histogram;
 pub mod prometheus;
 mod snapshot;
 pub mod store;
