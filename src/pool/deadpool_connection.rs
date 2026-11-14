@@ -1454,6 +1454,145 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_supported_compression_negotiates_each_new_session_in_parallel() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let received = Arc::new(tokio::sync::Semaphore::new(0));
+        let replies = Arc::new(tokio::sync::Semaphore::new(0));
+        let server_received = received.clone();
+        let server_replies = replies.clone();
+        tokio::spawn(async move {
+            for index in 0..3 {
+                let (mut peer, _) = listener.accept().await.unwrap();
+                let received = server_received.clone();
+                let replies = server_replies.clone();
+                tokio::spawn(async move {
+                    let mut command = [0; 18];
+                    peer.read_exact(&mut command).await.unwrap();
+                    assert_eq!(&command, crate::protocol::COMPRESS_DEFLATE);
+                    if index != 0 {
+                        // Hold the reply until both later sessions have sent
+                        // their probe, so a serialized probe would stall here.
+                        received.add_permits(1);
+                        replies.acquire().await.unwrap().forget();
+                    }
+                    peer.write_all(b"206 Compression active\r\n").await.unwrap();
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        let manager = TcpManager::new(
+            addr.ip().to_string(),
+            addr.port(),
+            "supported-parallel".into(),
+            TcpManagerOptions {
+                compress: None,
+                ..TcpManagerOptions::default()
+            },
+        )
+        .unwrap();
+
+        let negotiate = |manager: TcpManager| async move {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let mut stream = ConnectionStream::plain(tcp);
+            let mut buffer = [0; 128];
+            manager
+                .negotiate_compression(&mut stream, &mut buffer)
+                .await
+                .unwrap()
+        };
+        assert!(negotiate(manager.clone()).await);
+        assert_eq!(
+            manager.compression_support.get(),
+            Some(&CompressionSupport::Supported)
+        );
+
+        let second = tokio::spawn(negotiate(manager.clone()));
+        let third = tokio::spawn(negotiate(manager.clone()));
+        tokio::time::timeout(std::time::Duration::from_secs(1), received.acquire_many(2))
+            .await
+            .expect("cached support must let each new session probe without waiting on another")
+            .unwrap()
+            .forget();
+        replies.add_permits(2);
+        assert!(
+            second.await.unwrap(),
+            "a cached Supported backend must still negotiate compression on a new session"
+        );
+        assert!(third.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_compression_probe_leaves_discovery_open_for_the_next_session() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let probes = Arc::new(AtomicUsize::new(0));
+        let server_probes = probes.clone();
+        tokio::spawn(async move {
+            for index in 0..3 {
+                let (mut peer, _) = listener.accept().await.unwrap();
+                let probes = server_probes.clone();
+                tokio::spawn(async move {
+                    let mut command = [0; 18];
+                    if tokio::time::timeout(
+                        std::time::Duration::from_millis(200),
+                        peer.read_exact(&mut command),
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    probes.fetch_add(1, Ordering::SeqCst);
+                    if index == 0 {
+                        // Close without replying: the probe fails with an error.
+                        return;
+                    }
+                    peer.write_all(b"500 Unsupported\r\n").await.unwrap();
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        let manager = TcpManager::new(
+            addr.ip().to_string(),
+            addr.port(),
+            "failed-discovery".into(),
+            TcpManagerOptions {
+                compress: None,
+                ..TcpManagerOptions::default()
+            },
+        )
+        .unwrap();
+
+        let negotiate = |manager: TcpManager| async move {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let mut stream = ConnectionStream::plain(tcp);
+            let mut buffer = [0; 128];
+            manager
+                .negotiate_compression(&mut stream, &mut buffer)
+                .await
+        };
+        assert!(negotiate(manager.clone()).await.is_err());
+        assert_eq!(
+            manager.compression_support.get(),
+            None,
+            "a failed probe must not cache a support answer"
+        );
+
+        assert!(!negotiate(manager.clone()).await.unwrap());
+        assert_eq!(
+            manager.compression_support.get(),
+            Some(&CompressionSupport::Unsupported)
+        );
+        assert!(!negotiate(manager.clone()).await.unwrap());
+        assert_eq!(
+            probes.load(Ordering::SeqCst),
+            2,
+            "the failed probe is retried once, then Unsupported is remembered"
+        );
+    }
+
+    #[tokio::test]
     async fn backend_setup_has_a_deadline_when_greeting_stalls() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();

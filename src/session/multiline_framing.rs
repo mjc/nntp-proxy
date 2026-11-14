@@ -5759,6 +5759,535 @@ mod tests {
         }
     }
 
+    /// One-connection backend that greets, then answers the first BODY or
+    /// STAT only with the bytes sent on the returned channel, and never closes.
+    async fn held_reply_backend() -> (
+        crate::pool::DeadpoolConnectionProvider,
+        tokio::sync::oneshot::Sender<Vec<u8>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (reply, reply_ready) = tokio::sync::oneshot::channel::<Vec<u8>>();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            reader.get_mut().write_all(b"200 Ready\r\n").await.unwrap();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if reader.read_line(&mut line).await.unwrap() == 0 {
+                    return;
+                }
+                let request = crate::protocol::RequestContext::parse(line.as_bytes()).unwrap();
+                if request.is_stat() || request.kind() == crate::protocol::RequestKind::Body {
+                    if let Ok(bytes) = reply_ready.await {
+                        reader.get_mut().write_all(&bytes).await.unwrap();
+                    }
+                    std::future::pending::<()>().await;
+                    break;
+                }
+                reader.get_mut().write_all(b"200 Ready\r\n").await.unwrap();
+            }
+        });
+        let provider = crate::pool::DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        (provider, reply, server)
+    }
+
+    /// Accepts `allowance` bytes, then either fails like a closed client or
+    /// stays pending like a stalled one.
+    struct InterruptedWriter {
+        bytes: Vec<u8>,
+        allowance: usize,
+        stall: ClientStall,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ClientStall {
+        Closes,
+        Hangs,
+    }
+
+    impl AsyncWrite for InterruptedWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.allowance == 0 {
+                return match self.stall {
+                    ClientStall::Hangs => Poll::Pending,
+                    ClientStall::Closes => Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "client closed after partial write",
+                    ))),
+                };
+            }
+            let accepted = self.allowance.min(buf.len());
+            self.bytes.extend_from_slice(&buf[..accepted]);
+            self.allowance -= accepted;
+            Poll::Ready(Ok(accepted))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[test]
+    fn capture_and_write_completed_metrics_and_late_overflow_count_wire_once() {
+        let _guard = crate::pool::buffer::response_write_metrics_test_guard();
+        crate::pool::buffer::set_response_write_metrics_enabled(true);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let first = b"222 0 <metrics@capture.test>\r\nfirst bytes\r\n";
+                let tail = b"last bytes\r\n.\r\n";
+                let wire = [first.as_slice(), tail.as_slice()].concat();
+                // Retained to completion, and overflowing the limit after the
+                // first window was already written.
+                for limit in [wire.len(), first.len() + 1] {
+                    crate::pool::buffer::reset_response_write_metrics();
+                    let pool = make_pool();
+                    let mut buffer = pool.acquire();
+                    buffer.copy_from_slice(first);
+                    let mut conn = mock_backend_conn(vec![tail.to_vec()]).await;
+                    let request =
+                        crate::protocol::RequestContext::parse(b"BODY <metrics@capture.test>\r\n")
+                            .unwrap();
+                    let mut classified =
+                        ClassifiedResponse::read_for_test(&mut conn, &request, buffer)
+                            .await
+                            .unwrap();
+                    let mut capture = crate::pool::ChunkedResponse::default();
+                    let mut writer = RecordingWriter::default();
+                    let (bytes, retained) = classified
+                        .stream_for_test(&mut conn, &pool, crate::types::BackendId::from_index(0))
+                        .unwrap()
+                        .capture_and_write(&mut writer, &mut capture, limit)
+                        .await
+                        .unwrap();
+                    assert_eq!(writer.bytes, wire, "limit={limit}");
+                    assert_eq!(bytes as usize, wire.len(), "limit={limit}");
+                    assert_eq!(retained.is_some(), limit == wire.len(), "limit={limit}");
+                    assert!(capture.is_empty(), "limit={limit}");
+                    let metrics = crate::pool::buffer::response_write_metrics_snapshot();
+                    assert_eq!(metrics.responses, 1, "limit={limit}");
+                    assert_eq!(metrics.chunks_written, 2, "limit={limit}");
+                    assert_eq!(metrics.bytes_written, wire.len(), "limit={limit}");
+                    assert_eq!(metrics.max_chunks_per_response, 2, "limit={limit}");
+                    assert_eq!(writer.scalar_writes, 2, "limit={limit}");
+                }
+            });
+        crate::pool::buffer::set_response_write_metrics_enabled(false);
+        crate::pool::buffer::reset_response_write_metrics();
+    }
+
+    #[tokio::test]
+    async fn capture_and_write_cancellation_clears_capture_and_retires_inflight_guard() {
+        let (provider, reply, server) = held_reply_backend().await;
+        let mut guard = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+        let request =
+            crate::protocol::RequestContext::parse(b"BODY <cancel@capture.test>\r\n").unwrap();
+        request.write_wire_to(guard.stream_mut()).await.unwrap();
+        let first = b"222 0 <cancel@capture.test>\r\nfirst bytes\r\n";
+        let buffers = make_pool();
+        let mut buffer = buffers.acquire();
+        buffer.copy_from_slice(first);
+        let mut exchange = BackendResponseExchange::read(
+            guard,
+            &request,
+            buffer,
+            &buffers,
+            crate::types::BackendId::from_index(0),
+        )
+        .await
+        .unwrap();
+        let mut capture = crate::pool::ChunkedResponse::default();
+        let mut writer = RecordingWriter::default();
+        {
+            let mut forwarding = Box::pin(
+                exchange
+                    .receiving()
+                    .unwrap()
+                    .capture_and_write(&mut writer, &mut capture),
+            );
+            assert!(futures::poll!(&mut forwarding).is_pending());
+            // Dropping the future here cancels the transfer mid-response.
+        }
+        assert_eq!(
+            writer.bytes, first,
+            "the prefix was forwarded before cancellation"
+        );
+        assert!(
+            capture.is_empty(),
+            "a cancelled capture must not leave a partial cache payload"
+        );
+        let guard = exchange.into_connection_after_failure();
+        assert!(!guard.response_is_complete());
+        assert!(matches!(
+            crate::session::response_transfer::connection_reuse_after_response(&guard),
+            crate::session::response_transfer::ResponseConnectionReuse::Incomplete
+        ));
+        drop(guard);
+        assert_eq!(
+            provider.status_counts().size,
+            0,
+            "the in-flight connection must be retired, not pooled"
+        );
+        drop(reply);
+        server.abort();
+    }
+
+    #[test]
+    fn capture_and_write_partial_client_failure_and_cancellation_do_not_record_success() {
+        let _guard = crate::pool::buffer::response_write_metrics_test_guard();
+        crate::pool::buffer::set_response_write_metrics_enabled(true);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let first = b"222 0 <partial@capture.test>\r\nfirst bytes\r\n";
+                let tail = b"last bytes\r\n.\r\n";
+                let next = b"223 0 <next@capture.test>\r\n";
+                for stall in [ClientStall::Closes, ClientStall::Hangs] {
+                    crate::pool::buffer::reset_response_write_metrics();
+                    let (provider, reply, server) = held_reply_backend().await;
+                    let mut guard = provider
+                        .checkout_connection_guard()
+                        .await
+                        .unwrap()
+                        .activate();
+                    let request = crate::protocol::RequestContext::parse(
+                        b"BODY <partial@capture.test>\r\n",
+                    )
+                    .unwrap();
+                    request.write_wire_to(guard.stream_mut()).await.unwrap();
+                    reply
+                        .send([tail.as_slice(), next.as_slice()].concat())
+                        .unwrap();
+                    let pool = make_pool();
+                    let mut buffer = pool.acquire();
+                    buffer.copy_from_slice(first);
+                    let mut exchange = BackendResponseExchange::read(
+                        guard,
+                        &request,
+                        buffer,
+                        &pool,
+                        crate::types::BackendId::from_index(0),
+                    )
+                    .await
+                    .unwrap();
+                    let mut capture = crate::pool::ChunkedResponse::default();
+                    let mut writer = InterruptedWriter {
+                        bytes: Vec::new(),
+                        allowance: first.len() + 3,
+                        stall,
+                    };
+                    {
+                        let mut forwarding = Box::pin(
+                            exchange
+                                .receiving()
+                                .unwrap()
+                                .capture_and_write(&mut writer, &mut capture),
+                        );
+                        match stall {
+                            ClientStall::Hangs => assert!(
+                                tokio::time::timeout(
+                                    std::time::Duration::from_millis(50),
+                                    &mut forwarding
+                                )
+                                .await
+                                .is_err()
+                            ),
+                            ClientStall::Closes => assert!(matches!(
+                                forwarding.await,
+                                Err(ResponseTransferError::ClientDisconnect(_))
+                            )),
+                        }
+                    }
+                    assert_eq!(
+                        writer.bytes,
+                        [first.as_slice(), &tail[..3]].concat(),
+                        "{stall:?}"
+                    );
+                    assert!(capture.is_empty(), "{stall:?}");
+                    let guard = exchange.into_connection_after_failure();
+                    match stall {
+                        ClientStall::Hangs => assert!(!guard.response_is_complete()),
+                        ClientStall::Closes => {
+                            // The rest of the response was drained, so only
+                            // the next reply's bytes remain queued.
+                            assert!(guard.response_is_complete());
+                            assert!(matches!(
+                                crate::session::response_transfer::connection_reuse_after_response(&guard),
+                                crate::session::response_transfer::ResponseConnectionReuse::QueuedBytes { len }
+                                    if len == next.len()
+                            ));
+                        }
+                    }
+                    drop(guard);
+                    assert_eq!(provider.status_counts().size, 0, "{stall:?}");
+                    let metrics = crate::pool::buffer::response_write_metrics_snapshot();
+                    assert_eq!(metrics.responses, 0, "{stall:?}: no success may be recorded");
+                    assert_eq!(metrics.chunks_written, 0, "{stall:?}");
+                    assert_eq!(metrics.bytes_written, 0, "{stall:?}");
+                    server.abort();
+                }
+            });
+        crate::pool::buffer::set_response_write_metrics_enabled(false);
+        crate::pool::buffer::reset_response_write_metrics();
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum ColdFirstPacket {
+        StatusOnly,
+        WithBody,
+    }
+
+    async fn read_client_line(client: &mut tokio::net::TcpStream) -> Vec<u8> {
+        let mut line = Vec::new();
+        let mut byte = [0; 1];
+        while line.last() != Some(&b'\n') {
+            client.read_exact(&mut byte).await.unwrap();
+            line.push(byte[0]);
+        }
+        line
+    }
+
+    /// Drive a real per-command proxy with body caching on a cold cache.
+    /// The backend holds the rest of the response until the client has
+    /// received the first packet, so a proxy that buffered the whole
+    /// response for the cache before forwarding would time out here.
+    async fn assert_proxy_streams_cold_payload(
+        kind: crate::protocol::RequestKind,
+        first_packet: ColdFirstPacket,
+    ) {
+        use crate::config::{Cache, Config, RoutingMode, Server};
+        use crate::protocol::{RequestContext, RequestKind, StatusCode};
+        use crate::types::Port;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let id = "<accounting@capture.test>";
+        let (verb, status_line, headers): (&str, &[u8], &[u8]) = match kind {
+            RequestKind::Article => (
+                "ARTICLE",
+                b"220 0 <accounting@capture.test>\r\n",
+                b"Subject: Accounting\r\n\r\n",
+            ),
+            RequestKind::Body => ("BODY", b"222 0 <accounting@capture.test>\r\n", b""),
+            _ => unreachable!("only ARTICLE and BODY retain a cold-cache payload"),
+        };
+        let wire = [
+            status_line,
+            headers,
+            vec![b'x'; 512].as_slice(),
+            b"\r\n.\r\n".as_slice(),
+        ]
+        .concat();
+        let split = match first_packet {
+            ColdFirstPacket::StatusOnly => status_line.len(),
+            ColdFirstPacket::WithBody => wire.len() / 2,
+        };
+        let first = wire[..split].to_vec();
+        let tail = wire[split..].to_vec();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        let backend = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut stream = BufReader::new(stream);
+            stream.get_mut().write_all(b"200 Ready\r\n").await.unwrap();
+            loop {
+                let mut command = String::new();
+                if stream.read_line(&mut command).await.unwrap() == 0 {
+                    return;
+                }
+                let request = RequestContext::parse(command.as_bytes()).unwrap();
+                if request.kind() == kind {
+                    stream.get_mut().write_all(&first).await.unwrap();
+                    gate.await.unwrap();
+                    stream.get_mut().write_all(&tail).await.unwrap();
+                    std::future::pending::<()>().await;
+                    return;
+                }
+                stream
+                    .get_mut()
+                    .write_all(b"200 Reader ready\r\n")
+                    .await
+                    .unwrap();
+            }
+        });
+
+        let config = Config {
+            servers: vec![
+                Server::builder("127.0.0.1", Port::try_new(port).unwrap())
+                    .build()
+                    .unwrap(),
+            ],
+            cache: Some(Cache {
+                store_article_bodies: true,
+                adaptive_precheck: false,
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let proxy = crate::NntpProxy::new(config, RoutingMode::PerCommand)
+            .await
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let serving = proxy.clone();
+        let mut session = tokio::spawn(async move {
+            let (stream, address) = listener.accept().await.unwrap();
+            serving
+                .handle_client_per_command_routing(stream, address.into())
+                .await
+        });
+
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let greeting = read_client_line(&mut client).await;
+        assert_eq!(StatusCode::parse(&greeting), Some(StatusCode::new(201)));
+        let before = proxy.metrics().snapshot(None);
+        assert!(proxy.cache().get_request_message_id(id).await.is_none());
+
+        let request = RequestContext::parse(format!("{verb} {id}\r\n").as_bytes()).unwrap();
+        request.write_wire_to(&mut client).await.unwrap();
+        let mut actual = vec![0; wire.len()];
+        let prefix = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            client.read_exact(&mut actual[..split]),
+        )
+        .await;
+        if prefix.is_err() {
+            session.abort();
+            backend.abort();
+        }
+        prefix
+            .expect("the proxy must forward a cold-cache prefix before the backend completes")
+            .unwrap();
+        assert_eq!(&actual[..split], &wire[..split]);
+        assert!(
+            proxy.cache().get_request_message_id(id).await.is_none(),
+            "an incomplete response must not be cached"
+        );
+
+        release.send(()).unwrap();
+        client.read_exact(&mut actual[split..]).await.unwrap();
+        assert_eq!(actual, wire);
+        RequestContext::parse(b"QUIT\r\n")
+            .unwrap()
+            .write_wire_to(&mut client)
+            .await
+            .unwrap();
+        let goodbye = read_client_line(&mut client).await;
+        assert_eq!(StatusCode::parse(&goodbye), Some(StatusCode::new(205)));
+        tokio::time::timeout(std::time::Duration::from_secs(1), &mut session)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+
+        // Streaming must not change traffic accounting: each byte counts once.
+        let after = proxy.metrics().snapshot(None);
+        let (old, new) = (&before.backend_stats[0], &after.backend_stats[0]);
+        let command_len = request.request_wire_len().as_u64();
+        assert_eq!(new.total_commands.get() - old.total_commands.get(), 1);
+        assert_eq!(
+            new.bytes_sent.as_u64() - old.bytes_sent.as_u64(),
+            command_len
+        );
+        assert_eq!(
+            new.bytes_received.as_u64() - old.bytes_received.as_u64(),
+            wire.len() as u64
+        );
+        let user_totals = |snapshot: &crate::metrics::MetricsSnapshot| {
+            snapshot
+                .user_stats
+                .iter()
+                .fold((0, 0, 0), |(commands, sent, received), user| {
+                    (
+                        commands + user.total_commands.get(),
+                        sent + user.bytes_sent.as_u64(),
+                        received + user.bytes_received.as_u64(),
+                    )
+                })
+        };
+        let (old_user, new_user) = (user_totals(&before), user_totals(&after));
+        assert_eq!(new_user.0 - old_user.0, 1);
+        assert_eq!(new_user.1 - old_user.1, command_len);
+        assert_eq!(new_user.2 - old_user.2, wire.len() as u64);
+        assert_eq!(
+            after.client_to_backend_bytes.as_u64() - before.client_to_backend_bytes.as_u64(),
+            command_len
+        );
+        assert_eq!(
+            after.backend_to_client_bytes.as_u64() - before.backend_to_client_bytes.as_u64(),
+            wire.len() as u64
+        );
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while proxy.cache().get_request_message_id(id).await.is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the completed response must be cached");
+        backend.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_streams_cold_article_and_preserves_traffic_accounting() {
+        assert_proxy_streams_cold_payload(
+            crate::protocol::RequestKind::Article,
+            ColdFirstPacket::WithBody,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn proxy_streams_cold_article_status_only_prefix_before_backend_completion() {
+        assert_proxy_streams_cold_payload(
+            crate::protocol::RequestKind::Article,
+            ColdFirstPacket::StatusOnly,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn proxy_streams_cold_body_and_preserves_traffic_accounting() {
+        assert_proxy_streams_cold_payload(
+            crate::protocol::RequestKind::Body,
+            ColdFirstPacket::WithBody,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn proxy_streams_cold_body_status_only_prefix_before_backend_completion() {
+        assert_proxy_streams_cold_payload(
+            crate::protocol::RequestKind::Body,
+            ColdFirstPacket::StatusOnly,
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn capture_and_write_backend_eof_after_forwarding_is_not_retryable() {
         let first = b"222 0 <eof@capture.test>\r\nfirst line\r\n";
