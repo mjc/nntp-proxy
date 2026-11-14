@@ -301,6 +301,7 @@ pub fn create_test_config(server_ports: Vec<(u16, &str)>) -> Config {
         memory: Default::default(),
         health_check: HealthCheck::default(),
         cache: None,
+        logging: Default::default(),
         client_auth: ClientAuth::default(),
         metrics: None,
     }
@@ -1027,6 +1028,7 @@ pub fn create_test_config_with_auth(
         memory: Default::default(),
         health_check: HealthCheck::default(),
         cache: None,
+        logging: Default::default(),
         client_auth: ClientAuth {
             users: vec![UserCredentials {
                 username: username.to_string(),

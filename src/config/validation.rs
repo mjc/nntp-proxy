@@ -77,6 +77,16 @@ impl Config {
             ));
         }
 
+        if self.logging.backend_summary_interval_secs
+            > super::types::Logging::MAX_BACKEND_SUMMARY_INTERVAL_SECS
+        {
+            return Err(anyhow::anyhow!(
+                "logging.backend_summary_interval_secs must be at most {} (one day), got {}",
+                super::types::Logging::MAX_BACKEND_SUMMARY_INTERVAL_SECS,
+                self.logging.backend_summary_interval_secs
+            ));
+        }
+
         validate_socket_buffer_size(
             "memory.socket_recv_buffer_size",
             self.memory.socket_recv_buffer_size,
@@ -156,6 +166,7 @@ fn validate_server(server: &Server) -> Result<()> {
         && keepalive < MIN_RECOMMENDED_KEEPALIVE
     {
         tracing::warn!(
+            event = "config_value_discouraged",
             "Server '{}' has connection_keepalive set to {:?} (< {:?}). \
              This may cause excessive health check traffic and connection churn. \
              Consider using at least {:?} or None to disable.",
@@ -168,6 +179,7 @@ fn validate_server(server: &Server) -> Result<()> {
         && keepalive > MAX_RECOMMENDED_KEEPALIVE
     {
         tracing::warn!(
+            event = "config_value_discouraged",
             "Server '{}' has connection_keepalive set to {:?} (> {:?} / 5 minutes). \
              This may not detect stale connections quickly enough. Consider a lower value.",
             server.name.as_str(),
@@ -192,6 +204,28 @@ mod tests {
         }
 
         builder.build().unwrap()
+    }
+
+    #[test]
+    fn test_validate_caps_backend_summary_interval() {
+        let mut config = Config {
+            servers: vec![
+                Server::builder(
+                    "news.example.com",
+                    crate::types::Port::try_new(119).unwrap(),
+                )
+                .build()
+                .unwrap(),
+            ],
+            ..Config::default()
+        };
+        config.logging.backend_summary_interval_secs = 86_400;
+        assert!(config.validate().is_ok());
+        config.logging.backend_summary_interval_secs = 86_401;
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("backend_summary_interval_secs"), "{error}");
+        config.logging.backend_summary_interval_secs = u64::MAX;
+        assert!(config.validate().is_err());
     }
 
     #[test]

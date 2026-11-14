@@ -426,8 +426,9 @@ impl PooledBuffer {
     pub fn extend_from_slice(&mut self, data: &[u8]) {
         let needed = self.buffer.initialized_len() + data.len();
         // Accumulator/capture mode may grow; resized buffers are discarded on drop.
+        // Per response and expected for large articles, so debug only.
         if needed > self.buffer.capacity() {
-            tracing::warn!(
+            tracing::debug!(
                 "Capture buffer growing: {} + {} > {} capacity (will allocate)",
                 self.buffer.initialized_len(),
                 data.len(),
@@ -1521,6 +1522,8 @@ impl BufferPool {
                     REGULAR_FALLBACK_WARNINGS.should_warn(total, fallback_warning_clock_ms())
                 {
                     warn!(
+                        event = "buffer_pool_exhausted",
+                        pool = "regular",
                         max_pool_size = self.max_pool_size,
                         buffer_size = self.buffer_size.get(),
                         fallbacks_since_last_warning = since_last_warning,
@@ -1598,6 +1601,8 @@ impl BufferPool {
                     CAPTURE_FALLBACK_WARNINGS.should_warn(total, fallback_warning_clock_ms())
                 {
                     warn!(
+                        event = "buffer_pool_exhausted",
+                        pool = "capture",
                         max_pool_size = self.max_capture_pool_size,
                         capacity,
                         fallbacks_since_last_warning = since_last_warning,

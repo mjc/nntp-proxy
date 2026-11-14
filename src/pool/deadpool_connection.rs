@@ -420,6 +420,248 @@ pub struct TcpManager {
     pub(crate) churn: Arc<crate::pool::churn::ConnectionChurn>,
     /// Live connections per resolved address, so new ones go to the emptiest.
     address_load: Arc<crate::pool::address_balance::AddressLoad>,
+    /// Rate-limited operator events for connection setup failures.
+    events: Arc<SetupEvents>,
+}
+
+/// Why a new backend session could not be set up, as operators act on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupFailure {
+    /// Credentials or the login exchange were rejected after `AUTHINFO`.
+    LoginRefused,
+    /// The account is at its provider-side connection limit.
+    ConnectionLimit,
+    /// The backend answered but refused service before login: a non-2xx
+    /// greeting such as `400` (unavailable, too many connections) or `502`.
+    /// Usually transient or load-related, so it is not reported as a
+    /// credential problem.
+    Unavailable,
+    /// `MODE READER` refused after a successful login: an account or address
+    /// permission problem, not a transient one.
+    ReaderModeRefused,
+    /// Any other refusal at `AUTHINFO`; logged with the reply text.
+    LoginRejected,
+    /// DNS, TCP, TLS, or a timeout: the backend could not be reached.
+    Unreachable,
+    /// Reached and accepted, but the session cannot be used as configured
+    /// (a required password or compression is missing).
+    Misconfigured,
+}
+
+impl SetupFailure {
+    /// Refusals use the same classification as the login backoff.
+    fn of(error: &ConnectionError) -> Self {
+        use crate::connection_error::LoginRefusal;
+        match error.login_refusal() {
+            Some(LoginRefusal::Credentials) => Self::LoginRefused,
+            Some(LoginRefusal::ConnectionLimit) => Self::ConnectionLimit,
+            Some(LoginRefusal::ServiceUnavailable) => Self::Unavailable,
+            Some(LoginRefusal::ReaderModeRefused) => Self::ReaderModeRefused,
+            Some(LoginRefusal::Rejected) => Self::LoginRejected,
+            None => match error {
+                ConnectionError::PasswordRequired { .. }
+                | ConnectionError::CompressionRequired { .. } => Self::Misconfigured,
+                _ => Self::Unreachable,
+            },
+        }
+    }
+}
+
+/// One [`EventGate`](crate::logging::EventGate) per setup failure kind.
+///
+/// Shared by every clone of the manager so one backend reports each
+/// condition at most about once a minute, with a count, and once when
+/// sessions set up again with no failure for a full window.
+#[derive(Debug, Default)]
+struct SetupEvents {
+    login_refused: crate::logging::EventGate,
+    connection_limit: crate::logging::EventGate,
+    unavailable: crate::logging::EventGate,
+    reader_mode_refused: crate::logging::EventGate,
+    login_rejected: crate::logging::EventGate,
+    unreachable: crate::logging::EventGate,
+    misconfigured: crate::logging::EventGate,
+}
+
+impl SetupEvents {
+    fn failed(&self, manager: &TcpManager, error: &ConnectionError, retry_in: Duration) {
+        let backend = manager.name.as_str();
+        let host = manager.host.as_str();
+        let port = manager.port;
+        let retry_in_secs = retry_in.as_secs();
+        match SetupFailure::of(error) {
+            SetupFailure::LoginRefused => {
+                if let Some(count) = self.login_refused.record() {
+                    tracing::error!(
+                        event = "backend_login_refused",
+                        backend,
+                        host,
+                        port,
+                        count,
+                        retry_in_secs,
+                        error = %error,
+                        "Backend refused login"
+                    );
+                }
+            }
+            SetupFailure::ConnectionLimit => {
+                if let Some(count) = self.connection_limit.record() {
+                    tracing::warn!(
+                        event = "backend_connection_limit",
+                        backend,
+                        host,
+                        port,
+                        count,
+                        retry_in_secs,
+                        error = %error,
+                        "Backend account connection limit reached"
+                    );
+                }
+            }
+            SetupFailure::Unavailable => {
+                if let Some(count) = self.unavailable.record() {
+                    tracing::warn!(
+                        event = "backend_unavailable",
+                        backend,
+                        host,
+                        port,
+                        count,
+                        retry_in_secs,
+                        error = %error,
+                        "Backend refused service before login"
+                    );
+                }
+            }
+            SetupFailure::ReaderModeRefused => {
+                if let Some(count) = self.reader_mode_refused.record() {
+                    tracing::error!(
+                        event = "backend_reader_mode_refused",
+                        backend,
+                        host,
+                        port,
+                        count,
+                        retry_in_secs,
+                        error = %error,
+                        "Backend refused MODE READER after login"
+                    );
+                }
+            }
+            SetupFailure::LoginRejected => {
+                if let Some(count) = self.login_rejected.record() {
+                    tracing::warn!(
+                        event = "backend_login_rejected",
+                        backend,
+                        host,
+                        port,
+                        count,
+                        retry_in_secs,
+                        error = %error,
+                        "Backend rejected login"
+                    );
+                }
+            }
+            SetupFailure::Unreachable => {
+                if let Some(count) = self.unreachable.record() {
+                    tracing::warn!(
+                        event = "backend_unreachable",
+                        backend,
+                        host,
+                        port,
+                        count,
+                        error = %error,
+                        "Backend unreachable"
+                    );
+                }
+            }
+            SetupFailure::Misconfigured => {
+                if let Some(count) = self.misconfigured.record() {
+                    tracing::error!(
+                        event = "backend_misconfigured",
+                        backend,
+                        host,
+                        port,
+                        count,
+                        error = %error,
+                        "Backend session cannot be set up as configured"
+                    );
+                }
+            }
+        }
+    }
+
+    fn gates(&self) -> [(&crate::logging::EventGate, &'static str); 7] {
+        [
+            (&self.login_refused, "backend_login_refused_cleared"),
+            (&self.connection_limit, "backend_connection_limit_cleared"),
+            (&self.unavailable, "backend_unavailable_cleared"),
+            (
+                &self.reader_mode_refused,
+                "backend_reader_mode_refused_cleared",
+            ),
+            (&self.login_rejected, "backend_login_rejected_cleared"),
+            (&self.unreachable, "backend_unreachable_cleared"),
+            (&self.misconfigured, "backend_misconfigured_cleared"),
+        ]
+    }
+
+    /// A new session connected and logged in: evidence against every
+    /// condition. Only a successful login proves the account is accepted
+    /// again, so this is the only success the login-type conditions see.
+    fn login_succeeded(&self) {
+        for (gate, _) in self.gates() {
+            gate.note_success();
+        }
+    }
+
+    /// Established connections passed a health check: evidence that the
+    /// backend is reachable, but not that a new login would be accepted.
+    fn connections_healthy(&self) {
+        self.unreachable.note_success();
+    }
+
+    /// End every condition that has seen a success since its last failure
+    /// and a full window without failing. Polled by a small task per
+    /// backend, so it runs whether or not the pool has idle connections or
+    /// creates new ones; with nothing open it is one relaxed load per gate.
+    fn settle(&self, backend: &str) {
+        for (gate, event) in self.gates() {
+            if let Some(cleared) = gate.clear_if_recovered() {
+                tracing::info!(
+                    event,
+                    backend,
+                    occurrences = cleared.occurrences,
+                    duration_secs = cleared.duration.as_secs(),
+                    "Backend connection setup failures cleared"
+                );
+            }
+        }
+    }
+}
+
+/// How often each backend checks whether its setup-failure episodes have
+/// recovered. Well under the one-minute quiet window.
+const SETUP_EVENT_SETTLE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Poll [`SetupEvents::settle`] until the manager (and with it the events)
+/// is dropped. Holds only a weak reference so it never keeps a pool alive.
+/// Without a runtime (synchronous construction) episodes settle on the next
+/// successful login instead.
+fn spawn_setup_event_settler(events: &Arc<SetupEvents>, backend: String) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let events = Arc::downgrade(events);
+    runtime.spawn(async move {
+        let mut interval = tokio::time::interval(SETUP_EVENT_SETTLE_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let Some(events) = events.upgrade() else {
+                break;
+            };
+            events.settle(&backend);
+        }
+    });
 }
 
 /// Hand-written so the backend account name and password never reach `Debug`
@@ -444,6 +686,7 @@ impl std::fmt::Debug for TcpManager {
             login_backoff,
             churn,
             address_load,
+            events,
         } = self;
         f.debug_struct("TcpManager")
             .field("host", host)
@@ -461,11 +704,25 @@ impl std::fmt::Debug for TcpManager {
             .field("login_backoff", login_backoff)
             .field("churn", churn)
             .field("address_load", address_load)
+            .field("events", events)
             .finish()
     }
 }
 
 impl TcpManager {
+    /// A health-check cycle found working established connections; see
+    /// [`SetupEvents::connections_healthy`].
+    pub(crate) fn note_healthy_connections(&self) {
+        self.events.connections_healthy();
+    }
+
+    /// Report a setup failure observed outside [`managed::Manager::create`].
+    pub(crate) fn report_setup_failure(&self, error: &ConnectionError) {
+        // `create` was cut off before it could count the attempt.
+        self.churn.note_connect(ConnectOutcome::Failed);
+        self.events.failed(self, error, Duration::ZERO);
+    }
+
     /// Whether login backoff is currently keeping new connections away.
     pub(crate) fn login_backoff_active(&self) -> bool {
         self.login_backoff.is_waiting()
@@ -573,6 +830,8 @@ impl TcpManager {
             Some(_) | None => None,
         };
         let compression = CompressionPolicy::from_raw(options.compress, options.compress_level)?;
+        let events = Arc::new(SetupEvents::default());
+        spawn_setup_event_settler(&events, name.clone());
 
         Ok(Self {
             host,
@@ -590,6 +849,7 @@ impl TcpManager {
             login_backoff: Arc::default(),
             churn: Arc::default(),
             address_load: Arc::default(),
+            events,
         })
     }
 
@@ -1075,34 +1335,22 @@ impl managed::Manager for TcpManager {
             Ok(_) => {
                 self.churn.note_connect(ConnectOutcome::Created);
                 attempt.succeeded();
+                self.events.login_succeeded();
+                self.events.settle(&self.name);
             }
             Err(error) if error.is_login_refusal() => {
                 self.churn.note_connect(ConnectOutcome::LoginRefused);
+                // Zero means a late refusal from before a successful login:
+                // the gate stays open and new connections are not paused.
                 let retry_in = attempt.refused();
-                if retry_in.is_zero() {
-                    // A late refusal from before a successful login: the gate
-                    // stays open, so claiming a pause would mislead.
-                    tracing::warn!(
-                        backend = %self.name,
-                        refusal = ?error.login_refusal(),
-                        error = %error,
-                        "Backend refused login; refusal predates the current schedule, not pausing"
-                    );
-                } else {
-                    tracing::warn!(
-                        backend = %self.name,
-                        refusal = ?error.login_refusal(),
-                        retry_in_secs = retry_in.as_secs(),
-                        error = %error,
-                        "Backend refused login; pausing new connections to it"
-                    );
-                }
+                self.events.failed(self, error, retry_in);
             }
             // A network failure or timeout says nothing about the account;
             // dropping the attempt hands any probe slot to the next caller.
-            Err(_) => {
+            Err(error) => {
                 self.churn.note_connect(ConnectOutcome::Failed);
                 drop(attempt);
+                self.events.failed(self, error, Duration::ZERO);
             }
         }
         result
@@ -1861,6 +2109,7 @@ mod tests {
         let manager = login_manager(addr);
 
         let first = managed::Manager::create(&manager).await;
+        // "502 connection limit ... reached" is a limit refusal.
         assert!(matches!(
             first,
             Err(ConnectionError::ConnectionLimitExceeded { .. })
@@ -1940,6 +2189,337 @@ mod tests {
             let result = managed::Manager::create(&manager).await;
             assert!(matches!(result, Err(ConnectionError::IoError(_))));
         }
+    }
+
+    /// The backend account name and password must never appear in an
+    /// error, a log line at any level, or `Debug` output.
+    #[tokio::test]
+    async fn refused_login_never_exposes_credentials() {
+        const ACCOUNT: &str = "account-name-must-not-leak";
+        const SECRET: &str = "password-must-not-leak";
+        let (output, guard) = crate::logging::test_support::capture_json();
+        let refusals: [fn(usize) -> &'static str; 2] = [
+            |_| "481 authentication rejected\r\n",
+            |_| "482 too many connections\r\n",
+        ];
+        for refusal in refusals {
+            let (addr, _accepted) = spawn_login_server(refusal).await;
+            let manager = TcpManager::new(
+                addr.ip().to_string(),
+                addr.port(),
+                "backend-a".to_string(),
+                TcpManagerOptions {
+                    username: Some(ACCOUNT.to_string()),
+                    password: Some(SECRET.to_string()),
+                    compress: Some(false),
+                    ..TcpManagerOptions::default()
+                },
+            )
+            .unwrap();
+            let error = managed::Manager::create(&manager).await.unwrap_err();
+            for text in [error.to_string(), format!("{error:?}")] {
+                assert!(!text.contains(ACCOUNT) && !text.contains(SECRET), "{text}");
+            }
+        }
+        drop(guard);
+        let logged = output.text();
+        assert!(!logged.is_empty());
+        assert!(
+            !logged.contains(ACCOUNT) && !logged.contains(SECRET),
+            "{logged}"
+        );
+    }
+
+    #[test]
+    fn pool_side_setup_timeouts_count_as_failed_connects() {
+        let manager = login_manager("127.0.0.1:9".parse().unwrap());
+        let timeout = ConnectionError::IoError(io::Error::from(io::ErrorKind::TimedOut));
+        manager.report_setup_failure(&timeout);
+        assert_eq!(manager.churn.snapshot().failed, 1);
+    }
+
+    #[test]
+    fn authinfo_user_and_pass_share_the_481_precedence() {
+        let manager = login_manager("127.0.0.1:9".parse().unwrap());
+        for step in [AuthinfoStep::User, AuthinfoStep::Pass] {
+            let error = manager.authinfo_refusal("481 too many connections", step);
+            assert!(
+                matches!(error, ConnectionError::AuthenticationFailed { .. }),
+                "{step:?}: {error:?}"
+            );
+            assert_eq!(
+                SetupFailure::of(&error),
+                SetupFailure::LoginRefused,
+                "{step:?}"
+            );
+            let limit = manager.authinfo_refusal("502 Too many connections", step);
+            assert!(matches!(
+                limit,
+                ConnectionError::ConnectionLimitExceeded { .. }
+            ));
+        }
+        assert!(matches!(
+            manager.authinfo_refusal("500 what?", AuthinfoStep::User),
+            ConnectionError::UnexpectedAuthResponse { .. }
+        ));
+    }
+
+    #[test]
+    fn setup_failures_are_classified_for_operators() {
+        let backend = || "backend-a".to_string();
+        let response = || "481 rejected".to_string();
+        assert_eq!(
+            SetupFailure::of(&ConnectionError::AuthenticationFailed {
+                backend: backend(),
+                response: response(),
+            }),
+            SetupFailure::LoginRefused
+        );
+        assert_eq!(
+            SetupFailure::of(&ConnectionError::ConnectionLimitExceeded {
+                backend: backend(),
+                response: "482 too many connections".to_string(),
+            }),
+            SetupFailure::ConnectionLimit
+        );
+        assert_eq!(
+            SetupFailure::of(&ConnectionError::PasswordRequired { backend: backend() }),
+            SetupFailure::Misconfigured
+        );
+        assert_eq!(
+            SetupFailure::of(&ConnectionError::IoError(io::Error::from(
+                io::ErrorKind::ConnectionRefused
+            ))),
+            SetupFailure::Unreachable
+        );
+        assert_eq!(
+            SetupFailure::of(&ConnectionError::ReaderModeRefused {
+                backend: backend(),
+                response: "502 reading not permitted".to_string(),
+            }),
+            SetupFailure::ReaderModeRefused
+        );
+        assert_eq!(
+            SetupFailure::of(&ConnectionError::AuthenticationFailed {
+                backend: backend(),
+                response: "502 too many connections".to_string(),
+            }),
+            SetupFailure::ConnectionLimit,
+            "a limit-style refusal must not look like bad credentials"
+        );
+        for (greeting, expected) in [
+            ("400 too many connections", SetupFailure::ConnectionLimit),
+            (
+                "400 service temporarily unavailable",
+                SetupFailure::Unavailable,
+            ),
+            ("502 service unavailable", SetupFailure::Unavailable),
+        ] {
+            assert_eq!(
+                SetupFailure::of(&ConnectionError::InvalidGreeting {
+                    backend: backend(),
+                    greeting: greeting.to_string(),
+                }),
+                expected,
+                "{greeting}"
+            );
+        }
+    }
+
+    /// The pool fills with a successful login inside the quiet window and
+    /// then stays full: no further create or idle connection ever happens,
+    /// yet the periodic settler clears the episode once the window passes.
+    #[tokio::test(start_paused = true)]
+    async fn episode_clears_after_window_when_pool_fills_and_stays_full() {
+        let (output, guard) = crate::logging::test_support::capture_json();
+        let manager = login_manager("127.0.0.1:9".parse().unwrap());
+        let limit = ConnectionError::ConnectionLimitExceeded {
+            backend: "login-backoff".to_string(),
+            response: "482 too many connections".to_string(),
+        };
+        manager.events.failed(&manager, &limit, Duration::ZERO);
+
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        // The create that filled the pool.
+        manager.events.login_succeeded();
+        manager.events.settle(&manager.name);
+        assert!(output.events("backend_connection_limit_cleared").is_empty());
+
+        tokio::time::sleep(Duration::from_secs(80)).await;
+        drop(guard);
+        let cleared = output.events("backend_connection_limit_cleared");
+        assert_eq!(cleared.len(), 1, "{}", output.text());
+        assert_eq!(cleared[0]["occurrences"], 1);
+    }
+
+    /// A fully busy pool has no idle connections, so health checks skip it;
+    /// the connect that succeeded after the failure is enough evidence and
+    /// the settler clears `backend_unreachable` without any health cycle.
+    #[tokio::test(start_paused = true)]
+    async fn unreachable_clears_with_a_fully_busy_pool() {
+        let (output, guard) = crate::logging::test_support::capture_json();
+        let manager = login_manager("127.0.0.1:9".parse().unwrap());
+        let unreachable = ConnectionError::IoError(io::Error::from(io::ErrorKind::TimedOut));
+        manager
+            .events
+            .failed(&manager, &unreachable, Duration::ZERO);
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        manager.events.login_succeeded();
+
+        tokio::time::sleep(Duration::from_secs(80)).await;
+        drop(guard);
+        assert_eq!(
+            output.events("backend_unreachable_cleared").len(),
+            1,
+            "{}",
+            output.text()
+        );
+    }
+
+    /// Health checks passing on established connections clear
+    /// `backend_unreachable` once the window has passed.
+    #[tokio::test(start_paused = true)]
+    async fn unreachable_clears_from_health_checks_without_new_sessions() {
+        let (output, guard) = crate::logging::test_support::capture_json();
+        let manager = login_manager("127.0.0.1:9".parse().unwrap());
+        let unreachable = ConnectionError::IoError(io::Error::from(io::ErrorKind::TimedOut));
+        manager
+            .events
+            .failed(&manager, &unreachable, Duration::ZERO);
+
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        manager.note_healthy_connections();
+        assert!(output.events("backend_unreachable_cleared").is_empty());
+
+        tokio::time::sleep(Duration::from_secs(50)).await;
+        drop(guard);
+        assert_eq!(
+            output.events("backend_unreachable_cleared").len(),
+            1,
+            "{}",
+            output.text()
+        );
+    }
+
+    /// Credentials revoked while the pool is full: established sessions
+    /// keep passing health checks, but nothing proves a new login would be
+    /// accepted, so the refusal must stay open until a login succeeds.
+    #[tokio::test(start_paused = true)]
+    async fn revoked_credentials_with_full_pool_do_not_clear_without_a_login() {
+        let (output, guard) = crate::logging::test_support::capture_json();
+        let manager = login_manager("127.0.0.1:9".parse().unwrap());
+        let refused = ConnectionError::AuthenticationFailed {
+            backend: "login-backoff".to_string(),
+            response: "481 authentication rejected".to_string(),
+        };
+        manager
+            .events
+            .failed(&manager, &refused, Duration::from_secs(5));
+
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            manager.note_healthy_connections();
+        }
+        assert!(
+            output.events("backend_login_refused_cleared").is_empty(),
+            "{}",
+            output.text()
+        );
+
+        manager.events.login_succeeded();
+        manager.events.settle(&manager.name);
+        drop(guard);
+        assert_eq!(output.events("backend_login_refused_cleared").len(), 1);
+    }
+
+    /// Some logins hit the account limit while others succeed: the log must
+    /// stay at one line per window and only report recovery once failures
+    /// have stopped for a full window.
+    #[tokio::test(start_paused = true)]
+    async fn partial_failure_does_not_alternate_failure_and_cleared_lines() {
+        let (output, guard) = crate::logging::test_support::capture_json();
+        let manager = login_manager("127.0.0.1:9".parse().unwrap());
+        let limit = ConnectionError::ConnectionLimitExceeded {
+            backend: "login-backoff".to_string(),
+            response: "482 too many connections".to_string(),
+        };
+
+        // A refusal and a success every 10 s for two minutes.
+        for _ in 0..12 {
+            manager.events.failed(&manager, &limit, Duration::ZERO);
+            manager.events.login_succeeded();
+            manager.events.settle(&manager.name);
+            tokio::time::advance(Duration::from_secs(10)).await;
+        }
+        assert!(output.events("backend_connection_limit_cleared").is_empty());
+
+        tokio::time::advance(Duration::from_secs(60)).await;
+        manager.events.settle(&manager.name);
+        manager.events.settle(&manager.name);
+        drop(guard);
+
+        let failures = output.events("backend_connection_limit");
+        assert_eq!(failures.len(), 2, "{}", output.text());
+        assert_eq!(failures[0]["count"], 1);
+        assert_eq!(failures[1]["count"], 6);
+        let cleared = output.events("backend_connection_limit_cleared");
+        assert_eq!(cleared.len(), 1, "{}", output.text());
+        assert_eq!(cleared[0]["occurrences"], 12);
+    }
+
+    #[tokio::test]
+    async fn refused_login_logs_one_event_and_no_premature_cleared_line() {
+        let (output, guard) = crate::logging::test_support::capture_json();
+        let (addr, _accepted) = spawn_login_server(|n| {
+            if n == 0 {
+                "481 authentication rejected\r\n"
+            } else {
+                "281 welcome\r\n"
+            }
+        })
+        .await;
+        let manager = login_manager(addr);
+
+        assert!(managed::Manager::create(&manager).await.is_err());
+        for _ in 0..3 {
+            let gated = managed::Manager::create(&manager).await;
+            assert!(matches!(gated, Err(ConnectionError::LoginBackoff { .. })));
+        }
+        manager.login_backoff.expire_window();
+        managed::Manager::create(&manager).await.unwrap();
+        managed::Manager::create(&manager).await.unwrap();
+        drop(guard);
+
+        let refused = output.events("backend_login_refused");
+        assert_eq!(refused.len(), 1, "{}", output.text());
+        assert_eq!(refused[0]["level"], "ERROR");
+        assert_eq!(refused[0]["backend"], "login-backoff");
+        assert_eq!(refused[0]["count"], 1);
+        assert!(refused[0]["retry_in_secs"].as_u64().unwrap() > 0);
+
+        // The refusal was moments ago, so the successes do not yet prove
+        // recovery; see the partial-failure test for the cleared line.
+        assert!(output.events("backend_login_refused_cleared").is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_connect_failures_log_one_unreachable_line() {
+        let (output, guard) = crate::logging::test_support::capture_json();
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = closed.local_addr().unwrap();
+        drop(closed);
+        let manager = login_manager(addr);
+
+        for _ in 0..5 {
+            assert!(managed::Manager::create(&manager).await.is_err());
+        }
+        drop(guard);
+
+        let lines = output.events("backend_unreachable");
+        assert_eq!(lines.len(), 1, "{}", output.text());
+        assert_eq!(lines[0]["level"], "WARN");
+        assert_eq!(lines[0]["host"], "127.0.0.1");
+        assert_eq!(lines[0]["count"], 1);
     }
 
     #[tokio::test]

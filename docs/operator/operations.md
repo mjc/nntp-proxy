@@ -27,6 +27,13 @@ Set `NNTP_SERVER_*_STAT_MISSING=1` on backends that correctly return `430` for m
 
 The repository also includes [../../docker-compose.yml](../../docker-compose.yml).
 
+## Logs
+
+Headless mode logs to stdout. Set `[logging] format = "json"` (or
+`NNTP_PROXY_LOG_FORMAT=json`) when a log store should index fields, and alert
+on the `event` field. Colour is used only on a terminal. See
+[logging.md](logging.md).
+
 ## Metrics and state files
 
 Common persisted files:
@@ -68,7 +75,9 @@ nntp-proxy --port 8120
 
 - Check `username` and `password` on the matching `[[servers]]` entry.
 - Test direct connectivity to the backend.
-- Check logs for backend response codes.
+- Look for `event=backend_login_refused` or `event=backend_connection_limit`
+  lines; their `error` field carries the backend's response. See
+  [logging.md](logging.md) for every alertable event.
 
 ### Login refusals and connection limits
 
@@ -76,9 +85,10 @@ When a backend refuses a login (a bad greeting, a failed `AUTHINFO`, a refused
 `MODE READER`, or bad credentials), the proxy stops logging in to it for 5
 seconds, doubling up to 60 seconds while the refusals continue. When a pause
 ends, a single probe login decides whether to resume. Network errors do not
-start a pause. The `Backend refused login` warning carries a `refusal` field:
-`Credentials`, `ConnectionLimit`, `ServiceUnavailable`, `ReaderModeRefused`, or
-`Rejected`, followed by the backend's reply.
+start a pause. Each kind of refusal has its own rate-limited operator event
+(`backend_login_refused`, `backend_connection_limit`, `backend_unavailable`,
+`backend_reader_mode_refused`, `backend_login_rejected`) carrying the backend's
+reply; see [logging.md](logging.md).
 
 A refusal counts as a connection limit when it is a `482`, or when its text
 says so in whole words ("too many [simultaneous] connections", "max conns",

@@ -68,7 +68,9 @@ impl ResponseTransferError {
         cleanup: Result<(), Self>,
     ) -> Self {
         if let Err(cleanup_error) = cleanup {
-            tracing::warn!(
+            // A client that disconnects mid-response causes this; the
+            // connection is retired and nothing needs an operator.
+            tracing::debug!(
                 %write_error,
                 %cleanup_error,
                 "client write failed and the backend response was not preserved"

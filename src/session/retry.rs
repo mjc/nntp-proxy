@@ -39,7 +39,7 @@ macro_rules! retry_once {
             Ok(val) => Ok(val),
             Err(first_error) if ($skip)(&first_error) => Err(first_error),
             Err(first_error) => {
-                tracing::warn!($($key = %$val,)* error = ?first_error, "Backend error, retrying once");
+                tracing::debug!($($key = %$val,)* error = ?first_error, "Backend error, retrying once");
 
                 // Jittered backoff: 1–9ms prevents thundering-herd retries
                 let jitter_ms = {
@@ -52,7 +52,7 @@ macro_rules! retry_once {
                 match $expr {
                     Ok(val) => Ok(val),
                     Err(_retry_error) => {
-                        tracing::warn!($($key = %$val,)* retry_error = ?_retry_error, "Retry also failed");
+                        tracing::warn!($($key = %$val,)* error = ?first_error, retry_error = ?_retry_error, "Backend error, retry also failed");
                         Err(first_error)
                     }
                 }

@@ -16,8 +16,8 @@ pub use loading::{
 };
 pub use types::{
     BackendSelectionStrategy, Cache, ClientAuth, CompressionCodec, Config, DiskCache, HealthCheck,
-    LowerTierStatPrefetch, Memory, MetricsEndpoint, Proxy, QueuePressureLimits, Routing,
-    RoutingArticle, RoutingMode, Server, StatefulSessions, UserCredentials,
+    LogFormat, Logging, LowerTierStatPrefetch, Memory, MetricsEndpoint, Proxy, QueuePressureLimits,
+    Routing, RoutingArticle, RoutingMode, Server, StatefulSessions, UserCredentials,
 };
 pub(crate) use types::{REDACTED, redact};
 

@@ -294,6 +294,14 @@ impl SessionLoopState {
         self.backend_replies.has_pending_backend_replies()
     }
 
+    /// Whether the backend owes a reply before it may close; see
+    /// `BackendResponseOrder::owes_reply_before_quit`.
+    #[inline]
+    #[must_use]
+    pub fn backend_owes_reply(&self) -> bool {
+        self.backend_replies.owes_reply_before_quit()
+    }
+
     /// Return client writes made ready by a backend read.
     ///
     /// This preserves client-visible response ordering even when one read

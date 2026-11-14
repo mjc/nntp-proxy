@@ -2,7 +2,7 @@
 //!
 //! Provides shared argument structures and value enums for CLI parsing.
 
-use crate::config::{BackendSelectionStrategy, Config, RoutingMode};
+use crate::config::{BackendSelectionStrategy, Config, LogFormat, RoutingMode};
 use crate::types::{CacheCapacity, ConfigPath, Port, ThreadCount};
 use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
@@ -161,6 +161,16 @@ pub struct CommonArgs {
         help_heading = "Monitoring"
     )]
     pub metrics_listen: Option<SocketAddr>,
+
+    /// Headless stdout log format (overrides `[logging] format`)
+    #[arg(
+        long = "log-format",
+        value_enum,
+        value_name = "FORMAT",
+        env = "NNTP_PROXY_LOG_FORMAT",
+        help_heading = "General"
+    )]
+    pub log_format: Option<LogFormat>,
 }
 
 impl CommonArgs {
@@ -283,6 +293,9 @@ impl CommonArgs {
         }
         if let Some(rm) = self.routing_mode {
             config.routing.routing_mode = rm;
+        }
+        if let Some(format) = self.log_format {
+            config.logging.format = format;
         }
 
         let article_cache_capacity = self
@@ -719,7 +732,22 @@ mod tests {
             store_article_bodies: None,
             threads: None,
             metrics_listen: None,
+            log_format: None,
         }
+    }
+
+    #[test]
+    fn test_log_format_flag_overrides_config() {
+        let args = CommonArgs::try_parse_from(["nntp-proxy", "--log-format", "json"]).unwrap();
+        assert_eq!(args.log_format, Some(LogFormat::Json));
+
+        let mut config = Config::default();
+        assert_eq!(config.logging.format, LogFormat::Text);
+        args.apply_overrides(&mut config);
+        assert_eq!(config.logging.format, LogFormat::Json);
+
+        default_args().apply_overrides(&mut config);
+        assert_eq!(config.logging.format, LogFormat::Json);
     }
 
     #[test]

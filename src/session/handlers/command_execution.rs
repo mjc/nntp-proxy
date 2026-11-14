@@ -449,7 +449,9 @@ impl ClientSession {
         match crate::pool::health_check::check_tcp_alive(guard.health_check_stream_mut()) {
             Ok(()) => true,
             Err(err) => {
-                warn!(
+                // Backends close idle sockets on their own schedule; finding
+                // one closed before reuse is expected and handled here.
+                debug!(
                     client = %self.client_addr,
                     backend = backend_id.as_index(),
                     command_verb = ?request.verb(),
@@ -1485,7 +1487,9 @@ impl ClientSession {
                 let ResponseConnectionReuse::QueuedBytes { len } = reuse else {
                     unreachable!("dirty backend fate requires queued bytes");
                 };
-                warn!(
+                // The client write failed (usually a disconnect); retiring
+                // the connection is the normal cleanup.
+                debug!(
                     client = %self.client_addr,
                     backend = backend_id.as_index(),
                     command_verb = ?request.verb(),

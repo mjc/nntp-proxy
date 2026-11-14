@@ -156,7 +156,8 @@ on restart:
 | Field | Meaning |
 | --- | --- |
 | `backlog_skips` | Checkouts that skipped the backend because its queue was too long |
-| `busy_timeouts` | Checkouts that waited their whole limit without a connection |
+| `busy_timeouts` | Bounded routing checkouts that waited their whole limit without a connection |
+| `pool_wait_timeouts` | Checkouts without their own limit (stateful sessions, background work) that waited the pool's whole default wait; not counted in `busy_timeouts` |
 | `deadline_expiries` | Client requests whose `[routing.article].deadline_ms` ran out with this backend next |
 | `service_time_ewma_micros` | Running average of how long one command holds a connection (`0` before the first command) |
 | `last_resort_waits` | Checkouts that queued on this backend anyway because every other backend left for the request had been skipped as backlogged (`backlog_last_resort = "wait-shortest"`) |

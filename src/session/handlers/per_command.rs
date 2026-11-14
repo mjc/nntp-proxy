@@ -21,7 +21,7 @@ use smallvec::SmallVec;
 use std::sync::Arc;
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tracing::{debug, warn};
+use tracing::debug;
 
 use crate::command::{AuthAction, AuthenticationAccess, CommandHandler, CommandPlan};
 use crate::constants::buffer::READER_CAPACITY;
@@ -652,12 +652,7 @@ impl ClientSession {
             }
             Err(e) => {
                 if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
-                    connection::log_client_error(
-                        self.client_addr,
-                        self.username(),
-                        io_err,
-                        metrics,
-                    );
+                    connection::log_client_error(self.client_addr, io_err, metrics);
                 } else {
                     debug!("Client {} read error: {}", self.client_addr, e);
                 }
@@ -699,7 +694,7 @@ impl ClientSession {
         client_writer: &mut crate::session::ClientWriter,
     ) -> Result<Option<BatchLoopAction>, SessionError> {
         if batch.is_first_oversized() {
-            warn!(
+            debug!(
                 "Client {} sent oversized first command, rejecting with 501",
                 self.client_addr
             );
@@ -711,7 +706,7 @@ impl ClientSession {
             return Ok(Some(BatchLoopAction::Continue));
         }
         if batch.is_first_invalid() {
-            warn!(
+            debug!(
                 "Client {} sent invalid first command, rejecting with 501",
                 self.client_addr
             );
@@ -1462,7 +1457,7 @@ impl ClientSession {
         backend_connection: &mut BatchBackendConnection,
     ) -> Result<BatchLoopAction, SessionError> {
         if batch.is_trailing_oversized() {
-            warn!(
+            debug!(
                 "Client {} sent oversized command ({} bytes), rejecting",
                 self.client_addr,
                 batch.trailing_wire_len()
@@ -1475,7 +1470,7 @@ impl ClientSession {
             return Ok(BatchLoopAction::Continue);
         }
         if batch.is_trailing_invalid() {
-            warn!(
+            debug!(
                 "Client {} sent invalid trailing command, rejecting",
                 self.client_addr
             );

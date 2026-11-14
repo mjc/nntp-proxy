@@ -274,10 +274,8 @@ impl ClientSession {
                 Ok(metrics)
             }
             Err(error) => {
-                let disposition = error.disposition();
-                let source = error.into_source();
-                backend.finalize(disposition);
-                Err(crate::session::SessionError::from(source))
+                backend.finalize(error.disposition());
+                Err(error.into_session_error())
             }
         }
     }

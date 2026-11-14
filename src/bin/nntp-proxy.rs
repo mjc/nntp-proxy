@@ -29,7 +29,13 @@ fn main() -> Result<()> {
         && let Some(connect_addr) = args.common.tui_attach
     {
         let file_level = nntp_proxy::Config::default().proxy.log_file_level;
-        let _ = nntp_proxy::logging::init_logging(UiMode::Tui, &file_level, false, false);
+        let _ = nntp_proxy::logging::init_logging(
+            UiMode::Tui,
+            &file_level,
+            nntp_proxy::config::LogFormat::Text,
+            false,
+            false,
+        );
         let threads = args.common.threads;
         return RuntimeConfig::from_args(threads)
             .build_runtime()?
@@ -72,6 +78,7 @@ fn main() -> Result<()> {
     let log_buffer = nntp_proxy::logging::init_logging(
         ui_mode,
         &config.proxy.log_file_level,
+        config.logging.format,
         capture_in_memory_logs,
         write_debug_log,
     );
@@ -96,6 +103,7 @@ async fn run_proxy(
         .response_write_metrics_secs
         .filter(|secs| *secs > 0)
         .map(Duration::from_secs);
+    let backend_summary_interval_secs = config.logging.backend_summary_interval_secs;
     args.common
         .validate_dashboard_listen(&launch.host, launch.port)?;
     let metrics_listen = config.metrics.map(|endpoint| endpoint.listen);
@@ -125,6 +133,7 @@ async fn run_proxy(
     runtime::spawn_idle_connection_clearer(&proxy);
     runtime::spawn_response_write_metrics_logger(response_write_metrics_period);
     runtime::spawn_tokio_runtime_metrics_logger();
+    runtime::spawn_backend_summary_logger(&proxy, backend_summary_interval_secs);
 
     let (dashboard_handle, dashboard_shutdown_tx) =
         launch_dashboard_publisher(args.common.tui_listen, &proxy, log_buffer.clone()).await?;
@@ -460,6 +469,7 @@ mod tests {
             store_article_bodies: None,
             threads: None,
             metrics_listen: None,
+            log_format: None,
         }
     }
 

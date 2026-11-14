@@ -154,7 +154,7 @@ impl MetricsCollector {
         }
         let pruned = self.inner.store.prune_user_metrics();
         if pruned > 0 {
-            tracing::warn!(
+            tracing::info!(
                 pruned,
                 retained_users = self.inner.store.user_metrics.len(),
                 "Pruned inactive user metrics after new user insertion"
@@ -178,7 +178,7 @@ impl MetricsCollector {
     pub fn with_store(store: MetricsStore) -> Self {
         let pruned = store.prune_user_metrics();
         if pruned > 0 {
-            tracing::warn!(
+            tracing::info!(
                 pruned,
                 retained_users = store.user_metrics.len(),
                 "Pruned restored user metrics before building collector"
@@ -707,14 +707,25 @@ impl MetricsCollector {
     #[must_use]
     pub fn backend_counters(&self, backend_id: BackendId) -> Option<BackendCounters> {
         let store = self.inner.store.backend_stores.get(backend_id.as_index())?;
+        // A 430 increments errors_4xx and errors first, then article_missing
+        // with Release (see `add_article_missing`). Loading article_missing
+        // with Acquire before the error counts guarantees, within this one
+        // snapshot, that errors >= article_missing. Between two snapshots a
+        // 430 counted in the errors of one can still show up in the
+        // article_missing of the next, so per-interval deltas may shift by
+        // one; the summary's saturating subtraction absorbs that.
+        let article_missing = store.article_missing.load(Ordering::Acquire);
+        let errors_4xx = store.errors_4xx.load(Ordering::Relaxed);
+        let errors_5xx = store.errors_5xx.load(Ordering::Relaxed);
+        let errors = store.errors.load(Ordering::Relaxed);
         Some(BackendCounters {
             commands: store.total_commands.load(Ordering::Relaxed),
             bytes_to_backend: store.bytes_sent.load(Ordering::Relaxed),
             bytes_from_backend: store.bytes_received.load(Ordering::Relaxed),
-            errors: store.errors.load(Ordering::Relaxed),
-            errors_4xx: store.errors_4xx.load(Ordering::Relaxed),
-            errors_5xx: store.errors_5xx.load(Ordering::Relaxed),
-            article_missing: store.article_missing.load(Ordering::Relaxed),
+            errors,
+            errors_4xx,
+            errors_5xx,
+            article_missing,
             articles: store.article_count.load(Ordering::Relaxed),
             article_bytes: store.article_bytes_total.load(Ordering::Relaxed),
             error_reply_failovers: store.error_reply_failovers.load(Ordering::Relaxed),
@@ -743,8 +754,11 @@ impl MetricsCollector {
 /// every path that counts one comes through here and the rule lives once.
 #[inline]
 fn add_article_missing(store: &BackendStore, count: u64) {
-    store.article_missing.fetch_add(count, Ordering::Relaxed);
     add_error_4xx(store, count);
+    // Release after the error counts: a reader that loads article_missing
+    // with Acquire then sees every error increment for the 430s it counts
+    // (see `backend_counters`).
+    store.article_missing.fetch_add(count, Ordering::Release);
 }
 
 /// Add 4xx error replies; each is also counted in the error total.

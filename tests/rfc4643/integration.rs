@@ -203,6 +203,7 @@ fn test_config_auth_round_trip() {
         memory: Default::default(),
         health_check: HealthCheck::default(),
         cache: None,
+        logging: Default::default(),
         client_auth: ClientAuth {
             users: vec![UserCredentials {
                 username: "testuser".to_string(),

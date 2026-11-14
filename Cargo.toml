@@ -51,7 +51,7 @@ clap = { version = "4.6", features = ["derive", "env", "std", "help"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 toml = "1.2"
 tracing = { version = "0.1", features = ["std"], default-features = false }
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std", "registry", "ansi"], default-features = false }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std", "registry", "ansi", "json"], default-features = false }
 tracing-appender = "0.2"
 anyhow = "1.0"
 thiserror = "2.0"

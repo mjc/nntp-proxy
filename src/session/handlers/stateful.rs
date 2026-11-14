@@ -12,7 +12,7 @@ use crate::types::TransferMetrics;
 use anyhow::Result;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tracing::{debug, error, warn};
+use tracing::debug;
 
 use crate::constants::buffer::READER_CAPACITY;
 
@@ -22,6 +22,15 @@ const MAX_UPSTREAM_PIPELINE_DEPTH: usize = 16;
 pub(in crate::session) enum StatefulConnectionDisposition {
     RetireClient,
     RetireBackend,
+}
+
+/// Classify a clean backend close (EOF). A close while a reply is still
+/// owed failed just like a reset and is a backend error; a close between
+/// replies, or at or after `QUIT`, is a normal disconnect.
+fn backend_eof_error(state: &crate::session::state::SessionLoopState) -> Option<anyhow::Error> {
+    state
+        .backend_owes_reply()
+        .then(|| anyhow::anyhow!("backend closed the connection mid-response"))
 }
 
 #[must_use]
@@ -55,8 +64,20 @@ impl StatefulLoopError {
         self.disposition
     }
 
-    pub(in crate::session) fn into_source(self) -> anyhow::Error {
-        self.source
+    /// The session error, keeping the side the failure came from.
+    ///
+    /// The generic `anyhow` conversion decides by error kind: a reset or
+    /// broken pipe becomes a client disconnect, anything else a backend
+    /// error. In a stateful loop the side is known instead. A backend-side
+    /// failure (reset, clean close mid-response, any I/O error) is a backend
+    /// error; a client-side failure (reset, timeout, invalid data) is the
+    /// client's and is never blamed on the backend.
+    pub(in crate::session) fn into_session_error(self) -> crate::session::SessionError {
+        use crate::session::SessionError;
+        match self.disposition {
+            StatefulConnectionDisposition::RetireBackend => SessionError::Backend(self.source),
+            StatefulConnectionDisposition::RetireClient => SessionError::client_side(self.source),
+        }
     }
 }
 
@@ -102,7 +123,6 @@ enum StatefulSessionExit {
     ClientDisconnected,
     ClientReadError,
     BackendDisconnected,
-    BackendReadError,
 }
 
 impl StatefulSessionExit {
@@ -111,9 +131,9 @@ impl StatefulSessionExit {
             Self::ClientDisconnected | Self::ClientReadError => {
                 StatefulConnectionDisposition::RetireClient
             }
-            Self::BackendDisconnected | Self::BackendReadError => {
-                StatefulConnectionDisposition::RetireBackend
-            }
+            // A backend read error is not an exit: it ends the loop as a
+            // backend `StatefulLoopError`.
+            Self::BackendDisconnected => StatefulConnectionDisposition::RetireBackend,
         }
     }
 }
@@ -439,7 +459,8 @@ impl ClientSession {
                     // Expected on every checkout until the backoff window closes.
                     debug!(server = server_name, client = %self.client_addr, error = %e, "Backend in login backoff");
                 } else {
-                    error!(server = server_name, client = %self.client_addr, error = %e, "Failed to get pooled connection");
+                    // The pool already logged why the checkout failed.
+                    debug!(server = server_name, client = %self.client_addr, error = %e, "Failed to get pooled connection");
                 }
                 client_stream
                     .write_all(BACKEND_UNAVAILABLE)
@@ -479,13 +500,11 @@ impl ClientSession {
                 Ok(metrics)
             }
             Err(error) => {
-                let disposition = error.disposition();
-                let source = error.into_source();
-                match disposition {
+                match error.disposition() {
                     StatefulConnectionDisposition::RetireClient => conn_guard.fail_client(),
                     StatefulConnectionDisposition::RetireBackend => conn_guard.fail_backend(),
                 }
-                Err(crate::session::SessionError::from(source))
+                Err(error.into_session_error())
             }
         }
     }
@@ -601,10 +620,17 @@ impl ClientSession {
                         .await?;
                         continue;
                     }
-                    Ok(None) => return Ok(StatefulSessionExit::BackendDisconnected),
+                    Ok(None) => {
+                        if let Some(error) = backend_eof_error(state) {
+                            return Err(StatefulLoopError::backend(error));
+                        }
+                        return Ok(StatefulSessionExit::BackendDisconnected);
+                    }
                     Err(e) => {
-                        warn!(client = %self.client_addr, error = %e, "Backend read error");
-                        return Ok(StatefulSessionExit::BackendReadError);
+                        debug!(client = %self.client_addr, error = %e, "Backend read error");
+                        // A backend reset mid-transfer is a backend error, not a
+                        // client disconnect; the caller still flushes metrics.
+                        return Err(StatefulLoopError::backend(e));
                     }
                 }
             }
@@ -681,7 +707,7 @@ impl ClientSession {
                             }
                         }
                         Err(e) => {
-                            warn!(client = %self.client_addr, error = %e, "Client read error");
+                            debug!(client = %self.client_addr, error = %e, "Client read error");
                             return Ok(StatefulSessionExit::ClientReadError);
                         }
                     }
@@ -702,10 +728,17 @@ impl ClientSession {
                             )
                             .await?;
                         }
-                        Ok(None) => return Ok(StatefulSessionExit::BackendDisconnected),
+                        Ok(None) => {
+                            if let Some(error) = backend_eof_error(state) {
+                                return Err(StatefulLoopError::backend(error));
+                            }
+                            return Ok(StatefulSessionExit::BackendDisconnected);
+                        }
                         Err(e) => {
-                            warn!(client = %self.client_addr, error = %e, "Backend read error");
-                            return Ok(StatefulSessionExit::BackendReadError);
+                            debug!(client = %self.client_addr, error = %e, "Backend read error");
+                            // A backend reset mid-transfer is a backend error, not a
+                            // client disconnect; the caller still flushes metrics.
+                            return Err(StatefulLoopError::backend(e));
                         }
                     }
                 }
@@ -952,6 +985,34 @@ mod tests {
                     .expect("gated multiline property stalled");
                 });
             }
+        }
+    }
+
+    #[test]
+    fn loop_errors_keep_the_side_they_came_from() {
+        use crate::session::SessionError;
+        let reset =
+            || anyhow::Error::from(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+        assert!(matches!(
+            super::StatefulLoopError::backend(reset()).into_session_error(),
+            SessionError::Backend(_)
+        ));
+        assert!(matches!(
+            super::StatefulLoopError::client(reset()).into_session_error(),
+            SessionError::ClientDisconnect(_)
+        ));
+        for kind in [
+            std::io::ErrorKind::TimedOut,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            let error = anyhow::Error::from(std::io::Error::from(kind));
+            assert!(
+                matches!(
+                    super::StatefulLoopError::client(error).into_session_error(),
+                    SessionError::ClientDisconnect(_)
+                ),
+                "a client-side {kind:?} is not a backend error"
+            );
         }
     }
 

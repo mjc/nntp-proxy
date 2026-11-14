@@ -88,6 +88,10 @@ pub(crate) struct PersistedAdmission {
     backlog_skips: u64,
     /// Bounded checkouts that waited their whole limit without a connection.
     busy_timeouts: u64,
+    /// Checkouts without their own limit that waited the pool's whole
+    /// default wait. Not counted in `busy_timeouts`.
+    #[serde(default)]
+    pool_wait_timeouts: u64,
     /// Client requests whose deadline ran out with this backend next.
     deadline_expiries: u64,
     /// Average time one command holds a connection, in microseconds (0 = no
@@ -117,6 +121,7 @@ impl From<crate::pool::admission::BackendLoadSnapshot> for PersistedAdmission {
         Self {
             backlog_skips: snapshot.backlog_skips,
             busy_timeouts: snapshot.busy_timeouts,
+            pool_wait_timeouts: snapshot.pool_wait_timeouts,
             deadline_expiries: snapshot.deadline_expiries,
             service_time_ewma_micros: snapshot.service_time_ewma_micros,
             last_resort_waits: snapshot.last_resort_waits,
@@ -496,7 +501,7 @@ impl MetricsStore {
 
         let pruned_users = store.prune_user_metrics();
         if pruned_users > 0 {
-            tracing::warn!(
+            tracing::info!(
                 pruned_users,
                 retained_users = store.user_metrics.len(),
                 limit = MAX_RETAINED_USER_METRICS,

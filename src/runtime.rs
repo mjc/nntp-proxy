@@ -115,9 +115,19 @@ impl Default for RuntimeConfig {
     }
 }
 
+/// Set once the first pinning failure is reported.
+///
+/// Every runtime thread, blocking-pool threads included, runs the pinning
+/// hook, so one cause (a restrictive cgroup, say) would otherwise warn once
+/// per thread.
+#[cfg(target_os = "linux")]
+static PIN_FAILURE_REPORTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Pin the current thread to one CPU core for more stable scheduler locality.
 ///
 /// This is a best-effort operation - failures are logged but not fatal.
+/// Success is logged per thread only at debug; the caller logs one summary.
 ///
 /// # Arguments
 /// * `core` - CPU core ID to pin the current thread to
@@ -129,12 +139,18 @@ fn pin_current_thread_to_cpu(core: usize) {
 
     match sched_setaffinity(Some(gettid()), &cpu_set) {
         Ok(()) => {
-            tracing::info!("Successfully pinned thread to CPU core {core}");
+            tracing::debug!(core, "Pinned thread to CPU core");
         }
         Err(e) => {
-            tracing::warn!(
-                "Failed to pin thread to CPU core {core}: {e}, continuing without pinning"
-            );
+            if PIN_FAILURE_REPORTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                tracing::debug!(core, error = %e, "Failed to pin thread to CPU core");
+            } else {
+                tracing::warn!(
+                    core,
+                    error = %e,
+                    "Failed to pin thread to CPU core, continuing without pinning; later failures are logged at debug"
+                );
+            }
         }
     }
 }
@@ -149,6 +165,7 @@ fn build_single_cpu_affinity_set(core: usize) -> rustix::thread::CpuSet {
 #[cfg(target_os = "linux")]
 fn pin_current_thread_to_first_available_cpu(requested_cores: usize) {
     let cores = available_cpu_cores(requested_cores);
+    tracing::info!(core = cores[0], "Pinning the runtime thread to a CPU core");
     pin_current_thread_to_cpu(cores[0]);
 }
 
@@ -160,6 +177,11 @@ fn configure_worker_cpu_pinning(builder: &mut tokio::runtime::Builder, worker_th
     };
 
     let cores = Arc::new(available_cpu_cores(worker_threads));
+    tracing::info!(
+        worker_threads,
+        cores = ?cores,
+        "Pinning runtime threads to CPU cores round-robin"
+    );
     let next_worker = Arc::new(AtomicUsize::new(0));
 
     builder.on_thread_start({
@@ -643,7 +665,11 @@ pub fn spawn_tokio_runtime_metrics_logger() {
 #[cfg(not(tokio_unstable))]
 pub fn spawn_tokio_runtime_metrics_logger() {
     if std::env::var_os("NNTP_PROXY_TOKIO_RUNTIME_METRICS_SECS").is_some() {
-        tracing::warn!("NNTP_PROXY_TOKIO_RUNTIME_METRICS_SECS requires a tokio_unstable build");
+        tracing::warn!(
+            event = "config_setting_inactive",
+            setting = "NNTP_PROXY_TOKIO_RUNTIME_METRICS_SECS",
+            "Setting has no effect: it requires a tokio_unstable build"
+        );
     }
 }
 
@@ -695,22 +721,216 @@ fn remember_first_persistence_error(slot: &mut Option<anyhow::Error>, error: any
     }
 }
 
+/// Counters for one backend over one summary interval.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BackendSummary {
+    commands: u64,
+    articles: u64,
+    /// Authoritative `430` (article missing) replies, from the dedicated
+    /// per-backend counter.
+    missing: u64,
+    /// `missing` as a share of commands, in percent with one decimal.
+    missing_pct: f64,
+    /// Errors other than `430`s: other 4xx, 5xx, and failed exchanges.
+    errors: u64,
+    rx_bytes_per_sec: u64,
+}
+
+impl BackendSummary {
+    fn between(
+        previous: &crate::metrics::BackendCounters,
+        current: &crate::metrics::BackendCounters,
+        elapsed: Duration,
+    ) -> Self {
+        let delta = |pick: fn(&crate::metrics::BackendCounters) -> u64| {
+            pick(current).saturating_sub(pick(previous))
+        };
+        let commands = delta(|c| c.commands);
+        let missing = delta(|c| c.article_missing);
+        // Every 430 is also counted as an error; report the rest.
+        let errors = delta(|c| c.errors).saturating_sub(missing);
+        let rx_bytes = delta(|c| c.bytes_from_backend);
+        let missing_pct = if commands == 0 {
+            0.0
+        } else {
+            // Clamped defensively: every 430 is also a counted command, but a
+            // share above 100 % would be nonsense if a path ever missed one.
+            ((missing as f64 * 1000.0 / commands as f64).round() / 10.0).min(100.0)
+        };
+        Self {
+            commands,
+            articles: delta(|c| c.articles),
+            missing,
+            missing_pct,
+            errors,
+            rx_bytes_per_sec: rx_bytes.checked_div(elapsed.as_secs()).unwrap_or(rx_bytes),
+        }
+    }
+}
+
+/// Each backend's cumulative counters, in server order. Reads only the
+/// backend stores, unlike a full metrics snapshot, which clones every user.
+fn backend_counters(
+    metrics: &crate::metrics::MetricsCollector,
+) -> Vec<crate::metrics::BackendCounters> {
+    (0..metrics.num_backends())
+        .map(|index| {
+            metrics
+                .backend_counters(crate::types::BackendId::from_index(index))
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn log_backend_summaries(
+    names: &[String],
+    previous: &[crate::metrics::BackendCounters],
+    current: &[crate::metrics::BackendCounters],
+    elapsed: Duration,
+) {
+    for ((name, previous), current) in names.iter().zip(previous).zip(current) {
+        let summary = BackendSummary::between(previous, current, elapsed);
+        tracing::info!(
+            event = "backend_summary",
+            backend = %name,
+            interval_secs = elapsed.as_secs(),
+            commands = summary.commands,
+            articles = summary.articles,
+            missing = summary.missing,
+            missing_pct = summary.missing_pct,
+            errors = summary.errors,
+            rx_bytes_per_sec = summary.rx_bytes_per_sec,
+            "Backend summary"
+        );
+    }
+}
+
+/// Spawn the optional periodic per-backend summary.
+///
+/// Reads the lock-free counters the proxy already keeps and logs their
+/// change since the previous summary, so it adds no work to request paths.
+///
+/// Backend names are the same de-duplicated names the metrics labels use.
+pub fn spawn_backend_summary_logger(proxy: &std::sync::Arc<crate::NntpProxy>, interval_secs: u64) {
+    if interval_secs == 0 {
+        return;
+    }
+    let period = Duration::from_secs(interval_secs);
+    // Config validation caps the interval; this guards direct callers.
+    let Some(first_tick) = tokio::time::Instant::now().checked_add(period) else {
+        tracing::warn!(
+            interval_secs,
+            "Backend summary interval is too large; summaries disabled"
+        );
+        return;
+    };
+    let metrics = proxy.metrics().clone();
+    let server_names = crate::metrics::prometheus::source::unique_backend_names(proxy.servers());
+    tokio::spawn(async move {
+        let mut previous = backend_counters(&metrics);
+        let mut interval = tokio::time::interval_at(first_tick, period);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last = tokio::time::Instant::now();
+        loop {
+            interval.tick().await;
+            let now = tokio::time::Instant::now();
+            let current = backend_counters(&metrics);
+            log_backend_summaries(&server_names, &previous, &current, now - last);
+            previous = current;
+            last = now;
+        }
+    });
+}
+
+/// Runtime state written to disk, named for operator events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PersistedFile {
+    Stats,
+    AvailabilityIndex,
+}
+
+impl PersistedFile {
+    const fn failed_event(self) -> &'static str {
+        match self {
+            Self::Stats => "stats_persist_failed",
+            Self::AvailabilityIndex => "availability_persist_failed",
+        }
+    }
+
+    const fn cleared_event(self) -> &'static str {
+        match self {
+            Self::Stats => "stats_persist_failed_cleared",
+            Self::AvailabilityIndex => "availability_persist_failed_cleared",
+        }
+    }
+}
+
+/// Flatten a blocking save's join result into the save's own error.
+fn save_outcome<T>(result: Result<Result<T>, tokio::task::JoinError>) -> Result<T> {
+    result.map_err(anyhow::Error::from)?
+}
+
+/// A failed write loses state on restart, which an operator must fix (disk
+/// full, permissions), so failures are errors. The periodic saver retries
+/// every 30 seconds; `gate` keeps a persistent failure to about one line a
+/// minute with a count and logs once when saving works again.
+fn report_periodic_save<T>(
+    file: PersistedFile,
+    path: &std::path::Path,
+    gate: &crate::logging::EventGate,
+    result: Result<Result<T>, tokio::task::JoinError>,
+) {
+    match save_outcome(result) {
+        Ok(_) => {
+            if let Some(cleared) = gate.clear() {
+                tracing::info!(
+                    event = file.cleared_event(),
+                    path = %path.display(),
+                    failures = cleared.occurrences,
+                    duration_secs = cleared.duration.as_secs(),
+                    "Persisted state saved again"
+                );
+            }
+        }
+        Err(error) => {
+            if let Some(count) = gate.record() {
+                tracing::error!(
+                    event = file.failed_event(),
+                    path = %path.display(),
+                    count,
+                    error = %error,
+                    "Failed to save persisted state"
+                );
+            }
+        }
+    }
+}
+
+fn report_shutdown_save_failure(
+    file: PersistedFile,
+    path: &std::path::Path,
+    first_error: &mut Option<anyhow::Error>,
+    error: anyhow::Error,
+) {
+    tracing::error!(
+        event = file.failed_event(),
+        path = %path.display(),
+        count = 1_u64,
+        error = %error,
+        "Failed to save persisted state on shutdown"
+    );
+    remember_first_persistence_error(first_error, error);
+}
+
 fn handle_shutdown_metrics_save_result(
     first_error: &mut Option<anyhow::Error>,
     stats_path: &std::path::Path,
     result: Result<Result<()>, tokio::task::JoinError>,
 ) {
-    use tracing::{info, warn};
-
-    match result {
-        Ok(Ok(())) => info!("Metrics saved to {}", stats_path.display()),
-        Ok(Err(e)) => {
-            warn!("Failed to save metrics on shutdown: {}", e);
-            remember_first_persistence_error(first_error, e);
-        }
-        Err(e) => {
-            warn!("Failed to join metrics save task on shutdown: {}", e);
-            remember_first_persistence_error(first_error, e.into());
+    match save_outcome(result) {
+        Ok(()) => tracing::info!("Metrics saved to {}", stats_path.display()),
+        Err(error) => {
+            report_shutdown_save_failure(PersistedFile::Stats, stats_path, first_error, error);
         }
     }
 }
@@ -720,55 +940,17 @@ fn handle_shutdown_availability_save_result(
     availability_path: &std::path::Path,
     result: Result<Result<bool>, tokio::task::JoinError>,
 ) {
-    use tracing::{info, warn};
-
-    match result {
-        Ok(Ok(true)) => info!(
+    match save_outcome(result) {
+        Ok(true) => tracing::info!(
             "Availability index saved to {}",
             availability_path.display()
         ),
-        Ok(Ok(false)) => {}
-        Ok(Err(e)) => {
-            warn!("Failed to save availability index on shutdown: {}", e);
-            remember_first_persistence_error(first_error, e);
-        }
-        Err(e) => {
-            warn!("Failed to join availability save task on shutdown: {}", e);
-            remember_first_persistence_error(first_error, e.into());
-        }
-    }
-}
-
-fn handle_periodic_metrics_save_result(
-    stats_path: &std::path::Path,
-    result: Result<Result<()>, tokio::task::JoinError>,
-) {
-    use tracing::warn;
-
-    match result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => warn!("Failed to save metrics to {}: {}", stats_path.display(), e),
-        Err(e) => warn!("Failed to save metrics to {}: {}", stats_path.display(), e),
-    }
-}
-
-fn handle_periodic_availability_save_result(
-    availability_path: &std::path::Path,
-    result: Result<Result<bool>, tokio::task::JoinError>,
-) {
-    use tracing::warn;
-
-    match result {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => warn!(
-            "Failed to save availability index to {}: {}",
-            availability_path.display(),
-            e
-        ),
-        Err(e) => warn!(
-            "Failed to save availability index to {}: {}",
-            availability_path.display(),
-            e
+        Ok(false) => {}
+        Err(error) => report_shutdown_save_failure(
+            PersistedFile::AvailabilityIndex,
+            availability_path,
+            first_error,
+            error,
         ),
     }
 }
@@ -831,7 +1013,7 @@ pub async fn run_accept_loop(
     mut shutdown_rx: tokio::sync::mpsc::Receiver<()>,
     routing_mode: crate::RoutingMode,
 ) -> Result<()> {
-    use tracing::{error, info};
+    use tracing::{error, info, warn};
 
     let uses_per_command = routing_mode.supports_per_command_routing();
     let mut client_tasks = tokio::task::JoinSet::new();
@@ -857,20 +1039,14 @@ pub async fn run_accept_loop(
                 let (stream, addr) = accept_result?;
                 let proxy = proxy.clone();
 
+                // The public handlers log a backend error once with its
+                // session id and backend; a client disconnect is normal.
                 let client_task = async move {
-                    let result = if uses_per_command {
+                    let _ = if uses_per_command {
                         proxy.handle_client_per_command_routing(stream, addr.into()).await
                     } else {
                         proxy.handle_client(stream, addr.into()).await
                     };
-
-                    match result {
-                        // Normal completion or client disconnect — no action needed
-                        Ok(()) | Err(crate::session::SessionError::ClientDisconnect(_)) => {}
-                        Err(crate::session::SessionError::Backend(e)) => {
-                            error!("Error handling client {}: {:?}", addr, e);
-                        }
-                    }
                 };
 
                 client_tasks.spawn(client_task);
@@ -884,7 +1060,7 @@ pub async fn run_accept_loop(
     while !client_tasks.is_empty() {
         let now = tokio::time::Instant::now();
         if now >= drain_deadline {
-            error!(
+            warn!(
                 remaining_tasks = client_tasks.len(),
                 "Timed out waiting for client tasks to drain during shutdown"
             );
@@ -902,7 +1078,7 @@ pub async fn run_accept_loop(
             }
             Ok(None) => break,
             Err(_) => {
-                error!(
+                warn!(
                     remaining_tasks = client_tasks.len(),
                     "Timed out waiting for client tasks to join during shutdown"
                 );
@@ -1062,14 +1238,16 @@ pub fn spawn_metrics_saver(
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let gate = crate::logging::EventGate::default();
         loop {
             interval.tick().await;
-            let path = stats_path.clone();
             let names = server_names.clone();
             let metrics = proxy.metrics().clone();
-            let save_path = path.clone();
-            handle_periodic_metrics_save_result(
+            let save_path = stats_path.clone();
+            report_periodic_save(
+                PersistedFile::Stats,
                 &stats_path,
+                &gate,
                 tokio::task::spawn_blocking(move || metrics.save_to_disk(&save_path, &names)).await,
             );
         }
@@ -1093,13 +1271,15 @@ pub fn spawn_availability_saver(
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(30));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let gate = crate::logging::EventGate::default();
         loop {
             interval.tick().await;
             let cache = proxy.cache().clone();
-            let path = availability_path.clone();
-            let save_path = path.clone();
-            handle_periodic_availability_save_result(
-                &path,
+            let save_path = availability_path.clone();
+            report_periodic_save(
+                PersistedFile::AvailabilityIndex,
+                &availability_path,
+                &gate,
                 tokio::task::spawn_blocking(move || cache.save_to_disk(&save_path)).await,
             );
         }
@@ -1130,6 +1310,101 @@ pub fn spawn_idle_connection_clearer(proxy: &std::sync::Arc<crate::NntpProxy>) {
 mod tests {
     use super::*;
     use crate::types::Port;
+
+    #[test]
+    fn backend_summary_reports_interval_deltas() {
+        use crate::metrics::BackendCounters;
+        let previous = BackendCounters {
+            commands: 1_000,
+            errors: 50,
+            errors_4xx: 40,
+            article_missing: 35,
+            articles: 900,
+            bytes_from_backend: 10_000,
+            ..BackendCounters::default()
+        };
+        // 200 new 430s, 3 other 4xx, 2 5xx/transport errors.
+        let current = BackendCounters {
+            commands: 1_800,
+            errors: 255,
+            errors_4xx: 243,
+            article_missing: 235,
+            articles: 1_500,
+            bytes_from_backend: 3_010_000,
+            ..BackendCounters::default()
+        };
+
+        let summary = BackendSummary::between(&previous, &current, Duration::from_secs(300));
+        assert_eq!(
+            summary,
+            BackendSummary {
+                commands: 800,
+                articles: 600,
+                missing: 200,
+                missing_pct: 25.0,
+                errors: 5,
+                rx_bytes_per_sec: 10_000,
+            }
+        );
+
+        let idle = BackendSummary::between(&current, &current, Duration::from_secs(300));
+        assert_eq!(idle.commands, 0);
+        assert!(idle.missing_pct.abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn backend_summary_logs_one_line_per_backend() {
+        let (output, guard) = crate::logging::test_support::capture_json();
+        let stats = [
+            crate::metrics::BackendCounters::default(),
+            crate::metrics::BackendCounters::default(),
+        ];
+        log_backend_summaries(
+            &["backend-a".to_string(), "backend-b".to_string()],
+            &stats,
+            &stats,
+            Duration::from_secs(300),
+        );
+        drop(guard);
+        let lines = output.events("backend_summary");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["backend"], "backend-a");
+        assert_eq!(lines[1]["backend"], "backend-b");
+        assert_eq!(lines[0]["level"], "INFO");
+        assert_eq!(lines[0]["interval_secs"], 300);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn persistence_failure_logs_once_per_window_with_count_then_clears() {
+        let (output, guard) = crate::logging::test_support::capture_json();
+        let gate = crate::logging::EventGate::default();
+        let path = std::path::Path::new("stats.json");
+        let fail = || Ok(Err(anyhow::anyhow!("No space left on device")));
+
+        // Saves run every 30 s: one line at the first failure, one a minute later.
+        for _ in 0..4 {
+            report_periodic_save::<()>(PersistedFile::Stats, path, &gate, fail());
+            tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        }
+        report_periodic_save(PersistedFile::Stats, path, &gate, Ok(Ok(())));
+        report_periodic_save(PersistedFile::Stats, path, &gate, Ok(Ok(())));
+        drop(guard);
+
+        let failures = output.events("stats_persist_failed");
+        assert_eq!(failures.len(), 2, "{}", output.text());
+        assert_eq!(failures[0]["level"], "ERROR");
+        assert_eq!(failures[0]["count"], 1);
+        assert_eq!(failures[0]["path"], "stats.json");
+        assert_eq!(failures[0]["message"], "Failed to save persisted state");
+        // Failures at 30 s and 60 s; the 60 s one opens the next window.
+        assert_eq!(failures[1]["count"], 2);
+
+        let cleared = output.events("stats_persist_failed_cleared");
+        assert_eq!(cleared.len(), 1, "{}", output.text());
+        assert_eq!(cleared[0]["level"], "INFO");
+        assert_eq!(cleared[0]["failures"], 4);
+        assert_eq!(cleared[0]["duration_secs"], 120);
+    }
 
     #[test]
     fn test_runtime_config_from_args_default() {

@@ -21,7 +21,7 @@
 
 use super::provider::DeadpoolStatusCounts;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Weight of a new sample in the service-time average, as a right shift
 /// (`1/8`). The same smoothing TCP uses for its RTT estimate: one slow article
@@ -324,6 +324,7 @@ pub struct SkipSummary {
 pub struct BackendLoadSnapshot {
     pub backlog_skips: u64,
     pub busy_timeouts: u64,
+    pub pool_wait_timeouts: u64,
     pub deadline_expiries: u64,
     pub service_time_ewma_micros: u64,
     pub last_resort_waits: u64,
@@ -368,6 +369,7 @@ pub struct BackendLoad {
     service_time_micros: AtomicU64,
     backlog_skips: AtomicU64,
     busy_timeouts: AtomicU64,
+    pool_wait_timeouts: AtomicU64,
     deadline_expiries: AtomicU64,
     last_resort_waits: AtomicU64,
     last_resort_connected: AtomicU64,
@@ -386,10 +388,8 @@ pub struct BackendLoad {
     delivery: super::delivery::DeliveryStats,
     unlogged_backlog_skips: AtomicU64,
     unlogged_busy_timeouts: AtomicU64,
-    /// Milliseconds since `epoch`, offset by one interval so the first skip
-    /// is reported at once, at which the last summary was claimed.
-    last_summary_ms: AtomicU64,
-    epoch: Instant,
+    /// Lock-free once-per-interval claim; the first skip is reported at once.
+    summary_window: crate::logging::SummaryWindow,
     /// Distribution of the same hold times the average is built from, so a
     /// scrape can see the tail the average hides.
     exchange_duration: crate::metrics::histogram::LatencyHistogram,
@@ -401,6 +401,7 @@ impl Default for BackendLoad {
             service_time_micros: AtomicU64::new(0),
             backlog_skips: AtomicU64::new(0),
             busy_timeouts: AtomicU64::new(0),
+            pool_wait_timeouts: AtomicU64::new(0),
             deadline_expiries: AtomicU64::new(0),
             last_resort_waits: AtomicU64::new(0),
             last_resort_connected: AtomicU64::new(0),
@@ -412,8 +413,7 @@ impl Default for BackendLoad {
             delivery: super::delivery::DeliveryStats::default(),
             unlogged_backlog_skips: AtomicU64::new(0),
             unlogged_busy_timeouts: AtomicU64::new(0),
-            last_summary_ms: AtomicU64::new(0),
-            epoch: Instant::now(),
+            summary_window: crate::logging::SummaryWindow::new(SKIP_SUMMARY_INTERVAL),
             exchange_duration: crate::metrics::histogram::LatencyHistogram::new(
                 &crate::metrics::histogram::EXCHANGE_BUCKETS,
             ),
@@ -470,6 +470,13 @@ impl BackendLoad {
         self.busy_timeouts.fetch_add(1, Ordering::Relaxed);
         self.unlogged_busy_timeouts.fetch_add(1, Ordering::Relaxed);
         self.claim_summary(self.now_ms())
+    }
+
+    /// Count a checkout without its own limit that waited the pool's whole
+    /// default wait. Kept apart from `busy_timeouts`, which is for bounded
+    /// admission checkouts.
+    pub fn note_pool_wait_timeout(&self) {
+        self.pool_wait_timeouts.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count a request whose deadline ran out while this backend was next.
@@ -584,6 +591,7 @@ impl BackendLoad {
         BackendLoadSnapshot {
             backlog_skips: self.backlog_skips.load(Ordering::Relaxed),
             busy_timeouts: self.busy_timeouts.load(Ordering::Relaxed),
+            pool_wait_timeouts: self.pool_wait_timeouts.load(Ordering::Relaxed),
             deadline_expiries: self.deadline_expiries.load(Ordering::Relaxed),
             service_time_ewma_micros: self.service_time_micros.load(Ordering::Relaxed),
             last_resort_waits: self.last_resort_waits.load(Ordering::Relaxed),
@@ -596,28 +604,19 @@ impl BackendLoad {
     }
 
     fn now_ms(&self) -> u64 {
-        let elapsed = u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX);
-        elapsed.saturating_add(interval_ms())
+        self.summary_window.now_ms()
     }
 
     /// Let exactly one caller per interval take the unlogged counts.
     fn claim_summary(&self, now_ms: u64) -> Option<SkipSummary> {
-        let last = self.last_summary_ms.load(Ordering::Relaxed);
-        if now_ms.saturating_sub(last) < interval_ms() {
+        if !self.summary_window.try_claim_at(now_ms) {
             return None;
         }
-        self.last_summary_ms
-            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
-            .ok()?;
         Some(SkipSummary {
             backlog_skips: self.unlogged_backlog_skips.swap(0, Ordering::Relaxed),
             busy_timeouts: self.unlogged_busy_timeouts.swap(0, Ordering::Relaxed),
         })
     }
-}
-
-fn interval_ms() -> u64 {
-    u64::try_from(SKIP_SUMMARY_INTERVAL.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Reply for an article request that ends before every eligible backend
@@ -1096,7 +1095,7 @@ mod tests {
         assert_eq!(load.note_backlog_skip(), None);
         assert_eq!(load.note_busy_timeout(), None);
 
-        let later = load.now_ms() + interval_ms();
+        let later = load.now_ms() + load.summary_window.window_ms();
         assert_eq!(
             load.claim_summary(later),
             Some(SkipSummary {
@@ -1110,6 +1109,7 @@ mod tests {
             BackendLoadSnapshot {
                 backlog_skips: 2,
                 busy_timeouts: 1,
+                pool_wait_timeouts: 0,
                 deadline_expiries: 0,
                 service_time_ewma_micros: 0,
                 last_resort_waits: 0,

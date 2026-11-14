@@ -196,6 +196,9 @@ pub struct Config {
     /// Proxy server settings
     #[serde(default)]
     pub proxy: Proxy,
+    /// Log output settings
+    #[serde(default)]
+    pub logging: Logging,
     /// Routing configuration
     #[serde(default)]
     pub routing: Routing,
@@ -239,6 +242,37 @@ impl Default for MetricsEndpoint {
             listen: defaults::metrics_listen(),
         }
     }
+}
+
+/// Shape of headless stdout log lines.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum LogFormat {
+    /// Human-readable lines, the tracing default.
+    #[default]
+    Text,
+    /// One JSON object per line, for log stores that index fields.
+    Json,
+}
+
+/// Log output settings (`[logging]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Logging {
+    /// Headless stdout format. Text stays the default so existing log
+    /// scraping keeps working; JSON lets a log store query fields directly.
+    pub format: LogFormat,
+    /// Seconds between per-backend summary lines at `info`; `0` disables
+    /// them. Off by default because the TUI and stats file already show the
+    /// counters; headless deployments that only keep logs can turn it on.
+    /// At most [`Logging::MAX_BACKEND_SUMMARY_INTERVAL_SECS`].
+    pub backend_summary_interval_secs: u64,
+}
+
+impl Logging {
+    /// One day. Longer intervals are almost certainly a typo, and huge ones
+    /// would overflow the timer.
+    pub const MAX_BACKEND_SUMMARY_INTERVAL_SECS: u64 = 86_400;
 }
 
 /// Proxy server settings

@@ -524,7 +524,7 @@ pub fn load_config(config_path: &str) -> Result<Config> {
 /// are surfaced. Other tables are left alone: legacy layouts such as `[proxy]`
 /// are read from the raw TOML by the migration code and would otherwise produce
 /// false warnings.
-const UNKNOWN_KEY_REPORTED_TABLES: &[&str] = &["servers", "routing", "metrics"];
+const UNKNOWN_KEY_REPORTED_TABLES: &[&str] = &["servers", "routing", "metrics", "logging"];
 
 /// Deserialize a config file and return the unknown keys in
 /// [`UNKNOWN_KEY_REPORTED_TABLES`] as dotted paths such as `servers.1.tierr`.
@@ -571,7 +571,12 @@ fn load_config_with_env_provider<E: EnvProvider>(config_path: &str, env: &E) -> 
     let (mut config, unknown_keys) = parse_config_reporting_unknown_keys(&config_content)
         .with_context(|| format!("Failed to parse config file '{config_path}'"))?;
     for key in &unknown_keys {
-        tracing::warn!("Ignoring unknown config key '{}' in '{}'", key, config_path);
+        tracing::warn!(
+            event = "config_key_ignored",
+            key = %key,
+            config = %config_path,
+            "Ignoring unknown config key"
+        );
     }
 
     let mut file_config = config.clone();
@@ -1143,6 +1148,28 @@ sleepy = 1
             config.routing.backend_selection,
             BackendSelectionStrategy::LeastLoaded
         );
+    }
+
+    #[test]
+    fn test_logging_section_parses_and_reports_unknown_keys() {
+        let (config, unknown) = parse_config_reporting_unknown_keys(
+            r#"
+[logging]
+format = "json"
+formats = "text"
+backend_summary_interval_secs = 300
+"#,
+        )
+        .unwrap();
+        assert_eq!(config.logging.format, crate::config::LogFormat::Json);
+        assert_eq!(config.logging.backend_summary_interval_secs, 300);
+        assert_eq!(unknown, ["logging.formats"]);
+
+        let (config, _) = parse_config_reporting_unknown_keys("").unwrap();
+        assert_eq!(config.logging.format, crate::config::LogFormat::Text);
+        assert_eq!(config.logging.backend_summary_interval_secs, 0);
+
+        assert!(parse_config_reporting_unknown_keys("[logging]\nformat = \"xml\"\n").is_err());
     }
 
     #[test]

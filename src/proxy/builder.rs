@@ -143,6 +143,7 @@ impl NntpProxyBuilder {
             .sum::<usize>();
         if buffer_count < backend_connection_capacity {
             warn!(
+                event = "config_value_discouraged",
                 buffer_pool_count = buffer_count,
                 backend_connection_capacity,
                 "Buffer pool count is below backend connection capacity; exhausted pools will use visible fallback allocations"
@@ -323,6 +324,8 @@ impl NntpProxyBuilder {
     fn warn_if_disk_cache_inactive(cache_config: &crate::config::Cache, cache: &UnifiedCache) {
         if cache_config.disk.is_some() && !cache.stores_payload_responses() {
             warn!(
+                event = "config_setting_inactive",
+                setting = "cache.disk",
                 "Disk cache configured but store_article_bodies=false - disk cache is inactive in availability-only mode."
             );
         }

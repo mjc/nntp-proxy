@@ -24,6 +24,16 @@ log_file_level = "warn"
 # Optional stats persistence path used by the TUI dashboard
 # stats_file = "/var/lib/nntp-proxy/stats.json"
 
+# Log Output
+[logging]
+# Headless stdout format: "text" (default) or "json" (one object per line,
+# fields at the top level). Can be overridden with --log-format or
+# NNTP_PROXY_LOG_FORMAT. See docs/operator/logging.md.
+format = "text"
+# Seconds between one-line-per-backend summaries at info (default: 0 = off,
+# max: 86400). 300 suits headless deployments that keep only logs.
+# backend_summary_interval_secs = 300
+
 # Routing Configuration
 [routing]
 # Routing mode: "hybrid" (default), "per-command", or "stateful"

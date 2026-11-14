@@ -310,14 +310,11 @@ impl NntpProxy {
                 Ok(())
             }
             Err(e) => {
-                if let Some(bid) = backend_id {
+                // A client disconnect is not the backend's fault.
+                if let (Some(bid), SessionError::Backend(_)) = (backend_id, &e) {
                     self.metrics.record_error(bid);
                 }
-
-                // Only log backend errors — client disconnects are normal operation
-                if let SessionError::Backend(ref inner) = e {
-                    warn!("Session error for client {}: {:?}", client_addr, inner);
-                }
+                // The public entry point logs it, once.
                 Err(e)
             }
         }
@@ -338,10 +335,51 @@ impl NntpProxy {
         }
     }
 
+    /// Log a finished session's backend error, once.
+    ///
+    /// Each public entry point is a thin wrapper that runs the session and
+    /// then calls this, so every caller gets exactly one line however the
+    /// session ended; the inner code fills in `labels` as it learns them. A
+    /// client disconnect is normal and not logged.
+    fn log_session_outcome(
+        &self,
+        client_addr: ClientAddress,
+        labels: &SessionLabels,
+        result: &Result<(), SessionError>,
+    ) {
+        if let Err(SessionError::Backend(error)) = result {
+            let backend = labels
+                .backend
+                .and_then(|bid| self.servers.get(bid.as_index()))
+                .map(|server| server.name.as_str());
+            warn!(
+                client = %client_addr,
+                session_id = labels.session_id.as_deref(),
+                backend,
+                error = ?error,
+                "Client session ended with a backend error"
+            );
+        }
+    }
+
     pub async fn handle_client(
+        &self,
+        client_stream: TcpStream,
+        client_addr: ClientAddress,
+    ) -> Result<(), SessionError> {
+        let mut labels = SessionLabels::default();
+        let result = self
+            .handle_stateful_client(client_stream, client_addr, &mut labels)
+            .await;
+        self.log_session_outcome(client_addr, &labels, &result);
+        result
+    }
+
+    async fn handle_stateful_client(
         &self,
         mut client_stream: TcpStream,
         client_addr: ClientAddress,
+        labels: &mut SessionLabels,
     ) -> Result<(), SessionError> {
         debug!("New client connection from {}", client_addr);
 
@@ -352,10 +390,14 @@ impl NntpProxy {
                 .prepare_stateful_connection(&mut client_stream, client_addr)
                 .await
                 .map_err(SessionError::from)?;
+            labels.backend = Some(backend_id);
             let server_idx = backend_id.as_index();
 
             let session = self.create_session(client_addr, None);
-            let session_id = Self::generate_session_id(&session);
+            let session_id = labels
+                .session_id
+                .insert(Self::generate_session_id(&session))
+                .as_str();
 
             debug!("Starting stateful session for client {}", client_addr);
 
@@ -368,7 +410,7 @@ impl NntpProxy {
                 )
                 .await;
 
-            self.finalize_stateful_session(metrics, client_addr, &session_id, &session, backend_id)
+            self.finalize_stateful_session(metrics, client_addr, session_id, &session, backend_id)
         }
         .await
     }
@@ -387,8 +429,12 @@ impl NntpProxy {
         Box::pin(async move {
             let _connection_guard = ClientConnectionGuard::new(self);
 
-            self.handle_per_command_client(client_stream, client_addr)
-                .await
+            let mut labels = SessionLabels::default();
+            let result = self
+                .handle_per_command_client(client_stream, client_addr, &mut labels)
+                .await;
+            self.log_session_outcome(client_addr, &labels, &result);
+            result
         })
     }
 
@@ -397,6 +443,7 @@ impl NntpProxy {
         &self,
         mut client_stream: TcpStream,
         client_addr: ClientAddress,
+        labels: &mut SessionLabels,
     ) -> Result<(), SessionError> {
         let mode_label = self.routing_mode_display_name();
         debug!(
@@ -409,12 +456,22 @@ impl NntpProxy {
             .map_err(SessionError::from)?;
 
         let mut session = self.create_session(client_addr, Some(self.router.clone()));
-        let session_id = Self::generate_session_id(&session);
+        let session_id = labels
+            .session_id
+            .insert(Self::generate_session_id(&session))
+            .as_str();
 
         let metrics = session.handle_per_command_routing(client_stream).await;
 
-        self.finalize_per_command_session(metrics, client_addr, &session_id, &session)
+        self.finalize_per_command_session(metrics, client_addr, session_id, &session)
     }
+}
+
+/// What a session's log line names, filled in as the session learns it.
+#[derive(Debug, Default)]
+struct SessionLabels {
+    session_id: Option<String>,
+    backend: Option<crate::types::BackendId>,
 }
 
 #[cfg(test)]
@@ -469,6 +526,241 @@ mod tests {
 
     fn create_test_config() -> crate::config::Config {
         super::super::tests::create_test_config()
+    }
+
+    /// How the mock backend ends the connection after a partial reply.
+    #[derive(Clone, Copy)]
+    enum BackendClose {
+        /// RST: the backend aborts the connection.
+        Reset,
+        /// FIN: the backend closes cleanly, but mid-response.
+        Fin,
+    }
+
+    /// A backend that resets the connection mid-response must end the
+    /// session as a backend error, not look like the client leaving.
+    #[tokio::test]
+    async fn backend_reset_mid_transfer_is_a_backend_error() {
+        stateful_session_ends_as_backend_error(BackendClose::Reset).await;
+    }
+
+    /// A clean close after the status line but before the end of the reply
+    /// is a backend failure too.
+    #[tokio::test]
+    async fn backend_clean_close_mid_response_is_a_backend_error() {
+        stateful_session_ends_as_backend_error(BackendClose::Fin).await;
+    }
+
+    async fn stateful_session_ends_as_backend_error(close: BackendClose) {
+        use crate::types::{MaxConnections, Port};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = backend.accept().await {
+                tokio::spawn(async move {
+                    let mut stream = tokio::io::BufReader::new(stream);
+                    if stream.get_mut().write_all(b"200 ready\r\n").await.is_err() {
+                        return;
+                    }
+                    let mut line = String::new();
+                    while stream.read_line(&mut line).await.unwrap_or(0) > 0 {
+                        let upper = line.to_ascii_uppercase();
+                        if upper.contains("COMPRESS") {
+                            let _ = stream.get_mut().write_all(b"500 unsupported\r\n").await;
+                        } else if upper.contains("ARTICLE") {
+                            let _ = stream
+                                .get_mut()
+                                .write_all(b"220 0 <a@example.com>\r\npartial body")
+                                .await;
+                            let _ = stream.get_mut().flush().await;
+                            if matches!(close, BackendClose::Reset) {
+                                // Abort with RST instead of a clean close.
+                                let _ = socket2::SockRef::from(stream.get_ref())
+                                    .set_linger(Some(Duration::ZERO));
+                            } else {
+                                let _ = stream.get_mut().shutdown().await;
+                            }
+                            return;
+                        } else {
+                            let _ = stream.get_mut().write_all(b"200 ok\r\n").await;
+                        }
+                        line.clear();
+                    }
+                });
+            }
+        });
+
+        let config = crate::config::Config {
+            servers: vec![
+                crate::config::Server::builder("127.0.0.1", Port::try_new(backend_port).unwrap())
+                    .name("backend-a")
+                    .max_connections(MaxConnections::try_new(1).unwrap())
+                    .build()
+                    .unwrap(),
+            ],
+            ..Default::default()
+        };
+        let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut client = TcpStream::connect(client_addr).await.unwrap();
+            let mut greeting = [0_u8; 128];
+            let _ = client.read(&mut greeting).await;
+            client
+                .write_all(b"ARTICLE <a@example.com>\r\n")
+                .await
+                .unwrap();
+            let mut rest = Vec::new();
+            let _ =
+                tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut rest)).await;
+        });
+        let (stream, addr) = listener.accept().await.unwrap();
+
+        let (output, guard) = crate::logging::test_support::capture_json();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            proxy.handle_client(stream, addr.into()),
+        )
+        .await
+        .expect("session ends after the backend closes");
+        drop(guard);
+        let _ = client.await;
+
+        assert!(
+            matches!(result, Err(SessionError::Backend(_))),
+            "{result:?}"
+        );
+        let lines: Vec<_> = output
+            .json_lines()
+            .into_iter()
+            .filter(|line| line["message"] == "Client session ended with a backend error")
+            .collect();
+        assert_eq!(lines.len(), 1, "{}", output.text());
+        assert_eq!(lines[0]["backend"], "backend-a");
+    }
+
+    /// A backend may close at QUIT without answering commands pipelined
+    /// after it; that is a normal end, not a backend error.
+    #[tokio::test]
+    async fn backend_close_after_quit_is_a_clean_exit() {
+        use crate::types::{MaxConnections, Port};
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = backend.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = backend.accept().await {
+                tokio::spawn(async move {
+                    let mut stream = tokio::io::BufReader::new(stream);
+                    if stream.get_mut().write_all(b"200 ready\r\n").await.is_err() {
+                        return;
+                    }
+                    let mut line = String::new();
+                    while stream.read_line(&mut line).await.unwrap_or(0) > 0 {
+                        let upper = line.to_ascii_uppercase();
+                        if upper.contains("COMPRESS") {
+                            let _ = stream.get_mut().write_all(b"500 unsupported\r\n").await;
+                        } else if upper.contains("QUIT") {
+                            // Close without a 205 and without answering
+                            // anything pipelined after QUIT.
+                            let _ = stream.get_mut().shutdown().await;
+                            return;
+                        } else {
+                            let _ = stream.get_mut().write_all(b"200 ok\r\n").await;
+                        }
+                        line.clear();
+                    }
+                });
+            }
+        });
+
+        let config = crate::config::Config {
+            servers: vec![
+                crate::config::Server::builder("127.0.0.1", Port::try_new(backend_port).unwrap())
+                    .name("backend-a")
+                    .max_connections(MaxConnections::try_new(1).unwrap())
+                    .build()
+                    .unwrap(),
+            ],
+            ..Default::default()
+        };
+        let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = listener.local_addr().unwrap();
+        let client = tokio::spawn(async move {
+            let mut client = TcpStream::connect(client_addr).await.unwrap();
+            let mut greeting = [0_u8; 128];
+            let _ = client.read(&mut greeting).await;
+            client.write_all(b"QUIT\r\nGROUP x\r\n").await.unwrap();
+            let mut rest = Vec::new();
+            let _ =
+                tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut rest)).await;
+        });
+        let (stream, addr) = listener.accept().await.unwrap();
+
+        let (output, guard) = crate::logging::test_support::capture_json();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            proxy.handle_client(stream, addr.into()),
+        )
+        .await
+        .expect("session ends after the backend closes");
+        drop(guard);
+        let _ = client.await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert!(
+            !output
+                .text()
+                .contains("Client session ended with a backend error"),
+            "{}",
+            output.text()
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_session_error_is_logged_exactly_once() {
+        use crate::types::{MaxConnections, Port};
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let backend_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let config = crate::config::Config {
+            servers: vec![
+                crate::config::Server::builder("127.0.0.1", Port::try_new(backend_port).unwrap())
+                    .name("backend-a")
+                    .max_connections(MaxConnections::try_new(1).unwrap())
+                    .build()
+                    .unwrap(),
+            ],
+            ..Default::default()
+        };
+        let proxy = NntpProxy::new_sync(config, RoutingMode::Stateful).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, addr) = listener.accept().await.unwrap();
+
+        let (output, guard) = crate::logging::test_support::capture_json();
+        let result = proxy.handle_client(stream, addr.into()).await;
+        drop(guard);
+
+        assert!(
+            matches!(result, Err(SessionError::Backend(_))),
+            "{result:?}"
+        );
+        let lines: Vec<_> = output
+            .json_lines()
+            .into_iter()
+            .filter(|line| line["message"] == "Client session ended with a backend error")
+            .collect();
+        assert_eq!(lines.len(), 1, "{}", output.text());
+        assert_eq!(lines[0]["level"], "WARN");
+        assert_eq!(lines[0]["backend"], "backend-a");
+        assert!(lines[0]["session_id"].is_string(), "{}", output.text());
     }
 
     #[tokio::test]
@@ -671,6 +963,38 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().to_string(), "test error");
+    }
+
+    #[test]
+    fn client_disconnect_is_not_counted_as_a_backend_error() {
+        let proxy =
+            Arc::new(NntpProxy::new_sync(create_test_config(), RoutingMode::Stateful).unwrap());
+        let client =
+            ClientAddress::from("127.0.0.1:12345".parse::<std::net::SocketAddr>().unwrap());
+        let session = proxy.create_session(client, None);
+        let session_id = NntpProxy::generate_session_id(&session);
+        let backend = crate::types::BackendId::from_index(0);
+        let errors = |proxy: &NntpProxy| proxy.metrics.backend_counters(backend).unwrap().errors;
+
+        let _ = proxy.record_session_metrics(
+            Err(SessionError::ClientDisconnect(std::io::Error::from(
+                std::io::ErrorKind::BrokenPipe,
+            ))),
+            client,
+            &session_id,
+            &session,
+            Some(backend),
+        );
+        assert_eq!(errors(&proxy), 0);
+
+        let _ = proxy.record_session_metrics(
+            Err(SessionError::Backend(anyhow::anyhow!("backend reset"))),
+            client,
+            &session_id,
+            &session,
+            Some(backend),
+        );
+        assert_eq!(errors(&proxy), 1);
     }
 
     #[tokio::test]

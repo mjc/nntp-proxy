@@ -108,6 +108,7 @@ Without `--tui`, the server runs headless. The [runtime guide](docs/operator/run
 - [Operations](docs/operator/operations.md): Docker, persisted files, and troubleshooting
 - [Caching](docs/operator/caching.md)
 - [Metrics](docs/operator/metrics.md): Prometheus endpoint and metric reference
+- [Logging](docs/operator/logging.md): text and JSON output, levels, and alertable events
 - [Example configuration](config.example.toml), [full configuration](config.full.toml), and [cache configuration](config.cache.toml)
 - [Changelog](CHANGELOG.md)
 - [Development guide](docs/development.md)

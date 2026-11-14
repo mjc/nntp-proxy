@@ -730,6 +730,30 @@ impl BackendResponseOrder {
         self.ordered.iter().any(|reply| reply.awaits_backend())
     }
 
+    /// Whether the backend still owes a reply it must send before it may
+    /// close: the next pending reply answers something other than `QUIT`
+    /// and was sent before any `QUIT`.
+    ///
+    /// A server may close at or after `QUIT` (with or without `205`), so a
+    /// close while `QUIT` is next, or after it was answered, is normal even
+    /// with pipelined commands queued behind it.
+    pub(crate) fn owes_reply_before_quit(&self) -> bool {
+        let tracker = &self.inner;
+        let Some(next) = tracker.pending.front() else {
+            return false;
+        };
+        if next.kind == crate::protocol::RequestKind::Quit {
+            return false;
+        }
+        // A QUIT sent but no longer pending was answered, so everything
+        // still pending was sent after it.
+        !tracker.quit_sent
+            || tracker
+                .pending
+                .iter()
+                .any(|frame| frame.kind == crate::protocol::RequestKind::Quit)
+    }
+
     /// Queue a local reply that must be written only after earlier backend
     /// replies have been framed and forwarded.
     pub(crate) fn push_deferred_reply(&mut self, reply: &'static [u8]) {
@@ -882,6 +906,8 @@ struct BackendReplyTracker {
     pending: VecDeque<PendingRequestFrame>,
     /// Outcomes of replies completed since the session last took them.
     outcomes: crate::metrics::ResponseTally,
+    /// A `QUIT` was sent; replies queued after it may never come.
+    quit_sent: bool,
 }
 
 #[derive(Debug)]
@@ -2466,6 +2492,7 @@ impl BackendReplyTracker {
         kind: crate::protocol::RequestKind,
         status_forwarding: StatusForwarding,
     ) {
+        self.quit_sent |= kind == crate::protocol::RequestKind::Quit;
         self.pending.push_back(PendingRequestFrame {
             kind,
             state: PendingRequestFrameState::AwaitingStatusLine,

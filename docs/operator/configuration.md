@@ -16,16 +16,17 @@ If no config file exists and no backend environment variables are present, the p
 Keep the config ordered from general settings to concrete identities:
 
 1. `[proxy]`
-2. `[routing]`
-3. `[routing.queue.backpressure]`
-4. `[memory]`
-5. `[cache]`
-6. `[cache.disk]`
-7. `[health_check]`
-8. `[metrics]`
-9. `[client_auth]`
-10. `[[client_auth.users]]`
-11. `[[servers]]`
+2. `[logging]`
+3. `[routing]`
+4. `[routing.queue.backpressure]`
+5. `[memory]`
+6. `[cache]`
+7. `[cache.disk]`
+8. `[health_check]`
+9. `[metrics]`
+10. `[client_auth]`
+11. `[[client_auth.users]]`
+12. `[[servers]]`
 
 See [../../config.full.toml](../../config.full.toml) for a complete example.
 
@@ -42,6 +43,15 @@ See [../../config.full.toml](../../config.full.toml) for a complete example.
 | `log_file_level` | `"warn"` | Filter for the optional local `debug.log` appender |
 | `response_write_metrics_secs` | unset | Optional interval for response write metrics logging |
 | `stats_file` | unset | If unset, metrics persistence defaults to `stats.json` next to the config file |
+
+### `[logging]`
+
+| Field | Default | Notes |
+| --- | --- | --- |
+| `format` | `"text"` | Headless stdout format: `"text"` or `"json"`. `--log-format` / `NNTP_PROXY_LOG_FORMAT` override it |
+| `backend_summary_interval_secs` | `0` (off) | Seconds between per-backend summary lines at `info`; `300` is a reasonable choice for log-only monitoring. At most `86400` |
+
+Unknown keys in `[logging]` are reported at startup. See [logging.md](logging.md) for field names and the level policy.
 
 ### `[routing]`
 
@@ -337,7 +347,8 @@ proxy does not resolve DNS to infer provider identity. Hostnames are compared
 case-insensitively after removing one trailing DNS dot. Ports, credentials,
 TLS settings, tiers, and display names do not create separate provider slots.
 
-Unknown keys in `[[servers]]` and `[routing]` (including its subtables) are
+Unknown keys in `[[servers]]`, `[routing]` (including its subtables),
+`[metrics]`, and `[logging]` are
 ignored, and the proxy logs a warning naming each one at startup, for example
 `Ignoring unknown config key 'servers.1.stateful_session'`.
 

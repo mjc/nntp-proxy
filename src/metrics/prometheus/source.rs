@@ -26,19 +26,20 @@ pub fn gather(proxy: &NntpProxy) -> Scrape {
     let router = proxy.router();
     let cache = proxy.cache();
 
-    let mut seen_names = std::collections::HashSet::new();
+    let names = unique_backend_names(proxy.servers());
     let backends = proxy
         .servers()
         .iter()
         .zip(proxy.connection_providers())
         .enumerate()
-        .map(|(index, (server, provider))| {
+        .zip(names)
+        .map(|((index, (server, provider)), name)| {
             let backend_id = BackendId::from_index(index);
             let status = provider.status_counts();
             let health = provider.health_check_metrics();
             let load = provider.load();
             BackendScrape {
-                name: unique_name(&mut seen_names, server.name.as_str(), index),
+                name,
                 tier: server.tier.to_string(),
                 counters: metrics.backend_counters(backend_id).unwrap_or_default(),
                 pool: PoolScrape {
@@ -81,6 +82,18 @@ pub fn gather(proxy: &NntpProxy) -> Scrape {
         buffers: proxy.buffer_pool().scrape_stats(),
         backends,
     }
+}
+
+/// Each server's name as it appears in metrics labels and the backend
+/// summary log line, de-duplicated with [`unique_name`] so both agree.
+#[must_use]
+pub fn unique_backend_names(servers: &[crate::config::Server]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    servers
+        .iter()
+        .enumerate()
+        .map(|(index, server)| unique_name(&mut seen, server.name.as_str(), index))
+        .collect()
 }
 
 /// Two servers with the same name would export the same series twice, which
