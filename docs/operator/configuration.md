@@ -189,6 +189,13 @@ capacity times standing, never below a floor of 1/64:
   standing`, rounded up, as the share, so a demoted backend still gets one or
   two slots per cycle.
 
+Standing only reorders backends that can take the request now. A backend counts
+as free when it has an idle pooled connection, or room to open one that login
+backoff won't refuse; connections a client holds between commands are not free
+to others. When any backend in the tier is free, only free backends are
+considered, so a request never queues on a well-standing but full pool next to
+a demoted one with idle capacity. When none is free, standing decides as before.
+
 A demoted backend still gets every retry its tier owes it. When its peers
 answer `430` the request comes to it before any lower tier, as before. Those
 retries, the floor share, and overflow are how it earns its standing back.

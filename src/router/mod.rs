@@ -550,16 +550,51 @@ enum SelectionWeighting {
 /// loops are compiled separately for each and the capacity path stays as it
 /// was.
 trait Weighing {
+    /// Whether this weighing may send a request to a backend with no free
+    /// connection while another backend in the tier has one.
+    const FREE_SLOTS: FreeSlots;
     /// Share weight for weighted round-robin, in connections.
     fn weight(backend: &BackendInfo) -> usize;
     /// Least-loaded score from active requests and pool size; lower wins.
     fn load(backend: &BackendInfo, active: f64, max_conns: f64) -> LoadRatio;
 }
 
+/// How a weighing treats backends that have no free connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreeSlots {
+    /// Weight and load decide alone, as plain capacity routing always has.
+    Ignore,
+    /// A backend with no free connection is chosen only when no backend in
+    /// the tier has one: reordering by a score must never put a request in
+    /// a queue next to idle capacity.
+    Prefer,
+}
+
+/// Whether `backend` can take a request now without waiting: an idle pooled
+/// connection, or room to open one that login backoff won't refuse.
+/// Connections held by client leases are not free to other requests.
+fn has_free_slot(backend: &BackendInfo) -> bool {
+    let status = backend.provider.status_counts();
+    status.available > 0
+        || (status.size < status.max_size && !backend.provider.login_backoff_active())
+}
+
+/// Bit for `backend` in a free-slot set. Backends past the 64th share the
+/// top bit; availability limits backend count well below that.
+fn free_slot_mask(backend: BackendId) -> u64 {
+    1u64 << backend.as_index().min(63)
+}
+
+fn free_slot_bit(bits: u64, backend: BackendId) -> bool {
+    bits & free_slot_mask(backend) != 0
+}
+
 /// Weigh by pool capacity alone.
 struct ByCapacity;
 
 impl Weighing for ByCapacity {
+    const FREE_SLOTS: FreeSlots = FreeSlots::Ignore;
+
     #[inline]
     fn weight(backend: &BackendInfo) -> usize {
         backend.provider.max_size()
@@ -585,6 +620,8 @@ impl ByStanding {
 }
 
 impl Weighing for ByStanding {
+    const FREE_SLOTS: FreeSlots = FreeSlots::Prefer;
+
     /// Rounds up so a demoted pool keeps at least one slot, and stays in
     /// whole connections because the round-robin position advances by one
     /// per request: finer units would lengthen the cycle and hand each
@@ -1031,20 +1068,27 @@ impl BackendSelector {
                 )
             };
 
-            let selected = if availability
-                .is_some_and(|avail| !self.availability_missing_in_tier(avail, tier))
-            {
-                match &self.strategy {
-                    SelectionStrategy::WeightedRoundRobin(_) => self
-                        .select_capacity_weighted::<_, W>(tier_filter)
-                        .map(|backend| SelectedBackend {
-                            backend,
-                            pending_snapshot: None,
-                        }),
-                    SelectionStrategy::LeastLoaded(_) => self.select_weighted::<_, W>(tier_filter),
+            // Under FreeSlots::Prefer, narrow the tier to backends with a free
+            // connection whenever any has one, for every strategy. The check
+            // takes locks, so it runs once per backend per route, and only
+            // for weighings that ask for it: the capacity path calls the tier
+            // filter exactly as before.
+            let selected = match W::FREE_SLOTS {
+                FreeSlots::Ignore => self.select_in_tier::<_, W>(tier_filter, availability, tier),
+                FreeSlots::Prefer => {
+                    let free = self.free_slot_bits(&tier_filter);
+                    if free == 0 {
+                        self.select_in_tier::<_, W>(tier_filter, availability, tier)
+                    } else {
+                        self.select_in_tier::<_, W>(
+                            |backend: &&BackendInfo| {
+                                tier_filter(backend) && free_slot_bit(free, backend.id)
+                            },
+                            availability,
+                            tier,
+                        )
+                    }
                 }
-            } else {
-                self.select_weighted::<_, W>(tier_filter)
             };
             if tracing::enabled!(tracing::Level::DEBUG) {
                 self.debug_log_selection_candidates(
@@ -1086,6 +1130,44 @@ impl BackendSelector {
         // All tiers exhausted
         tracing::debug!("All tiers exhausted, no backends available");
         None
+    }
+
+    /// Pick within one tier: capacity-weighted first attempts under weighted
+    /// round-robin, weighted or least-loaded otherwise.
+    fn select_in_tier<F, W: Weighing>(
+        &self,
+        tier_filter: F,
+        availability: Option<&ArticleAvailability>,
+        tier: u8,
+    ) -> Option<SelectedBackend<'_>>
+    where
+        F: Fn(&&BackendInfo) -> bool,
+    {
+        if availability.is_some_and(|avail| !self.availability_missing_in_tier(avail, tier)) {
+            match &self.strategy {
+                SelectionStrategy::WeightedRoundRobin(_) => self
+                    .select_capacity_weighted::<_, W>(tier_filter)
+                    .map(|backend| SelectedBackend {
+                        backend,
+                        pending_snapshot: None,
+                    }),
+                SelectionStrategy::LeastLoaded(_) => self.select_weighted::<_, W>(tier_filter),
+            }
+        } else {
+            self.select_weighted::<_, W>(tier_filter)
+        }
+    }
+
+    /// Bit per candidate backend that has a free connection (see
+    /// [`has_free_slot`]), checked once each.
+    fn free_slot_bits<F>(&self, tier_filter: &F) -> u64
+    where
+        F: Fn(&&BackendInfo) -> bool,
+    {
+        self.backends
+            .iter()
+            .filter(|backend| tier_filter(backend) && has_free_slot(backend))
+            .fold(0, |bits, backend| bits | free_slot_mask(backend.id))
     }
 
     fn availability_missing_in_tier(&self, availability: &ArticleAvailability, tier: u8) -> bool {
@@ -2244,6 +2326,86 @@ mod tests {
             counts[1] > 50,
             "standing is for article lookups only: {counts:?}"
         );
+    }
+
+    /// A mock backend that greets and answers every line with `200`, enough
+    /// for a pool to open and hold connections.
+    async fn spawn_accepting_backend() -> u16 {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    if write.write_all(b"200 ready\r\n").await.is_err() {
+                        return;
+                    }
+                    while let Ok(Some(_)) = lines.next_line().await {
+                        if write.write_all(b"200 ok\r\n").await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn standing_never_queues_next_to_a_free_backend() {
+        use crate::pool::admission::{ArticleLookupOutcome, ArticleStanding};
+        for strategy in [
+            BackendSelectionStrategy::LeastLoaded,
+            BackendSelectionStrategy::WeightedRoundRobin,
+        ] {
+            let full_port = spawn_accepting_backend().await;
+            let free_port = spawn_accepting_backend().await;
+            let mut selector = BackendSelector::with_strategy(strategy).with_article_admission(
+                crate::pool::admission::ArticleAdmission::default()
+                    .with_standing(ArticleStanding::Adaptive),
+            );
+            for (name, port, max) in [("full", full_port, 1), ("free", free_port, 10)] {
+                selector.add_backend(
+                    ServerName::try_new(name.to_string()).unwrap(),
+                    crate::pool::DeadpoolConnectionProvider::builder("127.0.0.1", port)
+                        .max_connections(max)
+                        .build()
+                        .unwrap(),
+                    0,
+                );
+            }
+            // The healthy backend's only connection is busy; the free one is
+            // demoted, which alone would rank it far below.
+            let full = selector.backend_provider(BackendId::from_index(0)).unwrap();
+            let held = full.checkout_connection_guard().await.unwrap();
+            note_lookups(
+                &selector,
+                BackendId::from_index(1),
+                ArticleLookupOutcome::Missing,
+                200,
+            );
+
+            let availability = ArticleAvailability::new();
+            for _ in 0..20 {
+                let backend = selector
+                    .route(
+                        RouteRequest::new(ClientId::new())
+                            .with_availability(&availability)
+                            .for_lookup(RouteLookup::Article),
+                    )
+                    .unwrap()
+                    .backend_id();
+                assert_eq!(
+                    backend,
+                    BackendId::from_index(1),
+                    "{strategy:?}: a request must not queue on a full backend while another has room"
+                );
+                selector.complete_command(backend);
+            }
+            drop(held);
+        }
     }
 
     #[test]
