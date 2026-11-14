@@ -33,6 +33,22 @@ fn backend_eof_error(state: &crate::session::state::SessionLoopState) -> Option<
         .then(|| anyhow::anyhow!("backend closed the connection mid-response"))
 }
 
+/// Turn a clean backend close into the session exit. A close that answers
+/// the client's `QUIT` is how RFC 3977 ends a session, so it must not count
+/// as a backend failure: that would apply replacement cooldown and shrink
+/// the pool after every normal session end.
+fn backend_eof_exit(
+    state: &crate::session::state::SessionLoopState,
+) -> std::result::Result<StatefulSessionExit, StatefulLoopError> {
+    if let Some(error) = backend_eof_error(state) {
+        return Err(StatefulLoopError::backend(error));
+    }
+    if state.backend_closed_by_quit() {
+        return Ok(StatefulSessionExit::QuitCompleted);
+    }
+    Ok(StatefulSessionExit::BackendDisconnected)
+}
+
 #[must_use]
 pub(in crate::session) struct StatefulLoopResult {
     metrics: TransferMetrics,
@@ -122,13 +138,15 @@ impl std::ops::Deref for StatefulLoopResult {
 enum StatefulSessionExit {
     ClientDisconnected,
     ClientReadError,
+    /// The backend closed after answering the client's `QUIT`.
+    QuitCompleted,
     BackendDisconnected,
 }
 
 impl StatefulSessionExit {
     fn disposition(self) -> StatefulConnectionDisposition {
         match self {
-            Self::ClientDisconnected | Self::ClientReadError => {
+            Self::ClientDisconnected | Self::ClientReadError | Self::QuitCompleted => {
                 StatefulConnectionDisposition::RetireClient
             }
             // A backend read error is not an exit: it ends the loop as a
@@ -621,10 +639,7 @@ impl ClientSession {
                         continue;
                     }
                     Ok(None) => {
-                        if let Some(error) = backend_eof_error(state) {
-                            return Err(StatefulLoopError::backend(error));
-                        }
-                        return Ok(StatefulSessionExit::BackendDisconnected);
+                        return backend_eof_exit(state);
                     }
                     Err(e) => {
                         debug!(client = %self.client_addr, error = %e, "Backend read error");
@@ -729,10 +744,7 @@ impl ClientSession {
                             .await?;
                         }
                         Ok(None) => {
-                            if let Some(error) = backend_eof_error(state) {
-                                return Err(StatefulLoopError::backend(error));
-                            }
-                            return Ok(StatefulSessionExit::BackendDisconnected);
+                            return backend_eof_exit(state);
                         }
                         Err(e) => {
                             debug!(client = %self.client_addr, error = %e, "Backend read error");
@@ -1028,6 +1040,10 @@ mod tests {
             super::StatefulConnectionDisposition::RetireClient
         );
         assert_eq!(
+            super::StatefulSessionExit::QuitCompleted.disposition(),
+            super::StatefulConnectionDisposition::RetireClient
+        );
+        assert_eq!(
             super::StatefulSessionExit::BackendDisconnected.disposition(),
             super::StatefulConnectionDisposition::RetireBackend
         );
@@ -1301,6 +1317,99 @@ mod tests {
             drop(client);
             let _ = proxy.await.unwrap().unwrap();
         }
+    }
+
+    /// Run one stateful session where the backend answers each client line
+    /// with the next reply and then closes, while the client stays connected.
+    async fn run_until_backend_closes(
+        client_lines: &'static [u8],
+        backend_replies: &'static [&'static [u8]],
+    ) -> std::result::Result<super::StatefulLoopResult, super::StatefulLoopError> {
+        let session = test_session();
+        let (mut client_end, proxy_client_end) = tokio::io::duplex(4096);
+        let (backend_end, proxy_backend_end) = tokio::io::duplex(4096);
+        client_end.write_all(client_lines).await.unwrap();
+
+        let backend = tokio::spawn(async move {
+            let (backend_read, mut backend_write) = tokio::io::split(backend_end);
+            let mut reader = BufReader::new(backend_read);
+            let mut line = String::new();
+            for reply in backend_replies {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                backend_write.write_all(reply).await.unwrap();
+            }
+            // Dropping both halves closes the backend side cleanly.
+        });
+
+        let (proxy_client_read, proxy_client_write) = tokio::io::split(proxy_client_end);
+        let (backend_read, backend_write) = tokio::io::split(proxy_backend_end);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            session.run_stateful_proxy_loop(
+                BufReader::new(proxy_client_read),
+                proxy_client_write,
+                backend_read,
+                backend_write,
+                SessionLoopState::new(false),
+                BackendId::from_index(0),
+            ),
+        )
+        .await
+        .expect("stateful loop must end when the backend closes");
+        backend.await.unwrap();
+        drop(client_end);
+        result
+    }
+
+    #[tokio::test]
+    async fn backend_close_after_quit_retires_without_backend_failure() {
+        let result = run_until_backend_closes(b"QUIT\r\n", &[b"205 Goodbye\r\n"])
+            .await
+            .expect("a close that answers QUIT is a clean exit");
+        assert_eq!(
+            result.disposition(),
+            super::StatefulConnectionDisposition::RetireClient,
+            "a QUIT close must not apply backend replacement cooldown"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_close_after_pipelined_quit_retires_without_backend_failure() {
+        let result = run_until_backend_closes(
+            b"DATE\r\nQUIT\r\n",
+            &[b"111 20260101000000\r\n", b"205 Goodbye\r\n"],
+        )
+        .await
+        .expect("a close that answers QUIT is a clean exit");
+        assert_eq!(
+            result.disposition(),
+            super::StatefulConnectionDisposition::RetireClient
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_close_without_quit_remains_a_backend_failure() {
+        let result = run_until_backend_closes(b"DATE\r\n", &[b"111 20260101000000\r\n"])
+            .await
+            .expect("a close between replies is not an error");
+        assert_eq!(
+            result.disposition(),
+            super::StatefulConnectionDisposition::RetireBackend,
+            "an unprompted backend close still counts against the backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_close_after_an_unrelated_205_remains_a_backend_failure() {
+        // A 205 that answers DATE is not a QUIT reply.
+        let result = run_until_backend_closes(b"DATE\r\n", &[b"205 closing\r\n"])
+            .await
+            .expect("a close between replies is not an error");
+        assert_eq!(
+            result.disposition(),
+            super::StatefulConnectionDisposition::RetireBackend
+        );
     }
 
     #[tokio::test]

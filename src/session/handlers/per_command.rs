@@ -142,7 +142,12 @@ impl BatchBackendConnection {
 impl Drop for BatchBackendConnection {
     fn drop(&mut self) {
         if let Some(lease) = self.conn.take() {
-            lease.fail_backend();
+            // Only a clean, completed connection is parked in the slot, so a
+            // batch that ends here failed elsewhere: usually the client went
+            // away. Retire the socket without the replacement cooldown that
+            // a backend failure applies, or every client disconnect would
+            // shrink the backend's pool.
+            lease.fail_client();
         }
     }
 }
@@ -1619,6 +1624,45 @@ mod tests {
         let request = RequestContext::parse(b"GROUP alt.test\r\n").expect("valid request");
 
         assert_eq!(super::safe_command_log_label(&request), "GROUP");
+    }
+
+    #[tokio::test]
+    async fn dropped_batch_retires_its_parked_connection_without_shrinking_the_pool() {
+        let (port, accept_count) = spawn_greeting_server().await;
+        let server =
+            crate::config::Server::builder("127.0.0.1", crate::types::Port::try_new(port).unwrap())
+                .name("cooldown")
+                .max_connections(crate::types::MaxConnections::try_new(4).unwrap())
+                .compress(Some(false))
+                .replacement_cooldown(Duration::from_secs(30))
+                .build()
+                .unwrap();
+        let provider = DeadpoolConnectionProvider::from_server_config(&server, 0, 0).unwrap();
+        let conn = provider
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+
+        // A batch that ends early (client disconnect, cancellation) drops the
+        // clean connection it parked between commands.
+        drop(super::BatchBackendConnection {
+            conn: Some(super::BackendLease::new(BackendId::from_index(0), conn)),
+        });
+
+        assert_eq!(
+            provider.active_cooldowns(),
+            0,
+            "a client-side batch end must not apply backend replacement cooldown"
+        );
+        assert_eq!(provider.max_size(), 4, "the pool must keep its capacity");
+        let next = provider.checkout_connection_guard().await.unwrap();
+        next.release();
+        assert_eq!(
+            accept_count.load(Ordering::SeqCst),
+            2,
+            "the parked connection is still retired, not returned to the pool"
+        );
     }
 
     #[tokio::test]

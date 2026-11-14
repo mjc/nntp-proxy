@@ -302,6 +302,14 @@ impl SessionLoopState {
         self.backend_replies.owes_reply_before_quit()
     }
 
+    /// Whether a clean backend close completes a client `QUIT`; see
+    /// `BackendResponseOrder::closed_by_quit`.
+    #[inline]
+    #[must_use]
+    pub fn backend_closed_by_quit(&self) -> bool {
+        self.backend_replies.closed_by_quit()
+    }
+
     /// Return client writes made ready by a backend read.
     ///
     /// This preserves client-visible response ordering even when one read

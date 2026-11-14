@@ -754,6 +754,12 @@ impl BackendResponseOrder {
                 .any(|frame| frame.kind == crate::protocol::RequestKind::Quit)
     }
 
+    /// Whether a clean backend close now ends a session the client asked to
+    /// end: `QUIT` was sent and nothing sent before it is still owed.
+    pub(crate) fn closed_by_quit(&self) -> bool {
+        self.inner.quit_sent && !self.owes_reply_before_quit()
+    }
+
     /// Queue a local reply that must be written only after earlier backend
     /// replies have been framed and forwarded.
     pub(crate) fn push_deferred_reply(&mut self, reply: &'static [u8]) {
@@ -7379,6 +7385,52 @@ mod tests {
             Err(ResponseTransferError::ClientDisconnect(_))
         ));
         assert_eq!(conn.pending_bytes_len(), b"223 0 <next>\r\n".len());
+    }
+
+    #[test]
+    fn article_pipelined_before_quit_is_owed_until_its_terminator() {
+        let article = crate::protocol::RequestContext::parse(b"ARTICLE <a@example.com>\r\n")
+            .expect("valid request");
+        let quit = crate::protocol::RequestContext::parse(b"QUIT\r\n").expect("valid request");
+        let mut order = BackendResponseOrder::default();
+        order.push_request(article.kind());
+        order.push_request(quit.kind());
+        assert!(order.owes_reply_before_quit());
+        assert!(!order.closed_by_quit());
+
+        // A body line that looks like a closing status is still article data.
+        let _ = order.client_writes_for_backend_read(
+            b"220 0 <a@example.com>\r\nSubject: x\r\n\r\n205 closing\r\n",
+        );
+        assert!(
+            order.owes_reply_before_quit(),
+            "a close mid-article is a backend failure even with QUIT queued"
+        );
+        assert!(!order.closed_by_quit());
+
+        let _ = order.client_writes_for_backend_read(b".\r\n");
+        assert!(!order.owes_reply_before_quit());
+        assert!(
+            order.closed_by_quit(),
+            "only QUIT is left, so a close now ends the session"
+        );
+
+        let _ = order.client_writes_for_backend_read(b"205 Goodbye\r\n");
+        assert!(order.closed_by_quit());
+    }
+
+    #[test]
+    fn close_without_quit_is_not_closed_by_quit() {
+        let date = crate::protocol::RequestContext::parse(b"DATE\r\n").expect("valid request");
+        let mut order = BackendResponseOrder::default();
+        assert!(!order.closed_by_quit());
+        order.push_request(date.kind());
+        let _ = order.client_writes_for_backend_read(b"205 closing\r\n");
+        assert!(!order.owes_reply_before_quit());
+        assert!(
+            !order.closed_by_quit(),
+            "a 205 answering another command does not make a close a QUIT close"
+        );
     }
 
     #[test]

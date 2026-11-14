@@ -34,8 +34,8 @@ impl BackendLease {
         let _ = self.connection.complete_success();
     }
 
-    pub(super) fn fail_backend(self) {
-        self.connection.fail_backend();
+    pub(super) fn fail_client(self) {
+        self.connection.fail_client();
     }
 }
 
