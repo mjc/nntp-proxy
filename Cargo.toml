@@ -7,7 +7,6 @@ description = "High-throughput NNTP proxy with connection pooling, multiple back
 license = "MIT"
 repository = "https://github.com/mjc/nntp-proxy"
 documentation = "https://docs.rs/nntp-proxy"
-homepage = "https://github.com/mjc/nntp-proxy"
 keywords = ["nntp", "proxy", "server", "usenet", "multiplexing"]
 categories = [
     "network-programming",
@@ -87,7 +86,6 @@ rustls-native-certs = "0.8"  # Load system CA certificates
 rustls-pki-types = "1.15"  # PKI types for rustls
 webpki-roots = "1.0.11"  # Mozilla CA certificate bundle fallback
 crc32fast = "1.5.4"
-yenc = "0.2.2"  # yEnc encoding/decoding - faster and more correct than custom impl
 bytesize = { version = "2.7.0", features = ["serde"] }
 twox-hash = "2.1.5"
 rand = "0.10"  # Jittered backoff for stale-connection retries
@@ -95,6 +93,9 @@ flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }  
 pin-project-lite = "0.2"  # Safe pin projection (already in dep tree via tokio)
 hickory-resolver = { version = "0.26", features = ["tokio", "system-config"] }  # DNS lookups with TTL-aware caching from system resolver config
 serde_ignored = "0.1"  # Report unknown [[servers]]/[routing] config keys instead of silently ignoring them
+
+# Only the framing-bench fixtures (cfg(any(test, feature = "framing-bench"))) encode yEnc.
+yenc = { version = "0.2.2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1.54", features = ["test-util"] }  # Paused time for deterministic async tests
@@ -108,7 +109,7 @@ gungraun = "0.20"  # Callgrind instruction/branch/cache benchmarking
 
 [features]
 default = []
-framing-bench = []
+framing-bench = ["dep:yenc"]
 tokio-console = ["dep:console-subscriber", "tokio/tracing"]  # Runtime/task instrumentation for tokio-console; build with RUSTFLAGS="--cfg tokio_unstable"
 
 [lints.rust]
