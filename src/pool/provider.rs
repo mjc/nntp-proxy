@@ -729,6 +729,11 @@ impl DeadpoolConnectionProvider {
     /// whole checkout instead would abort a TLS handshake or authentication
     /// part-way and waste the backend connection it was building.
     ///
+    /// An idle-only budget ([`super::admission::BacklogPolicy::IdleOnly`])
+    /// never waits: it takes a free connection without blocking, or is
+    /// skipped as backlogged, unless the pass-over is let through as a rescue
+    /// probe.
+    ///
     /// Both busy outcomes are expected under load and the caller routes
     /// around them, so they are counted and summarised per backend instead of
     /// logged per request.
@@ -745,18 +750,23 @@ impl DeadpoolConnectionProvider {
     > {
         use crate::connection_error::ConnectionError;
 
+        if let super::admission::BacklogPolicy::IdleOnly { probes, .. } = budget.backlog() {
+            if let Some(conn) = self.checkout_if_free().await? {
+                return Ok(conn);
+            }
+            // A real pass-over: the checkout would have waited.
+            let probe =
+                probes == super::admission::RescueProbes::Counted && self.load.take_rescue_probe();
+            if !probe {
+                return Err(self.backlog_skip(self.estimated_wait()));
+            }
+        }
         let last_resort = budget.backlog() == super::admission::BacklogPolicy::LastResort;
         if last_resort {
             self.load.note_last_resort_wait();
         }
         if let super::admission::Admission::Skip { estimated_wait } = self.admission(budget) {
-            if let Some(summary) = self.load.note_backlog_skip() {
-                self.log_skip_summary(summary);
-            }
-            return Err(ConnectionError::Backlogged {
-                backend: Arc::clone(&self.name),
-                estimated_wait,
-            });
+            return Err(self.backlog_skip(estimated_wait));
         }
 
         let timeouts = managed::Timeouts {
@@ -786,6 +796,54 @@ impl DeadpoolConnectionProvider {
                 self.log_acquisition_failure(&err);
                 Err(err)
             }
+        }
+    }
+
+    /// Take a connection only if one is free now, without joining the queue.
+    /// `Ok(None)` means the checkout would have waited. Pool status screens
+    /// out a full pool cheaply and keeps the take from jumping queued
+    /// waiters; the non-blocking take then decides, so concurrent callers
+    /// that all saw one free connection cannot all get it.
+    async fn checkout_if_free(
+        &self,
+    ) -> Result<
+        Option<crate::pool::connection_guard::IdleConnection>,
+        crate::connection_error::ConnectionError,
+    > {
+        use crate::connection_error::ConnectionError;
+
+        if !super::admission::has_free_slot(self.status_counts()) {
+            return Ok(None);
+        }
+        // Deadpool treats a zero wait as a non-blocking permit take.
+        let timeouts = managed::Timeouts {
+            wait: Some(std::time::Duration::ZERO),
+            ..self.pool.timeouts()
+        };
+        match self.get_pooled_connection_with(&timeouts).await {
+            Ok(conn) => Ok(Some(crate::pool::connection_guard::IdleConnection::new(
+                conn,
+                self.clone(),
+            ))),
+            Err(ConnectionError::PoolExhausted { .. }) => Ok(None),
+            Err(err) => {
+                self.log_acquisition_failure(&err);
+                Err(err)
+            }
+        }
+    }
+
+    /// Count a skip without queueing and build its error.
+    fn backlog_skip(
+        &self,
+        estimated_wait: std::time::Duration,
+    ) -> crate::connection_error::ConnectionError {
+        if let Some(summary) = self.load.note_backlog_skip() {
+            self.log_skip_summary(summary);
+        }
+        crate::connection_error::ConnectionError::Backlogged {
+            backend: Arc::clone(&self.name),
+            estimated_wait,
         }
     }
 
@@ -1740,6 +1798,132 @@ mod tests {
             "with skipping off the checkout waits its limit"
         );
         assert_eq!(provider.load().snapshot().busy_timeouts, 1);
+    }
+
+    fn idle_only_budget(
+        wait: std::time::Duration,
+        probes: crate::pool::admission::RescueProbes,
+    ) -> crate::pool::admission::CheckoutBudget {
+        crate::pool::admission::CheckoutBudget::new(
+            wait,
+            crate::pool::admission::BacklogPolicy::SkipAbove { percent: 100 },
+        )
+        .idle_only(probes)
+    }
+
+    /// The idle check and the take are one step: a burst of idle-only
+    /// checkouts that all arrive while one connection is idle gets that one
+    /// connection once, and every other checkout is skipped without waiting.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn idle_only_burst_takes_the_one_idle_connection_once() {
+        use crate::pool::admission::RescueProbes;
+        const BURST: usize = 8;
+
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 1, None);
+        drop(provider.get_pooled_connection().await.unwrap());
+        assert_eq!(provider.status_counts().available, 1, "one idle connection");
+        let budget = idle_only_budget(std::time::Duration::from_secs(2), RescueProbes::Counted);
+
+        let start = Arc::new(tokio::sync::Barrier::new(BURST));
+        let started = std::time::Instant::now();
+        let checkouts: Vec<_> = (0..BURST)
+            .map(|_| {
+                let provider = provider.clone();
+                let start = Arc::clone(&start);
+                tokio::spawn(async move {
+                    start.wait().await;
+                    provider.checkout_for_attempt(budget).await
+                })
+            })
+            .collect();
+        let results: Vec<_> = futures::future::join_all(checkouts)
+            .await
+            .into_iter()
+            .map(|joined| joined.unwrap())
+            .collect();
+
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "no checkout waited"
+        );
+        let connected = results.iter().filter(|result| result.is_ok()).count();
+        let skipped = results
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result,
+                    Err(crate::connection_error::ConnectionError::Backlogged { .. })
+                )
+            })
+            .count();
+        assert_eq!((connected, skipped), (1, 7));
+        let load = provider.load().snapshot();
+        assert_eq!(load.backlog_skips, 7);
+        assert_eq!(load.busy_timeouts, 0);
+        assert_eq!(provider.load().rescue_pass_overs(), 7);
+    }
+
+    #[tokio::test]
+    async fn idle_only_opens_a_connection_when_the_pool_has_room() {
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 1, None);
+
+        let conn = provider
+            .checkout_for_attempt(idle_only_budget(
+                std::time::Duration::from_secs(2),
+                crate::pool::admission::RescueProbes::Counted,
+            ))
+            .await;
+
+        assert!(conn.is_ok(), "room to open a connection is not a wait");
+        assert_eq!(provider.load().rescue_pass_overs(), 0, "not a pass-over");
+    }
+
+    /// One pass-over in sixteen is let through to a normal checkout, which
+    /// then waits its limit on the full pool.
+    #[tokio::test]
+    async fn idle_only_lets_one_pass_over_in_sixteen_through() {
+        use crate::pool::admission::{RESCUE_PROBE_EVERY, RescueProbes};
+
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 1, None);
+        let _held = provider.get_pooled_connection().await.unwrap();
+        let budget = idle_only_budget(std::time::Duration::from_millis(1), RescueProbes::Counted);
+
+        let mut probed = 0;
+        for _ in 0..2 * RESCUE_PROBE_EVERY {
+            match provider.checkout_for_attempt(budget).await {
+                Err(crate::connection_error::ConnectionError::Backlogged { .. }) => {}
+                Err(crate::connection_error::ConnectionError::PoolExhausted { .. }) => probed += 1,
+                other => panic!("unexpected checkout result: {:?}", other.map(|_| ())),
+            }
+        }
+
+        assert_eq!(probed, 2);
+        let load = provider.load().snapshot();
+        assert_eq!(load.backlog_skips, 2 * RESCUE_PROBE_EVERY - 2);
+        assert_eq!(load.busy_timeouts, 2);
+        assert_eq!(provider.load().rescue_pass_overs(), 2 * RESCUE_PROBE_EVERY);
+    }
+
+    #[tokio::test]
+    async fn uncounted_idle_only_never_probes() {
+        use crate::pool::admission::{RESCUE_PROBE_EVERY, RescueProbes};
+
+        let addr = spawn_mock_nntp_server().await;
+        let provider = provider_with_cooldown(addr, 1, None);
+        let _held = provider.get_pooled_connection().await.unwrap();
+        let budget = idle_only_budget(std::time::Duration::from_millis(1), RescueProbes::Uncounted);
+
+        for _ in 0..2 * RESCUE_PROBE_EVERY {
+            assert!(matches!(
+                provider.checkout_for_attempt(budget).await,
+                Err(crate::connection_error::ConnectionError::Backlogged { .. })
+            ));
+        }
+        assert_eq!(provider.load().rescue_pass_overs(), 0);
+        assert_eq!(provider.load().snapshot().busy_timeouts, 0);
     }
 
     #[tokio::test]

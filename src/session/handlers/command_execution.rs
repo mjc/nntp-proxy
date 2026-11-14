@@ -100,6 +100,35 @@ pub(super) struct BackloggedBackends {
     skipped: SuppressedBackends,
     waited: SuppressedBackends,
     last_resort: LastResort,
+    floor: FloorDecisions,
+}
+
+/// One request's rescue-floor decisions, at most one per backend.
+///
+/// A request meets an under-floor backend in several places (the `STAT`
+/// sweep, a direct attempt, the last-resort pick). Counting a pass-over in
+/// each would tick the probe counter several times for one request, so the
+/// documented one-probe-in-16-pass-overs rate would not hold; deciding once
+/// and remembering the outcome keeps it.
+#[derive(Debug, Default)]
+struct FloorDecisions {
+    /// Backends the request already decided the floor for.
+    decided: SuppressedBackends,
+    /// Of those, the backends it passed over: an idle-only checkout found no
+    /// free connection and was not let through as a probe, or the probe was
+    /// then skipped as backlogged.
+    passed_over: SuppressedBackends,
+}
+
+/// How the rescue floor treats a backend for the rest of one request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FloorDecision {
+    /// Not decided yet; the next checkout decides.
+    Undecided,
+    /// Decided without a pass-over; treat it like any other backend.
+    Used,
+    /// Passed over; a last-resort pick treats it as an unlikely rescuer.
+    PassedOver,
 }
 
 impl BackloggedBackends {
@@ -122,13 +151,49 @@ impl BackloggedBackends {
         self.waited.suppress(backend_id);
     }
 
+    fn floor_decision(&self, backend_id: BackendId) -> FloorDecision {
+        if !self.floor.decided.contains(backend_id) {
+            FloorDecision::Undecided
+        } else if self.floor.passed_over.contains(backend_id) {
+            FloorDecision::PassedOver
+        } else {
+            FloorDecision::Used
+        }
+    }
+
+    /// Record the request's one rescue-floor decision for `backend_id`.
+    fn decide_floor(&mut self, backend_id: BackendId, decision: FloorDecision) {
+        self.floor.decided.suppress(backend_id);
+        if decision == FloorDecision::PassedOver {
+            self.floor.passed_over.suppress(backend_id);
+        }
+    }
+
+    /// A backlog skip of `backend_id`, which is then a last-resort candidate.
+    /// The skip of an idle-only checkout is the request's floor pass-over.
+    fn note_backlog_skip(
+        &mut self,
+        backend_id: BackendId,
+        budget: crate::pool::admission::CheckoutBudget,
+    ) {
+        self.skipped.suppress(backend_id);
+        if budget.is_idle_only() {
+            self.floor.passed_over.suppress(backend_id);
+        }
+    }
+
     /// Track why a checkout on `backend_id` failed: a backlog skip makes the
     /// backend a last-resort candidate, and a timed-out last-resort wait
     /// ends last resorts for the request.
-    fn note_checkout_failure(&mut self, backend_id: BackendId, error: &anyhow::Error) {
+    fn note_checkout_failure(
+        &mut self,
+        backend_id: BackendId,
+        budget: crate::pool::admission::CheckoutBudget,
+        error: &anyhow::Error,
+    ) {
         use crate::connection_error::ConnectionError;
         match error.downcast_ref::<ConnectionError>() {
-            Some(ConnectionError::Backlogged { .. }) => self.skipped.suppress(backend_id),
+            Some(ConnectionError::Backlogged { .. }) => self.note_backlog_skip(backend_id, budget),
             Some(ConnectionError::PoolExhausted { .. }) if self.waited.contains(backend_id) => {
                 self.last_resort = LastResort::Spent;
             }
@@ -332,7 +397,10 @@ enum RetryStatProbeOutcome {
     Unavailable(BackendId),
     /// Skipped as backlogged: unavailable to this request like any busy
     /// backend, but still a last-resort candidate for the request itself.
-    Backlogged(BackendId),
+    Backlogged {
+        backend_id: BackendId,
+        budget: crate::pool::admission::CheckoutBudget,
+    },
 }
 
 /// Classify a client write failure after the backend response is owned.
@@ -506,6 +574,19 @@ impl ClientSession {
         if state.budget.is_expired() {
             return Ok(self.article_deadline_expired(provider, backend_id, request));
         }
+        // A lookup after another backend already answered 430 measures how
+        // often this backend rescues a miss.
+        let article_lookup =
+            crate::command::CommandHandler::article_lookup_request(request).is_some();
+        let fallback_lookup = article_lookup && state.availability.missing_bits() != 0;
+        let checkout = Self::rescue_floor_checkout(
+            router,
+            provider,
+            backend_id,
+            state.backlogged,
+            fallback_lookup,
+            checkout,
+        );
 
         let Some(attempt) = self
             .prepare_backend_attempt(
@@ -529,11 +610,6 @@ impl ClientSession {
         };
 
         let status_code = attempt.status_code();
-        // A lookup after another backend already answered 430 measures how
-        // often this backend rescues a miss.
-        let article_lookup =
-            crate::command::CommandHandler::article_lookup_request(request).is_some();
-        let fallback_lookup = article_lookup && state.availability.missing_bits() != 0;
 
         if let Ok(missing) = AuthoritativeArticleMissing::from_status_code(backend, status_code) {
             trace!(
@@ -652,9 +728,13 @@ impl ClientSession {
     ///
     /// Backends excluded from this request are invisible here, as they are to
     /// the router's tier escalation.
+    ///
+    /// Picking can count a rescue-floor pass-over, so it records the
+    /// request's floor decisions; a backend already decided is not counted
+    /// again.
     fn last_resort_backend(
         router: &BackendSelector,
-        state: &ArticleAttemptState<'_>,
+        state: &mut ArticleAttemptState<'_>,
         excluded_backends: SuppressedBackends,
     ) -> Option<BackendId> {
         if state.budget.last_resort() != crate::pool::admission::BacklogLastResort::WaitShortest
@@ -692,10 +772,22 @@ impl ClientSession {
                     continue;
                 };
                 let wait = provider.estimated_wait();
-                let slot = if fallback_lookup
+                let passed_over = fallback_lookup
                     && provider.is_unlikely_to_rescue(&admission)
-                    && !provider.take_rescue_probe()
-                {
+                    && match state.backlogged.floor_decision(backend_id) {
+                        FloorDecision::PassedOver => true,
+                        FloorDecision::Used => false,
+                        FloorDecision::Undecided => {
+                            let decision = if provider.take_rescue_probe() {
+                                FloorDecision::Used
+                            } else {
+                                FloorDecision::PassedOver
+                            };
+                            state.backlogged.decide_floor(backend_id, decision);
+                            decision == FloorDecision::PassedOver
+                        }
+                    };
+                let slot = if passed_over {
                     &mut shortest_unlikely
                 } else {
                     &mut shortest
@@ -724,6 +816,44 @@ impl ClientSession {
             }
         }
         None
+    }
+
+    /// The checkout budget for `backend_id` once the rescue floor is applied.
+    ///
+    /// Once another backend has answered `430`, a backend under the floor is
+    /// used only when a connection is free now; otherwise it is skipped like
+    /// a backlogged backend, so dead articles do not queue on it. The
+    /// checkout itself enforces this ([`BacklogPolicy::IdleOnly`]), so a
+    /// burst of lookups cannot all claim one idle connection. Only the first
+    /// checkout in a request decides; a backend the request already used, for
+    /// example one the `STAT` sweep found the article on, is checked out
+    /// normally.
+    ///
+    /// The floor follows backlog skipping: with skipping off, or for a last
+    /// resort that already chose to wait, the budget is unchanged.
+    ///
+    /// [`BacklogPolicy::IdleOnly`]: crate::pool::admission::BacklogPolicy::IdleOnly
+    fn rescue_floor_checkout(
+        router: &BackendSelector,
+        provider: &crate::pool::DeadpoolConnectionProvider,
+        backend_id: BackendId,
+        backlogged: &mut BackloggedBackends,
+        fallback_lookup: bool,
+        checkout: crate::pool::admission::CheckoutBudget,
+    ) -> crate::pool::admission::CheckoutBudget {
+        if !fallback_lookup
+            || !matches!(
+                checkout.backlog(),
+                crate::pool::admission::BacklogPolicy::SkipAbove { .. }
+            )
+            || !provider.is_unlikely_to_rescue(&router.article_admission())
+            || backlogged.floor_decision(backend_id) != FloorDecision::Undecided
+        {
+            return checkout;
+        }
+        // A skip below upgrades this to a pass-over.
+        backlogged.decide_floor(backend_id, FloorDecision::Used);
+        checkout.idle_only(crate::pool::admission::RescueProbes::Counted)
     }
 
     fn article_deadline_expired(
@@ -790,16 +920,26 @@ impl ClientSession {
             return Ok(());
         }
 
+        // The sweep runs after a 430, which makes each probe a fallback lookup.
+        let fallback_lookup = state.availability.missing_bits() != 0;
         let mut probes = FuturesUnordered::new();
         for (backend_id, provider) in candidates {
             let router = Arc::clone(router);
             let stat_request = stat_request.clone_for_background_probe();
+            let budget = Self::rescue_floor_checkout(
+                &router,
+                &provider,
+                backend_id,
+                state.backlogged,
+                fallback_lookup,
+                probe_budget,
+            );
             probes.push(async move {
                 let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
-                let conn = match provider.checkout_for_attempt(probe_budget).await {
+                let conn = match provider.checkout_for_attempt(budget).await {
                     Ok(conn) => conn.activate(),
                     Err(crate::connection_error::ConnectionError::Backlogged { .. }) => {
-                        return RetryStatProbeOutcome::Backlogged(backend_id);
+                        return RetryStatProbeOutcome::Backlogged { backend_id, budget };
                     }
                     Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
                 };
@@ -868,9 +1008,9 @@ impl ClientSession {
                 RetryStatProbeOutcome::Unavailable(backend_id) => {
                     state.unavailable_backends.suppress(backend_id);
                 }
-                RetryStatProbeOutcome::Backlogged(backend_id) => {
+                RetryStatProbeOutcome::Backlogged { backend_id, budget } => {
                     state.unavailable_backends.suppress(backend_id);
-                    state.backlogged.skipped.suppress(backend_id);
+                    state.backlogged.note_backlog_skip(backend_id, budget);
                 }
             }
         }
@@ -906,6 +1046,11 @@ impl ClientSession {
             return;
         };
 
+        let admission = router.article_admission();
+        let probe_budget = admission.probe();
+        // In after-primary-miss mode every probe follows a 430; in first-attempt
+        // mode only those with a cached miss do.
+        let fallback_lookup = availability.missing_bits() != 0;
         let mut candidates = Vec::new();
         for tier in router.tiers().filter(|tier| *tier > 0) {
             for backend_id in router.backend_ids_in_tier(tier) {
@@ -920,24 +1065,29 @@ impl ClientSession {
                     continue;
                 };
                 if provider.stat_missing_enabled() {
-                    candidates.push((backend_id, provider.clone()));
+                    // After a 430, an under-floor backend takes only a free
+                    // connection, as in the request's own attempts. A
+                    // background probe is not the request's attempt, so its
+                    // pass-overs do not count toward rescue probes.
+                    let budget = if fallback_lookup && provider.is_unlikely_to_rescue(&admission) {
+                        probe_budget.idle_only(crate::pool::admission::RescueProbes::Uncounted)
+                    } else {
+                        probe_budget
+                    };
+                    candidates.push((backend_id, provider.clone(), budget));
                 }
             }
         }
         if candidates.is_empty() {
             return;
         }
-        let probe_budget = router.article_admission().probe();
-        // In after-primary-miss mode every probe follows a 430; in first-attempt
-        // mode only those with a cached miss do.
-        let fallback_lookup = availability.missing_bits() != 0;
 
         let router = Arc::clone(router);
         let cache = Arc::clone(&self.cache);
         let buffer_pool = self.buffer_pool.clone();
         tokio::spawn(async move {
             let mut probes = FuturesUnordered::new();
-            for (backend_id, provider) in candidates {
+            for (backend_id, provider, budget) in candidates {
                 let router = Arc::clone(&router);
                 let cache = Arc::clone(&cache);
                 let stat_request = stat_request.clone_for_background_probe();
@@ -948,7 +1098,7 @@ impl ClientSession {
                         .availability_slot(backend_id)
                         .expect("probe backend is registered");
                     let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
-                    let conn = match provider.checkout_for_attempt(probe_budget).await {
+                    let conn = match provider.checkout_for_attempt(budget).await {
                         Ok(conn) => conn.activate(),
                         Err(_) => return,
                     };
@@ -1128,7 +1278,9 @@ impl ClientSession {
             Ok(result) => result,
             Err(err) => {
                 state.unavailable_backends.suppress(backend_id);
-                state.backlogged.note_checkout_failure(backend_id, &err);
+                state
+                    .backlogged
+                    .note_checkout_failure(backend_id, budget, &err);
                 debug!(
                     client = %self.client_addr,
                     backend = backend_id.as_index(),
@@ -4631,6 +4783,349 @@ mod tests {
             route_and_read_status(&router, b"BODY <failing-not-busy@example.com>\r\n").await;
 
         assert_eq!(status, 503);
+    }
+
+    /// The busy estimate can say "free" while every connection is in use
+    /// (here: no service-time sample yet). A backend under the rescue floor
+    /// is still only used when a connection is idle, so the lookup answers
+    /// 430 at once instead of queueing on it until the deadline.
+    #[tokio::test]
+    async fn unlikely_rescuer_without_an_idle_connection_is_skipped_even_when_not_estimated_busy() {
+        let full = full_unsampled_pool().await;
+        for _ in 0..200 {
+            full.note_fallback_lookup(FallbackOutcome::NotFound);
+        }
+        let router = skipped_peer_router(
+            full.clone(),
+            short_deadline_admission().with_rescue_floor_percent(2),
+        )
+        .await;
+
+        let (status, elapsed) =
+            route_and_read_status(&router, b"BODY <no-idle-connection@example.com>\r\n").await;
+
+        assert_eq!(status, 430);
+        assert!(
+            elapsed < SHORT_DEADLINE / 2,
+            "did not wait for the full pool: {elapsed:?}"
+        );
+        assert_eq!(full.load().snapshot().deadline_expiries, 0);
+    }
+
+    fn floor_admission() -> crate::pool::admission::ArticleAdmission {
+        crate::pool::admission::ArticleAdmission::default().with_rescue_floor_percent(2)
+    }
+
+    /// Give `provider` a rescue rate well under a 2% floor.
+    fn put_under_rescue_floor(provider: &DeadpoolConnectionProvider) {
+        for _ in 0..200 {
+            provider.note_fallback_lookup(FallbackOutcome::NotFound);
+        }
+    }
+
+    /// A `STAT`-capable backend under the rescue floor whose only connection
+    /// is in use, with its `STAT` counter.
+    async fn full_stat_backend_under_floor() -> (DeadpoolConnectionProvider, Arc<AtomicUsize>) {
+        let (port, stats, _bodies) = spawn_stat_missing_probe_server().await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .stat_missing(true)
+            .build()
+            .unwrap();
+        std::mem::forget(provider.checkout_connection_guard().await.unwrap());
+        put_under_rescue_floor(&provider);
+        (provider, stats)
+    }
+
+    /// The idle check is part of the checkout: of a burst of fallback
+    /// lookups, only one gets the under-floor backend's single connection,
+    /// and the rest answer 430 at once instead of queueing behind it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn burst_of_fallback_lookups_uses_an_unlikely_rescuers_connection_once() {
+        const BURST: usize = 6;
+        let (missing_port, _) = spawn_article_response_server(b"430 No such article\r\n").await;
+        let missing = DeadpoolConnectionProvider::builder("127.0.0.1", missing_port)
+            .max_connections(BURST)
+            .build()
+            .unwrap();
+        // The lookup that gets this backend's connection holds it, so every
+        // other lookup in the burst finds it busy.
+        let (silent_port, _accepts, silent_lookups) = spawn_silent_article_server().await;
+        let unlikely = DeadpoolConnectionProvider::builder("127.0.0.1", silent_port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        put_under_rescue_floor(&unlikely);
+        let router = router_with_tiered_backends_and_admission(
+            vec![(missing, 0), (unlikely.clone(), 1)],
+            floor_admission(),
+        );
+
+        let mut lookups = tokio::task::JoinSet::new();
+        for index in 0..BURST {
+            let router = Arc::clone(&router);
+            lookups.spawn(async move {
+                let line = format!("BODY <burst-{index}@example.com>\r\n");
+                route_and_read_status(&router, line.as_bytes()).await
+            });
+        }
+        let mut answered = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while answered.len() < BURST - 1 {
+                answered.push(lookups.join_next().await.unwrap().unwrap());
+            }
+        })
+        .await
+        .expect("every lookup but the one holding the connection answers");
+        // The one that got the connection may still be opening it.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while silent_lookups.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("one lookup reaches the backend");
+        lookups.abort_all();
+
+        assert!(
+            answered.iter().all(|&(status, _)| status == 430),
+            "the rest skip it: {answered:?}"
+        );
+        assert_eq!(silent_lookups.load(Ordering::SeqCst), 1, "used once");
+        let load = unlikely.load().snapshot();
+        assert_eq!(load.backlog_skips, BURST as u64 - 1);
+        assert_eq!(load.busy_timeouts, 0, "nobody waited for it");
+        assert_eq!(load.last_resort_waits, 0);
+    }
+
+    /// A connection the session already holds to the backend costs no wait,
+    /// so the floor does not skip a backend whose pool is otherwise full.
+    #[tokio::test]
+    async fn unlikely_rescuer_is_used_through_the_sessions_cached_connection() {
+        let (port, lookups) = spawn_article_response_server(
+            b"222 0 <found@example.com> body follows\r\npayload\r\n.\r\n",
+        )
+        .await;
+        let unlikely = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        put_under_rescue_floor(&unlikely);
+        let router = router_with_admission_backends(
+            vec![missing_server().await, unlikely.clone()],
+            floor_admission(),
+        );
+        let unlikely_id = BackendId::from_index(1);
+        let cached = unlikely
+            .checkout_connection_guard()
+            .await
+            .unwrap()
+            .activate();
+        assert_eq!(unlikely.status_counts().available, 0, "the pool is full");
+
+        let session = test_session_with_backend_metrics(2);
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
+        let mut request = request_context(b"BODY <found@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        availability.record_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap());
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = Some(BackendLease::new(unlikely_id, cached));
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut backlogged = BackloggedBackends::default();
+        let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+            backlogged: &mut backlogged,
+            budget: floor_admission().start_request(),
+        };
+        let result = session
+            .try_backend_for_article(&router, &mut request, &mut client_writer, &mut state, false)
+            .await
+            .expect("the cached connection serves the lookup");
+        finalize_backend_connection(&mut backend_connection);
+
+        assert!(matches!(result, BackendAttemptResult::Success));
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
+        assert_eq!(unlikely.load().snapshot().backlog_skips, 0);
+        assert_eq!(unlikely.load().rescue_pass_overs(), 0);
+    }
+
+    /// One pass-over per request: the attempt that skipped the backend and
+    /// the last-resort pick that later looks at it count once together, so
+    /// the probe rate stays one in 16 requests.
+    #[tokio::test(start_paused = true)]
+    async fn rescue_floor_counts_one_pass_over_per_request() {
+        use crate::pool::admission::RESCUE_PROBE_EVERY;
+
+        let busy = backlogged_pool_with_rescue_history(FallbackOutcome::NotFound, 200).await;
+        let (lower_port, _) = spawn_article_response_server(b"430 No such article\r\n").await;
+        let lower = DeadpoolConnectionProvider::builder("127.0.0.1", lower_port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let router = router_with_tiered_backends_and_admission(
+            vec![(missing_server().await, 0), (busy.clone(), 0), (lower, 1)],
+            floor_admission(),
+        );
+
+        for index in 0..RESCUE_PROBE_EVERY {
+            let line = format!("BODY <one-pass-over-{index}@example.com>\r\n");
+            let _ = route_and_read_status(&router, line.as_bytes()).await;
+            assert_eq!(busy.load().rescue_pass_overs(), index + 1);
+        }
+        assert_eq!(
+            busy.load().snapshot().last_resort_waits,
+            RESCUE_PROBE_EVERY,
+            "the tier rule still waits on it every time"
+        );
+    }
+
+    /// With backlog skipping off nothing is skipped, and neither is a backend
+    /// under the floor: the request waits on it as before.
+    #[tokio::test]
+    async fn rescue_floor_follows_backlog_skip_off() {
+        let full = full_unsampled_pool().await;
+        put_under_rescue_floor(&full);
+        let router = skipped_peer_router(
+            full.clone(),
+            crate::pool::admission::ArticleAdmission::new(
+                Some(SHORT_DEADLINE),
+                crate::constants::pool::ARTICLE_CHECKOUT_WAIT,
+                crate::pool::admission::BacklogPolicy::Queue,
+            )
+            .with_rescue_floor_percent(2),
+        )
+        .await;
+
+        let (status, elapsed) =
+            route_and_read_status(&router, b"BODY <backlog-skip-off@example.com>\r\n").await;
+
+        assert_eq!(status, 503, "the busy backend never answered");
+        assert!(elapsed >= SHORT_DEADLINE, "it was waited on");
+        let load = full.load().snapshot();
+        assert_eq!(load.backlog_skips, 0);
+        assert_eq!(load.deadline_expiries, 1);
+        assert_eq!(full.load().rescue_pass_overs(), 0);
+    }
+
+    /// The STAT sweep after a 430 takes an under-floor backend only if a
+    /// connection is free, and the request's last-resort pick does not count
+    /// that pass-over again.
+    #[tokio::test]
+    async fn retry_stat_sweep_takes_an_unlikely_rescuer_only_when_idle() {
+        let session = test_session();
+        let (missing_port, _, _) = spawn_stat_missing_probe_server().await;
+        let (peer_port, peer_stats, _) = spawn_stat_missing_probe_server().await;
+        let (unlikely, unlikely_stats) = full_stat_backend_under_floor().await;
+        let stat_backend = |port| {
+            DeadpoolConnectionProvider::builder("127.0.0.1", port)
+                .max_connections(1)
+                .stat_missing(true)
+                .build()
+                .unwrap()
+        };
+        let router = router_with_tiered_backends_and_admission(
+            vec![
+                (stat_backend(missing_port), 0),
+                (stat_backend(peer_port), 0),
+                (unlikely.clone(), 1),
+            ],
+            floor_admission(),
+        );
+        let unlikely_id = BackendId::from_index(2);
+
+        let request = request_context(b"BODY <sweep-floor@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        availability.record_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap());
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut backlogged = BackloggedBackends::default();
+        let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+            backlogged: &mut backlogged,
+            budget: floor_admission().start_request(),
+        };
+        let started = std::time::Instant::now();
+        session
+            .parallel_retry_stat_sweep(&router, &request, &mut state)
+            .await
+            .expect("parallel retry STAT sweep should succeed");
+
+        assert!(
+            started.elapsed() < crate::constants::pool::STAT_PROBE_CHECKOUT_WAIT / 2,
+            "did not wait for the full pool"
+        );
+        assert_eq!(peer_stats.load(Ordering::SeqCst), 1);
+        assert_eq!(unlikely_stats.load(Ordering::SeqCst), 0);
+        assert!(state.unavailable_backends.contains(unlikely_id));
+        assert!(state.backlogged.is_candidate(unlikely_id));
+        assert_eq!(
+            state.backlogged.floor_decision(unlikely_id),
+            super::FloorDecision::PassedOver
+        );
+        let load = unlikely.load().snapshot();
+        assert_eq!((load.backlog_skips, load.busy_timeouts), (1, 0));
+        assert_eq!(unlikely.load().rescue_pass_overs(), 1);
+
+        let _ = super::ClientSession::last_resort_backend(
+            &router,
+            &mut state,
+            SuppressedBackends::empty(),
+        );
+        assert_eq!(
+            unlikely.load().rescue_pass_overs(),
+            1,
+            "the last-resort pick reuses the request's decision"
+        );
+    }
+
+    /// The background lower-tier STAT probe after a 430 also takes an
+    /// under-floor backend only if a connection is free, and does not use up
+    /// a pass-over.
+    #[tokio::test]
+    async fn lower_tier_stat_prefetch_takes_an_unlikely_rescuer_only_when_idle() {
+        let session = test_session();
+        let (primary_port, _, _) = spawn_stat_missing_probe_server().await;
+        let primary = DeadpoolConnectionProvider::builder("127.0.0.1", primary_port)
+            .max_connections(1)
+            .stat_missing(true)
+            .build()
+            .unwrap();
+        let (unlikely, unlikely_stats) = full_stat_backend_under_floor().await;
+        let router = router_with_tiered_backends_and_admission(
+            vec![(primary, 0), (unlikely.clone(), 1)],
+            floor_admission(),
+        );
+        let mut availability = ArticleAvailability::new();
+        availability.record_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap());
+
+        let started = std::time::Instant::now();
+        session.spawn_non_primary_tier_stat_prefetch(
+            &router,
+            &request_context(b"BODY <prefetch-floor@example.com>\r\n"),
+            &availability,
+            SuppressedBackends::empty(),
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while unlikely.load().snapshot().backlog_skips == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the probe skips the full backend at once");
+
+        assert!(started.elapsed() < crate::constants::pool::STAT_PROBE_CHECKOUT_WAIT / 2);
+        assert_eq!(unlikely_stats.load(Ordering::SeqCst), 0);
+        assert_eq!(unlikely.load().snapshot().busy_timeouts, 0);
+        assert_eq!(unlikely.load().rescue_pass_overs(), 0, "not a pass-over");
     }
 
     /// A lookup after another backend's 430 is a fallback lookup and feeds

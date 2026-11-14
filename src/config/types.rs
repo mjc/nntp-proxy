@@ -392,11 +392,13 @@ pub struct RoutingArticle {
     pub unfinished_replies_before_430: u8,
     /// Rescue-rate floor in percent (default `0`, off). A backend's rescue
     /// rate is how often it had an article after another backend answered
-    /// `430` for it, averaged over recent lookups. A busy backend below the
-    /// floor is not waited on as a last resort, and when only such backends
-    /// are left unconfirmed the lookup answers `430` at once. Saves minutes on
+    /// `430` for it, averaged over recent lookups. Once another backend has
+    /// answered `430`, a backend below the floor is used only when it has a
+    /// connection free right away, and when only such backends are left
+    /// unconfirmed the lookup answers `430` at once. Saves minutes on
     /// downloads whose articles are gone everywhere, at the cost of the rare
-    /// article only that backend had.
+    /// article only that backend had. Skips only through backlog skipping, so
+    /// it has no effect with `backlog_skip = false`.
     #[serde(default)]
     pub rescue_floor_percent: u8,
     /// Article standing (default `"off"`). A backend's standing falls fast

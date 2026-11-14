@@ -77,8 +77,9 @@ backlog_skip_percent = 100
 # After this many 503s for one message-id, once some backend has said 430 for it,
 # the next unfinished lookup answers 430 so dead articles fail fast. 0 = never.
 unfinished_replies_before_430 = 2
-# Rescue-rate floor in percent (0 = off). A busy backend that has found under this
-# share of recent articles other backends lacked is not waited for before 430.
+# Rescue-rate floor in percent (0 = off). After a 430, a backend that has found
+# under this share of recent articles other backends lacked is used only when it
+# has a connection free right away. No effect with backlog_skip = false.
 # rescue_floor_percent = 2
 # Article standing: "off" (default) or "adaptive". A backend's standing drops
 # fast on 430s and climbs back slowly on hits; "adaptive" scales its share of

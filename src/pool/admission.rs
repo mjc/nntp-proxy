@@ -72,6 +72,33 @@ pub enum BacklogPolicy {
     /// ordinary checkouts so operators can see how often skipping left a
     /// request with nowhere else to go.
     LastResort,
+    /// Take a connection only if one is free now (an idle connection, or
+    /// room to open one, with nobody queued ahead); otherwise skip as
+    /// backlogged without waiting at all.
+    ///
+    /// For a backend under the rescue floor once another backend answered
+    /// `430`: it rarely has the article, so it is worth a request only when
+    /// it costs no wait. The queue estimate cannot decide this, because a
+    /// burst of quick misses pulls the service-time average down until it
+    /// reports no wait while every connection is busy. Deciding inside the
+    /// checkout, with a non-blocking take, keeps a burst of lookups from all
+    /// seeing the same idle connection and then queueing behind each other.
+    ///
+    /// `percent` is the skip threshold this budget had before; a pass-over
+    /// let through as a rescue probe is admitted with it, like
+    /// [`Self::SkipAbove`].
+    IdleOnly { percent: u16, probes: RescueProbes },
+}
+
+/// Whether passing over an idle-only backend counts toward its rescue probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RescueProbes {
+    /// The pass-over is counted, and every [`RESCUE_PROBE_EVERY`]th one is
+    /// let through so the backend's rescue rate keeps updating.
+    Counted,
+    /// A background lookup that is not a client request's own attempt: it
+    /// must not use up the request's one pass-over, and never probes.
+    Uncounted,
 }
 
 /// What an article request does when backlog skipping has left no other
@@ -189,6 +216,31 @@ impl CheckoutBudget {
     pub const fn backlog(self) -> BacklogPolicy {
         self.backlog
     }
+
+    /// Restrict this checkout to a connection that is free now; see
+    /// [`BacklogPolicy::IdleOnly`].
+    ///
+    /// Only a budget that may skip changes: with backlog skipping off
+    /// ([`BacklogPolicy::Queue`]) nothing is ever skipped, so the rescue floor
+    /// does not skip either, and a last resort has already chosen to wait.
+    #[must_use]
+    pub const fn idle_only(self, probes: RescueProbes) -> Self {
+        match self.backlog {
+            BacklogPolicy::SkipAbove { percent } => Self {
+                backlog: BacklogPolicy::IdleOnly { percent, probes },
+                ..self
+            },
+            BacklogPolicy::Queue | BacklogPolicy::LastResort | BacklogPolicy::IdleOnly { .. } => {
+                self
+            }
+        }
+    }
+
+    /// Whether this checkout takes only a connection that is free now.
+    #[must_use]
+    pub const fn is_idle_only(self) -> bool {
+        matches!(self.backlog, BacklogPolicy::IdleOnly { .. })
+    }
 }
 
 /// Decision for one checkout.
@@ -216,10 +268,10 @@ pub fn estimate_wait(status: DeadpoolStatusCounts, service_time: Option<Duration
     let Some(service_time) = service_time else {
         return Duration::ZERO;
     };
-    let free = status.available + status.max_size.saturating_sub(status.size);
-    if status.waiting < free {
+    if has_free_slot(status) {
         return Duration::ZERO;
     }
+    let free = free_slots(status);
     if status.max_size == 0 {
         return Duration::MAX;
     }
@@ -228,12 +280,28 @@ pub fn estimate_wait(status: DeadpoolStatusCounts, service_time: Option<Duration
     Duration::from_micros(u64::try_from(micros).unwrap_or(u64::MAX))
 }
 
+/// Connections a checkout could take without waiting: idle ones plus room to
+/// open new ones.
+const fn free_slots(status: DeadpoolStatusCounts) -> usize {
+    status.available + status.max_size.saturating_sub(status.size)
+}
+
+/// Whether a checkout arriving now would get a connection without waiting:
+/// free capacity is left after every checkout already queued.
+#[must_use]
+pub const fn has_free_slot(status: DeadpoolStatusCounts) -> bool {
+    status.waiting < free_slots(status)
+}
+
 /// Decide whether a checkout with `budget` should queue given `estimated_wait`.
+///
+/// An idle-only checkout gets here only when its pass-over was let through as
+/// a rescue probe, and is then admitted like the skip threshold it came from.
 #[must_use]
 pub fn admit(estimated_wait: Duration, budget: CheckoutBudget) -> Admission {
     match budget.backlog {
         BacklogPolicy::Queue | BacklogPolicy::LastResort => Admission::Queue,
-        BacklogPolicy::SkipAbove { percent } => {
+        BacklogPolicy::SkipAbove { percent } | BacklogPolicy::IdleOnly { percent, .. } => {
             let limit = budget.wait.saturating_mul(u32::from(percent)) / 100;
             if estimated_wait > limit {
                 Admission::Skip { estimated_wait }
@@ -497,6 +565,12 @@ impl BackendLoad {
             == RESCUE_PROBE_EVERY - 1
     }
 
+    /// Pass-overs counted toward rescue probes so far.
+    #[cfg(test)]
+    pub(crate) fn rescue_pass_overs(&self) -> u64 {
+        self.unlikely_rescue_skips.load(Ordering::Relaxed)
+    }
+
     /// Share of recent fallback lookups that found the article, in parts per
     /// million, or `None` until [`MIN_FALLBACK_LOOKUPS`] have been seen.
     #[must_use]
@@ -660,9 +734,9 @@ pub struct ArticleAdmission {
     unavailable_reply: UnavailableReply,
     last_resort: BacklogLastResort,
     unfinished_replies_before_430: u8,
-    /// Rescue rate (parts per million) below which a backlogged backend is
-    /// neither waited on as a last resort nor waited for before answering
-    /// `430`. Zero disables.
+    /// Rescue rate (parts per million) below which, after a `430`, a backend
+    /// is used only when it has a connection free right away and is not
+    /// waited for before answering `430`. Zero disables.
     rescue_floor_ppm: u32,
     /// Whether article routing within a tier weighs backends by standing.
     standing: ArticleStanding,
@@ -1179,6 +1253,39 @@ mod tests {
         }
         let ppm = load.rescue_ppm().unwrap();
         assert!(ppm < 30_000, "one early hit must not dominate: {ppm}");
+    }
+
+    /// The floor skips only through backlog skipping: with skipping off, or
+    /// for a last resort, the budget is unchanged.
+    #[test]
+    fn idle_only_applies_only_to_a_budget_that_may_skip() {
+        let wait = Duration::from_secs(3);
+        for backlog in [BacklogPolicy::Queue, BacklogPolicy::LastResort] {
+            let budget = CheckoutBudget::new(wait, backlog);
+            assert_eq!(budget.idle_only(RescueProbes::Counted), budget);
+        }
+        let idle_only = CheckoutBudget::new(wait, BacklogPolicy::SkipAbove { percent: 40 })
+            .idle_only(RescueProbes::Counted);
+        assert!(idle_only.is_idle_only());
+        assert_eq!(
+            idle_only.backlog(),
+            BacklogPolicy::IdleOnly {
+                percent: 40,
+                probes: RescueProbes::Counted
+            }
+        );
+        assert_eq!(idle_only.wait(), wait);
+    }
+
+    #[test]
+    fn free_slot_counts_idle_and_unopened_connections_after_waiters() {
+        assert!(has_free_slot(status(1, 1, 1, 0)));
+        assert!(has_free_slot(status(0, 1, 2, 0)));
+        assert!(!has_free_slot(status(0, 1, 1, 0)));
+        assert!(
+            !has_free_slot(status(0, 1, 2, 1)),
+            "a waiter takes the room"
+        );
     }
 
     #[test]

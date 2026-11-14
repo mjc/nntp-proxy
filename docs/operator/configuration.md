@@ -73,7 +73,7 @@ Time limits for `ARTICLE`, `BODY`, `HEAD`, and `STAT` lookups by message-id.
 | `backlog_skip` | `true` | Skip a backend at once, without queueing, when its estimated connection wait is too long |
 | `backlog_skip_percent` | `100` | Skip when the estimated wait is longer than this percentage of the attempt's wait. Lower values skip sooner |
 | `unavailable_reply` | `"503"` | `"503"` or `"430"`: the reply when a request ends before every eligible backend returned `430`, either because `deadline_ms` ran out or because every remaining backend was busy, skipped, refused the lookup with a non-`430` error, or failed. A request that every eligible backend answered with `430` always gets `430` |
-| `rescue_floor_percent` | `0` | Rescue-rate floor (0-100, `0` = off). A backend's rescue rate is the share of its recent lookups, made after another backend had answered `430`, that found the article. A busy backend under the floor is not waited on as a last resort, and a lookup whose only unconfirmed backends are under it answers `430` at once. See below |
+| `rescue_floor_percent` | `0` | Rescue-rate floor (0-100, `0` = off). A backend's rescue rate is the share of its recent lookups, made after another backend had answered `430`, that found the article. After another backend has answered `430`, a backend under the floor is used only when it has a connection free right away, and a lookup whose only unconfirmed backends are under it answers `430` at once. See below |
 | `unfinished_replies_before_430` | `2` | How many `503`s one message-id may get, once at least one backend returned `430` for it, before the next unfinished lookup answers `430`. `0` keeps answering `unavailable_reply`. Ignored when `unavailable_reply` is `"430"` |
 | `standing` | `"off"` | `"off"` or `"adaptive"`. With `"adaptive"`, each backend's share of article lookups within its tier is scaled by its recent standing: it falls fast on `430` and climbs back slowly on hits. Tier order and retry rules are unchanged. See below |
 | `backlog_last_resort` | `"wait-shortest"` | What a request does when backlog skipping leaves no other backend to try in the tier that should serve it. `"wait-shortest"` queues on the skipped backend with the shortest estimated wait, bounded by `checkout_wait_ms` and what is left of `deadline_ms`; `"give-up"` ends the request with `unavailable_reply` |
@@ -142,17 +142,31 @@ follow a `430` both count. The rate is trusted after 100 such lookups.
 With `rescue_floor_percent` set, and only once some backend has answered `430`
 for the article:
 
-- a backend under the floor that this request skipped as backlogged is not
-  waited on as a last resort, unless the request could not be served by any
-  lower tier either, so the tier rule (no lower tier before every eligible
-  backend in this tier answered `430`) still holds;
+- a backend under the floor is used only when a checkout would not wait: an
+  idle connection, or room to open one, with no checkout already queued. The
+  checkout itself decides, without blocking, so concurrent lookups cannot all
+  count on the same idle connection. Otherwise the backend is skipped like a
+  backlogged backend, whatever its queue estimate says. A connection the
+  client session already holds to that backend is still reused. The `STAT`
+  probes that follow a `430` and the background lower-tier `STAT` probes
+  apply the same rule;
+- a skipped backend under the floor is waited on as a last resort only to keep
+  the tier rule (no lower tier before every eligible backend in this tier
+  answered `430`): when a lower tier could still serve the request, the
+  request waits on it rather than moving down. When no lower tier could, it
+  is not waited on;
 - if every backend that has not answered `430` was skipped as backlogged and
   is under the floor, the lookup answers `430` at once. A backend that failed,
   refused, or ran out of time instead keeps the normal `503` handling.
 
-One in every 16 pass-overs still waits on the backend, and a backend that is
-not busy is asked normally, so its rate keeps tracking the workload and
-recovers when it starts finding articles again.
+One in every 16 pass-overs is let through to a normal checkout instead, and a
+request counts at most one pass-over per backend. Together with a backend
+that is not busy being asked normally, this keeps its rate tracking the
+workload, so it recovers when the backend starts finding articles again.
+Background lower-tier probes never count as pass-overs.
+
+The floor only ever skips through backlog skipping: with `backlog_skip =
+false` nothing is skipped, and `rescue_floor_percent` has no effect.
 
 The trade-off is an article that only that backend has, while its rate is
 below the floor. A low floor such as `2` limits that to roughly one article in
