@@ -1183,3 +1183,146 @@ async fn hybrid_and_stateful_count_every_frontend_command_byte_once() -> Result<
     }
     Ok(())
 }
+
+/// The recovery's `STAT` probe is the proxy's own provider traffic: it adds
+/// to the backup's command and byte counters once, and to no user or client
+/// counter, whatever the probe answers.
+#[tokio::test]
+async fn recovery_stat_probe_traffic_is_provider_only() -> Result<()> {
+    let mut baseline_user_commands = None;
+    for (verb, probe) in [
+        ("BODY", None),
+        ("BODY", Some(Probe::Found)),
+        ("BODY", Some(Probe::Unavailable)),
+        ("ARTICLE", Some(Probe::Missing)),
+    ] {
+        let context = format!("{verb} probe={probe:?}");
+        let secondary = Backend::other("secondary", 1, Lookup::Has);
+        let secondary = match probe {
+            Some(probe) => secondary.probed(probe),
+            None => secondary,
+        };
+        let mut harness =
+            Harness::start(&[Backend::pinned(Lookup::Missing), secondary], true).await?;
+        let before = harness.proxy.metrics().snapshot(None);
+        let before_client = harness.proxy.metrics().proxy_counters();
+        harness.select_group().await?;
+        let fetched = probe != Some(Probe::Missing);
+        let response = if fetched {
+            lookup_reply("secondary", verb)
+        } else {
+            std::str::from_utf8(nntp_proxy::protocol::NO_SUCH_ARTICLE)?.to_string()
+        };
+        harness.exchange(&format!("{verb} {ID}"), &response).await?;
+        harness.exchange("QUIT", "205 bye\r\n").await?;
+        assert_eq!(harness.client.read(&mut [0]).await?, 0);
+
+        let frontend_sent = format!("GROUP alt.test\r\n{verb} {ID}\r\nQUIT\r\n").len() as u64;
+        let frontend_received = (group_reply().len() + response.len() + "205 bye\r\n".len()) as u64;
+        // Session byte totals land when the session task finishes, which can
+        // trail the client seeing EOF.
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while harness
+                .proxy
+                .metrics()
+                .proxy_counters()
+                .client_bytes_received
+                - before_client.client_bytes_received
+                < frontend_sent
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await?;
+        let after = harness.proxy.metrics().snapshot(None);
+        let after_client = harness.proxy.metrics().proxy_counters();
+
+        let mut expected_commands = Vec::new();
+        let mut provider_received = 0;
+        if let Some(probe) = probe {
+            expected_commands.push(format!("STAT {ID}"));
+            provider_received += probe_reply("secondary", probe).len() as u64;
+        }
+        if fetched {
+            expected_commands.push(format!("{verb} {ID}"));
+            provider_received += lookup_reply("secondary", verb).len() as u64;
+        }
+        assert_eq!(
+            harness.message_id_commands_for("secondary"),
+            expected_commands,
+            "{context}"
+        );
+        let provider_sent = expected_commands
+            .iter()
+            .map(|command| command.len() as u64 + 2)
+            .sum::<u64>();
+        let backup = |stats: &nntp_proxy::metrics::MetricsSnapshot| {
+            let backup = &stats.backend_stats[1];
+            (
+                backup.total_commands.get(),
+                backup.bytes_sent.as_u64(),
+                backup.bytes_received.as_u64(),
+            )
+        };
+        let (commands_after, sent_after, received_after) = backup(&after);
+        let (commands_before, sent_before, received_before) = backup(&before);
+        assert_eq!(
+            (
+                commands_after - commands_before,
+                sent_after - sent_before,
+                received_after - received_before
+            ),
+            (
+                expected_commands.len() as u64,
+                provider_sent,
+                provider_received
+            ),
+            "{context}: backup commands, bytes sent, bytes received"
+        );
+
+        let user = |stats: &nntp_proxy::metrics::MetricsSnapshot| {
+            stats.user_stats.first().map_or((0, 0, 0), |user| {
+                (
+                    user.total_commands.get(),
+                    user.bytes_sent.as_u64(),
+                    user.bytes_received.as_u64(),
+                )
+            })
+        };
+        let (user_commands_after, user_sent_after, user_received_after) = user(&after);
+        let (user_commands_before, user_sent_before, user_received_before) = user(&before);
+        assert_eq!(
+            (
+                user_sent_after - user_sent_before,
+                user_received_after - user_received_before
+            ),
+            (frontend_sent, frontend_received),
+            "{context}: user bytes"
+        );
+        assert_eq!(
+            (
+                after_client.client_bytes_received - before_client.client_bytes_received,
+                after_client.client_bytes_sent - before_client.client_bytes_sent,
+            ),
+            (frontend_sent, frontend_received),
+            "{context}: client session bytes"
+        );
+        assert_eq!(
+            after_client.client_commands.iter().sum::<u64>()
+                - before_client.client_commands.iter().sum::<u64>(),
+            3,
+            "{context}: client commands"
+        );
+        if verb == "BODY" {
+            let user_commands = user_commands_after - user_commands_before;
+            match baseline_user_commands {
+                None => baseline_user_commands = Some(user_commands),
+                Some(baseline) => assert_eq!(
+                    user_commands, baseline,
+                    "{context}: a probe must not add a user command"
+                ),
+            }
+        }
+    }
+    Ok(())
+}

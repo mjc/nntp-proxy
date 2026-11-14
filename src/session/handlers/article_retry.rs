@@ -117,7 +117,10 @@ impl ClientSession {
             availability.record_missing_slot(slot);
         }
 
-        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        // The stateful loop already counted the client's command when it
+        // forwarded it to the pinned backend. Resending it to other backends
+        // is provider traffic, so the client side of the transfer stays zero.
+        let mut resent_command_bytes = ClientToBackendBytes::zero();
         let mut backend_to_client_bytes = BackendToClientBytes::zero();
         if self.cache.stores_payload_responses()
             && matches!(
@@ -136,7 +139,7 @@ impl ClientSession {
             self.metrics
                 .user_bytes_received(self.username(), backend_to_client_bytes.as_u64());
             return Ok(crate::types::TransferMetrics {
-                client_to_backend: client_to_backend_bytes,
+                client_to_backend: ClientToBackendBytes::zero(),
                 backend_to_client: backend_to_client_bytes,
             });
         }
@@ -151,7 +154,7 @@ impl ClientSession {
                 request_origin: ArticleRequestOrigin::ReaderAfterPinnedMiss,
                 client_writer,
                 backend_connection: backend_connection.slot(),
-                client_to_backend_bytes: &mut client_to_backend_bytes,
+                client_to_backend_bytes: &mut resent_command_bytes,
                 backend_to_client_bytes: &mut backend_to_client_bytes,
             },
         )
@@ -163,7 +166,7 @@ impl ClientSession {
                 .user_bytes_received(self.username(), backend_to_client_bytes.as_u64());
         }
         Ok(crate::types::TransferMetrics {
-            client_to_backend: client_to_backend_bytes,
+            client_to_backend: ClientToBackendBytes::zero(),
             backend_to_client: backend_to_client_bytes,
         })
     }

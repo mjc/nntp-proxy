@@ -968,20 +968,20 @@ impl ClientSession {
                     }
                 };
                 // The probe is a command to this backend like any other, so
-                // it counts in commands_total next to the 430 it may record;
-                // otherwise the missing share can exceed 100 %.
-                self.metrics.record_command(backend_id);
-                let buffer = self.buffer_pool.acquire();
-                let exchange = match backend::execute_request_exchange(
+                // it counts in commands_total next to the 430 it may record
+                // (otherwise the missing share can exceed 100 %), and its
+                // bytes count as provider traffic.
+                let exchange = match backend::execute_stat_probe_exchange(
                     conn,
                     &stat_request,
-                    buffer,
+                    self.buffer_pool.acquire(),
                     &self.buffer_pool,
-                    backend_id,
+                    backend::ProbeMetrics::new(&self.metrics, backend_id),
+                    backend::ProbeTiming::Untimed,
                 )
                 .await
                 {
-                    Ok(exchange) => exchange,
+                    Ok((exchange, _)) => exchange,
                     Err(error) => {
                         log_stat_probe_failure(
                             &provider,
@@ -1161,21 +1161,21 @@ impl ClientSession {
                             return;
                         }
                     };
-                    // Count the probe and its 430 in the same per-backend
-                    // counters as direct commands, so commands_total and
-                    // article_missing_total describe the same traffic.
-                    metrics.record_command(backend_id);
-                    let buffer = buffer_pool.acquire();
-                    let exchange = match backend::execute_request_exchange(
+                    // Count the probe, its bytes, and its 430 in the same
+                    // per-backend counters as direct commands, so
+                    // commands_total, bytes_total, and article_missing_total
+                    // describe the same traffic.
+                    let exchange = match backend::execute_stat_probe_exchange(
                         conn,
                         &stat_request,
-                        buffer,
+                        buffer_pool.acquire(),
                         &buffer_pool,
-                        backend_id,
+                        backend::ProbeMetrics::new(&metrics, backend_id),
+                        backend::ProbeTiming::Untimed,
                     )
                     .await
                     {
-                        Ok(exchange) => exchange,
+                        Ok((exchange, _)) => exchange,
                         Err(error) => {
                             log_stat_probe_failure(
                                 &provider,
@@ -1888,10 +1888,23 @@ impl ClientSession {
                 "Running STAT miss probe before backend article fetch"
             );
 
-            let probe = self
-                .execute_and_read_response(guard, backend, &stat_request)
-                .await
-                .map_err(|BackendReadAttemptError::Backend(e)| e)?;
+            // The probe is the proxy's own command, not the client's: it is
+            // charged to the backend only, never as a user command or bytes.
+            let sent_at = std::time::Instant::now();
+            let (exchange, timings) = backend::execute_stat_probe_exchange(
+                guard,
+                &stat_request,
+                self.buffer_pool.acquire(),
+                &self.buffer_pool,
+                backend::ProbeMetrics::new(&self.metrics, backend_id),
+                backend::ProbeTiming::Timed,
+            )
+            .await?;
+            let probe = PreparedBackendAttempt {
+                exchange,
+                timings,
+                sent_at,
+            };
             if probe
                 .exchange
                 .status_code()
@@ -3468,6 +3481,328 @@ mod tests {
         }
     }
 
+    fn assert_no_user_traffic(metrics: &MetricsCollector, context: &str) {
+        for user in metrics.snapshot(None).user_stats {
+            assert_eq!(
+                (
+                    user.total_commands.get(),
+                    user.bytes_sent.as_u64(),
+                    user.bytes_received.as_u64()
+                ),
+                (0, 0, 0),
+                "{context}: internal probes must not charge user {}",
+                user.username
+            );
+        }
+    }
+
+    /// Probes are provider traffic: each one adds its `STAT` line and reply
+    /// to the backend byte counters exactly once, whatever the reply, and
+    /// never to a user.
+    #[tokio::test]
+    async fn retry_stat_sweep_records_probe_bytes_once_without_user_traffic() {
+        const STAT_LINE: &[u8] = b"STAT <missing@example.com>\r\n";
+        for reply in [
+            b"223 0 <missing@example.com>\r\n".as_slice(),
+            b"430 Missing\r\n".as_slice(),
+            b"503 Probe unavailable\r\n".as_slice(),
+        ] {
+            let context = String::from_utf8_lossy(reply).trim_end().to_string();
+            let session = test_session_with_backend_metrics(2);
+            let (port0, stat0, body0) = spawn_stat_probe_server(reply).await;
+            let (port1, stat1, body1) = spawn_stat_probe_server(reply).await;
+            let router = router_with_tiered_backends([port0, port1].map(|port| {
+                (
+                    DeadpoolConnectionProvider::builder("127.0.0.1", port)
+                        .max_connections(1)
+                        .stat_missing(true)
+                        .build()
+                        .unwrap(),
+                    1,
+                )
+            }));
+            let request = request_context(b"BODY <missing@example.com>\r\n");
+            let mut availability = ArticleAvailability::new();
+            let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+            let mut backend_connection = None;
+            let mut unavailable_backends = SuppressedBackends::empty();
+            let mut state = ArticleAttemptState {
+                request_origin: ArticleRequestOrigin::Frontend,
+                availability: &mut availability,
+                client_to_backend_bytes: &mut client_to_backend_bytes,
+                backend_connection: &mut backend_connection,
+                unavailable_backends: &mut unavailable_backends,
+                backlogged: &mut BackloggedBackends::default(),
+                budget: crate::pool::admission::ArticleAdmission::default().start_request(),
+            };
+
+            session
+                .parallel_retry_stat_sweep(&router, &request, &mut state)
+                .await
+                .expect("parallel retry STAT sweep should succeed");
+
+            for backend in 0..2 {
+                let counters = session
+                    .metrics
+                    .backend_counters(BackendId::from_index(backend))
+                    .unwrap();
+                assert_eq!(counters.commands, 1, "{context}: backend {backend}");
+                assert_eq!(
+                    counters.bytes_to_backend,
+                    STAT_LINE.len() as u64,
+                    "{context}: backend {backend}"
+                );
+                assert_eq!(
+                    counters.bytes_from_backend,
+                    reply.len() as u64,
+                    "{context}: backend {backend}"
+                );
+            }
+            assert_eq!(
+                client_to_backend_bytes,
+                ClientToBackendBytes::zero(),
+                "{context}: probe bytes are not client bytes"
+            );
+            assert_no_user_traffic(&session.metrics, &context);
+            assert_eq!(
+                (stat0.load(Ordering::SeqCst), stat1.load(Ordering::SeqCst)),
+                (1, 1)
+            );
+            assert_eq!(
+                (body0.load(Ordering::SeqCst), body1.load(Ordering::SeqCst)),
+                (0, 0)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lower_tier_stat_prefetch_records_probe_bytes_once_without_user_traffic() {
+        const STAT_LINE: &[u8] = b"STAT <missing@example.com>\r\n";
+        for reply in [
+            b"223 0 <missing@example.com>\r\n".as_slice(),
+            b"430 Missing\r\n".as_slice(),
+            b"503 Probe unavailable\r\n".as_slice(),
+        ] {
+            let context = String::from_utf8_lossy(reply).trim_end().to_string();
+            let session = test_session_with_backend_metrics(2);
+            let (port0, stat0, _body0) = spawn_stat_probe_server(reply).await;
+            let (port1, stat1, _body1) = spawn_stat_probe_server(reply).await;
+            let router =
+                router_with_tiered_backends([(port0, 0), (port1, 1)].map(|(port, tier)| {
+                    (
+                        DeadpoolConnectionProvider::builder("127.0.0.1", port)
+                            .max_connections(1)
+                            .stat_missing(true)
+                            .build()
+                            .unwrap(),
+                        tier,
+                    )
+                }));
+            let request = request_context(b"BODY <missing@example.com>\r\n");
+            session.spawn_non_primary_tier_stat_prefetch(
+                &router,
+                &request,
+                &ArticleAvailability::new(),
+                SuppressedBackends::empty(),
+            );
+
+            let lower = BackendId::from_index(1);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let received = session
+                        .metrics
+                        .backend_counters(lower)
+                        .unwrap()
+                        .bytes_from_backend;
+                    let settled = router
+                        .backend_provider(lower)
+                        .is_some_and(|provider| provider.status_counts().available == 1);
+                    if received > 0 && settled {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{context}: prefetch should record its reply bytes"));
+
+            let counters = session.metrics.backend_counters(lower).unwrap();
+            assert_eq!(counters.commands, 1, "{context}");
+            assert_eq!(
+                counters.bytes_to_backend,
+                STAT_LINE.len() as u64,
+                "{context}"
+            );
+            assert_eq!(counters.bytes_from_backend, reply.len() as u64, "{context}");
+            let primary = session
+                .metrics
+                .backend_counters(BackendId::from_index(0))
+                .unwrap();
+            assert_eq!(
+                (
+                    primary.commands,
+                    primary.bytes_to_backend,
+                    primary.bytes_from_backend
+                ),
+                (0, 0, 0),
+                "{context}: the primary tier is never prefetched"
+            );
+            assert_no_user_traffic(&session.metrics, &context);
+            assert_eq!(
+                (stat0.load(Ordering::SeqCst), stat1.load(Ordering::SeqCst)),
+                (0, 1)
+            );
+        }
+    }
+
+    /// The selected probe before a retried lookup is the proxy's own command:
+    /// the backend counts both exchanges, the user only the lookup.
+    #[tokio::test]
+    async fn selected_stat_probe_counts_as_provider_traffic_not_a_user_command() {
+        const STAT_REPLY: &[u8] = b"223 0 <found@example.com>\r\n";
+        const BODY_REPLY: &[u8] = b"222 0 <found@example.com> body follows\r\npayload\r\n.\r\n";
+        let session = test_session_with_backend_metrics(1);
+        let (port, stat_commands, body_commands) = spawn_stat_probe_server(STAT_REPLY).await;
+        let router = router_with_tiered_backends([(
+            DeadpoolConnectionProvider::builder("127.0.0.1", port)
+                .max_connections(1)
+                .stat_missing(true)
+                .build()
+                .unwrap(),
+            0,
+        )]);
+        let (mut client_writer, _client_read, _client_write) = client_writer_pair().await;
+        let mut request = request_context(b"BODY <found@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            request_origin: ArticleRequestOrigin::Frontend,
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+            backlogged: &mut BackloggedBackends::default(),
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
+        };
+
+        let result = session
+            .try_backend_for_article(&router, &mut request, &mut client_writer, &mut state, true)
+            .await
+            .expect("retried lookup should succeed");
+        assert!(matches!(result, BackendAttemptResult::Success));
+        finalize_backend_connection(state.backend_connection);
+        assert_eq!(
+            (
+                stat_commands.load(Ordering::SeqCst),
+                body_commands.load(Ordering::SeqCst)
+            ),
+            (1, 1)
+        );
+
+        let counters = session
+            .metrics
+            .backend_counters(BackendId::from_index(0))
+            .unwrap();
+        let body_line = b"BODY <found@example.com>\r\n".len() as u64;
+        let stat_line = b"STAT <found@example.com>\r\n".len() as u64;
+        assert_eq!(counters.commands, 2);
+        assert_eq!(counters.bytes_to_backend, stat_line + body_line);
+        assert_eq!(
+            counters.bytes_from_backend,
+            (STAT_REPLY.len() + BODY_REPLY.len()) as u64
+        );
+        assert_eq!(
+            client_to_backend_bytes,
+            ClientToBackendBytes::new(body_line),
+            "only the client's own command is client traffic"
+        );
+        let snapshot = session.metrics.snapshot(None);
+        let [user] = snapshot.user_stats.as_slice() else {
+            panic!("expected one user");
+        };
+        assert_eq!(
+            user.total_commands.get(),
+            1,
+            "the probe is not a user command"
+        );
+        assert_eq!(user.bytes_sent.as_u64(), body_line);
+        assert_eq!(user.bytes_received.as_u64(), BODY_REPLY.len() as u64);
+    }
+
+    /// A probe whose reply never arrives still crossed the wire, so its sent
+    /// bytes and command must survive the request being cancelled.
+    #[tokio::test]
+    async fn selected_stat_probe_sent_bytes_survive_reply_wait_cancellation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (sent, seen) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            reader.get_mut().write_all(b"200 Ready\r\n").await.unwrap();
+            let mut line = String::new();
+            loop {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                if RequestContext::parse(line.as_bytes()).unwrap().kind() == RequestKind::Stat {
+                    sent.send(()).unwrap();
+                    std::future::pending::<()>().await;
+                    break;
+                }
+                reader.get_mut().write_all(b"200 OK\r\n").await.unwrap();
+            }
+        });
+        let session = test_session_with_backend_metrics(1);
+        let metrics = session.metrics.clone();
+        let router = router_with_tiered_backends([(
+            DeadpoolConnectionProvider::builder("127.0.0.1", port)
+                .max_connections(1)
+                .stat_missing(true)
+                .build()
+                .unwrap(),
+            0,
+        )]);
+        let attempt = tokio::spawn({
+            async move {
+                let mut request = request_context(b"ARTICLE <cancel@example.com>\r\n");
+                let mut availability = ArticleAvailability::new();
+                let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+                let mut backend_connection = None;
+                let mut unavailable_backends = SuppressedBackends::empty();
+                let mut writer = tokio::io::sink();
+                let mut state = ArticleAttemptState {
+                    request_origin: ArticleRequestOrigin::ReaderAfterPinnedMiss,
+                    availability: &mut availability,
+                    client_to_backend_bytes: &mut client_to_backend_bytes,
+                    backend_connection: &mut backend_connection,
+                    unavailable_backends: &mut unavailable_backends,
+                    backlogged: &mut BackloggedBackends::default(),
+                    budget: crate::pool::admission::ArticleAdmission::default().start_request(),
+                };
+                let _ = session
+                    .try_backend_for_article(&router, &mut request, &mut writer, &mut state, true)
+                    .await;
+            }
+        });
+        tokio::time::timeout(Duration::from_secs(3), seen)
+            .await
+            .expect("the probe should reach the backend")
+            .unwrap();
+        attempt.abort();
+        assert!(matches!(attempt.await, Err(error) if error.is_cancelled()));
+
+        let counters = metrics.backend_counters(BackendId::from_index(0)).unwrap();
+        assert_eq!(counters.commands, 1);
+        assert_eq!(
+            counters.bytes_to_backend,
+            b"STAT <cancel@example.com>\r\n".len() as u64
+        );
+        assert_eq!(counters.bytes_from_backend, 0);
+        assert_no_user_traffic(&metrics, "cancelled selected probe");
+        server.abort();
+    }
     fn assert_connection_returned_idle(router: &BackendSelector, backend: usize) {
         let status = router
             .backend_provider(BackendId::from_index(backend))

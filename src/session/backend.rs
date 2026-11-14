@@ -230,6 +230,82 @@ pub(crate) async fn execute_request_exchange_timed<'pool>(
     ))
 }
 
+/// Where an internal probe's traffic is charged: the provider, never the
+/// client whose request caused it. Probe lines are written by the proxy, so
+/// they belong in the per-backend counters but not in user or client bytes.
+#[derive(Clone, Copy)]
+pub(crate) struct ProbeMetrics<'a> {
+    metrics: &'a crate::metrics::MetricsCollector,
+    backend_id: crate::types::BackendId,
+}
+
+impl<'a> ProbeMetrics<'a> {
+    pub(crate) const fn new(
+        metrics: &'a crate::metrics::MetricsCollector,
+        backend_id: crate::types::BackendId,
+    ) -> Self {
+        Self {
+            metrics,
+            backend_id,
+        }
+    }
+}
+
+/// Whether a probe exchange is timed for the first-byte and send/receive
+/// histograms.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeTiming {
+    Untimed,
+    Timed,
+}
+
+/// First-byte, send, and receive durations in microseconds.
+pub(crate) type ProbeTimings = (u64, u64, u64);
+
+/// Send an internal `STAT` probe and read its reply, charging both to the
+/// backend.
+///
+/// The command and its bytes are counted as soon as the write completes, so
+/// a reply wait that times out, fails, or is cancelled cannot erase traffic
+/// that already reached the provider. A failed write counts nothing.
+pub(crate) async fn execute_stat_probe_exchange<'pool>(
+    mut conn: crate::pool::ConnectionGuard,
+    request: &RequestContext,
+    mut buffer: PooledBuffer,
+    pool: &'pool crate::pool::BufferPool,
+    charge: ProbeMetrics<'_>,
+    timing: ProbeTiming,
+) -> Result<(BackendResponseExchange<'pool>, Option<ProbeTimings>)> {
+    let ProbeMetrics {
+        metrics,
+        backend_id,
+    } = charge;
+    let start = (timing == ProbeTiming::Timed).then(std::time::Instant::now);
+    request.send_to(conn.stream_mut()).await?;
+    metrics.record_command(backend_id);
+    metrics.record_client_to_backend_bytes_for(backend_id, request.request_wire_len().as_u64());
+    let after_send = start.map(|_| std::time::Instant::now());
+
+    read_first_response_bytes(&mut buffer, conn.stream_mut()).await?;
+    let exchange = BackendResponseExchange::read(conn, request, buffer, pool, backend_id).await?;
+    // Only the framed reply is the probe's; an unparsable reply has no frame,
+    // so everything that arrived is counted.
+    let received = exchange
+        .single_line_bytes()
+        .map_or_else(|| exchange.received_len(), <[u8]>::len);
+    metrics.record_backend_to_client_bytes_for(backend_id, received as u64);
+
+    let timings = start.zip(after_send).map(|(start, after_send)| {
+        let after_recv = std::time::Instant::now();
+        (
+            duration_micros_u64(after_recv.duration_since(start)),
+            duration_micros_u64(after_send.duration_since(start)),
+            duration_micros_u64(after_recv.duration_since(after_send)),
+        )
+    });
+    Ok((exchange, timings))
+}
+
 #[cfg(response_contract = "exchange_constructor")]
 #[allow(dead_code)]
 fn exchange_constructor_is_not_a_caller_api() {
