@@ -92,6 +92,14 @@ On platforms without `/proc`, the `nntp_proxy_process_*` metrics are omitted.
 | `nntp_proxy_cache_disk_bytes_total` | counter | `direction` = `read`, `written` | Bytes moved to and from disk. Disk cache only. |
 | `nntp_proxy_cache_disk_ios_total` | counter | `direction` = `read`, `written` | Disk I/O operations. Disk cache only. |
 
+### Buffer pools
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `nntp_proxy_buffer_pool_buffers` | gauge | `pool` = `regular`, `capture`; `state` = `in_use`, `idle` | Pooled I/O buffers. Buffers are allocated on first use, so `in_use + idle` grows up to the ceiling and stays there. |
+| `nntp_proxy_buffer_pool_max_buffers` | gauge | `pool` | The ceiling: `memory.buffer_pool_count` (regular) or `memory.capture_pool_count` (capture). |
+| `nntp_proxy_buffer_pool_fallback_allocations_total` | counter | `pool` | Buffers allocated outside an exhausted pool and freed after use. Any steady rate means the pool is smaller than the number of concurrent client and backend connections; raise the count. The matching log warning repeats at most once a minute. |
+
 ### Backends
 
 Per-backend counters cover every routing mode. Pinned (stateful) sessions count commands, successful articles, `430`s, and error replies per reply, like per-command traffic, so `nntp_proxy_backend_article_bytes_total` and `nntp_proxy_backend_articles_total` update as each article completes in every mode.

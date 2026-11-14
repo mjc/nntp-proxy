@@ -78,6 +78,7 @@ pub fn gather(proxy: &NntpProxy) -> Scrape {
         process: ProcessStats::read(),
         proxy: metrics.proxy_counters(),
         cache: cache.scrape_stats(),
+        buffers: proxy.buffer_pool().scrape_stats(),
         backends,
     }
 }

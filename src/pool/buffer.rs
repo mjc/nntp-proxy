@@ -668,6 +668,75 @@ fn hot_path_allocation_metrics() -> &'static HotPathAllocationMetrics {
     METRICS.get_or_init(HotPathAllocationMetrics::default)
 }
 
+/// How often a pool-exhaustion warning may repeat. An exhausted pool falls
+/// back on every acquire, which logged hundreds of identical lines a minute.
+const FALLBACK_WARNING_INTERVAL_MS: u64 = 60_000;
+
+/// Lets one fallback warning through per interval and reports how many
+/// fallbacks happened since the previous one. The first fallback always warns.
+struct FallbackWarnings {
+    /// Milliseconds since `epoch` of the last warning, plus one (0 = never).
+    last_warned_ms: AtomicU64,
+    fallbacks_at_last_warning: AtomicUsize,
+}
+
+impl FallbackWarnings {
+    const fn new() -> Self {
+        Self {
+            last_warned_ms: AtomicU64::new(0),
+            fallbacks_at_last_warning: AtomicUsize::new(0),
+        }
+    }
+
+    /// Returns the fallbacks since the last warning when this caller should
+    /// warn now, given the running fallback total including this one.
+    fn should_warn(&self, total_fallbacks: usize, now_ms: u64) -> Option<usize> {
+        let stamp = now_ms.saturating_add(1);
+        let last = self.last_warned_ms.load(Ordering::Relaxed);
+        let due = last == 0 || stamp.saturating_sub(last) >= FALLBACK_WARNING_INTERVAL_MS;
+        if !due
+            || self
+                .last_warned_ms
+                .compare_exchange(last, stamp, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return None;
+        }
+        let previous = self
+            .fallbacks_at_last_warning
+            .swap(total_fallbacks, Ordering::Relaxed);
+        Some(total_fallbacks.saturating_sub(previous))
+    }
+}
+
+fn fallback_warning_clock_ms() -> u64 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    u64::try_from(EPOCH.get_or_init(Instant::now).elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+static REGULAR_FALLBACK_WARNINGS: FallbackWarnings = FallbackWarnings::new();
+static CAPTURE_FALLBACK_WARNINGS: FallbackWarnings = FallbackWarnings::new();
+
+/// Occupancy of one buffer pool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BufferPoolOccupancy {
+    /// Pooled buffers checked out right now (fallback buffers not included).
+    pub in_use: u64,
+    /// Allocated buffers waiting in the pool.
+    pub idle: u64,
+    /// Configured ceiling on pooled buffers.
+    pub max: u64,
+    /// Buffers allocated outside the pool because it was exhausted, since start.
+    pub fallback_allocations: u64,
+}
+
+/// Both buffer pools at scrape time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BufferPoolScrape {
+    pub regular: BufferPoolOccupancy,
+    pub capture: BufferPoolOccupancy,
+}
+
 fn duration_micros_u64(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
 }
@@ -1329,6 +1398,39 @@ impl BufferPool {
         (available, in_use, self.max_pool_size)
     }
 
+    /// Occupancy and fallback counts of both pools, for metrics export.
+    #[must_use]
+    pub fn scrape_stats(&self) -> BufferPoolScrape {
+        let occupancy = |idle: &AtomicUsize, allocated: &AtomicUsize, max: usize, fallbacks| {
+            let idle = idle.load(Ordering::Relaxed);
+            BufferPoolOccupancy {
+                in_use: allocated.load(Ordering::Relaxed).saturating_sub(idle) as u64,
+                idle: idle as u64,
+                max: max as u64,
+                fallback_allocations: fallbacks as u64,
+            }
+        };
+        let metrics = hot_path_allocation_metrics();
+        BufferPoolScrape {
+            regular: occupancy(
+                &self.pool_size,
+                &self.allocated_count,
+                self.max_pool_size,
+                metrics
+                    .regular_pool_fallback_allocations
+                    .load(Ordering::Relaxed),
+            ),
+            capture: occupancy(
+                &self.capture_pool_size,
+                &self.capture_allocated_count,
+                self.max_capture_pool_size,
+                metrics
+                    .capture_pool_fallback_allocations
+                    .load(Ordering::Relaxed),
+            ),
+        }
+    }
+
     /// Get a buffer from the pool or create a new one (lock-free)
     ///
     /// Returns a `PooledBuffer` that automatically returns to the pool when dropped.
@@ -1411,14 +1513,20 @@ impl BufferPool {
                     );
                 }
 
-                hot_path_allocation_metrics()
+                let total = hot_path_allocation_metrics()
                     .regular_pool_fallback_allocations
-                    .fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    max_pool_size = self.max_pool_size,
-                    buffer_size = self.buffer_size.get(),
-                    "Regular buffer pool exhausted; allocating fallback buffer"
-                );
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+                if let Some(since_last_warning) =
+                    REGULAR_FALLBACK_WARNINGS.should_warn(total, fallback_warning_clock_ms())
+                {
+                    warn!(
+                        max_pool_size = self.max_pool_size,
+                        buffer_size = self.buffer_size.get(),
+                        fallbacks_since_last_warning = since_last_warning,
+                        "Regular buffer pool exhausted; allocating fallback buffers (raise memory.buffer_pool_count; repeats at most once a minute)"
+                    );
+                }
                 self.wrap_regular_buffer(
                     Self::create_aligned_buffer(self.buffer_size.get()),
                     true,
@@ -1482,13 +1590,20 @@ impl BufferPool {
                     };
                 }
 
-                hot_path_allocation_metrics()
+                let total = hot_path_allocation_metrics()
                     .capture_pool_fallback_allocations
-                    .fetch_add(1, Ordering::Relaxed);
-                warn!(
-                    max_pool_size = self.max_capture_pool_size,
-                    capacity, "Capture buffer pool exhausted; allocating fallback buffer"
-                );
+                    .fetch_add(1, Ordering::Relaxed)
+                    + 1;
+                if let Some(since_last_warning) =
+                    CAPTURE_FALLBACK_WARNINGS.should_warn(total, fallback_warning_clock_ms())
+                {
+                    warn!(
+                        max_pool_size = self.max_capture_pool_size,
+                        capacity,
+                        fallbacks_since_last_warning = since_last_warning,
+                        "Capture buffer pool exhausted; allocating fallback buffers (raise memory.capture_pool_count; repeats at most once a minute)"
+                    );
+                }
                 // Pool exhausted - allocate a visible fallback buffer.
                 BufferAcquisition {
                     buffer: BytesMut::with_capacity(capacity),
@@ -2478,5 +2593,53 @@ mod contracts {
             buffer.copy_from_slice(b"changed");
             std::hint::black_box(appended.as_new_bytes());
         }
+    }
+
+    #[test]
+    fn fallback_warnings_fire_once_per_interval_and_count_the_gap() {
+        let warnings = FallbackWarnings::new();
+        assert_eq!(warnings.should_warn(1, 0), Some(1), "first fallback warns");
+        assert_eq!(warnings.should_warn(2, 10), None);
+        assert_eq!(
+            warnings.should_warn(500, FALLBACK_WARNING_INTERVAL_MS - 1),
+            None
+        );
+        assert_eq!(
+            warnings.should_warn(949, FALLBACK_WARNING_INTERVAL_MS),
+            Some(948),
+            "the next warning reports every fallback since the first"
+        );
+        assert_eq!(
+            warnings.should_warn(950, FALLBACK_WARNING_INTERVAL_MS + 5),
+            None
+        );
+    }
+
+    #[test]
+    fn scrape_stats_report_pooled_buffers_and_ceilings() {
+        let pool = BufferPool::new(BufferSize::try_new(4096).unwrap(), 2).with_capture_pool(64, 3);
+        let before = pool.scrape_stats();
+        let a = pool.acquire();
+        let b = pool.acquire();
+        drop(b);
+        let stats = pool.scrape_stats();
+        assert_eq!(
+            (stats.regular.in_use, stats.regular.idle, stats.regular.max),
+            (1, 1, 2)
+        );
+        assert_eq!(stats.capture.max, 3);
+
+        // A third concurrent buffer exceeds the ceiling of two and falls back.
+        let c = pool.acquire();
+        let d = pool.acquire();
+        assert!(
+            pool.scrape_stats().regular.fallback_allocations > before.regular.fallback_allocations
+        );
+        assert_eq!(
+            pool.scrape_stats().regular.in_use,
+            2,
+            "fallbacks are not pooled buffers"
+        );
+        drop((a, c, d));
     }
 }

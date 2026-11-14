@@ -94,6 +94,8 @@ pub struct Scrape {
     pub process: Option<ProcessStats>,
     pub proxy: ProxyCounters,
     pub cache: CacheScrape,
+    /// Regular and capture buffer pool occupancy.
+    pub buffers: crate::pool::buffer::BufferPoolScrape,
     pub backends: Vec<BackendScrape>,
 }
 
@@ -107,6 +109,7 @@ pub fn render(scrape: &Scrape) -> String {
     render_process(&mut out, scrape);
     render_proxy(&mut out, &scrape.proxy);
     render_cache(&mut out, &scrape.cache);
+    render_buffers(&mut out, &scrape.buffers);
     render_backends(&mut out, &scrape.backends);
     out.finish()
 }
@@ -256,6 +259,48 @@ fn render_proxy(out: &mut Exposition, proxy: &ProxyCounters) {
         &[],
         proxy.pipeline_commands,
     );
+}
+
+fn render_buffers(out: &mut Exposition, buffers: &crate::pool::buffer::BufferPoolScrape) {
+    let pools = [("regular", &buffers.regular), ("capture", &buffers.capture)];
+    out.family(
+        "nntp_proxy_buffer_pool_buffers",
+        MetricKind::Gauge,
+        "Pooled I/O buffers by pool and state.",
+    );
+    for (pool, occupancy) in pools {
+        for (state, value) in [("in_use", occupancy.in_use), ("idle", occupancy.idle)] {
+            out.sample(
+                "nntp_proxy_buffer_pool_buffers",
+                &[("pool", pool), ("state", state)],
+                value,
+            );
+        }
+    }
+    out.family(
+        "nntp_proxy_buffer_pool_max_buffers",
+        MetricKind::Gauge,
+        "Configured ceiling on pooled buffers (memory.buffer_pool_count / capture_pool_count).",
+    );
+    for (pool, occupancy) in pools {
+        out.sample(
+            "nntp_proxy_buffer_pool_max_buffers",
+            &[("pool", pool)],
+            occupancy.max,
+        );
+    }
+    out.family(
+        "nntp_proxy_buffer_pool_fallback_allocations_total",
+        MetricKind::Counter,
+        "Buffers allocated outside an exhausted pool and freed after use; raise the pool count when this grows.",
+    );
+    for (pool, occupancy) in pools {
+        out.sample(
+            "nntp_proxy_buffer_pool_fallback_allocations_total",
+            &[("pool", pool)],
+            occupancy.fallback_allocations,
+        );
+    }
 }
 
 fn render_cache(out: &mut Exposition, cache: &CacheScrape) {
@@ -899,6 +944,20 @@ pub(crate) mod tests {
                 misses: 5,
                 disk: Some(crate::cache::DiskDisplayStats::default()),
             },
+            buffers: crate::pool::buffer::BufferPoolScrape {
+                regular: crate::pool::buffer::BufferPoolOccupancy {
+                    in_use: 7,
+                    idle: 3,
+                    max: 300,
+                    fallback_allocations: 949,
+                },
+                capture: crate::pool::buffer::BufferPoolOccupancy {
+                    in_use: 1,
+                    idle: 0,
+                    max: 16,
+                    fallback_allocations: 0,
+                },
+            },
             backends: names
                 .iter()
                 .enumerate()
@@ -1215,6 +1274,24 @@ pub(crate) mod tests {
             value("nntp_proxy_backend_estimated_wait_seconds", None),
             Some(1.25)
         );
+    }
+
+    #[test]
+    fn buffer_pools_export_occupancy_ceiling_and_fallbacks() {
+        let text = render(&sample_scrape(&["a"]));
+        validate_exposition(&text);
+        for line in [
+            "nntp_proxy_buffer_pool_buffers{pool=\"regular\",state=\"in_use\"} 7",
+            "nntp_proxy_buffer_pool_buffers{pool=\"regular\",state=\"idle\"} 3",
+            "nntp_proxy_buffer_pool_buffers{pool=\"capture\",state=\"in_use\"} 1",
+            "nntp_proxy_buffer_pool_max_buffers{pool=\"regular\"} 300",
+            "nntp_proxy_buffer_pool_max_buffers{pool=\"capture\"} 16",
+            "nntp_proxy_buffer_pool_fallback_allocations_total{pool=\"regular\"} 949",
+            "nntp_proxy_buffer_pool_fallback_allocations_total{pool=\"capture\"} 0",
+        ] {
+            assert!(text.lines().any(|l| l == line), "missing {line}");
+        }
+        assert!(text.contains("# TYPE nntp_proxy_buffer_pool_fallback_allocations_total counter"));
     }
 
     #[test]
