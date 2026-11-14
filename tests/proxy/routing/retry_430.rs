@@ -10,8 +10,8 @@ use tokio::io::AsyncWriteExt;
 
 use crate::test_helpers::{
     MockNntpServer, connect_and_read_greeting, create_test_config, read_line_from_stream,
-    send_article_read_multiline_response, send_command_read_line, setup_proxy_with_backends,
-    spawn_proxy_with_config, spawn_single_backend_proxy,
+    read_multiline_body, send_article_read_multiline_response, send_command_read_line,
+    setup_proxy_with_backends, spawn_proxy_with_config, spawn_single_backend_proxy, status_code,
 };
 
 #[tokio::test]
@@ -40,7 +40,11 @@ async fn test_430_retry_finds_article_on_second_backend() -> Result<()> {
     eprintln!("Got response: {}", status.trim());
 
     // Should get article from Backend2 (after trying Backend1)
-    assert!(status.starts_with("220"), "Expected 220, got: {status}");
+    assert_eq!(
+        status_code(&status),
+        Some(220),
+        "Expected 220, got: {status}"
+    );
     assert!(!body.is_empty(), "Expected article body");
 
     Ok(())
@@ -65,8 +69,9 @@ async fn test_430_retry_tries_all_backends_before_giving_up() -> Result<()> {
         send_article_read_multiline_response(&mut client, "<test@example.com>").await?;
 
     // Should get 430 after trying all backends
-    assert!(
-        status.starts_with("430"),
+    assert_eq!(
+        status_code(&status),
+        Some(430),
         "Expected 430 after all backends tried, got: {status}"
     );
     assert!(body.is_empty(), "430 response should have no body");
@@ -93,8 +98,9 @@ async fn test_430_retry_finds_article_on_third_backend() -> Result<()> {
         send_article_read_multiline_response(&mut client, "<test@example.com>").await?;
 
     // Should get article from Backend3
-    assert!(
-        status.starts_with("220"),
+    assert_eq!(
+        status_code(&status),
+        Some(220),
         "Expected 220 from Backend3, got: {status}"
     );
     assert!(!body.is_empty(), "Expected article body");
@@ -116,8 +122,9 @@ async fn test_430_retry_works_in_hybrid_mode() -> Result<()> {
     let (status, body) =
         send_article_read_multiline_response(&mut client, "<test@example.com>").await?;
 
-    assert!(
-        status.starts_with("220"),
+    assert_eq!(
+        status_code(&status),
+        Some(220),
         "Expected article in hybrid mode, got: {status}"
     );
     assert!(!body.is_empty(), "Expected article body");
@@ -142,14 +149,19 @@ async fn test_430_retry_multiple_articles_different_patterns() -> Result<()> {
     // First request - Round-robin should try Backend1 first (has article)
     let (status1, body1) =
         send_article_read_multiline_response(&mut client, "<first@example.com>").await?;
-    assert!(status1.starts_with("220"), "First request should succeed");
+    assert_eq!(
+        status_code(&status1),
+        Some(220),
+        "First request should succeed"
+    );
     assert!(!body1.is_empty());
 
     // Second request - Round-robin tries Backend2 (430), should retry to Backend1
     let (status2, body2) =
         send_article_read_multiline_response(&mut client, "<second@example.com>").await?;
-    assert!(
-        status2.starts_with("220"),
+    assert_eq!(
+        status_code(&status2),
+        Some(220),
         "Second request should succeed after retry"
     );
     assert!(!body2.is_empty());
@@ -171,7 +183,7 @@ async fn test_430_retry_only_retries_for_430() -> Result<()> {
     // Normal article request should work
     let (status, body) =
         send_article_read_multiline_response(&mut client, "<test@example.com>").await?;
-    assert!(status.starts_with("220"), "Expected article");
+    assert_eq!(status_code(&status), Some(220), "Expected article");
     assert!(!body.is_empty());
 
     Ok(())
@@ -187,8 +199,9 @@ async fn test_430_retry_with_single_backend() -> Result<()> {
     let (status, body) =
         send_article_read_multiline_response(&mut client, "<test@example.com>").await?;
 
-    assert!(
-        status.starts_with("430"),
+    assert_eq!(
+        status_code(&status),
+        Some(430),
         "Expected 430 with single backend"
     );
     assert!(body.is_empty());
@@ -213,16 +226,18 @@ async fn test_430_retry_retires_connection_with_queued_backend_bytes() -> Result
 
     let (first_status, first_body) =
         send_article_read_multiline_response(&mut client, "<first@example.com>").await?;
-    assert!(
-        first_status.starts_with("430"),
+    assert_eq!(
+        status_code(&first_status),
+        Some(430),
         "first request should exhaust the single backend, got {first_status:?}"
     );
     assert!(first_body.is_empty(), "430 response should have no body");
 
     let (second_status, second_body) =
         send_article_read_multiline_response(&mut client, "<second@example.com>").await?;
-    assert!(
-        second_status.starts_with("430"),
+    assert_eq!(
+        status_code(&second_status),
+        Some(430),
         "stale queued backend bytes must not satisfy the next ARTICLE, got {second_status:?}"
     );
     assert!(second_body.is_empty(), "430 response should have no body");
@@ -265,15 +280,17 @@ async fn test_retry_tier_transient_exhaustion_returns_reply_and_keeps_session_op
     let mut client = connect_and_read_greeting(proxy_port).await?;
     let (status, body) =
         send_article_read_multiline_response(&mut client, "<transient@example.com>").await?;
-    assert!(
-        status.starts_with("503"),
+    assert_eq!(
+        status_code(&status),
+        Some(503),
         "transient tier exhaustion should return a command reply, got: {status}"
     );
     assert!(body.is_empty(), "503 response should not have a body");
 
     let date = send_command_read_line(&mut client, "DATE").await?;
-    assert!(
-        date.starts_with("111"),
+    assert_eq!(
+        status_code(&date),
+        Some(111),
         "session should remain usable after transient tier exhaustion, got: {date}"
     );
 
@@ -323,18 +340,21 @@ async fn test_ordered_retry_transient_exhaustion_returns_in_order_replies() -> R
     let first = read_line_from_stream(&mut client, "first ordered transient ARTICLE").await?;
     let second = read_line_from_stream(&mut client, "second ordered transient ARTICLE").await?;
 
-    assert!(
-        first.starts_with("503"),
+    assert_eq!(
+        status_code(&first),
+        Some(503),
         "first ordered transient exhaustion should return 503, got: {first}"
     );
-    assert!(
-        second.starts_with("503"),
+    assert_eq!(
+        status_code(&second),
+        Some(503),
         "second ordered transient exhaustion should return 503, got: {second}"
     );
 
     let date = send_command_read_line(&mut client, "DATE").await?;
-    assert!(
-        date.starts_with("111"),
+    assert_eq!(
+        status_code(&date),
+        Some(111),
         "session should remain usable after ordered transient exhaustion, got: {date}"
     );
 
@@ -351,16 +371,11 @@ async fn send_body_read_response(
         .await?;
     client.flush().await?;
     let status = read_line_from_stream(client, "BODY status line").await?;
-    let mut body = Vec::new();
-    if status.starts_with("222") {
-        loop {
-            let line = read_line_from_stream(client, "BODY body").await?;
-            if line == ".\r\n" {
-                break;
-            }
-            body.push(line);
-        }
-    }
+    let body = if status_code(&status) == Some(222) {
+        read_multiline_body(client, &status, "BODY body").await?
+    } else {
+        Vec::new()
+    };
     Ok((status, body))
 }
 
@@ -393,8 +408,9 @@ async fn test_non_430_error_reply_fails_over_to_backend_with_article() -> Result
         let (status, body) =
             send_body_read_response(&mut client, &format!("<failover-{index}@example.com>"))
                 .await?;
-        assert!(
-            status.starts_with("222"),
+        assert_eq!(
+            status_code(&status),
+            Some(222),
             "lookup {index} should be served by the backend that has it, got: {status}"
         );
         assert_eq!(body, vec!["Body line\r\n".to_string()]);
@@ -429,15 +445,17 @@ async fn test_non_430_error_replies_from_every_backend_return_fallback() -> Resu
     // No backend reported the article missing, so the reply is the one the
     // retry loop gives when no backend can take the request, not the
     // provider-specific 451.
-    assert!(
-        status.starts_with("503"),
+    assert_eq!(
+        status_code(&status),
+        Some(503),
         "every backend refusing should return the no-backend reply, got: {status}"
     );
     assert!(body.is_empty());
 
     let date = send_command_read_line(&mut client, "DATE").await?;
-    assert!(
-        date.starts_with("111"),
+    assert_eq!(
+        status_code(&date),
+        Some(111),
         "session should remain usable after every backend refused, got: {date}"
     );
 

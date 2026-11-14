@@ -3,10 +3,16 @@
 //! TLS backends return at most ~16 KiB per read even though each pooled read
 //! buffer is 1 MiB, so per-read buffer ownership can make a capture hold far
 //! more memory than the article it contains. Wall time alone cannot show that,
-//! so this harness reports the peak live heap of the whole proxy alongside the
+//! so this harness reports the peak live heap of the proxy alongside the
 //! pool fallback counters from `hot_path_allocation_metrics_snapshot`, and
 //! the client's time to first byte, which shows whether a cache-miss capture
 //! holds the response back until the backend finishes it.
+//!
+//! The mock backend and the load generator share the process, so their
+//! article-sized buffers are allocated before the baseline and reused; the
+//! peak then reflects proxy-side retention rather than harness copies. What
+//! the harness still allocates during a run (per-connection line readers,
+//! tasks, message IDs) is a few KiB per connection.
 //!
 //! Run with:
 //! `cargo bench --features framing-bench --bench capture_retention`
@@ -25,6 +31,7 @@ use nntp_proxy::types::{CacheCapacity, MaxConnections, Port};
 use nntp_proxy::{NntpProxy, RoutingMode};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -161,23 +168,63 @@ impl Scenario {
     }
 }
 
-fn spawn_backend(listener: TcpListener, scenario: Scenario) {
+/// Capacity that holds a generated article response without growing: the
+/// article plus its status line, `Message-ID` header, and terminator. A
+/// buffer sized to the article alone doubles on its first fill.
+const fn response_capacity(size: usize) -> usize {
+    size + 1024
+}
+
+/// Article-sized backend response buffers, allocated before the baseline so
+/// the mock backend's copies stay out of the measured peak.
+#[derive(Clone)]
+struct BackendBuffers(Arc<Mutex<Vec<Vec<u8>>>>);
+
+impl BackendBuffers {
+    fn preallocate(count: usize, size: usize) -> Self {
+        Self(Arc::new(Mutex::new(
+            (0..count)
+                .map(|_| Vec::with_capacity(response_capacity(size)))
+                .collect(),
+        )))
+    }
+
+    fn take(&self, size: usize) -> Vec<u8> {
+        self.0.lock().unwrap().pop().unwrap_or_else(|| {
+            eprintln!(
+                "capture_retention: backend buffer pool empty; allocation counts toward the peak"
+            );
+            Vec::with_capacity(response_capacity(size))
+        })
+    }
+
+    fn give_back(&self, buffer: Vec<u8>) {
+        self.0.lock().unwrap().push(buffer);
+    }
+}
+
+fn spawn_backend(listener: TcpListener, scenario: Scenario, buffers: BackendBuffers) {
     tokio::spawn(async move {
         while let Ok((stream, _)) = listener.accept().await {
             stream.set_nodelay(true).unwrap();
-            tokio::spawn(serve_backend(stream, scenario));
+            tokio::spawn(serve_backend(stream, scenario, buffers.clone()));
         }
     });
 }
 
-async fn serve_backend(stream: TcpStream, scenario: Scenario) {
+async fn serve_backend(stream: TcpStream, scenario: Scenario, buffers: BackendBuffers) {
+    let mut response = buffers.take(scenario.size);
+    serve_backend_with(stream, scenario, &mut response).await;
+    buffers.give_back(response);
+}
+
+async fn serve_backend_with(stream: TcpStream, scenario: Scenario, response: &mut Vec<u8>) {
     let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
+    let mut reader = BufReader::with_capacity(256, read_half);
     if write_half.write_all(b"200 bench ready\r\n").await.is_err() {
         return;
     }
-    let mut line = String::new();
-    let mut response = Vec::with_capacity(scenario.size);
+    let mut line = String::with_capacity(256);
     loop {
         line.clear();
         match reader.read_line(&mut line).await {
@@ -186,10 +233,10 @@ async fn serve_backend(stream: TcpStream, scenario: Scenario) {
         }
         let command = line.trim_end();
         let written = if let Some(id) = command.strip_prefix("ARTICLE ") {
-            benchmark_article_response_into(&mut response, id, scenario.size);
+            benchmark_article_response_into(response, id, scenario.size);
             match scenario.geometry {
-                Geometry::Dense => write_half.write_all(&response).await,
-                Geometry::Sparse => write_paced(&mut write_half, &response, scenario).await,
+                Geometry::Dense => write_half.write_all(response).await,
+                Geometry::Sparse => write_paced(&mut write_half, response, scenario).await,
             }
         } else if command == "QUIT" {
             let _ = write_half.write_all(b"205 bye\r\n").await;
@@ -232,20 +279,41 @@ fn spawn_proxy(listener: TcpListener, proxy: NntpProxy) {
     });
 }
 
-/// Bytes received and per-request time to first byte for one client.
+/// One client's article-sized buffers, allocated before the baseline and
+/// handed back after the run so the load generator's copies stay out of the
+/// measured peak.
+struct ClientBuffers {
+    expected: Vec<u8>,
+    response: Vec<u8>,
+    first_byte: Vec<Duration>,
+}
+
+impl ClientBuffers {
+    fn new(scenario: Scenario) -> Self {
+        Self {
+            expected: Vec::with_capacity(response_capacity(scenario.size)),
+            response: Vec::with_capacity(response_capacity(scenario.size)),
+            first_byte: Vec::with_capacity(scenario.requests),
+        }
+    }
+}
+
+/// Bytes received for one client, and its buffers with the per-request time
+/// to first byte.
 struct ClientResult {
     bytes: usize,
-    first_byte: Vec<Duration>,
+    buffers: ClientBuffers,
 }
 
 async fn run_client(
     address: std::net::SocketAddr,
     client: usize,
     scenario: Scenario,
+    mut buffers: ClientBuffers,
 ) -> anyhow::Result<ClientResult> {
     let mut stream = TcpStream::connect(address).await?;
     stream.set_nodelay(true)?;
-    let mut reader = BufReader::new(&mut stream);
+    let mut reader = BufReader::with_capacity(256, &mut stream);
     let mut greeting = String::new();
     reader.read_line(&mut greeting).await?;
     anyhow::ensure!(
@@ -254,13 +322,16 @@ async fn run_client(
     );
     drop(reader);
 
-    let mut expected = Vec::with_capacity(scenario.size);
-    let mut response = Vec::with_capacity(scenario.size);
+    let ClientBuffers {
+        expected,
+        response,
+        first_byte,
+    } = &mut buffers;
+    first_byte.clear();
     let mut received = 0;
-    let mut first_byte = Vec::with_capacity(scenario.requests);
     for request in 0..scenario.requests {
         let id = format!("<c{client}-r{request}@capture.bench>");
-        benchmark_article_response_into(&mut expected, &id, scenario.size);
+        benchmark_article_response_into(expected, &id, scenario.size);
         stream
             .write_all(format!("ARTICLE {id}\r\n").as_bytes())
             .await?;
@@ -274,7 +345,7 @@ async fn run_client(
     }
     Ok(ClientResult {
         bytes: received,
-        first_byte,
+        buffers,
     })
 }
 
@@ -286,7 +357,13 @@ fn percentile_ms(sorted: &[Duration], percentile: usize) -> f64 {
 async fn run(scenario: Scenario) -> anyhow::Result<()> {
     let backend = TcpListener::bind("127.0.0.1:0").await?;
     let backend_port = backend.local_addr()?.port();
-    spawn_backend(backend, scenario);
+    // One buffer per pooled connection, plus the warm-up connection and slack
+    // for a connection replaced mid-run.
+    spawn_backend(
+        backend,
+        scenario,
+        BackendBuffers::preallocate(scenario.concurrency + 2, scenario.size),
+    );
 
     let config = Config {
         servers: vec![
@@ -320,15 +397,16 @@ async fn run(scenario: Scenario) -> anyhow::Result<()> {
     spawn_proxy(listener, proxy);
 
     // Warm one connection so startup allocations are part of the baseline.
-    run_client(
-        address,
-        usize::MAX,
-        Scenario {
-            requests: 1,
-            ..scenario
-        },
-    )
-    .await?;
+    let warm = Scenario {
+        requests: 1,
+        ..scenario
+    };
+    run_client(address, usize::MAX, warm, ClientBuffers::new(warm)).await?;
+    let mut client_buffers: Vec<ClientBuffers> = (0..scenario.concurrency)
+        .map(|_| ClientBuffers::new(scenario))
+        .collect();
+    let mut results = Vec::with_capacity(scenario.concurrency);
+    let mut first_byte = Vec::with_capacity(scenario.concurrency * scenario.requests);
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let baseline = LIVE.load(Ordering::Relaxed);
@@ -338,19 +416,21 @@ async fn run(scenario: Scenario) -> anyhow::Result<()> {
 
     let mut clients = tokio::task::JoinSet::new();
     for client in 0..scenario.concurrency {
-        clients.spawn(run_client(address, client, scenario));
+        let buffers = client_buffers.pop().expect("one buffer set per client");
+        clients.spawn(run_client(address, client, scenario, buffers));
     }
-    let mut bytes = 0;
-    let mut first_byte = Vec::with_capacity(scenario.concurrency * scenario.requests);
     while let Some(result) = clients.join_next().await {
-        let client = result??;
-        bytes += client.bytes;
-        first_byte.extend(client.first_byte);
+        results.push(result??);
     }
-    first_byte.sort_unstable();
 
     let elapsed = started.elapsed();
     let peak = PEAK.load(Ordering::Relaxed);
+    let mut bytes = 0;
+    for client in &results {
+        bytes += client.bytes;
+        first_byte.extend_from_slice(&client.buffers.first_byte);
+    }
+    first_byte.sort_unstable();
     let after = hot_path_allocation_metrics_snapshot();
     let articles = scenario.concurrency * scenario.requests;
     println!(

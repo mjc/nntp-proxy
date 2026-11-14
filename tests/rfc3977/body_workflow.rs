@@ -20,6 +20,7 @@ use crate::test_helpers::{
     MockNntpServer, RfcTestClient, connect_and_read_greeting,
     create_test_server_config_with_max_connections, spawn_proxy_with_config,
 };
+use nntp_proxy::session::{MultilineLine, MultilineLineFramer};
 use nntp_proxy::{Config, RoutingMode, config::Cache};
 
 const PIPELINE_COMMON_RESPONSES: &[(&str, &str)] = &[
@@ -141,17 +142,36 @@ where
     R: AsyncBufRead + Unpin,
 {
     let status_line = read_line(reader, "BODY status line").await?;
+    let mut framer = MultilineLineFramer::after_status_line(status_line.as_bytes());
     let mut lines = Vec::new();
 
     loop {
         let line = read_line(reader, "BODY response line").await?;
-        if line == ".\r\n" {
+        if framer.push_line(line.as_bytes()) == MultilineLine::End {
             break;
         }
         lines.push(line);
     }
 
     Ok((status_line, lines))
+}
+
+/// Assert that `line` is where the proxy's framer ends the multiline response
+/// that began with `status_line` and `body_lines`.
+fn assert_ends_response(status_line: &str, body_lines: &[&str], line: &str, command: &str) {
+    let mut framer = MultilineLineFramer::after_status_line(status_line.as_bytes());
+    for body_line in body_lines {
+        assert_eq!(
+            framer.push_line(body_line.as_bytes()),
+            MultilineLine::Body,
+            "{command:?} body line {body_line:?} must not end the response"
+        );
+    }
+    assert_eq!(
+        framer.push_line(line.as_bytes()),
+        MultilineLine::End,
+        "{command:?} must end the response after its body, got {line:?}"
+    );
 }
 
 async fn read_multiline_responses<R>(
@@ -536,10 +556,8 @@ async fn expect_capture_streams_before_backend_finishes(
             expected_body_line
         );
     }
-    assert_eq!(
-        read_line(&mut reader, "multiline terminator").await?,
-        ".\r\n"
-    );
+    let terminator = read_line(&mut reader, "multiline terminator").await?;
+    assert_ends_response(expected_status, &[expected_body_line], &terminator, command);
 
     Ok(())
 }
@@ -604,10 +622,8 @@ async fn expect_pass_through_borrows_initial_backend_bytes(
             expected_body_line
         );
     }
-    assert_eq!(
-        read_line(&mut reader, "multiline terminator").await?,
-        ".\r\n"
-    );
+    let terminator = read_line(&mut reader, "multiline terminator").await?;
+    assert_ends_response(expected_status, &[expected_body_line], &terminator, command);
 
     Ok(())
 }
@@ -688,10 +704,8 @@ async fn expect_pass_through_borrows_initial_backend_bytes_with_auth(
             expected_body_line
         );
     }
-    assert_eq!(
-        read_line(&mut reader, "multiline terminator").await?,
-        ".\r\n"
-    );
+    let terminator = read_line(&mut reader, "multiline terminator").await?;
+    assert_ends_response(expected_status, &[expected_body_line], &terminator, command);
 
     Ok(())
 }

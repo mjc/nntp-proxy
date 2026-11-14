@@ -3890,6 +3890,94 @@ pub fn benchmark_framed_cache_response(
     crate::cache::FramedChunkedResponse::from_article_state(state)
 }
 
+/// Where a line read by a test client falls in a multiline response.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultilineLine {
+    /// A body line (still dot-stuffed); the response continues.
+    Body,
+    /// The line that completes the response.
+    End,
+}
+
+/// Line-at-a-time framing for integration tests that read a proxy's client
+/// socket one line at a time.
+///
+/// AGENTS.md keeps knowledge of how a multiline response ends inside this
+/// module, tests included. Tests cannot reach the crate-private framer, so
+/// this exposes the same `MultilineFramer` behind a line-oriented API instead
+/// of each test comparing raw lines against the terminator.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct MultilineLineFramer {
+    framer: MultilineFramer,
+}
+
+impl MultilineLineFramer {
+    /// Start framing the body that follows `status_line`, which must include
+    /// its line ending. The framer needs the status line's line ending to
+    /// recognise an empty body.
+    #[must_use]
+    pub fn after_status_line(status_line: &[u8]) -> Self {
+        let mut framer = MultilineFramer::default();
+        framer.update(status_line);
+        Self { framer }
+    }
+
+    /// Classify the next complete line of the response, including its line
+    /// ending. Do not push lines after [`MultilineLine::End`].
+    ///
+    /// # Panics
+    /// Panics if `line` holds the end of the response followed by more bytes,
+    /// which means the caller passed more than one line.
+    pub fn push_line(&mut self, line: &[u8]) -> MultilineLine {
+        match self
+            .framer
+            .split_chunk(line, PackedPendingBytesPolicy::Reject)
+        {
+            Ok(ChunkProgress::Incomplete) => MultilineLine::Body,
+            Ok(ChunkProgress::Complete(_)) => MultilineLine::End,
+            Err(error) => panic!("push_line expects one line at a time: {error:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod line_framer_tests {
+    use super::{MultilineLine, MultilineLineFramer};
+
+    fn classify(status_line: &[u8], lines: &[&[u8]]) -> Vec<MultilineLine> {
+        let mut framer = MultilineLineFramer::after_status_line(status_line);
+        lines.iter().map(|line| framer.push_line(line)).collect()
+    }
+
+    #[test]
+    fn body_lines_continue_until_the_terminator_line() {
+        assert_eq!(
+            classify(
+                b"222 0 <a@b>\r\n",
+                &[b"first\r\n", b"..dot-stuffed\r\n", b".\r\n"]
+            ),
+            [MultilineLine::Body, MultilineLine::Body, MultilineLine::End]
+        );
+    }
+
+    #[test]
+    fn empty_body_ends_on_the_first_line() {
+        assert_eq!(
+            classify(b"215 list follows\r\n", &[b".\r\n"]),
+            [MultilineLine::End]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "one line at a time")]
+    fn more_than_one_line_is_rejected() {
+        let mut framer = MultilineLineFramer::after_status_line(b"222 0 <a@b>\r\n");
+        framer.push_line(b".\r\n223 0 <c@d>\r\n");
+    }
+}
+
 #[inline]
 #[cfg(test)]
 fn find_terminator_end_from(data: &[u8], start: usize) -> Option<usize> {

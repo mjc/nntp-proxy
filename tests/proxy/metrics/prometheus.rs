@@ -2,7 +2,7 @@
 
 use crate::test_helpers::{
     MockNntpServer, create_test_config, send_article_read_multiline_response,
-    send_command_read_line, spawn_test_proxy_on_listener,
+    send_command_read_line, spawn_test_proxy_on_listener, status_code,
 };
 use anyhow::Result;
 use nntp_proxy::{NntpProxy, RoutingMode};
@@ -99,15 +99,15 @@ async fn scrape_reflects_article_and_stat_traffic() -> Result<()> {
     for _ in 0..3 {
         let (status, _) =
             send_article_read_multiline_response(&mut client, "<present@example.com>").await?;
-        assert!(status.starts_with("220"), "{status}");
+        assert_eq!(status_code(&status), Some(220), "{status}");
     }
     for _ in 0..2 {
         let status = send_command_read_line(&mut client, "STAT <present@example.com>").await?;
-        assert!(status.starts_with("223"), "{status}");
+        assert_eq!(status_code(&status), Some(223), "{status}");
     }
     let (status, _) =
         send_article_read_multiline_response(&mut client, "<missing@example.com>").await?;
-    assert!(status.starts_with("430"), "{status}");
+    assert_eq!(status_code(&status), Some(430), "{status}");
 
     let after = scrape(metrics_addr).await?;
     let backend = [("backend", "backend-a"), ("tier", "0")];
@@ -228,16 +228,16 @@ async fn stateful_sessions_count_replies_and_bytes_once() -> Result<()> {
     for _ in 0..2 {
         let (status, _) =
             send_article_read_multiline_response(&mut client, "<present@example.com>").await?;
-        assert!(status.starts_with("220"), "{status}");
+        assert_eq!(status_code(&status), Some(220), "{status}");
     }
     let (status, _) =
         send_article_read_multiline_response(&mut client, "<missing@example.com>").await?;
-    assert!(status.starts_with("430"), "{status}");
+    assert_eq!(status_code(&status), Some(430), "{status}");
     let status = send_command_read_line(&mut client, "GROUP alt.none").await?;
-    assert!(status.starts_with("411"), "{status}");
+    assert_eq!(status_code(&status), Some(411), "{status}");
     // A line over the 512-byte limit is refused locally.
     let status = send_command_read_line(&mut client, &format!("XFOO {}", "x".repeat(600))).await?;
-    assert!(status.starts_with("501"), "{status}");
+    assert_eq!(status_code(&status), Some(501), "{status}");
     drop(client);
 
     let body = scrape_after_sessions_end(metrics_addr).await?;
@@ -318,13 +318,13 @@ async fn hybrid_handoff_command_is_counted_once_as_sent_to_the_backend() -> Resu
     let group = "GROUP alt.none";
     let (status, _) =
         send_article_read_multiline_response(&mut client, "<present@example.com>").await?;
-    assert!(status.starts_with("220"), "{status}");
+    assert_eq!(status_code(&status), Some(220), "{status}");
     // GROUP switches the session to a pinned backend.
     let status = send_command_read_line(&mut client, group).await?;
-    assert!(status.starts_with("411"), "{status}");
+    assert_eq!(status_code(&status), Some(411), "{status}");
     let (status, _) =
         send_article_read_multiline_response(&mut client, "<present@example.com>").await?;
-    assert!(status.starts_with("220"), "{status}");
+    assert_eq!(status_code(&status), Some(220), "{status}");
     drop(client);
 
     let body = scrape_after_sessions_end(metrics_addr).await?;

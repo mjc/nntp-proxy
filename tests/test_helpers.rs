@@ -861,20 +861,44 @@ pub async fn send_article_read_multiline_response(
 
     eprintln!("Received status: {}", status_line.trim());
 
-    let mut body_lines = Vec::new();
-
-    // If 220, read multiline body
-    if status_line.starts_with("220") {
-        loop {
-            let line = read_line_from_stream(stream, "ARTICLE body").await?;
-            if line == ".\r\n" {
-                break;
-            }
-            body_lines.push(line);
-        }
-    }
+    let body_lines = if status_code(&status_line) == Some(220) {
+        read_multiline_body(stream, &status_line, "ARTICLE body").await?
+    } else {
+        Vec::new()
+    };
 
     Ok((status_line, body_lines))
+}
+
+/// Parsed status code of a response line, so tests never match raw status
+/// bytes.
+#[must_use]
+pub fn status_code(line: &str) -> Option<u16> {
+    nntp_proxy::protocol::StatusCode::parse(line.as_bytes()).map(|status| status.as_u16())
+}
+
+/// Read the body lines of a multiline response whose `status_line` was
+/// already read, excluding the line that ends the response. The proxy's
+/// framer decides where the response ends.
+///
+/// # Errors
+/// Returns any socket read error or a closed connection before the response
+/// ends.
+pub async fn read_multiline_body(
+    stream: &mut tokio::net::TcpStream,
+    status_line: &str,
+    context: &str,
+) -> Result<Vec<String>> {
+    let mut framer =
+        nntp_proxy::session::MultilineLineFramer::after_status_line(status_line.as_bytes());
+    let mut lines = Vec::new();
+    loop {
+        let line = read_line_from_stream(stream, context).await?;
+        if framer.push_line(line.as_bytes()) == nntp_proxy::session::MultilineLine::End {
+            return Ok(lines);
+        }
+        lines.push(line);
+    }
 }
 
 /// Send a command and read a multiline NNTP response until the terminator.
@@ -895,28 +919,17 @@ pub async fn send_command_read_multiline_response(
     // as multiline by NNTP semantics. Status 211 is ambiguous: GROUP is
     // single-line, while LISTGROUP is multiline.
     let command_upper = command.trim().to_ascii_uppercase();
-    let is_multiline = status_line.starts_with("100")
-        || status_line.starts_with("101")
-        || status_line.starts_with("215")
-        || status_line.starts_with("220")
-        || status_line.starts_with("221")
-        || status_line.starts_with("222")
-        || status_line.starts_with("224")
-        || status_line.starts_with("225")
-        || status_line.starts_with("230")
-        || status_line.starts_with("231")
-        || (status_line.starts_with("211") && command_upper.starts_with("LISTGROUP"));
+    let is_multiline = match status_code(&status_line) {
+        Some(100 | 101 | 215 | 220 | 221 | 222 | 224 | 225 | 230 | 231) => true,
+        Some(211) => command_upper.starts_with("LISTGROUP"),
+        _ => false,
+    };
 
-    let mut lines = Vec::new();
-    if is_multiline {
-        loop {
-            let line = read_line_from_stream(stream, "multiline response").await?;
-            if line == ".\r\n" {
-                break;
-            }
-            lines.push(line);
-        }
-    }
+    let lines = if is_multiline {
+        read_multiline_body(stream, &status_line, "multiline response").await?
+    } else {
+        Vec::new()
+    };
 
     Ok((status_line, lines))
 }
