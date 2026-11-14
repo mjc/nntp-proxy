@@ -21,6 +21,7 @@ use tokio::net::TcpStream;
 use tokio::sync::OnceCell;
 
 use crate::connection_error::ConnectionError;
+use crate::pool::address_balance::AddressLease;
 use crate::pool::churn::{CloseReason, ConnectOutcome};
 use crate::pool::login_backoff::{Admission, LoginBackoff};
 use crate::protocol::{RequestContext, authinfo_pass, authinfo_user};
@@ -42,6 +43,8 @@ pub struct ReadyBackendConnection(ConnectionStream, CloseTracking, tokio::time::
 struct CloseTracking {
     churn: Arc<crate::pool::churn::ConnectionChurn>,
     reason: Option<CloseReason>,
+    /// Released when the connection is destroyed, freeing its address slot.
+    _address: Option<crate::pool::address_balance::AddressLease>,
 }
 
 impl Drop for CloseTracking {
@@ -52,12 +55,17 @@ impl Drop for CloseTracking {
 }
 
 impl ReadyBackendConnection {
-    fn new(stream: ConnectionStream, churn: Arc<crate::pool::churn::ConnectionChurn>) -> Self {
+    fn new(
+        stream: ConnectionStream,
+        churn: Arc<crate::pool::churn::ConnectionChurn>,
+        address: Option<crate::pool::address_balance::AddressLease>,
+    ) -> Self {
         Self(
             stream,
             CloseTracking {
                 churn,
                 reason: None,
+                _address: address,
             },
             tokio::time::Instant::now(),
         )
@@ -168,7 +176,6 @@ enum CacheKind {
 }
 
 static DNS_RESOLVER: Mutex<Option<CachedResolver>> = Mutex::new(None);
-static NEXT_ADDR_START: AtomicUsize = AtomicUsize::new(0);
 static NEXT_IPV4_ROTATION: AtomicUsize = AtomicUsize::new(0);
 
 const RESOLV_CONF_RETRY: Duration = Duration::from_secs(5 * 60);
@@ -383,6 +390,8 @@ pub struct TcpManager {
     login_backoff: Arc<LoginBackoff>,
     /// Connection births and deaths, shared with the provider for export.
     pub(crate) churn: Arc<crate::pool::churn::ConnectionChurn>,
+    /// Live connections per resolved address, so new ones go to the emptiest.
+    address_load: Arc<crate::pool::address_balance::AddressLoad>,
 }
 
 impl TcpManager {
@@ -509,6 +518,7 @@ impl TcpManager {
             send_mode_reader: options.send_mode_reader,
             login_backoff: Arc::default(),
             churn: Arc::default(),
+            address_load: Arc::default(),
         })
     }
 
@@ -553,7 +563,9 @@ impl TcpManager {
         Ok(tcp_stream)
     }
 
-    async fn create_connected_tcp_stream(&self) -> Result<TcpStream, ConnectionError> {
+    async fn create_connected_tcp_stream(
+        &self,
+    ) -> Result<(TcpStream, AddressLease), ConnectionError> {
         let addrs = self.lookup_socket_addrs().await?;
         if let Ok(tcp_stream) = self.try_resolved_socket_addrs(&addrs).await {
             return Ok(tcp_stream);
@@ -578,24 +590,22 @@ impl TcpManager {
             })
     }
 
+    /// Connect to the resolved address with the fewest live connections from
+    /// this backend, falling back to the next emptiest on failure.
     async fn try_resolved_socket_addrs(
         &self,
         addrs: &[SocketAddr],
-    ) -> Result<TcpStream, Option<ConnectionError>> {
-        if addrs.is_empty() {
-            return Err(None);
-        }
-
+    ) -> Result<(TcpStream, AddressLease), Option<ConnectionError>> {
         let mut last_error = None;
         let mut skip_ipv6 = false;
-        let start = NEXT_ADDR_START.fetch_add(1, Ordering::Relaxed) % addrs.len();
-        for offset in 0..addrs.len() {
-            let socket_addr = addrs[(start + offset) % addrs.len()];
-            if skip_ipv6 && socket_addr.is_ipv6() {
-                continue;
-            }
+        let mut tried: SmallVec<[SocketAddr; 4]> = SmallVec::new();
+        while let Some(lease) = self.address_load.reserve_least_loaded(addrs, |addr| {
+            tried.contains(&addr) || (skip_ipv6 && addr.is_ipv6())
+        }) {
+            let socket_addr = lease.addr();
+            tried.push(socket_addr);
             match self.connect_socket_addr(socket_addr).await {
-                Ok(tcp_stream) => return Ok(tcp_stream),
+                Ok(tcp_stream) => return Ok((tcp_stream, lease)),
                 Err(error) => {
                     if Self::is_ipv6_network_unreachable(socket_addr, &error) {
                         let resolver = match dns_resolver() {
@@ -624,8 +634,8 @@ impl TcpManager {
     /// Create an optimized connection (TCP or TLS)
     pub(crate) async fn create_optimized_stream(
         &self,
-    ) -> Result<ConnectionStream, ConnectionError> {
-        let tcp_stream = self.create_connected_tcp_stream().await?;
+    ) -> Result<(ConnectionStream, AddressLease), ConnectionError> {
+        let (tcp_stream, address) = self.create_connected_tcp_stream().await?;
 
         // Perform TLS handshake if enabled
         if self.tls_policy.is_enabled() {
@@ -644,9 +654,9 @@ impl TcpManager {
                     backend: self.name.clone(),
                     source: e.into(),
                 })?;
-            Ok(ConnectionStream::tls(tls_stream))
+            Ok((ConnectionStream::tls(tls_stream), address))
         } else {
-            Ok(ConnectionStream::plain(tcp_stream))
+            Ok((ConnectionStream::plain(tcp_stream), address))
         }
     }
 }
@@ -927,7 +937,10 @@ impl TcpManager {
     /// Open, greet, authenticate and configure one backend session.
     async fn setup_session(&self) -> Result<ReadyBackendConnection, ConnectionError> {
         tokio::time::timeout(crate::constants::timeout::CONNECTION, async {
-            let mut stream = self.create_optimized_stream().await?;
+            // The address counts as healthy only once the whole session is
+            // ready: one that accepts TCP but fails TLS, the greeting or
+            // login must cool down, or it would stay the emptiest choice.
+            let (mut stream, mut address) = self.create_optimized_stream().await?;
             let mut buffer = [0u8; 4096];
 
             self.consume_greeting(&mut stream, &mut buffer).await?;
@@ -942,7 +955,12 @@ impl TcpManager {
                 stream = stream.into_compressed(level)?;
             }
 
-            Ok(ReadyBackendConnection::new(stream, Arc::clone(&self.churn)))
+            address.mark_connected();
+            Ok(ReadyBackendConnection::new(
+                stream,
+                Arc::clone(&self.churn),
+                Some(address),
+            ))
         })
         .await
         .map_err(|_| {
@@ -1216,7 +1234,7 @@ mod tests {
         .unwrap();
 
         let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
-        let stream = manager.create_connected_tcp_stream().await.unwrap();
+        let (stream, _address) = manager.create_connected_tcp_stream().await.unwrap();
         let _accepted = accept.await.unwrap();
 
         assert_eq!(stream.peer_addr().unwrap(), live_addr);
@@ -1286,7 +1304,7 @@ mod tests {
         .unwrap();
 
         let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
-        let stream = manager.create_connected_tcp_stream().await.unwrap();
+        let (stream, _address) = manager.create_connected_tcp_stream().await.unwrap();
         let _accepted = accept.await.unwrap();
 
         assert_eq!(stream.peer_addr().unwrap(), live_addr);
@@ -1402,13 +1420,98 @@ mod tests {
         )
         .unwrap();
 
-        let stream = manager
+        let (stream, lease) = manager
             .try_resolved_socket_addrs(&[unavailable_addr, available_addr])
             .await
             .expect("second resolved address should be tried after first connect error");
 
         assert_eq!(stream.peer_addr().unwrap(), available_addr);
+        assert_eq!(lease.addr(), available_addr);
+        assert_eq!(
+            manager.address_load.live_count(unavailable_addr),
+            0,
+            "the failed attempt released its reservation"
+        );
         accept_task.await.unwrap();
+    }
+
+    /// An address that accepts TCP but never completes session setup cools
+    /// down; a completed setup leaves its address healthy.
+    #[tokio::test]
+    async fn failed_session_setup_cools_the_address_down() {
+        let broken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let broken_addr = broken.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = broken.accept().await {
+                drop(stream); // accepts, then closes before any greeting
+            }
+        });
+        let manager = TcpManager::new(
+            broken_addr.ip().to_string(),
+            broken_addr.port(),
+            "broken".to_string(),
+            TcpManagerOptions {
+                compress: Some(false),
+                ..TcpManagerOptions::default()
+            },
+        )
+        .unwrap();
+        assert!(manager.setup_session().await.is_err());
+        assert!(manager.address_load.is_cooling(broken_addr));
+
+        let (healthy_addr, _accepted) = spawn_login_server(|_| "281 ok\r\n").await;
+        let healthy = login_manager(healthy_addr);
+        let connection = healthy.setup_session().await.unwrap();
+        assert!(!healthy.address_load.is_cooling(healthy_addr));
+        assert_eq!(healthy.address_load.live_count(healthy_addr), 1);
+        drop(connection);
+        assert_eq!(healthy.address_load.live_count(healthy_addr), 0);
+        assert!(!healthy.address_load.is_cooling(healthy_addr));
+    }
+
+    /// Connections from one backend spread evenly over its addresses, and a
+    /// closed connection frees its address for the next one.
+    #[tokio::test]
+    async fn connections_spread_evenly_over_resolved_addresses() {
+        let mut addrs = Vec::new();
+        for _ in 0..2 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addrs.push(listener.local_addr().unwrap());
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    // Hold each accepted socket open for the rest of the test.
+                    tokio::spawn(async move {
+                        let _stream = stream;
+                        std::future::pending::<()>().await;
+                    });
+                }
+            });
+        }
+        let manager = TcpManager::new(
+            "test.example.com".to_string(),
+            addrs[0].port(),
+            "SpreadBackend".to_string(),
+            TcpManagerOptions::default(),
+        )
+        .unwrap();
+
+        let mut connections = Vec::new();
+        for _ in 0..10 {
+            let (stream, mut lease) = manager.try_resolved_socket_addrs(&addrs).await.unwrap();
+            lease.mark_connected(); // as a completed session setup does
+            connections.push((stream, lease));
+        }
+        assert_eq!(manager.address_load.live_count(addrs[0]), 5);
+        assert_eq!(manager.address_load.live_count(addrs[1]), 5);
+
+        connections.retain(|(_, lease)| lease.addr() != addrs[1]);
+        assert_eq!(manager.address_load.live_count(addrs[1]), 0);
+        let (_, lease) = manager.try_resolved_socket_addrs(&addrs).await.unwrap();
+        assert_eq!(
+            lease.addr(),
+            addrs[1],
+            "the emptied address is refilled first"
+        );
     }
 
     #[test]
