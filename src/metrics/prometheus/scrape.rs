@@ -517,6 +517,20 @@ fn render_admission(out: &mut Exposition, backends: &[BackendScrape]) {
             backend.estimated_wait_seconds,
         );
     }
+    out.family(
+        "nntp_proxy_backend_article_standing",
+        Gauge,
+        "Recent article-lookup standing from 0 to 1: falls by 1/8 on each 430 or refused lookup and climbs by 1/128 of the gap on each hit. With routing.article.standing = \"adaptive\" it scales the backend's share of article lookups within its tier.",
+    );
+    for backend in backends {
+        let standing = f64::from(backend.admission.standing_ppm)
+            / f64::from(crate::pool::admission::STANDING_FULL_PPM);
+        out.sample(
+            "nntp_proxy_backend_article_standing",
+            &[("backend", &backend.name), ("tier", &backend.tier)],
+            standing,
+        );
+    }
 }
 
 fn render_backends(out: &mut Exposition, backends: &[BackendScrape]) {
@@ -822,6 +836,7 @@ pub(crate) mod tests {
                     admission: BackendLoadSnapshot {
                         backlog_skips: 7,
                         service_time_ewma_micros: 250_000,
+                        standing_ppm: 250_000,
                         ..BackendLoadSnapshot::default()
                     },
                     estimated_wait_seconds: 1.25,
@@ -1040,6 +1055,10 @@ pub(crate) mod tests {
         );
         assert_eq!(
             value("nntp_proxy_backend_service_time_seconds", None),
+            Some(0.25)
+        );
+        assert_eq!(
+            value("nntp_proxy_backend_article_standing", None),
             Some(0.25)
         );
         assert_eq!(

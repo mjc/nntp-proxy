@@ -34,6 +34,26 @@ const EWMA_SHIFT: u32 = 3;
 /// hundred lookups.
 const RESCUE_EWMA_SHIFT: u32 = 6;
 
+/// Full article standing, in parts per million.
+pub const STANDING_FULL_PPM: u32 = 1_000_000;
+
+/// Weight 1/8 a `430` carries in the standing average. Takedowns hit a whole
+/// release at once, so a backend that starts missing keeps missing for the
+/// rest of that download: about 18 misses in a row take it from full to a
+/// tenth, and about 35 to a hundredth, which is well under a second of
+/// traffic during a download.
+const STANDING_MISS_SHIFT: u32 = 3;
+
+/// Weight 1/128 a hit carries in the standing average. Recovery is earned
+/// slowly so one lucky hit between misses does not bring a demoted backend
+/// back: about 88 hits in a row take it halfway, about 300 to nine tenths.
+const STANDING_HIT_SHIFT: u32 = 7;
+
+/// Lowest standing routing will use, in parts per million (1/64). Keeps a
+/// demoted backend getting a trickle of first attempts so it can redeem
+/// itself even while its peers never miss.
+pub const STANDING_FLOOR_PPM: u32 = STANDING_FULL_PPM >> 6;
+
 /// Shortest gap between two skip summaries for one backend. A backlogged
 /// backend can be skipped thousands of times a minute; one line per backend
 /// every ten seconds keeps the signal without flooding the log.
@@ -70,6 +90,46 @@ pub enum BacklogLastResort {
     WaitShortest,
     /// End the request as soon as no unskipped backend is left.
     GiveUp,
+}
+
+/// Whether article routing within a tier prefers backends that have recently
+/// had the articles they were asked for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ArticleStanding {
+    /// Route by capacity and load only. Standing is still tracked and
+    /// exported so it can be watched before it is turned on.
+    #[default]
+    Off,
+    /// Scale each backend's share of article lookups within its tier by its
+    /// standing. Tier order is unchanged.
+    Adaptive,
+}
+
+impl ArticleStanding {
+    /// Get the configuration spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Adaptive => "adaptive",
+        }
+    }
+}
+
+impl std::fmt::Display for ArticleStanding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// What a backend answered to an article lookup, for its standing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArticleLookupOutcome {
+    /// The backend had the article.
+    Found,
+    /// The backend answered `430` or refused the lookup.
+    Missing,
 }
 
 /// What limited a checkout's wait.
@@ -206,6 +266,9 @@ pub struct BackendLoadSnapshot {
     pub rescue_ppm: u32,
     /// Fallback lookups folded into `rescue_ppm`.
     pub fallback_lookups: u64,
+    /// Recent article-lookup standing, in parts per million. See
+    /// [`BackendLoad::note_article_lookup`].
+    pub standing_ppm: u32,
 }
 
 /// Outcome of a lookup sent to a backend after another backend had already
@@ -248,6 +311,9 @@ pub struct BackendLoad {
     /// Times this backend was passed over for a low rescue rate; every
     /// [`RESCUE_PROBE_EVERY`]th is let through so the rate keeps updating.
     unlikely_rescue_skips: AtomicU64,
+    /// Asymmetric average of recent article lookups that found the article,
+    /// in parts per million. Starts full.
+    standing_ppm: AtomicU32,
     unlogged_backlog_skips: AtomicU64,
     unlogged_busy_timeouts: AtomicU64,
     /// Milliseconds since `epoch`, offset by one interval so the first skip
@@ -272,6 +338,7 @@ impl Default for BackendLoad {
             rescue_ppm: AtomicU32::new(0),
             fallback_lookups: AtomicU64::new(0),
             unlikely_rescue_skips: AtomicU64::new(0),
+            standing_ppm: AtomicU32::new(STANDING_FULL_PPM),
             unlogged_backlog_skips: AtomicU64::new(0),
             unlogged_busy_timeouts: AtomicU64::new(0),
             last_summary_ms: AtomicU64::new(0),
@@ -386,6 +453,32 @@ impl BackendLoad {
         self.rescue_ppm.store(next, Ordering::Relaxed);
     }
 
+    /// Fold one article lookup into this backend's standing.
+    ///
+    /// A miss moves the standing down by 1/8 of what is left and a hit moves
+    /// it up by 1/128 of the gap to full, so a backend that hits a takedown
+    /// drops to the bottom within a few dozen lookups but has to keep
+    /// finding articles for a few hundred to climb back. Like the other
+    /// averages this is a plain load and store; a sample lost to a race does
+    /// not matter.
+    pub fn note_article_lookup(&self, outcome: ArticleLookupOutcome) {
+        let current = self.standing_ppm.load(Ordering::Relaxed);
+        let next = match outcome {
+            ArticleLookupOutcome::Found => {
+                current + ((STANDING_FULL_PPM - current) >> STANDING_HIT_SHIFT)
+            }
+            ArticleLookupOutcome::Missing => current - (current >> STANDING_MISS_SHIFT),
+        };
+        self.standing_ppm.store(next, Ordering::Relaxed);
+    }
+
+    /// Recent article-lookup standing in parts per million, from
+    /// [`STANDING_FULL_PPM`] down towards zero.
+    #[must_use]
+    pub fn standing_ppm(&self) -> u32 {
+        self.standing_ppm.load(Ordering::Relaxed)
+    }
+
     /// Whether this pass-over of an unlikely rescuer should instead be let
     /// through as a probe. A backend that is only ever passed over would
     /// never be sampled again, so its rate could not recover when the
@@ -415,6 +508,7 @@ impl BackendLoad {
             last_resort_timeouts: self.last_resort_timeouts.load(Ordering::Relaxed),
             rescue_ppm: self.rescue_ppm.load(Ordering::Relaxed),
             fallback_lookups: self.fallback_lookups.load(Ordering::Relaxed),
+            standing_ppm: self.standing_ppm.load(Ordering::Relaxed),
         }
     }
 
@@ -561,6 +655,8 @@ pub struct ArticleAdmission {
     /// neither waited on as a last resort nor waited for before answering
     /// `430`. Zero disables.
     rescue_floor_ppm: u32,
+    /// Whether article routing within a tier weighs backends by standing.
+    standing: ArticleStanding,
 }
 
 impl Default for ArticleAdmission {
@@ -589,7 +685,20 @@ impl ArticleAdmission {
             last_resort: BacklogLastResort::WaitShortest,
             unfinished_replies_before_430: crate::constants::pool::UNFINISHED_REPLIES_BEFORE_430,
             rescue_floor_ppm: 0,
+            standing: ArticleStanding::Off,
         }
+    }
+
+    /// Weigh backends by their recent article standing when routing lookups.
+    #[must_use]
+    pub const fn with_standing(mut self, standing: ArticleStanding) -> Self {
+        self.standing = standing;
+        self
+    }
+
+    #[must_use]
+    pub const fn standing(&self) -> ArticleStanding {
+        self.standing
     }
 
     /// Stop waiting on busy backends that rarely have an article other
@@ -925,7 +1034,91 @@ mod tests {
                 last_resort_timeouts: 0,
                 rescue_ppm: 0,
                 fallback_lookups: 0,
+                standing_ppm: STANDING_FULL_PPM,
             }
+        );
+    }
+
+    #[test]
+    fn standing_starts_full_and_drops_fast_on_misses() {
+        let load = BackendLoad::default();
+        assert_eq!(load.standing_ppm(), STANDING_FULL_PPM);
+        for _ in 0..18 {
+            load.note_article_lookup(ArticleLookupOutcome::Missing);
+        }
+        assert!(
+            load.standing_ppm() < STANDING_FULL_PPM / 10,
+            "18 misses in a row put a backend under a tenth: {}",
+            load.standing_ppm()
+        );
+        for _ in 0..17 {
+            load.note_article_lookup(ArticleLookupOutcome::Missing);
+        }
+        assert!(load.standing_ppm() < STANDING_FULL_PPM / 100);
+    }
+
+    #[test]
+    fn standing_recovers_slowly_on_hits() {
+        let load = BackendLoad::default();
+        for _ in 0..200 {
+            load.note_article_lookup(ArticleLookupOutcome::Missing);
+        }
+        assert!(
+            load.standing_ppm() < STANDING_FLOOR_PPM / 100,
+            "a dead backend bottoms out far below the routing floor"
+        );
+
+        load.note_article_lookup(ArticleLookupOutcome::Found);
+        assert!(
+            load.standing_ppm() < STANDING_FULL_PPM / 100,
+            "one hit is not a redemption"
+        );
+        for _ in 0..87 {
+            load.note_article_lookup(ArticleLookupOutcome::Found);
+        }
+        let halfway = load.standing_ppm();
+        assert!(
+            (450_000..550_000).contains(&halfway),
+            "about 88 hits take it halfway: {halfway}"
+        );
+        for _ in 0..2_000 {
+            load.note_article_lookup(ArticleLookupOutcome::Found);
+        }
+        assert!(load.standing_ppm() > 999_000);
+        assert!(load.standing_ppm() <= STANDING_FULL_PPM);
+    }
+
+    #[test]
+    fn standing_settles_by_miss_rate() {
+        // One miss per `period` lookups. The 16:1 weight ratio puts a backend
+        // that misses one in a thousand near full and one that misses one in
+        // twenty near half.
+        for (period, low, high) in [(1_000, 970_000, 1_000_000), (20, 400_000, 650_000)] {
+            let load = BackendLoad::default();
+            for i in 0..20_000 {
+                let outcome = if i % period == 0 {
+                    ArticleLookupOutcome::Missing
+                } else {
+                    ArticleLookupOutcome::Found
+                };
+                load.note_article_lookup(outcome);
+            }
+            let standing = load.standing_ppm();
+            assert!(
+                (low..=high).contains(&standing),
+                "1 miss in {period}: {standing}"
+            );
+        }
+    }
+
+    #[test]
+    fn standing_is_off_by_default() {
+        assert_eq!(ArticleAdmission::default().standing(), ArticleStanding::Off);
+        assert_eq!(
+            ArticleAdmission::default()
+                .with_standing(ArticleStanding::Adaptive)
+                .standing(),
+            ArticleStanding::Adaptive
         );
     }
 

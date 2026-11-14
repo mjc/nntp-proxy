@@ -6,7 +6,7 @@
 use super::BackendLease;
 
 use crate::config::LowerTierStatPrefetch;
-use crate::pool::admission::FallbackOutcome;
+use crate::pool::admission::{ArticleLookupOutcome, FallbackOutcome};
 use crate::protocol::{RequestContext, RequestKind, RequestResponseMetadata, StatusCode};
 use crate::router::{ArticleBackend, BackendSelector, SuppressedBackends};
 use crate::session::SessionError;
@@ -463,8 +463,14 @@ impl ClientSession {
                 (*state.unavailable_backends, state.budget.checkout())
             }
         };
+        let lookup = if crate::command::CommandHandler::article_lookup_request(request).is_some() {
+            crate::router::RouteLookup::Article
+        } else {
+            crate::router::RouteLookup::Other
+        };
         let route_request = crate::router::RouteRequest::new(self.client_id)
             .with_availability(state.availability)
+            .for_lookup(lookup)
             .suppressing_backends(suppressed)
             .excluding_backends(excluded_backends);
         let backend = match router.route(route_request) {
@@ -521,8 +527,9 @@ impl ClientSession {
         let status_code = attempt.status_code();
         // A lookup after another backend already answered 430 measures how
         // often this backend rescues a miss.
-        let fallback_lookup = state.availability.missing_bits() != 0
-            && crate::command::CommandHandler::article_lookup_request(request).is_some();
+        let article_lookup =
+            crate::command::CommandHandler::article_lookup_request(request).is_some();
+        let fallback_lookup = article_lookup && state.availability.missing_bits() != 0;
 
         if let Ok(missing) = AuthoritativeArticleMissing::from_status_code(backend, status_code) {
             trace!(
@@ -534,6 +541,9 @@ impl ClientSession {
             );
             if fallback_lookup {
                 provider.note_fallback_lookup(FallbackOutcome::NotFound);
+            }
+            if article_lookup {
+                provider.note_article_lookup(ArticleLookupOutcome::Missing);
             }
             self.record_authoritative_article_missing(&missing, state.availability);
             if let Some(article_request) =
@@ -559,8 +569,13 @@ impl ClientSession {
         if let Some(error_reply) = ArticleErrorReply::classify(request, status_code) {
             // A refusal of the lookup itself says the backend will not serve
             // the article; a broken session says nothing about the article.
-            if fallback_lookup && error_reply == ArticleErrorReply::SessionUsable {
-                provider.note_fallback_lookup(FallbackOutcome::NotFound);
+            if error_reply == ArticleErrorReply::SessionUsable {
+                if fallback_lookup {
+                    provider.note_fallback_lookup(FallbackOutcome::NotFound);
+                }
+                if article_lookup {
+                    provider.note_article_lookup(ArticleLookupOutcome::Missing);
+                }
             }
             self.discard_article_error_reply(attempt, error_reply, request, state)
                 .await?;
@@ -568,6 +583,9 @@ impl ClientSession {
         }
         if fallback_lookup {
             provider.note_fallback_lookup(FallbackOutcome::Found);
+        }
+        if article_lookup {
+            provider.note_article_lookup(ArticleLookupOutcome::Found);
         }
 
         let response = match self
@@ -788,12 +806,14 @@ impl ClientSession {
                 // fallback lookup for the rescue rate.
                 if status_code.is_some_and(|status| status.as_u16() == 430) {
                     provider.note_fallback_lookup(FallbackOutcome::NotFound);
+                    provider.note_article_lookup(ArticleLookupOutcome::Missing);
                     RetryStatProbeOutcome::Missing(backend_id)
                 } else if release.is_err() {
                     RetryStatProbeOutcome::Unavailable(backend_id)
                 } else {
                     if status_code.is_some_and(|status| status.is_success()) {
                         provider.note_fallback_lookup(FallbackOutcome::Found);
+                        provider.note_article_lookup(ArticleLookupOutcome::Found);
                     }
                     RetryStatProbeOutcome::Present
                 }
@@ -930,11 +950,22 @@ impl ClientSession {
                     // so a 430 is still recorded below.
                     let _ = release_observed_probe_connection(conn, backend_id);
 
-                    if fallback_lookup && let Some(status) = status_code {
-                        if status.as_u16() == 430 {
-                            provider.note_fallback_lookup(FallbackOutcome::NotFound);
+                    if let Some(status) = status_code {
+                        let outcome = if status.is_article_missing() {
+                            Some(ArticleLookupOutcome::Missing)
                         } else if status.is_success() {
-                            provider.note_fallback_lookup(FallbackOutcome::Found);
+                            Some(ArticleLookupOutcome::Found)
+                        } else {
+                            None
+                        };
+                        if let Some(outcome) = outcome {
+                            provider.note_article_lookup(outcome);
+                            if fallback_lookup {
+                                provider.note_fallback_lookup(match outcome {
+                                    ArticleLookupOutcome::Found => FallbackOutcome::Found,
+                                    ArticleLookupOutcome::Missing => FallbackOutcome::NotFound,
+                                });
+                            }
                         }
                     }
                     if status_code.is_some_and(|status| status.as_u16() == 430)
@@ -4591,6 +4622,52 @@ mod tests {
         assert_eq!(
             total, 1,
             "only the lookup after the first 430 is a fallback lookup"
+        );
+    }
+
+    /// Every direct article attempt feeds the answering backend's standing:
+    /// a 430 pulls it down and a hit pulls it up.
+    #[tokio::test]
+    async fn article_attempts_feed_backend_standing() {
+        use crate::pool::admission::{ArticleLookupOutcome, STANDING_FULL_PPM};
+        let (missing_port, _) = spawn_article_response_server(b"430 No such article\r\n").await;
+        let missing = DeadpoolConnectionProvider::builder("127.0.0.1", missing_port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        let router = router_with_admission_backends(
+            vec![missing.clone()],
+            crate::pool::admission::ArticleAdmission::default(),
+        );
+        let (status, _) =
+            route_and_read_status(&router, b"BODY <standing-miss@example.com>\r\n").await;
+        assert_eq!(status, 430);
+        assert!(
+            missing.article_standing_ppm() < STANDING_FULL_PPM,
+            "a 430 lowers standing"
+        );
+
+        let (found_port, _) =
+            spawn_article_response_server(b"222 0 <standing@example.com>\r\npayload\r\n.\r\n")
+                .await;
+        let found = DeadpoolConnectionProvider::builder("127.0.0.1", found_port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        // Knock it down first so the climb back is visible.
+        for _ in 0..8 {
+            found.note_article_lookup(ArticleLookupOutcome::Missing);
+        }
+        let found_before = found.article_standing_ppm();
+        let router = router_with_admission_backends(
+            vec![found.clone()],
+            crate::pool::admission::ArticleAdmission::default(),
+        );
+        let (status, _) = route_and_read_status(&router, b"BODY <standing@example.com>\r\n").await;
+        assert_eq!(status, 222);
+        assert!(
+            found.article_standing_ppm() > found_before,
+            "a hit raises standing"
         );
     }
 

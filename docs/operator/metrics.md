@@ -134,6 +134,7 @@ These explain requests that skipped, waited on, or gave up on a backend without 
 | `nntp_proxy_backend_error_reply_failovers_total` | counter | Non-`430` error replies to article lookups that were retried on another backend instead of sent to the client. Shows a backend that refuses lookups with a non-standard code. |
 | `nntp_proxy_backend_service_time_seconds` | gauge | Moving average of how long one command holds a connection, used to estimate queue waits. `0` before the first sample. |
 | `nntp_proxy_backend_estimated_wait_seconds` | gauge | Estimated wait for a connection if a checkout joined the queue now. |
+| `nntp_proxy_backend_article_standing` | gauge | Recent article-lookup standing from 0 to 1. Starts at 1, drops by 1/8 on each `430` or refused lookup, and climbs by 1/128 of the gap on each hit. With `[routing.article] standing = "adaptive"` it scales the backend's share of article lookups within its tier. Tracked even when that setting is `"off"`. See [Article standing](configuration.md#article-standing). |
 
 ### Backend latency histograms
 
@@ -214,6 +215,14 @@ Pool saturation, from 0 (idle) to 1 (every connection busy):
 nntp_proxy_backend_pool_connections{state="in_use"}
 / on (backend, tier)
 nntp_proxy_backend_pool_max_connections
+```
+
+Backends demoted by article standing (below a tenth for ten minutes). A takedown
+on one provider shows up as that backend dropping while its tier peers stay
+near 1:
+
+```promql
+max_over_time(nntp_proxy_backend_article_standing[10m]) < 0.1
 ```
 
 Alert when requests queue for connections on a backend for several minutes:

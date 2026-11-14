@@ -80,6 +80,12 @@ unfinished_replies_before_430 = 2
 # Rescue-rate floor in percent (0 = off). A busy backend that has found under this
 # share of recent articles other backends lacked is not waited for before 430.
 # rescue_floor_percent = 2
+# Article standing: "off" (default) or "adaptive". A backend's standing drops
+# fast on 430s and climbs back slowly on hits; "adaptive" scales its share of
+# article lookups within its tier by it, so a provider whose copy of a release
+# was taken down stops getting first attempts until it finds articles again.
+# Tier order and retries are unchanged.
+# standing = "adaptive"
 # When every backend left in the tier that should serve a request was skipped
 # as backlogged: "wait-shortest" queues on the one with the shortest estimated
 # wait (bounded by checkout_wait_ms and the deadline); "give-up" ends the

@@ -749,6 +749,17 @@ impl DeadpoolConnectionProvider {
         self.load.note_fallback_lookup(outcome);
     }
 
+    /// Fold an article lookup's answer into this backend's standing.
+    pub fn note_article_lookup(&self, outcome: super::admission::ArticleLookupOutcome) {
+        self.load.note_article_lookup(outcome);
+    }
+
+    /// Recent article-lookup standing in parts per million.
+    #[must_use]
+    pub fn article_standing_ppm(&self) -> u32 {
+        self.load.standing_ppm()
+    }
+
     /// Whether `admission` says this backend is not worth waiting on when busy.
     #[must_use]
     pub fn is_unlikely_to_rescue(&self, admission: &super::admission::ArticleAdmission) -> bool {

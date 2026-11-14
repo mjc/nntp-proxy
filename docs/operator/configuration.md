@@ -75,6 +75,7 @@ Time limits for `ARTICLE`, `BODY`, `HEAD`, and `STAT` lookups by message-id.
 | `unavailable_reply` | `"503"` | `"503"` or `"430"`: the reply when a request ends before every eligible backend returned `430`, either because `deadline_ms` ran out or because every remaining backend was busy, skipped, refused the lookup with a non-`430` error, or failed. A request that every eligible backend answered with `430` always gets `430` |
 | `rescue_floor_percent` | `0` | Rescue-rate floor (0-100, `0` = off). A backend's rescue rate is the share of its recent lookups, made after another backend had answered `430`, that found the article. A busy backend under the floor is not waited on as a last resort, and a lookup whose only unconfirmed backends are under it answers `430` at once. See below |
 | `unfinished_replies_before_430` | `2` | How many `503`s one message-id may get, once at least one backend returned `430` for it, before the next unfinished lookup answers `430`. `0` keeps answering `unavailable_reply`. Ignored when `unavailable_reply` is `"430"` |
+| `standing` | `"off"` | `"off"` or `"adaptive"`. With `"adaptive"`, each backend's share of article lookups within its tier is scaled by its recent standing: it falls fast on `430` and climbs back slowly on hits. Tier order and retry rules are unchanged. See below |
 | `backlog_last_resort` | `"wait-shortest"` | What a request does when backlog skipping leaves no other backend to try in the tier that should serve it. `"wait-shortest"` queues on the skipped backend with the shortest estimated wait, bounded by `checkout_wait_ms` and what is left of `deadline_ms`; `"give-up"` ends the request with `unavailable_reply` |
 
 The estimated wait is `(requests ahead in the pool queue) × (average time one
@@ -159,6 +160,43 @@ fifty such lookups.
 
 Skips and checkout timeouts are summarised at `info` once per backend every
 10 seconds instead of logged per request.
+
+#### Article standing
+
+Takedowns remove a whole release from a provider at once, so a backend that
+starts answering `430` for a download usually keeps doing so for the rest of
+it. Each backend keeps a standing from 0 to 1, starting at 1:
+
+- every `430`, or a lookup refused with another error, moves it down by 1/8
+  of its value: about 18 misses in a row take it to a tenth, and about 35 to a
+  hundredth;
+- every hit moves it up by 1/128 of the gap to 1: about 88 hits in a row take
+  a bottomed-out backend halfway back, and about 300 to nine tenths.
+
+Direct `ARTICLE`/`BODY`/`HEAD`/`STAT` attempts and the `STAT` probes that
+follow a `430` all count. A backend settles near 1 when it misses one lookup
+in a thousand, and near 0.5 when it misses one in twenty.
+
+With `standing = "adaptive"`, article lookups weigh backends within a tier by
+capacity times standing, never below a floor of 1/64:
+
+- `backend_selection = "least-loaded"` compares `(active + 1) / (max_connections
+  × standing)`. A demoted backend gets first attempts only once its peers are
+  busy enough to look worse, so it serves as overflow rather than first
+  choice. The `+ 1` matters because a backend that answers `430` quickly stays
+  idle, and an idle backend would otherwise always look least loaded.
+- `backend_selection = "weighted-round-robin"` uses `max_connections ×
+  standing`, rounded up, as the share, so a demoted backend still gets one or
+  two slots per cycle.
+
+A demoted backend still gets every retry its tier owes it. When its peers
+answer `430` the request comes to it before any lower tier, as before. Those
+retries, the floor share, and overflow are how it earns its standing back.
+Standing is not saved across restarts, so every backend starts at 1.
+
+`GROUP`, overview, and list commands ignore standing. Standing is tracked and
+exported as `nntp_proxy_backend_article_standing` even when the setting is
+`"off"`, so you can watch it before turning it on.
 
 ### `[memory]`
 

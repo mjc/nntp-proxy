@@ -399,6 +399,14 @@ pub struct RoutingArticle {
     /// article only that backend had.
     #[serde(default)]
     pub rescue_floor_percent: u8,
+    /// Article standing (default `"off"`). A backend's standing falls fast
+    /// when it answers `430` and climbs back slowly as it finds articles.
+    /// `"adaptive"` scales each backend's share of article lookups within its
+    /// tier by that standing, so a backend whose copy of a release was taken
+    /// down stops getting first attempts for it until it starts finding
+    /// articles again. Tier order and retry rules are unchanged.
+    #[serde(default)]
+    pub standing: crate::pool::admission::ArticleStanding,
 }
 
 impl Default for RoutingArticle {
@@ -412,6 +420,7 @@ impl Default for RoutingArticle {
             backlog_last_resort: crate::pool::admission::BacklogLastResort::default(),
             unfinished_replies_before_430: defaults::article_unfinished_replies_before_430(),
             rescue_floor_percent: 0,
+            standing: crate::pool::admission::ArticleStanding::default(),
         }
     }
 }
@@ -439,6 +448,7 @@ impl RoutingArticle {
         .with_backlog_last_resort(self.backlog_last_resort)
         .with_unfinished_replies_before_430(self.unfinished_replies_before_430)
         .with_rescue_floor_percent(self.rescue_floor_percent)
+        .with_standing(self.standing)
     }
 }
 
@@ -1766,5 +1776,19 @@ mod tests {
             assert_eq!(routing.lower_tier_stat_prefetch, expected, "{spelling}");
         }
         assert!(toml::from_str::<Routing>("lower_tier_stat_prefetch = \"always\"").is_err());
+    }
+
+    #[test]
+    fn test_routing_article_standing_defaults_off_and_reaches_admission() {
+        use crate::pool::admission::ArticleStanding;
+        let defaults: RoutingArticle = toml::from_str("").unwrap();
+        assert_eq!(defaults.standing, ArticleStanding::Off);
+        assert_eq!(RoutingArticle::default().standing, ArticleStanding::Off);
+
+        let adaptive: RoutingArticle = toml::from_str("standing = \"adaptive\"").unwrap();
+        assert_eq!(adaptive.standing, ArticleStanding::Adaptive);
+        assert_eq!(adaptive.admission().standing(), ArticleStanding::Adaptive);
+
+        assert!(toml::from_str::<RoutingArticle>("standing = \"on\"").is_err());
     }
 }
