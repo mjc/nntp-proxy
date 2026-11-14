@@ -213,7 +213,7 @@ async fn query_backend(
     }
 }
 
-/// Run one precheck attempt, giving up after
+/// Run one precheck attempt, giving up on the query exchange after
 /// [`crate::constants::timeout::PRECHECK_QUERY`].
 ///
 /// A tier is only reported missing after every backend in it has answered, so
@@ -221,37 +221,43 @@ async fn query_backend(
 /// transport error, so the caller retries once on a fresh connection, and it
 /// is never a 430 fact. Cancelling the attempt drops its `ConnectionGuard`,
 /// which removes the stuck connection instead of returning it to the pool.
+///
+/// The checkout stays outside the query timeout. Its wait is bounded by the
+/// probe budget and connection setup by the pool's own deadline, so the
+/// shorter query timeout must not cancel a slow but valid TLS handshake or
+/// login part-way: that wastes a provider login, and the retry would cancel a
+/// second one before falling back to foreground routing.
 async fn bounded_backend_query(
     deps: &OwnedDeps,
     provider: &crate::pool::DeadpoolConnectionProvider,
     backend: &ArticleBackend,
     request: &RequestContext,
 ) -> Result<QueryAttemptResult, ()> {
-    tokio::time::timeout(
-        crate::constants::timeout::PRECHECK_QUERY,
-        execute_backend_query(deps, provider, backend, request),
-    )
-    .await
-    .unwrap_or(Err(()))
-}
-
-/// Execute a single backend query attempt
-///
-/// Returns Ok(QueryAttemptResult) on successful communication (even if article not found).
-/// Returns Err on connection errors (caller should retry).
-async fn execute_backend_query(
-    deps: &OwnedDeps,
-    provider: &crate::pool::DeadpoolConnectionProvider,
-    backend: &ArticleBackend,
-    request: &RequestContext,
-) -> Result<QueryAttemptResult, ()> {
-    let backend_id = backend.backend_id();
     let Ok(conn) = provider
         .checkout_for_attempt(deps.router.article_admission().probe())
         .await
     else {
         return Ok(QueryAttemptResult::Error);
     };
+    tokio::time::timeout(
+        crate::constants::timeout::PRECHECK_QUERY,
+        execute_backend_query(deps, conn, backend, request),
+    )
+    .await
+    .unwrap_or(Err(()))
+}
+
+/// Execute a single backend query attempt on a checked-out connection
+///
+/// Returns Ok(QueryAttemptResult) on successful communication (even if article not found).
+/// Returns Err on connection errors (caller should retry).
+async fn execute_backend_query(
+    deps: &OwnedDeps,
+    conn: crate::pool::connection_guard::IdleConnection,
+    backend: &ArticleBackend,
+    request: &RequestContext,
+) -> Result<QueryAttemptResult, ()> {
+    let backend_id = backend.backend_id();
     let conn = conn.activate();
 
     let buffer = deps.buffer_pool.acquire();
@@ -1101,6 +1107,92 @@ mod tests {
         });
 
         (addr, accepts)
+    }
+
+    /// Backend whose greeting arrives only after `greeting_delay`, then answers
+    /// every `STAT` with `223`. Returns its address and the number of
+    /// connections accepted.
+    async fn spawn_slow_greeting_stat_server(
+        greeting_delay: Duration,
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accept_count = Arc::clone(&accepts);
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                accept_count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    tokio::time::sleep(greeting_delay).await;
+                    let mut reader = BufReader::new(stream);
+                    if reader.get_mut().write_all(b"200 mock\r\n").await.is_err() {
+                        return;
+                    }
+                    let mut command = Vec::new();
+                    loop {
+                        command.clear();
+                        match reader.read_until(b'\n', &mut command).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(_) => {}
+                        }
+                        let kind = crate::protocol::RequestContext::parse(&command)
+                            .map(|request| request.kind());
+                        let reply: &[u8] =
+                            if matches!(kind, Some(crate::protocol::RequestKind::Stat)) {
+                                b"223 0 <slow@example.com>\r\n"
+                            } else {
+                                b"200 mock setup complete\r\n"
+                            };
+                        if reader.get_mut().write_all(reply).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        (addr, accepts)
+    }
+
+    /// Connection setup has its own deadline, so a slow but valid setup must
+    /// not be cancelled by the shorter query timeout. Cancelling it would
+    /// waste a provider login and, after the retry, give up on a backend that
+    /// was about to answer.
+    #[tokio::test(start_paused = true)]
+    async fn query_backend_waits_out_slow_connection_setup() {
+        use std::sync::atomic::Ordering;
+
+        let greeting_delay = crate::constants::timeout::PRECHECK_QUERY + Duration::from_millis(500);
+        let (addr, accepts) = spawn_slow_greeting_stat_server(greeting_delay).await;
+        let (selector, backend_id) = selector_with_backend(addr, 2);
+
+        let deps = OwnedDeps {
+            router: Arc::new(selector),
+            cache: Arc::new(UnifiedCache::memory(100, Duration::from_secs(60))),
+            buffer_pool: BufferPool::new(BufferSize::try_new(4096).unwrap(), 2),
+            metrics: MetricsCollector::new(1),
+        };
+
+        let request =
+            RequestContext::parse(b"STAT <slow@example.com>\r\n").expect("valid request line");
+        let started = tokio::time::Instant::now();
+        let result = query_backend(&deps, eligible(backend_id), &request).await;
+
+        assert!(
+            matches!(result, QueryResult::Found(id, _) if id == backend_id),
+            "a slow but valid setup must reach the STAT answer, got {result:?}"
+        );
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "no setup was cancelled and retried"
+        );
+        assert!(started.elapsed() < crate::constants::timeout::CONNECTION);
     }
 
     #[tokio::test(start_paused = true)]
