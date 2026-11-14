@@ -70,6 +70,27 @@ nntp-proxy --port 8120
 - Test direct connectivity to the backend.
 - Check logs for backend response codes.
 
+### Login refusals and connection limits
+
+When a backend refuses a login (a bad greeting, a failed `AUTHINFO`, a refused
+`MODE READER`, or bad credentials), the proxy stops logging in to it for 5
+seconds, doubling up to 60 seconds while the refusals continue. When a pause
+ends, a single probe login decides whether to resume. Network errors do not
+start a pause. The `Backend refused login` warning carries a `refusal` field:
+`Credentials`, `ConnectionLimit`, `ServiceUnavailable`, `ReaderModeRefused`, or
+`Rejected`, followed by the backend's reply.
+
+A refusal counts as a connection limit when it is a `482`, or when its text
+says so in whole words ("too many [simultaneous] connections", "max conns",
+"maximum number of connections", "connection limit", "session limit",
+"connections exceeded", "limit of 20 connections", and similar). A `481`, or
+text about login attempts, failed logins, a locked or expired account, a quota,
+a download limit, a rate limit, or commands out of sequence, is never a
+connection limit. Only a connection-limit refusal lowers an adaptive
+connection cap (see
+[Adaptive connection cap](configuration.md#adaptive-connection-cap)); a
+credential failure keeps the pool size and only backs off.
+
 ### Routing surprises
 
 - Check `[routing].mode` first when behavior does not match your workload.

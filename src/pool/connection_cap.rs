@@ -10,8 +10,10 @@
 //! With `connection_cap = "adaptive"` the pool remembers a working size
 //! instead:
 //!
-//! - **Fast down.** A refused login sets the cap to the connections the
-//!   provider had accepted at that moment.
+//! - **Fast down.** A connection-limit login refusal (see
+//!   [`crate::connection_error::LoginRefusal`]) sets the cap to the
+//!   connections the provider had accepted at that moment. A bad password
+//!   or any other refusal leaves it alone: fewer connections would not fix it.
 //! - **Slow up.** Below `max_connections`, the cap grows by one every
 //!   [`CLIMB_BELOW_CONFIGURED`] without a refusal.
 //! - **Very slow past it.** At or above `max_connections`, it grows by one
@@ -46,8 +48,9 @@ pub enum ConnectionCapPolicy {
     /// The pool may always grow to `max_connections` (default).
     #[default]
     Fixed,
-    /// Drop to the accepted count on a refused login, then climb back slowly,
-    /// and very slowly past `max_connections` while the pool is saturated.
+    /// Drop to the accepted count on a connection-limit login refusal, then
+    /// climb back slowly, and very slowly past `max_connections` while the
+    /// pool is saturated.
     Adaptive,
 }
 
@@ -154,7 +157,7 @@ impl ConnectionCap {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Times a refused login lowered the cap.
+    /// Times a connection-limit login refusal lowered the cap.
     #[must_use]
     pub fn reductions(&self) -> u64 {
         self.reductions.load(Ordering::Relaxed)

@@ -660,8 +660,11 @@ impl DeadpoolConnectionProvider {
             Ok(connection) => return Ok(connection),
             Err(error) => match error {
                 deadpool::managed::PoolError::Backend(conn_err) => {
-                    if conn_err.is_login_refusal() {
-                        self.note_login_refused();
+                    // Only a connection-limit refusal says how many
+                    // connections the account allows; a bad password or a
+                    // locked account must not shrink the pool.
+                    if conn_err.is_connection_limit_refusal() {
+                        self.note_connection_limit_refusal();
                     }
                     conn_err
                 }
@@ -1146,15 +1149,16 @@ impl DeadpoolConnectionProvider {
         self.cap.current()
     }
 
-    /// Times a refused login lowered the adaptive cap.
+    /// Times a connection-limit login refusal lowered the adaptive cap.
     #[must_use]
     pub fn connection_cap_reductions(&self) -> u64 {
         self.cap.reductions()
     }
 
-    /// A login was refused: with an adaptive cap, shrink the pool to the
-    /// connections the provider had accepted.
-    fn note_login_refused(&self) {
+    /// A login was refused for the account's connection limit: with an
+    /// adaptive cap, shrink the pool to the connections the provider had
+    /// accepted.
+    fn note_connection_limit_refusal(&self) {
         let open = self.pool.status().size;
         if let Some(super::connection_cap::CapChange::Lowered { from, to }) =
             self.cap.on_login_refused(open, tokio::time::Instant::now())
@@ -1481,6 +1485,15 @@ mod tests {
     /// Mock provider that accepts the first `accept` logins and answers every
     /// later `AUTHINFO PASS` with a connection-limit refusal.
     async fn spawn_limited_login_server(accept: usize) -> std::net::SocketAddr {
+        spawn_refusing_login_server(accept, "502 Too many connections").await
+    }
+
+    /// Mock provider that accepts the first `accept` logins and answers every
+    /// later `AUTHINFO PASS` with `refusal`.
+    async fn spawn_refusing_login_server(
+        accept: usize,
+        refusal: &'static str,
+    ) -> std::net::SocketAddr {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let logins = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1493,14 +1506,18 @@ mod tests {
                     write.write_all(b"200 ready\r\n").await.unwrap();
                     let mut index = 0;
                     while let Ok(Some(_line)) = lines.next_line().await {
-                        let reply: &[u8] = match index {
-                            0 => b"381 password required\r\n",
-                            1 if logins.fetch_add(1, Ordering::SeqCst) < accept => b"281 ok\r\n",
-                            1 => b"502 Too many connections\r\n",
-                            _ => b"200 ok\r\n",
+                        let reply: &str = match index {
+                            0 => "381 password required",
+                            1 if logins.fetch_add(1, Ordering::SeqCst) < accept => "281 ok",
+                            1 => refusal,
+                            _ => "200 ok",
                         };
                         index += 1;
-                        if write.write_all(reply).await.is_err() {
+                        if write
+                            .write_all(format!("{reply}\r\n").as_bytes())
+                            .await
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -1557,6 +1574,66 @@ mod tests {
 
         drop((first, second));
         provider.shutdown();
+    }
+
+    /// Only a refusal that names the connection limit lowers the adaptive
+    /// cap. A bad password, a locked account or a quota cannot be fixed by
+    /// holding fewer connections, so shrinking the pool for them would only
+    /// cost capacity once the account is fixed; login backoff still spaces
+    /// those logins out.
+    #[tokio::test]
+    async fn adaptive_cap_moves_only_on_connection_limit_refusals() {
+        use crate::connection_error::ConnectionError;
+        use crate::pool::connection_cap::ConnectionCapPolicy;
+        let cases = [
+            ("482 Too many connections", true),
+            ("502 connection limit (100) reached", true),
+            ("502 Too many connections", true),
+            ("481 Authentication failed", false),
+            ("481 Too many connections", false),
+            ("502 Too many failed login attempts, account locked", false),
+            ("502 Account quota used up", false),
+            ("502 Permission denied", false),
+        ];
+        for (refusal, lowers) in cases {
+            let addr = spawn_refusing_login_server(2, refusal).await;
+            let provider = capped_provider(addr, 4, ConnectionCapPolicy::Adaptive);
+
+            let first = provider.checkout_connection_guard().await.unwrap();
+            let second = provider.checkout_connection_guard().await.unwrap();
+            let third = provider.checkout_connection_guard().await;
+            let Err(error) = third else {
+                panic!("{refusal}: the third login must be refused");
+            };
+            assert!(error.is_login_refusal(), "{refusal}: {error}");
+            assert_eq!(
+                error.is_connection_limit_refusal(),
+                lowers,
+                "{refusal}: {error}"
+            );
+            if lowers {
+                assert!(
+                    matches!(error, ConnectionError::ConnectionLimitExceeded { .. }),
+                    "{refusal}: {error:?}"
+                );
+            }
+
+            let (cap, reductions) = if lowers { (2, 1) } else { (4, 0) };
+            assert_eq!(provider.connection_cap(), cap, "{refusal}");
+            assert_eq!(
+                provider.connection_cap_reductions(),
+                reductions,
+                "{refusal}"
+            );
+            assert_eq!(provider.max_size(), cap, "{refusal}");
+            assert!(
+                provider.login_backoff_active(),
+                "{refusal}: every refusal still starts login backoff"
+            );
+
+            drop((first, second));
+            provider.shutdown();
+        }
     }
 
     #[tokio::test]

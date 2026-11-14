@@ -819,9 +819,9 @@ impl TcpManager {
             return Ok(());
         }
 
-        Err(ConnectionError::InvalidGreeting {
+        Err(ConnectionError::ReaderModeRefused {
             backend: self.name.clone(),
-            greeting: response.trim().to_string(),
+            response: response.trim().to_string(),
         })
     }
 
@@ -954,54 +954,61 @@ impl TcpManager {
             if !crate::protocol::StatusCode::parse(response.as_bytes())
                 .is_some_and(|code| code.is_auth_accepted())
             {
-                // Some backends use 482 for connection-limit style auth setup failures.
-                if crate::protocol::StatusCode::parse(response.as_bytes())
-                    .is_some_and(|c| c.as_u16() == 482)
-                {
-                    tracing::error!(
-                        backend = %self.name,
-                        host = %self.host,
-                        port = self.port,
-                        response = %response.trim(),
-                        "Backend connection limit exceeded"
-                    );
-                    return Err(ConnectionError::ConnectionLimitExceeded {
-                        backend: self.name.clone(),
-                        response: response.trim().to_string(),
-                    });
-                }
-
-                tracing::error!(
-                    "Authentication failed for {} ({}:{}) - Server response: {} - Username: {}",
-                    self.name,
-                    self.host,
-                    self.port,
-                    response.trim(),
-                    username
-                );
-                return Err(ConnectionError::AuthenticationFailed {
-                    backend: self.name.clone(),
-                    response: response.trim().to_string(),
-                });
+                return Err(self.authinfo_refusal(&response, AuthinfoStep::Pass));
             }
             tracing::debug!(
-                "Successfully authenticated to {} ({}:{}) as {}",
-                self.name,
-                self.host,
-                self.port,
-                username
+                backend = %self.name,
+                host = %self.host,
+                port = self.port,
+                "Authenticated to backend"
             );
         } else if !crate::protocol::StatusCode::parse(response.as_bytes())
             .is_some_and(|code| code.is_auth_accepted())
         {
-            return Err(ConnectionError::UnexpectedAuthResponse {
-                backend: self.name.clone(),
-                response: response.trim().to_string(),
-            });
+            return Err(self.authinfo_refusal(&response, AuthinfoStep::User));
         }
 
         Ok(())
     }
+
+    /// The error for a refused `AUTHINFO` reply, built from the shared
+    /// classification so the error variant never contradicts
+    /// [`ConnectionError::login_refusal`]: `481` is bad credentials at either
+    /// step, a connection-limit reply is a limit, and anything else is a
+    /// failed login (`PASS`) or an unexpected reply (`USER`). `create` logs
+    /// the refusal once with its backoff, so this logs only at debug, and
+    /// never the account name.
+    fn authinfo_refusal(&self, response: &str, step: AuthinfoStep) -> ConnectionError {
+        use crate::connection_error::{AuthinfoReply, classify_authinfo_reply};
+        let backend = self.name.clone();
+        let response = response.trim().to_string();
+        tracing::debug!(
+            backend = %self.name,
+            host = %self.host,
+            port = self.port,
+            response = %response,
+            step = ?step,
+            "Backend refused AUTHINFO"
+        );
+        match (classify_authinfo_reply(&response), step) {
+            (AuthinfoReply::ConnectionLimit, _) => {
+                ConnectionError::ConnectionLimitExceeded { backend, response }
+            }
+            (AuthinfoReply::BadCredentials, _) | (AuthinfoReply::Other, AuthinfoStep::Pass) => {
+                ConnectionError::AuthenticationFailed { backend, response }
+            }
+            (AuthinfoReply::Other, AuthinfoStep::User) => {
+                ConnectionError::UnexpectedAuthResponse { backend, response }
+            }
+        }
+    }
+}
+
+/// Which `AUTHINFO` command a refusal answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthinfoStep {
+    User,
+    Pass,
 }
 
 impl TcpManager {
@@ -1077,12 +1084,14 @@ impl managed::Manager for TcpManager {
                     // stays open, so claiming a pause would mislead.
                     tracing::warn!(
                         backend = %self.name,
+                        refusal = ?error.login_refusal(),
                         error = %error,
                         "Backend refused login; refusal predates the current schedule, not pausing"
                     );
                 } else {
                     tracing::warn!(
                         backend = %self.name,
+                        refusal = ?error.login_refusal(),
                         retry_in_secs = retry_in.as_secs(),
                         error = %error,
                         "Backend refused login; pausing new connections to it"
@@ -1854,7 +1863,7 @@ mod tests {
         let first = managed::Manager::create(&manager).await;
         assert!(matches!(
             first,
-            Err(ConnectionError::AuthenticationFailed { .. })
+            Err(ConnectionError::ConnectionLimitExceeded { .. })
         ));
         for _ in 0..5 {
             let again = managed::Manager::create(&manager).await;
@@ -1865,6 +1874,33 @@ mod tests {
             1,
             "no session may be opened while the backend is in login backoff"
         );
+    }
+
+    /// Bad credentials are not a connection limit, but retrying them at once
+    /// gets the same answer, so they back off like any other refusal.
+    #[tokio::test]
+    async fn bad_credentials_back_off_as_credential_failures() {
+        let (addr, accepted) = spawn_login_server(|_| "481 Authentication failed\r\n").await;
+        let manager = login_manager(addr);
+
+        let first = managed::Manager::create(&manager).await;
+        let Err(error) = first else {
+            panic!("a 481 must refuse the login");
+        };
+        assert!(
+            matches!(error, ConnectionError::AuthenticationFailed { .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            error.login_refusal(),
+            Some(crate::connection_error::LoginRefusal::Credentials)
+        );
+        assert!(!error.is_connection_limit_refusal());
+        assert!(matches!(
+            managed::Manager::create(&manager).await,
+            Err(ConnectionError::LoginBackoff { .. })
+        ));
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1922,7 +1958,7 @@ mod tests {
         let (mut refused, mut gated) = (0, 0);
         for attempt in attempts {
             match attempt.await.unwrap() {
-                Err(ConnectionError::AuthenticationFailed { .. }) => refused += 1,
+                Err(ConnectionError::ConnectionLimitExceeded { .. }) => refused += 1,
                 Err(ConnectionError::LoginBackoff { .. }) => gated += 1,
                 other => panic!("unexpected result: {other:?}"),
             }

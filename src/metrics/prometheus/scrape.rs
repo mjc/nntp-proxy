@@ -54,7 +54,7 @@ pub struct PoolScrape {
     /// Connections allowed before cooldowns: `max_connections`, or the
     /// adaptive cap after login refusals.
     pub connection_cap: u64,
-    /// Times a refused login lowered the adaptive cap.
+    /// Times a connection-limit login refusal lowered the adaptive cap.
     pub connection_cap_reductions: u64,
 }
 
@@ -769,7 +769,7 @@ fn render_backends(out: &mut Exposition, backends: &[BackendScrape]) {
         (
             "nntp_proxy_backend_connection_cap",
             Gauge,
-            "Connections the backend may hold before cooldowns: max_connections, or with connection_cap = \"adaptive\" the cap that drops on a refused login and climbs back slowly (past max_connections only while saturated).",
+            "Connections the backend may hold before cooldowns: max_connections, or with connection_cap = \"adaptive\" the cap that drops on a connection-limit login refusal and climbs back slowly (past max_connections only while saturated).",
         ),
         |b| b.pool.connection_cap,
     );
@@ -779,7 +779,7 @@ fn render_backends(out: &mut Exposition, backends: &[BackendScrape]) {
         (
             "nntp_proxy_backend_connection_cap_reductions_total",
             Counter,
-            "Times a refused login lowered the backend's adaptive connection cap.",
+            "Times a connection-limit login refusal lowered the backend's adaptive connection cap.",
         ),
         |b| b.pool.connection_cap_reductions,
     );

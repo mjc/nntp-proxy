@@ -118,8 +118,8 @@ Every backend metric has the labels `backend` and `tier`, plus any listed here.
 | `nntp_proxy_backend_pool_connections` | gauge | `state` = `idle`, `in_use` | Pooled connections. |
 | `nntp_proxy_backend_leased_idle_connections` | gauge | | The part of `in_use` that a client holds between its commands without an exchange running. A large value while other requests wait means connections are reserved rather than working. |
 | `nntp_proxy_backend_pool_max_connections` | gauge | | Current pool limit. Lower than `max_connections` while replacement cooldowns are active. |
-| `nntp_proxy_backend_connection_cap` | gauge | | Connections allowed before cooldowns. Equals `max_connections`, unless `connection_cap = "adaptive"` lowered it after a refused login or raised it past `max_connections` while saturated. See [Adaptive connection cap](configuration.md#adaptive-connection-cap). |
-| `nntp_proxy_backend_connection_cap_reductions_total` | counter | | Times a refused login lowered the adaptive cap. Starts at zero with each process. |
+| `nntp_proxy_backend_connection_cap` | gauge | | Connections allowed before cooldowns. Equals `max_connections`, unless `connection_cap = "adaptive"` lowered it after a connection-limit login refusal or raised it past `max_connections` while saturated. See [Adaptive connection cap](configuration.md#adaptive-connection-cap). |
+| `nntp_proxy_backend_connection_cap_reductions_total` | counter | | Times a connection-limit login refusal (`482` or limit wording; never `481`) lowered the adaptive cap. Starts at zero with each process. |
 | `nntp_proxy_backend_pool_waiters` | gauge | | Checkouts waiting for a connection. |
 | `nntp_proxy_backend_pool_cooldowns` | gauge | | Slots withheld after broken connections. |
 | `nntp_proxy_backend_pending_commands` | gauge | | Commands routed to the backend and not finished. |

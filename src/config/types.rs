@@ -905,7 +905,8 @@ pub struct Server {
     pub stateful_sessions: StatefulSessions,
     /// Whether the pool size follows login refusals (default `"fixed"`).
     /// `"adaptive"` drops to the accepted count when the provider refuses a
-    /// login ("too many connections"), climbs back one connection a minute,
+    /// login at its connection limit ("too many connections", `482`; not a
+    /// bad password), climbs back one connection a minute,
     /// and past `max_connections` one every ten minutes while the pool is
     /// saturated. See [`crate::pool::connection_cap`].
     #[serde(

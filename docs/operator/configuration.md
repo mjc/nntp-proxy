@@ -352,9 +352,13 @@ refusals out (5 s, doubling to 60 s).
 
 With `connection_cap = "adaptive"` the pool remembers a size that works:
 
-- **Fast down.** When the provider refuses a login, the cap drops at once to
-  the number of connections the provider had accepted, and the pool shrinks
-  to match.
+- **Fast down.** When the provider refuses a login because the account is at
+  its connection limit (a `482`, or reply text such as "too many connections"
+  or "connection limit"), the cap drops at once to the number of connections
+  the provider had accepted, and the pool shrinks to match. Bad credentials
+  (`481`), a locked or expired account, a quota, or any other refusal back off
+  but leave the cap alone: fewer connections would not fix them. See
+  [Login refusals and connection limits](operations.md#login-refusals-and-connection-limits).
 - **Slow up.** Below `max_connections`, the cap grows by one connection per
   minute without a refusal.
 - **Very slow past `max_connections`.** At or above it, the cap grows by one
