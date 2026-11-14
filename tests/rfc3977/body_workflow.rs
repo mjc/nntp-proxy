@@ -758,6 +758,104 @@ async fn test_per_command_body_window_sends_two_requests_before_first_reply() ->
     Ok(())
 }
 
+/// Responses forwarded through the single-backend upstream window feed the
+/// backend's delivery estimate like direct attempts do.
+#[tokio::test]
+async fn test_per_command_body_window_feeds_delivery_estimate() -> Result<()> {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let _backend = spawn_delayed_pipeline_backend(
+        backend_listener,
+        &[
+            (
+                "BODY <delivery-window-1@example>",
+                "222 1 <delivery-window-1@example>\r\ndelivery-1\r\n.\r\n",
+            ),
+            (
+                "BODY <delivery-window-2@example>",
+                "222 2 <delivery-window-2@example>\r\ndelivery-2\r\n.\r\n",
+            ),
+        ],
+        &[],
+    );
+    let (proxy_port, proxy) = crate::test_helpers::spawn_proxy_with_config_handle(
+        pipeline_backend_config(backend_port, "BodyWindowDelivery"),
+        RoutingMode::PerCommand,
+    )
+    .await?;
+    let client = connect_and_read_greeting(proxy_port).await?;
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
+    write_commands(
+        &mut write_half,
+        &[
+            "BODY <delivery-window-1@example>\r\n",
+            "BODY <delivery-window-2@example>\r\n",
+        ],
+    )
+    .await?;
+    assert_eq!(read_multiline_responses(&mut reader, 2).await?.len(), 2);
+
+    let delivery = proxy.connection_providers()[0]
+        .delivery()
+        .snapshot(std::time::Instant::now());
+    assert_eq!(
+        delivery.observed, 1,
+        "the window is recorded as one sample covering both responses"
+    );
+    Ok(())
+}
+
+/// Error replies forwarded through a window are not article deliveries.
+#[tokio::test]
+async fn test_per_command_body_window_error_replies_do_not_feed_delivery() -> Result<()> {
+    let backend_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let backend_port = backend_listener.local_addr()?.port();
+    let _backend = spawn_delayed_pipeline_backend(
+        backend_listener,
+        &[
+            (
+                "BODY <refused-window-1@example>",
+                "503 Service temporarily unavailable\r\n",
+            ),
+            (
+                "BODY <refused-window-2@example>",
+                "503 Service temporarily unavailable\r\n",
+            ),
+        ],
+        &[],
+    );
+    let (proxy_port, proxy) = crate::test_helpers::spawn_proxy_with_config_handle(
+        pipeline_backend_config(backend_port, "BodyWindowRefused"),
+        RoutingMode::PerCommand,
+    )
+    .await?;
+    let client = connect_and_read_greeting(proxy_port).await?;
+    let (read_half, mut write_half) = client.into_split();
+    let mut reader = BufReader::new(read_half);
+    write_commands(
+        &mut write_half,
+        &[
+            "BODY <refused-window-1@example>\r\n",
+            "BODY <refused-window-2@example>\r\n",
+        ],
+    )
+    .await?;
+    for _ in 0..2 {
+        let line = read_line(&mut reader, "refused window response").await?;
+        assert_eq!(
+            nntp_proxy::protocol::StatusCode::parse(line.as_bytes()).map(|status| status.as_u16()),
+            Some(503),
+            "{line}"
+        );
+    }
+    let delivery = proxy.connection_providers()[0]
+        .delivery()
+        .snapshot(std::time::Instant::now());
+    assert_eq!(delivery.observed, 0, "error replies are not deliveries");
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_per_command_body_window_refills_after_first_response() -> Result<()> {
     const WINDOW: usize = 16;

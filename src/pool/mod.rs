@@ -16,6 +16,7 @@ pub mod connection_cap;
 pub mod connection_guard;
 pub mod connection_trait;
 pub(crate) mod deadpool_connection;
+pub mod delivery;
 pub mod health_check;
 pub(crate) mod login_backoff;
 pub mod prewarming;

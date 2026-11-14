@@ -314,6 +314,8 @@ pub struct BackendLoad {
     /// Asymmetric average of recent article lookups that found the article,
     /// in parts per million. Starts full.
     standing_ppm: AtomicU32,
+    /// Delivery rate, first-byte time, client stalls and leased connections.
+    delivery: super::delivery::DeliveryStats,
     unlogged_backlog_skips: AtomicU64,
     unlogged_busy_timeouts: AtomicU64,
     /// Milliseconds since `epoch`, offset by one interval so the first skip
@@ -339,6 +341,7 @@ impl Default for BackendLoad {
             fallback_lookups: AtomicU64::new(0),
             unlikely_rescue_skips: AtomicU64::new(0),
             standing_ppm: AtomicU32::new(STANDING_FULL_PPM),
+            delivery: super::delivery::DeliveryStats::default(),
             unlogged_backlog_skips: AtomicU64::new(0),
             unlogged_busy_timeouts: AtomicU64::new(0),
             last_summary_ms: AtomicU64::new(0),
@@ -470,6 +473,12 @@ impl BackendLoad {
             ArticleLookupOutcome::Missing => current - (current >> STANDING_MISS_SHIFT),
         };
         self.standing_ppm.store(next, Ordering::Relaxed);
+    }
+
+    /// Delivery measurements for this backend.
+    #[must_use]
+    pub const fn delivery(&self) -> &super::delivery::DeliveryStats {
+        &self.delivery
     }
 
     /// Recent article-lookup standing in parts per million, from

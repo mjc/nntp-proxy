@@ -274,6 +274,9 @@ struct InvalidBackendResponseContext<'a> {
 pub(super) struct PreparedBackendAttempt<'pool> {
     exchange: crate::session::backend::BackendResponseExchange<'pool>,
     timings: Option<BackendTimings>,
+    /// When the command was sent, after any checkout wait: the start of the
+    /// time this request kept the backend connection busy.
+    sent_at: std::time::Instant,
 }
 
 impl PreparedBackendAttempt<'_> {
@@ -303,6 +306,7 @@ impl PreparedBackendAttempt<'_> {
                 conn, response, pool, backend_id,
             ),
             timings: None,
+            sent_at: std::time::Instant::now(),
         }
     }
 }
@@ -588,10 +592,13 @@ impl ClientSession {
             provider.note_article_lookup(ArticleLookupOutcome::Found);
         }
 
+        let sent_at = attempt.sent_at;
+        let delivers_article = matches!(request.kind(), RequestKind::Article | RequestKind::Body);
+        let mut timed_writer = crate::io_util::StallTimer::new(&mut *client_writer);
         let response = match self
             .write_successful_retry_response(
                 attempt,
-                client_writer,
+                &mut timed_writer,
                 ResponseWriteContext {
                     request_origin: state.request_origin,
                     request,
@@ -605,13 +612,29 @@ impl ClientSession {
         {
             Ok(response) => response,
             Err(e @ SessionError::ClientDisconnect(_)) => {
+                // A client that stalls and then abandons the transfer held
+                // the connection; count it even though nothing was delivered.
+                provider
+                    .delivery()
+                    .record_client_stall(timed_writer.stalled());
                 return Err(e);
             }
             Err(e) => {
+                provider
+                    .delivery()
+                    .record_client_stall(timed_writer.stalled());
                 state.unavailable_backends.suppress(backend_id);
                 return Err(e);
             }
         };
+        if delivers_article {
+            provider.delivery().record_article(
+                response.wire_len().get() as u64,
+                sent_at.elapsed(),
+                timed_writer.stalled(),
+                std::time::Instant::now(),
+            );
+        }
         guard.complete();
         request.record_backend_response(backend_id, response);
         Ok(BackendAttemptResult::Success)
@@ -1121,6 +1144,9 @@ impl ClientSession {
 
         if let Some((ttfb, send, recv)) = attempt.timings {
             self.record_timing_metrics(backend_id, ttfb, send, recv);
+            provider
+                .delivery()
+                .record_ttfb(std::time::Duration::from_micros(ttfb));
         }
         *state.client_to_backend_bytes = state.client_to_backend_bytes.add(request_wire_len);
 
@@ -1422,7 +1448,12 @@ impl ClientSession {
             Some(BackendLease {
                 backend_id: cached_backend_id,
                 connection: mut guard,
+                _idle: idle,
             }) if cached_backend_id == backend_id => {
+                // The connection is in use from here on. An unbound field
+                // would live to the end of the match, double-counting the
+                // connection while the checkouts below await.
+                drop(idle);
                 if !self.cached_batch_connection_is_healthy(&mut guard, backend_id, request) {
                     guard.fail_backend();
                     let checkout_status = provider.status_counts();
@@ -1495,7 +1526,9 @@ impl ClientSession {
                 let BackendLease {
                     backend_id: cached_backend_id,
                     connection: cached_conn,
+                    _idle: idle,
                 } = cached;
+                drop(idle);
                 trace!(
                     client = %self.client_addr,
                     cached_backend = cached_backend_id.as_index(),
@@ -1659,29 +1692,20 @@ impl ClientSession {
         self.metrics.user_command(self.username());
 
         let buffer = self.buffer_pool.acquire();
-        let result = if should_sample_backend_timing() {
-            let (exchange, ttfb, send, recv) = backend::execute_request_exchange_timed(
-                conn,
-                request,
-                buffer,
-                &self.buffer_pool,
-                backend_id,
-            )
-            .await
-            .map_err(BackendReadAttemptError::Backend)?;
-            (exchange, Some((ttfb, send, recv)))
-        } else {
-            let exchange = backend::execute_request_exchange(
-                conn,
-                request,
-                buffer,
-                &self.buffer_pool,
-                backend_id,
-            )
-            .await
-            .map_err(BackendReadAttemptError::Backend)?;
-            (exchange, None)
-        };
+        // Every direct attempt is timed (three clock reads): routing and the
+        // delivery estimate need first-byte time and busy time per request,
+        // not a 1-in-16 sample.
+        let sent_at = std::time::Instant::now();
+        let (exchange, ttfb, send, recv) = backend::execute_request_exchange_timed(
+            conn,
+            request,
+            buffer,
+            &self.buffer_pool,
+            backend_id,
+        )
+        .await
+        .map_err(BackendReadAttemptError::Backend)?;
+        let result = (exchange, Some((ttfb, send, recv)));
         debug!(
             client = %self.client_addr,
             backend = backend_id.as_index(),
@@ -1691,7 +1715,11 @@ impl ClientSession {
         );
 
         let (exchange, timings) = result;
-        Ok(PreparedBackendAttempt { exchange, timings })
+        Ok(PreparedBackendAttempt {
+            exchange,
+            timings,
+            sent_at,
+        })
     }
 
     pub(super) async fn forward_response_for_already_sent_request<W>(
@@ -2110,9 +2138,9 @@ impl ClientSession {
 
         let cmd_bytes_metric = MetricsBytes::new(cmd_bytes);
         let resp_bytes_metric = MetricsBytes::new(resp_bytes);
-        let _ =
-            self.metrics
-                .record_command_execution(backend_id, cmd_bytes_metric, resp_bytes_metric);
+        let _ = self
+            .metrics
+            .record_exchange_bytes(backend_id, cmd_bytes_metric, resp_bytes_metric);
         if context.request_origin == ArticleRequestOrigin::Frontend {
             self.metrics.user_bytes_sent(self.username(), cmd_bytes);
         }
@@ -4781,6 +4809,42 @@ mod tests {
         assert!(
             found.article_standing_ppm() > found_before,
             "a hit raises standing"
+        );
+    }
+
+    /// Every direct article attempt is timed, so the backend's first-byte
+    /// average is fed by real traffic rather than a 1-in-16 sample.
+    #[tokio::test]
+    async fn article_attempts_feed_first_byte_time() {
+        let (port, _) =
+            spawn_article_response_server(b"222 0 <timed@example.com>\r\npayload\r\n.\r\n").await;
+        let provider = DeadpoolConnectionProvider::builder("127.0.0.1", port)
+            .max_connections(1)
+            .build()
+            .unwrap();
+        assert_eq!(
+            provider
+                .delivery()
+                .snapshot(std::time::Instant::now())
+                .ttfb_secs,
+            None
+        );
+        let router = router_with_admission_backends(
+            vec![provider.clone()],
+            crate::pool::admission::ArticleAdmission::default(),
+        );
+        for id in 0..3 {
+            let line = format!("BODY <timed-{id}@example.com>\r\n");
+            let (status, _) = route_and_read_status(&router, line.as_bytes()).await;
+            assert_eq!(status, 222);
+        }
+        assert!(
+            provider
+                .delivery()
+                .snapshot(std::time::Instant::now())
+                .ttfb_secs
+                .is_some(),
+            "unsampled timing records every attempt"
         );
     }
 

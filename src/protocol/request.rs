@@ -191,6 +191,11 @@ impl RequestResponseMetadata {
     pub(crate) const fn wire_len(self) -> ResponseWireLen {
         self.wire_len
     }
+
+    #[must_use]
+    pub(crate) const fn status(self) -> StatusCode {
+        self.status
+    }
 }
 
 /// Backend availability facts considered while routing one request.

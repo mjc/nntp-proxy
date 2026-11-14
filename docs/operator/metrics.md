@@ -100,7 +100,7 @@ Every backend metric has the labels `backend` and `tier`, plus any listed here.
 
 | Metric | Type | Extra labels | Meaning |
 | --- | --- | --- | --- |
-| `nntp_proxy_backend_commands_total` | counter | | Commands sent to the backend. |
+| `nntp_proxy_backend_commands_total` | counter | | Commands sent to the backend, each counted once when sent. (Before this release every delivered response was counted a second time.) |
 | `nntp_proxy_backend_articles_total` | counter | | Successful `ARTICLE`/`BODY`/`HEAD` responses. |
 | `nntp_proxy_backend_article_bytes_total` | counter | | Bytes in those responses. |
 | `nntp_proxy_backend_article_missing_total` | counter | | Authoritative `430 No such article` replies. |
@@ -108,6 +108,7 @@ Every backend metric has the labels `backend` and `tier`, plus any listed here.
 | `nntp_proxy_backend_errors_total` | counter | | All errors attributed to the backend: `4xx` and `5xx` replies plus transport and session failures. |
 | `nntp_proxy_backend_bytes_total` | counter | `direction` = `sent`, `received` | Bytes sent to and received from the backend. Per-command traffic is added per response; pinned (stateful) sessions add theirs every 100 loop iterations and when the session ends. |
 | `nntp_proxy_backend_pool_connections` | gauge | `state` = `idle`, `in_use` | Pooled connections. |
+| `nntp_proxy_backend_leased_idle_connections` | gauge | | The part of `in_use` that a client holds between its commands without an exchange running. A large value while other requests wait means connections are reserved rather than working. |
 | `nntp_proxy_backend_pool_max_connections` | gauge | | Current pool limit. Lower than `max_connections` while replacement cooldowns are active. |
 | `nntp_proxy_backend_connection_cap` | gauge | | Connections allowed before cooldowns. Equals `max_connections`, unless `connection_cap = "adaptive"` lowered it after a refused login or raised it past `max_connections` while saturated. See [Adaptive connection cap](configuration.md#adaptive-connection-cap). |
 | `nntp_proxy_backend_connection_cap_reductions_total` | counter | | Times a refused login lowered the adaptive cap. Starts at zero with each process. |
@@ -120,6 +121,16 @@ Every backend metric has the labels `backend` and `tier`, plus any listed here.
 | `nntp_proxy_backend_login_backoff` | gauge | | `1` while login backoff makes new connections to the backend fail locally: a backoff window is open, or the window has ended and the one probe login it allows is still in flight. `0` once logins are allowed again, even before a later login succeeds. |
 | `nntp_proxy_backend_health_checks_total` | counter | | Idle connections checked by the periodic health check. |
 | `nntp_proxy_backend_health_check_failures_total` | counter | | Idle connections that failed it. |
+
+### Backend delivery
+
+How fast each backend actually delivers articles, measured for routing and pipelining decisions. All have the labels `backend` and `tier`, start empty at each process start, and are not saved in the stats file.
+
+| Metric | Type | Labels | Meaning |
+| --- | --- | --- | --- |
+| `nntp_proxy_backend_delivery_bytes_per_second` | gauge | `horizon` = `short`, `long` | Article bytes per busy second **per connection**. Built from decayed sums of `ARTICLE`/`BODY` bytes and of the time from sending the command to the response completing, minus time blocked on the client, then divided, so a slow or erratic transfer weighs by its duration. `short` decays over 5 s and follows the current download (omitted when no sample arrived in 10 s); `long` decays over 300 s. Omitted until there is half a second of samples. |
+| `nntp_proxy_backend_ttfb_seconds` | gauge | | Moving average (weight 1/8) of time from sending an article command to its first response, over every direct attempt. A backend whose first-byte time is most of its exchange time is waiting on the server, not on bandwidth. |
+| `nntp_proxy_backend_client_stall_seconds_total` | counter | | Time article writes from this backend spent blocked on a slow client. While it grows, the backend's connections are held by the client, not by the provider. |
 
 ### Backend admission and failover
 
@@ -144,7 +155,7 @@ Both histograms have the labels `backend` and `tier` and expose `_bucket` (with 
 
 | Metric | Buckets (seconds) | Meaning |
 | --- | --- | --- |
-| `nntp_proxy_backend_first_byte_seconds` | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 | Time from sending a command until the backend's first response bytes arrive. Only commands the proxy times one at a time are included: retries and failover attempts, adaptive `STAT`/`HEAD` prechecks, and other commands sent on their own. Commands sent in a pipelined window are not timed individually, so `_count` can be well below `nntp_proxy_backend_commands_total`. |
+| `nntp_proxy_backend_first_byte_seconds` | 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10 | Time from sending a command until the backend's first response bytes arrive. Only commands the proxy times one at a time are included: retries and failover attempts, adaptive `STAT`/`HEAD` prechecks, and other commands sent on their own. Commands sent in a pipelined window are not timed individually. Direct article attempts are timed every time; adaptive prechecks are sampled 1 in 16. |
 | `nntp_proxy_backend_exchange_duration_seconds` | 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60 | Time a backend connection was busy with one exchange, from its first write to the end of the response. For an article fetch this is the whole transfer. A pipelined window of several commands on one connection counts as one exchange. This is the same measurement that backlog admission averages. |
 
 ## Scrape configuration

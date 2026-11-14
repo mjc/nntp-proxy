@@ -80,6 +80,8 @@ pub struct BackendScrape {
     pub admission: BackendLoadSnapshot,
     /// How long a checkout joining the pool queue now would wait.
     pub estimated_wait_seconds: f64,
+    /// Article delivery rate, first-byte time, client stalls, leased conns.
+    pub delivery: crate::pool::delivery::DeliverySnapshot,
 }
 
 /// Article/availability cache state at scrape time.
@@ -536,6 +538,68 @@ fn render_admission(out: &mut Exposition, backends: &[BackendScrape]) {
             standing,
         );
     }
+    out.family(
+        "nntp_proxy_backend_delivery_bytes_per_second",
+        Gauge,
+        "Article bytes per busy second per connection: decayed sums of ARTICLE/BODY bytes over time from command sent to response complete, minus time blocked on the client. horizon=\"short\" (5 s, omitted when no sample in 10 s) follows the current download; horizon=\"long\" (300 s) remembers. Omitted until enough samples.",
+    );
+    for backend in backends {
+        for (horizon, rate) in [
+            ("short", backend.delivery.short_bytes_per_sec),
+            ("long", backend.delivery.long_bytes_per_sec),
+        ] {
+            if let Some(rate) = rate {
+                out.sample(
+                    "nntp_proxy_backend_delivery_bytes_per_second",
+                    &[
+                        ("backend", &backend.name),
+                        ("tier", &backend.tier),
+                        ("horizon", horizon),
+                    ],
+                    rate,
+                );
+            }
+        }
+    }
+    out.family(
+        "nntp_proxy_backend_ttfb_seconds",
+        Gauge,
+        "Moving average (weight 1/8) of time from sending an article command to its first response, over every direct attempt. Omitted before the first sample.",
+    );
+    for backend in backends {
+        if let Some(ttfb) = backend.delivery.ttfb_secs {
+            out.sample(
+                "nntp_proxy_backend_ttfb_seconds",
+                &[("backend", &backend.name), ("tier", &backend.tier)],
+                ttfb,
+            );
+        }
+    }
+    out.family(
+        "nntp_proxy_backend_delivery_samples_total",
+        MetricKind::Counter,
+        "ARTICLE/BODY deliveries observed for the delivery estimate, including ones too short to use. Shows the estimate is being fed.",
+    );
+    for backend in backends {
+        #[allow(clippy::cast_precision_loss)]
+        out.sample(
+            "nntp_proxy_backend_delivery_samples_total",
+            &[("backend", &backend.name), ("tier", &backend.tier)],
+            backend.delivery.observed as f64,
+        );
+    }
+    out.family(
+        "nntp_proxy_backend_client_stall_seconds_total",
+        MetricKind::Counter,
+        "Time article writes from this backend spent blocked on a slow client, which held the backend connection without the provider being slow.",
+    );
+    for backend in backends {
+        out.sample(
+            "nntp_proxy_backend_client_stall_seconds_total",
+            &[("backend", &backend.name), ("tier", &backend.tier)],
+            backend.delivery.client_stall_secs,
+        );
+    }
 }
 
 fn render_backends(out: &mut Exposition, backends: &[BackendScrape]) {
@@ -633,6 +697,16 @@ fn render_backends(out: &mut Exposition, backends: &[BackendScrape]) {
             ("idle", |b| b.pool.idle),
             ("in_use", |b| b.pool.size.saturating_sub(b.pool.idle)),
         ],
+    );
+    backend_family(
+        out,
+        backends,
+        (
+            "nntp_proxy_backend_leased_idle_connections",
+            Gauge,
+            "Connections a client holds between its commands without an exchange running; a subset of pool_connections{state=\"in_use\"}, exported separately so sums over pool states stay correct.",
+        ),
+        |b| b.delivery.leased_idle as u64,
     );
     backend_family(
         out,
@@ -867,6 +941,14 @@ pub(crate) mod tests {
                         ..BackendLoadSnapshot::default()
                     },
                     estimated_wait_seconds: 1.25,
+                    delivery: crate::pool::delivery::DeliverySnapshot {
+                        short_bytes_per_sec: Some(1_500_000.0),
+                        long_bytes_per_sec: None,
+                        ttfb_secs: Some(0.375),
+                        client_stall_secs: 2.5,
+                        leased_idle: 3,
+                        observed: 41,
+                    },
                 })
                 .collect(),
         }
@@ -1088,6 +1170,42 @@ pub(crate) mod tests {
         assert_eq!(
             value("nntp_proxy_backend_connection_cap_reductions_total", None),
             Some(2.0)
+        );
+        assert_eq!(
+            value(
+                "nntp_proxy_backend_delivery_bytes_per_second",
+                Some(("horizon", "short"))
+            ),
+            Some(1_500_000.0)
+        );
+        assert_eq!(
+            value(
+                "nntp_proxy_backend_delivery_bytes_per_second",
+                Some(("horizon", "long"))
+            ),
+            None,
+            "an unknown horizon is omitted, not exported as zero"
+        );
+        assert_eq!(value("nntp_proxy_backend_ttfb_seconds", None), Some(0.375));
+        assert_eq!(
+            value("nntp_proxy_backend_delivery_samples_total", None),
+            Some(41.0)
+        );
+        assert_eq!(
+            value("nntp_proxy_backend_client_stall_seconds_total", None),
+            Some(2.5)
+        );
+        assert_eq!(
+            value("nntp_proxy_backend_leased_idle_connections", None),
+            Some(3.0)
+        );
+        assert_eq!(
+            value(
+                "nntp_proxy_backend_pool_connections",
+                Some(("state", "leased_idle"))
+            ),
+            None,
+            "leased-idle is a subset of in_use and must not be a pool state"
         );
         assert_eq!(
             value("nntp_proxy_backend_article_standing", None),

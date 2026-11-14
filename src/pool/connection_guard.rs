@@ -178,6 +178,13 @@ impl ConnectionGuard {
             .remove_with_cooldown(conn, crate::pool::churn::CloseReason::BackendError);
     }
 
+    /// Count this connection as held idle by a client lease until the
+    /// returned token drops.
+    #[must_use]
+    pub(crate) fn idle_lease(&self) -> crate::pool::delivery::IdleLease {
+        self.provider.idle_lease()
+    }
+
     /// Get mutable reference to the connection
     ///
     /// # Panics

@@ -180,6 +180,73 @@ struct SingleBackendArticleWindow<'a> {
 
 struct UpstreamRequestIndex(usize);
 
+/// Article bytes delivered through one upstream window and the time the
+/// connection spent on them, recorded as a single delivery sample when the
+/// window ends (including early exits).
+///
+/// Responses on one connection complete in order, so each response's busy
+/// slice runs from the previous completion (or the window start) to its own.
+/// Only successful ARTICLE/BODY slices count, so HEADs and error replies in
+/// a mixed window don't dilute the rate; the slices are summed before the
+/// minimum-duration check, because responses that arrive together forward
+/// in microseconds each.
+struct WindowDelivery<'a> {
+    provider: Option<&'a crate::pool::DeadpoolConnectionProvider>,
+    last_completion: std::time::Instant,
+    article_busy: std::time::Duration,
+    bytes: u64,
+    /// Stall inside the counted article slices, subtracted from their busy time.
+    article_stall: std::time::Duration,
+    /// Stall on everything else (HEADs, errors, failed responses), counted
+    /// as client stall only.
+    other_stall: std::time::Duration,
+}
+
+impl<'a> WindowDelivery<'a> {
+    fn new(provider: Option<&'a crate::pool::DeadpoolConnectionProvider>) -> Self {
+        Self {
+            provider,
+            last_completion: std::time::Instant::now(),
+            article_busy: std::time::Duration::ZERO,
+            bytes: 0,
+            article_stall: std::time::Duration::ZERO,
+            other_stall: std::time::Duration::ZERO,
+        }
+    }
+
+    /// One response finished; `article_bytes` is set only for a successful
+    /// ARTICLE/BODY reply.
+    fn add(&mut self, article_bytes: Option<u64>, client_stall: std::time::Duration) {
+        let now = std::time::Instant::now();
+        let slice = now.saturating_duration_since(self.last_completion);
+        self.last_completion = now;
+        if let Some(bytes) = article_bytes {
+            self.bytes += bytes;
+            self.article_busy += slice;
+            self.article_stall += client_stall;
+        } else {
+            self.other_stall += client_stall;
+        }
+    }
+}
+
+impl Drop for WindowDelivery<'_> {
+    fn drop(&mut self) {
+        let Some(provider) = self.provider else {
+            return;
+        };
+        if self.bytes > 0 {
+            provider.delivery().record_article(
+                self.bytes,
+                self.article_busy,
+                self.article_stall,
+                std::time::Instant::now(),
+            );
+        }
+        provider.delivery().record_client_stall(self.other_stall);
+    }
+}
+
 /// The batch connection a window may reuse, and the bound on a fresh checkout.
 struct ArticleWindowConnection<'a> {
     lease: &'a mut BatchBackendConnection,
@@ -1147,15 +1214,23 @@ impl ClientSession {
             backend_connection,
         } = params;
         let mut conn = Some(conn);
+        // One sample per window: responses that arrive together forward in
+        // microseconds, so per-response slices would be discarded as too
+        // short while the first one absorbed the whole wait.
+        let mut window_delivery = WindowDelivery::new(router.backend_provider(backend_id));
         let mut i = 0;
         while i < requests.len() {
             match &mut requests[i] {
                 ArticleWindowRequest::KnownMissing => {
-                    self.send_430_to_client(
-                        client_writer.get_mut(),
-                        &mut state.backend_to_client_bytes,
-                    )
-                    .await?;
+                    // A synthesized 430 is not backend work, but a client
+                    // stalling on it must not be charged to the next
+                    // article's slice: time it and close the slice here.
+                    let mut timed_writer = crate::io_util::StallTimer::new(client_writer.get_mut());
+                    let sent = self
+                        .send_430_to_client(&mut timed_writer, &mut state.backend_to_client_bytes)
+                        .await;
+                    window_delivery.add(None, timed_writer.stalled());
+                    sent?;
                 }
                 ArticleWindowRequest::SendUpstream {
                     backend,
@@ -1185,6 +1260,8 @@ impl ClientSession {
                                 .expect("backend connection is live")
                                 .fail_backend();
                             drop(requests);
+                            // Recovery is timed by the direct path; keep it out of the window.
+                            drop(window_delivery);
                             self.execute_pipelineable_commands_with_recorded_request_bytes_from(
                                 AccountedPipelineCommandIndex(i),
                                 PipelineCommandParams {
@@ -1202,19 +1279,32 @@ impl ClientSession {
                         in_flight += 1;
                     }
                     let response_conn = conn.take().expect("backend connection is live");
-                    let result = batch
+                    let (result, delivered) = batch
                         .with_context_mut(i, |mut request| async {
+                            let mut timed_writer =
+                                crate::io_util::StallTimer::new(client_writer.get_mut());
                             let result = self
                                 .forward_response_for_already_sent_request(
                                     response_conn,
-                                    client_writer.get_mut(),
+                                    &mut timed_writer,
                                     backend,
                                     &mut request,
                                     availability,
                                     &mut state.backend_to_client_bytes,
                                 )
                                 .await;
-                            (request, result)
+                            let stall = timed_writer.stalled();
+                            let delivered = matches!(
+                                request.kind(),
+                                crate::protocol::RequestKind::Article
+                                    | crate::protocol::RequestKind::Body
+                            )
+                            .then(|| request.response_metadata())
+                            .flatten()
+                            .filter(|response| response.status().is_success())
+                            .map(|response| response.wire_len().get() as u64);
+                            let delivered = (delivered, stall);
+                            (request, (result, delivered))
                         })
                         .await
                         .map_err(|_| {
@@ -1222,8 +1312,12 @@ impl ClientSession {
                                 "upstream window request lost its pipelineability while forwarding its response"
                             ))
                         })?;
+                    if result.is_err() {
+                        window_delivery.add(None, delivered.1);
+                    }
                     match result {
                         Ok(next_conn) => {
+                            window_delivery.add(delivered.0, delivered.1);
                             conn = Some(next_conn);
                             guard
                                 .take()
@@ -1243,6 +1337,8 @@ impl ClientSession {
                                 "Upstream window response read failed; retrying unread requests sequentially"
                             );
                             drop(requests);
+                            // Recovery is timed by the direct path; keep it out of the window.
+                            drop(window_delivery);
                             self.execute_pipelineable_commands_with_recorded_request_bytes_from(
                                 AccountedPipelineCommandIndex(i),
                                 PipelineCommandParams {
@@ -1328,6 +1424,8 @@ impl ClientSession {
                         .expect("backend connection is live")
                         .fail_backend();
                     drop(requests);
+                    // Recovery is timed by the direct path; keep it out of the window.
+                    drop(window_delivery);
                     self.execute_pipelineable_commands_with_recorded_request_bytes_from(
                         AccountedPipelineCommandIndex(i + 1),
                         PipelineCommandParams {

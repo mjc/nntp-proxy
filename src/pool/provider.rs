@@ -861,6 +861,19 @@ impl DeadpoolConnectionProvider {
         self.load.standing_ppm()
     }
 
+    /// Delivery rate, first-byte time, client stalls and leased connections.
+    #[must_use]
+    pub fn delivery(&self) -> &super::delivery::DeliveryStats {
+        self.load.delivery()
+    }
+
+    /// Count a client lease holding one of this backend's connections idle
+    /// until the returned token drops.
+    #[must_use]
+    pub fn idle_lease(&self) -> super::delivery::IdleLease {
+        super::delivery::IdleLease::new(Arc::clone(&self.load))
+    }
+
     /// Whether `admission` says this backend is not worth waiting on when busy.
     #[must_use]
     pub fn is_unlikely_to_rescue(&self, admission: &super::admission::ArticleAdmission) -> bool {

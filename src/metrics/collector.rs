@@ -414,15 +414,18 @@ impl MetricsCollector {
 
     /// Record command execution with per-backend and global byte tracking
     ///
-    /// Convenience method that combines the common pattern:
-    /// - Record command count for backend
-    /// - Record per-backend bytes sent/received
-    /// - Mark global bytes as recorded (type-state transition)
+    /// Record one finished exchange's bytes:
+    /// - per-backend bytes sent/received
+    /// - global bytes, marked recorded (type-state transition)
+    ///
+    /// The command is not counted here: it was counted when it was sent, and
+    /// counting it again double-counted every delivered response in
+    /// `nntp_proxy_backend_commands_total`.
     ///
     /// Returns recorded byte markers for compile-time tracking.
     #[inline]
     #[must_use]
-    pub fn record_command_execution(
+    pub fn record_exchange_bytes(
         &self,
         backend_id: BackendId,
         client_to_backend: crate::types::MetricsBytes<crate::types::Unrecorded>,
@@ -431,8 +434,8 @@ impl MetricsCollector {
         crate::types::MetricsBytes<crate::types::Recorded>,
         crate::types::MetricsBytes<crate::types::Recorded>,
     ) {
-        // Record command count
-        self.record_command(backend_id);
+        // The command itself was counted when it was sent; counting it again
+        // here double-counted every delivered response.
 
         // Record per-backend bytes
         self.record_client_to_backend_bytes_for(backend_id, client_to_backend.peek());

@@ -68,6 +68,7 @@ pub fn gather(proxy: &NntpProxy) -> Scrape {
                 exchange_duration: load.exchange_duration(),
                 admission: load.snapshot(),
                 estimated_wait_seconds: provider.estimated_wait().as_secs_f64(),
+                delivery: provider.delivery().snapshot(std::time::Instant::now()),
             }
         })
         .collect();

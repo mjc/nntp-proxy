@@ -15,13 +15,18 @@ use crate::types::BackendId;
 pub(super) struct BackendLease {
     pub(super) backend_id: BackendId,
     pub(super) connection: ConnectionGuard,
+    /// Counts the connection as leased and idle for the utilisation gauge;
+    /// it stops counting when the lease is taken apart for an exchange.
+    _idle: crate::pool::delivery::IdleLease,
 }
 
 impl BackendLease {
-    pub(super) const fn new(backend_id: BackendId, connection: ConnectionGuard) -> Self {
+    pub(super) fn new(backend_id: BackendId, connection: ConnectionGuard) -> Self {
+        let idle = connection.idle_lease();
         Self {
             backend_id,
             connection,
+            _idle: idle,
         }
     }
 

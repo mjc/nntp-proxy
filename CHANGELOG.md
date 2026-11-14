@@ -22,6 +22,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Per-backend `admission` counters in the stats file: backlog skips, checkout timeouts, deadline expiries, the service-time average, and last-resort waits with how many connected or timed out.
 - `[routing.article].standing` (`"off"` by default, or `"adaptive"`): each backend keeps an article standing that drops by 1/8 on every `430` and climbs by 1/128 of the gap on every hit. With `"adaptive"`, article lookups weigh backends within a tier by capacity times standing, so a provider that hits a takedown drops to overflow-only within a few dozen lookups and earns its share back as it finds articles. Least-loaded routing counts the request being placed, so a backend that stays idle by answering `430` quickly no longer wins every first attempt. Tier order and retries are unchanged. The new gauge `nntp_proxy_backend_article_standing` is exported in both modes.
 - Per-server `connection_cap` (`"fixed"` by default, or `"adaptive"`; env `NNTP_SERVER_<N>_CONNECTION_CAP`). With `"adaptive"`, a refused login ("too many connections") drops the pool at once to the connections the provider had accepted. The cap then climbs back one connection per minute, and past `max_connections` one per 10 minutes while the pool is saturated; the next refusal brings it straight back down. A pool that always regrew to `max_connections` kept tripping a provider limit that was lower or shared, and login backoff only spaced those refusals out. New metrics: `nntp_proxy_backend_connection_cap` and `nntp_proxy_backend_connection_cap_reductions_total`.
+- Backend delivery measurements for routing and pipelining decisions:
+  - `nntp_proxy_backend_delivery_bytes_per_second{horizon="short|long"}`: per-connection article delivery rate from decayed byte and busy-time sums, with client stalls excluded.
+  - `nntp_proxy_backend_ttfb_seconds`: first-response average over every direct article attempt.
+  - `nntp_proxy_backend_client_stall_seconds_total`: time article writes spent blocked on the client.
+  - `nntp_proxy_backend_leased_idle_connections`: connections a client holds between commands (a subset of `in_use`).
+  Direct article attempts are now timed every time instead of 1 in 16, so `nntp_proxy_backend_first_byte_seconds` covers all of them.
 - `[routing].lower_tier_stat_prefetch` controls the background lower-tier `STAT` probes for `ARTICLE`/`BODY`: `"first-attempt"` (default), `"after-primary-miss"`, or `"off"`. The probes are overhead on small lower-tier pools when the primary tier rarely misses.
 
 ### Changed
@@ -32,6 +38,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `nntp_proxy_backend_commands_total` counted every delivered response twice (once when the command was sent, again when the response was recorded), so a backend's `430` share was understated. Each command now counts once.
 - An article attempt no longer retries the same backend right after it refused a login (for example "too many connections") or while its pool is in login backoff. The pool refuses new connections for seconds after a refusal, so the retry 1-9 ms later could only fail. It added a short wait to every affected request and logged two warnings each time (332 pairs in two days on one deployment). The request now moves on to another backend at once, as it already did for a full or backlogged pool.
 - Messages logged while the binary loads its config, such as the backend list and legacy-schema migration notices, used to be dropped because logging was not set up yet. They are now held until logging starts, and printed to stderr if loading fails.
 - A hybrid session that can't get a backend for its first stateful command now receives `400 Backend server unavailable` instead of a silently closed connection.

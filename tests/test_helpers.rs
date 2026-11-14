@@ -546,11 +546,23 @@ pub async fn spawn_proxy_with_config(
     config: Config,
     routing_mode: nntp_proxy::RoutingMode,
 ) -> Result<u16> {
+    Ok(spawn_proxy_with_config_handle(config, routing_mode)
+        .await?
+        .0)
+}
+
+/// Like [`spawn_proxy_with_config`], but also returns the proxy so a test can
+/// inspect its providers.
+pub async fn spawn_proxy_with_config_handle(
+    config: Config,
+    routing_mode: nntp_proxy::RoutingMode,
+) -> Result<(u16, nntp_proxy::NntpProxy)> {
     use nntp_proxy::NntpProxy;
 
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
     let proxy_port = proxy_listener.local_addr()?.port();
     let proxy = NntpProxy::new(config, routing_mode).await?;
+    let handle = proxy.clone();
 
     tokio::spawn(async move {
         loop {
@@ -574,7 +586,7 @@ pub async fn spawn_proxy_with_config(
         }
     });
 
-    Ok(proxy_port)
+    Ok((proxy_port, handle))
 }
 
 /// Spawn a proxy backed by a single mock backend and return the proxy port.

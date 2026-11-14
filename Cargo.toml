@@ -175,6 +175,10 @@ name = "router_selection"
 harness = false
 
 [[bench]]
+name = "delivery_record"
+harness = false
+
+[[bench]]
 name = "request_classifier_callgrind"
 harness = false
 
