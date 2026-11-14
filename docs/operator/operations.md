@@ -106,6 +106,15 @@ credential failure keeps the pool size and only backs off.
 - Check `[routing].mode` first when behavior does not match your workload.
 - `hybrid` starts per-command and switches to a dedicated backend for stateful commands.
 
+### STAT probe failures
+
+Background `STAT` probes (the lower-tier prefetch and the retry sweep after a
+`430`) skip a backend for the request when the probe cannot check out a
+connection, send the command, or read the reply. Set
+`RUST_LOG=info,nntp_proxy::stat_probe=debug` to log each such failure with the
+backend, pool, phase (`lower_tier_prefetch` or `retry_sweep`), and error.
+These lines carry no request text or credentials.
+
 ### TLS failures
 
 - Keep `tls_verify_cert = true` in production.

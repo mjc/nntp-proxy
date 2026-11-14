@@ -943,7 +943,16 @@ impl ClientSession {
                     Err(crate::connection_error::ConnectionError::Backlogged { .. }) => {
                         return RetryStatProbeOutcome::Backlogged { backend_id, budget };
                     }
-                    Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
+                    Err(error) => {
+                        log_stat_probe_failure(
+                            &provider,
+                            backend_id,
+                            StatProbePhase::RetrySweep,
+                            StatProbeStep::Checkout,
+                            &error,
+                        );
+                        return RetryStatProbeOutcome::Unavailable(backend_id);
+                    }
                 };
                 // The probe is a command to this backend like any other, so
                 // it counts in commands_total next to the 430 it may record;
@@ -960,14 +969,34 @@ impl ClientSession {
                 .await
                 {
                     Ok(exchange) => exchange,
-                    Err(_) => return RetryStatProbeOutcome::Unavailable(backend_id),
+                    Err(error) => {
+                        log_stat_probe_failure(
+                            &provider,
+                            backend_id,
+                            StatProbePhase::RetrySweep,
+                            StatProbeStep::Exchange,
+                            &error,
+                        );
+                        return RetryStatProbeOutcome::Unavailable(backend_id);
+                    }
                 };
 
                 let status_code = exchange.status_code();
-                let Ok(conn) = exchange.observe_and_reuse().await else {
-                    return RetryStatProbeOutcome::Unavailable(backend_id);
+                let conn = match exchange.observe_and_reuse().await {
+                    Ok(conn) => conn,
+                    Err(error) => {
+                        log_stat_probe_failure(
+                            &provider,
+                            backend_id,
+                            StatProbePhase::RetrySweep,
+                            StatProbeStep::Drain,
+                            &error,
+                        );
+                        return RetryStatProbeOutcome::Unavailable(backend_id);
+                    }
                 };
-                let release = release_observed_probe_connection(conn, backend_id);
+                let release =
+                    release_observed_probe_connection(conn, backend_id, &stat_request, status_code);
 
                 // The STAT reply was fully framed before any stray bytes, so a
                 // 430 stays authoritative even when the socket must be retired.
@@ -1108,7 +1137,16 @@ impl ClientSession {
                     let _guard = BackendSelector::guard_for_manual_backend(router, backend_id);
                     let conn = match provider.checkout_for_attempt(budget).await {
                         Ok(conn) => conn.activate(),
-                        Err(_) => return,
+                        Err(error) => {
+                            log_stat_probe_failure(
+                                &provider,
+                                backend_id,
+                                StatProbePhase::LowerTierPrefetch,
+                                StatProbeStep::Checkout,
+                                &error,
+                            );
+                            return;
+                        }
                     };
                     // Count the probe and its 430 in the same per-backend
                     // counters as direct commands, so commands_total and
@@ -1125,15 +1163,39 @@ impl ClientSession {
                     .await
                     {
                         Ok(exchange) => exchange,
-                        Err(_) => return,
+                        Err(error) => {
+                            log_stat_probe_failure(
+                                &provider,
+                                backend_id,
+                                StatProbePhase::LowerTierPrefetch,
+                                StatProbeStep::Exchange,
+                                &error,
+                            );
+                            return;
+                        }
                     };
                     let status_code = exchange.status_code();
-                    let Ok(conn) = exchange.observe_and_reuse().await else {
-                        return;
+                    let conn = match exchange.observe_and_reuse().await {
+                        Ok(conn) => conn,
+                        Err(error) => {
+                            log_stat_probe_failure(
+                                &provider,
+                                backend_id,
+                                StatProbePhase::LowerTierPrefetch,
+                                StatProbeStep::Drain,
+                                &error,
+                            );
+                            return;
+                        }
                     };
                     // Retirement does not invalidate the already-framed reply,
                     // so a 430 is still recorded below.
-                    let _ = release_observed_probe_connection(conn, backend_id);
+                    let _ = release_observed_probe_connection(
+                        conn,
+                        backend_id,
+                        &stat_request,
+                        status_code,
+                    );
 
                     if let Some(status) = status_code {
                         let outcome = if status.is_article_missing() {
@@ -2351,10 +2413,90 @@ fn same_backend_retry_cannot_succeed(error: &anyhow::Error) -> bool {
 ///
 /// Queued bytes after the reply mean the backend sent something unrequested,
 /// so the socket cannot be trusted for another command and is retired.
+/// Which background STAT path a probe failure came from.
+#[derive(Debug, Clone, Copy)]
+enum StatProbePhase {
+    RetrySweep,
+    LowerTierPrefetch,
+}
+
+impl StatProbePhase {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::RetrySweep => "retry_sweep",
+            Self::LowerTierPrefetch => "lower_tier_prefetch",
+        }
+    }
+}
+
+/// The probe step that failed.
+#[derive(Debug, Clone, Copy)]
+enum StatProbeStep {
+    Checkout,
+    Exchange,
+    Drain,
+}
+
+/// A failed probe only marks the backend unavailable for the request, which
+/// is invisible from the client side. This dedicated target lets an operator
+/// enable just these lines (`RUST_LOG=info,nntp_proxy::stat_probe=debug`) to
+/// see why retries skipped a backend, without request text or credentials.
+fn log_stat_probe_failure(
+    provider: &crate::pool::DeadpoolConnectionProvider,
+    backend_id: BackendId,
+    phase: StatProbePhase,
+    step: StatProbeStep,
+    error: &dyn std::fmt::Display,
+) {
+    let backend = backend_id.as_index();
+    let pool = provider.name();
+    let phase = phase.as_str();
+    match step {
+        StatProbeStep::Checkout => debug!(
+            target: "nntp_proxy::stat_probe",
+            backend, pool, phase, error = %error,
+            "STAT probe checkout failed"
+        ),
+        StatProbeStep::Exchange => debug!(
+            target: "nntp_proxy::stat_probe",
+            backend, pool, phase, error = %error,
+            "STAT probe exchange failed"
+        ),
+        StatProbeStep::Drain => debug!(
+            target: "nntp_proxy::stat_probe",
+            backend, pool, phase, error = %error,
+            "STAT probe reply could not be drained"
+        ),
+    }
+}
+
 fn release_observed_probe_connection(
     conn: crate::pool::ConnectionGuard,
     backend_id: BackendId,
+    stat_request: &RequestContext,
+    status_code: Option<StatusCode>,
 ) -> Result<(), SessionError> {
+    // A probe that hears the session is closing (400) or lost its
+    // authorization (48x, 502) must not hand that socket to the next request,
+    // which would fail the same way; the caller treats the backend as
+    // unavailable rather than as having the article.
+    if let Some(status) = status_code
+        && ArticleErrorReply::classify(stat_request, status)
+            == Some(ArticleErrorReply::SessionUnusable)
+    {
+        debug!(
+            target: "nntp_proxy::stat_probe",
+            backend = backend_id.as_index(),
+            status_code = status.as_u16(),
+            "STAT probe reply ended the backend session; retiring connection"
+        );
+        conn.fail_backend();
+        return Err(SessionError::Backend(anyhow::anyhow!(
+            "backend {} ended the session with {} during a STAT probe",
+            backend_id.as_index(),
+            status.as_u16()
+        )));
+    }
     let pending_bytes = conn.pending_bytes_len();
     if pending_bytes == 0 {
         drop(conn.complete_success());
@@ -3551,6 +3693,115 @@ mod tests {
                 .availability()
                 .is_missing_slot(crate::cache::AvailabilitySlot::new(1).unwrap())
         );
+        assert_connection_retired(&router, 1);
+    }
+
+    const STAT_SERVICE_DISCONTINUED: &[u8] = b"400 Service discontinued\r\n";
+
+    #[tokio::test]
+    async fn retry_stat_sweep_retires_and_suppresses_a_backend_that_ends_its_session() {
+        let session = test_session();
+        let (port0, stat0, _body0) = spawn_stat_missing_probe_server().await;
+        let (port1, stat1, _body1) = spawn_stat_probe_server(STAT_SERVICE_DISCONTINUED).await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+        ]);
+
+        let request = request_context(b"BODY <missing@example.com>\r\n");
+        let mut availability = ArticleAvailability::new();
+        let mut client_to_backend_bytes = ClientToBackendBytes::zero();
+        let mut backend_connection = None;
+        let mut unavailable_backends = SuppressedBackends::empty();
+        let mut state = ArticleAttemptState {
+            availability: &mut availability,
+            client_to_backend_bytes: &mut client_to_backend_bytes,
+            backend_connection: &mut backend_connection,
+            unavailable_backends: &mut unavailable_backends,
+            backlogged: &mut BackloggedBackends::default(),
+            request_origin: ArticleRequestOrigin::Frontend,
+            budget: crate::pool::admission::ArticleAdmission::default().start_request(),
+        };
+        session
+            .parallel_retry_stat_sweep(&router, &request, &mut state)
+            .await
+            .expect("parallel retry STAT sweep should succeed");
+
+        assert_eq!(stat0.load(Ordering::SeqCst), 1);
+        assert_eq!(stat1.load(Ordering::SeqCst), 1);
+        assert!(availability.is_missing_slot(crate::cache::AvailabilitySlot::new(0).unwrap()));
+        assert!(
+            !availability.is_missing_slot(crate::cache::AvailabilitySlot::new(1).unwrap()),
+            "a 400 is not a 430 and must not be recorded as missing"
+        );
+        assert!(
+            unavailable_backends.contains(BackendId::from_index(1)),
+            "a backend whose session ended must be skipped for this request"
+        );
+        assert_connection_returned_idle(&router, 0);
+        assert_connection_retired(&router, 1);
+    }
+
+    #[tokio::test]
+    async fn non_primary_stat_prefetch_retires_a_connection_whose_session_ended() {
+        let session = test_session();
+        let (port0, _stat0, _body0) = spawn_stat_missing_probe_server().await;
+        let (port1, stat1, _body1) = spawn_stat_probe_server(STAT_SERVICE_DISCONTINUED).await;
+        let router = router_with_tiered_backends([
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port0)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                0,
+            ),
+            (
+                DeadpoolConnectionProvider::builder("127.0.0.1", port1)
+                    .max_connections(1)
+                    .stat_missing(true)
+                    .build()
+                    .unwrap(),
+                1,
+            ),
+        ]);
+
+        let request = request_context(b"BODY <missing@example.com>\r\n");
+        session.spawn_non_primary_tier_stat_prefetch(
+            &router,
+            &request,
+            &ArticleAvailability::new(),
+            SuppressedBackends::empty(),
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let status = router
+                    .backend_provider(BackendId::from_index(1))
+                    .expect("backend is registered")
+                    .status_counts();
+                if stat1.load(Ordering::SeqCst) == 1 && status.size == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the prefetch must retire the probe connection after a 400");
         assert_connection_retired(&router, 1);
     }
 
